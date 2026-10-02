@@ -1184,7 +1184,27 @@ impl ChatManager {
         cmd: AgentCommand,
         origin: Option<&'static str>,
     ) -> Result<()> {
-        self.enqueue(id, cmd, origin, None).await.map(|_| ())
+        self.enqueue(id, cmd, origin, None, || Ok(()))
+            .await
+            .map(|_| ())
+    }
+
+    /// A daemon command whose authority may change while the actor queue waits.
+    /// `admit` runs after every queue/order await, immediately before dispatch;
+    /// its returned reservation is retained through the synchronous enqueue.
+    /// Refusal releases queue quota and preserves the unused-startup evidence.
+    pub async fn command_as_checked<F, T>(
+        &self,
+        id: &str,
+        cmd: AgentCommand,
+        origin: Option<&'static str>,
+        admit: F,
+    ) -> Result<()>
+    where
+        F: FnOnce() -> Result<T> + Send,
+        T: Send,
+    {
+        self.enqueue(id, cmd, origin, None, admit).await.map(|_| ())
     }
 
     /// [`Self::command`] for a `send` / `send_after_turn` a client made under
@@ -1201,7 +1221,7 @@ impl ChatManager {
         cmd: AgentCommand,
         client_id: Option<&str>,
     ) -> Result<SendOutcome> {
-        self.enqueue(id, cmd, None, client_id).await
+        self.enqueue(id, cmd, None, client_id, || Ok(())).await
     }
 
     /// What session `id` knows about a client's send id; `None` means no evidence
@@ -1280,13 +1300,18 @@ impl ChatManager {
         }
     }
 
-    async fn enqueue(
+    async fn enqueue<F, T>(
         &self,
         id: &str,
         cmd: AgentCommand,
         origin: Option<&'static str>,
         client_id: Option<&str>,
-    ) -> Result<SendOutcome> {
+        admit: F,
+    ) -> Result<SendOutcome>
+    where
+        F: FnOnce() -> Result<T> + Send,
+        T: Send,
+    {
         let session = self.get_session(id).map_err(|error| {
             if client_id.is_some()
                 && matches!(
@@ -1358,6 +1383,7 @@ impl ChatManager {
             // Canceling this await may leave dispatch uncertain, never forgotten.
             session.send_state.dispatch(client_id).await?;
         }
+        let _admission = admit()?;
         if reservation.is_some() {
             // Mark before enqueue: an exit can race the first prompt while
             // the driver is still negotiating and has not echoed it yet.
@@ -1567,6 +1593,126 @@ pub(crate) fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::ContentBlock;
+    use std::time::Duration;
+
+    struct HeldCommands {
+        commands: Arc<Mutex<Option<mpsc::Receiver<AgentCommand>>>>,
+    }
+    impl AgentAdapter for HeldCommands {
+        fn kind(&self) -> &'static str {
+            "claude"
+        }
+        fn spawn(&self, _: SpawnSpec, io: DriverIo) -> Result<tokio::task::JoinHandle<DriverExit>> {
+            *self.commands.lock().unwrap() = Some(io.commands);
+            let mut kill = io.kill;
+            Ok(tokio::spawn(async move {
+                let _events = io.events;
+                let _ = kill.changed().await;
+                DriverExit::Killed
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn checked_enqueue_revalidates_after_order_and_channel_waits_without_using_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(ChatManager::new(
+            dir.path().join("chat"),
+            Box::new(|_, _| {}),
+            Box::new(|_, _| {}),
+        ));
+        let commands = Arc::new(Mutex::new(None));
+        manager
+            .spawn(
+                &HeldCommands {
+                    commands: commands.clone(),
+                },
+                SpawnSpec::new("checked", vec!["fixture".into()], dir.path().to_path_buf()),
+            )
+            .unwrap();
+        let session = manager.get_session("checked").unwrap();
+        let mut commands = commands.lock().unwrap().take().unwrap();
+        let allowed = Arc::new(AtomicBool::new(true));
+        let send = || AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "synthetic guarded prompt".into(),
+            }],
+        };
+        let order = session.command_order.lock().await;
+        let owner = manager.clone();
+        let permission = allowed.clone();
+        let waiting = tokio::spawn(async move {
+            owner
+                .command_as_checked("checked", send(), None, || {
+                    anyhow::ensure!(permission.load(Ordering::Acquire), "authority changed");
+                    Ok(())
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+        allowed.store(false, Ordering::Release);
+        drop(order);
+        assert!(waiting.await.unwrap().is_err());
+        assert!(matches!(
+            commands.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(manager.is_unused_startup("checked"));
+        assert_eq!(session.command_budget.lock().unwrap().sends, 0);
+        assert_eq!(session.command_budget.lock().unwrap().bytes, 0);
+        // Force the second await, after quota reservation but before dispatch.
+        for _ in 0..CMD_QUEUE {
+            session.cmd_tx.try_send(AgentCommand::Interrupt).unwrap();
+        }
+        allowed.store(true, Ordering::Release);
+        let owner = manager.clone();
+        let permission = allowed.clone();
+        let waiting = tokio::spawn(async move {
+            owner
+                .command_as_checked("checked", send(), None, || {
+                    anyhow::ensure!(permission.load(Ordering::Acquire), "authority changed");
+                    Ok(())
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while session.command_budget.lock().unwrap().sends != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        allowed.store(false, Ordering::Release);
+        assert!(matches!(
+            commands.recv().await,
+            Some(AgentCommand::Interrupt)
+        ));
+        assert!(waiting.await.unwrap().is_err());
+        assert_eq!(session.command_budget.lock().unwrap().sends, 0);
+        assert_eq!(session.command_budget.lock().unwrap().bytes, 0);
+        assert!(manager.is_unused_startup("checked"));
+        while let Ok(command) = commands.try_recv() {
+            assert!(matches!(command, AgentCommand::Interrupt));
+        }
+        assert!(!manager
+            .attach("checked", 0)
+            .unwrap()
+            .replay
+            .iter()
+            .any(|entry| matches!(entry.ev, AgentEvent::UserMessage { .. })));
+        // Refusals did not exhaust retained-send quota; the next valid send works.
+        manager
+            .command_as_checked("checked", send(), None, || Ok(()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            commands.recv().await,
+            Some(AgentCommand::Send { .. })
+        ));
+        assert!(!manager.is_unused_startup("checked"));
+        manager.kill("checked");
+    }
 
     fn chat_info_with_metadata(model: Option<&str>, mode: Option<&str>) -> ChatInfo {
         ChatInfo {

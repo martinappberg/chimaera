@@ -186,6 +186,8 @@ impl Session {
             cmd.env(name, value);
         }
 
+        // A shell must not mistake its terminal stdin for daemon cleanup evidence.
+        cmd.env_remove("CHIMAERA_SUPERVISOR_CLEANUP_FD");
         let mut child = pty
             .slave
             .spawn_command(cmd)

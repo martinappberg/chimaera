@@ -848,16 +848,65 @@ pub async fn clear_wedged_master(host: &str, session_bound_secs: u64) -> bool {
 pub async fn close_master(host: &str) -> anyhow::Result<()> {
     let host = hosts::normalize_alias(host)?;
     let route = route_of(&host);
-    let closed = bounded_mux_ssh(&host, &route, &["-O", "exit"], &[], 5).await;
-    let alias_closed = if route != Route::Alias {
-        bounded_mux_ssh(&host, &Route::Alias, &["-O", "exit"], &[], 5).await
-    } else {
-        Some(true)
-    };
-    if closed.is_none() || alias_closed.is_none() {
-        bail!("SSH login did not acknowledge closure within the deadline");
+    // Dropping a caller must not abandon the alias leg after closing its node.
+    close_masters_owned(route, move |route| {
+        let host = host.clone();
+        async move {
+            let mut command = mux_prologue(&host, &route);
+            command.args(["-O", "exit"]).arg(&host);
+            master_exit(command, Duration::from_secs(5)).await
+        }
+    })
+    .await
+    .context("SSH login cleanup task did not finish")?
+}
+
+fn close_masters_owned<F, Fut>(
+    route: Route,
+    mut close: F,
+) -> tokio::task::JoinHandle<anyhow::Result<()>>
+where
+    F: FnMut(Route) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = anyhow::Result<()>> + Send,
+{
+    tokio::spawn(async move {
+        let first = close(route.clone()).await;
+        let alias = if route != Route::Alias {
+            close(Route::Alias).await
+        } else {
+            Ok(())
+        };
+        first.and(alias)
+    })
+}
+
+async fn master_exit(mut command: Command, deadline: Duration) -> anyhow::Result<()> {
+    // OpenSSH's explicit ENOENT diagnostic distinguishes an absent master from
+    // a refused request, invalid config or failed spawn. Other locales fail
+    // closed rather than turning an arbitrary nonzero exit into success.
+    command.env("LC_ALL", "C");
+    let output = tokio::time::timeout(
+        deadline,
+        output_bounded(&mut command, 10, "SSH login closure"),
+    )
+    .await
+    .context("SSH login did not acknowledge closure within the deadline")?
+    .map_err(|_| anyhow::anyhow!("SSH login closure could not be completed"))?;
+    if !output.status.success() && !master_already_absent(&output) {
+        bail!("SSH login did not acknowledge closure");
     }
     Ok(())
+}
+
+fn master_already_absent(output: &std::process::Output) -> bool {
+    output.status.code() == Some(255)
+        && output.stdout.is_empty()
+        && std::str::from_utf8(&output.stderr).is_ok_and(|stderr| {
+            let line = stderr.trim();
+            line.starts_with("Control socket connect(")
+                && line.ends_with("): No such file or directory")
+                && !line.contains(['\n', '\r'])
+        })
 }
 
 async fn clear_wedged_master_via(host: &str, route: &Route, session_bound_secs: u64) -> bool {
@@ -1877,11 +1926,15 @@ fn parse_probe_output(stdout: &str) -> anyhow::Result<Option<Probe>> {
         Ok(manifest) => manifest,
         Err(err) => {
             if trailer_pid(trailer).is_some() && trailer_verdict(trailer) == Some(true) {
-                bail!("the manifest is unparsable ({err}) yet its pid is alive; refusing to start a second daemon");
+                bail!(
+                    "the manifest is unparsable ({err}) yet its pid is alive; refusing to start a second daemon"
+                );
             }
             let written_on = trailer_field(trailer, "host").unwrap_or_default();
             if !written_on.is_empty() && !node.is_empty() && !same_node(written_on, &node) {
-                bail!("the manifest is unparsable ({err}) and names node {written_on}, not {node}; refusing to start a second daemon");
+                bail!(
+                    "the manifest is unparsable ({err}) and names node {written_on}, not {node}; refusing to start a second daemon"
+                );
             }
             return Ok(None);
         }
@@ -3196,6 +3249,110 @@ async fn tunnel_proven(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn master_exit_requires_acknowledgment_or_an_explicit_absent_socket() {
+        for (script, succeeds) in [
+            ("exit 0", true),
+            ("exit 1", false),
+            (
+                "printf 'Control socket connect(/tmp/fixture): No such file or directory\\n' >&2; exit 255",
+                true,
+            ),
+            (
+                "printf 'Control socket connect(/tmp/fixture): Permission denied\\n' >&2; exit 255",
+                false,
+            ),
+            (
+                "printf 'unrelated failure\\nControl socket connect(/tmp/fixture): No such file or directory\\n' >&2; exit 255",
+                false,
+            ),
+            (
+                "printf 'untrusted output'; printf 'Control socket connect(/tmp/fixture): No such file or directory\\n' >&2; exit 255",
+                false,
+            ),
+        ] {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", script]);
+            assert_eq!(
+                master_exit(command, Duration::from_secs(2)).await.is_ok(),
+                succeeds
+            );
+        }
+        let missing = Command::new("/chimaera-fixture-missing-ssh");
+        assert!(master_exit(missing, Duration::from_secs(1)).await.is_err());
+        let mut stalled = Command::new("/bin/sleep");
+        stalled.arg("30");
+        assert!(master_exit(stalled, Duration::from_millis(20))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn master_cleanup_attempts_both_routes_even_when_the_node_refuses() {
+        for route in [
+            Route::Node("n".into()),
+            Route::NodeViaAlias("n".into()),
+            Route::Alias,
+        ] {
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let output = seen.clone();
+            let result = close_masters_owned(route.clone(), move |leg| {
+                output.lock().unwrap().push(leg.clone());
+                async move {
+                    if leg != Route::Alias {
+                        bail!("fixture refused closure");
+                    }
+                    Ok(())
+                }
+            })
+            .await
+            .unwrap();
+            let expected = if route == Route::Alias {
+                vec![Route::Alias]
+            } else {
+                vec![route, Route::Alias]
+            };
+            assert_eq!(*seen.lock().unwrap(), expected);
+            assert_eq!(result.is_ok(), expected.len() == 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn master_cleanup_finishes_the_alias_after_its_caller_is_cancelled() {
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let proceed = std::sync::Arc::new(tokio::sync::Notify::new());
+        let finished = std::sync::Arc::new(tokio::sync::Notify::new());
+        let caller = {
+            let (started, proceed, finished) = (started.clone(), proceed.clone(), finished.clone());
+            tokio::spawn(async move {
+                close_masters_owned(Route::NodeViaAlias("n".into()), move |leg| {
+                    let (started, proceed, finished) =
+                        (started.clone(), proceed.clone(), finished.clone());
+                    async move {
+                        if leg != Route::Alias {
+                            started.notify_one();
+                            proceed.notified().await;
+                        } else {
+                            finished.notify_one();
+                        }
+                        Ok(())
+                    }
+                })
+                .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        proceed.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), finished.notified())
+            .await
+            .unwrap();
+    }
 
     #[test]
     fn keeper_ssh_destination_retains_only_address_user_and_port() {
@@ -4931,7 +5088,9 @@ mod tests {
             false,
             Some(true),
             |_, _| {
-                ssh_failed("ssh: Could not resolve hostname ln01.cluster.edu: nodename nor servname provided")
+                ssh_failed(
+                    "ssh: Could not resolve hostname ln01.cluster.edu: nodename nor servname provided",
+                )
             },
         );
         let (out, _) = try_resolve(&fake, false).await;

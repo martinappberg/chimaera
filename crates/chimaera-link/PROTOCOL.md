@@ -493,8 +493,11 @@ Additive (2026-09-30): `POST|DELETE /v2/baton/{workspace}/move`, the
 passive read's `ready`/`power` query, the `{"type":"bringing","to":"here"|"computer"}`
 socket frame, the `bringing`/`still_working` refusal reasons and the `other`
 flag of `moved`. Clients that ignore them keep today's behavior (the work
-stays where it runs and a send wakes a sleeping cloud machine). The contract is
-in [HANDOFF](HANDOFF.md#acting-brings-the-work-to-you) and
+stays where it runs and a send wakes a sleeping cloud machine). In current
+native clients, opening synchronizes a local copy and ordinary input stays
+with the owner; only explicit Take over requests execution transfer. The
+section title is retained for existing links. The contract is
+in [HANDOFF](HANDOFF.md#explicit-take-over-moves-execution) and
 [VIEWING](VIEWING.md#forwarded-requests).
 
 ### Sleeping worker HTTP transport

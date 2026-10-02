@@ -21,7 +21,9 @@ pub(super) fn kept_copy_name(name: &str) -> bool {
         return false;
     };
     let stamp = &name[index + MARKER.len()..];
-    let (stamp, suffix) = stamp.split_at(stamp.len().min(13));
+    let Some((stamp, suffix)) = stamp.split_at_checked(13) else {
+        return false;
+    };
     stamp.len() == 13
         && stamp.as_bytes()[8] == b'-'
         && stamp
@@ -199,6 +201,9 @@ mod tests {
             "notes.mine-",
             "a.mine-2026092-1200",
             "a.mine-20260928x1200",
+            "a.mine-123456789012é",
+            "a.mine-ååååååå",
+            "a.mine-20260928-1200é",
         ] {
             assert!(!kept_copy_name(name), "{name}");
         }

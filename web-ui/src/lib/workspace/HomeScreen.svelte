@@ -26,6 +26,7 @@
     onHostStatus,
     onProChanged,
     openWindow,
+    proOpenCloudProject,
     remoteWorkspaces,
     removeHost,
     setNotCluster,
@@ -658,14 +659,27 @@
     return m ? `~${m[1] ?? ""}` : path;
   }
 
-  function openRow(e: MouseEvent, w: Workspace): void {
+  let copyingProject = $state<string | null>(null);
+  let copyError = $state<string | null>(null);
+  async function openRow(e: Pick<MouseEvent, "metaKey" | "ctrlKey">, w: Workspace): Promise<void> {
+    if (copyingProject !== null) return;
+    let target = w;
+    if (w.local_copy !== undefined && ownAlias === null && native) {
+      copyingProject = w.id; copyError = null;
+      try {
+        const copied = await proOpenCloudProject(w.id);
+        if (copied === null) return;
+        target = { ...w, id: copied.workspace_id, root: copied.root, name: copied.name, local_copy: copied.local_copy };
+      } catch (reason) {
+        copyError = await import("../pro/projectCopy").then(({ projectCopyError }) => projectCopyError(reason), () => "The local copy couldn’t refresh. Try Open again.");
+        return;
+      }
+      finally { copyingProject = null; }
+    }
     if ((e.metaKey || e.ctrlKey) && !jobScoped) {
-      // Cmd/Ctrl-click is the explicit "give me another window" gesture — on
-      // THIS screen's own daemon (see ownAlias). Job-scoped windows degrade
-      // to the in-window open (see jobScoped).
-      void openWindow(ownAlias, w.id, true);
+      await openWindow(ownAlias, target.id, true);
     } else {
-      onOpen(w);
+      onOpen(target);
     }
   }
 
@@ -845,6 +859,8 @@
           </span>
         </div>
       </div>
+      {#if copyError}<p class="err-line" role="alert">{copyError}</p>{/if}
+      {#if copyingProject !== null}<p class="hint" role="status">Updating the local project copy…</p>{/if}
       {#if !daemonReachable}<p class="offline-note" role="status">Connection interrupted. Your workspaces will reconnect when this machine is available.</p>{/if}
       {#if sorted.length === 0}
         <div class="blank">
@@ -888,7 +904,7 @@
               </div>
             {:else}
               <div class="rowwrap workspace-row" role="presentation" class:live={wsState === "alive"} class:attn={wsState === "attn"}>
-                <button class="row" title={w.root} onclick={(e) => openRow(e, w)}>
+                <button class="row" title={w.root} disabled={copyingProject !== null} onclick={(e) => void openRow(e, w)}>
                   <span
                     class="dot {wsState}"
                     title={!daemonReachable ? "Last known session state — this machine is offline" : wsState === "attn"
@@ -921,7 +937,7 @@
                     <button
                       class="side"
                       title="open in a new window"
-                      onclick={() => void openWindow(ownAlias, w.id, true)}>Open in new window</button
+                      disabled={copyingProject !== null} onclick={() => void openRow({ metaKey: true, ctrlKey: false }, w)}>Open in new window</button
                     >
                   {/if}
                   <button

@@ -769,3 +769,23 @@ async fn managed_fence_closes_queued_input_and_stops_the_owned_process_group() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn startup_cleanup_marker_never_reaches_terminal_child() {
+    let manager = SessionManager::new();
+    let mut options = opts(Some(vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "echo cleanup_marker=[${CHIMAERA_SUPERVISOR_CLEANUP_FD-absent}]".into(),
+    ]));
+    options
+        .env
+        .push(("CHIMAERA_SUPERVISOR_CLEANUP_FD".into(), "0".into()));
+    let info = manager.spawn(options).unwrap();
+    let mut attached = manager.attach(&info.id).unwrap();
+    let mut seen = String::from_utf8_lossy(&attached.snapshot).into_owned();
+    if !seen.contains("cleanup_marker=[absent]") {
+        seen.push_str(&read_until(&mut attached.output, "cleanup_marker=[absent]").await);
+    }
+    assert!(seen.contains("cleanup_marker=[absent]"));
+}

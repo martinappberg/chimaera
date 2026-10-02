@@ -1,13 +1,13 @@
 /**
- * Both versions a Chimaera Pro return kept. When the cloud and this computer
- * both changed a file while apart, the cloud's version took the file's path
+ * Both versions a Chimaera Pro return kept. When the incoming copy and this computer
+ * both changed a file while apart, the incoming version took the file's path
  * and this computer's version was saved right beside it as
  * `<name>.mine-<yyyymmdd-hhmm>` (the daemon's `pro/kept.rs`). This module is
  * the review's words and wire: which names are such copies (the file tree's
  * badge), what the chat's "back" line says, and the four daemon routes that
  * list the pairs, read both versions, and settle a pair.
  *
- * Plain words only: "the cloud", "this Mac" (or "this computer" off a Mac, or
+ * Plain words only: "incoming", "this Mac" (or "this computer" off a Mac, or
  * "your computer" in a browser view of the project), "both versions".
  */
 
@@ -53,28 +53,28 @@ function files(n: number): string {
 
 /** The chat's line where the work came home with files both sides changed. */
 export function backNote(total: number, here = hereName()): string {
-  return `Back on ${here}. The cloud and ${here} both changed ${files(total)} while apart.`;
+  return `Back on ${here}. Both copies changed ${files(total)} while apart.`;
 }
 
-/** "Use the cloud's" hover hint for one file: where this computer's copy
+/** "Use incoming" hover hint for one file: where this computer's copy
  *  goes (the Trash, or deleted when the folder's drive has none). */
-export function useCloudHint(deletedInCloud: boolean, trash: boolean, here = hereName()): string {
-  if (deletedInCloud) {
+export function useCloudHint(deletedIncoming: boolean, trash: boolean, here = hereName()): string {
+  if (deletedIncoming) {
     return trash
-      ? `The cloud deleted this file; ${here}'s copy moves to the Trash`
-      : `The cloud deleted this file; ${here}'s copy is deleted too`;
+      ? `The incoming copy deleted this file; ${here}'s copy moves to the Trash`
+      : `The incoming copy deleted this file; ${here}'s copy is deleted too`;
   }
   return trash
-    ? `The cloud's version stays; ${here}'s copy moves to the Trash`
-    : `The cloud's version stays; ${here}'s copy is deleted`;
+    ? `The incoming version stays; ${here}'s copy moves to the Trash`
+    : `The incoming version stays; ${here}'s copy is deleted`;
 }
 
-/** The "Use the cloud's for all" confirmation's text. */
+/** The "Use incoming for all" confirmation's text. */
 export function useCloudForAllBody(count: number, trash: boolean, here = hereName()): string {
   const Here = here.charAt(0).toUpperCase() + here.slice(1);
   return trash
-    ? `${Here}'s versions of ${files(count)} will be moved to the Trash. The cloud's versions stay.`
-    : `${Here}'s versions of ${files(count)} will be deleted: this folder's drive has no Trash. The cloud's versions stay.`;
+    ? `${Here}'s versions of ${files(count)} will be moved to the Trash. The incoming versions stay.`
+    : `${Here}'s versions of ${files(count)} will be deleted: this folder's drive has no Trash. The incoming versions stay.`;
 }
 
 /** After a choice the review said would use the Trash: copies no Trash
@@ -89,13 +89,12 @@ export function deletedNote(count: number, here = hereName()): string {
 export function keptCopyHint(name: string, here = hereName()): string {
   const original = keptOriginal(name) ?? "the file";
   return (
-    `${here.charAt(0).toUpperCase()}${here.slice(1)}'s version of ${original}, kept when the cloud and ` +
-    `${here} both changed it while apart. Right-click to review both versions.`
+    `${here.charAt(0).toUpperCase()}${here.slice(1)}'s version of ${original}, kept when both copies changed it while apart. Right-click to review both versions.`
   );
 }
 
-/** One pair, paths relative to the project folder. `path` holds the cloud's
- *  version (`size` null: the cloud deleted the file), `mine_path` this
+/** One pair, paths relative to the project folder. `path` holds the incoming
+ *  version (`size` null: the incoming copy deleted the file), `mine_path` this
  *  computer's. Times are Unix ms. */
 export interface KeptPair {
   path: string;
@@ -104,6 +103,12 @@ export interface KeptPair {
   mine_size: number;
   changed_at: number | null;
   mine_changed_at: number | null;
+  /** False when the saved copy's original name cannot be recovered safely. */
+  can_use_mine?: boolean;
+}
+
+export function canUseMine(pair: Pick<KeptPair, "can_use_mine">): boolean {
+  return pair.can_use_mine !== false;
 }
 
 /** `GET /pro/projects/{w}/kept`. */
@@ -118,11 +123,11 @@ export interface KeptReview {
   /** Kept copies the return did not name (it names up to 32). */
   unlisted: number;
   pairs: KeptPair[];
-  /** The cloud's diverged branches, kept beside this computer's. */
+  /** The incoming diverged branches, kept beside this computer's. */
   branches: string[];
   /** Whether the project is this computer's to change right now. */
   here: boolean;
-  /** Whether a copy discarded here ("Use the cloud's") moves to the Trash;
+  /** Whether a copy discarded here ("Use incoming") moves to the Trash;
    *  false: this folder's drive has no Trash, so it is deleted. */
   trash?: boolean;
   /** After `resolve_all`: pairs that could not take the choice. */

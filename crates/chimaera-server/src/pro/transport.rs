@@ -2,7 +2,7 @@
 use std::{
     collections::HashSet,
     future::Future,
-    path::Path,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -127,7 +127,7 @@ async fn probe_git(binary: &str, permit: Arc<OwnedSemaphorePermit>) -> Option<Gi
     command.arg("--version");
     // Discovery already reserved a child slot. Each credential-free probe
     // has its own short deadline and never starts a login shell.
-    let output = run_reserved(command, vec![], Duration::from_secs(2), 256, permit)
+    let output = run_reserved(command, vec![], Duration::from_secs(2), 256, permit, None)
         .await
         .ok()?;
     output
@@ -290,7 +290,44 @@ pub(super) async fn run(
     cap: usize,
 ) -> Result<Output> {
     let permit = Arc::new(CHILDREN.clone().acquire_owned().await?);
-    run_reserved(command, input, timeout, cap, permit).await
+    run_reserved(command, input, timeout, cap, permit, None).await
+}
+
+/// Stream one staged blob into a private, exclusively created file. The owned
+/// helper retains cache exclusion through cancellation/descendant cleanup;
+/// rejected or incomplete bytes never survive as a successful artifact.
+pub(super) async fn run_file(
+    command: Command,
+    destination: PathBuf,
+    timeout: Duration,
+    cap: u64,
+) -> Result<u64> {
+    let permit = Arc::new(CHILDREN.clone().acquire_owned().await?);
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options.open(&destination).await?;
+    let sink = FileSink {
+        file,
+        destination: destination.clone(),
+        cap,
+    };
+    let output = match run_reserved(command, vec![], timeout, 0, permit, Some(sink)).await {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&destination).await;
+            return Err(error);
+        }
+    };
+    ensure!(output.success, "staged Git blob export failed");
+    Ok(tokio::fs::metadata(destination).await?.len())
+}
+
+struct FileSink {
+    file: tokio::fs::File,
+    destination: PathBuf,
+    cap: u64,
 }
 
 async fn run_reserved(
@@ -299,6 +336,7 @@ async fn run_reserved(
     timeout: Duration,
     cap: usize,
     permit: Arc<OwnedSemaphorePermit>,
+    file: Option<FileSink>,
 ) -> Result<Output> {
     let cache = CACHE_GUARD.try_with(Clone::clone).ok();
     if let Some(cache) = &cache {
@@ -312,7 +350,13 @@ async fn run_reserved(
             verified: false,
             workspace,
         };
-        let result = run_owned(command, input, timeout, cap, canceled, workspace).await;
+        let destination = file.as_ref().map(|sink| sink.destination.clone());
+        let result = run_owned(command, input, timeout, cap, canceled, workspace, file).await;
+        if !matches!(&result, Ok(output) if output.success) {
+            if let Some(destination) = destination {
+                tokio::fs::remove_file(destination).await?;
+            }
+        }
         completion.verified = true;
         result
     });
@@ -440,6 +484,7 @@ async fn run_owned(
     cap: usize,
     mut canceled: tokio::sync::oneshot::Receiver<()>,
     workspace: Option<&str>,
+    mut file: Option<FileSink>,
 ) -> Result<Output> {
     if matches!(
         canceled.try_recv(),
@@ -492,7 +537,7 @@ async fn run_owned(
         };
         let (_, stdout, stderr, status) = tokio::try_join!(
             send,
-            read_bounded(stdout, cap),
+            read_output(stdout, cap, &mut file),
             read_bounded(stderr, 16 * 1024),
             helper.exited()
         )?;
@@ -524,8 +569,46 @@ async fn run_owned(
         result = tokio::time::timeout(timeout, work) => result.context("mirror helper timed out").and_then(|v| v),
         _ = &mut canceled => Err(anyhow::anyhow!("mirror helper request canceled")),
     };
-    helper.finish(result.is_ok()).await?;
+    let cleanup = helper.finish(result.is_ok()).await;
+    drop(file);
+    cleanup?;
     result
+}
+
+async fn read_output(
+    mut input: impl AsyncRead + Unpin,
+    cap: usize,
+    file: &mut Option<FileSink>,
+) -> std::io::Result<Vec<u8>> {
+    let Some(sink) = file else {
+        return read_bounded(input, cap).await;
+    };
+    let mut buffer = [0u8; 16 * 1024];
+    let mut overlap = Vec::with_capacity(128);
+    let mut length = 0u64;
+    loop {
+        let count = input.read(&mut buffer).await?;
+        if count == 0 {
+            break;
+        }
+        length = length
+            .checked_add(count as u64)
+            .ok_or_else(|| std::io::Error::other("staged Git blob exceeds limit"))?;
+        if length > sink.cap {
+            return Err(std::io::Error::other("staged Git blob exceeds limit"));
+        }
+        overlap.extend_from_slice(&buffer[..count]);
+        if super::policy::contains_credential(&overlap) {
+            return Err(std::io::Error::other(
+                "staged Git blob contains credentials",
+            ));
+        }
+        sink.file.write_all(&buffer[..count]).await?;
+        let keep = overlap.len().saturating_sub(128);
+        overlap.drain(..keep);
+    }
+    sink.file.sync_all().await?;
+    Ok(Vec::new())
 }
 
 // Never retain helper stderr: Git can include credentials, remote URLs or
@@ -820,7 +903,7 @@ async fn request_inner(
         Duration::from_secs(15)
     };
     let permit = Arc::new(REQUESTS.clone().acquire_owned().await?);
-    let mut output = run_reserved(command, input, timeout, JSON_CAP + 4, permit).await?;
+    let mut output = run_reserved(command, input, timeout, JSON_CAP + 4, permit, None).await?;
     ensure!(
         output.success && output.stdout.len() >= 4,
         "service is unavailable"
@@ -952,6 +1035,85 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn file_output_is_bounded_secret_scanned_and_removed_on_failed_or_cancelled_helpers() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-file-helper-{}",
+            chimaera_core::generate_token()
+        ));
+        tokio::fs::create_dir(&root).await.unwrap();
+        let output = root.join("blob");
+        let mut good = Command::new("sh");
+        good.args(["-c", "printf blob"]);
+        assert_eq!(
+            run_file(good, output.clone(), Duration::from_secs(5), 4)
+                .await
+                .unwrap(),
+            4
+        );
+        assert_eq!(tokio::fs::read(&output).await.unwrap(), b"blob");
+        tokio::fs::remove_file(&output).await.unwrap();
+        for (script, cap) in [
+            ("printf overflow", 2),
+            ("printf data; exit 1", 100),
+            (
+                "dd if=/dev/zero bs=16382 count=1 2>/dev/null; printf sk-abcdefghijklmnop",
+                32 * 1024,
+            ),
+        ] {
+            let mut command = Command::new("sh");
+            command.args(["-c", script]);
+            assert!(
+                run_file(command, output.clone(), Duration::from_secs(5), cap)
+                    .await
+                    .is_err()
+            );
+            assert!(!output.exists());
+        }
+        let missing = Command::new(root.join("missing-helper"));
+        assert!(
+            run_file(missing, output.clone(), Duration::from_secs(5), 100)
+                .await
+                .is_err()
+        );
+        assert!(!output.exists());
+        let ready = root.join("ready");
+        let late = root.join("late");
+        let release = root.join("release");
+        let mut command = Command::new("sh");
+        // A wall-clock delay could expire before a loaded test runtime observes
+        // ready. Release the descendant only after cancellation cleanup instead.
+        command.env("HELPER_READY", &ready).env("HELPER_LATE", &late).env("HELPER_RELEASE", &release)
+            .args(["-c", "printf partial; (printf ready > \"$HELPER_READY\"; while [ ! -e \"$HELPER_RELEASE\" ]; do sleep 0.05; done; printf escaped > \"$HELPER_LATE\") & wait"]);
+        let destination = output.clone();
+        let caller = tokio::spawn(async move {
+            run_file(command, destination, Duration::from_secs(5), 100).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!late.exists());
+        caller.abort();
+        let _ = caller.await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while output.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!late.exists());
+        tokio::fs::write(&release, b"release").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!late.exists());
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[cfg(unix)]
     async fn delayed_writer(cancel: bool, close_pipes: bool) {
         let root = std::env::temp_dir().join(format!(
             "chimaera-helper-lifetime-{}",
@@ -987,6 +1149,7 @@ mod tests {
                     },
                     1024,
                     permit,
+                    None,
                 )
                 .await
             })

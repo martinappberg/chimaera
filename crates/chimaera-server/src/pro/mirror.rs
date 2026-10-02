@@ -2,11 +2,13 @@
 //! never used for snapshot commits; all network Git runs from our clean cache.
 use super::{policy, protocol::MirrorCredentials, transport};
 use anyhow::{ensure, Context, Result};
+use rustix::fs::OFlags;
 use serde::Serialize;
 use std::{
     collections::BTreeSet,
     fs,
     io::{Read, Write},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
 
@@ -36,6 +38,15 @@ impl Report {
 }
 
 pub(super) async fn initialize(path: &Path) -> Result<()> {
+    initialize_format(path, "sha1").await
+}
+
+/// Repository object formats cannot be mixed or repaired by rewriting a cache.
+pub(super) async fn initialize_format(path: &Path, format: &str) -> Result<()> {
+    ensure!(
+        matches!(format, "sha1" | "sha256"),
+        "unsupported Git object format"
+    );
     if path
         .file_name()
         .is_some_and(|name| name == "working-tree.git")
@@ -48,10 +59,27 @@ pub(super) async fn initialize(path: &Path) -> Result<()> {
     if !tokio::fs::try_exists(path.join("HEAD")).await? {
         transport::git_output(
             transport::git(path, None).await?,
-            &["init", "--bare", "--quiet", "."],
+            &[
+                "init",
+                "--bare",
+                "--quiet",
+                &format!("--object-format={format}"),
+                ".",
+            ],
             vec![],
         )
         .await?;
+    } else {
+        let actual = transport::git_output(
+            transport::git(path, None).await?,
+            &["rev-parse", "--show-object-format"],
+            vec![],
+        )
+        .await?;
+        ensure!(
+            actual == format!("{format}\n").as_bytes(),
+            "Git cache object format differs; existing cache retained"
+        );
     }
     Ok(())
 }
@@ -282,6 +310,54 @@ pub(super) fn copy_tree(
     budget: u64,
     max_file: u64,
 ) -> Result<Report> {
+    let directory = pin_project(root)?;
+    copy_tree_pinned(
+        root,
+        &directory,
+        destination,
+        (paths, ignored),
+        budget,
+        max_file,
+    )
+}
+
+fn pin_project(root: &Path) -> Result<fs::File> {
+    let expected = fs::symlink_metadata(root)?;
+    ensure!(expected.is_dir(), "project folder changed during mirror");
+    // Registered workspace roots are canonical already. Resolving again would
+    // accept an ancestor replaced with a symlink before this copy started.
+    let directory = crate::download::open_beneath(
+        &fs::File::open("/")?,
+        root.strip_prefix("/")?,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+    )?;
+    let pinned = directory.metadata()?;
+    ensure!(
+        expected.dev() == pinned.dev() && expected.ino() == pinned.ino(),
+        "project folder changed during mirror"
+    );
+    Ok(directory)
+}
+
+fn check_project(root: &Path, directory: &fs::File) -> Result<()> {
+    let current = fs::symlink_metadata(root)?;
+    let pinned = directory.metadata()?;
+    ensure!(
+        current.is_dir() && current.dev() == pinned.dev() && current.ino() == pinned.ino(),
+        "project folder changed during mirror"
+    );
+    Ok(())
+}
+
+fn copy_tree_pinned(
+    root: &Path,
+    directory: &fs::File,
+    destination: &Path,
+    (paths, ignored): (Vec<PathBuf>, Vec<PathBuf>),
+    budget: u64,
+    max_file: u64,
+) -> Result<Report> {
+    check_project(root, directory)?;
     fs::create_dir_all(destination)?;
     let mut report = Report {
         left_out: Some(Vec::new()),
@@ -296,32 +372,33 @@ pub(super) fn copy_tree(
             report.leave_out(&relative);
             continue;
         }
-        let source = root.join(&relative);
-        // Every ancestor is checked: a directory swapped to a symlink cannot
-        // turn an allowlisted project path into a home credential read.
-        let mut ancestor = root.to_path_buf();
-        let mut safe = true;
-        for part in relative.components() {
-            ancestor.push(part);
-            if fs::symlink_metadata(&ancestor).is_ok_and(|m| m.file_type().is_symlink()) {
-                safe = false;
-                break;
-            }
-        }
-        if !safe {
-            report.excluded += 1;
-            report.leave_out(&relative);
-            continue;
-        }
-        let metadata = match fs::symlink_metadata(&source) {
-            Ok(m) if m.is_file() => m,
-            Ok(_) => {
-                // Symlinks and special files exist but are never mirrored.
+        // Open every component relative to the pinned project descriptor.
+        // Checking ancestor paths before a full-path open leaves a race where
+        // a replacement symlink can export an unrelated private directory.
+        let mut input = match crate::download::open_beneath(
+            directory,
+            &relative,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        ) {
+            Ok(file) => file,
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(nix::libc::ELOOP | nix::libc::ENOTDIR)
+                ) =>
+            {
+                report.excluded += 1;
                 report.leave_out(&relative);
                 continue;
             }
-            Err(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
         };
+        let metadata = input.metadata()?;
+        if !metadata.is_file() {
+            report.leave_out(&relative);
+            continue;
+        }
         if metadata.len() > max_file.min(policy::MAX_FILE_BYTES) {
             report.too_large += 1;
             report.leave_out(&relative);
@@ -335,20 +412,6 @@ pub(super) fn copy_tree(
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut options = fs::OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(
-                (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32,
-            );
-        }
-        let mut input = options.open(source)?;
-        ensure!(
-            input.metadata()?.is_file(),
-            "project file changed during mirror"
-        );
         let mut output = fs::OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -389,6 +452,7 @@ pub(super) fn copy_tree(
         report.bytes += length;
         report.files += 1;
     }
+    check_project(root, directory)?;
     Ok(report)
 }
 
@@ -439,7 +503,10 @@ pub(super) async fn commit_tree(repository: &Path, tree: &Path, branch: &str) ->
                 vec![],
             )
             .await?;
-            if old_tree == format!("{tree}\n").as_bytes() {
+            // A handoff commit identifies this publication, even if an idle
+            // project has not changed. Reusing it makes Git skip receive-pack
+            // and lets an old receipt masquerade as the pre-sleep checkpoint.
+            if branch != "handoff" && old_tree == format!("{tree}\n").as_bytes() {
                 return Ok(parent.clone());
             }
         }
@@ -505,20 +572,19 @@ pub(super) async fn mirror_repository(
     {
         return Ok(());
     }
-    initialize(cache).await?;
-    transport::git_output(
-        transport::git(cache, None).await?,
-        &[
-            "fetch",
-            "--prune",
-            "--no-tags",
-            root.to_str().context("invalid workspace path")?,
-            "+refs/*:refs/*",
-        ],
+    let format = transport::git_output(
+        transport::git(root, None).await?,
+        &["rev-parse", "--show-object-format"],
         vec![],
     )
     .await?;
-    super::repository::keep_source_head(root, cache).await?;
+    let format = std::str::from_utf8(&format)?.trim();
+    ensure!(
+        format == "sha1",
+        "Cloud Git transfer currently requires a SHA-1 repository; SHA-256 service support is unavailable"
+    );
+    initialize_format(cache, format).await?;
+    cache_repository_refs(root, cache).await?;
     let objects = transport::git_output(
         transport::git(cache, None).await?,
         &["rev-list", "--objects", "--all"],
@@ -544,6 +610,54 @@ pub(super) async fn mirror_repository(
     Ok(())
 }
 
+async fn cache_repository_refs(root: &Path, cache: &Path) -> Result<()> {
+    transport::git_output(
+        transport::git(cache, None).await?,
+        &[
+            "fetch",
+            "--prune",
+            "--no-tags",
+            root.to_str().context("invalid workspace path")?,
+            "+refs/*:refs/*",
+            "^refs/chimaera/staging/*",
+        ],
+        vec![],
+    )
+    .await?;
+    // Recovery trees are local-only. Also retire any accidentally cached old
+    // private refs before --mirror can publish them.
+    let private_refs = transport::git_output(
+        transport::git(cache, None).await?,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/chimaera/staging/",
+        ],
+        vec![],
+    )
+    .await?;
+    let private_refs = std::str::from_utf8(&private_refs)?;
+    ensure!(
+        private_refs.lines().count() <= 4096,
+        "staging recovery ref count exceeds limit"
+    );
+    for reference in private_refs.lines() {
+        ensure!(
+            reference.starts_with("refs/chimaera/staging/")
+                && super::repository::reference(reference),
+            "invalid staging recovery ref"
+        );
+        transport::git_output(
+            transport::git(cache, None).await?,
+            &["update-ref", "-d", reference],
+            vec![],
+        )
+        .await?;
+    }
+    super::repository::keep_source_head(root, cache).await?;
+    Ok(())
+}
+
 /// Validate the complete tree before checkout creates any remote-controlled
 /// paths. The server's quota is repeated locally, including aggregate bytes.
 pub(super) async fn validate_tree(
@@ -552,6 +666,15 @@ pub(super) async fn validate_tree(
     budget: u64,
     max_file: u64,
 ) -> Result<()> {
+    validate_tree_bytes(repository, branch, budget, max_file).await?;
+    Ok(())
+}
+pub(super) async fn validate_tree_bytes(
+    repository: &Path,
+    branch: &str,
+    budget: u64,
+    max_file: u64,
+) -> Result<u64> {
     let bytes = transport::git_output(
         transport::git(repository, None).await?,
         &["ls-tree", "-r", "-z", "-l", branch],
@@ -601,7 +724,7 @@ pub(super) async fn validate_tree(
             "remote mirror contains a credential or unsafe path"
         );
     }
-    Ok(())
+    Ok(total)
 }
 
 pub(super) async fn repository_origin(root: &Path) -> Option<String> {
@@ -627,6 +750,135 @@ pub(super) async fn repository_origin(root: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinned_snapshot_refuses_replaced_roots_and_never_follows_parent_or_file_links() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-mirror-confined-{}",
+            chimaera_core::generate_token()
+        ));
+        let project = root.join("project");
+        let private = root.join("private");
+        fs::create_dir_all(project.join("sub")).unwrap();
+        fs::create_dir_all(&private).unwrap();
+        let project = project.canonicalize().unwrap();
+        fs::write(project.join("sub/file.txt"), "project bytes").unwrap();
+        fs::write(private.join("file.txt"), "unrelated private bytes").unwrap();
+        let directory = pin_project(&project).unwrap();
+        let paths = || (vec![PathBuf::from("sub/file.txt")], Vec::new());
+        fs::rename(project.join("sub"), project.join("old-sub")).unwrap();
+        symlink(&private, project.join("sub")).unwrap();
+        let stage = root.join("parent-link");
+        let report = copy_tree_pinned(&project, &directory, &stage, paths(), 1000, 1000).unwrap();
+        assert_eq!(report.files, 0);
+        assert_eq!(
+            report.left_out.unwrap(),
+            vec![PathBuf::from("sub/file.txt")]
+        );
+        assert!(!stage.join("sub/file.txt").exists());
+        fs::remove_file(project.join("sub")).unwrap();
+        fs::rename(project.join("old-sub"), project.join("sub")).unwrap();
+        fs::remove_file(project.join("sub/file.txt")).unwrap();
+        symlink(private.join("file.txt"), project.join("sub/file.txt")).unwrap();
+        let stage = root.join("file-link");
+        let report = copy_tree_pinned(&project, &directory, &stage, paths(), 1000, 1000).unwrap();
+        assert_eq!(report.files, 0);
+        assert!(!stage.join("sub/file.txt").exists());
+        fs::rename(&project, root.join("original-project")).unwrap();
+        fs::create_dir_all(project.join("sub")).unwrap();
+        fs::write(project.join("sub/file.txt"), "replacement project bytes").unwrap();
+        let stage = root.join("replacement-root");
+        assert!(copy_tree_pinned(&project, &directory, &stage, paths(), 1000, 1000).is_err());
+        assert!(!stage.exists());
+        fs::remove_dir_all(&project).unwrap();
+        symlink(&private, &project).unwrap();
+        assert!(pin_project(&project).is_err());
+        // A preexisting ancestor link must not nominate a different root.
+        fs::create_dir(private.join("nested")).unwrap();
+        assert!(pin_project(&project.join("nested")).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn staging_recovery_refs_never_enter_the_outbound_mirror_cache() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-private-refs-{}",
+            chimaera_core::generate_token()
+        ));
+        fs::create_dir_all(root.join("source")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let source = root.join("source");
+        let cache = root.join("cache.git");
+        transport::git_output(
+            transport::git(&source, None).await.unwrap(),
+            &["init", "--quiet", "--initial-branch=main"],
+            vec![],
+        )
+        .await
+        .unwrap();
+        fs::write(source.join("file"), "ordinary").unwrap();
+        transport::git_output(
+            transport::git(&source, None).await.unwrap(),
+            &["add", "file"],
+            vec![],
+        )
+        .await
+        .unwrap();
+        let mut command = transport::git(&source, None).await.unwrap();
+        command
+            .env("GIT_AUTHOR_NAME", "Fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid");
+        transport::git_output(command, &["commit", "--quiet", "-m", "base"], vec![])
+            .await
+            .unwrap();
+        let reference = "refs/chimaera/staging/private-fixture";
+        transport::git_output(
+            transport::git(&source, None).await.unwrap(),
+            &["update-ref", reference, "HEAD^{tree}"],
+            vec![],
+        )
+        .await
+        .unwrap();
+        initialize(&cache).await.unwrap();
+        // Seed a stale cache ref to prove it cannot survive the push preparation.
+        transport::git_output(
+            transport::git(&cache, None).await.unwrap(),
+            &[
+                "fetch",
+                "--no-tags",
+                source.to_str().unwrap(),
+                &format!("+{reference}:{reference}"),
+            ],
+            vec![],
+        )
+        .await
+        .unwrap();
+        cache_repository_refs(&source, &cache).await.unwrap();
+        let refs = transport::git_output(
+            transport::git(&cache, None).await.unwrap(),
+            &["for-each-ref", "--format=%(refname)"],
+            vec![],
+        )
+        .await
+        .unwrap();
+        let refs = std::str::from_utf8(&refs).unwrap();
+        assert!(refs.lines().any(|name| name == "refs/heads/main"));
+        assert!(!refs
+            .lines()
+            .any(|name| name.starts_with("refs/chimaera/staging/")));
+        assert!(!transport::git_output(
+            transport::git(&source, None).await.unwrap(),
+            &["ls-tree", reference],
+            vec![]
+        )
+        .await
+        .unwrap()
+        .is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     /// Counts WARN events on this thread (the test's current-thread runtime).
     struct Warnings(std::sync::Arc<std::sync::atomic::AtomicUsize>);
@@ -711,6 +963,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unchanged_idle_handoff_requires_a_new_publication() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-idle-publication-{}",
+            chimaera_core::generate_token()
+        ));
+        let shadow = root.join("shadow");
+        let stage = root.join("stage");
+        fs::create_dir_all(&stage).unwrap();
+        fs::write(stage.join("manifest.json"), br#"{"continuation":"idle"}"#).unwrap();
+        initialize(&shadow).await.unwrap();
+        let first = commit_tree(&shadow, &stage, "handoff").await.unwrap();
+        let second = commit_tree(&shadow, &stage, "handoff").await.unwrap();
+        assert_ne!(
+            first, second,
+            "an old acknowledged OID cannot confirm a new drain"
+        );
+        let objects = transport::git_output(
+            transport::git(&shadow, None).await.unwrap(),
+            &[
+                "rev-parse",
+                &format!("{second}^"),
+                &format!("{first}^{{tree}}"),
+                &format!("{second}^{{tree}}"),
+            ],
+            vec![],
+        )
+        .await
+        .unwrap();
+        let objects = std::str::from_utf8(&objects)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>();
+        assert_eq!(objects[0], first);
+        assert_eq!(
+            objects[1], objects[2],
+            "the publication identity changes without altering project bytes"
+        );
+        for branch in ["main", "config"] {
+            let first = commit_tree(&shadow, &stage, branch).await.unwrap();
+            assert_eq!(commit_tree(&shadow, &stage, branch).await.unwrap(), first);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn snapshots_preserve_user_history_and_filter_private_paths() {
         let root = std::env::temp_dir().join(format!(
             "chimaera-mirror-{}",
@@ -726,7 +1023,8 @@ mod tests {
         fs::write(project.join("ignored.txt"), "private").unwrap();
         fs::write(project.join(".chimaeraignore"), "ignored.txt\n").unwrap();
         let paths = inventory(&project, &shadow).await.unwrap();
-        let report = copy_tree(&project, &stage, paths, 10000, 1000).unwrap();
+        let report =
+            copy_tree(&project.canonicalize().unwrap(), &stage, paths, 10000, 1000).unwrap();
         assert_eq!(report.files, 2);
         assert!(!stage.join(".env").exists());
         assert!(!stage.join("ignored.txt").exists());
@@ -778,7 +1076,7 @@ mod tests {
             let paths = inventory(&project, &shadow).await.unwrap();
             assert!(paths.0.iter().any(|path| path == Path::new(&staged_name)));
             let first = root.join("first");
-            copy_tree(&project, &first, paths, 10000, 1000).unwrap();
+            copy_tree(&project.canonicalize().unwrap(), &first, paths, 10000, 1000).unwrap();
             assert!(!first.join(&staged_name).exists());
             assert_eq!(
                 fs::read(first.join("notes.md")).unwrap(),
@@ -791,7 +1089,14 @@ mod tests {
             fs::rename(&staged, &target).unwrap();
             let paths = inventory(&project, &shadow).await.unwrap();
             let second = root.join("second");
-            copy_tree(&project, &second, paths, 10000, 1000).unwrap();
+            copy_tree(
+                &project.canonicalize().unwrap(),
+                &second,
+                paths,
+                10000,
+                1000,
+            )
+            .unwrap();
             assert_eq!(
                 fs::read(second.join("notes.md")).unwrap(),
                 b"unfinished now complete"

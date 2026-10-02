@@ -53,6 +53,8 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             get(crate::pro::project_list).put(crate::pro::projects),
         )
         .route("/pro/projects/open", post(crate::pro::open_project))
+        .route("/pro/projects/copy", post(crate::pro::copy_project))
+        .route("/pro/projects/takeover", post(crate::pro::takeover_project))
         // Both versions a return kept (`pro/kept.rs`): list, compare, choose.
         .route("/pro/projects/{id}/kept", get(crate::pro::kept_list))
         .route("/pro/projects/{id}/kept/file", get(crate::pro::kept_file))

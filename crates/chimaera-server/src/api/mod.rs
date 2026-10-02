@@ -61,6 +61,9 @@ pub(crate) async fn health(State(state): State<Arc<AppState>>) -> Json<serde_jso
         "pid": state.pid,
         "uptime_secs": state.started.elapsed().as_secs(),
     });
+    if let Some(ack) = crate::pro::supervisor_cleanup_ack(&state) {
+        value["supervisor_cleanup"] = json!(ack);
+    }
     if crate::cloud::enabled() {
         value["pro_cloud_operations"] =
             json!(crate::cloud::active_operations() + crate::pro::active_operations(&state));

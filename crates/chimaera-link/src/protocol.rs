@@ -354,12 +354,16 @@ pub struct Host {
     pub status: HostStatus,
     pub daemon: Option<Daemon>,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster: Option<crate::HostCluster>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AddHost {
     pub alias: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh: Option<SshTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_policy: Option<crate::ClusterPolicy>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SshTarget {

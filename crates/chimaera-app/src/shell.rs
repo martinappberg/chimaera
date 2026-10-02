@@ -1049,6 +1049,8 @@ pub fn run() {
             pro::pro_refresh_account,
             pro::projects::pro_cloud_projects,
             pro::projects::pro_open_cloud_project,
+            pro::projects::pro_copy_project,
+            pro::projects::pro_take_over_project,
             pro::billing::pro_billing_checkout,
             pro::billing::pro_billing_portal,
             pro::billing::pro_cancel_billing,

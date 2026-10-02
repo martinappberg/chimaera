@@ -944,10 +944,10 @@ async fn laptop_first_sign_out_and_unreachable_account_keep_local_work_running()
     };
     assert_eq!(refused["code"], "read_only", "{refused}");
     assert_eq!(refused["reason"], "elsewhere", "{refused}");
-    assert_eq!(refused["owner"], "cloud", "{refused}");
+    assert!(refused["owner"].is_null(), "{refused}");
     assert_eq!(
         refused["message"],
-        "This project is running in the cloud right now. That was not sent."
+        "This project is running elsewhere right now. That was not sent."
     );
     let (status, body) = request(
         &state,
@@ -959,7 +959,7 @@ async fn laptop_first_sign_out_and_unreachable_account_keep_local_work_running()
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(
         body,
-        json!({"error":"workspace_owned_elsewhere","owner":"cloud"})
+        json!({"error":"workspace_owned_elsewhere","owner":null})
     );
     assert!(!project.root.join("REFUSED_ELSEWHERE").exists());
 

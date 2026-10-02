@@ -1,12 +1,12 @@
 <script lang="ts">
   /**
    * Both versions a Chimaera Pro return kept, side by side, to choose which
-   * stays. When the cloud and this computer both changed a file while apart,
-   * the file holds the cloud's version and this computer's sits beside it as
+   * stays. When the incoming copy and this computer both changed a file while apart,
+   * the file holds the incoming version and this computer's sits beside it as
    * `<name>.mine-<stamp>`; this view lists those files, compares the two
    * versions of the selected one (`KeptDiff`), and settles it: this
-   * computer's replaces the file, the cloud's stays, or both stay as they are.
-   * Branches the cloud kept beside this computer's are listed, without
+   * computer's replaces the file, the incoming version stays, or both stay as they are.
+   * Branches the incoming copy kept beside this computer's are listed, without
    * actions (merging them is ordinary Git work).
    *
    * One tab per workspace (`layout.ts` KeptTab). Reads on mount and whenever
@@ -21,6 +21,7 @@
   import { formatFullTimestamp, formatMessageTimestamp } from "../shared/time";
   import {
     fetchKeptFile,
+    canUseMine,
     hereName,
     hereTitle,
     KeptError,
@@ -154,6 +155,7 @@
 
   async function choose(pair: KeptPair, choice: KeptChoice): Promise<void> {
     if (wsId === null || busy !== null) return;
+    if (choice === "use_mine" && !canUseMine(pair)) return;
     busy = pair.mine_path;
     actionError = null;
     actionNote = null;
@@ -174,6 +176,7 @@
 
   async function chooseAll(choice: KeptChoice): Promise<void> {
     if (wsId === null || busy !== null) return;
+    if (choice === "use_mine" && !pairs.every(canUseMine)) return;
     confirmAll = null;
     busy = "all";
     actionError = null;
@@ -215,14 +218,14 @@
     const files = n === 1 ? "1 file" : `${n} files`;
     return confirmAll === "use_cloud"
       ? {
-          title: "Use the cloud's version for all?",
+          title: "Use the incoming version for all?",
           body: useCloudForAllBody(n, toTrash, here),
-          label: "Use the cloud's",
+          label: "Use incoming",
           danger: !toTrash,
         }
       : {
           title: `Use ${here}'s version for all?`,
-          body: `${Here}'s versions replace the cloud's in ${files}.`,
+          body: `${Here}'s versions replace the incoming versions in ${files}.`,
           label: `Use ${here}'s`,
           danger: false,
         };
@@ -261,16 +264,16 @@
       <div class="titles">
         <h1>Both versions kept</h1>
         <p class="lede">
-          The cloud and {here} both changed {review.total === 1 ? "this file" : "these files"} while apart. Each file now
-          has the cloud's version, and {here}'s version is saved beside it. Choose which one stays.
+          Both copies changed {review.total === 1 ? "this file" : "these files"} while apart. Each file now
+          has the incoming version, and {here}'s version is saved beside it. Choose which one stays.
         </p>
       </div>
       {#if pairs.length > 1}
         <div class="all">
           <button class="btn" disabled={busy !== null || !canChoose} onclick={() => (confirmAll = "use_cloud")}
-            >Use the cloud's for all</button
+            >Use incoming for all</button
           >
-          <button class="btn" disabled={busy !== null || !canChoose} onclick={() => (confirmAll = "use_mine")}
+          <button class="btn" disabled={busy !== null || !canChoose || !pairs.every(canUseMine)} onclick={() => (confirmAll = "use_mine")}
             >Use {here}'s for all</button
           >
         </div>
@@ -307,7 +310,7 @@
                     <span class="file-name">{name(pair.path)}</span>
                     {#if folder(pair.path) !== "" || pair.size === null}
                       <span class="file-sub"
-                        >{#if pair.size === null}deleted in the cloud{#if folder(pair.path) !== ""}{" · "}{/if}{/if}{folder(
+                        >{#if pair.size === null}deleted in the incoming copy{#if folder(pair.path) !== ""}{" · "}{/if}{/if}{folder(
                           pair.path,
                         )}</span
                       >
@@ -344,15 +347,15 @@
             <div class="choices" role="group" aria-label="Choose a version">
               <button
                 class="btn primary"
-                disabled={busy !== null || !canChoose}
-                title="{Here}'s version replaces the file; the copy beside it goes away"
+                disabled={busy !== null || !canChoose || !canUseMine(current)}
+                title={canUseMine(current) ? `${Here}'s version replaces the file; the copy beside it goes away` : "The original filename can't be recovered safely. Keep both versions or use incoming."}
                 onclick={() => void choose(current, "use_mine")}>Use {here}'s</button
               >
               <button
                 class="btn primary"
                 disabled={busy !== null || !canChoose}
                 title={useCloudHint(current.size === null, toTrash, here)}
-                onclick={() => void choose(current, "use_cloud")}>Use the cloud's</button
+                onclick={() => void choose(current, "use_cloud")}>Use incoming</button
               >
               <button
                 class="btn"
@@ -364,7 +367,7 @@
           </div>
           {#if current.size === null}
             <p class="deleted" role="note">
-              The cloud deleted this file. Use {here}'s to bring it back, or the cloud's to leave it deleted.
+              The incoming copy deleted this file. Use {here}'s to bring it back, or use incoming to leave it deleted.
             </p>
           {/if}
           <div class="labels">
@@ -376,9 +379,9 @@
               <button class="link" onclick={() => open(current.mine_path)}>Open</button>
             </div>
             <div class="label">
-              <span class="who">The cloud's version</span>
+              <span class="who">The incoming version</span>
               {#if current.size === null}
-                <span class="meta">deleted in the cloud</span>
+                <span class="meta">deleted in the incoming copy</span>
               {:else}
                 <span class="meta" title={current.changed_at === null ? "" : formatFullTimestamp(current.changed_at)}
                   >{sizeLabel(current.size)}{#if current.changed_at !== null}{" · "}{when(current.changed_at)}{/if}</span
@@ -403,7 +406,7 @@
                       {#if file.mine.changed_at !== null}<span class="card-when">changed {when(file.mine.changed_at)}</span>{/if}
                     </div>
                     <div class="card">
-                      <span class="card-who">The cloud's version</span>
+                      <span class="card-who">The incoming version</span>
                       {#if file.cloud === null}
                         <span class="card-size">Deleted</span>
                       {:else}
@@ -441,8 +444,8 @@
 
 {#snippet branchList(branches: string[])}
   <div class="branches">
-    <p class="section">Branches from the cloud</p>
-    <p class="hint">The cloud's work on these branches is kept under these names; your own branches are unchanged.</p>
+    <p class="section">Incoming branches</p>
+    <p class="hint">The incoming work on these branches is kept under these names; your own branches are unchanged.</p>
     <ul>
       {#each branches as branch (branch)}
         <li title={branch}>

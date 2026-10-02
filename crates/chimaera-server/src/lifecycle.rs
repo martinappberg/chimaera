@@ -10,6 +10,9 @@ use crate::{app, lock, AppState, ServerConfig};
 
 /// Bind on 127.0.0.1, write the manifest, and serve until SIGINT/SIGTERM.
 pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
+    // Consume the trusted launcher's one-shot pipe before restore or helpers
+    // can inherit it. Ordinary device and cluster startup have no such channel.
+    let supervisor_cleanup = crate::pro::read_supervisor_cleanup().await?;
     // A cluster workspace job: its data dir is the workspace's folder on the
     // shared filesystem, and the manifest there is the workspace's lease. A
     // previous job of the same workspace may still be shutting down (a
@@ -148,6 +151,8 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
             tokio::task::spawn_blocking(move || crate::workspaces::seed_cluster_workspace(&state))
                 .await;
     }
+
+    crate::pro::stage_supervisor_cleanup(&state, supervisor_cleanup);
 
     // Theming shims: regenerated at every daemon start (and after installs /
     // uninstalls / settings edits) so they always match this build's resolution

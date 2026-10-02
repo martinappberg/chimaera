@@ -10,6 +10,7 @@ use futures::{SinkExt, StreamExt};
 use reqwest::Method;
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
+    collections::HashMap,
     net::{Ipv4Addr, SocketAddr},
     sync::Arc,
     time::Duration,
@@ -688,7 +689,7 @@ impl Client {
     /// accepts (a stale revocation cache) and answers 503 `account_unavailable`
     /// while the account is down; neither rotates the one-use refresh token or
     /// signs out. Only an account that itself answers 401 does.
-    async fn keeper_request(
+    async fn keeper_request_raw(
         &self,
         method: Method,
         segments: &[&str],
@@ -713,12 +714,137 @@ impl Client {
                 self.refresh_if_current(&token).await?;
                 continue;
             }
-            if !response.status().is_success() {
-                bail!("keeper request rejected ({})", response.status().as_u16());
-            }
             return Ok(response);
         }
         bail!("sign in required")
+    }
+    async fn keeper_request(
+        &self,
+        method: Method,
+        segments: &[&str],
+        body: Option<serde_json::Value>,
+    ) -> Result<reqwest::Response> {
+        let response = self.keeper_request_raw(method, segments, body).await?;
+        if !response.status().is_success() {
+            bail!("keeper request rejected ({})", response.status().as_u16());
+        }
+        Ok(response)
+    }
+    pub async fn cluster_capabilities(&self) -> Result<crate::ClusterCapabilities> {
+        let response = self
+            .keeper_request_raw(Method::GET, &["v1", "cluster", "capabilities"], None)
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(crate::ServiceUnsupported.into());
+        }
+        let capabilities: crate::ClusterCapabilities = cluster_response(response).await?;
+        if !capabilities.control_supported() {
+            return Err(crate::ServiceUnsupported.into());
+        }
+        Ok(capabilities)
+    }
+    pub async fn cluster_operation(
+        &self,
+        host_id: &str,
+        operation: &crate::ClusterOperation,
+    ) -> Result<crate::ClusterReply> {
+        operation.validate()?;
+        let capabilities = self.cluster_capabilities().await?;
+        if matches!(operation, crate::ClusterOperation::StartJob { .. })
+            && !capabilities.jobs_supported()
+        {
+            return Err(crate::ServiceUnsupported.into());
+        }
+        let body =
+            serde_json::to_value(operation).map_err(|_| anyhow!("invalid cluster request"))?;
+        let reply: crate::ClusterReply = cluster_response(
+            self.keeper_request_raw(
+                Method::POST,
+                &["v1", "hosts", host_id, "cluster", "operations"],
+                Some(body),
+            )
+            .await?,
+        )
+        .await?;
+        reply.validate()?;
+        if !operation.accepts(&reply) {
+            bail!("cluster reply does not match operation");
+        }
+        if let crate::ClusterReply::Host { host } = &reply {
+            if host.id != host_id {
+                bail!("cluster host reply does not match operation");
+            }
+        }
+        Ok(reply)
+    }
+    /// Retain the original operation across a lost reply; this never submits it.
+    pub async fn cluster_operation_state(
+        &self,
+        host_id: &str,
+        operation: &crate::ClusterOperation,
+    ) -> Result<crate::ClusterOperationState> {
+        operation.validate()?;
+        let id = operation
+            .operation_id()
+            .context("cluster read has no operation id")?;
+        self.cluster_capabilities().await?;
+        let state: crate::ClusterOperationState = cluster_response(
+            self.keeper_request_raw(
+                Method::GET,
+                &["v1", "hosts", host_id, "cluster", "operations", id],
+                None,
+            )
+            .await?,
+        )
+        .await?;
+        state.validate_for(operation)?;
+        if let crate::ClusterOperationState::Completed { reply } = &state {
+            if let crate::ClusterReply::Host { host } = reply.as_ref() {
+                if host.id != host_id {
+                    bail!("cluster host reply does not match operation");
+                }
+            }
+        }
+        Ok(state)
+    }
+    pub async fn cluster_tcp(
+        &self,
+        host_id: &str,
+        job_id: &str,
+        workspace_id: Option<&str>,
+    ) -> Result<Socket> {
+        anyhow::ensure!(
+            chimaera_core::cluster::valid_job_id(job_id),
+            "invalid cluster job id"
+        );
+        if let Some(id) = workspace_id {
+            anyhow::ensure!(
+                chimaera_core::cluster::valid_workspace_id(id),
+                "invalid cluster workspace id"
+            );
+        }
+        if !self.cluster_capabilities().await?.jobs_supported() {
+            return Err(crate::ServiceUnsupported.into());
+        }
+        if let Some(id) = workspace_id {
+            self.open_socket(
+                &[
+                    "v1",
+                    "hosts",
+                    host_id,
+                    "jobs",
+                    job_id,
+                    "workspaces",
+                    id,
+                    "tcp",
+                ],
+                false,
+            )
+            .await
+        } else {
+            self.open_socket(&["v1", "hosts", host_id, "jobs", job_id, "tcp"], false)
+                .await
+        }
     }
     /// Rows of a host kind this client does not know are dropped.
     pub async fn hosts(&self) -> Result<Vec<Host>> {
@@ -736,6 +862,17 @@ impl Client {
         self.add_host_with_ssh(alias, None).await
     }
     pub async fn add_host_with_ssh(&self, alias: &str, ssh: Option<SshTarget>) -> Result<Host> {
+        self.add_host_with_policy(alias, ssh, None).await
+    }
+    pub async fn add_host_with_policy(
+        &self,
+        alias: &str,
+        ssh: Option<SshTarget>,
+        cluster_policy: Option<crate::ClusterPolicy>,
+    ) -> Result<Host> {
+        if cluster_policy.is_some() {
+            self.cluster_capabilities().await?;
+        }
         json_response(
             self.keeper_request(
                 Method::POST,
@@ -743,6 +880,7 @@ impl Client {
                 Some(serde_json::to_value(AddHost {
                     alias: alias.into(),
                     ssh,
+                    cluster_policy,
                 })?),
             )
             .await?,
@@ -848,14 +986,18 @@ impl Client {
                 let result = async {
                     let socket = client.open_socket(&["v1", "events"], true).await?;
                     let (mut tx, mut rx) = socket.split();
+                    let mut prompts = ConnectionPrompts::default();
                     let mut ping = tokio::time::interval_at(Instant::now() + Duration::from_secs(20), Duration::from_secs(20));
                     let mut last_pong = Instant::now();
                     let connected = Instant::now();
                     loop {
+                        for id in prompts.expire() {
+                            out.try_send(Ok(Event::PromptClosed { id })).map_err(|_| anyhow!("events consumer slow"))?;
+                        }
                         tokio::select! {
                             _ = out.closed() => return Ok(()),
                             command = incoming.recv() => match command {
-                                Some(command) => send_json(&mut tx, &command).await?,
+                                Some(command) => { if let Some(command) = prompts.answer(command) { send_json(&mut tx, &command).await?; } },
                                 None => return Ok(()),
                             },
                             message = rx.next() => match message {
@@ -865,6 +1007,7 @@ impl Client {
                                         Ok(Event::Host { host }) if host.kind == HostKind::Unknown => continue,
                                         Ok(event) => event,
                                     };
+                                    let Some(event) = prompts.receive(event)? else { continue; };
                                     match tokio::time::timeout(Duration::from_secs(10), out.send(Ok(event))).await {
                                         Ok(Ok(())) => {}
                                         Ok(Err(_)) => return Ok(()),
@@ -911,8 +1054,84 @@ impl Client {
     }
 }
 
+/// Caller-visible prompt identifiers belong only to the socket that received
+/// them. Native callers may hold a cloned command sender through reconnect;
+/// its old answer must not match a keeper's reused prompt identifier.
+#[derive(Default)]
+struct ConnectionPrompts {
+    by_wire: HashMap<String, LocalPrompt>,
+}
+struct LocalPrompt {
+    id: String,
+    expires: Instant,
+    answered: bool,
+}
+impl ConnectionPrompts {
+    fn receive(&mut self, event: Event) -> Result<Option<Event>> {
+        Ok(Some(match event {
+            Event::Prompt {
+                id,
+                host_id,
+                prompt,
+                echo,
+            } => {
+                if !self.by_wire.contains_key(&id) && self.by_wire.len() >= 64 {
+                    bail!("events prompt limit");
+                }
+                let local = self.by_wire.entry(id).or_insert_with(|| LocalPrompt {
+                    id: base64::Engine::encode(
+                        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                        rand::random::<[u8; 32]>(),
+                    ),
+                    expires: Instant::now() + Duration::from_secs(180),
+                    answered: false,
+                });
+                Event::Prompt {
+                    id: local.id.clone(),
+                    host_id,
+                    prompt,
+                    echo,
+                }
+            }
+            Event::PromptClosed { id } => {
+                let Some(local) = self.by_wire.remove(&id) else {
+                    return Ok(None);
+                };
+                Event::PromptClosed { id: local.id }
+            }
+            other => other,
+        }))
+    }
+    fn answer(&mut self, command: EventCommand) -> Option<EventCommand> {
+        let EventCommand::Answer { id, value } = command;
+        let (wire, local) = self.by_wire.iter_mut().find(|(_, local)| local.id == id)?;
+        if local.answered || local.expires <= Instant::now() {
+            return None;
+        }
+        local.answered = true;
+        Some(EventCommand::Answer {
+            id: wire.clone(),
+            value,
+        })
+    }
+    fn expire(&mut self) -> Vec<String> {
+        let mut expired = Vec::new();
+        self.by_wire.retain(|_, local| {
+            if local.expires > Instant::now() {
+                true
+            } else {
+                expired.push(local.id.clone());
+                false
+            }
+        });
+        expired
+    }
+}
+
 pub struct EventConnection {
     pub events: mpsc::Receiver<Result<Event, String>>,
+    /// Answer IDs come from this connection's received Prompt events, never a
+    /// keeper API response; queued stale IDs are discarded on reconnect.
     pub commands: mpsc::Sender<EventCommand>,
     task: JoinHandle<()>,
 }
@@ -940,6 +1159,34 @@ pub struct LinkTunnel {
 }
 impl LinkTunnel {
     pub async fn bind(client: Client, host_id: String) -> Result<Self> {
+        Self::bind_resource(client, host_id, None).await
+    }
+    pub async fn bind_cluster(
+        client: Client,
+        host_id: String,
+        job_id: String,
+        workspace_id: Option<String>,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            chimaera_core::cluster::valid_job_id(&job_id),
+            "invalid cluster job id"
+        );
+        if let Some(id) = workspace_id.as_deref() {
+            anyhow::ensure!(
+                chimaera_core::cluster::valid_workspace_id(id),
+                "invalid cluster workspace id"
+            );
+        }
+        if !client.cluster_capabilities().await?.jobs_supported() {
+            return Err(crate::ServiceUnsupported.into());
+        }
+        Self::bind_resource(client, host_id, Some((job_id, workspace_id))).await
+    }
+    async fn bind_resource(
+        client: Client,
+        host_id: String,
+        job: Option<(String, Option<String>)>,
+    ) -> Result<Self> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let local_port = listener.local_addr()?.port();
         let task = tokio::spawn(async move {
@@ -959,10 +1206,14 @@ impl LinkTunnel {
                         };
                         failures = 0;
                         let Ok(permit) = limits.clone().try_acquire_owned() else { drop(tcp); continue; };
-                        let client = client.clone(); let host_id = host_id.clone();
+                        let client = client.clone(); let host_id = host_id.clone(); let job=job.clone();
                         streams.spawn(async move {
                             let _permit = permit;
-                            if let Ok(socket) = client.tcp(&host_id).await { let _ = bridge(tcp, socket).await; }
+                            let socket=match job {
+                                Some((job_id,workspace_id))=>client.cluster_tcp(&host_id,&job_id,workspace_id.as_deref()).await,
+                                None=>client.tcp(&host_id).await,
+                            };
+                            if let Ok(socket) = socket { let _ = bridge(tcp, socket).await; }
                         });
                     }
                     _ = streams.join_next(), if !streams.is_empty() => {}
@@ -1095,6 +1346,37 @@ fn backoff(attempt: u32) -> Duration {
     let ceiling = (500_u64.saturating_mul(1 << attempt.min(5))).min(10_000);
     Duration::from_millis(ceiling / 2 + rand::random_range(0..=ceiling / 2))
 }
+async fn cluster_response<T: DeserializeOwned>(mut response: reqwest::Response) -> Result<T> {
+    let status = response.status();
+    let limit = if status.is_success() {
+        crate::CLUSTER_REPLY_MAX
+    } else {
+        4096
+    };
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            bail!("cluster response exceeds limit");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if !status.is_success() {
+        let code = serde_json::from_slice::<ClusterErrorBody>(&bytes)
+            .ok()
+            .map(|body| body.error)
+            .unwrap_or(crate::ClusterErrorCode::Unknown);
+        return Err(crate::ClusterRequestError {
+            status: status.as_u16(),
+            code,
+        }
+        .into());
+    }
+    serde_json::from_slice(&bytes).map_err(|_| anyhow!("invalid cluster JSON response"))
+}
+#[derive(serde::Deserialize)]
+struct ClusterErrorBody {
+    error: crate::ClusterErrorCode,
+}
 async fn json_response<T: DeserializeOwned>(response: reqwest::Response) -> Result<T> {
     if !response.status().is_success() {
         bail!("request rejected ({})", response.status().as_u16());
@@ -1109,7 +1391,8 @@ async fn json_response_body<T: DeserializeOwned>(mut response: reqwest::Response
         }
         bytes.extend_from_slice(&chunk);
     }
-    serde_json::from_slice(&bytes).context("invalid JSON response")
+    // Typed deserialization errors can include token values from the body.
+    serde_json::from_slice(&bytes).map_err(|_| anyhow!("invalid JSON response"))
 }
 async fn send_json<S, T>(socket: &mut S, value: &T) -> Result<()>
 where
@@ -1202,6 +1485,60 @@ mod tests {
             String::from_utf8_lossy(&request[..read]).into_owned()
         });
         (endpoint, server)
+    }
+
+    #[tokio::test]
+    async fn malformed_token_responses_do_not_expose_or_install_secrets() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        const BODY: &str = r#"{"access_token":"synthetic-access","refresh_token":"synthetic-refresh","token_type":"Bearer","expires_in":"synthetic-private-expiry"}"#;
+        for refresh in [false, true] {
+            let (endpoint, server) = answering("200 OK", BODY).await;
+            let original = Tokens {
+                access_token: "before-access".into(),
+                refresh_token: "before-refresh".into(),
+                token_type: "Bearer".into(),
+                expires_in: 900,
+            };
+            let client = Client::new(&endpoint, Some(original)).unwrap();
+            let updates = client.token_updates();
+            let error = if refresh {
+                client
+                    .refresh_if_current("before-access")
+                    .await
+                    .unwrap_err()
+            } else {
+                client
+                    .exchange_code(TokenRequest {
+                        grant_type: "authorization_code".into(),
+                        code: "fixture".into(),
+                        redirect_uri: "http://127.0.0.1:43210/callback".into(),
+                        code_verifier: "fixture-verifier".into(),
+                        device_name: "fixture".into(),
+                    })
+                    .await
+                    .unwrap_err()
+            };
+            let request = server.await.unwrap();
+            assert!(request.starts_with(if refresh {
+                "POST /v1/oauth/refresh "
+            } else {
+                "POST /v1/oauth/token "
+            }));
+            for rendered in std::iter::once(format!("{error:?} {error:#}"))
+                .chain(error.chain().map(|cause| format!("{cause:?} {cause}")))
+            {
+                assert!(
+                    !rendered.contains("synthetic-"),
+                    "response leaked through error: {rendered}"
+                );
+            }
+            assert_eq!(client.tokens().await.unwrap().access_token, "before-access");
+            assert_eq!(
+                client.tokens().await.unwrap().refresh_token,
+                "before-refresh"
+            );
+            assert!(!updates.has_changed().unwrap());
+        }
     }
 
     /// The catalog answers before anyone signs in: no credentials go out (not
@@ -1355,5 +1692,41 @@ mod tests {
         for status in [200, 404, 408, 429, 500, 502, 503, 504] {
             assert!(!refresh_revoked(status), "{status}");
         }
+    }
+}
+
+#[cfg(test)]
+mod connection_prompt_tests {
+    use super::*;
+    fn event(id: &str) -> Event {
+        Event::Prompt {
+            id: id.into(),
+            host_id: "host".into(),
+            prompt: "Synthetic?".into(),
+            echo: false,
+        }
+    }
+    #[test]
+    fn prompt_map_is_bounded_expires_and_answers_only_once() {
+        let mut map = ConnectionPrompts::default();
+        let Some(Event::Prompt { id, .. }) = map.receive(event("wire")).unwrap() else {
+            unreachable!()
+        };
+        assert!(
+            matches!(map.answer(EventCommand::Answer { id: id.clone(), value: None }), Some(EventCommand::Answer { id, value: None }) if id == "wire")
+        );
+        assert!(map
+            .answer(EventCommand::Answer {
+                id: id.clone(),
+                value: None
+            })
+            .is_none());
+        for index in 1..64 {
+            map.receive(event(&format!("wire-{index}"))).unwrap();
+        }
+        assert!(map.receive(event("overflow")).is_err());
+        map.by_wire.get_mut("wire").unwrap().expires = Instant::now();
+        assert_eq!(map.expire(), vec![id]);
+        assert!(map.receive(event("overflow")).is_ok());
     }
 }

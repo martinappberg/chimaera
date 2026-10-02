@@ -180,6 +180,10 @@ Signing in at the account's address in a browser lands in the same workbench the
 
 Settings there holds only **Chimaera Pro** (`SettingsView` with `account`, which renders `pro/BrowserAccount.svelte` in place): the plan and its badge, usage as percentages of the account's own allowances, **Manage plan and billing** (**See plans** without a plan), which opens the account's billing page in the same tab, and **Sign out**, which signs out this browser only. Devices, other sign-ins and **Sign out everywhere** are on that billing page. Both reads are passive, same-origin and cookie-authenticated (`pro/accountHome.ts`; routes in the [protocol](../../crates/chimaera-link/PROTOCOL.md#account-home-in-a-browser)), and neither wakes a cloud machine. Home rereads its list every 30 seconds while visible (every 10 while part of it is still connecting); a session that ended returns to the sign-in page. Project views and host views are unchanged; their Pro page links to the same billing page.
 
+In a browser project view, **Home** in the workspace header returns to the
+account's project list. It stays available in the focus-mode strip on a phone
+and does not wake or move work.
+
 ## Subscriber branding
 
 An active Pro or Max account wears a small plan badge beside the Home wordmark and in the workspace header. The dedicated Pro page uses the same badge. The workspace badge opens the dedicated Pro page. There is no full-width Pro row in the workspace sidebar; free and signed-out users can still find Pro at the end of Settings and from Home. Pro is an optional add-on, so its Settings group follows every working section and its entry uses the same neutral style for everyone: **Get Pro** with one short optional-benefit line for confirmed free or signed-out accounts. Paid accounts see **Your Chimaera Pro** or **Your Chimaera Max** and **View account**. Loading or unknown account state, and an account whose payment needs attention without an active plan, stay neutral. A connection warning never clears the badge. The styling follows the current theme, and an unknown, signed-out or inactive plan shows no paid badge.
@@ -397,7 +401,9 @@ Native IPC commands (the `LOCAL_ACCOUNT_COMMANDS` list in
 `pro_refresh_account`, `pro_sign_in`, `pro_cancel_sign_in`, `pro_sign_out`,
 `pro_sign_out_everywhere`, `pro_take_return`, `pro_billing_checkout`,
 `pro_billing_portal`, `pro_cancel_billing`, `pro_cloud_status`,
-`pro_cloud_request`, `pro_cloud_projects`, `pro_open_cloud_project`,
+`pro_cloud_request`, `pro_cloud_projects`, `pro_copy_project`,
+`pro_open_cloud_project` (the compatibility alias),
+`pro_take_over_project`,
 `pro_mirror_status`, `pro_set_never_mirror`, `pro_hosts`, `pro_set_host_kept`,
 `pro_devices` and `pro_revoke_device`. They are granted only to windows showing
 this computer's own daemon; a remote host's, another computer's or the cloud's UI
@@ -524,24 +530,34 @@ Quitting the app (⌘Q, the menu, the tray, Dock › Quit, logging out), or clos
 Implementation: [`shell/quit.rs`](../../crates/chimaera-app/src/shell/quit.rs) asks and posts `POST /api/v1/pro/sleep {deadline_ms, park: true, workspace_ids}`; each `/pro/status` project row carries additive `working_agents`, `cloud_handoff` and `parked`; the app posts `/pro/wake` at launch while anything is parked ([`pro/AGENTS.md`](../../crates/chimaera-server/src/pro/AGENTS.md), "Quit handover").
 ### After a reinstall or reset
 
-A project folder remembers which project it is: registering it records its workspace id in the folder (inside `.git` when the folder is a Git repository, or in a linked worktree's own git directory, so it is never committed and never shows up as a changed file; otherwise in a small `.chimaera-workspace` file that is never copied to the cloud). Open the same folder again after a reinstall, a reset of Chimaera's data, or on a second computer, and it is the same project, not a new one: its cloud copy matches it instead of showing beside it as "In the cloud · not on this computer", and the project's cloud work comes home to it the usual way: both versions of a file that changed in both places are kept (yours beside it as `<name>.mine-…`), and files that exist only on this computer stay. The project comes back to the latest computer that had it; opening it on another of your computers takes it over when the first one is idle, and never while a computer is working on it. A folder that is moved keeps its project; a duplicate of a folder on the same computer becomes a separate project of its own; a plain `git clone` is a separate project until you open the project from Cloud projects. A folder that cannot be written to (read-only, some network drives) simply carries no id. Implementation: [`workspaces/identity.rs`](../../crates/chimaera-server/src/workspaces/identity.rs) and the registration table in [`workspaces.rs`](../../crates/chimaera-server/src/workspaces.rs); the daemon remembers which projects you opened on this computer (`pro::note_opened`) and lets the return path bring them home even when the account's preferred computer is another one ([`pro/AGENTS.md`](../../crates/chimaera-server/src/pro/AGENTS.md), "Who a project returns to").
+A project folder records its workspace identity inside its Git directory (or a
+small `.chimaera-workspace` marker for a non-Git folder). Opening an already
+synced project on another computer refreshes a local copy; execution remains
+with its current owner. **Take over** separately moves execution through the
+existing safe handoff. A duplicate folder on the same computer becomes a
+separate project; a plain Git clone is separate until selected from synced
+projects. Read-only folders carry no persistent marker. Identity lives in
+[`workspaces/identity.rs`](../../crates/chimaera-server/src/workspaces/identity.rs).
 
-Projects first created in the cloud appear on Home without being downloaded.
-Opening one on a computer without a local copy asks where to save it through the
-native picker. An empty folder becomes the project folder; choosing a folder
-that already has files (such as `~/Projects`) makes a new folder named after
-the project inside it. Cancellation leaves the cloud copy untouched.
-The confirmed destination is remembered for that project on that computer;
-existing local projects retain their original folders. A missing destination or
-an unrelated nonempty folder fails safely instead of overwriting data. A project
-refused because it is mid-step in the cloud opens by itself once that step
-finishes: Home retries on each list refresh while visible, for up to 15 minutes,
-and only after its folder is saved so the picker never reappears. Native
-conversation identifiers survive when the local folder differs. The old global
-projects-root preference no longer authorizes automatic imports. Both repository and shadow histories are retained
-within the account quota; source history is never silently pruned. Initial Git
-transfers have a bounded 16-minute deadline and remain cancelable.
+Synced projects without a local copy appear on Home. **Open project** asks where
+to save the copy: an empty folder is used directly; a nonempty parent receives a
+new folder named after the project. Cancellation leaves saved work untouched.
+Later opens refresh the bound destination immediately from the latest published
+checkpoint, preserving local conflicts. Open never acquires execution, resumes
+agents or runs setup. A missing/moved folder or unrelated nonempty destination
+fails safely. An older daemon without the exact copy acknowledgment requires an
+update; there is no fallback to its old transfer-on-open route.
 
+A copied workspace's placement strip offers **Take over** only after a ready
+copy and current ownership epoch are verified. Sessions continue on the current
+owner until that explicit action completes. Copied-local edits are retained but
+are not automatically published. **Project copies** in Settings also reports Git
+staging: synchronized, an older snapshot without staging, or conflicts. Conflicts
+keep the local staged version for conflicting paths and preserve both index
+snapshots for recovery, including staged-only content. Its advanced recovery
+reference is relative to the actual Git directory, so linked worktrees work too.
+Source and shadow histories remain within account quotas; initial transfers have
+a bounded 16-minute deadline.
 Implementation: [`pro/`](../../crates/chimaera-server/src/pro/AGENTS.md),
 [`MirrorSettings.svelte`](../../web-ui/src/lib/settings/MirrorSettings.svelte),
 [`power.rs`](../../crates/chimaera-app/src/shell/power.rs), and the
@@ -647,23 +663,14 @@ recording it, the copy the app sends next runs it a second time.
 Typing that is refused is said in a small note over the terminal; typing that
 was still on its way when a connection ended is not replayed.
 
-**Acting brings the work to you; looking doesn't.** When another of your
-computers is running a project and you send a chat message or type into a
-terminal of it on this computer, the work comes here. The message or the
-typing waits on this computer ("sending…", and the chat or terminal says
-"Bringing the work here…"); the other computer finishes what it is doing (a
-chat finishes its turn, a terminal agent reaches its next pause; plain
-terminals never hold it up), saves the project as it does before sleep and
-lets go, and this computer takes it the way work comes home and delivers
-what you sent, once, in the same conversation. The other computer's own
-window then says "Continuing on your other computer…". If the other computer
-has not let go within five minutes, what you sent comes back (a message
-returns to the composer) with "Your other computer is still working on this.
-Try again when it pauses." Whoever acts last wins: if someone types or sends
-on the other computer after you asked, the work stays there. Looking never
-moves anything: opening the project, scrolling, reading files and watching a
-terminal leave the work where it runs, and saving a file still saves it on
-the computer running the project, as before. From a phone the same holds, with one addition:
+**Execution moves only with Take over.** Opening a synced project creates or
+updates its local copy. Chat messages and terminal input still route to the
+current owner; they do not implicitly acquire execution. **Take over** asks that
+owner to finish its current step, save and release, then establishes execution
+here. A failed or stale action leaves the current owner authoritative and asks
+for a fresh explicit decision. Explicit opens may wake the cloud; background
+views, polls and refreshes never wake or move work.
+From a phone the same holds, with one addition:
 when the cloud is asleep with the project and one of your computers is
 online with the app open (preferably the one the project last ran on, and
 one on power), a message or typing from the phone brings the work to that
@@ -672,7 +679,7 @@ to your computer…". Only if no computer takes it within about twenty seconds
 is the cloud woken as before. For this, the cloud saves each project it holds
 as it goes to sleep. Implementation: [`pro/moves.rs`](../../crates/chimaera-server/src/pro/moves.rs)
 and the viewer relay in [`session_proxy.rs`](../../crates/chimaera-server/src/session_proxy.rs)
-(the contract is in [HANDOFF](../../crates/chimaera-link/HANDOFF.md#acting-brings-the-work-to-you)).
+(the contract is in [HANDOFF](../../crates/chimaera-link/HANDOFF.md#explicit-take-over-moves-execution)).
 
 **Moving between devices is not an exit.** When a conversation moves between
 this computer and the cloud, every open view is told it *moved*: the chat stays
@@ -827,8 +834,8 @@ cloud copies once the account confirms them again.
 ## Project views follow the current owner
 
 Opening the same project on a phone, browser or another computer does not move
-execution away from its online preferred computer; acting on it from another
-computer does (see "Acting brings the work to you" above). Logical browser routes and
+execution away from its current computer; a native local copy requires explicit
+**Take over** to move execution. Logical browser routes and
 native project views resolve the
 current owner passively, carry its exact workspace/epoch and preserve the same
 session identity. Files, previews and watches follow that owner while native file

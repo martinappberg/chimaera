@@ -202,3 +202,34 @@ activity, whose existing bounded rollout policy remains. Reports contain no
 host, job, project or credential identities. Restart recovery reports unknown
 until all saved job evidence has been reconciled; absence of a live viewer is
 never idle proof. Old keepers that never negotiated retain legacy behavior.
+
+## JSON envelopes and correlation
+
+Control requests use the `operation` string as their JSON discriminator. Example:
+{"operation":"start_job","operation_id":"op_123","job_id":"j-0000abcd","name":null,"spec":{"time":"1:00"},"open":[],"startup":"","attached":false,"replaces":null,"save_as":null}
+
+An operation id contains 1–128 ASCII letters, digits, underscores or hyphens. It is opaque, account/host scoped, and has no path or credential authority. Existing core validators continue to own job/workspace ids. Requests reject unknown operation kinds and fields; service replies accept additive fields and retain unknown discriminator/state values as unsupported evidence.
+
+Replies use `result` as discriminator:
+- overview: {"result":"overview","overview":<existing overview fields plus config_sum/state_unreadable/records/routes>}
+- facts: {"result":"facts","facts":<existing cluster facts>}
+- read_config: {"result":"config","config":<existing ClusterConfig>,"config_sum":"..."}
+- generic saved mutations: {"result":"saved"}
+- list_dir: {"result":"directory","directory":<existing directory listing>}
+- add_workspace: {"result":"workspace","workspace":<existing cluster workspace>}
+- start_job: {"result":"job","job_id":"j-0000abcd","slurm_job_id":null,"attached":true}
+- stop_job: {"result":"stop_pending","job_id":"j-0000abcd"} or {"result":"stopped","job_id":"j-0000abcd"}
+- set_policy/stop_login_daemon: {"result":"host","host":<existing host plus cluster metadata>}
+- start_estimate: {"result":"estimate","job_id":"j-0000abcd","at_ms":null}
+
+Protected overview routes are a list of {job_id,workspace_id?:<id>,daemon:<existing Daemon>}. An omitted workspace_id addresses the job-host. They contain no node, port or client-supplied SSH destination. Daemon credentials have no Debug representation and remain native RAM only.
+
+Operation history replies are {"state":"pending"}, {"state":"uncertain"}, {"state":"unknown"}, or {"state":"completed","reply":<original typed reply>}. A completed state without a validated reply is not completion evidence. Unknown values never trigger resubmission or job cleanup.
+
+Fixed control errors are {"error":<code>} without SSH diagnostics. Codes include operation_changed, cluster_requires_job, jobs_held, job_unavailable, jobs_changed and rollout_pending. The reservation uses the published rollout_pending spelling; no alias is implied.
+
+Client serialization enforces the 64KiB request ceiling before sending, validates existing launch/config/id fields, and reads cluster replies under their explicit 2MiB ceiling. The ordinary 1MiB REST ceiling stays unchanged. Missing/false/version-mismatched capabilities fail before mutations and job socket creation; absence is never inferred from arbitrary errors on a submitted mutation.
+
+Clients correlate replies before accepting them: start/stop/estimate job_id equals the exact requested job id; completed history replies match the exact retained operation kind and its requested identities. A job mutation never accepts a different id merely because it is otherwise valid. Unknown or mismatched replies leave the operation unresolved. All enclosing route/snapshot/reply/history types that can contain daemon credentials omit Debug or explicitly redact those values. Durable replay records contain sanitized non-secret results only; protected daemon routes are rebuilt from current verified state in RAM and never replay a persisted bearer.
+
+A generic `saved` history reply is authoritative only because the authenticated history URL names the exact immutable account/host operation record. It must never be synthesized from a latest-job result or unrelated cache. Request hashes remain internal deduplication state; they are not a client wire requirement.

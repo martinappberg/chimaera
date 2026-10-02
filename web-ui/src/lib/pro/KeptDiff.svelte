@@ -1,7 +1,7 @@
 <script lang="ts">
   /**
    * Both versions of one kept file side by side, differences highlighted:
-   * this computer's on the left, the cloud's on the right. Read-only
+   * this computer's on the left, the incoming version on the right. Read-only
    * @codemirror/merge, the renderer the git diff and the editor's compare
    * view use, with unchanged runs folded. The parent keys this component on
    * the pair, so a new pair mounts a fresh view.

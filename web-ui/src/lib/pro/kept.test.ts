@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   backNote,
+  canUseMine,
   deletedNote,
   isKeptCopy,
   keptCopyHint,
@@ -13,6 +14,11 @@ import {
 } from "./kept";
 
 describe("kept copies", () => {
+  it("withholds an unsafe local replacement while retaining older daemon compatibility", () => {
+    expect(canUseMine({ can_use_mine: false })).toBe(false);
+    expect(canUseMine({ can_use_mine: true })).toBe(true);
+    expect(canUseMine({})).toBe(true);
+  });
   it("recognises the daemon's names and nothing else", () => {
     // canonical::kept_copy_name's cases.
     for (const name of ["notes.md.mine-20260929-1412", "a.mine-20260928-1200-3", "x.tar.gz.mine-20260101-0000"]) {
@@ -49,22 +55,22 @@ describe("kept copies", () => {
 describe("words", () => {
   it("says where the work came back and how many files both sides changed", () => {
     expect(backNote(3, "this Mac")).toBe(
-      "Back on this Mac. The cloud and this Mac both changed 3 files while apart.",
+      "Back on this Mac. Both copies changed 3 files while apart.",
     );
     expect(backNote(1, "your computer")).toBe(
-      "Back on your computer. The cloud and your computer both changed 1 file while apart.",
+      "Back on your computer. Both copies changed 1 file while apart.",
     );
   });
 
   it("says a discarded copy moves to the Trash, and only says deleted when it is", () => {
-    expect(useCloudHint(false, true, "this Mac")).toBe("The cloud's version stays; this Mac's copy moves to the Trash");
-    expect(useCloudHint(true, true, "this Mac")).toBe("The cloud deleted this file; this Mac's copy moves to the Trash");
-    expect(useCloudHint(false, false, "this computer")).toBe("The cloud's version stays; this computer's copy is deleted");
+    expect(useCloudHint(false, true, "this Mac")).toBe("The incoming version stays; this Mac's copy moves to the Trash");
+    expect(useCloudHint(true, true, "this Mac")).toBe("The incoming copy deleted this file; this Mac's copy moves to the Trash");
+    expect(useCloudHint(false, false, "this computer")).toBe("The incoming version stays; this computer's copy is deleted");
     expect(useCloudForAllBody(3, true, "this Mac")).toBe(
-      "This Mac's versions of 3 files will be moved to the Trash. The cloud's versions stay.",
+      "This Mac's versions of 3 files will be moved to the Trash. The incoming versions stay.",
     );
     expect(useCloudForAllBody(1, false, "this Mac")).toBe(
-      "This Mac's versions of 1 file will be deleted: this folder's drive has no Trash. The cloud's versions stay.",
+      "This Mac's versions of 1 file will be deleted: this folder's drive has no Trash. The incoming versions stay.",
     );
     expect(deletedNote(1, "this Mac")).toBe("The Trash couldn't take this Mac's copy, so it was deleted.");
     expect(deletedNote(2, "this Mac")).toBe("The Trash couldn't take 2 of this Mac's copies, so they were deleted.");

@@ -10,6 +10,8 @@ export interface Workspace {
   name: string;
   /** Unix seconds of the last open/activity; 0/absent on old daemons. */
   last_opened_at?: number;
+  /** Additive exact local-copy role; absence is an ordinary workspace. */
+  local_copy?: import("../net/native").LocalProjectCopy;
   /**
    * The workspace's Mastermind binding: the privileged chat session's id +
    * the ask/auto gating mode its act tools were spawned with. Absent when

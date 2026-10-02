@@ -303,7 +303,7 @@ pub(super) async fn login(
     drop(captured);
     let mut scratch = Vec::new();
     let status = {
-        let wait = child.child.wait();
+        let wait = child.wait();
         tokio::pin!(wait);
         loop {
             tokio::select! {
@@ -319,7 +319,7 @@ pub(super) async fn login(
             }
         }
     };
-    // Release the reaped group now, not after the Git setup that follows.
+    // Group cleanup precedes reaping; no process identity survives into Git setup.
     drop((input, output, child));
     if !status.success() {
         return Err("sign_in_failed");

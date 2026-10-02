@@ -24,16 +24,18 @@ mod snapshot_diagnostics;
 #[derive(Serialize, Deserialize)]
 pub(super) struct Manifest {
     version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project: Option<super::projects::catalog::Metadata>,
     #[serde(default)]
-    branch: Option<String>,
+    pub(super) branch: Option<String>,
     #[serde(default)]
-    repository_origin: Option<String>,
+    pub(super) repository_origin: Option<String>,
     #[serde(default)]
-    repository: Option<super::repository::Snapshot>,
-    workspace_id: String,
+    pub(super) repository: Option<super::repository::Snapshot>,
+    pub(super) workspace_id: String,
     pub root: PathBuf,
-    name: String,
-    epoch: u64,
+    pub(super) name: String,
+    pub(super) epoch: u64,
     clean: bool,
     #[serde(default)]
     continuation: execution::wire::Continuation,
@@ -42,7 +44,7 @@ pub(super) struct Manifest {
     /// Additive: project paths this snapshot deliberately left out. Only a
     /// snapshot that carries this inventory can show that a file is gone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    left_out: Option<Vec<PathBuf>>,
+    pub(super) left_out: Option<Vec<PathBuf>>,
 }
 #[derive(Serialize, Deserialize)]
 struct SessionArchive {
@@ -83,7 +85,7 @@ pub(super) async fn account(
     );
     Ok(response)
 }
-async fn credentials(
+pub(super) async fn credentials(
     config: &Configure,
     workspace: &str,
     epoch: Option<u64>,
@@ -370,6 +372,83 @@ async fn reconcile_generation(
     generation: u64,
 ) -> Result<Option<u64>> {
     authority::config_matches(state, config, workspace)?;
+    // A local copy never renews/acquires execution or advertises a return
+    // destination. Only the explicit takeover operation may hydrate it.
+    if super::project_copy::copy_only(state, workspace) {
+        ensure!(
+            generation == state.pro.generation.load(Ordering::Acquire)
+                && super::projects::account_matches(state, workspace),
+            "Account changed during copy owner read"
+        );
+        let baton: Baton = account(config, &execution::path(config, workspace, ""), "GET", None)
+            .await?
+            .json()?;
+        ensure!(
+            baton.workspace_id == workspace
+                && generation == state.pro.generation.load(Ordering::Acquire),
+            "Copy owner read changed"
+        );
+        let _configuration = state.pro.configuration.lock().await;
+        ensure!(
+            generation == state.pro.generation.load(Ordering::Acquire)
+                && super::projects::account_matches(state, workspace),
+            "Account changed during copy owner read"
+        );
+        if !super::project_copy::copy_only(state, workspace) {
+            return Ok(None);
+        }
+        // An older passive answer must not regress an admitted takeover. An
+        // active owned move already observes its own epoch through hydration.
+        if super::moves::pulling(state, workspace) {
+            return Ok(None);
+        }
+        let previous = lock(&state.pro.ownership).get(workspace).cloned();
+        let newer = previous.as_ref().is_some_and(|ownership| match ownership {
+            Ownership::Local { epoch }
+            | Ownership::Remote { epoch, .. }
+            | Ownership::Hydrating { epoch }
+            | Ownership::SettingUp { epoch }
+            | Ownership::Transferring { epoch }
+            | Ownership::AwaitingVerification { epoch }
+            | Ownership::PrivacyDisabled { epoch } => *epoch > baton.epoch,
+        });
+        if newer {
+            return Ok(None);
+        }
+        if let Some(copy) = lock(&state.pro.preferences)
+            .get_mut(workspace)
+            .and_then(|p| p.copy.as_mut())
+        {
+            copy.owner_epoch = Some(baton.epoch);
+        }
+        if let Some(holder) = baton
+            .holder_id
+            .as_ref()
+            .filter(|holder| *holder != &config.delegation.device_id)
+        {
+            lock(&state.pro.ownership).insert(
+                workspace.to_owned(),
+                Ownership::Remote {
+                    epoch: baton.epoch,
+                    holder: holder.clone(),
+                },
+            );
+        } else if baton.holder_id.is_none() && matches!(previous, Some(Ownership::Remote { .. })) {
+            lock(&state.pro.ownership).remove(workspace);
+        }
+        let requested = lock(&state.pro.preferences)
+            .get(workspace)
+            .and_then(|p| p.copy.as_ref())
+            .is_some_and(|copy| copy.takeover_requested);
+        super::persist(state).await?;
+        if requested
+            && (baton.move_to.as_deref() == Some(config.delegation.device_id.as_str())
+                || baton.holder_id.as_deref() == Some(config.delegation.device_id.as_str()))
+        {
+            super::moves::answer(state, config, workspace, &baton);
+        }
+        return Ok(None);
+    }
     ensure!(
         generation == state.pro.generation.load(Ordering::Acquire),
         "Account changed during project transfer"
@@ -1003,6 +1082,10 @@ async fn snapshot_inner_scoped(
     sleep: Option<Sleep>,
     phase: &mut &'static str,
 ) -> Result<()> {
+    ensure!(
+        !super::project_copy::copy_only(state, workspace),
+        "local copy cannot publish execution state"
+    );
     authority::config_matches(state, config, workspace)?;
     let effective = execution::effective(state, config, workspace)?;
     // The unrefined configuration, for a reconcile after the account has
@@ -1140,10 +1223,21 @@ async fn snapshot_inner_scoped(
             publish_policy(config, &workspace.id, epoch, has_agents).await?;
         }
         *phase = "capture_repository";
-        let super::repository::Described { branch, origin: repository_origin, snapshot: repository } =
+        let super::repository::Described { branch, origin: repository_origin, snapshot: mut repository } =
             super::repository::describe(&state.pro, &workspace.id, &workspace.root).await?;
-        let manifest = Manifest {version:1,branch,repository_origin,repository,workspace_id:workspace.id.clone(),root:workspace.root.clone(),name:workspace.name.clone(),epoch,clean,continuation,profile:profile.clone(),sessions:archives,left_out:report.left_out.clone()};
-        tokio::fs::write(handoff.join("manifest.json"), serde_json::to_vec(&manifest)?).await?;
+        let mut staging_bytes = 0u64;
+        if let Some(repository) = repository.as_mut() {
+            let remaining = budget.saturating_sub(report.bytes).saturating_sub(config_report.bytes).saturating_sub(archive_bytes);
+            let (descriptor, bytes) = super::repository::staging::capture(&workspace.root, &handoff, remaining, max_file).await?;
+            staging_bytes = bytes;
+            repository.staging = Some(descriptor);
+        }
+        let manifest = Manifest {version:1,project:super::projects::catalog::metadata(&workspace.name,!workspace.cloud_internal && !workspace.hidden),branch,repository_origin,repository,workspace_id:workspace.id.clone(),root:workspace.root.clone(),name:workspace.name.clone(),epoch,clean,continuation,profile:profile.clone(),sessions:archives,left_out:report.left_out.clone()};
+        let manifest_bytes = serde_json::to_vec(&manifest)?;
+        ensure!(manifest_bytes.len() <= 256*1024, "handoff manifest exceeds limit");
+        let used = report.bytes.checked_add(config_report.bytes).and_then(|bytes|bytes.checked_add(archive_bytes)).and_then(|bytes|bytes.checked_add(staging_bytes)).and_then(|bytes|bytes.checked_add(manifest_bytes.len() as u64)).context("snapshot size overflow")?;
+        ensure!(used <= budget, "snapshot exceeds combined storage limit");
+        tokio::fs::write(handoff.join("manifest.json"), manifest_bytes).await?;
         *phase = "mirror_repository";
         mirror::mirror_repository(&workspace.root, &root.join("repository.git"), &grant).await?;
         *phase = "commit_files";
@@ -1163,12 +1257,13 @@ async fn snapshot_inner_scoped(
             let preference = preferences.entry(workspace.id.clone()).or_default();
             preference.profile = profile;
             preference.published_tree = Some(tree_oid.clone());
+            if config.execution.is_some() { preference.published_handoff = Some(handoff_oid.clone()); }
         }
         {
             // The last return's report stays until the next return replaces it.
             let mut statuses = lock(&state.pro.status);
             let previous = statuses.remove(&workspace.id).unwrap_or_default();
-            statuses.insert(workspace.id.clone(), WorkspaceStatus {report,last_mirrored_at:Some(super::now()),storage_limit_bytes:budget,error:None,error_code:None,kept_both:previous.kept_both,kept_paths:previous.kept_paths,kept_at:previous.kept_at,kept_total:previous.kept_total,blocked_providers:Vec::new()});
+            statuses.insert(workspace.id.clone(), WorkspaceStatus {report,last_mirrored_at:Some(super::now()),storage_limit_bytes:budget,error:None,error_code:None,git_staging:previous.git_staging,kept_both:previous.kept_both,kept_paths:previous.kept_paths,kept_at:previous.kept_at,kept_total:previous.kept_total,blocked_providers:Vec::new()});
         }
         *phase = "persist_snapshot";
         super::persist(state).await?;
@@ -1321,7 +1416,7 @@ pub(super) async fn fetch_snapshot(
     };
     fetch_snapshot_at(&effective, workspace, cache, receipt.as_ref()).await
 }
-async fn fetch_snapshot_at(
+pub(super) async fn fetch_snapshot_at(
     config: &Configure,
     workspace: &str,
     cache: &Path,
@@ -1400,6 +1495,14 @@ pub(super) async fn hydrate(
     fork: bool,
     destination_root: Option<&Path>,
 ) -> Result<()> {
+    ensure!(
+        !super::project_copy::copy_only(state, workspace)
+            || lock(&state.pro.preferences)
+                .get(workspace)
+                .and_then(|p| p.copy.as_ref())
+                .is_some_and(|copy| copy.takeover_requested),
+        "Explicit Take over is required for a local copy"
+    );
     let generation = state.pro.generation.load(Ordering::Acquire);
     let bound_destination =
         authority::destination(state, config, workspace, destination_root).await?;
@@ -1470,7 +1573,8 @@ async fn hydrate_scoped(
         );
         Ok(())
     };
-    if lock(&state.workspaces).get(workspace).is_some()
+    if !super::project_copy::copy_only(state, workspace)
+        && lock(&state.workspaces).get(workspace).is_some()
         && matches!(lock(&state.pro.ownership).get(workspace),Some(Ownership::SettingUp{epoch}) if *epoch==expected_epoch)
     {
         reconcile(state, config, workspace).await?;
@@ -1673,7 +1777,7 @@ async fn hydrate_scoped(
         let read_grant = credentials(config, workspace, None).await?;
         let local_shadow = state.pro.root.join(workspace).join("working-tree.git");
         let mut planned = Vec::new();
-        let (git_branches,kept) = if !recovering {
+        let (git_branches,kept,git_staging) = if !recovering {
             if tokio::fs::try_exists(&stage).await? { tokio::fs::remove_dir_all(&stage).await?; }
             let private_stage=stage.clone();
             tokio::task::spawn_blocking(move || -> Result<()> {
@@ -1682,8 +1786,14 @@ async fn hydrate_scoped(
                 std::fs::set_permissions(&private_stage,std::fs::Permissions::from_mode(0o700))?;
                 Ok(())
             }).await??;
+            let transfer_budget = read_grant.storage_limit_bytes.min(1024*1024*1024);
+            let mut transfer_bytes = 0u64;
+            for branch in ["main", "config", "handoff"] {
+                let bytes = mirror::validate_tree_bytes(&cache,execution::receipt::revision(receipt, branch)?,transfer_budget,read_grant.max_file_bytes).await?;
+                transfer_bytes = transfer_bytes.checked_add(bytes).context("snapshot size overflow")?;
+                ensure!(transfer_bytes <= transfer_budget, "snapshot exceeds combined storage limit");
+            }
             for (branch, folder) in [("main", "tree"),("config", "config"),("handoff", "handoff")] {
-                mirror::validate_tree(&cache,execution::receipt::revision(receipt, branch)?,read_grant.storage_limit_bytes.min(1024*1024*1024),read_grant.max_file_bytes).await?;
                 let destination = stage.join(folder);
                 tokio::fs::create_dir_all(&destination).await?;
                 let mut command = transport::git(&cache, None).await?;
@@ -1702,14 +1812,28 @@ async fn hydrate_scoped(
                 super::install::snapshot(&original,&before_copy,&|path| super::policy::allowed_path(path) || path.file_name().and_then(|name|name.to_str()).is_some_and(super::canonical::kept_copy_name),budget)?;
                 super::install::snapshot(&before_copy,&checkout_copy,&|_|true,budget)
             }).await??;
-            let (git_branches,git_writes) = super::repository::prepare_receive(
+            let (acknowledged, copy_checkpoint) = {
+                let preferences = lock(&state.pro.preferences);
+                let preference = preferences.get(workspace);
+                (preference.and_then(|p| p.published_handoff.clone()), preference.and_then(|p| p.copy.as_ref()).and_then(|copy| copy.checkpoint.clone()))
+            };
+            let copied_baseline = if let Some(checkpoint) = &copy_checkpoint {
+                let copy_cache = state.pro.root.join(workspace).join("copy-incoming.git");
+                Some(takeover_copy_baseline(&copy_cache, &stage, checkpoint, budget).await?)
+            } else { None };
+            let staging_baseline = if let Some(copied) = copied_baseline {
+                copied
+            } else {
+                staging_baseline(&local_shadow, &stage.join("baseline-handoff"), acknowledged, budget).await?
+            };
+            let super::repository::Prepared {branches:git_branches,writes:git_writes,staging:git_staging} = super::repository::prepare_receive(
                 &destination_root,&checkout,&stage.join("repository"),
-                super::repository::Incoming {cache:&state.pro.root.join(workspace).join("incoming-repository.git"),credentials:&read_grant,branch:manifest.branch.as_deref(),origin:manifest.repository_origin.as_deref(),snapshot:manifest.repository.as_ref()},&current,
+                super::repository::Incoming {cache:&state.pro.root.join(workspace).join("incoming-repository.git"),credentials:&read_grant,branch:manifest.branch.as_deref(),origin:manifest.repository_origin.as_deref(),snapshot:manifest.repository.as_ref(),staging:Some(super::repository::StagingIncoming {handoff:&stage.join("handoff"),baseline:staging_baseline.as_ref().map(|(path,descriptor)|(path.as_path(),descriptor))})},&current,
             ).await.context("repository return preparation failed")?;
             planned.extend(git_writes);
         let baseline = stage.join("baseline");
-        let old_shadow = super::shadow_cache::baseline(&local_shadow).await?;
-        let has_baseline = old_shadow.is_some();
+        let old_shadow = if copy_checkpoint.is_none() { super::shadow_cache::baseline(&local_shadow).await? } else { None };
+        let has_baseline = copy_checkpoint.is_some() || old_shadow.is_some();
         if let Some(old_shadow) = &old_shadow {
             tokio::fs::create_dir_all(&baseline).await?;
             // The last snapshot this computer published successfully. A local
@@ -1764,14 +1888,26 @@ async fn hydrate_scoped(
         let report = serde_json::to_vec(&(git_branches.clone(),kept.clone()))?;
         let report_path = stage.join("report.json");
         tokio::task::spawn_blocking(move ||crate::persist::atomic_write_json_durable(&report_path,report)).await??;
-        (git_branches,kept)
+        let report_path = stage.join("staging-report.json");
+        let report = serde_json::to_vec(&git_staging)?;
+        tokio::task::spawn_blocking(move ||crate::persist::atomic_write_json_durable(&report_path,report)).await??;
+        (git_branches,kept,git_staging)
         } else {
             let report_path = stage.join("report.json");
-            tokio::task::spawn_blocking(move || -> Result<ReturnReport> {
+            let (branches,kept) = tokio::task::spawn_blocking(move || -> Result<ReturnReport> {
                 let (file,meta)=crate::fs::open_regular(&report_path)?;
                 ensure!(meta.len() <= 64*1024,"return report exceeds limit");
                 Ok(serde_json::from_reader(file)?)
-            }).await??
+            }).await??;
+            let report_path = stage.join("staging-report.json");
+            let staging = tokio::task::spawn_blocking(move || -> Result<_> {
+                match crate::fs::open_regular(&report_path) {
+                    Ok((file,meta)) => { ensure!(meta.len() <= 32*1024,"staging return report exceeds limit"); Ok(serde_json::from_reader(file)?) },
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(super::repository::StagingStatus::Uncaptured),
+                    Err(error) => Err(error.into()),
+                }
+            }).await??;
+            (branches,kept,staging)
         };
         // All archives are validated before the first target mutation. Recovery
         // requires their original immutable metadata; it never recaptures a
@@ -1834,11 +1970,14 @@ async fn hydrate_scoped(
         }
         // Both sides now share the installed tree: it is the baseline for the
         // next return until this computer publishes again.
-        let published_tree = if tokio::fs::try_exists(local_shadow.join("HEAD")).await? {
+        mirror::initialize(&local_shadow).await?;
+        let published_tree = {
             let source = cache.to_str().context("invalid cache path")?.to_owned();
+            let main = execution::receipt::revision(receipt, "main")?;
+            let handoff = execution::receipt::revision(receipt, "handoff")?;
             transport::git_output(
                 transport::git(&local_shadow, None).await?,
-                &["fetch", "--no-tags", &source, "+refs/heads/main:refs/chimaera/baseline"],
+                &["fetch", "--no-tags", &source, &format!("+{main}:refs/chimaera/baseline"), &format!("+{handoff}:refs/chimaera/baseline-handoff")],
                 vec![],
             )
             .await?;
@@ -1849,11 +1988,12 @@ async fn hydrate_scoped(
             )
             .await?;
             Some(String::from_utf8(installed)?.trim().to_owned())
-        } else { None };
+        };
         current()?;
         let execution_uncertain = grant.requires_fork
             || receipt.is_some_and(|receipt|receipt.continuation==execution::wire::Continuation::Uncertain);
         let profile=manifest.profile;
+        let received_handoff = receipt.map(|receipt|receipt.handoff_oid.clone());
         // Installation commits before profile commands can have external effects
         // and before any deferred agent is eligible to start.
         let commit_guard=super::mutation::begin_import(state,workspace,epoch,generation).await?;
@@ -1867,7 +2007,6 @@ async fn hydrate_scoped(
             {
                 let mut preferences=lock(&commit_state.pro.preferences);
                 let preference=preferences.entry(commit_workspace.clone()).or_default();
-                if let Some(tree)=published_tree { preference.published_tree=Some(tree); }
                 preference.execution_uncertain=execution_uncertain;
                 preference.profile=profile;
                 preference.git_branches=git_branches;
@@ -1878,7 +2017,15 @@ async fn hydrate_scoped(
                 install.commit(&||commit_guard.check(&worker_state))?;
                 Ok((install,commit_guard))
             }).await??;
-            commit_guard.setting_up(&commit_state)?;
+            {
+                let mut preferences=lock(&commit_state.pro.preferences);
+                let preference=preferences.entry(commit_workspace.clone()).or_default();
+                if let Some(tree)=published_tree { preference.published_tree=Some(tree); }
+                if let Some(handoff)=received_handoff { preference.published_handoff=Some(handoff); }
+                preference.git_staging=Some(git_staging.clone());
+            }
+            lock(&commit_state.pro.status).entry(commit_workspace.clone()).or_default().git_staging=Some(git_staging);
+            super::project_copy::promote(&commit_state,&commit_workspace,&commit_guard).await?;
             super::persist(&commit_state).await?;
             drop(commit_guard);
             Ok::<_,anyhow::Error>(install)
@@ -1901,7 +2048,7 @@ async fn hydrate_scoped(
     }
     result
 }
-fn prepare_marker(
+pub(super) fn prepare_marker(
     root: &Path,
     checkout: &Path,
     stage: &Path,
@@ -1955,6 +2102,123 @@ fn prepare_marker(
         after: Some(after),
     })
 }
+/// A completed copy has its own immutable receipt baseline. Takeover must
+/// preserve edits against that copy, never a newer cloud tip or local shadow.
+async fn takeover_copy_baseline(
+    cache: &Path,
+    stage: &Path,
+    checkpoint: &execution::wire::Checkpoint,
+    budget: u64,
+) -> Result<Option<(PathBuf, super::repository::staging::Descriptor)>> {
+    execution::receipt::validate(checkpoint)?;
+    let mut bytes = 0_u64;
+    for revision in [&checkpoint.working_tree_oid, &checkpoint.handoff_oid] {
+        bytes = bytes
+            .checked_add(
+                mirror::validate_tree_bytes(
+                    cache,
+                    revision,
+                    budget.min(1024 * 1024 * 1024),
+                    super::policy::MAX_FILE_BYTES,
+                )
+                .await?,
+            )
+            .context("copy baseline exceeds quota")?;
+    }
+    ensure!(bytes <= budget, "combined copy baseline exceeds quota");
+    let baseline = stage.join("baseline");
+    tokio::fs::create_dir_all(&baseline).await?;
+    let mut command = transport::git(cache, None).await?;
+    command.env("GIT_WORK_TREE", &baseline);
+    transport::git_output(
+        command,
+        &[
+            "--work-tree",
+            baseline.to_str().context("invalid copy baseline path")?,
+            "checkout",
+            &checkpoint.working_tree_oid,
+            "--",
+            ".",
+        ],
+        vec![],
+    )
+    .await?;
+    staging_baseline(
+        cache,
+        &stage.join("baseline-handoff"),
+        Some(checkpoint.handoff_oid.clone()),
+        budget,
+    )
+    .await
+}
+
+/// Missing immutable staging baseline stays unknown. Never replace it with the
+/// shadow's newest (possibly unacknowledged) local handoff commit.
+pub(super) async fn staging_baseline(
+    shadow: &Path,
+    stage: &Path,
+    published: Option<String>,
+    budget: u64,
+) -> Result<Option<(PathBuf, super::repository::staging::Descriptor)>> {
+    let Some(revision) = published else {
+        return Ok(None);
+    };
+    ensure!(
+        revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "invalid acknowledged staging baseline"
+    );
+    if !tokio::fs::try_exists(shadow.join("HEAD")).await? {
+        return Ok(None);
+    }
+    let mut probe = transport::git(shadow, None).await?;
+    probe.args(["cat-file", "-e", &format!("{revision}^{{commit}}")]);
+    if !transport::run(probe, vec![], Duration::from_secs(10), 256)
+        .await?
+        .success
+    {
+        return Ok(None);
+    }
+    let bytes = transport::git_output(
+        transport::git(shadow, None).await?,
+        &["show", &format!("{revision}:manifest.json")],
+        vec![],
+    )
+    .await?;
+    ensure!(bytes.len() <= 256 * 1024, "baseline manifest exceeds limit");
+    let manifest: Manifest = serde_json::from_slice(&bytes)?;
+    let Some(descriptor) = manifest
+        .repository
+        .and_then(|repository| repository.staging)
+    else {
+        return Ok(None);
+    };
+    mirror::validate_tree(
+        shadow,
+        &revision,
+        budget.min(1024 * 1024 * 1024),
+        super::policy::MAX_FILE_BYTES,
+    )
+    .await?;
+    tokio::fs::create_dir_all(stage).await?;
+    let mut command = transport::git(shadow, None).await?;
+    command.env("GIT_WORK_TREE", stage);
+    transport::git_output(
+        command,
+        &[
+            "--work-tree",
+            stage.to_str().context("invalid baseline stage")?,
+            "checkout",
+            &revision,
+            "--",
+            "git",
+        ],
+        vec![],
+    )
+    .await?;
+    super::repository::staging::require_service_format(stage, &descriptor).await?;
+    Ok(Some((stage.to_owned(), descriptor)))
+}
+
 /// The published commit when this shadow still has it, else its main tip
 /// (older state files recorded no publication).
 async fn baseline_revision(shadow: &Path, published: Option<String>) -> Result<String> {
@@ -1988,7 +2252,7 @@ async fn baseline_revision(shadow: &Path, published: Option<String>) -> Result<S
 ///   kept beside it the same way first.
 ///
 /// The report lists the kept copies' own paths (up to 32).
-fn install_tree(
+pub(super) fn install_tree(
     source: &Path,
     destination: &Path,
     baseline: Option<&Path>,
@@ -2287,6 +2551,9 @@ pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> 
         .collect();
     let mut hosts: Option<Vec<super::protocol::Host>> = None;
     for (workspace, epoch, holder) in candidates {
+        if super::project_copy::copy_only(state, &workspace) {
+            continue;
+        }
         // Only a project already registered on this device may return automatically.
         // Discovery and old global-folder preferences never authorize adoption.
         if lock(&state.workspaces).get(&workspace).is_none()
@@ -2750,6 +3017,9 @@ pub(super) mod continuity_tests;
 mod provider_tests;
 
 pub(super) fn eligible(state: &AppState, workspace: &crate::workspaces::Workspace) -> bool {
+    if super::project_copy::copy_only(state, &workspace.id) {
+        return false;
+    }
     if authority::registered_root(state, &workspace.id, &workspace.root).is_err() {
         return false;
     }
@@ -3441,6 +3711,170 @@ mod return_tests {
         assert_eq!(
             baseline_revision(&shadow, None).await.unwrap(),
             "refs/heads/main"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn staging_baseline_uses_only_exact_acknowledged_handoff_and_never_the_newest_tip() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-staging-baseline-{}",
+            chimaera_core::generate_token()
+        ));
+        tree(&root.join("source"), &[("file", "t0")]);
+        let root = root.canonicalize().unwrap();
+        let source = root.join("source");
+        transport::git_output(
+            transport::git(&source, None).await.unwrap(),
+            &["init", "--quiet"],
+            vec![],
+        )
+        .await
+        .unwrap();
+        transport::git_output(
+            transport::git(&source, None).await.unwrap(),
+            &["add", "file"],
+            vec![],
+        )
+        .await
+        .unwrap();
+        let shadow = root.join("working-tree.git");
+        mirror::initialize(&shadow).await.unwrap();
+        let mut acknowledged = None;
+        let mut copy_checkpoint = None;
+        let mut expected = Vec::new();
+        for version in ["t0", "t1"] {
+            std::fs::write(source.join("file"), version).unwrap();
+            transport::git_output(
+                transport::git(&source, None).await.unwrap(),
+                &["add", "file"],
+                vec![],
+            )
+            .await
+            .unwrap();
+            let handoff = root.join(version);
+            let (descriptor, _) = super::super::repository::staging::capture(
+                &source,
+                &handoff,
+                1024 * 1024,
+                1024 * 1024,
+            )
+            .await
+            .unwrap();
+            let manifest = Manifest {
+                version: 1,
+                project: None,
+                branch: None,
+                repository_origin: None,
+                repository: Some(super::super::repository::Snapshot {
+                    head: None,
+                    config: vec![],
+                    staging: Some(descriptor),
+                }),
+                workspace_id: "w-fixture".into(),
+                root: source.clone(),
+                name: "Fixture".into(),
+                epoch: 1,
+                clean: true,
+                continuation: execution::wire::Continuation::Idle,
+                profile: Default::default(),
+                sessions: vec![],
+                left_out: Some(vec![]),
+            };
+            std::fs::write(
+                handoff.join("manifest.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            let oid = mirror::commit_tree(&shadow, &handoff, "handoff")
+                .await
+                .unwrap();
+            let working = mirror::commit_tree(
+                &shadow,
+                &tree(
+                    &root.join(format!("working-{version}")),
+                    &[("file", version), ("unchanged", "base")],
+                ),
+                "main",
+            )
+            .await
+            .unwrap();
+            if version == "t0" {
+                copy_checkpoint = Some(execution::wire::Checkpoint {
+                    id: "cp-fixture".into(),
+                    sequence: 1,
+                    source_holder_id: "d-fixture".into(),
+                    source_epoch: 1,
+                    working_tree_oid: working.clone(),
+                    config_oid: working,
+                    handoff_oid: oid.clone(),
+                    continuation: execution::wire::Continuation::Idle,
+                });
+                acknowledged = Some(oid);
+                expected = std::fs::read(handoff.join("git/index.json")).unwrap();
+            }
+        }
+        let baseline = staging_baseline(&shadow, &root.join("baseline"), acknowledged, 1024 * 1024)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            std::fs::read(baseline.0.join("git/index.json")).unwrap(),
+            expected
+        );
+        assert!(
+            staging_baseline(&shadow, &root.join("unknown"), None, 1024 * 1024)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(staging_baseline(
+            &shadow,
+            &root.join("missing"),
+            Some("a".repeat(40)),
+            1024 * 1024
+        )
+        .await
+        .unwrap()
+        .is_none());
+        let checkpoint = copy_checkpoint.unwrap();
+        let takeover = root.join("takeover");
+        let copied = takeover_copy_baseline(&shadow, &takeover, &checkpoint, 1024 * 1024)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            std::fs::read(copied.0.join("git/index.json")).unwrap(),
+            expected
+        );
+        assert_eq!(
+            std::fs::read(takeover.join("baseline/file")).unwrap(),
+            b"t0"
+        );
+        let local = tree(
+            &root.join("local-copy"),
+            &[("file", "local edit"), ("unchanged", "base")],
+        );
+        let incoming = tree(
+            &root.join("incoming-copy"),
+            &[("file", "t0"), ("unchanged", "cloud edit")],
+        );
+        assert!(
+            install_tree(&incoming, &local, Some(&takeover.join("baseline")), None)
+                .unwrap()
+                .1
+                .is_empty()
+        );
+        assert_eq!(std::fs::read(local.join("file")).unwrap(), b"local edit");
+        assert_eq!(
+            std::fs::read(local.join("unchanged")).unwrap(),
+            b"cloud edit"
+        );
+        let mut missing = checkpoint;
+        missing.working_tree_oid = "b".repeat(40);
+        assert!(
+            takeover_copy_baseline(&shadow, &root.join("missing-copy"), &missing, 1024 * 1024)
+                .await
+                .is_err()
         );
         std::fs::remove_dir_all(root).unwrap();
     }

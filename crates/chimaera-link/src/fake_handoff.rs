@@ -57,16 +57,17 @@ impl FixtureHandoff {
                 || path == "/v1/serve"
                 || path.starts_with("/v1/serve/"))
     }
+    pub async fn event_device(&self, headers: &HeaderMap) -> String {
+        holder(&*self.state.lock().await, headers)
+    }
     pub async fn revoke_all(&self) {
         let mut data = self.state.lock().await;
         data.delegations.clear();
         data.credentials.clear();
     }
-    pub async fn bind_device(&self, token: &str, device: &str) -> anyhow::Result<()> {
-        let mut data = self.state.lock().await;
-        anyhow::ensure!(data.devices.len() < 256, "fixture device limit");
-        data.devices.insert(token.into(), device.into());
-        Ok(())
+    pub async fn replace_devices(&self, devices: HashMap<String, String>) {
+        debug_assert!(devices.len() <= 256);
+        self.state.lock().await.devices = devices;
     }
 }
 pub(crate) fn routes() -> Router<FakeKeeper> {
@@ -362,6 +363,10 @@ fn delegated_response(token: String, device: String, seconds: i64) -> Json<Deleg
 async fn delegate(State(keeper): State<FakeKeeper>, headers: HeaderMap) -> Response {
     let mut data = keeper.handoff().state.lock().await;
     let device = holder(&data, &headers);
+    let replacing = data
+        .delegations
+        .values()
+        .any(|d| d.device == device && d.deadline > Instant::now());
     data.delegations
         .retain(|_, d| d.device != device && d.deadline > Instant::now());
     if data.delegations.len() >= 256 {
@@ -380,9 +385,11 @@ async fn delegate(State(keeper): State<FakeKeeper>, headers: HeaderMap) -> Respo
         },
     );
     drop(data);
-    // A replacement invalidates old live sockets too. The single-account
-    // fixture reconnects all device streams; production targets the parent.
-    keeper.invalidate_live_transports();
+    // Only replacement revokes anything. Retain the existing global fixture
+    // fence for old delegated tunnels; production targets the parent device.
+    if replacing {
+        keeper.invalidate_live_transports();
+    }
     delegated_response(token, device, 86400).into_response()
 }
 async fn renew_delegation(State(keeper): State<FakeKeeper>, headers: HeaderMap) -> Response {

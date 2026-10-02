@@ -11,6 +11,8 @@
 | `src/handoff.rs` | Typed ownership and credential bodies, immutable workspace binding and bounded exact daemon acknowledgment; secrets redact Debug |
 | `src/fake_handoff.rs` | Bounded baton and credential-fencing fixture |
 | `src/protocol.rs` | Serializable wire types and resource ceilings |
+| `src/cluster.rs` | Capability-gated control DTOs, bounded request validation and exact reply/history identity checks; credential-bearing responses omit Debug |
+| `src/fake_cluster.rs` | Immutable operation/dedup and job-scoped socket fixture; no SSH or scheduler implementation |
 | `src/client.rs` | Account REST, refresh serialization, events reconnect with connection-local prompt IDs, loopback tunnels, reverse serve |
 | `src/error.rs` | Typed outcomes callers must tell apart from network failures: `AuthorizationRevoked`, `ServiceUnsupported`, `AlreadySubscribed` (checkout conflict requires a fresh account read) |
 | `src/oauth.rs` | PKCE and state validation; caller owns system browser and keychain |
@@ -75,9 +77,11 @@ Invariants:
   persisted through `Client::token_updates`. Daemon tokens stay in memory.
   A started refresh rotation finishes under the token lock (bounded by the HTTP
   timeout) even if its caller is canceled; clearing credentials waits behind it.
-  Debug output and errors must not print any token or SSH password.
+  Debug output and errors must not print any token or SSH password. REST JSON
+  parse failures use a stable error without the deserializer source: malformed
+  typed fields can embed response secrets in Display/Debug/source chains.
 - Every data message is ≤64 KiB, queues ≤16 frames, concurrent streams ≤128.
-  Control frames are ≤128 KiB, REST bodies ≤1 MiB. Backpressure is mandatory.
+  Control frames are ≤128 KiB, ordinary REST bodies ≤1 MiB. Cluster requests are ≤64 KiB and protected replies ≤2 MiB. Backpressure is mandatory.
 - Protocol v0 closes the entire stream on TCP EOF; do not silently invent a
   half-close marker or change daemon bytes to implement one.
 - Handshake, heartbeat, prompt and pending reverse-stream deadlines are bounded.
@@ -89,3 +93,5 @@ Check with `cargo +1.96.0 fmt`,
 executable against the running fixture/real keeper when transport changes.
 
 Events prompt IDs delivered by `Client::events` are opaque local aliases for that socket generation, not IDs to compare with a keeper REST response. Answers map back only through its bounded live prompt table (64 entries, 180 seconds, first answer only); an answer queued during backoff/upgrade or after a reused keeper ID is discarded. `PromptClosed` uses the same local alias. The public wire remains unchanged. The fixture replaces only the authenticated device's old event connection; global revocation still closes every device. Fixture token rotations retain that device identity in tables bounded by the current 256 access / 64 refresh token ceilings, including baton/delegation identity. A first delegation mint revokes nothing; replacing an existing delegation still uses the fixture-only global transport fence to preserve revoked-tunnel safety. `tests/events.rs` drives real loopback reconnect backoff, stalled upgrades and simultaneous devices.
+
+Cluster clients require the explicit version/flags before control mutations or job sockets. A false/missing job-tunnel flag rejects submission before effects. Generic saved history is trusted only from the authenticated exact immutable operation record; start/stop/estimate and host replies additionally correlate their exposed identities. Unknown states never grant a route, prove an end or authorize resubmission. Passive cluster conformance performs only cached overview/facts reads; disposable fixture tests exercise submission and tunnels without invoking SSH/Slurm.

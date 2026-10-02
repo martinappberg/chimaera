@@ -3,6 +3,14 @@
 mod connect;
 mod disconnect;
 mod process;
+/// Bounded output for probes using their own environment, with the same
+/// process-group cleanup as provider authentication subprocesses.
+pub(crate) async fn bounded_process_output(
+    command: &mut tokio::process::Command,
+) -> Result<(bool, Vec<u8>), &'static str> {
+    let output = process::output(command).await?;
+    Ok((output.success, output.stdout))
+}
 #[cfg(test)]
 mod tests;
 pub(crate) fn active_operations() -> usize {

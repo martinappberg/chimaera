@@ -4,7 +4,7 @@
   import { pageVisible } from "../shared/visibility";
   import { asyncDisposer } from "../shared/asyncDisposer";
   import type { Workspace } from "../workspace/sessions";
-  import { RETURN_WINDOW_ENDED_COPY } from "./presentation";
+  import { projectCopyError } from "./projectCopy";
   import { fetchHomeProjects, type HomeProject } from "./accountHome";
   /** `browser`: the web's Home (the account's own page), which has no local
    *  computer: every cloud project is listed, and opening one goes to its
@@ -18,25 +18,9 @@
   let projects = $state<CloudProject[]>([]);
   let busy = $state<string | null>(null);
   let error = $state<string | null>(null);
+  let listError = $state(false);
   let revision = $state(0);
   let generation = 0;
-  /** A project refused because it is mid-step in the cloud opens by itself once
-   * it reaches a pause: retried on each list refresh while Home shows, for a
-   * bounded time, and only after its folder is saved so no picker reappears. */
-  let retry: { id: string; until: number } | null = null;
-  const BUSY = "This project is finishing a step in the cloud. It opens here as soon as that step finishes.";
-  /** The app's fixed codes for a project that didn't open (`open_code` in
-   * shell/pro/projects.rs); anything else reads as the generic line. */
-  const OPEN_ERRORS: Record<string, string> = {
-    project_busy: BUSY,
-    project_folder_not_empty: "That folder already contains files. Choose a new empty project folder so your existing work stays untouched.",
-    project_folder_missing: "This project's local folder is unavailable. Restore or reconnect that folder, then try again. No new copy was created.",
-    project_folder_nested: "Choose a folder that isn't inside another project or Git repository.",
-    account_changed: "Your account changed. Open the project again.",
-    project_already_opening: "Another project is opening. Try again when it's done.",
-    project_unavailable: "This project isn't available in the cloud right now. Its cloud copy is intact. Try again shortly.",
-    return_window_ended: RETURN_WINDOW_ENDED_COPY,
-  };
   // A legacy pending import can have a local registry row without an approved
   // destination. Keep its explicit folder-choice recovery action reachable.
   const cloudOnly = $derived(projects.filter(project => project.local_root === null || !knownIds.includes(project.workspace_id)));
@@ -46,16 +30,9 @@
       const next = await proCloudProjects();
       if (request !== generation) return;
       projects = next;
-      if (error !== BUSY) error = null;
-      const pending = retry;
-      if (pending === null || busy !== null) return;
-      const project = next.find(row => row.workspace_id === pending.id);
-      if (project === undefined || Date.now() > pending.until) {
-        retry = null;
-        if (error === BUSY) error = "This project is still busy in the cloud. Open it again whenever you're ready; its cloud copy is intact.";
-      } else if (project.available && project.local_root !== null) void open(project);
+      listError = false;
     }
-    catch { if (request === generation && error !== BUSY) error = "Cloud projects couldn't refresh. Your local projects remain available."; }
+    catch { if (request === generation) listError = true; }
   }
   $effect(() => {
     revision;
@@ -68,17 +45,12 @@
   async function open(project: CloudProject): Promise<void> {
     if (busy !== null) return;
     busy = project.workspace_id;
-    // An automatic retry keeps its explanation on screen while it runs.
-    if (retry?.id !== project.workspace_id) error = null;
+    error = null;
     try {
       const local = await proOpenCloudProject(project.workspace_id);
-      retry = null;
-      if (local !== null) onOpen?.({ id: local.workspace_id, root: local.root, name: local.name });
+      if (local !== null) onOpen?.({ id: local.workspace_id, root: local.root, name: local.name, local_copy: local.local_copy });
     } catch (reason) {
-      const code = reason instanceof Error ? reason.message : String(reason);
-      const waiting = code === "project_busy";
-      retry = waiting ? { id: project.workspace_id, until: retry?.id === project.workspace_id ? retry.until : Date.now() + 15 * 60_000 } : null;
-      error = Object.hasOwn(OPEN_ERRORS, code) ? OPEN_ERRORS[code] : "This project couldn't open here. Its cloud copy is intact. Please try again shortly.";
+      error = projectCopyError(reason);
     } finally { busy = null; }
   }
 
@@ -127,13 +99,14 @@
     {/if}
     {#if homeError}<p class="error" role="alert">Your cloud projects couldn't {homeRows === null ? "load" : "refresh"} just now. Your work stays saved, and this page keeps trying.</p>{/if}
   </section>
-{:else if cloudOnly.length > 0 || error}
-  <section class="cloud-projects" aria-label="Cloud projects">
-    <div class="heading"><h2>Cloud projects</h2></div>
-    <p class="hint">Projects created in the cloud. When you open one here for the first time, choose where to keep its local copy.</p>
+{:else if cloudOnly.length > 0 || error || listError}
+  <section class="cloud-projects" aria-label="Synced projects">
+    <div class="heading"><h2>Synced projects</h2></div>
+    <p class="hint">Open a project to save or update its local copy. Its sessions keep running on their current computer until you choose Take over.</p>
     {#each cloudOnly as project (project.workspace_id)}
-      <div class="project"><div><span class="name">{project.name}</span><span class="hint">{project.local_root ? "Local destination saved" : "In the cloud · not on this computer"}{#if !project.available} · Temporarily unavailable{/if}</span></div><button disabled={busy !== null || !project.available} onclick={() => void open(project)}>{busy === project.workspace_id ? "Opening…" : "Open project"}</button></div>
+      <div class="project"><div><span class="name">{project.name}</span><span class="hint">{(project.destination_saved || project.local_root) ? "Local destination saved" : "No local copy yet"}{#if !project.available} · Temporarily unavailable{/if}</span></div><button disabled={busy !== null || !project.available} onclick={() => void open(project)}>{busy === project.workspace_id ? "Opening…" : "Open project"}</button></div>
     {/each}
+    {#if listError}<p class="error" role="alert">Synced projects couldn’t refresh. Your local projects remain available.</p>{/if}
     {#if error}<p class="error" role="alert">{error}</p>{/if}
   </section>
 {/if}

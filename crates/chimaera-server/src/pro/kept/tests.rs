@@ -241,6 +241,210 @@ async fn each_choice_settles_its_pair_and_the_report_ends_with_the_last() {
 }
 
 #[tokio::test]
+async fn a_shortened_kept_name_never_overwrites_an_existing_prefix_neighbor() {
+    let fx = Fixture::new();
+    let name = "a".repeat(250);
+    fx.write(&name, "local version");
+    let kept = canonical::KeptCopies::new()
+        .keep(&fx.project.join(&name), Path::new(&name))
+        .unwrap();
+    let mine = kept.to_str().unwrap();
+    let neighbor = canonical::original_name(kept.file_name().unwrap().to_str().unwrap()).unwrap();
+    assert_ne!(neighbor, name);
+    fx.write(&name, "cloud version");
+    fx.write(neighbor, "unrelated prefix neighbor");
+    fx.keep(1, &[mine]);
+    assert_eq!(fx.list().await["pairs"][0]["can_use_mine"], false);
+    let (status, result) = fx.resolve(mine, "use_mine").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(result["error_code"], "unsafe_path");
+    assert_eq!(
+        fx.read(neighbor).as_deref(),
+        Some("unrelated prefix neighbor")
+    );
+    assert_eq!(fx.read(&name).as_deref(), Some("cloud version"));
+    assert_eq!(fx.read(mine).as_deref(), Some("local version"));
+    assert_eq!(fx.open(), Some(1));
+}
+
+#[tokio::test]
+async fn a_replaced_root_symlink_never_reads_or_changes_outside_pairs() {
+    let fx = Fixture::new();
+    fx.keep(1, &[&kept("a.txt")]);
+    let outside = fx.root.join("outside");
+    std::fs::write(outside.join("a.txt"), "outside original").unwrap();
+    std::fs::write(outside.join(kept("a.txt")), "outside kept").unwrap();
+    std::fs::rename(&fx.project, fx.root.join("previous-project")).unwrap();
+    std::os::unix::fs::symlink(&outside, &fx.project).unwrap();
+    let (status, _) = fx.resolve(&kept("a.txt"), "use_mine").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _) = fx.call(Method::GET, "kept", None).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        std::fs::read_to_string(outside.join("a.txt")).unwrap(),
+        "outside original"
+    );
+    assert_eq!(
+        std::fs::read_to_string(outside.join(kept("a.txt"))).unwrap(),
+        "outside kept"
+    );
+}
+
+#[tokio::test]
+async fn owned_choices_hold_drainage_after_cancellation_and_refuse_changed_authority() {
+    for case in 0..3 {
+        let fx = Fixture::new();
+        fx.write("a.txt", "cloud");
+        fx.write(&kept("a.txt"), "mine");
+        fx.keep(1, &[&kept("a.txt")]);
+        crate::lock(&fx.state.pro.ownership)
+            .insert(fx.workspace.clone(), Ownership::Local { epoch: 3 });
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let owner = fx.state.clone();
+        let workspace = fx.workspace.clone();
+        let task = tokio::spawn(async move {
+            choose(
+                &owner,
+                &workspace,
+                false,
+                move |root, recorded, home, current| {
+                    entered_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    let path = recorded[0].clone();
+                    let mut result = Outcome::default();
+                    result.discarded(apply(root, &path, Choice::UseMine, home, current)?);
+                    result.settled.push(path);
+                    Ok(result)
+                },
+            )
+            .await
+        });
+        entered_rx.await.unwrap();
+        assert!(!crate::pro::execution::quiescent(&fx.state, &fx.workspace));
+        let cache = fx.state.pro.cache(&fx.workspace).unwrap();
+        assert!(cache.try_lock().is_err());
+        assert!(fx.state.pro.configuration.try_lock().is_err());
+        match case {
+            0 => {
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+                assert!(!crate::pro::execution::quiescent(&fx.state, &fx.workspace));
+                assert!(cache.try_lock().is_err());
+                resume_tx.send(()).unwrap();
+                let _configuration =
+                    tokio::time::timeout(Duration::from_secs(5), fx.state.pro.configuration.lock())
+                        .await
+                        .unwrap();
+                assert_eq!(fx.read("a.txt").as_deref(), Some("mine"));
+                assert_eq!(fx.open(), None);
+            }
+            _ => {
+                if case == 1 {
+                    crate::lock(&fx.state.pro.ownership).insert(
+                        fx.workspace.clone(),
+                        Ownership::Remote {
+                            epoch: 4,
+                            holder: "other-device".into(),
+                        },
+                    );
+                } else {
+                    fx.state.pro.generation.fetch_add(1, Ordering::AcqRel);
+                }
+                resume_tx.send(()).unwrap();
+                assert!(matches!(task.await.unwrap(), Err(Refusal::NotHere)));
+                assert_eq!(fx.read("a.txt").as_deref(), Some("cloud"));
+                assert_eq!(fx.read(&kept("a.txt")).as_deref(), Some("mine"));
+                assert_eq!(fx.open(), Some(1));
+            }
+        }
+        assert!(crate::pro::execution::quiescent(&fx.state, &fx.workspace));
+    }
+}
+
+#[tokio::test]
+async fn listing_waits_for_return_replacement_and_refuses_an_account_change() {
+    for changed_account in [false, true] {
+        let fx = Fixture::new();
+        // The old report's sibling is absent. Scanning it without the return
+        // reservation would settle a new report that reuses the same name.
+        fx.keep(1, &[&kept("a.txt")]);
+        let cache = fx.state.pro.cache(&fx.workspace).unwrap();
+        let held = cache.lock().await;
+        let owner = fx.state.clone();
+        let workspace = fx.workspace.clone();
+        let task = tokio::spawn(async move { listing(&owner, &workspace).await });
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!task.is_finished(), "listing must wait for the return");
+        assert_eq!(fx.open(), Some(1));
+        {
+            let _configuration = fx.state.pro.configuration.lock().await;
+            fx.write("a.txt", "new cloud");
+            fx.write(&kept("a.txt"), "new mine");
+            fx.keep(1, &[&kept("a.txt")]);
+            if changed_account {
+                fx.state.pro.generation.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        drop(held);
+        let result = task.await.unwrap();
+        if changed_account {
+            assert!(matches!(result, Err(Refusal::NotHere)));
+        } else {
+            let value = result.unwrap();
+            assert_eq!(value["files"], 1);
+            assert_eq!(value["pairs"][0]["mine_path"], kept("a.txt"));
+        }
+        assert_eq!(fx.open(), Some(1));
+        assert_eq!(fx.read(&kept("a.txt")).as_deref(), Some("new mine"));
+    }
+}
+
+#[test]
+fn a_root_swapped_away_and_back_cannot_supply_a_foreign_mutation_parent() {
+    let fx = Fixture::new();
+    fx.write("a.txt", "cloud");
+    fx.write(&kept("a.txt"), "mine");
+    let foreign = fx.root.join("outside");
+    std::fs::write(foreign.join("a.txt"), "foreign cloud").unwrap();
+    std::fs::write(foreign.join(kept("a.txt")), "foreign mine").unwrap();
+    let pinned = open_dir(&fx.project, Path::new("")).unwrap().unwrap();
+    let displaced = fx.root.join("displaced");
+    let calls = std::cell::Cell::new(0);
+    let current = || {
+        if calls.get() == 0 {
+            std::fs::rename(&fx.project, &displaced).unwrap();
+            std::fs::rename(&foreign, &fx.project).unwrap();
+        } else {
+            std::fs::rename(&fx.project, &foreign).unwrap();
+            std::fs::rename(&displaced, &fx.project).unwrap();
+        }
+        calls.set(calls.get() + 1);
+        Ok(pinned.try_clone().unwrap())
+    };
+    apply(
+        &fx.project,
+        &PathBuf::from(kept("a.txt")),
+        Choice::UseMine,
+        None,
+        &current,
+    )
+    .unwrap();
+    assert_eq!(calls.get(), 2);
+    assert_eq!(fx.read("a.txt").as_deref(), Some("mine"));
+    assert_eq!(
+        std::fs::read_to_string(foreign.join("a.txt")).unwrap(),
+        "foreign cloud"
+    );
+    assert_eq!(
+        std::fs::read_to_string(foreign.join(kept("a.txt"))).unwrap(),
+        "foreign mine"
+    );
+}
+
+#[tokio::test]
 async fn a_restart_keeps_the_open_pairs_and_when_they_came_home() {
     let fx = Fixture::new();
     fx.write("a.txt", "cloud");

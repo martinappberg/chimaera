@@ -6,7 +6,7 @@ use axum::{
         ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade},
         DefaultBodyLimit, Path, Query, State,
     },
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -41,6 +41,8 @@ struct Inner {
     serve_generation: watch::Sender<u64>,
     streams: Arc<Semaphore>,
     handoff: crate::fake_handoff::FixtureHandoff,
+    clusters: crate::fake_cluster::FixtureCluster,
+    cluster_upgrade_pause: Mutex<Option<(Arc<Semaphore>, Arc<Semaphore>)>>,
 }
 struct Data {
     hosts: HashMap<String, Host>,
@@ -52,7 +54,8 @@ struct Data {
     answers: Vec<EventCommand>,
     serve: Option<(String, mpsc::Sender<ServeEvent>)>,
     pending: HashMap<String, (String, oneshot::Sender<WebSocket>)>,
-    events_epoch: u64,
+    event_connections: HashMap<String, watch::Sender<()>>,
+    event_devices: HashMap<String, String>,
 }
 struct Code {
     challenge: String,
@@ -73,6 +76,8 @@ impl FakeKeeper {
                 serve_generation,
                 streams: Arc::new(Semaphore::new(MAX_STREAMS)),
                 handoff: Default::default(),
+                clusters: Default::default(),
+                cluster_upgrade_pause: Mutex::new(None),
                 state: Mutex::new(Data {
                     hosts: HashMap::new(),
                     targets: HashMap::new(),
@@ -89,9 +94,113 @@ impl FakeKeeper {
                     answers: Vec::new(),
                     serve: None,
                     pending: HashMap::new(),
-                    events_epoch: 0,
+                    event_connections: HashMap::new(),
+                    event_devices: HashMap::from([
+                        (STATIC_TOKEN.into(), "fake-device".into()),
+                        (STATIC_REFRESH.into(), "fake-device".into()),
+                    ]),
                 }),
             }),
+        }
+    }
+    pub(crate) fn clusters(&self) -> &crate::fake_cluster::FixtureCluster {
+        &self.inner.clusters
+    }
+    pub async fn add_cluster_target(&self, alias: &str, snapshot: ClusterSnapshot) -> Result<Host> {
+        let mut host = self
+            .add_target(alias, SocketAddr::from((Ipv4Addr::LOCALHOST, 1)), None)
+            .await?;
+        host.cluster = Some(HostCluster {
+            scheduler: ClusterScheduler::Slurm,
+            login_serve: false,
+            not_cluster: false,
+        });
+        self.inner
+            .state
+            .lock()
+            .await
+            .hosts
+            .insert(host.id.clone(), host.clone());
+        self.inner.clusters.add_host(host.clone(), snapshot).await;
+        Ok(host)
+    }
+    pub async fn set_cluster_capabilities(&self, value: Option<ClusterCapabilities>) {
+        self.inner.clusters.capabilities(value).await;
+    }
+    pub async fn cluster_submissions(&self, host: &str) -> usize {
+        self.inner.clusters.submissions(host).await
+    }
+    pub async fn set_cluster_reply(&self, host: &str, value: Option<serde_json::Value>) {
+        self.inner.clusters.override_reply(host, value).await;
+    }
+    pub async fn set_cluster_operation_state(
+        &self,
+        host: &str,
+        id: &str,
+        state: ClusterOperationState,
+    ) {
+        self.inner.clusters.state(host, id, state).await;
+    }
+    pub async fn set_cluster_target(
+        &self,
+        host: &str,
+        job: &str,
+        workspace: Option<&str>,
+        address: SocketAddr,
+    ) -> Result<()> {
+        self.inner
+            .clusters
+            .target(host, job, workspace, address)
+            .await
+    }
+    pub async fn cluster_snapshot(&self, host: &str) -> Option<ClusterSnapshot> {
+        self.inner.clusters.snapshot(host).await
+    }
+    /// Fixture-only barrier after authentication and before the upgrade/dial.
+    pub async fn pause_cluster_upgrade(&self) -> (Arc<Semaphore>, Arc<Semaphore>) {
+        let gates = (Arc::new(Semaphore::new(0)), Arc::new(Semaphore::new(0)));
+        *self.inner.cluster_upgrade_pause.lock().await = Some(gates.clone());
+        gates
+    }
+    pub(crate) async fn cluster_fixture_tcp(
+        &self,
+        ws: WebSocketUpgrade,
+        target: SocketAddr,
+        mut stopped: watch::Receiver<bool>,
+        mut authority: AuthenticatedGeneration,
+    ) -> Response {
+        let Ok(permit) = self.inner.streams.clone().try_acquire_owned() else {
+            return StatusCode::TOO_MANY_REQUESTS.into_response();
+        };
+        let pause = self.inner.cluster_upgrade_pause.lock().await.clone();
+        if let Some((entered, release)) = pause {
+            entered.add_permits(1);
+            if let Ok(permit) = release.acquire().await {
+                permit.forget();
+            }
+        }
+        if *authority.receiver.borrow() != authority.epoch {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        configure(ws, false).on_upgrade(move |socket| async move {
+            let _permit = permit;
+            if *authority.receiver.borrow()!=authority.epoch || *stopped.borrow() {return;}
+
+            let flow = async {
+                if let Ok(Ok(tcp)) =
+                    tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(target)).await
+                {
+                    let _ = bridge_axum(tcp, socket).await;
+                }
+            };
+            tokio::select! {biased;_=authority.receiver.changed()=>(),_=stopped.changed()=>(),_=flow=>()}
+        })
+    }
+    pub(crate) async fn cluster_host_updated(&self, host: Host) {
+        let mut data = self.inner.state.lock().await;
+        if let Some(row) = data.hosts.get_mut(&host.id) {
+            *row = host.clone();
+            let _ = self.inner.events.send(Event::Host { host });
         }
     }
     pub fn tokens() -> Tokens {
@@ -125,6 +234,7 @@ impl FakeKeeper {
             status: HostStatus::Connected,
             daemon,
             error: None,
+            cluster: None,
         };
         state.targets.insert(host.id.clone(), address);
         state.hosts.insert(host.id.clone(), host.clone());
@@ -144,15 +254,31 @@ impl FakeKeeper {
         if device_id.is_empty() || device_id.len() > 128 {
             bail!("invalid fixture device");
         }
-        let tokens = {
-            let mut state = self.inner.state.lock().await;
-            issue_tokens(&mut state)
-        };
+        let mut state = self.inner.state.lock().await;
+        state.refresh.retain(|_, expiry| *expiry > Instant::now());
+        if state.refresh.len() >= 64 {
+            bail!("fixture device token limit");
+        }
+        let tokens = issue_tokens(&mut state, device_id);
+        self.sync_devices(&state).await;
+        Ok(tokens)
+    }
+    // Token issuance holds Data before this handoff lock, so a concurrent
+    // rotation cannot restore an older identity table. No reverse nested lock.
+    async fn sync_devices(&self, data: &Data) {
         self.inner
             .handoff
-            .bind_device(&tokens.access_token, device_id)
-            .await?;
-        Ok(tokens)
+            .replace_devices(
+                data.access
+                    .keys()
+                    .filter_map(|token| {
+                        data.event_devices
+                            .get(token)
+                            .map(|device| (token.clone(), device.clone()))
+                    })
+                    .collect(),
+            )
+            .await;
     }
     pub fn router(&self) -> Router {
         let private = Router::new()
@@ -171,6 +297,7 @@ impl FakeKeeper {
             )
             .route("/v1/billing/checkout", post(fixture_checkout))
             .route("/v1/billing/portal", post(fixture_portal))
+            .merge(crate::fake_cluster::router())
             .route("/v1/hosts", get(hosts).post(add_host))
             .route("/v1/hosts/{id}", axum::routing::delete(delete_host))
             .route("/v1/hosts/{id}/reconnect", post(reconnect))
@@ -248,9 +375,14 @@ fn nonce() -> String {
         rand::random::<[u8; 32]>(),
     )
 }
+#[derive(Clone)]
+pub(crate) struct AuthenticatedGeneration {
+    pub(crate) receiver: watch::Receiver<u64>,
+    pub(crate) epoch: u64,
+}
 async fn auth(
     State(keeper): State<FakeKeeper>,
-    request: axum::extract::Request,
+    mut request: axum::extract::Request,
     next: Next,
 ) -> Response {
     let bearer = request
@@ -258,17 +390,17 @@ async fn auth(
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
-    let authorized = if let Some(token) = bearer {
-        keeper
-            .inner
-            .state
-            .lock()
-            .await
-            .access
-            .get(token)
-            .is_some_and(|expiry| *expiry > Instant::now())
+    let mut generation = keeper.inner.generation.subscribe();
+    let (authorized, epoch) = if let Some(token) = bearer {
+        let data = keeper.inner.state.lock().await;
+        (
+            data.access
+                .get(token)
+                .is_some_and(|expiry| *expiry > Instant::now()),
+            *generation.borrow_and_update(),
+        )
     } else {
-        false
+        (false, *generation.borrow_and_update())
     };
     let delegated = if let Some(token) = bearer {
         keeper
@@ -279,7 +411,17 @@ async fn auth(
     } else {
         false
     };
+    if delegated
+        && !authorized
+        && (request.uri().path().contains("/cluster/") || request.uri().path().contains("/jobs/"))
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     if authorized || delegated {
+        request.extensions_mut().insert(AuthenticatedGeneration {
+            receiver: generation,
+            epoch,
+        });
         next.run(request).await
     } else {
         StatusCode::UNAUTHORIZED.into_response()
@@ -340,19 +482,27 @@ async fn add_host(State(keeper): State<FakeKeeper>, Json(request): Json<AddHost>
         status: HostStatus::Offline,
         daemon: None,
         error: Some("No --host fixture target for this alias".into()),
+        cluster: None,
     };
     state.hosts.insert(host.id.clone(), host.clone());
     let _ = keeper.inner.events.send(Event::Host { host: host.clone() });
     (StatusCode::CREATED, Json(host)).into_response()
 }
-async fn delete_host(State(keeper): State<FakeKeeper>, Path(id): Path<String>) -> StatusCode {
+async fn delete_host(State(keeper): State<FakeKeeper>, Path(id): Path<String>) -> Response {
+    if keeper.clusters().remove_if_idle(&id).await.is_err() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error":"jobs_held"})),
+        )
+            .into_response();
+    }
     let mut state = keeper.inner.state.lock().await;
     state.targets.remove(&id);
     if state.hosts.remove(&id).is_none() {
-        return StatusCode::NOT_FOUND;
+        return StatusCode::NOT_FOUND.into_response();
     }
     let _ = keeper.inner.events.send(Event::HostRemoved { host_id: id });
-    StatusCode::NO_CONTENT
+    StatusCode::NO_CONTENT.into_response()
 }
 async fn reconnect(State(keeper): State<FakeKeeper>, Path(id): Path<String>) -> StatusCode {
     let state = keeper.inner.state.lock().await;
@@ -382,6 +532,7 @@ async fn sign_out(State(keeper): State<FakeKeeper>) -> StatusCode {
     let mut state = keeper.inner.state.lock().await;
     state.access.clear();
     state.refresh.clear();
+    state.event_devices.clear();
     state.prompts.clear();
     state.serve = None;
     state.pending.clear();
@@ -442,7 +593,7 @@ async fn authorize(
         .replace('<', "&lt;");
     Html(format!("<!doctype html><title>Local keeper sign in</title><h1>Development sign in</h1><p>This loopback fixture does not contact an identity provider.</p><a href=\"{escaped}\">Sign in to local keeper</a>")).into_response()
 }
-fn issue_tokens(data: &mut Data) -> Tokens {
+fn issue_tokens(data: &mut Data, device: &str) -> Tokens {
     data.access.retain(|_, expiry| *expiry > Instant::now());
     data.refresh.retain(|_, expiry| *expiry > Instant::now());
     if data.access.len() >= 256 {
@@ -469,6 +620,13 @@ fn issue_tokens(data: &mut Data) -> Tokens {
         tokens.refresh_token.clone(),
         Instant::now() + Duration::from_secs(86400),
     );
+    // Keep only current token identities: at most 256 access + 64 refresh rows.
+    data.event_devices
+        .retain(|token, _| data.access.contains_key(token) || data.refresh.contains_key(token));
+    data.event_devices
+        .insert(tokens.access_token.clone(), device.into());
+    data.event_devices
+        .insert(tokens.refresh_token.clone(), device.into());
     tokens
 }
 async fn token(State(keeper): State<FakeKeeper>, Json(request): Json<TokenRequest>) -> Response {
@@ -486,13 +644,16 @@ async fn token(State(keeper): State<FakeKeeper>, Json(request): Json<TokenReques
     {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    Json(issue_tokens(&mut data)).into_response()
+    let tokens = issue_tokens(&mut data, "fake-device");
+    keeper.sync_devices(&data).await;
+    Json(tokens).into_response()
 }
 async fn refresh(
     State(keeper): State<FakeKeeper>,
     Json(request): Json<RefreshRequest>,
 ) -> Response {
     let mut data = keeper.inner.state.lock().await;
+    let device = data.event_devices.get(&request.refresh_token).cloned();
     if data
         .refresh
         .remove(&request.refresh_token)
@@ -508,7 +669,12 @@ async fn refresh(
         )
             .into_response();
     }
-    Json(issue_tokens(&mut data)).into_response()
+    let Some(device) = device else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let tokens = issue_tokens(&mut data, &device);
+    keeper.sync_devices(&data).await;
+    Json(tokens).into_response()
 }
 fn configure(ws: WebSocketUpgrade, control: bool) -> WebSocketUpgrade {
     let size = if control {
@@ -521,19 +687,53 @@ fn configure(ws: WebSocketUpgrade, control: bool) -> WebSocketUpgrade {
         .write_buffer_size(0)
         .max_write_buffer_size((MAX_IN_FLIGHT + 1) * size)
 }
-async fn events(State(keeper): State<FakeKeeper>, ws: WebSocketUpgrade) -> Response {
-    configure(ws, true).on_upgrade(move |socket| event_loop(keeper, socket))
+async fn events(
+    State(keeper): State<FakeKeeper>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let token = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or("");
+    let device = {
+        let data = keeper.inner.state.lock().await;
+        if data.access.contains_key(token) {
+            let Some(device) = data.event_devices.get(token) else {
+                return StatusCode::UNAUTHORIZED.into_response();
+            };
+            Some(device.clone())
+        } else {
+            None
+        }
+    };
+    // Delegations were verified by middleware and keep their holder binding.
+    let device = match device {
+        Some(device) => device,
+        None => keeper.inner.handoff.event_device(&headers).await,
+    };
+    configure(ws, true).on_upgrade(move |socket| event_loop(keeper, socket, device))
 }
-async fn event_loop(keeper: FakeKeeper, mut socket: WebSocket) {
+async fn event_loop(keeper: FakeKeeper, mut socket: WebSocket, device: String) {
     let mut revoked = keeper.inner.generation.subscribe();
     let mut events = keeper.inner.events.subscribe();
-    let epoch;
+    let mut replaced;
     let initial;
     let prompts;
     {
         let mut data = keeper.inner.state.lock().await;
-        data.events_epoch += 1;
-        epoch = data.events_epoch;
+        data.event_connections
+            .retain(|_, connection| connection.receiver_count() > 0);
+        if !data.event_connections.contains_key(&device)
+            && data.event_connections.len() >= MAX_STREAMS
+        {
+            return;
+        }
+        let (connection, replacement) = watch::channel(());
+        replaced = replacement;
+        // Dropping the previous sender closes only this device's old socket.
+        data.event_connections.insert(device, connection);
         initial = data.hosts.values().cloned().collect::<Vec<_>>();
         prompts = data
             .prompts
@@ -558,6 +758,7 @@ async fn event_loop(keeper: FakeKeeper, mut socket: WebSocket) {
     loop {
         tokio::select! {
             _ = revoked.changed() => break,
+            _ = replaced.changed() => break,
             _ = expiry_tick.tick() => {
                 let mut data = keeper.inner.state.lock().await;
                 let expired = data.prompts.iter().filter(|(_, (expiry, _))| *expiry <= Instant::now()).map(|(id, _)| id.clone()).collect::<Vec<_>>();
@@ -582,7 +783,7 @@ async fn event_loop(keeper: FakeKeeper, mut socket: WebSocket) {
                 _ => break,
             },
             _ = ping.tick() => {
-                if pong.elapsed() >= Duration::from_secs(60) || keeper.inner.state.lock().await.events_epoch != epoch { break; }
+                if pong.elapsed() >= Duration::from_secs(60) { break; }
                 if socket.send(AxumMessage::Ping(Vec::new().into())).await.is_err() { break; }
             }
         }
@@ -603,6 +804,13 @@ async fn tcp(
         let Some(host) = data.hosts.get(&id) else {
             return StatusCode::NOT_FOUND.into_response();
         };
+        if host.cluster.is_some() && host.daemon.is_none() {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error":"cluster_requires_job"})),
+            )
+                .into_response();
+        }
         if host.status != HostStatus::Connected {
             return StatusCode::CONFLICT.into_response();
         }
@@ -680,6 +888,7 @@ async fn serve_loop(keeper: FakeKeeper, mut socket: WebSocket) {
         status: HostStatus::Connected,
         daemon: Some(daemon),
         error: None,
+        cluster: None,
     };
     {
         let mut data = keeper.inner.state.lock().await;

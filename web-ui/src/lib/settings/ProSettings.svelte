@@ -106,7 +106,7 @@
   const signInLine = $derived(signInPhase === null ? signInNoteCopy(signInNote(status)) : null);
   /** Sign-out being confirmed: every "Sign out everywhere", and a plain one
    * while a project is running in the cloud (named, since it stays there). */
-  let signOutAsk = $state<{ everywhere: boolean; cloud: string[] } | null>(null);
+  let signOutAsk = $state<{ everywhere: boolean; remote: string[] } | null>(null);
   /** Sign-out finished here while the saved sign-in is removed later by the
    * app; shown quietly on the signed-out page, not as a failure. */
   let signOutLine = $state<string | null>(null);
@@ -298,25 +298,25 @@
   }
   const signOutBody = $derived.by(() => {
     if (signOutAsk === null) return "";
-    const { everywhere, cloud } = signOutAsk;
+    const { everywhere, remote } = signOutAsk;
     const lines: string[] = [];
     if (everywhere) lines.push("This signs you out everywhere you use Chimaera Pro, including this computer, and closes the cluster logins Pro keeps connected for you.");
-    if (cloud.length === 1) lines.push(`${cloud[0]} is running in the cloud. It stays there until you sign in again.`);
-    else if (cloud.length > 1) lines.push(`${projectList(cloud)} are running in the cloud. They stay there until you sign in again.`);
+    if (remote.length === 1) lines.push(`${remote[0]} is running elsewhere. Sign in again to view it through Chimaera Pro.`);
+    else if (remote.length > 1) lines.push(`${projectList(remote)} are running elsewhere. Sign in again to view them through Chimaera Pro.`);
     lines.push("Nothing on this computer stops.");
     return lines.join(" ");
   });
-  /** Projects running in the cloud are named before signing out: they stay
-   * there until the next sign-in. Unknown (the read failed) names none. */
+  /** Remote projects are named without guessing their owner's machine kind.
+   * Unknown (the read failed) names none. */
   async function requestSignOut(everywhere: boolean): Promise<void> {
     if (busy !== null || status?.initializing) return;
     busy = "sign-out-check";
-    let cloud: string[] = [];
-    try { cloud = (await proMirrorStatus()).workspaces.filter(workspace => workspace.ownership?.state === "remote" && !workspace.never_mirror).map(workspace => workspace.name); }
+    let remote: string[] = [];
+    try { remote = (await proMirrorStatus()).workspaces.filter(workspace => workspace.ownership?.state === "remote" && !workspace.never_mirror).map(workspace => workspace.name); }
     catch { /* Nothing to name; signing out still stops nothing here. */ }
     finally { busy = null; }
     if (!alive) return;
-    if (everywhere || cloud.length > 0) signOutAsk = { everywhere, cloud };
+    if (everywhere || remote.length > 0) signOutAsk = { everywhere, remote };
     else await signOut(false);
   }
   async function signOut(everywhere: boolean): Promise<void> {

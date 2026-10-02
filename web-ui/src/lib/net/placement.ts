@@ -64,7 +64,7 @@ export interface OwnerNote {
 export function placementLabel(placement: unknown, available: boolean | undefined, note: OwnerNote = {}): string | null {
   if (typeof placement !== "object" || placement === null) return null;
   const remote = (placement as { remote?: unknown }).remote;
-  const where = typeof remote === "string" && remote.startsWith("device-") ? ON_ANOTHER_COMPUTER : IN_THE_CLOUD;
+  const where = typeof remote === "string" && remote.startsWith("device-") ? ON_ANOTHER_COMPUTER : typeof remote === "string" && remote.startsWith("worker-") ? IN_THE_CLOUD : "Running elsewhere";
   if (note.owner === "asleep") return where + ASLEEP;
   if (note.owner === "waking") return where + WAKING;
   return available === false && note.reconnectingShown !== true && note.reachable !== true ? where + RECONNECTING : where;
@@ -83,9 +83,10 @@ export type SessionPause =
  *  computer, or ("other") another of the user's computers — acting there
  *  brought the work there. On the wire the last is `to:"computer"` with the
  *  additive `other:true`. */
-export type MovedTo = "cloud" | "computer" | "other";
+export type MovedTo = "cloud" | "computer" | "other" | "elsewhere";
 export function movedTo(frame: { to?: unknown; other?: unknown }): MovedTo {
-  if (frame.to !== "computer") return "cloud";
+  if (frame.to === "cloud") return "cloud";
+  if (frame.to !== "computer") return "elsewhere";
   return frame.other === true ? "other" : "computer";
 }
 
@@ -114,11 +115,14 @@ export function pauseLabel(pause: SessionPause | null, { signedOut = false }: { 
   if (pause.type === "moved") {
     if (pause.to === "other") return { status: "Continuing on your other computer…", detail: null };
     if (pause.to === "computer") return { status: "Continuing on your computer…", detail: null };
+    if (pause.to === "elsewhere") return elsewherePause(signedOut);
     return signedOut
       ? { status: "This conversation is in the cloud. Sign in to Chimaera Pro to bring it back.", detail: null }
       : { status: "Continuing in the cloud…", detail: null };
   }
   switch (pause.reason) {
+    case "elsewhere":
+      return elsewherePause(signedOut);
     case "restarting":
       // A daemon restart of any cause (an update, a crash, a reboot after
       // the battery ran out): say what happens next, not why.
@@ -133,6 +137,10 @@ export function pauseLabel(pause: SessionPause | null, { signedOut = false }: { 
     default:
       return { status: "Opening…", detail: null };
   }
+}
+
+function elsewherePause(signedOut: boolean): { status: string; detail: null } {
+  return { status: signedOut ? "This conversation is elsewhere. Sign in to Chimaera Pro to view it." : "Continuing elsewhere…", detail: null };
 }
 
 export class PlacementError extends Error {

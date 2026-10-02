@@ -81,7 +81,8 @@ describe("passive placement transport", () => {
 describe("paused sessions", () => {
   it("reads the moved and paused frames and the row field alike", () => {
     expect(parsePause({ type: "moved", to: "computer" })).toEqual({ type: "moved", to: "computer" });
-    expect(parsePause({ type: "moved" })).toEqual({ type: "moved", to: "cloud" });
+    expect(parsePause({ type: "moved" })).toEqual({ type: "moved", to: "elsewhere" });
+    expect(parsePause({ type: "moved", to: "cloud" })).toEqual({ type: "moved", to: "cloud" });
     // Acting on another computer brought the work there: older clients read
     // `to:"computer"`, this one says which computer.
     expect(parsePause({ type: "moved", to: "computer", other: true })).toEqual({ type: "moved", to: "other" });
@@ -114,6 +115,24 @@ describe("paused sessions", () => {
     expect(signedOut).not.toContain("…");
     // Coming home is unaffected: it does not need the account.
     expect(pauseLabel({ type: "moved", to: "computer" }, { signedOut: true }).status).toBe("Continuing on your computer…");
+  });
+});
+
+describe("unknown owner presentation", () => {
+  it("never turns an opaque owner or malformed move into cloud", () => {
+    for (const remote of ["opaque", "d-home", "worker", null, undefined]) {
+      expect(placementLabel({ remote }, true)).toBe("Running elsewhere");
+      expect(placementLabel({ remote }, false)).toBe("Running elsewhere · reconnecting");
+    }
+    for (const to of [undefined, null, "opaque", "worker-a"]) {
+      const pause = parsePause({ type: "moved", to });
+      expect(pause).toEqual({ type: "moved", to: "elsewhere" });
+      expect(pauseLabel(pause).status).toBe("Continuing elsewhere…");
+      expect(pauseLabel(pause, { signedOut: true }).status).toContain("Sign in to Chimaera Pro to view it.");
+    }
+    expect(pauseLabel(parsePause({ type: "paused", reason: "elsewhere" })).status).toBe("Continuing elsewhere…");
+    expect(placementLabel({ remote: "device-d-home" }, true)).toBe("On another computer");
+    expect(placementLabel({ remote: "worker-cloud" }, true)).toBe("In the cloud");
   });
 });
 

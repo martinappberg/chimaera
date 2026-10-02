@@ -151,17 +151,21 @@ pub(crate) fn tui_at_pause(
         | AgentState::RateLimited => true,
         AgentState::Running => false,
         AgentState::Unknown => {
-            if record
-                .turn_complete_at
-                .is_some_and(|at| last_output_at <= at.saturating_add(TURN_SETTLE_MS))
-            {
-                return true;
-            }
             let own_terminal = match (foreground, pid) {
                 (Some(foreground), Some(pid)) => u32::try_from(foreground) == Ok(pid),
                 _ => true,
             };
-            now.saturating_sub(last_output_at) >= TUI_QUIET_MS && own_terminal
+            if !own_terminal {
+                return false;
+            }
+            if record.turn_complete_at.is_some_and(|at| {
+                record.terminal_input_at.is_none_or(|input| input < at)
+                    && last_output_at <= at.saturating_add(TURN_SETTLE_MS)
+            }) {
+                return true;
+            }
+            let last_activity = last_output_at.max(record.terminal_input_at.unwrap_or(0));
+            now.saturating_sub(last_activity) >= TUI_QUIET_MS
         }
     }
 }
@@ -234,6 +238,9 @@ pub(crate) struct AgentRecord {
     /// the PTY output clock). A Codex TUI has no hook state; this, with the
     /// PTY's own output recency, tells whether it sits at a safe pause.
     pub(crate) turn_complete_at: Option<u64>,
+    /// Nonempty input admitted by the PTY writer, never a refused viewer frame.
+    /// A new turn must not inherit the previous notify's safe-pause evidence.
+    pub(crate) terminal_input_at: Option<u64>,
     /// Latest `customTitle` transcript record (wins over `ai_title`).
     pub(crate) custom_title: Option<String>,
     /// Latest `{"type":"ai-title"}` transcript record.
@@ -343,6 +350,7 @@ impl AgentRecord {
             native_cwd: None,
             codex_thread_id: None,
             turn_complete_at: None,
+            terminal_input_at: None,
             custom_title: None,
             ai_title: None,
             first_prompt: None,
@@ -751,6 +759,27 @@ mod tests {
             Some(7),
             Some(7),
             now + 5_000
+        ));
+        // A previous completion cannot override a newly foreground tool.
+        assert!(!tui_at_pause(&codex, true, now - 50, Some(7), Some(9), now));
+        // Even before the new turn produces output, admitted input is activity.
+        codex.turn_complete_at = None;
+        codex.terminal_input_at = Some(now);
+        assert!(!tui_at_pause(
+            &codex,
+            true,
+            now - TUI_QUIET_MS,
+            Some(7),
+            Some(7),
+            now
+        ));
+        assert!(tui_at_pause(
+            &codex,
+            true,
+            now,
+            Some(7),
+            Some(7),
+            now + TUI_QUIET_MS
         ));
         // Claude's hook states decide; rate limiting is a pause, running is not.
         let mut claude = AgentRecord::new("k".into(), AgentKind::Claude);

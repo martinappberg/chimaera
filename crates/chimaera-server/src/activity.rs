@@ -76,10 +76,10 @@ pub(crate) fn record(state: &crate::AppState, id: &str) {
     state.changes.notify_waiters();
 }
 /// The chat commands that are the user acting. They count as interaction
-/// here; they are what this daemon's relay holds, wakes a sleeping owner for
-/// and brings work to this computer for (`session_proxy`), and nothing else
-/// is; and a keeper that keeps a sleeping cloud machine's sockets holds and
-/// wakes for the same list (VIEWING.md, "A sleeping cloud machine's sockets"
+/// here; the daemon's relay holds them and wakes a sleeping owner for them,
+/// while ordinary input stays with that owner (`session_proxy`). Only explicit
+/// Take over changes execution ownership. A keeper holds and wakes sleeping
+/// cloud machine sockets for the same list (VIEWING.md, "A sleeping cloud machine's sockets"
 /// mirrors it; change both together). The seven settings commands the user
 /// gives are held by both as well, without waking or moving anything
 /// ([`chat_frame`]). The automatic `SetThinking`, the reads, `cancel_send`
@@ -106,7 +106,7 @@ pub(crate) fn is_interaction(command: &chimaera_agent::model::AgentCommand) -> b
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ChatFrame {
     /// The user acting: exactly [`is_interaction`]. Held in order, and a
-    /// reason to wake a machine or bring work to this computer.
+    /// reason to wake the current owner, never an implicit takeover.
     Acting,
     /// One of the seven settings the user gives. Held (coalesced) and
     /// delivered in order with what the user did, but no reason to wake or

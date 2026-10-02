@@ -49,7 +49,7 @@ use std::{
 const TEXT_MAX: u64 = 512 * 1024;
 /// A kept copy's name this long may have been shortened to fit the file-name
 /// limit (`canonical::KeptCopies::keep`), so the name it points back to may
-/// not be the original's: such a pair never brings a missing file back.
+/// not be the original's: such a pair never replaces any file by inference.
 const SHORTENED_AT: usize = 240;
 /// How long a choice waits for a mirror pass or another choice on the same
 /// project before answering `busy`.
@@ -87,6 +87,7 @@ struct Pair {
     mine_size: u64,
     changed_at: Option<u64>,
     mine_changed_at: Option<u64>,
+    can_use_mine: bool,
 }
 
 #[derive(Debug)]
@@ -209,12 +210,17 @@ fn split(mine_path: &Path) -> Result<(PathBuf, String, String), Refusal> {
 /// The pair's folder, walked from the project folder with every component
 /// `O_NOFOLLOW`. `Ok(None)`: the folder is gone.
 fn open_dir(root: &Path, parent: &Path) -> Result<Option<File>, Refusal> {
-    let root_dir = File::open(root).map_err(|_| Refusal::Unavailable)?;
-    if !root_dir.metadata().is_ok_and(|meta| meta.is_dir()) {
-        return Err(Refusal::Unavailable);
-    }
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    match crate::download::open_beneath(&root_dir, parent, flags) {
+    let anchor = File::open("/").map_err(|_| Refusal::Unavailable)?;
+    let relative = root.strip_prefix("/").map_err(|_| Refusal::Unavailable)?;
+    let root_dir = crate::download::open_beneath(&anchor, relative, flags)
+        .map_err(|_| Refusal::Unavailable)?;
+    open_parent(&root_dir, parent)
+}
+
+fn open_parent(root_dir: &File, parent: &Path) -> Result<Option<File>, Refusal> {
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    match crate::download::open_beneath(root_dir, parent, flags) {
         Ok(dir) => Ok(Some(dir)),
         Err(error) => match Errno::from_io_error(&error) {
             Some(Errno::NOENT) => Ok(None),
@@ -289,6 +295,7 @@ fn inspect(root: &Path, mine_path: &Path) -> Result<Option<Pair>, Refusal> {
         mine_size: mine_meta.len(),
         changed_at: cloud.as_ref().and_then(millis),
         mine_changed_at: millis(&mine_meta),
+        can_use_mine: mine.len() < SHORTENED_AT,
     }))
 }
 
@@ -301,9 +308,11 @@ fn apply(
     mine_path: &Path,
     choice: Choice,
     home: Option<&Path>,
+    current: &dyn Fn() -> Result<File, Refusal>,
 ) -> Result<Option<Discarded>, Refusal> {
     let (parent, mine, original) = split(mine_path)?;
-    let Some(dir) = open_dir(root, &parent)? else {
+    let verified_root = current()?;
+    let Some(dir) = open_parent(&verified_root, &parent)? else {
         return match choice {
             Choice::UseMine => Err(Refusal::Gone),
             _ => Ok(None),
@@ -317,10 +326,18 @@ fn apply(
     }
     match (entry(&dir, &original)?, choice) {
         (Entry::Other, _) => return Err(Refusal::Unsafe),
-        (Entry::Missing, Choice::UseMine) if mine.len() >= SHORTENED_AT => {
-            return Err(Refusal::Unsafe)
-        }
+        (_, Choice::UseMine) if mine.len() >= SHORTENED_AT => return Err(Refusal::Unsafe),
         _ => {}
+    }
+    let verified_root = current()?;
+    let verified_parent = open_parent(&verified_root, &parent)?.ok_or(Refusal::Unavailable)?;
+    {
+        use std::os::unix::fs::MetadataExt;
+        let before = dir.metadata().map_err(failed)?;
+        let after = verified_parent.metadata().map_err(failed)?;
+        if (before.dev(), before.ino()) != (after.dev(), after.ino()) {
+            return Err(Refusal::Unavailable);
+        }
     }
     match choice {
         Choice::KeepBoth => Ok(None),
@@ -409,6 +426,29 @@ fn settle(state: &AppState, workspace: &str, settled: &[PathBuf], everything: bo
 /// a copy discarded here goes to the Trash (`trash`; otherwise it is
 /// deleted).
 async fn listing(state: &Arc<AppState>, workspace: &str) -> Result<Value, Refusal> {
+    let generation = super::mutation::generation(state);
+    let cache = state.pro.cache(workspace).map_err(|_| Refusal::Busy)?;
+    let held = tokio::time::timeout(LOCK_WAIT, cache.lock_owned())
+        .await
+        .map_err(|_| Refusal::Busy)?;
+    let configuration = state.pro.configuration.clone().lock_owned().await;
+    if generation != super::mutation::generation(state) {
+        return Err(Refusal::NotHere);
+    }
+    let owner = state.clone();
+    let workspace = workspace.to_owned();
+    tokio::spawn(async move {
+        let _held = held;
+        let _configuration = configuration;
+        listing_reserved(&owner, &workspace).await
+    })
+    .await
+    .map_err(failed)?
+}
+
+/// Caller retains cache/configuration ownership through scan and settlement;
+/// a newer return cannot replace this report while old paths are classified.
+async fn listing_reserved(state: &Arc<AppState>, workspace: &str) -> Result<Value, Refusal> {
     let Report { root, recorded } = report(state, workspace)?;
     let scan_root = root.clone();
     let home = state.pro.trash.clone();
@@ -549,50 +589,114 @@ async fn choose(
     state: &Arc<AppState>,
     workspace: &str,
     everything: bool,
-    work: impl FnOnce(&Path, Vec<PathBuf>, Option<&Path>) -> Result<Outcome, Refusal> + Send + 'static,
+    work: impl FnOnce(
+            &Path,
+            Vec<PathBuf>,
+            Option<&Path>,
+            &dyn Fn() -> Result<File, Refusal>,
+        ) -> Result<Outcome, Refusal>
+        + Send
+        + 'static,
 ) -> Result<Value, Refusal> {
+    let generation = super::mutation::generation(state);
     report(state, workspace)?;
     if !super::may_write(state, workspace) {
         return Err(Refusal::NotHere);
     }
     let cache = state.pro.cache(workspace).map_err(|_| Refusal::Busy)?;
-    let _held = tokio::time::timeout(LOCK_WAIT, cache.lock_owned())
+    let held = tokio::time::timeout(LOCK_WAIT, cache.lock_owned())
         .await
         .map_err(|_| Refusal::Busy)?;
     // Again under the lock: a return may have replaced the report, or taken
     // the project away, while this waited.
+    let configuration = state.pro.configuration.clone().lock_owned().await;
     let Report { root, recorded } = report(state, workspace)?;
-    if !super::may_write(state, workspace) {
+    if generation != super::mutation::generation(state) || !super::may_write(state, workspace) {
         return Err(Refusal::NotHere);
     }
+    // This existing final-mutation reservation counts local managed work and
+    // requires a live worker proof; free/unconfigured local work stays inert.
+    let reservation =
+        super::mutation::begin_launch(state, workspace).map_err(|_| Refusal::NotHere)?;
+    let ownership = crate::lock(&state.pro.ownership).get(workspace).cloned();
     let folder = root.clone();
-    let home = state.pro.trash.clone();
-    let Outcome {
-        settled,
-        failures,
-        trashed,
-        deleted,
-    } = tokio::task::spawn_blocking(move || work(&folder, recorded, home.as_deref()))
+    let identity = tokio::task::spawn_blocking(move || {
+        use std::os::unix::fs::MetadataExt;
+        let dir = open_dir(&folder, Path::new(""))?.ok_or(Refusal::Unavailable)?;
+        let meta = dir.metadata().map_err(failed)?;
+        Ok::<_, Refusal>((meta.dev(), meta.ino()))
+    })
+    .await
+    .map_err(failed)??;
+    let owner = state.clone();
+    let workspace = workspace.to_owned();
+    tokio::spawn(async move {
+        let _held = held;
+        let _configuration = configuration;
+        let _reservation = reservation;
+        let state = &owner;
+        let workspace = workspace.as_str();
+        let folder = root.clone();
+        let worker_state = owner.clone();
+        let worker_workspace = workspace.to_owned();
+        let expected_ownership = ownership.clone();
+        let home = state.pro.trash.clone();
+        let Outcome {
+            settled,
+            failures,
+            trashed,
+            deleted,
+        } = tokio::task::spawn_blocking(move || {
+            let current = || {
+                use std::os::unix::fs::MetadataExt;
+                if generation != super::mutation::generation(&worker_state)
+                    || !super::may_write(&worker_state, &worker_workspace)
+                    || crate::lock(&worker_state.pro.ownership)
+                        .get(&worker_workspace)
+                        .cloned()
+                        != ownership
+                {
+                    return Err(Refusal::NotHere);
+                }
+                let dir = open_dir(&folder, Path::new(""))?.ok_or(Refusal::Unavailable)?;
+                let meta = dir.metadata().map_err(failed)?;
+                if (meta.dev(), meta.ino()) != identity {
+                    return Err(Refusal::Unavailable);
+                }
+                Ok(dir)
+            };
+            current()?;
+            work(&folder, recorded, home.as_deref(), &current)
+        })
         .await
         .map_err(failed)??;
-    settle(
-        state,
-        workspace,
-        &settled,
-        everything && failures.is_empty(),
-    );
-    super::persist(state).await.map_err(failed)?;
-    state.changes.notify_waiters();
-    for path in &settled {
-        if let Ok((parent, _, original)) = split(path) {
-            let file = root.join(parent).join(original);
-            crate::git::mark_path_dirty(state, &file.to_string_lossy()).await;
+        if generation != super::mutation::generation(state)
+            || !super::may_write(state, workspace)
+            || crate::lock(&state.pro.ownership).get(workspace).cloned() != expected_ownership
+        {
+            return Err(Refusal::NotHere);
         }
-    }
-    let mut value = listing(state, workspace).await?;
-    value["failed"] = Value::Array(failures);
-    value["discarded"] = json!({"trash": trashed, "deleted": deleted});
-    Ok(value)
+        settle(
+            state,
+            workspace,
+            &settled,
+            everything && failures.is_empty(),
+        );
+        super::persist(state).await.map_err(failed)?;
+        state.changes.notify_waiters();
+        for path in &settled {
+            if let Ok((parent, _, original)) = split(path) {
+                let file = root.join(parent).join(original);
+                crate::git::mark_path_dirty(state, &file.to_string_lossy()).await;
+            }
+        }
+        let mut value = listing_reserved(state, workspace).await?;
+        value["failed"] = Value::Array(failures);
+        value["discarded"] = json!({"trash": trashed, "deleted": deleted});
+        Ok(value)
+    })
+    .await
+    .map_err(failed)?
 }
 
 /// `POST /pro/projects/{workspace}/kept/resolve` `{mine_path, choice}`: settle
@@ -604,15 +708,20 @@ pub(crate) async fn resolve(
 ) -> Response {
     let mine_path = PathBuf::from(&request.mine_path);
     let choice = request.choice;
-    let result = choose(&state, &workspace, false, move |root, recorded, home| {
-        if !recorded.contains(&mine_path) {
-            return Err(Refusal::NotKept);
-        }
-        let mut outcome = Outcome::default();
-        outcome.discarded(apply(root, &mine_path, choice, home)?);
-        outcome.settled.push(mine_path);
-        Ok(outcome)
-    })
+    let result = choose(
+        &state,
+        &workspace,
+        false,
+        move |root, recorded, home, current| {
+            if !recorded.contains(&mine_path) {
+                return Err(Refusal::NotKept);
+            }
+            let mut outcome = Outcome::default();
+            outcome.discarded(apply(root, &mine_path, choice, home, current)?);
+            outcome.settled.push(mine_path);
+            Ok(outcome)
+        },
+    )
     .await;
     match result {
         Ok(value) => Json(value).into_response(),
@@ -630,22 +739,27 @@ pub(crate) async fn resolve_all(
     Json(request): Json<ResolveAll>,
 ) -> Response {
     let choice = request.choice;
-    let result = choose(&state, &workspace, true, move |root, recorded, home| {
-        let mut outcome = Outcome::default();
-        for path in recorded {
-            match apply(root, &path, choice, home) {
-                Ok(went) => {
-                    outcome.discarded(went);
-                    outcome.settled.push(path);
+    let result = choose(
+        &state,
+        &workspace,
+        true,
+        move |root, recorded, home, current| {
+            let mut outcome = Outcome::default();
+            for path in recorded {
+                match apply(root, &path, choice, home, current) {
+                    Ok(went) => {
+                        outcome.discarded(went);
+                        outcome.settled.push(path);
+                    }
+                    Err(refusal) => outcome.failures.push(json!({
+                        "mine_path": shown(&path),
+                        "error_code": refusal.parts().1,
+                    })),
                 }
-                Err(refusal) => outcome.failures.push(json!({
-                    "mine_path": shown(&path),
-                    "error_code": refusal.parts().1,
-                })),
             }
-        }
-        Ok(outcome)
-    })
+            Ok(outcome)
+        },
+    )
     .await;
     match result {
         Ok(value) => Json(value).into_response(),

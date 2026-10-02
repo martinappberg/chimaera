@@ -15,10 +15,14 @@ const SOURCE_HEAD: &str = "refs/chimaera/source-head";
 // A transaction keeps one of the two transport child slots while read-tree
 // needs the other. Reserve transaction ownership before taking its child slot.
 static REF_TRANSACTIONS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+pub(super) mod staging;
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub(super) struct Snapshot {
     pub head: Option<String>,
     pub config: Vec<Entry>,
+    /// Absent on older snapshots: unknown staging, never an empty index.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staging: Option<staging::Descriptor>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Entry {
@@ -33,7 +37,7 @@ fn name(value: &str) -> bool {
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || b"._-/@".contains(&c))
 }
-fn reference(value: &str) -> bool {
+pub(super) fn reference(value: &str) -> bool {
     value.starts_with("refs/")
         && value.len() <= 1024
         && !value.chars().any(char::is_control)
@@ -221,6 +225,16 @@ pub(super) async fn describe(
 }
 
 async fn capture(root: &Path) -> Result<Snapshot> {
+    let format = transport::git_output(
+        project_git(root).await?,
+        &["rev-parse", "--show-object-format"],
+        vec![],
+    )
+    .await?;
+    ensure!(
+        format == b"sha1\n",
+        "Cloud Git transfer currently requires a SHA-1 repository; SHA-256 service support is unavailable"
+    );
     let head = optional(root, &["rev-parse", "--verify", "HEAD"]).await?;
     let bytes = transport::git_output(
         project_git(root).await?,
@@ -249,7 +263,11 @@ async fn capture(root: &Path) -> Result<Snapshot> {
             config.push(entry);
         }
     }
-    Ok(Snapshot { head, config })
+    Ok(Snapshot {
+        head,
+        config,
+        staging: None,
+    })
 }
 pub(super) async fn keep_source_head(root: &Path, cache: &Path) -> Result<()> {
     if optional(root, &["rev-parse", "--verify", "HEAD"])
@@ -379,6 +397,27 @@ pub(super) struct Incoming<'a> {
     pub branch: Option<&'a str>,
     pub origin: Option<&'a str>,
     pub snapshot: Option<&'a Snapshot>,
+    pub staging: Option<StagingIncoming<'a>>,
+}
+pub(super) struct StagingIncoming<'a> {
+    pub handoff: &'a Path,
+    pub baseline: Option<(&'a Path, &'a staging::Descriptor)>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub(super) enum StagingStatus {
+    Uncaptured,
+    Synced,
+    Conflicts {
+        paths: Vec<String>,
+        total: usize,
+        recovery: String,
+    },
+}
+pub(super) struct Prepared {
+    pub branches: Vec<String>,
+    pub writes: Vec<super::install::Write>,
+    pub staging: StagingStatus,
 }
 pub(super) async fn install_roots(root: &Path) -> Result<Vec<PathBuf>> {
     let Some(actual) = optional(root, &["rev-parse", "--absolute-git-dir"]).await? else {
@@ -408,14 +447,19 @@ pub(super) async fn prepare_receive(
     stage: &Path,
     incoming: Incoming<'_>,
     check: &(dyn Fn() -> Result<()> + Sync),
-) -> Result<(Vec<String>, Vec<super::install::Write>)> {
+) -> Result<Prepared> {
     let credentials = incoming.credentials;
     let branch = incoming.branch;
     let snapshot = incoming.snapshot;
     if branch.is_none() && snapshot.is_none() {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok(Prepared {
+            branches: Vec::new(),
+            writes: Vec::new(),
+            staging: StagingStatus::Uncaptured,
+        });
     }
     let git_dir = optional(original, &["rev-parse", "--absolute-git-dir"]).await?;
+    let existed = git_dir.is_some();
     let mut checked = HashSet::new();
     let mut common_dir = None;
     let mut worktree_dir = None;
@@ -482,6 +526,7 @@ pub(super) async fn prepare_receive(
                     &|path| {
                         matches!(path.to_str(), Some("HEAD" | "index" | "config.worktree"))
                             || path.starts_with("refs")
+                            || shared_index_name(path)
                     },
                     budget,
                 )?;
@@ -501,12 +546,47 @@ pub(super) async fn prepare_receive(
         tokio::fs::create_dir_all(&before).await?;
     }
     check()?;
+    let local_staging = if existed
+        && snapshot
+            .and_then(|snapshot| snapshot.staging.as_ref())
+            .is_some()
+    {
+        Some(staging::local_index(checkout, &stage.join("destination.index")).await?)
+    } else {
+        None
+    };
     let preserved = STAGED_CHECKOUT
         .scope(
             checkout.to_path_buf(),
             receive_inner(checkout, &incoming, check, Some(&checked)),
         )
         .await?;
+    let staging = if let Some(descriptor) = snapshot.and_then(|snapshot| snapshot.staging.as_ref())
+    {
+        let transfer = incoming
+            .staging
+            .as_ref()
+            .context("Portable Git staging artifact is unavailable")?;
+        STAGED_CHECKOUT
+            .scope(
+                checkout.to_path_buf(),
+                staging::receive(
+                    checkout,
+                    local_staging.as_ref(),
+                    staging::Receiving {
+                        handoff: transfer.handoff,
+                        descriptor,
+                        baseline: transfer.baseline,
+                        budget: credentials.storage_limit_bytes,
+                        max_file: credentials.max_file_bytes,
+                    },
+                    check,
+                ),
+            )
+            .await?
+    } else {
+        StagingStatus::Uncaptured
+    };
     let target = common_dir.unwrap_or_else(|| original.join(".git"));
     let target_exists = tokio::fs::try_exists(&target).await?;
     if !target_exists {
@@ -521,7 +601,11 @@ pub(super) async fn prepare_receive(
             Ok(writes)
         })
         .await??;
-        return Ok((preserved, writes));
+        return Ok(Prepared {
+            branches: preserved,
+            writes,
+            staging,
+        });
     }
     let (target, before, after, actual, project, pointer) = (
         target.clone(),
@@ -531,6 +615,10 @@ pub(super) async fn prepare_receive(
         original.to_path_buf(),
         stage.join("pointer-before/.git"),
     );
+    let staging_recovery = match &staging {
+        StagingStatus::Conflicts { recovery, .. } => Some(recovery.clone()),
+        _ => None,
+    };
     let writes = tokio::task::spawn_blocking(move || -> Result<_> {
         let mut writes = super::install::changes(&target, &before, &after)?;
         // Even an unchanged HEAD/index is a checkout invariant: a concurrent
@@ -557,19 +645,39 @@ pub(super) async fn prepare_receive(
             });
             // HEAD/index belong to the linked worktree, refs/config to common.
             let worktree_before = after.with_file_name("worktree-before");
+            if let Some(recovery) = &staging_recovery {
+                for write in &mut writes {
+                    if write.relative.starts_with(recovery) {
+                        write.root = actual.clone();
+                    }
+                }
+            }
             writes.retain(|write| {
                 !matches!(
                     write.relative.to_str(),
                     Some("HEAD" | "index" | "config.worktree")
                 )
             });
-            for name in ["HEAD", "index", "config.worktree"] {
-                let old = worktree_before.join(name);
-                let new = after.join(name);
+            let mut private_names = vec![
+                PathBuf::from("HEAD"),
+                PathBuf::from("index"),
+                PathBuf::from("config.worktree"),
+            ];
+            for entry in std::fs::read_dir(&worktree_before)? {
+                let entry = entry?;
+                let name = PathBuf::from(entry.file_name());
+                if shared_index_name(&name) {
+                    writes.retain(|write| write.relative != name);
+                    private_names.push(name);
+                }
+            }
+            for name in private_names {
+                let old = worktree_before.join(&name);
+                let new = after.join(&name);
                 if old.is_file() || new.is_file() {
                     writes.push(super::install::Write {
                         root: actual.clone(),
-                        relative: name.into(),
+                        relative: name,
                         before: old.is_file().then_some(old),
                         after: new.is_file().then_some(new),
                     });
@@ -581,7 +689,26 @@ pub(super) async fn prepare_receive(
         Ok(writes)
     })
     .await??;
-    Ok((preserved, writes))
+    Ok(Prepared {
+        branches: preserved,
+        writes,
+        staging,
+    })
+}
+
+// Split indexes resolve their backing file relative to the actual worktree Git
+// directory. Preserve that bounded dependency in the private transaction copy.
+fn shared_index_name(path: &Path) -> bool {
+    path.components().count() == 1
+        && path
+            .to_str()
+            .and_then(|name| name.strip_prefix("sharedindex."))
+            .is_some_and(|oid| {
+                matches!(oid.len(), 40 | 64)
+                    && oid
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
 }
 
 async fn receive_inner(
@@ -596,6 +723,7 @@ async fn receive_inner(
         branch,
         origin,
         snapshot,
+        staging: _,
     } = *incoming;
     if branch.is_none() && snapshot.is_none() {
         return Ok(Vec::new());
@@ -619,6 +747,19 @@ async fn receive_inner(
                     && head.bytes().all(|c| c.is_ascii_hexdigit())),
             "invalid repository head"
         );
+    }
+    if let Some(snapshot) = snapshot {
+        ensure!(
+            snapshot.head.as_ref().is_none_or(|head| head.len() == 40),
+            "Cloud Git transfer currently requires a SHA-1 repository; SHA-256 service support is unavailable"
+        );
+    }
+    if let Some(descriptor) = snapshot.and_then(|snapshot| snapshot.staging.as_ref()) {
+        let artifact = incoming
+            .staging
+            .as_ref()
+            .context("Portable Git staging artifact is unavailable")?;
+        staging::require_service_format(artifact.handoff, descriptor).await?;
     }
     mirror::initialize(cache).await?;
     let url = transport::endpoint(&credentials.repository_url)?;
@@ -797,7 +938,10 @@ async fn publish_refs(
                 .strip_prefix(namespace)
                 .context("foreign fetched ref")?
         );
-        if reference == SOURCE_HEAD || reference.starts_with("refs/chimaera-transfer/") {
+        if reference == SOURCE_HEAD
+            || reference.starts_with("refs/chimaera-transfer/")
+            || reference.starts_with("refs/chimaera/staging/")
+        {
             continue;
         }
         ensure!(self::reference(&reference), "invalid fetched ref name");
@@ -1444,7 +1588,11 @@ mod tests {
             .unwrap();
             super::super::install::snapshot(&before, &checkout, &|_| true, 16 * 1024 * 1024)
                 .unwrap();
-            let (kept, mut writes) = prepare_receive(
+            let Prepared {
+                branches: kept,
+                mut writes,
+                staging: _,
+            } = prepare_receive(
                 &project,
                 &checkout,
                 &temporary.join("repository-stage"),
@@ -1454,6 +1602,7 @@ mod tests {
                     branch: Some(branch),
                     origin: None,
                     snapshot: None,
+                    staging: None,
                 },
                 &|| Ok(()),
             )
@@ -1561,6 +1710,274 @@ mod tests {
             std::fs::remove_dir_all(temporary).unwrap();
         }
     }
+    #[tokio::test]
+    async fn portable_staging_joins_repository_transaction_and_restart_for_fresh_and_linked_destinations(
+    ) {
+        use axum::{
+            extract::{Path as HttpPath, State},
+            routing::get,
+            Router,
+        };
+        async fn serve(
+            State(root): State<PathBuf>,
+            HttpPath(path): HttpPath<String>,
+        ) -> Result<Vec<u8>, axum::http::StatusCode> {
+            if path.contains("..") {
+                return Err(axum::http::StatusCode::BAD_REQUEST);
+            }
+            tokio::fs::read(root.join(path))
+                .await
+                .map_err(|_| axum::http::StatusCode::NOT_FOUND)
+        }
+        for linked in [false, true] {
+            let temporary = std::env::temp_dir().join(format!(
+                "chimaera-index-transaction-{}",
+                chimaera_core::generate_token()
+            ));
+            std::fs::create_dir_all(temporary.join("source")).unwrap();
+            let temporary = temporary.canonicalize().unwrap();
+            let source = temporary.join("source");
+            git(&source, &["init", "--quiet", "--initial-branch=main"]).await;
+            std::fs::write(source.join("partial"), b"HEAD").unwrap();
+            git(&source, &["add", "."]).await;
+            git(&source, &["commit", "-qm", "base"]).await;
+            let base_artifact = temporary.join("base-artifact");
+            let (base_descriptor, _) =
+                staging::capture(&source, &base_artifact, 16 * 1024 * 1024, 1024 * 1024)
+                    .await
+                    .unwrap();
+            let destination = if linked {
+                git(
+                    &temporary,
+                    &["clone", "--quiet", source.to_str().unwrap(), "main"],
+                )
+                .await;
+                let root = temporary.join("linked");
+                git(
+                    &temporary.join("main"),
+                    &[
+                        "worktree",
+                        "add",
+                        "--quiet",
+                        "-b",
+                        "work",
+                        root.to_str().unwrap(),
+                    ],
+                )
+                .await;
+                std::fs::write(root.join("partial"), b"LOCAL INDEX").unwrap();
+                git(&root, &["add", "partial"]).await;
+                std::fs::write(root.join("partial"), b"LOCAL WORKTREE").unwrap();
+                git(&root, &["update-index", "--split-index"]).await;
+                root
+            } else {
+                let root = temporary.join("fresh");
+                std::fs::create_dir(&root).unwrap();
+                root
+            };
+            std::fs::write(source.join("partial"), b"INDEX").unwrap();
+            std::fs::write(source.join("only"), b"STAGED ONLY").unwrap();
+            git(&source, &["add", "."]).await;
+            std::fs::write(source.join("partial"), b"WORKTREE").unwrap();
+            std::fs::remove_file(source.join("only")).unwrap();
+            let artifact = temporary.join("artifact");
+            let (descriptor, _) =
+                staging::capture(&source, &artifact, 16 * 1024 * 1024, 1024 * 1024)
+                    .await
+                    .unwrap();
+            let mut snapshot = capture(&source).await.unwrap();
+            snapshot.staging = Some(descriptor);
+            git(
+                &temporary,
+                &[
+                    "clone",
+                    "--quiet",
+                    "--bare",
+                    source.to_str().unwrap(),
+                    "repository.git",
+                ],
+            )
+            .await;
+            let mirror = temporary.join("repository.git");
+            git(&mirror, &["update-server-info"]).await;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    Router::new()
+                        .route("/{*path}", get(serve))
+                        .with_state(mirror),
+                )
+                .await
+                .unwrap()
+            });
+            let credentials = MirrorCredentials {
+                workspace_id: "w-fixture".into(),
+                repository_url: url.clone(),
+                working_tree_url: url,
+                username: "fixture".into(),
+                password: "fixture".into(),
+                read_only: true,
+                storage_limit_bytes: 16 * 1024 * 1024,
+                max_file_bytes: 1024 * 1024,
+            };
+            let before = temporary.join("tree-before");
+            let checkout = temporary.join("checkout");
+            let stage = temporary.join("repository-stage");
+            super::super::install::snapshot(
+                &destination,
+                &before,
+                &|path| !path.starts_with(".git"),
+                16 * 1024 * 1024,
+            )
+            .unwrap();
+            super::super::install::snapshot(&before, &checkout, &|_| true, 16 * 1024 * 1024)
+                .unwrap();
+            let actual_index = if linked {
+                Some(PathBuf::from(
+                    git(
+                        &destination,
+                        &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+                    )
+                    .await,
+                ))
+            } else {
+                None
+            };
+            let original_index = actual_index
+                .as_ref()
+                .map(|path| std::fs::read(path).unwrap());
+            let Prepared {
+                branches: _,
+                mut writes,
+                staging: report,
+            } = prepare_receive(
+                &destination,
+                &checkout,
+                &stage,
+                Incoming {
+                    cache: &temporary.join("incoming.git"),
+                    credentials: &credentials,
+                    branch: Some("refs/heads/main"),
+                    origin: None,
+                    snapshot: Some(&snapshot),
+                    staging: Some(StagingIncoming {
+                        handoff: &artifact,
+                        baseline: Some((&base_artifact, &base_descriptor)),
+                    }),
+                },
+                &|| Ok(()),
+            )
+            .await
+            .unwrap();
+            if let Some(index) = &actual_index {
+                assert_eq!(
+                    std::fs::read(index).unwrap(),
+                    *original_index.as_ref().unwrap()
+                );
+            } else {
+                assert!(!destination.join(".git").exists());
+                std::fs::write(checkout.join("partial"), b"WORKTREE").unwrap();
+            }
+            let recovery = match report {
+                StagingStatus::Conflicts {
+                    recovery, paths, ..
+                } => {
+                    assert!(linked);
+                    assert_eq!(paths, ["partial"]);
+                    Some(recovery)
+                }
+                StagingStatus::Synced => {
+                    assert!(!linked);
+                    None
+                }
+                StagingStatus::Uncaptured => panic!("captured staging became unknown"),
+            };
+            writes.extend(
+                super::super::install::changes(&destination, &before, &checkout)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|write| !write.relative.starts_with(".git")),
+            );
+            let binding = super::super::install::Binding {
+                endpoint: "https://fixture.invalid".into(),
+                account: Some("a-fixture".into()),
+                workspace: "w-fixture".into(),
+                epoch: 3,
+                receipt: Some("fixture-receipt".into()),
+            };
+            let journal = temporary.join("journal");
+            let mut transaction = super::super::install::Transaction::prepare(
+                &journal,
+                binding.clone(),
+                writes,
+                16 * 1024 * 1024,
+            )
+            .unwrap();
+            transaction
+                .reserve_git(install_roots(&destination).await.unwrap(), &|| Ok(()))
+                .unwrap();
+            transaction.apply(&|| Ok(())).unwrap();
+            drop(transaction);
+            let mut resumed = super::super::install::Transaction::open(&journal, &binding)
+                .unwrap()
+                .unwrap();
+            resumed.reserve_git(Vec::new(), &|| Ok(())).unwrap();
+            resumed.apply(&|| Ok(())).unwrap();
+            resumed.commit(&|| Ok(())).unwrap();
+            resumed.cleanup().unwrap();
+            assert_eq!(git(&destination, &["show", "HEAD:partial"]).await, "HEAD");
+            assert_eq!(
+                git(&destination, &["show", ":partial"]).await,
+                if linked { "LOCAL INDEX" } else { "INDEX" }
+            );
+            assert_eq!(git(&destination, &["show", ":only"]).await, "STAGED ONLY");
+            assert!(!destination.join("only").exists());
+            assert_eq!(
+                std::fs::read(destination.join("partial")).unwrap(),
+                if linked {
+                    b"LOCAL WORKTREE".as_slice()
+                } else {
+                    b"WORKTREE".as_slice()
+                }
+            );
+            if let Some(recovery) = recovery {
+                let path = PathBuf::from(
+                    git(
+                        &destination,
+                        &[
+                            "rev-parse",
+                            "--path-format=absolute",
+                            "--git-path",
+                            &recovery,
+                        ],
+                    )
+                    .await,
+                );
+                assert!(path.join("local.index").is_file());
+                assert!(path.join("incoming.index").is_file());
+                assert!(!temporary.join("main/.git").join(&recovery).exists());
+                git(&destination, &["gc", "--prune=now"]).await;
+                let oid = transport::git_output(
+                    transport::git(&destination, None).await.unwrap(),
+                    &["hash-object", "--stdin"],
+                    b"INDEX".to_vec(),
+                )
+                .await
+                .unwrap();
+                let oid = std::str::from_utf8(&oid).unwrap().trim();
+                assert_eq!(git(&destination, &["cat-file", "blob", oid]).await, "INDEX");
+                assert_eq!(
+                    git(&destination, &["show", ":partial"]).await,
+                    "LOCAL INDEX"
+                );
+            }
+            server.abort();
+            std::fs::remove_dir_all(temporary).unwrap();
+        }
+    }
+
     async fn git(root: &Path, args: &[&str]) -> String {
         let mut command = transport::git(root, None).await.unwrap();
         command
@@ -1771,11 +2188,13 @@ mod tests {
             std::fs::read_to_string(root.join("created.txt")).unwrap(),
             "local version"
         );
-        assert!(std::fs::read_dir(&root).unwrap().all(|entry| !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .starts_with(crate::persist::PROJECT_STAGING_PREFIX)));
+        assert!(std::fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(crate::persist::PROJECT_STAGING_PREFIX)
+        }));
         std::fs::remove_dir_all(root).unwrap();
     }
     #[tokio::test]
@@ -2043,10 +2462,26 @@ mod tests {
             ],
         )
         .await;
+        git(
+            &laptop,
+            &[
+                "update-ref",
+                &format!("{namespace}chimaera/staging/fixture"),
+                "HEAD^{tree}",
+            ],
+        )
+        .await;
         std::fs::write(laptop.join(".git/FETCH_HEAD"), "user fetch marker\n").unwrap();
         let preserved = publish_refs(&laptop, namespace, true, &|| Ok(()), None)
             .await
             .unwrap();
+        assert!(optional(
+            &laptop,
+            &["rev-parse", "--verify", "refs/chimaera/staging/fixture"]
+        )
+        .await
+        .unwrap()
+        .is_none());
         assert_eq!(
             std::fs::read_to_string(laptop.join(".git/FETCH_HEAD")).unwrap(),
             "user fetch marker\n"

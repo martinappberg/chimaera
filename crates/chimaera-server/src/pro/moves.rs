@@ -1,16 +1,9 @@
-//! Acting brings the work to you; looking never does.
+//! Explicit takeover moves execution; opening and ordinary input do not.
 //!
-//! **Between computers.** Sending a chat message or typing into a terminal on
-//! this computer while another of the user's computers holds the project
-//! asks the account to move the work here (`POST /v2/baton/{w}/move`). The
-//! holder learns it from its next lease renewal (`move_to`), finishes its
-//! current step (a chat's turn, a terminal agent's next pause; plain shells
-//! never wait), publishes and releases exactly like the clean handoff, and
-//! this computer then takes the project the way a return does. The input that
-//! asked is held by the viewer relay (`session_proxy`) and delivered here
-//! once, or answered with a refusal when the other computer did not let go
-//! within five minutes. The last actor wins: the holder's own user acting
-//! after the request (by the account's clock) cancels it.
+//! **Between computers.** Opening creates a local copy. Ordinary input stays
+//! with its current owner. Explicit Take over posts the existing account move
+//! request, waits for the holder to drain/release, then hydrates the checkpoint.
+//! The last actor rule still lets the current owner keep its work.
 //!
 //! **From a phone.** When a phone acts on a project a sleeping cloud machine
 //! holds, the account names one of the user's online computers (`move_to`,
@@ -159,7 +152,7 @@ fn can_take(state: &AppState, config: &Configure, workspace: &str) -> bool {
 /// waking the cloud) and whether it is on power. Only a personal computer on
 /// the negotiated protocol says anything.
 pub(super) fn watch_query(state: &AppState, config: &Configure, workspace: &str) -> &'static str {
-    if !can_take(state, config, workspace) {
+    if super::project_copy::copy_only(state, workspace) || !can_take(state, config, workspace) {
         return "";
     }
     if state
@@ -173,23 +166,9 @@ pub(super) fn watch_query(state: &AppState, config: &Configure, workspace: &str)
     }
 }
 
-/// Starts bringing `workspace` to this computer, or joins the request already
-/// under way. `None` when this computer cannot take it; the caller then
-/// behaves as before (the input goes to the current owner).
-pub(crate) fn bring_here(
-    state: &Arc<AppState>,
-    workspace: &str,
-) -> Option<watch::Receiver<Outcome>> {
-    let config = lock(&state.pro.runtime).clone()?;
-    if !can_take(state, &config, workspace) {
-        return None;
-    }
-    start(state, config, workspace, true, BOUND)
-}
-
 /// A signed-in personal computer on the negotiated protocol whose account is
 /// at `endpoint`: one that may take a project another computer runs, for
-/// fixtures that exercise what asks it to ([`bring_here`]).
+/// fixtures that exercise its current-owner viewer relay.
 #[cfg(test)]
 pub(crate) fn device_fixture(state: &AppState, endpoint: &str) {
     let config = serde_json::from_value(json!({
@@ -227,7 +206,14 @@ pub(crate) fn settle_fixture(state: &AppState, workspace: &str, outcome: Outcome
 /// the cloud slept, or this computer's own earlier request outlived the
 /// daemon that made it): take it at once, unless a request is under way.
 pub(super) fn answer(state: &Arc<AppState>, config: &Configure, workspace: &str, baton: &Baton) {
-    if !can_take(state, config, workspace) || pulling(state, workspace) {
+    if !can_take(state, config, workspace)
+        || pulling(state, workspace)
+        || (super::project_copy::copy_only(state, workspace)
+            && !lock(&state.pro.preferences)
+                .get(workspace)
+                .and_then(|p| p.copy.as_ref())
+                .is_some_and(|copy| copy.takeover_requested))
+    {
         return;
     }
     let request = baton.move_requested_at.clone().unwrap_or_default();
@@ -246,7 +232,7 @@ pub(super) fn answer(state: &Arc<AppState>, config: &Configure, workspace: &str,
     } else {
         BOUND
     };
-    let _ = start(state, config.clone(), workspace, false, bound);
+    let _ = start(state, config.clone(), workspace, false, None, bound);
 }
 
 fn start(
@@ -254,6 +240,7 @@ fn start(
     config: Configure,
     workspace: &str,
     ask: bool,
+    expected_epoch: Option<u64>,
     bound: Duration,
 ) -> Option<watch::Receiver<Outcome>> {
     let mut pulls = lock(&state.pro.moves.pulls);
@@ -266,14 +253,37 @@ fn start(
     if pulls.len() >= LIMIT {
         return None;
     }
+    // Admission and idle-only intent retirement share this lock. A copy must
+    // still have an explicit durable intent when its pull becomes active.
+    let copy_request = lock(&state.pro.preferences)
+        .get(workspace)
+        .and_then(|p| p.copy.as_ref())
+        .filter(|copy| copy.takeover_requested)
+        .and_then(|copy| copy.takeover_request.clone());
+    if super::project_copy::copy_only(state, workspace) && copy_request.is_none() {
+        return None;
+    }
     let (sender, receiver) = watch::channel(Outcome::Waiting);
     pulls.insert(workspace.to_owned(), sender);
     drop(pulls);
+    let generation = state
+        .pro
+        .generation
+        .load(std::sync::atomic::Ordering::Acquire);
     let owner = state.clone();
     let workspace = workspace.to_owned();
     tokio::spawn(async move {
         let mut stage = "read";
-        let result = pull(&owner, &config, &workspace, ask, bound, &mut stage).await;
+        let result = pull(
+            &owner,
+            &config,
+            &workspace,
+            ask,
+            expected_epoch,
+            bound,
+            &mut stage,
+        )
+        .await;
         let outcome = match result {
             Ok(()) => Outcome::Here,
             Err(error) => {
@@ -291,6 +301,13 @@ fn start(
                 Outcome::Refused
             }
         };
+        if outcome == Outcome::Refused {
+            if let Some(request) = copy_request {
+                let _ =
+                    super::project_copy::cancel_takeover(&owner, &workspace, generation, &request)
+                        .await;
+            }
+        }
         if let Some(sender) = lock(&owner.pro.moves.pulls).remove(&workspace) {
             let _ = sender.send(outcome);
         }
@@ -316,6 +333,23 @@ pub(super) fn pulling(state: &AppState, workspace: &str) -> bool {
         .is_some_and(|sender| *sender.borrow() == Outcome::Waiting)
 }
 
+/// Serialize a pre-start retirement against pull admission. The callback only
+/// mutates in-memory intent; persistence happens after this synchronous lock.
+pub(super) fn if_idle<T>(
+    state: &AppState,
+    workspace: &str,
+    retire: impl FnOnce() -> T,
+) -> Option<T> {
+    let pulls = lock(&state.pro.moves.pulls);
+    if pulls
+        .get(workspace)
+        .is_some_and(|sender| *sender.borrow() == Outcome::Waiting)
+    {
+        return None;
+    }
+    Some(retire())
+}
+
 /// The negotiated ownership read. Only negotiated computers take part
 /// (`can_take`), so it is the v2 resource even before this computer has seen
 /// the project's policy; the answer records it (`execution::observe`) like the
@@ -336,6 +370,7 @@ async fn pull(
     config: &Configure,
     workspace: &str,
     ask: bool,
+    expected_epoch: Option<u64>,
     bound: Duration,
     stage: &mut &'static str,
 ) -> Result<()> {
@@ -343,6 +378,10 @@ async fn pull(
     let deadline = tokio::time::Instant::now() + bound;
     if ask {
         let baton = read(state, config, workspace).await?;
+        ensure!(
+            expected_epoch.is_none_or(|epoch| epoch == baton.epoch),
+            "Project ownership changed before Take over"
+        );
         *stage = "ask";
         if baton.holder_id.as_deref() == Some(me.as_str())
             && super::owned_epoch(state, workspace) == Some(baton.epoch)
@@ -377,7 +416,14 @@ async fn pull(
             "the other computer kept the work"
         );
         let mut wait = POLL;
-        if !mine && (baton.holder_id.is_none() || execution::expired(&baton)) {
+        if (!mine && (baton.holder_id.is_none() || execution::expired(&baton)))
+            || (mine
+                && super::project_copy::copy_only(state, workspace)
+                && lock(&state.pro.preferences)
+                    .get(workspace)
+                    .and_then(|p| p.copy.as_ref())
+                    .is_some_and(|copy| copy.takeover_requested))
+        {
             // Released (or a paused cloud machine the account lets this
             // computer take): take it the way a return does.
             *stage = "take";
@@ -396,6 +442,37 @@ async fn pull(
                 .unwrap_or_else(|| anyhow::anyhow!("the other computer did not let go in time")));
         }
         tokio::time::sleep(wait).await;
+    }
+}
+
+/// Explicit local takeover preserves the existing account move body and checks
+/// the epoch the user saw before submitting that move.
+pub(super) async fn take_over_here(
+    state: &Arc<AppState>,
+    config: &Configure,
+    workspace: &str,
+    expected_epoch: u64,
+) -> Result<()> {
+    ensure!(
+        can_take(state, config, workspace),
+        "Take over is unavailable on this device"
+    );
+    let mut receiver = start(
+        state,
+        config.clone(),
+        workspace,
+        true,
+        Some(expected_epoch),
+        BOUND,
+    )
+    .context("Too many takeover requests are pending")?;
+    loop {
+        let outcome = *receiver.borrow_and_update();
+        match outcome {
+            Outcome::Here => return Ok(()),
+            Outcome::Refused => anyhow::bail!("The account kept execution with the current owner"),
+            Outcome::Waiting => receiver.changed().await.context("Take over stopped")?,
+        }
     }
 }
 
@@ -557,6 +634,22 @@ pub(super) fn abandoned(state: &AppState, baton: &Baton, previous: Option<&Owner
         && baton.move_to.is_none()
         && matches!(previous, Some(Ownership::Transferring { epoch }) if *epoch == baton.epoch)
         && other_computer(state, &baton.workspace_id)
+}
+
+#[cfg(test)]
+pub(super) fn fill_requests_fixture(state: &AppState) {
+    let mut pulls = lock(&state.pro.moves.pulls);
+    for index in 0..LIMIT {
+        pulls.insert(
+            format!("w-pending-{index}"),
+            watch::channel(Outcome::Waiting).0,
+        );
+    }
+}
+
+#[cfg(test)]
+pub(super) fn pending_fixture(state: &AppState, workspace: &str) {
+    lock(&state.pro.moves.pulls).insert(workspace.into(), watch::channel(Outcome::Waiting).0);
 }
 
 #[cfg(test)]

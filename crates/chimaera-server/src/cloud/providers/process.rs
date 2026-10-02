@@ -28,13 +28,50 @@ impl Child {
             group,
         })
     }
+
+    /// Keep the leader waitable until the final group signal: reaping first
+    /// would permit its PID to be reused by an unrelated process group.
+    pub async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        #[cfg(unix)]
+        {
+            use rustix::process::{waitid, WaitId, WaitIdOptions};
+            if let Some(group) = self.group {
+                let mut changed =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())?;
+                loop {
+                    match waitid(
+                        WaitId::Pid(group),
+                        WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+                    ) {
+                        Ok(Some(_)) => break,
+                        Ok(None) => {}
+                        Err(rustix::io::Errno::INTR) => continue,
+                        Err(error) => return Err(error.into()),
+                    }
+                    tokio::select! {
+                        _ = changed.recv() => {},
+                        _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+                    }
+                }
+                // No await between observing completion, signalling, and clearing
+                // the identity. Cancellation afterward cannot signal a reaped PID.
+                self.stop_group();
+            }
+        }
+        self.child.wait().await
+    }
+
+    #[cfg(unix)]
+    fn stop_group(&mut self) {
+        if let Some(group) = self.group.take() {
+            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+        }
+    }
 }
 impl Drop for Child {
     fn drop(&mut self) {
         #[cfg(unix)]
-        if let Some(group) = self.group.take() {
-            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
-        }
+        self.stop_group();
         let _ = self.child.start_kill();
     }
 }
@@ -90,13 +127,18 @@ pub(super) async fn output_tracked(
         let mut err = Vec::new();
         let mut stdout = stdout.take((LIMIT + 1) as u64);
         let mut stderr = stderr.take((LIMIT + 1) as u64);
-        let (a, b) = tokio::join!(stdout.read_to_end(&mut out), stderr.read_to_end(&mut err));
-        a.map_err(|_| "probe_failed")?;
-        b.map_err(|_| "probe_failed")?;
-        if out.len() > LIMIT || err.len() > LIMIT {
-            return Err("output_limit");
-        }
-        let status = child.child.wait().await.map_err(|_| "probe_failed")?;
+        let drain = async {
+            let (a, b) = tokio::join!(stdout.read_to_end(&mut out), stderr.read_to_end(&mut err));
+            a.map_err(|_| "probe_failed")?;
+            b.map_err(|_| "probe_failed")?;
+            if out.len() > LIMIT || err.len() > LIMIT {
+                return Err("output_limit");
+            }
+            Ok(())
+        };
+        let (_, status) = tokio::try_join!(drain, async {
+            child.wait().await.map_err(|_| "probe_failed")
+        })?;
         Ok(Output {
             success: status.success(),
             code: status.code(),
@@ -204,5 +246,44 @@ pub(super) fn group_alive(pid: u32) -> bool {
     {
         let _ = pid;
         false
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn exited_leader_releases_descendant_pipes_before_the_output_deadline() {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 60 & printf done; exit 7"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = tokio::time::timeout(Duration::from_secs(3), output(&mut command))
+            .await
+            .expect("the leader's exit must close inherited pipes")
+            .unwrap();
+        assert!(!output.success);
+        assert_eq!(output.code, Some(7));
+        assert_eq!(output.stdout, b"done");
+    }
+
+    #[tokio::test]
+    async fn wait_clears_group_identity_before_reaping_and_supports_repeated_wait() {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "exit 3"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = Child::spawn(&mut command).unwrap();
+        assert!(child.group.is_some());
+        assert_eq!(child.wait().await.unwrap().code(), Some(3));
+        assert!(
+            child.group.is_none(),
+            "Drop must not signal a reaped process group"
+        );
+        assert!(child.child.id().is_none());
+        assert_eq!(child.wait().await.unwrap().code(), Some(3));
     }
 }

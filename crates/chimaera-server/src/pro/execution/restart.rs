@@ -108,6 +108,9 @@ impl State {
             unclean: Mutex::new(unclean),
             uncertain: Mutex::new(uncertain),
             boot,
+            supervisor_state_invalid: unknown,
+            supervisor_pending: Mutex::default(),
+            supervisor_ack: Mutex::default(),
             tick: Mutex::default(),
             changed: tokio::sync::Notify::new(),
         }

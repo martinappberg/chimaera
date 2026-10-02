@@ -46,7 +46,7 @@ pub(super) struct Pro {
     daemon_stamp: Mutex<Option<DaemonStamp>>,
     worker_links: tokio::sync::Mutex<HashMap<String, chimaera_link::LinkTunnel>>,
     runtime: tokio::sync::Mutex<Option<Runtime>>,
-    pub(super) operation: tokio::sync::Mutex<()>,
+    pub(super) operation: Arc<tokio::sync::Mutex<()>>,
     refresh: tokio::sync::Mutex<()>,
     ready: tokio::sync::watch::Sender<bool>,
     initialization_phase: Mutex<InitializationPhase>,
@@ -176,7 +176,7 @@ impl Pro {
             daemon_stamp: Mutex::new(None),
             worker_links: tokio::sync::Mutex::new(HashMap::new()),
             runtime: tokio::sync::Mutex::new(None),
-            operation: tokio::sync::Mutex::new(()),
+            operation: Arc::new(tokio::sync::Mutex::new(())),
             refresh: tokio::sync::Mutex::new(()),
             ready: tokio::sync::watch::channel(ready).0,
             initialization_phase: Mutex::new(InitializationPhase::Keychain),
@@ -1314,6 +1314,7 @@ mod tests {
             status: chimaera_link::HostStatus::Offline,
             daemon: None,
             error: None,
+            cluster: None,
         };
         pro.remember_device(&device);
         assert!(super::direct_ssh_bypass(true, pro.is_device(&device.alias)).is_err());
@@ -2260,14 +2261,37 @@ pub(super) async fn daemon_request(
     suffix: &str,
     body: Option<serde_json::Value>,
 ) -> Result<serde_json::Value> {
+    daemon_request_guarded(state, method, suffix, body, ()).await
+}
+
+pub(super) async fn daemon_request_guarded(
+    state: &Shell,
+    method: &str,
+    suffix: &str,
+    body: Option<serde_json::Value>,
+    guard: impl Send + 'static,
+) -> Result<serde_json::Value> {
+    let local = lock(&state.local).clone();
+    local_daemon_request(local, method, suffix, body, guard).await
+}
+
+async fn local_daemon_request(
+    local: crate::daemon::LocalDaemon,
+    method: &str,
+    suffix: &str,
+    body: Option<serde_json::Value>,
+    guard: impl Send + 'static,
+) -> Result<serde_json::Value> {
     anyhow::ensure!(
         suffix.starts_with("/pro/") && !suffix.contains(['\r', '\n']),
         "invalid local Pro route"
     );
-    let local = lock(&state.local).clone();
     let method = method.to_string();
     let suffix = suffix.to_string();
     tokio::task::spawn_blocking(move || {
+        // Canceling the native caller cannot cancel this blocking request.
+        // Its operation admission must live through the actual HTTP outcome.
+        let _guard = guard;
         let url = format!("http://127.0.0.1:{}/api/v1{suffix}", local.port);
         let authorization = format!("Bearer {}", local.token);
         let mut response = match method.as_str() {
@@ -2302,7 +2326,11 @@ pub(super) async fn daemon_request(
                 .timeout_global(Some(Duration::from_secs(
                     if matches!(
                         suffix.as_str(),
-                        "/pro/projects/open" | "/pro/sleep" | "/pro/execution/recover"
+                        "/pro/projects/open"
+                            | "/pro/projects/copy"
+                            | "/pro/projects/takeover"
+                            | "/pro/sleep"
+                            | "/pro/execution/recover"
                     ) {
                         1140
                     } else {
@@ -2326,7 +2354,10 @@ pub(super) async fn daemon_request(
             "local Pro response exceeds limit"
         );
         if !response.status().is_success() {
-            if suffix == "/pro/projects/open" {
+            if matches!(
+                suffix.as_str(),
+                "/pro/projects/open" | "/pro/projects/copy" | "/pro/projects/takeover"
+            ) {
                 anyhow::bail!(open_failure(&bytes));
             }
             anyhow::bail!("The Pro operation couldn't finish. Try again shortly.");
@@ -2365,6 +2396,8 @@ fn project_failure_code(code: &str) -> &'static str {
         "account_changed" => open_code::ACCOUNT_CHANGED,
         "unavailable" => open_code::UNAVAILABLE,
         "return_window_ended" => open_code::RETURN_WINDOW_ENDED,
+        "copy_upgrade_required" => open_code::UPDATE_REQUIRED,
+        "checkpoint_pending" => open_code::CHECKPOINT_PENDING,
         _ => open_code::FAILED,
     }
 }

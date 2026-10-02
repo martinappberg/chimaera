@@ -14,12 +14,22 @@ use crate::AppState;
 pub(crate) async fn list_workspaces(
     State(state): State<Arc<AppState>>,
 ) -> Json<Vec<serde_json::Value>> {
+    let workspaces = crate::lock(&state.workspaces).listed();
     Json(
-        crate::lock(&state.workspaces)
-            .listed()
+        workspaces
             .into_iter()
             .filter(|workspace| !crate::cloud::is_onboarding_workspace(workspace))
-            .map(|workspace| json!(workspace))
+            .map(|workspace| {
+                let copy = crate::pro::local_copy_view(&state, &workspace.id);
+                let mut value = json!(workspace);
+                if let Some(copy) = copy {
+                    value
+                        .as_object_mut()
+                        .expect("workspace object")
+                        .insert("local_copy".into(), copy);
+                }
+                value
+            })
             .collect(),
     )
 }

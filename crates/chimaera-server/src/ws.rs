@@ -170,7 +170,7 @@ enum ClientMessage {
 /// The first authenticated frame fixes both project scope and account generation.
 /// A later account with an equal workspace/epoch cannot revive this connection.
 #[derive(Clone)]
-struct SocketScope {
+pub(crate) struct SocketScope {
     scope: crate::workspace_scope::Scope,
     admission: crate::workspace_scope::Mutation,
 }
@@ -229,30 +229,53 @@ impl SocketScope {
     }
 }
 
-async fn terminal_input(
+pub(crate) async fn terminal_input(
     state: &Arc<AppState>,
     id: &str,
     input: &chimaera_pty::InputSender,
     bytes: Bytes,
     scope: Option<&SocketScope>,
 ) -> Result<(), chimaera_pty::ExecError> {
-    if let Some(scope) = scope {
-        let scope = scope.clone();
-        let state = Arc::clone(state);
-        let id = id.to_owned();
-        input
-            .send_authorized(bytes, move || {
-                scope
-                    .begin_session(&state, &id)
-                    .map_err(|_| chimaera_pty::ExecError::Busy("project connection changed".into()))
-            })
-            .await
-    } else {
-        input
+    let key = crate::lock(&state.agents)
+        .get(id)
+        .map(|record| record.key.clone());
+    if scope.is_none() && key.is_none() {
+        return input
             .send(bytes)
             .await
-            .map_err(|_| chimaera_pty::ExecError::SessionGone)
+            .map_err(|_| chimaera_pty::ExecError::SessionGone);
     }
+    let scope = scope.cloned();
+    let state = Arc::clone(state);
+    let id = id.to_owned();
+    let nonempty = !bytes.is_empty();
+    input
+        .send_authorized(bytes, move || {
+            let refused = || chimaera_pty::ExecError::Busy("project connection changed".into());
+            let guard = if let Some(scope) = scope {
+                Some(scope.begin_session(&state, &id).map_err(|_| refused())?)
+            } else {
+                let workspace = crate::lock(&state.session_workspaces).get(&id).cloned();
+                match workspace {
+                    Some(workspace) => crate::pro::mutation::begin_launch(&state, &workspace)
+                        .map_err(|_| refused())?,
+                    None => None,
+                }
+            };
+            if let Some(key) = key {
+                let mut agents = crate::lock(&state.agents);
+                let record = agents
+                    .get_mut(&id)
+                    .filter(|record| record.key == key)
+                    .ok_or_else(refused)?;
+                if nonempty {
+                    record.terminal_input_at = Some(crate::session_view::now_ms());
+                    record.turn_complete_at = None;
+                }
+            }
+            Ok(guard)
+        })
+        .await
 }
 
 /// `client_id`: the id the client minted for this send (already checked), so
@@ -338,7 +361,7 @@ impl Pause {
 /// What [`classify_pause`] decides from, gathered from daemon state.
 #[derive(Clone, Debug, Default)]
 struct PauseFacts {
-    /// This daemon is a cloud machine (its sessions move to "your computer").
+    /// This daemon is a cloud machine; its own arriving sessions are known.
     worker: bool,
     /// The project's work left this computer for another of the user's
     /// computers (acting there brought it there), not for the cloud.
@@ -382,12 +405,15 @@ struct EntryFacts {
 /// [`ProState`](crate::pro) exposing the ownership phase would settle both
 /// without that inference.
 fn classify_pause(facts: &PauseFacts, ran_here: impl FnOnce() -> bool) -> Option<Pause> {
-    let away = if facts.worker {
-        "computer"
-    } else if facts.other {
-        "other"
+    let away = if facts.other {
+        Pause::Moved("other")
     } else {
-        "cloud"
+        // New reason on the existing paused frame: old clients stay neutral
+        // instead of interpreting an unknown moved destination as cloud.
+        Pause::Paused {
+            reason: "elsewhere",
+            provider: None,
+        }
     };
     let Some(entry) = &facts.entry else {
         // Opening a transfer before its entry is recorded: say so rather than
@@ -429,7 +455,7 @@ fn classify_pause(facts: &PauseFacts, ran_here: impl FnOnce() -> bool) -> Option
         });
     }
     if facts.transfer {
-        return Some(Pause::Moved(away));
+        return Some(away);
     }
     if entry.writable || (facts.worker && !ran_here()) {
         return Some(Pause::Paused {
@@ -437,7 +463,7 @@ fn classify_pause(facts: &PauseFacts, ran_here: impl FnOnce() -> bool) -> Option
             provider: None,
         });
     }
-    Some(Pause::Moved(away))
+    Some(away)
 }
 
 fn entry_facts(state: &AppState, entry: &crate::ledger::LedgerEntry) -> EntryFacts {
@@ -744,7 +770,7 @@ pub(crate) fn command_refusal(mut answer: serde_json::Value, text: &str) -> serd
 /// Input this socket may not deliver. The additive `reason` lets a client say
 /// why in its own words (`watching`: the viewer chose to watch; `elsewhere`:
 /// the project runs on the other machine right now), and the additive
-/// `owner` (`"cloud"` | `"computer"`, [`session_owner`]) where it runs, so the
+/// `owner` (`"cloud"` | `"computer"` | null, [`session_owner`]) where it runs, so the
 /// words need no guess; `message` stays plain.
 fn refusal(state: &AppState, id: &str, watching: bool) -> serde_json::Value {
     let owner = session_owner(state, id);
@@ -756,21 +782,23 @@ fn refusal(state: &AppState, id: &str, watching: bool) -> serde_json::Value {
             .get(id)
             .cloned()
             .unwrap_or_default();
-        let place = if owner == "cloud" {
+        let place = if owner == Some("cloud") {
             "in the cloud"
         } else if crate::pro::other_computer(state, &workspace) {
             "on your other computer"
-        } else {
+        } else if owner == Some("computer") {
             "on your computer"
+        } else {
+            "elsewhere"
         };
         json!({"type":"error","code":"read_only","reason":"elsewhere","owner":owner,
                "message":format!("This project is running {place} right now. That was not sent.")})
     }
 }
 
-/// Where the project of session `id` runs now: `"cloud"` or `"computer"`
+/// Where the project of session `id` runs now, when known (otherwise null):
 /// (`pro::owner_kind`; a session with no project runs where this daemon is).
-pub(crate) fn session_owner(state: &AppState, id: &str) -> &'static str {
+pub(crate) fn session_owner(state: &AppState, id: &str) -> Option<&'static str> {
     let workspace = crate::lock(&state.session_workspaces)
         .get(id)
         .cloned()
@@ -2850,15 +2878,35 @@ mod tests {
                 json!({"type":"moved","to":"computer","other":true})
             );
         }
-        // A cloud machine's other owner is always the user's computer.
+        // The explicit move destination remains known on either source role.
         let worker = PauseFacts {
             worker: true,
             ..left(true, true)
         };
         assert_eq!(
             classify_pause(&worker, || true),
-            Some(Pause::Moved("computer"))
+            Some(Pause::Moved("other"))
         );
+    }
+
+    #[test]
+    fn an_unknown_move_uses_a_neutral_backward_compatible_pause() {
+        let facts = PauseFacts {
+            transfer: true,
+            entry: Some(EntryFacts::default()),
+            ..PauseFacts::default()
+        };
+        for worker in [false, true] {
+            let pause = classify_pause(
+                &PauseFacts {
+                    worker,
+                    ..facts.clone()
+                },
+                || true,
+            )
+            .unwrap();
+            assert_eq!(pause.frame(), json!({"type":"paused","reason":"elsewhere"}));
+        }
     }
 
     #[test]
@@ -2879,20 +2927,20 @@ mod tests {
         };
         assert_eq!(
             classify_pause(&exporting(false), || true),
-            Some(Pause::Moved("cloud"))
+            paused("elsewhere")
         );
         assert_eq!(
             classify_pause(&exporting(true), || true),
-            Some(Pause::Moved("computer"))
+            paused("elsewhere")
         );
         // Stopped because another machine now runs the project.
         assert_eq!(
             classify_pause(&stopped(false, false), || true),
-            Some(Pause::Moved("cloud"))
+            paused("elsewhere")
         );
         assert_eq!(
             classify_pause(&stopped(true, false), || true),
-            Some(Pause::Moved("computer"))
+            paused("elsewhere")
         );
         // Waiting out a restart on the machine that owns the project: after
         // every Pro update, a computer's own chats are not "in the cloud".

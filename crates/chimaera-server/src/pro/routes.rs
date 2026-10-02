@@ -230,6 +230,16 @@ async fn configure_inner(
     if let Err(error) = super::ensure_root(&state.pro.root).await {
         return failure(error);
     }
+    if execution::supervisor::pending(&state) && config.execution.is_none() {
+        return failure(anyhow::anyhow!(
+            "supervisor cleanup requires execution configuration"
+        ));
+    }
+    // Configure serializes this startup-only cleanup with all replacement.
+    // No execution lease or lost enrollment policy is created here.
+    if let Err(error) = execution::supervisor::apply(&state, accepted.as_ref()).await {
+        return failure(error);
+    }
     // Refreshing the same negotiated identity only replaces the credential;
     // it must not interrupt running work or reset the local lease deadline.
     let same = lock(&state.pro.runtime).as_ref().is_some_and(|old| {
@@ -410,7 +420,7 @@ pub(crate) async fn status(State(state): State<Arc<AppState>>) -> Json<serde_jso
     // `cloud_handoff` (the cloud could take it now); the native app asks
     // before quitting only when a working project could move.
     Json(
-        json!({"configured":state.pro.configured.load(Ordering::Acquire) && !renewal_failed,"renewal_failed":renewal_failed,"workspace_configuration":authority.acknowledgment(),"projects_root":super::projects_root(&state),"projects_root_confirmed":lock(&state.pro.projects_root).is_some(),"sessions":sessions,"workspaces":workspaces.into_iter().filter(|workspace| authority.allows(&workspace.id)).take(128).map(|workspace|json!({"workspace_id":workspace.id,"name":workspace.name,"root":workspace.root,"never_mirror":preferences.get(&workspace.id).is_some_and(|p|p.never_mirror),"privacy_pending":preferences.get(&workspace.id).is_some_and(|p|p.privacy_pending),"ownership":ownership.get(&workspace.id),"continuity":preferences.get(&workspace.id).and_then(|p|p.continuity.as_ref()),"execution_allowed":super::may_execute(&state,&workspace.id),"execution_uncertain":preferences.get(&workspace.id).is_some_and(|p|p.execution_uncertain),"mirror":statuses.get(&workspace.id),"blocked_providers":statuses.get(&workspace.id).map(|status|status.blocked_providers.clone()).unwrap_or_default(),"git_branches":preferences.get(&workspace.id).map(|p|&p.git_branches),"profile":preferences.get(&workspace.id).map(|p|&p.profile),"parked":parked.contains(&workspace.id),"working_agents":engine::working_agents(&state,&workspace.id),"cloud_handoff":!renewal_failed && cloud_handoff(&state,config.as_ref(),&workspace.id)})).collect::<Vec<_>>()}),
+        json!({"configured":state.pro.configured.load(Ordering::Acquire) && !renewal_failed,"renewal_failed":renewal_failed,"workspace_configuration":authority.acknowledgment(),"projects_root":super::projects_root(&state),"projects_root_confirmed":lock(&state.pro.projects_root).is_some(),"sessions":sessions,"workspaces":workspaces.into_iter().filter(|workspace| authority.allows(&workspace.id)).take(128).map(|workspace|json!({"workspace_id":workspace.id,"name":workspace.name,"root":workspace.root,"never_mirror":preferences.get(&workspace.id).is_some_and(|p|p.never_mirror),"privacy_pending":preferences.get(&workspace.id).is_some_and(|p|p.privacy_pending),"ownership":ownership.get(&workspace.id),"continuity":preferences.get(&workspace.id).and_then(|p|p.continuity.as_ref()),"local_copy":super::local_copy_view(&state,&workspace.id),"git_staging":preferences.get(&workspace.id).and_then(|p|p.git_staging.as_ref()),"execution_allowed":super::may_execute(&state,&workspace.id),"execution_uncertain":preferences.get(&workspace.id).is_some_and(|p|p.execution_uncertain),"mirror":statuses.get(&workspace.id),"blocked_providers":statuses.get(&workspace.id).map(|status|status.blocked_providers.clone()).unwrap_or_default(),"git_branches":preferences.get(&workspace.id).map(|p|&p.git_branches),"profile":preferences.get(&workspace.id).map(|p|&p.profile),"parked":parked.contains(&workspace.id),"working_agents":engine::working_agents(&state,&workspace.id),"cloud_handoff":!renewal_failed && cloud_handoff(&state,config.as_ref(),&workspace.id)})).collect::<Vec<_>>()}),
     )
 }
 /// A project a sleep or quit flush may hand over: this computer owns it, the
@@ -1204,7 +1214,7 @@ pub(crate) async fn projects(
 }
 
 // Discovery is passive; adoption has a separate, explicit local action.
-pub(crate) use super::projects::{open_project, project_list};
+pub(crate) use super::projects::{copy_project, open_project, project_list, takeover_project};
 
 #[cfg(test)]
 #[path = "profile_tests.rs"]

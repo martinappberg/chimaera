@@ -9,15 +9,17 @@ revocable delegation over the authenticated local API.
 | `mod.rs` | Bounded, credential-free persistent state, ownership/import fences and deferred-command policy. |
 | `authority.rs` / `authority_tests.rs` | Immutable workspace-bound worker acceptance, credential-free persisted latch, renewal/route/root guards and synthetic side-effect regressions. |
 | `routes.rs` | Authenticated configure/status/privacy/profile/power/hydration HTTP handlers. Profile GET returns an account-generation-bound ETag; PUT optionally checks one exact If-Match under the same preference lock as replacement (412 on change). Older unconditional PUT remains supported. Accepted writes retain configuration/job reservations through durable persistence even if the caller disconnects. `profile_tests.rs` covers stale confirmation, generation changes and disk failure. `/pro/status` rows carry additive `parked`, `working_agents` and `cloud_handoff` (see the quit handover below). |
-| `projects.rs` | Passive bounded cloud-project discovery and explicit per-device local adoption; native-picked folder validation, saved directory identity, retry and legacy-import fences. |
+| `projects.rs` / `projects/catalog.rs` | Passive published-account discovery (negotiated `/v2/projects`, at most 128 rows/pages; legacy capability absence or 404 falls back to passive worker discovery), explicit copy/takeover routes, native-picked folder validation and inode/account-bound retry. Catalog rows infer no host or execution authority; errors retain cached rows and destination bindings. Legacy `/open` refuses rather than transferring execution. |
+| `project_copy.rs` / `project_copy/tests.rs` | Immutable read-only checkpoint copies with the existing file/Git transaction, independent durable copy enrollment, exact pending baselines, counted admission and explicit post-commit role promotion. Copy selects its receipt through passive `/v2/baton` GET; the legacy v1 response has no checkpoint and is never a fallback. Missing negotiated receipt refuses enrollment/install. No agent/session/configuration restore or copied-edit publication. |
 | `projects/tests.rs` | Synthetic loopback HTTP plus real Git transfer, passive-read, conflict, retry, restart and two-device destination checks. |
 | `execution.rs` / `execution/` | Negotiated execution leases, independent stop watchdog, durable launch/crash evidence, immutable receipts and stopped same-installation recovery. |
-| `execution/mutation.rs` | Bounded file/lifecycle/command commit reservations; account/epoch admission uses short in-memory locks, while clean stop and replacement wait for actual work even if its HTTP caller disappears. Reserved launches fail promptly if configuration is draining them, rather than waiting on themselves. |
+| `execution/supervisor.rs` / `supervisor_tests.rs` | Optional Linux startup-only cleanup receipt from a trusted fixed launcher, exact account/project/root/revision/boot binding, persisted launch generation and authenticated acknowledgment. Cleanup clears process uncertainty only; missing policy and execution authority remain fenced. |
+| `execution/mutation.rs` | Bounded file/lifecycle/command commit reservations; account/epoch admission uses short in-memory locks, while clean stop and replacement wait for actual work even if its HTTP caller disappears. Reserved launches fail promptly if configuration is draining them, rather than waiting on themselves. `Dispatch` captures exact ownership and account generation before asynchronous communication reads, then reserves the final actor enqueue; worker proofs remain mandatory, while a device's expired publication lease does not block its own local work. |
 | `engine.rs` | Lease renewal (own account-request budget; installs and agent stops run as their own tasks), mirror coordinator, recoverable staged hydration, deadline-bound sleep flush, three-way return and lazy return. |
 | `install.rs` / `install/tests.rs` | Durable, account/epoch/checkpoint-bound return file intents: private before/after blobs, descriptor-relative no-follow replacement, exact restart roll-forward, checkout invariants and refusal to overwrite newer user edits. |
 | `detached.rs` | Owned transfer tasks keyed by (kind, project, epoch): a caller that disconnects never cancels a flush or hydration; repeats join; a completed release is remembered ten minutes. |
 | `drain.rs` | `POST/DELETE /pro/drain`: refuse new transfer work and wait for jobs, transfer tasks, project caches and Git helpers before a cloud machine suspends; on a cloud machine it first publishes each project it holds (the copy a computer takes when a phone acts while it sleeps). |
-| `moves.rs` | Acting brings the work to you: the asking side (`bring_here`, `answer`: request, wait for the release, take the epoch like a return, bounded five minutes / ninety seconds for a phone's request), the holder's side (`consider` on each renewal: `decide` last actor wins by the account's clock, else `hand_over` at the next pause through `routes::hand_to_computer`), `acted_here` (this computer's own input), `other_computer` (where a moved session says it went) and the passive read's `watch_query`. |
+| `moves.rs` | Explicit Take over (`take_over_here`) and previously admitted phone requests (`answer`): request, wait for release and take the epoch like a return, bounded five minutes / ninety seconds for a phone request, the holder's side (`consider` on each renewal: `decide` last actor wins by the account's clock, else `hand_over` at the next pause through `routes::hand_to_computer`), `acted_here` (this computer's own input), `other_computer` (where a moved session says it went) and the passive read's `watch_query`. |
 | `continuity_tests.rs` | Loopback account fixture (records requests, scripted grants, delays; Git endpoints refuse connections) for policy, abandoned flush, sleep deadline, quit handover (parked, failed park, status fields), own-epoch reacquire, lapsed cloud lease and drain tests. |
 | `snapshot_diagnostics.rs` | Fixed snapshot failure categories; no response bodies, paths, identifiers or error text enter diagnostic logs. |
 | `handback.rs` | Bounded automatic return coordination across worker wake and ownership changes; lost release replies are resolved by authority reads without repeating ambiguous requests. |
@@ -26,12 +28,13 @@ revocable delegation over the authenticated local API.
 | `protocol.rs` | Additive account contract subset and strict worker host-to-holder identity translation; intentionally no link/TLS dependency in the daemon. |
 | `transport.rs` | Bounded external curl/git children; cached mirror-only Git compatibility selection; credentials only in memory, never argv or Git config. The account's 403 `{"error":"return_window_ended"}` (a plan that ended and whose time to bring cloud work home has passed) becomes an error of its own in `engine::account`, so its mirror-row and open `error_code` read `return_window_ended`; any other 403 stays a plain response. |
 | `policy.rs` | Mirrored-path policy (credentials, `.git`, staging names, kept copies and a folder's `.chimaera-workspace` identity marker at any depth are never mirrored), `REBUILT_DIRS` (dependency and cache folders that never travel as untracked content, used by the mirror inventory and the agent-config export), credential filtering, size budgets and cloud-profile classification. |
-| `mirror.rs` | Separate shadow and repository Git directories, incremental transfer and conservative hand-back. |
+| `mirror.rs` | Separate shadow and repository Git directories, incremental transfer and conservative hand-back. Outgoing file reads walk every component without following symlinks beneath the pinned canonical project directory; a replaced root refuses the snapshot. Main/config trees deduplicate unchanged bytes; each handoff gets a fresh child commit so even an unchanged idle drain requires a new exact publication receipt. |
 | `shadow_cache.rs` | Validated reconstruction of an objectively damaged outgoing shadow, retaining its complete prior store in a bounded no-overwrite quarantine. |
-| `repository.rs` | Portable remote/tracking allowlist; bounded staged repository import (including original index/object contents), compare-and-swap adoption and index/ref-lock cancellation cleanup. Linked-worktree HEAD/index remain in their private Git directory; common refs/config remain shared. Staged commands bind both `GIT_DIR` and `GIT_WORK_TREE`, including fresh-project init, so a new destination cannot fail init or discover an enclosing repository. `describe` is a snapshot's repository step: a plain folder (no repository) is ordinary, logged once at info (`ProState.plain_folders`) and never as a failed helper; a detached HEAD is no branch, not a failure. |
-| `canonical.rs` | Keeps the user's own version of a conflicting file right beside it (`<name>.mine-<yyyymmdd-hhmm>`) when a return installs the incoming one; bounded per return, never overwrites an earlier copy, never mirrored. `original_name` maps a copy back to the file it sits beside. |
-| `kept.rs` / `kept/tests.rs` | The review of what a return kept in both versions: list the recorded pairs (and the cloud's `@cloud` branches, read live), both texts for the side-by-side view, and settling a pair (`use_mine` / `use_cloud` / `keep_both`, one or all) — only recorded siblings, only inside the project, every name opened `O_NOFOLLOW` beneath the folder's descriptor. Tests drive the real router. |
-| `trash.rs` | Where a discarded kept copy goes: renamed (through its folder's descriptor, never replacing a name) into the home Trash (`~/.Trash`; the freedesktop.org home trash on Linux, with its `.trashinfo`), else its drive's existing Trash (`.Trashes/<uid>`; `.Trash/<uid>`, `.Trash-<uid>`), else deleted. `ProState::trash` holds the home Trash; tests point it at a fixture (never the real one). |
+| `repository.rs` | Portable remote/tracking allowlist; bounded staged repository import (including original index/object contents), compare-and-swap adoption and index/ref-lock cancellation cleanup. Linked-worktree HEAD/index and new staging recovery indexes remain in their private Git directory; common refs/config/objects remain shared. Staged commands bind both `GIT_DIR` and `GIT_WORK_TREE`, including fresh-project init, so a new destination cannot fail init or discover an enclosing repository. `describe` is a snapshot's repository step: a plain folder (no repository) is ordinary, logged once at info (`ProState.plain_folders`) and never as a failed helper; a detached HEAD is no branch, not a failure. |
+| `repository/staging.rs` | Explicit bounded index entries and staged-only blobs in the immutable handoff, preserving HEAD/index/working-file distinctions, intent-to-add and merge stages. Source indexes normalize only in a private copy; checksum/mandatory-extension/path/credential/size checks fail closed. Receivers verify blobs, rebuild extension/stat-free indexes and merge per path against the exact acknowledged handoff baseline. Conflicts retain both recoverable indexes, including in linked worktrees; a transaction-published private `refs/chimaera/staging/<token>` tree pins every nongitlink blob against GC and is excluded from outbound mirrors and imported refs. Linked split-index backing files remain private to their actual worktree Git directory. `git_staging` is durable, bounded and explicitly uncaptured for legacy snapshots. Service-backed SHA-256 remains unsupported despite codec coverage. |
+| `canonical.rs` | Keeps the user's own version of a conflicting file right beside it (`<name>.mine-<yyyymmdd-hhmm>`) when a return installs the incoming one; bounded per return, never overwrites an earlier copy, never mirrored. Unicode lookalike names are parsed without byte-boundary panics. `original_name` maps a copy back to the file it sits beside. |
+| `kept.rs` / `kept/tests.rs` | The review of what a return kept in both versions: recorded pairs and live `@cloud` branches, both texts and choices (`use_mine` / `use_cloud` / `keep_both`, one or all). Every root/child is opened `O_NOFOLLOW`; choices pin the root inode and retain counted ownership/configuration/cache reservations in an owned task through file effects and persistence. Per-choice authority checks refuse a changed account/epoch/root. Ambiguous shortened basenames set `can_use_mine:false` and never replace a prefix neighbor. Router, cancellation, changed-authority and long-name regressions cover these seams. |
+| `trash.rs` | Where a discarded kept copy goes: renamed (through its folder's descriptor, never replacing a name) into the home Trash (`~/.Trash`; the freedesktop.org home trash on Linux, with its `.trashinfo`), else its drive's existing Trash (`.Trashes/<uid>`; `.Trash/<uid>`, `.Trash-<uid>`), else deleted. A filesystem without exclusive rename refuses and retains the copy, never falling back to a racy replacing rename or deletion. `ProState::trash` holds the home Trash; tests point it at a fixture (never the real one). |
 | `config.rs` | Portable agent configuration export/import, full overlay prevalidation and staged merge before return mutations, scoped environment-omission diagnostics and destination connection identity preservation. |
 
 One recorded holder and epoch controls shared writes. **Laptop first (D1):** a
@@ -221,27 +224,62 @@ checks before copies. Oversized preparation refuses before changing the project.
 
 Cloud discovery is independent of power state and the obsolete global projects
 folder. `GET /api/v1/pro/projects` returns `{projects,error}`; each row has
-`workspace_id`, `name`, `host_id`, `host_alias`, `local_root`, `available`, and
-`error`. Refreshes are serialized, cached for 30 seconds, bounded to ten seconds,
-eight workers and 128 rows. They use ordinary cached worker GETs: no wake intent,
+`workspace_id`, `name`, `host_id`, `host_alias`, `local_root`, `destination_saved`, `available`, and
+`error`. `host_id`/`host_alias` are null for account catalog rows: display metadata
+never guesses the holder's kind. Refreshes are serialized, cached for 30 seconds,
+bounded to ten seconds and 128 rows/pages. Exact `project_catalog:1` capability
+selects the account's immutable acknowledged-checkpoint catalog. Hidden/internal
+workspaces publish `project.visible:false`; invalid names omit that optional
+metadata. Missing legacy capability or initial catalog 404 uses ordinary cached
+worker GETs (at most eight workers). A negotiated empty catalog never restores
+stale worker rows; any other failure retains remembered rows/destinations. No wake intent,
 mkdir, Git fetch, workspace registration or baton mutation. The worker's explicit
 `cloud_internal` setup-workspace marker excludes provider-login scratch projects
 from both discovery and automatic mirroring.
 
-`POST /api/v1/pro/projects/open` accepts `{workspace_id,destination_root?,expected_account_id,expected_endpoint}` and
-returns `{workspace_id,root,name}`. A failure answers 400 `{error,code,error_code}`: `error` is diagnostic text
-(not a contract), `code` the shared transfer category (`routes::error_code`), and `error_code` the additive stable
-reason the native app maps to its own words (a timeout is 504 `{error,error_code:"timed_out"}`). The codes are
-`folder_not_empty`, `folder_nested` (inside another project or Git repository), `folder_missing`, `folder_moved`
-(the saved folder was replaced), `folder_unusable` (not an absolute real, writable directory), `folder_required`
-(a folder must be chosen first), `folder_mismatch` (differs from the saved folder), `busy` (mid-step in the cloud),
-`owned_elsewhere`, `privacy` (the project stays on its device), `account_changed`, `other_account`, `signed_out`,
-`unavailable`, `not_a_project`, `limit_reached`, `return_window_ended` (the plan ended and the time to bring its
-work home has passed) and `failed` (anything else). Each is tagged where it is raised (`projects.rs` `Refused`);
-an engine failure falls back to its category (`open_error_code`). The native shell supplies the chosen final
-folder; webview arguments contain only a workspace ID. A fresh folder must
-already exist, be writable and empty, and lie outside another project/repository.
-The selection is checked before cloud hand-back and immediately before install.
+`POST /api/v1/pro/projects/copy` requires `copy_version:1` beside
+`{workspace_id,destination_root?,expected_account_id,expected_endpoint}`. The
+acknowledgment repeats `copy_version:1`, `state:local_copy|owned_local`,
+`workspace_id`, `root` and `name`; a completed copy also carries its immutable
+checkpoint, truthful `git_staging` report and kept-file count. `/projects/open`
+returns 426 `copy_upgrade_required`; clients must never fall back to it. Opening
+an already owning local project preserves its work without demotion or download.
+Copy downloads an account read grant, stages only project files/portable Git and
+its identity marker, and changes neither execution owner nor preferred home.
+A failed copy retains its exact pending checkpoint and journal for retry. A saved
+folder is reused when `destination_saved` is true, even before `local_root` is
+ready. Fresh folders must already exist, be writable and empty, outside another
+project/repository. No profiles, global agent configuration or sessions restore
+on this path. Copy files are never automatically published.
+
+`POST /api/v1/pro/projects/takeover` requires
+`{workspace_id,expected_account_id,expected_endpoint,expected_epoch}`. Only a
+completed inode/account-bound local copy may request the existing validated
+account move. Ordinary chat/terminal input continues at the current owner and
+never asks for a move. An owned bounded task records a unique explicit intent,
+waits for drain/release, then uses the normal leased hydration. Failed old intents
+cannot clear a newer one. Copy enrollment and the old-daemon `legacy_pending`
+fence retire only after the file transaction committed, under `ImportGuard`
+through durable `SettingUp`; failed role persistence restores both restrictions.
+Copied projects never resume, renew/acquire in background, publish, advertise
+phone readiness or enter lazy return. A persisted explicit pending takeover may
+resume its own interrupted move; ordinary passive owner reads do not admit one.
+
+Workspace list/status rows expose additive `local_copy` when enrolled:
+`{state:ready|pending|taking_over|recovery_needed,ready,checkpoint?,owner_epoch?}`.
+Ready copy roles retain the latest authenticated Baton epoch for explicit Take
+over; passive reads refresh it under account-generation/configuration admission.
+List omits it
+for ordinary projects; status uses null. `recovery_needed` explicitly means the
+independent enrollment survived missing/damaged role metadata. The capped
+`copy-authority.json` latch is persisted before role state, survives sign-out and
+ordinary state corruption; unreadable enrollment conservatively fences known
+registered/Pro projects. An absent latch preserves free behavior. Execution/file
+mutation remains restrictive; local-copy file editing needs its separate future
+admission, never an execution grant. Error bodies retain stable `error_code`
+reason categories (`folder_*`, account/privacy/availability failures); unsupported
+copy capability is 426, bounded copy timeout is 504 `timed_out`.
+
 Recorded directory identity prevents missing/replaced folders from being silently
 recreated. The local configure request carries `account_id`: it is required
 whenever execution is negotiated (every current device and worker
@@ -254,50 +292,15 @@ remain pinned to their saved folder. Old `import_roots` entries migrate only to
 pending-ID fences, never to permission to import. A partially registered legacy
 project needs explicit selection of its original folder before recovery.
 
-**Who a project returns to.** `lazy_handback` returns a project to this computer when
-this installation is the policy's preferred one (`execution::preferred_here`; the
-account sets `preferred_installation_id` to the latest device that acquired, and
-never refuses an acquire for not being preferred, only `held`) OR when the user
-opened the project here and it is not held here yet (`execution::opened_here`, the
-in-memory `ProState.opened_here` set). `pro::note_opened` inserts: `POST
-/workspaces` for a project that already existed (a registered root, the id a
-folder's marker names, a moved folder; never a freshly minted id or a local
-duplicate) and `POST /workspaces/{id}/open` while ownership is not `Local`.
-`execution::accept` success (both protocol versions) and sign-out remove it. So the
-project comes back to the latest computer that had it, and opening it on another
-of the user's computers takes it over once the first is idle. A live device
-holder keeps the existing `Remote` handling ("on your other computer"): the flag
-stays set, and the moment that lease lapses (or the holder releases) the next pass
-pulls it. The settle rule for moving live cloud work is unchanged, and the pull is
-the ordinary hydrate: kept-both, and with no shadow every differing local file is
-kept as `.mine-…` while local-only files stay.
-
-**Acting brings the work to you** (`moves.rs`; contract in
-[HANDOFF](../../../chimaera-link/HANDOFF.md#acting-brings-the-work-to-you)).
-Opening a project on another computer views it; the first chat command or
-typing there (the viewer relay, `session_proxy::relay`, on a `device-` route)
-asks the account to move it (`POST /v2/baton/{w}/move`), holds that input,
-says `{"type":"bringing","to":"here"}`, and once this computer took the epoch
-(`hydrate`, as a return; the account reserves the next acquisition for it)
-delivers the input to the resumed session (`ws::deliver_held`) and closes the
-socket quietly. The holder sees `move_to` in its renewal answer
-(`engine::reconcile_generation` → `moves::consider`, only while `Local`):
-its own user's last unscoped input (`ws.rs` → `acted_here`) after the request
-claims (posts `move` naming itself); otherwise `hand_over` waits for
-`engine::at_pause` (plain shells never count) and runs the same owned clean
-flush as `/pro/handoff`; a failed flush recovers here and claims. Its views
-then say `moved` with `other:true` (`ws::classify_pause`, `owner_kind`). A
-holder whose release nobody took (the request withdrawn or lapsed:
-`moves::abandoned`) takes its own released epoch back in the lease loop. A
-phone's request (`move_reason:"phone"`) is answered the same way by the
-computer the account named, from `reconcile` (`moves::answer`), without the
-settle gate; the lazy return pass leaves a project being brought here alone
-(`moves::pulling`). The passive read adds `?ready=1&power=…` when this
-computer could take the project (`moves::watch_query`). A conversation that
-arrived and was not used yet still moves on: a chat resumed without a fork
-reports its native id only with its first turn, so the ledger keeps the id it
-was resumed from until then (`ledger::snapshot`); without it the handover
-could not export it (and a restart would have lost its history).
+**Who execution returns to.** Existing executing projects retain their preferred
+installation/lazy-return policy. Opening a project on another computer creates a
+copy and neither inserts an opened-here hint nor changes that policy. Explicit
+Take over uses `moves::take_over_here`; the holder still learns `move_to`, drains
+at a safe pause and may keep its work if its own user acted after the request.
+Phone requests target only eligible executors, never ordinary local copies.
+Ordinary viewer input is forwarded to the current owner, including sleeping-owner
+wake behavior; `session_proxy` does not submit account moves. The native
+conversation identity still remains in the ledger until its first resumed turn.
 
 Normal lazy return only handles registered projects without a pending adoption.
 Moving live cloud work waits for the settle gate (awake on power for five
@@ -418,7 +421,9 @@ none, so it would be deleted).
 (`mine`, `cloud`: `{size, changed_at, text, binary?, too_large?}`, text up to
 512 KiB of UTF-8, `cloud` null when deleted).
 `POST …/kept/resolve {mine_path, choice}` settles one recorded pair:
-`use_mine` renames the sibling over the file (a deleted file comes back),
+`use_mine` renames the sibling over the file (a deleted file comes back), except
+potentially shortened basenames (`pair.can_use_mine:false`), which require manual
+recovery rather than inferring a target even when a prefix neighbor exists;
 `use_cloud` moves the sibling to the Trash (`trash::discard`: a rename
 through the pair's directory descriptor, so the path fences are unchanged;
 deleted only where no Trash on its drive takes it), `keep_both` moves
@@ -432,9 +437,13 @@ copies included (they keep their `.mine-…` names). Refusals are
 `.git`), `gone` (`use_mine` with the copy no longer there), `not_here`
 (another owner, arriving, or leaving), `busy` (the project's cache lock held
 past ten seconds), `folder_unavailable`, `failed`. Choices hold the project's
-cache lock (serialized with mirror passes), update `kept_both`/`kept_paths`,
-persist, and mark git status dirty; a listing settles recorded copies that are
-gone or no longer plain files. The report ends when nothing waits.
+cache and configuration reservations (serialized with mirror passes), update
+`kept_both`/`kept_paths`, persist, and mark git status dirty. Listings retain
+the same reservations through scanning and settlement, so an older scan cannot
+clear a newer return's report. Mutation parents are opened beneath the verified
+root descriptor and checked again before effects, rather than reopened from an
+untrusted root path. A listing settles recorded copies that are gone or no longer
+plain files. The report ends when nothing waits.
 A baseline file absent from the incoming snapshot is deleted only when the
 manifest's additive `left_out` inventory (≤4096 paths the sender omitted by
 policy, size, symlink, credential content or `.chimaeraignore`) is present and
@@ -516,3 +525,5 @@ remain prerequisites to enabling selected-project secrets.
 Snapshot failures emit only a fixed operation phase, fixed error category and clean/snapshot boolean, including failures recovered by resuming an idle session. Recovery does not turn that failure into a successful handoff; response and retry behavior are unchanged.
 
 Mirror helpers require known Git 2.36 or newer and explicitly harden committed objects, refs and pack metadata with full fsync. A failed local shadow fetch only becomes eligible for repair when strict object validation confirms a missing or damaged object in the existing shadow; healthy divergence and ordinary transport failures retain their failure. Incoming and replacement object graphs must pass complete strict Git validation. The previous working-tree baseline is extracted before replacement. Both replacement and preserved evidence files are boundedly fsynced before the final authority check and swap. The entire damaged repository, including unpublished refs, reflogs and objects, is retained in one fixed same-volume quarantine; a second replacement cannot overwrite it. An interrupted swap with a missing current shadow uses only the preserved previous repository as its local baseline and rebuilds from the newly authenticated incoming snapshot. Per-workspace owned cache guards serialize snapshot, preflight fetch and hydration without blocking other projects; weak registry entries retain the same mutex while detached cleanup holds it. Managed Git process-group cleanup retains the guard and child capacity until observed quiescence; unknown cleanup keeps only that workspace unavailable for the daemon lifetime. The blocking rebuild cleanup and finalizer retain the guard across caller cancellation, and final replacement also holds configuration exclusion while checking exact ownership and synchronizing directories. No user repository ref or forced publication is involved.
+
+Owner presentation never infers a peer kind from an opaque holder or the current daemon's role. Refusals carry `owner:null` when unknown; an explicit computer move remains named. Unknown stopped-session destinations use the existing `paused` frame with additive `reason:"elsewhere"`, so older clients stay neutral rather than defaulting a new moved destination to cloud. Local arrival/role and authenticated route aliases retain their known labels.

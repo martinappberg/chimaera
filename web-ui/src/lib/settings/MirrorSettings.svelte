@@ -5,6 +5,7 @@
   import { copyIssue, projectCopiesSetupLine, projectCopyError, projectPlace } from "../pro/presentation";
   import { computerSteps, proposedSetup, settleProposal, type ProposalDecision } from "../pro/profile";
   import { proMirrorStatus, proSetNeverMirror, type MirrorStatus, type MirrorWorkspace } from "../net/native";
+  import { stagingPresentation } from "../pro/projectCopy";
   import { requestKeptReview } from "../pro/keptReviews.svelte";
   let { visible = true, recoveryOnly = false }: { visible?: boolean; recoveryOnly?: boolean } = $props();
   let status = $state<MirrorStatus | null>(null);
@@ -95,6 +96,7 @@
   {#if status?.workspaces.length === 0}<p class="hint">No project copies to show yet.</p>{/if}
   {#each status?.workspaces ?? [] as workspace (workspace.workspace_id)}
     {@const steps = computerSteps(workspace.profile)}
+    {@const staging = stagingPresentation(workspace.git_staging ?? workspace.mirror?.git_staging)}
     <details>
       <summary><span class="title">{workspace.name}</span><span class="hint">{projectPlace(workspace)}</span></summary>
       <div class="project">
@@ -125,6 +127,12 @@
             <ul>{#each steps as step, index (index)}<li>{step}</li>{/each}</ul>
           </div>
         {/if}
+          {#if staging !== null}
+            <div class="staging" role="status"><p class="hint">{staging.text}</p>
+              {#if staging.paths.length}<ul>{#each staging.paths as path,index (index)}<li>{path}</li>{/each}</ul>{/if}
+              {#if staging.recovery !== null}<p class="hint">Git recovery reference: <code>{staging.recovery}</code></p>{/if}
+            </div>
+          {/if}
         {#if workspace.mirror}
           {#if workspace.mirror.last_mirrored_at}<p class="hint">Last copied {new Date(workspace.mirror.last_mirrored_at * 1000).toLocaleString()}</p>{/if}
           {#if workspace.mirror.kept_both}<div class="kept-row"><p class="hint kept" role="status">{keptBoth(workspace.mirror)}</p><button class="link" onclick={() => requestKeptReview(workspace.workspace_id)}>Review</button></div>{/if}
@@ -167,6 +175,9 @@
   .steps { display: flex; flex-direction: column; gap: 6px; }
   .steps p { margin: 0; }
   .steps ul { margin: 0; padding-left: 18px; font-family: var(--mono); font-size: var(--text-xs); overflow-wrap: anywhere; user-select: text; }
+  .staging { overflow-wrap: anywhere; }
+  .staging p { margin: 0; }
+  .staging ul, .staging code { font-family: var(--mono); font-size: var(--text-xs); user-select: text; }
   .steps li + li { margin-top: 4px; }
   @media (pointer: coarse) { summary, .btn, .check { min-height: 40px; } .btn { padding: 9px 12px; } }
 </style>

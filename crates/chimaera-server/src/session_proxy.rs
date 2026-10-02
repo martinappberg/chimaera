@@ -1569,11 +1569,8 @@ const DOUBTFUL_READY: Duration = if cfg!(test) {
 /// viewer's socket is this relay's whole answer. A transport without the
 /// mark leaves the relay on the path above, whatever the scope probe said.
 ///
-/// When the owner is another of the user's computers, that first input
-/// instead brings the work here (`pro::bring_here`): it is held while the
-/// other computer finishes its step and hands the project over, then
-/// delivered once to the session running on this computer, or refused when
-/// the other computer kept it.
+/// Ordinary input stays with the current owner. The separate explicit Take
+/// over route changes execution placement; this relay never requests a move.
 pub(crate) async fn socket(
     state: &Arc<AppState>,
     id: &str,
@@ -1755,19 +1752,6 @@ impl Link<'_> {
         }
         (text.to_owned(), false)
     }
-    /// Whether acting here brings the work here: the owner is another of the
-    /// user's computers (a `device-` route) and this viewer may type.
-    fn movable(&self) -> bool {
-        !self.read_only && self.route.host_id.starts_with("device-")
-    }
-    /// The additive status while the work comes here, once per request.
-    async fn bringing(&self, downstream: &mut axum::extract::ws::WebSocket) -> Result<()> {
-        bounded_send(
-            downstream,
-            Down::Text(json!({"type":"bringing","to":"here"}).to_string().into()),
-        )
-        .await
-    }
     /// Input that arrived while the work is coming here and did not fit what
     /// is already held: not sent, and said so.
     async fn refuse_bringing(
@@ -1880,8 +1864,8 @@ enum Viewer {
     /// The user acting: a terminal's typing (its binary frames; text frames
     /// are grid control), or one of a chat's acting commands, which are
     /// exactly the daemon's own list (`activity::is_interaction`). Held,
-    /// and the only thing that wakes a sleeping owner or brings the work to
-    /// this computer. `client_id`: the id a send was made under.
+    /// and the only thing that wakes a sleeping owner. Ordinary input stays
+    /// with that owner. `client_id`: the id a send was made under.
     Input { client_id: Option<String> },
     /// One of a chat's seven settings commands. Held, and delivered only in
     /// front of this viewer's next input: it wakes nothing, moves nothing,
@@ -2177,8 +2161,8 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
         bytes: 0,
         budget: &HELD_BUDGET,
     };
-    // Acting here is bringing the work here: held input waits for that, not
-    // for the current owner.
+    // Ordinary input stays with the owner. This relay does not initiate a pull;
+    // execution moves only through the separate explicit Take over action.
     let mut pull: Option<tokio::sync::watch::Receiver<crate::pro::MoveOutcome>> = None;
     let mut upstream: Option<Box<Upstream>> = None;
     let mut ready = false;
@@ -2461,14 +2445,8 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                         _ => {}
                     }
                     let input = matches!(what, Viewer::Input { .. });
-                    // Acting on a project another of the user's computers runs
-                    // brings the work here; looking never does.
-                    if input && pull.is_none() && link.movable() {
-                        if let Some(receiver) = crate::pro::bring_here(link.state, &link.workspace) {
-                            pull = Some(receiver);
-                            if link.bringing(downstream).await.is_err() { return; }
-                        }
-                    }
+                    // Ordinary input stays with this socket's current owner.
+                    // Only the explicit takeover route starts a move.
                     if pull.is_some() && (link.chat || input) {
                         // While the work is coming, nothing a chat sends goes
                         // to the owner it is leaving: input and settings wait
@@ -3037,13 +3015,13 @@ mod tests {
         Down::Text(frame.to_string().into())
     }
 
-    /// What the relay wakes a machine for and brings work here for is the
+    /// What the relay wakes the current owner for is the
     /// daemon's own list of acting commands and a terminal's typing, nothing
     /// else. The seven settings are held without either. The thinking
     /// preference a chat pushes by itself, a read, `cancel_send` and a
     /// command it cannot sort are neither.
     #[test]
-    fn only_acting_input_wakes_or_brings_work_here() {
+    fn only_acting_input_wakes_the_current_owner() {
         let input =
             |frame: Value| matches!(Viewer::of(true, &chat_frame(frame)), Viewer::Input { .. });
         for frame in [

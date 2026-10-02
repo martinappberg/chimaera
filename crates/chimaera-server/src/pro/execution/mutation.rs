@@ -15,6 +15,83 @@ pub(crate) struct Guard {
     workspace: String,
 }
 
+/// Copy installation counts toward stop/replacement drainage but never admits
+/// execution or a publication. Its immutable pending checkpoint is its scope.
+pub(in crate::pro) struct CopyGuard {
+    _commit: Guard,
+    _configuration: tokio::sync::OwnedMutexGuard<()>,
+    workspace: String,
+    generation: u64,
+    checkpoint: super::wire::Checkpoint,
+    root: std::path::PathBuf,
+}
+impl CopyGuard {
+    pub(in crate::pro) fn check(&self, state: &AppState) -> anyhow::Result<()> {
+        let matching = lock(&state.pro.preferences)
+            .get(&self.workspace)
+            .filter(|preference| {
+                !preference.never_mirror
+                    && !preference.privacy_pending
+                    && !preference.execution_launch_pending
+                    && !preference.execution_groups_overflow
+            })
+            .and_then(|preference| preference.copy.as_ref())
+            .is_some_and(|copy| {
+                !copy.takeover_requested && copy.pending.as_ref() == Some(&self.checkpoint)
+            });
+        if generation(state) != self.generation
+            || !matching
+            || crate::pro::project_copy::live_processes(state, &self.workspace)
+            || super::unclean(state, &self.workspace)
+            || super::setup::active(state, &self.workspace)
+            || !crate::pro::project_copy::copy_only(state, &self.workspace)
+            || !crate::pro::projects::account_matches(state, &self.workspace)
+        {
+            return Err(Changed.into());
+        }
+        Ok(())
+    }
+    /// Blocking filesystem callers revalidate the selected inode too.
+    pub(in crate::pro) fn check_files(&self, state: &AppState) -> anyhow::Result<()> {
+        self.check(state)?;
+        crate::pro::projects::check_copy_destination(state, &self.workspace, &self.root)?;
+        self.check(state)
+    }
+}
+
+pub(in crate::pro) async fn begin_copy(
+    state: &Arc<AppState>,
+    workspace: &str,
+    generation: u64,
+    checkpoint: super::wire::Checkpoint,
+    root: std::path::PathBuf,
+) -> anyhow::Result<CopyGuard> {
+    let configuration = state.pro.configuration.clone().lock_owned().await;
+    super::receipt::validate(&checkpoint)?;
+    let commit = {
+        let mut commits = lock(&state.pro.execution.commits.0);
+        if commits.get(workspace).copied().unwrap_or(0) > 0 || commits.values().sum::<usize>() >= 64
+        {
+            return Err(Changed.into());
+        }
+        *commits.entry(workspace.to_owned()).or_default() += 1;
+        Guard {
+            commits: state.pro.execution.commits.0.clone(),
+            workspace: workspace.to_owned(),
+        }
+    };
+    let guard = CopyGuard {
+        _commit: commit,
+        _configuration: configuration,
+        workspace: workspace.to_owned(),
+        generation,
+        checkpoint,
+        root,
+    };
+    guard.check(state)?;
+    Ok(guard)
+}
+
 /// Return installation belongs to its admitted account/epoch through filesystem
 /// waits and the durable setup transition. Configuration replacement is
 /// serialized; stop/replacement also sees the counted commit until its owned
@@ -55,6 +132,27 @@ impl ImportGuard {
             self.workspace.clone(),
             Ownership::SettingUp { epoch: self.epoch },
         );
+        Ok(())
+    }
+
+    /// The copy-role retirement follows a durable setup transition. Validate
+    /// that exact transition without admitting new filesystem or execution work.
+    pub(in crate::pro) fn check_setting_up(&self, state: &AppState) -> anyhow::Result<()> {
+        let managed = super::managed(state, &self.workspace);
+        let proofs = lock(&state.pro.execution.proofs);
+        let ownership = lock(&state.pro.ownership);
+        if self.generation != generation(state)
+            || !matches!(ownership.get(&self.workspace),Some(Ownership::SettingUp {epoch}) if *epoch==self.epoch)
+            || (managed
+                && !proofs.get(&self.workspace).is_some_and(|proof| {
+                    !proof.stopped
+                        && proof.generation == self.generation
+                        && proof.epoch == self.epoch
+                        && proof.deadline.valid()
+                }))
+        {
+            return Err(Changed.into());
+        }
         Ok(())
     }
 
@@ -142,6 +240,50 @@ impl Drop for Guard {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn local_dispatch_owner_fixture(state: &AppState, workspace: &str, epoch: u64) {
+    lock(&state.pro.ownership).insert(workspace.to_owned(), Ownership::Local { epoch });
+}
+
+/// An asynchronous daemon send retains its original account and exact ownership.
+/// Local devices still use ownership alone; workers additionally need a live proof
+/// when begin() reserves the final dispatch. No presentation phase is authority.
+#[derive(Clone)]
+pub(crate) struct Dispatch {
+    workspace: String,
+    generation: u64,
+    ownership: Option<Ownership>,
+}
+impl Dispatch {
+    pub(crate) fn capture(state: &AppState, workspace: &str) -> anyhow::Result<Self> {
+        let captured = Self {
+            workspace: workspace.to_owned(),
+            generation: generation(state),
+            ownership: lock(&state.pro.ownership).get(workspace).cloned(),
+        };
+        captured.check(state)?;
+        Ok(captured)
+    }
+    fn check(&self, state: &AppState) -> anyhow::Result<()> {
+        if self.generation != generation(state)
+            || lock(&state.pro.ownership).get(&self.workspace) != self.ownership.as_ref()
+            || !crate::pro::may_execute(state, &self.workspace)
+            || self.generation != generation(state)
+        {
+            return Err(Changed.into());
+        }
+        Ok(())
+    }
+    pub(crate) fn begin(&self, state: &AppState) -> anyhow::Result<Option<Guard>> {
+        self.check(state)?;
+        let guard = begin_launch(state, &self.workspace)?;
+        // Reservation orders subsequent stop/replacement against this send. A
+        // transition between check and reservation must not refresh the intent.
+        self.check(state)?;
+        Ok(guard)
+    }
+}
+
 /// Count the final synchronous spawn/registration window so a clean transfer
 /// cannot mistake a not-yet-registered child for an empty workload. Ordinary
 /// unconfigured local sessions remain inert; device work needs ownership alone.
@@ -151,6 +293,13 @@ pub(crate) fn begin_launch(state: &AppState, workspace: &str) -> anyhow::Result<
     }
     let generation = generation(state);
     let managed = super::managed(state, workspace);
+    let tracked = managed
+        || (lock(&state.pro.runtime).is_some()
+            && (lock(&state.pro.preferences)
+                .get(workspace)
+                .is_some_and(|p| p.account.is_some())
+                || lock(&state.pro.adoptions).contains_key(workspace)
+                || lock(&state.pro.opened_here).contains(workspace)));
     let worker = super::worker(state);
     let installing = lock(&state.pro.installing).contains(workspace);
     let proofs = lock(&state.pro.execution.proofs);
@@ -158,8 +307,11 @@ pub(crate) fn begin_launch(state: &AppState, workspace: &str) -> anyhow::Result<
     if generation != self::generation(state) {
         return Err(Changed.into());
     }
+    if crate::pro::project_copy::copy_only(state, workspace) {
+        return Err(Changed.into());
+    }
     match ownership.get(workspace) {
-        None if !managed => return Ok(None),
+        None if !tracked => return Ok(None),
         None if !worker => {}
         Some(Ownership::Local { .. } | Ownership::SettingUp { .. }) => {}
         Some(Ownership::AwaitingVerification { .. }) if !worker && !installing => {}
@@ -199,6 +351,9 @@ pub(crate) fn generation(state: &AppState) -> u64 {
     state.pro.generation.load(Ordering::Acquire)
 }
 pub(crate) fn capture(state: &AppState, workspace: &str) -> anyhow::Result<Option<(u64, u64)>> {
+    if crate::pro::project_copy::copy_only(state, workspace) {
+        return Err(Changed.into());
+    }
     // A device's own local commands are admitted by ownership alone (laptop
     // first); only a worker ties them to its live lease epoch.
     if !super::managed(state, workspace) || !super::worker(state) {
@@ -223,6 +378,9 @@ pub(crate) fn begin(
     epoch: u64,
     generation: u64,
 ) -> anyhow::Result<Guard> {
+    if crate::pro::project_copy::copy_only(state, workspace) {
+        return Err(Changed.into());
+    }
     // Proof -> ownership is the same order as lease validation. Holding both
     // through the reservation orders admission against stop and epoch changes.
     let proofs = lock(&state.pro.execution.proofs);

@@ -144,6 +144,8 @@ impl JsonlChild {
         for k in env_remove {
             cmd.env_remove(k);
         }
+        // Startup-only supervisor input is consumed by the daemon, never an agent.
+        cmd.env_remove("CHIMAERA_SUPERVISOR_CLEANUP_FD");
         let mut child = cmd
             .spawn()
             .with_context(|| format!("failed to spawn {bin}"))?;
@@ -580,5 +582,29 @@ mod tests {
             assert!(Instant::now() < deadline, "the background sleep survived");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod supervisor_channel_tests {
+    use super::*;
+    #[tokio::test]
+    async fn startup_cleanup_marker_never_reaches_agent_child() {
+        let mut child = JsonlChild::spawn(
+            "/bin/sh",
+            &[
+                "-c".into(),
+                r#"printf '{"marker":"%s"}\n' "${CHIMAERA_SUPERVISOR_CLEANUP_FD-absent}""#.into(),
+            ],
+            &std::env::temp_dir(),
+            &[("CHIMAERA_SUPERVISOR_CLEANUP_FD".into(), "0".into())],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            child.recv(Duration::from_secs(5)).await.unwrap().unwrap()["marker"],
+            "absent"
+        );
+        child.shutdown(Duration::from_secs(1)).await.unwrap();
     }
 }

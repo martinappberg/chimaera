@@ -504,7 +504,17 @@ async fn graceful_same_boot_restart_does_not_fence_but_a_crash_probes_survivors(
     lock(&state.session_workspaces).insert(agent.id.clone(), "w-a".into());
     intent.registered(agent.id.clone());
     tokio::time::timeout(Duration::from_secs(3), async {
-        while lock(&state.pro.preferences)["w-a"].execution_launch_pending {
+        loop {
+            let saved = std::fs::read(state.pro.root.join("state.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+            if saved.as_ref().is_some_and(|value| {
+                value["preferences"]["w-a"]["execution_launch_pending"] != true
+                    && value["preferences"]["w-a"]["execution_groups"]
+                        == serde_json::json!([agent.pid.unwrap()])
+            }) {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })

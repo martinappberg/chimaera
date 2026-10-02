@@ -25,9 +25,13 @@ fn configured_notify(config: &Path) -> anyhow::Result<Option<Vec<String>>> {
     let contents = match crate::doc_check::read_regular(config, CONFIG_CAP) {
         Ok(Some(bytes)) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        result => anyhow::bail!("cannot read bounded Codex config: {result:?}"),
+        _ => anyhow::bail!("cannot read bounded Codex config"),
     };
-    let config: toml::Value = toml::from_str(std::str::from_utf8(&contents)?)?;
+    let text = std::str::from_utf8(&contents)
+        .map_err(|_| anyhow::anyhow!("invalid Codex config encoding"))?;
+    // TOML errors retain the full source, which can contain credentials.
+    let config: toml::Value =
+        toml::from_str(text).map_err(|_| anyhow::anyhow!("invalid Codex config"))?;
     let Some(notify) = config.get("notify") else {
         return Ok(None);
     };
@@ -75,23 +79,34 @@ pub(crate) async fn codex_home(state: &crate::AppState) -> PathBuf {
     })
 }
 async fn login_codex_home() -> Option<PathBuf> {
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(6),
-        tokio::process::Command::new(crate::launcher::login_shell())
-            .arg("-ilc")
-            .arg("env")
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .output(),
+    let mut command = tokio::process::Command::new(crate::launcher::login_shell());
+    command
+        .arg("-ilc")
+        .arg("printf 'CODEX_HOME=%s\\n' \"${CODEX_HOME-}\"");
+    probe_codex_home(&mut command, std::time::Duration::from_secs(6)).await
+}
+async fn probe_codex_home(
+    command: &mut tokio::process::Command,
+    timeout: std::time::Duration,
+) -> Option<PathBuf> {
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let (success, stdout) = tokio::time::timeout(
+        timeout,
+        crate::cloud::providers::bounded_process_output(command),
     )
     .await
     .ok()?
     .ok()?;
-    env_codex_home(&String::from_utf8_lossy(&output.stdout))
+    if !success {
+        return None;
+    }
+    env_codex_home(std::str::from_utf8(&stdout).ok()?)
 }
-/// `CODEX_HOME` from `env` output (the last assignment wins; rc banners
-/// before it are ignored). Only an absolute path counts.
+/// The last exact assignment wins; login rc banners are ignored. Only an
+/// absolute path counts. The probe prints this variable alone, never `env`.
 fn env_codex_home(env: &str) -> Option<PathBuf> {
     env.lines()
         .rev()
@@ -188,11 +203,9 @@ pub(crate) async fn args_in(
     .await;
     match written {
         Ok(Ok(path)) => crate::launcher::codex_notify_args(&path),
-        result => {
-            tracing::warn!(
-                ?result,
-                "Codex identity hook unavailable; preserving user notify"
-            );
+        _ => {
+            // Parser and filesystem errors can retain config text or private paths.
+            tracing::warn!("Codex identity hook unavailable; preserving user notify");
             Vec::new()
         }
     }
@@ -392,5 +405,113 @@ mod tests {
         assert_eq!(env_codex_home("CODEX_HOME=relative\n"), None);
         assert_eq!(env_codex_home("PATH=/bin\n"), None);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn malformed_notify_errors_never_retain_config_contents() {
+        let dir = std::env::temp_dir().join(format!(
+            "codex-config-error-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "api_key = \"synthetic-private-token\"\nnotify = [broken\n",
+        )
+        .unwrap();
+        let error = configured_notify(&path).unwrap_err();
+        assert_eq!(error.to_string(), "invalid Codex config");
+        for cause in error.chain() {
+            assert!(!format!("{cause:?} {cause}").contains("synthetic-private-token"));
+        }
+        assert!(!format!("{error:?} {error:#}").contains("synthetic-private-token"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn login_home_probe_is_bounded_and_requires_success() {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", "printf 'CODEX_HOME=/tmp/codex-home\\n'"]);
+        assert_eq!(
+            probe_codex_home(&mut command, std::time::Duration::from_secs(2)).await,
+            Some(PathBuf::from("/tmp/codex-home"))
+        );
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", "printf 'CODEX_HOME=/tmp/codex-home\\n'; exit 1"]);
+        assert!(
+            probe_codex_home(&mut command, std::time::Duration::from_secs(2))
+                .await
+                .is_none()
+        );
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", "head -c 70000 /dev/zero"]);
+        assert!(
+            probe_codex_home(&mut command, std::time::Duration::from_secs(2))
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn login_probe_cancellation_timeout_and_exit_stop_descendants() {
+        for mode in ["cancel", "timeout", "exit"] {
+            let dir = std::env::temp_dir().join(format!(
+                "codex-probe-group-{}",
+                chimaera_core::generate_token()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let pidfile = dir.join("pid");
+            let tail = if mode == "exit" { "exit 0" } else { "wait" };
+            let script = format!(
+                "sleep 30 & printf '%s' \"$!\" > {}; {tail}",
+                quote(&pidfile.to_string_lossy())
+            );
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command.args(["-c", &script]);
+            let timeout = if mode == "timeout" {
+                std::time::Duration::from_millis(500)
+            } else {
+                std::time::Duration::from_secs(3)
+            };
+            let task = tokio::spawn(async move { probe_codex_home(&mut command, timeout).await });
+            let pid = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if let Ok(contents) = std::fs::read_to_string(&pidfile) {
+                        if let Ok(pid) = contents.parse::<u32>() {
+                            break pid;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            if mode == "cancel" {
+                task.abort();
+            }
+            let result = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+                .await
+                .unwrap();
+            if mode != "cancel" {
+                assert!(result.unwrap().is_none());
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    // A zombie is stopped; some CI PID1s reap slowly.
+                    let running = std::process::Command::new("/bin/ps")
+                        .args(["-o", "stat=", "-p", &pid.to_string()])
+                        .output()
+                        .unwrap();
+                    let stat = String::from_utf8_lossy(&running.stdout);
+                    if stat.trim().is_empty() || stat.trim().starts_with('Z') {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 }

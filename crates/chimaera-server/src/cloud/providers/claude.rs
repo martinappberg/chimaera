@@ -107,7 +107,7 @@ pub(super) async fn login(
     };
     let flow = async {
         tokio::select! {
-            status = child.child.wait() => {
+            status = child.wait() => {
                 return if status.map_err(|_| "sign_in_failed")?.success() { Ok(()) } else { Err("sign_in_failed") };
             }
             code = receiver.recv() => {
@@ -120,7 +120,7 @@ pub(super) async fn login(
             }
         }
         crate::lock(&attempt.input).take();
-        let status = tokio::time::timeout(Duration::from_secs(30), child.child.wait())
+        let status = tokio::time::timeout(Duration::from_secs(30), child.wait())
             .await
             .map_err(|_| "sign_in_not_confirmed")?
             .map_err(|_| "sign_in_failed")?;

@@ -11,6 +11,7 @@ default = []
 fixtures = ["dep:axum", "dep:clap"]
 
 [dependencies]
+chimaera-core = { path = "../chimaera-core" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

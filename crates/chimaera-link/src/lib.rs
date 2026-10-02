@@ -1,6 +1,8 @@
 //! Optional device transport. Constructing a client never opens a connection.
 mod bridge;
 mod client;
+pub mod cluster;
+pub use cluster::*;
 mod continuity;
 mod error;
 mod handoff;
@@ -24,3 +26,6 @@ pub mod fake;
 
 #[cfg(feature = "fixtures")]
 mod fake_handoff;
+
+#[cfg(feature = "fixtures")]
+mod fake_cluster;

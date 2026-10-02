@@ -75,6 +75,18 @@ impl Authority {
     }
 }
 impl Accepted {
+    pub(super) fn cleanup_binding(
+        &self,
+        account: &str,
+        workspace: &str,
+        revision: u64,
+        identity: (u64, u64),
+    ) -> bool {
+        self.account_id == account
+            && self.workspace.workspace_id == workspace
+            && self.workspace.revision == revision
+            && self.identity == identity
+    }
     pub fn ack(&self) -> WorkspaceConfigureAck {
         WorkspaceConfigureAck {
             workspace_authority: 1,

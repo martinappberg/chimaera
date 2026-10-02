@@ -77,10 +77,30 @@ pub(super) fn discard(
     root: &Path,
     home: Option<&Path>,
 ) -> std::io::Result<Discarded> {
+    discard_using(dir, name, origin, root, home, rename_new)
+}
+
+fn discard_using(
+    dir: &File,
+    name: &str,
+    origin: &Path,
+    root: &Path,
+    home: Option<&Path>,
+    rename: fn(&File, &str, &Path) -> rustix::io::Result<()>,
+) -> std::io::Result<Discarded> {
     let device = dir.metadata()?.dev();
     for bin in bins(root, home, device) {
-        match into(dir, name, origin, &bin) {
+        match into(dir, name, origin, &bin, rename) {
             Ok(()) => return Ok(Discarded::Trash),
+            // Unsupported exclusive rename is not proof that deletion is
+            // acceptable. Keep the original instead of racing a Trash writer.
+            Err(error)
+                if error
+                    .raw_os_error()
+                    .is_some_and(|code| unsupported(Errno::from_raw_os_error(code))) =>
+            {
+                return Err(error)
+            }
             // Another drive after all (a bind mount), or a Trash that cannot
             // take it: try the next one.
             Err(error) => tracing::debug!(%error, "a Trash could not take a discarded copy"),
@@ -176,7 +196,13 @@ fn top(root: &Path, device: u64) -> Option<PathBuf> {
     Some(top.to_path_buf())
 }
 
-fn into(dir: &File, name: &str, origin: &Path, bin: &Bin) -> std::io::Result<()> {
+fn into(
+    dir: &File,
+    name: &str,
+    origin: &Path,
+    bin: &Bin,
+    rename: fn(&File, &str, &Path) -> rustix::io::Result<()>,
+) -> std::io::Result<()> {
     if bin.personal {
         if let Err(error) = std::fs::DirBuilder::new().mode(0o700).create(&bin.path) {
             if error.kind() != std::io::ErrorKind::AlreadyExists {
@@ -189,7 +215,7 @@ fn into(dir: &File, name: &str, origin: &Path, bin: &Bin) -> std::io::Result<()>
     }
     if cfg!(target_os = "macos") {
         for attempt in 0..ATTEMPTS {
-            match rename_new(dir, name, &bin.path.join(candidate(name, attempt))) {
+            match rename(dir, name, &bin.path.join(candidate(name, attempt))) {
                 Err(Errno::EXIST) => continue,
                 other => return other.map_err(Into::into),
             }
@@ -223,7 +249,7 @@ fn into(dir: &File, name: &str, origin: &Path, bin: &Bin) -> std::io::Result<()>
         let moved = file
             .write_all(record.as_bytes())
             .and_then(|()| file.sync_all())
-            .and_then(|()| rename_new(dir, name, &files.join(&taken)).map_err(Into::into));
+            .and_then(|()| rename(dir, name, &files.join(&taken)).map_err(Into::into));
         match moved {
             Ok(()) => return Ok(()),
             Err(error) => {
@@ -239,17 +265,7 @@ fn into(dir: &File, name: &str, origin: &Path, bin: &Bin) -> std::io::Result<()>
 
 /// Rename `name` in `dir` to `target`, never replacing anything there.
 fn rename_new(dir: &File, name: &str, target: &Path) -> rustix::io::Result<()> {
-    match rustix::fs::renameat_with(dir, name, CWD, target, RenameFlags::NOREPLACE) {
-        // A drive without an exclusive rename (NFS, some network shares): the
-        // name was reserved or found free just before; check once more.
-        Err(error) if unsupported(error) => {
-            if std::fs::symlink_metadata(target).is_ok() {
-                return Err(Errno::EXIST);
-            }
-            rustix::fs::renameat(dir, name, CWD, target)
-        }
-        other => other,
-    }
+    rustix::fs::renameat_with(dir, name, CWD, target, RenameFlags::NOREPLACE)
 }
 
 fn unsupported(error: Errno) -> bool {
@@ -399,6 +415,37 @@ mod tests {
         assert!(!root.join(name).exists());
         // A copy that is already gone is an error, as before.
         assert!(discard(&dir, name, &root.join(name), &root, None).is_err());
+    }
+
+    #[test]
+    fn unsupported_exclusive_trash_rename_preserves_both_original_and_existing_trash() {
+        let folder = Folder::new();
+        let root = folder.0.join("project");
+        let trash = fixture_home_trash(&folder.0);
+        let name = "a.mine-20260929-1412";
+        let target = in_trash(&trash, name);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "previously discarded work").unwrap();
+        std::fs::write(root.join(name), "current local edit").unwrap();
+        let dir = File::open(&root).unwrap();
+        let error = discard_using(
+            &dir,
+            name,
+            &root.join(name),
+            &root,
+            Some(&trash),
+            |_, _, _| Err(Errno::NOTSUP),
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(Errno::NOTSUP.raw_os_error()));
+        assert_eq!(
+            std::fs::read_to_string(root.join(name)).unwrap(),
+            "current local edit"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target).unwrap(),
+            "previously discarded work"
+        );
     }
 
     #[test]

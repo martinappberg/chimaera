@@ -515,16 +515,37 @@ async fn scoped_request(
         let Some(document) = query.get("path").cloned() else {
             return denied(StatusCode::BAD_REQUEST);
         };
-        if let Err(error) = scope.read(&state, document.clone()).await {
-            return outside_read(error);
-        }
+        let generation = crate::pro::mutation::generation(&state);
         let Some(root) = crate::lock(&state.workspaces)
             .get(&scope.workspace_id)
             .map(|workspace| workspace.root)
         else {
             return denied(StatusCode::CONFLICT);
         };
-        return crate::doc_check::check_within(document, root).await;
+        // Pin the project before the separate path proof. Every subsequent
+        // document/target operation is relative to this exact directory inode.
+        let pinned = match crate::doc_check::pin_project(root.clone()).await {
+            Ok(pinned) => pinned,
+            Err(_) => return denied(StatusCode::CONFLICT),
+        };
+        if let Err(error) = scope.read(&state, document.clone()).await {
+            if generation != crate::pro::mutation::generation(&state)
+                || scope.validate(&state).is_err()
+            {
+                return denied(StatusCode::CONFLICT);
+            }
+            return outside_read(error);
+        }
+        let response = crate::doc_check::check_within(document, pinned).await;
+        if generation != crate::pro::mutation::generation(&state)
+            || scope.validate(&state).is_err()
+            || crate::lock(&state.workspaces)
+                .get(&scope.workspace_id)
+                .is_none_or(|workspace| workspace.root != root)
+        {
+            return denied(StatusCode::CONFLICT);
+        }
+        return response;
     }
     if path == "/fs/home" && read {
         let root = crate::lock(&state.workspaces)

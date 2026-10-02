@@ -5435,6 +5435,9 @@
       bind:this={railEl}
     >
       <div class="workspace">
+        {#if projectView && !isNativeShell()}
+          <a class="account-home-link" href="/" aria-label="Back to account Home" title="Back to Home">Home</a>
+        {/if}
         <button
           class="ws-btn"
           class:placeholder={workspace === null && activeWsId === null}
@@ -5982,6 +5985,11 @@
             ? `${getHostLabel()} › ${$computeStatus.self.node}`
             : stripHost}</span
         >
+        {#if workspace?.local_copy !== undefined && isNativeShell() && !isRemoteWindow}
+          {#await import("./lib/pro/ProjectCopyStatus.svelte") then { default: ProjectCopyStatus }}
+            <ProjectCopyStatus workspaceId={workspace.id} onTaken={() => void refreshWorkspaces()} />
+          {:catch}<span>Project controls couldn’t load. Reopen this workspace to try again.</span>{/await}
+        {/if}
         {#if isRemoteWindow && !projectView && $linkRtt !== null && $linkRtt >= LINK_RTT_BADGE_MS}
           <!-- Honest latency signal: on a distant host every keystroke echo
                and UI fetch pays at least this — better named than mysterious
@@ -6264,6 +6272,9 @@
     <!-- Focus-mode session strip: the rail is gone, but the window always
          says where you are. Hidden whenever the rail is visible. -->
     <footer class="strip">
+      {#if projectView && !isNativeShell()}
+        <a class="account-home-link" href="/" aria-label="Back to account Home" title="Back to Home">Home</a>
+      {/if}
       {#if !detachedWindow}
         <!-- Sidebar reveal is the MAIN window's affordance. A detached solo
              window offers no rail at all — it is just its pane; the way back
@@ -6373,6 +6384,11 @@
       <span class="strip-host" class:remote={isRemoteWindow} title={health?.hostname}
         >{stripHost}</span
       >
+      {#if workspace?.local_copy !== undefined && isNativeShell() && !isRemoteWindow}
+        {#await import("./lib/pro/ProjectCopyStatus.svelte") then { default: ProjectCopyStatus }}
+          <ProjectCopyStatus workspaceId={workspace.id} onTaken={() => void refreshWorkspaces()} />
+        {:catch}<span>Project controls couldn’t load. Reopen this workspace to try again.</span>{/await}
+      {/if}
       {#if isRemoteWindow && !projectView && $linkRtt !== null && $linkRtt >= LINK_RTT_BADGE_MS}
         <!-- Detached windows ghost keystrokes like any remote window — they
              get the same honest latency signal. -->
@@ -6826,6 +6842,19 @@
     background: color-mix(in srgb, var(--accent) 55%, var(--edge));
   }
 
+  .account-home-link {
+    display: inline-flex;
+    align-items: center;
+    flex: none;
+    min-height: 28px;
+    padding: 0 5px;
+    color: var(--muted);
+    font-size: var(--text-xs);
+    text-decoration: none;
+    border-radius: 4px;
+  }
+  .account-home-link:hover { color: var(--fg); background: var(--row-hover); }
+  .account-home-link:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
   .workspace {
     display: flex;
     align-items: center;

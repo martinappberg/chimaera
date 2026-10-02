@@ -1,13 +1,12 @@
 # Logical project viewing
 
-Opening a project on another device is a view onto its current owner. It never
-acquires ownership, wakes a worker, releases the home computer, or runs an
-input twice (a client repeats only a chat send, under the id the owner accepts
-at most once). Acting on it can move the work:
-input on another of the user's computers brings the project there, and a
-phone's input while the cloud sleeps may bring it to an online computer
-([HANDOFF](HANDOFF.md#acting-brings-the-work-to-you)). Ordinary SSH and non-Pro
-local windows keep their existing routes.
+Opening a synced project on another computer creates or updates a local copy
+without acquiring ownership, waking a worker or changing its preferred home.
+A passive owner view and ordinary input keep their route to the current owner;
+only explicit Take over moves execution. Copy edits are not automatically
+published. A browser gateway may still apply its separately negotiated sleeping
+worker policy ([HANDOFF](HANDOFF.md#explicit-take-over-moves-execution)). Ordinary
+SSH and non-Pro local windows keep their existing routes.
 
 ## Passive placement
 
@@ -327,18 +326,20 @@ its text, its position or the time.
   carry, and characters that JSON escapes need several bytes each) is
   recorded with its text cut in the middle, never replaced.
 
-What the rule does not cover, stated plainly:
+The guarantee is bounded, and older daemons have narrower semantics:
 
-- A withdrawal is remembered for as long as the conversation's process
-  lives. After that process is replaced (a restart of the daemon, a resume,
-  switching the conversation to its terminal and back), a copy of the
-  withdrawn send that arrives only then is accepted and runs. Holders
-  discard what they hold when its socket closes and answer a cancel for what
-  they still hold, so no copy should outlive a withdrawal.
-- A daemon that is killed after it handed a message to the agent and before
-  it recorded the echo leaves a delivered message whose id it does not know.
-  The client's resend then runs it a second time, or, after two minutes,
-  its withdrawal is answered "withdrawn" although it ran.
+- Current daemons persist up to 128 settled receipt/withdrawal IDs and retain
+  every unresolved ID within the fixed 64-outstanding cap across restart,
+  process replacement and transfer. Once a settled ID ages out of that bounded
+  retention, it no longer fences a late retry.
+- A crash after dispatch but before a durable receipt leaves an uncertain
+  outcome. The daemon answers `send_uncertain`, never automatically repeats it
+  or claims it was withdrawn. This does not promise exactly-once external
+  effects. Queued driver input remains unresolved until `sent`; a queued echo
+  alone does not prove survival across process replacement.
+- Legacy daemons without durable receipts remember withdrawals only for the
+  current process and can repeat input after losing its echo. Clients must not
+  treat that older protocol as the current durable guarantee.
 
 When the machine is awake again for any reason, the keeper attaches every
 socket it kept, on its own, with the remembered authentication. An events
@@ -471,24 +472,12 @@ twice itself; a viewer socket that closes while this relay still holds input
 loses that input here, and the client sends it again by its id at its next
 `ready`.
 
-When the route is a `device-` route (another of the user's computers owns the
-project) and this computer can take it, the first real input instead brings
-the work here: the relay holds it (the same budget), says
-`{"type":"bringing","to":"here"}`, stops forwarding anything a chat sends to
-the owner (input and settings are held for the session here; the rest is
-dropped, a `cancel_send` included, unless it names a held send) and
-hides the owner's `moved`/`paused` frames and its closing socket for this move.
-Once this computer holds the project and its session resumed, what was held
-is delivered once to the local session, in the order the user did it
-(settings included), and the socket closes quietly (the viewer reconnects to
-the session here and its replay carries the message). The whole batch gets
-one wait for that session to start, and once a setting could not be applied
-nothing after it is run: those frames are refused instead.
-When the other computer keeps the work, each held chat command is refused
-with `command_failed`, `reason:"still_working"` and the plain line "Your other
-computer is still working on this. Try again when it pauses." (typing: one
-`read_only` with the same reason); input beyond what is held while the work
-is coming is refused with `reason:"bringing"`. A browser view gets the same
+When the route is a `device-` route, ordinary terminal/chat input is forwarded
+to the current owner. Opening a local copy or typing never requests a move.
+Explicit Take over uses the checked ownership endpoint; only after successful
+acquisition and resume does new input route to the local executor. An owner
+that is still working may refuse the explicit move with `still_working`.
+A browser view gets the same
 `bringing` frame with `to:"computer"` from the account's gateway when its
 action on a sleeping cloud machine is sent to one of the user's computers
 instead; the gateway holds the socket authentication and first input and
@@ -496,14 +485,11 @@ delivers them once to that computer's session, or to the woken cloud machine
 (`waking`) when no computer took the work. Like a keeper it holds only acting
 commands and the seven settings commands while the work is being brought,
 never a view's other frames. Every `read_only` refusal (`reason`:
-`watching`, `elsewhere`, `busy`, `waking`, `bringing`, `still_working`, `reconnecting`) and every HTTP
-`409 {"error":"workspace_owned_elsewhere"}` also carry the additive
-`owner: "cloud" | "computer"`: where the project's work runs now, so a client
-can say "running in the cloud" / "running on your computer" without guessing.
-An owning daemon names its recorded owner (the other machine while another
-owner holds the project — a cloud machine's other owner is the user's
-computer, a computer's is the cloud — else itself); a viewing daemon's relay
-names its route's owner (a `worker-` route is the cloud).
+`watching`, `elsewhere`, `busy`, `waking`, `bringing`, `still_working`, `reconnecting`)
+and HTTP `409 {"error":"workspace_owned_elsewhere"}` may carry the additive
+`owner: "cloud" | "computer" | null`. Only a known typed route or explicit
+placement establishes the label. Opaque holder IDs and this daemon's own role
+do not identify another owner; `null` stays neutral in the client.
 
 A session with no process where a viewer asks is not an exit, and its owning
 daemon says why (additively; older clients ignore both and reconnect):
@@ -516,7 +502,9 @@ where the session is going; a computer receiving its work back says
 waiting out a daemon restart on the machine that owns the project, waiting for
 its agent (`provider`) to be signed in on the cloud machine, being opened by
 its transfer, or a plain terminal that moved with its project and only runs on
-a computer. The socket then closes; the session's paused row carries the same
+a computer. An opaque elsewhere owner uses
+`{"type":"paused","reason":"elsewhere","owner":null}` rather than guessing a
+`moved.to` destination. The socket then closes; the session's paused row carries the same
 object as its additive `pause` field, and a client reconnects at once when the
 row stops being paused. When the project's route changes under an established
 socket, the viewer's daemon sends `moved` (to where the new route points) and
@@ -643,7 +631,10 @@ configuration does not revive an old connection. Terminal input rechecks that
 admission in the actual PTY writer and holds it through write/flush; resizes hold
 it inside the blocking operation. Structured commands retain it through a bounded,
 owned enqueue, and clean transitions fence the old driver before activating a
-replacement. Unscoped local and SSH sockets preserve their existing behavior.
+replacement. Unscoped local and SSH sockets keep their ordinary routes;
+agent PTY input also invalidates stale completion at writer admission and
+respects the current local execution fence. Free plain shells keep ordinary
+enqueue behavior.
 
 The initial forwarded surface is an explicit allowlist: scoped workspace/session
 rosters; reads of the owner's `/health`, `/settings`, `/agents`, `/plugins`,

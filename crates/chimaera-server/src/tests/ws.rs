@@ -3,8 +3,8 @@ use crate::*;
 
 /// Stopping a session for a transfer (what a Pro handoff export does: mark
 /// it transferring, park its ledger entry, stop the process) must tell every
-/// attached view that it moved — not that it exited — both on the live
-/// socket and on every reconnect until it runs somewhere again.
+/// attached view that it is elsewhere, without guessing its host kind or
+/// treating the transfer as an exit, on the live socket and on reconnect.
 #[tokio::test]
 async fn ws_sessions_stopped_for_a_transfer_say_moved_not_exited() {
     use futures::SinkExt;
@@ -100,19 +100,19 @@ async fn ws_sessions_stopped_for_a_transfer_say_moved_not_exited() {
         loop {
             let frame = next_json(&mut socket).await;
             assert_ne!(frame["type"], "exited", "{path}: a move is not an exit");
-            if frame["type"] == "moved" {
-                assert_eq!(frame["to"], "cloud");
+            if frame["type"] == "paused" {
+                assert_eq!(frame["reason"], "elsewhere");
                 break;
             }
         }
         drop(guard);
-        // The project now runs in the cloud. Reconnecting keeps saying so,
+        // The project now has an opaque other owner. Reconnecting stays neutral,
         // never replaying a stopped driver as `ready {alive:false}`.
         crate::pro::install_remote_owner_fixture(&state, "w-moving", 5);
         let mut again = connect(path.clone()).await;
         let frame = next_json(&mut again).await;
-        assert_eq!(frame["type"], "moved", "{path}: {frame}");
-        assert_eq!(frame["to"], "cloud", "{path}: {frame}");
+        assert_eq!(frame["type"], "paused", "{path}: {frame}");
+        assert_eq!(frame["reason"], "elsewhere", "{path}: {frame}");
     }
     state
         .stopping
@@ -1438,4 +1438,71 @@ async fn ws_chat_sends_are_accepted_once_under_their_client_id() {
     }
     assert_eq!(replayed, seen);
     state.chat.kill(&id);
+}
+
+/// Only a writer-admitted input invalidates completion: an ownership refusal
+/// must leave the previous pause evidence untouched and never write the PTY.
+#[tokio::test]
+async fn terminal_input_invalidates_completion_only_after_admission() {
+    let state = test_state();
+    let cwd = test_dir("terminal-input-admission");
+    let workspace = lock(&state.workspaces).add(cwd.clone()).unwrap();
+    let session = state
+        .sessions
+        .spawn(chimaera_pty::SpawnOpts {
+            cwd,
+            name: None,
+            cols: 80,
+            rows: 24,
+            command: Some(vec!["/bin/cat".into()]),
+            id: None,
+            env: Vec::new(),
+            env_remove: Vec::new(),
+            scrollback: None,
+        })
+        .unwrap()
+        .id;
+    lock(&state.session_workspaces).insert(session.clone(), workspace.id.clone());
+    let mut record =
+        crate::agents::AgentRecord::new("fixture-key".into(), crate::agents::AgentKind::Codex);
+    record.turn_complete_at = Some(123);
+    lock(&state.agents).insert(session.clone(), record);
+    let input = state.sessions.attach(&session).unwrap().input;
+    crate::ws::terminal_input(&state, &session, &input, bytes::Bytes::new(), None)
+        .await
+        .unwrap();
+    assert_eq!(lock(&state.agents)[&session].turn_complete_at, Some(123));
+    crate::ws::terminal_input(
+        &state,
+        &session,
+        &input,
+        bytes::Bytes::from_static(b"accepted\n"),
+        None,
+    )
+    .await
+    .unwrap();
+    {
+        let agents = lock(&state.agents);
+        assert_eq!(agents[&session].turn_complete_at, None);
+        assert!(agents[&session].terminal_input_at.is_some());
+    }
+    {
+        let mut agents = lock(&state.agents);
+        let record = agents.get_mut(&session).unwrap();
+        record.turn_complete_at = Some(123);
+        record.terminal_input_at = None;
+    }
+    crate::pro::install_remote_owner_fixture(&state, &workspace.id, 5);
+    assert!(crate::ws::terminal_input(
+        &state,
+        &session,
+        &input,
+        bytes::Bytes::from_static(b"refused\n"),
+        None
+    )
+    .await
+    .is_err());
+    assert_eq!(lock(&state.agents)[&session].turn_complete_at, Some(123));
+    assert_eq!(lock(&state.agents)[&session].terminal_input_at, None);
+    state.sessions.kill(&session).unwrap();
 }

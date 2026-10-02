@@ -30,6 +30,8 @@ bytes.workspace = true
 # Content hashes for file versions (`X-Content-Hash`, PUT `expect_hash`), the
 # stable `X-Mtime` token, and draft-mirror file names.
 sha2.workspace = true
+# Portable Git indexes retain Git's SHA-1 checksum where the repository uses it.
+sha1 = "0.11"
 comrak = { version = "0.54.0", default-features = false }
 ammonia = "4.1.3"
 csv = "1.4.0"

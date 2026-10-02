@@ -1290,9 +1290,11 @@ export async function proRefreshAccount(): Promise<void> {
 export interface CloudProject {
   workspace_id: string;
   name: string;
-  host_id: string;
-  host_alias: string;
+  host_id?: string | null;
+  host_alias?: string | null;
   local_root: string | null;
+  /** Saved destination binding, including interrupted copies not ready to open. */
+  destination_saved?: boolean;
   available: boolean;
   error: string | null;
 }
@@ -1301,6 +1303,7 @@ export interface CloudProjectOpen {
   workspace_id: string;
   root: string;
   name: string;
+  local_copy?: LocalProjectCopy;
 }
 
 export async function proCloudProjects(): Promise<CloudProject[]> {
@@ -1310,7 +1313,19 @@ export async function proCloudProjects(): Promise<CloudProject[]> {
 export async function proOpenCloudProject(workspaceId: string): Promise<CloudProjectOpen | null> {
   const t = tauri();
   if (t === null) throw new Error("Open the desktop app to save a local project copy.");
-  return t.core.invoke<CloudProjectOpen | null>("pro_open_cloud_project", { workspaceId });
+  // A distinct command refuses old native shells before their legacy Open
+  // implementation can acquire execution. Never fall back to that command.
+  return t.core.invoke<CloudProjectOpen | null>("pro_copy_project", { workspaceId }).catch(reason => {
+    const detail = reason instanceof Error ? reason.message : typeof reason === "string" ? reason : "";
+    if (/^Command pro_copy_project not found$/i.test(detail)) throw new Error("project_copy_update_required");
+    throw reason;
+  });
+}
+
+export async function proTakeOverProject(workspaceId: string, expectedEpoch: number): Promise<void> {
+  const t = tauri();
+  if (t === null) throw new Error("Open the desktop app to take over execution.");
+  await t.core.invoke<void>("pro_take_over_project", { workspaceId, expectedEpoch });
 }
 
 export async function proBillingCheckout(plan: "pro" | "max", interval: "month" | "year"): Promise<void> {
@@ -1478,13 +1493,18 @@ export interface MirrorProfile {
   deferred: string[];
   missing_environment: string[];
 }
+export interface LocalProjectCopy { state: "ready" | "pending" | "taking_over" | "recovery_needed"; ready: boolean; checkpoint?: unknown | null; owner_epoch?: number | null }
+export type GitStagingStatus = { state: "uncaptured" } | { state: "synced" } | { state: "conflicts"; paths: string[]; total: number; recovery: string };
 export interface MirrorWorkspace {
   workspace_id: string; name: string; root: string; never_mirror: boolean; privacy_pending?: boolean;
   checkpoint_id?: string | null;
+  local_copy?: LocalProjectCopy | null;
+  git_staging?: GitStagingStatus;
+  execution_allowed?: boolean;
   ownership: { state: "awaiting_verification" | "local" | "remote" | "transferring" | "hydrating" | "setting_up" | "privacy_disabled"; epoch: number; holder?: string } | null;
   mirror: { files: number; bytes: number; excluded: number; too_large: number; last_mirrored_at: number | null; storage_limit_bytes: number; error: string | null;
     /** Additive (newer daemons): a stable code for `error`, and the files the last return kept in both versions. */
-    error_code?: string | null; kept_both?: number; kept_paths?: string[] } | null;
+    error_code?: string | null; kept_both?: number; kept_paths?: string[]; git_staging?: GitStagingStatus } | null;
   profile: MirrorProfile | null;
   git_branches?: string[] | null;
   blocked_providers?: CloudBlockedProvider[];

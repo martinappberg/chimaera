@@ -13,7 +13,7 @@ static OPEN_PROJECT: Semaphore = Semaphore::const_new(1);
 /// Fixed codes for a project that did not open; the page maps each to a
 /// sentence (`CloudProjects.svelte`). Anything unexpected is `FAILED`.
 pub(in crate::shell) mod open_code {
-    /// Still mid-step in the cloud; the page retries on its own.
+    /// A saved copy or transfer is currently busy; requires another explicit action.
     pub const BUSY: &str = "project_busy";
     pub const FOLDER_NOT_EMPTY: &str = "project_folder_not_empty";
     pub const FOLDER_MISSING: &str = "project_folder_missing";
@@ -25,6 +25,8 @@ pub(in crate::shell) mod open_code {
     /// The plan ended and the time to bring its cloud work home has passed.
     pub const RETURN_WINDOW_ENDED: &str = "return_window_ended";
     pub const FAILED: &str = "project_open_failed";
+    pub const UPDATE_REQUIRED: &str = "project_copy_update_required";
+    pub const CHECKPOINT_PENDING: &str = "project_checkpoint_pending";
 
     pub(super) fn of(error: &anyhow::Error) -> &'static str {
         let text = error.to_string();
@@ -37,6 +39,8 @@ pub(in crate::shell) mod open_code {
             ALREADY_OPENING,
             UNAVAILABLE,
             RETURN_WINDOW_ENDED,
+            UPDATE_REQUIRED,
+            CHECKPOINT_PENDING,
         ]
         .into_iter()
         .find(|code| text == *code)
@@ -48,9 +52,13 @@ pub(in crate::shell) mod open_code {
 pub struct CloudProject {
     workspace_id: String,
     name: String,
-    host_id: String,
-    host_alias: String,
+    #[serde(default)]
+    host_id: Option<String>,
+    #[serde(default)]
+    host_alias: Option<String>,
     local_root: Option<PathBuf>,
+    #[serde(default)]
+    destination_saved: bool,
     available: bool,
     error: Option<String>,
 }
@@ -59,6 +67,8 @@ pub struct CloudProjectOpen {
     workspace_id: String,
     root: PathBuf,
     name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local_copy: Option<serde_json::Value>,
 }
 #[derive(Deserialize)]
 struct Listing {
@@ -186,14 +196,14 @@ fn import_body(
 ) -> Option<serde_json::Value> {
     if saved {
         Some(
-            json!({"workspace_id":workspace_id,"expected_account_id":account,"expected_endpoint":endpoint}),
+            json!({"copy_version":1,"workspace_id":workspace_id,"expected_account_id":account,"expected_endpoint":endpoint}),
         )
     } else {
-        selected.map(|root| json!({"workspace_id":workspace_id,"destination_root":root,"expected_account_id":account,"expected_endpoint":endpoint}))
+        selected.map(|root| json!({"copy_version":1,"workspace_id":workspace_id,"destination_root":root,"expected_account_id":account,"expected_endpoint":endpoint}))
     }
 }
 #[tauri::command]
-pub async fn pro_open_cloud_project(
+pub async fn pro_copy_project(
     app: AppHandle,
     window: tauri::WebviewWindow,
     state: tauri::State<'_, Shell>,
@@ -234,24 +244,21 @@ pub async fn pro_open_cloud_project(
             generation == state.pro.generation(),
             open_code::ACCOUNT_CHANGED
         );
-        let saved = project.local_root.is_some();
+        let saved = project.destination_saved || project.local_root.is_some();
         let chosen = if saved {
             None
         } else {
             choose(&app, &window, &project).await?
         };
-        let (selected, created) = match chosen {
+        let selected = match chosen {
             Some(chosen) => {
                 let name = project.name.clone();
-                let (path, created) =
+                let (path, _) =
                     tokio::task::spawn_blocking(move || destination(&chosen, &name)).await??;
-                (Some(path), created)
+                Some(path)
             }
-            None => (None, false),
+            None => None,
         };
-        // A folder this call made is removed again (only while still empty)
-        // when the project does not open there.
-        let made = created.then(|| selected.clone()).flatten();
         let Some(body) = import_body(&workspace_id, saved, selected, &account, &endpoint) else {
             return Ok(None);
         };
@@ -261,17 +268,18 @@ pub async fn pro_open_cloud_project(
             generation == state.pro.generation() && state.pro.client().await.is_some(),
             open_code::ACCOUNT_CHANGED
         );
-        let opened = daemon_request(&state, "POST", "/pro/projects/open", Some(body)).await;
-        let opened = match opened {
-            Ok(value) => value,
-            Err(error) => {
-                if let Some(made) = made {
-                    let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir(made)).await;
-                }
-                return Err(error);
-            }
-        };
-        let imported = serde_json::from_value(opened)?;
+        // Even a failed request may have enrolled this inode durably. Keep the
+        // destination for an explicit retry; an HTTP error cannot prove it is
+        // unbound, and an empty replacement folder would no longer be ours.
+        let opened = super::daemon_request_guarded(
+            &state,
+            "POST",
+            "/pro/projects/copy",
+            Some(body),
+            _operation,
+        )
+        .await?;
+        let imported = copy_ack(opened, &workspace_id)?;
         ensure!(
             generation == state.pro.generation(),
             open_code::ACCOUNT_CHANGED
@@ -283,9 +291,143 @@ pub async fn pro_open_cloud_project(
     .map_err(|error: anyhow::Error| open_code::of(&error).to_owned())
 }
 
+/// Older pages retain their command name but still receive safe copy behavior.
+#[tauri::command]
+pub async fn pro_open_cloud_project(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, Shell>,
+    workspace_id: String,
+) -> Result<Option<CloudProjectOpen>, String> {
+    pro_copy_project(app, window, state, workspace_id).await
+}
+
+/// A successful status code cannot stand in for negotiated copy semantics.
+fn copy_ack(value: serde_json::Value, workspace: &str) -> Result<CloudProjectOpen> {
+    ensure!(
+        value["copy_version"] == 1
+            && matches!(value["state"].as_str(), Some("local_copy" | "owned_local")),
+        open_code::UPDATE_REQUIRED
+    );
+    let copied = value["state"] == "local_copy";
+    let owner_epoch = value["local_copy"]["owner_epoch"].clone();
+    ensure!(
+        owner_epoch.is_null()
+            || owner_epoch
+                .as_u64()
+                .is_some_and(|epoch| epoch <= 9_007_199_254_740_991),
+        open_code::UPDATE_REQUIRED
+    );
+    let mut result: CloudProjectOpen =
+        serde_json::from_value(value).context(open_code::UPDATE_REQUIRED)?;
+    // Project-role chrome derives only from the exact ACK, not an additive
+    // role field an older daemon might supply without copy semantics.
+    result.local_copy = copied.then(|| json!({"state":"ready","ready":true}));
+    if copied && !owner_epoch.is_null() {
+        result.local_copy.as_mut().unwrap()["owner_epoch"] = owner_epoch;
+    }
+    ensure!(
+        result.workspace_id == workspace
+            && result.root.is_absolute()
+            && !result
+                .root
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+            && !result.name.is_empty()
+            && result.name.len() <= 1024,
+        open_code::UPDATE_REQUIRED
+    );
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn pro_take_over_project(
+    app: AppHandle,
+    state: tauri::State<'_, Shell>,
+    workspace_id: String,
+    expected_epoch: u64,
+) -> Result<(), String> {
+    async {
+        let _operation = OPEN_PROJECT.try_acquire().context(open_code::ALREADY_OPENING)?;
+        ensure!(!workspace_id.is_empty() && workspace_id.len() <= 128
+            && workspace_id.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c)), open_code::FAILED);
+        ensure!(state.pro.client().await.is_some(), open_code::ACCOUNT_CHANGED);
+        let (generation, account, endpoint) = {
+            let _account_change = state.pro.operation.lock().await;
+            let account = super::lock(&state.pro.account).as_ref().map(|account| account.account_id.clone()).context(open_code::ACCOUNT_CHANGED)?;
+            let endpoint = state.pro.endpoint.clone().context(open_code::UNAVAILABLE)?;
+            (state.pro.generation(), account, endpoint)
+        };
+        let answer = super::daemon_request_guarded(&state, "POST", "/pro/projects/takeover", Some(json!({"workspace_id":workspace_id,"expected_epoch":expected_epoch,"expected_account_id":account,"expected_endpoint":endpoint})), _operation).await?;
+        ensure!(answer["workspace_id"] == workspace_id && answer["state"] == "owned_local", open_code::UPDATE_REQUIRED);
+        ensure!(generation == state.pro.generation(), open_code::ACCOUNT_CHANGED);
+        let _ = app.emit("pro-changed", ());
+        Ok(())
+    }.await.map_err(|error:anyhow::Error| open_code::of(&error).to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn cancelled_copy_keeps_admission_until_the_http_request_finishes() {
+        use std::io::{Read, Write};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let local = crate::daemon::LocalDaemon {
+            port: listener.local_addr().unwrap().port(),
+            token: "synthetic-local-token".into(),
+            build: None,
+            outdated: false,
+            live_sessions: None,
+        };
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = tokio::task::spawn_blocking(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+                assert!(request.len() < 4096);
+            }
+            assert!(request.starts_with(b"POST /api/v1/pro/projects/copy HTTP/1.1\r\n"));
+            let mut body = [0; 4];
+            stream.read_exact(&mut body).unwrap();
+            assert_eq!(&body, b"null");
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+        let admission = Arc::new(Semaphore::new(1));
+        let permit = admission.clone().try_acquire_owned().unwrap();
+        let command = tokio::spawn(async move {
+            super::super::local_daemon_request(local, "POST", "/pro/projects/copy", None, permit)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        command.abort();
+        assert!(command.await.unwrap_err().is_cancelled());
+        assert!(admission.try_acquire().is_err());
+        release_tx.send(()).unwrap();
+        let _next = tokio::time::timeout(Duration::from_secs(5), admission.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        server.await.unwrap();
+    }
+
     #[test]
     fn a_parent_folder_gets_a_new_project_folder_and_an_empty_one_is_used() {
         let base = std::env::temp_dir().join(format!(
@@ -392,6 +534,61 @@ mod tests {
     }
 
     #[test]
+    fn opening_requires_the_exact_copy_acknowledgment() {
+        let good = json!({"copy_version":1,"state":"local_copy","workspace_id":"w-one","root":"/tmp/copied","name":"One"});
+        assert_eq!(
+            copy_ack(good.clone(), "w-one").unwrap().local_copy,
+            Some(json!({"state":"ready","ready":true}))
+        );
+        let mut owned = good.clone();
+        owned["state"] = json!("owned_local");
+        assert!(copy_ack(owned, "w-one").unwrap().local_copy.is_none());
+        let mut released = good.clone();
+        released["local_copy"] = json!({"state":"ready","ready":true,"owner_epoch":7});
+        assert_eq!(
+            copy_ack(released.clone(), "w-one").unwrap().local_copy,
+            Some(json!({"state":"ready","ready":true,"owner_epoch":7}))
+        );
+        for epoch in [
+            json!(-1),
+            json!(1.5),
+            json!("7"),
+            json!(9_007_199_254_740_992_u64),
+        ] {
+            released["local_copy"]["owner_epoch"] = epoch;
+            assert!(copy_ack(released.clone(), "w-one").is_err());
+        }
+        for (key, value) in [
+            ("copy_version", json!(2)),
+            ("state", json!("hydrating")),
+            ("workspace_id", json!("w-other")),
+            ("root", json!("relative")),
+        ] {
+            let mut bad = good.clone();
+            bad[key] = value;
+            assert!(copy_ack(bad, "w-one").is_err());
+        }
+        assert!(copy_ack(
+            json!({"workspace_id":"w-one","root":"/tmp/copied","name":"One"}),
+            "w-one"
+        )
+        .is_err());
+    }
+    #[test]
+    fn a_passive_catalog_project_needs_no_inferred_host_identity() {
+        let project: CloudProject = serde_json::from_value(json!({"workspace_id":"w-one","name":"One","local_root":null,"destination_saved":true,"available":true,"error":null})).unwrap();
+        assert!(project.host_id.is_none() && project.host_alias.is_none());
+        // A pending saved binding is still reused, even with no ready registry root.
+        assert!(import_body(
+            &project.workspace_id,
+            project.destination_saved,
+            None,
+            "account",
+            "https://example.invalid"
+        )
+        .is_some());
+    }
+    #[test]
     fn cancel_never_produces_an_import_request() {
         assert!(
             import_body("w-cloud", false, None, "account", "https://example.invalid").is_none()
@@ -408,7 +605,7 @@ mod tests {
                 "https://example.invalid"
             ),
             Some(
-                json!({"workspace_id":"w-cloud","expected_account_id":"account","expected_endpoint":"https://example.invalid"})
+                json!({"copy_version":1,"workspace_id":"w-cloud","expected_account_id":"account","expected_endpoint":"https://example.invalid"})
             )
         );
         assert_eq!(
@@ -420,7 +617,7 @@ mod tests {
                 "https://example.invalid"
             ),
             Some(
-                json!({"workspace_id":"w-cloud","destination_root":"/chosen/project","expected_account_id":"account","expected_endpoint":"https://example.invalid"})
+                json!({"copy_version":1,"workspace_id":"w-cloud","destination_root":"/chosen/project","expected_account_id":"account","expected_endpoint":"https://example.invalid"})
             )
         );
     }

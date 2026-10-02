@@ -22,6 +22,8 @@ use std::{
 };
 
 const MAX_PROJECTS: usize = 128;
+pub(super) mod catalog;
+static TAKEOVER_ACTIONS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(32);
 
 /// Why an open refused, as the stable `error_code` on the route's failure body
 /// (`open_error_code`; the list is in the pro map). Tagged where each refusal is
@@ -58,9 +60,10 @@ pub(super) fn open_error_code(error: &anyhow::Error) -> &'static str {
 pub(super) struct Project {
     workspace_id: String,
     name: String,
-    host_id: String,
-    host_alias: String,
+    host_id: Option<String>,
+    host_alias: Option<String>,
     local_root: Option<PathBuf>,
+    destination_saved: bool,
     available: bool,
     error: Option<String>,
 }
@@ -94,13 +97,22 @@ pub(crate) struct Open {
 }
 
 pub(super) fn adoption_pending(state: &AppState, workspace: &str) -> bool {
+    if lock(&state.pro.preferences)
+        .get(workspace)
+        .is_some_and(super::project_copy::ready)
+    {
+        return false;
+    }
     lock(&state.pro.legacy_pending).contains(workspace)
         || lock(&state.pro.adoptions)
             .get(workspace)
             .is_some_and(|entry| !entry.complete)
 }
 fn local_root(state: &AppState, workspace: &str) -> Option<PathBuf> {
-    if lock(&state.pro.legacy_pending).contains(workspace)
+    if (lock(&state.pro.legacy_pending).contains(workspace)
+        && !lock(&state.pro.preferences)
+            .get(workspace)
+            .is_some_and(super::project_copy::ready))
         || !account_matches(state, workspace)
         || (!lock(&state.pro.adoptions).contains_key(workspace)
             && lock(&state.pro.preferences)
@@ -174,6 +186,9 @@ async fn discover(state: &Arc<AppState>, config: &Configure) -> Result<Vec<Proje
         config.delegation.workspace.is_none(),
         "workspace authority does not permit discovery"
     );
+    if let Some(projects) = catalog::list(state, config).await? {
+        return Ok(projects);
+    }
     let hosts: Vec<Host> = transport::request(
         &config.keeper_url,
         "/v1/hosts",
@@ -213,7 +228,7 @@ async fn discover(state: &Arc<AppState>, config: &Configure) -> Result<Vec<Proje
                 let previous = lock(&state.pro.project_cache).projects.clone();
                 for mut project in previous
                     .into_iter()
-                    .filter(|project| project.host_id == host.id)
+                    .filter(|project| project.host_id.as_deref() == Some(host.id.as_str()))
                 {
                     if projects.len() >= MAX_PROJECTS {
                         break;
@@ -223,6 +238,8 @@ async fn discover(state: &Arc<AppState>, config: &Configure) -> Result<Vec<Proje
                         project.error =
                             Some("Cloud project list is temporarily unavailable".into());
                         project.local_root = local_root(state, &project.workspace_id);
+                        project.destination_saved = account_matches(state, &project.workspace_id)
+                            && lock(&state.pro.adoptions).contains_key(&project.workspace_id);
                         projects.push(project);
                     }
                 }
@@ -238,6 +255,8 @@ async fn discover(state: &Arc<AppState>, config: &Configure) -> Result<Vec<Proje
             }
             projects.push(Project {
                 local_root: local_root(state, &row.id),
+                destination_saved: account_matches(state, &row.id)
+                    && lock(&state.pro.adoptions).contains_key(&row.id),
                 workspace_id: row.id,
                 name: row
                     .name
@@ -245,13 +264,14 @@ async fn discover(state: &Arc<AppState>, config: &Configure) -> Result<Vec<Proje
                     .filter(|c| !c.is_control())
                     .take(128)
                     .collect(),
-                host_id: host.id.clone(),
-                host_alias: host
-                    .alias
-                    .chars()
-                    .filter(|c| !c.is_control())
-                    .take(128)
-                    .collect(),
+                host_id: Some(host.id.clone()),
+                host_alias: Some(
+                    host.alias
+                        .chars()
+                        .filter(|c| !c.is_control())
+                        .take(128)
+                        .collect(),
+                ),
                 available: true,
                 error: None,
             });
@@ -435,6 +455,18 @@ fn verify(destination: &Destination, require_empty: bool) -> Result<()> {
     }
     Ok(())
 }
+
+pub(super) fn check_copy_destination(state: &AppState, workspace: &str, root: &Path) -> Result<()> {
+    let destination = lock(&state.pro.adoptions)
+        .get(workspace)
+        .cloned()
+        .context("local copy destination is unavailable")?;
+    ensure!(
+        destination.root == root && account_matches(state, workspace),
+        "local copy destination authority changed"
+    );
+    verify(&destination, false)
+}
 /// Recheck immediately before filesystem installation, after potentially slow
 /// downloads. A durable marker makes partial imports retryable only at this path.
 pub(super) async fn begin_install(state: &AppState, workspace: &str, root: &Path) -> Result<()> {
@@ -459,7 +491,8 @@ pub(super) async fn begin_install(state: &AppState, workspace: &str, root: &Path
     );
     let check = destination.clone();
     tokio::task::spawn_blocking(move || verify(&check, !check.started)).await??;
-    let legacy = lock(&state.pro.legacy_pending).remove(workspace);
+    let legacy = !super::project_copy::copy_only(state, workspace)
+        && lock(&state.pro.legacy_pending).remove(workspace);
     if !destination.started || legacy {
         if let Some(entry) = lock(&state.pro.adoptions).get_mut(workspace) {
             entry.started = true;
@@ -470,7 +503,7 @@ pub(super) async fn begin_install(state: &AppState, workspace: &str, root: &Path
     Ok(())
 }
 
-async fn open(state: &Arc<AppState>, request: Open) -> Result<serde_json::Value> {
+async fn copy(state: &Arc<AppState>, request: Open) -> Result<serde_json::Value> {
     anyhow::ensure!(
         !crate::lock(&state.pro.authority).restricted(),
         refuse("unavailable", "workspace destination is fixed")
@@ -501,11 +534,7 @@ async fn open(state: &Arc<AppState>, request: Open) -> Result<serde_json::Value>
                 == request.expected_endpoint.trim_end_matches('/'),
         refuse("account_changed", "Account changed; open the project again")
     );
-    let project = list(state)
-        .await
-        .projects
-        .into_iter()
-        .find(|row| row.workspace_id == request.workspace_id);
+
     let _jobs = state.pro.jobs.lock().await;
     ensure!(
         generation == state.pro.generation.load(Ordering::Acquire),
@@ -586,7 +615,7 @@ async fn open(state: &Arc<AppState>, request: Open) -> Result<serde_json::Value>
         let root = existing.root.clone();
         let (root, device, inode) =
             tokio::task::spawn_blocking(move || check_directory(&root)).await??;
-        if legacy {
+        if legacy || !super::may_write(state, &request.workspace_id) {
             lock(&state.pro.adoptions).insert(
                 request.workspace_id.clone(),
                 Destination {
@@ -602,12 +631,30 @@ async fn open(state: &Arc<AppState>, request: Open) -> Result<serde_json::Value>
         }
         root
     } else {
+        // Worker discovery is a passive presentation cache, never account
+        // authority. A new device may copy a project whose worker is asleep or
+        // whose executor is another device, using its scoped read grant.
+        let baton: Baton = engine::account(
+            &config,
+            &format!("/v2/baton/{}", request.workspace_id),
+            "GET",
+            None,
+        )
+        .await?
+        .json()?;
         ensure!(
-            project.is_some(),
+            baton.workspace_id == request.workspace_id
+                && !baton.mirror_disabled
+                && baton.checkpoint.is_some(),
             refuse(
-                "unavailable",
-                "Cloud project is not available in this account"
+                "checkpoint_pending",
+                "No durable project copy is available yet"
             )
+        );
+        let grant = engine::credentials(&config, &request.workspace_id, None).await?;
+        ensure!(
+            grant.read_only && generation == state.pro.generation.load(Ordering::Acquire),
+            "Account changed before copy folder enrollment"
         );
         let root = request.destination_root.context(Refused {
             code: "folder_required",
@@ -635,13 +682,16 @@ async fn open(state: &Arc<AppState>, request: Open) -> Result<serde_json::Value>
     };
     if let Some(existing) = existing.filter(|_| {
         super::may_write(state, &request.workspace_id)
+            && super::owned_epoch(state, &request.workspace_id).is_some()
             && !adoption_pending(state, &request.workspace_id)
     }) {
-        return Ok(json!({"workspace_id":existing.id,"root":existing.root,"name":existing.name}));
+        return Ok(
+            json!({"workspace_id":existing.id,"root":existing.root,"name":existing.name,"copy_version":1,"state":"owned_local"}),
+        );
     }
     let baton: Baton = engine::account(
         &config,
-        &format!("/v1/baton/{}", request.workspace_id),
+        &format!("/v2/baton/{}", request.workspace_id),
         "GET",
         None,
     )
@@ -651,104 +701,225 @@ async fn open(state: &Arc<AppState>, request: Open) -> Result<serde_json::Value>
         baton.workspace_id == request.workspace_id && !baton.mirror_disabled,
         refuse("privacy", "Mirroring is not available for this project")
     );
-    // A restart verification must not download an older mirror over a locally
-    // completed adoption. Reconcile the owned lease, then open existing files.
-    if baton.holder_id.as_deref() == Some(&config.delegation.device_id)
-        && !adoption_pending(state, &request.workspace_id)
-        && lock(&state.workspaces).get(&request.workspace_id).is_some()
-    {
-        engine::reconcile(state, &config, &request.workspace_id).await?;
-        if super::owned_epoch(state, &request.workspace_id).is_some() {
-            let workspace =
-                lock(&state.workspaces)
-                    .get(&request.workspace_id)
-                    .context(Refused {
-                        code: "unavailable",
-                        message: "Local project is unavailable",
-                    })?;
-            return Ok(
-                json!({"workspace_id":workspace.id,"root":workspace.root,"name":workspace.name}),
-            );
-        }
-    }
-    if let Some(holder) = baton
-        .holder_id
-        .as_deref()
-        .filter(|holder| *holder != config.delegation.device_id)
-    {
-        let project = project.as_ref().context(Refused {
-            code: "unavailable",
-            message: "The cloud project is unavailable; try again when it reconnects",
-        })?;
-        ensure!(
-            super::protocol::worker_holder_id(&project.host_id) == Some(holder),
-            refuse(
-                "owned_elsewhere",
-                "This project is currently open on another device"
-            )
-        );
-        let response = transport::request(
-            &config.keeper_url,
-            &format!("/v1/hosts/{}/http/api/v1/pro/handoff", project.host_id),
-            "POST",
-            &config.delegation.access_token,
-            Some(&json!({"workspace_id":request.workspace_id,"expected_epoch":baton.epoch})),
-        )
-        .await?;
-        ensure!(
-            response.status != 409,
-            refuse(
-                "busy",
-                "The cloud project is busy; wait for a pause and try again"
-            )
-        );
-        ensure!(
-            (200..300).contains(&response.status),
-            refuse("unavailable", "Cloud hand-back is temporarily unavailable")
-        );
-    }
-    ensure!(
-        generation == state.pro.generation.load(Ordering::Acquire),
-        refuse("account_changed", "Account changed; open the project again")
-    );
-    engine::hydrate(
+    let receipt = baton.checkpoint.context(Refused {
+        code: "checkpoint_pending",
+        message: "No durable project copy is available yet; try again after the owner publishes",
+    })?;
+    super::project_copy::sync(
         state,
         &config,
         &request.workspace_id,
-        baton.epoch,
-        false,
-        Some(&destination),
+        destination,
+        generation,
+        super::project_copy::Selection {
+            checkpoint: receipt,
+            holder: baton.holder_id,
+            epoch: baton.epoch,
+        },
     )
-    .await?;
-    if let Some(entry) = lock(&state.pro.adoptions).get_mut(&request.workspace_id) {
-        entry.complete = true;
-    }
-    super::persist(state).await?;
-    lock(&state.pro.project_cache).checked_at = 0;
-    state.changes.notify_waiters();
-    let workspace = lock(&state.workspaces)
-        .get(&request.workspace_id)
-        .context(Refused {
-            code: "unavailable",
-            message: "Imported project registration is unavailable",
-        })?;
-    Ok(json!({"workspace_id":workspace.id,"root":workspace.root,"name":workspace.name}))
+    .await
 }
+
 pub(crate) async fn open_project(
     State(state): State<Arc<AppState>>,
     Json(request): Json<Open>,
 ) -> Response {
-    // Bounded operation; caller cancellation may leave a fenced, retryable
-    // partial import, never an automatic background adoption.
-    match tokio::time::timeout(Duration::from_secs(19 * 60), open(&state, request)).await {
+    let _ = (state, request);
+    (StatusCode::UPGRADE_REQUIRED, Json(json!({"error":"Update this client to open a local copy; opening no longer transfers execution","error_code":"copy_upgrade_required","copy_version":1}))).into_response()
+}
+
+#[derive(Deserialize)]
+pub(crate) struct CopyRequest {
+    copy_version: u16,
+    #[serde(flatten)]
+    project: Open,
+}
+pub(crate) async fn copy_project(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<CopyRequest>,
+) -> Response {
+    if request.copy_version != 1 {
+        return (StatusCode::UPGRADE_REQUIRED, Json(json!({"error":"Unsupported project-copy capability","error_code":"copy_upgrade_required","copy_version":1}))).into_response();
+    }
+    match tokio::time::timeout(Duration::from_secs(19 * 60), copy(&state, request.project)).await {
         Ok(Ok(project)) => Json(project).into_response(),
         Ok(Err(error)) => {
             let code = open_error_code(&error);
             super::routes::failure_with_code(error, code)
         }
-        Err(_) => (StatusCode::GATEWAY_TIMEOUT, Json(json!({"error":"Project transfer timed out; retry Open on this Mac to continue at the saved folder","error_code":"timed_out"}))).into_response(),
+        Err(_) => (StatusCode::GATEWAY_TIMEOUT, Json(json!({"error":"Project copy timed out; retry Open at the saved folder","error_code":"timed_out","copy_version":1}))).into_response(),
     }
+}
+
+pub(super) async fn begin_copy_install(
+    state: &AppState,
+    workspace: &str,
+    root: &Path,
+) -> Result<()> {
+    let destination = lock(&state.pro.adoptions)
+        .get(workspace)
+        .cloned()
+        .context("local copy destination is unavailable")?;
+    ensure!(
+        destination.root == root && account_matches(state, workspace),
+        "local copy destination authority changed"
+    );
+    let workspaces = lock(&state.workspaces).list();
+    ensure!(
+        !workspaces.iter().any(|entry| entry.id != workspace
+            && (root.starts_with(&entry.root) || entry.root.starts_with(root))),
+        "local copy destination overlaps another project"
+    );
+    let check = destination.clone();
+    tokio::task::spawn_blocking(move || verify(&check, !check.started)).await??;
+    if !destination.started {
+        lock(&state.pro.adoptions)
+            .get_mut(workspace)
+            .context("local copy destination disappeared")?
+            .started = true;
+        super::persist(state).await?;
+    }
+    Ok(())
+}
+
+pub(super) fn complete_copy(state: &AppState, workspace: &str) {
+    if let Some(entry) = lock(&state.pro.adoptions).get_mut(workspace) {
+        entry.complete = true;
+    }
+    lock(&state.pro.project_cache).checked_at = 0;
 }
 
 #[cfg(test)]
 mod tests;
+
+#[derive(Deserialize)]
+pub(crate) struct TakeoverRequest {
+    expected_account_id: String,
+    expected_endpoint: String,
+    workspace_id: String,
+    expected_epoch: u64,
+}
+async fn takeover(state: &Arc<AppState>, request: TakeoverRequest) -> Result<serde_json::Value> {
+    ensure!(
+        super::valid_id(&request.workspace_id),
+        "Invalid project identity"
+    );
+    let (config, generation) = configuration(state).await;
+    let config = config.context("Sign in before taking over execution")?;
+    ensure!(
+        config.account_id.as_deref() == Some(request.expected_account_id.as_str())
+            && config.endpoint.trim_end_matches('/')
+                == request.expected_endpoint.trim_end_matches('/')
+            && account_matches(state, &request.workspace_id),
+        "Account changed before Take over"
+    );
+    ensure!(
+        config.role == Role::Device && config.execution.is_some(),
+        "Take over requires the negotiated device protocol"
+    );
+    let workspace = lock(&state.workspaces)
+        .get(&request.workspace_id)
+        .context("Open a local copy before taking over")?;
+    if super::may_execute(state, &workspace.id) {
+        return Ok(
+            json!({"workspace_id":workspace.id,"root":workspace.root,"name":workspace.name,"state":"owned_local"}),
+        );
+    }
+    let mut intent = String::new();
+    let prepared = async {
+        let _configuration = state.pro.configuration.lock().await;
+        ensure!(
+            generation == state.pro.generation.load(Ordering::Acquire),
+            "Account changed before Take over"
+        );
+        let (owner, id, root) = (state.clone(), workspace.id.clone(), workspace.root.clone());
+        tokio::task::spawn_blocking(move || check_copy_destination(&owner, &id, &root)).await??;
+        let pending_install =
+            tokio::fs::try_exists(state.pro.root.join(&workspace.id).join("copy-install")).await?;
+        ensure!(
+            !pending_install,
+            "Finish the interrupted local copy before Take over"
+        );
+        {
+            let mut preferences = lock(&state.pro.preferences);
+            let copy = preferences
+                .get_mut(&workspace.id)
+                .and_then(|p| p.copy.as_mut())
+                .context("Open a local copy before taking over")?;
+            ensure!(
+                copy.ready && copy.pending.is_none(),
+                "Finish the local copy before Take over"
+            );
+            copy.takeover_requested = true;
+            if copy.takeover_request.is_none() {
+                copy.takeover_request = Some(chimaera_core::generate_token());
+            }
+            intent = copy
+                .takeover_request
+                .clone()
+                .context("Takeover intent disappeared")?;
+        }
+        super::persist(state).await
+    }
+    .await;
+    if let Err(error) = prepared {
+        if !intent.is_empty() {
+            let _ = super::project_copy::cancel_unstarted_takeover(
+                state,
+                &workspace.id,
+                generation,
+                &intent,
+            )
+            .await;
+        }
+        return Err(error);
+    }
+    // The existing validated move request owns the drain/acquire protocol. A
+    // user-visible action supplies the observed epoch; no input triggers it.
+    if let Err(error) =
+        super::moves::take_over_here(state, &config, &workspace.id, request.expected_epoch).await
+    {
+        let _ = super::project_copy::cancel_unstarted_takeover(
+            state,
+            &workspace.id,
+            generation,
+            &intent,
+        )
+        .await;
+        return Err(error);
+    }
+    ensure!(
+        super::may_execute(state, &workspace.id),
+        "Take over did not establish local execution"
+    );
+    Ok(
+        json!({"workspace_id":workspace.id,"root":workspace.root,"name":workspace.name,"state":"owned_local"}),
+    )
+}
+pub(crate) async fn takeover_project(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<TakeoverRequest>,
+) -> Response {
+    let Ok(permit) = TAKEOVER_ACTIONS.try_acquire() else {
+        return super::routes::failure_with_code(
+            anyhow::anyhow!("Too many takeover requests are pending"),
+            "busy",
+        );
+    };
+    // The bounded intent and its cleanup outlive a disconnected caller.
+    match tokio::spawn(async move {
+        let _permit = permit;
+        takeover(&state, request).await
+    })
+    .await
+    {
+        Ok(result) => match result {
+            Ok(result) => Json(result).into_response(),
+            Err(error) => {
+                let code = open_error_code(&error);
+                super::routes::failure_with_code(error, code)
+            }
+        },
+        Err(error) => super::routes::failure(error.into()),
+    }
+}

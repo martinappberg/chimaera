@@ -11,6 +11,7 @@ mod kept;
 mod mirror;
 mod moves;
 mod policy;
+mod project_copy;
 mod projects;
 mod protocol;
 mod provider_gate;
@@ -23,9 +24,9 @@ pub(crate) use drain::{cancel as cancel_drain, start as drain};
 pub(crate) use kept::{
     file as kept_file, list as kept_list, resolve as kept_resolve, resolve_all as kept_resolve_all,
 };
-pub(crate) use moves::{acted_here, bring_here, other_computer, Outcome as MoveOutcome};
 #[cfg(test)]
-pub(crate) use moves::{device_fixture, settle_fixture};
+pub(crate) use moves::device_fixture;
+pub(crate) use moves::{acted_here, other_computer, Outcome as MoveOutcome};
 pub(crate) use policy::CloudProfile;
 pub(crate) use provider_gate::{
     blocking_provider, cloud_provider_blocks, workspace_provider_blocks,
@@ -57,6 +58,7 @@ pub(crate) struct ProState {
     projects_root: Mutex<Option<PathBuf>>,
     adoptions: Mutex<HashMap<String, projects::Destination>>,
     legacy_pending: Mutex<std::collections::HashSet<String>>,
+    copies: project_copy::Enrollment,
     project_cache: Mutex<projects::Cache>,
     discovery: AsyncMutex<()>,
     status: Mutex<HashMap<String, WorkspaceStatus>>,
@@ -135,6 +137,8 @@ enum Ownership {
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Preference {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    copy: Option<project_copy::CopyState>,
     #[serde(default)]
     account: Option<String>,
     #[serde(default)]
@@ -164,6 +168,8 @@ struct Preference {
     #[serde(default)]
     execution_identity: Option<execution::wire::Identity>,
     #[serde(default)]
+    supervisor_generation: Option<u64>,
+    #[serde(default)]
     recovery_pending: bool,
     #[serde(default)]
     never_mirror: bool,
@@ -171,10 +177,15 @@ struct Preference {
     privacy_pending: bool,
     #[serde(default)]
     git_branches: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    git_staging: Option<repository::StagingStatus>,
     /// The working-tree commit of the last acknowledged publication: the
     /// three-way baseline when work returns.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     published_tree: Option<String>,
+    /// Exact acknowledged handoff baseline, including portable Git staging.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    published_handoff: Option<String>,
     #[serde(default)]
     profile: policy::CloudProfile,
 }
@@ -188,6 +199,8 @@ struct WorkspaceStatus {
     /// Additive: a stable code for `error` (see `routes::error_code`).
     #[serde(skip_serializing_if = "Option::is_none")]
     error_code: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git_staging: Option<repository::StagingStatus>,
     /// Additive: files the last return kept in both versions that still
     /// wait for a choice (`kept.rs` settles them one by one), and up to 32 of
     /// their project-relative paths.
@@ -424,6 +437,11 @@ impl ProState {
             entry.kept_at = (kept.at > 0).then_some(kept.at);
             entry.kept_total = Some(kept.total.max(kept.files));
         }
+        for (id, preference) in &disk.preferences {
+            if let Some(staging) = &preference.git_staging {
+                status.entry(id.clone()).or_default().git_staging = Some(staging.clone());
+            }
+        }
         let authority = authority::Authority::load(&root);
         let execution = execution::State::restore(
             &root,
@@ -431,6 +449,7 @@ impl ProState {
             disk.worker || crate::cloud::enabled(),
             unknown,
         );
+        let copies = project_copy::Enrollment::load(&root);
         Self {
             root,
             configured: AtomicBool::new(false),
@@ -444,6 +463,7 @@ impl ProState {
             projects_root: Mutex::new(disk.projects_root),
             adoptions: Mutex::new(disk.adoptions),
             legacy_pending: Mutex::new(legacy_pending),
+            copies,
             project_cache: Mutex::new(projects::Cache::default()),
             discovery: AsyncMutex::new(()),
             status: Mutex::new(status),
@@ -486,6 +506,9 @@ impl ProState {
 /// latest computer that had the project is the one it returns to. Bounded;
 /// inert without Pro.
 pub(crate) fn note_opened(state: &crate::AppState, workspace: &str) {
+    if project_copy::copy_only(state, workspace) {
+        return;
+    }
     if matches!(
         crate::lock(&state.pro.ownership).get(workspace),
         Some(Ownership::Local { .. })
@@ -505,7 +528,17 @@ pub(crate) fn opened_here(state: &crate::AppState, workspace: &str) -> bool {
 /// Only a verified ownership transition or an explicit clean handoff fences a
 /// device's writer; a cloud worker additionally waits for restart
 /// verification. Connectivity loss never pauses local work.
+pub(crate) fn local_copy_view(
+    state: &crate::AppState,
+    workspace: &str,
+) -> Option<serde_json::Value> {
+    project_copy::view(state, workspace)
+}
+
 pub(crate) fn may_write(state: &crate::AppState, workspace: &str) -> bool {
+    if execution::supervisor::pending(state) || project_copy::copy_only(state, workspace) {
+        return false;
+    }
     if authority::workspace(state, workspace).is_err()
         || (crate::lock(&state.pro.authority).restricted()
             && !state
@@ -560,6 +593,10 @@ pub(crate) use execution::prepare_launch as prepare_managed_launch;
 pub(crate) use execution::recovery_context as checkpoint_recovery_context;
 #[cfg(test)]
 pub(crate) use execution::remote_owner_fixture as install_remote_owner_fixture;
+pub(crate) use execution::supervisor::{
+    ack as supervisor_cleanup_ack, read_startup as read_supervisor_cleanup,
+    stage as stage_supervisor_cleanup,
+};
 #[cfg(test)]
 pub(crate) use execution::{
     refused_fixture as refuse_renewal_fixture, renewed_fixture as renew_execution_fixture,
@@ -648,25 +685,19 @@ pub(crate) fn interrupted_return(
         && execution::resume_allowed(state, &entry.workspace_id)
 }
 
-/// Where a project's work runs now, in a client's words: `"cloud"` (a cloud
-/// machine) or `"computer"` (the user's own computer). The additive `owner`
-/// of the `read_only` and `workspace_owned_elsewhere` refusals, so a client
-/// can say "running in the cloud" instead of guessing. A cloud machine's
-/// other owner is the user's computer; a computer's is the cloud unless the
-/// work left for another of the user's computers (`moves::other_computer`) —
-/// the rule `ws::classify_pause` also applies; a project arriving here, or
-/// verifying after a restart, runs here.
-pub(crate) fn owner_kind(state: &crate::AppState, workspace: &str) -> &'static str {
-    let (here, away) = if execution::worker(state) {
-        ("cloud", "computer")
-    } else if moves::other_computer(state, workspace) {
-        ("computer", "computer")
-    } else {
-        ("computer", "cloud")
-    };
+/// Presentation evidence only: the current daemon's role and an explicitly
+/// recorded move to another computer are known. An opaque remote holder
+/// cannot identify a cloud machine or a computer, so its owner is null.
+pub(crate) fn owner_kind(state: &crate::AppState, workspace: &str) -> Option<&'static str> {
     match ownership_phase(state, workspace) {
-        Phase::Elsewhere | Phase::Leaving => away,
-        Phase::Here | Phase::Verifying | Phase::Arriving => here,
+        Phase::Elsewhere | Phase::Leaving => {
+            moves::other_computer(state, workspace).then_some("computer")
+        }
+        Phase::Here | Phase::Verifying | Phase::Arriving => Some(if execution::worker(state) {
+            "cloud"
+        } else {
+            "computer"
+        }),
     }
 }
 /// Whether this session waits at boot for this life's ownership proof.
@@ -786,6 +817,9 @@ pub(crate) async fn await_scope_renewal(
         == execution::Renewal::Renewed
 }
 pub(crate) fn owned_epoch(state: &crate::AppState, workspace: &str) -> Option<u64> {
+    if project_copy::copy_only(state, workspace) {
+        return None;
+    }
     match crate::lock(&state.pro.ownership).get(workspace) {
         Some(Ownership::Local { epoch }) => Some(*epoch),
         _ => None,
@@ -845,6 +879,7 @@ fn now() -> u64 {
 async fn persist(state: &crate::AppState) -> anyhow::Result<()> {
     let mut written = state.pro.persistence.lock().await;
     ensure_root(&state.pro.root).await?;
+    project_copy::persist_latch(state).await?;
     execution::record_groups(state);
     let ownership = crate::lock(&state.pro.ownership).clone();
     let preferences = crate::lock(&state.pro.preferences).clone();
@@ -891,6 +926,14 @@ async fn persist(state: &crate::AppState) -> anyhow::Result<()> {
 }
 
 pub(crate) fn may_import(state: &crate::AppState, workspace: &str, epoch: u64) -> bool {
+    if project_copy::copy_only(state, workspace)
+        && !crate::lock(&state.pro.preferences)
+            .get(workspace)
+            .and_then(|p| p.copy.as_ref())
+            .is_some_and(|copy| copy.takeover_requested)
+    {
+        return false;
+    }
     if authority::workspace(state, workspace).is_err()
         || (crate::lock(&state.pro.authority).restricted()
             && !state
@@ -984,15 +1027,22 @@ pub(crate) fn sweep_leftovers(state: &std::sync::Arc<crate::AppState>) {
     });
 }
 
-/// A paused row's name where nothing better exists, in words that read the
-/// same wherever it is shown (a viewer sees a cloud machine's rows too, so
-/// never "here"): a cloud machine holds terminals that stay with your
-/// computer and agents about to start in the cloud; a computer shows work the
-/// cloud is continuing, or work about to resume.
+/// A paused row's fallback title uses this daemon's known role or an
+/// explicit destination, and keeps opaque remote owners neutral.
 pub(crate) fn paused_label(
     state: &crate::AppState,
     entry: &crate::ledger::LedgerEntry,
 ) -> &'static str {
+    if matches!(
+        ownership_phase(state, &entry.workspace_id),
+        Phase::Elsewhere | Phase::Leaving
+    ) {
+        return if moves::other_computer(state, &entry.workspace_id) {
+            "Continuing on your other computer"
+        } else {
+            "Continuing elsewhere"
+        };
+    }
     if execution::worker(state) {
         return if entry.agent.is_some() {
             "Starting in the cloud"
@@ -1000,10 +1050,7 @@ pub(crate) fn paused_label(
             "Terminal on your computer"
         };
     }
-    match crate::lock(&state.pro.ownership).get(&entry.workspace_id) {
-        Some(Ownership::Remote { .. }) => "Continuing in the cloud",
-        _ => "Paused",
-    }
+    "Paused"
 }
 
 /// Graceful daemon stop: clear managed-execution evidence once this life's
@@ -1330,16 +1377,20 @@ mod tests {
                 holder: "worker-a".into(),
             },
         );
+        assert_eq!(owner_kind(&state, "w-a"), None, "an opaque other owner");
+        assert_eq!(
+            owner_kind(&state, "w-unknown"),
+            Some("computer"),
+            "runs here"
+        );
+        crate::lock(&state.pro.ownership).insert("w-a".into(), Ownership::Hydrating { epoch: 3 });
+        assert_eq!(owner_kind(&state, "w-a"), Some("computer"), "arriving here");
+        execution::worker_fixture(&state);
         assert_eq!(
             owner_kind(&state, "w-a"),
-            "cloud",
-            "a computer's other owner"
+            Some("cloud"),
+            "a cloud machine's own"
         );
-        assert_eq!(owner_kind(&state, "w-unknown"), "computer", "runs here");
-        crate::lock(&state.pro.ownership).insert("w-a".into(), Ownership::Hydrating { epoch: 3 });
-        assert_eq!(owner_kind(&state, "w-a"), "computer", "arriving here");
-        execution::worker_fixture(&state);
-        assert_eq!(owner_kind(&state, "w-a"), "cloud", "a cloud machine's own");
         crate::lock(&state.pro.ownership).insert(
             "w-a".into(),
             Ownership::Remote {
@@ -1349,8 +1400,26 @@ mod tests {
         );
         assert_eq!(
             owner_kind(&state, "w-a"),
-            "computer",
-            "a cloud machine's other owner"
+            None,
+            "a cloud machine also cannot identify an opaque other owner"
+        );
+        let entry = crate::ledger::LedgerEntry {
+            id: "s-a".into(),
+            suspended: true,
+            handoff: None,
+            workspace_id: "w-a".into(),
+            cwd: root.clone(),
+            pinned_name: None,
+            cols: 80,
+            rows: 24,
+            theme: "dark".into(),
+            created_at: 0,
+            agent: None,
+        };
+        assert_eq!(
+            paused_label(&state, &entry),
+            "Continuing elsewhere",
+            "a worker's remote row is not starting here"
         );
         assert!(!restart_deferred(&state, "s-a"));
         defer_boot_session(&state, "s-a");

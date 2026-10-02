@@ -5,6 +5,7 @@ mod lease;
 pub(crate) mod mutation;
 mod restart;
 pub(super) mod setup;
+pub(super) mod supervisor;
 pub(super) use restart::{persist_latch, record_groups, reprobe, shutdown};
 pub(super) mod receipt;
 pub(super) mod recovery;
@@ -43,6 +44,10 @@ pub(super) struct State {
     /// policy; a worker also runs nothing there. Bounded to 128.
     pub(super) uncertain: Mutex<std::collections::HashSet<String>>,
     boot: Option<String>,
+    /// Cleanup cannot repair unreadable enrollment or ownership state.
+    supervisor_state_invalid: bool,
+    supervisor_pending: Mutex<Option<supervisor::CleanupReceipt>>,
+    supervisor_ack: Mutex<Option<supervisor::CleanupAck>>,
     /// The watchdog's latest tick (see `thawed`).
     tick: Mutex<Option<std::time::Instant>>,
     /// Fires whenever a proof is installed, fenced or dropped, so a viewer
@@ -326,6 +331,11 @@ pub(super) fn accept(
         generation == state.pro.generation.load(Ordering::Acquire),
         "stale execution generation"
     );
+    ensure!(
+        !supervisor::pending(state)
+            && (!supervisor::supervised(state) || config.execution.is_some()),
+        "supervised execution requires startup cleanup and a negotiated lease"
+    );
     // A worker cannot accept (or keep) a lease while it cannot prove old
     // processes stopped. A device keeps running regardless (laptop first).
     ensure!(
@@ -451,8 +461,11 @@ pub(super) fn accept(
 /// Local execution admission. Ownership transitions (another verified owner,
 /// an in-progress transfer) are fenced separately by `may_write`.
 pub(super) fn allows(state: &AppState, workspace: &str) -> bool {
+    if supervisor::pending(state) {
+        return false;
+    }
     if !managed(state, workspace) {
-        return true;
+        return !supervisor::supervised(state);
     }
     if lock(&state.pro.preferences)
         .get(workspace)
@@ -669,7 +682,8 @@ pub(super) fn managed_session(state: &AppState, id: &str) -> bool {
     state.chat.get(id).is_some() || lock(&state.agents).contains_key(id)
 }
 pub(super) fn quiescent(state: &AppState, workspace: &str) -> bool {
-    if (uncertain(state, workspace) && worker(state))
+    if supervisor::pending(state)
+        || (uncertain(state, workspace) && worker(state))
         || unclean(state, workspace)
         || !mutation::idle(state, workspace)
         || setup::active(state, workspace)

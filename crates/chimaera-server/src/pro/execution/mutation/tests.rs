@@ -380,3 +380,36 @@ async fn queued_real_shell_command_keeps_original_generation_and_epoch() {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[test]
+fn asynchronous_dispatch_keeps_exact_ownership_account_and_worker_deadline() {
+    let (state, root) = fixture();
+    let admission = Dispatch::capture(&state, "w-a").unwrap();
+    // A laptop's expired publication lease must not stop its own local work.
+    lock(&state.pro.execution.proofs)
+        .get_mut("w-a")
+        .unwrap()
+        .deadline = super::super::lease::Deadline::expired_fixture();
+    drop(admission.begin(&state).unwrap());
+    lock(&state.pro.ownership).insert("w-a".into(), Ownership::Local { epoch: 5 });
+    assert!(admission.begin(&state).is_err());
+    lock(&state.pro.ownership).insert("w-a".into(), Ownership::AwaitingVerification { epoch: 5 });
+    let awaiting = Dispatch::capture(&state, "w-a").unwrap();
+    lock(&state.pro.ownership).insert("w-a".into(), Ownership::AwaitingVerification { epoch: 6 });
+    assert!(awaiting.begin(&state).is_err());
+    let free = Dispatch::capture(&state, "free").unwrap();
+    assert!(free.begin(&state).unwrap().is_none());
+    state.pro.generation.fetch_add(1, Ordering::AcqRel);
+    assert!(free.begin(&state).is_err());
+    std::fs::remove_dir_all(root).unwrap();
+    let (state, root) = fixture();
+    super::super::worker_fixture(&state);
+    let admission = Dispatch::capture(&state, "w-a").unwrap();
+    lock(&state.pro.execution.proofs)
+        .get_mut("w-a")
+        .unwrap()
+        .deadline = super::super::lease::Deadline::expired_fixture();
+    assert!(admission.begin(&state).is_err());
+    assert!(idle(&state, "w-a"));
+    std::fs::remove_dir_all(root).unwrap();
+}

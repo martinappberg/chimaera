@@ -287,8 +287,8 @@ pub async fn pro_cloud_request(app: AppHandle, request: Request) -> Result<Value
     };
     // Credential submission and removal must stay bound to the same account
     // while the blocking HTTP client sends the explicitly authorized operation.
-    let _account_operation = if account_mutation {
-        Some(state.pro.operation.lock().await)
+    let account_operation = if account_mutation {
+        Some(state.pro.operation.clone().lock_owned().await)
     } else {
         None
     };
@@ -366,73 +366,76 @@ pub async fn pro_cloud_request(app: AppHandle, request: Request) -> Result<Value
         .ok_or("Cloud machine is not ready")?
         .token
         .clone();
-    let result = tokio::task::spawn_blocking(move || -> Result<Value, String> {
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(timeout)))
-            .max_redirects(0)
-            .http_status_as_error(false)
-            .build()
-            .into();
-        let mut response = if let Some(body) = body {
-            agent
-                .post(&url)
-                .header("Authorization", &format!("Bearer {token}"))
-                .send_json(body)
-        } else {
-            agent
-                .get(&url)
-                .header("Authorization", &format!("Bearer {token}"))
-                .call()
-        }
-        .map_err(|error| {
-            // A transport failure only; the daemon's answer, when there is
-            // one, is read below and never logged.
-            tracing::warn!(%route, %error, "cloud request failed in transit");
-            SETUP_FAILED
-        })?;
-        let status = response.status();
-        if !status.is_success() {
-            tracing::info!(%route, status = status.as_u16(), "cloud request refused");
-        }
-        let sleeping = response
-            .headers()
-            .get("x-chimaera-worker-state")
-            .is_some_and(|state| state == "sleeping");
-        let mut bytes = Vec::new();
-        response
-            .body_mut()
-            .as_reader()
-            .take(64 * 1024 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| SETUP_FAILED)?;
-        if bytes.len() > 64 * 1024 {
-            return Err("Cloud setup response exceeds limit".into());
-        }
-        if asleep_answer(status.as_u16(), sleeping, &bytes) {
-            return Err(CLOUD_ASLEEP.into());
-        }
-        let value = response_value(status.as_u16(), &bytes)?;
-        if !status.is_success() {
-            return Err(match value["error"].as_str() {
-                Some("cloud_provider_not_ready") => {
-                    "Connect the agent required by this project before continuing."
-                }
-                Some("provider_unavailable") => "This provider cannot connect here yet.",
-                // This fixed code is mapped to copy by the typed UI. Never
-                // forward arbitrary provider errors or CLI output.
-                Some("provider_busy") => "provider_busy",
-                // Half a pasted `code#state`: the attempt stays open, the UI
-                // asks for the whole code.
-                Some("authorization_code_incomplete") => "authorization_code_incomplete",
-                _ => SETUP_FAILED,
+    let result = blocking_request(
+        account_operation,
+        tunnel,
+        move || -> Result<Value, String> {
+            let agent: ureq::Agent = ureq::Agent::config_builder()
+                .timeout_global(Some(Duration::from_secs(timeout)))
+                .max_redirects(0)
+                .http_status_as_error(false)
+                .build()
+                .into();
+            let mut response = if let Some(body) = body {
+                agent
+                    .post(&url)
+                    .header("Authorization", &format!("Bearer {token}"))
+                    .send_json(body)
+            } else {
+                agent
+                    .get(&url)
+                    .header("Authorization", &format!("Bearer {token}"))
+                    .call()
             }
-            .into());
-        }
-        Ok(value)
-    })
+            .map_err(|error| {
+                // A transport failure only; the daemon's answer, when there is
+                // one, is read below and never logged.
+                tracing::warn!(%route, %error, "cloud request failed in transit");
+                SETUP_FAILED
+            })?;
+            let status = response.status();
+            if !status.is_success() {
+                tracing::info!(%route, status = status.as_u16(), "cloud request refused");
+            }
+            let sleeping = response
+                .headers()
+                .get("x-chimaera-worker-state")
+                .is_some_and(|state| state == "sleeping");
+            let mut bytes = Vec::new();
+            response
+                .body_mut()
+                .as_reader()
+                .take(64 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| SETUP_FAILED)?;
+            if bytes.len() > 64 * 1024 {
+                return Err("Cloud setup response exceeds limit".into());
+            }
+            if asleep_answer(status.as_u16(), sleeping, &bytes) {
+                return Err(CLOUD_ASLEEP.into());
+            }
+            let value = response_value(status.as_u16(), &bytes)?;
+            if !status.is_success() {
+                return Err(match value["error"].as_str() {
+                    Some("cloud_provider_not_ready") => {
+                        "Connect the agent required by this project before continuing."
+                    }
+                    Some("provider_unavailable") => "This provider cannot connect here yet.",
+                    // This fixed code is mapped to copy by the typed UI. Never
+                    // forward arbitrary provider errors or CLI output.
+                    Some("provider_busy") => "provider_busy",
+                    // Half a pasted `code#state`: the attempt stays open, the UI
+                    // asks for the whole code.
+                    Some("authorization_code_incomplete") => "authorization_code_incomplete",
+                    _ => SETUP_FAILED,
+                }
+                .into());
+            }
+            Ok(value)
+        },
+    )
     .await
     .map_err(|_| SETUP_FAILED)?;
-    drop(tunnel);
     if state.pro.generation() != generation {
         return Err("Account changed during cloud setup".into());
     }
@@ -463,6 +466,21 @@ const SETUP_FAILED: &str = "Couldn't complete cloud setup. Try again shortly.";
 /// The fixed code for a cloud machine that is asleep or still starting. The
 /// page maps it to a quiet line ("waking up" / "asleep"), never an error.
 const CLOUD_ASLEEP: &str = "cloud_asleep";
+
+/// A canceled IPC future cannot release the account fence or close the route
+/// while its already-admitted blocking request is still sending credentials.
+async fn blocking_request<T: Send + 'static, R: Send + 'static>(
+    account_operation: Option<tokio::sync::OwnedMutexGuard<()>>,
+    tunnel: T,
+    send: impl FnOnce() -> R + Send + 'static,
+) -> Result<R, tokio::task::JoinError> {
+    tokio::task::spawn_blocking(move || {
+        let _account_operation = account_operation;
+        let _tunnel = tunnel;
+        send()
+    })
+    .await
+}
 
 /// A sleeping or starting cloud machine answers through its transport: 503
 /// `worker_asleep` / `worker_unavailable`, or an answer marked
@@ -544,6 +562,79 @@ fn connection_browser_url(connection: &Value) -> Result<url::Url, String> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn canceled_submission_retains_account_fence_and_route_until_http_finishes() {
+        use std::io::Write;
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        struct Route(Arc<AtomicBool>);
+        impl Drop for Route {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/submit", listener.local_addr().unwrap());
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = tokio::task::spawn_blocking(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+                assert!(request.len() < 4096);
+            }
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+        let operation = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = operation.clone().lock_owned().await;
+        let route_closed = Arc::new(AtomicBool::new(false));
+        let route = Route(route_closed.clone());
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let command = tokio::spawn(async move {
+            blocking_request(Some(guard), route, move || {
+                let agent: ureq::Agent = ureq::Agent::config_builder()
+                    .timeout_global(Some(Duration::from_secs(10)))
+                    .build()
+                    .into();
+                let response = agent.post(&url).send_empty().unwrap();
+                assert_eq!(response.status(), 204);
+                let _ = finished_tx.send(());
+            })
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        command.abort();
+        assert!(command.await.unwrap_err().is_cancelled());
+        assert!(operation.try_lock().is_err(), "sign-out must still wait");
+        assert!(!route_closed.load(Ordering::Acquire));
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), finished_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let _replacement = tokio::time::timeout(Duration::from_secs(5), operation.lock())
+            .await
+            .unwrap();
+        assert!(route_closed.load(Ordering::Acquire));
+        server.await.unwrap();
+    }
+
     fn worker(token: &str) -> Host {
         Host {
             id: "w-1".into(),
@@ -556,6 +647,7 @@ mod tests {
                 sessions: 0,
             }),
             error: None,
+            cluster: None,
         }
     }
 

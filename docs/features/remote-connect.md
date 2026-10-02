@@ -195,6 +195,11 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
   control-plane output is collected concurrently under 8 MiB stdout / 1 MiB stderr and wall-clock
   limits; overflow or timeout kills and reaps the process. Fetched daemons are cached per
   triple-and-version.
+- **Attached job output stays bounded while it drains.** Each stdout/stderr reader keeps at most
+  a 4 KiB line prefix, discards an oversized line's remainder, and continues through invalid UTF-8.
+  The diagnostic tail retains eight sanitized lines of at most 300 characters each. Explicit
+  ControlMaster closure attempts both routed legs within bounded deadlines, including after its
+  caller is cancelled; it succeeds only on an acknowledged exit or a verified absent control socket.
 - **Tunnel teardown cannot hold the app hostage.** Tunnel objects are removed from shared maps
   before any process/network wait, so one dead host cannot block health checks or commands for
   another. Child reaping gets a two-second ceiling; ControlMaster forward cancellation is

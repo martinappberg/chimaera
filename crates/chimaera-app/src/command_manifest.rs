@@ -76,6 +76,8 @@ pub const LOCAL_ACCOUNT_COMMANDS: &[&str] = &[
     "pro_refresh_account",
     "pro_cloud_projects",
     "pro_open_cloud_project",
+    "pro_copy_project",
+    "pro_take_over_project",
     "pro_billing_checkout",
     "pro_billing_portal",
     "pro_cancel_billing",

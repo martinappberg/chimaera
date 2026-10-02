@@ -2874,13 +2874,10 @@ async fn chat_commands_that_are_not_the_user_acting_never_wake_the_owner() {
     );
 }
 
-/// Acting on a project another of the user's computers runs brings the work
-/// here; nothing else does. The commands that are not the user acting pass
-/// straight to the owner (it answers the `cancel_send`), and the first real
-/// send is what says `bringing`. The request fails in this fixture (there is
-/// no account), so the send comes back, named by its id.
+/// Passive commands and ordinary input both reach the current computer owner,
+/// even when the viewing Mac is eligible to take over explicitly.
 #[tokio::test]
-async fn chat_commands_that_are_not_the_user_acting_never_bring_the_work_here() {
+async fn passive_commands_and_ordinary_input_never_take_over_from_another_computer() {
     let fixture = routed_remote("passive-bring", false, "device-other", false).await;
     // This computer could take the project.
     let nowhere = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2916,63 +2913,52 @@ async fn chat_commands_that_are_not_the_user_acting_never_bring_the_work_here() 
     );
 
     socket
-        .send(send_as("BRING_IT", "client-bring"))
+        .send(send_as("STAY_THERE", "client-stays"))
         .await
         .unwrap();
-    let mut bringing = false;
-    loop {
-        let frame = next_json(&mut socket).await;
-        if frame["type"] == "bringing" {
-            assert_eq!(frame["to"], "here", "{frame}");
-            bringing = true;
-        }
-        if frame["code"] == "command_failed" {
-            assert_eq!(frame["reason"], "still_working", "{frame}");
-            assert_eq!(frame["command"], "send", "{frame}");
-            assert_eq!(frame["client_id"], "client-bring", "{frame}");
-            break;
-        }
-    }
-    assert!(bringing, "the send asked to bring the work here");
-    assert_eq!(user_turns(&fixture.capture, "BRING_IT"), 0);
+    delivered_once(&fixture.capture, "STAY_THERE").await;
+    let frames = until_quiet(&mut socket, std::time::Duration::from_millis(300)).await;
+    assert!(
+        frames
+            .iter()
+            .all(|frame| frame["type"] != "bringing" && frame["code"] != "command_failed"),
+        "{frames:?}"
+    );
+    assert!(
+        fixture.local.chat.get(&fixture.id).is_none(),
+        "viewing and sending never spawn here"
+    );
+    assert!(fixture.local.sessions.list().is_empty());
+    assert_eq!(
+        fixture
+            .remote
+            .chat
+            .client_id_state(&fixture.id, "client-stays"),
+        Some(chimaera_agent::ClientIdState::Confirmed)
+    );
 }
 
-/// An account that takes a connection and never answers: a request to bring
-/// the work here stays under way for as long as a test needs it to.
-async fn silent_account() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move {
-        let mut open = Vec::new();
-        while let Ok((socket, _)) = listener.accept().await {
-            open.push(socket);
-        }
-    });
-    endpoint
-}
-
-/// A chat on another of the user's computers, viewed from a computer that is
-/// bringing its work here: `first` was sent and is held for the move.
-async fn pulling(
+/// A sleeping owner whose wake waits for the test to release it. This tests
+/// held-input safety without relying on the removed implicit takeover action.
+async fn waking(
     label: &str,
     first: Message,
 ) -> (
     SleepingChat,
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
 ) {
-    let fixture = routed_remote(label, false, "device-other", false).await;
-    pro::device_fixture(&fixture.local, &silent_account().await);
+    let fixture = sleeping_remote_chat(label).await;
+    fixture
+        .transport
+        .hold_wake
+        .store(true, std::sync::atomic::Ordering::Release);
     let mut socket = open_chat(&fixture).await;
-    loop {
-        if next_json(&mut socket).await["type"] == "ready" {
-            break;
-        }
-    }
+    assert_eq!(next_json(&mut socket).await["code"], "worker_asleep");
     socket.send(first).await.unwrap();
     loop {
         let frame = next_json(&mut socket).await;
         assert_ne!(frame["code"], "command_failed", "{frame}");
-        if frame["type"] == "bringing" {
+        if frame["type"] == "waking" {
             break;
         }
     }
@@ -2980,12 +2966,11 @@ async fn pulling(
 }
 
 /// A holder treats a held send's id as the daemon treats an accepted one.
-/// While the work is coming here the old owner's `ready` reaches the viewer,
+/// While the owner wakes its `ready` reaches the viewer,
 /// whose client sends its unconfirmed send again: that second copy must be
 /// dropped, not refused. A refusal would return the message to the composer
-/// while the first copy is delivered here a moment later. Both ways the copy
-/// "does not fit": four commands already held, and a send over half the
-/// byte bound.
+/// while the first copy is delivered to its owner a moment later. Cover both
+/// an ordinary send and one larger than half the byte bound.
 #[tokio::test]
 async fn a_second_copy_of_a_held_send_is_dropped_never_refused() {
     let quiet = std::time::Duration::from_millis(400);
@@ -2997,15 +2982,8 @@ async fn a_second_copy_of_a_held_send_is_dropped_never_refused() {
             .collect()
     };
 
-    // Four commands held: a fifth is refused, the copy of the first is not.
-    let (fixture, mut socket) =
-        pulling("held-copy-count", send_as("HELD_X", "client-held-x")).await;
-    for n in 1..=3 {
-        socket
-            .send(send_as(&format!("HELD_{n}"), &format!("client-held-{n}")))
-            .await
-            .unwrap();
-    }
+    // One held send: a duplicate stays held, a different send is refused.
+    let (fixture, mut socket) = waking("held-copy-count", send_as("HELD_X", "client-held-x")).await;
     socket
         .send(send_as("HELD_X", "client-held-x"))
         .await
@@ -3029,7 +3007,7 @@ async fn a_second_copy_of_a_held_send_is_dropped_never_refused() {
             ]
         }))
     };
-    let (fixture, mut socket) = pulling("held-copy-bytes", large("LARGE_X")).await;
+    let (fixture, mut socket) = waking("held-copy-bytes", large("LARGE_X")).await;
     socket.send(large("LARGE_X")).await.unwrap();
     let frames = until_quiet(&mut socket, quiet).await;
     assert!(refused(&frames).is_empty(), "{frames:?}");
@@ -3048,13 +3026,13 @@ async fn a_second_copy_of_a_held_send_is_dropped_never_refused() {
 }
 
 /// A `cancel_send` for a send the relay holds is answered by the relay: not
-/// withdrawn. Forwarded, it would reach the owner the work is leaving, which
+/// withdrawn. Forwarded, it would reach the sleeping owner, which
 /// never saw the send and would call it withdrawn; the client would return
-/// the message and the move would then deliver it. While the work is coming
-/// nothing a chat sends goes to that owner at all.
+/// the message and the wake would then deliver it. While the owner is waking,
+/// no unheld cancellation or automatic preference is forwarded.
 #[tokio::test]
 async fn a_cancel_for_a_held_send_is_answered_by_the_holder() {
-    let (fixture, mut socket) = pulling("held-cancel", send_as("HELD_X", "client-held-x")).await;
+    let (fixture, mut socket) = waking("held-cancel", send_as("HELD_X", "client-held-x")).await;
     socket
         .send(command(
             serde_json::json!({"type":"cancel_send","client_id":"client-held-x"}),
@@ -3095,7 +3073,7 @@ async fn a_cancel_for_a_held_send_is_answered_by_the_holder() {
         assert_eq!(
             fixture.remote.chat.client_id_state(&fixture.id, id),
             None,
-            "the owner the work is leaving never heard about {id}"
+            "the sleeping owner never heard about {id}"
         );
     }
     let stdin = std::fs::read_to_string(&fixture.capture).unwrap_or_default();
@@ -3169,13 +3147,14 @@ async fn a_setting_picked_while_the_owner_sleeps_is_held_and_applies_to_the_next
     assert!(!stdin.contains("get_usage"), "{stdin}");
 }
 
-/// Typing held while the work comes here waits for the session here. A
-/// terminal's grid control still passes to the computer it is leaving (the
-/// pane keeps its size), but must not take the held typing with it.
+/// Grid control during a wake never carries held typing ahead of the owner.
 #[tokio::test]
-async fn grid_control_during_a_move_never_delivers_the_held_typing() {
-    let fixture = routed_remote("held-typing", true, "device-other", false).await;
-    pro::device_fixture(&fixture.local, &silent_account().await);
+async fn grid_control_during_a_wake_never_delivers_the_held_typing() {
+    let fixture = sleeping_remote("held-typing", true).await;
+    fixture
+        .transport
+        .hold_wake
+        .store(true, std::sync::atomic::Ordering::Release);
     let (mut socket, _) = tokio_tungstenite::connect_async(format!(
         "ws://{}/ws/sessions/{}",
         fixture.local_addr, fixture.id
@@ -3188,17 +3167,13 @@ async fn grid_control_during_a_move_never_delivers_the_held_typing() {
         ))
         .await
         .unwrap();
-    loop {
-        if next_json(&mut socket).await["type"] == "ready" {
-            break;
-        }
-    }
+    assert_eq!(next_json(&mut socket).await["code"], "worker_asleep");
     socket
         .send(Message::Binary(b"HELD_TYPING\r".to_vec().into()))
         .await
         .unwrap();
     loop {
-        if next_json(&mut socket).await["type"] == "bringing" {
+        if next_json(&mut socket).await["type"] == "waking" {
             break;
         }
     }
@@ -3208,9 +3183,24 @@ async fn grid_control_during_a_move_never_delivers_the_held_typing() {
         ))
         .await
         .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     let typed = std::fs::read_to_string(&fixture.capture).unwrap_or_default();
     assert!(!typed.contains("HELD_TYPING"), "{typed}");
+    fixture.transport.release.notify_one();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let typed = std::fs::read_to_string(&fixture.capture).unwrap_or_default();
+        if typed.contains("HELD_TYPING") {
+            assert_eq!(typed.matches("HELD_TYPING").count(), 1);
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "held typing never reached owner"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(fixture.local.sessions.list().is_empty());
 }
 
 fn set_mode(mode: &str) -> Message {
@@ -3232,13 +3222,11 @@ fn refusals(frames: &[serde_json::Value]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// When the work arrives here, what the relay held reaches the session on
-/// this computer in the order the user did it, settings included, and none
-/// of it reaches the computer the work left.
+/// Input and settings held during wake reach the same owner in original order.
 #[tokio::test]
-async fn held_input_and_settings_reach_the_session_here_in_order() {
+async fn held_input_and_settings_reach_the_current_owner_in_order() {
     let (fixture, mut socket) =
-        pulling("held-arrives", send_as("FIRST_HERE", "client-first")).await;
+        waking("held-arrives", send_as("FIRST_THERE", "client-first")).await;
     socket.send(set_mode("plan")).await.unwrap();
     socket
         .send(command(
@@ -3246,104 +3234,45 @@ async fn held_input_and_settings_reach_the_session_here_in_order() {
         ))
         .await
         .unwrap();
-    let frames = until_quiet(&mut socket, std::time::Duration::from_millis(300)).await;
+    let frames = until_quiet(&mut socket, std::time::Duration::from_millis(200)).await;
     assert!(refusals(&frames).is_empty(), "{frames:?}");
-
-    // The project is here now and its session runs on this computer.
-    let here = test_dir("held-arrives-here");
-    let capture = here.join("agent-stdin.txt");
-    let fake = write_fake_claude("held-arrives-agent");
-    let script = std::fs::read_to_string(&fake).unwrap();
-    std::fs::write(
-        &fake,
-        script.replace("cat >/dev/null", "cat > \"$CHIMAERA_TEST_CAPTURE\""),
-    )
-    .unwrap();
-    let mut spec = chimaera_agent::driver::SpawnSpec::new(
-        fixture.id.clone(),
-        vec![fake.to_string_lossy().into_owned()],
-        here,
-    );
-    spec.env.push((
-        "CHIMAERA_TEST_CAPTURE".into(),
-        capture.to_string_lossy().into_owned(),
-    ));
-    fixture
-        .local
-        .chat
-        .spawn(&chimaera_agent::claude::ClaudeAdapter, spec)
-        .unwrap();
-    pro::settle_fixture(&fixture.local, &fixture.workspace, pro::MoveOutcome::Here);
-
-    // The viewer's socket closes once everything was delivered, with no
-    // refusal on the way.
-    use futures::StreamExt;
-    loop {
-        match tokio::time::timeout(std::time::Duration::from_secs(10), socket.next())
-            .await
-            .expect("the socket never closed")
-        {
-            Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
-            Some(Ok(Message::Text(text))) => assert!(!text.contains("command_failed"), "{text}"),
-            Some(Ok(_)) => {}
+    fixture.transport.release.notify_one();
+    delivered_once(&fixture.capture, "FIRST_THERE").await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let stdin = loop {
+        let text = std::fs::read_to_string(&fixture.capture).unwrap_or_default();
+        if text.contains("picked-model") {
+            break text;
         }
-    }
-    delivered_once(&capture, "FIRST_HERE").await;
-    let stdin = std::fs::read_to_string(&capture).unwrap();
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "held settings never reached owner"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
     let line = |needle: &str| {
         stdin
             .lines()
             .position(|line| line.contains(needle))
-            .unwrap_or_else(|| panic!("{needle} never reached the session here: {stdin}"))
+            .unwrap()
     };
-    assert!(line("FIRST_HERE") < line("set_permission_mode"));
+    assert!(line("FIRST_THERE") < line("set_permission_mode"));
     assert!(line("set_permission_mode") < line("picked-model"));
-    // The send kept its id on the way: the client's own copy would be dropped.
     assert_eq!(
         fixture
-            .local
+            .remote
             .chat
             .client_id_state(&fixture.id, "client-first"),
         Some(chimaera_agent::ClientIdState::Confirmed)
     );
-    let left = std::fs::read_to_string(&fixture.capture).unwrap_or_default();
-    assert!(
-        !left.contains("FIRST_HERE") && !left.contains("set_permission_mode"),
-        "nothing went to the computer the work left: {left}"
-    );
-    fixture.local.chat.kill(&fixture.id);
+    assert!(fixture.local.chat.get(&fixture.id).is_none());
 }
 
 /// Whenever held input comes back, the settings held with it come back too,
-/// each refused by the command it was: the other computer keeping the work,
-/// a wake that fails, and the project changing owner.
+/// each refused by the command it was: a wake that fails and a project
+/// changing owner.
 #[tokio::test]
 async fn held_settings_are_refused_by_name_with_the_input_they_waited_with() {
-    // The other computer keeps the work.
-    let (fixture, mut socket) = pulling("held-kept", send_as("KEPT", "client-kept")).await;
-    socket.send(set_mode("plan")).await.unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    pro::settle_fixture(
-        &fixture.local,
-        &fixture.workspace,
-        pro::MoveOutcome::Refused,
-    );
-    let frames = until_quiet(&mut socket, std::time::Duration::from_millis(500)).await;
-    assert_eq!(
-        refusals(&frames),
-        [
-            ("send".to_owned(), "client-kept".to_owned()),
-            ("set_mode".to_owned(), String::new())
-        ],
-        "{frames:?}"
-    );
-    assert!(
-        frames
-            .iter()
-            .all(|frame| frame["code"] != "command_failed" || frame["reason"] == "still_working"),
-        "{frames:?}"
-    );
-
     // A wake that fails.
     let fixture = sleeping_remote_chat("held-failed-wake").await;
     fixture
@@ -3496,49 +3425,49 @@ async fn a_held_setting_rides_ahead_of_the_next_input_on_a_ready_socket() {
     assert!(refusals(&frames).is_empty(), "{frames:?}");
 }
 
-/// A session that never starts here costs the held batch one wait, not one
-/// per frame, and every held frame is then refused by name.
+/// Changing ownership while a wake holds input refuses the whole batch; it
+/// cannot replay the send against a newly selected execution owner.
 #[tokio::test]
-async fn a_session_that_never_starts_here_refuses_the_whole_batch_after_one_wait() {
-    let (fixture, mut socket) =
-        pulling("held-no-session", send_as("NOWHERE", "client-nowhere")).await;
+async fn an_owner_change_refuses_held_input_and_settings_without_replay() {
+    let (fixture, mut socket) = waking(
+        "held-owner-change",
+        send_as("OLD_OWNER", "client-old-owner"),
+    )
+    .await;
     socket.send(set_mode("plan")).await.unwrap();
-    socket
-        .send(send_as("NOWHERE_TOO", "client-nowhere-2"))
-        .await
-        .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    let started = tokio::time::Instant::now();
-    pro::settle_fixture(&fixture.local, &fixture.workspace, pro::MoveOutcome::Here);
+    let (status, _) = request(
+        &fixture.local,
+        Method::POST,
+        "/api/v1/pro/placements",
+        Some(serde_json::json!({
+            "host_id":"worker-next","endpoint":format!("http://{}",fixture.transport_addr),
+            "token":"test-token","workspace_id":fixture.workspace,"epoch":5
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
     let mut frames = Vec::new();
-    use futures::StreamExt;
     loop {
-        match tokio::time::timeout(std::time::Duration::from_secs(15), socket.next())
-            .await
-            .expect("the socket never closed")
-        {
-            Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
-            Some(Ok(Message::Text(text))) => {
-                frames.push(serde_json::from_str::<serde_json::Value>(&text).unwrap())
-            }
-            Some(Ok(_)) => {}
+        let frame = next_json(&mut socket).await;
+        let moved = frame["type"] == "moved";
+        frames.push(frame);
+        if moved {
+            break;
         }
     }
     assert_eq!(
         refusals(&frames),
         [
-            ("send".to_owned(), "client-nowhere".to_owned()),
-            ("set_mode".to_owned(), String::new()),
-            ("send".to_owned(), "client-nowhere-2".to_owned())
+            ("send".into(), "client-old-owner".into()),
+            ("set_mode".into(), String::new())
         ],
         "{frames:?}"
     );
-    // Three frames, one wait (2 s in tests): well under two of them.
-    assert!(
-        started.elapsed() < std::time::Duration::from_millis(3500),
-        "{:?}",
-        started.elapsed()
-    );
+    fixture.transport.release.notify_one();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(user_turns(&fixture.capture, "OLD_OWNER"), 0);
+    assert!(fixture.local.chat.get(&fixture.id).is_none());
 }
 
 /// A viewer told the owner cannot be reached is closed when a kept attach

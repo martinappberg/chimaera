@@ -433,6 +433,8 @@ mod tests {
         assert!(allowed_path(Path::new("docs/chimaera-workspace.md")));
         assert!(allowed_path(Path::new("chimaera-workspace")));
         assert!(allowed_path(Path::new("src/main.rs")));
+        // A filename resembling a kept-copy suffix can still be Unicode.
+        assert!(allowed_path(Path::new("docs/a.mine-123456789012é")));
         assert!(allowed_path(Path::new("skills/example/SKILL.md")));
         assert!(contains_credential(b"-----BEGIN OPENSSH PRIVATE KEY-----"));
         assert!(contains_credential(b"sk-abcdefghijklmnopqrstuv"));

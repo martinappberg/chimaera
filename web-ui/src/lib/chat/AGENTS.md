@@ -427,7 +427,7 @@ closes those sockets, and for another computer as owner. In a native window the 
 owner wakes (the additive `{"type":"waking"}` → `store.waking`, "Waking the
 cloud machine…"), refuses further acting commands until it answers, and answers
 anything it cannot deliver with `command_failed`. Only acting commands (the
-daemon's `activity::is_interaction`) wake the owner or bring work here; the
+daemon's `activity::is_interaction`) wake its current owner; the
 seven settings commands are held with them (above), everything else is
 dropped while the owner is away. Every refusal carries the additive `command`
 it answers and the `client_id` it was sent under; the store keeps each send
@@ -435,10 +435,11 @@ with its pictures (`noteSent`) until its echo and hands it back
 (`restoredDrafts` → `composerBus`'s return channel) only for
 `command:"send"` / `"send_after_turn"` — never for a refused interrupt/permission
 answer, which could resurrect a delivered message. A send made while not
-live shows at once in `store.sending` ("sending…") until its echo. Acting on a conversation another
-of the user's computers runs brings its work here: the daemon holds the send
-and says `{"type":"bringing","to":"here"}` (a browser view's gateway says
-`to:"computer"` when a phone's send on a sleeping cloud goes to a computer) →
+live shows at once in `store.sending` ("sending…") until its echo. Ordinary chat input stays with its current owner, including from a copied-local
+project. Only explicit **Take over** moves execution to this computer. The
+additive `{"type":"bringing","to":"here"}` frame remains understood for older
+relays; a browser gateway says `to:"computer"` when a phone's send on a sleeping
+cloud goes to an eligible computer →
 `store.bringing` ("Bringing the work here…" / "Bringing the work to your
 computer…", the send shown pending); it ends with the next `ready`, a wake, a
 move, or a `command_failed` with `reason:"still_working"` (the other computer

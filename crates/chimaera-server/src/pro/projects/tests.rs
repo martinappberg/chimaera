@@ -120,6 +120,20 @@ fn repositories(root: &Path) -> String {
             "working-tree.git",
         ],
     );
+    for branch in ["main", "config", "handoff"] {
+        let oid = git(
+            &root.join("working-tree.git"),
+            &["rev-parse", &format!("refs/heads/{branch}")],
+        );
+        git(
+            &root.join("working-tree.git"),
+            &[
+                "update-ref",
+                &format!("refs/chimaera/checkpoints/c-copy/{branch}"),
+                &oid,
+            ],
+        );
+    }
     git(&root.join("working-tree.git"), &["update-server-info"]);
     head
 }
@@ -142,12 +156,15 @@ async fn respond(State(f): State<Arc<Fixture>>, request: Request<Body>) -> Respo
         }
     }
     lock(&f.requests).push(format!("{} {path}", request.method()));
-    let baton = || json!({"workspace_id":"w-cloud","holder_id":lock(&f.holder).clone(),"epoch":f.epoch.load(Ordering::SeqCst),"expires_at":"2099-01-01T00:00:00Z","server_now":"2026-01-01T00:00:00Z","requires_fork":false});
+    let baton = || json!({"workspace_id":"w-cloud","holder_id":lock(&f.holder).clone(),"epoch":f.epoch.load(Ordering::SeqCst),"expires_at":"2099-01-01T00:00:00Z","server_now":"2026-01-01T00:00:00Z","requires_fork":false,"checkpoint":{"id":"c-copy","sequence":1,"source_holder_id":"worker-1","source_epoch":3,"working_tree_oid":git(&f.root.join("working-tree.git"),&["rev-parse","refs/chimaera/checkpoints/c-copy/main"]),"config_oid":git(&f.root.join("working-tree.git"),&["rev-parse","refs/chimaera/checkpoints/c-copy/config"]),"handoff_oid":git(&f.root.join("working-tree.git"),&["rev-parse","refs/chimaera/checkpoints/c-copy/handoff"]),"continuation":"uncertain"}});
     match path {
         "/v1/hosts" => Json(json!([{"id":"worker-1","alias":"Cloud","kind":"worker","status":"connected"}])).into_response(),
         "/v1/hosts/worker-1/http/api/v1/workspaces" => Json(json!([{"id":"w-cloud","name":"Cloud project"},{"id":"w-setup","name":"Setup","cloud_internal":true}])).into_response(),
         "/v1/hosts/worker-1/http/api/v1/pro/handoff" => { f.handoffs.fetch_add(1,Ordering::Relaxed);*lock(&f.holder)=None;StatusCode::NO_CONTENT.into_response() },
-        "/v1/baton/w-cloud" => {let reply=baton();if let Some(next)=lock(&f.holder_after_next_read).take(){*lock(&f.holder)=next;}Json(reply).into_response()},
+        // The legacy account route has no immutable checkpoint field. Keep
+        // this distinct so copy tests cannot accidentally authorize via v1.
+        "/v1/baton/w-cloud" => {let mut reply=baton();reply.as_object_mut().unwrap().remove("checkpoint");if let Some(next)=lock(&f.holder_after_next_read).take(){*lock(&f.holder)=next;}Json(reply).into_response()},
+        "/v2/baton/w-cloud" => {let reply=baton();if let Some(next)=lock(&f.holder_after_next_read).take(){*lock(&f.holder)=next;}Json(reply).into_response()},
         "/v1/baton/w-cloud/renew" => Json(baton()).into_response(),
         "/v1/baton/w-cloud/acquire" => {let bytes=axum::body::to_bytes(request.into_body(),4096).await.unwrap();let body:serde_json::Value=serde_json::from_slice(&bytes).unwrap();let requested=body["holder_id"].as_str().unwrap();if body["expected_epoch"].as_u64()!=Some(f.epoch.load(Ordering::SeqCst)) || lock(&f.holder).as_deref().is_some_and(|holder|holder!=requested){return StatusCode::CONFLICT.into_response();}f.acquires.fetch_add(1,Ordering::Relaxed);*lock(&f.holder)=Some(requested.into());Json(baton()).into_response() },
         "/v1/mirror/credentials" => Json(json!({"workspace_id":"w-cloud","repository_url":format!("{}/repository.git",f.origin),"working_tree_url":format!("{}/working-tree.git",f.origin),"username":"fixture","password":"synthetic-fixture","read_only":true,"storage_limit_bytes":10485760,"max_file_bytes":1000000})).into_response(),
@@ -180,7 +197,49 @@ fn configure(state: &AppState, origin: &str) {
     });
 }
 #[tokio::test]
-async fn passive_discovery_then_explicit_real_git_adoption_preserves_roots_and_retries() {
+async fn copy_requires_a_negotiated_checkpoint_without_legacy_fallback() {
+    let root = temp();
+    let chosen = root.join("chosen");
+    std::fs::create_dir(&chosen).unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let seen = requests.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let router = Router::new().fallback(any(move |request: Request<Body>| {
+        let seen = seen.clone();
+        async move {
+            lock(&seen).push(request.uri().path().to_owned());
+            Json(json!({"workspace_id":"w-cloud","holder_id":"worker-1","epoch":3,"expires_at":"2099-01-01T00:00:00Z","server_now":"2026-01-01T00:00:00Z","requires_fork":false,"checkpoint":null})).into_response()
+        }
+    }));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let laptop = state(&root.join("daemon"));
+    configure(&laptop, &origin);
+    let error = copy(
+        &laptop,
+        Open {
+            expected_account_id: "account-fixture".into(),
+            expected_endpoint: origin,
+            workspace_id: "w-cloud".into(),
+            destination_root: Some(chosen.clone()),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(open_error_code(&error), "checkpoint_pending");
+    assert_eq!(&*lock(&requests), &["/v2/baton/w-cloud"]);
+    assert!(lock(&laptop.pro.adoptions).is_empty());
+    assert!(lock(&laptop.workspaces).list().is_empty());
+    assert!(std::fs::read_dir(&chosen).unwrap().next().is_none());
+    server.abort();
+    drop(laptop);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn passive_discovery_then_explicit_copy_preserves_owner_roots_and_retries() {
     let root = temp();
     let fixture_root = root.clone();
     let head = tokio::task::spawn_blocking(move || repositories(&fixture_root))
@@ -221,7 +280,7 @@ async fn passive_discovery_then_explicit_real_git_adoption_preserves_roots_and_r
     std::fs::create_dir(&chosen).unwrap();
     std::fs::write(chosen.join("personal.txt"), "untouched").unwrap();
     assert_eq!(
-        open(
+        copy(
             &laptop,
             Open {
                 expected_account_id: "account-fixture".into(),
@@ -241,7 +300,7 @@ async fn passive_discovery_then_explicit_real_git_adoption_preserves_roots_and_r
         "untouched"
     );
     std::fs::remove_file(chosen.join("personal.txt")).unwrap();
-    let opened = open(
+    let opened = copy(
         &laptop,
         Open {
             expected_account_id: "account-fixture".into(),
@@ -253,6 +312,29 @@ async fn passive_discovery_then_explicit_real_git_adoption_preserves_roots_and_r
     .await
     .unwrap();
     assert_eq!(opened["workspace_id"], "w-cloud");
+    assert_eq!(opened["copy_version"], 1);
+    assert_eq!(opened["state"], "local_copy");
+    assert!(lock(&fixture.requests)
+        .iter()
+        .any(|request| request == "GET /v2/baton/w-cloud"));
+    assert!(!lock(&fixture.requests)
+        .iter()
+        .any(|request| request == "GET /v1/baton/w-cloud"));
+    assert_eq!(opened["git_staging"]["state"], "uncaptured");
+    assert_eq!(lock(&fixture.holder).as_deref(), Some("1"));
+    assert_eq!(fixture.epoch.load(Ordering::Relaxed), 3);
+    assert!(!super::super::may_execute(&laptop, "w-cloud"));
+    assert!(!super::super::may_write(&laptop, "w-cloud"));
+    assert!(!engine::eligible(
+        &laptop,
+        &lock(&laptop.workspaces).get("w-cloud").unwrap()
+    ));
+    assert!(lock(&laptop.pro.legacy_pending).contains("w-cloud"));
+    assert!(lock(&laptop.pro.preferences)
+        .get("w-cloud")
+        .unwrap()
+        .published_tree
+        .is_none());
     assert_eq!(opened["root"], chosen.to_string_lossy().as_ref());
     assert_eq!(
         std::fs::read_to_string(chosen.join("project.txt")).unwrap(),
@@ -266,9 +348,9 @@ async fn passive_discovery_then_explicit_real_git_adoption_preserves_roots_and_r
         "w-cloud"
     );
     assert!(chosen.join(".git/chimaera-workspace").is_file());
-    assert_eq!(fixture.handoffs.load(Ordering::Relaxed), 1);
+    assert_eq!(fixture.handoffs.load(Ordering::Relaxed), 0);
     std::fs::write(chosen.join("project.txt"), "new local work\n").unwrap();
-    let repeated = open(
+    let repeated = copy(
         &laptop,
         Open {
             expected_account_id: "account-fixture".into(),
@@ -280,8 +362,8 @@ async fn passive_discovery_then_explicit_real_git_adoption_preserves_roots_and_r
     .await
     .unwrap();
     assert_eq!(opened, repeated);
-    assert_eq!(fixture.handoffs.load(Ordering::Relaxed), 1);
-    assert_eq!(fixture.acquires.load(Ordering::Relaxed), 1);
+    assert_eq!(fixture.handoffs.load(Ordering::Relaxed), 0);
+    assert_eq!(fixture.acquires.load(Ordering::Relaxed), 0);
     assert_eq!(
         std::fs::read_to_string(chosen.join("project.txt")).unwrap(),
         "new local work\n"
@@ -289,7 +371,7 @@ async fn passive_discovery_then_explicit_real_git_adoption_preserves_roots_and_r
     lock(&laptop.pro.runtime).as_mut().unwrap().account_id = Some("different-account".into());
     assert!(local_root(&laptop, "w-cloud").is_none());
     assert!(!account_matches(&laptop, "w-cloud"));
-    assert!(open(
+    assert!(copy(
         &laptop,
         Open {
             expected_account_id: "account-fixture".into(),
@@ -304,11 +386,12 @@ async fn passive_discovery_then_explicit_real_git_adoption_preserves_roots_and_r
         std::fs::read_to_string(chosen.join("project.txt")).unwrap(),
         "new local work\n"
     );
-    assert_eq!(fixture.handoffs.load(Ordering::Relaxed), 1);
+    assert_eq!(fixture.handoffs.load(Ordering::Relaxed), 0);
     configure(&laptop, &origin);
     let restarted = state(&root.join("laptop"));
     configure(&restarted, &origin);
-    open(
+    lock(&restarted.session_workspaces).insert("old-moved-session".into(), "w-cloud".into());
+    copy(
         &restarted,
         Open {
             expected_account_id: "account-fixture".into(),
@@ -323,9 +406,9 @@ async fn passive_discovery_then_explicit_real_git_adoption_preserves_roots_and_r
         std::fs::read_to_string(chosen.join("project.txt")).unwrap(),
         "new local work\n"
     );
-    assert_eq!(fixture.acquires.load(Ordering::Relaxed), 1);
+    assert_eq!(fixture.acquires.load(Ordering::Relaxed), 0);
     std::fs::rename(&chosen, root.join("moved")).unwrap();
-    assert!(open(
+    assert!(copy(
         &restarted,
         Open {
             expected_account_id: "account-fixture".into(),
@@ -337,7 +420,7 @@ async fn passive_discovery_then_explicit_real_git_adoption_preserves_roots_and_r
     .await
     .is_err());
     assert!(!chosen.exists());
-    assert_eq!(fixture.handoffs.load(Ordering::Relaxed), 1);
+    assert_eq!(fixture.handoffs.load(Ordering::Relaxed), 0);
     // A second device's explicit choice records a different local root for the
     // same stable workspace identity, without moving the first device's files.
     *lock(&fixture.holder) = Some("1".into());
@@ -345,7 +428,7 @@ async fn passive_discovery_then_explicit_real_git_adoption_preserves_roots_and_r
     configure(&second, &origin);
     let second_root = root.join("second-choice");
     std::fs::create_dir(&second_root).unwrap();
-    let second_open = open(
+    let second_open = copy(
         &second,
         Open {
             expected_account_id: "account-fixture".into(),
@@ -362,7 +445,7 @@ async fn passive_discovery_then_explicit_real_git_adoption_preserves_roots_and_r
         std::fs::read_to_string(root.join("moved/project.txt")).unwrap(),
         "new local work\n"
     );
-    assert_eq!(fixture.handoffs.load(Ordering::Relaxed), 2);
+    assert_eq!(fixture.handoffs.load(Ordering::Relaxed), 0);
     drop(second);
     // Signing out during the repository network transfer must be observed
     // before git init/ref adoption or any working file installation starts.
@@ -372,7 +455,7 @@ async fn passive_discovery_then_explicit_real_git_adoption_preserves_roots_and_r
     let cancel_root = root.join("cancel-target");
     std::fs::create_dir(&cancel_root).unwrap();
     *lock(&fixture.invalidate_on_repository_fetch) = Some(canceled.clone());
-    assert!(open(
+    assert!(copy(
         &canceled,
         Open {
             expected_account_id: "account-fixture".into(),
@@ -403,13 +486,16 @@ async fn a_failed_open_carries_a_stable_error_code_beside_its_message() {
     let failure = |workspace_id: &'static str| {
         let laptop = laptop.clone();
         async move {
-            let response = open_project(
+            let response = copy_project(
                 State(laptop),
-                Json(Open {
-                    expected_account_id: "account-fixture".into(),
-                    expected_endpoint: "http://127.0.0.1:1".into(),
-                    workspace_id: workspace_id.into(),
-                    destination_root: None,
+                Json(CopyRequest {
+                    copy_version: 1,
+                    project: Open {
+                        expected_account_id: "account-fixture".into(),
+                        expected_endpoint: "http://127.0.0.1:1".into(),
+                        workspace_id: workspace_id.into(),
+                        destination_root: None,
+                    },
                 }),
             )
             .await;
@@ -547,7 +633,7 @@ async fn original_laptop_root_is_bound_to_its_account_before_automatic_return() 
     assert!(!engine::eligible(&state, &workspace));
     assert!(local_root(&state, "w-cloud").is_none());
     lock(&state.pro.project_cache).checked_at = super::super::now();
-    let result = open(
+    let result = copy(
         &state,
         Open {
             workspace_id: "w-cloud".into(),
@@ -1049,4 +1135,127 @@ async fn cache_wait_cannot_admit_an_old_account_configuration() {
         assert!(!owner.pro.root.join("w-generation").exists());
     }
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn legacy_open_refuses_without_acquiring_and_owning_copy_is_inert() {
+    let root = temp();
+    let laptop = state(&root.join("daemon"));
+    configure(&laptop, "http://127.0.0.1:1");
+    let chosen = root.join("chosen");
+    std::fs::create_dir(&chosen).unwrap();
+    std::fs::write(chosen.join("keep.txt"), "owned local work").unwrap();
+    let workspace = crate::workspaces::Workspace {
+        id: "w-cloud".into(),
+        root: chosen.clone(),
+        name: "Local owner".into(),
+        last_opened_at: 0,
+        mastermind: None,
+        plugins_on: vec![],
+        cloud_internal: false,
+        hidden: false,
+    };
+    lock(&laptop.workspaces).import_exact(workspace).unwrap();
+    let config = lock(&laptop.pro.runtime).clone().unwrap();
+    bind_workspace_account(&laptop, &config, "w-cloud").unwrap();
+    lock(&laptop.pro.ownership).insert(
+        "w-cloud".into(),
+        super::super::Ownership::Local { epoch: 9 },
+    );
+    lock(&laptop.pro.project_cache).checked_at = super::super::now();
+    let request = || Open {
+        workspace_id: "w-cloud".into(),
+        destination_root: None,
+        expected_account_id: "account-fixture".into(),
+        expected_endpoint: "http://127.0.0.1:1".into(),
+    };
+    let response = open_project(State(laptop.clone()), Json(request())).await;
+    assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+    assert!(lock(&laptop.pro.adoptions).is_empty());
+    let ack = copy(&laptop, request()).await.unwrap();
+    assert_eq!(ack["state"], "owned_local");
+    assert!(super::super::may_execute(&laptop, "w-cloud"));
+    assert!(lock(&laptop.pro.preferences)
+        .get("w-cloud")
+        .unwrap()
+        .copy
+        .is_none());
+    assert!(!laptop.pro.root.join("copy-authority.json").exists());
+    assert_eq!(
+        std::fs::read_to_string(chosen.join("keep.txt")).unwrap(),
+        "owned local work"
+    );
+    drop(laptop);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn refused_takeover_start_retires_its_saved_intent_and_keeps_copy_reopenable() {
+    for limited in [false, true] {
+        let root = temp();
+        let laptop = state(&root.join("daemon"));
+        configure(&laptop, "http://127.0.0.1:1");
+        lock(&laptop.pro.runtime).as_mut().unwrap().execution=Some(serde_json::from_value(json!({"version":1,"installation_id":"i-fixture","capability":super::super::execution::wire::ExecutionCapability::checkpoint_fork()})).unwrap());
+        let chosen = root.join("chosen");
+        std::fs::create_dir(&chosen).unwrap();
+        let mut destination = reserve(&chosen, &[], &[]).unwrap();
+        destination.account = account_scope(&lock(&laptop.pro.runtime).clone().unwrap());
+        destination.started = true;
+        destination.complete = true;
+        lock(&laptop.pro.adoptions).insert("w-cloud".into(), destination);
+        lock(&laptop.workspaces)
+            .import_exact(crate::workspaces::Workspace {
+                id: "w-cloud".into(),
+                root: chosen,
+                name: "Copy".into(),
+                last_opened_at: 0,
+                mastermind: None,
+                plugins_on: vec![],
+                cloud_internal: false,
+                hidden: false,
+            })
+            .unwrap();
+        lock(&laptop.pro.preferences)
+            .entry("w-cloud".into())
+            .or_default()
+            .copy = Some(super::super::project_copy::CopyState {
+            checkpoint: None,
+            pending: None,
+            ready: true,
+            takeover_requested: false,
+            takeover_request: None,
+            owner_epoch: Some(3),
+        });
+        if limited {
+            super::super::moves::fill_requests_fixture(&laptop);
+        } else {
+            lock(&laptop.pro.parked).insert("w-cloud".into());
+        }
+        assert!(takeover(
+            &laptop,
+            TakeoverRequest {
+                workspace_id: "w-cloud".into(),
+                expected_account_id: "account-fixture".into(),
+                expected_endpoint: "http://127.0.0.1:1".into(),
+                expected_epoch: 3
+            }
+        )
+        .await
+        .is_err());
+        let copy = lock(&laptop.pro.preferences)
+            .get("w-cloud")
+            .unwrap()
+            .copy
+            .clone()
+            .unwrap();
+        assert!(copy.ready);
+        assert!(!copy.takeover_requested);
+        assert!(copy.takeover_request.is_none());
+        assert_eq!(
+            super::super::project_copy::view(&laptop, "w-cloud").unwrap()["state"],
+            "ready"
+        );
+        drop(laptop);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

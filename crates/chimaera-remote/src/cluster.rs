@@ -7,6 +7,11 @@
 //! the same `ssh -L` as the workspaces themselves); a workspace keeps its
 //! chats in its own folder, so it moves between jobs.
 //!
+//! The optional keeper uses the same helpers, owning job connections itself.
+//! `start_job_with_id` and `spawn_attached_once` add remote, non-expiring claims
+//! for its durable operation journal; uncertainties require reconciliation, never
+//! a second scheduler effect. The direct app/CLI wrappers retain their lifecycle.
+//!
 //! Every exec is one bounded `ssh host sh -s` with the script on STDIN, never
 //! in argv: startup commands may carry secrets (an `export API_KEY=…` on an
 //! egress-limited cluster), and argv is visible to every user of a shared
@@ -1281,6 +1286,44 @@ pub async fn start_job(
     config: &ClusterConfig,
     req: &JobStart<'_>,
 ) -> anyhow::Result<StartOutcome> {
+    start_job_inner(host, home, config, req, new_job_id(), false).await
+}
+
+/// Submit using a caller's durable identity. An existing remote claim is never
+/// submitted again, even when its reply or local keeper journal was lost.
+/// The caller reconciles records/queue/accounting; absence is not terminal proof.
+/// Claims cover process/SSH/reply loss. After storage loss, reconcile the exact
+/// deterministic scheduler name before any effect; mkdir alone proves no fsync.
+pub async fn start_job_with_id(
+    host: &str,
+    home: RemoteHome,
+    config: &ClusterConfig,
+    req: &JobStart<'_>,
+    job_id: &str,
+) -> anyhow::Result<StartOutcome> {
+    anyhow::ensure!(valid_job_id(job_id), "unknown job");
+    start_job_inner(host, home, config, req, job_id.to_owned(), true).await
+}
+
+#[derive(Debug)]
+pub struct StartUncertain {
+    pub job: String,
+}
+impl std::fmt::Display for StartUncertain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("job submission requires reconciliation; it was not repeated")
+    }
+}
+impl std::error::Error for StartUncertain {}
+
+async fn start_job_inner(
+    host: &str,
+    home: RemoteHome,
+    config: &ClusterConfig,
+    req: &JobStart<'_>,
+    jid: String,
+    stable: bool,
+) -> anyhow::Result<StartOutcome> {
     let spec = req.spec.clone().normalized();
     spec.validate().map_err(anyhow::Error::msg)?;
     for wid in req.open {
@@ -1296,15 +1339,14 @@ pub async fn start_job(
         req.run_startup.len() <= STARTUP_MAX,
         "Startup commands are limited to 32 KB"
     );
-    let jid = new_job_id();
     let name = req
         .name
         .map(str::trim)
         .filter(|n| !n.is_empty())
         .map(|n| n.chars().take(60).collect::<String>())
         .unwrap_or_else(|| job_display_name(&spec));
-    let token = &chimaera_core::generate_token()[..6];
-    let job_name = slurm::job_name(&name, token);
+    let token = chimaera_core::generate_token();
+    let job_name = slurm::job_name(&name, if stable { &jid[2..] } else { &token[..6] });
     let dir = job_dir(home, &jid);
     let record = JobRecord {
         id: jid.clone(),
@@ -1339,7 +1381,11 @@ pub async fn start_job(
 
     let mut s = String::from("umask 077\nunset SLURM_JOB_ID SLURM_JOBID\n");
     s.push_str(&path_line(host));
-    s.push_str(&format!("D=\"{dir}\"\nmkdir -p \"$D\" || exit 3\n"));
+    let receipt = stable.then(chimaera_core::generate_token);
+    if let Some(nonce) = &receipt {
+        s.push_str(&format!("printf '===begin {nonce}\\n'\n"));
+    }
+    s.push_str(&submission_claim(&dir, stable));
     s.push_str(&write_file_lines("$D/job.sh", &script_text));
     s.push_str(&write_file_lines("$D/startup.sh", req.run_startup));
     s.push_str(&write_file_lines(
@@ -1367,23 +1413,28 @@ pub async fn start_job(
                 }
             })
             .collect();
-        s.push_str(&format!(
-            "out=$(sbatch {} \"$D/job.sh\" 2>\"$D/.sbatch.err\"); rc=$?\n\
-             id=${{out%%;*}}\n\
-             case \"$id\" in ''|*[!0-9_]*) [ \"$rc\" -eq 0 ] && rc=97 ;; esac\n\
-             if [ \"$rc\" -eq 0 ]; then\n\
-             \x20 sed \"s/__CHIMAERA_JOB_ID__/$id/\" \"$D/job.pending\" > \"$D/job.json.tmp\" && mv -f \"$D/job.json.tmp\" \"$D/job.json\"\n\
-             fi\n\
-             rm -f \"$D/job.pending\"\n\
-             printf '===rc %s\\n===id %s\\n===err\\n' \"$rc\" \"$id\"; cat \"$D/.sbatch.err\" 2>/dev/null; rm -f \"$D/.sbatch.err\"\n\
-             [ \"$rc\" -eq 0 ] || rm -rf \"$D\"\n\
-             printf '===end\\n'\n",
-            args.join(" ")
-        ));
+        s.push_str(&submission_lines(&args.join(" "), stable));
     }
-    let out = run_script(host, &s, EXEC_SECS).await?;
+    let out = match run_script(host, &s, EXEC_SECS).await {
+        Ok(out) => out,
+        Err(_) if stable => return Err(StartUncertain { job: jid }.into()),
+        Err(error) => return Err(error),
+    };
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let secs = sections(&stdout);
+    let secs = if let Some(receipt) = &receipt {
+        match submission_receipt(&stdout, receipt, req.attached) {
+            Some(secs) => secs,
+            None => return Err(StartUncertain { job: jid }.into()),
+        }
+    } else {
+        sections(&stdout)
+    };
+    if stable
+        && (section(&secs, "end").is_none()
+            || matches!(marker_arg(&secs, "rc"), Some("96" | "97" | "98")))
+    {
+        return Err(StartUncertain { job: jid }.into());
+    }
     if section(&secs, "end").is_none() {
         bail!(
             "starting a job on {host} failed: {}",
@@ -1392,6 +1443,9 @@ pub async fn start_job(
     }
     invalidate_queue(host);
     if req.attached {
+        if stable && marker_arg(&secs, "rc") != Some("0") {
+            return Err(StartUncertain { job: jid }.into());
+        }
         return Ok(StartOutcome::Attached { job: jid, job_name });
     }
     let rc = marker_arg(&secs, "rc").unwrap_or("1");
@@ -1410,6 +1464,85 @@ pub async fn start_job(
     })
 }
 
+fn submission_receipt(stdout: &str, nonce: &str, attached: bool) -> Option<Vec<(String, String)>> {
+    let begin = format!("===begin {nonce}");
+    let mut lines = stdout.lines();
+    lines.find(|line| *line == begin)?;
+    let mut secs: Vec<(String, String)> = Vec::with_capacity(4);
+    for line in lines {
+        if let Some(key) = line.strip_prefix("===") {
+            if secs.len() >= 4 {
+                return None;
+            }
+            secs.push((key.trim_end().to_owned(), String::new()));
+        } else if let Some((key, body)) = secs.last_mut() {
+            if key != "err" && !line.trim().is_empty() {
+                return None;
+            }
+            if body.len().saturating_add(line.len() + 1) > STARTUP_MAX {
+                return None;
+            }
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    let expected = if attached {
+        vec!["rc", "end"]
+    } else {
+        vec!["rc", "id", "err", "end"]
+    };
+    // An existing claim's rc98 receipt has no batch id; it is uncertainty.
+    if secs.len() == 2 && secs[0].0 == "rc 98" && secs[1].0 == "end" {
+        return Some(secs);
+    }
+    if secs.len() != expected.len()
+        || secs
+            .iter()
+            .zip(expected)
+            .any(|((key, _), want)| key.split_whitespace().next() != Some(want))
+    {
+        return None;
+    }
+    let rc = marker_arg(&secs, "rc")?.parse::<u16>().ok()?;
+    if secs[0].0 != format!("rc {rc}") || secs.last()?.0 != "end" {
+        return None;
+    }
+    if !attached && rc == 0 {
+        let id = marker_arg(&secs, "id")?;
+        if !valid_slurm_job_id(id) || secs[1].0 != format!("id {id}") {
+            return None;
+        }
+    }
+    Some(secs)
+}
+
+fn submission_claim(dir: &str, stable: bool) -> String {
+    if stable {
+        // mkdir is the remote, non-expiring claim, before any sbatch effect.
+        // Retain it on every uncertainty; never remove it merely to retry.
+        format!("D=\"{dir}\"\nmkdir -p \"${{D%/*}}\" || exit 3\nif ! mkdir \"$D\"; then printf '===rc 98\\n===end\\n'; exit 0; fi\nset -e\n")
+    } else {
+        format!("D=\"{dir}\"\nmkdir -p \"$D\" || exit 3\n")
+    }
+}
+fn submission_lines(args: &str, stable: bool) -> String {
+    let before = if stable { "set +e\n" } else { "" };
+    let after = if stable { "set -e\n" } else { "" };
+    let remove = if stable {
+        ""
+    } else {
+        "rm -f \"$D/job.pending\"\n[ \"$rc\" -eq 0 ] || rm -rf \"$D\"\n"
+    };
+    format!("{before}out=$(sbatch {args} \"$D/job.sh\" 2>\"$D/.sbatch.err\"); rc=$?\n{after}\
+             id=${{out%%;*}}\n\
+             case \"$id\" in ''|*[!0-9_]*) if [ \"$rc\" -eq 0 ]; then rc=97; fi ;; esac\n\
+             if [ \"$rc\" -eq 0 ]; then\n\
+              sed \"s/__CHIMAERA_JOB_ID__/$id/\" \"$D/job.pending\" > \"$D/job.json.tmp\" && mv -f \"$D/job.json.tmp\" \"$D/job.json\" || rc=96\n\
+             fi\n\
+             printf '===rc %s\\n===id %s\\n===err\\n' \"$rc\" \"$id\"; cat \"$D/.sbatch.err\" 2>/dev/null || true; rm -f \"$D/.sbatch.err\"\n\
+             {remove}printf '===end\\n'\n")
+}
+
 /// Hold an attached job in the foreground: `ssh -tt host srun … job.sh`. The
 /// pty makes the login node hang the job up when this connection ends —
 /// app quit, laptop sleep, a dropped link — so nothing outlives the user's
@@ -1422,6 +1555,42 @@ pub fn spawn_attached(
     job_name: &str,
     gpu_flag: GpuFlag,
 ) -> anyhow::Result<Child> {
+    spawn_attached_inner(host, home, jid, spec, job_name, gpu_flag, false)
+}
+
+/// Keeper-owned interactive launch. A remote one-shot claim refuses a replay
+/// after lost SSH/restart; the caller retains its hold until terminal proof.
+pub fn spawn_attached_once(
+    host: &str,
+    home: RemoteHome,
+    jid: &str,
+    spec: &LaunchSpec,
+    job_name: &str,
+    gpu_flag: GpuFlag,
+) -> anyhow::Result<Child> {
+    anyhow::ensure!(valid_job_id(jid), "unknown job");
+    anyhow::ensure!(
+        job_name.ends_with(&format!("~{}", &jid[2..])),
+        "job identity does not match"
+    );
+    spec.validate()
+        .map_err(|_| anyhow::anyhow!("invalid launch specification"))?;
+    spawn_attached_inner(host, home, jid, spec, job_name, gpu_flag, true)
+}
+
+fn attached_claim(dir: &str) -> String {
+    format!("[ -f \"{dir}/job.json\" ] && mkdir \"{dir}/attached.started\" || exit 98; ")
+}
+
+fn spawn_attached_inner(
+    host: &str,
+    home: RemoteHome,
+    jid: &str,
+    spec: &LaunchSpec,
+    job_name: &str,
+    gpu_flag: GpuFlag,
+    once: bool,
+) -> anyhow::Result<Child> {
     anyhow::ensure!(valid_job_id(jid), "unknown job");
     let args: Vec<String> = spec
         .srun_args(job_name, gpu_flag)
@@ -1430,8 +1599,13 @@ pub fn spawn_attached(
         .collect();
     // One line, so each statement needs its `;`: the PATH line ends in a
     // newline, and a space there once made it `export PATH exec srun …`.
+    let claim = if once {
+        attached_claim(&job_dir(home, jid))
+    } else {
+        String::new()
+    };
     let script = format!(
-        "unset SLURM_JOB_ID SLURM_JOBID; {}exec srun {} /bin/bash \"{}/job.sh\"",
+        "unset SLURM_JOB_ID SLURM_JOBID; {claim}{}exec srun {} /bin/bash \"{}/job.sh\"",
         path_line(host).replace('\n', "; "),
         args.join(" "),
         job_dir(home, jid)
@@ -1455,7 +1629,6 @@ pub fn spawn_attached(
 /// why. Reads both pipes to their end (a full pipe would stall srun); `echo`
 /// also passes each line to this process's stderr (the CLI's terminal).
 pub fn attached_output(child: &mut Child, echo: bool) -> Arc<Mutex<VecDeque<String>>> {
-    use tokio::io::{AsyncBufReadExt, BufReader};
     const KEEP: usize = 8;
     let tail = Arc::new(Mutex::new(VecDeque::with_capacity(KEEP)));
     let pipes: [Option<Box<dyn tokio::io::AsyncRead + Unpin + Send>>; 2] = [
@@ -1464,25 +1637,55 @@ pub fn attached_output(child: &mut Child, echo: bool) -> Arc<Mutex<VecDeque<Stri
     ];
     for pipe in pipes.into_iter().flatten() {
         let tail = tail.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(pipe).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let line = plain_line(&line);
-                if line.is_empty() || line.starts_with("Shared connection to") {
-                    continue;
-                }
-                if echo {
-                    eprintln!("{line}");
-                }
-                let mut t = tail.lock().unwrap_or_else(|p| p.into_inner());
-                if t.len() == KEEP {
-                    t.pop_front();
-                }
-                t.push_back(line.chars().take(300).collect());
-            }
-        });
+        tokio::spawn(drain_attached(pipe, tail, echo));
     }
     tail
+}
+
+/// An attached process may never print a newline, or print invalid UTF-8.
+/// Keep a bounded prefix of each line while still draining its entire stream.
+const ATTACHED_LINE_BYTES: usize = 4096;
+async fn drain_attached<R>(mut pipe: R, tail: Arc<Mutex<VecDeque<String>>>, echo: bool)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut block = [0; 4096];
+    let mut line = Vec::with_capacity(ATTACHED_LINE_BYTES);
+    let emit = |line: &[u8]| {
+        let text = plain_line(&String::from_utf8_lossy(line));
+        if text.is_empty() || text.starts_with("Shared connection to") {
+            return;
+        }
+        if echo {
+            eprintln!("{text}");
+        }
+        let mut tail = tail.lock().unwrap_or_else(|p| p.into_inner());
+        if tail.len() == 8 {
+            tail.pop_front();
+        }
+        tail.push_back(text.chars().take(300).collect());
+    };
+    loop {
+        match pipe.read(&mut block).await {
+            Ok(0) | Err(_) => {
+                if !line.is_empty() {
+                    emit(&line);
+                }
+                return;
+            }
+            Ok(count) => {
+                for byte in &block[..count] {
+                    if *byte == b'\n' {
+                        emit(&line);
+                        line.clear();
+                    } else if line.len() < ATTACHED_LINE_BYTES {
+                        line.push(*byte);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// A terminal line without its colors and carriage returns.
@@ -2444,6 +2647,165 @@ mod tests {
     }
 
     #[test]
+    fn stable_receipts_require_fresh_begin_and_exact_positive_completion() {
+        let nonce = "fresh_attempt";
+        assert!(submission_receipt("===rc 0\n===end\n", nonce, true).is_none());
+        assert!(
+            submission_receipt("===rc 0\n===end\n===begin fresh_attempt\n", nonce, true).is_none()
+        );
+        assert!(submission_receipt("===begin fresh_attempt\n===end\n", nonce, true).is_none());
+        assert!(submission_receipt(
+            "===begin fresh_attempt\n===rc 0 extra\n===end\n",
+            nonce,
+            true
+        )
+        .is_none());
+        assert!(submission_receipt(
+            "===begin fresh_attempt\n===rc 0\n===end\n===end\n",
+            nonce,
+            true
+        )
+        .is_none());
+        assert!(submission_receipt(
+            "===begin fresh_attempt\n===rc 0\n===id bad\n===err\n===end\n",
+            nonce,
+            false
+        )
+        .is_none());
+        let attached = submission_receipt(
+            "===rc 9\n===end\n===begin fresh_attempt\n===rc 0\n===end\n",
+            nonce,
+            true,
+        )
+        .unwrap();
+        assert_eq!(marker_arg(&attached, "rc"), Some("0"));
+        let batch = submission_receipt(
+            "noise\n===begin fresh_attempt\n===rc 0\n===id 12345\n===err\n===end\n",
+            nonce,
+            false,
+        )
+        .unwrap();
+        assert_eq!(marker_arg(&batch, "id"), Some("12345"));
+    }
+
+    struct SubmissionFixture(std::path::PathBuf);
+    impl SubmissionFixture {
+        fn new(sbatch: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let root = std::env::temp_dir().join(format!(
+                "chimaera-submit-{}",
+                chimaera_core::generate_token()
+            ));
+            std::fs::create_dir_all(root.join("bin")).unwrap();
+            let path = root.join("bin/sbatch");
+            std::fs::write(
+                &path,
+                format!("#!/bin/sh\nprintf 'called\\n' >> \"$HOME/calls\"\n{sbatch}\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            Self(root)
+        }
+        fn run(&self, script: &str) -> std::process::Output {
+            std::process::Command::new("sh")
+                .args(["-c", script])
+                .env("HOME", &self.0)
+                .env(
+                    "PATH",
+                    format!("{}:/usr/bin:/bin", self.0.join("bin").display()),
+                )
+                .output()
+                .unwrap()
+        }
+        fn submit_script(&self) -> String {
+            let mut script = String::from("umask 077\n");
+            script.push_str(&submission_claim("$HOME/cluster/j/j-1234abcd", true));
+            script.push_str(&write_file_lines(
+                "$D/job.pending",
+                "{\"slurm_job_id\":\"__CHIMAERA_JOB_ID__\"}",
+            ));
+            script.push_str(&write_file_lines("$D/job.sh", "exit 0"));
+            script.push_str(&submission_lines("--parsable", true));
+            script
+        }
+        fn calls(&self) -> usize {
+            std::fs::read_to_string(self.0.join("calls")).map_or(0, |s| s.lines().count())
+        }
+    }
+    impl Drop for SubmissionFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn stable_submission_claim_prevents_duplicate_after_lost_reply() {
+        let f = SubmissionFixture::new("printf '12345;cluster\\n'");
+        let script = f.submit_script();
+        let first = f.run(&script);
+        assert!(first.status.success());
+        assert!(String::from_utf8_lossy(&first.stdout).contains("===id 12345"));
+        let record = std::fs::read_to_string(f.0.join("cluster/j/j-1234abcd/job.json")).unwrap();
+        assert!(record.contains("12345"));
+        // Forget the first reply; the remote claim remains and retry makes no effect.
+        let retry = f.run(&script);
+        assert!(String::from_utf8_lossy(&retry.stdout).contains("===rc 98"));
+        assert_eq!(f.calls(), 1);
+        assert_eq!(
+            std::fs::read_to_string(f.0.join("cluster/j/j-1234abcd/job.json")).unwrap(),
+            record
+        );
+    }
+    #[test]
+    fn stable_submission_preserves_refused_and_unparseable_evidence() {
+        for (sbatch, rc) in [
+            ("printf 'invalid partition\\n' >&2; exit 1", "===rc 1"),
+            ("printf 'invalid id\\n'", "===rc 97"),
+        ] {
+            let f = SubmissionFixture::new(sbatch);
+            let script = f.submit_script();
+            let first = f.run(&script);
+            assert!(
+                String::from_utf8_lossy(&first.stdout).contains(rc),
+                "{}",
+                String::from_utf8_lossy(&first.stdout)
+            );
+            assert!(f.0.join("cluster/j/j-1234abcd/job.pending").is_file());
+            f.run(&script);
+            assert_eq!(f.calls(), 1);
+        }
+    }
+    #[test]
+    fn stable_submission_partial_prepare_never_resubmits() {
+        let f = SubmissionFixture::new("printf '12345\\n'");
+        assert!(f
+            .run(&submission_claim("$HOME/cluster/j/j-1234abcd", true))
+            .status
+            .success());
+        let retry = f.run(&f.submit_script());
+        assert!(String::from_utf8_lossy(&retry.stdout).contains("===rc 98"));
+        assert_eq!(f.calls(), 0);
+    }
+    #[test]
+    fn attached_remote_claim_allows_only_one_effect_even_after_exit() {
+        let f = SubmissionFixture::new("exit 0");
+        let dir = "$HOME/cluster/j/j-1234abcd";
+        let prepare = format!(
+            "{}{}",
+            submission_claim(dir, true),
+            write_file_lines("$D/job.json", "{}")
+        );
+        assert!(f.run(&prepare).status.success());
+        let script = format!(
+            "{}printf 'called\\n' >> \"$HOME/calls\"",
+            attached_claim(dir)
+        );
+        assert!(f.run(&script).status.success());
+        assert_eq!(f.run(&script).status.code(), Some(98));
+        assert_eq!(f.calls(), 1);
+    }
+
+    #[test]
     fn sections_split_on_markers_and_drop_rc_noise() {
         let out = "Welcome to the cluster!\n===now 1700000000\n===squeue 0\n1|p|RUNNING|1:00|n1|1|1G|0:01|/w|None|x\n===config 1234\n{\"version\":1}\n===end\n";
         let secs = sections(out);
@@ -2504,6 +2866,56 @@ mod tests {
             "srun: error: Invalid partition"
         );
         assert_eq!(plain_line("  \r"), "");
+    }
+
+    #[tokio::test]
+    async fn attached_output_drains_oversized_invalid_and_unterminated_lines() {
+        use tokio::io::AsyncWriteExt;
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        let tail = Arc::new(Mutex::new(VecDeque::new()));
+        let output = tail.clone();
+        let drain = tokio::spawn(drain_attached(reader, output, false));
+        let producer = tokio::spawn(async move {
+            // A megabyte without a newline must not stall the child or grow
+            // the current-line buffer; invalid bytes must not stop draining.
+            let block = [b'x'; 8192];
+            for _ in 0..128 {
+                writer.write_all(&block).await.unwrap();
+            }
+            writer.write_all(b"\n\xff\xfe invalid\n").await.unwrap();
+            for _ in 0..9 {
+                writer.write_all(b"old\n").await.unwrap();
+            }
+            writer
+                .write_all(b"\x1b[31mfinal valid\x1b[0m\r")
+                .await
+                .unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(3), producer)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), drain)
+            .await
+            .unwrap()
+            .unwrap();
+        let tail = tail.lock().unwrap();
+        assert_eq!(tail.len(), 8);
+        assert_eq!(tail.back().unwrap(), "final valid");
+        assert!(tail.iter().all(|line| line.chars().count() <= 300));
+    }
+
+    #[tokio::test]
+    async fn attached_output_retains_a_bounded_prefix_and_reads_after_invalid_utf8() {
+        let mut bytes = vec![b'x'; ATTACHED_LINE_BYTES * 32];
+        bytes.extend_from_slice(b"\n\xff malformed\nnext line");
+        let tail = Arc::new(Mutex::new(VecDeque::new()));
+        drain_attached(bytes.as_slice(), tail.clone(), false).await;
+        let tail = tail.lock().unwrap();
+        assert_eq!(tail.len(), 3);
+        assert_eq!(tail[0], "x".repeat(300));
+        assert_eq!(tail[1], "\u{fffd} malformed");
+        assert_eq!(tail[2], "next line");
     }
 
     #[test]

@@ -10,6 +10,30 @@ use tokio::{
 };
 use tokio_tungstenite::tungstenite::Message;
 
+/// Read-only cluster checks. This deliberately submits no scheduler jobs.
+pub async fn run_cluster(client: &Client, host_id: &str) -> Result<Vec<String>> {
+    let caps = client.cluster_capabilities().await?;
+    ensure!(caps.control_supported(), "cluster control is unsupported");
+    let mut report = vec!["cluster capability version and flags verified".into()];
+    let reply = client
+        .cluster_operation(host_id, &ClusterOperation::Overview { refresh: false })
+        .await?;
+    ensure!(
+        matches!(reply, ClusterReply::Overview { .. }),
+        "cluster overview missing"
+    );
+    report.push("bounded passive overview and protected route identities verified".into());
+    let reply = client
+        .cluster_operation(host_id, &ClusterOperation::Facts { refresh: false })
+        .await?;
+    ensure!(
+        matches!(reply, ClusterReply::Facts { .. }),
+        "cluster facts missing"
+    );
+    report.push("cached typed cluster facts decoded".into());
+    Ok(report)
+}
+
 pub async fn run(
     endpoint: &str,
     token: &str,
@@ -87,24 +111,28 @@ pub async fn run(
             .iter()
             .find(|h| h.id == host_id)
             .context("requested host is absent")?;
-        let daemon = host
-            .daemon
-            .as_ref()
-            .context("requested host has no daemon manifest")?;
-        let tunnel = LinkTunnel::bind(client.clone(), host_id.into()).await?;
-        let response = http
-            .get(format!(
-                "http://127.0.0.1:{}/api/v1/health",
-                tunnel.local_port
-            ))
-            .bearer_auth(&daemon.token)
-            .send()
-            .await?;
-        ensure!(
-            response.status().is_success(),
-            "daemon health failed through TCP bridge"
-        );
-        report.push("real daemon health through loopback TCP bridge".into());
+        if host.cluster.is_some() {
+            report.extend(run_cluster(&client, host_id).await?);
+        } else {
+            let daemon = host
+                .daemon
+                .as_ref()
+                .context("requested host has no daemon manifest")?;
+            let tunnel = LinkTunnel::bind(client.clone(), host_id.into()).await?;
+            let response = http
+                .get(format!(
+                    "http://127.0.0.1:{}/api/v1/health",
+                    tunnel.local_port
+                ))
+                .bearer_auth(&daemon.token)
+                .send()
+                .await?;
+            ensure!(
+                response.status().is_success(),
+                "daemon health failed through TCP bridge"
+            );
+            report.push("real daemon health through loopback TCP bridge".into());
+        }
     }
     // A local echo endpoint makes reverse serve verifiable without an agent or
     // a daemon installation on the machine running the suite.
@@ -173,17 +201,20 @@ pub async fn run(
             .as_str()
             .context("prompt id absent")?
             .to_string();
-        next_event(
+        let received = next_event(
             &mut events,
-            |event| matches!(event, Event::Prompt { id: actual, .. } if actual == &id),
+            |event| matches!(event, Event::Prompt { host_id, .. } if host_id == &host.id),
         )
         .await?;
+        let Event::Prompt { id: local_id, .. } = received else {
+            unreachable!()
+        };
         events
-            .answer(id.clone(), Some("fixture-answer".into()))
+            .answer(local_id.clone(), Some("fixture-answer".into()))
             .await?;
         next_event(
             &mut events,
-            |event| matches!(event, Event::PromptClosed { id: actual } if actual == &id),
+            |event| matches!(event, Event::PromptClosed { id: actual } if actual == &local_id),
         )
         .await?;
         let answers: Vec<EventCommand> = http

@@ -95,6 +95,38 @@ unexpired holder and epoch when accepting a push, so transferred ownership fence
 an old token immediately. Read-only credentials cannot execute receive-pack.
 Exhausted storage rejects writes without removing existing objects.
 
+The receipt-pinned handoff manifest may carry an additive repository staging
+descriptor `{ "version": 1, "index": "git/index.json" }`. That fixed artifact
+contains bounded, sorted entries with relative `path`, Git `mode`, merge `stage`,
+object `oid` and optional `intent` (intent-to-add), plus `version: 1` and object
+`format`. Its referenced staged blobs live at `git/blobs/<oid>`, independently of
+HEAD and working files. An absent descriptor means **staging was not captured**;
+it never means an empty index. Credential paths/blobs, corrupt checksums,
+unsupported mandatory extensions and sparse indexes refuse transfer explicitly.
+No imported index extensions, stat cache, hooks or filters execute or travel.
+Source indexes are normalized only in a private copy; receivers verify every
+blob OID and rebuild their private index before the recoverable installation.
+Tree, configuration, session archives, staging artifacts and manifest bytes
+share one storage ceiling. Service-backed repository transfer currently requires
+SHA-1; SHA-256 index codec support alone does not negotiate a mirror service's
+object format.
+
+The daemon's optional `mirror.git_staging` status is tagged by `state`:
+`uncaptured`, `synced`, or `conflicts`. A conflict includes `total`, at most 16
+`paths` (at most 16 KiB combined), and a Git-directory-relative `recovery` such as
+`chimaera-staging/<id>`. That directory retains `local.index`, `incoming.index`
+and the full `conflicts.json`. Its `objects.ref` names a private
+`refs/chimaera/staging/<id>` tree pinning all nongitlink blobs from both indexes
+through Git garbage collection. Recovery metadata and pins join the same file
+transaction and storage ceiling; those internal refs never enter repository
+mirrors or imported refs. Gitlinks remain pointers rather than copied objects.
+Resolve the directory through Git's `--git-path` for linked worktrees. Three-way
+staging uses the exact last acknowledged handoff (or the completed local copy's
+immutable checkpoint on Take over) as baseline, merges independent
+entries and keeps local conflicting entries; missing baseline stays unknown and
+retains both differing versions. A conflict or uncaptured status never claims
+full staging synchronization. Reports survive daemon restart.
+
 URLs contain no userinfo, query secrets or credentials and require HTTPS, except
 literal loopback fixture endpoints. Passwords stay in memory and reach Git through
 a scoped credential helper, never command-line arguments, persisted Git config or
@@ -385,8 +417,7 @@ handoff/hydrate/sleep/privacy work with 409 `{error:"draining"}`, and answers 20
 finalizer outliving its caller) and Git helper slot is free and state is synced
 to disk. On a cloud machine it first publishes each project it holds under a
 live lease (at most thirty seconds, ten short of the deadline): the copy a
-computer may take the work from while the machine sleeps ([acting brings the
-work to you](#acting-brings-the-work-to-you)). Past the deadline (default 60 s, at most 600 s) it releases itself and
+computer may take the work from while the machine sleeps ([execution moves](#explicit-take-over-moves-execution)). Past the deadline (default 60 s, at most 600 s) it releases itself and
 answers 409 `{error:"transfer_busy"}`. `DELETE /api/v1/pro/drain` cancels; a drain
 also lapses 15 wall-clock minutes after it began (a machine resumed without a
 cancel). The token is at most 24 characters with no control characters. Drain
@@ -529,13 +560,18 @@ at a safe pause and releases, and the computer then hydrates. A `held` refusal
 is never treated as final, and the computer never fetches or acquires from
 under a suspended owner.
 
-### Acting brings the work to you
+<a id="acting-brings-the-work-to-you"></a>
 
-Opening a project elsewhere only views its owner; acting on it moves the work.
-Both halves are additive.
+### Explicit Take over moves execution
 
-**Between computers.** A computer whose user sends a chat message or types
-into a terminal of a project another signed-in computer holds asks for it:
+Opening a synced project on another computer creates or updates a local file
+copy without moving execution or changing its preferred executor. Ordinary
+chat messages and terminal input go to the current owner. The separate
+**Take over** action requests execution here. The browser gateway's policy for
+an eligible computer when the cloud sleeps remains separate below.
+
+**Between computers.** A computer whose user explicitly takes over a project
+another signed-in computer holds asks for it:
 `POST /v2/baton/{workspace}/move` with `{holder_id, epoch}` (its own holder,
 the epoch it saw; a device credential or its daemon's delegation; a cloud
 machine's credential is 403). While the other computer holds a live lease the
@@ -710,3 +746,37 @@ must not make an older account reject ordinary publication. Replayed receipts
 retain their original immutable metadata. Invalid or unsupported metadata must
 never create a visible catalog row. No project names or request bodies enter
 service logs.
+
+### Optional Linux supervisor cleanup
+
+This startup-only consumer is for a trusted project namespace supervisor. It is
+not enabled by ordinary daemon startup or an HTTP request. The launcher first
+verifies that the previous project's reserved UID has no surviving processes,
+pins the registered root, and persists a new launch generation outside the
+project's writable state. It supplies `CHIMAERA_SUPERVISOR_CLEANUP_FD=0` with a
+read-only stdin pipe containing at most 4096 bytes of JSON followed by EOF:
+
+```json
+{"version":1,"workspace_id":"w-example","account_id":"a-example","root_identity":{"device":1,"inode":2},"registration_revision":7,"launch_generation":3,"previous_generation":2,"os_boot_id":"00000000-0000-0000-0000-000000000000"}
+```
+
+The consumer closes the channel before ledger restore and fails startup on a
+malformed, oversized, non-pipe or non-EOF channel (three-second deadline). It
+keeps local execution and writes fenced until workspace-bound execution
+Configure matches account, workspace, root device/inode, registration revision
+and current boot. Generation replay, live local authority or invalid persisted
+state fail closed. The accepted generation and cleared active-launch evidence
+share one atomic write before authenticated health can include:
+
+```json
+{"supervisor_cleanup":{"execution_cleanup":1,"workspace_id":"w-example","registration_revision":7,"launch_generation":3}}
+```
+
+The supervisor must verify that exact acknowledgment from the specific daemon
+it launched. Arbitrary JSON, a project-written health response or ordinary bearer
+authentication is not independent proof of cleanup. The pipe's provenance comes
+from the trusted fixed launcher and its outside registry. Cleanup grants no
+execution lease, including on a fresh project: normal negotiated account
+acquisition and immutable-checkpoint validation are still required. This
+consumer does not enable the separate private namespace prototype in deployed
+workers, nor provide a macOS process-containment claim.

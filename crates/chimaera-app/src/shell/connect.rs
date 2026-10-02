@@ -1047,6 +1047,7 @@ mod tests {
                 sessions: 0,
             }),
             error: None,
+            cluster: None,
         }
     }
 
