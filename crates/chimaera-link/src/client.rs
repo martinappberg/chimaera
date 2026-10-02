@@ -835,6 +835,7 @@ impl Client {
         &self,
         host: &str,
         grant: &crate::SshAuthGrant,
+        expected_boot: &str,
     ) -> Result<crate::Socket> {
         anyhow::ensure!(
             crate::placement::valid_id(host),
@@ -842,6 +843,10 @@ impl Client {
         );
         grant.validate()?;
         let caps = self.ssh_auth_capabilities().await?;
+        anyhow::ensure!(
+            caps.keeper_boot == expected_boot,
+            "SSH authentication boot changed"
+        );
         let mut socket = self
             .open_socket(
                 &[
@@ -865,7 +870,7 @@ impl Client {
         .map_err(|_| anyhow!("SSH authentication readiness expired"))?;
         match ready {
             Some(Ok(Message::Text(value))) => {
-                crate::SshAuthHello::from_frame(value.as_bytes(), grant, &caps.keeper_boot)?;
+                crate::SshAuthHello::from_frame(value.as_bytes(), grant, expected_boot)?;
             }
             _ => bail!("SSH authentication readiness failed"),
         }

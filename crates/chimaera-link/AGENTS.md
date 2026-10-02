@@ -17,7 +17,7 @@
 | `src/cluster.rs` | Capability-gated control DTOs, bounded request validation and exact reply/history identity checks; credential-bearing responses omit Debug |
 | `src/fake_ssh_auth.rs` | Opt-in disposable native-grant authority fixture; inert save, exact device/epoch/boot/destination, bounded admission, no SSH/key effects |
 | `src/fake_cluster.rs` | Immutable operation/dedup and job-scoped socket fixture; no SSH or scheduler implementation |
-| `src/client.rs` | Account REST, refresh serialization, events reconnect with connection-local prompt IDs, loopback tunnels, reverse serve |
+| `src/client.rs` | Account REST, refresh serialization, events reconnect with connection-local prompt IDs, loopback tunnels, reverse serve; signing socket capability and Ready checks retain the caller's original selected keeper boot |
 | `src/error.rs` | Typed outcomes callers must tell apart from network failures: `AuthorizationRevoked`, `ServiceUnsupported`, `AlreadySubscribed` (checkout conflict requires a fresh account read) |
 | `src/oauth.rs` | PKCE and state validation; caller owns system browser and keychain |
 | `src/bridge.rs` | Bounded bidirectional TCP/WebSocket pump and heartbeat |

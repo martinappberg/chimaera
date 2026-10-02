@@ -25,12 +25,15 @@ impl Fixture {
             .await
             .unwrap()
     }
-    async fn grant(&self, host: &str) -> SshAuthGrant {
+    async fn grant(&self, host: &str) -> (SshAuthGrant, String) {
         let caps = self.client().ssh_auth_capabilities().await.unwrap();
-        self.client()
-            .create_ssh_auth_grant(host, &request(caps.keeper_boot))
+        let boot = caps.keeper_boot;
+        let grant = self
+            .client()
+            .create_ssh_auth_grant(host, &request(boot.clone()))
             .await
-            .unwrap()
+            .unwrap();
+        (grant, boot)
     }
 }
 impl Drop for Fixture {
@@ -78,7 +81,7 @@ async fn absent_capability_prevents_registration_and_first_connect_is_inert_unti
     assert_eq!(host.status, HostStatus::Offline);
     assert!(host.daemon.is_none());
     assert_eq!(f.keeper.ssh_auth_reconnects().await, 0);
-    let grant = f.grant(&host.id).await;
+    let (grant, boot) = f.grant(&host.id).await;
     assert_eq!(f.keeper.ssh_auth_reconnects().await, 0);
     assert!(
         client
@@ -87,7 +90,10 @@ async fn absent_capability_prevents_registration_and_first_connect_is_inert_unti
             .is_err(),
         "grant needs a live device channel"
     );
-    let _socket = client.ssh_auth_socket(&host.id, &grant).await.unwrap();
+    let _socket = client
+        .ssh_auth_socket(&host.id, &grant, &boot)
+        .await
+        .unwrap();
     client
         .reconnect_host_with_ssh_auth(&host.id, &grant)
         .await
@@ -121,18 +127,30 @@ async fn selected_host_device_boot_and_live_destination_are_required() {
     f.keeper.set_ssh_auth_supported(true).await;
     let first = f.host("first").await;
     let second = f.host("second").await;
-    let grant = f.grant(&first.id).await;
+    let (grant, boot) = f.grant(&first.id).await;
     let client = f.client();
     let other = Client::new(
         &f.keeper.endpoint,
         Some(f.keeper.tokens_for_device("second-device").await.unwrap()),
     )
     .unwrap();
-    assert!(other.ssh_auth_socket(&first.id, &grant).await.is_err());
-    assert!(client.ssh_auth_socket(&second.id, &grant).await.is_err());
-    let _socket = client.ssh_auth_socket(&first.id, &grant).await.unwrap();
+    assert!(other
+        .ssh_auth_socket(&first.id, &grant, &boot)
+        .await
+        .is_err());
+    assert!(client
+        .ssh_auth_socket(&second.id, &grant, &boot)
+        .await
+        .is_err());
+    let _socket = client
+        .ssh_auth_socket(&first.id, &grant, &boot)
+        .await
+        .unwrap();
     assert!(
-        client.ssh_auth_socket(&first.id, &grant).await.is_err(),
+        client
+            .ssh_auth_socket(&first.id, &grant, &boot)
+            .await
+            .is_err(),
         "live channel replacement refused"
     );
     assert!(client
@@ -178,9 +196,12 @@ async fn admission_is_per_device_expiry_releases_capacity_and_header_is_reconnec
         .create_ssh_auth_grant(&host.id, &request(caps.keeper_boot.clone()))
         .await
         .is_err());
-    f.keeper.expire_ssh_auth_grant(&grants[0].grant_id).await;
-    assert!(client.ssh_auth_socket(&host.id, &grants[0]).await.is_err());
-    let grant = f.grant(&host.id).await;
+    f.keeper.expire_ssh_auth_grant(&grants[0].0.grant_id).await;
+    assert!(client
+        .ssh_auth_socket(&host.id, &grants[0].0, &grants[0].1)
+        .await
+        .is_err());
+    let (grant, _) = f.grant(&host.id).await;
     for path in [
         "/v1/hosts",
         "/v1/hosts/irrelevant/cluster/operations",
@@ -230,7 +251,7 @@ async fn global_admission_and_browser_origin_are_refused_without_effects() {
         .await
         .is_err());
     f.keeper.set_ssh_auth_supported(true).await;
-    let grant = f.grant(&host.id).await;
+    let (grant, _) = f.grant(&host.id).await;
     let url = format!(
         "{}/v1/hosts/{}/ssh/auth/grants/{}/ws",
         f.keeper.endpoint.replacen("http:", "ws:", 1),
@@ -255,11 +276,34 @@ async fn global_admission_and_browser_origin_are_refused_without_effects() {
 }
 
 #[tokio::test]
+async fn socket_requires_original_selection_boot_before_upgrade_not_only_latest_ready() {
+    let f = Fixture::start().await;
+    f.keeper.set_ssh_auth_supported(true).await;
+    let host = f.host("cluster").await;
+    let (_, original_boot) = f.grant(&host.id).await;
+    f.keeper.set_ssh_auth_supported(true).await;
+    let (grant, current_boot) = f.grant(&host.id).await;
+    assert_ne!(original_boot, current_boot);
+    assert!(f
+        .client()
+        .ssh_auth_socket(&host.id, &grant, &original_boot)
+        .await
+        .is_err());
+    // Refusal happened before reserving the upgrade: the valid original
+    // selection can still establish this fresh grant's only channel.
+    let _socket = f
+        .client()
+        .ssh_auth_socket(&host.id, &grant, &current_boot)
+        .await
+        .unwrap();
+    assert_eq!(f.keeper.ssh_auth_reconnects().await, 0);
+}
+#[tokio::test]
 async fn paused_upgrade_cannot_admit_reconnect_or_send_ready_after_signout() {
     let f = Fixture::start().await;
     f.keeper.set_ssh_auth_supported(true).await;
     let host = f.host("cluster").await;
-    let grant = f.grant(&host.id).await;
+    let (grant, boot) = f.grant(&host.id).await;
     let entered = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
     let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
     f.keeper
@@ -268,7 +312,7 @@ async fn paused_upgrade_cannot_admit_reconnect_or_send_ready_after_signout() {
     let client = f.client();
     let id = host.id.clone();
     let g = grant.clone();
-    let upgrade = tokio::spawn(async move { client.ssh_auth_socket(&id, &g).await });
+    let upgrade = tokio::spawn(async move { client.ssh_auth_socket(&id, &g, &boot).await });
     tokio::time::timeout(Duration::from_secs(2), entered.acquire())
         .await
         .unwrap()

@@ -57,7 +57,9 @@ ids and all packet contents have no Debug/log representation.
 A reserved upgrade is not an active signing channel. After the upgrade and fresh
 current-device/session/boot validation, the server sends exactly one first text
 frame `{type:"ready",version:1,grant_id:<exact id>,keeper_boot:<exact boot>}`.
-The native client validates it before its socket API returns or Reconnect may
+The native client retains the original selection's keeper boot, checks current
+capabilities against that exact boot before upgrading, and validates Ready against
+the same original boot before its socket API returns or Reconnect may
 use that channel. Ready has a thirty-second maximum deadline within the grant's
 absolute lifetime. Missing, duplicate/later Ready, unknown fields/kinds or a
 mismatched identity fail closed. No request may precede Ready, and a paused or
