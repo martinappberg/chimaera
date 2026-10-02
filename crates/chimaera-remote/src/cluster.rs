@@ -10,7 +10,9 @@
 //! The optional keeper uses the same helpers, owning job connections itself.
 //! `start_job_with_id` and `spawn_attached_once` add remote, non-expiring claims
 //! for its durable operation journal; uncertainties require reconciliation, never
-//! a second scheduler effect. The direct app/CLI wrappers retain their lifecycle.
+//! a second scheduler effect. A stable batch start checks Slurm --test-only once
+//! before actual submission; only a fresh distinct refusal phase proves that
+//! the real submit was never invoked. Direct app/CLI lifecycle is unchanged.
 //!
 //! Every exec is one bounded `ssh host sh -s` with the script on STDIN, never
 //! in argv: startup commands may carry secrets (an `export API_KEY=…` on an
@@ -1449,7 +1451,9 @@ async fn start_job_inner(
         }
         return Ok(StartOutcome::Attached { job: jid, job_name });
     }
-    let rc = marker_arg(&secs, "rc").unwrap_or("1");
+    let rc = marker_arg(&secs, "rc")
+        .or_else(|| marker_arg(&secs, "preflight_rc"))
+        .unwrap_or("1");
     if rc != "0" {
         if stable && !stable_batch_non_submission(&secs) {
             return Err(StartUncertain { job: jid }.into());
@@ -1490,10 +1494,15 @@ fn submission_receipt(stdout: &str, nonce: &str, attached: bool) -> Option<Vec<(
             body.push('\n');
         }
     }
+    let preflight = !attached
+        && secs
+            .first()
+            .is_some_and(|(key, _)| key.starts_with("preflight_rc "));
+    let status = if preflight { "preflight_rc" } else { "rc" };
     let expected = if attached {
         vec!["rc", "end"]
     } else {
-        vec!["rc", "id", "err", "end"]
+        vec![status, "id", "err", "end"]
     };
     // An existing claim's rc98 receipt has no batch id; it is uncertainty.
     if secs.len() == 2 && secs[0].0 == "rc 98" && secs[1].0 == "end" {
@@ -1507,8 +1516,11 @@ fn submission_receipt(stdout: &str, nonce: &str, attached: bool) -> Option<Vec<(
     {
         return None;
     }
-    let rc = marker_arg(&secs, "rc")?.parse::<u16>().ok()?;
-    if secs[0].0 != format!("rc {rc}") || secs.last()?.0 != "end" {
+    let rc = marker_arg(&secs, status)?.parse::<u16>().ok()?;
+    if secs[0].0 != format!("{status} {rc}")
+        || secs.last()?.0 != "end"
+        || (preflight && (rc == 0 || rc > 255))
+    {
         return None;
     }
     if !attached && rc == 0 {
@@ -1525,6 +1537,11 @@ fn submission_receipt(stdout: &str, nonce: &str, attached: bool) -> Option<Vec<(
 /// after the fresh nonce/exact frame parser succeeds, never on SSH diagnostics.
 /// Shell execution errors and signal termination are not scheduler refusals.
 fn stable_batch_non_submission(sections: &[(String, String)]) -> bool {
+    if marker_arg(sections, "preflight_rc").is_some() {
+        // The exact nonce phase is emitted only on the branch that exits before
+        // real submission. Classification is guidance, not stderr authority.
+        return sections.get(1).is_some_and(|(marker, _)| marker == "id");
+    }
     let rejected = marker_arg(sections, "rc")
         .and_then(|rc| rc.parse::<u8>().ok())
         .is_some_and(|rc| (1..126).contains(&rc) && !matches!(rc, 96..=98));
@@ -1565,12 +1582,21 @@ fn submission_lines(args: &str, stable: bool) -> String {
     let before = if stable { "set +e\n" } else { "" };
     let after = if stable { "set -e\n" } else { "" };
     let locale = if stable { "LC_ALL=C LANG=C " } else { "" };
+    let preflight = if stable {
+        format!("{before}test_out=$(LC_ALL=C LANG=C sbatch --test-only {args} \"$D/job.sh\" 2>\"$D/.sbatch.err\"); test_rc=$?\n\
+            if [ \"$test_rc\" -ne 0 ] || [ -n \"$test_out\" ]; then\n\
+             printf '===preflight_rc %s\\n===id %s\\n===err\\n' \"$test_rc\" \"$test_out\"; cat \"$D/.sbatch.err\" 2>/dev/null || true; rm -f \"$D/.sbatch.err\"\n\
+             printf '===end\\n'; exit 0\n\
+            fi\n")
+    } else {
+        String::new()
+    };
     let remove = if stable {
         ""
     } else {
         "rm -f \"$D/job.pending\"\n[ \"$rc\" -eq 0 ] || rm -rf \"$D\"\n"
     };
-    format!("{before}out=$({locale}sbatch {args} \"$D/job.sh\" 2>\"$D/.sbatch.err\"); rc=$?\n{after}\
+    format!("{preflight}{before}out=$({locale}sbatch {args} \"$D/job.sh\" 2>\"$D/.sbatch.err\"); rc=$?\n{after}\
              id=${{out%%;*}}\n\
              case \"$id\" in ''|*[!0-9_]*) if [ \"$rc\" -eq 0 ]; then rc=97; fi ;; esac\n\
              if [ \"$rc\" -eq 0 ]; then\n\
@@ -3177,6 +3203,9 @@ mod tests {
     struct SubmissionFixture(std::path::PathBuf);
     impl SubmissionFixture {
         fn new(sbatch: &str) -> Self {
+            Self::with_preflight(sbatch, "exit 0")
+        }
+        fn with_preflight(sbatch: &str, preflight: &str) -> Self {
             use std::os::unix::fs::PermissionsExt;
             let root = std::env::temp_dir().join(format!(
                 "chimaera-submit-{}",
@@ -3186,7 +3215,7 @@ mod tests {
             let path = root.join("bin/sbatch");
             std::fs::write(
                 &path,
-                format!("#!/bin/sh\nprintf 'called\\n' >> \"$HOME/calls\"\n{sbatch}\n"),
+                format!("#!/bin/sh\nif [ \"$1\" = --test-only ]; then\n printf 'called\\n' >> \"$HOME/preflight-calls\"\n {preflight}\nfi\nprintf 'called\\n' >> \"$HOME/calls\"\n{sbatch}\n"),
             )
             .unwrap();
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -3316,6 +3345,132 @@ mod tests {
         ] {
             let sections = submission_receipt(frame, "refusal_probe", false).unwrap();
             assert!(!stable_batch_non_submission(&sections));
+        }
+    }
+    #[test]
+    fn stable_preflight_refusal_proves_zero_real_submission_and_never_replays() {
+        for (preflight, positive, kind) in [
+            (
+                "printf 'sbatch: error: Batch jobs not allowed; use interactive\n' >&2; exit 1",
+                true,
+                Refusal::BatchNotAllowed,
+            ),
+            (
+                "printf 'sbatch: error: Message receive failure\n' >&2; exit 1",
+                true,
+                Refusal::Other,
+            ),
+            (
+                "printf '12345\n'; printf 'site failure\n' >&2; exit 1",
+                false,
+                Refusal::Other,
+            ),
+        ] {
+            let fixture = SubmissionFixture::with_preflight("printf '12345\n'", preflight);
+            let script = format!(
+                "printf '===begin preflight_probe\n'\n{}",
+                fixture.submit_script()
+            );
+            let result = fixture.run(&script);
+            assert!(result.status.success());
+            let output = String::from_utf8_lossy(&result.stdout);
+            let sections = submission_receipt(&output, "preflight_probe", false).unwrap();
+            assert!(sections[0].0.starts_with("preflight_rc "));
+            assert_eq!(stable_batch_non_submission(&sections), positive);
+            assert_eq!(classify_refusal(section(&sections, "err").unwrap()), kind);
+            assert_eq!(fixture.calls(), 0);
+            assert_eq!(
+                std::fs::read_to_string(fixture.0.join("preflight-calls"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+            assert!(submission_receipt(&output, "stale_nonce", false).is_none());
+            assert!(
+                submission_receipt(&output.replace("===end", ""), "preflight_probe", false)
+                    .is_none()
+            );
+            assert!(submission_receipt(&output, "preflight_probe", true).is_none());
+            let retry = fixture.run(&script);
+            let retry = submission_receipt(
+                &String::from_utf8_lossy(&retry.stdout),
+                "preflight_probe",
+                false,
+            )
+            .unwrap();
+            assert!(!stable_batch_non_submission(&retry));
+            assert_eq!(fixture.calls(), 0);
+            assert_eq!(
+                std::fs::read_to_string(fixture.0.join("preflight-calls"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+        }
+    }
+    #[test]
+    fn stable_preflight_stdout_cannot_hide_a_nonconforming_submission_wrapper() {
+        let fixture =
+            SubmissionFixture::with_preflight("printf '54321\n'", "printf '12345\n'; exit 0");
+        let script = format!(
+            "printf '===begin preflight_probe\n'\n{}",
+            fixture.submit_script()
+        );
+        let result = fixture.run(&script);
+        let output = String::from_utf8_lossy(&result.stdout);
+        assert!(output.contains("===preflight_rc 0"));
+        assert!(submission_receipt(&output, "preflight_probe", false).is_none());
+        assert_eq!(fixture.calls(), 0);
+        fixture.run(&script);
+        assert_eq!(fixture.calls(), 0);
+        assert_eq!(
+            std::fs::read_to_string(fixture.0.join("preflight-calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+    #[test]
+    fn stable_preflight_uses_same_arguments_then_one_actual_submission() {
+        let fixture = SubmissionFixture::with_preflight(
+            "printf '%s\n' \"$*\" >> \"$HOME/args\"; printf '12345\n'",
+            "printf '%s\n' \"$*\" >> \"$HOME/args\"; exit 0",
+        );
+        let script = format!(
+            "printf '===begin preflight_probe\n'\n{}",
+            fixture.submit_script()
+        );
+        let result = fixture.run(&script);
+        let sections = submission_receipt(
+            &String::from_utf8_lossy(&result.stdout),
+            "preflight_probe",
+            false,
+        )
+        .unwrap();
+        assert_eq!(marker_arg(&sections, "rc"), Some("0"));
+        assert_eq!(marker_arg(&sections, "id"), Some("12345"));
+        let args = std::fs::read_to_string(fixture.0.join("args")).unwrap();
+        let args: Vec<_> = args.lines().collect();
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0].strip_prefix("--test-only "), Some(args[1]));
+        assert_eq!(fixture.calls(), 1);
+        fixture.run(&script);
+        assert_eq!(fixture.calls(), 1);
+        assert_eq!(
+            std::fs::read_to_string(fixture.0.join("args"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+        for frame in [
+            "===begin preflight_probe\n===preflight_rc 0\n===id\n===err\n===end\n",
+            "===begin preflight_probe\n===preflight_rc 256\n===id\n===err\n===end\n",
+        ] {
+            assert!(submission_receipt(frame, "preflight_probe", false).is_none());
         }
     }
     #[test]
