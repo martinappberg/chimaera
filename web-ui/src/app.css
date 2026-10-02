@@ -592,6 +592,36 @@ body.dragging {
   }
 }
 
+/* One scrollbar treatment for the session list, Recents and file tree. */
+.sidebar-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--fg) 22%, transparent) transparent;
+}
+
+/* Keep a usable drag target around a quiet thumb, including in WKWebView.
+   Standard non-auto scrollbar properties override the WebKit dimensions. */
+@supports selector(::-webkit-scrollbar) {
+  .sidebar-scrollbar {
+    scrollbar-width: auto;
+    scrollbar-color: auto;
+  }
+  .sidebar-scrollbar::-webkit-scrollbar {
+    width: 8px;
+  }
+  .sidebar-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .sidebar-scrollbar::-webkit-scrollbar-thumb {
+    background: color-mix(in srgb, var(--fg) 22%, transparent);
+    border: 2px solid transparent;
+    border-radius: 4px;
+    background-clip: padding-box;
+  }
+  .sidebar-scrollbar::-webkit-scrollbar-thumb:hover {
+    background-color: color-mix(in srgb, var(--fg) 38%, transparent);
+  }
+}
+
 /* xterm chrome: transparent viewport (the slot owns the background) and a
    thin, quiet scrollbar instead of the default heavy one. */
 .xterm .xterm-viewport {

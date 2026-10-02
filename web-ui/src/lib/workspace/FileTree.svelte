@@ -1017,7 +1017,7 @@
   </div>
   <!-- The tree is its own scroller so the ancestor overlay can stick to ITS
        top edge (the rail body around it does not scroll). -->
-  <div class="tree-scroll" bind:this={scrollEl} data-tree-root={root}>
+  <div class="tree-scroll sidebar-scrollbar" bind:this={scrollEl} data-tree-root={root}>
     <!-- Zero-height sticky anchor: what it holds is painted over the top rows
          and never moves the content. During an OS file drag it names the drop
          destination instead of the ancestors — one message at a time. -->

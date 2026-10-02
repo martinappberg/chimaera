@@ -1669,6 +1669,7 @@ fn control_only_switch_journal(path: &std::path::Path) -> bool {
                 to: chimaera_agent::model::SessionUi::Chat,
             } => saw_chat_switch = true,
             AgentEvent::ModeSwitch { .. }
+            | AgentEvent::StartupProgress { .. }
             | AgentEvent::Init { .. }
             | AgentEvent::ModeChanged { .. }
             | AgentEvent::EffortState { .. }
@@ -4809,6 +4810,9 @@ mod tests {
                 &[
                     AgentEvent::ModeSwitch {
                         to: chimaera_agent::model::SessionUi::Chat,
+                    },
+                    AgentEvent::StartupProgress {
+                        detail: "Running startup hooks…".into(),
                     },
                     AgentEvent::Init {
                         native_session_id: native_id.into(),
