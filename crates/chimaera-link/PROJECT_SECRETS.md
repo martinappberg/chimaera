@@ -174,6 +174,99 @@ bounded cleanup; reaching that limit refuses new submissions rather than
 discarding a still-needed acknowledgment. No terminal receipt can restore a
 canceled or already applied intent.
 
+## Account authorization for the durable queue
+
+These internal endpoints are fixed service-to-service paths. They receive no
+custom value, value hash, provider credential or caller-selected destination:
+
+| Method and path | Purpose |
+| --- | --- |
+| `POST /internal/v1/personal/project-secrets/admissions` | Admit one explicit `set` intent durably |
+| `POST /internal/v1/personal/project-secrets/applications/authorize` | Freshly authorize that exact pending intent for automatic application |
+| `POST /internal/v1/personal/project-secrets/edits/authorize` | Freshly authorize an explicit `apply`, `cancel` or `remove` decision |
+| `POST /internal/v1/personal/project-secrets/admissions/retire` | Irreversibly retire the exact original intent |
+
+All four require the keeper's current service bearer and the current personal
+worker service token in the closed request. They are unavailable unless this
+separate secret-control capability is enabled; provider-control admission is
+never an alternative. The authorization tuple is a closed object of at most
+8 KiB, with these exact fields:
+
+- `version:1`, `account_id`, `holder_id`, `worker_credential_digest`;
+- `device_id`, `device_session_epoch`, `workspace_id`, `expected_revision`;
+- `operation_id`, `expected_pending` (UUID or null), `action`, `names`.
+
+IDs and revisions follow the external bounds above. The worker digest is the
+64-character lowercase SHA-256 of its current service credential; it never
+enters a project. `names` is a sorted, distinct list of at most 32 valid secret
+names: the entire resulting pending batch for `set`, the exact shown batch for
+`apply` or `cancel`, and the single applied name for `remove`. A `set` has at
+least one name and its operation UUID becomes the pending intent identity;
+it cannot equal its previous pending UUID. Apply/cancel require a non-null
+pending UUID and nonempty names. Remove has exactly one name. Process boot IDs
+are deliberately absent: restarting the same worker preserves intent, whereas
+replacing its credential or machine invalidates it.
+
+Admission accepts the closed object `{authorization,device_token,worker_token,
+device_authority}`. The keeper generates `device_authority` as exactly 32 random
+bytes encoded as canonical unpadded base64url before its first request. It never
+comes from a project. The account stores only its hash with the immutable tuple,
+original device/account epoch and original keeper/worker credential identities.
+The original full device access token must be current when creating the row.
+An exact retry can observe that same row after ordinary access-token refresh;
+it cannot alter its tuple, renew a retired row or authorize resubmitting values.
+The keeper retains the authority only in the trusted encrypted queue/control
+store, never a plaintext device access token.
+
+Automatic application accepts the closed object `{authorization,worker_token,
+device_authority}` and must find the original live `set` admission. Explicit
+edits instead accept `{authorization,device_token,worker_token}` with action
+`apply`, `cancel` or `remove`; they always require a current full device access
+token. Apply now is a fresh explicit decision for all the shown names, so it can
+replace authority retired by an earlier device revocation without reading values
+back or silently adopting unseen edits. The worker must still compare the exact
+pending identity and applied revision at its serialized execution fence.
+
+Admission/application/edit validation locks account, keeper cell and worker cell
+in that order, then verifies the original/current device, session epoch,
+entitlement, current service identities and exact nonrevoked workspace
+registration revision using the clock after those waits. Missing registration
+refuses. All success replies are closed, at most 12 KiB, and exactly
+`{version:1,authorized:true,authorization:<original tuple>}`. Their private local
+proof is one-use and expires five seconds from the caller's request start;
+response arrival never restarts the clock. Keeper and worker perform their
+post-wait identity checks before consuming it. A reply is not a queued or
+applied receipt. These routes never wake a service, stop work or change a grant.
+
+Retirement accepts `{authorization,worker_token,device_authority}` and returns
+`{version:1,retired:true,authorization:<original tuple>}`. It requires current
+keeper/worker authority for the same account, plus the exact original tuple and
+hashed admission authority, but not a still-live original device or old project
+revision. This permits cleanup after revocation without resurrecting authority.
+It marks the row terminal irreversibly and is idempotent while the tombstone is
+retained. A retired or missing row cannot authorize application; retirement of a
+missing row refuses. Admission never re-creates a retained retired operation.
+After all bounded receipts have expired, a genuinely new explicit full-device
+decision is required; status, recovery and automatic application cannot create
+an admission. UUIDs alone do not prove an unlimited replay history. The worker
+retires superseded/canceled/applied intents after
+its corresponding durable local transition, preserving an owned cleanup receipt
+until retirement is acknowledged. Partial admission or local persistence failure
+never counts as successfully queued.
+
+There are at most 128 live admissions and 1024 total retained rows per account.
+Admission refuses when full; it does not discard an older live intent. No live
+admission expires merely because a project remains busy. Revoked/expired device
+sessions, changed account epoch, replaced service identities and changed/revoked
+project registrations permanently retire their admissions during bounded
+maintenance. Retired rows remain for at least 24 hours, with cleanup batches of
+at most 1000. External operation receipts independently preserve their minimum
+retention and reject replay while retained before a new internal admission could
+be attempted.
+Each complete request is at most 12 KiB and rejects duplicate/unknown fields;
+credential-bearing request types have no Debug implementation. Service tokens
+are 16–256 ASCII letters, digits, `_` or `-`; no credential is logged.
+
 ## Acceptance gate
 
 Capability enablement requires the real account, keeper, supervisor, daemon and
