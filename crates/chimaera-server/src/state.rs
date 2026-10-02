@@ -77,6 +77,8 @@ pub(crate) struct AppState {
     /// the moment the id is in neither registry — a vanishing row would make
     /// every window prune the session's tabs mid-toggle.
     pub(crate) chat_switching: Mutex<HashMap<String, String>>,
+    /// Durable public imports gate execution before boot ledger restoration.
+    pub(crate) bundle_imports: crate::bundle::PendingImports,
     /// Workspaces with a Mastermind PUT/DELETE in flight. The routes are
     /// multi-step (retire old → bind → spawn, with rollback); two racing
     /// callers would leak the loser's spawned session and could clobber the
@@ -312,6 +314,7 @@ impl AppState {
             chat_signals: Mutex::new(Some(chat_signals_rx)),
             chat_recipes: Mutex::new(HashMap::new()),
             chat_switching: Mutex::new(HashMap::new()),
+            bundle_imports: crate::bundle::PendingImports::load(&data_dir),
             mastermind_switching: Mutex::new(std::collections::HashSet::new()),
             spawn_reservations: Mutex::new(HashMap::new()),
             session_workspaces: Mutex::new(HashMap::new()),

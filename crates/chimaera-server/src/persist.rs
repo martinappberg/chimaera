@@ -36,8 +36,8 @@ pub(crate) fn project_temp_name(name: &std::ffi::OsStr) -> std::ffi::OsString {
 /// storage before returning (F_FULLFSYNC on macOS, where fsync alone may stay
 /// in the drive cache). For state whose loss after a crash or power cut would
 /// let two machines run the same work: Pro ownership and the session ledger's
-/// Pro transfer writes. Ordinary preference stores and the generic bundle
-/// routes keep the cheaper write.
+/// Pro transfer writes, including public session imports. Ordinary preference
+/// stores keep the cheaper write.
 pub(crate) fn atomic_write_json_durable(
     path: &Path,
     contents: impl AsRef<[u8]>,
@@ -58,6 +58,17 @@ pub(crate) fn atomic_write_json_durable(
     // (EINVAL/ENOTSUP on some network and FUSE mounts) does not make this
     // write a failure; any other error does.
     let directory = std::fs::File::open(parent)?;
+    match full_sync(&directory) {
+        Err(error) if !directory_sync_unsupported(&error) => Err(error),
+        _ => Ok(()),
+    }
+}
+/// Called under a store's writer gate when a newer snapshot already won. Sync
+/// that current version rather than replaying the older durable caller's bytes.
+pub(crate) fn sync_json_durable(path: &Path) -> anyhow::Result<()> {
+    let (file, _) = crate::fs::open_regular(path)?;
+    full_sync(&file)?;
+    let directory = std::fs::File::open(path.parent().context("durable state needs a parent")?)?;
     match full_sync(&directory) {
         Err(error) if !directory_sync_unsupported(&error) => Err(error),
         _ => Ok(()),

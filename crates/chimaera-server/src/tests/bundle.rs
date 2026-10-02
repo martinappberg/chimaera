@@ -1,6 +1,7 @@
 use super::support::*;
 use crate::*;
 use bundle::{ExportMode, ImportOptions, Origin};
+use serde_json::json;
 
 /// A metadata failure after file installation is retried from immutable
 /// preparation, including evidence held only by the old local journal.
@@ -452,4 +453,356 @@ async fn destination_remap_preserves_relative_cwd_and_stages_before_resume() {
     source.sessions.kill(id).unwrap();
     target.sessions.kill(id).unwrap();
     std::fs::remove_file(archive).unwrap();
+}
+
+fn public_fixture(root: &std::path::Path, index: &[u8], view: Option<&[u8]>) -> std::path::PathBuf {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+    let path = test_dir("public-bundle-archive").join("source.zip");
+    let mut members = vec![
+        (
+            "native.jsonl",
+            b"{\"type\":\"user\",\"message\":\"fixture\"}\n".as_slice(),
+        ),
+        (
+            "journal.jsonl",
+            b"{\"seq\":1,\"ts\":1,\"ev\":{\"type\":\"notice\",\"text\":\"incoming\"}}\n".as_slice(),
+        ),
+        ("index.json", index),
+    ];
+    if let Some(view) = view {
+        members.push(("view.json", view));
+    }
+    let mut checksums = serde_json::Map::new();
+    for (name, bytes) in &members {
+        let digest: String = Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        checksums.insert((*name).into(), json!({"bytes":bytes.len(),"sha256":digest}));
+    }
+    let manifest = json!({"version":1,"workspace":{"id":"w-public","root":root,"name":"public","last_opened_at":0},
+        "session":{"id":"s-public","workspace_id":"w-public","cwd":root,"cols":80,"rows":24,
+            "agent":{"kind":"claude","resume":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","title":"fixture","ui":"chat"}},
+        "source_host":"fixture","source_os":"test","stopped":true,"members":checksums});
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    zip.start_file("manifest.json", options).unwrap();
+    zip.write_all(&serde_json::to_vec(&manifest).unwrap())
+        .unwrap();
+    for (name, bytes) in members {
+        zip.start_file(name, options).unwrap();
+        zip.write_all(bytes).unwrap();
+    }
+    zip.finish().unwrap();
+    path
+}
+fn public_options(root: &std::path::Path) -> ImportOptions {
+    ImportOptions {
+        fork: false,
+        origin: Origin::Home,
+        epoch: 5,
+        defer_start: true,
+        destination_root: Some(root.to_owned()),
+    }
+}
+
+#[tokio::test]
+async fn public_bundle_validates_all_metadata_before_canonical_writes() {
+    let _serial = bundle::TEST_SERIAL.lock().await;
+    for (index, view) in [
+        (b"broken".as_slice(), None),
+        (b"{}".as_slice(), Some(b"broken".as_slice())),
+    ] {
+        let state = test_state();
+        let project = std::fs::canonicalize(test_dir("public-bad-metadata")).unwrap();
+        let archive = public_fixture(&project, index, view);
+        let journal = state.chat.journal_dir().join("s-public.jsonl");
+        std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        std::fs::write(&journal, b"original").unwrap();
+        assert!(
+            bundle::import(state.clone(), &archive, public_options(&project))
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&journal).unwrap(), b"original");
+        assert!(lock(&state.workspaces).get("w-public").is_none());
+        assert!(!project.join(".chimaera-workspace").exists());
+        assert!(crate::pro::may_execute(&state, "w-public"));
+    }
+}
+
+#[tokio::test]
+async fn public_bundle_failed_metadata_is_fenced_across_restart_and_exact_retry() {
+    let _serial = bundle::TEST_SERIAL.lock().await;
+    let data = test_dir("public-recover-data");
+    let state = test_state_with_data_dir(0, data.clone());
+    let project = std::fs::canonicalize(test_dir("public-recover-project")).unwrap();
+    let archive = public_fixture(&project, b"{\"model\":\"fixture\"}", None);
+    let journal = state.chat.journal_dir().join("s-public.jsonl");
+    std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
+    std::fs::write(&journal, b"original local history").unwrap();
+    let index = state.chat.journal_dir().join("index.json");
+    std::fs::create_dir(&index).unwrap();
+    let response = bundle::import_route(
+        axum::extract::State(state.clone()),
+        axum::extract::Query(public_options(&project)),
+        axum::body::Body::from(std::fs::read(&archive).unwrap()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = http_body_util::BodyExt::collect(response.into_body())
+        .await
+        .unwrap()
+        .to_bytes();
+    let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(error["error_code"], "bundle_import_pending");
+    assert!(error["error"]
+        .as_str()
+        .unwrap()
+        .contains("Retry the same archive"));
+    let (status, status_body) = request(&state, Method::GET, "/api/v1/pro/status", None).await;
+    assert!(status.is_success());
+    let row = status_body["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["workspace_id"] == "w-public")
+        .unwrap();
+    assert_eq!(row["bundle_import"]["state"], "recovery_needed");
+    assert!(!crate::pro::may_execute(&state, "w-public"));
+    assert!(state
+        .bundle_imports
+        .check_session("s-public", None)
+        .is_err());
+    assert!(state.chat.get("s-public").is_none());
+    let before = state
+        .chat
+        .journal_dir()
+        .parent()
+        .unwrap()
+        .join("bundles/imports/prepared/s-public/stage/1.before");
+    assert_eq!(std::fs::read(before).unwrap(), b"original local history");
+    drop(state);
+    std::fs::remove_dir(&index).unwrap();
+    let restarted = test_state_with_data_dir(0, data);
+    assert!(!crate::pro::may_execute(&restarted, "w-public"));
+    let mut different = public_options(&project);
+    different.epoch += 1;
+    assert!(bundle::import(restarted.clone(), &archive, different)
+        .await
+        .is_err());
+    let imported = bundle::import(restarted.clone(), &archive, public_options(&project))
+        .await
+        .unwrap();
+    assert!(imported.paused);
+    assert!(restarted.chat.get("s-public").is_none());
+    assert!(crate::pro::may_execute(&restarted, "w-public"));
+    assert_eq!(
+        crate::workspaces::identity::read(&project).unwrap().id,
+        "w-public"
+    );
+    assert!(lock(&restarted.deferred_sessions).contains_key("s-public"));
+    // Exit/replacement is irrelevant to a positive committed receipt. Preserve
+    // native/journal progress made after the completed import on exact replay.
+    std::fs::write(&journal, b"newer canonical history").unwrap();
+    bundle::import(restarted.clone(), &archive, public_options(&project))
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(journal).unwrap(), b"newer canonical history");
+}
+
+#[tokio::test]
+async fn malformed_pending_import_record_blocks_restoration_and_new_workspace_launch() {
+    let data = test_dir("public-damaged-pending");
+    std::fs::create_dir(data.join("bundles")).unwrap();
+    std::fs::write(data.join("bundles/pending.json"), b"broken").unwrap();
+    let state = test_state_with_data_dir(0, data);
+    assert!(!crate::pro::may_execute(&state, "unrelated-free-project"));
+    assert!(state.bundle_imports.admit("w-new", "s-new", None).is_err());
+    assert_eq!(state.bundle_imports.view("w-new").unwrap()["damaged"], true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_bundle_caller_cancellation_retains_config_and_pending_until_owned_commit() {
+    let _serial = bundle::TEST_SERIAL.lock().await;
+    let state = test_state();
+    let project = std::fs::canonicalize(test_dir("public-cancel-project")).unwrap();
+    let archive = public_fixture(&project, b"{}", None);
+    let (entered, release) = bundle::hold_public(&state, "s-public", false);
+    let importer = state.clone();
+    let options = public_options(&project);
+    let call = tokio::spawn(async move { bundle::import(importer, &archive, options).await });
+    entered.await.unwrap();
+    call.abort();
+    assert!(!crate::pro::may_execute(&state, "w-public"));
+    let config = state.clone();
+    let mut disable = tokio::spawn(async move {
+        request(&config, Method::DELETE, "/api/v1/pro/configure", None).await
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut disable)
+            .await
+            .is_err(),
+        "caller cancellation cannot release configuration before owned metadata writes settle"
+    );
+    release.send(()).unwrap();
+    assert!(disable.await.unwrap().0.is_success());
+    assert!(!state.bundle_imports.blocks_workspace("w-public"));
+    assert!(lock(&state.deferred_sessions).contains_key("s-public"));
+    assert!(state.chat.get("s-public").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_bundle_resume_refuses_account_replacement_after_async_preparation() {
+    let _serial = bundle::TEST_SERIAL.lock().await;
+    let source = test_state();
+    let target = test_state();
+    let project = std::fs::canonicalize(test_dir("public-resume-account")).unwrap();
+    let (_, workspace) = request(
+        &source,
+        Method::POST,
+        "/api/v1/workspaces",
+        Some(json!({"root":project})),
+    )
+    .await;
+    let (_, session) = request(
+        &source,
+        Method::POST,
+        "/api/v1/sessions",
+        Some(json!({"workspace_id":workspace["id"]})),
+    )
+    .await;
+    let id = session["id"].as_str().unwrap().to_owned();
+    let archive = bundle::export(source.clone(), &id, ExportMode::Snapshot)
+        .await
+        .unwrap();
+    let (entered, release) = bundle::hold_public(&target, &id, true);
+    let importer = target.clone();
+    let call = tokio::spawn(async move {
+        bundle::import(
+            importer,
+            &archive,
+            ImportOptions {
+                fork: false,
+                origin: Origin::Home,
+                epoch: 1,
+                defer_start: false,
+                destination_root: None,
+            },
+        )
+        .await
+    });
+    entered.await.unwrap();
+    // Local disconnect keeps laptop processes intact, but still replaces the
+    // account generation. Final actual spawn must retain the old admission.
+    assert!(
+        request(&target, Method::DELETE, "/api/v1/pro/configure", None)
+            .await
+            .0
+            .is_success()
+    );
+    release.send(()).unwrap();
+    assert!(call.await.unwrap().is_err());
+    assert!(target.sessions.get(&id).is_none());
+    assert!(lock(&target.deferred_sessions).contains_key(&id));
+    source.sessions.kill(&id).unwrap();
+}
+
+#[tokio::test]
+async fn public_bundle_view_failure_retry_flushes_the_existing_cached_layout() {
+    let _serial = bundle::TEST_SERIAL.lock().await;
+    let data = test_dir("public-view-failure");
+    let state = test_state_with_data_dir(0, data.clone());
+    let project = std::fs::canonicalize(test_dir("public-view-project")).unwrap();
+    let archive = public_fixture(&project, b"{}", Some(b"{\"layout\":\"incoming\"}"));
+    let view = data.join("view-state.json");
+    std::fs::create_dir(&view).unwrap();
+    assert!(
+        bundle::import(state.clone(), &archive, public_options(&project))
+            .await
+            .is_err()
+    );
+    assert!(lock(&state.view_state).get("ws_w-public").is_some());
+    assert!(!crate::pro::may_execute(&state, "w-public"));
+    std::fs::remove_dir(&view).unwrap();
+    bundle::import(state.clone(), &archive, public_options(&project))
+        .await
+        .unwrap();
+    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(view).unwrap()).unwrap();
+    assert_eq!(saved["ws_w-public"]["layout"], "incoming");
+    assert!(crate::pro::may_execute(&state, "w-public"));
+}
+
+#[tokio::test]
+async fn public_bundle_cannot_replace_a_live_resumed_chat_before_its_native_init() {
+    use chimaera_agent::driver::{AgentAdapter, DriverExit, DriverIo, SpawnSpec};
+    struct Quiet;
+    impl AgentAdapter for Quiet {
+        fn kind(&self) -> &'static str {
+            "claude"
+        }
+        fn spawn(
+            &self,
+            _spec: SpawnSpec,
+            mut io: DriverIo,
+        ) -> anyhow::Result<tokio::task::JoinHandle<DriverExit>> {
+            Ok(tokio::spawn(async move {
+                let events = io.events;
+                let commands = io.commands;
+                let _ = io.kill.changed().await;
+                drop(events);
+                drop(commands);
+                DriverExit::Killed
+            }))
+        }
+    }
+    let _serial = bundle::TEST_SERIAL.lock().await;
+    let state = test_state();
+    let project = std::fs::canonicalize(test_dir("public-live-resume")).unwrap();
+    let archive = public_fixture(&project, b"{}", None);
+    let id = "s-already-resuming";
+    lock(&state.chat_recipes).insert(
+        id.into(),
+        crate::chat::ChatRecipe {
+            workspace_root: project.clone(),
+            workspace_id: "w-old".into(),
+            kind: crate::agents::AgentKind::Claude,
+            bin: "/bin/false".into(),
+            version: None,
+            settings: None,
+            mcp_config: None,
+            model: None,
+            resume: Some("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into()),
+            fork_at: None,
+            fork_head: false,
+            rollback_turns: None,
+            revert_before_turn: None,
+            remote_control: crate::chat::RemoteControlAtStart::No,
+            carry_ultracode: false,
+            theme: "dark".into(),
+            prelude: None,
+            mastermind: None,
+            portable_context: None,
+            created_at_ms: None,
+        },
+    );
+    state
+        .chat
+        .spawn(&Quiet, SpawnSpec::new(id, vec![], project.clone()))
+        .unwrap();
+    assert!(state.chat.get(id).unwrap().native_session_id.is_none());
+    assert!(state.chat.get(id).unwrap().alive);
+    let error = bundle::import(state.clone(), &archive, public_options(&project))
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        error.to_string().contains("native conversation is active"),
+        "{error}"
+    );
+    assert!(!state.chat.journal_dir().join("s-public.jsonl").exists());
+    assert!(crate::pro::may_execute(&state, "w-public"));
+    state.chat.fence(id);
 }

@@ -130,6 +130,21 @@ impl ViewStateStore {
         key: String,
         value: serde_json::Value,
     ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+        self.put_inner(key, value, false)
+    }
+    pub(crate) fn put_durable(
+        &mut self,
+        key: String,
+        value: serde_json::Value,
+    ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+        self.put_inner(key, value, true)
+    }
+    fn put_inner(
+        &mut self,
+        key: String,
+        value: serde_json::Value,
+        durable: bool,
+    ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
         self.items.insert(key.clone(), Arc::new(value));
         self.touch(&key);
         self.evict();
@@ -151,9 +166,17 @@ impl ViewStateStore {
             // flushed is dropped rather than rolling the file back.
             let mut last = crate::lock(&writer);
             if seq <= *last {
-                return Ok(());
+                return if durable {
+                    crate::persist::sync_json_durable(&path)
+                } else {
+                    Ok(())
+                };
             }
-            crate::persist::atomic_write_json(&path, bytes)?;
+            if durable {
+                crate::persist::atomic_write_json_durable(&path, bytes)?;
+            } else {
+                crate::persist::atomic_write_json(&path, bytes)?;
+            }
             *last = seq;
             Ok(())
         })

@@ -112,11 +112,25 @@ impl Snapshot {
     /// this change too): a slow write must never put an older list back.
     /// One write at a time; they share the temp file.
     pub(crate) fn write(self) -> anyhow::Result<()> {
+        self.write_inner(false)
+    }
+    fn write_durable(self) -> anyhow::Result<()> {
+        self.write_inner(true)
+    }
+    fn write_inner(self, durable: bool) -> anyhow::Result<()> {
         let mut written = crate::lock(&self.written);
         if *written >= self.generation {
-            return Ok(());
+            return if durable {
+                crate::persist::sync_json_durable(&self.path)
+            } else {
+                Ok(())
+            };
         }
-        crate::persist::atomic_write_json(&self.path, &self.bytes)?;
+        if durable {
+            crate::persist::atomic_write_json_durable(&self.path, &self.bytes)?;
+        } else {
+            crate::persist::atomic_write_json(&self.path, &self.bytes)?;
+        }
         *written = self.generation;
         Ok(())
     }
@@ -364,6 +378,13 @@ impl WorkspaceStore {
             return Err(error);
         }
         Ok(())
+    }
+
+    /// Bundle receipts require the current registry, not just its rename, to
+    /// survive a crash. Share the normal snapshot ordering gate.
+    pub(crate) fn import_exact_durable(&mut self, workspace: Workspace) -> anyhow::Result<()> {
+        self.import_exact(workspace)?;
+        self.snapshot()?.write_durable()
     }
 
     /// Make sure workspace `id` exists, under exactly this id: a cluster

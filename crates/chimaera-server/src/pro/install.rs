@@ -65,7 +65,7 @@ fn space(directory: &File, bytes: u64) -> Result<()> {
     );
     Ok(())
 }
-pub(super) fn stage_budget(root: &Path) -> Result<()> {
+pub(crate) fn stage_budget(root: &Path) -> Result<()> {
     let (files, directories) = paths(root)?;
     let root_dir = directory(root)?;
     let mut total = 0u64;
@@ -93,6 +93,38 @@ pub(super) fn stage_budget(root: &Path) -> Result<()> {
     }
     sync_enrollment(root)?;
     space(&root_dir, 0)
+}
+
+/// Durable bounded state beside the installation journal or its admission
+/// marker. Pin every parent; an existing temporary symlink is never followed.
+pub(crate) fn write_state(path: &Path, bytes: &[u8]) -> Result<()> {
+    ensure!(
+        bytes.len() as u64 <= MAX_JOURNAL,
+        "durable installation state exceeds limit"
+    );
+    let parent = path.parent().context("installation state has no parent")?;
+    ensure!(path.is_absolute(), "installation state must be absolute");
+    let filesystem = File::open("/")?;
+    let dir = parent_checked(&filesystem, path.strip_prefix("/")?, true, &|| Ok(()))?;
+    sync_enrollment(parent)?;
+    let name = path.file_name().context("installation state has no name")?;
+    let temporary = format!("state-{}.tmp", chimaera_core::generate_token());
+    let result = (|| {
+        let mut file = File::from(rustix::fs::openat(
+            &dir,
+            temporary.as_str(),
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_bits_truncate(0o600),
+        )?);
+        file.write_all(bytes)?;
+        sync_file(&file)?;
+        rustix::fs::renameat(&dir, temporary.as_str(), &dir, name)?;
+        sync_dir(&dir)
+    })();
+    if result.is_err() {
+        let _ = rustix::fs::unlinkat(&dir, temporary.as_str(), AtFlags::empty());
+    }
+    result
 }
 
 /// A staged file change. `before` is the version observed while planning, not a
@@ -245,7 +277,7 @@ pub(super) fn changes(root: &Path, before: &Path, after: &Path) -> Result<Vec<Wr
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub(super) struct Binding {
+pub(crate) struct Binding {
     pub endpoint: String,
     pub account: Option<String>,
     pub workspace: String,
@@ -283,7 +315,7 @@ struct Journal {
     #[serde(default)]
     git_roots: Vec<PathBuf>,
 }
-pub(super) struct Transaction {
+pub(crate) struct Transaction {
     directory: PathBuf,
     journal: Journal,
     reservations: Vec<Reservation>,
@@ -300,7 +332,7 @@ fn relative(path: &Path) -> Result<()> {
     Ok(())
 }
 /// Open an absolute path without following any component, including the root.
-pub(super) fn directory(path: &Path) -> Result<File> {
+pub(crate) fn directory(path: &Path) -> Result<File> {
     ensure!(path.is_absolute(), "installation root must be absolute");
     let base = File::open("/")?;
     let path = path.strip_prefix("/")?;
@@ -510,6 +542,23 @@ fn coalesce(writes: Vec<Write>) -> Result<Vec<Write>> {
     }
     Ok(result)
 }
+fn valid_roots(roots: &[PathBuf]) -> Result<()> {
+    ensure!(roots.len() <= 2, "installation has too many Git roots");
+    let mut unique = BTreeSet::new();
+    for root in roots {
+        ensure!(
+            root.is_absolute()
+                && root.as_os_str().len() <= 4096
+                && root.components().count() <= 64
+                && root
+                    .components()
+                    .all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
+                && unique.insert(root),
+            "invalid or duplicate installation Git root"
+        );
+    }
+    Ok(())
+}
 impl Transaction {
     pub(super) fn cleanup_committed(
         directory: &Path,
@@ -546,7 +595,7 @@ impl Transaction {
         );
         transaction.cleanup()
     }
-    pub(super) fn open(directory: &Path, binding: &Binding) -> Result<Option<Self>> {
+    pub(crate) fn open(directory: &Path, binding: &Binding) -> Result<Option<Self>> {
         let path = directory.join("journal.json");
         if !path.try_exists()? {
             return Ok(None);
@@ -559,29 +608,47 @@ impl Transaction {
             "installation journal exceeds limit"
         );
         let mut journal: Journal = serde_json::from_reader(file.take(MAX_JOURNAL + 1))?;
-        Self::replay(&dir, &mut journal)?;
         ensure!(
             journal.version == 1 && journal.binding == *binding,
             "unfinished installation belongs to another account or checkpoint"
         );
+        valid_roots(&journal.git_roots)?;
+        Self::replay(&dir, &mut journal)?;
         ensure!(
             journal.intents.len() <= super::policy::MAX_PATHS,
             "installation journal has too many paths"
         );
-        for intent in &journal.intents {
+        ensure!(
+            !journal.committed || journal.intents.iter().all(|intent| intent.applied),
+            "invalid installation commit state"
+        );
+        for (index, intent) in journal.intents.iter().enumerate() {
             relative(&intent.relative)?;
             ensure!(
                 intent
                     .aside
-                    .starts_with(crate::persist::PROJECT_STAGING_PREFIX)
-                    && !intent.aside.contains('/'),
+                    .strip_prefix(&format!(
+                        "{}return-",
+                        crate::persist::PROJECT_STAGING_PREFIX
+                    ))
+                    .is_some_and(|tail| tail.split_once('-').is_some_and(
+                        |(nonce, position)| nonce.len() == 16
+                            && nonce.bytes().all(|b| b.is_ascii_hexdigit())
+                            && position == index.to_string()
+                    )),
                 "unsafe installation recovery name"
             );
-            for version in [&intent.before, &intent.after].into_iter().flatten() {
-                ensure!(
-                    !version.blob.contains('/') && version.bytes <= super::policy::MAX_FILE_BYTES,
-                    "unsafe installation blob"
-                );
+            for (suffix, version) in [("before", &intent.before), ("after", &intent.after)] {
+                if let Some(version) = version {
+                    ensure!(
+                        version.blob == format!("{index}.{suffix}")
+                            && version.bytes <= super::policy::MAX_FILE_BYTES
+                            && version.mode <= 0o777
+                            && version.sha256.len() == 64
+                            && version.sha256.bytes().all(|b| b.is_ascii_hexdigit()),
+                        "unsafe installation blob"
+                    );
+                }
             }
         }
         Ok(Some(Self {
@@ -590,7 +657,7 @@ impl Transaction {
             reservations: Vec::new(),
         }))
     }
-    pub(super) fn prepare(
+    pub(crate) fn prepare(
         directory: &Path,
         binding: Binding,
         writes: Vec<Write>,
@@ -727,18 +794,7 @@ impl Transaction {
             bytes.len() as u64 <= MAX_JOURNAL,
             "installation journal exceeds limit"
         );
-        let dir = directory(&self.directory)?;
-        let temporary = format!("journal-{}.tmp", chimaera_core::generate_token());
-        let mut file = File::from(rustix::fs::openat(
-            &dir,
-            temporary.as_str(),
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::from_bits_truncate(0o600),
-        )?);
-        file.write_all(&bytes)?;
-        sync_file(&file)?;
-        rustix::fs::renameat(&dir, temporary.as_str(), &dir, "journal.json")?;
-        sync_dir(&dir)
+        write_state(&self.directory.join("journal.json"), &bytes)
     }
     /// Reserve the original Git stores through file and metadata installation.
     /// A crash leaves recognizable locks; retries reclaim only this journal's
@@ -748,6 +804,8 @@ impl Transaction {
         roots: Vec<PathBuf>,
         current: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
+        valid_roots(&roots)?;
+        valid_roots(&self.journal.git_roots)?;
         if !self.reservations.is_empty() {
             return Ok(());
         }
@@ -959,9 +1017,10 @@ impl Transaction {
             let file = File::from(rustix::fs::openat(
                 dir,
                 "progress.jsonl",
-                OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
                 Mode::empty(),
             )?);
+            ensure!(file.metadata()?.is_file(), "invalid installation progress");
             file.set_len(end as u64)?;
             sync_file(&file)?;
         }
@@ -978,7 +1037,12 @@ impl Transaction {
         let mut file = File::from(rustix::fs::openat(
             &dir,
             "progress.jsonl",
-            OFlags::WRONLY | OFlags::APPEND | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            OFlags::WRONLY
+                | OFlags::APPEND
+                | OFlags::CREATE
+                | OFlags::NOFOLLOW
+                | OFlags::NONBLOCK
+                | OFlags::CLOEXEC,
             Mode::from_bits_truncate(0o600),
         )?);
         let mut bytes = serde_json::to_vec(&(index, phase))?;
@@ -999,10 +1063,10 @@ impl Transaction {
         }
         Ok(())
     }
-    pub(super) fn committed(&self) -> bool {
+    pub(crate) fn committed(&self) -> bool {
         self.journal.committed
     }
-    pub(super) fn apply(&mut self, current: &dyn Fn() -> Result<()>) -> Result<()> {
+    pub(crate) fn apply(&mut self, current: &dyn Fn() -> Result<()>) -> Result<()> {
         if self.journal.committed {
             return Ok(());
         }
@@ -1131,7 +1195,7 @@ impl Transaction {
     }
     /// Commit before profile commands or agent admission. Retained backups are
     /// deleted only after this durable bit; no external command is rolled back.
-    pub(super) fn commit(&mut self, current: &dyn Fn() -> Result<()>) -> Result<()> {
+    pub(crate) fn commit(&mut self, current: &dyn Fn() -> Result<()>) -> Result<()> {
         ensure!(
             self.journal.intents.iter().all(|intent| intent.applied),
             "installation is incomplete"
@@ -1142,7 +1206,7 @@ impl Transaction {
         current()?;
         self.progress(self.journal.intents.len(), 3)
     }
-    pub(super) fn cleanup(mut self) -> Result<()> {
+    pub(crate) fn cleanup(mut self) -> Result<()> {
         ensure!(
             self.journal.committed,
             "cannot discard unfinished installation"

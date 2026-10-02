@@ -32,6 +32,8 @@ struct Metadata {
     links: BTreeMap<String, String>,
     send_state: Option<Vec<u8>>,
     files: Vec<FileIntent>,
+    #[serde(default)]
+    public: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -72,12 +74,13 @@ fn admissible(state: &Arc<AppState>, entry: &LedgerEntry, epoch: u64) -> Result<
         .as_ref()
         .and_then(|agent| agent.resume.as_deref())
     {
-        if state
-            .chat
-            .list()
-            .iter()
-            .any(|s| s.alive && s.native_session_id.as_deref() == Some(native))
-        {
+        if state.chat.list().iter().any(|s| {
+            s.alive
+                && (s.native_session_id.as_deref() == Some(native)
+                    || crate::lock(&state.chat_recipes)
+                        .get(&s.id)
+                        .is_some_and(|recipe| recipe.resume.as_deref() == Some(native)))
+        }) {
             bail!("native conversation is active in another session");
         }
         let live: std::collections::HashSet<_> = state
@@ -241,6 +244,7 @@ fn prepare_files(
     mut opened: Opened,
     options: ImportOptions,
     stage: &Path,
+    public: bool,
 ) -> Result<Metadata> {
     std::fs::create_dir_all(stage)?;
     std::fs::set_permissions(stage, std::fs::Permissions::from_mode(0o700))?;
@@ -273,7 +277,8 @@ fn prepare_files(
                     .destination_root
                     .as_ref()
                     .is_some_and(|r| r != &metadata.workspace.root)
-                || metadata.files.len() > 2
+                || metadata.public != public
+                || metadata.files.len() > 3
             {
                 bail!("prepared bundle binding mismatch");
             }
@@ -288,7 +293,7 @@ fn prepare_files(
     // There is no complete preparation yet. These are our own incomplete
     // bounded copies, not destination data; an existing transaction requires
     // metadata.json at the engine boundary and can never enter this branch.
-    for index in 0..2 {
+    for index in 0..3 {
         for suffix in ["before", "after"] {
             match std::fs::remove_file(stage.join(format!("{index}.{suffix}"))) {
                 Ok(()) => {}
@@ -365,6 +370,22 @@ fn prepare_files(
             MAX_JOURNAL,
         )?;
     }
+    if public {
+        let project = &opened.manifest.workspace;
+        if crate::workspaces::identity::read(&project.root).is_some_and(|m| m.id != project.id) {
+            bail!("destination carries a different workspace identity");
+        }
+        let marker = crate::workspaces::identity::marker_path(&project.root);
+        let mut bytes = serde_json::to_vec(&crate::workspaces::identity::Marker {
+            id: project.id.clone(),
+            written_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        })?;
+        bytes.push(b'\n');
+        stage_file(stage, &mut files, &marker, &mut bytes.as_slice(), 4096)?;
+    }
     opened.entry.handoff = Some(HandoffResume {
         fork: options.fork,
         origin: options.origin,
@@ -383,6 +404,7 @@ fn prepare_files(
         links: opened.manifest.links,
         send_state,
         files,
+        public,
     };
     let payload = serde_json::to_string(&metadata)?;
     let bytes = serde_json::to_vec(&Sealed {
@@ -409,14 +431,29 @@ pub(crate) async fn prepare_import(
     let _permit = OPERATIONS.try_acquire().context("bundle transfer busy")?;
     let path = path.to_owned();
     let opened = tokio::task::spawn_blocking(move || open_archive(&path)).await??;
-    let guard = crate::chat::ChatSwitchGuard::acquire(&state, &opened.entry.id, "transfer")
-        .context("session lifecycle operation already in progress")?;
+    prepare_opened(state, opened, options, staging, generation, None, false).await
+}
+
+async fn prepare_opened(
+    state: Arc<AppState>,
+    opened: Opened,
+    options: ImportOptions,
+    staging: &Path,
+    generation: u64,
+    guard: Option<crate::chat::ChatSwitchGuard>,
+    public: bool,
+) -> Result<PreparedImport> {
+    let guard = match guard {
+        Some(guard) => guard,
+        None => crate::chat::ChatSwitchGuard::acquire(&state, &opened.entry.id, "transfer")
+            .context("session lifecycle operation already in progress")?,
+    };
     admissible(&state, &opened.entry, options.epoch)?;
     validate_links(&state, &opened.entry, &opened.manifest.links)?;
     let setup = state.clone();
     let stage = staging.to_owned();
     let metadata =
-        tokio::task::spawn_blocking(move || prepare_files(&setup, opened, options, &stage))
+        tokio::task::spawn_blocking(move || prepare_files(&setup, opened, options, &stage, public))
             .await??;
     if crate::lock(&state.workspaces)
         .list()
@@ -483,13 +520,18 @@ impl PreparedImport {
         .await?;
         // A canceled caller must not release account/epoch or session guards
         // while an owned blocking metadata write still has access to stores.
-        tokio::spawn(async move { self.finalize_admitted(Arc::new(admission)).await }).await?
+        tokio::spawn(async move {
+            let (imported, _, _guard) = self.finalize_admitted(Arc::new(admission), true).await?;
+            Ok::<_, anyhow::Error>(imported)
+        })
+        .await?
     }
 
     async fn finalize_admitted(
         self,
         admission: Arc<crate::pro::mutation::ImportGuard>,
-    ) -> Result<ImportedSession> {
+        receipt: bool,
+    ) -> Result<(ImportedSession, LedgerEntry, crate::chat::ChatSwitchGuard)> {
         let _session_guard = self._guard;
         #[cfg(test)]
         if let Some((entered, held)) = self.pause {
@@ -522,7 +564,7 @@ impl PreparedImport {
                 }
                 let root = metadata.workspace.root.clone();
                 blocking_admission.check(&state)?;
-                crate::lock(&state.workspaces).import_exact(metadata.workspace)?;
+                crate::lock(&state.workspaces).import_exact_durable(metadata.workspace)?;
                 if let Some(bytes) = metadata.send_state {
                     blocking_admission.check(&state)?;
                     chimaera_agent::journal::import_send_state(
@@ -557,7 +599,11 @@ impl PreparedImport {
             let key = format!("ws_{}", entry.workspace_id);
             let task = {
                 let mut store = crate::lock(&self.state.view_state);
-                store.get(&key).is_none().then(|| store.put(key, view))
+                let current = store
+                    .get(&key)
+                    .map(|value| value.as_ref().clone())
+                    .unwrap_or(view);
+                Some(store.put_durable(key, current))
             };
             if let Some(task) = task {
                 task.await??;
@@ -568,23 +614,361 @@ impl PreparedImport {
         crate::lock(&self.state.links).extend(links);
         flush_ledger(&self.state, true).await?;
         admission.check(&self.state)?;
-        let receipt = root(&self.state)
-            .join("imports")
-            .join(format!("{}.json", entry.id));
-        let receipt_state = self.state.clone();
-        tokio::task::spawn_blocking(move || {
-            admission.check(&receipt_state)?;
-            crate::persist::atomic_write_json_durable(
-                &receipt,
-                serde_json::to_vec(&json!({"epoch":epoch,"sha256":digest,"root":workspace_root}))?,
-            )
-        })
-        .await??;
+        if receipt {
+            let receipt = root(&self.state)
+                .join("imports")
+                .join(format!("{}.json", entry.id));
+            let receipt_state = self.state.clone();
+            tokio::task::spawn_blocking(move || {
+                admission.check(&receipt_state)?;
+                crate::persist::atomic_write_json_durable(
+                    &receipt,
+                    serde_json::to_vec(
+                        &json!({"epoch":epoch,"sha256":digest,"root":workspace_root}),
+                    )?,
+                )
+            })
+            .await??;
+        }
         self.state.changes.notify_waiters();
-        Ok(ImportedSession {
-            id: entry.id,
-            workspace_id: entry.workspace_id,
-            paused: true,
-        })
+        Ok((
+            ImportedSession {
+                id: entry.id.clone(),
+                workspace_id: entry.workspace_id.clone(),
+                paused: true,
+            },
+            entry,
+            _session_guard,
+        ))
     }
+}
+
+#[cfg(test)]
+type TestPause = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+#[cfg(test)]
+type TestPauses = std::collections::HashMap<(usize, String, bool), TestPause>;
+#[cfg(test)]
+static PUBLIC_PAUSES: std::sync::LazyLock<std::sync::Mutex<TestPauses>> =
+    std::sync::LazyLock::new(Default::default);
+#[cfg(test)]
+pub(crate) fn hold_public(
+    state: &Arc<AppState>,
+    id: &str,
+    resume: bool,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (entered, waiting) = tokio::sync::oneshot::channel();
+    let (release, held) = tokio::sync::oneshot::channel();
+    crate::lock(&PUBLIC_PAUSES).insert(
+        (Arc::as_ptr(state) as usize, id.into(), resume),
+        (entered, held),
+    );
+    (waiting, release)
+}
+#[cfg(test)]
+fn public_pause(state: &Arc<AppState>, id: &str, resume: bool) -> Option<TestPause> {
+    crate::lock(&PUBLIC_PAUSES).remove(&(Arc::as_ptr(state) as usize, id.into(), resume))
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicReceipt {
+    version: u32,
+    pending: pending::Pending,
+}
+
+pub(super) async fn import_public(
+    state: Arc<AppState>,
+    path: PathBuf,
+    options: ImportOptions,
+    generation: u64,
+    permit: tokio::sync::SemaphorePermit<'static>,
+) -> Result<ImportedSession> {
+    tokio::spawn(async move {
+        let _permit = permit;
+        let mut opened = tokio::task::spawn_blocking(move || open_archive(&path)).await??;
+        normalize_destination(&mut opened, &options).await?;
+        let guard = crate::chat::ChatSwitchGuard::acquire(&state, &opened.entry.id, "transfer")
+            .context("session lifecycle operation already in progress")?;
+        // Cancellation before this owned task starts has no effects. After it starts,
+        // neither filesystem workers nor metadata writes outlive their admission.
+        let admission = Arc::new(
+            crate::pro::mutation::begin_import(
+                &state,
+                &opened.entry.workspace_id,
+                options.epoch,
+                generation,
+            )
+            .await?,
+        );
+        let pending = pending::Pending {
+            binding: crate::pro::bundle_install_binding(
+                &state,
+                &opened.entry.workspace_id,
+                options.epoch,
+                opened.digest.clone(),
+            )?,
+            id: opened.entry.id.clone(),
+            destination: opened.manifest.workspace.root.clone(),
+            native: opened.entry.agent.as_ref().and_then(|a| a.resume.clone()),
+            fork: options.fork,
+            origin: options.origin,
+            defer_start: options.defer_start,
+        };
+        let recovery_state = state.clone();
+        let recovery_id = pending.id.clone();
+        let result: Result<ImportedSession> = async {
+            let data = root(&state)
+                .parent()
+                .context("bundle data parent")?
+                .to_owned();
+            let bundles = tokio::task::spawn_blocking(move || -> Result<PathBuf> {
+                Ok(std::fs::canonicalize(data)?.join("bundles"))
+            })
+            .await??;
+            let recovering = state.bundle_imports.matching(&pending)?;
+            let receipt_path = bundles
+                .clone()
+                .join("imports")
+                .join(format!("{}.json", pending.id));
+            let read_path = receipt_path.clone();
+            let expected = pending.clone();
+            let committed = tokio::task::spawn_blocking(move || -> Result<(bool, bool)> {
+                let bytes = match read_capped(&read_path, MAX_METADATA) {
+                    Ok(bytes) => bytes,
+                    Err(error)
+                        if error
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+                    {
+                        return Ok((false, false))
+                    }
+                    Err(error) => return Err(error),
+                };
+                let receipt = serde_json::from_slice::<PublicReceipt>(&bytes);
+                let full = receipt.is_ok_and(|r| r.version == 2 && r.pending == expected);
+                let legacy: Value = serde_json::from_slice(&bytes)?;
+                let old = legacy.get("version").is_none()
+                    && legacy["epoch"].as_u64() == Some(expected.binding.epoch)
+                    && legacy["sha256"].as_str() == expected.binding.receipt.as_deref()
+                    && legacy["root"].as_str() == expected.destination.to_str();
+                Ok((full, old))
+            })
+            .await??;
+            let live = state.chat.get(&pending.id).is_some_and(|s| s.alive)
+                || state.sessions.get(&pending.id).is_some_and(|s| s.alive);
+            if committed.0 || (committed.1 && live && !recovering) {
+                // The committed receipt proves metadata and files landed. A dead
+                // actor is not permission to overwrite its newer canonical history.
+                let mut entry = crate::lock(&state.deferred_sessions)
+                    .get(&pending.id)
+                    .cloned()
+                    .unwrap_or(opened.entry);
+                entry.handoff = Some(HandoffResume {
+                    fork: options.fork,
+                    origin: options.origin,
+                    epoch: options.epoch,
+                });
+                if entry.workspace_id != pending.binding.workspace
+                    || !entry.cwd.starts_with(&pending.destination)
+                {
+                    bail!("committed bundle session binding changed");
+                }
+                let native_state = state.clone();
+                entry = tokio::task::spawn_blocking(move || -> Result<LedgerEntry> {
+                    if let Some(native) = native_destination(&native_state, &entry)? {
+                        entry.agent.as_mut().unwrap().transcript = Some(native);
+                    }
+                    Ok(entry)
+                })
+                .await??;
+                let live = state.chat.get(&entry.id).is_some_and(|s| s.alive)
+                    || state.sessions.get(&entry.id).is_some_and(|s| s.alive);
+                if !live {
+                    admission.check(&state)?;
+                    let restore_state = state.clone();
+                    let restore_workspace = opened.manifest.workspace.clone();
+                    let check = admission.clone();
+                    tokio::task::spawn_blocking(move || {
+                        check.check(&restore_state)?;
+                        crate::lock(&restore_state.workspaces)
+                            .import_exact_durable(restore_workspace)
+                    })
+                    .await??;
+                    crate::ledger::defer(&state, entry.clone())?;
+                    flush_ledger(&state, true).await?;
+                }
+                if recovering {
+                    let finish_state = state.clone();
+                    let finish_pending = pending.clone();
+                    let check = admission.clone();
+                    tokio::task::spawn_blocking(move || {
+                        check.check(&finish_state)?;
+                        finish_state.bundle_imports.finish(&finish_pending)
+                    })
+                    .await??;
+                }
+                return finish_public(
+                    state,
+                    admission,
+                    guard,
+                    entry,
+                    opened.manifest.workspace,
+                    options,
+                )
+                .await;
+            }
+            admissible(&state, &opened.entry, options.epoch)?;
+            let directory = bundles.join("imports/prepared").join(&pending.id);
+            let stage = directory.join("stage");
+            let transaction_path = directory.join("transaction");
+            let probe = transaction_path.clone();
+            let record = stage.join("metadata.json");
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                if probe.try_exists()? && !record.try_exists()? {
+                    bail!("unfinished bundle installation has lost its recovery metadata");
+                }
+                Ok(())
+            })
+            .await??;
+            let workspace = opened.manifest.workspace.clone();
+            let mut deferred = options.clone();
+            deferred.defer_start = true;
+            let mut prepared = prepare_opened(
+                state.clone(),
+                opened,
+                deferred,
+                &stage,
+                generation,
+                Some(guard),
+                true,
+            )
+            .await?;
+            let install_state = state.clone();
+            let marker = pending.clone();
+            let check = admission.clone();
+            let writes = std::mem::take(&mut prepared.writes);
+            let apply_stage = stage.clone();
+            let prepared_entry = prepared.metadata.entry.clone();
+            let transaction =
+                tokio::task::spawn_blocking(move || -> Result<install::Transaction> {
+                    check.check(&install_state)?;
+                    install_state.bundle_imports.begin(marker.clone())?;
+                    // Publication serialized against final free/local spawn registration.
+                    // Recheck after enrollment so an earlier admitted launch cannot hide.
+                    let entry = LedgerEntry::from_json(&prepared_entry)
+                        .context("invalid prepared session")?;
+                    admissible(&install_state, &entry, marker.binding.epoch)?;
+                    install::stage_budget(&apply_stage)?;
+                    let mut transaction =
+                        match install::Transaction::open(&transaction_path, &marker.binding)? {
+                            Some(transaction) => transaction,
+                            None => install::Transaction::prepare(
+                                &transaction_path,
+                                marker.binding,
+                                writes,
+                                200_000_000,
+                            )?,
+                        };
+                    transaction.apply(&|| check.check(&install_state))?;
+                    Ok(transaction)
+                })
+                .await??;
+            #[cfg(test)]
+            {
+                prepared.pause = public_pause(&state, &pending.id, false);
+            }
+            let (imported, entry, guard) =
+                prepared.finalize_admitted(admission.clone(), false).await?;
+            let final_state = state.clone();
+            let marker = pending.clone();
+            let check = admission.clone();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let mut transaction = transaction;
+                transaction.commit(&|| check.check(&final_state))?;
+                check.check(&final_state)?;
+                install::write_state(
+                    &receipt_path,
+                    &serde_json::to_vec(&PublicReceipt {
+                        version: 2,
+                        pending: marker.clone(),
+                    })?,
+                )?;
+                final_state.bundle_imports.finish(&marker)?;
+                // Cleanup never authorizes another write. Edited recovery artifacts
+                // remain retained; the committed receipt still prevents replay.
+                if transaction.cleanup().is_ok() {
+                    std::fs::remove_dir_all(&directory).ok();
+                }
+                Ok(())
+            })
+            .await??;
+            let _ = imported;
+            finish_public(state, admission, guard, entry, workspace, options).await
+        }
+        .await;
+        match result {
+            Err(_)
+                if recovery_state
+                    .bundle_imports
+                    .check_session(&recovery_id, None)
+                    .is_err() =>
+            {
+                Err(pending::PendingError.into())
+            }
+            other => other,
+        }
+    })
+    .await?
+}
+
+async fn finish_public(
+    state: Arc<AppState>,
+    admission: Arc<crate::pro::mutation::ImportGuard>,
+    _guard: crate::chat::ChatSwitchGuard,
+    entry: LedgerEntry,
+    workspace: Workspace,
+    options: ImportOptions,
+) -> Result<ImportedSession> {
+    let live = state.chat.get(&entry.id).is_some_and(|s| s.alive)
+        || state.sessions.get(&entry.id).is_some_and(|s| s.alive);
+    let paused = options.defer_start || (entry.agent.is_none() && options.origin == Origin::Moved);
+    if !live && !paused {
+        admission.check(&state)?;
+        let captured = crate::pro::mutation::Dispatch::capture(&state, &workspace.id)?;
+        let admission = Arc::try_unwrap(admission)
+            .map_err(|_| anyhow::anyhow!("bundle admission still in use"))?;
+        let commit = admission.into_resume();
+        crate::pro::mutation::resume_import(commit, captured, async {
+            #[cfg(test)]
+            if let Some((entered, held)) = public_pause(&state, &entry.id, true) {
+                let _ = entered.send(());
+                let _ = held.await;
+            }
+            state.chat.remove(&entry.id);
+            crate::ledger::respawn_transfer(
+                &state,
+                &entry,
+                workspace,
+                options.fork,
+                Some(options.origin.as_str()),
+            )
+            .await?;
+            crate::lock(&state.deferred_sessions).remove(&entry.id);
+            state.session_proxy.clear_workspace(&entry.workspace_id);
+            flush_ledger(&state, true).await
+        })
+        .await?;
+    }
+    state.changes.notify_waiters();
+    Ok(ImportedSession {
+        id: entry.id,
+        workspace_id: entry.workspace_id,
+        paused: !live && paused,
+    })
 }

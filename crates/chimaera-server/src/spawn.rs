@@ -363,11 +363,22 @@ pub(crate) async fn spawn_session(
     if let Some(intent) = &intent {
         intent.check().map_err(SpawnFailure::Internal)?;
     }
+    let native = match &spec.kind {
+        SpawnKind::Agent { resume, .. } => resume.as_deref(),
+        SpawnKind::Shell => None,
+    };
+    crate::pro::mutation::check_import_resume(state, &workspace.id)
+        .map_err(SpawnFailure::Internal)?;
+    let import_admission = state
+        .bundle_imports
+        .admit(&workspace.id, &id, native)
+        .map_err(SpawnFailure::Internal)?;
     let spawned = if managed {
         state.sessions.spawn_managed(opts)
     } else {
         state.sessions.spawn(opts)
     };
+    drop(import_admission);
     match spawned {
         Ok(info) => {
             crate::lock(&state.session_workspaces).insert(info.id.clone(), workspace.id.clone());

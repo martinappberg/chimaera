@@ -536,7 +536,10 @@ pub(crate) fn local_copy_view(
 }
 
 pub(crate) fn may_write(state: &crate::AppState, workspace: &str) -> bool {
-    if execution::supervisor::pending(state) || project_copy::copy_only(state, workspace) {
+    if execution::supervisor::pending(state)
+        || project_copy::copy_only(state, workspace)
+        || state.bundle_imports.blocks_workspace(workspace)
+    {
         return false;
     }
     if authority::workspace(state, workspace).is_err()
@@ -923,6 +926,28 @@ async fn persist(state: &crate::AppState) -> anyhow::Result<()> {
     execution::persist_latch(state).await?;
     *written = Some(bytes);
     Ok(())
+}
+
+/// A public archive's recovery belongs to the actual configured account,
+/// while an ordinary unconfigured local import has no invented identity.
+pub(crate) fn bundle_install_binding(
+    state: &crate::AppState,
+    workspace: &str,
+    epoch: u64,
+    digest: String,
+) -> anyhow::Result<install::Binding> {
+    authority::workspace(state, workspace)?;
+    let config = crate::lock(&state.pro.runtime);
+    Ok(install::Binding {
+        endpoint: config
+            .as_ref()
+            .map(|c| c.endpoint.clone())
+            .unwrap_or_default(),
+        account: config.as_ref().and_then(|c| c.account_id.clone()),
+        workspace: workspace.to_owned(),
+        epoch,
+        receipt: Some(digest),
+    })
 }
 
 pub(crate) fn may_import(state: &crate::AppState, workspace: &str, epoch: u64) -> bool {

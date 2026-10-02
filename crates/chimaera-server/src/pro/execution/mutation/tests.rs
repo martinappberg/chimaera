@@ -413,3 +413,55 @@ fn asynchronous_dispatch_keeps_exact_ownership_account_and_worker_deadline() {
     assert!(idle(&state, "w-a"));
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[tokio::test]
+async fn imported_resume_retains_exact_account_epoch_but_never_inherits_into_child_tasks() {
+    let (state, root) = fixture();
+    let current = generation(&state);
+    let guard = begin_import(&state, "w-a", 4, current).await.unwrap();
+    let dispatch = Dispatch::capture(&state, "w-a").unwrap();
+    let commit = guard.into_resume();
+    resume_import(commit, dispatch, async {
+        assert!(!super::super::quiescent(&state, "w-a"));
+        assert!(check_import_resume(&state, "w-a").is_ok());
+        assert!(check_import_resume(&state, "unrelated").is_err());
+        let child = state.clone();
+        // Task-local scope never creates a transferable grant. An unrelated
+        // child uses its own ordinary final admission, without this request's scope.
+        assert!(tokio::spawn(async move {
+            IMPORT_RESUME.try_with(|_| ()).is_err()
+                && check_import_resume(&child, "unrelated").is_ok()
+        })
+        .await
+        .unwrap());
+        local_dispatch_owner_fixture(&state, "w-a", 5);
+        assert!(check_import_resume(&state, "w-a").is_err());
+        local_dispatch_owner_fixture(&state, "w-a", 4);
+        state.pro.generation.fetch_add(1, Ordering::AcqRel);
+        assert!(check_import_resume(&state, "w-a").is_err());
+    })
+    .await;
+    assert!(super::super::quiescent(&state, "w-a"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_import_resume_releases_count_only_after_its_owned_future_is_dropped() {
+    let (state, root) = fixture();
+    let guard = begin_import(&state, "w-a", 4, generation(&state))
+        .await
+        .unwrap();
+    let dispatch = Dispatch::capture(&state, "w-a").unwrap();
+    let commit = guard.into_resume();
+    let (entered, ready) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(resume_import(commit, dispatch, async move {
+        let _ = entered.send(());
+        std::future::pending::<()>().await;
+    }));
+    ready.await.unwrap();
+    assert!(!super::super::quiescent(&state, "w-a"));
+    task.abort();
+    assert!(task.await.is_err());
+    assert!(super::super::quiescent(&state, "w-a"));
+    std::fs::remove_dir_all(root).unwrap();
+}

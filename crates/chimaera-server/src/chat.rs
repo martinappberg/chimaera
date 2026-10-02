@@ -887,11 +887,22 @@ async fn switch_to_pty(
     {
         return false;
     }
+    if crate::pro::mutation::check_import_resume(state, &successor_recipe.workspace_id).is_err() {
+        return false;
+    }
+    let Ok(import_admission) = state.bundle_imports.admit(
+        &successor_recipe.workspace_id,
+        id,
+        successor_recipe.resume.as_deref(),
+    ) else {
+        return false;
+    };
     let spawned = if crate::pro::managed_execution(state, &successor_recipe.workspace_id) {
         state.sessions.spawn_managed(opts)
     } else {
         state.sessions.spawn(opts)
     };
+    drop(import_admission);
     match spawned {
         Ok(_) => {
             if !crate::pro::may_execute(state, &successor_recipe.workspace_id) {
@@ -3489,7 +3500,14 @@ pub(crate) async fn spawn_chat_session(
         // Return value (whether history was seeded) matters only to the
         // create-from-recent path, which pre-seeds and inspects it there; here
         // (view-switch / rewind) the session always stays in chat.
+        crate::pro::mutation::check_import_resume(state, &recipe.workspace_id)?;
+        let import_admission = state.bundle_imports.read_admission(
+            &recipe.workspace_id,
+            &id,
+            recipe.resume.as_deref(),
+        )?;
         let _ = tokio::task::block_in_place(|| seed_resumed_journal(state, &id, &recipe));
+        drop(import_admission);
     }
 
     if matches!(recipe.kind, AgentKind::Grok | AgentKind::Antigravity) {
@@ -3512,7 +3530,13 @@ pub(crate) async fn spawn_chat_session(
         .kind
         .chat_adapter()
         .ok_or_else(|| anyhow::anyhow!("no chat adapter registered"))?;
+    crate::pro::mutation::check_import_resume(state, &recipe.workspace_id)?;
+    let import_admission =
+        state
+            .bundle_imports
+            .admit(&recipe.workspace_id, &id, recipe.resume.as_deref())?;
     let info = state.chat.spawn(adapter, spec);
+    drop(import_admission);
     if info.is_err() {
         crate::lock(&state.chat_recipes).remove(&id);
     } else if !crate::pro::may_execute(state, &recipe.workspace_id) {

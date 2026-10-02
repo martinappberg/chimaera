@@ -104,6 +104,17 @@ pub(crate) struct ImportGuard {
     generation: u64,
 }
 impl ImportGuard {
+    /// Execution preparation must not reacquire our configuration lock. Keep
+    /// the counted reservation until its final captured launch admission settles.
+    pub(crate) fn into_resume(self) -> Guard {
+        let Self {
+            _commit,
+            _configuration,
+            ..
+        } = self;
+        drop(_configuration);
+        _commit
+    }
     /// Publish setup only for the hydration whose durable commit we admitted.
     /// The caller retains this guard through persistence, so account replacement
     /// cannot observe a released reservation between commit and this transition.
@@ -213,6 +224,7 @@ pub(crate) async fn begin_import(
 }
 tokio::task_local! {
     static REQUEST_RESERVED: ();
+    static IMPORT_RESUME: Dispatch;
 }
 pub(crate) fn request_reserved() -> bool {
     REQUEST_RESERVED.try_with(|_| ()).is_ok()
@@ -226,6 +238,25 @@ pub(crate) async fn reserved_request<F: std::future::Future>(
             let _guard = guard;
             operation.await
         })
+        .await
+}
+pub(crate) fn check_import_resume(state: &AppState, workspace: &str) -> anyhow::Result<()> {
+    IMPORT_RESUME
+        .try_with(|captured| {
+            if captured.workspace != workspace {
+                return Err(Changed.into());
+            }
+            captured.check(state)
+        })
+        .unwrap_or(Ok(()))
+}
+pub(crate) async fn resume_import<F: std::future::Future>(
+    guard: Guard,
+    captured: Dispatch,
+    operation: F,
+) -> F::Output {
+    IMPORT_RESUME
+        .scope(captured, reserved_request(guard, operation))
         .await
 }
 impl Drop for Guard {

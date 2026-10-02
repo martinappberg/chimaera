@@ -444,3 +444,104 @@ fn a_new_repository_never_commits_over_a_concurrent_external_git_index_edit() {
         newer_index
     );
 }
+
+#[test]
+fn invalid_recovery_roots_and_names_refuse_before_any_git_filesystem_loop() {
+    let fixture = Fixture::new();
+    let transaction = Transaction::prepare(
+        &fixture.journal(),
+        binding(),
+        vec![fixture.write("a", Some(b"old"), Some(b"new"))],
+        1024,
+    )
+    .unwrap();
+    let path = fixture.journal().join("journal.json");
+    let original = fs::read(&path).unwrap();
+    for roots in [
+        vec![
+            PathBuf::from("/missing-a"),
+            PathBuf::from("/missing-b"),
+            PathBuf::from("/missing-c"),
+        ],
+        vec![PathBuf::from("/missing-a"), PathBuf::from("/missing-a")],
+        vec![PathBuf::from("/tmp/../missing-a")],
+        vec![PathBuf::from("relative")],
+        vec![PathBuf::from(format!("/{}", "a".repeat(4096)))],
+    ] {
+        let mut record: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        record["git_roots"] = serde_json::to_value(roots).unwrap();
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let error = Transaction::open(&fixture.journal(), &binding())
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("Git root"),
+            "validates before attempting to open nonexistent paths: {error}"
+        );
+    }
+    for field in ["committed", "aside", "blob"] {
+        let mut record: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        match field {
+            "committed" => record["committed"] = true.into(),
+            "aside" => record["intents"][0]["aside"] = ".chimaera-staging-return-wrong-0".into(),
+            _ => record["intents"][0]["before"]["blob"] = "../foreign".into(),
+        }
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        assert!(Transaction::open(&fixture.journal(), &binding()).is_err());
+    }
+    assert_eq!(fs::read(fixture.root().join("a")).unwrap(), b"old");
+    drop(transaction);
+}
+
+#[test]
+fn durable_state_enrollment_never_creates_children_through_a_symlink() {
+    let fixture = Fixture::new();
+    let outside = fixture.0.join("outside");
+    fs::create_dir(&outside).unwrap();
+    let alias = fixture.0.join("alias");
+    std::os::unix::fs::symlink(&outside, &alias).unwrap();
+    assert!(write_state(&alias.join("not-created/state.json"), b"{}").is_err());
+    assert!(!outside.join("not-created").exists());
+}
+
+#[test]
+fn a_foreign_binding_never_repairs_an_incomplete_progress_tail() {
+    let fixture = Fixture::new();
+    let transaction = Transaction::prepare(
+        &fixture.journal(),
+        binding(),
+        vec![fixture.write("a", Some(b"old"), Some(b"new"))],
+        1024,
+    )
+    .unwrap();
+    let progress = fixture.journal().join("progress.jsonl");
+    fs::write(&progress, b"[0,1]\n{").unwrap();
+    let mut foreign = binding();
+    foreign.epoch += 1;
+    assert!(Transaction::open(&fixture.journal(), &foreign).is_err());
+    assert_eq!(fs::read(progress).unwrap(), b"[0,1]\n{");
+    drop(transaction);
+}
+
+#[test]
+fn a_fifo_progress_record_refuses_without_waiting_for_an_external_reader() {
+    let fixture = Fixture::new();
+    let mut transaction = Transaction::prepare(
+        &fixture.journal(),
+        binding(),
+        vec![fixture.write("a", Some(b"old"), Some(b"new"))],
+        1024,
+    )
+    .unwrap();
+    nix::unistd::mkfifo(
+        &fixture.journal().join("progress.jsonl"),
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+    )
+    .unwrap();
+    let started = std::time::Instant::now();
+    assert!(Transaction::open(&fixture.journal(), &binding()).is_err());
+    assert!(transaction.progress(0, 1).is_err());
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    assert_eq!(fs::read(fixture.root().join("a")).unwrap(), b"old");
+}

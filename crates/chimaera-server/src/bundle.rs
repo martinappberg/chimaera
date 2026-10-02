@@ -25,8 +25,13 @@ use tokio::io::AsyncWriteExt;
 
 #[path = "bundle_empty.rs"]
 mod empty;
+#[path = "bundle_pending.rs"]
+mod pending;
 #[path = "bundle_prepared.rs"]
 mod prepared;
+pub(crate) use pending::PendingImports;
+#[cfg(test)]
+pub(crate) use prepared::hold_public;
 pub(crate) use prepared::prepare_import;
 
 pub(crate) const MAX_ARCHIVE: u64 = 100_000_000;
@@ -325,6 +330,7 @@ async fn export_inner(
     if !valid_id(id) {
         bail!("invalid session ID");
     }
+    state.bundle_imports.check_session(id, None)?;
     let _guard = crate::chat::ChatSwitchGuard::acquire(&state, id, "transfer")
         .context("session lifecycle operation already in progress")?;
     let mut entry = crate::ledger::snapshot(&state)
@@ -332,6 +338,12 @@ async fn export_inner(
         .into_iter()
         .find(|e| e.id == id)
         .context("unknown session")?;
+    state
+        .bundle_imports
+        .check_session(id, entry.agent.as_ref().and_then(|a| a.resume.as_deref()))?;
+    if state.bundle_imports.blocks_workspace(&entry.workspace_id) {
+        return Err(pending::PendingError.into());
+    }
     entry.suspended = false;
     entry.handoff = None;
     // A terminal agent carries whether a turn was in flight, read while it
@@ -434,6 +446,12 @@ fn write_archive(
     mode: ExportMode,
     path: &Path,
 ) -> Result<()> {
+    let _read = state.bundle_imports.read_admission(
+        &workspace.id,
+        &entry.id,
+        entry.agent.as_ref().and_then(|a| a.resume.as_deref()),
+    )?;
+
     let mut memory = BTreeMap::<String, Vec<u8>>::new();
     let journal = state.chat.journal_dir().join(format!("{}.jsonl", entry.id));
     if entry.agent.is_some() {
@@ -587,6 +605,7 @@ fn open_archive(path: &Path) -> Result<Opened> {
                 | "send-state.json"
         ) || !names.insert(file.name().to_owned())
             || file.compression() != zip::CompressionMethod::Stored
+            || file.compressed_size() != file.size()
             || file.is_symlink()
             || file.is_dir()
         {
@@ -647,15 +666,20 @@ fn open_archive(path: &Path) -> Result<Opened> {
             bail!("bundle member length mismatch");
         }
         let mut digest = Sha256::new();
+        let mut count = 0u64;
         let mut block = [0; 64 * 1024];
         loop {
             let n = file.read(&mut block)?;
             if n == 0 {
                 break;
             }
+            count += n as u64;
+            if count > expected.bytes {
+                bail!("bundle member grew beyond declared length");
+            }
             digest.update(&block[..n]);
         }
-        if hex(digest.finalize()) != expected.sha256 {
+        if count != expected.bytes || hex(digest.finalize()) != expected.sha256 {
             bail!("bundle member checksum mismatch");
         }
     }
@@ -714,24 +738,6 @@ fn open_archive(path: &Path) -> Result<Opened> {
         digest,
     })
 }
-fn install_member(opened: &mut Opened, name: &str, path: &Path) -> Result<()> {
-    let mut input = opened.zip.by_name(name)?;
-    if std::fs::symlink_metadata(path).is_ok_and(|m| !m.is_file()) {
-        bail!("bundle destination is not a regular file");
-    }
-    let temp = path.with_extension(format!("bundle-{}", &chimaera_core::generate_token()[..16]));
-    let result = (|| {
-        let mut output = private_create(&temp)?;
-        std::io::copy(&mut input, &mut output)?;
-        output.sync_all()?;
-        std::fs::rename(&temp, path)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(temp);
-    }
-    result
-}
 fn native_destination(state: &AppState, entry: &LedgerEntry) -> Result<Option<PathBuf>> {
     let Some(agent) = &entry.agent else {
         return Ok(None);
@@ -769,7 +775,7 @@ fn native_destination(state: &AppState, entry: &LedgerEntry) -> Result<Option<Pa
         _ => bail!("unsupported native agent"),
     }
 }
-/// An ordinary (non-durable) import; the route streams into `import_inner`.
+/// Tests use the same durable public import path as the streaming HTTP route.
 #[cfg(test)]
 pub(crate) async fn import(
     state: Arc<AppState>,
@@ -777,16 +783,10 @@ pub(crate) async fn import(
     options: ImportOptions,
 ) -> Result<ImportedSession> {
     let _permit = OPERATIONS.try_acquire().context("bundle operation limit")?;
-    import_inner(state, path, options, false).await
+    let generation = crate::pro::mutation::generation(&state);
+    import_inner(state, path, options, generation, _permit).await
 }
-async fn import_inner(
-    state: Arc<AppState>,
-    path: &Path,
-    options: ImportOptions,
-    durable: bool,
-) -> Result<ImportedSession> {
-    let path = path.to_owned();
-    let mut opened = tokio::task::spawn_blocking(move || open_archive(&path)).await??;
+async fn normalize_destination(opened: &mut Opened, options: &ImportOptions) -> Result<()> {
     if let Some(destination) = options.destination_root.as_ref() {
         let destination = destination.clone();
         let old_root = opened.manifest.workspace.root.clone();
@@ -824,284 +824,28 @@ async fn import_inner(
         opened.entry.cwd = cwd;
         opened.manifest.workspace.root = root;
     }
-    let id = opened.entry.id.clone();
-    let workspace_id = opened.entry.workspace_id.clone();
-    let _guard = crate::chat::ChatSwitchGuard::acquire(&state, &id, "transfer")
-        .context("session lifecycle operation already in progress")?;
-    if !crate::pro::may_import(&state, &workspace_id, options.epoch) {
-        bail!("workspace owned elsewhere");
-    }
-    if crate::pro::owned_epoch(&state, &workspace_id).is_some_and(|epoch| epoch != options.epoch) {
-        bail!("stale bundle ownership epoch");
-    }
-    let live = state.chat.get(&id).is_some_and(|s| s.alive)
-        || state.sessions.get(&id).is_some_and(|s| s.alive);
-    if live {
-        let receipt = root(&state).join("imports").join(format!("{id}.json"));
-        let receipt =
-            tokio::task::spawn_blocking(move || read_capped(&receipt, MAX_METADATA)).await?;
-        if receipt
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .is_some_and(|value| {
-                value["epoch"].as_u64() == Some(options.epoch)
-                    && value["sha256"].as_str() == Some(&opened.digest)
-                    && value["root"].as_str() == opened.manifest.workspace.root.to_str()
-            })
-        {
-            return Ok(ImportedSession {
-                id,
-                workspace_id,
-                paused: false,
-            });
-        }
-        bail!("session already running; stop it before importing");
-    }
-    if let Some(native) = opened
-        .entry
-        .agent
-        .as_ref()
-        .and_then(|a| a.resume.as_deref())
-    {
-        if state
-            .chat
-            .list()
-            .iter()
-            .any(|session| session.alive && session.native_session_id.as_deref() == Some(native))
-        {
-            bail!("native conversation is active in another session");
-        }
-        let live_ids: std::collections::HashSet<_> = state
-            .sessions
-            .list()
-            .into_iter()
-            .filter(|session| session.alive)
-            .map(|session| session.id)
-            .collect();
-        if crate::lock(&state.agents).iter().any(|(id, record)| {
-            live_ids.contains(id)
-                && record
-                    .resume_id()
-                    .or_else(|| record.resumed_from.clone())
-                    .as_deref()
-                    == Some(native)
-        }) {
-            bail!("native conversation is active in another session");
-        }
-    }
-    for (terminal, agent) in &opened.manifest.links {
-        if terminal != &id && agent != &id {
-            bail!("bundle link does not belong to its session");
-        }
-        for endpoint in [terminal, agent] {
-            let known = crate::lock(&state.session_workspaces)
-                .get(endpoint)
-                .cloned()
-                .or_else(|| {
-                    crate::lock(&state.deferred_sessions)
-                        .get(endpoint)
-                        .map(|entry| entry.workspace_id.clone())
-                });
-            if known.is_some_and(|known| known != workspace_id) {
-                bail!("bundle link crosses workspace boundaries");
-            }
-        }
-    }
-    let paused =
-        options.defer_start || (opened.entry.agent.is_none() && options.origin == Origin::Moved);
-    opened.entry.handoff = Some(HandoffResume {
-        fork: options.fork,
-        origin: options.origin,
-        epoch: options.epoch,
-    });
-    let archive_digest = opened.digest.clone();
-    let linked = opened.manifest.links.clone();
-    let setup = state.clone();
-    let workspace = opened.manifest.workspace.clone();
-    let (entry, view) =
-        tokio::task::spawn_blocking(move || -> Result<(LedgerEntry, Option<Value>)> {
-            let canonical = std::fs::canonicalize(&workspace.root)
-                .context("workspace root must exist at its original path before import")?;
-            if opened.entry.agent.is_none() {
-                opened.entry.cwd = clamp_into(&workspace.root, &opened.entry.cwd);
-            }
-            if canonical != workspace.root || !opened.entry.cwd.is_dir() {
-                bail!("bundle paths must exist without remapping");
-            }
-            let (marker_root, marker_id) = (workspace.root.clone(), workspace.id.clone());
-            crate::lock(&setup.workspaces).import_exact(workspace)?;
-            // The folder carries the id it was registered under.
-            crate::workspaces::identity::write(&marker_root, &marker_id);
-            // Preserve local evidence before replacing the lossy journal. Old
-            // archives have no member and must never clear newer receipts.
-            if opened.entry.agent.is_some()
-                || opened.manifest.members.contains_key("send-state.json")
-            {
-                let bytes = if opened.manifest.members.contains_key("send-state.json") {
-                    let mut bytes = Vec::new();
-                    opened
-                        .zip
-                        .by_name("send-state.json")?
-                        .read_to_end(&mut bytes)?;
-                    bytes
-                } else {
-                    chimaera_agent::journal::export_send_state(
-                        setup.chat.journal_dir(),
-                        &opened.entry.id,
-                    )?
-                };
-                chimaera_agent::journal::import_send_state(
-                    setup.chat.journal_dir(),
-                    &opened.entry.id,
-                    &bytes,
-                )?;
-            }
-            if let Some(native) = native_destination(&setup, &opened.entry)? {
-                install_member(&mut opened, "native.jsonl", &native)?;
-                if opened
-                    .entry
-                    .agent
-                    .as_ref()
-                    .is_some_and(|a| a.kind == crate::agents::AgentKind::Codex)
-                    && !crate::codex_notify::verify_rollout(
-                        &native,
-                        opened
-                            .entry
-                            .agent
-                            .as_ref()
-                            .unwrap()
-                            .resume
-                            .as_deref()
-                            .unwrap(),
-                        opened
-                            .entry
-                            .agent
-                            .as_ref()
-                            .unwrap()
-                            .native_cwd
-                            .as_deref()
-                            .unwrap_or(&opened.entry.cwd),
-                    )
-                {
-                    bail!("native rollout identity does not match bundle");
-                }
-                opened.entry.agent.as_mut().unwrap().transcript = Some(native);
-            }
-            if opened.manifest.members.contains_key("journal.jsonl") {
-                let mut bytes = Vec::new();
-                opened
-                    .zip
-                    .by_name("journal.jsonl")?
-                    .read_to_end(&mut bytes)?;
-                validate_journal(&bytes)?;
-                let journal = setup
-                    .chat
-                    .journal_dir()
-                    .join(format!("{}.jsonl", opened.entry.id));
-                install_member(&mut opened, "journal.jsonl", &journal)?;
-            }
-            if let Some(native) = opened
-                .entry
-                .agent
-                .as_ref()
-                .and_then(|a| a.resume.as_deref())
-            {
-                let settings: Value = if opened.manifest.members.contains_key("index.json") {
-                    serde_json::from_reader(opened.zip.by_name("index.json")?)?
-                } else {
-                    json!({})
-                };
-                setup
-                    .chat
-                    .index()
-                    .record_settings(native, &opened.entry.id, |target| {
-                        target.model = settings["model"].as_str().map(str::to_owned);
-                        target.effort = settings["effort"].as_str().map(str::to_owned);
-                        target.mode = settings["mode"].as_str().map(str::to_owned);
-                    });
-            }
-            let view = if opened.manifest.members.contains_key("view.json") {
-                let bytes = opened.zip.by_name("view.json")?.size();
-                if bytes > 64 * 1024 {
-                    bail!("view state exceeds limit");
-                }
-                Some(serde_json::from_reader(opened.zip.by_name("view.json")?)?)
-            } else {
-                None
-            };
-            Ok((opened.entry, view))
-        })
-        .await??;
-    if let Some(view) = view {
-        let key = format!("ws_{workspace_id}");
-        let task = {
-            let mut store = crate::lock(&state.view_state);
-            if store.get(&key).is_none() {
-                Some(store.put(key, view))
-            } else {
-                None
-            }
-        };
-        if let Some(task) = task {
-            task.await??;
-        }
-    }
-    crate::ledger::defer(&state, entry.clone())?;
-    {
-        let mut links = crate::lock(&state.links);
-        for (terminal, agent) in linked {
-            links.insert(terminal, agent);
-        }
-    }
-    flush_ledger(&state, durable).await?;
-    if !paused {
-        let workspace = crate::lock(&state.workspaces)
-            .get(&workspace_id)
-            .context("workspace disappeared")?;
-        state.chat.remove(&id);
-        crate::ledger::respawn_transfer(
-            &state,
-            &entry,
-            workspace,
-            options.fork,
-            Some(options.origin.as_str()),
-        )
-        .await?;
-        crate::lock(&state.deferred_sessions).remove(&id);
-        state.session_proxy.clear_workspace(&workspace_id);
-        flush_ledger(&state, durable).await?;
-    }
-    let imported_root = crate::lock(&state.workspaces)
-        .get(&workspace_id)
-        .context("workspace disappeared")?
-        .root;
-    let receipt = root(&state).join("imports").join(format!("{id}.json"));
-    tokio::task::spawn_blocking(move || {
-        crate::persist::atomic_write_json(
-            &receipt,
-            serde_json::to_vec(
-                &json!({"epoch":options.epoch,"sha256":archive_digest,"root":imported_root}),
-            )?,
-        )
-    })
-    .await??;
-    state.changes.notify_waiters();
-    Ok(ImportedSession {
-        id,
-        workspace_id,
-        paused,
-    })
+    Ok(())
+}
+async fn import_inner(
+    state: Arc<AppState>,
+    path: &Path,
+    options: ImportOptions,
+    generation: u64,
+    permit: tokio::sync::SemaphorePermit<'static>,
+) -> Result<ImportedSession> {
+    prepared::import_public(state, path.to_owned(), options, generation, permit).await
 }
 #[derive(Deserialize)]
 pub(crate) struct ExportRequest {
     stop: bool,
 }
 fn failure(error: anyhow::Error) -> Response {
-    (
-        StatusCode::CONFLICT,
-        Json(json!({"error":error.to_string()})),
-    )
-        .into_response()
+    let body = if error.is::<pending::PendingError>() {
+        json!({"error":error.to_string(),"error_code":"bundle_import_pending"})
+    } else {
+        json!({"error":error.to_string()})
+    };
+    (StatusCode::CONFLICT, Json(body)).into_response()
 }
 async fn archive_response(path: PathBuf) -> Result<Response> {
     let file = tokio::fs::File::open(&path).await?;
@@ -1153,6 +897,7 @@ pub(crate) async fn import_route(
     Query(options): Query<ImportOptions>,
     body: Body,
 ) -> Response {
+    let generation = crate::pro::mutation::generation(&state);
     let path = temp_path(&state);
     let result: Result<ImportedSession> = async {
         let _permit = OPERATIONS.try_acquire().context("bundle operation limit")?;
@@ -1174,8 +919,7 @@ pub(crate) async fn import_route(
         }
         file.flush().await?;
         drop(file);
-        let durable = crate::pro::configured(&state);
-        import_inner(state, &path, options, durable).await
+        import_inner(state, &path, options, generation, _permit).await
     }
     .await;
     let _ = tokio::fs::remove_file(path).await;
@@ -1313,6 +1057,37 @@ mod tests {
         assert!(
             open_archive(&path).is_err(),
             "unexpected members are never extracted"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn stored_member_cannot_underreport_actual_size() {
+        let directory = dir();
+        let archive = directory.join("forged.zip");
+        let mut zip = zip::ZipWriter::new(File::create(&archive).unwrap());
+        zip.start_file(
+            "manifest.json",
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored),
+        )
+        .unwrap();
+        zip.write_all(&vec![b'x'; 4096]).unwrap();
+        zip.finish().unwrap();
+        let mut bytes = std::fs::read(&archive).unwrap();
+        let central = bytes.windows(4).position(|b| b == b"PK\x01\x02").unwrap();
+        // ZIP Stored reads compressed bytes, even if the central directory
+        // advertises a smaller decompressed length. CRC still covers all4096.
+        bytes[central + 24..central + 28].copy_from_slice(&1u32.to_le_bytes());
+        std::fs::write(&archive, bytes).unwrap();
+        let mut zip = zip::ZipArchive::new(File::open(&archive).unwrap()).unwrap();
+        let mut member = zip.by_index(0).unwrap();
+        assert_eq!(member.size(), 1);
+        let mut actual = Vec::new();
+        member.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual.len(), 4096);
+        assert_eq!(
+            open_archive(&archive).err().unwrap().to_string(),
+            "invalid bundle member"
         );
         std::fs::remove_dir_all(directory).unwrap();
     }

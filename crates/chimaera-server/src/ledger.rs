@@ -736,6 +736,10 @@ pub(crate) async fn respawn_transfer(
     fork_head: bool,
     origin: Option<&'static str>,
 ) -> anyhow::Result<()> {
+    state.bundle_imports.check_session(
+        &entry.id,
+        entry.agent.as_ref().and_then(|a| a.resume.as_deref()),
+    )?;
     // Chat sessions resurrect through the chat spawn path (regenerate the
     // per-session settings/mcp files against THIS daemon, resume the native
     // conversation, reuse the existing on-disk journal) — a wholly different

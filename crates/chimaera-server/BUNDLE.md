@@ -51,7 +51,9 @@ Missing, truncated, corrupt or meaningful history is still a transfer error.
 
 ZIP members use stored compression, regular-file permissions 0600, and exact
 names. Directories, symlinks, duplicate names, unexpected members, compression,
-length mismatch, and SHA-256 mismatch are rejected before installation.
+length mismatch, and SHA-256 mismatch are rejected before installation. Stored
+compressed and uncompressed lengths must agree, and hashing counts actual bytes;
+an understated central-directory length cannot bypass these limits.
 
 `manifest.json` contains:
 
@@ -109,6 +111,44 @@ The commit retains its reservation through the exact Hydrating→SettingUp trans
 and durable state write; initial profile setup uses the same configuration lock
 and ownership check.
 
+The public session-import route uses the same preparation and file transaction.
+It parses and bounds all index/view/delivery metadata before canonical effects,
+retains original/new native and journal versions, and installs the workspace
+identity marker in that transaction. Shared stores are merged and synced before
+its committed receipt; ordinary free/local imports need no account enrollment.
+A receipt binds the archive digest, workspace/root, account/endpoint when
+configured, epoch, fork/origin and deferred-start options. An exact committed
+retry remains idempotent after the actor exits and preserves newer canonical
+history. Legacy receipts retain their narrower live-actor retry behavior.
+
+An incomplete public import records a durable pending binding before canonical
+writes. At most 64 bindings / 256 KiB are retained; admission refuses additional
+imports instead of dropping older evidence. Startup loads this state before
+restoration. Incomplete sessions, their native identity and their workspace
+cannot spawn, resume, export or accept new local mutations; missing state leaves
+ordinary free work unchanged. Corrupt, oversized or unreadable pending state
+fails closed. An exact archive/options/account-bound retry rolls forward from
+immutable recovery data; changed options or missing/damaged recovery data refuse
+without rewriting originals. Do not delete retained originals to retry.
+
+`/api/v1/pro/status` adds optional workspace `bundle_import` recovery details:
+`{state:"recovery_needed",sessions:["session-id"],damaged:false}`. Import-related
+admission errors preserve the existing HTTP 409 `error` string and add
+`error_code:"bundle_import_pending"`, instructing the user to retry the same
+archive and import options. A damaged global record reports `damaged:true`.
+Export and import exclude each other for the same workspace or native identity.
+A bounded read token remains owned by the actual blocking exporter through
+cancellation; it never holds the hot admission mutex across filesystem I/O.
+Resumed chat journal seeding uses the same short reservation, and a live resumed
+conversation is recognized from its recipe before a native init event arrives.
+
+Caller cancellation does not abandon admitted writes: the owned operation keeps
+its bounded transfer slot, configuration/epoch admission and lifecycle guard.
+Optional process startup follows the durable commit, releases configuration to
+avoid launch preparation deadlock, and retains a counted request plus the
+original account/ownership until final actual spawn. That request scope is not
+inherited by unrelated spawned tasks.
+
 The target must already have the original canonical root/cwd unless the explicit
 `destination_root=/canonical/existing/path` import option is set. A remap keeps
 the cwd relative to the original workspace root and rejects missing directories
@@ -164,10 +204,11 @@ bundle slots instead of failing when several projects flush at once; the
 single-session routes still refuse at once.
 
 A paused row is named by its pinned name, else its conversation title, else
-words for where it is shown: on a cloud machine "Terminal on your computer"
-(a moved shell) or "Starting in the cloud" (an agent waiting to start); on a computer
-"Continuing in the cloud" when another owner holds the project, otherwise
-"Paused".
+words for where it is shown: a verified local cloud arrival can say "Terminal
+on your computer" (a moved shell) or "Starting in the cloud" (an agent waiting
+to start). A project held by an opaque other owner says "Continuing elsewhere";
+an explicitly identified other computer can say "Continuing on another computer".
+Owner ID prefixes never identify its placement. Other suspended rows say "Paused".
 
 ## Placement forwarding
 
