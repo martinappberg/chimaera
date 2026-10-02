@@ -904,6 +904,7 @@ _Captured 2026-10-02 from the maintainer's direct answers in this conversation._
 - **Wake:** “Explicit opens may wake the cloud; polls and refreshes never do
   (latest recorded decision)”. The phone-to-available-computer policy remains.
 - **Custom secrets:** “Include selected-project custom secrets in this completion”.
+  For changes while work is active: “Queue until idle; offer Apply now”.
   Named provider connections and custom project permissions remain distinct.
 
 ### Cloud connections — scope and experience

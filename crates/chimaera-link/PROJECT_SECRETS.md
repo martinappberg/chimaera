@@ -1,0 +1,188 @@
+# Selected-project custom secrets v1
+
+This optional contract is disabled until the complete project execution,
+storage, network, provider and control boundaries have passed integration tests.
+Publishing this contract advertises no capability and enables no service.
+An older deployment must return unsupported before accepting a secret value.
+
+A custom secret is an environment value shared with explicitly selected cloud
+projects. It is separate from the personal-cloud Claude, Codex and GitHub
+connections in [PROVIDERS.md](PROVIDERS.md). A project receiving a value can use
+or print it; this feature isolates other projects, rather than promising to
+erase values from an authorized project's outputs or external services.
+
+## Product behavior
+
+The control lives in the personal account surface. The user supplies a name,
+value and selected projects. Each selected project has its own stored grant,
+revision, pending change and outcome. Selecting several projects does not imply
+an atomic change across them. Results identify any project that did not accept
+the change; success for one project must not hide a failure in another.
+
+Additions and replacements queue until the affected cloud project is idle.
+**Apply now** explicitly stops that project's current cloud work and applies
+its queued changes. The confirmation names the project and every queued name
+that will be applied. Removing access also explicitly warns that the affected
+cloud work stops. Neither operation takes over local/HPC execution, changes the
+preferred executor, or resumes an agent automatically.
+
+Queued, applying, applied, canceled and unconfirmed are distinct visible states.
+A saved queue receipt is not an applied receipt. No input is silently retried
+after an ambiguous reply. Status reads resolve the original operation ID and
+never create or restore an intent, submit values, start a daemon or wake compute.
+Explicit submission and Apply now may request cloud availability; polling and
+refresh remain passive.
+
+Stored values are never read back. The UI clears its entered value after the
+submission starts and when its account changes or the editor closes. It never
+stores values in local storage, settings, a URL, a session journal or telemetry.
+The control displays names, selected projects and outcomes only.
+
+## Authority and negotiation
+
+The exact positive capability is `project_secrets:1`. It is independent of
+`providers_control` and `provider_runtime`; none implies another. It is offered
+only by the personal control plane after the actual worker proves the complete
+isolated-project path. A cached capability can show status but cannot authorize
+a value submission. Missing, partial or unknown versions refuse before values
+are forwarded. There is no legacy shared-daemon fallback.
+
+Only a freshly authenticated personal device session can submit, cancel,
+replace, immediately apply or remove a secret. Daemon delegations, project
+bearers, viewer tokens and provider-runtime capabilities cannot edit secrets.
+Native commands are available only to this computer's local account window;
+a remote/project webview cannot use the native account bridge. An account web
+surface uses its own authenticated same-origin control route and CSRF defenses,
+never a project daemon as a credential proxy.
+
+The keeper chooses the current personal worker from authenticated account
+state. The worker chooses the project from its trusted stable-ID catalog and
+durable registration. Requests never select a host, path, process, port, UID,
+executable, environment overlay location or account identity.
+
+## Bounded control messages
+
+The fixed external keeper surface is:
+
+| Method and path | Purpose |
+| --- | --- |
+| `GET /v1/personal/project-secrets` | Passive redacted catalog and exact capability acknowledgment |
+| `POST /v1/personal/project-secrets/commands` | One explicit project command |
+| `GET /v1/personal/project-secrets/operations/{operation_id}` | Passive original-device operation status |
+
+A command has version `1`, a canonical UUID `operation_id`, one stable
+`workspace_id`, its exact `expected_revision`, and `expected_pending` (the exact
+pending intent UUID, or JSON null when no intent was shown). Stale registration
+or pending state returns a conflict with redacted current status. A fresh read
+and another explicit decision are required; there is no automatic CAS retry.
+Revisions are integers from zero through `9007199254740991`, never wrapping.
+Stable IDs are 1–128 ASCII letters, digits, `_` or `-`.
+
+Commands are a closed tagged union:
+
+| `action` | Additional fields | Effect |
+| --- | --- | --- |
+| `set` | `name`, `value` | Queue one addition/replacement; preserve other applied values and the pending changes shown by `expected_pending` |
+| `apply` | None | Apply that exact pending batch now, with its explicit stop confirmation |
+| `cancel` | None | Cancel that exact pending batch; applied values remain unchanged |
+| `remove` | `name` | Stop the project and remove that applied name; cancel its pending batch, as stated in the confirmation |
+
+An accepted `set` replaces the pending intent identity, retaining other queued
+names from the exact previously displayed intent. Its fresh personal admission
+authorizes the whole resulting batch; the response lists all queued names.
+The native/browser control shows those names before a submission that carries
+existing queued changes forward. Another device's unseen edit cannot be folded
+into the user's decision. A remove confirmation also names any queued changes
+that will be canceled. An absent name is a conflict, not a false removal success.
+
+There are at most 128 registered projects, 32 applied or resulting secret names
+per project and one pending batch per project. A name is 1–128 uppercase ASCII
+letters, digits or `_`, with no leading digit. Runtime/loader/shell/provider
+configuration names are reserved and visibly refused; the negotiated catalog
+provides the exact supported restrictions. Values are nonempty UTF-8, at most
+8 KiB each, without NUL. The complete JSON request is at most 64 KiB, including
+escaping, and rejects duplicate and unknown fields. Value-bearing types have
+no debug representation; request/error logging must not include their bytes.
+Catalog/status bodies have a 1 MiB ceiling and contain no values or value hashes.
+
+An operation UUID never authorizes re-submitting a value. Once accepted, the
+trusted worker owns bounded persistence and cleanup even if the caller leaves.
+A lost reply is resolved through the original operation status. A different
+payload under an old operation ID refuses; responses never reveal whether a
+guessed value matches stored data. At most 16 requests and four pending writes
+are admitted per personal worker, with queue/backpressure limits retained until
+the actual owned work and cleanup end.
+
+## Durable queue and application
+
+The queue stores encrypted values outside all project files, homes, bind mounts,
+mirrors and process environments. Encryption authenticates account, stable
+project, immutable intent identity, base grant revision and name. A pending
+value is not usable by the current project runtime. Only names and nonsecret
+operation receipts are exposed to status. The existing applied grant remains
+unchanged while an update waits.
+
+A queued batch survives ordinary worker restart and device access-token refresh.
+There is no arbitrary idle-wait expiration: one bounded pending batch per
+project is durable user intent. Its original personal device/session epoch,
+current keeper and worker credential identities, project registration, base
+revision and exact resulting batch remain bound. Revoking that device/session,
+changing the account epoch, replacing those service identities, canceling the
+batch or changing the project registration retires its authority. It requires
+a new explicit decision; neither polling nor recovery may mint a replacement.
+No plaintext device access bearer is persisted with the queue.
+
+Before applying, the keeper obtains fresh account authorization for that exact
+durable secret-purpose admission and current service credentials. Provider
+login admissions cannot be reused. The account check survives ordinary access
+refresh but rejects actual device/session/account revocation. The private
+authorization is one-use and expires within five seconds measured from request
+start. After the reply, the keeper and worker recheck their current registration,
+pending intent and expected applied revision before any effect. Account outages
+leave the batch queued and do not permit applying from a cached successful read.
+
+Automatic application first proves the exact project has no active agent turn,
+pending input, setup command, mutation, user terminal or other user workload.
+An idle managed agent may be durably parked through the existing conversation
+drain/resume protocol; its conversation and delivery receipts must survive.
+An idle-looking terminal, quiet output, an empty browser view, missing process
+evidence or a failed status request is not proof that stopping is safe.
+Unknown or unresumable workloads keep the change queued. The idle decision,
+durable parking and stopping/admission fence share the same serialized runtime
+owner: new work cannot start between the check and the update. An explicit
+Apply now uses that same fence after its stop confirmation. Custom processes
+and detached descendants belong to the project runtime and cannot escape the
+stop boundary.
+
+The trusted owner durably fences the old grant revision before stopping the
+complete old project runtime. Only a positive cleanup acknowledgment, confirmed
+remote revocation floor and durable new encrypted grant permit an applied
+receipt. Partial cleanup, a failed write or a lost remote acknowledgment remains
+applying/recovery-required and denies old authority. Restart resumes the owned
+transition, never replays raw submitted values or acknowledges a missing step.
+Other projects and their work remain unaffected.
+
+Applying/removing a secret changes only the named project grants. Unchanged
+applied values are preserved internally without returning them to the client.
+Removing the last custom secret leaves the isolated project usable; it does not
+delete the project, revoke named provider connections or disable future cloud
+work. It still requires the same stop/revocation acknowledgment.
+
+Pending admission retention is bounded by the project cap. Terminal operation
+receipts are retained for at least 24 hours with a finite account limit and
+bounded cleanup; reaching that limit refuses new submissions rather than
+discarding a still-needed acknowledgment. No terminal receipt can restore a
+canceled or already applied intent.
+
+## Acceptance gate
+
+Capability enablement requires the real account, keeper, supervisor, daemon and
+native/browser control flow: queue through restart and refresh, cancel, explicit
+apply, positive idle fencing, revocation during lock waits, ambiguous replies,
+stale same-account edits and credential replacement. Verify two projects with
+different values for the same name through actual PTYs, structured chat, Git,
+plugins/MCP and process/file/network boundaries. Confirm selected-project
+values never reach unselected projects or the personal provider coordinator.
+Drive light/dark and narrow layouts, multi-project partial results, unsaved input
+cleanup and passive polls while compute is unavailable. Unit checks alone do
+not enable this contract.
