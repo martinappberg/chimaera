@@ -2647,7 +2647,7 @@ The maintainer noticed that Claude Code reads queued messages inside a running t
 
 ## Pass 39 (2026-09-30 — live probes claude 2.1.284 + codex 0.157.1): agent communication's carriers. ADOPTED.
 
-The Agent notes plugin became built-in agent communication (plan `docs/agent-communication-plan.md`): a message from another agent must reach a working agent at its next step and must never start a turn the user's wake policy didn't allow. These are the wire facts that choice rests on.
+The Agent notes plugin became built-in agent communication (plan `docs/design/agent-communication-plan.md`): a message from another agent must reach a working agent at its next step and must never start a turn the user's wake policy didn't allow. These are the wire facts that choice rests on.
 
 #### Claude 2.1.284
 

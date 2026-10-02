@@ -1,5 +1,5 @@
 /**
- * A plugin's problems as marks in the editor (docs/plugin-platform-plan.md
+ * A plugin's problems as marks in the editor (docs/design/plugin-platform-plan.md
  * §4; the LaTeX plan's "errors as editor marks"): every active plugin's
  * `diagnostics/1` items for this file, drawn by `@codemirror/lint` as gutter
  * marks and underlines. Fetched when the editor opens and again on each

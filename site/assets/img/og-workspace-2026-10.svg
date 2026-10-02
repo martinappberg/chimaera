@@ -1,0 +1,160 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-labelledby="title description">
+  <title id="title">Chimaera — a workspace for everything you do with agents</title>
+  <desc id="description">Chimaera's project workspace brings your files, agent conversations, and a live browser together, locally or remotely.</desc>
+  <!-- Editable social card. Render with og-workspace-2026-10.mjs (Sharp). -->
+  <defs>
+    <linearGradient id="paper" x2="1" y2="1">
+      <stop stop-color="#fbfbfc"/><stop offset="1" stop-color="#f1f3f2"/>
+    </linearGradient>
+    <linearGradient id="mark" x1="54" y1="84" x2="186" y2="156" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#5c5c62"/><stop offset="1" stop-color="#939399"/>
+    </linearGradient>
+    <clipPath id="window"><rect x="604" y="154" width="538" height="386" rx="14"/></clipPath>
+    <clipPath id="chat"><rect x="731" y="202" width="179" height="302" rx="7"/></clipPath>
+    <clipPath id="preview"><rect x="919" y="202" width="213" height="139" rx="7"/></clipPath>
+    <clipPath id="browser"><rect x="919" y="350" width="213" height="154" rx="7"/></clipPath>
+    <style>
+      .sans { font-family: Arial, Helvetica, sans-serif; }
+      .mono { font-family: Menlo, 'DejaVu Sans Mono', monospace; }
+      .muted { fill: #9a9aa6; }
+      .icon { fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+    </style>
+  </defs>
+
+  <!-- Quiet light brand surface, with the actual mark geometry. -->
+  <rect width="1200" height="630" fill="url(#paper)"/>
+  <path d="M64 126H1136" stroke="#e0e3e1"/>
+  <g transform="translate(53 45) scale(.26)" fill="none" stroke="url(#mark)" stroke-width="15" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M120 46L186 84V156L120 194L54 156V84Z"/>
+    <path d="M151.4 154.9A47 47 0 1 1 151.4 85.1"/>
+  </g>
+  <text x="122" y="87" class="mono" fill="#1d1d20" font-size="31" font-weight="600" letter-spacing="-.8">chimaera</text>
+
+  <!-- The approved positioning is the single dominant message. -->
+  <g class="sans" font-size="53" font-weight="700" letter-spacing="-1.8">
+    <text x="64" y="250" fill="#1d1d20">A workspace for</text>
+    <text x="64" y="316" fill="#1d1d20">everything you do</text>
+    <text x="64" y="382" fill="#27845d">with agents.</text>
+  </g>
+  <text x="66" y="455" class="sans" fill="#65656d" font-size="21">Your agents. Your files. Local or remote.</text>
+  <text x="66" y="557" class="mono" fill="#27845d" font-size="18">chimaera.sh</text>
+  <path d="M207 551H227M221 545L227 551L221 557" fill="none" stroke="#27845d" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- A compact illustrative workspace, using Chimaera's pane, rail and tab grammar. -->
+  <rect x="604" y="163" width="538" height="386" rx="14" fill="#1d1d20" opacity=".08"/>
+  <g clip-path="url(#window)">
+    <rect x="604" y="154" width="538" height="386" fill="#17171c"/>
+    <rect x="604" y="154" width="538" height="36" fill="#1c1c23"/>
+    <path d="M604 190H1142" stroke="#31313b"/>
+    <g class="mono" font-size="10">
+      <text x="620" y="177" fill="#e7e7ea">atlas</text>
+      <path d="M659 172L662 175L665 172" fill="none" stroke="#9a9aa6" stroke-width="1.3" stroke-linecap="round"/>
+      <text x="1126" y="177" fill="#9a9aa6" text-anchor="end">project workspace</text>
+    </g>
+
+    <!-- File and agent navigation rail. -->
+    <rect x="604" y="190" width="117" height="325" fill="#1c1c23"/>
+    <g class="mono" font-size="9" fill="#b2b2bd">
+      <path d="M620 204L625 207V213L620 216L615 213V207Z" fill="none" stroke="#9a9aa6" stroke-width="1.2"/>
+      <text x="633" y="214">dashboard</text>
+      <text x="618" y="243" fill="#80808d" font-size="8" letter-spacing="1">AGENTS</text>
+      <rect x="612" y="251" width="101" height="25" rx="4" fill="#2d2d36"/>
+      <path d="M621 256.5L622.4 260.1L626 261.5L622.4 262.9L621 266.5L619.6 262.9L616 261.5L619.6 260.1Z" fill="none" stroke="#3fbf85" stroke-width="1.3"/>
+      <text x="633" y="267" fill="#e7e7ea">Claude Code</text>
+      <path d="M620 284L617 287L620 290M624 284L627 287L624 290" fill="none" stroke="#9a9aa6" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="633" y="291">Codex</text>
+      <text x="618" y="328" fill="#80808d" font-size="8" letter-spacing="1">FILES</text>
+      <path d="M616 342L619 345L616 348" fill="none" stroke="#9a9aa6" stroke-width="1.2"/>
+      <text x="626" y="348">atlas</text>
+      <text x="639" y="372">brief.md</text>
+      <rect x="612" y="382" width="101" height="23" rx="4" fill="#2d2d36"/>
+      <text x="639" y="397" fill="#e7e7ea">results.csv</text>
+      <text x="639" y="421">report.pdf</text>
+      <text x="639" y="445">figure.svg</text>
+      <text x="639" y="469">app.ts</text>
+      <g fill="none" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M626 362H632L635 365V374H626ZM632 362V365H635" stroke="#9a9aa6"/>
+        <path d="M626 387H635V399H626ZM626 391H635M630 391V399" stroke="#58c39c"/>
+        <path d="M626 411H632L635 414V423H626ZM632 411V414H635" stroke="#9a9aa6"/>
+        <path d="M626 435H635V447H626ZM627 445L630 442L632 444L634 441" stroke="#d8a45c"/>
+        <path d="M629 459L626 463L629 467M632 459L635 463L632 467" stroke="#6f9ae4"/>
+      </g>
+    </g>
+
+    <!-- Agent conversation, beside the files rather than obscuring them. -->
+    <rect x="731" y="202" width="179" height="302" rx="7" fill="#121218" stroke="#3b6857"/>
+    <g clip-path="url(#chat)">
+      <rect x="732" y="203" width="177" height="26" fill="#1c1c23"/>
+      <path d="M731 228H910" stroke="#31313b"/>
+      <path d="M732 228H839" stroke="#3fbf85" stroke-width="2"/>
+      <text x="746" y="219" class="mono" font-size="9" fill="#e7e7ea">Claude Code</text>
+      <text x="894" y="219" class="mono" font-size="9" fill="#9a9aa6">×</text>
+      <text x="745" y="254" class="mono muted" font-size="8">you</text>
+      <g class="sans" font-size="10" fill="#e7e7ea">
+        <text x="745" y="274">Use the project brief and</text>
+        <text x="745" y="289">these results in the report.</text>
+      </g>
+      <rect x="745" y="302" width="132" height="20" rx="4" fill="#1c1c23" stroke="#31313b"/>
+      <text x="752" y="315" class="mono" font-size="8" fill="#b2b2bd">@ results.csv · rows 2–3</text>
+      <path d="M745 339H896" stroke="#31313b"/>
+      <text x="745" y="363" class="mono" font-size="8" fill="#3fbf85">Claude Code</text>
+      <g class="sans" font-size="10" fill="#d0d0d7">
+        <text x="745" y="382">The report is ready to review.</text>
+        <text x="745" y="398">I’ve opened it beside</text>
+        <text x="745" y="414">the source data.</text>
+      </g>
+      <rect x="743" y="454" width="155" height="38" rx="5" fill="#1c1c23" stroke="#31313b"/>
+      <text x="752" y="477" class="sans muted" font-size="9">Ask your agent…</text>
+      <path d="M882 479V468M878 472L882 468L886 472" fill="none" stroke="#9a9aa6" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+
+    <!-- A real-shaped data grid, with a precise highlighted cell range. -->
+    <rect x="919" y="202" width="213" height="139" rx="7" fill="#121218" stroke="#31313b"/>
+    <g clip-path="url(#preview)">
+      <rect x="920" y="203" width="211" height="26" fill="#1c1c23"/>
+      <path d="M919 228H1132" stroke="#31313b"/>
+      <rect x="920" y="203" width="119" height="25" fill="#25252d"/>
+      <path d="M920 228H1039" stroke="#3fbf85" stroke-width="2"/>
+      <text x="931" y="219" class="mono" font-size="9" fill="#e7e7ea">results.csv</text>
+      <text x="1025" y="219" class="mono" font-size="9" fill="#9a9aa6">×</text>
+      <text x="1049" y="219" class="mono" font-size="8" fill="#9a9aa6">report.pdf</text>
+      <rect x="920" y="230" width="211" height="23" fill="#1c1c23"/>
+      <g class="mono" font-size="8" fill="#d0d0d7">
+        <text x="951" y="246">Item</text><text x="1104" y="246" text-anchor="end">Value</text>
+        <text x="930" y="273" fill="#777785">1</text><text x="951" y="273">A</text><text x="1104" y="273" text-anchor="end">42</text>
+        <text x="930" y="297" fill="#777785">2</text><text x="951" y="297">B</text><text x="1104" y="297" text-anchor="end">38</text>
+        <text x="930" y="321" fill="#777785">3</text><text x="951" y="321">C</text><text x="1104" y="321" text-anchor="end">27</text>
+      </g>
+      <path d="M945 230V341M1044 230V341M919 253H1132M919 282H1132M919 307H1132" stroke="#31313b"/>
+      <rect x="1045" y="254" width="85" height="52" fill="#3fbf85" opacity=".12"/>
+      <rect x="1045" y="254" width="85" height="52" fill="none" stroke="#3fbf85" stroke-width="1"/>
+    </g>
+
+    <!-- Browser pane, displaying an app on the workspace host. -->
+    <rect x="919" y="350" width="213" height="154" rx="7" fill="#fbfbfc" stroke="#31313b"/>
+    <g clip-path="url(#browser)">
+      <rect x="920" y="351" width="211" height="27" fill="#1c1c23"/>
+      <path d="M932 361L929 364L932 367M942 361L945 364L942 367" fill="none" stroke="#9a9aa6" stroke-width="1.1" stroke-linecap="round"/>
+      <rect x="954" y="356" width="159" height="16" rx="3" fill="#121218" stroke="#31313b"/>
+      <text x="960" y="367" class="mono" font-size="8" fill="#b2b2bd">localhost:3000</text>
+      <text x="933" y="400" class="sans" font-size="11" fill="#1d1d20" font-weight="700">Project overview</text>
+      <rect x="1085" y="387" width="32" height="15" rx="4" fill="#e8f3ed"/>
+      <text x="1101" y="397" class="sans" text-anchor="middle" fill="#27845d" font-size="7">Live</text>
+      <path d="M936 477H1115M936 451H1115M936 425H1115" stroke="#e3e3e7"/>
+      <path d="M939 469L965 458L991 462L1017 440L1043 447L1069 430L1095 437L1114 418" fill="none" stroke="#2e9e6b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M939 469L965 458L991 462L1017 440L1043 447L1069 430L1095 437L1114 418V477H939Z" fill="#2e9e6b" opacity=".08"/>
+      <circle cx="1017" cy="440" r="2.5" fill="#2e9e6b"/>
+      <circle cx="1114" cy="418" r="2.5" fill="#2e9e6b"/>
+      <text x="935" y="492" class="mono" font-size="7" fill="#80808a">MON</text>
+      <text x="1115" y="492" class="mono" font-size="7" fill="#80808a" text-anchor="end">FRI</text>
+    </g>
+
+    <!-- Remote identity belongs to the same workspace, not a migration story. -->
+    <rect x="604" y="515" width="538" height="25" fill="#1c1c23"/>
+    <path d="M604 515H1142" stroke="#31313b"/>
+    <circle cx="621" cy="527" r="2.5" fill="#3fbf85"/>
+    <text x="632" y="530" class="mono" font-size="8" fill="#b2b2bd">work-server / remote</text>
+    <text x="1126" y="530" class="mono" font-size="8" fill="#9a9aa6" text-anchor="end">main</text>
+  </g>
+  <rect x="604.5" y="154.5" width="537" height="385" rx="13.5" fill="none" stroke="#41414b" stroke-width="1"/>
+</svg>

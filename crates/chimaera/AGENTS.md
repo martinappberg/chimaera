@@ -8,8 +8,8 @@ is a thin delegation to a sibling library crate. Parent map: repo-root
 ## What lives here (and what does NOT)
 
 - **IS**: argument parsing, the global allocator + tracing init, and per-command
-  orchestration/output. ~350 LoC of straight-line dispatch. Keep it that way — do
-  not grow a command-abstraction layer for six flat subcommands.
+  orchestration/output. Keep dispatch thin; substantial command logic belongs in
+  the sibling library crates or the existing command modules.
 - **IS NOT**: the daemon. `serve` is a 3-line delegation to
   `chimaera_server::run`. The **daemon lifecycle you're probably looking for**
   (manifest write/remove, SIGINT/SIGTERM, graceful shutdown, restart handoff,

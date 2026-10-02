@@ -6,7 +6,7 @@
  * previews its target on hover (the target's span, drawn as written) and
  * opens it on click. The Knowledge snapshot is the first source
  * (`knowledge/references.ts`); the plugin platform's `references/1`
- * publishers register the same way (docs/plugin-platform-plan.md).
+ * publishers register the same way (docs/design/plugin-platform-plan.md).
  *
  * A candidate only becomes a chip when a source resolves it, so "COVID-19"
  * or a stray "D-1" that names nothing stays text. What a chip points at is

@@ -1,5 +1,7 @@
 # Documents, files & references: the plan
 
+> **Dated design record.** Current behavior is in [files and previews](../features/files-and-previews.md). The implementation summary and proposals below describe the 2026-09-26 snapshot, including work deferred at that time.
+
 Dated 2026-09-25. It covers the markdown viewer, every other file viewer, embeds, file
 links from agents, pointing agents at parts of files, how files show up in chat, and
 safe editing over a remote link. It was built from four code maps of the tree at
@@ -13,8 +15,8 @@ separate effort); see [Out of scope](#out-of-scope).
 ## Status (2026-09-26)
 
 Built in martinappberg/chimaera#159. The feature pages
-([files and previews](features/files-and-previews.md), [agents](features/agents.md),
-[chat mode](features/chat-mode.md), [terminals](features/terminals.md)) describe what
+([files and previews](../features/files-and-previews.md), [agents](../features/agents.md),
+[chat mode](../features/chat-mode.md), [terminals](../features/terminals.md)) describe what
 shipped; the phases below remain the design record.
 
 - **Shipped:**
@@ -49,7 +51,7 @@ shipped; the phases below remain the design record.
   - the reference basket, agent-opened tabs (`show_user`) and backlinks;
   - EPUB/email and the LibreOffice path.
 - **Not yet built:**
-  - `![](note.md#Heading)` transclusion (cards show an excerpt);
+  - `![](../note.md#Heading)` transclusion (cards show an excerpt);
   - the "what changed" gutter;
   - server-side thumbnails (measure first).
 
@@ -67,7 +69,7 @@ shipped; the phases below remain the design record.
   It understands `file.py:12:3`, `#L10-L20`, subfolders, other working directories,
   bare file names, `a/` and `b/` diff prefixes, and paths an agent creates later. It
   opens the file *at* the line.
-- **Embed anything.** `![caption](results/umap.png)` already works for images. The same
+- **Embed anything.** `![caption](../results/umap.png)` already works for images. The same
   standard syntax will embed PDFs (a page), other markdown (a section), code (a line
   range), tables (a slice), HTML reports, video, notebooks and slides. The same embed
   cards show agent output in the chat.
@@ -104,7 +106,7 @@ shipped; the phases below remain the design record.
    bytes, cache by content version.
 7. **The daemon stays small.** It streams bytes, slices, hashes and headers. Parsing
    and drawing happen in the browser. Conversions that need real CPU are opt-in,
-   bounded and off the reactor ([daemon rules](../.claude/rules/daemon.md)).
+   bounded and off the reactor ([daemon rules](../../.claude/rules/daemon.md)).
 
 ## Phase 0: never lose an edit
 
@@ -329,9 +331,9 @@ Chromium before each step ships.
 
 ### Syntax
 
-Standard markdown first. `![caption](path.ext#fragment)` embeds by file kind, and
+Standard markdown first. `![caption](../path.ext#fragment)` embeds by file kind, and
 GitHub still shows images and meaningful alt text. Size hints use Obsidian's form,
-`![caption|400](plot.png)`. `![[file#fragment|400]]` is read for compatibility.
+`![caption|400](../plot.png)`. `![[file#fragment|400]]` is read for compatibility.
 
 | Target | Renders as |
 |---|---|
@@ -373,7 +375,7 @@ GitHub still shows images and meaningful alt text. Size hints use Obsidian's for
 
 The same cards replace today's thin artifact tiles:
 
-- `![](results/plot.png)` in agent prose renders (it is a broken image today).
+- `![](../results/plot.png)` in agent prose renders (it is a broken image today).
 - The turn's "made this turn" gallery also catches files written by shell commands
   (a plot saved by a script), HTML reports, documents, spreadsheets and slides, not
   only images, tables and PDFs touched by edit tools. Aborted turns keep theirs.
@@ -440,9 +442,9 @@ What agents are taught to write. Everything renders on GitHub and in Obsidian:
 - Math: `$…$`, `$$…$$`, `` ```math ``. Diagrams: `` ```mermaid ``.
 - YAML frontmatter: `title`, `summary`, `status`, `audience` (`public` or
   `internal`), `updated`, `tags`.
-- Links: `[text](relative/path.md#heading)` with `%20` for spaces. Never absolute
+- Links: `[text](../relative/path.md#heading)` with `%20` for spaces. Never absolute
   local paths in a public document.
-- Embeds: `![meaningful alt text](relative/path.ext#fragment)`.
+- Embeds: `![meaningful alt text](../relative/path.ext#fragment)`.
 - Avoid: wikilinks, MDX, Markdoc tags, Pandoc/Quarto `:::` divs, MyST directives,
   HackMD containers (they show as literal text on GitHub).
 
@@ -552,7 +554,7 @@ Phase 0 and Phase 1 are independent and can run in parallel worktrees. Phase 2 m
 precede 3. Phase 4 builds on 1 (resolver) and 2 (renderer). Quick wins can land any
 time. Each phase ships behind the usual gates (`just check`, web-UI check, test and
 build) and is driven live before merge, per the
-[verify-app](../.claude/skills/verify-app/SKILL.md) skill.
+[verify-app](../../.claude/skills/verify-app/SKILL.md) skill.
 
 ## Open decisions
 
@@ -571,7 +573,7 @@ build) and is driven live before merge, per the
   errors as editor marks): a separate effort by the maintainer's call. The locator
   grammar and embed cards here are designed so a compiled PDF slots in unchanged.
 - A real IDE editor (LSP, completion, multi-file refactor) stays a non-goal
-  ([DESIGN.md](../DESIGN.md#scope-philosophy-and-non-goals)).
+  ([docs/design/README.md](README.md#scope-philosophy-and-non-goals)).
 
 ## Appendix: what the code does today
 

@@ -1,9 +1,11 @@
 # The Agent Dashboard — design & plan
 
-Status: **v0.1 + v0.1.x + v0.2 + Mastermind v1 built and live-verified on the PR #62
+> **Dated design record.** Current behavior is in [Dashboard](../features/dashboard.md) and [agent communication](../features/agent-communication.md). The July 2026 proposal, follow-ups, and maintainer decisions below are historical; later communication work supersedes parts of the original worker model.
+
+Snapshot status (2026-07-16): **v0.1 + v0.1.x + v0.2 + Mastermind v1 built and live-verified on the PR #62
 branch** (2026-07-16, billed real-agent runs on claude AND codex — including
 **codex-as-Mastermind**, gated by the driver answering its MCP elicitations; the
-original claude-only refusal predated that finding). Remaining phases: v0.3's
+original claude-only refusal predated that finding). Follow-ups proposed in that snapshot: v0.3's
 observe-for-all + codex TUI hook consent, and v1.x (`ask_mastermind`, proactivity
 opt-in, memory). This document synthesizes a research pass over the
 codebase, the current Claude Code and Codex integration surfaces (verified
@@ -78,7 +80,7 @@ one user-picked agent per workspace: the **Mastermind**, which lives on the
 dashboard, delegates rather than does, and is a normal chat session of the
 user's own agent with the act-tier MCP tools attached.
 
-This is not a new direction. DESIGN.md's founding moat already names an
+This is not a new direction. docs/design/README.md's founding moat already names an
 "attention-aware multi-agent dashboard" as one of its four legs, and M2
 shipped its seed (the attention state machine + session strip). This plan is
 that leg, grown up.

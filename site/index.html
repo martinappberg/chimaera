@@ -3,39 +3,97 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Chimaera · your agent workbench</title>
+    <meta name="robots" content="max-image-preview:large" />
+    <title>Chimaera · A workspace for your AI agents</title>
     <meta
       name="description"
-      content="Chimaera runs Claude Code, Codex, and other coding agents in parallel, each as a rich chat UI or its real TUI, with the files they produce rendered beside them. The daemon keeps every session alive on the host that owns the work, so sessions survive disconnect. One static Rust binary. No root, no containers."
+      content="Work with your own AI agents, files, and tools in one open-source workspace. Use Claude Code, Codex, and more, locally or over SSH."
     />
     <link rel="icon" href="assets/img/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="assets/css/styles.css" />
+    <link rel="stylesheet" href="assets/css/styles.css?v=20261001" />
+    <link rel="stylesheet" href="assets/css/demo.css?v=20261001.1" />
+    <link rel="stylesheet" href="assets/css/demo-previews.css?v=20261001" />
     <link rel="canonical" href="https://chimaera.sh/" />
+    <link rel="sitemap" type="application/xml" href="sitemap.xml" />
 
     <meta property="og:type" content="website" />
     <meta property="og:site_name" content="Chimaera" />
     <meta property="og:locale" content="en_US" />
-    <meta property="og:title" content="Chimaera · your agent workbench" />
+    <meta property="og:title" content="Chimaera · a workspace for everything you do with agents" />
     <meta
       property="og:description"
-      content="Run coding agents in parallel, as a rich chat UI or the real TUI, with the files they produce rendered beside them. The daemon owns the sessions on the host that owns the work, so they survive disconnect. One static Rust binary, no root."
+      content="Work with your own AI agents, files, and tools in one open-source workspace. Use Claude Code, Codex, and more, locally or over SSH."
     />
     <meta property="og:url" content="https://chimaera.sh/" />
     <!-- Version this filename when the card changes; social crawlers cache image URLs. -->
-    <meta property="og:image" content="https://chimaera.sh/assets/img/og-agent-workbench-2026-07.png" />
-    <meta property="og:image:secure_url" content="https://chimaera.sh/assets/img/og-agent-workbench-2026-07.png" />
+    <meta property="og:image" content="https://chimaera.sh/assets/img/og-workspace-2026-10.png" />
+    <meta property="og:image:secure_url" content="https://chimaera.sh/assets/img/og-workspace-2026-10.png" />
     <meta property="og:image:type" content="image/png" />
     <meta property="og:image:width" content="1200" />
     <meta property="og:image:height" content="630" />
-    <meta property="og:image:alt" content="Chimaera — your agent workbench" />
+    <meta property="og:image:alt" content="Chimaera. A workspace for everything you do with agents. Conversations, files, and a browser side by side." />
     <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:title" content="Chimaera · your agent workbench" />
+    <meta name="twitter:title" content="Chimaera · a workspace for everything you do with agents" />
     <meta
       name="twitter:description"
-      content="An agent workbench: persistent coding-agent sessions on whatever host owns the work, in a rich chat UI or the real TUI. One static Rust binary. Sessions survive disconnect."
+      content="Work with your own AI agents, files, and tools in one open-source workspace. Use Claude Code, Codex, and more, locally or over SSH."
     />
-    <meta name="twitter:image" content="https://chimaera.sh/assets/img/og-agent-workbench-2026-07.png" />
-    <meta name="twitter:image:alt" content="Chimaera — your agent workbench" />
+    <meta name="twitter:image" content="https://chimaera.sh/assets/img/og-workspace-2026-10.png" />
+    <meta name="twitter:image:alt" content="Chimaera. A workspace for everything you do with agents. Conversations, files, and a browser side by side." />
+
+    <script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "WebSite",
+      "@id": "https://chimaera.sh/#website",
+      "url": "https://chimaera.sh/",
+      "name": "Chimaera",
+      "alternateName": "chimaera",
+      "inLanguage": "en",
+      "description": "A workspace for everything you do with agents."
+    },
+    {
+      "@type": "SoftwareSourceCode",
+      "@id": "https://chimaera.sh/#software",
+      "name": "Chimaera",
+      "url": "https://chimaera.sh/",
+      "description": "Work with your own AI agents, files, and tools in one open-source workspace. Use Claude Code, Codex, and more, locally or over SSH.",
+      "codeRepository": "https://github.com/martinappberg/chimaera",
+      "license": "https://github.com/martinappberg/chimaera/blob/main/LICENSE",
+      "programmingLanguage": [
+        "Rust",
+        "TypeScript"
+      ],
+      "image": "https://chimaera.sh/assets/img/og-workspace-2026-10.png"
+    },
+    {
+      "@type": "WebPage",
+      "@id": "https://chimaera.sh/#webpage",
+      "url": "https://chimaera.sh/",
+      "name": "Chimaera · A workspace for your AI agents",
+      "description": "Work with your own AI agents, files, and tools in one open-source workspace. Use Claude Code, Codex, and more, locally or over SSH.",
+      "inLanguage": "en",
+      "isPartOf": {
+        "@id": "https://chimaera.sh/#website"
+      },
+      "about": {
+        "@id": "https://chimaera.sh/#software"
+      },
+      "primaryImageOfPage": {
+        "@type": "ImageObject",
+        "url": "https://chimaera.sh/assets/img/og-workspace-2026-10.png",
+        "width": 1200,
+        "height": 630
+      },
+      "mainEntity": {
+        "@id": "https://chimaera.sh/#software"
+      }
+    }
+  ]
+}
+    </script>
 
     <script>
       (function () {
@@ -78,7 +136,7 @@
             <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5A11.5 11.5 0 0 0 .5 12a11.5 11.5 0 0 0 7.86 10.92c.58.1.79-.25.79-.55v-2c-3.2.7-3.88-1.37-3.88-1.37-.53-1.34-1.3-1.7-1.3-1.7-1.06-.72.08-.71.08-.71 1.17.08 1.79 1.2 1.79 1.2 1.04 1.79 2.73 1.27 3.4.97.1-.76.41-1.27.74-1.56-2.55-.29-5.24-1.28-5.24-5.68 0-1.25.45-2.28 1.19-3.08-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.18 1.18a11 11 0 0 1 5.8 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.8 1.19 1.83 1.19 3.08 0 4.41-2.69 5.38-5.25 5.67.42.36.8 1.08.8 2.18v3.23c0 .31.2.66.8.55A11.5 11.5 0 0 0 23.5 12 11.5 11.5 0 0 0 12 .5z" /></svg>
             <span>GitHub</span>
           </a>
-          <button class="icon-btn nav__burger" id="burger" type="button" aria-label="Open menu">
+          <button class="icon-btn nav__burger" id="burger" type="button" aria-label="Open menu" aria-controls="sheet" aria-expanded="false">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18" /></svg>
           </button>
         </div>
@@ -86,9 +144,9 @@
     </header>
 
     <!-- Mobile sheet -->
-    <div class="sheet" id="sheet" aria-hidden="true">
+    <div class="sheet" id="sheet" aria-hidden="true" inert>
       <div class="sheet__scrim" data-close></div>
-      <div class="sheet__panel">
+      <div class="sheet__panel" role="dialog" aria-modal="true" aria-label="Navigation">
         <div class="sheet__head">
           <span class="wordmark" style="font-size: 16px">chimaera</span>
           <button class="icon-btn" data-close type="button" aria-label="Close menu" style="margin-left: auto">
@@ -104,338 +162,166 @@
     </div>
 
     <main>
-      <!-- ===================== HERO ===================== -->
       <section class="hero">
         <div class="wrap">
           <div class="hero__head">
-            <h1>Your agent workbench.</h1>
-            <p class="hero__sub">
-              Chimaera runs Claude Code, Codex, and other coding agents in
-              parallel. Drive each as a rich chat UI or its real terminal, with
-              the files they produce rendered beside it, and it shows you which
-              one needs you. The daemon keeps every session alive on the host
-              that owns the work, so you can close your laptop mid-run and
-              nothing dies. Reconnect, and every session is right where you left
-              it.
-            </p>
+            <span class="eyebrow">chimaera / the agent workbench</span>
+            <h1>A workspace for everything you do with agents.</h1>
+            <p class="hero__sub">Run the agents you already use, with your accounts, skills, and connections. Keep conversations, files, and outputs side by side. Work locally or on a remote host.</p>
             <div class="hero__cta">
-              <a class="btn btn--primary" href="#download">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12m0 0l4-4m-4 4l-4-4M4 19h16" /></svg>
-                Download
-              </a>
-              <a class="btn" href="docs.html">Read the docs</a>
+              <a class="btn btn--primary btn--download" href="#download"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12m-5-5 5 5 5-5M5 16v4h14v-4"/></svg>Get chimaera</a>
             </div>
             <div class="hero__meta">
+              <span><i class="dot"></i> open source</span>
+              <span><i class="dot"></i> your agents · your files</span>
               <span><i class="dot"></i> macOS, Linux &amp; Windows (beta)</span>
-              <span><i class="dot"></i> one static binary</span>
-              <span><i class="dot"></i> no root, no containers</span>
-              <span><i class="dot"></i> runs on old-glibc systems</span>
             </div>
           </div>
 
-          <!-- Workbench mockup -->
-          <div class="mock-frame">
-            <div class="mock" role="img" aria-label="The Chimaera workbench: a rail of terminal and agent sessions on the left, a split view with a running Claude Code session, a volcano-plot preview, and a differential-expression report, and a session strip showing which agent needs attention.">
-              <div class="mock__bar">
-                <div class="mock__dots"><i></i><i></i><i></i></div>
-                <div class="mock__title">
-                  <svg class="hexmark" width="13" height="13" viewBox="0 0 240 240" aria-hidden="true"><g fill="none" stroke="var(--bm-1)" stroke-width="15" stroke-linecap="round" stroke-linejoin="round"><path d="M120 46 L186 84 L186 156 L120 194 L54 156 L54 84 Z"/><path d="M151.4 154.9 A 47 47 0 1 1 151.4 85.1"/></g></svg>
-                  rnaseq-pipeline · ssh://gpu-node
-                </div>
+          <figure class="workspace-demo" id="workspace">
+            <div class="wb-app" id="workspace-demo" data-nosnippet data-mobile-panel="file" data-pane-focus="" role="region" aria-label="Interactive sample Chimaera workspace">
+              <div class="wb-titlebar">
+                <img src="assets/img/favicon.svg" width="16" height="16" alt="">
+                <strong>chimaera</strong>
+                <button type="button" class="wb-icon-button wb-sidebar-toggle" data-action="sidebar" aria-label="Show workspace files" aria-expanded="false" aria-controls="wb-sidebar"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="2"/><path d="M6 3v10"/></svg></button>
+                <span class="wb-host">SSH · work-server</span>
+                <button type="button" class="wb-icon-button" data-action="expand" aria-label="Expand workspace preview" aria-pressed="false" title="Expand workspace"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 2H2v4m8-4h4v4M2 10v4h4m8-4v4h-4"/></svg></button>
               </div>
-              <div class="mock__body">
-                <aside class="mock__rail">
-                  <div class="rail-sec">terminals</div>
-                  <div class="rail-row">
-                    <svg class="glyph" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 4.5L6.5 8 3 11.5M8.5 12h4.5"/></svg>
-                    <span class="name">salmon quant</span>
+              <div class="wb-mobile-nav" aria-label="Preview panes">
+                <button type="button" data-mobile="chat" aria-pressed="false">Agent</button>
+                <button type="button" data-mobile="file" aria-pressed="true">Files</button>
+                <button type="button" data-mobile="browser" aria-pressed="false">Browser</button>
+              </div>
+              <div class="wb-body">
+                <aside class="wb-sidebar" id="wb-sidebar" aria-label="Sample project navigation">
+                  <div class="wb-workspace-name">project-atlas <span>⌄</span></div>
+                  <nav class="wb-navigation" aria-label="Workspace views and agents">
+                    <button type="button" data-open="_dashboard" data-nav aria-pressed="false"><span class="wb-nav-icon">▦</span>dashboard</button>
+                    <button type="button" data-open="_knowledge" data-nav aria-pressed="false"><span class="wb-nav-icon">▤</span>knowledge</button>
+                    <button type="button" data-open="_extensions" data-nav aria-pressed="false"><span class="wb-nav-icon">◇</span>extensions</button>
+                    <div class="wb-rail-label">terminals</div>
+                    <button type="button" data-open="_terminal" data-nav aria-pressed="false"><span class="wb-nav-icon">›_</span>dev server</button>
+                    <div class="wb-rail-label">agents</div>
+                    <button type="button" data-agent="claude" aria-pressed="true"><svg class="wb-agent-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.5l1.4 3.6 3.6 1.4-3.6 1.4L8 12.5 6.6 8.9 3 7.5l3.6-1.4z"/></svg>Claude Code</button>
+                    <button type="button" data-agent="codex" aria-pressed="false"><svg class="wb-agent-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M6.4 4.8L3.6 8l2.8 3.2M9.6 4.8L12.4 8l-2.8 3.2"/></svg>Codex</button>
+                    <details class="wb-agent-menu"><summary>+ agent ⌄</summary><div><button type="button" data-agent="agy">Antigravity</button><button type="button" data-agent="grok">Grok Build</button></div></details>
+                  </nav>
+                  <div class="wb-files-section">
+                    <div class="wb-files-heading"><span>FILES</span><small>14</small><button type="button" class="wb-icon-button" data-action="search" aria-label="Search sample files" title="Search files"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="6.5" cy="6.5" r="4"/><path d="m10 10 3.5 3.5"/></svg></button></div>
+                    <input id="wb-search" type="search" aria-label="Filter sample files" placeholder="Find a file" hidden>
+                    <div class="wb-files" id="wb-files"><div class="wb-file">brief.md</div><div class="wb-file">report.pdf</div><div class="wb-file">data.xlsx</div></div>
                   </div>
-                  <div class="rail-sec">agents</div>
-                  <div class="rail-row active">
-                    <svg class="glyph" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 2.5l1.4 3.6 3.6 1.4-3.6 1.4L8 12.5 6.6 8.9 3 7.5l3.6-1.4z"/></svg>
-                    <span class="name">fix DESeq2 contrasts</span>
-                  </div>
-                  <div class="rail-row">
-                    <svg class="glyph" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.4 4.8L3.6 8l2.8 3.2M9.6 4.8L12.4 8l-2.8 3.2"/></svg>
-                    <span class="name">refactor loaders</span>
-                    <span class="attn" title="needs you"></span>
-                  </div>
-                  <div class="rail-sec">recent</div>
-                  <div class="rail-row">
-                    <svg class="glyph" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 2.5l1.4 3.6 3.6 1.4-3.6 1.4L8 12.5 6.6 8.9 3 7.5l3.6-1.4z"/></svg>
-                    <span class="name">write QC summary</span>
-                  </div>
+                  <div class="wb-rail-footer"><span>⑂</span><span>main</span><span style="margin-left:auto">work-server</span></div>
                 </aside>
-
-                <div class="mock__stage">
-                  <section class="pane">
-                    <div class="pane__tabs">
-                      <span class="tab active">
-                        <svg class="glyph" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 2.5l1.4 3.6 3.6 1.4-3.6 1.4L8 12.5 6.6 8.9 3 7.5l3.6-1.4z"/></svg>
-                        claude
-                      </span>
-                    </div>
-                    <div class="term" aria-hidden="true">
-                      <div class="term__log">
-<div class="l"><span class="g">&gt;</span> volcano plot uses the wrong contrast, fix it</div>
-<div class="l">&nbsp;</div>
-<div class="l"><span class="g">⏺</span> Switching the DESeq2 contrast to treated vs</div>
-<div class="l">&nbsp;&nbsp;control and regenerating the figure.</div>
-<div class="l">&nbsp;</div>
-<div class="l"><span class="g">⏺</span> Update<span class="m">(scripts/deseq2.R)</span></div>
-<div class="l">&nbsp;&nbsp;<span class="m">⎿ Updated · 1 addition, 1 removal</span></div>
-<div class="l">&nbsp;&nbsp;&nbsp;&nbsp;<span class="del">- res &lt;- results(dds)</span></div>
-<div class="l">&nbsp;&nbsp;&nbsp;&nbsp;<span class="add">+ res &lt;- results(dds, contrast =</span></div>
-<div class="l">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="add">c("cond","treated","control"))</span></div>
-<div class="l">&nbsp;</div>
-<div class="l"><span class="g">⏺</span> Bash<span class="m">(Rscript scripts/deseq2.R)</span></div>
-<div class="l">&nbsp;&nbsp;<span class="m">⎿ figures/volcano.png · 2,214 DE genes</span></div>
-<div class="l">&nbsp;</div>
-<div class="l"><span class="g">⏺</span> Write<span class="m">(results/deseq2_report.md)</span></div>
-<div class="l">&nbsp;</div>
-<div class="l"><span class="g">⏺</span> Done. Using treated vs control now.</div>
-                      </div>
-                      <div class="term__prompt"><span class="g">&gt;</span> <span class="cursor"></span> <span class="ph">run the QC summary next</span></div>
-                      <div class="term__status"><span><span class="acc">⏵⏵</span> accept edits on</span><span>claude-opus-4.8</span></div>
+                <div class="wb-stage">
+                  <section class="wb-pane wb-chat-pane" aria-label="Sample agent conversation">
+                    <div class="wb-pane-bar"><div class="wb-tab wb-tab--active" id="wb-agent-tab">Build the project overview</div></div>
+                    <div class="wb-chat-messages" id="wb-chat-messages"><div class="wb-chat-label">You</div><p>Turn the project notes and data into a report and a small interactive page.</p><div class="wb-chat-label">Claude Code</div><p>The report and interactive overview are ready.</p></div>
+                    <div class="wb-compose">
+                      <div id="wb-reference" class="wb-reference" hidden></div>
+                      <textarea id="wb-composer" aria-label="Sample message draft" placeholder="Message Claude Code" rows="2"></textarea>
+                      <div class="wb-compose-footer"><span id="wb-agent-name">Claude Code</span><span>⌄</span><span>Sample conversation</span></div>
                     </div>
                   </section>
-
-                  <section class="pane">
-                    <div class="pane__tabs">
-                      <span class="tab active">
-                        <svg class="glyph" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="2.5" y="2.5" width="11" height="11" rx="1.5" fill="none" stroke="currentColor"/><path d="M2.5 6.5h11" stroke="currentColor"/></svg>
-                        volcano.png
-                      </span>
-                    </div>
-                    <div class="preview" aria-hidden="true">
-                      <div class="preview__cap">treated vs control</div>
-                      <svg class="volcano" viewBox="0 0 260 166" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
-                        <line class="axis" x1="32" y1="146" x2="252" y2="146"/>
-                        <line class="axis" x1="32" y1="146" x2="32" y2="14"/>
-                        <line class="thr" x1="124" y1="20" x2="124" y2="146"/>
-                        <line class="thr" x1="160" y1="20" x2="160" y2="146"/>
-                        <line class="thr" x1="32" y1="125" x2="252" y2="125"/>
-                        <circle cx="137.9" cy="133.8" r="1.7" class="ns"/><circle cx="160.0" cy="136.2" r="1.7" class="ns"/><circle cx="160.0" cy="140.8" r="1.7" class="ns"/><circle cx="136.4" cy="143.4" r="1.7" class="ns"/><circle cx="115.0" cy="135.1" r="1.7" class="ns"/><circle cx="145.8" cy="121.0" r="1.7" class="ns"/><circle cx="127.6" cy="131.2" r="1.7" class="ns"/><circle cx="172.7" cy="136.7" r="1.7" class="ns"/><circle cx="147.0" cy="138.5" r="1.7" class="ns"/><circle cx="146.1" cy="133.8" r="1.7" class="ns"/><circle cx="132.0" cy="132.2" r="1.7" class="ns"/><circle cx="147.2" cy="142.5" r="1.7" class="ns"/><circle cx="134.8" cy="132.1" r="1.7" class="ns"/><circle cx="126.7" cy="136.7" r="1.7" class="ns"/><circle cx="148.9" cy="126.7" r="1.7" class="ns"/><circle cx="124.4" cy="131.2" r="1.7" class="ns"/><circle cx="140.3" cy="127.1" r="1.7" class="ns"/><circle cx="154.4" cy="130.6" r="1.7" class="ns"/><circle cx="152.8" cy="134.9" r="1.7" class="ns"/><circle cx="128.5" cy="123.6" r="1.7" class="ns"/><circle cx="152.0" cy="132.3" r="1.7" class="ns"/><circle cx="124.3" cy="133.2" r="1.7" class="ns"/><circle cx="162.9" cy="126.5" r="1.7" class="ns"/><circle cx="139.1" cy="135.7" r="1.7" class="ns"/><circle cx="111.2" cy="126.5" r="1.7" class="ns"/><circle cx="138.6" cy="128.5" r="1.7" class="ns"/><circle cx="159.8" cy="142.6" r="1.7" class="ns"/><circle cx="146.2" cy="135.8" r="1.7" class="ns"/><circle cx="150.4" cy="136.0" r="1.7" class="ns"/><circle cx="146.6" cy="138.3" r="1.7" class="ns"/><circle cx="110.0" cy="130.8" r="1.7" class="ns"/><circle cx="150.6" cy="135.0" r="1.7" class="ns"/><circle cx="120.8" cy="126.5" r="1.7" class="ns"/><circle cx="147.9" cy="138.0" r="1.7" class="ns"/><circle cx="144.0" cy="127.2" r="1.7" class="ns"/><circle cx="141.9" cy="140.9" r="1.7" class="ns"/><circle cx="127.7" cy="125.9" r="1.7" class="ns"/><circle cx="134.9" cy="127.2" r="1.7" class="ns"/><circle cx="139.6" cy="133.8" r="1.7" class="ns"/><circle cx="148.2" cy="115.5" r="1.7" class="ns"/><circle cx="129.2" cy="137.8" r="1.7" class="ns"/><circle cx="138.1" cy="142.3" r="1.7" class="ns"/><circle cx="144.5" cy="136.1" r="1.7" class="ns"/><circle cx="142.3" cy="144.4" r="1.7" class="ns"/><circle cx="154.4" cy="139.3" r="1.7" class="ns"/><circle cx="157.7" cy="133.4" r="1.7" class="ns"/><circle cx="141.8" cy="131.9" r="1.7" class="ns"/><circle cx="164.6" cy="126.5" r="1.7" class="ns"/><circle cx="123.8" cy="142.4" r="1.7" class="ns"/><circle cx="153.9" cy="137.2" r="1.7" class="ns"/><circle cx="146.6" cy="139.8" r="1.7" class="ns"/><circle cx="160.9" cy="140.3" r="1.7" class="ns"/><circle cx="138.3" cy="140.1" r="1.7" class="ns"/><circle cx="174.0" cy="136.2" r="1.7" class="ns"/><circle cx="140.9" cy="133.5" r="1.7" class="ns"/><circle cx="144.7" cy="124.5" r="1.7" class="ns"/><circle cx="136.5" cy="131.0" r="1.7" class="ns"/><circle cx="173.6" cy="136.0" r="1.7" class="ns"/><circle cx="153.1" cy="126.8" r="1.7" class="ns"/><circle cx="126.9" cy="144.5" r="1.7" class="ns"/>
-                        <circle cx="204.6" cy="80.3" r="1.7" class="up"/><circle cx="187.0" cy="41.9" r="1.7" class="up"/><circle cx="209.6" cy="92.4" r="1.7" class="up"/><circle cx="243.2" cy="115.9" r="1.7" class="up"/><circle cx="206.9" cy="91.6" r="1.7" class="up"/><circle cx="191.4" cy="64.8" r="1.7" class="up"/><circle cx="193.2" cy="66.6" r="1.7" class="up"/><circle cx="168.6" cy="114.0" r="1.7" class="up"/><circle cx="201.0" cy="110.9" r="1.7" class="up"/><circle cx="168.5" cy="115.1" r="1.7" class="up"/><circle cx="213.9" cy="63.6" r="1.7" class="up"/><circle cx="218.0" cy="110.2" r="1.7" class="up"/><circle cx="188.8" cy="115.8" r="1.7" class="up"/><circle cx="204.0" cy="40.3" r="1.7" class="up"/><circle cx="171.2" cy="41.1" r="1.7" class="up"/><circle cx="208.4" cy="89.2" r="1.7" class="up"/><circle cx="177.4" cy="45.4" r="1.7" class="up"/><circle cx="186.9" cy="100.9" r="1.7" class="up"/><circle cx="196.7" cy="72.9" r="1.7" class="up"/><circle cx="218.5" cy="112.4" r="1.7" class="up"/><circle cx="211.3" cy="43.2" r="1.7" class="up"/><circle cx="217.6" cy="89.2" r="1.7" class="up"/>
-                        <circle cx="110.4" cy="61.0" r="1.7" class="dn"/><circle cx="94.9" cy="84.3" r="1.7" class="dn"/><circle cx="71.4" cy="94.3" r="1.7" class="dn"/><circle cx="102.5" cy="97.6" r="1.7" class="dn"/><circle cx="110.4" cy="66.2" r="1.7" class="dn"/><circle cx="91.3" cy="103.4" r="1.7" class="dn"/><circle cx="97.2" cy="65.9" r="1.7" class="dn"/><circle cx="95.6" cy="53.0" r="1.7" class="dn"/><circle cx="98.1" cy="60.5" r="1.7" class="dn"/><circle cx="70.2" cy="45.6" r="1.7" class="dn"/><circle cx="109.1" cy="64.6" r="1.7" class="dn"/><circle cx="110.0" cy="115.7" r="1.7" class="dn"/><circle cx="108.5" cy="59.7" r="1.7" class="dn"/><circle cx="119.2" cy="87.8" r="1.7" class="dn"/><circle cx="100.5" cy="88.2" r="1.7" class="dn"/><circle cx="107.6" cy="81.4" r="1.7" class="dn"/><circle cx="64.8" cy="86.3" r="1.7" class="dn"/><circle cx="87.4" cy="61.5" r="1.7" class="dn"/>
-                        <text x="142" y="162" text-anchor="middle">log₂ fold change</text>
-                        <text x="12" y="82" text-anchor="middle" transform="rotate(-90 12 82)">−log₁₀ padj</text>
-                      </svg>
-                      <div class="preview__legend">
-                        <span><i style="background: var(--accent)"></i> up</span>
-                        <span><i style="background: var(--rate)"></i> down</span>
-                        <span><i style="background: var(--faint)"></i> n.s.</span>
-                      </div>
-                    </div>
-                  </section>
-
-                  <section class="pane">
-                    <div class="pane__tabs">
-                      <span class="tab active">
-                        <svg class="glyph" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3h10v10H3z" fill="none"/><path d="M5 6.5h6M5 9h6M5 11h3.5"/></svg>
-                        deseq2_report.md
-                      </span>
-                    </div>
-                    <div class="mdview" aria-hidden="true">
-                      <h4 class="mdview__h1">Differential expression</h4>
-                      <p class="mdview__meta">treated vs control · 2,214 genes at padj &lt; 0.05</p>
-                      <table>
-                        <tr><th>gene</th><th>log₂FC</th><th>padj</th></tr>
-                        <tr><td>IL6</td><td class="up">+3.1</td><td>2e-11</td></tr>
-                        <tr><td>MMP9</td><td class="up">+2.7</td><td>8e-10</td></tr>
-                        <tr><td>CXCL8</td><td class="up">+2.4</td><td>4e-09</td></tr>
-                        <tr><td>SOD2</td><td class="dn">−1.9</td><td>1e-06</td></tr>
-                      </table>
-                    </div>
-                  </section>
-
-                  <div class="mock__strip">
-                    <span class="chip"><svg class="glyph" width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 2.5l1.4 3.6 3.6 1.4-3.6 1.4L8 12.5 6.6 8.9 3 7.5l3.6-1.4z"/></svg> fix DESeq2</span>
-                    <span class="chip attn"><svg class="glyph" width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.4 4.8L3.6 8l2.8 3.2M9.6 4.8L12.4 8l-2.8 3.2"/></svg> refactor · needs you</span>
-                    <span class="strip-right">3 sessions · daemon healthy</span>
+                  <div class="wb-right">
+                    <section class="wb-pane wb-preview-pane" aria-label="Sample file viewer">
+                      <div class="wb-pane-bar"><div class="wb-tabs" id="wb-tabs" role="tablist" aria-label="Open sample files"></div><button type="button" class="wb-icon-button" data-action="focus-file" aria-label="Expand file pane" title="Expand file pane"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 2H2v4m8-4h4v4M2 10v4h4m8-4v4h-4"/></svg></button></div>
+                      <div class="wb-preview-toolbar"><span id="wb-path">docs / brief.md</span><button type="button" id="wb-source" data-action="source" aria-pressed="false" hidden>Source</button><button type="button" id="wb-ref-button" data-action="reference">Reference file</button></div>
+                      <div class="wb-preview" id="wb-preview" role="tabpanel" tabindex="0"><div class="wb-page"><h2>Project atlas</h2><p>Project notes, source data, and outputs in one workspace.</p></div></div>
+                    </section>
+                    <section class="wb-pane wb-browser-pane" aria-label="Sample browser pane">
+                      <div class="wb-pane-bar"><span class="wb-tab wb-tab--active"><span aria-hidden="true">◎</span>localhost:5173</span><button type="button" class="wb-icon-button" data-action="focus-browser" aria-label="Expand browser pane" title="Expand browser pane"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 2H2v4m8-4h4v4M2 10v4h4m8-4v4h-4"/></svg></button></div>
+                      <div class="wb-browser-toolbar"><button type="button" class="wb-icon-button" data-action="reload-browser" aria-label="Reload sample browser"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13 6a5 5 0 1 0 0 5M13 2v4H9"/></svg></button><span class="wb-browser-address">localhost:5173/overview</span></div>
+                      <div class="wb-browser-content" id="wb-browser-content"><div class="wb-page"><h3>Project atlas</h3><p>Interactive overview</p></div></div>
+                    </section>
                   </div>
                 </div>
               </div>
+              <span id="wb-status" class="wb-sr-only" aria-live="polite"></span>
             </div>
-          </div>
+            <figcaption>Interactive preview. Sample files and conversations.</figcaption>
+          </figure>
         </div>
       </section>
 
-      <!-- ===================== WHY ===================== -->
       <section class="section section--tight" id="why">
         <div class="wrap">
-          <div class="section-head" style="max-width: 720px">
-            <span class="eyebrow">why it exists</span>
-            <h2>One tool instead of two half-fits</h2>
-            <p>
-              Running agents on a remote machine usually takes two tools:
-              code-server in a browser tab to read files, and tmux over SSH to
-              keep the agents alive. Browser terminals die on reload. tmux shows
-              no file output. The reports, plots, and tables an agent produces
-              end up nowhere near the session that made them. Chimaera does both
-              jobs in one window, on the machine that owns the work.
-            </p>
+          <div class="section-head">
+            <span class="eyebrow">built around the project</span>
+            <h2>The whole project, within reach.</h2>
+            <p>Open your project. Arrange the files, conversations, and tools you need for the task.</p>
+          </div>
+          <div class="workflow">
+            <div><span class="eyebrow">01 / your project</span><h3>Start with your files.</h3><p>Open a folder on your machine or a remote host. See the project you’re working on.</p></div>
+            <div><span class="eyebrow">02 / your workspace</span><h3>Put the work in view.</h3><p>Open a document, table, image, or app beside the conversation. Arrange the panes to suit the task.</p></div>
+            <div><span class="eyebrow">03 / your agents</span><h3>Choose who you work with.</h3><p>Use your preferred agent, bring files into the conversation, and point directly at what should change.</p></div>
           </div>
         </div>
       </section>
 
-      <!-- ===================== FEATURES ===================== -->
       <section class="section" id="features">
         <div class="wrap">
-          <div class="section-head">
-            <span class="eyebrow">features</span>
-            <h2>What's in it</h2>
-          </div>
-
+          <div class="section-head"><span class="eyebrow">inside the workspace</span><h2>From the first prompt to the next decision.</h2><p>For code, documents, data, and the projects that cross all three.</p></div>
           <div class="features">
-            <article class="feature">
-              <div class="feature__mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a9 9 0 1 0 9 9"/><path d="M12 7v5l3 2"/><path d="M21 3v6h-6"/></svg></div>
-              <h3>Sessions survive disconnect</h3>
-              <div class="feature__body"><p>
-                The daemon holds every PTY with full server-side terminal state.
-                Reload, reconnect, or reattach from another machine and you get
-                the same screen back, with no lost scrollback and no broken
-                reconnect.
-              </p></div>
-            </article>
-
-            <article class="feature">
-              <div class="feature__mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16M4 12h16M4 18h9"/><circle cx="18.5" cy="18" r="2.5"/></svg></div>
-              <h3>One launcher for your agents</h3>
-              <div class="feature__body"><p>
-                Claude Code, Codex, Gemini CLI, and Antigravity, each detected
-                if installed, resumable per workspace, and installable from
-                official sources. Binaries live under <code>~/.chimaera</code>,
-                and your credentials stay yours.
-              </p></div>
-            </article>
-
-            <article class="feature">
-              <div class="feature__mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 15a2 2 0 0 1-2 2H8l-4 4V6a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2z"/><path d="M8 9.5h8M8 12.5h5"/></svg></div>
-              <h3>Chat mode or the real TUI</h3>
-              <div class="feature__body"><p>
-                Every agent runs two ways on one session, a toggle apart. Chat
-                mode, the default, is a rich structured UI: tool cards,
-                permission prompts, rewind, and inline previews of what each
-                turn made. Flip to the real <code>claude</code> or
-                <code>codex</code> TUI and it looks, behaves, and bills exactly
-                like your terminal.
-              </p></div>
-            </article>
-
-            <article class="feature">
-              <div class="feature__mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 15l4-4 4 4 3-3 4 4"/><circle cx="8" cy="9" r="1.4"/></svg></div>
-              <h3>Previews and a real file manager</h3>
-              <div class="feature__body"><p>
-                Rich previews for the files agents make: images, Markdown,
-                CSV/TSV, PDF, notebooks, and HTML reports, down to the
-                MultiQC/FastQC output that usually forces a code-server install.
-                It doubles as a real file manager: create, rename, drag to
-                reference, and download outputs from a remote.
-              </p></div>
-            </article>
-
-            <article class="feature">
-              <div class="feature__mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="5" r="2.2"/><circle cx="6" cy="19" r="2.2"/><circle cx="18" cy="8.5" r="2.2"/><path d="M6 7.2v9.6M18 10.7a6 6 0 0 1-6 6H8.2"/></svg></div>
-              <h3>Git, built in</h3>
-              <div class="feature__body"><p>
-                A source-control panel with side-by-side diffs, worktree create
-                and remove, a branch per agent, and a session-scoped view of
-                exactly what an agent changed. The review side of git, without
-                leaving the workbench.
-              </p></div>
-            </article>
-
-            <article class="feature">
-              <div class="feature__mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7.5" height="7.5" rx="1"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="1"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="1"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="1"/></svg></div>
-              <h3>A real workbench layout</h3>
-              <div class="feature__body"><p>
-                Split panes, tabs, drag-and-drop, focus mode, and a session
-                strip that says where you are. Terminals and file previews are
-                the same kind of surface, so you arrange them however the work
-                wants.
-              </p></div>
-            </article>
-
+            <article class="feature"><span class="eyebrow">agents + coordination</span><h3>Choose your agent. Keep your workspace.</h3><p>Chimaera runs your own Claude Code, Codex, Antigravity, or Grok Build, with the skills and connections configured on the workspace’s host. Keep your setup and give it a workspace.</p><a href="docs.html#agents">Meet the agent workspace →</a></article>
+            <article class="feature"><span class="eyebrow">files + feedback</span><h3>Work with what they make.</h3><p>Documents, spreadsheets, PDFs, images, notebooks, diagrams, and media beside the chat. Select a passage, region, or cell to give precise feedback. Edit text and Markdown in place.</p><a href="docs.html#previews">Explore files and previews →</a></article>
+            <article class="feature"><span class="eyebrow">context + continuity</span><h3>Put your project files to work.</h3><p>Reference a file, a passage, or a region in the conversation. Keep notes and decisions nearby, and follow the work through session history and Timeline.</p><a href="docs.html#knowledge">Put project context to work →</a></article>
+            <article class="feature"><span class="eyebrow">tools + review</span><h3>Keep your hands on the work.</h3><p>Persistent terminals, Git diffs and history, worktrees, and live web apps in panes. Give an agent access to a specific shell, with its commands visible to you.</p><a href="docs.html#git">Review and run the work →</a></article>
+            <article class="feature"><span class="eyebrow">local + remote</span><h3>Go where the work is.</h3><p>Start with a folder on your machine. Connect a server over SSH, or open workspaces inside Slurm jobs. Bring the same agents, files, and tools to each project.</p><a href="docs.html#connect">Connect your machines →</a></article>
+            <article class="feature"><span class="eyebrow">extensions + skills</span><h3>Make room for your workflow.</h3><p>Bring project Knowledge into view. Compile LaTeX and Typst to PDF beside the source. Add agent skills and connections, or build new tools and views with the extension platform.</p><a href="docs.html#extensions">Extend the workbench →</a></article>
           </div>
         </div>
       </section>
 
-      <!-- ===================== HOW IT WORKS ===================== -->
+      <section class="section" id="knowledge">
+        <div class="wrap">
+          <div class="showcase project-context">
+            <figure class="context-view" aria-label="Illustrative Timeline and Knowledge views">
+              <div class="context-view__head"><span>project atlas</span><span>Project context</span></div>
+              <div class="context-view__timeline" data-nosnippet>
+                <div class="context-view__label"><h3>Timeline</h3><span>Today</span></div>
+                <div class="context-event"><span class="context-event__time">10:24</span><div><strong>Summary and chart completed</strong><span>Claude Code · report.md · figure.svg</span></div></div>
+                <div class="context-event"><span class="context-event__time">10:27</span><div><strong>Report reviewed against the source</strong><span>Codex · results.csv</span></div></div>
+              </div>
+              <div class="context-view__knowledge" data-nosnippet>
+                <div class="context-view__label"><h3>Knowledge</h3><span>From project files</span></div>
+                <div class="context-note"><span class="eyebrow">decision</span><p>Keep the source table alongside every report.</p></div>
+                <div class="context-note"><span class="eyebrow">handoff</span><p>Report reviewed. Next: compare with last month.</p></div>
+              </div>
+              <figcaption>Illustrative project activity and recorded knowledge</figcaption>
+            </figure>
+            <div class="showcase__body">
+              <span class="eyebrow">knowledge + extensions</span>
+              <h2>Put your project knowledge in view.</h2>
+              <p>Follow project activity in Timeline. Use Knowledge extensions to browse the findings, decisions, and handoffs recorded in your files.</p>
+              <p>Extensions add new views, file viewers, and tools for your agents. Choose the ones that suit your work, or build your own.</p>
+              <div class="context-links"><a href="docs.html#knowledge">Explore project context <span aria-hidden="true">→</span></a><a href="docs.html#extensions">Explore extensions <span aria-hidden="true">→</span></a></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
       <section class="section" id="how">
         <div class="wrap">
-          <div class="section-head">
-            <span class="eyebrow">how it works</span>
-            <h2>The daemon owns the sessions. Windows are views.</h2>
-          </div>
-
-          <div class="showcase">
-            <div class="showcase__body">
-              <span class="eyebrow">local or remote</span>
-              <h2>Connect over your own SSH</h2>
-              <p>
-                <code>chimaera connect &lt;host&gt;</code> shells out to your
-                system <code>ssh</code>, so ProxyJump, ControlMaster, and 2FA
-                from <code>~/.ssh/config</code> all work as-is. The daemon
-                installs into <code>~/.chimaera</code> on the host, with no root
-                and no containers.
-              </p>
-              <ul class="checklist">
-                <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg><span><b>Install-if-missing.</b> Detects the target with <code>uname</code> and drops in the right static binary.</span></li>
-                <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg><span><b>Start-or-attach.</b> Reuses a running daemon, tunnels the port, opens the UI.</span></li>
-                <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg><span><b>Self-updating.</b> An outdated remote daemon is replaced on connect. An idle shell holding an environment is never killed without asking.</span></li>
-              </ul>
+          <div class="workspace-reach">
+            <div class="workspace-reach__copy">
+              <span class="eyebrow">local + remote</span>
+              <h2>Your workspace,<br>wherever the work lives.</h2>
+              <p>Open a folder on your laptop or connect to a remote machine. Work with the files, agents, and tools on that host from the same app.</p>
+              <a href="docs.html#connect">Explore remote workspaces <span aria-hidden="true">→</span></a>
             </div>
-            <div class="showcase__media">
-              <div class="codecard">
-                <div class="codecard__bar">
-                  <div class="mock__dots"><i></i><i></i><i></i></div>
-                  <span class="name">zsh · your laptop</span>
-                </div>
-                <pre><code><span class="c"># run it locally</span>
-<span class="p">$</span> chimaera serve
-  <span class="c">→ workbench on http://127.0.0.1:9700</span>
-
-<span class="c"># or drive a remote host: HPC login node, dev box, anything</span>
-<span class="p">$</span> chimaera connect <span class="s">gpu-node</span>
-  <span class="c">→ installing daemon in ~/.chimaera … ok</span>
-  <span class="c">→ tunnelling :9700 … ok</span>
-  <span class="c">→ opening workbench</span></code></pre>
+            <div class="workspace-hosts">
+              <div class="workspace-host">
+                <svg viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><rect x="6" y="5" width="20" height="16" rx="2"/><path d="M3 26h26l-3-5H6l-3 5Z"/><path d="M13 24h6"/></svg>
+                <div><h3>On your machine</h3><p>Your local folders and agent setup.</p><span class="workspace-host__detail">macOS · Linux · Windows (beta)</span></div>
+                <span class="workspace-host__badge">Local</span>
               </div>
-            </div>
-          </div>
-
-          <div class="showcase showcase--flip">
-            <div class="showcase__body">
-              <span class="eyebrow">built for shared machines</span>
-              <h2>One static binary. Old glibc. No root.</h2>
-              <p>
-                The daemon cross-compiles to fully static musl binaries (x86_64
-                and aarch64) that run on old HPC systems, verified on a cluster
-                running glibc 2.17 with no root. It is built to live on a shared
-                login node: bounded allocations, hard ceilings on preview
-                extraction, and about 150&nbsp;MB RSS at steady state.
-              </p>
-              <ul class="checklist">
-                <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg><span><b>NFS-safe state.</b> Append-only, size-capped JSONL under <code>~/.chimaera</code>, so there is no SQLite near Lustre.</span></li>
-                <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg><span><b>Good citizen.</b> No busy loops, no unbounded buffers.</span></li>
-                <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg><span><b>Native app included.</b> A Tauri shell wraps the same UI with a home screen of workspaces and one-click connect. It auto-updates; quitting kills nothing.</span></li>
-              </ul>
-            </div>
-            <div class="showcase__media">
-              <div class="codecard">
-                <div class="codecard__bar">
-                  <div class="mock__dots"><i></i><i></i><i></i></div>
-                  <span class="name">login-node · CentOS 7.9</span>
-                </div>
-                <pre><code><span class="p">$</span> ldd ./chimaera
-  <span class="c">not a dynamic executable</span>
-
-<span class="p">$</span> ./chimaera serve --port 9700
-  <span class="c">chimaera 0.1 · build a1b9f3c</span>
-  <span class="c">workspaces: 2 · sessions: 5 (3 live)</span>
-  <span class="c">listening on 127.0.0.1:9700</span></code></pre>
+              <div class="workspace-host workspace-host--remote">
+                <svg viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><rect x="5" y="4" width="22" height="10" rx="2"/><rect x="5" y="18" width="22" height="10" rx="2"/><path d="M10 9h1m4 0h7M10 23h1m4 0h7"/></svg>
+                <div><h3>On a remote host</h3><p>Your remote files, agents, and tools.</p><span class="workspace-host__detail">Connect with your existing SSH configuration</span></div>
+                <span class="workspace-host__badge">SSH</span>
               </div>
+              <div class="workspace-compute"><span>Need more compute?</span><a href="docs.html#clusters">Open a workspace inside a Slurm job <span aria-hidden="true">↗</span></a></div>
             </div>
           </div>
         </div>
@@ -448,7 +334,7 @@
             <span class="eyebrow">download</span>
             <h2>Get chimaera</h2>
             <p>
-              The native app bundles the daemon and auto-updates itself. The
+              The native app bundles the daemon and offers signed updates. The
               standalone daemon binaries are for remote hosts, and
               <code>chimaera connect</code> installs them for you.
             </p>
@@ -461,14 +347,14 @@
                 <p>
                   The workbench in real windows: a home screen of workspaces and
                   remote hosts, one-click connect, and signature-verified
-                  auto-update on launch.
+                  updates.
                 </p>
                 <div class="dl__release" id="release-tag">latest release · native app</div>
                 <a class="btn btn--primary dl__mainbtn" id="dl-app" href="https://github.com/martinappberg/chimaera/releases/latest" target="_blank" rel="noopener">
                   <svg id="dl-app-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M16.4 12.6c0-2.3 1.9-3.4 2-3.5-1.1-1.6-2.8-1.8-3.4-1.8-1.4-.1-2.8.9-3.5.9-.7 0-1.8-.8-3-.8-1.5 0-2.9.9-3.7 2.3-1.6 2.7-.4 6.8 1.1 9 .7 1.1 1.6 2.3 2.7 2.2 1.1 0 1.5-.7 2.8-.7 1.3 0 1.6.7 2.8.7 1.1 0 1.9-1.1 2.6-2.2.8-1.2 1.2-2.5 1.2-2.5-.1 0-2.3-.9-2.3-3.5zM14.2 5.6c.6-.7 1-1.8.9-2.8-.9 0-2 .6-2.6 1.3-.6.7-1 1.7-.9 2.7 1 .1 2-.5 2.6-1.2z"/></svg>
                   <span id="dl-app-label">Download for macOS</span>
                 </a>
-                <div class="dl__note" id="dl-app-note">Apple Silicon · .dmg · auto-updates after install</div>
+                <div class="dl__note" id="dl-app-note">Apple Silicon · .dmg · signed updates</div>
               </div>
 
               <div class="dl__secondary">
@@ -478,7 +364,7 @@
                     <span class="asset__ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M8 21h8M12 18v3"/></svg></span>
                     <div class="asset__meta">
                       <div class="t">Linux app · x86_64</div>
-                      <div class="d">AppImage · auto-updates · .deb/.rpm on GitHub</div>
+                      <div class="d">AppImage · signed updates · .deb/.rpm on GitHub</div>
                     </div>
                     <a class="asset__dl" id="dl-linux-app" href="https://github.com/martinappberg/chimaera/releases/latest" target="_blank" rel="noopener" aria-label="Download Linux app (AppImage)">
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0l4-4m-4 4l-4-4M4 19h16"/></svg>
@@ -537,11 +423,11 @@
             <div class="codecard">
               <div class="codecard__bar">
                 <div class="mock__dots"><i></i><i></i><i></i></div>
-                <span class="name">build from source · needs Rust + Node</span>
+                <span class="name">build from source · pinned Rust toolchain + Node 22</span>
               </div>
               <pre><code><span class="p">$</span> git clone https://github.com/martinappberg/chimaera
 <span class="p">$</span> cd chimaera
-<span class="p">$</span> npm --prefix web-ui install <span class="k">&amp;&amp;</span> npm --prefix web-ui run build
+<span class="p">$</span> npm --prefix web-ui ci <span class="k">&amp;&amp;</span> npm --prefix web-ui run build
 <span class="p">$</span> cargo build --release -p chimaera
 <span class="p">$</span> ./target/release/chimaera serve</code></pre>
             </div>
@@ -557,26 +443,14 @@
             <h2>Good to know</h2>
           </div>
           <div class="faq">
-            <details class="qa">
-              <summary>How do my agents run and bill?<svg class="plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></summary>
-              <div class="qa__body">Two ways, a toggle apart. In the <strong>real TUI</strong>, an agent runs as the actual <code>claude</code> or <code>codex</code> terminal in a normal PTY, spawned through your login shell with your environment, so it behaves and bills exactly as it does in any terminal. In <strong>chat mode</strong> (the default), Chimaera drives the same CLI over its structured JSON protocol to render the rich chat UI; that path bills like the CLI's structured/headless mode rather than the interactive TUI. Either way, Chimaera never touches your credentials, it just owns the process. One setting (<code>agents.defaultView</code>) picks which mode new sessions open in, and any session flips between the two.</div>
-            </details>
-            <details class="qa">
-              <summary>Do my credentials go through Chimaera?<svg class="plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></summary>
-              <div class="qa__body">No. Credentials stay yours. They live in your <code>HOME</code> and login-shell environment, independent of who installed the agent binary. Chimaera can install and update agent CLIs from official sources, but never touches your auth.</div>
-            </details>
-            <details class="qa">
-              <summary>Is it only for HPC?<svg class="plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></summary>
-              <div class="qa__body">No. It is a general tool for running agents wherever the work lives. HPC login nodes are the founding stress test (old glibc, no root, shared machines), which is why it also behaves well on a laptop or a plain dev server.</div>
-            </details>
-            <details class="qa">
-              <summary>What platforms are supported?<svg class="plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></summary>
-              <div class="qa__body">macOS, Linux, and Windows (beta). The app ships for macOS (Apple Silicon), Linux (AppImage / .deb / .rpm), and Windows (an NSIS installer, beta); the daemon ships as static musl binaries for x86_64 and aarch64 Linux plus an aarch64 macOS build. On Windows the daemon runs inside WSL2, so expect a couple of first-run setup steps. See the <a href="docs.html#platforms">docs</a>.</div>
-            </details>
-            <details class="qa">
-              <summary>What's the license?<svg class="plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></summary>
-              <div class="qa__body">GNU AGPL-3.0, free to use, self-host, and modify. For a closed-source product or service built on Chimaera, a commercial license is available: <a href="mailto:mkjberg@gmail.com">get in touch</a>. Contributions require a CLA.</div>
-            </details>
+            <details class="qa"><summary>What kind of tool is Chimaera?<svg class="plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></summary><div class="qa__body">An agent workbench: a folder-centered place to work with agents and their outputs. It combines conversations, file viewing, lightweight editing, terminals, review, and project context. Start with one agent and a local folder; add more agents, remote machines, or extensions when they help.</div></details>
+            <details class="qa"><summary>Which agents can I use?<svg class="plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></summary><div class="qa__body">Chimaera runs Claude Code, Codex, Antigravity, and Grok Build themselves, using your provider accounts and the skills and connections configured on the workspace’s host. Claude Code and Codex also support switching between chat and their real terminal UI. See <a href="docs.html#agents">agent support</a>.</div></details>
+            <details class="qa"><summary>How do accounts and billing work?<svg class="plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></summary><div class="qa__body">Use your own agent-provider accounts on the host where the agents run. Chimaera launches the agent CLIs using those accounts. Your provider handles authentication, usage limits, and billing for the mode you use.</div></details>
+            <details class="qa"><summary>How does it keep project context together?<svg class="plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></summary><div class="qa__body">Session history and Timeline connect the work to the agents and files involved. With a knowledge plugin enabled, you can browse recorded findings, decisions, and handoffs beside the project. Your files remain on the workspace’s host, with uploads and downloads for moving them where you need them.</div></details>
+            <details class="qa"><summary>What can I work on?<svg class="plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></summary><div class="qa__body">You can use a local folder for writing, working with data, building software, or mixed projects. Remote hosts and Slurm jobs extend where that workspace can run. They are optional.</div></details>
+            <details class="qa"><summary>What platforms are supported?<svg class="plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></summary><div class="qa__body">macOS on Apple Silicon, Linux (AppImage, .deb, and .rpm), and Windows in beta with a WSL2 daemon. See <a href="docs.html#platforms">platform setup</a>. Chimaera is pre-release and moving quickly.</div></details>
+            <details class="qa"><summary>What is the license?<svg class="plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></summary><div class="qa__body">GNU AGPL-3.0. See the <a href="https://github.com/martinappberg/chimaera/blob/main/LICENSE">license</a> for terms. A commercial license is also available; <a href="mailto:mkjberg@gmail.com">contact the author</a>. Contributions require a CLA.</div></details>
+
           </div>
         </div>
       </section>
@@ -591,7 +465,7 @@
               <svg class="hexmark" width="24" height="24" viewBox="0 0 240 240" aria-hidden="true"><g fill="none" stroke="var(--bm-1)" stroke-width="15" stroke-linecap="round" stroke-linejoin="round"><path d="M120 46 L186 84 L186 156 L120 194 L54 156 L54 84 Z"/><path d="M151.4 154.9 A 47 47 0 1 1 151.4 85.1"/></g></svg>
               <span class="wordmark" style="font-size: 16px">chimaera</span>
             </a>
-            <p>Your agent workbench. Persistent coding-agent sessions and their outputs, on the host that owns the work.</p>
+            <p>Your agents, their outputs, and your project context. Together in one workspace.</p>
           </div>
           <div class="footer__cols">
             <div class="footer__col">
@@ -605,7 +479,7 @@
               <h4>project</h4>
               <a href="https://github.com/martinappberg/chimaera" target="_blank" rel="noopener">GitHub</a>
               <a href="https://github.com/martinappberg/chimaera/releases" target="_blank" rel="noopener">Releases</a>
-              <a href="https://github.com/martinappberg/chimaera/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">Contributing</a>
+              <a href="https://github.com/martinappberg/chimaera/blob/main/.github/CONTRIBUTING.md" target="_blank" rel="noopener">Contributing</a>
             </div>
             <div class="footer__col">
               <h4>legal</h4>
@@ -621,6 +495,10 @@
       </div>
     </footer>
 
-    <script src="assets/js/site.js" defer></script>
+    <script src="assets/js/site.js?v=20261001" defer></script>
+    <script src="assets/js/demo-icons.js?v=20261001" defer></script>
+    <script src="assets/js/demo-previews.js?v=20261001" defer></script>
+    <script src="assets/js/demo.js?v=20261001.1" defer></script>
+    <script src="assets/js/demo-scroll.js?v=20261001" defer></script>
   </body>
 </html>

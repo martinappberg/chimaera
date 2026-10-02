@@ -1,7 +1,7 @@
 <script lang="ts">
   /**
    * Where a file meets the plugins active in its workspace
-   * (docs/plugin-platform-plan.md §5): a file a plugin claims (`[[files]]`)
+   * (docs/design/plugin-platform-plan.md §5): a file a plugin claims (`[[files]]`)
    * opens in that plugin's file view, with **Text** one click away; two
    * plugins claiming it offer the choice, remembered per workspace and file
    * kind. The bar above also carries the claiming plugins' status chips

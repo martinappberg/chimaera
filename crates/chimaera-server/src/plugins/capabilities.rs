@@ -1,6 +1,6 @@
 //! What a plugin can do, derived from its manifest: the one list the card
 //! shows, the trust prompt asks about, and the host enforces. Design:
-//! docs/plugin-platform-plan.md §1 ("Capabilities").
+//! docs/design/plugin-platform-plan.md §1 ("Capabilities").
 //!
 //! - **Atoms.** Each capability is one atom, a short JSON array such as
 //!   `["access","files","read"]` or `["agent-tool","knowledge_search"]`. A plugin's

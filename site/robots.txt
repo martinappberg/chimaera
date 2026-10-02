@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://chimaera.sh/sitemap.xml

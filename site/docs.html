@@ -3,32 +3,92 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Docs · Chimaera</title>
+    <meta name="robots" content="max-image-preview:large" />
+    <title>Chimaera Docs · Install, run, and extend your workspace</title>
     <meta
       name="description"
-      content="Install and run Chimaera: serve locally, connect to a remote host over SSH, use the workbench, and keep everything up to date."
+      content="Install Chimaera, start your first workspace, connect remote hosts over SSH, and use agents, file viewers, extensions, and Slurm jobs."
     />
     <link rel="icon" href="assets/img/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="assets/css/styles.css" />
+    <link rel="stylesheet" href="assets/css/styles.css?v=20261001" />
     <link rel="canonical" href="https://chimaera.sh/docs.html" />
+    <link rel="sitemap" type="application/xml" href="sitemap.xml" />
     <meta property="og:type" content="website" />
     <meta property="og:site_name" content="Chimaera" />
     <meta property="og:locale" content="en_US" />
-    <meta property="og:title" content="Docs · Chimaera" />
-    <meta property="og:description" content="Install and run Chimaera: serve locally, connect over SSH, use the workbench, keep it up to date." />
+    <meta property="og:title" content="Chimaera Docs · Install, run, and extend your workspace" />
+    <meta property="og:description" content="Install Chimaera, start your first workspace, connect remote hosts over SSH, and use agents, file viewers, extensions, and Slurm jobs." />
     <meta property="og:url" content="https://chimaera.sh/docs.html" />
     <!-- Version this filename when the card changes; social crawlers cache image URLs. -->
-    <meta property="og:image" content="https://chimaera.sh/assets/img/og-agent-workbench-2026-07.png" />
-    <meta property="og:image:secure_url" content="https://chimaera.sh/assets/img/og-agent-workbench-2026-07.png" />
+    <meta property="og:image" content="https://chimaera.sh/assets/img/og-workspace-2026-10.png" />
+    <meta property="og:image:secure_url" content="https://chimaera.sh/assets/img/og-workspace-2026-10.png" />
     <meta property="og:image:type" content="image/png" />
     <meta property="og:image:width" content="1200" />
     <meta property="og:image:height" content="630" />
-    <meta property="og:image:alt" content="Chimaera — your agent workbench" />
+    <meta property="og:image:alt" content="Chimaera. A workspace for everything you do with agents. Conversations, files, and a browser side by side." />
     <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:title" content="Docs · Chimaera" />
-    <meta name="twitter:description" content="Install and run Chimaera: serve locally, connect over SSH, use the workbench, and keep it up to date." />
-    <meta name="twitter:image" content="https://chimaera.sh/assets/img/og-agent-workbench-2026-07.png" />
-    <meta name="twitter:image:alt" content="Chimaera — your agent workbench" />
+    <meta name="twitter:title" content="Chimaera Docs · Install, run, and extend your workspace" />
+    <meta name="twitter:description" content="Install Chimaera, start your first workspace, connect remote hosts over SSH, and use agents, file viewers, extensions, and Slurm jobs." />
+    <meta name="twitter:image" content="https://chimaera.sh/assets/img/og-workspace-2026-10.png" />
+    <meta name="twitter:image:alt" content="Chimaera. A workspace for everything you do with agents. Conversations, files, and a browser side by side." />
+    <script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "WebSite",
+      "@id": "https://chimaera.sh/#website",
+      "url": "https://chimaera.sh/",
+      "name": "Chimaera",
+      "alternateName": "chimaera",
+      "inLanguage": "en",
+      "description": "A workspace for everything you do with agents."
+    },
+    {
+      "@type": "WebPage",
+      "@id": "https://chimaera.sh/docs.html#webpage",
+      "url": "https://chimaera.sh/docs.html",
+      "name": "Chimaera Docs · Install, run, and extend your workspace",
+      "description": "Install Chimaera, start your first workspace, connect remote hosts over SSH, and use agents, file viewers, extensions, and Slurm jobs.",
+      "inLanguage": "en",
+      "isPartOf": {
+        "@id": "https://chimaera.sh/#website"
+      },
+      "about": {
+        "@id": "https://chimaera.sh/#software"
+      },
+      "primaryImageOfPage": {
+        "@type": "ImageObject",
+        "url": "https://chimaera.sh/assets/img/og-workspace-2026-10.png",
+        "width": 1200,
+        "height": 630
+      },
+      "breadcrumb": {
+        "@id": "https://chimaera.sh/docs.html#breadcrumbs"
+      }
+    },
+    {
+      "@type": "BreadcrumbList",
+      "@id": "https://chimaera.sh/docs.html#breadcrumbs",
+      "itemListElement": [
+        {
+          "@type": "ListItem",
+          "position": 1,
+          "name": "Chimaera",
+          "item": "https://chimaera.sh/"
+        },
+        {
+          "@type": "ListItem",
+          "position": 2,
+          "name": "Documentation",
+          "item": "https://chimaera.sh/docs.html"
+        }
+      ]
+    }
+  ]
+}
+    </script>
+
     <script>
       (function () {
         try {
@@ -53,9 +113,9 @@
           <span class="wordmark">chimaera</span>
         </a>
         <nav class="nav__links" aria-label="Primary">
-          <a href="index.html#features">Features</a>
-          <a href="index.html#how">How it works</a>
-          <a href="index.html#download">Download</a>
+          <a href="./#features">Features</a>
+          <a href="./#how">How it works</a>
+          <a href="./#download">Download</a>
           <a href="docs.html" aria-current="page">Docs</a>
         </nav>
         <div class="nav__actions">
@@ -67,27 +127,27 @@
             <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5A11.5 11.5 0 0 0 .5 12a11.5 11.5 0 0 0 7.86 10.92c.58.1.79-.25.79-.55v-2c-3.2.7-3.88-1.37-3.88-1.37-.53-1.34-1.3-1.7-1.3-1.7-1.06-.72.08-.71.08-.71 1.17.08 1.79 1.2 1.79 1.2 1.04 1.79 2.73 1.27 3.4.97.1-.76.41-1.27.74-1.56-2.55-.29-5.24-1.28-5.24-5.68 0-1.25.45-2.28 1.19-3.08-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.18 1.18a11 11 0 0 1 5.8 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.8 1.19 1.83 1.19 3.08 0 4.41-2.69 5.38-5.25 5.67.42.36.8 1.08.8 2.18v3.23c0 .31.2.66.8.55A11.5 11.5 0 0 0 23.5 12 11.5 11.5 0 0 0 12 .5z" /></svg>
             <span>GitHub</span>
           </a>
-          <button class="icon-btn nav__burger" id="burger" type="button" aria-label="Open menu">
+          <button class="icon-btn nav__burger" id="burger" type="button" aria-label="Open menu" aria-controls="sheet" aria-expanded="false">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18" /></svg>
           </button>
         </div>
       </div>
     </header>
 
-    <div class="sheet" id="sheet" aria-hidden="true">
+    <div class="sheet" id="sheet" aria-hidden="true" inert>
       <div class="sheet__scrim" data-close></div>
-      <div class="sheet__panel">
+      <div class="sheet__panel" role="dialog" aria-modal="true" aria-label="Navigation">
         <div class="sheet__head">
           <span class="wordmark" style="font-size: 17px">chimaera</span>
           <button class="icon-btn" data-close type="button" aria-label="Close menu" style="margin-left: auto">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" /></svg>
           </button>
         </div>
-        <a href="index.html#features" data-close>Features</a>
-        <a href="index.html#how" data-close>How it works</a>
-        <a href="index.html#download" data-close>Download</a>
+        <a href="./#features" data-close>Features</a>
+        <a href="./#how" data-close>How it works</a>
+        <a href="./#download" data-close>Download</a>
         <a href="docs.html" data-close>Docs</a>
-        <a class="btn btn--primary" href="index.html#download" data-close>Get chimaera</a>
+        <a class="btn btn--primary" href="./#download" data-close>Get chimaera</a>
       </div>
     </div>
 
@@ -97,21 +157,28 @@
         <h4>Getting started</h4>
         <a href="#what">What it is</a>
         <a href="#install">Install</a>
+        <a href="#first-workspace">Your first workspace</a>
         <a href="#serve">Run locally</a>
         <a href="#connect">Connect to a remote host</a>
         <h4>Using it</h4>
         <a href="#workspaces">Workspaces &amp; windows</a>
+        <a href="#dashboard">Dashboard &amp; coordination</a>
         <a href="#agents">Agents</a>
         <a href="#chat">Chat mode &amp; the TUI</a>
         <a href="#previews">File previews</a>
         <a href="#files">Files &amp; uploads</a>
         <a href="#git">Git &amp; worktrees</a>
         <a href="#linked">Linked terminals</a>
+        <a href="#knowledge">History &amp; Knowledge</a>
+        <a href="#extensions">Extensions &amp; connections</a>
+        <a href="#clusters">Clusters</a>
         <h4>Operating</h4>
+        <a href="#recovery">Persistence &amp; recovery</a>
         <a href="#updates">Staying current</a>
         <a href="#settings">Settings</a>
         <a href="#platforms">Platforms</a>
         <a href="#faq">Troubleshooting</a>
+        <a href="#develop">Develop &amp; extend</a>
         <a href="#license">License</a>
       </aside>
 
@@ -119,8 +186,8 @@
       <main class="docs__main">
         <h1>Documentation</h1>
         <p class="docs__lede">
-          Everything you need to install Chimaera, run it locally or on a remote
-          host, and drive your agents from one window.
+          A workspace for everything you do with agents. Open a project, start
+          an agent, explore its outputs, and bring your tools and context together.
         </p>
 
         <div class="note">
@@ -128,50 +195,47 @@
         </div>
 
         <h2 id="what">What it is</h2>
-        <p>
-          Chimaera is an <strong>agent workbench</strong>. One static Rust binary
-          (<code>chimaera</code>) is the whole server. It owns your coding-agent
-          sessions as persistent, daemon-owned PTY processes on whatever host owns
-          the work: your laptop, a dev server, or a remote box. Around them it
-          serves a workspace-first web UI with file previews, terminals, and git
-          state.
-        </p>
-        <p>
-          Each agent runs one of two ways on the same session, a toggle apart: a
-          rich <strong>chat UI</strong> (the default), or its <strong>real
-          interactive TUI</strong> in a daemon-owned PTY (see
-          <a href="#chat">Chat mode &amp; the TUI</a>). The daemon owns the sessions
-          and windows are just views, so a closed window or a dropped SSH connection
-          never ends a run. A native Tauri app wraps the same UI in real windows.
-        </p>
+        <p>Chimaera is an <strong>agent workbench</strong>: your agents, the files they work on, and the context of your project in one workspace. Use it to build software, prepare documents, work with data, and carry a project across those activities.</p>
+        <p>A workspace starts with a folder. Open conversations, file previews, terminals, Git views, and web apps beside one another. The dashboard helps you direct several agents; Timeline and Knowledge help you return to the work. Extensions add tools and workflows to the same environment.</p>
+        <p>The native app and browser share the same UI. A server on the workspace’s host owns the sessions and files. It can run on your machine, on a remote server over SSH, or inside a Slurm compute job.</p>
 
         <h2 id="install">Install</h2>
         <h3>Native app (recommended)</h3>
         <p>
           Grab the macOS, Linux, or Windows app from the
-          <a href="index.html#download">download section</a> or the
+          <a href="./#download">download section</a> or the
           <a href="https://github.com/martinappberg/chimaera/releases/latest" target="_blank" rel="noopener">latest release</a>
           (macOS <code>.dmg</code>; Linux AppImage / <code>.deb</code> / <code>.rpm</code>;
           Windows <code>.exe</code> installer, beta). It bundles the daemon, gives
-          you a home screen of workspaces and remote hosts, and auto-updates itself
-          (signature-verified) on launch.
+          you a home screen of workspaces and remote hosts, and offers signature-verified updates.
         </p>
 
         <h3>Build from source</h3>
-        <p>You need stable Rust and Node (see <code>.nvmrc</code> / <code>rust-toolchain.toml</code> for exact versions).</p>
+        <p>Use Node 22 and the Rust toolchain pinned in <code>rust-toolchain.toml</code>.</p>
         <div class="codecard">
           <div class="codecard__bar"><div class="mock__dots"><i></i><i></i><i></i></div><span class="name">build</span></div>
           <pre><code><span class="p">$</span> git clone https://github.com/martinappberg/chimaera
 <span class="p">$</span> cd chimaera
-<span class="p">$</span> npm --prefix web-ui install
+<span class="p">$</span> npm --prefix web-ui ci
 <span class="p">$</span> npm --prefix web-ui run build      <span class="c"># the daemon embeds web-ui/dist</span>
-<span class="p">$</span> cargo build --release -p chimaera</code></pre>
+<span class="p">$</span> cargo build --release -p chimaera
+<span class="p">$</span> ./target/release/chimaera serve</code></pre>
         </div>
         <p>
           If you use <a href="https://github.com/casey/just" target="_blank" rel="noopener">just</a>,
           <code>just serve</code> does the UI build + daemon run in one step, and
           <code>just app-build</code> bundles the native app.
         </p>
+
+        <h2 id="first-workspace">Your first workspace</h2>
+        <ol>
+          <li><strong>Open a folder</strong> from the app’s home screen. Choose a project you want to work on.</li>
+          <li><strong>Start an agent.</strong> Choose a provider in the launcher. Install its CLI if needed, then complete its sign-in flow on the host where the workspace runs.</li>
+          <li><strong>Give it a concrete task.</strong> For example, summarize the files in this folder, improve a document, or make a change to an app.</li>
+          <li><strong>Open the result beside the conversation.</strong> Click a file in the tree or an output in the chat. Select the part you want changed and refer to it in a follow-up.</li>
+          <li><strong>Shape the workspace.</strong> Split a pane, add a terminal, start another agent, or open the dashboard to see where things stand.</li>
+        </ol>
+        <p>Add Knowledge and document tools from <a href="#extensions">Extensions</a> as you need them. The <a href="https://github.com/martinappberg/chimaera/blob/main/docs/features/README.md">feature catalog</a> gives the detailed behavior of each surface.</p>
 
         <h2 id="serve">Run locally</h2>
         <p>Start the daemon; it prints the URL to open.</p>
@@ -217,6 +281,8 @@
           click (probe → auto-install → start → tunnel, shown as progress states).
         </p>
 
+        <p>When the host is a cluster, Chimaera opens its <a href="#clusters">cluster workflow</a> so you can start a compute job and open workspaces inside it.</p>
+
         <h2 id="workspaces">Workspaces &amp; windows</h2>
         <p>
           A <strong>window is a workspace</strong>: a folder, local or remote.
@@ -232,76 +298,38 @@
           <li>Layout is per-window view state, owned by the daemon and restored when you return.</li>
         </ul>
 
+        <h2 id="dashboard">Dashboard &amp; coordination</h2>
+        <p>Open <strong>Dashboard</strong> in the rail (or press <kbd>⌘/Ctrl 0</kbd>) to see <strong>Needs you</strong>, <strong>Since you left</strong>, and the running agents. Answer supported chat permissions inline, or jump into a conversation for a question or review.</p>
+        <p>Agents in the same workspace can see each other’s recent work and exchange messages. Settings → Agents controls communication and whether a message may wake an idle agent. A wake starts a provider turn.</p>
+        <p>Add a <strong>Mastermind</strong> when you want a coordinator. Ask it to brief you, read the workspace’s activity, or help direct work across agents. You choose its authority; the workspace’s attention controls keep decisions visible.</p>
+
         <h2 id="agents">Agents</h2>
-        <p>
-          The launcher detects the agent CLIs you have installed and can install or
-          update them from official sources (curated scripts, checksum-verified,
-          never <code>sudo</code>). Binaries live under <code>~/.chimaera</code>, and
-          your credentials stay entirely yours (in <code>HOME</code> and your
-          login-shell environment).
-        </p>
+        <p>Chimaera launches the agent’s own runtime in your workspace, using that host’s account, environment, project instructions, skills, and configured connections. A local workspace uses your local setup; an SSH workspace uses your setup on the remote host. The launcher detects installed agent CLIs and offers managed install and update flows from their official sources.</p>
         <ul>
-          <li><strong>Claude Code</strong> (<code>claude</code>) and <strong>Codex</strong>: first-class, and run in chat mode or as the real TUI.</li>
-          <li><strong>Gemini CLI</strong> and <strong>Antigravity</strong> (<code>agy</code>): detected and launchable as TUIs, but not yet first-class (no managed install or attention state).</li>
-          <li><strong>Plain shells</strong>: first-class workspace sessions too.</li>
+          <li><strong>Claude Code</strong> and <strong>Codex</strong>: structured chat and real terminal sessions, with conversation switching between those views.</li>
+          <li><strong>Antigravity</strong> and <strong>Grok Build</strong>: structured chat through ACP, plus their CLI launch paths. Use chat for Chimaera’s workspace messaging integration.</li>
+          <li><strong>Plain shells</strong>: workspace terminals for running commands directly or linking to an agent.</li>
         </ul>
-        <p>
-          Run as many as you want side by side. Each agent's state becomes an
-          <strong>attention signal</strong> so a rail badge and the session strip
-          tell you which one is waiting on you, and approval always happens in
-          context, never out of band. Sessions auto-name after what they're actually
-          doing, and ended conversations drop into a per-workspace Recents list you
-          can resume from.
-        </p>
+        <p>Chimaera adds workspace tools for agent communication, linked terminals, and extensions. Models, reasoning controls, permissions, and resume behavior follow each provider’s integration. The launcher and chat show the controls available for that agent. Sign-in, usage limits, and billing are governed by the provider; Chimaera does not include model usage.</p>
 
         <h2 id="chat">Chat mode &amp; the TUI</h2>
-        <p>
-          Every agent runs one of two ways on the same session, a toggle apart. New
-          sessions open in <strong>chat mode</strong> by default; the setting
-          <code>agents.defaultView</code> changes that, and any session flips between
-          the two live.
-        </p>
-        <ul>
-          <li>
-            <strong>Chat mode</strong> drives the CLI over its structured JSON
-            protocol (Claude Code over <code>stream-json</code>, Codex over
-            <code>codex app-server</code>) and renders a first-class chat UI:
-            streamed thinking, tool cards, permission and question prompts,
-            model/effort pickers, rewind, and inline previews of the files each turn
-            produced. It reconnects losslessly, so a dropped socket never loses the
-            transcript.
-          </li>
-          <li>
-            <strong>The real TUI</strong> runs the actual <code>claude</code> /
-            <code>codex</code> terminal in a daemon-owned PTY: full CLI fidelity, and
-            it bills exactly like the interactive terminal.
-          </li>
-        </ul>
-        <p>
-          <strong>Rewind (Claude):</strong> hover a past message to revert the files
-          that turn changed, or fork the conversation from that point. Chat sessions
-          survive a disconnect; they do not yet survive a daemon restart, so a
-          restart retires them to Recents for manual resume.
-        </p>
+        <p>New supported agent sessions open in <strong>chat mode</strong> by default. It renders streamed responses, tool calls, permission prompts, questions, and file outputs around a composer. Provider-specific controls appear where supported.</p>
+        <p>Claude Code and Codex can switch a conversation between chat and their <strong>real terminal UI</strong>. The switch resumes the conversation in the chosen surface; it is not a simultaneous view of one running process. Antigravity and Grok do not offer that same-session switch.</p>
+        <p>Use <code>agents.defaultView</code> to choose the starting view for new sessions. Saved conversations reopen in their saved view. Failed chats that already contain a prompt or saved conversation retain their error and recovery actions.</p>
+        <p>Rewind and conversation branching are available for supported Claude/Codex operations. See the <a href="https://github.com/martinappberg/chimaera/blob/main/docs/features/chat-mode.md">chat guide</a> for provider-specific behavior.</p>
 
-        <h2 id="previews">File previews</h2>
-        <p>
-          The previews are the reason you can retire code-server. The server
-          extracts and the client renders, so whole files are never loaded into
-          the browser.
-        </p>
+        <h2 id="previews">File previews &amp; precise feedback</h2>
+        <p>Open a file from the tree or chat to view it beside the agent. Split panes and tabs let you compare outputs and keep source material close.</p>
         <ul>
-          <li><strong>Images</strong>: with zoom, pan, and fit.</li>
-          <li><strong>Markdown</strong>: rendered, with an edit/preview toggle.</li>
-          <li><strong>CSV / TSV</strong>: paged tables, gzip and BGZF included.</li>
-          <li><strong>PDF</strong>: bundled viewer, no CDN (air-gapped safe).</li>
-          <li><strong>Notebooks</strong>: <code>.ipynb</code> with outputs.</li>
-          <li><strong>HTML reports</strong>: self-contained and sandboxed, the MultiQC / FastQC class of scientific output.</li>
+          <li><strong>Text and Markdown:</strong> source, reading, and live editing views; math, callouts, linked notes, embeds, and Mermaid diagrams.</li>
+          <li><strong>Tables:</strong> CSV/TSV, compressed text tables, Excel and OpenDocument spreadsheets, and Parquet.</li>
+          <li><strong>Documents:</strong> PDFs, Word documents, PowerPoint decks, and Markdown slide decks.</li>
+          <li><strong>Visuals and media:</strong> images, video, audio, Canvas, Excalidraw, and draw.io documents.</li>
+          <li><strong>Interactive work:</strong> notebooks with outputs, sandboxed HTML reports, and live web apps in browser panes.</li>
         </ul>
-        <p>
-          Lightweight editing is built in (CodeMirror, <kbd>⌘S</kbd> to save, a
-          dirty indicator), enough to fix a script, not a full IDE.
-        </p>
+        <p><strong>Point to the part that matters.</strong> Reference a passage, PDF area, image region, table selection, notebook cell, slide, or media moment in a chat. Chimaera carries the file and location into your feedback.</p>
+        <p>Text and Markdown support lightweight editing with save conflict handling and draft recovery. Other formats use dedicated viewers. Size limits, paging, and bounded reads depend on the format; see <a href="https://github.com/martinappberg/chimaera/blob/main/docs/features/files-and-previews.md">files and previews</a>.</p>
+        <p><strong>Live apps:</strong> open a detected localhost URL from a terminal, or add a browser pane, to use a web app beside your agent. Chimaera’s proxy also reaches apps on the remote workspace’s host.</p>
 
         <h2 id="files">Files &amp; uploads</h2>
         <p>
@@ -317,20 +345,21 @@
 
         <h2 id="git">Git &amp; worktrees</h2>
         <p>
-          A source-control panel for the workspace's repo: a branch header with
+          A source-control panel for repositories in the workspace: a branch header with
           ahead/behind counts, and every changed path grouped into conflicts,
           staged, changes, and untracked. Click any row to open a side-by-side diff
           in an adjacent pane. It is <strong>review-first</strong>: status and diff,
           not stage / commit / push; those stay in a terminal for now.
         </p>
         <ul>
+          <li><strong>History.</strong> Browse repository commits, file history, and branch changes. Session records connect an agent’s work to its changed files and available Git history.</li>
           <li><strong>Worktrees.</strong> Spin a branch into its own openable window: create a worktree under a managed root and spawn an agent or terminal into it. Removal is fenced (managed root only, no live session, clean tree), and the branch itself survives.</li>
           <li><strong>A branch per agent.</strong> The Branches view maps which session runs in which worktree, derived from each session's working directory, so you can jump straight to the agent on another branch.</li>
           <li><strong>Session-scoped changes.</strong> Review exactly what one agent touched, cross-referenced with live git status.</li>
         </ul>
         <p>
-          Refresh is event-driven (a file save, an agent write, a terminal command
-          finishing), never a status poll. Git is resolved through your login shell
+          Refresh follows file saves, agent writes, and completed terminal commands,
+          with a periodic backstop for changes made outside the app. Git is resolved through your login shell
           and needs <strong>version 2.15+</strong>; on old-git or shared-storage
           clusters the panel turns the two common dead-ends (git too old, "dubious
           ownership") into one-step fixes.
@@ -345,6 +374,31 @@
           the link is audited in that terminal's own scrollback so you can see
           exactly what happened.
         </p>
+
+        <h2 id="knowledge">History &amp; Knowledge</h2>
+        <p><strong>All sessions</strong> brings together past agent work, its transcript, timing, and recorded file changes. A project can have session history with or without Git. <strong>Timeline</strong> records agent activity, notable commands, messages, and other workspace events; the dashboard uses it for <strong>Since you left</strong>.</p>
+        <p><strong>Knowledge</strong> appears when an enabled extension provides it, such as Mycelium. It lets you search and browse recorded findings, decisions, conventions, to-dos, and handoffs, follow their source references, and open the underlying files. The provider reads project records; agents create and maintain those records through their own workflows.</p>
+        <p>Open <strong>Extensions</strong>, install and enable a knowledge provider for the workspace, and follow its setup instructions. See <a href="https://github.com/martinappberg/chimaera/blob/main/docs/features/timeline-and-knowledge.md">Timeline and Knowledge</a> for the sources and views.</p>
+
+        <h2 id="extensions">Extensions, skills &amp; connections</h2>
+        <p>The <strong>Extensions</strong> view brings together workbench plugins, agent plugins, skills, and connections. Each extends a different part of your environment.</p>
+        <ul>
+          <li><strong>Workbench plugins</strong> run as WebAssembly components in Chimaera. Install them from the first-party catalog, a repository release, or a local build, then enable them per workspace. Review requested capabilities and trust before granting access.</li>
+          <li><strong>Mycelium, LaTeX, and Typst</strong> are first-party extensions: project Knowledge, and LaTeX/Typst compilation to PDF beside the source with diagnostics and agent tools. Follow the extension’s setup instructions to install its compiler.</li>
+          <li><strong>Agent plugins and skills</strong> are reported by the agents and installed through their native managers. Chimaera makes them visible in the workspace.</li>
+          <li><strong>Connections</strong> shows your agents’ configured MCP services and hosted connectors, with status and provider sign-in flows where available.</li>
+        </ul>
+        <p>Plugin details expose capabilities, activity, updates, and rollback. Developers can add tools, provider data, and plugin UI using the <a href="https://github.com/martinappberg/chimaera/blob/main/docs/agent-guides/plugins.md">extension authoring guide</a>.</p>
+
+        <h2 id="clusters">Clusters</h2>
+        <p>Connect a Slurm cluster from the home screen to open its cluster page. Start a job with the resources and time you need, then open one or more workspaces inside it. Agents and the workspace server run on the compute node; the login node handles short connection and scheduler commands.</p>
+        <p>The cluster page shows jobs, their resources and remaining time, and the workspaces inside them. When a job ends, continue a saved workspace in a new job. Configure startup commands for modules and environments on the host or workspace.</p>
+        <p>Job management uses Slurm. See the <a href="https://github.com/martinappberg/chimaera/blob/main/docs/features/compute.md">cluster guide</a> for setup, reconnection, and site-specific behavior.</p>
+
+        <h2 id="recovery">Persistence &amp; recovery</h2>
+        <p>Closing a workspace window or losing the client connection leaves the server’s agent and terminal processes running. The host doing the work must remain awake and available. Reconnecting restores the view.</p>
+        <p>A daemon restart ends those processes. With <code>daemon.restoreSessions</code> enabled, the ledger restores supported saved conversations and starts fresh shells at their saved locations. Native conversation handles and provider transcripts determine whether a conversation can resume.</p>
+        <p><strong>Pick Up Interrupted Work After a Restart</strong> (<code>chat.resumeAfterRestart</code>) can send a resumed chat a message to continue interrupted work. This starts a turn on your provider account. Shell environments and arbitrary running processes are not checkpointed. See <a href="https://github.com/martinappberg/chimaera/blob/main/docs/features/lifecycle-and-persistence.md">the recovery guide</a>.</p>
 
         <h2 id="updates">Staying current</h2>
         <p>Two things keep themselves current so a running setup keeps pace with releases:</p>
@@ -381,10 +435,9 @@
           <li><strong>Windows (beta):</strong> a native app whose daemon runs the Linux musl binary inside WSL2, reached over localhost. The engine and the SSH-connect path are CI-tested; the first-run wizard and the interop askpass chain haven't had a hands-on pass on retail hardware yet, so it ships as a clearly-labeled <strong>beta</strong> download. Expect to walk through a couple of setup steps on first launch.</li>
         </ul>
         <p>
-          The daemon is built to live on shared login nodes: bounded allocations,
-          hard ceilings on preview extraction, and about 150&nbsp;MB RSS under a
-          core at steady state. Durable state is append-only, size-capped JSONL
-          under <code>~/.chimaera</code>, with no SQLite anywhere near NFS/Lustre.
+          The daemon uses bounded preview extraction and capped state. Durable history uses
+          JSONL and small atomic JSON files under <code>~/.chimaera</code>, suitable for
+          shared filesystems. Cluster workspaces normally run inside compute jobs.
         </p>
 
         <h2 id="faq">Troubleshooting</h2>
@@ -409,6 +462,10 @@
           you normally SSH in); Chimaera reuses it for non-interactive commands.
         </p>
 
+        <h2 id="develop">Develop &amp; extend</h2>
+        <p>For changes to Chimaera itself, start with <a href="https://github.com/martinappberg/chimaera/blob/main/AGENTS.md">AGENTS.md</a> and <a href="https://github.com/martinappberg/chimaera/blob/main/.github/CONTRIBUTING.md">.github/CONTRIBUTING.md</a>. The repository has area maps and matching Claude/Codex workflows for development and live verification.</p>
+        <p>For an extension, use the <a href="https://github.com/martinappberg/chimaera/blob/main/docs/agent-guides/plugins.md">plugin guide for people and agents</a>: choose the extension point, build a component, declare capabilities, install it locally, and verify it in an isolated workspace. The <a href="https://github.com/martinappberg/chimaera/blob/main/docs/README.md">documentation index</a> separates current behavior from historical design plans.</p>
+
         <h2 id="license">License</h2>
         <p>
           Chimaera is licensed under the
@@ -417,7 +474,7 @@
           closed-source product or service on Chimaera, a commercial license is
           available: <a href="mailto:mkjberg@gmail.com">contact the author</a>.
           Contributions require a CLA (see
-          <a href="https://github.com/martinappberg/chimaera/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">CONTRIBUTING.md</a>).
+          <a href="https://github.com/martinappberg/chimaera/blob/main/.github/CONTRIBUTING.md" target="_blank" rel="noopener">.github/CONTRIBUTING.md</a>).
         </p>
 
         <div class="note" style="margin-top: 40px">
@@ -438,7 +495,7 @@
       </div>
     </footer>
 
-    <script src="assets/js/site.js" defer></script>
+    <script src="assets/js/site.js?v=20261001" defer></script>
     <script>
       // Highlight the docs section currently in view.
       (function () {

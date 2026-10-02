@@ -2,7 +2,7 @@
  * Pure helpers for the cluster surfaces (the host row, the cluster page, the
  * start sheet, the folder picker, the workspace window's notices): job and
  * workspace state → plain words, the start sheet's form → a Slurm launch
- * spec, and time formatting. The words follow docs/hpc-portal-plan.md §4:
+ * spec, and time formatting. The words follow docs/design/hpc-portal-plan.md §4:
  * cluster, job, workspace, chats — never server, session, allocation.
  *
  * Generic Slurm only — nothing here knows a site, a partition name, or a

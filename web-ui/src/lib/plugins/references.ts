@@ -1,7 +1,7 @@
 /**
  * Plugins' `references/1` as id-reference sources (shared/references.ts),
  * the registry's second kind of source after the Knowledge snapshot
- * (docs/plugin-platform-plan.md §4): each active plugin that publishes ids
+ * (docs/design/plugin-platform-plan.md §4): each active plugin that publishes ids
  * here registers one source — its id shapes, and its ids resolved to
  * targets that preview and open their span, or open one of its views. Read
  * again when the workspace or its plugins change and on a `references/1`

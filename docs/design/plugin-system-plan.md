@@ -1,10 +1,12 @@
 # The plugin system: WASM plugins on a small host
 
+> **Dated design record.** Use [extensions](../features/plugins.md), the [extension guide](../agent-guides/plugins.md), and area maps when changing the current host. The original WASM design and dated implementation notes below precede the platform expansion and built-in agent communication.
+
 Dated 2026-09-26. A plan with a proof of concept attached: the design below is
 proven by porting the two workbench plugins that exist today (Agent notes,
-Mycelium) to run as WASM components before anything new is built on it. Read
-this first when touching `crates/chimaera-plugin-api`, `crates/chimaera-server/src/plugins/`
-or `plugins/`. The earlier plugin seam (manifests embedded as data, behaviour as
+Mycelium) to run as WASM components before anything new is built on it. It
+records the original design for `crates/chimaera-plugin-api`,
+`crates/chimaera-server/src/plugins/` and `plugins/`. The earlier plugin seam (manifests embedded as data, behaviour as
 named first-party code) is in [timeline-knowledge-plugins-plan.md §6](timeline-knowledge-plugins-plan.md);
 this plan replaces its "named built-in" column. What comes after it (screens,
 programs, side-program installs, and trust in proportion to what a plugin can do) is
@@ -18,8 +20,8 @@ P1 to P3 are built, P4's live proof passed, the first-party plugins live in
 their own repositories, and (2026-09-27, decision 6) the daemon ships only the
 lock that names them, never their bytes: every plugin, first-party or not,
 installs from its release or from a directory. The feature page
-([plugins](features/plugins.md)), the authoring guide
-([agent-guides/plugins.md](agent-guides/plugins.md)) and the maps
+([plugins](../features/plugins.md)), the authoring guide
+([agent-guides/plugins.md](../agent-guides/plugins.md)) and the maps
 (`crates/chimaera-plugin-api/AGENTS.md`, `plugins/AGENTS.md`, the server map)
 describe what shipped; the phases below remain the design record.
 
@@ -513,7 +515,7 @@ updates](#versions-and-updates). The page is the Extensions tab.)
   `repo`, `sha256_wasm`, `sha256_toml`), the only thing of theirs the daemon
   embeds: a user installs each from its release at the pinned version
   (decision 6), and a plugin in development installs from a directory
-  ([plugins/AGENTS.md](../plugins/AGENTS.md)). The `plugins/` cargo workspace
+  ([plugins/AGENTS.md](../../plugins/AGENTS.md)). The `plugins/` cargo workspace
   keeps only the host's test fixture.
 - **A plugin repository** is a claude and codex marketplace repository (so its
   skills, hooks and agent-side pieces install through the agents' own managers,
@@ -567,7 +569,7 @@ visible, checksum-verified download.
   failure shows as the `fault` line — **Install <pinned>** for
   an available plugin, an **Update** chip when one is available, and **Use
   previous** / **Check now** / **Remove** for installed copies. The full
-  field list: [features/plugins.md](features/plugins.md#versions-installs--updates).
+  field list: [features/plugins.md](../features/plugins.md#versions-installs--updates).
 - **Layout:** `~/.chimaera/plugins/<id>/<version>/{plugin.toml,plugin.wasm,SHA256SUMS[,local-path]}`
   (the release's `SHA256SUMS` kept beside the two files; `local-path`, one
   line, only for a copy installed from a directory) with an atomic `current`

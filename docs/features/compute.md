@@ -7,7 +7,7 @@ runs one `chimaera serve` per open workspace. The app (or the CLI) starts, lists
 stops things with short ssh commands; the login node only ever sees those, a read-only
 `chimaera browse` that exits at once, and the user's interactive terminal. Regular remotes
 (dev servers, lab machines, cloud VMs) are unaffected. Design and the maintainer's
-decisions: [docs/hpc-portal-plan.md](../hpc-portal-plan.md).
+decisions: [docs/design/hpc-portal-plan.md](../design/hpc-portal-plan.md).
 
 **Where it lives:** detection and the cluster outcome in `crates/chimaera-remote/src/lib.rs`
 (`sh_scheduler`, `resolve_daemon`, `ClusterHost`, `connect_compute_node`); every cluster

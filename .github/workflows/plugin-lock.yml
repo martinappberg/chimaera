@@ -7,7 +7,7 @@ name: plugin-lock
 # PR auto-merges (squash) only when every bumped plugin is sandboxed and asks
 # for nothing new (the same capability lines as its pinned release); a
 # privileged plugin, or one whose capabilities changed, waits for a person
-# to review it and set its tier and caps (docs/plugin-platform-plan.md §2). Hourly, on demand, and on a `plugin-released` dispatch
+# to review it and set its tier and caps (docs/design/plugin-platform-plan.md §2). Hourly, on demand, and on a `plugin-released` dispatch
 # (a plugin repository may send one after publishing; the schedule covers
 # it otherwise).
 #

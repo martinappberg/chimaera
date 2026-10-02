@@ -1,7 +1,7 @@
 <script lang="ts">
   /**
    * Choose a folder on a cluster to add as a workspace — the only file
-   * browsing outside a workspace window (docs/hpc-portal-plan.md §4.4).
+   * browsing outside a workspace window (docs/design/hpc-portal-plan.md §4.4).
    * Folders only; each listing is one short, read-only `chimaera browse` on
    * the login node (nothing keeps running there). You step into the folder
    * you want and add it, like a native "Choose" dialog.

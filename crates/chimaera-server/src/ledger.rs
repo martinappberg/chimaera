@@ -8,7 +8,7 @@
 //! pinned name) rather than its process. On boot the daemon resurrects from
 //! it: shells respawn at their last cwd, claude agents respawn with
 //! `--resume`, and non-resumable agents retire honestly into Recents instead
-//! of vanishing (DESIGN.md: "cold-restart → re-attach every session via
+//! of vanishing (docs/design/README.md: "cold-restart → re-attach every session via
 //! --resume with preserved cwd").
 //!
 //! Session ids are preserved across the restart. That single property is

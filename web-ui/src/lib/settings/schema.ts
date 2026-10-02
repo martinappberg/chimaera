@@ -238,7 +238,7 @@ const DEFS = {
     ],
     scope: "client",
   },
-  // Agent communication (docs/agent-communication-plan.md §7): one global
+  // Agent communication (docs/design/agent-communication-plan.md §7): one global
   // switch, on by default; the daemon reads both from its cached map.
   "agents.communication.enabled": {
     title: "Agents can see and message each other",

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // The plugin kill switch's keys and signatures (plugins::revoke,
-// docs/plugin-platform-plan.md §2). A fetched plugins/revoked.json counts
+// docs/design/plugin-platform-plan.md §2). A fetched plugins/revoked.json counts
 // only with Ed25519 signatures (plugins/revoked.sig, one hex signature per
 // line) from at least `threshold` of the keys in plugins/revocation-keys.txt,
 // which every chimaera build embeds.

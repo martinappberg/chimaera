@@ -1,6 +1,6 @@
 <script lang="ts">
   /**
-   * The dashboard's plugin panels (docs/plugin-platform-plan.md §3): each
+   * The dashboard's plugin panels (docs/design/plugin-platform-plan.md §3): each
    * active plugin's `[[views]]` with `slot = "panel"`, after core's own
    * sections, headed by the view's title and the plugin's name. Nothing
    * when no active plugin has one.

@@ -1,7 +1,7 @@
 //! Screens in the Chimaera format (`ui/1`): the routes that render a
 //! plugin's view and deliver its actions, the check every tree passes
 //! before a window sees it, and invalidation. Design:
-//! docs/plugin-platform-plan.md §3; every node and prop:
+//! docs/design/plugin-platform-plan.md §3; every node and prop:
 //! docs/agent-guides/plugins.md ("Screens").
 //!
 //! - **Checked on arrival.** A tree is at most `TREE_MAX` bytes and

@@ -1,6 +1,6 @@
 <script lang="ts">
   /**
-   * The agent launcher popover (DESIGN.md "The agent launcher"), opened by
+   * The agent launcher popover (docs/design/README.md "The agent launcher"), opened by
    * the split button's chevron ONLY — hover (~150ms) on the chevron or a
    * click; the main surface is a pure instant spawn and never opens this.
    *

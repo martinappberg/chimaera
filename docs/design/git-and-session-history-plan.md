@@ -1,6 +1,8 @@
 # Git in the workbench, and session history
 
-Dated 2026-09-28. A plan, not a record: nothing here has shipped. It has two parts:
+> **Dated design record.** Git and session-history work shipped in PR #219. Use [Git](../features/git.md) and [session history](../features/session-history.md) for current behavior; the original proposal below can include unimplemented follow-ups.
+
+Dated 2026-09-28. This was written before implementation. It has two parts:
 
 - **Part 1: the core git pieces that are missing.** Several repositories in one
   workspace, history, diffs against any revision, sessions that know their branch,
@@ -17,7 +19,7 @@ The plan was built from a code map of the tree at `09c9ea12`
 ([what exists today](#what-exists-today)) and a survey of how Claude Code, Codex,
 Cursor, Conductor and GitHub Copilot handle worktrees and agent history
 ([prior art](#prior-art)). It shares one route with the plugin platform plan
-(`docs/plugin-platform-plan.md` on `claude/brave-hamilton-afhtt3`, not yet on main):
+(`docs/design/plugin-platform-plan.md`, then on `claude/brave-hamilton-afhtt3` before its merge):
 the log and `rev=` diff that plan adds for the editor's change bars
 ([§2](#2-history), [§3](#3-diffs-against-any-revision)).
 
@@ -29,7 +31,7 @@ the log and `rev=` diff that plan adds for the editor's change bars
 2. **Nothing asks you to use git.** No prompt to commit, branch or open a pull
    request. No "uncommitted changes" warnings. No automatic commits, and no commit per
    turn. No "initialize a repository?" offer.
-3. **Read-only stays** ([git feature page, Intent](features/git.md#intent--human-authored-ground-truth)).
+3. **Read-only stays** ([git feature page, Intent](../features/git.md#intent--human-authored-ground-truth)).
    Chimaera shows git. You and your agents change it, in a terminal or a conversation.
    Creating and removing worktrees stays the one change Chimaera makes itself.
 4. **A worktree stays a dimension of its repository**, never a peer workspace (same
@@ -37,7 +39,7 @@ the log and `rev=` diff that plan adds for the editor's change bars
 5. **Login-node discipline.** Nothing scans a whole tree, nothing polls unless a window
    is watching, and every git call goes through the existing limits: 4 processes, 8 s,
    8 MB. Records are append-only, capped JSONL. See
-   [daemon rules](../.claude/rules/daemon.md).
+   [daemon rules](../../.claude/rules/daemon.md).
 
 ## What exists today
 
@@ -56,7 +58,7 @@ the log and `rev=` diff that plan adds for the editor's change bars
   root (`rev-parse --show-toplevel`). A root that only *contains* repositories shows
   "not a git repository", and repositories nested inside are invisible.
 - **No history.** No log, no commit view, no diff against a commit or a branch base.
-  [DESIGN.md](../DESIGN.md)'s M4 promised a log that was never built.
+  [docs/design/README.md](README.md)'s M4 promised a log that was never built.
 - **Sessions do not know their branch.** Every claude hook payload carries the current
   `cwd`, but `agents.rs` reads only `transcript_path` from it (~526). An agent that
   moves into a worktree is shown where it started.

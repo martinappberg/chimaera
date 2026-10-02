@@ -1,175 +1,218 @@
 <p align="center">
-  <img src="docs/logo.svg" alt="Chimaera" width="112" height="112">
-</p>
-
-<h1 align="center">Chimaera</h1>
-
-<p align="center"><strong>Your agent workbench.</strong></p>
-
-<p align="center">
-  Run Claude Code, Codex, and other coding agents in parallel, each as a rich chat UI or its<br>
-  real terminal, with the files they produce rendered beside them. The daemon keeps every<br>
-  session alive on the host that owns the work, so close the laptop mid-run and nothing dies.
+  <a href="https://chimaera.sh/">
+    <img src="site/assets/img/og-workspace-2026-10.png" alt="Chimaera. A workspace for everything you do with agents. Your agents. Your files. Local or remote." width="1200">
+  </a>
 </p>
 
 <p align="center">
-  <a href="https://chimaera.sh/"><strong>Website</strong></a>
+  <a href="https://chimaera.sh/#download"><strong>Download</strong></a>
+  &nbsp;·&nbsp;
+  <a href="https://chimaera.sh/#workspace">Explore the workspace</a>
   &nbsp;·&nbsp;
   <a href="https://chimaera.sh/docs.html">Docs</a>
   &nbsp;·&nbsp;
-  <a href="https://github.com/martinappberg/chimaera/releases/latest">Download</a>
+  <a href="docs/agent-guides/plugins.md">Build an extension</a>
 </p>
 
 <p align="center">
+  <a href="https://github.com/martinappberg/chimaera/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/martinappberg/chimaera"></a>
   <a href="LICENSE"><img alt="License: AGPL-3.0" src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg"></a>
-  <img alt="Platforms: macOS, Linux, and Windows (beta)" src="https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows%20(beta)-lightgrey.svg">
-  <img alt="Status: pre-release" src="https://img.shields.io/badge/status-pre--release-orange.svg">
+  <img alt="Platforms: macOS, Linux, Windows beta" src="https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows%20(beta)-lightgrey.svg">
 </p>
 
----
+Chimaera is an open-source **agent workbench**. Open a project folder and put your
+agents, files, and tools side by side. Read a document while an agent works on it.
+Inspect a table, review a diff, or run a web app beside the conversation. Work on
+your own machine or connect to a remote host.
 
-Chimaera runs many coding agents at once, keeps them alive on the host that owns the work, and
-shows you what they produced: file previews, terminals, and git state, all in one window. One
-static Rust binary is the whole server; the client is a web UI it serves itself, plus a native
-app that wraps the same UI in real windows. The daemon owns the sessions, and windows are just
-views. Close the laptop mid-run and nothing happens; reconnect, and every session is right
-where you left it.
+It runs your own **Claude Code, Codex, Antigravity, or Grok Build**, with the
+accounts, skills, and connections configured on that host. Your agents do the
+work. Chimaera gives you a place to direct it, see the results, and keep the
+project in view.
 
-Each agent runs one of two ways on the same session, a toggle apart. In **chat mode** (the
-default) Chimaera drives the agent over its structured JSON protocol and renders a first-class
-chat UI: streamed thinking, tool cards, permission prompts, rewind, and inline previews of the
-files each turn produced. Flip to the **real TUI** and the same agent runs as its actual
-`claude`/`codex` terminal in a daemon-owned PTY, looking, behaving, and billing exactly like
-your subscription terminal.
+[Get started](#get-started) · [Inside the workspace](#inside-the-workspace) ·
+[Run from the command line](#run-from-the-command-line) · [Build from source](#build-from-source) ·
+[Development](#development)
 
-## Why
+## Get started
 
-The usual way to run coding agents on a remote machine is a two-tool split: code-server in a
-browser tab for looking at files, and tmux over SSH for keeping the agents alive, with all the
-misery of nesting one inside the other. Browser terminals die on reload; tmux renders nothing.
-The deliverable of an agent session is usually *files* (reports, plots, tables), not the
-conversation, and no existing tool puts the sessions and their outputs in one window that
-survives disconnection. Chimaera replaces that stack.
+1. **[Download the native app](https://chimaera.sh/#download).** It bundles the
+   daemon and provides signed updates.
+2. **Open a folder**, locally or on a remote host. The app opens a workspace around it.
+3. **Choose an agent.** Use the launcher to install a supported CLI if needed,
+   sign in with its provider, and start a conversation.
+4. **Open the output beside the chat.** Arrange panes, reference files, and bring
+   another agent into the same project when you need one.
 
-## Quickstart
+| Platform | Native app |
+|---|---|
+| macOS | Apple Silicon, `.dmg` |
+| Linux | x86_64, AppImage, `.deb`, or `.rpm` |
+| Windows | x64 installer, with the daemon and agents running in WSL2; beta |
 
-The quickest start is the **native app**: grab it from the
-[latest release](https://github.com/martinappberg/chimaera/releases/latest) (macOS, Linux, and a
-Windows beta); it bundles the daemon and auto-updates itself. To build from source instead, you
-need stable Rust and Node.
+[Installation and platform setup](https://chimaera.sh/docs.html#platforms) ·
+[All releases](https://github.com/martinappberg/chimaera/releases)
+
+## Inside the workspace
+
+### Your agents, working together
+
+Keep several agents in the same project. Use structured chat or an agent terminal,
+see questions and approvals in the dashboard, and follow recent activity. Agents
+can exchange messages within the workspace. An optional **Mastermind** coordinator
+helps brief you and direct the work.
+
+All four supported agents have structured chat. Claude Code and Codex also let you
+switch the same conversation between chat and their real terminal interfaces.
+Provider authentication, usage limits, and billing apply to the mode you use.
+
+[Agents](docs/features/agents.md) · [Coordination](docs/features/agent-communication.md)
+
+### Files you can see and work with
+
+Open Markdown, PDFs, Word documents, spreadsheets, slide decks, tables, images,
+notebooks, diagrams, video, audio, and HTML reports. Keep a live web app in a
+browser pane. Edit text and Markdown directly. Give an agent a file reference,
+text selection, table cell, image region, or media timestamp as context.
+
+The file manager handles uploads, downloads, moves, and copies. Git views bring
+status, diffs, history, and worktrees into the workspace. Session history records
+changes even in folders without a Git repository.
+
+[Files and previews](docs/features/files-and-previews.md) ·
+[Browser panes](docs/features/browser-pane.md) · [Git](docs/features/git.md)
+
+### Project context, close to the work
+
+Follow activity in Timeline and catch up through the dashboard. Keep source files,
+notes, and decisions beside the conversation. Knowledge extensions make findings,
+decisions, and handoffs recorded in project files browsable in the workspace.
+
+[Timeline and Knowledge](docs/features/timeline-and-knowledge.md) ·
+[Dashboard](docs/features/dashboard.md) · [Session history](docs/features/session-history.md)
+
+### Local folders and remote machines
+
+Connect through your existing SSH configuration. Chimaera installs its server on
+the remote host and opens the workspace through a tunnel. Files, agents, and tools
+run on that host. On Slurm clusters, start a job and open workspaces on its compute
+node from the same app.
+
+[SSH connections](docs/features/remote-connect.md) · [Slurm workspaces](docs/features/compute.md)
+
+### A workspace you can extend
+
+Extensions add views, file viewers, and tools for your agents. Workbench plugins
+are WebAssembly components installed separately and enabled per workspace. They
+can reuse Chimaera's UI, publish project context and diagnostics, and expose tools
+to agents through declared capabilities. The Extensions view also brings together
+your agents' plugins, skills, and connections.
+
+[Using extensions](docs/features/plugins.md) ·
+[Extension authoring guide for people and agents](docs/agent-guides/plugins.md)
+
+## Run from the command line
+
+The standalone `chimaera` binary serves the same web UI as the native app. Download
+it for your host from the [latest release](https://github.com/martinappberg/chimaera/releases/latest)
+and make it executable. For example, on **Linux x86_64**:
+
+```sh
+curl -fL https://github.com/martinappberg/chimaera/releases/latest/download/chimaera-x86_64-unknown-linux-musl -o chimaera
+chmod +x chimaera
+./chimaera serve
+```
+
+Open the `http://127.0.0.1:…/#token=…` URL printed in the terminal. The daemon binds
+to loopback and chooses a free port; use `serve --port 9700` to choose one yourself.
+The agent CLIs run on this host and need their own installation and provider login.
+
+With `chimaera` on your `PATH`, connect to a remote host using its SSH alias:
+
+```sh
+chimaera connect work-server
+```
+
+Chimaera deploys a matching server, starts it, and opens a tunnel. Remote deployment
+requires no root access or containers. Static Linux binaries support x86_64 and
+aarch64 without a system glibc dependency. Scheduler-equipped hosts use the
+[cluster workflow](docs/features/compute.md) to run workspaces inside Slurm jobs.
+
+Useful commands:
+
+```sh
+chimaera status                 # inspect the local daemon
+chimaera status work-server     # inspect a remote host
+chimaera doctor                 # check local paths and prerequisites
+chimaera plugin list            # list available and installed workbench plugins
+```
+
+[CLI reference](docs/features/cli.md) · [Remote setup](https://chimaera.sh/docs.html#connect)
+
+## Build from source
+
+You need **Node 22**, npm, Rust through **rustup**, and a C/C++ build toolchain.
+The repository pins Rust in [rust-toolchain.toml](rust-toolchain.toml); rustup
+selects it automatically. Run these commands on macOS, Linux, or inside WSL2 on
+Windows. Build the UI first because the daemon embeds it.
 
 ```sh
 git clone https://github.com/martinappberg/chimaera
 cd chimaera
-npm --prefix web-ui install
-npm --prefix web-ui run build      # the daemon embeds web-ui/dist
-cargo build --release -p chimaera
+npm --prefix web-ui ci
+npm --prefix web-ui run build
+cargo build --locked --release -p chimaera
+./target/release/chimaera serve
 ```
 
-Run it locally:
+A source checkout uses isolated development state under `~/.chimaera-dev` until
+release version stamping. It does not share the installed app's state. Building
+or running the daemon does not require building plugins.
 
-```sh
-chimaera serve                     # starts the daemon, prints the UI URL
-```
-
-Run it on a remote host (an HPC login node, a dev server, anything you can ssh to):
-
-```sh
-just dist                          # one-time: build linux-musl binaries into ~/.chimaera/dist
-chimaera connect <host>            # install-if-missing, start-or-attach, tunnel, open the UI
-```
-
-`connect` shells out to your system `ssh`, so `ProxyJump`, `ControlMaster`, and 2FA from
-`~/.ssh/config` all just work. The daemon installs into `~/.chimaera` on the host: no root,
-no containers, nothing else to set up.
-
-If you use [just](https://github.com/casey/just), `just serve` does the UI build + daemon run
-in one step, and `just app-build` bundles the native app.
-
-## Features
-
-- **Sessions that survive disconnect.** tmux-grade ownership: the daemon holds every PTY with
-  full server-side terminal state. Reload, reconnect, or reattach from another machine and you
-  get the identical screen back, with no lost scrollback and no broken reconnect.
-- **Chat mode or the real TUI.** Every agent runs two ways on one session, a toggle apart. Chat
-  mode (the default) is a rich structured UI: streamed thinking, tool cards, permission
-  prompts, rewind, and inline previews of what each turn produced. Flip to the real
-  `claude`/`codex` TUI and it looks, behaves, and bills exactly like your subscription terminal.
-- **Multi-agent launcher.** Claude Code, Codex, Gemini CLI, and Antigravity CLI in one
-  launcher: detected if installed, resumable per workspace, and installable/updatable from
-  official sources through the UI. Binaries live under `~/.chimaera`, and your credentials stay
-  entirely yours. Run several at once, and attention state tells you which one needs you.
-- **File previews.** Images, Markdown, CSV/TSV (gzip included), PDF, notebooks, and sandboxed
-  self-contained HTML reports, including the heavy MultiQC/FastQC-class scientific outputs that
-  normally force a code-server install. Server extracts, client renders, whole files are never
-  loaded.
-- **Git, built in.** A source-control panel with side-by-side diffs, worktree create/remove, a
-  branch per agent, and a session-scoped view of exactly what an agent changed. The review side
-  of git, without leaving the workbench.
-- **Linked terminals.** Hand an agent a leash to a live shell, the one with your environment
-  already loaded, instead of paying setup cost per command. Links are user-granted, scoped,
-  and audited in the terminal's own scrollback.
-- **A real workbench layout.** Split panes, tabs, drag-and-drop, focus mode, and a session strip
-  that always says where you are, with curated light/dark themes injected into the agents' own
-  TUIs so everything matches.
-- **Files, in and out.** A file manager with create/rename/delete, copy/cut/paste, and
-  symlink-aware browsing; drag a file or folder onto a session to reference it; drop files from
-  your desktop (or paste a screenshot) to stream them to the session's host; download outputs
-  back from a remote with one click.
-- **Native app.** A Tauri shell wraps the same UI: a window per workspace, a home screen of
-  workspaces and remote hosts with one-click connect, restored on relaunch. macOS and Linux
-  (AppImage/deb/rpm); Windows via WSL2 is in beta. Quitting the app kills nothing.
-
-## Platforms
-
-macOS and Linux, native app and daemon both. The daemon cross-compiles to fully static musl
-binaries (x86_64 and aarch64) that run on old-glibc systems, verified on a cluster running
-glibc 2.17 with no root. Windows support runs the Linux daemon inside WSL2 and ships as a
-labeled **beta** installer (expect a couple of first-run setup steps).
-
-## Staying current
-
-Two things update themselves, so a running setup keeps pace with releases:
-
-- **The daemon** is replaced on connect when it is older than the client: silently if it
-  has no live sessions, otherwise behind an explicit "update" action that spells out what
-  it ends (an idle shell holding a `module load`/conda environment is never killed without
-  asking). Works the same for the local daemon and remote ones over ssh.
-- **The native app** checks GitHub releases on launch and offers a one-click "update &
-  restart"; the download is signature-verified before it installs.
-
-## Status
-
-Early and pre-release, moving fast. Interfaces, storage formats, and the wire protocol all
-change without notice. See [DESIGN.md](DESIGN.md) for the full design and roadmap.
+The native app is a separate Tauri workspace in `crates/chimaera-app`. See
+[contributor setup](.github/CONTRIBUTING.md) for native development and verification.
 
 ## Development
 
-The workspace is a Rust daemon (`crates/`) plus a Svelte web UI (`web-ui/`) it embeds, and a
-standalone Tauri app (`crates/chimaera-app`). Start here:
+The server is Rust, the web UI is Svelte 5, and the native shell is Tauri 2.
+The same daemon and web UI power local and remote workspaces.
 
-- **[AGENTS.md](AGENTS.md)** is the fast orientation map: repo layout, the dev loop, working
-  rules, and how releases work. Read it first, whether you're a person or an agent.
-- **[CONTRIBUTING.md](CONTRIBUTING.md)**: dev setup, code style, verification culture, the CLA.
-- **[DESIGN.md](DESIGN.md)** is the design spine: problem, product model, scope, roadmap,
-  decisions log. It links to the deep **[architecture guide](docs/agent-guides/architecture.md)**
-  (the source of truth for how it's built and why).
+| Directory | Contents |
+|---|---|
+| [`crates/`](crates/) | CLI, daemon, PTY engine, agent protocols, remote connections, plugin API, and native app |
+| [`web-ui/`](web-ui/) | Svelte workspace UI |
+| [`plugins/`](plugins/) | Curated plugin lock and host test fixtures; released plugins live in their own repositories |
+| [`site/`](site/) | Public website and usage docs |
+| [`docs/`](docs/README.md) | Feature guides, developer guides, and design records |
+| [`scripts/`](scripts/) | Build, verification, and repository maintenance tools |
+
+After the UI build above, install [just](https://github.com/casey/just) and run:
 
 ```sh
-just check      # fmt + clippy + test (the same gate CI runs)
-just serve      # build the UI and run the daemon locally
-just dev-ui     # Vite dev server against a running daemon (develop on :5173)
+npm --prefix web-ui run check   # Svelte and TypeScript checks
+npm --prefix web-ui run test    # targeted Vitest suites
+just check                     # plugin test assets, then Rust fmt, clippy, and tests
+node scripts/check-doc-links.mjs
+node scripts/check-agent-assets.mjs
 ```
 
-A releasing merge to `main` cuts a published release; the version is bumped from the
-squash-merge **subject** (Conventional Commits: `feat:` → minor, `fix:` → patch, `!` →
-major; `refactor:`/`chore:`/`docs:` and `[skip release]` ship nothing). Full rules:
-[docs/agent-guides/releases.md](docs/agent-guides/releases.md).
+For an isolated daemon or native-app preview, follow the
+[development workflow](.claude/skills/develop/SKILL.md). It gives the checkout its
+own state and port. The [contributing guide](.github/CONTRIBUTING.md) covers the
+full loop and the checks required for each kind of change.
+
+- **Changing the application:** start at [AGENTS.md](AGENTS.md), then read the
+  relevant area map and [feature guide](docs/features/README.md).
+- **Building an extension:** use the [extension authoring guide](docs/agent-guides/plugins.md),
+  including the starter component, local install, permissions, and verification.
+- **Adding an agent integration:** read the [integration guide](docs/agent-guides/agent-integrations.md)
+  and the [protocol reference](crates/chimaera-agent/PROTOCOL.md).
+- **Understanding the design:** read the [architecture guide](docs/agent-guides/architecture.md).
+  Dated proposals and decisions live under [docs/design](docs/design/README.md).
 
 ## License
 
-Chimaera is licensed under the [GNU AGPL-3.0](LICENSE): free for everyone to use, self-host,
-and modify. If you want to build a closed-source product or service on Chimaera, a commercial
-license is available: contact mkjberg@gmail.com.
-
-Contributions require a CLA (see [CONTRIBUTING.md](CONTRIBUTING.md)).
+Chimaera is licensed under the [GNU AGPL-3.0](LICENSE). A commercial license is
+available for closed-source products and services: [contact the author](mailto:mkjberg@gmail.com).
+Contributions require the [Contributor License Agreement](CLA.md); see
+[contributing](.github/CONTRIBUTING.md) for the process.

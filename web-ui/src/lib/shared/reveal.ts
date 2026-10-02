@@ -16,7 +16,7 @@ import { get, writable } from "svelte/store";
  * Where to land in a file. `line` (1-based, with optional `endLine`/`col`)
  * addresses text; the other fields address the non-text viewers, which ignore
  * `line` (pass 1) when they have their own anchor. Mirrors the locator
- * fragments in docs/document-workbench-plan.md.
+ * fragments in docs/design/document-workbench-plan.md.
  */
 export interface Reveal {
   line: number;

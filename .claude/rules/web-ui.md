@@ -5,8 +5,8 @@ paths: ["web-ui/**"]
 
 # Web-UI rules
 
-Svelte 5 (runes). Build/check needs **Node 22** (`nvm use 22`; the nvm default 16
-errors). Depth: [chat/AGENTS.md](../../web-ui/src/lib/chat/AGENTS.md),
+Svelte 5 (runes). Build/check needs **Node 22** (`.nvmrc`; `nvm use 22`).
+Depth: [chat/AGENTS.md](../../web-ui/src/lib/chat/AGENTS.md),
 [dashboard/AGENTS.md](../../web-ui/src/lib/dashboard/AGENTS.md),
 [settings/AGENTS.md](../../web-ui/src/lib/settings/AGENTS.md),
 [knowledge/AGENTS.md](../../web-ui/src/lib/knowledge/AGENTS.md), and

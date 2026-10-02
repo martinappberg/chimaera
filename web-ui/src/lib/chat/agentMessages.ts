@@ -1,7 +1,7 @@
 /**
  * Messages from other agents, as the reader's transcript shows them. The
  * daemon hands an agent its peers' messages in one text format
- * (docs/agent-communication-plan.md §12): each message is a bracketed header
+ * (docs/design/agent-communication-plan.md §12): each message is a bracketed header
  * line, then its body — a peer's quoted line by line (`> `), the
  * Mastermind's not. A send that starts a turn leads with one bracketed line
  * saying why. This module turns that text (and the hook-delivered

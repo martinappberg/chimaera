@@ -43,17 +43,40 @@
   var sheet = document.getElementById("sheet");
   var burger = document.getElementById("burger");
   function closeSheet() {
-    if (sheet) sheet.classList.remove("open");
+    if (!sheet || !sheet.classList.contains("open")) return;
+    if (burger) {
+      burger.setAttribute("aria-expanded", "false");
+      burger.focus();
+    }
+    sheet.classList.remove("open");
+    sheet.setAttribute("aria-hidden", "true");
+    sheet.inert = true;
   }
   if (burger && sheet) {
     burger.addEventListener("click", function () {
       sheet.classList.add("open");
+      sheet.inert = false;
+      sheet.setAttribute("aria-hidden", "false");
+      burger.setAttribute("aria-expanded", "true");
+      sheet.querySelector("button[data-close]").focus();
     });
     sheet.addEventListener("click", function (e) {
       if (e.target.closest("[data-close]")) closeSheet();
     });
     document.addEventListener("keydown", function (e) {
       if (e.key === "Escape") closeSheet();
+      if (e.key === "Tab" && sheet.classList.contains("open")) {
+        var links = sheet.querySelectorAll("a[href], button");
+        var first = links[0];
+        var last = links[links.length - 1];
+        if (e.shiftKey && document.activeElement === first) {
+          e.preventDefault();
+          last.focus();
+        } else if (!e.shiftKey && document.activeElement === last) {
+          e.preventDefault();
+          first.focus();
+        }
+      }
     });
   }
 
@@ -164,12 +187,12 @@
           var lsz = sizeOf(".AppImage");
           note.textContent =
             "x86_64 · AppImage" + (lsz ? " · " + lsz : "") +
-            " · auto-updates (.deb/.rpm on GitHub)";
+            " · signed updates (.deb/.rpm on GitHub)";
         }
       } else if (dmg && note) {
         var msz = sizeOf(".dmg");
         note.textContent =
-          "Apple Silicon · .dmg" + (msz ? " · " + msz : "") + " · auto-updates";
+          "Apple Silicon · .dmg" + (msz ? " · " + msz : "") + " · signed updates";
       }
 
       if (tag) {

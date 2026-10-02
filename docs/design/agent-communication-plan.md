@@ -1,8 +1,10 @@
 # Agent communication — design & plan
 
+> **Dated design record.** Current behavior is in [agent communication](../features/agent-communication.md). The original proposals and as-built notes below preserve the 2026-09-30 design context; later provider support may differ.
+
 Status: **built** (2026-09-30, branch `claude/agent-communication-redesign-224c66`),
 verified live against claude 2.1.284 and codex 0.157.1 — see "As built" below and
-[features/agent-communication.md](features/agent-communication.md). It
+[features/agent-communication.md](../features/agent-communication.md). It
 replaces the *Agent notes* workbench plugin with a built-in feature, **on by
 default and switchable off**: every agent in a workspace can see which other
 agents are running and what they're doing, and send them messages that

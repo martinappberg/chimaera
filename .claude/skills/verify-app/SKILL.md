@@ -13,11 +13,14 @@ the real thing. Your PR should say what you ran and what you observed.
 ## 1. Tests + lints first (necessary, not sufficient)
 
 ```sh
-just check         # cargo fmt --check + clippy -D warnings + cargo test --workspace
 npm --prefix web-ui run check      # svelte-check, if you touched the UI
 npm --prefix web-ui run test       # targeted reducer/unit coverage
 npm --prefix web-ui run build      # production bundle and generated assets
+just check                        # plugin assets, then fmt/clippy/test in both Rust workspaces
 ```
+
+Build `web-ui/dist` before workspace Rust checks on a fresh checkout; the server
+embeds it. For a daemon-only change, an existing bundle satisfies that prerequisite.
 
 `crates/chimaera-pty` has real PTY tests (`tests.rs`, `snapshot.rs`) — extend
 them when you change terminal state or snapshotting.
@@ -25,9 +28,13 @@ them when you change terminal state or snapshotting.
 ## 2. Drive the real flow
 
 Bring up the dev loop (see the **develop** skill), then exercise the *actual*
-path you changed. Use the `preview_*` tooling to observe: `preview_snapshot`
+path you changed. When available, use the `preview_*` tooling to observe: `preview_snapshot`
 for structure/content, `preview_console_logs` + `preview_logs` for errors,
 `preview_network` for API/WS traffic, `preview_screenshot` for proof.
+
+If those tools are absent, use the develop skill's manual isolated launcher,
+daemon terminal output, and the available browser or native-app inspection tools.
+Report any visual or network surface your session could not inspect.
 
 **In a Claude cloud session** (`CLAUDE_CODE_REMOTE=true`) there is no preview
 tooling: run the daemon headless and drive it over HTTP/WS instead, starting from
@@ -47,18 +54,22 @@ Match the exercise to what you touched:
   (Known accepted gap: a resync while on the alternate screen can't restore the
   primary screen's scrollback.)
 - **Previews** — open the file types you touched (image, markdown, csv/tsv incl.
-  gzip, pdf, sandboxed html). Confirm the server streams (never loads whole files)
-  and the client renders; watch RSS stays bounded on a big file.
+  gzip, pdf, sandboxed html). Confirm that ranged/paged formats stay incremental,
+  whole-file formats enforce their size caps, and the client renders; watch
+  daemon and browser memory on a big file.
 - **Agent launch / links** — launch an agent runtime, confirm attention badges
-  (needs-attention / finished / errored) fire from hooks, and that a linked
-  terminal grant is scoped and audited in scrollback.
-- **Reconnect** — reload the page and reattach from another machine/tab; the
-  event bus should replay only the gap (seq-numbered), not the whole stream.
+  (needs-attention / finished / errored) derive from protocol events in chat
+  and Claude hooks in its TUI, and that a linked terminal grant is scoped and
+  audited in scrollback.
+- **Reconnect** — reload and reattach from another machine/tab. Chat sockets
+  (`/ws/chat/{id}`) replay the seq-numbered gap; the session-list bus
+  (`/ws/events`) sends the current full roster; PTY sockets rebuild the screen
+  from an escape-sequence snapshot.
 
 ## 3. Resource discipline is part of "works"
 
-The daemon runs on shared login nodes. While exercising, sanity-check it stays
-within budget (~150 MB RSS target, <1 core steady-state, no runaway buffers) —
+The daemon must stay light on shared hosts; cluster workspaces normally run
+inside allocations. While exercising, sanity-check it stays within budget (~150 MB RSS target, <1 core steady-state, no runaway buffers) —
 a preview of a huge Parquet/HTML file must never balloon memory. A change that
 works but leaks or busy-loops is not done.
 

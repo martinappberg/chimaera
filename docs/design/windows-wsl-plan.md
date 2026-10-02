@@ -1,5 +1,7 @@
 # Windows via WSL2 — implementation plan
 
+> **Dated design record.** Windows is now offered as a beta. Use [native app](../features/native-app.md) for current support; the implementation and external research notes below preserve the July 2026 snapshot and its verification limits.
+
 A native Windows chimaera app **without porting the daemon**: the same Tauri shell
 (real windows, WebView2, NSIS installer, auto-updater) drives the **unmodified
 Linux musl daemon** inside the user's WSL2 distro. This is the VS Code
@@ -7,15 +9,15 @@ Remote-WSL / Podman-machine architecture, chosen so the Unix core (PTYs, shells,
 signals, ControlMaster ssh) stays single-platform — the Windows-specific surface
 is a thin launch-and-transport layer in the shell.
 
-> **Status: M0 (portability gates, three-platform CI, Linux bundles), M1
+> **Snapshot status (July 2026): M0 (portability gates, three-platform CI, Linux bundles), M1
 > (the WSL engine + first-run wizard + the wsl-smoke live gate) and M2
 > (connect's ssh-in-WSL transport + the interop askpass relay) are
 > implemented on this branch, plus a full post-review hardening pass
 > (persisted distro+pinned-user target, user creation for wizard-installed
 > Ubuntu, the 2.1.1 version gate, fetch-before-stop updates, wizard-visible
-> provisioning, bounded transport/relay I/O, wizard-scoped capability). The
-> site holds back the Windows download until a real-hardware pass over the
-> wizard + askpass chain.**
+> provisioning, bounded transport/relay I/O, wizard-scoped capability). At
+> that snapshot the site held back the Windows download pending a real-hardware
+> pass over the wizard + askpass chain.**
 > Every claim below was researched 2026-07-10
 > against official sources (Microsoft Learn, the open-sourced `microsoft/WSL`
 > repo — including its shipping source code — OpenSSH sources, Tauri docs,

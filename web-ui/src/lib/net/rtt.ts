@@ -3,7 +3,7 @@
  * poll's fetch timing. On a tunneled remote this is what the user actually
  * feels: every keystroke echo costs one RTT, every cold HTTP fetch about two
  * (the ssh mux channel-open pays a full RTT before the request starts —
- * measured against a real login node, docs/perf-remote-plan.md).
+ * measured against a real login node, docs/design/perf-remote-plan.md).
  *
  * The estimate is the MINIMUM over a small rolling window: a keepalive-warm
  * health fetch costs ~1×RTT while a cold one costs ~2×RTT, so the window

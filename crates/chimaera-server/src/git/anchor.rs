@@ -3,7 +3,7 @@
 //! made between two anchors. A small internal API over the service's bounded
 //! runner (4 processes, 8 s, capped output): the session tracker captures an
 //! anchor at session start, at claude's turn ends and at session end, and
-//! the session record (Part 2 of docs/git-and-session-history-plan.md)
+//! the session record (Part 2 of docs/design/git-and-session-history-plan.md)
 //! reads them. Read-only: nothing here changes a repository, and nothing
 //! requires or prompts for commits — they only show up as HEAD moving.
 

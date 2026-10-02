@@ -1,10 +1,12 @@
 # Agents — launch, lifecycle & runtimes
 
-Launching and managing Claude Code, Codex, Antigravity and Grok Build. An agent runs either as its **real interactive TUI** in
-a daemon-owned PTY (Tier A — looks, behaves, and *bills* like any terminal) or as a
-**structured chat session** (Tier B — see [chat-mode.md](chat-mode.md)) on the same session
-identity. This page covers getting an agent running, the session rail that tracks it,
-renaming/killing, managed installs, and resuming ended conversations.
+Launching and managing Claude Code, Codex, Antigravity and Grok Build. Chimaera runs
+the agent's own runtime as its **real interactive TUI** in a daemon-owned PTY
+(Tier A) or as a **structured chat session** through its native protocol
+(Tier B — see [chat-mode.md](chat-mode.md)). Claude Code and Codex can switch a
+saved conversation between these views. This page covers getting an agent running,
+the session rail that tracks it, renaming/killing, managed installs, and resuming
+ended conversations.
 
 **Where it lives (shared):** UI `web-ui/src/lib/workspace/{Launcher.svelte,launcher.ts,
 sessions.ts}` + the rail/split-button in `web-ui/src/App.svelte`. Daemon:
@@ -12,6 +14,15 @@ sessions.ts}` + the rail/split-button in `web-ui/src/App.svelte`. Daemon:
 spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /api/v1/agents`,
 `POST/DELETE /api/v1/agents/{id}/install`, `GET /api/v1/agents/claude/sessions`,
 `GET /api/v1/recents`, `POST /agent-events/{id}?key=`, and `/ws/events` for the roster.
+
+## Your existing agent setup
+
+Chimaera launches the agent's own runtime in your workspace, using that host's
+account, environment, project instructions, skills, and configured connections.
+A local workspace uses your local setup; an SSH workspace uses your user's setup
+on the remote host. Chimaera adds workspace integration through session-scoped
+settings, hooks, and MCP tools. Chat controls select the model and permissions
+for the current session; see [chat mode](chat-mode.md) for provider behavior.
 
 ## Launching an agent
 
@@ -99,7 +110,7 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
 - **Where it lives.** `launcher.rs` (`list_agents`, `detect`, `resolve_bin`, `models`,
   `is_outdated`, `claude_resumables`); upstream latest-release probes in `agent_updates.rs`.
   Routes `GET /api/v1/agents`, `GET /api/v1/agents/claude/sessions`.
-- **Key behaviors.** Detection runs three login shells + version probes concurrently (serial would
+- **Key behaviors.** Detection runs the four registered agents' login shells + version probes concurrently (serial would
   visibly stall the popover), with a 6s timeout backstopped by well-known paths. `is_outdated` flags
   npm-era codex (0.1.x). The Antigravity IDE's `agy` symlink (which just opens the GUI) is detected
   and refused. Resumables are scanned off the reactor, exclude transcripts already open in a live
@@ -122,7 +133,7 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
   Roster: `GET /api/v1/sessions` polled every 5s + `/ws/events` snapshots. Rename
   `PATCH /api/v1/sessions/{id}`; kill `DELETE /api/v1/sessions/{id}`.
 - **Key behaviors.** State dot: running=accent "alive", needs_permission/idle_prompt=amber "attn",
-  finished="done", errored="err", rate_limited="rate". Hook-less agent TUIs (codex/gemini/agy)
+  finished="done", errored="err", rate_limited="rate". Hook-less agent TUIs (Codex, Antigravity and Grok; legacy Gemini records)
   never get hook state — their busy signal is **output recency**: the PTY reader stamps
   `last_output_at` per chunk (`chimaera-pty`, kept off the wire), and `session_view.rs` derives a
   boolean `output_active` for agent rows still in state `unknown` (a working TUI streams tokens /
@@ -160,8 +171,8 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
   `POST /api/v1/agent-events/{id}?key=` (registered *after* the bearer layer; the per-session key
   in the URL authorizes it — claude's hooks can't know the daemon token).
 - **Key behaviors.** Settings/mcp files are written 0600 (they embed the secret). Attention state
-  is **claude-only for TUIs** (codex/gemini integrations haven't landed). In chat mode this path is
-  bypassed — the protocol drives state instead (hooks are unreliable under `-p stream-json`).
+  is **Claude-only for TUIs**. In chat mode protocol events provide the richer state; Claude
+  chat still receives hooks for context, agent-message delivery and transcript integration.
 
 ## Recents — resume ended conversations
 
@@ -204,12 +215,13 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
   YAML frontmatter, relative links and embeds with fragments; it also renders on GitHub and in
   Obsidian) and can check a document before handing it over. The user sees the same findings as
   a chip on the markdown toolbar.
-- **How it's used.** Nothing to set up for agents launched in Chimaera: the chimaera MCP server's
+- **How it's used.** For sessions with Chimaera MCP integration (all four chat providers, Claude terminals
+  and eligible Codex terminals), the chimaera MCP server's
   `initialize` instructions carry a six-line documents paragraph, `document_guide` (no args)
   returns the full guide, and `check_document {path}` returns a readable report (a relative path
   resolves against the session's cwd, then its workspace root). Both are read-only and
-  pre-approved for every session (`mcp::ALWAYS_ALLOWED_TOOLS`, beside `notify`), so neither
-  raises a permission prompt. In the preview, a quiet
+  pre-approved for native Claude/Codex sessions (`mcp::ALWAYS_ALLOWED_TOOLS`, beside
+  `notify`); ACP providers retain their native approval behavior. In the preview, a quiet
   **"N issues"** chip appears on the markdown toolbar when the document has errors or warnings
   (red with any error, amber otherwise; notes only appear in its popover); clicking an issue
   reveals its line in reading, live or source. For agents launched **outside** Chimaera,
@@ -257,7 +269,7 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
 - Antigravity and Grok Build share ACP chat; their same-session terminal/chat switch and native
   rewind are not offered. Managed installs include their official native runtimes. Google's
   chat package is pinned independently of `agy`; Linux chat needs glibc. Third-party harness
-  registration (including Pi) is [designed, not yet implemented](../agent-harness-design.md).
+  registration (including Pi) is [designed, not yet implemented](../agent-guides/agent-integrations.md).
 - Gemini CLI is retired from new launches; existing records retain their identity.
 
 ---
@@ -270,7 +282,7 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
 > be "helpfully" changed without asking.
 
 ### Why agents are launched this way
-_Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the maintainer._
+_Captured 2026-07-09 — drafted from docs/design/README.md + code, confirmed live with the maintainer._
 
 - **Problem it solves.** Workspace-scoped agent sessions with attention state, replacing scattered
   agent chats — the workbench's reason for being.

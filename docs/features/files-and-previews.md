@@ -3,17 +3,21 @@
 Browsing and managing the workspace's files. The file tree and the Finder browse, open,
 and — via their right-click context menus — create, rename, delete, and download files
 and folders; the preview service streams file bytes and renders them as code, markdown,
-tables, PDFs, images, video and audio, sandboxed HTML, Jupyter notebooks, program logs,
-Marp slide decks, mermaid diagrams, or a binary info card — plus a light single-file
-editor. Everything streams (never whole-file loads) to hold the daemon's ~150 MB RSS
-budget on shared login nodes.
+tables and spreadsheets, PDFs, images, Word documents, PowerPoint decks, Parquet,
+video and audio, sandboxed HTML, Jupyter notebooks, program logs, Marp slide decks,
+Mermaid diagrams, diagram boards, or a binary info card — plus a light single-file
+editor. Reads and parsers have explicit size limits: large tables, PDFs and Parquet use
+paging or ranges; Office documents and boards load bounded files in the browser, and
+small editable text files load whole. The daemon streams raw bytes and bounds extraction
+work for local, remote and cluster workspaces.
 
 **Where it lives (shared):** UI `web-ui/src/lib/previews/` (`files.ts` loaders,
 `fileStore.svelte.ts` the content store, `CodeView`, `MarkdownView` + `mdDoc.ts` /
 `docLinks.ts` / `mdLive.ts` / `mdBlocks.ts` and the markdown engine in `doc/` (`parser.ts`,
 `model.ts`, `render.ts`, `reader.ts`, `live.ts`, `embeds.ts`), `TableView`, `PdfView`, `ImageView`, `MediaView`, `HtmlView`, `BinaryView`,
 `NotebookView` + `notebook.ts`, `LogView` + `logText.ts`, `SlidesView` + `marp.ts`,
-`MermaidView`, `RawTextView`, `ansi.ts`, `FinderView`, `cm.ts`) +
+`MermaidView`, `DocxView`, `PptxView` + `pptxDeck.ts`, `BoardView` + `boards/`,
+`ParquetView` + `parquet.ts`, `rawBytes.ts`, `RawTextView`, `ansi.ts`, `FinderView`, `cm.ts`) +
 `web-ui/src/lib/workspace/FileTree.svelte` + glyphs in `web-ui/src/lib/shared/`
 (`FileIcon`, `FolderIcon`, `icons.ts`). Daemon: **the preview endpoints are in
 `crates/chimaera-server/src/fs.rs`**, except the notebook pager (`notebook.rs`). The file diff
@@ -528,11 +532,12 @@ superseded folder navigation cannot start a create operation in a different dire
   [agents.md](agents.md#documents-the-portable-dialect-check_document-and-the-issues-chip).
 
   **Hover previews on links** (`previews/doc/hoverController.svelte.ts`, the popover
-  `doc/HoverPreview.svelte`, pure pieces in `doc/hover.ts`). In **reading**, rest the pointer
-  on a link for 400 ms; in **live**, where a plain hover edits, hold Mod (Cmd or Ctrl) over a
-  link — in a rendered block or in the source being edited — and letting go of Mod keeps it
-  open while the pointer stays. From the keyboard, **Mod+K** on a focused link (reading) or
-  with the cursor in a link (live) shows it, and again hides it. What it shows: a `.md` link
+  `doc/HoverPreview.svelte`, pure pieces in `doc/hover.ts`). While the document shows its
+  render (**reading**, or **live** before entering a block), rest the pointer on a link for
+  400 ms. While editing in live mode, hold Mod (Cmd or Ctrl) over a link in a rendered block
+  or the source; letting go of Mod keeps the popover open while the pointer stays. From the
+  keyboard, **Mod+K** on a focused rendered link or with the cursor in an edited link shows
+  it, and again hides it. What it shows: a `.md` link
   (or a `#heading` in this document) the section it names — its heading down to the next of
   the same rank — or the document's opening, drawn by the reading renderer (equations,
   highlighted fences, diagrams, pictures), a step smaller and height-capped; a footnote
@@ -1065,8 +1070,8 @@ superseded folder navigation cannot start a create operation in a different dire
   WebGL renderers attached. Inactive chat tabs freeze their bounded transcript snapshot while the
   pooled reducer/socket continues; historical artifact previews load only near the viewport, and
   initial journal hydration mounts from the newest end once instead of painting oldest-to-newest.
-- **Parking is opacity + inert, one layer per tab, fenced by selection stops.** Parked layers
-  never hide with `visibility:hidden`, `display:none`, `pointer-events`, `user-select` or a
+- **Parking is opacity + inert, one layer per tab, fenced by selection stops.** A tab switch parks layers
+  without `visibility:hidden`, `display:none`, `pointer-events`, `user-select` or a
   `z-index` on the shown one — every one of those inherits (WebKit re-resolves and re-shapes the
   whole parked subtree per switch) or traps a view's `position:fixed` overlay; a switch never
   inserts a sibling into the pane (positional selectors would re-resolve every parked document);
@@ -1126,8 +1131,10 @@ superseded folder navigation cannot start a create operation in a different dire
   workspace, and its slow directory hash caps at the same 1000 entries as `fs/list`. New-directory
   baselines are limited to four per two-second poll, so registration churn cannot turn those caps
   into a continuous shared-filesystem scan.
-- Previews **stream**; a preview of a huge Parquet/HTML/CSV must never balloon memory. This is a
-  review criterion, not a nice-to-have (see [rules/daemon.md](../../.claude/rules/daemon.md)).
+- Preview work is **bounded**: raw responses stream; table and PDF pages and Parquet ranges load
+  on demand; whole-file viewers and editing enforce their per-format caps. Neither daemon nor
+  browser should materialize an unbounded file (see
+  [rules/daemon.md](../../.claude/rules/daemon.md)).
 - Capability tickets expire after 10 minutes and the in-memory store is capped at 4096; expiry-first
   eviction keeps unauthenticated preview URLs bounded even under repeated minting.
 
@@ -1141,7 +1148,7 @@ superseded folder navigation cannot start a create operation in a different dire
 > be "helpfully" changed without asking.
 
 ### Why previews (and lightweight editing) are shaped this way
-_Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the maintainer._
+_Captured 2026-07-09 — drafted from docs/design/README.md + code, confirmed live with the maintainer._
 
 - **Problem it solves.** Previews are the durable **moat** — the part Anthropic won't build —
   because the deliverable of an agent session (especially in bioinformatics) is usually *files*

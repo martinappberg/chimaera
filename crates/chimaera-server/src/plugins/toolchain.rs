@@ -1,4 +1,4 @@
-//! Side programs a plugin installs (`[[tools]]`, docs/plugin-platform-plan.md
+//! Side programs a plugin installs (`[[tools]]`, docs/design/plugin-platform-plan.md
 //! §8): declared downloads the host fetches on the user's click, never
 //! install scripts.
 //!

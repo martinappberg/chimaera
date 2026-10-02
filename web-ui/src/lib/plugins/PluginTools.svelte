@@ -1,6 +1,6 @@
 <script lang="ts">
   /**
-   * An installed plugin's Tools section (docs/plugin-platform-plan.md §8):
+   * An installed plugin's Tools section (docs/design/plugin-platform-plan.md §8):
    * each side program it can download, with what is on this host (version,
    * size) and the one action that fits — Install, Update (the plugin now
    * names a newer version), Remove. The daemon downloads from the declared

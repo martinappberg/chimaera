@@ -1,7 +1,9 @@
 # LaTeX and Typst: the first plugins on the platform
 
-Dated 2026-09-25, revised 2026-09-26, 2026-09-28 and 2026-09-29. A plan, not a
-record: nothing here has shipped. It covers two workbench plugins, **LaTeX** and
+> **Dated design record.** LaTeX and Typst plugins are available with the platform shipped in PR #225. Use [extensions](../features/plugins.md) and the [extension guide](../agent-guides/plugins.md) for current behavior; this proposal does not establish that every planned feature shipped.
+
+Dated 2026-09-25, revised 2026-09-26, 2026-09-28 and 2026-09-29. The original
+pre-implementation proposal covers two workbench plugins, **LaTeX** and
 **Typst**: building documents on the host, showing the PDF beside the source,
 jumping between the two, turning compile errors into editor marks an agent can fix,
 showing what changed, installing a TeX Live when the host has none, teaching agents
@@ -10,7 +12,7 @@ privileged plugins on the [plugin platform](plugin-platform-plan.md), which owns
 everything generic (screens, programs, side-program installs, output folders, data
 surfaces, change bars, trust). This plan is what is specific to LaTeX and Typst, and
 which platform pieces they use. It was split out of the documents plan
-(`docs/document-workbench-plan.md`, shipped as martinappberg/chimaera#159) and built
+(`docs/design/document-workbench-plan.md`, shipped as martinappberg/chimaera#159) and built
 from reads of the tree (last at `4b2f9a1`) plus a survey of TeX Live, latexmk,
 Tectonic, TinyTeX, Typst, SyncTeX, pandoc and the tools that already do this (VS
 Code's LaTeX Workshop, texlab, tinymist, Overleaf's compile limits). Claims about
@@ -107,7 +109,7 @@ Documents panel (each plugin's settings and tools appear in Settings → Plugins
 5. **Opening a file never runs project code without consent.** A project `latexmkrc`
    is Perl; unrestricted shell escape is arbitrary commands.
 6. **Not an IDE.** No language server, completion or refactoring
-   ([DESIGN.md](../DESIGN.md#scope-philosophy-and-non-goals)).
+   ([docs/design/README.md](README.md#scope-philosophy-and-non-goals)).
 7. **One pipeline for people and agents.** A save and an agent's `compile_latex` run
    the same job and update the same view.
 
@@ -465,7 +467,7 @@ bar; **show partial output** switches to the partial PDF LaTeX often leaves.
   3.20; use the biber from the same TeX Live." "Package
   `@preview/cetz:0.3.4` is not cached and this host is offline."
 - **Log text is untrusted.** It contains text from the document. The platform's
-  components show it as text, never as HTML ([web-UI rules](../.claude/rules/web-ui.md)).
+  components show it as text, never as HTML ([web-UI rules](../../.claude/rules/web-ui.md)).
 
 ### Ask the agent to fix it
 
@@ -987,7 +989,7 @@ confinement for jobs) are in its [plan](plugin-platform-plan.md#17-open-decision
 
 - **LaTeX or Typst in core.** Everything specific lives in the plugins; core gets only
   generic platform pieces.
-- **A language server, completion or refactoring** (texlab, tinymist): the DESIGN.md
+- **A language server, completion or refactoring** (texlab, tinymist): the docs/design/README.md
   non-goal.
 - **A WASM engine in the browser**, and **bundling** an engine in the binary.
 - **Tectonic** ([why](#latex-the-hosts-tex-live-or-tinytex)).

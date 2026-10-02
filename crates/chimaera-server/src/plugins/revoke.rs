@@ -1,5 +1,5 @@
 //! The kill switch: a list of plugin builds chimaera blocks, everywhere.
-//! Design: docs/plugin-platform-plan.md §2 ("The kill switch").
+//! Design: docs/design/plugin-platform-plan.md §2 ("The kill switch").
 //!
 //! - **Two copies of one file.** `plugins/revoked.json` is embedded in every
 //!   build (a host that never reaches the network is covered by its next

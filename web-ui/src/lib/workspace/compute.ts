@@ -8,7 +8,7 @@
  * page load on a laptop. On-cluster it refetches every 60s, but ONLY while the
  * window is visible; a hidden tab pauses and catches up on the next
  * visibilitychange. Nothing here asks more often than once a minute (the
- * scheduler-politeness floor, docs/hpc-portal-plan.md §2.5): the catch-up and
+ * scheduler-politeness floor, docs/design/hpc-portal-plan.md §2.5): the catch-up and
  * the first-fetch retry honor the same floor. `?refresh=true` is an API knob
  * nothing in the UI calls today: it forces the daemon to re-detect — the "I
  * just module-loaded slurm" path — and a "slurm" answer there restarts polling.

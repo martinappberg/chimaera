@@ -1,6 +1,6 @@
 //! Output folders: where a plugin keeps what it makes (a built PDF, a log,
 //! a snapshot to diff against), one per (plugin, workspace), outside the
-//! repository. Design: docs/plugin-platform-plan.md §7.
+//! repository. Design: docs/design/plugin-platform-plan.md §7.
 //!
 //! - `<cache dir>/plugins/<id>/<workspace>/` (`chimaera_core::cache_dir`:
 //!   `$XDG_CACHE_HOME/chimaera`, survives restarts, never night-scrubbed).

@@ -10,7 +10,7 @@
 //! Windows side), which is why the rest of the shell — window URLs, health
 //! checks, tokens — is unchanged from macOS.
 //!
-//! Design constraints, each backed by docs/windows-wsl-plan.md research:
+//! Design constraints, each backed by docs/design/windows-wsl-plan.md research:
 //!
 //! - **Registry before wsl.exe.** On Windows 11 24H2 a bare wsl.exe run with
 //!   WSL absent can block 60s on an interactive "Press any key to install"

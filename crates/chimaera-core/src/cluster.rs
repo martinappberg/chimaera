@@ -5,7 +5,7 @@
 //! Pure types and text — the ssh transport lives in `chimaera-remote`, the
 //! in-job processes in `chimaera-server`.
 //!
-//! The model (docs/hpc-portal-plan.md): you start **jobs**, and open
+//! The model (docs/design/hpc-portal-plan.md): you start **jobs**, and open
 //! **workspaces** inside them. A workspace keeps its chats in its own folder,
 //! so it can be open in at most one job at a time and move between jobs.
 //!

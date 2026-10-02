@@ -1,5 +1,5 @@
 //! Session history: one lasting record per agent session (plan
-//! `docs/git-and-session-history-plan.md` §7–§10). Who started it, what it
+//! `docs/design/git-and-session-history-plan.md` §7–§10). Who started it, what it
 //! changed, what it cost, and where its transcript is — with or without git.
 //!
 //! Durable state is one append-only JSONL per workspace,
