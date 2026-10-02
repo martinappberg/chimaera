@@ -672,3 +672,41 @@ the old binding, stops managed execution, publishes its final snapshot using
 owner clean-release boundary as normal handoff, not an OS attestation assembled
 from client JSON. Account issuance reserves the old epoch; a timeout cannot
 renew the recovery deadline or grant another execution owner.
+
+## Passive synced-project catalog
+
+`GET /v2/projects?after=<workspace_id>` is an optional, passive account endpoint
+for full device tokens and device daemon delegations. Worker/keeper service
+credentials, workspace-bound grants and recovery grants cannot enumerate it.
+The account advertises exact `project_catalog: 1` in `/v2/capabilities`; an older
+service may answer 404. Reads never create or wake a machine, renew a lease,
+change preferred execution, or advertise a takeover destination. Normal account,
+device, delegation, entitlement and return-window checks apply on every request.
+
+The response is `{catalog_version:1,projects:[{workspace_id,name,epoch,
+checkpoint_id}],next_cursor}`. Rows are ordered by workspace ID, with at most 128
+per page and an optional exclusive `after` cursor. Clients cap their complete
+list at 128. Only mirrored projects with an acknowledged checkpoint, mirroring
+enabled and validated visible metadata are listed. There is no inferred host
+kind or routing authority in this presentation data; opening resolves the
+current owner separately. A missing row is not permission to delete a local
+folder, and a transient catalog error never erases a remembered destination.
+
+New handoff manifests may include `project:{version:1,name,visible}`. The name
+is nonempty, at most 512 UTF-8 bytes and contains no control characters; `visible`
+is false for internal service/setup workspaces. Missing metadata on older
+snapshots is unknown and is omitted from this catalog; a client may still use
+its existing bounded passive discovery. Metadata becomes visible only with its
+immutable checkpoint acknowledgment, never merely because a client supplied a
+workspace ID or a local pending publication.
+
+The final internal mirror authorization may advertise exact `project_catalog:1`.
+Only with that capability does the mirror include optional `project` metadata
+from the verified handoff manifest in
+`POST /internal/v2/workspaces/{workspace}/checkpoint`. The account validates it
+under the existing publication/holder/account lock and stores it with that
+receipt. Missing capability means omit the added request field; a newer mirror
+must not make an older account reject ordinary publication. Replayed receipts
+retain their original immutable metadata. Invalid or unsupported metadata must
+never create a visible catalog row. No project names or request bodies enter
+service logs.
