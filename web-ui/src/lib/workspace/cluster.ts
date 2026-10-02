@@ -535,6 +535,46 @@ export function childPath(dir: string, name: string): string {
   return dir === "/" ? `/${name}` : `${dir.replace(/\/+$/, "")}/${name}`;
 }
 
+/** The folder picker's box holds a path (`/…`, `~…`, `$VAR…`), not a filter. */
+export function isTypedPath(text: string): boolean {
+  return /^[/~$]/.test(text.trim());
+}
+
+/** A typed path as the folder to list and what to match in it:
+ *  "~/proj/an" → { dir: "~/proj/", tail: "an" }; "~" → { dir: "~", tail: "" }. */
+export function splitTypedPath(text: string): { dir: string; tail: string } {
+  const t = text.trim();
+  const slash = t.lastIndexOf("/");
+  if (slash < 0) return { dir: t, tail: "" };
+  return { dir: t.slice(0, slash + 1), tail: t.slice(slash + 1) };
+}
+
+/** Folders matching what was typed, case-insensitive: names that start with
+ *  it first, then names containing it, then names with its letters in order
+ *  ("jdo" finds "j_dodo"); each group keeps the listing's order. */
+export function filterFolders<T extends { name: string }>(folders: readonly T[], query: string): T[] {
+  const q = query.trim().toLowerCase();
+  if (q === "") return [...folders];
+  const prefix: T[] = [];
+  const inside: T[] = [];
+  const loose: T[] = [];
+  for (const f of folders) {
+    const n = f.name.toLowerCase();
+    if (n.startsWith(q)) prefix.push(f);
+    else if (n.includes(q)) inside.push(f);
+    else if (inOrder(q, n)) loose.push(f);
+  }
+  return [...prefix, ...inside, ...loose];
+}
+
+function inOrder(needle: string, hay: string): boolean {
+  let i = 0;
+  for (const c of hay) {
+    if (c === needle[i] && ++i === needle.length) return true;
+  }
+  return false;
+}
+
 /** The folder above an absolute path; null at the root (or for a relative path). */
 export function parentPath(path: string): string | null {
   const p = path.replace(/\/+$/, "");

@@ -727,24 +727,34 @@ async fn ensure_binary(app: &AppHandle, alias: &str) -> Result<(), String> {
     };
     let progress_app = app.clone();
     let progress_alias = alias.to_string();
-    cluster::ensure_cluster_binary(
+    let reported = std::sync::atomic::AtomicBool::new(false);
+    let installed = cluster::ensure_cluster_binary(
         alias,
         home(),
         entry.and_then(|e| e.binary).as_deref(),
-        &move |phase| {
+        &|phase| {
             let label = match phase {
                 chimaera_remote::Phase::Downloading { .. } => "downloading",
                 chimaera_remote::Phase::Installing { .. } => "installing",
                 _ => return,
             };
+            reported.store(true, std::sync::atomic::Ordering::Relaxed);
             let _ = progress_app.emit(
                 "connect-progress",
                 json!({ "alias": progress_alias, "phase": label }),
             );
         },
     )
-    .await
-    .map_err(err)?;
+    .await;
+    // A connect's progress line ends with its host-status; this one has none,
+    // so it says it's over (or the Home row reads "installing…" for good).
+    if reported.load(std::sync::atomic::Ordering::Relaxed) {
+        let _ = app.emit(
+            "connect-progress",
+            json!({ "alias": alias, "phase": "done" }),
+        );
+    }
+    installed.map_err(err)?;
     let shell = app.state::<Shell>();
     lock(&shell.clusters)
         .entry(alias.to_string())
@@ -1567,6 +1577,25 @@ pub(super) async fn cluster_set_login_serve(
     tracing::info!("ipc: cluster_set_login_serve {alias} {on}");
     let owned = alias.clone();
     let entry = with_hosts(move |hosts| hosts.set_login_serve(&owned, on)).await?;
+    lock(&state.host_entries).insert(alias.clone(), entry.clone());
+    let info = lock(&state.clusters)
+        .get(&alias)
+        .and_then(|c| c.info.clone());
+    Ok(state_for(&entry, "disconnected", None).with_cluster(&entry, info.as_ref()))
+}
+
+/// Say a host is not a cluster after all (`on`), or is one again. Not a
+/// cluster: it connects like any remote, its row loses the cluster page, and
+/// a daemon started there doesn't tell its agents they're on a login node.
+#[tauri::command]
+pub(super) async fn set_not_cluster(
+    state: State<'_, Shell>,
+    alias: String,
+    on: bool,
+) -> Result<HostState, String> {
+    tracing::info!("ipc: set_not_cluster {alias} {on}");
+    let owned = alias.clone();
+    let entry = with_hosts(move |hosts| hosts.set_not_cluster(&owned, on)).await?;
     lock(&state.host_entries).insert(alias.clone(), entry.clone());
     let info = lock(&state.clusters)
         .get(&alias)

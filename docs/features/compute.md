@@ -39,6 +39,13 @@ startup commands, the lease) in `crates/chimaera-server/src/{compute,lifecycle,e
   the host row then connects to a login-node daemon like any remote, and the cluster
   page (jobs) stays one click away. An older build that rewrites `hosts.json` drops the
   field, which turns the override off.
+- **Not a cluster.** For a host that only looks like one (Slurm's tools on a
+  workstation's `PATH`): "This isn't a cluster…" in the cluster page's ⋯ menu, with a
+  confirm (`hosts.json` `not_cluster`; it replaces the override). The host then connects
+  like any remote, its row loses the cluster page, and a daemon started there runs with
+  `CHIMAERA_NOT_A_CLUSTER=1`, so its agents aren't told they're on a shared login node.
+  The row's "it's a cluster" undoes it (disconnects, then connects onto the cluster
+  page). `chimaera connect` honors it too.
 - **The CLI.** `chimaera connect <cluster>` explains cluster mode and exits;
   `chimaera status <cluster>` says it is a cluster.
 
@@ -56,9 +63,16 @@ startup commands, the lease) in `crates/chimaera-server/src/{compute,lifecycle,e
   terminal-only window, "<host> · login node", running `ssh <host>` over the app's
   ControlMaster — never listed as a workspace, never restored, its session ends when the
   window closes), ⋯ (startup commands, rules for agents, refresh partitions, the
-  override) and **Start a job**.
+  override, not a cluster) and **Start a job**. The app's own binary install on the
+  cluster shows on the Home row while it runs and ends with a `done` progress event.
 - **Workspaces.** Added with a folder picker (`chimaera browse --dir`: folders only, git
-  and already-added marks, a typed path) — the only browsing outside a workspace window.
+  and already-added marks) — the only browsing outside a workspace window. It types like
+  the workspace folder picker: the box filters this folder (names that start with what
+  you typed, then containing it, then with its letters in order), or, starting with `/`,
+  `~` or `$`, is a path that completes from its folder's listing (one `browse` per folder,
+  debounced). ↑↓ pick, ↩ steps in (or goes to the path as typed; a name not among a
+  capped listing's first 2000 is tried as a folder here), ⌫ on an empty box goes up, ⌘↩
+  adds the folder you're in.
   A workspace is open in at most one job; a job may hold several, or none. **Open** goes
   where it is open. Anywhere else is the user's pick, never a silent default: each
   running job (its node, time left, and what's already open in it, since it shares

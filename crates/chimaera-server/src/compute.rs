@@ -234,6 +234,9 @@ pub(crate) struct ComputeService {
     /// This daemon is a cluster workspace job: in a Slurm allocation AND
     /// started by a workspace job script (`CHIMAERA_CLUSTER_WORKSPACE`).
     cluster_job: bool,
+    /// The user said this host isn't a cluster (`CHIMAERA_NOT_A_CLUSTER`,
+    /// set by connect): Slurm on its PATH doesn't make it a login node.
+    not_a_cluster: bool,
     /// Mirror of the cached detection (`DET_*`), updated wherever detection
     /// is (re)run. Unknown until the first `/compute` (every window asks once
     /// at boot) — never triggered from the agent-context path.
@@ -266,6 +269,7 @@ impl ComputeService {
             bindir: std::env::var_os("CHIMAERA_SLURM_BINDIR").map(PathBuf::from),
             self_job,
             cluster_job,
+            not_a_cluster: env_nonempty(chimaera_core::cluster::ENV_NOT_A_CLUSTER).is_some(),
             detected: AtomicU8::new(DET_UNKNOWN),
             ended: std::sync::Mutex::new(EndedJobs::default()),
         }
@@ -278,6 +282,7 @@ impl ComputeService {
             bindir: Some(dir),
             self_job: None,
             cluster_job: false,
+            not_a_cluster: false,
             detected: AtomicU8::new(DET_UNKNOWN),
             ended: std::sync::Mutex::new(EndedJobs::default()),
         }
@@ -397,7 +402,8 @@ impl ComputeService {
     /// - Inside a Slurm job: the job, its node and resources, its absolute
     ///   end, how to use it, and the cluster's rules for agents.
     /// - Not in a job, on a host where Slurm was detected (a login-node
-    ///   daemon the user allowed): the short login-node version.
+    ///   daemon the user allowed): the short login-node version — unless
+    ///   the user said the host isn't a cluster.
     ///
     /// Off-cluster this is one `Option` check and one atomic load — no lock,
     /// no subprocess, no file read: the login-node branch reads only the
@@ -405,7 +411,7 @@ impl ComputeService {
     /// never runs one itself.
     pub(crate) async fn agent_context(&self) -> Option<String> {
         if self.self_job.is_none() {
-            return (self.detected.load(Ordering::Acquire) == DET_SLURM)
+            return (!self.not_a_cluster && self.detected.load(Ordering::Acquire) == DET_SLURM)
                 .then(|| LOGIN_NODE_CONTEXT.to_string());
         }
         // Baked ONCE per daemon lifetime, at first use: the allocation's
@@ -1375,6 +1381,13 @@ mod tests {
             svc.agent_context().await.as_deref(),
             Some(LOGIN_NODE_CONTEXT)
         );
+        // ...unless the user said this host isn't a cluster.
+        let workstation = ComputeService {
+            not_a_cluster: true,
+            ..ComputeService::with_bindir(dir.clone())
+        };
+        workstation.snapshot(false).await;
+        assert_eq!(workstation.agent_context().await, None);
 
         // Inside an allocation: the self block rides the snapshot.
         let svc = ComputeService::with_bindir_and_job(dir.clone(), "4242");

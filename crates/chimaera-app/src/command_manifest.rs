@@ -26,6 +26,7 @@ pub const DAEMON_UI_COMMANDS: &[&str] = &[
     "cluster_close",
     "cluster_move",
     "cluster_queue_open",
+    "set_not_cluster",
     "cluster_set_startup",
     "cluster_forget_setup",
     "cluster_set_agent_rules",

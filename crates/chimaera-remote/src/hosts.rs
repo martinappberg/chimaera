@@ -74,6 +74,11 @@ pub struct HostEntry {
     /// the safe direction.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub login_serve: bool,
+    /// The user said this host is not a cluster, though its login shell
+    /// reaches a batch scheduler (a workstation with Slurm's tools): it
+    /// connects like any remote, and nothing cluster-shaped is shown.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub not_cluster: bool,
     /// The scheduler the last connect found on the host — a display hint for
     /// the home screen before the next connect re-probes. Never trusted for
     /// behavior: every connect probes afresh.
@@ -176,6 +181,7 @@ impl HostsStore {
             added_at: unix_now(),
             last_connected_at: None,
             login_serve: false,
+            not_cluster: false,
             scheduler: None,
         };
         self.items.push(entry.clone());
@@ -209,6 +215,7 @@ impl HostsStore {
                     added_at: unix_now(),
                     last_connected_at: Some(unix_now()),
                     login_serve: false,
+                    not_cluster: false,
                     scheduler: None,
                 };
                 self.items.push(entry.clone());
@@ -232,6 +239,28 @@ impl HostsStore {
             .find(|h| h.alias == *alias)
             .expect("just added");
         entry.login_serve = on;
+        let entry = entry.clone();
+        self.save()?;
+        Ok(entry)
+    }
+
+    /// Say `alias` is (`on`) or isn't a cluster after all (adding the host if
+    /// unknown); "not a cluster" replaces the login-node override, which it
+    /// makes moot. Returns the updated entry.
+    pub fn set_not_cluster(&mut self, alias: &str, on: bool) -> anyhow::Result<HostEntry> {
+        let alias = &normalize_alias(alias)?;
+        if !self.items.iter().any(|h| h.alias == *alias) {
+            self.add(alias, None)?;
+        }
+        let entry = self
+            .items
+            .iter_mut()
+            .find(|h| h.alias == *alias)
+            .expect("just added");
+        entry.not_cluster = on;
+        if on {
+            entry.login_serve = false;
+        }
         let entry = entry.clone();
         self.save()?;
         Ok(entry)
@@ -389,6 +418,20 @@ mod tests {
                 .unwrap()
                 .login_serve
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// "Not a cluster" persists, clears the login-node override, and turns
+    /// back off.
+    #[test]
+    fn not_cluster_persists_and_replaces_the_override() {
+        let (mut store, dir) = tmp_store("not-cluster");
+        store.set_login_serve("box", true).unwrap();
+        let e = store.set_not_cluster("box", true).unwrap();
+        assert!(e.not_cluster && !e.login_serve);
+        let reloaded = HostsStore::load(dir.join("hosts.json"));
+        assert!(reloaded.get("box").unwrap().not_cluster);
+        assert!(!store.set_not_cluster("box", false).unwrap().not_cluster);
         std::fs::remove_dir_all(&dir).ok();
     }
 

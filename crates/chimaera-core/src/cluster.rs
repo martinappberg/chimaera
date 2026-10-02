@@ -36,6 +36,11 @@ use crate::slurm::{GpuFlag, LaunchSpec, PartitionChoice, Scheduler};
 pub const ENV_DATA_DIR: &str = "CHIMAERA_DATA_DIR";
 /// A workspace chimaera's runtime dir — node-local, gone with the job.
 pub const ENV_RUNTIME_DIR: &str = "CHIMAERA_RUNTIME_DIR";
+/// Set on a daemon the user started on a host they said is not a cluster
+/// (though Slurm is on its PATH): its agents aren't told they are on a
+/// shared login node.
+pub const ENV_NOT_A_CLUSTER: &str = "CHIMAERA_NOT_A_CLUSTER";
+
 /// Path of the [`WorkspaceSeed`] a workspace chimaera registers at boot.
 pub const ENV_CLUSTER_WORKSPACE: &str = "CHIMAERA_CLUSTER_WORKSPACE";
 /// A file of startup commands (this job's) applied as the outermost prelude

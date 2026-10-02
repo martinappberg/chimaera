@@ -525,6 +525,10 @@ pub struct ConnectOpts {
     /// per-host override). Without it, a host whose login shell reaches a
     /// batch scheduler never gets a daemon: connect answers [`ClusterHost`].
     pub login_serve: bool,
+    /// The user said this host is not a cluster (Slurm's tools on a
+    /// workstation's PATH): it connects like any host, and a daemon started
+    /// here doesn't tell its agents they are on a shared login node.
+    pub not_cluster: bool,
 }
 
 /// `connect` found a cluster: a host whose login shell reaches a batch
@@ -1044,6 +1048,8 @@ trait RemoteOps {
 /// policy in [`resolve_daemon`] never needs to know which.
 struct SshOps {
     home: RemoteHome,
+    /// The host isn't a cluster, by the user's word (`ConnectOpts::not_cluster`).
+    not_cluster: bool,
 }
 
 impl RemoteOps for SshOps {
@@ -1089,7 +1095,7 @@ impl RemoteOps for SshOps {
         deploy_binary(host, path, self.home, &progress).await
     }
     async fn start_remote(&self, host: &str) -> anyhow::Result<Manifest> {
-        start_remote(host, self.home).await
+        start_remote(host, self.home, self.not_cluster).await
     }
     async fn ensure_remote_binary(
         &self,
@@ -1282,7 +1288,7 @@ async fn resolve_daemon(
     // below routed to the daemon's node.
     let first = ops.remote_probe(host, true).await?;
     let scheduler = ops.scheduler(host);
-    if scheduler.is_cluster() && !opts.login_serve {
+    if scheduler.is_cluster() && !opts.login_serve && !opts.not_cluster {
         // A cluster: nothing of ours may keep running on its login node, so
         // nothing is started, updated, or attached to — and no other login
         // node is dialed to judge an old daemon (that could prompt for a
@@ -1403,6 +1409,7 @@ pub async fn connect(
     // a dev home and a dev client can never stop or replace the real daemon.
     let ops = SshOps {
         home: RemoteHome::current(),
+        not_cluster: opts.not_cluster,
     };
     let (manifest, outdated, live_sessions) = resolve_daemon(&ops, host, &opts, &progress).await?;
     // Where `locate` left the alias: the forward must end on the daemon's
@@ -1463,7 +1470,16 @@ pub async fn locate_daemon(
     host: &str,
     home: RemoteHome,
 ) -> anyhow::Result<Option<(Manifest, bool)>> {
-    locate(&SshOps { home }, host, &|_| {}, None).await
+    locate(
+        &SshOps {
+            home,
+            not_cluster: false,
+        },
+        host,
+        &|_| {},
+        None,
+    )
+    .await
 }
 
 /// Frame the manifest in [`remote_probe`] / [`start_remote`] output on BOTH
@@ -2491,7 +2507,7 @@ fn parse_cli_version(text: &str) -> Option<String> {
 
 /// Start the daemon on the host, then wait — in ONE remote exec — until its
 /// manifest reports a live pid.
-async fn start_remote(host: &str, home: RemoteHome) -> anyhow::Result<Manifest> {
+async fn start_remote(host: &str, home: RemoteHome, not_cluster: bool) -> anyhow::Result<Manifest> {
     tracing::info!("starting chimaera daemon on {host} ({})", home.dir());
     ssh_run(
         host,
@@ -2525,7 +2541,15 @@ async fn start_remote(host: &str, home: RemoteHome) -> anyhow::Result<Manifest> 
              {env}{bin} serve --daemonize >> {log} 2>&1 < /dev/null && exit; \
              {env}setsid nohup {bin} serve >> {log} 2>&1 < /dev/null & disown",
             log_dir = home.log_dir(),
-            env = home.serve_env(),
+            env = format!(
+                "{}{}",
+                home.serve_env(),
+                if not_cluster {
+                    format!("{}=1 ", chimaera_core::cluster::ENV_NOT_A_CLUSTER)
+                } else {
+                    String::new()
+                }
+            ),
             bin = home.bin_path(),
             log = home.log_path(),
         ),
@@ -4352,6 +4376,22 @@ mod tests {
     }
 
     /// The warned override: a cluster the user allowed is a regular remote.
+    #[tokio::test]
+    async fn resolve_daemon_on_a_host_said_not_to_be_a_cluster_behaves_like_any_host() {
+        let fake = FakeOps {
+            scheduler: Scheduler::Slurm,
+            ..FakeOps::base()
+        };
+        let opts = ConnectOpts {
+            not_cluster: true,
+            ..Default::default()
+        };
+        let (manifest, _, _) = resolve_daemon(&fake, "host", &opts, &|_| {})
+            .await
+            .expect("started");
+        assert_eq!(manifest.pid, 999);
+    }
+
     #[tokio::test]
     async fn resolve_daemon_on_an_allowed_cluster_behaves_like_any_host() {
         let fake = FakeOps {

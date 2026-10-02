@@ -22,9 +22,10 @@ pub async fn run(
     }
     // The login-node override is per host and shared with the app: a flag
     // given here is remembered, and one set in the app applies here too.
-    let saved = HostsStore::load_default()
-        .get(host)
-        .is_some_and(|h| h.login_serve);
+    let entry = HostsStore::load_default().get(host);
+    let saved = entry.as_ref().is_some_and(|h| h.login_serve);
+    // "Not a cluster" (set in the app) holds here too.
+    let not_cluster = entry.as_ref().is_some_and(|h| h.not_cluster);
     if login_node && !saved {
         if let Err(e) = HostsStore::load_default().set_login_serve(host, true) {
             tracing::debug!("could not remember the login-node override for {host}: {e}");
@@ -35,6 +36,7 @@ pub async fn run(
         binary: binary.map(Path::to_path_buf),
         update_daemon,
         login_serve: login_node || saved,
+        not_cluster,
     };
     let connected = connect(host, opts, |phase| match phase {
         Phase::Probing => tracing::info!("probing {host} for a running daemon"),

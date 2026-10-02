@@ -22,6 +22,7 @@
     openWindow,
     remoteWorkspaces,
     removeHost,
+    setNotCluster,
     shutdownHost,
     updateLocalDaemon,
     type ConnectProgress,
@@ -261,6 +262,7 @@
     installing: "installing chimaera…",
     starting: "starting the daemon…",
     tunneling: "bringing the tunnel up…",
+    done: "",
   };
 
   onMount(() => {
@@ -296,6 +298,10 @@
     unlisteners.push(
       asyncDisposer(
         onConnectProgress((p) => {
+          if (p.phase === "done") {
+            phases = mapWithout(phases, p.alias);
+            return;
+          }
           const label =
             p.phase === "routing" && p.node !== undefined
               ? `reaching the daemon on ${p.node}…`
@@ -427,6 +433,21 @@
     remoteWs = mapWithout(remoteWs, alias);
     clusterOverviews.forget(alias);
     void refreshHosts();
+  }
+
+  /** A host the user said isn't a cluster is one after all: drop its tunnel
+   *  (a daemon on it keeps running, as on any disconnect), then connect,
+   *  which lands on its cluster page. */
+  async function backToCluster(alias: string): Promise<void> {
+    hostErrors = mapWithout(hostErrors, alias);
+    try {
+      if (hosts.find((h) => h.alias === alias)?.status === "connected") await disconnectHost(alias);
+      const state = await setNotCluster(alias, false);
+      hosts = hosts.map((h) => (h.alias === alias ? state : h));
+      await connect(alias);
+    } catch (e) {
+      hostErrors = new Map(hostErrors).set(alias, e instanceof Error ? e.message : String(e));
+    }
   }
 
   /** End all sessions on a host; its daemon and the tunnel stay up. */
@@ -647,6 +668,13 @@
         hosts = hosts.map((h) => (h.alias === state.alias ? state : h));
       }}
       onHostsChanged={() => void refreshHosts()}
+      onNotCluster={clusterWs === null
+        ? (state) => {
+            hosts = hosts.map((h) => (h.alias === state.alias ? state : h));
+            clusterView = null;
+            void connect(state.alias);
+          }
+        : undefined}
     />
     {/if}
   {:else}
@@ -1068,6 +1096,13 @@
                         class="side stop"
                         title="shut down {h.alias} — end all sessions and stop the daemon"
                         onclick={() => (confirmShutdown = h.alias)}>shut down</button
+                      >
+                    {/if}
+                    {#if h.not_cluster}
+                      <button
+                        class="side"
+                        title="you said {h.alias} isn't a cluster — treat it as one again (Chimaera then runs only inside jobs there)"
+                        onclick={() => void backToCluster(h.alias)}>it's a cluster</button
                       >
                     {/if}
                     <button class="side x" title="forget host" onclick={() => (confirmForget = h.alias)}

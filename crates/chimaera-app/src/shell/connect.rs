@@ -52,8 +52,10 @@ pub struct HostState {
     node: Option<String>,
     /// Set when the host is a cluster: from this process's connect, else the
     /// scheduler the last connect recorded in hosts.json (a hint until the
-    /// next probe).
+    /// next probe). Never for a host the user said isn't one.
     cluster: Option<ClusterWire>,
+    /// The user said this host isn't a cluster (its row offers to undo it).
+    not_cluster: bool,
 }
 
 /// A cluster host as the page sees it (see `ClusterHostInfo` in native.ts).
@@ -79,7 +81,10 @@ impl HostState {
         entry: &HostEntry,
         live: Option<&super::cluster::ClusterInfo>,
     ) -> Self {
-        let scheduler = live.map(|i| i.scheduler).or(entry.scheduler);
+        let scheduler = live
+            .map(|i| i.scheduler)
+            .or(entry.scheduler)
+            .filter(|_| !entry.not_cluster);
         self.cluster = scheduler
             .filter(|s| s.is_cluster())
             .map(|scheduler| ClusterWire {
@@ -183,6 +188,7 @@ pub(super) fn state_for(
         live_sessions: tunnel.and_then(|t| t.live_sessions),
         node: tunnel.and_then(|t| t.route.node().map(str::to_string)),
         cluster: None,
+        not_cluster: entry.not_cluster,
     }
 }
 
@@ -245,6 +251,7 @@ async fn run_connect(
         binary: entry.binary.clone(),
         update_daemon,
         login_serve: entry.login_serve,
+        not_cluster: entry.not_cluster,
     };
     let progress_app = app.clone();
     let progress_alias = alias.to_string();
@@ -615,6 +622,7 @@ async fn landed_on_cluster(
         added_at: 0,
         last_connected_at: None,
         login_serve: false,
+        not_cluster: false,
         scheduler: Some(found.scheduler),
     });
     lock(&state.host_entries).insert(alias.to_string(), entry.clone());
@@ -670,6 +678,7 @@ async fn host_entry(alias: &str) -> HostEntry {
             added_at: 0,
             last_connected_at: None,
             login_serve: false,
+            not_cluster: false,
             scheduler: None,
         })
 }

@@ -91,6 +91,9 @@ export interface HostState {
    * scheduler the last connect found (a hint until the next probe).
    */
   cluster: ClusterHostInfo | null;
+  /** The user said this host isn't a cluster, though Slurm is on its PATH:
+   *  it connects like any remote (its row offers to undo this). */
+  not_cluster: boolean;
 }
 
 /** Progress of an in-flight connect, mirrored from chimaera-remote phases. */
@@ -103,7 +106,10 @@ export interface ConnectProgress {
     | "downloading"
     | "installing"
     | "starting"
-    | "tunneling";
+    | "tunneling"
+    /** A cluster's binary install finished (or failed): its row's line goes.
+     *  (A connect ends with its `host-status` instead.) */
+    | "done";
   /** The login node a `routing` phase is reaching (it may ask to authenticate). */
   node?: string;
 }
@@ -669,6 +675,11 @@ export async function clusterSetAgentRules(alias: string, rules: AgentRules): Pr
 /** The warned per-host override: allow chimaera on this cluster's login node. */
 export async function clusterSetLoginServe(alias: string, on: boolean): Promise<HostState> {
   return shell().core.invoke<HostState>("cluster_set_login_serve", { alias, on });
+}
+
+/** Say a host isn't a cluster after all (`on`), or is one again. */
+export async function setNotCluster(alias: string, on: boolean): Promise<HostState> {
+  return shell().core.invoke<HostState>("set_not_cluster", { alias, on });
 }
 
 /** SIGTERM a daemon an earlier connect left on the cluster's login node. */

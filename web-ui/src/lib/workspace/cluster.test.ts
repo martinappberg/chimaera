@@ -28,7 +28,10 @@ import {
   liveJobs,
   memWords,
   nodeSizeWords,
+  filterFolders,
+  isTypedPath,
   openInHint,
+  splitTypedPath,
   openPlan,
   otherJobsWords,
   parentPath,
@@ -351,6 +354,26 @@ describe("jobs in words", () => {
     expect(openPlan([one, waiting])).toEqual({ kind: "choose", running: [one], pending: [waiting] });
     const two = job({ id: "j-0000cccc", name: "GPU" });
     expect(openPlan([one, two])).toEqual({ kind: "choose", running: [one, two], pending: [] });
+  });
+
+  it("filters a folder listing as you type, best matches first", () => {
+    const f = (...names: string[]) => names.map((name) => ({ name }));
+    const all = f("ajd", "Jdoe", "j_dodo", "notes", "xjdox");
+    expect(filterFolders(all, "").map((x) => x.name)).toEqual(all.map((x) => x.name));
+    expect(filterFolders(all, "JDO").map((x) => x.name)).toEqual(["Jdoe", "xjdox", "j_dodo"]);
+    expect(filterFolders(all, " jd ").map((x) => x.name)).toEqual(["Jdoe", "ajd", "xjdox", "j_dodo"]);
+    expect(filterFolders(all, "zzz")).toEqual([]);
+  });
+
+  it("tells a typed path from a filter, and splits it for completion", () => {
+    expect(isTypedPath("/scratch/u")).toBe(true);
+    expect(isTypedPath("~/proj")).toBe(true);
+    expect(isTypedPath("$SCRATCH/x")).toBe(true);
+    expect(isTypedPath("proj")).toBe(false);
+    expect(splitTypedPath("~/proj/an")).toEqual({ dir: "~/proj/", tail: "an" });
+    expect(splitTypedPath("/scratch/users/")).toEqual({ dir: "/scratch/users/", tail: "" });
+    expect(splitTypedPath("~")).toEqual({ dir: "~", tail: "" });
+    expect(splitTypedPath("$SCRATCH")).toEqual({ dir: "$SCRATCH", tail: "" });
   });
 
   it("says where a running job would open a workspace", () => {

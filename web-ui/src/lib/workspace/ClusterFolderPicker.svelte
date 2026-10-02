@@ -5,6 +5,11 @@
    * Folders only; each listing is one short, read-only `chimaera browse` on
    * the login node (nothing keeps running there). You step into the folder
    * you want and add it, like a native "Choose" dialog.
+   *
+   * Typing works as in the workspace folder picker: the box filters this
+   * folder (best matches first), or — starting with `/`, `~` or `$` — is a
+   * path that completes from its folder's listing. ↑↓ pick, ↩ steps in,
+   * ⌫ on an empty box goes up, ⌘↩ adds the folder you're in.
    */
   import { onMount } from "svelte";
   import {
@@ -14,7 +19,7 @@
     type ClusterWorkspace,
   } from "../net/native";
   import { modalFocus } from "../shared/modalFocus";
-  import { childPath } from "./cluster";
+  import { childPath, filterFolders, isTypedPath, parentPath, splitTypedPath } from "./cluster";
 
   interface Props {
     alias: string;
@@ -33,7 +38,11 @@
   /** A listing taking long is almost always the first-ever copy of chimaera. */
   let slow = $state(false);
   let error = $state<string | null>(null);
-  let goTo = $state("");
+  /** The box: a filter for this folder, or a typed path. */
+  let input = $state("");
+  let highlight = $state(0);
+  let filterEl = $state<HTMLInputElement | null>(null);
+  let listEl = $state<HTMLDivElement | null>(null);
   let name = $state("");
   let busy = $state(false);
   let addError = $state<string | null>(null);
@@ -69,6 +78,64 @@
     return out;
   });
 
+  // --- typed-path completion ---------------------------------------------------
+  // A path in the box lists its folder (once per folder, debounced: each
+  // listing is an ssh exec) and matches the part after the last `/`.
+  const typedPath = $derived(isTypedPath(input) ? input.trim() : null);
+  let pathListing = $state<ClusterDirListing | null>(null);
+  /** The folder `pathListing` (or `pathError`) answers for, as typed. */
+  let pathBase = $state("");
+  let pathError = $state<string | null>(null);
+  let pathSeq = 0;
+
+  $effect(() => {
+    const tp = typedPath;
+    if (tp === null) return;
+    const { dir } = splitTypedPath(tp);
+    if (dir === pathBase) return;
+    const mine = ++pathSeq;
+    const timer = setTimeout(() => {
+      clusterListDir(alias, dir).then(
+        (l) => {
+          if (mine !== pathSeq) return;
+          pathListing = l;
+          pathError = null;
+          pathBase = dir;
+          highlight = 0;
+        },
+        (e: unknown) => {
+          if (mine !== pathSeq) return;
+          pathListing = null;
+          pathError = e instanceof Error ? e.message : String(e);
+          pathBase = dir;
+          highlight = 0;
+        },
+      );
+    }, 200);
+    return () => clearTimeout(timer);
+  });
+
+  /** The typed path's folder is still being read. */
+  const pathPending = $derived(typedPath !== null && splitTypedPath(typedPath).dir !== pathBase);
+
+  /** What the list shows: this folder filtered, or the typed path's matches. */
+  const shown = $derived.by((): { folders: ClusterDirListing["folders"]; base: string } => {
+    if (typedPath !== null) {
+      if (pathPending || pathListing === null) return { folders: [], base: "" };
+      return {
+        folders: filterFolders(pathListing.folders, splitTypedPath(typedPath).tail),
+        base: pathListing.path,
+      };
+    }
+    if (listing === null) return { folders: [], base: "" };
+    return { folders: filterFolders(listing.folders, input), base: listing.path };
+  });
+
+  $effect(() => {
+    const el = listEl?.querySelector(`[data-idx="${highlight}"]`);
+    el?.scrollIntoView({ block: "nearest" });
+  });
+
   async function go(path: string): Promise<void> {
     const target = path.trim();
     if (target === "") return;
@@ -84,7 +151,8 @@
       const next = await clusterListDir(alias, target);
       if (mine !== seq) return;
       listing = next;
-      goTo = "";
+      input = "";
+      highlight = 0;
       name = "";
     } catch (e) {
       if (mine !== seq) return;
@@ -102,8 +170,9 @@
     void go(places[0] ?? "~");
   });
 
-  function enter(folder: { name: string }): void {
-    void go(childPath(here, folder.name));
+  function enter(folder: { name: string }, base: string = here): void {
+    void go(childPath(base, folder.name));
+    filterEl?.focus();
   }
 
   async function add(openAfter: boolean): Promise<void> {
@@ -124,6 +193,47 @@
       e.preventDefault();
       onClose();
     }
+  }
+
+  const canAdd = $derived(!busy && listing !== null && !hereIsWorkspace);
+
+  /** The box's keys (Escape is the window's: it closes from anywhere). */
+  function onFilterKeydown(e: KeyboardEvent): void {
+    const n = shown.folders.length;
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      if (n > 0) highlight = Math.min(highlight + 1, n - 1);
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      if (n > 0) highlight = Math.max(highlight - 1, 0);
+    } else if (e.key === "Backspace" && input === "") {
+      const up = parentPath(here);
+      if (up !== null && !loading) {
+        e.preventDefault();
+        void go(up);
+      }
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      if (e.metaKey || e.ctrlKey) {
+        if (canAdd) void add(canOpen);
+        return;
+      }
+      const pick = shown.folders[highlight];
+      if (pick !== undefined) enter(pick, shown.base);
+      else if (typedPath !== null) void go(typedPath);
+      // Not among the folders shown (a long listing stops at 2000): try it
+      // as a folder in here.
+      else if (input.trim() !== "" && listing !== null) void go(childPath(here, input.trim()));
+    }
+  }
+
+  function focusOnMount(node: HTMLElement): void {
+    node.focus();
+  }
+
+  /** Clicks on rows and crumbs leave the typing in the box. */
+  function keepFocus(e: MouseEvent): void {
+    e.preventDefault();
   }
 </script>
 
@@ -149,6 +259,20 @@
       </div>
     </div>
 
+    <input
+      class="filter"
+      bind:this={filterEl}
+      bind:value={input}
+      use:focusOnMount
+      oninput={() => (highlight = 0)}
+      onkeydown={onFilterKeydown}
+      placeholder="Filter, or type a path — ~/x, $SCRATCH/x"
+      spellcheck="false"
+      autocomplete="off"
+      aria-label="Filter these folders, or type a path on the cluster"
+      aria-controls="cluster-folder-list"
+    />
+
     <div class="crumbs" aria-label="Where you are">
       {#if listing !== null}
         {#each crumbs as c, i (c.path)}
@@ -157,13 +281,22 @@
             type="button"
             class="crumb"
             class:here={i === crumbs.length - 1}
+            tabindex="-1"
+            onmousedown={keepFocus}
             onclick={() => void go(c.path)}>{c.label}</button
           >
         {/each}
       {/if}
     </div>
 
-    <div class="list" class:stale={loading && listing !== null}>
+    <div
+      class="list"
+      id="cluster-folder-list"
+      role="listbox"
+      aria-label="Folders"
+      bind:this={listEl}
+      class:stale={(loading && listing !== null) || pathPending}
+    >
       {#if listing === null && loading}
         <div class="state" role="status">
           {slow ? `First time on ${alias}: copying Chimaera there (one time)…` : "Reading…"}
@@ -172,8 +305,20 @@
         <div class="state err">{error}</div>
       {:else if listing !== null}
         {#if error !== null}<div class="state err">{error}</div>{/if}
-        {#each listing.folders as f, i (`${i}:${f.name}`)}
-          <button type="button" class="row" onclick={() => enter(f)} title={childPath(here, f.name)}>
+        {#each shown.folders as f, i (`${i}:${f.name}`)}
+          <button
+            type="button"
+            class="row"
+            class:hl={i === highlight}
+            role="option"
+            aria-selected={i === highlight}
+            data-idx={i}
+            tabindex="-1"
+            onmousedown={keepFocus}
+            onmouseenter={() => (highlight = i)}
+            onclick={() => enter(f, shown.base)}
+            title={childPath(shown.base, f.name)}
+          >
             <svg class="ico" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
               <path
                 d="M2 4.5c0-.6.4-1 1-1h3.2l1.3 1.4H13c.6 0 1 .4 1 1v5.6c0 .6-.4 1-1 1H3c-.6 0-1-.4-1-1z"
@@ -188,29 +333,29 @@
             {#if f.git}<span class="mark">git</span>{/if}
           </button>
         {:else}
-          <div class="state">No folders in here.</div>
+          {#if typedPath !== null}
+            <div class="state" class:err={!pathPending && pathError !== null}>
+              {pathPending
+                ? "Reading…"
+                : pathError !== null
+                  ? pathError
+                  : "No folder matches — ↩ goes to the path as typed."}
+            </div>
+          {:else if input.trim() !== ""}
+            <div class="state">
+              No folder here matches “{input.trim()}”{listing.truncated
+                ? " among the first 2000 — ↩ tries it as a folder in here."
+                : "."}
+            </div>
+          {:else}
+            <div class="state">No folders in here.</div>
+          {/if}
         {/each}
-        {#if listing.truncated}<div class="state">Only the first 2000 folders are shown.</div>{/if}
+        {#if typedPath === null && input.trim() === "" && listing.truncated}
+          <div class="state">Only the first 2000 folders are shown — type to find one.</div>
+        {/if}
       {/if}
     </div>
-
-    <form
-      class="goto"
-      onsubmit={(e) => {
-        e.preventDefault();
-        void go(goTo);
-      }}
-    >
-      <input
-        class="in mono"
-        bind:value={goTo}
-        placeholder="Go to a path — ~/x or $SCRATCH/x"
-        spellcheck="false"
-        autocomplete="off"
-        aria-label="Go to a path on the cluster"
-      />
-      <button type="submit" class="quiet" disabled={goTo.trim() === "" || loading}>Go</button>
-    </form>
 
     <div class="foot">
       {#if listing !== null}
@@ -242,6 +387,7 @@
             type="button"
             class="cta"
             disabled={busy || listing === null || hereIsWorkspace}
+            title="⌘↩"
             onclick={() => void add(true)}>{busy ? "Adding…" : "Add and open"}</button
           >
         {:else}
@@ -249,6 +395,7 @@
             type="button"
             class="cta"
             disabled={busy || listing === null || hereIsWorkspace}
+            title="⌘↩"
             onclick={() => void add(false)}>{busy ? "Adding…" : `Add ${hereName}`}</button
           >
         {/if}
@@ -338,6 +485,24 @@
     border-color: color-mix(in srgb, var(--accent) 60%, var(--edge));
   }
 
+  .filter {
+    flex: none;
+    border: none;
+    border-top: 1px solid var(--edge);
+    outline: none;
+    background: none;
+    color: var(--fg);
+    font: inherit;
+    font-family: var(--mono);
+    font-size: var(--text-md);
+    padding: 11px 16px 7px;
+  }
+
+  .filter::placeholder {
+    color: var(--muted);
+    opacity: 0.7;
+  }
+
   .crumbs {
     flex: none;
     display: flex;
@@ -406,8 +571,8 @@
     cursor: pointer;
   }
 
-  .row:hover {
-    background: var(--row-hover);
+  .row.hl {
+    background: var(--row-active);
   }
 
   .ico {
@@ -450,14 +615,6 @@
     white-space: pre-wrap;
   }
 
-  .goto {
-    flex: none;
-    display: flex;
-    gap: 8px;
-    padding: 8px 16px;
-    border-top: 1px solid var(--edge);
-  }
-
   .in {
     min-width: 0;
     border: 1px solid var(--edge);
@@ -468,11 +625,6 @@
     font-size: var(--text-sm);
     padding: 5px 9px;
     outline: none;
-  }
-
-  .in.mono {
-    flex: 1;
-    font-family: var(--mono);
   }
 
   .in:focus {
