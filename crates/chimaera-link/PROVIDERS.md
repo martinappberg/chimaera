@@ -141,6 +141,41 @@ generation/credential digest under the registration gate. No matching active
 operation, any changed authority or an account/worker outage refuses; no
 unregistered or cached-validation fallback exists.
 
+The keeper performs that fresh check through the account's fixed private
+`POST /internal/v1/personal/providers/publications/authorize` endpoint. The
+caller is authenticated by the current keeper service bearer, scoped to exactly
+one account. The closed JSON body is at most 12 KiB and has exactly three fields:
+`authorization` (the complete worker-private request above, itself at most
+8 KiB), `device_token` (the original device access bearer retained by the live
+operation), and `worker_token` (the currently registered worker service bearer).
+Both bearer values are 16–256 ASCII base64url bytes; neither may be a delegation,
+workspace grant or runtime capability. They remain in private live memory and
+are never returned, persisted in operation records, or included in diagnostics.
+Missing fields, extra fields and exceeded bounds refuse before authorization.
+
+The account transaction locks the exact account first, then its keeper and
+worker cell rows in that order, before checking the device and service credential
+rows. It revalidates the presented keeper and worker hashes against the locked
+current cells, the worker's exact holder ID, the device's current access token,
+unrevoked session and exact account epoch, and the current paid entitlement.
+Expiry is checked against the current database clock after lock acquisition.
+Device revocation/token rotation and cell credential replacement use compatible
+lock ordering; no external call or provider effect occurs while these locks are
+held. A changed or expired credential, delegation, missing current cell, account
+mismatch or absent entitlement refuses. The account does not infer a process
+boot or registration from caller fields: the keeper must still match those
+fields to its retained operation and registration after this fresh call returns.
+
+Success is at most 12 KiB and exactly
+`{"version":1,"authorized":true,"authorization":<the complete exact request>}`.
+The keeper requires every field and the full tuple to match, then rechecks its
+current registration and live operation before minting the private one-use
+publication nonce. It never forwards the account reply or either bearer to a
+browser or project. Legacy account validation replies without an explicit
+`delegated:false` cannot authorize personal control; ordinary legacy data-plane
+validation retains its existing compatibility behavior. Unsupported services,
+network/parser failures and account lock timeouts refuse without fallback.
+
 A successful bounded reply repeats the complete exact request tuple and adds
 `authorized:true`, `publication_nonce:<new opaque one-use value>` and
 `expires_in:1..5` seconds. It is sent only on that private authenticated
