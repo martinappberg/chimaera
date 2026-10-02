@@ -1535,14 +1535,25 @@ async fn permission_deny_with_feedback_continues_turn() {
 #[tokio::test]
 async fn startup_hooks_are_visible_before_init_and_replay_without_private_output() {
     let fx = fixture();
-    fx.manager
-        .spawn(&ClaudeAdapter, spec("hooks", &fx.cwd, "startup-hooks"))
-        .unwrap();
+    let release = fx.cwd.join("release-startup-hooks");
+    let mut launch = spec("hooks", &fx.cwd, "startup-hooks");
+    launch.env.push((
+        "FAKE_STARTUP_HOOK_RELEASE".into(),
+        release.to_string_lossy().into_owned(),
+    ));
+    fx.manager.spawn(&ClaudeAdapter, launch).unwrap();
     let mut attached = fx.manager.attach("hooks", 0).unwrap();
     let mut seen = attached.replay.clone();
-    wait_for(&mut attached.live, &mut seen, "startup hooks", |ev| {
-        matches!(ev, AgentEvent::StartupProgress { detail } if detail == "Running startup hooks…")
-    }).await;
+    let is_hook_progress = |ev: &AgentEvent| matches!(ev, AgentEvent::StartupProgress { detail } if detail == "Running startup hooks…");
+    if !seen.iter().any(|entry| is_hook_progress(&entry.ev)) {
+        wait_for(
+            &mut attached.live,
+            &mut seen,
+            "startup hooks",
+            is_hook_progress,
+        )
+        .await;
+    }
     assert!(
         fx.manager.is_unused_startup("hooks"),
         "progress alone must not retain an unused failed chat"
@@ -1550,6 +1561,8 @@ async fn startup_hooks_are_visible_before_init_and_replay_without_private_output
     assert!(!seen
         .iter()
         .any(|entry| matches!(entry.ev, AgentEvent::Init { .. })));
+    // Release only after the pre-Init assertions: no scheduler-speed assumption.
+    std::fs::write(&release, b"").unwrap();
     wait_for(&mut attached.live, &mut seen, "init", |ev| {
         matches!(ev, AgentEvent::Init { .. })
     })
