@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { untrack } from "svelte";
   import { getActiveWorkspaceId } from "../net/api";
   import { pageVisible } from "../shared/visibility";
   import { openInSystemBrowser } from "../shared/urlOpen";
@@ -44,7 +44,6 @@
       baseline[key] = value;
     }
     inputs = next;
-
   }
 
   async function load(check = false): Promise<void> {
@@ -55,13 +54,15 @@
       // A fast installer can finish during the initial executable probes.
       // Reconcile once after that result so a reload cannot retain stale
       // “needs setup” rows after successful installation.
-      if (list.some(a => a.installation && !a.installation.running)) list = await pollAgents();
+      if (list.some(a => (a.installation && !a.installation.running) || (a.setup && !a.setup.running))) list = await pollAgents();
       syncInputs(list);
     }
     catch (e) { loadError = e instanceof Error ? e.message : "Couldn't load agents"; }
     finally { loading = false; }
   }
-  onMount(() => { void load(); });
+  $effect(() => {
+    if (visible && $pageVisible) untrack(() => { void load(); });
+  });
 
   async function save(a: AgentInfo): Promise<void> {
     const key = pathKey(a.id);
@@ -132,7 +133,8 @@
             {#if a.installed}<p class="detail" title={a.latestError ?? undefined}>{a.managed ? "Managed by Chimaera" : "Your installation"}{#if status.text} · {status.text}{/if}</p>{/if}
           </div>
           <div class="actions">
-            {#if busy}<button class="btn" onclick={() => install(a, "install", true)}>View progress</button>
+            {#if a.setup?.running}<button class="btn" onclick={() => install(a, "install", true)}>View progress</button>
+            {:else if a.installation?.running}<span class="detail" role="status">Installing in a terminal…</span>
             {:else if (!a.installed || a.chatSetupRequired) && a.managedInstall}
               <button class="btn primary" disabled={wsId === null} onclick={() => void install(a)}>{a.chatSetupRequired ? "Set up chat" : "Install"}</button>
             {:else if a.managed && (a.updateAvailable || a.outdated)}
@@ -142,6 +144,7 @@
             {/if}
           </div>
         </div>
+        {#if a.installation?.running && !a.setup?.running}<p class="notice">Follow this installation in its terminal in the sidebar.</p>{/if}
         {#if a.setup && !busy}<button class="link setup-result" onclick={() => install(a, "install", true)}>{a.setup.phase === "failed" ? "Setup needs attention — view result" : a.setup.phase === "cancelled" ? "Installation cancelled — view result" : "View installation result"}</button>{/if}
         {#if messages[a.id]}<p class="notice" role="status">{messages[a.id]}</p>{/if}
         {#if rowError[a.id]}<p class="err" role="alert">{rowError[a.id]}</p>{/if}

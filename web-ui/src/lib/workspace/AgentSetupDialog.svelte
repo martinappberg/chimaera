@@ -16,12 +16,13 @@
   let requestId: string | null = null;
   let checking = $state(false);
   let initial = true;
+  let ignoredOperationId: string | null = null;
   let disposed = false;
   const operation = $derived(details?.operation ?? null);
   const running = $derived(setupRunning(operation));
   const agent = $derived($agentCatalog.find(a => a.id === request.agent.id) ?? request.agent);
   const verb = $derived(({ install: "Install", update: "Update", reinstall: "Reinstall" })[request.action]);
-  const title = $derived(operation?.phase === "succeeded" ? "Installation finished" : operation?.phase === "failed" ? "Setup needs attention" : operation?.phase === "cancelled" ? "Installation cancelled" : operation?.phase === "cancelling" ? "Stopping installation" : running ? `${operation?.action === "update" ? "Updating" : operation?.action === "reinstall" ? "Reinstalling" : "Installing"} ${agent.name}` : `${verb} ${agent.name}`);
+  const title = $derived(operation?.phase === "succeeded" ? `${agent.name} installed` : operation?.phase === "failed" ? `${agent.name} setup needs attention` : operation?.phase === "cancelled" ? "Installation cancelled" : operation?.phase === "cancelling" ? "Stopping installation" : running ? `${operation?.action === "update" ? "Updating" : operation?.action === "reinstall" ? "Reinstalling" : "Installing"} ${agent.name}` : `${verb} ${agent.name}`);
 
   async function check(): Promise<void> {
     if (checking) return;
@@ -29,7 +30,8 @@
     try {
       const next = await getAgentSetup(agent.id);
       if (disposed) return;
-      if (initial && !request.showResult && !setupRunning(next.operation)) next.operation = null;
+      if (initial && !request.showResult && !setupRunning(next.operation)) ignoredOperationId = next.operation?.id ?? null;
+      if (next.operation?.id === ignoredOperationId && !setupRunning(next.operation)) next.operation = null;
       initial = false;
       if (next.operation?.id === requestId) requestId = null;
       const changed = next.operation?.phase !== details?.operation?.phase;
@@ -76,7 +78,10 @@
     finally { busy = false; }
   }
   function launch(ui: "chat" | "term"): void {
-    onclose(); onlaunch({ agent: agent.id, ui, explicit: true });
+    // Start while the request still exists: closing clears the shared store
+    // and invalidates this component’s derived agent synchronously.
+    onlaunch({ agent: agent.id, ui, explicit: true });
+    onclose();
   }
 </script>
 
@@ -102,7 +107,9 @@
         </div>
         <details class="output" open={operation.phase === "failed" || running}>
           <summary>Installer output{operation.truncated ? " · latest 64 KB" : ""}</summary>
-          <pre role="region" aria-label="Installer output" tabindex="0">{operation.output || "Waiting for installer output…"}</pre>
+          {#if agent.path}<div class="selected-path">Executable for new sessions: <code>{agent.path}</code></div>{/if}
+          <!-- svelte-ignore a11y_no_noninteractive_tabindex (keyboard users must be able to scroll the bounded output region) -->
+          <pre role="region" aria-label="Installer output" tabindex="0">{operation.output || (running ? "Waiting for installer output…" : "The installer produced no output.")}</pre>
         </details>
       {:else}
         <p class="note">Installation does not sign you in or verify chat. Provider availability and host compatibility are checked when you open the agent.</p>
@@ -149,6 +156,7 @@
   .result { border-left:3px solid var(--accent); padding:10px 14px; margin:16px 0; background:var(--rail-bg); line-height:1.6; font-size:12px; }
   .result strong { font-weight:500; } .result span { display:block; color:var(--muted); font-size:11px; margin-top:6px; }
   .failed { border-color:var(--err); }
+  .selected-path { padding:0 12px 12px; overflow-wrap:anywhere; color:var(--muted); font-size:11px; line-height:1.6; }
   .output { border:1px solid var(--edge); border-radius:8px; overflow:hidden; }
   summary { cursor:pointer; padding:12px; color:var(--muted); font-size:12px; }
   pre { margin:0; padding:12px; max-height:220px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; background:var(--rail-bg); font-size:11px; line-height:1.6; }

@@ -10,7 +10,7 @@ ended conversations.
 
 **Where it lives (shared):** UI `web-ui/src/lib/workspace/{Launcher.svelte,launcher.ts,
 sessions.ts}` + the rail/split-button in `web-ui/src/App.svelte`. Daemon:
-`crates/chimaera-server/src/{api/sessions.rs,launcher.rs,agents.rs,runtimes.rs,agent_state.rs,
+`crates/chimaera-server/src/{api/sessions.rs,launcher.rs,agents.rs,runtimes.rs,agent_setup.rs,agent_state.rs,
 spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /api/v1/agents`,
 `POST/DELETE /api/v1/agents/{id}/install`, `GET /api/v1/agents/claude/sessions`,
 `GET /api/v1/recents`, `POST /agent-events/{id}?key=`, and `/ws/events` for the roster.
@@ -71,23 +71,35 @@ for the current session; see [chat mode](chat-mode.md) for provider behavior.
 
 ## Managed runtimes — install / update / theming shims
 
-- **What & when.** Chimaera installs and updates the agent CLIs itself (curated scripts, official
-  sources, checksums when published, never sudo), streaming the installer into a visible terminal pane —
-  and writes tiny theming "shims" that inject a scheme-matched theme into agent spawns.
-- **How it's used.** Click an install chip → `POST /api/v1/agents/{id}/install {workspace_id}`
-  spawns the curated command as an ordinary shell session you watch. Click an update affordance
-  (launcher `→ <new>`, or Settings → Agents "Update") → `POST /api/v1/agents/{id}/update`
-  re-runs the same curated script (it always fetches latest and re-swaps atomically) as a session
-  named `update <agent>` — **managed binaries only**; for your own binary the daemon 400s and the
-  UI never offers it. `DELETE /api/v1/agents/{id}/install` uninstalls the managed copy (driven
-  from the Agents settings panel, after an in-app `ConfirmDialog` that keeps a failure inline).
-- **Where it lives.** `runtimes.rs` (`install_agent`, `update_agent`, `start_install`,
-  `install_script`, `write_shims`, `regenerate_shims`); latest-release awareness in
-  `agent_updates.rs`.
+- **What & when.** Chimaera installs and updates its own agent copies from official sources,
+  with checksums when published and no sudo. Launcher and Settings → Agents open the same setup
+  dialog, showing the host, installation folder, progress, output, and final result. Installers
+  run without a terminal or a session tab; opening or closing the dialog never starts an agent.
+- **How it's used.** Choose Install, Update, or Advanced → Reinstall, then start the operation
+  in the dialog. Keep working closes the dialog; View progress/result in Agents settings returns
+  to it. Cancel stops only that installer. Failure and cancellation keep the last 64 KiB of output
+  and the exit code when available; Retry is explicit. Storage/quota, permission, and incompatible
+  system-library failures explain what to fix. Results last until the daemon restarts; a lost
+  connection is unknown status, never success.
+- **Installation is one step.** A zero installer exit code says files were installed, not that
+  the account is signed in or structured chat works. Afterward, Open terminal to sign in opens the
+  provider's interactive agent; Try chat explicitly starts a chat, whose normal startup UI reports
+  authentication, compatibility, or handshake errors. Settings says “Installed · Supports chat and
+  terminal” rather than claiming readiness. Running conversations and account data are kept.
+- **Where it lives.** `agent_setup.rs`, `workspace/agentSetup.ts`, and
+  `workspace/AgentSetupDialog.svelte`: authenticated `GET/POST /api/v1/agents/{id}/setup` and
+  `DELETE /api/v1/agents/{id}/setup/{operation}`. POST carries `workspace_id`, an
+  `install|update|reinstall` action, and an idempotency `request_id`; same-daemon duplicate clicks
+  join active work. The catalog's additive `setup` summary lets Settings rediscover it. One result
+  per provider, bounded memory, a 15-minute deadline, and process-group cancellation keep work
+  bounded. Polling pauses with a hidden document. Legacy `/install` and `/update` PTY endpoints
+  remain compatible. Curated scripts/shims live in `runtimes.rs`; update discovery in
+  `agent_updates.rs`. `DELETE /api/v1/agents/{id}/install` still removes only the managed copy,
+  after Settings' confirmation, leaving account data and other installations alone.
 - **Key behaviors.** Scripts are composed by the daemon (never the client), `set -euo pipefail`,
   HTTPS-only, no sudo, version charset-whitelisted, downloads in a `mktemp` dir. Layout
-  `~/.chimaera/agents/<agent>/<version>/bin/` with an atomic per-agent symlink swap (running
-  sessions keep their exec'd inode — the update session says so up front). Cluster workspace
+  `~/.chimaera/agents/<agent>/<package>/bin/` with an atomic per-agent symlink swap (running
+  sessions keep their existing package). Cluster workspace
   daemons share this directory instead of installing into each workspace's `data/agents`;
   `CHIMAERA_HOME` still isolates development installs. Existing workspace-local copies are
   read fallbacks; updates install into the shared directory. A shared per-agent file lock
@@ -102,10 +114,10 @@ for the current session; see [chat mode](chat-mode.md) for provider behavior.
   Older daemons on the same shared storage also delay cleanup until closed or upgraded.
   Antigravity's replaced chat packages are reclaimed once their version is unused.
   Codex installs as its
-  whole release package rather than just the entrypoint — it spawns companions
+  whole release package into a fresh directory even for a same-version repair, so it never
+  replaces companions a running session still needs. It installs the package rather than just the entrypoint — it spawns companions
   (`codex-code-mode-host`, bundled rg/zsh) from beside its own executable, and an entrypoint-only
-  install shipped a codex whose code mode failed closed. One install/update per agent (409 while
-  running, either verb, including another workspace sharing the install). Antigravity installs its complete Google chat package alongside the
+  install shipped a codex whose code mode failed closed. One install/update per agent across both setup APIs (409 when another workspace holds the shared lock). Antigravity installs its complete Google chat package alongside the
   terminal executable. Grok uses xAI’s standalone release. These two chat/runtime artifacts are
   fetched over HTTPS from the vendor; they do not publish separate checksums at these endpoints.
   Gemini CLI is retained for reading existing records, with no new managed install. Shims are written **only**

@@ -185,7 +185,11 @@ async fn start_script(
     });
     lock(&state.agent_setup).insert(kind, operation.clone());
     tokio::spawn(async move {
+        crate::runtimes::prune_install_versions(state.managed_root.clone(), kind).await;
         let (phase, code, message) = run(&state, &operation, receiver, cwd, script).await;
+        if phase == Phase::Succeeded {
+            crate::runtimes::prune_install_versions(state.managed_root.clone(), kind).await;
+        }
         lock(&operation.progress).message = "Refreshing the installed version…".into();
         // Keep the shared lock through detection; there must be no false
         // completion while a competing workspace changes the executable.
@@ -270,6 +274,13 @@ async fn run(
     cwd: PathBuf,
     script: String,
 ) -> (Phase, Option<i32>, String) {
+    if *cancel.borrow() {
+        return (
+            Phase::Cancelled,
+            None,
+            "Installation cancelled before it started.".into(),
+        );
+    }
     let env = crate::api::session_env(state, &lock(&op.progress).id, "dark", None);
     let remove = crate::api::spawn_env_remove(&env);
     let mut cmd = tokio::process::Command::new("/bin/bash");
@@ -308,7 +319,9 @@ async fn run(
         }
     };
     let result = tokio::select! {
-        result = async { tokio::join!(child.wait(), &mut reads).0 } => Some(result),
+        // Keep the leader unreaped while descendants hold the pipes open, so
+        // cancellation cannot signal a recycled process-group ID.
+        result = async { (&mut reads).await; child.wait().await } => Some(result),
         _ = stopped => None,
         _ = tokio::time::sleep(DEADLINE) => None,
     };
@@ -435,9 +448,20 @@ mod tests {
             AgentKind::Codex,
             "/tmp".into(),
             request("one"),
-            "echo started; sleep 120".into(),
+            "trap 'echo cleanup' EXIT; echo started; sleep 120".into(),
         )
         .await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !snapshot(&state, AgentKind::Codex)
+                .unwrap()
+                .output
+                .contains("started")
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
         start_script(
             state.clone(),
             AgentKind::Codex,
@@ -451,7 +475,9 @@ mod tests {
         assert_eq!(stale.status(), StatusCode::CONFLICT);
         assert!(snapshot(&state, AgentKind::Codex).unwrap().running());
         cancel(State(state.clone()), Path(("codex".into(), "one".into()))).await;
-        assert!(completed(&state).await.phase == Phase::Cancelled);
+        let p = completed(&state).await;
+        assert!(p.phase == Phase::Cancelled);
+        assert!(p.output.contains("cleanup"));
     }
     #[tokio::test]
     async fn large_output_is_bounded_and_success_never_claims_authentication() {

@@ -624,7 +624,7 @@ pub(crate) async fn start_install(
     }
 }
 
-async fn prune_install_versions(root: PathBuf, kind: AgentKind) {
+pub(crate) async fn prune_install_versions(root: PathBuf, kind: AgentKind) {
     // Cleanup is best-effort; a read-only/stale manifest must not turn a
     // working install into a failure. The caller retains the install lock.
     match tokio::task::spawn_blocking(move || crate::runtime_retention::prune_locked(&root, kind))
@@ -637,7 +637,10 @@ async fn prune_install_versions(root: PathBuf, kind: AgentKind) {
 
 /// All workspace daemons share this advisory lock. The descriptor stays alive
 /// until the installer exits; process death releases it without a stale lockdir.
-pub(crate) async fn lock_install(root: &Path, kind: AgentKind) -> Result<std::fs::File, Box<Response>> {
+pub(crate) async fn lock_install(
+    root: &Path,
+    kind: AgentKind,
+) -> Result<std::fs::File, Box<Response>> {
     let lock_root = root.to_path_buf();
     let result = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
         std::fs::create_dir_all(&lock_root)?;
@@ -1300,7 +1303,14 @@ mod tests {
             assert!(script.contains("mv -f \"$root/bin/.$1.new\" \"$root/bin/$1\""));
             let agent = kind.as_str();
             assert!(
-                script.contains(&format!("swap {agent} \"$version\"")),
+                script.contains(&format!(
+                    "swap {agent} \"${}\"",
+                    if kind == AgentKind::Codex {
+                        "package"
+                    } else {
+                        "version"
+                    }
+                )),
                 "{kind:?}"
             );
             // Ends by printing the installed version through the new link.
