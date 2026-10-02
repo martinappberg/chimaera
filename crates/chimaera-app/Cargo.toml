@@ -15,11 +15,18 @@ repository = "https://github.com/martinappberg/chimaera"
 name = "chimaera"
 path = "src/main.rs"
 
+[features]
+# Enabled only for destination-bound signing verification until native/keeper gates pass.
+ssh-agent-prototype = ["dep:ssh-key", "dep:signature", "dep:base64"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
 anyhow = "1"
+ssh-key = { version = "0.6.7", features = ["crypto"], optional = true }
+signature = { version = "2", optional = true }
+base64 = { version = "0.22", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }

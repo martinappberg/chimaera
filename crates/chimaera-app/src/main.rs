@@ -14,6 +14,9 @@ mod http;
 mod menu;
 mod notify;
 mod shell;
+#[cfg(feature = "ssh-agent-prototype")]
+#[allow(dead_code)] // No native Connect path advertises signing before live acceptance.
+mod ssh_agent;
 mod tray;
 mod update;
 mod windows;
