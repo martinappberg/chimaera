@@ -542,7 +542,11 @@ fn move_retry(
 /// The negotiated account contract retains a thirty-second reconnect grace.
 /// Wait cheaply on ownership before spending a bounded hydration attempt.
 fn acquisition_ready(baton: &Baton) -> bool {
-    if baton.holder_id.is_none() {
+    // A phone request is issued only after the account proves a cleanly
+    // suspended cloud owner. Its named destination may acquire immediately;
+    // the account rechecks that proof atomically with acquisition. Waiting for
+    // lease expiry here would outlive the phone's twenty-second fallback.
+    if baton.holder_id.is_none() || baton.move_reason.as_deref() == Some("phone") {
         return true;
     }
     matches!((timestamp_ms(&baton.server_now), baton.expires_at.as_deref().and_then(timestamp_ms)),
@@ -881,6 +885,16 @@ mod tests {
         }
         value["holder_id"] = serde_json::Value::Null;
         assert!(acquisition_ready(&serde_json::from_value(value).unwrap()));
+    }
+
+    #[test]
+    fn an_account_admitted_phone_return_does_not_wait_for_the_cloud_lease() {
+        let mut grant = baton("2026-09-30T00:00:00Z", Some("2026-09-30T00:00:00Z"));
+        assert!(!acquisition_ready(&grant));
+        grant.move_reason = Some("phone".into());
+        assert!(acquisition_ready(&grant));
+        grant.move_reason = Some("unknown".into());
+        assert!(!acquisition_ready(&grant));
     }
     #[tokio::test]
     async fn live_account_retry_is_bounded_and_account_change_stops_it() {

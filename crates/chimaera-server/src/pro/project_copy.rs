@@ -137,6 +137,41 @@ struct Report {
     staging: super::repository::StagingStatus,
 }
 
+/// Carry unresolved local-copy conflicts into its next copy or takeover.
+/// Call only while preparing a new transaction: the combined report is saved
+/// in that transaction's stage, so a retry cannot count its files twice.
+pub(super) fn carry_kept(
+    state: &AppState,
+    workspace: &str,
+    kept: (usize, Vec<std::path::PathBuf>),
+) -> (usize, Vec<std::path::PathBuf>) {
+    if !copy_only(state, workspace) {
+        return kept;
+    }
+    let statuses = lock(&state.pro.status);
+    let Some(previous) = statuses
+        .get(workspace)
+        .filter(|status| status.kept_both.is_some())
+    else {
+        return kept;
+    };
+    let mut paths = previous.kept_paths.clone();
+    let duplicates = kept.1.iter().filter(|path| paths.contains(path)).count();
+    let count = previous
+        .kept_both
+        .unwrap_or(0)
+        .saturating_add(kept.0.saturating_sub(duplicates));
+    for path in kept.1 {
+        if paths.len() >= 32 {
+            break;
+        }
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    (count, paths)
+}
+
 /// Consume only the chosen immutable publication. Neither this path nor its
 /// retry installs sessions, agent configuration, a proof or a preferred home.
 pub(super) struct Selection {
@@ -257,6 +292,7 @@ pub(super) async fn sync(
             }).await??);
             let (root,checkout,marker,id)=(destination.clone(),stage.join("checkout"),stage.join("marker"),workspace.to_owned());
             writes.push(tokio::task::spawn_blocking(move ||engine::prepare_marker(&root,&checkout,&marker,&id)).await??);
+            let kept=carry_kept(state,workspace,kept);
             let report=Report {name:manifest.name,branches:prepared.branches,kept,staging:prepared.staging};
             let report_path=stage.join("report.json");
             let bytes=serde_json::to_vec(&report)?;
@@ -307,8 +343,9 @@ pub(super) async fn sync(
                 let preference=preferences.get_mut(&id).context("copy receipt disappeared")?;
                 preference.copy=Some(CopyState {checkpoint:Some(selected.clone()),pending:None,ready:true,takeover_requested:false,takeover_request:None,owner_epoch:Some(epoch)});
                 preference.git_staging=Some(report.staging.clone());
-                preference.git_branches=report.branches;
+                preference.git_branches=report.branches.clone();
             }
+            super::report_return(&owner,&id,report.kept.clone(),&report.branches);
             super::projects::complete_copy(&owner,&id);
             // Failed persistence retains the completed transaction for exact
             // retry; an in-memory ready copy still cannot execute or publish.

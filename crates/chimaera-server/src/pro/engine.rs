@@ -1885,6 +1885,7 @@ async fn hydrate_scoped(
         planned.extend(tokio::task::spawn_blocking(move ||config::prepare_import(&overlay,&home,&config_workspace,&config_stage,budget)).await??);
         let (marker_root,marker_checkout,marker_stage,marker_id)=(destination_root.clone(),checkout.clone(),stage.join("marker"),workspace.to_owned());
         planned.push(tokio::task::spawn_blocking(move ||prepare_marker(&marker_root,&marker_checkout,&marker_stage,&marker_id)).await??);
+        let kept = super::project_copy::carry_kept(state,workspace,kept);
         let report = serde_json::to_vec(&(git_branches.clone(),kept.clone()))?;
         let report_path = stage.join("report.json");
         tokio::task::spawn_blocking(move ||crate::persist::atomic_write_json_durable(&report_path,report)).await??;

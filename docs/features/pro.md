@@ -572,9 +572,10 @@ routed session is labelled "In the cloud" or "On another computer" ("·
 reconnecting" while its owner cannot be reached and this view's own connection
 to it is down); opening it never silently starts another local agent.
 
-**Opening is viewing; doing wakes.** Attaching to a chat or terminal, polling
-rosters and watching files never wake a paused cloud project. The first real
-input does: a keystroke, a chat message, a stop or a permission answer. On a
+**Explicit opens and input may wake; background views never do.** An explicit
+project open may wake cloud without moving execution. Passive chat or terminal
+attaches, roster polls, refreshes and file watches never wake a paused project.
+Real input may wake it too: a keystroke, a chat message, a stop or a permission answer. On a
 computer, the daemon keeps the chat/terminal connection open while the owner is
 paused or reconnecting, holds that first input (a little typing, up to four
 chat commands, within one daemon-wide budget) and delivers it once after the
@@ -609,9 +610,9 @@ browser view of a sleeping project still opens: the account reports it as
 **When the service keeps the cloud's connections.** The account service may
 keep a sleeping cloud machine's chat, terminal and event connections itself;
 it marks each connection it keeps (`X-Chimaera-Sockets: kept`), and the app
-works with a service of either kind. No service that keeps them is deployed
-as this is written, so the paragraph above is what happens today, with one
-addition: to learn which kind it talks to, the daemon makes one connection
+works with a service of either kind. The keeper supports these retained
+connections; the paragraph above describes fallback behavior with an older
+service. To learn which kind it talks to, the daemon makes one connection
 attempt to a sleeping cloud machine that carries no wake request (a service
 that keeps none refuses it), at most once every five minutes per machine.
 Against a service that keeps them, a connection opens as usual while the
@@ -650,16 +651,16 @@ two minutes is not sent again; the app withdraws it instead, and it returns
 to the composer with the note "not delivered" unless it had arrived after
 all, in which case it shows in the transcript. A message that comes back
 with pictures comes back whole: if the composer has no room for them yet, it
-waits until it does. What this does not cover: a
-machine that runs an older version of Chimaera has no ids, so nothing is sent
+waits until it does. Withdrawal and dispatch evidence are stored independently
+of the conversation journal and survive agent replacement, daemon restart and
+project transfer within the bounded retention contract. A crash after dispatch
+but before its echo leaves delivery uncertain: automatic resend is refused and
+the composer asks the user to check the conversation. This prevents blind
+replay; it does not promise exactly-once external effects by the agent.
+A machine that runs an older version of Chimaera has no ids, so nothing is sent
 to it twice and a message whose connection ended before it confirmed stays
 "sending…" there; a message sent to a machine in the instant it fell
-asleep waits, shown as "sending…", until something wakes that machine; a
-withdrawn message is only remembered as withdrawn until the conversation's
-agent is restarted (an update, a resume, switching to its terminal and
-back), so a copy that turned up after that would run; and if the machine's
-Chimaera is killed in the instant between handing a message to the agent and
-recording it, the copy the app sends next runs it a second time.
+asleep waits, shown as "sending…", until something wakes that machine.
 Typing that is refused is said in a small note over the terminal; typing that
 was still on its way when a connection ended is not replayed.
 

@@ -44,6 +44,56 @@ fn enroll(state: &AppState) {
     });
     lock(&state.pro.legacy_pending).insert("w-copy".into());
 }
+
+#[tokio::test]
+async fn copy_conflict_report_survives_restart_and_transaction_replay() {
+    let (state, root) = fixture();
+    enroll(&state);
+    let prior = PathBuf::from("notes.md.mine-20261002-0600");
+    super::super::report_return(&state, "w-copy", (1, vec![prior.clone()]), &[]);
+    super::super::persist(&state).await.unwrap();
+    drop(state);
+    let restored = Arc::new(AppState::new(
+        "fixture".into(),
+        "fixture".into(),
+        4242,
+        0,
+        root.clone(),
+        root.join("config"),
+    ));
+    assert_eq!(
+        carry_kept(&restored, "w-copy", (0, vec![])),
+        (1, vec![prior.clone()])
+    );
+    let new = PathBuf::from("more.md.mine-20261002-0601");
+    let staged = carry_kept(&restored, "w-copy", (1, vec![new.clone()]));
+    assert_eq!(staged, (2, vec![prior, new]));
+    // An interrupted commit replays the stage, never combines it a second time.
+    for _ in 0..2 {
+        super::super::report_return(&restored, "w-copy", staged.clone(), &[]);
+        super::super::persist(&restored).await.unwrap();
+    }
+    assert_eq!(lock(&restored.pro.status)["w-copy"].kept_both, Some(2));
+    assert_eq!(lock(&restored.pro.status)["w-copy"].kept_paths, staged.1);
+    let many = carry_kept(
+        &restored,
+        "w-copy",
+        (
+            40,
+            (0..32)
+                .map(|i| PathBuf::from(format!("{i}.mine-20261002-0602")))
+                .collect(),
+        ),
+    );
+    assert_eq!(many.0, 42);
+    assert_eq!(many.1.len(), 32);
+    assert_eq!(
+        carry_kept(&restored, "w-ordinary", (0, vec![])),
+        (0, vec![])
+    );
+    drop(restored);
+    std::fs::remove_dir_all(root).unwrap();
+}
 #[tokio::test]
 async fn copy_fence_survives_signout_and_ordinary_state_corruption() {
     let (state, root) = fixture();

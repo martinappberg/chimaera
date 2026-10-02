@@ -405,7 +405,11 @@ share: counts always, names while they fit, plus when the return happened and
 how many files it kept then) and raises one `kept_both` notice per return that
 kept anything (`notices::push_kept_both`, which names the return's kept
 `@cloud` branches too: `engine::hydrate_scoped` passes `repository::receive`'s
-result).
+result). A local copy reports its kept files immediately after its file
+transaction commits. Unresolved copy conflicts carry into its next copy or
+explicit takeover: the combined bounded report is saved in the new transaction's
+stage, so retrying the commit cannot count the same files twice. Promotion to
+execution keeps that report available for review.
 
 **Reviewing both versions** (`kept.rs`, all authenticated, none reachable
 through a browser view's workspace scope):
