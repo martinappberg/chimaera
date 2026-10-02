@@ -894,9 +894,11 @@ async fn workspace_status(
         let state = state.clone();
         let ws = workspace.id.clone();
         tokio::task::spawn_blocking(move || {
-            let text = crate::lock(&state.env_preludes)
-                .current()
-                .effective(&ws, None);
+            let startup = crate::environment::job_startup_blocking();
+            let text =
+                crate::lock(&state.env_preludes)
+                    .current()
+                    .effective(startup.as_deref(), &ws, None);
             prelude_summary(&text)
         })
         .await

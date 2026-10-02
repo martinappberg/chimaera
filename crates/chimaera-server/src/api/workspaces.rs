@@ -16,7 +16,7 @@ pub(crate) async fn list_workspaces(
 ) -> Json<Vec<serde_json::Value>> {
     Json(
         crate::lock(&state.workspaces)
-            .list()
+            .listed()
             .into_iter()
             .filter(|workspace| !crate::cloud::is_onboarding_workspace(workspace))
             .map(|workspace| json!(workspace))
@@ -27,6 +27,9 @@ pub(crate) async fn list_workspaces(
 #[derive(Deserialize)]
 pub(crate) struct CreateWorkspace {
     root: String,
+    /// The native app's own internal workspace (`Workspace::hidden`).
+    #[serde(default)]
+    hidden: bool,
 }
 
 /// POST /api/v1/workspaces — register a directory, idempotent per canonical
@@ -69,6 +72,16 @@ pub(crate) async fn create_workspace(
                 .into_response();
         }
     };
+    if body.hidden {
+        return match crate::lock(&state.workspaces).add_hidden(root) {
+            Ok(workspace) => Json(workspace).into_response(),
+            Err(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": err.to_string()})),
+            )
+                .into_response(),
+        };
+    }
     // The registry holds the marker's id under another root: that root is
     // stat'ed here, off the store's lock, to tell a moved folder (its old
     // root is gone) from a local duplicate (it is still there).
@@ -135,7 +148,7 @@ pub(crate) async fn open_workspace(
 ) -> Response {
     match crate::lock(&state.workspaces).touch(&id) {
         Some(workspace) => {
-            if !workspace.cloud_internal {
+            if !workspace.cloud_internal && !workspace.hidden {
                 crate::pro::note_opened(&state, &workspace.id);
                 let (root, id) = (workspace.root.clone(), workspace.id.clone());
                 tokio::task::spawn_blocking(move || {

@@ -61,9 +61,9 @@ core; an addition can change when there's a clear improvement. Don't be too stri
 | [native-app.md](native-app.md) | The Tauri shell: real OS windows, window restore, the signed app+daemon self-updater, the update toast |
 | [lifecycle-and-persistence.md](lifecycle-and-persistence.md) | "Close the laptop, nothing dies" — daemon-owned sessions, the session ledger + restart handoff, graceful shutdown, update awareness |
 | [environment.md](environment.md) | Environment preludes — per-host/workspace/launch startup commands (`module load`, `conda activate`) run once per session before the shell or agent |
-| [compute.md](compute.md) | Slurm awareness — daemon-side scheduler detection, the user's queue snapshot, the rail compute chip + popover (hidden off-cluster) |
+| [compute.md](compute.md) | Clusters (HPC + Slurm) — nothing on the login node; you start Slurm jobs from the app's cluster page or `chimaera compute` and open workspaces inside them (several per job, moving between jobs with their chats); discovery, start sheet, folder picker, continue in a new job, notifications, what agents in a job are told, the passive rail chip |
 | [settings.md](settings.md) | The dotted-key `settings.json` model (hand-edit-aware), the settings UI, theme palettes |
-| [cli.md](cli.md) | The `chimaera` binary: `serve`, `connect`, `status`, `kill`, `doctor`, `shell-integration`, `plugin` |
+| [cli.md](cli.md) | The `chimaera` binary: `serve`, `connect`, `status`, `kill`, `doctor`, `shell-integration`, `compute`, `plugin` |
 
 ## Not in this catalog (on purpose)
 

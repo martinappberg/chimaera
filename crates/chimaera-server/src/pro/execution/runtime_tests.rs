@@ -56,6 +56,7 @@ async fn real_http_negotiation_status_and_restart_cannot_downgrade_enrolled_work
             mastermind: None,
             plugins_on: vec![],
             cloud_internal: false,
+            hidden: false,
         })
         .unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

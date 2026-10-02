@@ -469,6 +469,7 @@ async fn legacy_pending_registration_is_fenced_until_explicit_folder_choice() {
         mastermind: None,
         plugins_on: vec![],
         cloud_internal: false,
+        hidden: false,
     };
     std::fs::create_dir_all(root.join("daemon/pro")).unwrap();
     lock(&old.workspaces)
@@ -531,6 +532,7 @@ async fn original_laptop_root_is_bound_to_its_account_before_automatic_return() 
         mastermind: None,
         plugins_on: vec![],
         cloud_internal: false,
+        hidden: false,
     };
     lock(&state.workspaces)
         .import_exact(workspace.clone())
@@ -662,7 +664,7 @@ fn lazy_return_preserves_finished_conversation_through_real_worker_route() {
         let source = root.join("cloud-project");
         std::fs::create_dir(&source).unwrap();
         let cloud = state(&root.join("cloud-daemon"));
-        let workspace = crate::workspaces::Workspace { id: "w-cloud".into(), root: source.clone(), name: "Cloud project".into(), last_opened_at: super::super::now(), mastermind: None, plugins_on: Vec::new(), cloud_internal: false };
+        let workspace = crate::workspaces::Workspace { id: "w-cloud".into(), root: source.clone(), name: "Cloud project".into(), last_opened_at: super::super::now(), mastermind: None, plugins_on: Vec::new(), cloud_internal: false, hidden: false };
         lock(&cloud.workspaces).import_exact(workspace.clone()).unwrap();
         let native = cloud.claude_projects_dir.join(crate::launcher::encode_cwd(&source)).join(format!("{NATIVE}.jsonl"));
         std::fs::create_dir_all(native.parent().unwrap()).unwrap();
@@ -803,6 +805,7 @@ fn worker_roundtrip(corrupt_shadow: bool) {
                     mastermind: None,
                     plugins_on: vec![],
                     cloud_internal: false,
+                    hidden: false,
                 })
                 .unwrap();
             let mut config = lock(&s.pro.runtime).clone().unwrap();

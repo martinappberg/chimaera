@@ -173,13 +173,13 @@ if (import.meta.env.DEV) {
 
   ok(t("http://localhost:8888/lab?token=a") === "localhost:8888/lab?token=a", "loopback + token");
   ok(t("http://127.0.0.1:8501") === "127.0.0.1:8501/", "bare loopback origin");
-  ok(t("http://sh03-09n14:8888/tree") === "sh03-09n14:8888/tree", "host with explicit port");
+  ok(t("http://compute-014:8888/tree") === "compute-014:8888/tree", "host with explicit port");
   ok(t("http://localhost:3000/#/runs/42") === "localhost:3000/#/runs/42", "hash-router route kept");
   ok(t("https://github.com/foo/bar") === "", "ordinary web URLs are not proxyable");
   // The upstream hop is clear-text HTTP/1.1: a TLS app must reach the real
   // browser, not fail inside the pane.
   ok(t("https://localhost:8443/lab") === "", "TLS loopback apps are not proxyable");
-  ok(t("https://sh03-09n14:8888/tree") === "", "TLS is refused even with a port");
+  ok(t("https://compute-014:8888/tree") === "", "TLS is refused even with a port");
   ok(t("http://user:pw@localhost:1/") === "", "userinfo URLs never qualify");
   ok(isWebUrl("https://x.dev") && !isWebUrl("javascript:alert(1)"), "only web schemes pass");
   ok(!isWebUrl("file:///etc/passwd"), "file: never passes");

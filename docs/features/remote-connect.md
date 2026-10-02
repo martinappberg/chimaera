@@ -52,6 +52,19 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
   `connected` and opening `http://127.0.0.1:{port}/#token={token}&host={alias}`. A listener that
   merely accepts is not ready.
 
+## Clusters: nothing on the login node
+
+- **What.** The same probe exec also reports whether the host's login shell reaches a
+  batch scheduler (Slurm, PBS, LSF). On such a host `connect` starts, updates and attaches
+  to nothing: it answers a typed `ClusterHost` (`crates/chimaera-remote/src/lib.rs`),
+  which the app shows as a cluster row and the CLI explains. Workspaces there run as Slurm
+  jobs instead — see [compute.md](compute.md).
+- **Every automatic path inherits it** — launch restore, reconnect after sleep or a 401, a
+  job window healing its connection — because they all go through the one connect flight.
+- **The override** "Run Chimaera on the login node" (per host, `hosts.json` `login_serve`;
+  the CLI's `--login-node`) turns a cluster back into a regular remote, for clusters whose
+  admins allow it. Off unless set; an older build rewriting `hosts.json` turns it off.
+
 ## Key behaviors & gotchas
 
 - **One ControlMaster per host.** Every ssh/scp call rides one chimaera-owned master
@@ -113,7 +126,7 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
   (one more prompt on a Duo cluster). The node is dialed directly with the alias's own ssh config
   (`-o HostName=<node>`: user, keys, ProxyJump carry over) only when the laptop resolves its name
   to an address the cluster resolves it to — otherwise a search domain could reach, and send the
-  password to, an unrelated host (Sherlock's bare `sh04-ln03` is `10.20.0.63` inside and public
+  password to, an unrelated host (a cluster's bare `login-b` can be a `10.x` address inside and public
   outside). Else, or if the direct dial never reaches an sshd, it goes through the alias's master
   as a `-W` leg, resolved inside the cluster. Only that in-cluster route can show a renamed host
   (the manifest's old name leading back to the node we landed on) — the user's ssh config may

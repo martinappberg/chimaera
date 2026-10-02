@@ -12,7 +12,6 @@ import { workbenchPath } from "./base";
 import { writable } from "svelte/store";
 import { getHostLabel, getJobContext, getToken } from "./api";
 import type { Workspace } from "../workspace/sessions";
-import type { ComputeSessionList } from "../workspace/computeSessions";
 
 interface TauriGlobal {
   core: { invoke: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T> };
@@ -48,7 +47,22 @@ export function isNativeShell(): boolean {
 }
 
 /** Connection lifecycle of a saved remote host, as reported by the shell. */
-export type HostStatus = "disconnected" | "connecting" | "connected" | "error";
+export type HostStatus = "disconnected" | "connecting" | "connected" | "cluster" | "error";
+
+/** A batch scheduler a host's login shell reaches (only Slurm is driven). */
+export type Scheduler = "slurm" | "pbs" | "lsf";
+
+/**
+ * A host where a batch scheduler was found: chimaera never runs on its login
+ * node (unless `login_serve`), workspaces run as jobs instead.
+ */
+export interface ClusterHostInfo {
+  scheduler: Scheduler;
+  /** The user allowed a daemon on this cluster's login node (warned). */
+  login_serve: boolean;
+  /** A daemon an earlier connect left on the login node, if the probe saw it. */
+  login_daemon: { node: string; pid: number; alive: boolean | null } | null;
+}
 
 export interface HostState {
   alias: string;
@@ -76,6 +90,14 @@ export interface HostState {
    * connection lands (null = wherever the alias lands).
    */
   node: string | null;
+  /**
+   * Set when the host is a cluster — from this session's connect, or the
+   * scheduler the last connect found (a hint until the next probe).
+   */
+  cluster: ClusterHostInfo | null;
+  /** The user said this host isn't a cluster, though Slurm is on its PATH:
+   *  it connects like any remote (its row offers to undo this). */
+  not_cluster: boolean;
 }
 
 /** Progress of an in-flight connect, mirrored from chimaera-remote phases. */
@@ -88,7 +110,10 @@ export interface ConnectProgress {
     | "downloading"
     | "installing"
     | "starting"
-    | "tunneling";
+    | "tunneling"
+    /** A cluster's binary install finished (or failed): its row's line goes.
+     *  (A connect ends with its `host-status` instead.) */
+    | "done";
   /** The login node a `routing` phase is reaching (it may ask to authenticate). */
   node?: string;
 }
@@ -330,38 +355,352 @@ export async function remoteWorkspaces(alias: string): Promise<Workspace[]> {
   return t.core.invoke<Workspace[]>("remote_workspaces", { alias });
 }
 
-/**
- * The connected host's compute-node sessions + partitions, shell-proxied —
- * the LOCAL home screen's per-host indicator count. The shell strips each
- * session's daemon port/token before anything reaches JS. Managing sessions
- * (launch/cancel/refresh) lives on the host-detail page, which talks to the
- * login daemon's routes directly (see workspace/computeSessions.ts).
- */
-export async function remoteComputeSessions(alias: string): Promise<ComputeSessionList> {
-  const t = tauri();
-  if (t === null) throw new Error("not running in the native shell");
-  return t.core.invoke<ComputeSessionList>("remote_compute_sessions", { alias });
+// --- Clusters: jobs, and workspaces open inside them ----------------------
+//
+// On a cluster nothing of ours keeps running on the login node: the shell
+// runs short ssh commands (squeue/sbatch/scancel + the read-only `chimaera
+// browse`), and Chimaera runs inside Slurm jobs the user starts. Workspaces
+// open inside a job; a workspace keeps its chats in its own folder, so it
+// moves between jobs. Ports and tokens never reach JS.
+
+/** What a job asks Slurm for; absent fields = the cluster's default. */
+export interface LaunchSpec {
+  /** Slurm time limit (`2-00:00:00`, `04:00:00`). Required. */
+  time: string;
+  partition?: string | null;
+  account?: string | null;
+  qos?: string | null;
+  constraint?: string | null;
+  cpus?: number | null;
+  /** Memory per node, Slurm's spelling (`16G`). */
+  mem?: string | null;
+  gpus?: number | null;
 }
 
-/** Tunnel to a ready compute-node session; the shell opens its window. */
-export async function connectComputeSession(alias: string, jobId: string): Promise<void> {
+export interface ClusterWorkspace {
+  id: string;
+  name: string;
+  path: string;
+  created_ms: number;
+}
+
+export interface ClusterSetup {
+  name: string;
+  spec: LaunchSpec;
+}
+
+export interface AgentRules {
+  /** A file on the cluster holding its published rules for agents. */
+  file?: string | null;
+  /** Text the user wrote or pasted. */
+  text: string;
+}
+
+export interface ClusterConfig {
+  version: number;
+  workspaces: ClusterWorkspace[];
+  setups: ClusterSetup[];
+  /** What the last job on this cluster started with. */
+  last_spec?: LaunchSpec | null;
+  agent_rules: AgentRules;
+  learned: {
+    /** Partitions that refused a batch job (started attached instead). */
+    interactive_only?: string[];
+    /** Fields the cluster insisted on: "account" | "qos" | "constraint". */
+    requires?: string[];
+  };
+}
+
+export type ClusterJobState = "waiting" | "starting" | "running" | "ended";
+
+export interface ClusterJob {
+  id: string;
+  /** What the page calls it: a saved setup's name, else partition · time. */
+  name: string;
+  state: ClusterJobState;
+  slurm_job_id?: string;
+  node?: string;
+  partition?: string;
+  cpus?: string;
+  mem?: string;
+  gpus?: number;
+  /** When its time runs out (epoch ms, cluster clock). */
+  ends_at_ms?: number;
+  /** Why it waits, when it isn't plain priority (Slurm's own word). */
+  reason?: string;
+  /** Held in the foreground by this app's connection (stops on disconnect). */
+  attached: boolean;
+  /** How it ended (Slurm's terminal state: TIMEOUT, CANCELLED, …). */
+  ended?: string;
+  ended_at_ms?: number;
+  stopped_by_user: boolean;
+  /** Its node reaches the internet (agents can work), once probed. */
+  egress?: boolean;
+  /** Workspaces it opens when it starts. */
+  open: string[];
+  /** The job it continues. */
+  replaces?: string;
+  spec: LaunchSpec;
+  /** Its own startup commands. */
+  startup: string;
+  submitted_ms: number;
+  /** Slurm's start estimate while it waits (epoch ms), when it has one. */
+  start_estimate_ms?: number | null;
+}
+
+export type ClusterWorkspaceState = "open" | "queued" | "closed";
+
+export interface ClusterWorkspaceView {
+  id: string;
+  name: string;
+  path: string;
+  /** `open` in `job`, `queued` (opens when `job` starts), or `closed`. */
+  state: ClusterWorkspaceState;
+  job?: string;
+  last_open_ms?: number;
+  /** Agents working right now, when the app holds its job's connection. */
+  working?: number;
+  /** Its chimaera exited on its own — the last lines it printed. */
+  failed?: string;
+  /** Its job is opening it right now (it may be waiting for another job to let go). */
+  opening?: boolean;
+  /** It is saving its chats and closing (a close or a move). */
+  closing?: boolean;
+}
+
+export interface ClusterOverview {
+  scheduler: Scheduler;
+  login_node: string;
+  /** The user's home folder on the cluster (paths under it show as `~/…`). */
+  home?: string;
+  now_ms: number;
+  jobs: ClusterJob[];
+  workspaces: ClusterWorkspaceView[];
+  /** The user's other (non-chimaera) Slurm jobs — a count, no controls. */
+  other_jobs: { running: number; waiting: number };
+  /** The queue couldn't be read this round; states are carried forward. */
+  degraded: boolean;
+  /** When the queue was last actually asked (epoch ms). */
+  queue_at_ms: number;
+  config: ClusterConfig;
+  /** Startup commands: the cluster's, and each workspace's (by id). */
+  startup: { cluster: string; workspaces: Record<string, string> };
+}
+
+export interface PartitionChoice {
+  name: string;
+  default: boolean;
+  /** sinfo's limit, raw (`7-00:00:00`, `UNLIMITED`) and in seconds. */
+  max_time: string;
+  max_time_secs: number | null;
+  cpus_per_node: string;
+  mem_per_node: string;
+  gpus: boolean;
+  preemptible: boolean;
+  up: boolean;
+  /** Accounts that may submit here (empty when the cluster uses none). */
+  accounts?: string[];
+}
+
+export interface ClusterFacts {
+  scheduler: Scheduler;
+  version: string;
+  partitions: PartitionChoice[];
+  accounts: string[];
+  default_account: string | null;
+  fetched_ms: number;
+}
+
+export type StartResult =
+  | { kind: "submitted"; job: string; slurm_job_id: string }
+  | { kind: "attached"; job: string }
+  | {
+      kind: "refused";
+      /** The scheduler's own words, cleaned — show verbatim. */
+      message: string;
+      refusal:
+        | "batch_not_allowed"
+        | "account_required"
+        | "qos_required"
+        | "constraint_required"
+        | "other";
+    };
+
+/** One folder's subfolders, for choosing a workspace. */
+export interface ClusterDirListing {
+  path: string;
+  parent?: string | null;
+  /** The folder itself is already a workspace: its id. */
+  workspace?: string | null;
+  folders: { name: string; git: boolean; workspace?: string | null }[];
+  truncated: boolean;
+}
+
+function shell(): TauriGlobal {
   const t = tauri();
   if (t === null) throw new Error("not running in the native shell");
-  await t.core.invoke<void>("connect_compute_session", { alias, jobId });
+  return t;
 }
 
 /**
- * scancel a compute-node session through the LOGIN daemon (`alias` is the
- * login host) and close any live tunnel to that job. A job window ending its
- * own allocation must use this rather than its own daemon's DELETE route:
- * the login daemon owns the launch record (the job daemon has a different
- * compute root, so cancelling there never marks it), and the shell tears the
- * job tunnel down with it. Rejects with the shell's error message on failure.
+ * The cluster page's data in one ssh exec. The queue itself is asked at most
+ * once a minute per host (a cached read fills in between).
  */
-export async function cancelComputeSession(alias: string, jobId: string): Promise<void> {
+export async function clusterOverview(alias: string): Promise<ClusterOverview> {
+  return shell().core.invoke<ClusterOverview>("cluster_overview", { alias });
+}
+
+/** Partitions, limits and accounts the start sheet offers (cached a day). */
+export async function clusterFacts(alias: string, refresh = false): Promise<ClusterFacts> {
+  return shell().core.invoke<ClusterFacts>("cluster_facts", { alias, refresh });
+}
+
+/** Add a folder on the cluster as a workspace. */
+export async function clusterAddWorkspace(
+  alias: string,
+  path: string,
+  name: string,
+): Promise<ClusterWorkspace> {
+  return shell().core.invoke<ClusterWorkspace>("cluster_add_workspace", { alias, path, name });
+}
+
+/** Take a closed workspace off the list (its folder and chats stay put). */
+export async function clusterRemoveWorkspace(alias: string, workspaceId: string): Promise<void> {
+  await shell().core.invoke<void>("cluster_remove_workspace", { alias, workspaceId });
+}
+
+/** One folder's subfolders on the cluster (`~` and `$VARS` expand there). */
+export async function clusterListDir(alias: string, path: string): Promise<ClusterDirListing> {
+  return shell().core.invoke<ClusterDirListing>("cluster_list_dir", { alias, path });
+}
+
+/**
+ * Start a job. `open` = workspaces to open when it starts; `runStartup` =
+ * startup commands for this job only; `saveAs` names a setup to remember
+ * (and names the job). A partition that refuses batch jobs comes back
+ * `refused` with `batch_not_allowed` — retry with `attached`.
+ */
+export async function clusterStartJob(
+  alias: string,
+  spec: LaunchSpec,
+  open: string[],
+  runStartup: string,
+  name: string | null,
+  saveAs: string | null,
+  attached: boolean,
+): Promise<StartResult> {
+  return shell().core.invoke<StartResult>("cluster_start_job", {
+    alias,
+    spec,
+    open,
+    runStartup,
+    name,
+    saveAs,
+    attached,
+  });
+}
+
+/**
+ * Continue a running job in a new one (named by `jobId`, or by a workspace
+ * open in it): the same setup unless `spec` says otherwise. When the new job
+ * starts, it takes this job's workspaces over and this one stops.
+ */
+export async function clusterContinueJob(
+  alias: string,
+  target: { jobId: string } | { workspaceId: string },
+  spec: LaunchSpec | null = null,
+  runStartup: string | null = null,
+): Promise<StartResult> {
+  return shell().core.invoke<StartResult>("cluster_continue_job", {
+    alias,
+    jobId: "jobId" in target ? target.jobId : null,
+    workspaceId: "workspaceId" in target ? target.workspaceId : null,
+    spec,
+    runStartup,
+  });
+}
+
+/** Stop a job (every workspace in it saves its chats first). */
+export async function clusterStopJob(alias: string, jobId: string): Promise<void> {
+  await shell().core.invoke<void>("cluster_stop_job", { alias, jobId });
+}
+
+/** Forget an ended job's line. */
+export async function clusterDismissJob(alias: string, jobId: string): Promise<void> {
+  await shell().core.invoke<void>("cluster_dismiss_job", { alias, jobId });
+}
+
+/**
+ * Open a workspace's window: where it's open, else in job `jobId` (which the
+ * page chose). Resolves once the window is up.
+ */
+export async function clusterOpen(
+  alias: string,
+  workspaceId: string,
+  jobId: string | null = null,
+): Promise<void> {
+  await shell().core.invoke<void>("cluster_open", { alias, workspaceId, jobId });
+}
+
+/** Close a workspace in its job (it saves its chats). */
+export async function clusterClose(alias: string, workspaceId: string): Promise<void> {
+  await shell().core.invoke<void>("cluster_close", { alias, workspaceId });
+}
+
+/** Move an open workspace to another running job; its chats and windows follow. */
+export async function clusterMove(alias: string, workspaceId: string, jobId: string): Promise<void> {
+  await shell().core.invoke<void>("cluster_move", { alias, workspaceId, jobId });
+}
+
+/** Open a workspace when a job that is still waiting starts. */
+export async function clusterQueueOpen(alias: string, workspaceId: string, jobId: string): Promise<void> {
+  await shell().core.invoke<void>("cluster_queue_open", { alias, workspaceId, jobId });
+}
+
+/** Save startup commands: the cluster's (`workspaceId` null) or one workspace's. */
+export async function clusterSetStartup(
+  alias: string,
+  workspaceId: string | null,
+  text: string,
+): Promise<void> {
+  await shell().core.invoke<void>("cluster_set_startup", { alias, workspaceId, text });
+}
+
+/** Forget a saved setup. */
+export async function clusterForgetSetup(alias: string, name: string): Promise<void> {
+  await shell().core.invoke<void>("cluster_forget_setup", { alias, name });
+}
+
+/** Save what agents on this cluster are told about its rules. */
+export async function clusterSetAgentRules(alias: string, rules: AgentRules): Promise<void> {
+  await shell().core.invoke<void>("cluster_set_agent_rules", { alias, rules });
+}
+
+/** The warned per-host override: allow chimaera on this cluster's login node. */
+export async function clusterSetLoginServe(alias: string, on: boolean): Promise<HostState> {
+  return shell().core.invoke<HostState>("cluster_set_login_serve", { alias, on });
+}
+
+/** Say a host isn't a cluster after all (`on`), or is one again. */
+export async function setNotCluster(alias: string, on: boolean): Promise<HostState> {
+  return shell().core.invoke<HostState>("set_not_cluster", { alias, on });
+}
+
+/** SIGTERM a daemon an earlier connect left on the cluster's login node. */
+export async function clusterStopLoginDaemon(alias: string): Promise<void> {
+  await shell().core.invoke<void>("cluster_stop_login_daemon", { alias });
+}
+
+/** Open a terminal-only window with `ssh <alias>` (the login node). */
+export async function clusterOpenTerminal(alias: string): Promise<void> {
+  await shell().core.invoke<void>("cluster_open_terminal", { alias });
+}
+
+/** A cluster's jobs or workspaces changed — refetch. */
+export function onClusterChanged(handler: (alias: string) => void): Promise<() => void> {
   const t = tauri();
-  if (t === null) throw new Error("not running in the native shell");
-  await t.core.invoke<void>("cancel_compute_session", { alias, jobId });
+  if (t === null) return Promise.resolve(() => {});
+  return t.event.listen<{ alias: string }>("cluster-changed", (e) => handler(e.payload.alias));
 }
 
 /** Subscribe to connect progress events. Returns an unsubscribe promise. */
@@ -378,8 +717,12 @@ export function onConnectProgress(
 export interface HostStatusEvent {
   alias: string;
   /** "down" = the forward stopped answering (remote daemon or ssh died);
-   *  "error" = a connect attempt failed (whoever started it). */
-  status: "connected" | "down" | "error";
+   *  "error" = a connect attempt failed (whoever started it);
+   *  "ended" = a job window's job left the queue (its composite
+   *  `<alias>#job<id>` key only) — `reason` then carries Slurm's state
+   *  (TIMEOUT, CANCELLED, FAILED, PREEMPTED, …) or "stopped" when the user
+   *  stopped it. A "down" without "ended" is still just a connection blip. */
+  status: "connected" | "down" | "error" | "ended";
   /** Local end of the tunnel (may change across a reconnect). */
   local_port: number | null;
   /** New daemon token, on "connected" only — lets a window re-home if the
@@ -389,8 +732,8 @@ export interface HostStatusEvent {
    *  observed the attempt (startup restore) can surface it instead of
    *  showing "connecting" forever. */
   error?: string;
-  /** Why a live connection transitioned down. This is context for the
-   *  automatic reconnect, not a failed reconnect attempt. */
+  /** Why a live connection transitioned down (context for the automatic
+   *  reconnect, not a failed attempt) — or, on "ended", how the job ended. */
   reason?: string;
   /** Source build now served through this tunnel. */
   build?: string;
@@ -659,6 +1002,7 @@ export async function openWindow(
   if (job !== null) {
     params.set("job", job.jobId);
     if (job.node !== null) params.set("node", job.node);
+    if (job.cws !== null) params.set("cws", job.cws);
   }
   const hash = params.size > 0 ? `#${params.toString()}` : "";
   // The hash now carries every piece of per-window state, so severing opener
@@ -827,6 +1171,7 @@ export function openDetachedPopup(
   if (job !== null) {
     params.set("job", job.jobId);
     if (job.node !== null) params.set("node", job.node);
+    if (job.cws !== null) params.set("cws", job.cws);
   }
   const features = [
     "popup=yes",

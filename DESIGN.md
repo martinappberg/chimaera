@@ -300,7 +300,7 @@ which is the survival property that matters.
   already work on loopback if that changes.
 
 - **2026-07-14 — HPC environment + compute-node placement (design pass; tunnel reachability
-  verified live on Sherlock).** Two deliberately separated axes. **Environment prelude:** opaque
+  verified live on a production cluster).** Two deliberately separated axes. **Environment prelude:** opaque
   shell text (`ml …`, `micromamba activate`, `export …`) run before a shell/agent, *never parsed*
   by Chimaera (so conda/lmod/spack/venv/nix need zero tool-specific code), concatenated across
   host→workspace→session scopes (env last-wins), injected at the one spawn seam both shells and
@@ -315,21 +315,21 @@ which is the survival property that matters.
   `{node,port,token}` manifest (no sync — same Lustre path, same binary already visible), dynamic
   `:0` ports (multi-user/multi-workspace on one node never collide). Reaching a compute-node daemon
   is a **negotiated, bounded probe ladder** — B (loopback + ssh-adopt forward through the login
-  node; *preferred*, port unexposed; verified on Sherlock incl. `pam_slurm_adopt`) → A (routable
-  bind + direct login→node forward + token; verified reachable on Sherlock) → **unsupported → fall
+  node; *preferred*, port unexposed; verified on a production cluster incl. `pam_slurm_adopt`) → A (routable
+  bind + direct login→node forward + token; verified reachable on a production cluster) → **unsupported → fall
   back to Mode 1, stated plainly** (reverse-tunnel rung dropped as scope, ladder left open).
   **Two-tier persistence** made explicit: login-node daemon = forever; compute-node daemon = until
-  walltime. **Outbound gate closed on Sherlock (2026-07-14):** direct compute-node egress to
+  walltime. **Outbound gate closed on a production cluster (2026-07-14):** direct compute-node egress to
   `api.anthropic.com` verified (HTTP 405, no proxy) — Mode 2 fully viable there. Elsewhere a
   per-cluster fact: probed at job start, recorded in the manifest; where blocked, Mode 2 degrades
   by capability (terminals/previews on the node, agents via Mode 1). Deep spec: Architecture →
   Environment prelude & compute-node sessions.
 - **2026-07-15 — Mode 2 core SHIPPED (daemon routes + tunnel ladder + CLI + app/home-screen
-  surfaces), verified end-to-end on Sherlock.** Implemented shape: launch/discover/cancel are
+  surfaces), verified end-to-end on a production cluster.** Implemented shape: launch/discover/cancel are
   LOGIN-daemon routes (it owns sbatch, the preludes, its own shared-FS binary) — the client
   side only tunnels and opens windows; the registry stays stateless (`squeue` ⋈ per-job
   manifests under `data_dir()/compute/<jobid>`). The live pass forced one ladder amendment:
-  hostbased-only node sshd (Sherlock) defeats a laptop-originated node leg, so rung B gained a
+  hostbased-only node sshd defeats a laptop-originated node leg, so rung B gained a
   **chained** mechanic — a login-resident `ssh -N -L` relay to the node's loopback running as
   the remote command of the same laptop ssh that forwards to it (lifetimes coupled, nothing
   orphaned, daemon stays loopback). Rung A's `--bind-routable` (opt-in 0.0.0.0, token-gated)
@@ -345,7 +345,7 @@ which is the survival property that matters.
   the client is DETACHED: `setsid nohup srun … &` orphans it onto init, tmux-grade — it
   survives daemon restarts and ends only at walltime, scancel, or a login-node reboot.
   What srun-only buys: ONE launch mechanism that works on every partition (including
-  interactive-only ones like Sherlock's `dev`, whose job_submit policy refuses batch —
+  interactive-only ones, whose job_submit policy refuses batch —
   found live), no batch/interactive mode switch, no learned per-partition preferences.
   Costs, accepted openly: sessions die with a login-node reboot, and clusters that reap
   login-node user processes (where tmux dies too) are honest "not supported" territory.
@@ -361,7 +361,7 @@ which is the survival property that matters.
   stateless reconnect registry, walltime ends things deterministically. The ownership the
   maintainer wants exists already at the right level — the login daemon kills via scancel
   (cards' cancel, the banner's end-job), which beats a process handle as owner-of-record.
-  srun's one genuine advantage — interactive-only partitions (Sherlock's `dev` refuses
+  srun's one genuine advantage — interactive-only partitions (some refuse
   batch; found live) — is noted as a possible future "Mode 2b" interactive-allocation
   flavor that would be explicitly connection-tied; not in scope now. Programmatic/web
   access is unaffected either way (launch is a daemon HTTP route).
@@ -369,12 +369,28 @@ which is the survival property that matters.
   opt-in (maintainer decision).** Raised because the connection is token-gated anyway and the
   node is "our own"; decided against flipping: compute nodes are routinely SHARED (co-tenant
   jobs on the same node reach a 0.0.0.0 bind; only the token gates them), the chained-B rung
-  gives every ssh-reachable cluster a loopback path anyway (verified on hostbased-only
-  Sherlock), and one leaked/logged token on a routable bind is a cluster-internal exposure
+  gives every ssh-reachable cluster a loopback path anyway (verified on a hostbased-only
+  production cluster), and one leaked/logged token on a routable bind is a cluster-internal exposure
   loopback never has. Rung A via the explicit `routable` launch flag (dialog checkbox with
   exposure warning, CLI flag) is the escape hatch for clusters whose ladder finds no ssh
   path; "not supported on this cluster" stays an acceptable honest end state. No per-host
   auto-routable memory for now — premature until a real cluster defeats rung B.
+- **2026-09-30 — Clusters: nothing on the login node; workspaces run as jobs (maintainer
+  decisions; SUPERSEDES the three 2026-07-16 entries above).** A cluster's admins asked the
+  maintainer to stop running the daemon on their login nodes, and HPC centers generally forbid
+  anything server-like, unattended, or outliving the interactive session there — a detached
+  `srun` and a login-node relay included. So: connect detects a batch scheduler in its probe
+  and, on such a host, starts nothing (a warned per-host override remains for clusters that
+  allow it); the APP (and CLI) is the control plane, running short `squeue`/`sbatch`/`scancel`
+  execs over the ControlMaster, never more often than once a minute; each workspace is ONE
+  Slurm job (`sbatch --no-requeue`; interactive-only partitions get an `srun` held by the
+  app's own connection) whose daemon keeps its data on the shared filesystem so chats move
+  from job to job; jobs bind the node's address (token-gated) and are reached with a plain
+  `ssh -L` through the login node — **reversing the 2026-07-16 loopback decision** (the
+  maintainer: "I reverse my July decision"); a person starts every job (no restarts,
+  scheduled starts, or requeues); nothing site-specific anywhere. Plan:
+  [docs/hpc-portal-plan.md](docs/hpc-portal-plan.md); feature page:
+  [docs/features/compute.md](docs/features/compute.md).
 
 Still open:
 

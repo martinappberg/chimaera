@@ -683,12 +683,12 @@ mod tests {
             s.read_to_string(&mut prompt).unwrap(); // returns on the client's half-close
             assert_eq!(
                 prompt,
-                "chimaera-askpass-scope-v1\nSherlock\nuser@host's password:"
+                "chimaera-askpass-scope-v1\ncluster\nuser@host's password:"
             );
             s.write_all(b"hunter2\n").unwrap(); // secret + newline, same as serve_one
         });
 
-        let got = ask(sock.as_os_str(), Some("Sherlock"), "user@host's password:").unwrap();
+        let got = ask(sock.as_os_str(), Some("cluster"), "user@host's password:").unwrap();
         assert_eq!(got, "hunter2");
         server.join().unwrap();
         std::fs::remove_file(&sock).ok();
@@ -697,9 +697,9 @@ mod tests {
     #[test]
     fn prompt_scope_round_trips_and_old_helpers_stay_unscoped() {
         let (alias, prompt) = split_prompt_request(
-            "chimaera-askpass-scope-v1\nSherlock\nPasscode or option (1-3):\nDuo".into(),
+            "chimaera-askpass-scope-v1\ncluster\nPasscode or option (1-3):\nDuo".into(),
         );
-        assert_eq!(alias.as_deref(), Some("Sherlock"));
+        assert_eq!(alias.as_deref(), Some("cluster"));
         assert_eq!(prompt, "Passcode or option (1-3):\nDuo");
 
         let (alias, prompt) = split_prompt_request("Passcode or option (1-3):\nDuo prompt".into());

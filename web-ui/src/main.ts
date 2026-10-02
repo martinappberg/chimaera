@@ -13,6 +13,8 @@ import "./app.css";
 import App from "./App.svelte";
 import { installReloadHook } from "./lib/layout/windowReload";
 import { isAccountHome } from "./lib/net/base";
+import { terminalWindowSession } from "./lib/net/api";
+import TerminalWindow from "./lib/terminal/TerminalWindow.svelte";
 
 // Before mount: the native Reload Window must still reach a window whose App
 // fails to boot.
@@ -25,11 +27,12 @@ if (!target) {
   throw new Error("missing #app mount point");
 }
 
-// The web's Home (the account's own signed-in page) has no daemon behind it,
-// so it mounts its own Home and Settings instead of the workbench, which
-// would start asking one for workspaces and sessions. Loaded only there.
+// Account Home has no daemon; a cluster's terminal-only window has no workbench.
+const termSession = terminalWindowSession();
 const app = isAccountHome()
   ? import("./lib/pro/AccountHome.svelte").then(({ default: AccountHome }) => mount(AccountHome, { target }))
-  : mount(App, { target });
+  : termSession !== null
+    ? mount(TerminalWindow, { target, props: { sessionId: termSession } })
+    : mount(App, { target });
 
 export default app;

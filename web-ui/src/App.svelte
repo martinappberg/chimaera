@@ -21,6 +21,7 @@
     isHomeHub,
     leaveHomeHub,
     setDetachedWindow,
+    takeOpenRequest,
     clearUnauthorized,
     notifyUnauthorized,
     pollHealth,
@@ -273,6 +274,8 @@
   import ExtensionsGlyph from "./lib/plugins/ExtensionsGlyph.svelte";
   import { transferBlock, transferInto, type FileSource } from "./lib/workspace/fileTransfer";
   import ComputeStrip from "./lib/workspace/ComputeStrip.svelte";
+  import type JobWindowNotices from "./lib/workspace/JobWindowNotices.svelte";
+  import type JobClusterHome from "./lib/workspace/JobClusterHome.svelte";
   import {
     dropSpotAt,
     folderTargetAt,
@@ -319,7 +322,7 @@
     appUpdateStatus,
     askpassActive,
     closeThisWindow,
-    connectComputeSession,
+    clusterOpen,
     connectHost,
     isNativeShell,
     onAppUpdate,
@@ -493,8 +496,11 @@
   /** The key this window's tunnel reports `host-status` under. A job window
    *  listens ONLY on its composite key — matching the bare login alias made
    *  every login-tunnel blip re-home job windows onto the login daemon
-   *  (found live: "opening the session just opens Sherlock"). */
-  const statusAlias = jobCtx !== null ? `${hostAlias}#job${jobCtx.jobId}` : hostAlias;
+   *  (found live: "opening the session just opens the login host"). */
+  const statusAlias =
+    jobCtx !== null
+      ? `${hostAlias}#job${jobCtx.jobId}${jobCtx.cws !== null ? `~${jobCtx.cws}` : ""}`
+      : hostAlias;
   /** Only the native shell can re-run ssh; a browser tunnel is the CLI's job. */
   const canReconnect = isRemoteWindow && isNativeShell();
   /** Native events are not replayed. A stale-token page must not invoke
@@ -514,6 +520,40 @@
   let reconnecting = $state(false);
   /** Last reconnect failure, surfaced with a Retry. */
   let reconnectError = $state<string | null>(null);
+  /** A job window's job left the queue (the shell's `ended` on its key);
+   *  `reason` is Slurm's state, or "stopped" for a stop from the app. */
+  let jobEnded = $state<{ reason: string | null } | null>(null);
+  /** The job window's notices — their own chunk, loaded only in job windows. */
+  let JobNoticesView = $state<typeof JobWindowNotices | null>(null);
+  if (jobCtx !== null) {
+    import("./lib/workspace/JobWindowNotices.svelte").then(
+      (m) => {
+        JobNoticesView = m.default;
+      },
+      (err: unknown) => console.error("job window notices failed to load", err),
+    );
+  }
+  /** A cluster workspace window's cluster page (its own chunk), shown over
+   *  the workspace in place of the folder picker: this window's chimaera
+   *  knows only its one workspace; the cluster page knows them all. */
+  const clusterWs = isNativeShell() ? (jobCtx?.cws ?? null) : null;
+  let clusterHomeOpen = $state(false);
+  let ClusterHomeView = $state<typeof JobClusterHome | null>(null);
+
+  function openClusterHome(): void {
+    clusterHomeOpen = true;
+    if (ClusterHomeView !== null) return;
+    import("./lib/workspace/JobClusterHome.svelte").then(
+      (m) => {
+        ClusterHomeView = m.default;
+      },
+      (err: unknown) => {
+        clusterHomeOpen = false;
+        console.error("cluster page failed to load", err);
+      },
+    );
+  }
+
   /** Context from the shell's liveness monitor for the current drop. */
   let reconnectReason = $state<string | null>(null);
   /** Dismissing a failed reconnect downgrades it to an ambient Retry instead
@@ -530,18 +570,22 @@
   /** Re-establish this remote window's ssh tunnel. Idempotent: the shell
    *  reuses a live tunnel, and reuses the old loopback port so a heal needs no
    *  navigation. Surfaces the SSH auth modal (mounted app-wide) only if ssh
-   *  actually re-prompts. A job window heals through the COMPUTE path — its
-   *  tunnel goes laptop→node, and rebuilding the login tunnel wouldn't touch
-   *  it; the shell probes/rebuilds the job tunnel and pings the composite
-   *  status key with the (possibly new) port. */
+   *  actually re-prompts. A job window heals through its cluster workspace —
+   *  `cluster_open` reuses or rebuilds the job's forward, keeps this window,
+   *  and pings the composite status key with the (possibly new) port. */
   async function attemptReconnect(): Promise<void> {
-    if (!canReconnect || reconnecting) return;
+    if (!canReconnect || reconnecting || jobEnded !== null) return;
     reconnecting = true;
     reconnectError = null;
     try {
       await reconnectListener.ready;
       if (jobCtx !== null) {
-        await connectComputeSession(hostAlias, jobCtx.jobId);
+        if (jobCtx.cws === null) {
+          // A window from before job windows named their workspace: nothing
+          // here can find its job again.
+          throw new Error(`Open this workspace again from ${hostAlias}'s page in Home.`);
+        }
+        await clusterOpen(hostAlias, jobCtx.cws);
       } else {
         await connectHost(hostAlias);
       }
@@ -555,7 +599,8 @@
   }
 
   function beginReconnect(reason: string): void {
-    if (!canReconnect) return;
+    // A job that ended has nothing to reconnect to: its overlay says so.
+    if (!canReconnect || jobEnded !== null) return;
     reconnectReason = reason;
     showReconnect = true;
     void attemptReconnect();
@@ -578,6 +623,15 @@
 
   function handleHostStatus(e: HostStatusEvent): void {
     if (!canReconnect || e.alias !== statusAlias) return;
+    if (e.status === "ended") {
+      // Only a job window's composite key ends; a "down" without it is still
+      // just a connection blip (the reconnect below).
+      if (jobCtx === null) return;
+      jobEnded = { reason: e.reason ?? null };
+      finishReconnect();
+      return;
+    }
+    if (jobEnded !== null) return;
     if (e.status === "down") {
       beginReconnect(e.reason ?? "The remote connection stopped responding.");
       return;
@@ -604,6 +658,7 @@
       if (jobCtx !== null) {
         params.set("job", jobCtx.jobId);
         if (jobCtx.node !== null) params.set("node", jobCtx.node);
+        if (jobCtx.cws !== null) params.set("cws", jobCtx.cws);
       }
       requireAssetNavigation(
         buildMoved ? "build" : "connection",
@@ -3033,6 +3088,12 @@
   let pickerLoadFailed = false;
 
   function openPicker(): void {
+    // A folder opened here would belong to this job's chimaera alone, not
+    // the cluster: a cluster workspace's window picks from the cluster page.
+    if (clusterWs !== null) {
+      openClusterHome();
+      return;
+    }
     if (pickerOpen) return;
     pickerRestoreEl = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     refreshWorkspaces();
@@ -3521,6 +3582,24 @@
     const id = pendingNoticeFocus;
     pendingNoticeFocus = null;
     untrack(() => focusFromNotification(id));
+  });
+
+  // A file the shell asked this window to show (`open=` in the hash — a
+  // cluster file peek copied to this machine): once per page load, after the
+  // workspace view has loaded, as a preview tab in the focused pane — and
+  // only a path inside this workspace that exists.
+  let openRequest: string | null = takeOpenRequest();
+  $effect(() => {
+    if (openRequest === null || !layoutReady || workspace === null) return;
+    const path = openRequest;
+    openRequest = null;
+    const root = workspace.root.replace(/\/+$/, "");
+    // Inside this workspace only (the shell copies peeks into the folder it
+    // opened this window on); a `..` segment can't climb back out.
+    if (!path.startsWith(`${root}/`) || path.split("/").includes("..")) return;
+    void fsProbe(path).then((found) => {
+      if (found === "ok") untrack(() => openFilePath(path));
+    });
   });
 
   // Focus a pending session once the incoming workspace's layout has booted.
@@ -5359,7 +5438,7 @@
         <button
           class="ws-btn"
           class:placeholder={workspace === null && activeWsId === null}
-          title={workspace?.root}
+          title={clusterWs !== null ? `${workspace?.root ?? ""} — every workspace on ${hostAlias}` : workspace?.root}
           onclick={openPicker}
         >
           <span class="ws-label">
@@ -5895,8 +5974,8 @@
           title={eventsUp ? "connected" : "disconnected"}
           aria-label={eventsUp ? "connected" : "disconnected"}
         ></span>
-        <!-- Inside an allocation the label carries the node ("Sherlock ›
-             sh02-02n44") so a compute-node window never poses as its login
+        <!-- Inside an allocation the label carries the node ("cluster ›
+             n042") so a compute-node window never poses as its login
              node — derived from the daemon's self block, hash-independent. -->
         <span class="daemon-host" class:remote={isRemoteWindow} title={health?.hostname}
           >{$computeStatus?.self
@@ -6486,6 +6565,28 @@
       </div>
     {/each}
   </div>
+{/if}
+
+{#if clusterWs !== null && clusterHomeOpen && ClusterHomeView !== null}
+  <ClusterHomeView
+    alias={hostAlias}
+    here={clusterWs}
+    hereName={workspace?.name ?? "workspace"}
+    onClose={() => (clusterHomeOpen = false)}
+  />
+{/if}
+
+{#if jobCtx !== null && JobNoticesView !== null}
+  <!-- A job window: the "continue on a new node" offer near the job's time
+       limit, and the calm overlay once the shell says the job ended. -->
+  <JobNoticesView
+    alias={hostAlias}
+    cws={jobCtx.cws}
+    self={$computeStatus?.self ?? null}
+    receivedAt={$computeStatus?.received_at_ms ?? 0}
+    ended={jobEnded}
+    stacked={reconnectSurface !== "hidden" && !$askpassActive}
+  />
 {/if}
 
 {#if reconnectSurface !== "hidden" && !$askpassActive}

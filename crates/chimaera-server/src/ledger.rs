@@ -398,6 +398,10 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
         .values()
         .map(|(id, _)| id.clone())
         .collect();
+    // A hidden workspace's sessions (the app's login-node terminal) live only
+    // as long as their window: a restart must not bring one back as a plain
+    // local shell. Read before — never nested in — the locks below.
+    let hidden = crate::lock(&state.workspaces).hidden_ids();
     let workspaces = crate::lock(&state.session_workspaces);
     let agents = crate::lock(&state.agents);
     let cwds = crate::lock(&state.current_cwds);
@@ -408,6 +412,9 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
         .filter(|info| info.alive && !install_ids.contains(&info.id))
         .filter_map(|info| {
             let workspace_id = workspaces.get(&info.id)?.clone();
+            if hidden.contains(&workspace_id) {
+                return None;
+            }
             let agent = agents.get(&info.id).map(|record| LedgerAgent {
                 kind: record.kind,
                 resume: record.resume_id().or_else(|| record.resumed_from.clone()),
@@ -454,6 +461,9 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
         .filter(|c| c.alive && !install_ids.contains(&c.id) && !pty_ids.contains(c.id.as_str()))
         .filter_map(|c| {
             let workspace_id = workspaces.get(&c.id)?.clone();
+            if hidden.contains(&workspace_id) {
+                return None;
+            }
             let kind = AgentKind::parse(c.agent.as_str())?;
             let record = agents.get(&c.id);
             let title = record

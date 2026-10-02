@@ -174,6 +174,20 @@ pub(super) fn state(root: &Path) -> Arc<AppState> {
         root.join("home/.claude"),
     ))
 }
+
+#[tokio::test]
+async fn hidden_login_terminal_workspace_is_never_a_mirror_candidate() {
+    let root = temp("hidden-login-workspace");
+    let state = state(&root);
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let visible = lock(&state.workspaces).add(project.clone()).unwrap();
+    assert!(eligible(&state, &visible));
+    let hidden = lock(&state.workspaces).add_hidden(project).unwrap();
+    assert!(!eligible(&state, &hidden));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 pub(super) fn device(endpoint: &str) -> Configure {
     serde_json::from_value(json!({
         "account_id": "a-fixture",

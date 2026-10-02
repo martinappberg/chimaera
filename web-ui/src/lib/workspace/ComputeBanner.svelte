@@ -1,16 +1,12 @@
 <script lang="ts">
   import {
+    endOwnJob,
     formatSlurmDuration,
     parseSlurmTimeLeft,
     type ComputeSelf,
   } from "./compute";
-  import { cancelComputeSession } from "./computeSessions";
-  import {
-    cancelComputeSession as cancelViaShell,
-    closeThisWindow,
-    isNativeShell,
-  } from "../net/native";
-  import { ApiError, getHostLabel } from "../net/api";
+  import { closeThisWindow, clusterClose, isNativeShell } from "../net/native";
+  import { ApiError, getHostLabel, getJobContext } from "../net/api";
   import { pageVisible } from "../shared/visibility";
 
   interface Props {
@@ -31,9 +27,16 @@
   let keepBtn = $state<HTMLButtonElement | null>(null);
 
   const native = isNativeShell();
-  /** The LOGIN host this job window was tunnelled through (the shell put the
-   *  alias in the hash); "local" means there is no shell tunnel to speak of. */
+  /** The cluster this job window was tunnelled to (the shell put the alias
+   *  in the hash); "local" means there is no shell tunnel to speak of. */
   const loginAlias = getHostLabel();
+  /** The cluster workspace this window shows (`cws=`); null on an old window. */
+  const clusterWs = getJobContext()?.cws ?? null;
+  /** The app's workspace window: the action closes this workspace only — the
+   *  job (and any other workspace in it) keeps running. Elsewhere (a browser
+   *  tab) this daemon can only end its own job. */
+  const closesOnly = native && loginAlias !== "local" && clusterWs !== null;
+  const verb = closesOnly ? "Close" : "Stop";
 
   // Same live-tick discipline as ComputeStrip: the fetched time_left only
   // moves per poll, so tick locally against the receipt time and re-sync on
@@ -84,22 +87,20 @@
 
   const bannerTitle = $derived(
     phase === "ended"
-      ? `slurm job ${alloc.job_id} cancelled — the allocation and this window's daemon are ending`
-      : `slurm job ${alloc.job_id} on ${alloc.node} — this whole workbench lives inside the allocation and ends at walltime`,
+      ? `Slurm job ${alloc.job_id} is ending, and this window's server with it`
+      : `Slurm job ${alloc.job_id} on ${alloc.node}. This workspace runs inside the job and stops at its time limit.`,
   );
 
   async function endJob(): Promise<void> {
     if (phase !== "confirm") return;
     cancelError = null;
     phase = "cancelling";
-    if (native && loginAlias !== "local") {
-      // Native: the shell's own command scancels via the LOGIN daemon — the
-      // one that owns the launch record (this job daemon has a different
-      // compute root, so a DELETE here never marks it cancelled and a later
-      // watched cancel raises a spurious ENDED tombstone) — and closes the
-      // job tunnel with it.
+    if (native && loginAlias !== "local" && clusterWs !== null) {
+      // Native: the shell closes THIS workspace in its job (other workspaces
+      // in the same job keep running) — its chimaera saves the chats and
+      // exits, and the window's forward goes with it.
       try {
-        await cancelViaShell(loginAlias, alloc.job_id);
+        await clusterClose(loginAlias, clusterWs);
       } catch (e) {
         cancelError = e instanceof Error ? e.message : String(e);
         phase = "confirm";
@@ -108,12 +109,13 @@
       phase = "ended";
       return;
     }
-    // Browser fallback: this daemon's own DELETE. Only a NETWORK-level death
-    // is the expected success signal (scancel kills this very daemon, so the
-    // response often can't land); a daemon that ANSWERED with an error means
-    // the job is still running — say so instead of claiming ended.
+    // Browser (or a window from before `cws=`): this daemon ends its own
+    // job. Only a NETWORK-level death is the expected success signal (the
+    // job takes this very daemon down, so the response often can't land); a
+    // daemon that ANSWERED with an error means the job is still running —
+    // say so instead of claiming ended.
     try {
-      await cancelComputeSession(alloc.job_id);
+      await endOwnJob();
     } catch (e) {
       if (e instanceof ApiError) {
         cancelError = e.message;
@@ -137,11 +139,11 @@
 
 <svelte:window onkeydown={onWindowKeydown} />
 
-<!-- The compute window's home-page identity card: everything the user asked
+<!-- The job window's home-page identity card: everything the user asked
      "am I on a compute node, with what, for how long?" answers at a glance —
-     node, partition, job id, resources, and a live walltime countdown. The
-     rail's ComputeStrip carries the same truth inside a workspace; this is
-     the front door's version. -->
+     node, partition, job id, resources, and a live countdown to the job's
+     time limit. The rail's ComputeStrip carries the same truth inside a
+     workspace; this is the front door's version. -->
 <div
   class="banner"
   class:arming={phase === "confirm" || phase === "cancelling"}
@@ -154,16 +156,21 @@
     <div
       class="confirm"
       role="alertdialog"
-      aria-label={`cancel slurm job ${alloc.job_id}?`}
+      aria-label={closesOnly ? "Close this workspace?" : "Stop this job?"}
       aria-describedby="compute-banner-end-copy"
     >
       <div class="confirm-text">
         <span class="confirm-copy" id="compute-banner-end-copy">
-          cancel slurm job {alloc.job_id}? the whole allocation ends — every terminal, agent,
-          and unsaved change in this window dies
+          {#if closesOnly}
+            Close this workspace? Its chats are saved and the job keeps running. Terminals,
+            running commands and unsaved edits in this window end.
+          {:else}
+            Stop this job? Chats are saved. Terminals, running commands and unsaved edits in this
+            window end with it.
+          {/if}
         </span>
         {#if cancelError !== null}
-          <span class="confirm-err" role="alert">cancel failed — {cancelError}</span>
+          <span class="confirm-err" role="alert">Couldn't stop it: {cancelError}</span>
         {/if}
       </div>
       <div class="confirm-actions">
@@ -171,13 +178,17 @@
           class="confirm-end"
           disabled={phase === "cancelling"}
           onclick={() => void endJob()}
-          >{phase === "cancelling" ? "ending…" : cancelError !== null ? "retry" : "end the job"}</button
+          >{phase === "cancelling"
+            ? `${closesOnly ? "Closing" : "Stopping"}…`
+            : cancelError !== null
+              ? "Try again"
+              : verb}</button
         >
         <button
           class="confirm-keep"
           bind:this={keepBtn}
           disabled={phase === "cancelling"}
-          onclick={disarm}>keep</button
+          onclick={disarm}>{closesOnly ? "Keep open" : "Keep running"}</button
         >
       </div>
     </div>
@@ -190,7 +201,7 @@
           <rect x="2" y="9" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
           <rect x="9" y="9" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
         </svg>
-        <span>compute session</span>
+        <span>Job</span>
         {#if alloc.state !== "" && alloc.state !== "RUNNING"}
           <span class="state">{alloc.state}</span>
         {/if}
@@ -212,24 +223,28 @@
       <!-- Terminal state: the daemon behind this window is about to die, so
            the page stops pretending — no countdown, no further actions. -->
       <div class="right">
-        <div class="ending-msg">allocation ending…</div>
+        <div class="ending-msg">{closesOnly ? "Closing…" : "Stopping…"}</div>
         <div class="sub">
-          slurm job {alloc.job_id} cancelled — this window's daemon is going down
+          {closesOnly
+            ? "This workspace is closing. Its chats are saved."
+            : "The job is ending, and this window with it. Chats are saved."}
         </div>
         {#if native}
-          <button class="close-win" onclick={closeThisWindow}>close window</button>
+          <button class="close-win" onclick={closeThisWindow}>Close window</button>
         {/if}
       </div>
     {:else}
       <div class="right">
         <div class="countdown" class:closing>{countdown}</div>
         <div class="sub">
-          {remaining === null ? "walltime" : "walltime remaining"}
+          {remaining === null ? "time limit" : "left"}
         </div>
         <button
           class="end-job"
-          title={`cancel slurm job ${alloc.job_id} — the whole allocation ends`}
-          onclick={() => (phase = "confirm")}>end job</button
+          title={closesOnly
+            ? "Close this workspace — its chats are saved; the job keeps running"
+            : `Stop this job (Slurm ${alloc.job_id}) — chats are saved`}
+          onclick={() => (phase = "confirm")}>{verb}</button
         >
       </div>
     {/if}

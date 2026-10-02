@@ -162,7 +162,7 @@
       return;
     }
     // When completing a path, prefer an exact match of the typed segment so
-    // Enter on "/oak/stanford" descends into stanford even if other fuzzy
+    // Enter on "/data/lab" descends into lab even if other fuzzy
     // matches sort ahead of it.
     if (typedPath !== null) {
       const tail = splitTyped(typedPath).tail.toLowerCase();

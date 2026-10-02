@@ -1711,6 +1711,103 @@ async fn codex_fork_rollback_and_compact_surface() {
         .expect("shutdown");
 }
 
+/// Drive one turn through a driver session; returns the reply text.
+async fn driver_turn_text(
+    manager: &ChatManager,
+    id: &str,
+    rx: &mut tokio::sync::broadcast::Receiver<std::sync::Arc<chimaera_agent::journal::SeqEvent>>,
+    prompt: &str,
+) -> String {
+    manager
+        .command(
+            id,
+            AgentCommand::Send {
+                blocks: vec![ContentBlock::Text {
+                    text: prompt.into(),
+                }],
+            },
+        )
+        .await
+        .expect("send");
+    let mut text = String::new();
+    let deadline = tokio::time::Instant::now() + TURN;
+    loop {
+        let entry = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .expect("timed out waiting for driver events")
+            .expect("broadcast closed");
+        match &entry.ev {
+            AgentEvent::MessageChunk { text: t, .. } => text.push_str(t),
+            AgentEvent::TurnCompleted { .. } => return text,
+            AgentEvent::TurnAborted { reason, .. } => panic!("turn aborted: {reason}"),
+            _ => {}
+        }
+    }
+}
+
+/// `SpawnSpec::developer_note` (a cluster job's facts) through the real
+/// codex driver: it reaches a fresh thread, and a RESUMED thread in a new
+/// process gets the new note — codex never replaces a thread's opening
+/// instructions on resume (neither `-c developer_instructions` nor
+/// thread/resume's `developerInstructions`; Pass 47), which is why the note
+/// rides `thread/inject_items` and not the launcher's argv.
+#[tokio::test]
+#[ignore = "live: spawns real codex via the driver, needs auth, bills two tiny turns"]
+async fn driver_codex_developer_note_reaches_fresh_and_resumed_threads() {
+    use chimaera_agent::codex::CodexAdapter;
+    use std::sync::Arc;
+
+    let dir = tmpdir();
+    let manager = Arc::new(ChatManager::new(
+        dir.path().join("chat"),
+        Box::new(|_, _| {}),
+        Box::new(|id, exit| tracing::info!(%id, ?exit, "driver exit")),
+    ));
+    let ask = "What is the code word in your developer instructions? If more than one \
+               code word appears, give only the most recent one. Reply with the word only.";
+    let spec = |id: &str, note: &str, thread: Option<String>| {
+        let mut spec = SpawnSpec::new(
+            id,
+            vec!["codex".into(), "app-server".into()],
+            dir.path().to_path_buf(),
+        );
+        spec.initial_effort = Some("low".into());
+        spec.developer_note = Some(note.into());
+        spec.pinned_native_id = thread;
+        spec
+    };
+
+    manager
+        .spawn(
+            &CodexAdapter,
+            spec("s-note-a", "The code word is FIRSTOTTER.", None),
+        )
+        .expect("spawn driver");
+    let mut rx = manager.attach("s-note-a", 0).expect("attach").live;
+    let fresh = driver_turn_text(&manager, "s-note-a", &mut rx, ask).await;
+    assert!(
+        fresh.contains("FIRSTOTTER"),
+        "fresh thread got the note: {fresh:?}"
+    );
+    let thread = manager
+        .get("s-note-a")
+        .and_then(|info| info.native_session_id.clone())
+        .expect("Init carried the thread id");
+    manager.kill("s-note-a");
+
+    let note = "The code word is now SECONDHERON; it replaces any earlier code word.";
+    manager
+        .spawn(&CodexAdapter, spec("s-note-b", note, Some(thread)))
+        .expect("respawn driver");
+    let mut rx = manager.attach("s-note-b", 0).expect("attach").live;
+    let resumed = driver_turn_text(&manager, "s-note-b", &mut rx, ask).await;
+    assert!(
+        resumed.contains("SECONDHERON"),
+        "resumed thread got the new note: {resumed:?}"
+    );
+    manager.kill("s-note-b");
+}
+
 /// The production path end-to-end: ChatManager + ClaudeAdapter driver against
 /// the real CLI — pinned --session-id, handshake Init, mapped events, journal
 /// replay. This is what a chat session actually runs as.

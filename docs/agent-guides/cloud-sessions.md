@@ -71,7 +71,7 @@ The repo rule is *verify live, don't just unit-test*. In the cloud:
 - **Local-only** (say so in the PR instead of claiming it): visual checks in the
   browser pane (there is none; whether the image carries a headless Chrome is
   unverified), `just chat-smoke` (needs authenticated `claude`/`codex` CLIs and bills
-  real turns), HPC hosts over SSH (`connect`, Sherlock), the Tauri app and WebKit
+  real turns), HPC hosts over SSH (`connect`, real clusters), the Tauri app and WebKit
   harnesses, and the musl `zigbuild` release builds (CI covers those).
 
 ## Git and PRs

@@ -17,7 +17,11 @@ const HOME_HUB_KEY = "chimaera.homeHub";
 /** Set when this window was opened onto a compute-node daemon (Mode 2). */
 const JOB_KEY = "chimaera.job";
 const NODE_KEY = "chimaera.node";
+/** The cluster workspace a job window serves (`cws=`), for stop/continue. */
+const CWS_KEY = "chimaera.cws";
 const DETACHED_KEY = "chimaera.dt";
+/** A terminal-only window's session (`term=`): the page shows just it. */
+const TERM_KEY = "chimaera.term";
 
 /**
  * Read the access token, workspace id, host label, and window id from the
@@ -49,6 +53,12 @@ function initFromHash(): string | null {
   const detachedFromHash = params.get("dt") === "1";
   const jobFromHash = params.get("job");
   const nodeFromHash = params.get("node");
+  const cwsFromHash = params.get("cws");
+  const termFromHash = params.get("term");
+  // A file the shell asks this window to show once (a cluster file peek).
+  // Held in memory only, never sessionStorage: a reload must not reopen it.
+  const openFromHash = params.get("open");
+  if (openFromHash !== null && openFromHash.startsWith("/")) pendingOpen = openFromHash;
   if (detachedFromHash) {
     sessionStorage.setItem(DETACHED_KEY, "1");
     // A detached browser popup is an auxiliary context: it inherited a CLONE
@@ -74,6 +84,7 @@ function initFromHash(): string | null {
     sessionStorage.removeItem(WS_KEY);
     sessionStorage.removeItem(JOB_KEY);
     sessionStorage.removeItem(NODE_KEY);
+    sessionStorage.removeItem(CWS_KEY);
     if (hostFromHash === null) sessionStorage.removeItem(HOST_KEY);
     if (wsFromHash === null) {
       sessionStorage.setItem(HOME_HUB_KEY, "1");
@@ -104,6 +115,12 @@ function initFromHash(): string | null {
   if (nodeFromHash !== null) {
     sessionStorage.setItem(NODE_KEY, nodeFromHash);
   }
+  if (cwsFromHash !== null && /^[A-Za-z0-9_-]{1,64}$/.test(cwsFromHash)) {
+    sessionStorage.setItem(CWS_KEY, cwsFromHash);
+  }
+  if (termFromHash !== null && /^[A-Za-z0-9_-]{1,64}$/.test(termFromHash)) {
+    sessionStorage.setItem(TERM_KEY, termFromHash);
+  }
   if (
     params.has("token") ||
     wsFromHash !== null ||
@@ -111,14 +128,41 @@ function initFromHash(): string | null {
     winFromHash !== null ||
     homeHubFromHash ||
     jobFromHash !== null ||
-    nodeFromHash !== null
+    nodeFromHash !== null ||
+    cwsFromHash !== null ||
+    termFromHash !== null ||
+    openFromHash !== null
   ) {
     history.replaceState(null, "", location.pathname + location.search);
   }
   return isBrowserGateway() ? null : tokenFromHash ?? sessionStorage.getItem(TOKEN_KEY);
 }
 
+/** Set by `initFromHash` before `token` (declared first so the hoisted
+ *  bootstrap can assign it). */
+let pendingOpen: string | null = null;
 let token = initFromHash();
+
+/**
+ * The session a terminal-only window shows (the `term=` hash param — a
+ * cluster's login-node terminal), or null for every other window. Kept in
+ * sessionStorage so a reload stays a terminal window.
+ */
+export function terminalWindowSession(): string | null {
+  return sessionStorage.getItem(TERM_KEY);
+}
+
+/**
+ * The absolute path the shell asked this window to open (the `open=` hash
+ * param — a cluster file peek copied to this machine), once: the first call
+ * returns it, later calls null. The caller checks it lies inside the
+ * workspace and exists before opening it.
+ */
+export function takeOpenRequest(): string | null {
+  const p = pendingOpen;
+  pendingOpen = null;
+  return p;
+}
 
 /** The bearer token for this session, if one was provided. */
 export function getToken(): string | null {
@@ -231,19 +275,26 @@ export function isRemoteHost(): boolean {
 }
 
 /** The Slurm job a job-scoped window was opened onto (from the shell's
- *  `job=`/`node=` hash params). Orientation only — the daemon's own
+ *  `job=`/`node=`/`cws=` hash params). Orientation only — the daemon's own
  *  `/compute` `self` block is the authoritative "am I inside a job" fact
  *  (windows opened from within a compute window may not carry the params). */
 export interface JobContext {
   jobId: string;
   node: string | null;
+  /** The cluster workspace this job serves (`w-…`) — what stop, continue
+   *  and reconnect name to the shell. Null on a window from an older build. */
+  cws: string | null;
 }
 
-/** Non-null when this window was opened job-scoped (a compute-node session). */
+/** Non-null when this window was opened job-scoped (a workspace's job). */
 export function getJobContext(): JobContext | null {
   const jobId = sessionStorage.getItem(JOB_KEY);
   if (jobId === null) return null;
-  return { jobId, node: sessionStorage.getItem(NODE_KEY) };
+  return {
+    jobId,
+    node: sessionStorage.getItem(NODE_KEY),
+    cws: sessionStorage.getItem(CWS_KEY),
+  };
 }
 
 /** The workspace id this tab is scoped to, if any (window = workspace). */

@@ -842,11 +842,13 @@ async fn switch_to_pty(
     }
     // A view-switch respawn is a real spawn too — same prelude as the chat
     // process it replaces (the recipe carries the launch scope).
+    let startup = crate::environment::job_startup().await;
     let prelude = crate::environment::materialize_prelude(
         state,
         id,
         &recipe.workspace_id,
         recipe.prelude.as_deref(),
+        startup.as_deref(),
     );
     let env = crate::api::session_env(state, id, &recipe.theme, prelude.as_deref());
     let env_remove = crate::api::spawn_env_remove(&env);
@@ -3191,6 +3193,16 @@ pub(crate) async fn spawn_chat_session(
     );
     let chat_bin = crate::launcher::chat_executable(state, recipe.kind, &recipe.bin).await?;
     let recovered_effort = codex_initial_effort(state, &recipe).await;
+    // Read before the no-await stretch below: a cluster job's startup
+    // commands (the outermost prelude scope) and, for codex, the cluster
+    // context it gets as a developer note once its thread opens (claude's
+    // rides the hook carrier). Both are None off-cluster without any I/O.
+    let startup = crate::environment::job_startup().await;
+    let codex_cluster_context = if recipe.kind == AgentKind::Codex {
+        state.compute.agent_context().await
+    } else {
+        None
+    };
     // Re-enforce the journal-dir budget as sessions are created: pruning only
     // at boot lets a weeks-long daemon accumulate one capped journal per
     // session past the documented ceiling.
@@ -3311,6 +3323,7 @@ pub(crate) async fn spawn_chat_session(
         &id,
         &recipe.workspace_id,
         recipe.prelude.as_deref(),
+        startup.as_deref(),
     );
     spec.env = crate::api::session_env(state, &id, &recipe.theme, prelude.as_deref());
     // Strip the daemon's own launcher context (same set the PTY path removes)
@@ -3443,6 +3456,7 @@ pub(crate) async fn spawn_chat_session(
     spec.fork_at = recipe.fork_at.clone();
     spec.fork_head = recipe.fork_head;
     spec.portable_context = recipe.portable_context.clone();
+    spec.developer_note = codex_cluster_context;
     // Resurrection carries the original creation time so age survives the
     // restart; every other path leaves it None → the spawn stamps now.
     spec.created_at_ms = recipe.created_at_ms;
@@ -3666,7 +3680,7 @@ pub(crate) async fn resurrect_chat_transfer(
             // (the conversation survives, its processes do not). Tell the
             // agent once, as a message it can act on (see `pickup_message`).
             let enabled = crate::lock(&state.settings).resume_after_restart();
-            let pick_up = if mastermind_mode.is_some() {
+            let pick_up = if mastermind_mode.is_some() || state.compute.is_cluster_job() {
                 None
             } else if let Some(origin) = origin {
                 let recovery = crate::pro::checkpoint_recovery_context(state, &entry.workspace_id);
@@ -3792,7 +3806,8 @@ const PICKUP_MIN_INTERVAL_MS: u64 = 10 * 60 * 1000;
 
 /// The message a resurrected chat gets about the work the restart cut off,
 /// or `None` when it gets none: nothing was cut off, the user turned the
-/// setting off, the conversation did not actually resume (a fresh boot has
+/// setting off (or the daemon is a cluster workspace job — the caller folds
+/// that into `enabled`), the conversation did not actually resume (a fresh boot has
 /// no memory of how that work was started), it is a Mastermind (the daemon
 /// never starts its turns — reactive-only, by design), or the last pick-up
 /// went out moments ago (a restart loop).

@@ -345,7 +345,7 @@ recorded in PROTOCOL.md Pass 19. `chat-smoke` after the driver change: 16/16 (on
 claude-side flake passed alone).
 
 **Not exercised live yet:** the compute chip against a real Slurm scheduler (it reuses
-`ComputeStrip`'s exact parsing; needs a Sherlock pass); the output-only TUI now-line
+`ComputeStrip`'s exact parsing; needs a pass on a real cluster); the output-only TUI now-line
 flip on screen (the shared `output_active`/`dotTitle` path shipped verified in #59);
 the store-tier work drop-down rendering subagents ∪ background tasks simultaneously.
 

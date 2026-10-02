@@ -269,14 +269,14 @@ same tool without a per-agent install.
 
 **The tab** — a singleton `{v:"plugins"}` (additive layout kind), reachable
 from the dashboard, settings and quick-open, naming the host ("on
-sherlock") because installs are per host. Three views:
+cluster") because installs are per host. Three views:
 
 - **Installed** — workbench plugins, then each agent's plugins.
 - **Skills** — every skill each agent can use here (§6.4).
 - **Browse** — later: what the agents' marketplaces offer (§6.5).
 
 ```
- Plugins                    Installed · Skills · Browse     on sherlock
+ Plugins                    Installed · Skills · Browse      on cluster
  WORKBENCH
  Mycelium   Project memory your agents record in .living/            [on]
    Here: active — 4 findings · 12 learnings · 3 decisions

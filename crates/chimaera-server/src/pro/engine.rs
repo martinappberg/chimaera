@@ -1740,6 +1740,7 @@ async fn hydrate_scoped(
             mastermind: None,
             plugins_on: Vec::new(),
             cloud_internal: false,
+            hidden: false,
         };
         let owner = state.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
@@ -2546,7 +2547,8 @@ pub(super) fn eligible(state: &AppState, workspace: &crate::workspaces::Workspac
     if authority::registered_root(state, &workspace.id, &workspace.root).is_err() {
         return false;
     }
-    if crate::cloud::is_onboarding_workspace(workspace)
+    if workspace.hidden
+        || crate::cloud::is_onboarding_workspace(workspace)
         || lock(&state.pro.legacy_pending).contains(&workspace.id)
         || !super::projects::account_matches(state, &workspace.id)
     {
@@ -2642,6 +2644,7 @@ mod tests {
                 mastermind: None,
                 plugins_on: vec![],
                 cloud_internal: false,
+                hidden: false,
             })
             .unwrap();
         lock(&state.pro.ownership).insert("w-project".into(), Ownership::Hydrating { epoch: 3 });
@@ -2766,6 +2769,7 @@ mod tests {
                 mastermind: None,
                 plugins_on: vec![],
                 cloud_internal: false,
+                hidden: false,
             })
             .unwrap();
         let claude = root.join("claude");

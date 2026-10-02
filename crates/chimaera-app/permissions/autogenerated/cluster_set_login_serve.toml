@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cluster-set-login-serve"
+description = "Enables the cluster_set_login_serve command without any pre-configured scope."
+commands.allow = ["cluster_set_login_serve"]
+
+[[permission]]
+identifier = "deny-cluster-set-login-serve"
+description = "Denies the cluster_set_login_serve command without any pre-configured scope."
+commands.deny = ["cluster_set_login_serve"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cluster-move"
+description = "Enables the cluster_move command without any pre-configured scope."
+commands.allow = ["cluster_move"]
+
+[[permission]]
+identifier = "deny-cluster-move"
+description = "Denies the cluster_move command without any pre-configured scope."
+commands.deny = ["cluster_move"]

@@ -12,6 +12,7 @@
 //! trust-on-first-use host-key policy, so a freshly installed app can connect
 //! to a host it has never seen without a tty to confirm the key.
 
+pub mod cluster;
 pub mod hosts;
 
 #[cfg(unix)]
@@ -20,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context};
+use chimaera_core::slurm::Scheduler;
 use chimaera_core::{same_node, Manifest};
 use tokio::process::{Child, Command};
 
@@ -354,6 +356,20 @@ fn ssh_cmd(host: &str) -> Command {
     c
 }
 
+/// The argv of an interactive `ssh` to `host` over chimaera's own
+/// ControlMaster (the user's terminal on a cluster's login node): the shared
+/// options along the host's current route, a forced tty, the host. No
+/// password prompt when the master is up; ssh's own prompt in the terminal
+/// when it isn't.
+pub fn interactive_ssh_argv(host: &str) -> Vec<String> {
+    let mut argv = vec!["ssh".to_string()];
+    argv.extend(route_opts(host, &route_of(host)));
+    argv.extend(ssh_opts());
+    argv.push("-t".into());
+    argv.push(host.to_string());
+    argv
+}
+
 /// An `scp` command pre-loaded with the shared options, so a binary copy
 /// reuses the connection the probe already authenticated instead of prompting
 /// again.
@@ -523,7 +539,53 @@ pub struct ConnectOpts {
     /// Replace an outdated remote daemon even when it has live sessions
     /// (they end with it). The stop is always graceful — SIGTERM, never -9.
     pub update_daemon: bool,
+    /// The user allowed a daemon on this cluster's login node (the warned
+    /// per-host override). Without it, a host whose login shell reaches a
+    /// batch scheduler never gets a daemon: connect answers [`ClusterHost`].
+    pub login_serve: bool,
+    /// The user said this host is not a cluster (Slurm's tools on a
+    /// workstation's PATH): it connects like any host, and a daemon started
+    /// here doesn't tell its agents they are on a shared login node.
+    pub not_cluster: bool,
 }
+
+/// `connect` found a cluster: a host whose login shell reaches a batch
+/// scheduler. Nothing was started, updated or tunnelled — chimaera runs on
+/// such a host only inside jobs (see [`cluster`]), unless the user allowed
+/// the login node ([`ConnectOpts::login_serve`]). Callers downcast for it
+/// like [`TunnelPhaseError`].
+#[derive(Clone, Debug)]
+pub struct ClusterHost {
+    pub host: String,
+    pub scheduler: Scheduler,
+    /// A daemon a previous connect left on the login node, if the probe saw
+    /// its manifest — so the UI can offer to shut it down.
+    pub login_daemon: Option<LoginDaemon>,
+}
+
+/// A chimaera daemon registered on a cluster's login node.
+#[derive(Clone, Debug)]
+pub struct LoginDaemon {
+    /// The login node it registered on.
+    pub node: String,
+    pub pid: u32,
+    /// `Some` when judged on its own node; `None` when it registered on
+    /// another node of the alias's pool (its pid means nothing from here).
+    pub alive: Option<bool>,
+}
+
+impl std::fmt::Display for ClusterHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} is a {} cluster: chimaera doesn't run on its login nodes — start a workspace as a job instead",
+            self.host,
+            self.scheduler.tag()
+        )
+    }
+}
+
+impl std::error::Error for ClusterHost {}
 
 /// Which per-user state root on the HOST a connect targets. Every remote
 /// side effect — the manifest probed, the binary installed, the daemon
@@ -597,7 +659,7 @@ impl RemoteHome {
         format!("{}/bin", self.dir())
     }
 
-    fn bin_path(self) -> String {
+    pub(crate) fn bin_path(self) -> String {
         format!("{}/chimaera", self.bin_dir())
     }
 
@@ -984,7 +1046,11 @@ trait RemoteOps {
     fn set_route(&self, host: &str, route: Route);
     /// Where THIS machine resolves `node` (see [`routes_to`]).
     async fn local_addrs(&self, node: &str) -> Vec<std::net::IpAddr>;
-    async fn remote_probe(&self, host: &str) -> anyhow::Result<ProbeRun>;
+    /// One probe exec. `detect` adds the scheduler check (the login shell's
+    /// PATH walk) — the decision phase's first probe only.
+    async fn remote_probe(&self, host: &str, detect: bool) -> anyhow::Result<ProbeRun>;
+    /// The scheduler the last detecting probe found on `host`.
+    fn scheduler(&self, host: &str) -> Scheduler;
     async fn remote_sessions_count(
         &self,
         host: &str,
@@ -1018,6 +1084,8 @@ trait RemoteOps {
 /// policy in [`resolve_daemon`] never needs to know which.
 struct SshOps {
     home: RemoteHome,
+    /// The host isn't a cluster, by the user's word (`ConnectOpts::not_cluster`).
+    not_cluster: bool,
 }
 
 impl RemoteOps for SshOps {
@@ -1030,8 +1098,11 @@ impl RemoteOps for SshOps {
     async fn local_addrs(&self, node: &str) -> Vec<std::net::IpAddr> {
         local_addrs(node).await
     }
-    async fn remote_probe(&self, host: &str) -> anyhow::Result<ProbeRun> {
-        probe_run(host, self.home).await
+    async fn remote_probe(&self, host: &str, detect: bool) -> anyhow::Result<ProbeRun> {
+        probe_run(host, self.home, detect).await
+    }
+    fn scheduler(&self, host: &str) -> Scheduler {
+        scheduler_of(host).map(|s| s.kind).unwrap_or_default()
     }
     async fn remote_sessions_count(
         &self,
@@ -1060,7 +1131,7 @@ impl RemoteOps for SshOps {
         deploy_binary(host, path, self.home, &progress).await
     }
     async fn start_remote(&self, host: &str) -> anyhow::Result<Manifest> {
-        start_remote(host, self.home).await
+        start_remote(host, self.home, self.not_cluster).await
     }
     async fn ensure_remote_binary(
         &self,
@@ -1083,13 +1154,22 @@ async fn locate(
     ops: &impl RemoteOps,
     host: &str,
     progress: &impl Fn(Phase),
+    first: Option<ProbeRun>,
 ) -> anyhow::Result<Option<(Manifest, bool)>> {
+    // `first`: a probe the caller already ran along the current route — it
+    // stands in for whichever probe below comes first, so the decision phase
+    // pays one exec, not two.
+    let mut first = first;
     // A route an earlier connect learned goes first: it lands straight on the
     // daemon's node (one dial, one prompt) instead of wherever the pool sends
     // a new master. Anything but a verdict from that node starts over.
     let learned = ops.route(host);
     if learned != Route::Alias {
-        let why = match ops.remote_probe(host).await {
+        let run = match first.take() {
+            Some(run) => Ok(run),
+            None => ops.remote_probe(host, false).await,
+        };
+        let why = match run {
             // Stopped since (a graceful stop removes the manifest): a fresh
             // start there keeps the alias on the node it was routed to.
             Ok(ProbeRun::Ran(None)) => return Ok(None),
@@ -1105,7 +1185,11 @@ async fn locate(
         ops.set_route(host, Route::Alias);
     }
 
-    let landed = match ops.remote_probe(host).await? {
+    let run = match first.take() {
+        Some(run) => run,
+        None => ops.remote_probe(host, false).await?,
+    };
+    let landed = match run {
         // An unreachable host reads as nothing running, as it always has:
         // the start path then surfaces ssh's own error.
         ProbeRun::Failed(_) | ProbeRun::Ran(None) => return Ok(None),
@@ -1138,7 +1222,7 @@ async fn locate(
     let mut why = String::new();
     for route in routes_to(&node, &landed.manifest_node_addrs, &local) {
         ops.set_route(host, route.clone());
-        match ops.remote_probe(host).await {
+        match ops.remote_probe(host, false).await {
             // The verdict now comes from the node that wrote the manifest.
             Ok(ProbeRun::Ran(Some(p))) if p.here() && same_node(&p.node, &node) => {
                 tracing::info!("{host}: reached {node} ({route:?})");
@@ -1162,7 +1246,7 @@ async fn locate(
             // on — which just read the manifest — can tell them apart.
             Ok(ProbeRun::Ran(None)) => {
                 ops.set_route(host, Route::Alias);
-                match ops.remote_probe(host).await? {
+                match ops.remote_probe(host, false).await? {
                     ProbeRun::Ran(None) => return Ok(None),
                     _ => {
                         why = format!(
@@ -1232,12 +1316,39 @@ async fn resolve_daemon(
     let local_build = chimaera_core::BUILD_ID;
     let mut outdated = false;
     let mut live_sessions = None;
-    // One remote exec answers "is there a manifest", "is its pid alive", and
-    // "was it written on this node" (`probe_run`): every ssh exec through the
-    // ControlMaster costs a channel-open RTT plus a fork on a loaded login
-    // node. `locate` adds execs only for a manifest another node wrote, and
-    // leaves every op below routed to the daemon's node.
-    let manifest = match locate(ops, host, progress).await? {
+    // One remote exec answers "is there a manifest", "is its pid alive",
+    // "was it written on this node" and "does the login shell reach a batch
+    // scheduler" (`probe_run`): every ssh exec through the ControlMaster
+    // costs a channel-open RTT plus a fork on a loaded login node. `locate`
+    // adds execs only for a manifest another node wrote, and leaves every op
+    // below routed to the daemon's node.
+    let first = ops.remote_probe(host, true).await?;
+    let scheduler = ops.scheduler(host);
+    if scheduler.is_cluster() && !opts.login_serve && !opts.not_cluster {
+        // A cluster: nothing of ours may keep running on its login node, so
+        // nothing is started, updated, or attached to — and no other login
+        // node is dialed to judge an old daemon (that could prompt for a
+        // second login). The probe's own view is reported as-is.
+        let login_daemon = match &first {
+            ProbeRun::Ran(Some(p)) => Some(LoginDaemon {
+                node: p.manifest.hostname.clone(),
+                pid: p.manifest.pid,
+                alive: p.here().then_some(p.alive),
+            }),
+            _ => None,
+        };
+        tracing::info!(
+            "{host} is a {} cluster; no daemon on its login node",
+            scheduler.tag()
+        );
+        return Err(ClusterHost {
+            host: host.to_string(),
+            scheduler,
+            login_daemon,
+        }
+        .into());
+    }
+    let manifest = match locate(ops, host, progress, Some(first)).await? {
         Some((m, true)) => {
             // Only pay for the session-count round trip when it can change
             // the decision (build mismatch, or an explicit update request).
@@ -1334,6 +1445,7 @@ pub async fn connect(
     // a dev home and a dev client can never stop or replace the real daemon.
     let ops = SshOps {
         home: RemoteHome::current(),
+        not_cluster: opts.not_cluster,
     };
     let (manifest, outdated, live_sessions) = resolve_daemon(&ops, host, &opts, &progress).await?;
     // Where `locate` left the alias: the forward must end on the daemon's
@@ -1394,7 +1506,16 @@ pub async fn locate_daemon(
     host: &str,
     home: RemoteHome,
 ) -> anyhow::Result<Option<(Manifest, bool)>> {
-    locate(&SshOps { home }, host, &|_| {}).await
+    locate(
+        &SshOps {
+            home,
+            not_cluster: false,
+        },
+        host,
+        &|_| {},
+        None,
+    )
+    .await
 }
 
 /// Frame the manifest in [`remote_probe`] / [`start_remote`] output on BOTH
@@ -1549,15 +1670,31 @@ impl std::fmt::Display for ProbeFailure {
 /// a remote fork (~300-500 ms on a loaded login node at WAN latency). `None`
 /// = no readable manifest (or ssh itself failed — "nothing running", as the
 /// connect flow has always read an unreachable host).
+/// Which batch scheduler `host`'s login shell reaches — one probe exec (which
+/// also raises the ControlMaster, so it may ask the user to authenticate).
+/// Every later cluster command finds the scheduler on the PATH this learned.
+pub async fn detect_scheduler(host: &str, home: RemoteHome) -> anyhow::Result<SchedulerInfo> {
+    let host = &hosts::normalize_alias(host)?;
+    if let ProbeRun::Failed(f) = probe_run(host, home, true).await? {
+        bail!("could not reach {host}: {f}");
+    }
+    Ok(scheduler_of(host).unwrap_or_default())
+}
+
 pub async fn remote_probe(host: &str, home: RemoteHome) -> anyhow::Result<Option<Probe>> {
-    match probe_run(host, home).await? {
+    match probe_run(host, home, true).await? {
         ProbeRun::Ran(probe) => Ok(probe),
         ProbeRun::Failed(_) => Ok(None),
     }
 }
 
-async fn probe_run(host: &str, home: RemoteHome) -> anyhow::Result<ProbeRun> {
-    let cmd = sh_wrap(&probe_script(&home.manifest_path()));
+async fn probe_run(host: &str, home: RemoteHome, detect: bool) -> anyhow::Result<ProbeRun> {
+    let script = if detect {
+        format!("{} {}", sh_scheduler(), probe_script(&home.manifest_path()))
+    } else {
+        probe_script(&home.manifest_path())
+    };
+    let cmd = sh_wrap(&script);
     // SSH_ONESHOT_SECS, not shorter: the first call to a host raises the
     // ControlMaster and may sit in an askpass password/Duo prompt.
     let output = output_bounded(ssh_cmd(host).arg(cmd), SSH_ONESHOT_SECS, "ssh").await?;
@@ -1567,9 +1704,85 @@ async fn probe_run(host: &str, home: RemoteHome) -> anyhow::Result<ProbeRun> {
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         }));
     }
-    let probe = parse_probe_output(&String::from_utf8_lossy(&output.stdout))
-        .with_context(|| format!("probing the daemon on {host}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if detect {
+        set_scheduler(host, parse_scheduler_line(&stdout));
+    }
+    let probe =
+        parse_probe_output(&stdout).with_context(|| format!("probing the daemon on {host}"))?;
     Ok(ProbeRun::Ran(probe))
+}
+
+/// Marks the scheduler verdict line in a probe's stdout (an echoing rc file
+/// can't fake it, and it is never a substring of the manifest JSON).
+const SCHED_MARK: &str = "---chimaera-sched---";
+
+/// What the login shell can reach on a host: the scheduler, and the
+/// directory its submit command lives in (prefixed to `PATH` by every later
+/// cluster command, which run in a plain `sh -c`, not a login shell).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SchedulerInfo {
+    pub kind: Scheduler,
+    pub bindir: String,
+}
+
+static SCHEDULERS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, SchedulerInfo>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// The scheduler the last detecting probe of `host` found in this process.
+pub fn scheduler_of(host: &str) -> Option<SchedulerInfo> {
+    SCHEDULERS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(host)
+        .cloned()
+}
+
+fn set_scheduler(host: &str, info: Option<SchedulerInfo>) {
+    let mut map = SCHEDULERS.lock().unwrap_or_else(|p| p.into_inner());
+    match info {
+        Some(info) => map.insert(host.to_string(), info),
+        None => map.remove(host),
+    };
+}
+
+/// POSIX-sh fragment printing which batch scheduler the user's LOGIN shell
+/// can reach: `SCHED_MARK <tag> <dir of the submit command>`. A PATH walk,
+/// never `command -v`: clusters wrap these tools in profile shell functions
+/// (`command -v squeue` then names the function, not a file), and the walk
+/// reads the same under every shell. The PATH comes from the user's login
+/// shell when it answers `-lc` (tcsh refuses it; a profile that `exec`s
+/// another shell swallows it), else from `sh -l` (the system profile, where
+/// clusters put their scheduler), else this shell's.
+fn sh_scheduler() -> String {
+    format!(
+        r#"P=$("${{SHELL:-/bin/sh}}" -lc 'printf "\n%s%s\n" __chimaera_path__ "$PATH"' </dev/null 2>/dev/null | sed -n 's/^__chimaera_path__//p' | tail -n 1); [ -n "$P" ] || P=$(sh -lc 'printf "\n%s%s\n" __chimaera_path__ "$PATH"' </dev/null 2>/dev/null | sed -n 's/^__chimaera_path__//p' | tail -n 1); [ -n "$P" ] || P=$PATH; has() {{ _o=$IFS; IFS=:; set -f; for _d in $P; do if [ -n "$_d" ] && [ -f "$_d/$1" ] && [ -x "$_d/$1" ]; then IFS=$_o; set +f; printf %s "$_d"; return 0; fi; done; IFS=$_o; set +f; return 1; }}; s=none; b=; if b=$(has sbatch) && has squeue >/dev/null && has scancel >/dev/null && has sinfo >/dev/null; then s=slurm; elif b=$(has qsub) && has qstat >/dev/null; then s=pbs; elif b=$(has bsub) && has bjobs >/dev/null; then s=lsf; else b=; fi; printf '\n%s %s %s\n' '{SCHED_MARK}' "$s" "$b";"#
+    )
+}
+
+/// The scheduler verdict in a detecting probe's stdout; `None` when the
+/// line is missing (the probe never got that far).
+fn parse_scheduler_line(stdout: &str) -> Option<SchedulerInfo> {
+    let rest = stdout
+        .lines()
+        .rev()
+        .find_map(|l| l.trim().strip_prefix(SCHED_MARK))?;
+    let mut words = rest.split_whitespace();
+    let kind = Scheduler::from_tag(words.next().unwrap_or("none"));
+    let bindir = words.next().unwrap_or("").to_string();
+    // The dir rides into later command lines as a PATH prefix: only a plain
+    // absolute path is kept.
+    let bindir = if bindir.starts_with('/')
+        && bindir
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-+".contains(c))
+    {
+        bindir
+    } else {
+        String::new()
+    };
+    Some(SchedulerInfo { kind, bindir })
 }
 
 /// The POSIX-sh script [`remote_probe`] runs on the host: the manifest at
@@ -2330,7 +2543,7 @@ fn parse_cli_version(text: &str) -> Option<String> {
 
 /// Start the daemon on the host, then wait — in ONE remote exec — until its
 /// manifest reports a live pid.
-async fn start_remote(host: &str, home: RemoteHome) -> anyhow::Result<Manifest> {
+async fn start_remote(host: &str, home: RemoteHome, not_cluster: bool) -> anyhow::Result<Manifest> {
     tracing::info!("starting chimaera daemon on {host} ({})", home.dir());
     ssh_run(
         host,
@@ -2364,7 +2577,15 @@ async fn start_remote(host: &str, home: RemoteHome) -> anyhow::Result<Manifest> 
              {env}{bin} serve --daemonize >> {log} 2>&1 < /dev/null && exit; \
              {env}setsid nohup {bin} serve >> {log} 2>&1 < /dev/null & disown",
             log_dir = home.log_dir(),
-            env = home.serve_env(),
+            env = format!(
+                "{}{}",
+                home.serve_env(),
+                if not_cluster {
+                    format!("{}=1 ", chimaera_core::cluster::ENV_NOT_A_CLUSTER)
+                } else {
+                    String::new()
+                }
+            ),
             bin = home.bin_path(),
             log = home.log_path(),
         ),
@@ -2582,6 +2803,17 @@ async fn wait_for_port(port: u16, tunnel: &mut Child) -> anyhow::Result<bool> {
 /// cut users off mid-typing.
 const SSH_ONESHOT_SECS: u64 = 240;
 
+/// The line worth showing from a failed ssh exec: ssh's own complaint is its
+/// last stderr line (a chatty login banner sits before it), else the exit
+/// status.
+fn ssh_failure_line(stderr: &[u8], status: &std::process::ExitStatus) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    match text.lines().rev().find(|l| !l.trim().is_empty()) {
+        Some(line) => line.trim().to_string(),
+        None => format!("ssh exited {status}"),
+    }
+}
+
 /// Run a remote command, failing loudly if it does not exit 0.
 async fn ssh_run(host: &str, cmd: &str) -> anyhow::Result<()> {
     let output = output_bounded(ssh_cmd(host).arg(cmd), SSH_ONESHOT_SECS, "ssh").await?;
@@ -2594,36 +2826,29 @@ async fn ssh_run(host: &str, cmd: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-// --- Mode 2: compute-node sessions ------------------------------------------
+// --- Workspace jobs: reaching a chimaera inside a Slurm job ------------------
 //
-// A chimaera daemon launched AS a Slurm job (by the login daemon's
-// POST /compute/sessions) lives on a compute node. Reaching it is a
-// two-rung ladder, probed per connect and honest about defeat:
+// A cluster workspace runs as a Slurm job whose daemon listens on its compute
+// node's address (`serve --bind-routable`, token-gated). Reaching it is a
+// short ladder, probed per connect and honest about defeat:
 //
-//   B (SshAdopt, preferred) — ssh to the NODE itself, first leg relayed
-//     through the already-authenticated login ControlMaster (`-W`). The job
-//     daemon stays loopback-bound, and pam_slurm_adopt clusters also adopt
-//     the connection into the job's cgroup.
-//   A (Direct) — forward `local -> node:port` over the login master. Only
-//     works when the job was launched with `--bind-routable` (token-gated
-//     0.0.0.0); the fallback for clusters that refuse laptop→node ssh.
-//   neither — "compute-node sessions not supported on this cluster", the
-//     job keeps running and login-node (Mode 1) use still works.
+//   Direct (preferred) — the login ControlMaster forwards `local -> node:port`
+//     (`ssh -L`), exactly the forward HPC centers tell users to keep open to a
+//     service in their own job. The login node's sshd does the forwarding;
+//     nothing of ours runs there.
+//   SshAdopt (fallback) — ssh to the NODE itself, first leg relayed through
+//     the login master (`-W`), for clusters whose compute nodes the login node
+//     can't reach on a high port but that adopt ssh into the user's job.
+//   neither — "can't reach compute nodes from here"; the job keeps running.
 
 /// Which rung of the node-tunnel ladder carried the connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComputeRung {
-    /// Laptop ssh's end-to-end to the node (pam_slurm_adopt clusters that
-    /// allow laptop-credential auth on nodes).
-    SshAdopt,
-    /// A login-node-resident relay to the node's loopback, running AS the
-    /// remote command of the same laptop ssh that forwards to it — the
-    /// cluster-native path where node sshd is hostbased-only (Sherlock:
-    /// found live, laptop legs get "Permission denied (hostbased)").
-    /// Lifetimes are coupled: kill the child, both legs die.
-    Chained,
-    /// Direct login→node port forward; routable-bound jobs only.
+    /// The login master forwards straight to the job's port on its node.
     Direct,
+    /// Laptop ssh end-to-end to the node (clusters that adopt ssh into the
+    /// user's job and accept the user's own credentials on nodes).
+    SshAdopt,
 }
 
 /// A live tunnel to a compute-node daemon.
@@ -2637,12 +2862,11 @@ pub struct ComputeTunnel {
     pub port: u16,
     pub token: String,
     pub rung: ComputeRung,
-    /// The `-L` spec of a forward the login ControlMaster holds instead of
-    /// `child`: rung A's when its mux client delegated, and the chained
-    /// rung's outer forward always (its ssh rides `ssh_base`, so the master
-    /// owns the local listener even while the child holds the relay).
-    /// `None` for rung B1 — `node_ssh_base` pins `ControlPath=none`, so
-    /// that child owns its forward end-to-end and dies with it.
+    /// The `-L` spec of a forward the login ControlMaster may hold instead of
+    /// `child`: always the direct rung's (cancelled on close whether or not
+    /// its mux client delegated — that can happen after the probe). `None` for
+    /// the ssh-adopt rung — `node_ssh_base` pins `ControlPath=none`, so that
+    /// child owns its forward end-to-end and dies with it.
     master_forward: Option<String>,
     /// The login alias's [`Route`] when the tunnel opened — which master
     /// holds `master_forward`.
@@ -2660,8 +2884,8 @@ impl ComputeTunnel {
         )
     }
 
-    /// Wait for the tunnel child (never returns for a healthy rung-B
-    /// forward; quickly when rung A delegated to the master).
+    /// Wait for the tunnel child (never returns for a healthy ssh-adopt
+    /// forward; quickly when the direct rung delegated to the master).
     pub async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
         self.child.wait().await
     }
@@ -2814,40 +3038,6 @@ fn spawn_node_tunnel(
         .map_err(|e| TunnelPhaseError(format!("failed to spawn node ssh tunnel: {e}")).into())
 }
 
-/// The chained rung: ONE laptop ssh that (a) forwards `local` to a relay
-/// port on the LOGIN node and (b) runs, as its remote command, a
-/// login-resident `ssh -N -L` to the node's loopback — hostbased
-/// login→node auth, exactly what cluster-internal ssh is built for. The
-/// inner relay dies with the outer channel, so nothing is orphaned on the
-/// login node.
-fn spawn_chained_node_tunnel(
-    host: &str,
-    route: &Route,
-    node: &str,
-    local: u16,
-    relay_port: u16,
-    remote: u16,
-) -> anyhow::Result<Child> {
-    ssh_base_via(host, route)
-        .args(["-o", "ExitOnForwardFailure=yes"])
-        .arg("-L")
-        .arg(format!("{local}:127.0.0.1:{relay_port}"))
-        .arg(host)
-        .arg(format!(
-            // The INNER ssh runs on the login node, whose OpenSSH can be
-            // ancient (Sherlock's rejects `accept-new` — found live).
-            // `no` + a null known_hosts is the old-ssh-safe form, and right
-            // for cluster-internal hops anyway: node host keys churn on
-            // reimage, and the login→node trust is hostbased, not TOFU.
-            "exec ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes \
-             -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-             -o ConnectTimeout=15 -L {relay_port}:127.0.0.1:{remote} {node}"
-        ))
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| TunnelPhaseError(format!("failed to spawn chained node tunnel: {e}")).into())
-}
-
 fn spawn_direct_node_tunnel(
     host: &str,
     route: &Route,
@@ -2866,23 +3056,25 @@ fn spawn_direct_node_tunnel(
         .map_err(|e| TunnelPhaseError(format!("failed to spawn direct node tunnel: {e}")).into())
 }
 
-/// Build the tunnel to a compute-node daemon: rung B, then rung A when the
-/// job daemon has a routable bind, else an honest error. The arbiter on
-/// every rung is `tunnel_proven`: an authed 200 through OUR forward, from a
-/// child that is still running afterwards (or that delegated the forward to
-/// the ControlMaster and exited 0 — rung A whenever a master is up) — a
+/// Build the tunnel to a workspace job's daemon: the direct forward, then
+/// ssh into the node, else an honest error. The arbiter on every rung is
+/// `tunnel_proven`: an authed 200 through OUR forward, from a child that is
+/// still running afterwards (or that delegated the forward to the
+/// ControlMaster and exited 0 — the direct rung whenever a master is up) — a
 /// forward that binds but can't reach the daemon, answers with the wrong
-/// daemon, or dies right after answering (a bind-clash exit racing a stale
-/// relay) is a failure, not a success.
+/// daemon, or dies right after answering is a failure, not a success.
 pub async fn connect_compute_node(
     host: &str,
     node: &str,
     job_id: &str,
     port: u16,
     token: &str,
-    routable: bool,
 ) -> anyhow::Result<ComputeTunnel> {
     anyhow::ensure!(!node.is_empty(), "job {job_id} has no node yet (queued?)");
+    anyhow::ensure!(
+        valid_node_name(node),
+        "job {job_id}'s node name {node:?} is not a plain host name"
+    );
     // One read of the login alias's route for the whole ladder: every rung's
     // forward registers on that master, and every cancel (and the tunnel's
     // own close) must reach the same one even if a login reconnect re-routes
@@ -2901,7 +3093,39 @@ pub async fn connect_compute_node(
         child,
     };
 
-    // Rung B1 — laptop ssh end-to-end to the node; daemon stays loopback.
+    // Direct — the login master forwards to the node's port.
+    let local = pick_local_port(None, port)?;
+    let spec = format!("{local}:{node}:{port}");
+    match spawn_direct_node_tunnel(host, &route, node, local, port) {
+        Ok(mut child) => match wait_for_port(local, &mut child).await {
+            Ok(mux) => {
+                if tunnel_proven(local, token, 15, mux, &mut child)
+                    .await
+                    .is_some()
+                {
+                    tracing::info!(%node, %job_id, "workspace job tunnel up (direct)");
+                    // Always cancelled on close, delegated or not: the mux
+                    // client may hand the forward to the master just after
+                    // the probe answers, and a cancel the master doesn't
+                    // hold is a no-op it answers locally.
+                    return Ok(mk(local, ComputeRung::Direct, Some(spec.clone()), child));
+                }
+                // A delegated forward outlives the exited mux client — the
+                // probe failing does not tear it down, so cancel or the
+                // master keeps proxying the local port until it expires.
+                let cancel_master = forward_delegated(mux, &mut child);
+                child.kill().await.ok();
+                if cancel_master {
+                    cancel_master_forward(host, &route, &spec).await;
+                }
+                tracing::info!(%node, "direct forward opened but the job's daemon did not answer");
+            }
+            Err(err) => tracing::info!(%node, %err, "direct forward unavailable"),
+        },
+        Err(err) => tracing::info!(%node, %err, "direct forward spawn failed"),
+    }
+
+    // SshAdopt — laptop ssh end-to-end to the node.
     let target = node_target(host, node).await;
     let local = pick_local_port(None, port)?;
     match spawn_node_tunnel(host, &route, &target, local, port) {
@@ -2911,97 +3135,21 @@ pub async fn connect_compute_node(
                     .await
                     .is_some()
                 {
-                    tracing::info!(%node, %job_id, "compute tunnel up (rung B, ssh-adopt)");
+                    tracing::info!(%node, %job_id, "workspace job tunnel up (ssh into the node)");
                     return Ok(mk(local, ComputeRung::SshAdopt, None, child));
                 }
                 child.kill().await.ok();
-                tracing::info!(%node, "rung B forwarded but the job daemon did not answer");
+                tracing::info!(%node, "ssh into the node forwarded but the job's daemon did not answer");
             }
-            Err(err) => tracing::info!(%node, %err, "rung B unavailable"),
+            Err(err) => tracing::info!(%node, %err, "ssh into the node unavailable"),
         },
-        Err(err) => tracing::info!(%node, %err, "rung B spawn failed"),
-    }
-
-    // Rung B2 (chained) — the login node relays to the node's loopback.
-    // The relay port must be free ON THE LOGIN NODE — always randomized:
-    // the daemon's own port number is exactly where a previous connect's
-    // relay (or another tenant of a shared login node) already sits, so it
-    // is the one candidate guaranteed to clash with ourselves. A bind clash
-    // exits the inner ssh (ExitOnForwardFailure), caught by wait_for_port's
-    // early-exit branch or by tunnel_proven's still-running check.
-    for relay_port in [fastrand_port(), fastrand_port(), fastrand_port()] {
-        let local = pick_local_port(None, port)?;
-        let Ok(mut child) = spawn_chained_node_tunnel(host, &route, node, local, relay_port, port)
-        else {
-            break;
-        };
-        // The outer `-L` rides `ssh_base`, so the login master holds the
-        // local listener — abandoning this attempt must cancel it (killing
-        // the child only tears down the relay leg). Best-effort on the Err
-        // arm too: an early inner-relay death can land AFTER the forward
-        // registered, and cancelling a never-registered spec is a no-op.
-        let outer_spec = format!("{local}:127.0.0.1:{relay_port}");
-        match wait_for_port(local, &mut child).await {
-            Ok(mux)
-                if tunnel_proven(local, token, 15, mux, &mut child)
-                    .await
-                    .is_some() =>
-            {
-                tracing::info!(%node, %job_id, relay_port, "compute tunnel up (rung B, chained via login node)");
-                return Ok(mk(local, ComputeRung::Chained, Some(outer_spec), child));
-            }
-            Ok(_) => {
-                child.kill().await.ok();
-                cancel_master_forward(host, &route, &outer_spec).await;
-                tracing::info!(%node, relay_port, "chained rung forwarded but the job daemon did not answer");
-            }
-            Err(err) => {
-                child.kill().await.ok();
-                cancel_master_forward(host, &route, &outer_spec).await;
-                tracing::info!(%node, relay_port, %err, "chained rung attempt failed");
-            }
-        }
-    }
-
-    // Rung A — direct login→node forward; only for routable-bound jobs.
-    if routable {
-        let local = pick_local_port(None, port)?;
-        let spec = format!("{local}:{node}:{port}");
-        if let Ok(mut child) = spawn_direct_node_tunnel(host, &route, node, local, port) {
-            match wait_for_port(local, &mut child).await {
-                Ok(mux) => {
-                    if let Some(mux) = tunnel_proven(local, token, 10, mux, &mut child).await {
-                        tracing::info!(%node, %job_id, "compute tunnel up (rung A, direct)");
-                        return Ok(mk(
-                            local,
-                            ComputeRung::Direct,
-                            mux.then(|| spec.clone()),
-                            child,
-                        ));
-                    }
-                    // A delegated forward outlives the exited mux client —
-                    // the probe failing does not tear it down, so cancel or
-                    // the master keeps proxying the local port until it
-                    // expires.
-                    let cancel_master = forward_delegated(mux, &mut child);
-                    child.kill().await.ok();
-                    if cancel_master {
-                        cancel_master_forward(host, &route, &spec).await;
-                    }
-                }
-                Err(err) => tracing::info!(%node, %err, "rung A unavailable"),
-            }
-        }
+        Err(err) => tracing::info!(%node, %err, "ssh into the node spawn failed"),
     }
 
     bail!(
-        "compute-node sessions are not supported on this cluster over ssh (rung B failed{}) — \
-         the job keeps running; use it from the login node",
-        if routable {
-            ", and the direct forward to the node's routable port also failed"
-        } else {
-            ", and the job was not launched with a routable bind"
-        }
+        "can't reach compute nodes on this cluster from here: neither a forward through the \
+         login node to {node}:{port} nor ssh into {node} reached the workspace's chimaera — \
+         the job keeps running"
     )
 }
 
@@ -3043,127 +3191,6 @@ async fn tunnel_proven(
         Ok(Some(status)) if status.success() => Some(true),
         Ok(Some(_)) | Err(_) => None,
     }
-}
-
-/// A pseudo-random high port for the chained relay's login-node bind —
-/// clock-derived plus a call counter (no rand dependency; bare subsecond
-/// nanos can repeat across the quick successive calls of one rung loop);
-/// collisions just burn one bounded retry.
-fn fastrand_port() -> u16 {
-    static SEQ: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    let salt = SEQ
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        .wrapping_mul(7919) as u32;
-    20000 + ((nanos.wrapping_add(salt)) % 40000) as u16
-}
-
-/// Escape a value for a curl `--config` line (`\` and `"` per curl's
-/// documented config quoting).
-fn curl_config_escape(v: &str) -> String {
-    v.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-/// Call the LOGIN daemon's API via curl-over-ssh. Token, method, url, and
-/// body all ride stdin as a curl config (`--config -`) so nothing sensitive
-/// lands in argv on a shared login node. Returns stdout on HTTP success.
-/// `timeout_secs` bounds curl end-to-end (`-m`) — size it to the route:
-/// cutting a slow-but-legitimate response mid-flight aborts the request's
-/// work server-side.
-async fn login_daemon_api(
-    host: &str,
-    manifest: &Manifest,
-    method: &str,
-    path: &str,
-    body: Option<&serde_json::Value>,
-    timeout_secs: u64,
-) -> anyhow::Result<String> {
-    let mut config = format!(
-        "header = \"Authorization: Bearer {}\"\nrequest = \"{}\"\nurl = \"http://127.0.0.1:{}{}\"\n",
-        manifest.token, method, manifest.port, path
-    );
-    if let Some(body) = body {
-        config.push_str("header = \"Content-Type: application/json\"\n");
-        config.push_str(&format!(
-            "data = \"{}\"\n",
-            curl_config_escape(&body.to_string())
-        ));
-    }
-    let mut command = ssh_cmd(host);
-    command
-        .arg(format!("curl -fsS -m {timeout_secs} --config -"))
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    let mut child = command.spawn().context("failed to run ssh")?;
-    if let Some(mut stdin) = child.stdin.take() {
-        use tokio::io::AsyncWriteExt;
-        stdin.write_all(config.as_bytes()).await.ok();
-    }
-    let output = collect_child_bounded(child, SSH_ONESHOT_SECS, "ssh curl").await?;
-    if !output.status.success() {
-        bail!(
-            "daemon API {method} {path} on {host} failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-/// GET /compute/sessions on the login daemon (the stateless registry).
-pub async fn compute_sessions(
-    host: &str,
-    manifest: &Manifest,
-) -> anyhow::Result<serde_json::Value> {
-    let out = login_daemon_api(host, manifest, "GET", "/api/v1/compute/sessions", None, 20).await?;
-    serde_json::from_str(out.trim()).context("bad compute sessions payload")
-}
-
-/// POST /compute/sessions — submit; returns the job id.
-pub async fn compute_launch(
-    host: &str,
-    manifest: &Manifest,
-    spec: &serde_json::Value,
-) -> anyhow::Result<String> {
-    // 60, not the quick-verb 20: the launch route runs Slurm detection plus
-    // a multi-round queue-adoption loop server-side (worst case ~30s) — a
-    // client-side timeout here kills curl mid-launch and loses the job id.
-    let out = login_daemon_api(
-        host,
-        manifest,
-        "POST",
-        "/api/v1/compute/sessions",
-        Some(spec),
-        60,
-    )
-    .await?;
-    let v: serde_json::Value = serde_json::from_str(out.trim()).context("bad launch payload")?;
-    v.get("job_id")
-        .and_then(|j| j.as_str())
-        .map(str::to_string)
-        .context("launch returned no job_id")
-}
-
-/// DELETE /compute/sessions/{id} — scancel through the login daemon.
-pub async fn compute_cancel(host: &str, manifest: &Manifest, job_id: &str) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        job_id.chars().all(|c| c.is_ascii_digit()) && !job_id.is_empty(),
-        "invalid job id"
-    );
-    login_daemon_api(
-        host,
-        manifest,
-        "DELETE",
-        &format!("/api/v1/compute/sessions/{job_id}"),
-        None,
-        20,
-    )
-    .await
-    .map(|_| ())
 }
 
 #[cfg(test)]
@@ -3394,6 +3421,59 @@ mod tests {
     /// backslashes, and a `!` (csh history expansion — `tcsh -c "sh -c 'echo
     /// hello!world'"` dies with "Event not found") must reach `sh`
     /// byte-for-byte through each of them, tcsh and fish included.
+    /// The scheduler check finds Slurm by walking the LOGIN shell's PATH —
+    /// tools that exist only on a profile-managed PATH count, a partial
+    /// toolset doesn't — and reports the submit command's directory. It runs
+    /// under every login shell a cluster account may have (tcsh refuses
+    /// `-lc`, so its PATH comes from `sh -l` / the shell itself).
+    #[cfg(unix)]
+    #[test]
+    fn scheduler_check_walks_the_login_path_under_every_shell() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("chimaera-sched-{}", std::process::id()));
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let tool = |name: &str| {
+            let p = bin.join(name);
+            std::fs::write(&p, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        for t in ["sbatch", "squeue", "scancel"] {
+            tool(t);
+        }
+        let run = |shell: &str| {
+            let path = format!("{}:/usr/bin:/bin", bin.display());
+            let out = std::process::Command::new(shell)
+                .args(["-c", &sh_wrap(&sh_scheduler())])
+                .env("PATH", &path)
+                .env("SHELL", "/nonexistent-shell")
+                .env("HOME", &dir)
+                .output()
+                .expect("spawn shell");
+            parse_scheduler_line(&String::from_utf8_lossy(&out.stdout))
+        };
+        for shell in login_shells() {
+            let info = run(shell).expect("a verdict line");
+            assert_eq!(info.kind, Scheduler::None, "{shell}: sinfo is missing");
+        }
+        tool("sinfo");
+        for shell in login_shells() {
+            let info = run(shell).expect("a verdict line");
+            assert_eq!(info.kind, Scheduler::Slurm, "{shell}");
+            assert_eq!(info.bindir, bin.display().to_string(), "{shell}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            parse_scheduler_line("noise\n---chimaera-sched--- slurm /opt/x;rm\n"),
+            Some(SchedulerInfo {
+                kind: Scheduler::Slurm,
+                bindir: String::new()
+            }),
+            "a dir that isn't a plain path is dropped, never spliced into a later PATH"
+        );
+        assert_eq!(parse_scheduler_line("no verdict here"), None);
+    }
+
     #[cfg(unix)]
     #[test]
     fn sh_wrap_survives_every_login_shell() {
@@ -3821,7 +3901,7 @@ mod tests {
                 .map(|value| value.to_string_lossy().into_owned())
         }
 
-        assert_eq!(alias(&ssh_cmd("Sherlock")), Some("Sherlock".into()));
+        assert_eq!(alias(&ssh_cmd("cluster")), Some("cluster".into()));
         assert_eq!(alias(&scp_cmd("remote-2")), Some("remote-2".into()));
         assert_eq!(
             alias(&node_ssh_base("login.example.edu", &Route::Alias)),
@@ -4196,6 +4276,8 @@ mod tests {
         probe: Option<ProbeScript>,
         /// Where "this machine" resolves any node name.
         local: Vec<std::net::IpAddr>,
+        /// What the detecting probe reports.
+        scheduler: Scheduler,
     }
 
     impl FakeOps {
@@ -4210,6 +4292,7 @@ mod tests {
                 start_manifest: fake_manifest(Some(chimaera_core::BUILD_ID), 999),
                 probe: None,
                 local: vec![CLUSTER_ADDR],
+                scheduler: Scheduler::None,
             }
         }
         fn record(&self, c: Call) {
@@ -4234,7 +4317,7 @@ mod tests {
         async fn local_addrs(&self, _node: &str) -> Vec<std::net::IpAddr> {
             self.local.clone()
         }
-        async fn remote_probe(&self, _host: &str) -> anyhow::Result<ProbeRun> {
+        async fn remote_probe(&self, _host: &str, _detect: bool) -> anyhow::Result<ProbeRun> {
             self.record(Call::RemoteProbe);
             if let Some(probe) = &self.probe {
                 return probe(&self.route.borrow());
@@ -4246,6 +4329,9 @@ mod tests {
                 manifest_node_resolves: None,
                 manifest_node_addrs: Vec::new(),
             })))
+        }
+        fn scheduler(&self, _host: &str) -> Scheduler {
+            self.scheduler
         }
         async fn remote_sessions_count(
             &self,
@@ -4301,6 +4387,7 @@ mod tests {
             version: "0.0.1".into(),
             started_at: 0,
             build: build.map(str::to_string),
+            slurm_job_id: None,
         }
     }
 
@@ -4345,6 +4432,82 @@ mod tests {
     /// daemon as-is — the session count is skipped (it can't change the
     /// decision), nothing is stopped/deployed/started, and the only phase is
     /// the initial probe.
+    #[tokio::test]
+    async fn resolve_daemon_never_starts_or_attaches_on_a_cluster() {
+        // Nothing running: a plain host would get a fresh daemon; a cluster
+        // gets nothing at all — one probe, then the typed answer.
+        let fake = FakeOps {
+            scheduler: Scheduler::Slurm,
+            ..FakeOps::base()
+        };
+        let (out, phases) = try_resolve(&fake, false).await;
+        let err = out.expect_err("a cluster is not connected to");
+        let cluster = err.downcast_ref::<ClusterHost>().expect("ClusterHost");
+        assert_eq!(cluster.scheduler, Scheduler::Slurm);
+        assert!(cluster.login_daemon.is_none());
+        assert_eq!(fake.calls(), vec![Call::RemoteProbe]);
+        assert_eq!(phases, vec!["probing"]);
+
+        // A daemon an earlier connect left on the login node is reported —
+        // never attached to, updated, or stopped by a connect.
+        let fake = FakeOps {
+            scheduler: Scheduler::Slurm,
+            probe_manifest: Some(fake_manifest(Some("old.1"), 42)),
+            alive: true,
+            sessions: Some(0),
+            ..FakeOps::base()
+        };
+        let (out, _) = try_resolve(&fake, true).await;
+        let err = out.expect_err("still a cluster");
+        let found = err
+            .downcast_ref::<ClusterHost>()
+            .and_then(|c| c.login_daemon.clone())
+            .expect("the old daemon is reported");
+        assert_eq!((found.pid, found.alive), (42, Some(true)));
+        assert_eq!(fake.calls(), vec![Call::RemoteProbe], "no stop, no deploy");
+    }
+
+    /// The warned override: a cluster the user allowed is a regular remote.
+    #[tokio::test]
+    async fn resolve_daemon_on_a_host_said_not_to_be_a_cluster_behaves_like_any_host() {
+        let fake = FakeOps {
+            scheduler: Scheduler::Slurm,
+            ..FakeOps::base()
+        };
+        let opts = ConnectOpts {
+            not_cluster: true,
+            ..Default::default()
+        };
+        let (manifest, _, _) = resolve_daemon(&fake, "host", &opts, &|_| {})
+            .await
+            .expect("started");
+        assert_eq!(manifest.pid, 999);
+    }
+
+    #[tokio::test]
+    async fn resolve_daemon_on_an_allowed_cluster_behaves_like_any_host() {
+        let fake = FakeOps {
+            scheduler: Scheduler::Slurm,
+            ..FakeOps::base()
+        };
+        let opts = ConnectOpts {
+            login_serve: true,
+            ..Default::default()
+        };
+        let (manifest, _, _) = resolve_daemon(&fake, "host", &opts, &|_| {})
+            .await
+            .expect("started");
+        assert_eq!(manifest.pid, 999);
+        assert_eq!(
+            fake.calls(),
+            vec![
+                Call::RemoteProbe,
+                Call::EnsureRemoteBinary,
+                Call::StartRemote
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn resolve_daemon_reuses_matching_build() {
         let fake = FakeOps {
@@ -5025,7 +5188,7 @@ mod tests {
 
     #[test]
     fn node_names_are_validated_before_ssh_sees_them() {
-        for ok in [LN01, "login1", "sh03-ln06.stanford.edu", "node_7"] {
+        for ok in [LN01, "login1", "login-a.cluster.example", "node_7"] {
             assert!(valid_node_name(ok), "{ok}");
         }
         for bad in [
@@ -5052,7 +5215,7 @@ mod tests {
         assert_eq!(
             routes_to("sh04-ln03", &[a], &[b]),
             vec![Route::NodeViaAlias("sh04-ln03".into())],
-            "resolved elsewhere here (Sherlock's bare names: 10.x inside, public outside)"
+            "resolved elsewhere here (a cluster's bare names: 10.x inside, public outside)"
         );
         assert_eq!(
             routes_to(LN01, &[a], &[]),

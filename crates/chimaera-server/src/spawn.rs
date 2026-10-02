@@ -86,11 +86,17 @@ pub(crate) async fn spawn_session(
     // context) and, for claude, in the hook URL.
     let id = spec.id.unwrap_or_else(crate::agents::fresh_session_id);
     let cwd = spec.cwd.unwrap_or_else(|| workspace.root.clone());
-    // The user's environment prelude (host ⊕ workspace ⊕ launch), written
-    // per session and sourced once by the shell rc / agent wrapper. Runs
-    // per real spawn only — reconnects reattach to the live PTY.
-    let prelude =
-        crate::environment::materialize_prelude(state, &id, &workspace.id, spec.prelude.as_deref());
+    // The user's environment prelude (startup ⊕ host ⊕ workspace ⊕ launch),
+    // written per session and sourced once by the shell rc / agent wrapper.
+    // Runs per real spawn only — reconnects reattach to the live PTY.
+    let startup = crate::environment::job_startup().await;
+    let prelude = crate::environment::materialize_prelude(
+        state,
+        &id,
+        &workspace.id,
+        spec.prelude.as_deref(),
+        startup.as_deref(),
+    );
     let env = crate::api::session_env(state, &id, &spec.theme, prelude.as_deref());
     let env_remove = crate::api::spawn_env_remove(&env);
     let mut opts = chimaera_pty::SpawnOpts {

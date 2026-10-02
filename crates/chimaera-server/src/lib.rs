@@ -12,7 +12,6 @@ mod cloud;
 mod codex_notify;
 mod comms;
 mod compute;
-mod compute_jobs;
 mod doc_check;
 mod download;
 mod drafts;
@@ -24,6 +23,7 @@ mod fs;
 mod fs_watch;
 mod git;
 mod history;
+mod job_host;
 mod knowledge;
 mod launcher;
 mod ledger;
@@ -60,15 +60,16 @@ mod ws;
 pub struct ServerConfig {
     /// Port to bind on 127.0.0.1. `None` lets the OS assign a free port.
     pub port: Option<u16>,
-    /// Bind 0.0.0.0 instead of loopback. OPT-IN, for Mode 2 rung A only:
-    /// a compute-node daemon on a cluster without ssh-to-node, where the
-    /// login node forwards straight to the node's port and the per-job
-    /// bearer token is the gate. Loopback stays the default everywhere —
-    /// this deliberately amends the "never accepts non-loopback" security
-    /// note (architecture.md § Security notes).
+    /// Bind 0.0.0.0 instead of loopback (`--bind-routable`). What a cluster
+    /// workspace job's `chimaera serve` passes: the app reaches the job with
+    /// a plain `ssh -L <port>:<node>:<port>` through the login node, and the
+    /// per-job bearer token is the gate. Loopback stays the default for every
+    /// other daemon — this deliberately amends the "never accepts
+    /// non-loopback" security note (architecture.md § Security notes).
     pub routable_bind: bool,
 }
 
+pub use job_host::run as run_job_host;
 pub use lifecycle::run;
 /// `chimaera plugin caps <plugin.toml>`: a manifest's tier, capability
 /// digest and Can list, as the lock and the card record them.

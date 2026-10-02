@@ -2006,7 +2006,7 @@ case and the unscoped defensive case.
 
 ## Pass 29 (2026-07-21 — codex effort survives reopen and honors new-thread config). ADOPTED.
 
-A Sherlock session exposed a different `low` failure after Pass 28. Its
+A session on a production cluster exposed a different `low` failure after Pass 28. Its
 Chimaera journal recorded the parent changing from the model default `low` to
 `xhigh`, then recorded a parent `low` immediately after each app-server process
 restart. The native Codex rollout still contained earlier
@@ -2887,6 +2887,17 @@ Nothing on either agent's wire changes: the drivers send what they sent and echo
 - Limits, on purpose: a withdrawn id is forgotten when the session's process is replaced (pinned by `a_withdrawn_send_id_is_forgotten_with_its_sessions_process`), and a daemon killed between writing the agent's stdin and journaling the echo leaves a delivered send with no id. Neither gets a journal event.
 
 Hermetic: `a_client_send_id_is_accepted_when_queued_and_rides_its_echo`, `a_send_id_is_forgotten_with_a_driver_that_never_handled_it`, `cancelling_a_send_id_only_works_before_it_is_accepted`, `the_send_id_record_keeps_only_the_newest_ids`, `reopen_reads_back_the_newest_send_ids`, `client_send_ids_are_short_and_plain`, the additive-field case in `user_message_delivery_fields_are_additive`; through `fake-claude`: `a_send_queued_during_the_handshake_is_accepted_once` (the agent answers its handshake a second late), `a_send_id_in_the_journal_is_still_refused_after_a_restart` (a second manager over the same journal), `cancel_send_wins_before_acceptance_and_loses_after`, `a_send_too_long_for_one_journal_line_keeps_its_ids_and_runs_once`, `an_oversize_user_message_is_cut_not_replaced`; server: `ws_chat_sends_are_accepted_once_under_their_client_id`. Both drivers' files changed only by the new field's `client_id: None` in their `UserMessage` literals, so `just chat-smoke` was not run for this pass.
+
+## Pass 47 (2026-10-01 — live probes, codex 0.157.1): a resumed thread keeps its opening instructions; `thread/inject_items` reaches it. ADOPTED.
+
+A cluster workspace job tells its agents which job they are in, on which node, until when, and the cluster's rules for agents. Claude gets that through the hook carrier. For codex the text rode `-c developer_instructions` on the app-server's argv, which anyone on a shared compute node can read with `ps`. These probes asked where else it can go, and found that the argv seam was also stale after a resume.
+
+- **Codex fixes a thread's developer instructions at its first turn, for good.** They are recorded once in the rollout as a `developer` message. A thread spawned with `-c developer_instructions="… ZEBRA"` and opened with `thread/start {developerInstructions: "… OTTER"}` answered OTTER: the open param replaces the argv value on a fresh thread. Resumed in a new app-server with a different argv value (YAK) and `thread/resume {developerInstructions: "… HERON"}`, it still answered OTTER; resumed with only a new argv value (ELK), OTTER again. The rollout held only the OTTER message. So a chat continued in a new job kept the first job's facts under the argv design, and a portable branch's `developerInstructions` on resume is a no-op (the branch already carries its context from the open).
+- **`thread/inject_items {threadId, items}`** (generated 0.157.1 schema: "Raw Responses API items to append to the thread's model-visible history") answers `{}` and starts no turn. A `{"type":"message","role":"developer","content":[{"type":"input_text","text":…}]}` item was followed on a fresh thread before its first turn (INJECTFRESH) and right after a resume, where a newer code word superseded the older one (INJECTRESUME). It emits no item notifications and does not appear in `thread/turns/list`, so the transcript stays as it was.
+
+Adopted: `SpawnSpec.developer_note` (the cluster context, codex chats only) rides `thread/inject_items` once the thread opens, after any rewind (a revert could otherwise drop it). Nothing of it is on argv any more, and the user's own `developer_instructions` stay untouched (the argv design replaced them, so it skipped codex whenever the user had set one). A failed inject is logged and the chat opens without it.
+
+Gate: live `driver_codex_developer_note_reaches_fresh_and_resumed_threads` through the real driver (fresh FIRSTOTTER; resumed in a new process with a new note, SECONDHERON); hermetic `developer_note_is_one_developer_message_for_inject_items`; full `just chat-smoke` 27/27.
 
 ## ACP v1 — Grok Build and Google Antigravity (2026-10-01)
 

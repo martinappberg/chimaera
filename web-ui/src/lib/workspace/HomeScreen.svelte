@@ -6,14 +6,13 @@
   import { paidPlan, proOffered } from "../net/plan";
   import { gatewayWorkspace, isBrowserGateway } from "../net/base";
   import { projectWhere, projectWhereLabel } from "../net/placement";
-  import ComputeLaunchDialog from "./ComputeLaunchDialog.svelte";
+  import type ClusterPage from "./ClusterPage.svelte";
   import { keyHint } from "../shared/keybindings";
   import { isBusy, needsApproval, type Session, type Workspace } from "./sessions";
   import {
     addHost,
     beginUpdate,
     checkAppUpdate,
-    connectComputeSession,
     connectHost,
     closeThisWindow,
     disconnectHost,
@@ -22,13 +21,14 @@
     listHosts,
     localDaemonState,
     navigateHome,
+    onClusterChanged,
     onConnectProgress,
     onHostStatus,
     onProChanged,
     openWindow,
-    remoteComputeSessions,
     remoteWorkspaces,
     removeHost,
+    setNotCluster,
     shutdownHost,
     updateLocalDaemon,
     type ConnectProgress,
@@ -36,20 +36,10 @@
     type HostStatusEvent,
     type LocalDaemonState,
   } from "../net/native";
-  import {
-    cancelComputeSession,
-    listComputeSessions,
-    type ComputeSessionList,
-    type ComputeSessionView,
-  } from "./computeSessions";
-  import {
-    computeStatus,
-    formatSlurmDuration,
-    knownScheduler,
-    parseSlurmTimeLeft,
-    rememberScheduler,
-  } from "./compute";
+  import { computeStatus } from "./compute";
   import ComputeBanner from "./ComputeBanner.svelte";
+  import { clusterNow, clusterOverviews } from "./clusterStore.svelte";
+  import { anyJobRunning, hostSummary, schedulerLabel } from "./clusterRow";
   import { getJobContext, isHomeHub, type Health } from "../net/api";
   import { asyncDisposer } from "../shared/asyncDisposer";
   import { pageVisible } from "../shared/visibility";
@@ -172,71 +162,71 @@
   let confirmEnd = $state<string | null>(null);
   let confirmShutdown = $state<string | null>(null);
 
-  // --- compute-node sessions (Mode 2: Slurm jobs owning a full daemon) --------
-  // Two disjoint surfaces (maintainer restructure, 2026-07-15):
-  //  · LOCAL home screen: a per-host indicator COUNT only (shell-proxied),
-  //    fetched at connect time — the cards live on the host, not here.
-  //  · HOST-DETAIL page (a remote window's home): the full group — cards,
-  //    launch dialog, cancel — talking to the login daemon's routes directly.
-  //    Job-scoped windows suppress it (the allocation strip is their UI).
+  // --- clusters (hosts whose login shell reaches a batch scheduler) ----------
+  // Nothing of ours runs on a cluster's login node: its row reads the
+  // cluster's workspaces through short ssh commands, and clicking it opens
+  // the cluster page in place (the job is a detail of each workspace there).
 
-  /** Local home: per-connected-host session lists, for the indicator line. */
-  let remoteCompute = $state<Map<string, ComputeSessionList>>(new Map());
-  /** Aliases whose FIRST compute fetch is still in flight — the indicator
-   *  shows "checking for compute…" instead of silently not existing, so a
-   *  cluster host reads as one from the moment it connects. */
-  let computeChecking = $state<Set<string>>(new Set());
+  /** The cluster page shown in place of the host list (its alias), or null. */
+  let clusterView = $state<string | null>(null);
+  /** The cluster page's code — its own chunk, loaded the first time a
+   *  cluster opens (most homes never show one). */
+  let ClusterPageView = $state<typeof ClusterPage | null>(null);
 
-  /** True when this home screen IS a host-detail page. Two "am I job-scoped"
-   *  signals gate the compute hub: the window's own `job=` params AND the
-   *  daemon's `/compute` `self` block — a compute-node daemon detects Slurm
-   *  on its node too, and without the second signal its home page renders
-   *  the launch hub, posing as the login host (a hall of mirrors — the
-   *  maintainer's job window "opened Sherlock with the compute nodes"). */
-  const isHostPage = $derived(
-    native &&
-      ownAlias !== null &&
-      getJobContext() === null &&
-      ($computeStatus?.self ?? null) === null,
-  );
-  /** This window sits on a compute-node daemon (either job-scope signal
-   *  isHostPage reads). Its workspace ids were minted at seed time on the
-   *  JOB daemon — `openWindow(ownAlias, …)` targets the bare LOGIN alias,
-   *  where those ids don't exist (the window lands on the launcher) — so
-   *  cross-window opening isn't offered here. */
+  function showCluster(alias: string): void {
+    if (ClusterPageView === null) {
+      import("./ClusterPage.svelte").then(
+        (m) => {
+          ClusterPageView = m.default;
+        },
+        (err: unknown) => {
+          // Stale assets after an update: say so on the row instead of a
+          // blank page with no way back.
+          clusterView = null;
+          const why = err instanceof Error ? err.message : String(err);
+          hostErrors = new Map(hostErrors).set(alias, `couldn't open the cluster page: ${why}`);
+        },
+      );
+    }
+    clusterView = alias;
+  }
+
+  /** A host the shell knows as a cluster (this session's probe, or a hint). */
+  function isCluster(h: HostState): boolean {
+    return h.cluster !== null || h.status === "cluster";
+  }
+
+  /** A cluster host with an ssh connection this session — the only kind the
+   *  row may read from (an unconnected one could raise an auth prompt). */
+  function clusterReadable(h: HostState): boolean {
+    return isCluster(h) && (h.status === "cluster" || h.status === "connected");
+  }
+
+  /** The cluster row's one line, from the shared overview cache. */
+  function clusterLine(h: HostState): string | null {
+    const entry = clusterOverviews.entry(h.alias);
+    if (entry === undefined) return null;
+    if (entry.overview === null) return entry.loading ? "reading the cluster…" : null;
+    return hostSummary(entry.overview, clusterNow(entry));
+  }
+
+  /** Whether any of a cluster's jobs is running (the row's dot). */
+  function clusterRunning(alias: string): boolean {
+    const ov = clusterOverviews.entry(alias)?.overview;
+    return ov !== null && ov !== undefined && anyJobRunning(ov);
+  }
+
+  /** This home screen sits on a compute-node daemon (a workspace's job):
+   *  either the window's own `job=` params or the daemon's `/compute` `self`
+   *  block. Its workspace ids were minted on the JOB daemon —
+   *  `openWindow(ownAlias, …)` targets the bare cluster alias, where those
+   *  ids don't exist — so cross-window opening isn't offered here. */
   const jobScoped = $derived(
     getJobContext() !== null || ($computeStatus?.self ?? null) !== null,
   );
-  /** Host page: the daemon's own compute list (null = not fetched / no route). */
-  let hostCompute = $state<ComputeSessionList | null>(null);
-  /** A list fetch is in flight — first load shows the probe line, later
-   *  ones spin the refresh glyph (quiet liveness, not a blocking state). */
-  let hostComputeLoading = $state(false);
-  /** List-level failure (the fetch itself); card-level errors live below. */
-  let hostComputeError = $state<string | null>(null);
-  /** Job id pending the in-row two-step scancel confirm. */
-  let confirmCancel = $state<string | null>(null);
-  let launchOpen = $state(false);
-  /** Poll gate: the sessions list only refreshes while the page is visible.
-   *  A local mirror rather than shared/visibility.ts's `pageVisible` store —
-   *  this component's one visibilitychange listener also fires immediate
-   *  refreshes on return, which a bare store subscription wouldn't carry. */
-  let docVisible = $state(document.visibilityState === "visible");
-  /** The open currently in flight (job id) — the card pulses "connecting…",
-   *  its actions freeze, and a second click is impossible until it settles. */
-  let connectingJob = $state<string | null>(null);
-  /** scancel'd jobs → their state when the cancel was sent. The card shows
-   *  "cancelling…" until a refetch shows the job GONE or in a new state
-   *  (Slurm then reports CANCELLING/COMPLETING, which speak for themselves). */
-  let cancelling = $state<Map<string, string>>(new Map());
-  /** Per-card failure lines (open/cancel), keyed by job id. */
-  let cardErrors = $state<Map<string, string>>(new Map());
-  /** Drops stale list responses (a manual refresh overtaking the poller). */
-  let computeFetchSeq = 0;
-  /** Client clock when the current list arrived — the tick baseline. */
-  let listReceivedAt = $state(Date.now());
-  /** ONE shared 1s tick for every RUNNING card (never per-card timers). */
-  let nowTick = $state(Date.now());
+  /** A cluster workspace's window: its home is the cluster page (its own
+   *  chimaera knows only this one workspace; the page knows them all). */
+  const clusterWs = $derived(native && ownAlias !== null ? (getJobContext()?.cws ?? null) : null);
 
   // --- local daemon build parity (native shell, local window only) ------------
 
@@ -314,27 +304,18 @@
     installing: "installing chimaera…",
     starting: "starting the daemon…",
     tunneling: "bringing the tunnel up…",
+    done: "",
   };
 
   onMount(() => {
-    if (!native) return;
-    if (ownAlias !== null) {
-      // A remote window's home: no remote-hosts machinery here (that section
-      // is the LOCAL first screen's). Boot the compute-sessions surface
-      // instead — host pages only; a job-scoped window's compute UI is the
-      // allocation strip.
-      if (!isHostPage) return;
-      void refreshHostCompute();
-      const onVis = (): void => {
-        docVisible = document.visibilityState === "visible";
-        // Hidden paused the poller; catch up NOW instead of waiting a period.
-        // Re-check isHostPage: it can flip false after mount (the daemon's
-        // `self` block arriving) and this handler must not outlive the fact.
-        if (docVisible && isHostPage) void refreshHostCompute();
-      };
-      document.addEventListener("visibilitychange", onVis);
-      return () => document.removeEventListener("visibilitychange", onVis);
+    if (clusterWs !== null && ownAlias !== null) {
+      showCluster(ownAlias);
+      void refreshHosts();
+      return;
     }
+    // A remote window's home has no remote-hosts machinery (that section is
+    // the LOCAL first screen's); a job window's compute UI is its banner.
+    if (!native || ownAlias !== null) return;
     void refreshHosts();
     // Every native window asks for the shell state: the outdated note renders
     // only on the local window, but the dev-build flag drives the host-row
@@ -346,22 +327,28 @@
       void checkAppUpdate().then((v) => (appUpdate = v));
     }
     const unlisteners: Array<() => void> = [asyncDisposer(onProChanged(() => { if (document.visibilityState === "visible") void refreshHosts(); }))];
-    // Local home: pause the compute-indicator refresh while hidden, and
-    // catch up the moment the page is visible again.
     const onVis = (): void => {
-      docVisible = document.visibilityState === "visible";
-      if (docVisible) {
-        void refreshHosts();
-        for (const h of hosts) {
-          if (h.status === "connected") void refreshCompute(h.alias);
-        }
-      }
+      if (document.visibilityState === "visible") void refreshHosts();
     };
     document.addEventListener("visibilitychange", onVis);
     unlisteners.push(() => document.removeEventListener("visibilitychange", onVis));
+    // A cluster's workspaces changed (a start, stop, or handoff — from this
+    // window or another): refresh its row. The cluster page, when open,
+    // listens for itself and shares the same cache.
+    unlisteners.push(
+      asyncDisposer(
+        onClusterChanged((alias) => {
+          if (clusterView !== alias) void clusterOverviews.refresh(alias, 0);
+        }),
+      ),
+    );
     unlisteners.push(
       asyncDisposer(
         onConnectProgress((p) => {
+          if (p.phase === "done") {
+            phases = mapWithout(phases, p.alias);
+            return;
+          }
           const label =
             p.phase === "routing" && p.node !== undefined
               ? `reaching the daemon on ${p.node}…`
@@ -377,6 +364,12 @@
     unlisteners.push(
       asyncDisposer(
         onHostStatus((e) => {
+          // Job-window events belong to the cluster overview, never a host row.
+          const job = e.alias.indexOf("#job");
+          if (job !== -1) {
+            if (e.status === "ended") void clusterOverviews.refresh(e.alias.slice(0, job), 0);
+            return;
+          }
           if (hosts.some((host) => host.alias === e.alias)) {
             applyHostStatus(e);
             return;
@@ -402,7 +395,10 @@
   const unlistedStatus = new Map<string, HostStatusEvent>();
 
   function applyHostStatus(e: HostStatusEvent): void {
-    hosts = hosts.map((h) =>
+    const row = hosts.find((h) => h.alias === e.alias);
+    if (row === undefined) return;
+    const plainCluster = row.status === "cluster" && row.cluster?.login_serve !== true;
+    if (!plainCluster || e.status === "error") hosts = hosts.map((h) =>
       h.alias === e.alias
         ? {
             ...h,
@@ -418,11 +414,10 @@
     phases = mapWithout(phases, e.alias);
     if (e.status === "down") {
       remoteWs = mapWithout(remoteWs, e.alias);
-      remoteCompute = mapWithout(remoteCompute, e.alias);
     }
     if (e.status === "error" && e.error !== undefined) {
       hostErrors = new Map(hostErrors).set(e.alias, e.error);
-    } else if (e.status === "connected") {
+    } else if (e.status === "connected" && !plainCluster) {
       hostErrors = mapWithout(hostErrors, e.alias);
       // A connect this window didn't run (startup restore, another
       // window) still gets its workspace list, so the row is browsable.
@@ -440,7 +435,6 @@
             // dropped again in between; the next transition retries
           });
       }
-      if (!remoteCompute.has(e.alias)) void refreshCompute(e.alias);
     }
   }
 
@@ -459,7 +453,12 @@
     try {
       const state = await connectHost(alias, updateDaemon);
       hosts = hosts.map((h) => (h.alias === alias ? state : h));
-      void refreshCompute(alias);
+      if (state.status === "cluster") {
+        // No tunnel, no daemon on the login node: the cluster page opens in
+        // place, right here in the local home.
+        showCluster(alias);
+        return;
+      }
       // Host browsing is navigation inside the singleton Home hub. A workspace
       // click continues in that window; only an explicit new-window gesture
       // creates another native workbench.
@@ -487,7 +486,6 @@
   async function disconnect(alias: string): Promise<void> {
     await disconnectHost(alias);
     remoteWs = mapWithout(remoteWs, alias);
-    remoteCompute = mapWithout(remoteCompute, alias);
     void refreshHosts();
   }
 
@@ -495,8 +493,23 @@
     confirmForget = null;
     await removeHost(alias);
     remoteWs = mapWithout(remoteWs, alias);
-    remoteCompute = mapWithout(remoteCompute, alias);
+    clusterOverviews.forget(alias);
     void refreshHosts();
+  }
+
+  /** A host the user said isn't a cluster is one after all: drop its tunnel
+   *  (a daemon on it keeps running, as on any disconnect), then connect,
+   *  which lands on its cluster page. */
+  async function backToCluster(alias: string): Promise<void> {
+    hostErrors = mapWithout(hostErrors, alias);
+    try {
+      if (hosts.find((h) => h.alias === alias)?.status === "connected") await disconnectHost(alias);
+      const state = await setNotCluster(alias, false);
+      hosts = hosts.map((h) => (h.alias === alias ? state : h));
+      await connect(alias);
+    } catch (e) {
+      hostErrors = new Map(hostErrors).set(alias, e instanceof Error ? e.message : String(e));
+    }
   }
 
   /** End all sessions on a host; its daemon and the tunnel stay up. */
@@ -517,247 +530,25 @@
     try {
       await shutdownHost(alias);
       remoteWs = mapWithout(remoteWs, alias);
-      remoteCompute = mapWithout(remoteCompute, alias);
     } catch (e) {
       hostErrors = new Map(hostErrors).set(alias, e instanceof Error ? e.message : String(e));
     }
     void refreshHosts();
   }
 
-  /** Local home: fetch a connected host's session list for the indicator.
-   *  Never throws — a shell/daemon without the surface just means no
-   *  indicator. The first fetch per alias shows as "checking for compute…". */
-  async function refreshCompute(alias: string): Promise<void> {
-    if (!remoteCompute.has(alias) && !computeChecking.has(alias)) {
-      computeChecking = new Set(computeChecking).add(alias);
-    }
-    try {
-      const list = await remoteComputeSessions(alias);
-      remoteCompute = new Map(remoteCompute).set(alias, list);
-      rememberScheduler(alias, list.scheduler);
-    } catch {
-      // no scheduler / older shell — the indicator simply doesn't show
-    } finally {
-      if (computeChecking.has(alias)) {
-        const next = new Set(computeChecking);
-        next.delete(alias);
-        computeChecking = next;
-      }
-    }
-  }
-
-  /** RUNNING+PENDING sessions on a connected host — the indicator count. */
-  function computeCount(alias: string): number {
-    const rc = remoteCompute.get(alias);
-    if (rc === undefined || rc.scheduler !== "slurm") return 0;
-    return rc.sessions.filter((s) => s.state === "RUNNING" || s.state === "PENDING").length;
-  }
-
-  /** Indicator tooltip: the cluster's partition names ground "this host has
-   *  compute nodes" in something real without opening the host. */
-  function computeTitle(alias: string, rc: ComputeSessionList): string {
-    const parts = rc.partitions
-      .map((p) => p.name)
-      .slice(0, 6)
-      .join(", ");
-    const n = computeCount(alias);
-    const head =
-      n > 0
-        ? `${n} compute session${n === 1 ? "" : "s"} on ${alias}`
-        : `Slurm detected on ${alias}`;
-    return `${head} — open the host to launch & manage compute sessions${
-      parts === "" ? "" : ` (partitions: ${parts})`
-    }`;
-  }
-
-  // Local home: keep the per-host compute indicators honest without
-  // hammering anything — one proxied call per connected host per minute,
-  // visible only (the remote daemon caches its snapshot ~30s anyway).
+  // Cluster rows read their overview while the host list is on screen: at
+  // most once a minute per host (the shell's own floor too), paused while
+  // hidden — the effect re-runs on return, and the floor absorbs a quick
+  // hide/show. The cluster page, when open, polls for itself.
   $effect(() => {
-    if (!native || ownAlias !== null || !docVisible) return;
-    const t = setInterval(() => {
-      for (const h of hosts) {
-        if (h.status === "connected") void refreshCompute(h.alias);
-      }
-    }, 60_000);
-    return () => clearInterval(t);
-  });
-
-  // --- host page: the full compute-sessions surface ---------------------------
-
-  /** Refetch this host's sessions from ITS daemon. Keeps the stale list on a
-   *  transient failure (with a quiet inline error) — never blanks the page.
-   *  Sequenced so an overtaken response can never clobber a newer one. */
-  async function refreshHostCompute(): Promise<void> {
-    const seq = ++computeFetchSeq;
-    hostComputeLoading = true;
-    try {
-      const list = await listComputeSessions();
-      if (seq !== computeFetchSeq) return;
-      hostCompute = list;
-      hostComputeError = null;
-      rememberScheduler(hostLabel, list.scheduler);
-      // Re-sync the shared tick baseline to this response — but NOT for a
-      // degraded round (squeue failed; time_left carried forward stale):
-      // re-baselining there would restart every countdown from its
-      // pre-outage value on each poll.
-      if (!list.degraded) {
-        listReceivedAt = Date.now();
-        nowTick = listReceivedAt;
-      }
-      // A "cancelling…" card settles once the job is gone or Slurm moved it
-      // to a new state (CANCELLING/COMPLETING then speak for themselves).
-      if (cancelling.size > 0) {
-        const next = new Map(cancelling);
-        for (const [id, stateAtCancel] of next) {
-          const row = list.sessions.find((s) => s.job_id === id);
-          if (row === undefined || row.state !== stateAtCancel) next.delete(id);
-        }
-        cancelling = next;
-      }
-    } catch (e) {
-      if (seq !== computeFetchSeq) return;
-      hostComputeError = e instanceof Error ? e.message : String(e);
-    } finally {
-      if (seq === computeFetchSeq) hostComputeLoading = false;
-    }
-  }
-
-  /** A session flips PENDING→RUNNING on its own — poll while visible, faster
-   *  while something is queued, and stop once the host says "no scheduler"
-   *  (login-node discipline: bounded, purposeful squeue traffic only). */
-  const anyPending = $derived(
-    hostCompute?.sessions.some((s) => s.state === "PENDING") ?? false,
-  );
-  const schedulerKnownNone = $derived(
-    hostCompute !== null && hostCompute.scheduler !== "slurm",
-  );
-  $effect(() => {
-    if (!isHostPage || !docVisible || schedulerKnownNone) return;
-    // 5s while anything is pending: the list call now reads the fast-twitch
-    // signals (process table + manifests) fresh each time WITHOUT touching
-    // the controller — squeue still refreshes on its own 30s cadence — so a
-    // tighter poll here buys instant-feeling flips at zero cluster cost.
-    const t = setInterval(() => void refreshHostCompute(), anyPending ? 5_000 : 30_000);
-    return () => clearInterval(t);
-  });
-
-  /** Tunnel to a ready session — the shell builds it and opens the window.
-   *  Hard-gated: only a `ready` card is openable, and only one open can be
-   *  in flight at a time (the card shows "connecting…" until it settles). */
-  async function openHostCompute(cs: ComputeSessionView): Promise<void> {
-    if (!cs.ready || connectingJob !== null || cancelling.has(cs.job_id)) return;
-    cardErrors = mapWithout(cardErrors, cs.job_id);
-    connectingJob = cs.job_id;
-    try {
-      await connectComputeSession(hostLabel, cs.job_id);
-    } catch (e) {
-      cardErrors = new Map(cardErrors).set(
-        cs.job_id,
-        e instanceof Error ? e.message : String(e),
-      );
-    } finally {
-      connectingJob = null;
-    }
-  }
-
-  /** scancel the job (Slurm ends everything in the allocation). The card
-   *  wears "cancelling…" until a refetch shows movement (see refresh). */
-  async function cancelHostCompute(cs: ComputeSessionView): Promise<void> {
-    confirmCancel = null;
-    if (cancelling.has(cs.job_id)) return;
-    cardErrors = mapWithout(cardErrors, cs.job_id);
-    cancelling = new Map(cancelling).set(cs.job_id, cs.state);
-    try {
-      await cancelComputeSession(cs.job_id);
-    } catch (e) {
-      cancelling = mapWithout(cancelling, cs.job_id);
-      cardErrors = new Map(cardErrors).set(
-        cs.job_id,
-        e instanceof Error ? e.message : String(e),
-      );
-    }
-    void refreshHostCompute();
-  }
-
-  /** "{cpus} cpu · {mem} · {gres}" — omitting whatever the wire didn't carry. */
-  function resourceLabel(cs: ComputeSessionView): string {
-    const parts: string[] = [];
-    if (cs.cpus !== null) parts.push(`${cs.cpus} cpu`);
-    if (cs.mem !== null && cs.mem !== "") parts.push(cs.mem);
-    if (cs.gres !== null && cs.gres !== "") parts.push(cs.gres);
-    return parts.join(" · ");
-  }
-
-  // --- card presentation (Slurm's raw vocabulary, styled but never renamed) ---
-
-  /** Dot class: transitional client states win, then the raw Slurm state
-   *  maps onto the home screen's dot language. ENDED (a tombstone card for a
-   *  job that left the queue — walltime, failure) wears the dormant default. */
-  function sessionDot(cs: ComputeSessionView, connecting: boolean, isCancelling: boolean): string {
-    if (isCancelling) return "ending";
-    if (connecting) return "booting";
-    if (cs.state === "RUNNING") return cs.ready ? "alive" : "booting";
-    if (cs.state === "PENDING") return "queued";
-    if (cs.state === "COMPLETING" || cs.state === "CANCELLING") return "ending";
-    return "";
-  }
-
-  /** The mono meta slot: node / raw state / transitional verbs. While
-   *  PENDING, squeue's %N carries the pending REASON — shown raw too. */
-  function sessionMeta(cs: ComputeSessionView, connecting: boolean, isCancelling: boolean): string {
-    if (isCancelling) return cs.state === "ENDED" ? "dismissing…" : "cancelling…";
-    if (connecting) return "connecting…";
-    if (cs.state === "ENDED") return "ended";
-    if (cs.state === "RUNNING") {
-      if (cs.ready) return cs.node;
-      return cs.node === "" ? "starting…" : `${cs.node} · starting…`;
-    }
-    if (cs.state === "PENDING") {
-      return cs.node === "" ? cs.state : `${cs.state} ${cs.node}`;
-    }
-    return cs.node === "" ? cs.state : `${cs.node} · ${cs.state}`;
-  }
-
-  /** One honest tooltip for the row and its open action. */
-  function sessionTitle(cs: ComputeSessionView, connecting: boolean, isCancelling: boolean): string {
-    if (isCancelling) return `cancelling slurm job ${cs.job_id}…`;
-    if (connecting) return `connecting to slurm job ${cs.job_id}…`;
-    if (cs.state === "ENDED") {
-      return `slurm job ${cs.job_id} ended (walltime or failure) — dismiss to clear`;
-    }
-    if (cs.ready) return `open the session on ${cs.node} (slurm job ${cs.job_id})`;
-    if (cs.state === "PENDING") return "starts when the job leaves the queue";
-    if (cs.state === "RUNNING") {
-      return `slurm job ${cs.job_id} is starting — its daemon isn't up yet`;
-    }
-    return `slurm job ${cs.job_id} — ${cs.state}`;
-  }
-
-  /** RUNNING cards tick down between polls off the ONE shared clock (client
-   *  math only — zero extra fetches). Other states show the raw value: for
-   *  PENDING it's the requested LIMIT, not a countdown. */
-  function displayTimeLeft(cs: ComputeSessionView): string {
-    // Slurm's %L emits INVALID/NOT_SET while a job transitions — placeholder
-    // words, not durations, so show a dash. UNLIMITED (and any other raw
-    // value) stays: Slurm vocabulary is never relabeled.
-    if (cs.time_left === "INVALID" || cs.time_left === "NOT_SET") return "—";
-    if (cs.state !== "RUNNING") return cs.time_left;
-    const base = parseSlurmTimeLeft(cs.time_left);
-    if (base === null) return cs.time_left;
-    return formatSlurmDuration(
-      Math.max(0, base - Math.floor((nowTick - listReceivedAt) / 1000)),
-    );
-  }
-
-  const anyRunning = $derived(
-    hostCompute?.sessions.some((s) => s.state === "RUNNING") ?? false,
-  );
-  // The shared ticker: one interval for the whole list, only while the page
-  // is visible and something is actually counting down.
-  $effect(() => {
-    if (!isHostPage || !docVisible || !anyRunning) return;
-    const t = setInterval(() => (nowTick = Date.now()), 1000);
+    if (!native || ownAlias !== null || clusterView !== null || !$pageVisible) return;
+    const aliases = hosts.filter(clusterReadable).map((h) => h.alias);
+    if (aliases.length === 0) return;
+    const ask = (): void => {
+      for (const alias of aliases) void clusterOverviews.refresh(alias, 55_000);
+    };
+    ask();
+    const t = setInterval(ask, 60_000);
     return () => clearInterval(t);
   });
 
@@ -839,7 +630,7 @@
     return new Date(unixSecs * 1000).toISOString().slice(0, 10);
   }
 
-  /** A login node's first label — "sh03-ln06" for "sh03-ln06.stanford.edu". */
+  /** A login node's first label — "login-a" for "login-a.cluster.example". */
   function shortNode(node: string): string {
     return node.split(".")[0] || node;
   }
@@ -886,6 +677,24 @@
   }
 </script>
 
+{#snippet jobsRow(alias: string)}
+  <div class="rowwrap" role="presentation">
+    <button
+      class="row sub jobs"
+      title="Start Slurm jobs on {alias} and open workspaces inside them"
+      onclick={() => showCluster(alias)}
+    >
+      <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+        <rect x="2" y="2" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
+        <rect x="9" y="2" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
+        <rect x="2" y="9" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
+        <rect x="9" y="9" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
+      </svg>
+      <span class="name">Jobs</span>
+    </button>
+  </div>
+{/snippet}
+
 <div class="home">
   {#if health !== null}
     <!-- The mark identifies the DAEMON serving this window (the daemon
@@ -906,7 +715,38 @@
     </button>
   {/if}
   <HomeNavigation active="workspaces" plan={$paidPlan} showPro={isBrowserGateway() || (native && $proOffered === true)}
-    onHome={() => { if (showBackToHome) void backToHome(); }} {onPro} {onSettings} />
+    onHome={() => {
+      if (showBackToHome) void backToHome();
+      else clusterView = null;
+    }} {onPro} {onSettings} />
+  {#if clusterView !== null}
+    {@const alias = clusterView}
+    <div class="cluster-surface">
+    {#if ClusterPageView !== null}
+    <ClusterPageView
+      {alias}
+      host={hosts.find((h) => h.alias === alias) ?? null}
+      onBack={clusterWs !== null ? () => void backToHome() : () => (clusterView = null)}
+      here={clusterWs}
+      onHere={() => {
+        const own = workspaces.find((w) => w.id === clusterWs);
+        if (own !== undefined) onOpen(own);
+      }}
+      onHostState={(state) => {
+        hosts = hosts.map((h) => (h.alias === state.alias ? state : h));
+      }}
+      onHostsChanged={() => void refreshHosts()}
+      onNotCluster={clusterWs === null
+        ? (state) => {
+            hosts = hosts.map((h) => (h.alias === state.alias ? state : h));
+            clusterView = null;
+            void connect(state.alias);
+          }
+        : undefined}
+    />
+    {/if}
+    </div>
+  {:else}
   <div class="inner">
     <header class="masthead">
       <div class="masthead-leading">
@@ -1070,152 +910,6 @@
       {/if}
     </section>
 
-    {#if isHostPage && hostCompute === null && knownScheduler(hostLabel) === "slurm"}
-      <!-- The first compute fetch also runs the daemon's scheduler detection
-           (a login-shell PATH walk — seconds on a slow cluster). The probe
-           holds the section's seat ONLY on hosts a previous fetch confirmed
-           as clusters (maintainer: never tease plain remotes with scheduler
-           checks) — a first-ever cluster confirms silently and the section
-           simply appears. -->
-      <div class="probe-line" role="status">
-        {#if hostComputeError === null}
-          <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
-            <rect x="2" y="2" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
-            <rect x="9" y="2" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
-            <rect x="2" y="9" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
-            <rect x="9" y="9" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
-          </svg>
-          <span>loading compute sessions…</span>
-        {:else}
-          <span class="err">compute check failed — {hostComputeError}</span>
-        {/if}
-      </div>
-    {:else if isHostPage && hostCompute !== null && hostCompute.scheduler === "slurm"}
-      <!-- Mode 2 (maintainer intent, features/compute.md): chimaera sessions
-           running as Slurm jobs — first-class connectable entities with
-           "x compute and hours left". This host's own page is where they are
-           launched and managed; the local home screen only counts them. -->
-      <section>
-        <div class="sec-head">
-          <h2 class="sec-title">Compute sessions</h2>
-          <span class="sec-acts">
-            <button class="ghost" onclick={() => (launchOpen = true)}
-              >new compute session…</button
-            >
-            <button
-              class="ghost refresh"
-              class:spinning={hostComputeLoading}
-              title="refresh compute sessions"
-              aria-label="refresh compute sessions"
-              disabled={hostComputeLoading}
-              onclick={() => void refreshHostCompute()}
-            >
-              <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
-                <path
-                  d="M13.2 8a5.2 5.2 0 1 1-1.5-3.7M13.4 2.5v2.3h-2.3"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="1.4"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                />
-              </svg>
-            </button>
-          </span>
-        </div>
-        {#if hostCompute.sessions.length === 0}
-          <p class="hint">
-            None running. A compute session is a full chimaera workbench submitted as a Slurm
-            job — its own node and resources, ended cleanly at walltime.
-          </p>
-        {:else}
-          <div class="rows">
-            {#each hostCompute.sessions as cs (cs.job_id)}
-              {@const isConnecting = connectingJob === cs.job_id}
-              {@const isCancelling = cancelling.has(cs.job_id)}
-              {@const dotCls = sessionDot(cs, isConnecting, isCancelling)}
-              {@const meta = sessionMeta(cs, isConnecting, isCancelling)}
-              {@const title = sessionTitle(cs, isConnecting, isCancelling)}
-              {@const res = resourceLabel(cs)}
-              {@const cerr = cardErrors.get(cs.job_id)}
-              {#if confirmCancel === cs.job_id}
-                <div class="row confirm" role="alertdialog" aria-label="cancel compute session?">
-                  <span class="name">{cs.name}</span>
-                  <span class="confirm-label"
-                    >cancel job {cs.job_id}? everything in the allocation ends</span
-                  >
-                  <button class="confirm-yes" onclick={() => void cancelHostCompute(cs)}
-                    >cancel job</button
-                  >
-                  <button class="confirm-no" onclick={() => (confirmCancel = null)}>keep</button>
-                </div>
-              {:else}
-                <div class="rowwrap" role="presentation" class:live={dotCls === "alive"}>
-                  <button
-                    class="row comp"
-                    {title}
-                    disabled={!cs.ready || isConnecting || isCancelling}
-                    onclick={() => void openHostCompute(cs)}
-                  >
-                    <span class="dot {dotCls}" title={cs.state}></span>
-                    <span class="name" class:dim={isCancelling}>{cs.name}</span>
-                    <span class="node">{meta}</span>
-                    {#if res !== ""}
-                      <span class="badge">{res}</span>
-                    {/if}
-                    <span
-                      class="when"
-                      title={cs.state === "RUNNING" ? "walltime remaining" : "walltime limit"}
-                      >{displayTimeLeft(cs)}</span
-                    >
-                  </button>
-                  {#if !isCancelling}
-                    {#if cs.state === "ENDED"}
-                      <!-- A tombstone: nothing to open or cancel — dismissing
-                           clears the record (same DELETE, no confirm; the job
-                           is already gone). -->
-                      <button
-                        class="side"
-                        title="clear this ended session from the list"
-                        onclick={() => void cancelHostCompute(cs)}>dismiss</button
-                      >
-                    {:else}
-                      <button
-                        class="side"
-                        class:busy={isConnecting}
-                        {title}
-                        disabled={!cs.ready || isConnecting}
-                        onclick={() => void openHostCompute(cs)}
-                        >{isConnecting ? "connecting…" : "open"}</button
-                      >
-                      <button
-                        class="side stop"
-                        title="cancel slurm job {cs.job_id}"
-                        disabled={isConnecting}
-                        onclick={() => (confirmCancel = cs.job_id)}>cancel</button
-                      >
-                    {/if}
-                  {/if}
-                </div>
-                {#if cerr !== undefined}
-                  <div class="err-line card">{cerr}</div>
-                {/if}
-                {#if cs.egress === false}
-                  <!-- Only a VERIFIED-blocked probe warns; absent egress
-                       means "couldn't verify", not blocked. -->
-                  <div class="egress-note">agents can't reach the API from this node</div>
-                {/if}
-              {/if}
-            {/each}
-          </div>
-        {/if}
-        {#if hostComputeError !== null}
-          <div class="err-line">{hostComputeError}</div>
-        {/if}
-      </section>
-    {/if}
-
-
     {#if native && ownAlias === null && $paidPlan !== null}
       <!-- The cloud projects list (and the Pro presentation copy behind it)
            loads only for a paid plan: it stays out of the always-loaded
@@ -1281,7 +975,9 @@
 
           {#if hosts.length === 0 && !addOpen}
             <p class="hint">
-              Connect a server or cluster using its SSH alias. Sessions keep running there when you disconnect.
+              No remotes yet. Add a server's or a cluster's ssh alias — chimaera installs itself in
+              <code>~/.chimaera{localState?.dev_build ? "-dev" : ""}</code> over ssh, no root needed. On a
+              cluster it runs only inside your jobs, never on the login node.
             </p>
           {:else}
             <div class="rows">
@@ -1289,8 +985,8 @@
                 {@const phase = phases.get(h.alias)}
                 {@const err = hostErrors.get(h.alias)}
                 {@const ws = remoteWs.get(h.alias)}
-                {@const compCount = computeCount(h.alias)}
-                {@const comp = remoteCompute.get(h.alias)}
+                {@const cluster = isCluster(h)}
+                {@const loginServe = h.cluster?.login_serve === true}
                 <div class="host-card">
                 {#if confirmShutdown === h.alias}
                   <div class="row confirm strong" role="alertdialog" aria-label="shut down host?">
@@ -1324,6 +1020,61 @@
                     <button class="confirm-yes" onclick={() => void forget(h.alias)}>forget</button>
                     <button class="confirm-no" onclick={() => (confirmForget = null)}>cancel</button>
                   </div>
+                {:else if cluster && !loginServe}
+                  <!-- A cluster: chimaera never runs on its login node, so
+                       there is nothing to tunnel to — the row reads the
+                       cluster's workspaces and opens its page in place. -->
+                  {@const line = clusterReadable(h) ? clusterLine(h) : null}
+                  {@const running = clusterRunning(h.alias)}
+                  <div class="rowwrap" role="presentation" class:connected={running}>
+                    <button
+                      class="row"
+                      title="{h.alias}'s jobs and workspaces"
+                      disabled={h.status === "connecting"}
+                      onclick={() => void connect(h.alias)}
+                    >
+                      <span
+                        class="dot {h.status === 'connecting' ? 'starting' : running ? 'alive' : ''}"
+                        title={h.status === "connecting"
+                          ? "connecting…"
+                          : running
+                            ? "a job is running"
+                            : "no job running"}
+                      ></span>
+                      <span class="name">{h.alias}</span>
+                      <span
+                        class="pill-sched"
+                        title="{h.alias} has a batch scheduler: Chimaera runs inside jobs you start there, never on the login node"
+                        >{schedulerLabel(h.cluster?.scheduler)}</span
+                      >
+                      {#if localState?.dev_build}
+                        <span
+                          class="pill-dev"
+                          title="dev build — every connection targets this machine's own build in ~/.chimaera-dev on {h.alias}; the real daemon there is untouched"
+                          >dev</span
+                        >
+                      {/if}
+                      {#if phase !== undefined}
+                        <span class="phase">{phase === PHASE_LABEL.probing ? "connecting…" : phase}</span>
+                      {:else if line !== null}
+                        <span class="phase quiet">{line}</span>
+                      {:else}
+                        <span class="when">{ago(h.last_connected_at)}</span>
+                      {/if}
+                    </button>
+                    <button class="side x" title="forget host" onclick={() => (confirmForget = h.alias)}
+                      >&times;</button
+                    >
+                  </div>
+                  {#if err !== undefined}
+                    <div class="err-line">{err}</div>
+                  {/if}
+                  {#if h.cluster !== null && h.cluster.login_daemon !== null && phase === undefined}
+                    <div class="note-line warn">
+                      a chimaera server from before is still running on {shortNode(h.cluster.login_daemon.node)} —
+                      <button class="update-act" onclick={() => void connect(h.alias)}>open to shut it down</button>
+                    </div>
+                  {/if}
                 {:else}
                   <div class="rowwrap host-row" role="presentation" class:connected={h.status === "connected"}>
                     <button
@@ -1350,7 +1101,7 @@
                             : "not connected"}
                       ></span>
                       <span class="workspace-label">
-                        <span class="host-name"><span class="name">{h.alias}</span>{#if h.via_pro}<span class="via-pro" title="Connected through Chimaera Pro">via Pro</span>{/if}{#if localState?.dev_build}<span
+                        <span class="host-name"><span class="name">{h.alias}</span>{#if h.via_pro}<span class="via-pro" title="Connected through Chimaera Pro">via Pro</span>{/if}{#if cluster}<span class="pill-sched">{schedulerLabel(h.cluster?.scheduler)}</span><span class="pill-dev" title="chimaera runs on {h.alias}'s login node (turned on in the cluster page's … menu)">login node</span>{/if}{#if localState?.dev_build}<span
                           class="pill-dev"
                           title="dev build — every connection targets this machine's own build in ~/.chimaera-dev on {h.alias}; the real daemon there is untouched"
                           >dev</span
@@ -1392,6 +1143,13 @@
                       <button class="side x" title="forget host" onclick={() => (confirmForget = h.alias)}
                         >Forget machine</button
                       >
+                      {#if h.not_cluster}
+                        <button
+                          class="side"
+                          title="you said {h.alias} isn't a cluster — treat it as one again (Chimaera then runs only inside jobs there)"
+                          onclick={() => void backToCluster(h.alias)}>it's a cluster</button
+                        >
+                      {/if}
                     </HomeActions>
                   </div>
                   {#if err !== undefined}
@@ -1420,55 +1178,18 @@
                           </button>
                         </div>
                       {/each}
-                      {#if comp !== undefined && comp.scheduler === "slurm"}
-                        <!-- Indicator ONLY (maintainer, 2026-07-15): the cards
-                             and the launch dialog live on the host's own page.
-                             Clicking = the host row's own action. A cluster
-                             reads as one even at zero sessions — "there are
-                             compute nodes here" is the load-bearing fact. -->
-                        <div class="rowwrap" role="presentation">
-                          <button
-                            class="row sub comp-count"
-                            title={computeTitle(h.alias, comp)}
-                            onclick={() => void navigateHost(h.alias)}
-                          >
-                            <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
-                              <rect x="2" y="2" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
-                              <rect x="9" y="2" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
-                              <rect x="2" y="9" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
-                              <rect x="9" y="9" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
-                            </svg>
-                            {#if compCount > 0}
-                              <span class="name"
-                                >{compCount} compute session{compCount === 1 ? "" : "s"}</span
-                              >
-                              <span class="path">slurm</span>
-                            {:else}
-                              <span class="name">slurm cluster</span>
-                              <span class="path">no compute sessions</span>
-                            {/if}
-                          </button>
-                        </div>
-                      {:else if comp === undefined && computeChecking.has(h.alias) && knownScheduler(h.alias) === "slurm"}
-                        <div class="rowwrap" role="presentation">
-                          <div class="row sub comp-count checking" role="status">
-                            <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
-                              <rect x="2" y="2" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
-                              <rect x="9" y="2" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
-                              <rect x="2" y="9" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
-                              <rect x="9" y="9" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
-                            </svg>
-                            <span class="name">slurm cluster</span>
-                            <span class="path">checking…</span>
-                          </div>
-                        </div>
-                      {/if}
+                      {#if cluster}{@render jobsRow(h.alias)}{/if}
                       <div class="rowwrap" role="presentation">
                         <button class="row sub browse" onclick={() => void navigateHost(h.alias)}>
                           <span class="name">Open {h.alias}</span><span aria-hidden="true">→</span>
                         </button>
                       </div>
                     </div>
+                  {:else if cluster}
+                    <!-- The login-node override is on, so the row connects to
+                         the login daemon as before; the cluster page (jobs)
+                         stays one click away. -->
+                    <div class="remote-ws">{@render jobsRow(h.alias)}</div>
                   {/if}
                 {/if}
                 </div>
@@ -1479,18 +1200,8 @@
       </section>
     {/if}
   </div>
-
-  {#if launchOpen && isHostPage}
-    <ComputeLaunchDialog
-      alias={hostLabel}
-      partitions={hostCompute?.partitions ?? []}
-      onClose={() => (launchOpen = false)}
-      onLaunched={() => {
-        launchOpen = false;
-        void refreshHostCompute();
-      }}
-    />
   {/if}
+
 </div>
 
 <style>
@@ -1502,6 +1213,7 @@
   }
 
   .home { position: absolute; inset: 0; display: flex; overflow: hidden; background: var(--bg); }
+  .cluster-surface { flex: 1; min-width: 0; min-height: 0; overflow-y: auto; }
   .inner { flex: 1; min-width: 0; overflow-y: auto; padding: 56px clamp(24px, 4vw, 64px) 24px; display: flex; flex-direction: column; gap: 36px; }
   .inner > :global(*) { width: 100%; max-width: 860px; margin-left: auto; margin-right: auto; box-sizing: border-box; }
   .masthead { display: flex; align-items: center; justify-content: space-between; gap: 20px; flex-wrap: wrap; margin-bottom: 8px; }
@@ -1930,11 +1642,7 @@
 
   /* Hidden document: pause the presence dots — nobody sees them breathe
      (the html.app-hidden contract; see app.css). */
-  :global(html.app-hidden) .dot.starting,
-  :global(html.app-hidden) .dot.queued,
-  :global(html.app-hidden) .dot.booting,
-  :global(html.app-hidden) .row.comp-count.checking,
-  :global(html.app-hidden) .probe-line {
+  :global(html.app-hidden) .dot.starting {
     animation-play-state: paused;
   }
 
@@ -1996,158 +1704,35 @@
     flex-direction: column;
   }
 
-  /* The compute-sessions header carries two actions (launch + refresh). */
-  .sec-acts {
-    display: flex;
-    align-items: center;
-    gap: 2px;
-  }
-
-  .ghost.refresh {
-    display: flex;
-    align-items: center;
-    padding: 2px 4px;
-  }
-
-  /* The node a session landed on — mono like a path, never stealing the
-     name's space. */
-  .node {
-    flex: none;
-    max-width: 30%;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-family: var(--mono);
-    font-size: var(--text-sm);
-    color: var(--muted);
-  }
-
-  /* A not-yet-ready session can't be opened; the row still reads, the
-     actions just wait. */
-  .row:disabled .name,
-  .row:disabled .node {
-    opacity: 0.75;
-  }
-
-  .side:disabled {
-    opacity: 0.45;
-    cursor: default;
-  }
-
-  .side:disabled:hover {
-    color: var(--muted);
-  }
-
-  /* Verified-blocked egress: the one per-cluster fact worth a warning —
-     terminals/previews still work there, agents can't. */
-  .egress-note {
-    padding: 0 10px 6px 27px;
-    font-family: var(--mono);
-    font-size: var(--text-xs);
-    color: var(--warn);
-  }
-
-  /* Compute-card dots: Slurm's states styled, never renamed. queued =
-     hollow muted pulse (waiting in line, nothing alive yet); booting =
-     accent pulse (the allocation runs, its daemon is coming up — also the
-     "connecting…" wait); ending = warn (CANCELLING/COMPLETING and the
-     local "cancelling…" wait). */
-  .dot.queued {
-    box-sizing: border-box;
-    background: transparent;
-    border: 1.5px solid var(--muted);
-    opacity: 1;
-    animation: dotpulse 1.6s ease-in-out infinite;
-  }
-
-  .dot.booting {
-    background: var(--accent);
-    opacity: 1;
-    animation: dotpulse 1.1s ease-in-out infinite;
-  }
-
-  .dot.ending {
-    background: var(--warn);
-    opacity: 0.9;
-  }
-
-  /* A non-openable compute row is calmly disabled — not "in progress"
-     (the generic .row:disabled progress cursor belongs to connecting
-     hosts, not to a job waiting in the queue). */
-  .row.comp:disabled {
-    cursor: default;
-  }
-
-  /* The name recedes while its card is being cancelled. */
-  .name.dim {
-    opacity: 0.55;
-  }
-
-  /* Card-level failure aligns under the card's name (the egress indent). */
-  .err-line.card {
-    padding-left: 27px;
-  }
-
-  /* The in-flight "connecting…" action stays visible without hover. */
-  .side.busy {
-    visibility: visible;
-  }
-
-  /* Local home's per-host compute indicator: quiet like the browse row,
-     waking on hover — an indicator, not a control surface. */
-  .row.comp-count svg {
+  /* A login_serve cluster's entry into its cluster page: quiet like the
+     browse row, waking on hover. */
+  .row.jobs svg {
     flex: none;
     color: var(--muted);
     opacity: 0.7;
   }
 
-  .row.comp-count .name {
+  .row.jobs .name {
     color: var(--muted);
   }
 
-  .row.comp-count:hover .name {
+  .row.jobs:hover .name {
     color: var(--fg);
   }
 
-  /* First fetch in flight: same quiet row, softly breathing, not clickable. */
-  .row.comp-count.checking {
-    animation: dotpulse 1.4s ease-in-out infinite;
-    cursor: default;
-  }
-
-  /* Host page, before the scheduler is known: the compute section's seat is
-     held by one breathing line instead of the section popping in from
-     nothing (or never arriving, on a host without a scheduler). */
-  .probe-line {
-    display: flex;
-    align-items: center;
-    gap: 7px;
-    padding: 2px 10px 0;
-    font-size: var(--text-sm);
-    color: var(--muted);
-    animation: dotpulse 1.4s ease-in-out infinite;
-  }
-
-  .probe-line svg {
+  /* The scheduler tag on a cluster row — a fact, quietly stated. */
+  .pill-sched {
     flex: none;
-    opacity: 0.7;
+    font-size: var(--text-xs);
+    color: var(--muted);
+    border: 1px solid var(--edge);
+    border-radius: 999px;
+    padding: 1px 7px;
+    white-space: nowrap;
   }
 
-  .probe-line .err {
-    animation: none;
-    opacity: 0.8;
-  }
-
-  /* The refresh glyph turns while a list fetch is in flight — the section's
-     only "something is happening" tell, poll or click alike. */
-  .ghost.refresh.spinning svg {
-    animation: spin 0.9s linear infinite;
-  }
-
-  @keyframes spin {
-    to {
-      transform: rotate(360deg);
-    }
+  .note-line.warn {
+    color: var(--warn);
   }
 
   .row.confirm {
@@ -2322,11 +1907,8 @@
     .remote-ws .row.sub { flex-wrap: wrap; gap: 5px 10px; }
     .remote-ws .row.sub .name { max-width: 100%; }
     .remote-ws .path { flex-basis: 100%; order: 1; }
-    .row.comp { flex-wrap: wrap; }
-    .row.comp .name { max-width: 100%; }
-    .row.comp .node { flex-basis: calc(100% - 24px); }
   }
   @media (prefers-reduced-motion: reduce) {
-    .dot, .row.comp-count.checking, .probe-line, .ghost.refresh.spinning svg { animation: none; }
+    .dot { animation: none; }
   }
 </style>

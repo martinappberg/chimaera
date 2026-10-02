@@ -8,7 +8,7 @@ Dated 2026-09-01. Companion to the (retired) local audit `docs/perf-plan.md`
 
 - Daemon: release v0.40.8 (includes the full #125–#130 perf series), run as an
   isolated instance (`CHIMAERA_HOME` under `~/chimaera-perftest`) on
-  `sh04-ln03.sherlock.stanford.edu`.
+  a login node of a production cluster.
 - Tunnel: `ssh -L` forward delegated to the **same live ControlMaster the app
   uses** (`~/.chimaera/cm/…`) — the production topology, one TCP connection
   multiplexing every WS + HTTP request.
@@ -133,7 +133,7 @@ release binary (mildly compressible; harmless).
 
 **R6 — connect/reconnect round trips (chimaera-remote + the app shell).
 SHIPPED, with the wedge path and monitor backoff unit-tested only.**
-Live-verified on Sherlock for connect/update timings: probe 1.85→1.37 s,
+Live-verified on a production cluster for connect/update timings: probe 1.85→1.37 s,
 stop 1.70→1.08 s, start 2.80→1.38 s. Every separate `ssh host cmd` through
 the ControlMaster is a channel-open RTT plus a remote fork on a loaded login
 node (~300-500 ms at ~170 ms RTT), so the connect path folds its serial

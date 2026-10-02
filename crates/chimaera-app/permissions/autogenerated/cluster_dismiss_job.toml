@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cluster-dismiss-job"
+description = "Enables the cluster_dismiss_job command without any pre-configured scope."
+commands.allow = ["cluster_dismiss_job"]
+
+[[permission]]
+identifier = "deny-cluster-dismiss-job"
+description = "Denies the cluster_dismiss_job command without any pre-configured scope."
+commands.deny = ["cluster_dismiss_job"]

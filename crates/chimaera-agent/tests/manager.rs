@@ -1586,9 +1586,14 @@ async fn startup_hooks_are_visible_before_init_and_replay_without_private_output
             "Loading agent settings and tools…"
         ]
     );
-    assert!(!serde_json::to_string(&replay)
-        .unwrap()
-        .contains("private hook context"));
+    assert!(!serde_json::to_string(
+        &replay
+            .iter()
+            .map(|entry| entry.as_ref())
+            .collect::<Vec<_>>()
+    )
+    .unwrap()
+    .contains("private hook context"));
     fx.manager.kill("hooks");
 }
 

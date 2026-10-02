@@ -333,10 +333,10 @@ struct WsInput {
     live: Vec<Record>,
 }
 
-/// The workspaces a usage route covers: the named one, or every one. `None`
-/// when a named workspace is unknown.
+/// The workspaces a usage route covers: the named one, or every listed one
+/// (never the app's hidden ones). `None` when a named workspace is unknown.
 fn inputs_for(state: &Arc<AppState>, workspace_id: Option<&str>) -> Option<Vec<WsInput>> {
-    let workspaces = crate::lock(&state.workspaces).list();
+    let workspaces = crate::lock(&state.workspaces).listed();
     let chosen: Vec<_> = match workspace_id {
         Some(id) => vec![workspaces.into_iter().find(|w| w.id == id)?],
         None => workspaces,

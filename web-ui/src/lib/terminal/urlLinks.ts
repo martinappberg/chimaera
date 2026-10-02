@@ -148,7 +148,7 @@ if (import.meta.env.DEV) {
     "streamlit's bare-origin URL links",
   );
   ok(
-    targets("running on http://sh03-09n14:8888/tree.").join() === "sh03-09n14:8888/tree",
+    targets("running on http://compute-014:8888/tree.").join() === "compute-014:8888/tree",
     "compute-node hostnames link when a port is explicit (trailing dot trimmed)",
   );
   ok(targets("see https://github.com/foo/bar").length === 0, "ordinary web URLs stay plain");

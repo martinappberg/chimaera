@@ -9,14 +9,15 @@ pub(super) use axum::http::{header, Method, Request, StatusCode};
 pub(super) use http_body_util::BodyExt;
 pub(super) use tower::ServiceExt;
 
-/// Fresh temp directory, unique per call within this test process.
+/// Fresh even when the OS reuses a PID from an earlier test run.
 pub(super) fn test_dir(label: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(
-        "chimaera-server-test-{}-{label}-{}",
+        "chimaera-server-test-{}-{label}-{}-{}",
         std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
+        COUNTER.fetch_add(1, Ordering::Relaxed),
+        chimaera_core::generate_token(),
     ));
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -34,15 +35,24 @@ pub(super) fn test_state_with_port(port: u16) -> Arc<AppState> {
 }
 
 pub(super) fn test_state_with_data_dir(port: u16, data_dir: PathBuf) -> Arc<AppState> {
+    Arc::new(fixture_state(port, data_dir))
+}
+
+fn fixture_state(port: u16, data_dir: PathBuf) -> AppState {
     let config_dir = data_dir.join("config");
-    Arc::new(AppState::new(
+    let provider_home = data_dir.join("provider-home");
+    let mut state = AppState::new(
         "test-token".to_string(),
         "testhost".to_string(),
         4242,
         port,
         data_dir,
         config_dir,
-    ))
+    );
+    state.claude_projects_dir = provider_home.join(".claude/projects");
+    state.claude_settings_path = provider_home.join(".claude/settings.json");
+    state.codex_config_path = provider_home.join(".codex/config.toml");
+    state
 }
 
 /// Test state with the Claude transcript store pointed at a fixture dir
@@ -50,15 +60,7 @@ pub(super) fn test_state_with_data_dir(port: u16, data_dir: PathBuf) -> Arc<AppS
 /// env-var mutation that races across parallel tests).
 pub(super) fn test_state_with_claude_store(store: PathBuf) -> Arc<AppState> {
     let data = test_dir("data");
-    let config = data.join("config");
-    let mut state = AppState::new(
-        "test-token".to_string(),
-        "testhost".to_string(),
-        4242,
-        0,
-        data,
-        config,
-    );
+    let mut state = fixture_state(0, data);
     state.claude_projects_dir = store;
     Arc::new(state)
 }

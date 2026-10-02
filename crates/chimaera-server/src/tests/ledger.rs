@@ -305,7 +305,6 @@ async fn journal_budget_spares_chats_the_ledger_resurrects() {
     state.chat.kill("s-chat-b");
 }
 
-/// Laptop first across a restart: a Pro-managed project's previous sessions
 /// Laptop first across a restart: a Pro-managed project's previous agents
 /// wait for this daemon life to verify ownership (so a project the cloud took
 /// over never resumes a stale turn here), then resume anyway when the account
@@ -620,4 +619,81 @@ async fn a_resumed_chat_keeps_its_conversation_before_its_first_turn() {
     state
         .stopping
         .store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// The native app's hidden workspace (a cluster's login-node terminal):
+/// never listed, and its sessions never enter the ledger — a restart must
+/// not bring that terminal back as a plain local shell. Registration is
+/// idempotent per root and stays hidden.
+#[tokio::test]
+async fn hidden_workspace_is_unlisted_and_its_sessions_stay_out_of_the_ledger() {
+    let state = test_state();
+    let root = std::fs::canonicalize(test_dir("ledger-hidden-root")).unwrap();
+    let body = serde_json::json!({"root": root.to_string_lossy(), "hidden": true});
+    let (status, ws) = request(
+        &state,
+        Method::POST,
+        "/api/v1/workspaces",
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{ws}");
+    assert_eq!(ws["hidden"], true);
+    let hidden_id = ws["id"].as_str().unwrap().to_string();
+    let (_, again) = request(&state, Method::POST, "/api/v1/workspaces", Some(body)).await;
+    assert_eq!(
+        again["id"].as_str(),
+        Some(hidden_id.as_str()),
+        "idempotent per root"
+    );
+
+    let shown = std::fs::canonicalize(test_dir("ledger-shown-root")).unwrap();
+    let (_, plain) = request(
+        &state,
+        Method::POST,
+        "/api/v1/workspaces",
+        Some(serde_json::json!({"root": shown.to_string_lossy()})),
+    )
+    .await;
+    assert!(
+        plain.get("hidden").is_none(),
+        "a user workspace's wire shape is unchanged"
+    );
+    let shown_id = plain["id"].as_str().unwrap().to_string();
+
+    let (_, listed) = request(&state, Method::GET, "/api/v1/workspaces", None).await;
+    let ids: Vec<&str> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|w| w["id"].as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![shown_id.as_str()],
+        "only the user's workspace is listed"
+    );
+
+    let mut sids = Vec::new();
+    for ws in [&hidden_id, &shown_id] {
+        let (status, session) = request(
+            &state,
+            Method::POST,
+            "/api/v1/sessions",
+            Some(serde_json::json!({ "workspace_id": ws })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "spawn failed: {session}");
+        sids.push(session["id"].as_str().unwrap().to_string());
+    }
+    let (entries, _) = ledger::snapshot(&state);
+    let in_ledger: Vec<&str> = entries.iter().map(|e| e.workspace_id.as_str()).collect();
+    assert_eq!(
+        in_ledger,
+        vec![shown_id.as_str()],
+        "the hidden session stays out"
+    );
+    for sid in sids {
+        state.sessions.kill(&sid).ok();
+    }
 }

@@ -95,6 +95,7 @@ mod tests {
                 mastermind: None,
                 plugins_on: vec![],
                 cloud_internal: false,
+                hidden: false,
             })
             .unwrap();
         lock(&state.pro.ownership).insert("w-diagnostic".into(), Ownership::Local { epoch: 3 });

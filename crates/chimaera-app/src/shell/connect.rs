@@ -11,7 +11,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use super::restore::open_ui_window;
 use super::tunnel::Tunnel;
-use super::{authorize_scope_origin, lock, ConnectFlight, Shell};
+use super::{ConnectFlight, Shell, authorize_scope_origin, lock};
 use crate::windows::WindowRecord;
 
 type ConnectFlightOwner = tokio::sync::watch::Sender<Option<Result<(), String>>>;
@@ -53,6 +53,57 @@ pub struct HostState {
     node: Option<String>,
     via_pro: bool,
     kept: bool,
+    /// Set when the host is a cluster: from this process's connect, else the
+    /// scheduler the last connect recorded in hosts.json (a hint until the
+    /// next probe). Never for a host the user said isn't one.
+    cluster: Option<ClusterWire>,
+    /// The user said this host isn't a cluster (its row offers to undo it).
+    not_cluster: bool,
+}
+
+/// A cluster host as the page sees it (see `ClusterHostInfo` in native.ts).
+#[derive(Clone, Serialize)]
+pub struct ClusterWire {
+    scheduler: chimaera_core::slurm::Scheduler,
+    login_serve: bool,
+    login_daemon: Option<LoginDaemonWire>,
+}
+
+#[derive(Clone, Serialize)]
+struct LoginDaemonWire {
+    node: String,
+    pid: u32,
+    alive: Option<bool>,
+}
+
+impl HostState {
+    /// Attach what is known about `entry` being a cluster: this process's
+    /// live verdict when there is one, else the hint hosts.json keeps.
+    pub(super) fn with_cluster(
+        mut self,
+        entry: &HostEntry,
+        live: Option<&super::cluster::ClusterInfo>,
+    ) -> Self {
+        self.not_cluster = entry.not_cluster;
+        let scheduler = live
+            .map(|i| i.scheduler)
+            .or(entry.scheduler)
+            .filter(|_| !entry.not_cluster);
+        self.cluster = scheduler
+            .filter(|s| s.is_cluster())
+            .map(|scheduler| ClusterWire {
+                scheduler,
+                login_serve: entry.login_serve,
+                login_daemon: live
+                    .and_then(|i| i.login_daemon.as_ref())
+                    .map(|d| LoginDaemonWire {
+                        node: d.node.clone(),
+                        pid: d.pid,
+                        alive: d.alive,
+                    }),
+            });
+        self
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -142,6 +193,8 @@ pub(super) fn state_for(
         node: tunnel.and_then(|t| t.node().map(str::to_string)),
         via_pro: tunnel.is_some_and(|t| t.link_id().is_some()),
         kept: entry.kept,
+        cluster: None,
+        not_cluster: entry.not_cluster,
     }
 }
 
@@ -162,7 +215,12 @@ async fn publish_connected_state(app: &AppHandle, state: &Shell, alias: &str) ->
         let tunnels = state.tunnels.lock().await;
         let tunnel = tunnels.get(alias)?;
         (
-            state_for(&entry, "connected", Some(tunnel)),
+            state_for(&entry, "connected", Some(tunnel)).with_cluster(
+                &entry,
+                lock(&state.clusters)
+                    .get(alias)
+                    .and_then(|c| c.info.as_ref()),
+            ),
             connected_status(
                 alias,
                 tunnel.local_port,
@@ -198,6 +256,8 @@ async fn run_connect(
         local_port,
         binary: entry.binary.clone(),
         update_daemon,
+        login_serve: entry.login_serve,
+        not_cluster: entry.not_cluster,
     };
     let progress_app = app.clone();
     let progress_alias = alias.to_string();
@@ -255,6 +315,9 @@ pub(super) async fn do_connect(
                 match outcome {
                     Ok(outcome) => match outcome.expect("wait_for guarantees Some") {
                         Ok(()) if !update_daemon => {
+                            if let Some(reply) = cluster_state(&state, &alias).await {
+                                return Ok(reply);
+                            }
                             match publish_connected_state(app, &state, &alias).await {
                                 Some(reply) => return Ok(reply),
                                 // Disconnected between the flight landing and
@@ -444,7 +507,20 @@ async fn run_flight(
         other => other,
     };
 
-    let tunnel = result.map_err(|e| format!("{e:#}"))?;
+    let tunnel = match result {
+        Ok(tunnel) => tunnel,
+        Err(e) => match e.downcast_ref::<chimaera_remote::ClusterHost>() {
+            Some(found) => return Ok(landed_on_cluster(app, alias, found).await),
+            None => return Err(format!("{e:#}")),
+        },
+    };
+    if let Some(c) = lock(&state.clusters).get_mut(alias) {
+        // A cluster the user allowed a login-node daemon on: still a cluster
+        // (the page offers jobs), but no stale "left on the login node" note.
+        if let Some(info) = &mut c.info {
+            info.login_daemon = None;
+        }
+    }
     // Stamp the connection and keep the stamped entry for every later publish
     // of this alias (joiners, healthy-tunnel reuse); a failed stamp keeps the
     // pre-connect entry rather than failing a connect that just landed.
@@ -688,6 +764,9 @@ pub(super) fn keeper_state(host: &chimaera_link::Host, tunnel: Option<&Tunnel>) 
         added_at: 0,
         last_connected_at: None,
         kept: true,
+        login_serve: false,
+        not_cluster: false,
+        scheduler: None,
     };
     let status = match host.status {
         chimaera_link::HostStatus::Connecting | chimaera_link::HostStatus::Prompting => {
@@ -772,6 +851,85 @@ async fn drop_compute_tunnels_of(app: &AppHandle, state: &Shell, alias: &str) {
     }
 }
 
+/// The connect landed on a cluster: nothing was started. Remember what it
+/// found, forget windows that pointed at a login-node daemon (there is none
+/// now), and answer with the cluster's state — a success, not an error.
+async fn landed_on_cluster(
+    app: &AppHandle,
+    alias: &str,
+    found: &chimaera_remote::ClusterHost,
+) -> HostState {
+    let state = app.state::<Shell>();
+    let info = super::cluster::ClusterInfo {
+        scheduler: found.scheduler,
+        login_daemon: found.login_daemon.clone(),
+    };
+    lock(&state.clusters)
+        .entry(alias.to_string())
+        .or_default()
+        .info = Some(info.clone());
+    let entry = {
+        let alias = alias.to_string();
+        let scheduler = found.scheduler;
+        with_hosts(move |hosts| {
+            let stamped = hosts.record_connected(&alias)?;
+            Ok(hosts
+                .record_scheduler(&alias, scheduler)?
+                .unwrap_or(stamped))
+        })
+        .await
+    }
+    .unwrap_or_else(|_| HostEntry {
+        alias: alias.to_string(),
+        binary: None,
+        added_at: 0,
+        last_connected_at: None,
+        kept: false,
+        login_serve: false,
+        not_cluster: false,
+        scheduler: Some(found.scheduler),
+    });
+    lock(&state.host_entries).insert(alias.to_string(), entry.clone());
+    // Saved windows onto this host's old login-node daemon can't come back.
+    {
+        let mut registry = lock(&state.registry);
+        let stale: Vec<String> = registry
+            .list()
+            .into_iter()
+            .filter(|r| r.alias.as_deref() == Some(alias) && r.compute.is_none())
+            .map(|r| r.id)
+            .collect();
+        for id in stale {
+            registry.remove(&id);
+        }
+    }
+    let _ = app.emit(
+        "host-status",
+        HostStatus {
+            alias: alias.to_string(),
+            status: "cluster",
+            local_port: None,
+            token: None,
+            error: None,
+            reason: None,
+            build: None,
+            node: None,
+        },
+    );
+    state_for(&entry, "cluster", None).with_cluster(&entry, Some(&info))
+}
+
+/// A cluster host's state when this process already knows it is one (a
+/// joiner of a flight that landed on a cluster).
+async fn cluster_state(state: &Shell, alias: &str) -> Option<HostState> {
+    let info = lock(&state.clusters).get(alias)?.info.clone()?;
+    if state.tunnels.lock().await.contains_key(alias) {
+        return None;
+    }
+    let entry = lock(&state.host_entries).get(alias).cloned()?;
+    Some(state_for(&entry, "cluster", None).with_cluster(&entry, Some(&info)))
+}
+
 async fn host_entry(alias: &str) -> HostEntry {
     let owned = alias.to_string();
     with_hosts(move |hosts| Ok(hosts.get(&owned)))
@@ -784,6 +942,9 @@ async fn host_entry(alias: &str) -> HostEntry {
             added_at: 0,
             last_connected_at: None,
             kept: false,
+            login_serve: false,
+            not_cluster: false,
+            scheduler: None,
         })
 }
 
@@ -816,8 +977,8 @@ mod tests {
     use std::sync::Mutex;
 
     use super::{
-        await_keeper_login, claim_connect_flight, connected_status, reusable_tunnel_port,
-        LinkFailure,
+        LinkFailure, await_keeper_login, claim_connect_flight, connected_status,
+        reusable_tunnel_port,
     };
     use crate::shell::lock;
     use chimaera_link::{Daemon, Host, HostKind, HostStatus};
@@ -900,29 +1061,28 @@ mod tests {
     #[test]
     fn connected_status_carries_the_authoritative_endpoint() {
         let status = connected_status(
-            "Sherlock",
+            "cluster",
             43123,
             "fresh-token",
             Some("build.2"),
-            Some("sh03-ln06.stanford.edu"),
+            Some("login-a.cluster.example"),
         );
-        assert_eq!(status.alias, "Sherlock");
+        assert_eq!(status.alias, "cluster");
         assert_eq!(status.status, "connected");
         assert_eq!(status.local_port, Some(43123));
         assert_eq!(status.token.as_deref(), Some("fresh-token"));
         assert_eq!(status.build.as_deref(), Some("build.2"));
-        assert_eq!(status.node.as_deref(), Some("sh03-ln06.stanford.edu"));
+        assert_eq!(status.node.as_deref(), Some("login-a.cluster.example"));
     }
 
     #[test]
     fn connect_flight_is_published_before_async_work_can_begin() {
         let connecting = Mutex::new(HashMap::new());
-        let owner = claim_connect_flight(&connecting, "Sherlock").expect("first caller owns");
-        let joiner =
-            claim_connect_flight(&connecting, "Sherlock").expect_err("second caller joins");
+        let owner = claim_connect_flight(&connecting, "cluster").expect("first caller owns");
+        let joiner = claim_connect_flight(&connecting, "cluster").expect_err("second caller joins");
 
         let registered = lock(&connecting)
-            .get("Sherlock")
+            .get("cluster")
             .expect("flight was published synchronously")
             .clone();
         assert!(registered.same_channel(&joiner));

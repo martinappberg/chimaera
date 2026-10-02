@@ -373,7 +373,7 @@ mod tests {
         );
     }
 
-    /// The Sherlock login-node scenario: a site rc has already installed a
+    /// The login-node scenario on a production cluster: a site rc has already installed a
     /// DEBUG trap whose handler calls functions (user-audit shells). The
     /// integration must still emit command-start/done marks — on bash < 4.4
     /// that takes the prompt-time re-arm, because trap changes made while an

@@ -328,7 +328,7 @@ _Captured 2026-07-09 (from the maintainer, in-session)._
 _Captured 2026-07-16 (from the maintainer, in-session)._
 
 - **Problem it solves — both halves equally.** The field dead end (a managed codex's own
-  `codex update` on Sherlock failing with "could not detect the installation method" — managed
+  `codex update` on an HPC login node failing with "could not detect the installation method" — managed
   binaries had no update path at all) AND staleness awareness: agent CLIs release near-daily, and
   the user should see at a glance, on every host chimaera runs on, whether an agent is stale — and
   fix it in one click.

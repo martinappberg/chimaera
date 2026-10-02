@@ -778,17 +778,20 @@ pub(crate) async fn ingest(
         crate::git::mark_path_dirty(&state, &path).await;
     }
 
-    // Compute-session context: a daemon running INSIDE a Slurm allocation
-    // (a Mode 2 compute-node daemon) tells its agents so, via the hook
-    // response's `additionalContext` — the only chimaera-owned channel that
-    // reaches BOTH surfaces (TUI and chat ride the same `--settings` hooks)
-    // without touching any user-owned file ($HOME is a shared filesystem, so
-    // a CLAUDE.md edit would leak into login-node sessions). Delivered once
-    // per record, on whichever carrier fires first: SessionStart covers chat
-    // mode (hooks fire normally under stream-json EXCEPT UserPromptSubmit —
-    // PROTOCOL.md), the first UserPromptSubmit covers TUIs where SessionStart
-    // has been unreliable (see the transcript_path note above). Off-cluster
-    // `agent_context` is None in one Option check — response unchanged.
+    // Cluster context: a daemon running INSIDE a Slurm job (a cluster
+    // workspace job) tells its agents where they run, what the job holds,
+    // when it ends and the cluster's rules for agents; a login-node daemon
+    // the user allowed tells them they are on a shared login node. Via the
+    // hook response's `additionalContext` — the only chimaera-owned channel
+    // that reaches BOTH surfaces (TUI and chat ride the same `--settings`
+    // hooks) without touching any user-owned file ($HOME is a shared
+    // filesystem, so a CLAUDE.md edit would leak into every node's
+    // sessions). Delivered once per record, on whichever carrier fires
+    // first: SessionStart covers chat mode (hooks fire normally under
+    // stream-json EXCEPT UserPromptSubmit — PROTOCOL.md), the first
+    // UserPromptSubmit covers TUIs where SessionStart has been unreliable
+    // (see the transcript_path note above). Off-cluster `agent_context` is
+    // None after one Option check and one atomic load — response unchanged.
     let mut context: Vec<String> = Vec::new();
     if compute_ctx_pending {
         if let Some(ctx) = state.compute.agent_context().await {

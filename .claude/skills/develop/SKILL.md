@@ -242,7 +242,7 @@ never install later from a shared `target/debug/chimaera` path that another buil
 may have replaced. Signing changes executable bytes, so compare signed artifacts
 with their own recorded hashes rather than with the unsigned linker output.
 
-**2. To test against a REMOTE host from that isolated app** (e.g. Sherlock): a
+**2. To test against a REMOTE host from that isolated app** (e.g. an HPC cluster): a
 dev connect deploys **your** build, never a release, so a musl daemon of this
 branch must exist where THIS app looks. The trap: the in-app hint says
 `~/.chimaera/dist`, but an **isolated** app reads its own
@@ -250,7 +250,7 @@ branch must exist where THIS app looks. The trap: the in-app hint says
 `chimaera-<arch>-linux-musl` name (`dist_name`, `chimaera-remote`):
 
 ```sh
-# needs zig + cargo-zigbuild; arch = the host's (Sherlock = x86_64)
+# needs zig + cargo-zigbuild; arch = the host's (most clusters are x86_64)
 cargo zigbuild --release --target x86_64-unknown-linux-musl -p chimaera
 HOME_DIR="$(bash .claude/skills/develop/run-app-isolated.sh --print-home)"
 mkdir -p "$HOME_DIR/data/dist"
