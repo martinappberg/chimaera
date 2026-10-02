@@ -1,8 +1,10 @@
 # The plugin platform: screens, programs, tools and trust
 
-Dated 2026-09-29. A plan, and from phase P6 on a record: **P6 (trust) is built**
-([the feature page](features/plugins.md#trust-what-a-plugin-can-do-and-who-approved-it));
-P7 onward is still plan. It grows the WASM
+> **Dated design record.** The platform shipped in PR #225. Use [extensions](../features/plugins.md) and the [extension guide](../agent-guides/plugins.md) for the current interface; the phase statuses and code map below preserve earlier implementation snapshots.
+
+Snapshot status (2026-09-29): **P6 (trust) was built**
+([the feature page](../features/plugins.md#trust-what-a-plugin-can-do-and-who-approved-it));
+P7 onward was still planned at that snapshot. The design grows the WASM
 plugin host of the [plugin system plan](plugin-system-plan.md) (shipped as the WIT
 world `chimaera:plugin@0.1.0`) into a platform: a plugin can draw screens in
 Chimaera's own format, run the programs it declares, install the side programs it
@@ -86,7 +88,7 @@ asked for the platform to be built, starting with the trust phase (P6).
    each data surface carry a version. Additions are minor; an unknown node or field
    degrades visibly, never breaks.
 6. **Login-node discipline.** Lazy, bounded, nothing polls, a quota per plugin, one
-   daemon-wide queue for programs ([daemon rules](../.claude/rules/daemon.md)).
+   daemon-wide queue for programs ([daemon rules](../../.claude/rules/daemon.md)).
 7. **Off means off.** Where no plugin is active, what agents see is byte-identical
    (the `agent_view` fixtures) and every file opens in its default viewer.
 8. **Today's plugins keep working.** Adopting anything new is opt-in and never
@@ -653,7 +655,7 @@ scope = "workspace"               # host | workspace
   with `setting-get(key)` and hears `settings-changed`.
 - `schema.ts` stays the single source of truth for core settings; plugin settings are
   a second, declared source, documented as an exception the way Environment and
-  Documents are ([settings map](../web-ui/src/lib/settings/AGENTS.md)).
+  Documents are ([settings map](../../web-ui/src/lib/settings/AGENTS.md)).
 
 ## 10. Agents
 
@@ -925,7 +927,7 @@ run in parallel. P9 needs both. P10 needs P7.
 ## Coordination: the Knowledge redesign (2026-09-29)
 
 The Knowledge redesign (branch `claude/knowledge-redesign`,
-`docs/knowledge-redesign-plan.md`) and this platform meet in four places. What
+`docs/design/knowledge-redesign-plan.md`) and this platform meet in four places. What
 the redesign should build so that the two fit, decided here for both:
 
 1. **Knowledge is the `knowledge/1` surface: core draws it, the plugin owns its

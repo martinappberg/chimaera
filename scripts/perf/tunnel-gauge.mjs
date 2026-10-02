@@ -3,7 +3,7 @@
 // designates one "visible", floods N others via /exec, and measures:
 //   - bytes/sec arriving per socket (parked sockets receiving = tunnel waste)
 //   - keystroke echo RTT on the visible terminal, idle vs under flood
-// Findings + fix plan: docs/perf-remote-plan.md
+// Findings + fix plan: docs/design/perf-remote-plan.md
 // Usage: node scripts/perf/tunnel-gauge.mjs <base> <token> <flood-count> <id> <id> ...
 //   PARK=1 …  parked sockets auth with {"parked": true} (the R2 attach — no
 //   snapshot) AND send {"type":"park"} before the flood (the R1 frames):

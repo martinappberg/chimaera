@@ -1,4 +1,4 @@
-//! Git G1 (docs/git-and-session-history-plan.md): sessions know their
+//! Git G1 (docs/design/git-and-session-history-plan.md): sessions know their
 //! repository and branch, anchors and the commits between them, refresh
 //! after terminal commands, and the worktree polish (base, lock,
 //! `.worktreeinclude`, the merged/unshared fences, a session's `cwd`).

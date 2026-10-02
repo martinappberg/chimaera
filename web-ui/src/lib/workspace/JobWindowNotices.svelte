@@ -1,7 +1,7 @@
 <script lang="ts">
   /**
    * What a cluster workspace's window (served from inside a Slurm job) says
-   * about the job's end (docs/hpc-portal-plan.md §4.5):
+   * about the job's end (docs/design/hpc-portal-plan.md §4.5):
    * - under an hour left (and once more under ten minutes): a non-blocking
    *   banner offering to continue in a new job — it queues now with the same
    *   setup, and when it starts this job's workspaces move over and this

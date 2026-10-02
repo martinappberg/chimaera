@@ -1,5 +1,11 @@
 # Chat-mode live-test checklist
 
+> **Historical verification checklist — 2026-07-08.** This records the original
+> Claude/Codex review pass, including its then-current versions and setup. For
+> current verification use the [chat-mode workflow](../../.claude/skills/chat-mode/SKILL.md),
+> [live app verification](../../.claude/skills/verify-app/SKILL.md), and
+> [chat feature guide](../features/chat-mode.md). This is not a current completion checklist.
+
 Purpose: confirm that the review's fixes + refactors **preserved behavior** —
 nothing in the structured chat mode regressed. Run against a live daemon + UI
 (the `develop` skill; use `chimaerad-isolated` + Vite in a worktree), plus

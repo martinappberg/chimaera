@@ -1,6 +1,6 @@
 //! The plugin host's runtime: WASM components (`chimaera:plugin`, the WIT in
 //! `crates/chimaera-plugin-api/wit`) under wasmtime, one sandboxed instance
-//! per (plugin, workspace). Design: docs/plugin-system-plan.md ("The host").
+//! per (plugin, workspace). Design: docs/design/plugin-system-plan.md ("The host").
 //!
 //! - **One engine per process**, built on first use (Cranelift, epoch
 //!   interruption, a 64 MiB virtual reservation per memory instead of 4 GiB:

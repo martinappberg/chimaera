@@ -5,37 +5,222 @@ agent CLI) and says exactly what it adds. It is a Rust crate compiled to one
 portable WebAssembly component, `plugin.wasm`, beside a `plugin.toml` manifest;
 the daemon's plugin host runs it in a sandbox through the `chimaera:plugin` WIT
 world. This guide is the recipe. Design and rationale:
-[plugin-system-plan.md](../plugin-system-plan.md) (the host, the limits,
+[plugin-system-plan.md](../design/plugin-system-plan.md) (the host, the limits,
 versions and updates) and
-[timeline-knowledge-plugins-plan.md §6](../timeline-knowledge-plugins-plan.md)
+[timeline-knowledge-plugins-plan.md §6](../design/timeline-knowledge-plugins-plan.md)
 (the seam and the card). What users see: [features/plugins.md](../features/plugins.md).
 The maps: the API crate [chimaera-plugin-api](../../crates/chimaera-plugin-api/AGENTS.md),
 the lock and the test fixture [plugins/](../../plugins/AGENTS.md). The first-party
 plugins, each its own repository and a real example beside the illustration here:
-[chimaera-plugin-mycelium](https://github.com/martinappberg/chimaera-plugin-mycelium) (API 0.1, sandboxed), and
+[chimaera-plugin-mycelium](https://github.com/martinappberg/chimaera-plugin-mycelium) (sandboxed), and
 [chimaera-plugin-latex](https://github.com/martinappberg/chimaera-plugin-latex) and
 [chimaera-plugin-typst](https://github.com/martinappberg/chimaera-plugin-typst) (API 0.2, privileged: file
 views, programs, a downloaded tool, long agent tools).
 
+## Start here: choose the extension seam
+
+In the UI, **Extensions** includes workbench plugins, agent-native plugins,
+skills and connections. These are different authoring targets:
+
+| You want to add | Use | Start with |
+|---|---|---|
+| A workbench view, file preview/action, diagnostics, Knowledge provider, or workspace-scoped agent tool | A workbench plugin: `plugin.toml` + a WebAssembly component | The [starter below](#minimal-api-02-plugin), then the [platform reference](#the-platform-api-02) |
+| Instructions, skills, hooks or MCP connections inside an existing agent CLI | That agent's native extension package | Its own packaging/install contract; a workbench plugin may declare it in `requires.agent_plugins` or `recommends.agent_plugins` |
+| A new agent harness or structured chat driver | Chimaera's agent integration | [Agent engine map](../../crates/chimaera-agent/AGENTS.md) and [protocol](../../crates/chimaera-agent/PROTOCOL.md); a plugin manifest cannot register a harness |
+| A general workbench capability unavailable through host imports | A deliberate change to the host API | [API map](../../crates/chimaera-plugin-api/AGENTS.md), [server map](../../crates/chimaera-server/AGENTS.md), and [interface versioning](#versions-and-updates-from-the-authors-side) |
+
+Keep domain parsing, compilation orchestration and UI trees in the plugin's
+own repository. Extend the host only with a reusable capability and tests;
+the daemon and client must not branch on a new plugin's id or file format.
+Workbench plugins use the host's semantic `ui/1` trees and existing viewers,
+rather than shipping arbitrary JavaScript, HTML or a Svelte bundle.
+
+For an agent implementing a plugin, work in this order:
+
+1. Read the plugin repository's own `AGENTS.md`, manifest, API dependency pin
+   and tests. In this repository, read the [API map](../../crates/chimaera-plugin-api/AGENTS.md)
+   and [fixtures map](../../plugins/AGENTS.md); if changing the host or renderer,
+   also read the most specific map and matching `.claude/rules/` files.
+2. Write the promised **For you** / **For agents** behavior and choose the
+   smallest access, views, events and programs that implement it.
+3. Build and inspect capabilities before installing in an isolated daemon.
+   Installing, trusting and switching on are separate operations.
+4. Verify the visible flow and tools while on, while off, in another workspace
+   and after reinstalling the build. Keep pure parsers/state transitions in
+   native tests; exercise host imports through the real daemon.
+5. Report commands, observed outcomes and any unverified platform or agent.
+   Follow the [author checklist](#author-checklist) before releasing.
+
+The current SDK targets **API 0.2**; the host also serves the frozen 0.1 world.
+For source questions, the authority is the
+[WIT](../../crates/chimaera-plugin-api/wit/chimaera.wit),
+[Rust SDK](../../crates/chimaera-plugin-api/src/lib.rs),
+[manifest parser](../../crates/chimaera-server/src/plugins/mod.rs),
+[platform declarations](../../crates/chimaera-server/src/plugins/platform.rs)
+and [screen validator](../../crates/chimaera-server/src/plugins/screens.rs).
+The linked design plans explain rationale; a plan does not establish that an
+API or command has shipped.
+
+## Minimal API 0.2 plugin
+
+This complete starter exposes one agent tool and one workbench tab without
+filesystem, Timeline, session or program access. Create these three files in
+a separate `chimaera-plugin-hello/` directory. There is no scaffold generator
+in this repository. Replace the dependency path with the absolute path to
+your Chimaera checkout while developing locally:
+
+`Cargo.toml`:
+
+```toml
+[package]
+name = "chimaera-plugin-hello"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+chimaera-plugin-api = { path = "/absolute/path/to/chimaera/crates/chimaera-plugin-api" }
+```
+
+`plugin.toml`:
+
+```toml
+id = "hello"
+name = "Hello"
+version = "0.1.0"
+summary = "A greeting tab and a greeting tool for agents in this workspace."
+api = "0.2"
+
+[access]
+files = "none"
+timeline = "none"
+sessions = "none"
+
+[provides]
+mcp_tools = ["hello_greet"]
+
+[adds]
+ui = ["A Hello tab with a greeting"]
+agents = ["The hello_greet tool replies with a greeting"]
+
+[[views]]
+id = "greeting"
+title = "Hello"
+slot = "tab"
+```
+
+`src/lib.rs`:
+
+```rust
+use chimaera_plugin_api::serde_json::{json, Value};
+use chimaera_plugin_api::{ui, Context, Plugin, ToolDef, ToolResult};
+
+struct Hello;
+
+impl Plugin for Hello {
+    fn tools() -> Vec<ToolDef> {
+        vec![ToolDef::new(
+            "hello_greet",
+            "Reply with a greeting.",
+            json!({"type": "object", "properties": {}, "additionalProperties": false}),
+        )]
+    }
+
+    fn instructions() -> Option<String> {
+        Some("Use hello_greet when asked to test the Hello plugin.".into())
+    }
+
+    fn call_tool(_cx: Context, name: &str, _args: Value) -> ToolResult {
+        match name {
+            "hello_greet" => ToolResult::text("Hello from this workspace's plugin."),
+            other => ToolResult::error(format!("unknown tool {other}")),
+        }
+    }
+
+    fn render(_cx: Context, view: &str, _args: Value) -> Result<Value, String> {
+        match view {
+            "greeting" => Ok(ui::tree(ui::stack(vec![
+                ui::heading("Hello"),
+                ui::text("Hello from this workspace's plugin."),
+            ]))),
+            other => Err(format!("unknown view {other}")),
+        }
+    }
+}
+
+chimaera_plugin_api::export!(Hello);
+```
+
+From the plugin directory, use the same pinned compiler as the current
+Chimaera checkout (check `rust-toolchain.toml` when it changes):
+
+```sh
+rustup target add --toolchain 1.96.0 wasm32-wasip2
+cargo +1.96.0 fmt --all --check
+cargo +1.96.0 clippy --all-targets -- -D warnings
+cargo +1.96.0 test
+cargo +1.96.0 build --release --target wasm32-wasip2
+mkdir -p dist
+cp target/wasm32-wasip2/release/chimaera_plugin_hello.wasm dist/plugin.wasm
+cp plugin.toml dist/plugin.toml
+```
+
+Do not use a plain native `cargo build` for the component. Keep `dist/` and
+`target/` out of version control. For a published plugin, replace the local
+SDK path with a git dependency pinned to a real commit that provides API 0.2
+(as in [the crate section](#the-crate)), and commit its Cargo lockfile.
+
+Start the isolated daemon from the Chimaera checkout using
+[develop](../../.claude/skills/develop/SKILL.md#isolated-per-worktree-run-coding-agents--use-this-in-a-worktree).
+Then run these commands **from that checkout**, replacing the install path
+with your plugin's absolute `dist/` path:
+
+```sh
+target/debug/chimaera plugin caps /absolute/path/to/chimaera-plugin-hello/dist/plugin.toml
+CHIMAERA_HOME="$PWD/.chimaera-dev" target/debug/chimaera plugin add --path /absolute/path/to/chimaera-plugin-hello/dist
+CHIMAERA_HOME="$PWD/.chimaera-dev" target/debug/chimaera plugin list
+```
+
+The CLI reads the daemon manifest under `CHIMAERA_HOME`; omitting it can
+target your normal daemon. A local build may ask you to trust its declared
+capabilities. Review them as part of the install flow. In the preview's
+**Extensions → Plugins**, switch **Hello** on in a test workspace, expand its
+card and use **Open** to show the tab. A new agent session in that workspace
+should offer and successfully call `hello_greet` (an agent CLI may display its
+own MCP-server prefix). Switch it off and verify that the tool and
+view are unavailable there and that another workspace remains unaffected.
+
+For the edit loop, rebuild, copy both files to `dist/`, then repeat the same
+isolated `plugin add --path` command. Reinstalling the same version replaces
+the bytes and resets the live instance; no daemon restart is needed. A
+client sees the new tool set on its next `tools/list`; use a fresh agent
+session if its CLI caches tool discovery. If staging `SHA256SUMS`, regenerate
+it after every edit or the next install will correctly refuse stale hashes.
+
 ## The rules that don't bend
 
-- **A plugin is a Rust crate compiled to WASM.** A `cdylib` built for
-  `wasm32-wasip2` against `chimaera-plugin-api`: never code compiled into the
-  daemon, never a script, never native code. No plugin behaviour is daemon
+- **A workbench plugin's entry point is a WASM component.** A Rust `cdylib`
+  built for `wasm32-wasip2` against `chimaera-plugin-api`, loaded through the
+  host contract. Native programs are separate declared jobs. No plugin behaviour is daemon
   code; a plugin that needs something the host doesn't offer needs a new host
   import (a WIT change, below), not a special case in the daemon.
-- **The host bounds everything.** A plugin cannot open a file, start a
-  process, reach the network or touch the daemon's state; it asks the host,
-  and every limit (deadlines, memory, read and listing caps, state size,
-  Timeline rate caps) is enforced there, for every plugin. Never enforce a
-  host limit in the plugin; pre-checking for a friendlier message is fine.
-- **The exports are the complete set; imports are additive.** Every plugin
-  provides the six exports of the `plugin` interface (the `Plugin` trait
-  gives each a default). Removing or changing an export, or a record a
-  plugin returns, breaks every built plugin. A new host import does not: a
-  host may offer more than a component uses, so the planned WIT 0.2 (jobs,
-  a watch set, screens: the [platform plan](../plugin-platform-plan.md)) adds
-  imports without breaking a 0.1 plugin.
+- **The host enforces the component's boundaries.** WebAssembly has no
+  direct file, process, environment or network access; it asks through host
+  imports. The host enforces deadlines, memory, read/listing caps, state size
+  and Timeline rate caps. A plugin with declared programs or downloads is
+  **privileged**: its native jobs run with the daemon user's access, outside
+  the WASM sandbox. Job resource limits are not filesystem or network
+  isolation. Never rely on a plugin to enforce a host boundary;
+  pre-checking for a friendlier message is fine.
+- **The WIT world is the complete contract.** API 0.2 has six exports in
+  `plugin` and three in `screens`; the `Plugin` trait supplies defaults for
+  all of them. Removing or changing an export or returned record breaks
+  components targeting that world. Keep the frozen 0.1 world and its host
+  bindings when evolving 0.2; an older compiled component does not acquire
+  a new world simply because the Rust trait has defaults.
 - **No host call in a native test.** Built natively (tests, clippy), every
   host import is a wit-bindgen stub that aborts the whole test binary. Keep
   pure logic in functions that take data (the example's `src/pad.rs`) or
@@ -61,8 +246,9 @@ views, programs, a downloaded tool, long agent tools).
 - **Agent-side pieces ride open standards** (MCP, Agent Skills, the agents'
   own plugin managers) so they keep working outside Chimaera. Never
   reimplement `claude plugin` / `codex plugin`.
-- **Login-node discipline.** Detection is a few `stat`s off the reactor,
-  cached; nothing polls; a plugin nobody switches on is never compiled.
+- **Login-node discipline.** Detection is a few `stat`s off the reactor and
+  cached. Use the host's bounded events/watch set for changes; avoid a
+  plugin-specific polling loop. A plugin nobody switches on is never compiled.
 
 ## The manifest
 
@@ -71,7 +257,7 @@ an error, not a silently ignored key) and validated: the id, the version, the
 release source.
 
 ```toml
-id = "mycelium"                 # stable; lowercase letters, digits, dashes; ≤ 64; not "install"
+id = "mycelium"                 # stable; lowercase letters, digits, dashes; ≤ 64; "install"/"preview" reserved
 name = "Mycelium"
 version = "0.1.1"               # the plugin's own, MAJOR.MINOR.PATCH; must equal the crate's
 summary = "Project memory your agents record as they work — findings, decisions, learnings."
@@ -137,8 +323,10 @@ What each part does, and what exists today:
 | `setup.prompt` | a new chat session of the user's chosen agent, sent this prompt | `plugins::setup_workspace` |
 | `provides.knowledge` | the plugin is the Knowledge provider; its `knowledge` export feeds the view and `GET /workspaces/{id}/knowledge` | `knowledge.rs`, `runtime::knowledge` |
 | `provides.mcp_tools` | tools served by the chimaera MCP where active, plus the `instructions` paragraph; pre-allowed at spawn. Unique names, 1–64 ASCII letters, digits, underscores or dashes — no dots (codex pre-approves a tool by a dotted config key a dot would split); built-in names are reserved | `plugins/tools.rs`, `runtime::offer` |
-| `provides.events` | which `on-event` variants the host delivers (none by default); `hook` and `session-ended` are delivered, `switched-on` / `switched-off` are declarable but not delivered yet | `runtime::hook`, `runtime::session_ended` |
-| `provides.views` | parses and rides the wire; nothing renders it | none yet |
+| `provides.events` | declared events only (none by default): `hook`, `session-ended`, `switched-on`, `switched-off`; API 0.2 also supports file, settings and job events ([events](#events)) | `runtime`, workspace switch handler, `files.rs`, `pdata.rs`, `jobs.rs` |
+| `provides.views` | legacy string list; does not declare a platform screen. Use top-level `[[views]]` for screens | `manifest_json`; `platform::validate` for `[[views]]` |
+| `[[views]]`, `[[files]]`, `[[actions]]`, `[[settings]]` | API 0.2 screens, file kinds, file actions and declared settings; see the [platform reference](#the-platform-api-02) | `platform.rs`, `screens.rs`, `files.rs`, `pdata.rs` |
+| `[[programs]]`, `[[tools]]` | API 0.2 native jobs and optional downloaded tools; either makes the plugin privileged | `platform.rs`, `jobs.rs`, `toolchain.rs` |
 | `[adds]` | the card's "For you: …" (`ui`) and "For agents: …" (`agents`) sentences | the UI |
 | `[release] github` | where the checker and Update look for newer versions; required for release installs and must match the repository being fetched; the maintainer badge additionally requires a recorded official source or pinned bytes | `plugins/releases.rs`, `plugins/installed.rs`, `plugins/mod.rs` |
 
@@ -149,13 +337,13 @@ summaries from the release's own `plugin.toml`, fetched and checksum-verified
 by the daemon (`GET /plugins/{pid}/details`, `POST /plugins/preview`) — so
 write them for someone deciding whether to install.
 
-`settings` and `commands`, sketched in the earlier plan, are not manifest
-keys; the first plugin that needs one adds it with a test and a row here.
+Use `[[settings]]` for API 0.2 settings and `[[actions]]` for file actions.
+There is no manifest `commands` key; unknown keys are rejected.
 
 ### What it can do: the capabilities
 
 The daemon derives one list from the manifest — the plugin's **capabilities**
-([platform plan §1](../plugin-platform-plan.md#1-capabilities)): its
+([platform plan §1](../design/plugin-platform-plan.md#1-capabilities)): its
 `[access]`, each agent tool, the hook line (`events = ["hook"]`), being the
 Knowledge provider, each agent-side plugin it names (with its marketplace) and
 a setup prompt. That list is the card's **Can** row, what a trust prompt asks
@@ -322,7 +510,8 @@ plugin's own choice of how much to keep.
 
 The other exports: `knowledge(cx, known)` returns `Ok(None)` when `known` (the
 stamp the host holds) is still current, else `Snapshot::new(&stamp, &data)`
-(Mycelium's `src/lib.rs` is the example); `query` has no caller yet.
+(Mycelium's `src/lib.rs` is the example); `query` serves the authenticated UI
+query route and paginated `ui/1` lists/tables.
 `Context` carries `workspace`, `session` (absent for workspace-level asks such
 as `knowledge`) and `mastermind`. The host ignores the `cx` a plugin passes
 back and serves the workspace and session of the call in flight, so a plugin
@@ -344,7 +533,7 @@ return the host's reason as a `String`). The limits are in
 | `host::sessions(&cx)` | the workspace's sessions: `id`, `kind`, `name`, `chat`, `alive`, `mastermind` | at most 256 |
 | `host::timeline_append(&cx, &entry)` | appends a Timeline entry; returns its seq | only from a session's call; `{"kind":"note","to":…,"text":…}` and no other kind or field; text ≤ 2 KiB; `to` a session in this workspace, `"mastermind"` or null; 10 posts per session per minute (the window agent messages share); shown on the Timeline, never delivered into an agent |
 | `host::timeline_recent(&cx, &kinds, limit)` | the newest entries of `kinds`, newest first | looks through the newest 200 entries; at most 16 kinds |
-| `host::emit(&cx, &event)` | a `{"type":"plugin","plugin":…,"workspace":…, …event}` frame on `/ws/events` | one JSON object ≤ 16 KiB; the host's keys win; a ring of 64 (no UI reads these yet) |
+| `host::emit(&cx, &event)` | a `{"type":"plugin","plugin":…,"workspace":…, …event}` frame on `/ws/events` | one JSON object ≤ 16 KiB; the host's keys win; a ring of 64; routed to the client's platform-frame listeners. Prefer `invalidate` or `publish` for standard screen/surface updates |
 | `host::now_ms()` | wall-clock ms since the epoch | |
 | `host::log(level, message)` | a daemon log line tagged with the plugin | 64 lines per call, 2 KiB each |
 
@@ -397,11 +586,15 @@ on the daemon's host:
 mkdir -p /tmp/scratchpad-dev
 cp target/wasm32-wasip2/release/chimaera_plugin_scratchpad.wasm /tmp/scratchpad-dev/plugin.wasm
 cp plugin.toml /tmp/scratchpad-dev/plugin.toml
-chimaera plugin add --path /tmp/scratchpad-dev   # or POST /api/v1/plugins/install {"path": "/tmp/scratchpad-dev"}
+# From the Chimaera checkout, after starting its isolated daemon:
+CHIMAERA_HOME="$PWD/.chimaera-dev" target/debug/chimaera plugin add --path /tmp/scratchpad-dev
 ```
 
-The daemon copies both files (and a `SHA256SUMS`, when the directory has one:
-both files must then match it) into `~/.chimaera/plugins/<id>/<version>/`,
+The authenticated REST equivalent is `POST /api/v1/plugins/install` with
+`{"path": "/tmp/scratchpad-dev"}`. The directory must exist on the daemon's
+host, including when the UI connects remotely. The daemon copies both files
+(and a `SHA256SUMS`, when the directory has one: both files must then match it)
+into `<CHIMAERA_HOME>/plugins/<id>/<version>/` (`~/.chimaera` by default),
 notes the directory in `local-path`, and gates the manifest like any other.
 Installing the same version again replaces it in place, so the loop is:
 rebuild, copy, `chimaera plugin add --path <dir>`, and a running session's
@@ -453,16 +646,19 @@ What the card shows is the daemon's, never the plugin's own claim:
   automatically (CI-gated) — and the installed copy's `[release] github`
   matches the lock's `repo` (case-insensitive). The bytes must also match the
   lock or come from a release install whose source the host recorded in
-  `source-github`. An update from that repository keeps the badge. Local
-  installs do not copy that marker, so a rebuilt copy cannot assert the badge.
+  `source-github`. Its standing must also remain `verified`: a sandboxed
+  update needs the lock's approved capability digest; a privileged build
+  needs the pinned version and verified bytes. Local installs do not copy
+  that marker, so a rebuilt copy cannot assert the badge.
 - **"local build"**: the copy was installed from a directory (`--path`;
   `local_path` on the wire).
 - **Can**: what it can do, in the daemon's words (`can` on the wire), for
   every plugin, verified or not — and, when it can't run on this host, why
   (`hold`: waiting for the user's trust, blocked by Chimaera, or the host's
-  policy). A first-party update keeps the badge only while its capability
-  digest is the one the lock recorded (`caps`); one that asks for more is the
-  user's to trust, and loses the badge.
+  policy). A sandboxed first-party update keeps the badge only while its
+  capability digest is the one the lock recorded (`caps`); one that asks for
+  more is the user's to trust, and loses the badge. Privileged builds require
+  the lock's pin even when their capability digest stays the same.
 - **Nothing about checksums.** The safety mechanism is the daemon's: it
   checks every download against the release's `SHA256SUMS` (and a
   first-party one against the lock's two sha256s), keeps that file beside the
@@ -495,17 +691,20 @@ A first-party bump:
 2. Daemons that have it installed offer it: the checker asks every
    installed plugin whose manifest names `[release]`, and **Update** (or
    `chimaera plugin update <id>`) installs it. A first-party copy updated past
-   the pin keeps its check badge.
+   the pin keeps its check badge only when sandboxed and its capabilities
+   still match the lock; privileged updates require review/trust until pinned.
 3. The chimaera repository follows on its own: within the hour, the
    `plugin-lock` workflow checks the new release (`SHA256SUMS` against the
    downloaded bytes; the manifest's id, version and `[release] github`
    against the lock), rewrites the entry in `plugins/plugins.lock` and opens
-   `fix: update <Name> to <version>` with squash auto-merge. CI installs the
+   `fix: update <Name> to <version>`. Auto-merge is limited to sandboxed
+   releases whose capability declarations match the pinned release; other
+   bumps wait for a maintainer to approve `tier` and `caps`. CI installs the
    release against the new lock, and the merge cuts a patch release: from it,
    **Install** fetches that version. Details, the one-time token and how to
    turn a version down: [plugins/AGENTS.md](../../plugins/AGENTS.md).
 
-To add one: a repository shaped like those two, its first release, a
+To add a first-party plugin: a repository shaped like the examples, its first release, a
 `[[plugin]]` in the lock, the daemon-side tests (above), a feature page and
 this guide if it adds a manifest part, and a live check (install it in the
 isolated preview, switch it on, watch a new session get exactly the
@@ -518,10 +717,9 @@ gates, and that it says what it adds.
 **Third-party** plugins live in their own repository and install on a daemon's
 host:
 
-- The repository is also a claude and codex marketplace repository, so its
-  agent-side pieces install through the agents' own plugin managers:
-  `.claude-plugin/`, `.codex-plugin/`, skills and hooks beside the crate and
-  its `plugin.toml`.
+- If it also ships agent-side pieces, package them for each supported agent's
+  own plugin manager (for Claude/Codex, their marketplace metadata, skills
+  and hooks). A workbench-only plugin needs no agent marketplace package.
 - Its manifest names `[release] github = "owner/repo"`, so the daemon can
   check it and the card can offer **Update**.
 - Each release is tagged `v<version>` and carries three assets:
@@ -549,7 +747,7 @@ host:
   (the example's `lines` key). A plugin that wants a clean slate writes a new
   key.
 - **The gates decide who gets it.** `api` must be a WIT version the daemon
-  serves (0.1 today), and `requires.chimaera` (optional) must match the
+  serves (0.1 and 0.2 here), and `requires.chimaera` (optional) must match the
   daemon. A release that fails either is never offered, and an installed copy
   that stops passing is listed off with its reason ("needs a newer chimaera",
   "needs a newer plugin", "needs chimaera ≥ x"). Set `requires.chimaera` when
@@ -564,24 +762,27 @@ host:
   every installed version; a first-party plugin is then listed as available
   again.
 - **Changing the interface.** The WIT package version is the contract. Adding
-  a host import is a minor bump (0.2 is planned in the
-  [platform plan](../plugin-platform-plan.md#11-the-interface-wit-02)); changing or
-  removing an export is a new major with a new world, served beside the old
-  one for a transition. With any WIT change, bump the package version, the
+  a host import needs a new package version; changing or removing an export
+  requires a new compatible host binding/world strategy, served beside the
+  old one for a transition. API 0.2 is implemented (see the
+  [platform plan](../design/plugin-platform-plan.md#11-the-interface-wit-02) for its
+  design). With any WIT change, bump the package version, the
   API crate's version with it, and the host's `plugins::API`, adding the new
   version to `plugins::SERVED_APIS` beside those it still serves.
 
 ## The platform: API 0.2
 
 A plugin that says `api = "0.2"` gets the platform
-([plan](../plugin-platform-plan.md) §3–§9): screens in Chimaera's own format,
+([plan](../design/plugin-platform-plan.md) §3–§9): screens in Chimaera's own format,
 file kinds and file actions, data surfaces core draws, file events, an output
 folder, declared settings and durable state. The host serves 0.1 beside it
 unchanged (its own bindings, `wit-0.1/`), so moving is a choice: bump the
 `chimaera-plugin-api` dependency and `api`, and **declare `[access]`** — in 0.2
 a key left out means none (0.1 implied files, the Timeline with notes, and
-sessions). Every new export has a default, so a 0.1 plugin compiles on 0.2
-unchanged. Programs, side-program downloads and long agent tools are in
+sessions). The new trait methods have defaults, so existing 0.1 source can
+often be rebuilt against 0.2 without new method implementations; the rebuilt
+component must declare `api = "0.2"`. Existing 0.1 components keep using
+the frozen world. Programs, side-program downloads and long agent tools are in
 [their own section](#programs-jobs-and-tools); they make a plugin privileged.
 
 ```toml
@@ -714,7 +915,7 @@ Data core draws with its own views; `publish` checks the shape:
 | `diagnostics/1` | `{items: [{file, severity (error warning info hint), line (from 1), column?, end_line?, end_column?, message, context?, source?}]}`, ≤ 200 per file, ≤ 2,000 per key |
 | `output/1` | `{source, output, state (building ok errors failed), label?, finished_ms?, changed_pages?, log?}` |
 | `sourcemap/1` | `{output, files: [path], records: [[file, line, page, x, y, width, height]]}`, ≤ 4 MiB, kept in the output folder |
-| `knowledge/1` | the Knowledge snapshot (see the [coordination section](../plugin-platform-plan.md#coordination-the-knowledge-redesign-2026-09-29)), ≤ 4 MiB |
+| `knowledge/1` | the Knowledge snapshot (see the [coordination section](../design/plugin-platform-plan.md#coordination-the-knowledge-redesign-2026-09-29)), ≤ 4 MiB |
 | `references/1` | ids it answers for: `{shapes: [{kind, pattern}], ids: [{id, key, kind, title, span?: {path, line, end_line}, view?}]}` — 1–16 shapes, each a regex source of ≤ 80 bytes with no groups or anchors; ≤ 5,000 ids a key; ≤ 4 MiB, kept in the output folder. Every id with a `span` or a `view` becomes a chip where its shape matches in chats and Knowledge: hover previews the span, a click opens it (or the plugin's view). `end_line` 0 means to the end of the file |
 
 Paths are workspace-relative or `output:<path>`. A window asks
@@ -732,7 +933,7 @@ events debounced per file. Declaring one of the 0.2 events needs `api = "0.2"`.
 ### Programs, jobs and tools
 
 A plugin may run programs on the host, and download the ones it needs
-([plan](../plugin-platform-plan.md) §6, §8). Either makes it **privileged**: the
+([plan](../design/plugin-platform-plan.md) §6, §8). Either makes it **privileged**: the
 card says "runs programs" and lists each one, a shell (`sh`, `bash`, `python`,
 `node`, `env`, …) gets "Runs sh: this plugin can run any command on this host",
 and a first-party privileged plugin is verified only at the lock's pin, since
@@ -812,8 +1013,11 @@ and 200,000 entries), runs the setup steps as jobs, and keeps
 `~/.chimaera/tools/<plugin>/<tool>/<version>/` behind a `current` link (two
 versions at most; the host setting `plugins.toolsDir` moves that root, and an
 install first checks for room: the download, about three times it unpacked,
-and 1 GB to spare). Nothing outside that folder changes: its `bin` joins only
-this plugin's jobs' PATH. Removing the plugin removes its tools.
+and 1 GB to spare). The host confines unpacking to that folder and adds its
+`bin` only to this plugin's jobs' PATH. Setup steps and later native jobs are
+privileged processes: they can access files and network as the daemon user,
+and a `programs.network` description is disclosure, not an enforced network
+allowlist. Removing the plugin removes its managed tools.
 
 ### Testing a 0.2 plugin
 
@@ -825,3 +1029,71 @@ actions, query, settings, output, surfaces, file events, a restart).
 served by a local fake host, a wrong checksum, a waiting agent tool). Copy
 their shape: pure logic in functions that take data, the host calls in the
 daemon's tests.
+
+## Worked examples and acceptance checks
+
+Choose the smallest example that covers the capability you are adding.
+Fixtures are host-test inputs, with intentionally hostile tools for checking
+limits; use their API shape rather than publishing a fixture unchanged.
+
+| Task | Concrete reference | What to verify live |
+|---|---|---|
+| Add a tab, dashboard panel, status chip or card section | [Platform manifest](../../plugins/test-platform/plugin.toml) and [implementation](../../plugins/test-platform/src/lib.rs) | Open each declared slot, trigger an action, resize narrow/wide, check light/dark and keyboard navigation |
+| Claim a file kind and add file actions | The platform fixture's `doc` view and `count-words` action | Open a matching file, use Text/Open with, save it, change it from an agent or shell and observe the declared events |
+| Publish diagnostics, output or references | The platform fixture's `publish` action; [surface validation](../../crates/chimaera-server/src/plugins/surfaces.rs) | Check editor marks and links, replace/remove a surface, switch off and confirm stale entries disappear |
+| Keep durable settings/state | The platform fixture's `keep` action and settings; [data/settings host](../../crates/chimaera-server/src/plugins/pdata.rs) | Reset defaults, switch off/on and restart the isolated daemon; migrate values written by the previous plugin version |
+| Run a program, download a tool or answer a long agent call | [Privileged manifest](../../plugins/test-privileged/plugin.toml), [implementation](../../plugins/test-privileged/src/lib.rs) and [job tests](../../crates/chimaera-server/src/tests/plugin_jobs.rs) | Missing program/tool, explicit install, progress, success/error, timeout/cancel and switching off during a job; check `tool_resume` and the delayed response |
+| Read project Knowledge | [Mycelium repository](https://github.com/martinappberg/chimaera-plugin-mycelium), [Knowledge tests](../../crates/chimaera-server/src/tests/knowledge.rs) | Detection, empty/malformed input, duplicate ids and links, changed snapshot, provider update and switch-off |
+| Build documents into a preview | [LaTeX repository](https://github.com/martinappberg/chimaera-plugin-latex), [Typst repository](https://github.com/martinappberg/chimaera-plugin-typst) | Source/PDF view, errors, output links, host-program selection and downloaded-tool selection on every claimed platform |
+
+For a change to the host itself, build the fixtures with
+`bash scripts/build-plugins.sh`, then run `just check` and the relevant UI
+checks. For a plugin-only change, use that repository's native checks and
+WASM build, followed by a real isolated-daemon flow. A docs-only edit needs
+the doc-link check; it does not require starting a daemon. The
+[verify-app workflow](../../.claude/skills/verify-app/SKILL.md) describes
+runtime evidence to record when behavior changes.
+
+### When the local build does not appear
+
+| Symptom | Check next |
+|---|---|
+| Installed on the wrong daemon, or no daemon found | Run the CLI on the daemon host with the preview's `CHIMAERA_HOME`; compare `plugin list` with that preview's Extensions cards |
+| Card says on but not active | Check `detect.any`, workspace root, symlink refusal, daemon/API gates, agent requirements and `hold`/`fault`; the workspace switch alone is not activation |
+| Import refused after moving from 0.1 to 0.2 | Declare `[access]` explicitly; 0.2 defaults each omitted access to none |
+| Component will not load | Confirm `wasm32-wasip2`, SDK WIT version and manifest `api`; copy the renamed component, not a native library or `wasm32-unknown-unknown` module |
+| No agent tools offered | Make `provides.mcp_tools` match `tools()` exactly, use unique names prefixed for your plugin, check object schemas, then request a new `tools/list` or start a fresh session |
+| Screen rejected, action does nothing | Read the reported JSON-path problems, return a `ui/1` tree, match the declared view/action, and respect built-in action payloads; use `invalidate` when updating another open view |
+| Native unit tests abort | A test reached a `host::*` or `platform::*` import; move the logic behind pure inputs or a test adapter |
+| Reinstall fails verification | Regenerate or remove a local staging `SHA256SUMS` after changing either file; published checksums must match both assets |
+| New version asks for trust | Inspect `plugin caps`: capability growth and privileged updates can require approval even for an existing first-party repository |
+
+## Author checklist
+
+- The extension seam and repository are correct; domain behavior stays in the
+  plugin, and a host change is generic, versioned and tested.
+- `Cargo.toml`, `plugin.toml`, release tag and compiled WIT agree. The SDK is
+  pinned for release builds; a new plugin targets API 0.2 and declares access.
+- `[adds]`, descriptions and setup prompts describe actual user/agent
+  behavior. Tools have plugin-specific names, object schemas, useful errors
+  and matching manifest/export lists.
+- Native tests cover pure logic and failure cases without host imports. The
+  WASM build succeeds; real host calls and UI behavior have live evidence.
+- Activation and call gates work while on/off and across workspaces. Check
+  detection, absent/malformed inputs, relevant caps and fault recovery.
+- Views use semantic nodes and core viewers; verify narrow/wide, light/dark,
+  labels, focus and an understandable empty/error state. Events, watches,
+  invalidation and published surfaces are used for updates.
+- Programs/downloads are declared and disclosed. Test missing dependencies,
+  job limits/cancellation and each claimed platform. Keep reproducible URLs,
+  checksums and tool setup; a native job is privileged.
+- Updates accept old state and settings, and rollback is usable. Capability
+  changes are intentional and checked with `chimaera plugin caps`.
+- A release carries `plugin.wasm`, `plugin.toml` and `SHA256SUMS`, with a
+  matching `[release] github`. Curated first-party inclusion additionally
+  requires the lock review and tests in [plugins/AGENTS.md](../../plugins/AGENTS.md).
+- The plugin repository's README/agent instructions explain build, local
+  install, supported hosts and usage. Update this guide for an API change,
+  the relevant maps for host wiring, and the feature catalog for shipped
+  user-facing behavior. Report what was verified and what still needs a host,
+  credential or platform you could not exercise.

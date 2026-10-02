@@ -1,6 +1,6 @@
 package chimaera:plugin@0.2.0;
 
-// The platform world (docs/plugin-platform-plan.md). Everything 0.1 had keeps
+// The platform world (docs/design/plugin-platform-plan.md). Everything 0.1 had keeps
 // its meaning; 0.2 adds the `platform` imports (output folders, data surfaces,
 // screens' invalidation, the watch set, declared settings, durable state, the
 // roots, and programs run as jobs), the `screens` exports (render, on-action,

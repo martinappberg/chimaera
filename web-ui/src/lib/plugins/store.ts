@@ -19,7 +19,7 @@
  *   POST /plugins/{pid}/skip {version}             Skip this version (an update that asks for more)
  *   GET  /plugins/{pid}/activity                   the activity log, newest first
  *
- * Trust (docs/plugin-platform-plan.md §2): a plugin the maintainers haven't
+ * Trust (docs/design/plugin-platform-plan.md §2): a plugin the maintainers haven't
  * verified, or an update that asks for more, is refused with 409 and what it
  * can do (`TrustNeeded.ask`); the caller shows the trust prompt and sends
  * the same request again with the capability digest the user saw.

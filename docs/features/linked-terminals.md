@@ -28,8 +28,11 @@ leash-drawing in `web-ui/src/App.svelte`; the drag band that arms a link is in
   (drops locally, re-lists on failure). Each agent gets a **deterministic accent hue** (a curated
   5-hue palette clear of the semantic colors) painted on its chips, its linked-pane borders, and
   its exec pulses. Reference resolution prefers the leash: a selection from a *linked* terminal
-  lands on its bound agent before any focused/MRU/newest agent. Links live **in memory only** — a
-  link dies with either session, and sessions die with the daemon.
+  lands on its bound agent before any focused/MRU/newest agent. Live links are held in memory and
+  included in the session ledger. Boot restoration reinstates an edge only when both
+  endpoints are present in the restored PTY roster; a dead endpoint drops its link. The
+  current boot check does not include structured-chat agents, so their links must be granted
+  again after a daemon restart (`ledger::consume_boot`).
 
 ## The MCP server
 
@@ -40,11 +43,11 @@ leash-drawing in `web-ui/src/App.svelte`; the drag band that arms a link is in
 - **How it's used.** Wired into claude via the generated `--mcp-config`, and into codex via
   `-c mcp_servers.chimaera.*` overrides (key in the env, never argv — every codex chat; a codex
   TUI while agent communication is on or a workbench plugin with tools is active in its
-  workspace), pointing at
-  `POST /api/v1/mcp/{agent_id}?key={secret}` (JSON-RPC over MCP streamable-HTTP, stateless). Tools:
+  workspace). ACP chats receive the same server through their session MCP configuration.
+  The endpoint is `POST /api/v1/mcp/{agent_id}?key={secret}` (JSON-RPC over MCP streamable-HTTP, stateless). Tools:
   `list_terminals` (the agent's granted terminals), `run_in_terminal` (type a command, await the
   outcome — the same [exec engine](terminals.md#the-exec-engine-and-command-journal)), `read_terminal`
-  (the command journal). The same server also carries `notify` (every session, pre-approved) — see
+  (the command journal). The same server also carries `notify` (every MCP-equipped session; native Claude/Codex pre-allow it) — see
   [notifications.md](notifications.md).
 - **Where it lives.** `mcp.rs` (`mcp`, `tool_defs`, `list_terminals`/`run_in_terminal`/`read_terminal`,
   `autolink_mentions`, `resolve_terminal`). The same server gives every session the document
@@ -95,7 +98,7 @@ also used to pressure-test the questionnaire in the [capture-feature-intent](../
   only** and dropped with the session/daemon, the `@term:` mention as the consent, the accent-hue
   coloring — are how it works **for now**, not a promise. Treat them as the current implementation,
   not a contract.
-- **The security shape (deliberate, from the design).** DESIGN.md's decision log frames a few
+- **The security shape (deliberate, from the design).** docs/design/README.md's decision log frames a few
   stances as intentional: **the user grants links, agents cannot self-link**; a linked agent's tools
   see **exactly** its links and nothing else; approvals stay Claude Code's own. Per the maintainer's
   "additions to the core can improve — don't be too strict" rule these are *deliberate today, not

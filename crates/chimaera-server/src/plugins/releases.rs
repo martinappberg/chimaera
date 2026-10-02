@@ -1,5 +1,5 @@
 //! Plugin releases: where a newer version of a plugin comes from, and
-//! whether one exists. Design: docs/plugin-system-plan.md ("Versions and
+//! whether one exists. Design: docs/design/plugin-system-plan.md ("Versions and
 //! updates").
 //!
 //! A plugin's manifest may name `[release] github = "owner/repo"`: the

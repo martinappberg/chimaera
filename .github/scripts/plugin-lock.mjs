@@ -14,7 +14,7 @@
 // so a bump this script writes still has to pass CI to merge.
 //
 // What the plugin can do is the maintainers' to approve (`tier` and `caps`,
-// docs/plugin-platform-plan.md §2): a bump auto-merges only when the entry is
+// docs/design/plugin-platform-plan.md §2): a bump auto-merges only when the entry is
 // sandboxed and the release's capability lines (`capabilityLines`: `api`
 // and every table but the card's words, the release source and detect) are
 // the pinned release's, so its digest is unchanged. Otherwise the PR opens
@@ -154,7 +154,7 @@ export function capabilityLines(text) {
 
 /**
  * A plugin.toml's tool downloads (`[[tools.artifacts]]`,
- * docs/plugin-platform-plan.md §8): `{tool, platform, url, sha256, size}`
+ * docs/design/plugin-platform-plan.md §8): `{tool, platform, url, sha256, size}`
  * for each, read strictly (`key = "string"` and `size = <integer>`, `_`
  * allowed). The lock pins the manifest, the manifest pins every artifact:
  * a bump downloads each one and compares, so the chain holds only if

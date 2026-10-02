@@ -24,16 +24,18 @@ This skill closes that gap. It has two jobs, and the split is load-bearing:
 | [site/docs.html](../../../site/docs.html) | The install/usage docs page (sidebar + sections). |
 
 All three must agree on the **headline**, the **feature list**, and the **billing story**. A
-change to one is usually a change to all three.
+change to one is usually a change to all three. Describe implemented behavior only: future
+plans and other projects do not belong in the shipped feature list.
 
 ## Sources of truth (read these first — derive, don't remember)
 
 | Source | Gives you |
 |---|---|
 | [docs/features/](../../../docs/features/README.md) | What the app *does* now, feature by feature — the derived truth. **Read this before writing any factual claim.** Honor its `Status: partial` flags. |
-| [DESIGN.md](../../../DESIGN.md) | The positioning spine: the problem, the "four-way intersection nobody ships," non-goals, and the dated decisions log (e.g. chat became the default view 2026-07-07). |
+| [Product story](../../../docs/product-story.md) | Maintainer-approved framing and the reasons behind the page structure. |
+| [docs/design/README.md](../../../docs/design/README.md) | Current positioning and dated rationale. Founding comparisons and roadmap entries are historical context, not proof that a capability shipped. |
 | [AGENTS.md](../../../AGENTS.md) | The one-paragraph "what Chimaera is" — the canonical framing to stay consistent with. |
-| `git log` since the last touch | What shipped that the copy hasn't caught up with (see step 1). |
+| Current code + `git log` since the last touch | Verify catalog claims and find shipped changes the copy has missed (see step 1). |
 
 ## Step 1 — compute the delta
 
@@ -50,24 +52,30 @@ Two kinds of drift to hunt:
   (Standing example: structured **chat mode** shipped and became the *default* agent view, but the
   site kept selling only "the real TUIs.")
 - **Now-false claims** — a public statement the code no longer supports. Read each against the
-  feature catalog. (Standing example: the FAQ "agents bill exactly like a terminal" went stale the
-  moment chat mode — the `-p stream-json` billing class — became the default.)
+  feature catalog. (Standing example: a blanket "agents bill exactly like a terminal" promise
+  does not establish current provider policy for every chat surface. Verify billing claims
+  against current official provider guidance before publishing them.)
 
 ## Step 2 — brainstorm positioning with the maintainer (required, never unilateral)
 
 Positioning is product ground truth. Lay out the picture, then let the maintainer choose:
 
 - **Current selling points** — pulled from the live copy.
-- **The substance** — the real differentiators from DESIGN.md: a no-root single-static-binary
-  server *on* the host that owns the work · survive-disconnect / nothing-dies · attention-aware
-  multi-agent · rich (scientific) previews · workspace-first (vs. chat-first).
-- **The tensions** — has the product outgrown its framing? Is a negation-lead ("*not an IDE*")
-  still earning its place at the top, or should it demote to a clarifier? Is the page leading with
-  the right audience (general vs. HPC/science)?
+- **The substance** — implemented capabilities that help someone direct agents, inspect
+  and refine outputs, and return with project context. Include coordination, document/file
+  workflows, history, Knowledge, and extensions; show local/remote reach where relevant.
+- **The current decision** — [product-story.md](../../../docs/product-story.md) records the
+  maintainer's whole-workspace framing: “A workspace for everything you do with agents.”
+  Keep the audience broad, lead with use and value, and place recovery details in operating
+  docs. The homepage describes capabilities positively; it is not an absence checklist.
+- **The tensions** — distinguish the concrete workspace people open from the extension
+  platform that lets it grow. Revisit genuine new choices with the maintainer rather than
+  reopening settled wording on every factual update.
 
-Use **AskUserQuestion** for the genuine forks — headline/tagline, which features to foreground,
-audience emphasis. Give a recommendation per fork *and* let the maintainer decide. Record the
-decisions in the PR body so the next run knows what was deliberate.
+Ask the maintainer about genuine positioning forks using the available question tool or
+plain chat — headline/tagline, which features to foreground, audience emphasis. Give a
+recommendation and let the maintainer decide. Reuse decisions already authorized in the
+session; record them in the PR body so the next run knows what was deliberate.
 
 ## Step 3 — apply, consistently
 
@@ -77,21 +85,33 @@ decisions in the PR body so the next run knows what was deliberate.
   the "**workbench**" noun, the hexmark, curated light *and* dark. The site is hand-written static
   HTML — reuse existing components/classes (`.feature`, `.qa`, `.showcase`, `.codecard`); don't
   invent new CSS unless the design genuinely needs it.
-- **Don't overclaim.** Match `docs/features` honesty: git is *review-only* (status/diff + worktree
-  create/remove — no commit/push); Gemini/Antigravity are detected but not first-class; chat
-  sessions survive a disconnect but **not yet a daemon restart**.
+- **Don't overclaim.** Verify current capabilities in code: git provides review, history and
+  worktree management, with no commit/push UI. Claude Code, Codex, Antigravity and Grok Build
+  have structured chat adapters; Gemini is retained for saved history, not new launches.
+  Only Claude/Codex support verified terminal/chat switching and the Mastermind role.
+  Closing a view or losing its connection leaves daemon-owned work running while its
+  host and daemon stay alive. Restart restoration resumes supported conversations under
+  the saved identity; it starts new processes, and interrupted work follows the restart
+  settings. Compute jobs remain bounded by their allocations. Never promise work continues
+  through sleep of the host running it or that every process survives a restart.
 
 ## Step 4 — verify (the UI-quality bar applies to the public face too)
 
 - `node scripts/check-doc-links.mjs` — every relative markdown link + `#anchor` in the README/docs.
-- **Site anchors:** every sidebar `href="#x"` in `docs.html` has a matching `id="x"` (grep both).
+- `node scripts/check-site.mjs` — public-site links, metadata, structured data, social images,
+  and sitemap consistency. CI and the Pages deployment both run this guard.
+- Keep page titles and descriptions specific to each page, use canonical URLs in internal
+  links and `site/sitemap.xml`, and update the versioned social image when the message changes.
+  Structured data describes real project facts; never add invented ratings. Sample workspace
+  content stays inside a static `div` with `data-nosnippet` so it cannot supply search snippets.
 - **Eyeball it:** serve the static site and look at the hero, a new feature card, and the changed
-  FAQ in **both** light and dark. Either add a temporary `site` entry to `.claude/launch.json`
-  (`python3 -m http.server`, then `preview_start` → `preview_screenshot`, and revert the entry
-  before committing), or just `python3 -m http.server --directory site` and open it.
+  FAQ in **both** light and dark. Use the existing `site` entry in `.claude/launch.json`
+  (`preview_start` → `preview_screenshot`) when that tooling is available, or run
+  `python3 -m http.server --directory site` and open it with the available browser tools.
 
 ## Step 5 — ship
 
-It's a **`docs:`** change → ships no release (see [ship-pr](../ship-pr/SKILL.md)). Title it
+It's a **`docs:`** change → requests no release (an earlier releasing merge may
+still be pending; see [ship-pr](../ship-pr/SKILL.md)). Title it
 `docs: refresh public messaging — <the gist>`. The body says **what shipped since last time** and
 **what positioning calls the maintainer made**, so the trail is legible for the next pass.

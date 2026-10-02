@@ -285,7 +285,7 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
 > be "helpfully" changed without asking.
 
 ### Why connect works this way
-_Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the maintainer._
+_Captured 2026-07-09 — drafted from docs/design/README.md + code, confirmed live with the maintainer._
 
 - **Problem it solves.** The no-root, single-static-binary, ssh-only deployment *is* the moat —
   stood up like code-server (claude + chimaerad user-side, authenticate once).

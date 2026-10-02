@@ -2,8 +2,9 @@
 
 Persistent, daemon-owned terminal sessions — plain shells and agent TUIs alike. The
 terminal is the product's core primitive: the child process lives in the daemon, not the
-window, so closing the laptop or dropping the socket doesn't kill it. The client is an
-ephemeral xterm.js that renders bytes; **all terminal state is server-side**.
+window, so closing a window or dropping the socket leaves it running while its host and
+daemon remain alive. Host sleep pauses local work; a daemon restart respawns a new shell.
+The client is an ephemeral xterm.js that renders bytes; **all terminal state is server-side**.
 
 **Where it lives (shared):** the engine is `crates/chimaera-pty/src/`
 (`lib.rs` `SessionManager`, `session.rs`, `snapshot.rs`, `marks.rs`, `exec.rs`, `tests.rs`);
@@ -37,9 +38,11 @@ pipe), `POST /api/v1/sessions` (spawn), `POST /api/v1/sessions/{id}/exec`,
 
 ## Reconnect, resize & resync
 
-- **What & when.** The terminal reconnects forever after an unclean close (sleep, network blip,
-  daemon restart) and rebuilds the exact screen; resizing reflows the PTY and the headless Term
-  together.
+- **What & when.** The terminal retries after an unclean socket close (client sleep or a
+  network blip) and rebuilds the live session's screen. After a daemon restart, a restored
+  terminal is a new process with a fresh screen — see
+  [lifecycle-and-persistence.md](lifecycle-and-persistence.md). Resizing reflows the PTY and
+  the headless Term together.
 - **How it's used.** Invisible in the happy path. On reconnect the screen is wiped and rebuilt
   from a fresh snapshot; a visible client sends its current grid in the `auth` frame so the
   server adopts client dims *before* rendering (a parked reconnect sends none — its first
@@ -236,7 +239,7 @@ official `@xterm/addon-search`; shared routing is described in
 > be "helpfully" changed without asking.
 
 ### Why terminals work this way
-_Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the maintainer._
+_Captured 2026-07-09 — drafted from docs/design/README.md + code, confirmed live with the maintainer._
 
 - **Problem it solves.** Replace tmux/zellij nested inside code-server. Server-side terminal state
   with instant lossless reattach is *the* fix for code-server's terminals-die-on-reload; plain

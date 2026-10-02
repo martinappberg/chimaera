@@ -1,4 +1,4 @@
-//! Agent communication end to end (plan: docs/agent-communication-plan.md):
+//! Agent communication end to end (plan: docs/design/agent-communication-plan.md):
 //! messages on the Timeline, carried to claude on its next hook exactly
 //! once, broadcasts, the wake policy for idle chats (ask / never / auto,
 //! and a reply the reader asked for), the user's hand-over and wake

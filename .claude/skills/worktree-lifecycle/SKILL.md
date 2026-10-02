@@ -5,7 +5,7 @@ description: Keep Chimaera's git worktrees and their Rust build output from fill
 
 # Worktree lifecycle
 
-Every agent session works in its own git worktree: Claude Code under
+Isolated agent sessions use their own git worktrees: Claude Code under
 `.claude/worktrees/<name>`, the Codex app under `~/.codex/worktrees/<id>/chimaera`.
 Each one grows its own cargo `target/` (the daemon workspace, plus
 `crates/chimaera-app/target` and `plugins/target`), and single worktrees have reached

@@ -1,4 +1,4 @@
-//! Programs a plugin runs, as jobs the host owns (docs/plugin-platform-plan.md
+//! Programs a plugin runs, as jobs the host owns (docs/design/plugin-platform-plan.md
 //! §6). Only a program the manifest declares (`[[programs]]`) can run, by
 //! name: the host resolves it on the PATH the user's terminals get (the
 //! login shell plus the environment prelude, captured once per prelude),

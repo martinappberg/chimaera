@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Deterministic backstop for the docs: every relative markdown link must resolve
 // to a real file, and every `#anchor` must match a heading in the target file.
-// Splitting DESIGN.md into docs/agent-guides/ moved anchors around; this is what
+// Splitting docs/design/README.md into docs/agent-guides/ moved anchors around; this is what
 // keeps the nested AGENTS.md maps and skills from silently pointing at nothing.
 //
 // Zero deps. Run: `node scripts/check-doc-links.mjs` (CI + the doc-drift hook use it).
@@ -15,6 +15,8 @@ const root = execSync('git rev-parse --show-toplevel').toString().trim();
 // documents with deliberately broken links), not documentation: skipped.
 const files = execSync("git ls-files -co --exclude-standard '*.md'", { cwd: root })
   .toString().split('\n').filter(Boolean)
+  // A tracked document may have been deleted or moved without staging yet.
+  .filter((f) => existsSync(join(root, f)))
   .filter((f) => !/(^|\/)tests\/fixtures\//.test(f));
 
 // GitHub-flavored heading slug: lowercase, drop anything but word chars/space/hyphen

@@ -4,7 +4,7 @@ A lasting record of every agent session in a workspace: who started it, what it 
 used, and where its transcript is — with or without git. **All sessions** lists every past session
 (Recents keeps only the last 20, and can archive rows out of the rail); **Activity** in Settings
 totals sessions, tokens and time across every workspace, and the dashboard carries one quiet line
-of it. Design: [docs/git-and-session-history-plan.md](../git-and-session-history-plan.md) Part 2
+of it. Design: [docs/design/git-and-session-history-plan.md](../design/git-and-session-history-plan.md) Part 2
 (§7–§10).
 
 **Where it lives (shared):** daemon `crates/chimaera-server/src/history/` (`mod.rs` the record and
@@ -35,11 +35,13 @@ reads an ended session's record; the same-file line rides the claude hook answer
   closed it; `crashed` — a chat driver's protocol error, failed handshake or non-zero exit that
   showed no life after; `retired` — the daemon ended the record: a stop or restart), `files`
   `{n, top≤10}` (workspace-relative), `usage` `{cost_usd, tokens_in, tokens_out, turns}`,
-  `transcript` `{kind, journal?, path?, native?}` and `git` (null — see below).
+  `transcript` `{kind, journal?, path?, native?}` and `git` (session anchors and commits when
+  the session worked in a repository; null when unavailable — see below).
 - **Usage sources.** A claude TUI: its statusline heartbeat's running totals
   (`cost.total_cost_usd`, `context_window.total_*_tokens`) and its prompts for turns. A claude
   chat: each result's running cost total and per-turn tokens. A codex chat: the thread's running
-  token totals, no cost. A codex (or gemini) TUI: nothing — `null`, never zero. A running total
+  token totals, no cost. ACP chats currently record turns but no token/cost totals.
+  Hook-less agent TUIs record neither — `null`, never zero. A running total
   counts only what THIS record spent: its increases, the first value as the baseline when it was
   painted before any turn, a drop read as a counter restart, and a resumed conversation's previous
   total (kept as the record's `totals`) subtracted.
@@ -50,8 +52,10 @@ reads an ended session's record; the same-file line rides the claude hook answer
 - **The audit trail.** The Mastermind's acts (`spawn_agent`, `spawn_terminal`, `message_agent`,
   `interrupt_agent`), agent wakes (`wake_agent`) and the user's hand-overs (`deliver_note`,
   `deliver_messages`) append `act` lines — `{ts, by, act, target?, detail≤200}` — to the same file.
-- **Git.** `git` stays null until Part 1's per-session anchors are wired: `history::git_field` is
-  the one seam (`{start, current, commits[]}`, read from memory at close).
+- **Git.** `history::git_field` reads the session tracker's anchors from memory at close;
+  `history::attach_git` adds the tracker's commits, amending an already closed record if the
+  result arrives later. The compact record carries `start`, `end`, `commits[]`, `commits_n`
+  and any history-change flags when available; sessions outside a repository carry null.
 - **Bounds.** A record is about 1 KiB (lines over 8 KiB are refused). Past 4 MiB the file compacts
   (temp + rename): the newest ~2 MiB of records and every open one stay, older records fold into
   one `month` line per UTC month (sessions, time, and cost and tokens per agent and model), acts
@@ -64,14 +68,14 @@ reads an ended session's record; the same-file line rides the claude hook answer
   Quick Open "All sessions") opens a pane tab: sessions grouped by day (Today, Yesterday, Sep 26),
   newest first. A row is the agent glyph and the title (else the first prompt), then — muted, on
   the right — who started it only when it wasn't you ("by Mastermind", "after restart", "fork of
-  …"), "crashed" when it did, the duration, files changed, commits once git anchors exist, and
+  …"), "crashed" when it did, the duration, files changed, recorded commits, and
   tokens when known. No dollars. Clicking opens the conversation: a running session, or a resume
   through the Recents flow while the agent still has it ("Resume" shows on hover). A row whose
   conversation is gone is muted with a second line, "Conversation no longer available" (the
   tooltip says why: claude deletes transcripts after `cleanupPeriodDays`, 30 by default; no handle
   was recorded); clicking it, or the files count on any row, opens what it changed.
-- **Filters.** A search field (titles and first prompts); "All · Claude · Codex" only when more
-  than one agent kind exists; **Archived** only when some conversations are archived (see below);
+- **Filters.** A search field (titles and first prompts); **All** plus the agent kinds present in
+  history, only when more than one kind exists; **Archived** only when some conversations are archived (see below);
   **Mastermind actions** as a quiet link at the foot.
 - **Key behaviors.** Paged by `before` (a `started` ms), 50 a page. Live records come from memory,
   flagged `live`. Refetched while visible and on the `/ws/events` recents nudge (App's
@@ -101,7 +105,7 @@ reads an ended session's record; the same-file line rides the claude hook answer
   is one list whether or not git exists: the files, each with a small edit count
   (`SessionEdits.svelte`, also in All sessions). A click opens the git diff when there's a repo and
   the file has an uncommitted change, otherwise the agent's own edits for that file, in order,
-  opened in place. Commits will come first once Part 1's session anchors are wired.
+  opened in place. Recorded commits appear first; rewritten history is marked explicitly.
 - `GET /sessions/{id}/edits?workspace_id=` reads the chat journal's edit tool calls (claude's
   Edit/Write/MultiEdit input, codex's patches) or, for a claude TUI, claude's transcript through
   the existing importer; a failed edit is left out. Capped at 100 files, 300 edits, 16 KiB per side,

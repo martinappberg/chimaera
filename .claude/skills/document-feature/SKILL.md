@@ -1,6 +1,6 @@
 ---
 name: document-feature
-description: Add or update a Chimaera feature page under docs/features/ so the feature catalog stays true as capabilities ship. Use when a change adds or changes user-facing behavior — a new pane surface, route, agent capability, CLI command — or when you find a feature page that's stale or missing. Defines the page structure, the derived-vs-intent split, and the rule that a feat: PR must carry its doc update.
+description: "Add or update a Chimaera feature page under docs/features/ so the feature catalog stays true as capabilities ship. Use when a change adds or changes user-facing behavior — a new pane surface, route, agent capability, CLI command — or when you find a feature page that's stale or missing. Defines the page structure, the derived-vs-intent split, and the rule that a feat: PR must carry its doc update."
 ---
 
 # Documenting a Chimaera feature
@@ -25,9 +25,8 @@ of shipping. This skill is how you do that.
 
 ## Which page
 
-Map the feature to an existing page (see the [index](../../../docs/features/README.md) table):
-workbench · terminals · agents · chat-mode · files-and-previews · git · linked-terminals ·
-remote-connect · native-app · lifecycle-and-persistence · settings · cli. Add a new page only
+Map the feature to an existing page using the current
+[index](../../../docs/features/README.md) table. Add a new page only
 for a genuinely new capability area (a whole new subsystem) — then add its row to the index
 table **and** a `check` line to the [doc-drift hook](../../hooks/doc-drift.sh) mapping its code
 entry points to the new page.

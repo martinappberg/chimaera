@@ -111,7 +111,7 @@ repos,branches,log,show,compare}`, `GET/POST/DELETE /api/v1/git/worktrees`,
   the agent's `cwd_current`). UI `shared/BranchChip.svelte`, `chat/ChatView.svelte`,
   `dashboard/AgentCard.svelte`.
 - **Key behaviors.** A session's folder is its shell's polled cwd, the `cwd` every claude hook carries,
-  else its spawn folder (codex/gemini TUIs have no hooks and keep their start folder). The tracker
+  else its spawn folder (hook-less agent TUIs keep their start folder). The tracker
   resolves it once per folder (`rev-parse`), reads the branch from `HEAD` (no process), and recomputes
   only when a folder changes or a git epoch moves — never on a timer. It keeps anchors
   `{repo, worktree, branch, head}` at start, at claude turn ends and at end (in memory; ended sessions
@@ -131,7 +131,7 @@ repos,branches,log,show,compare}`, `GET/POST/DELETE /api/v1/git/worktrees`,
   {workspace_id, kind:"agent", cwd:<worktree>}` — the agent starts in THIS workspace with the branch's
   worktree as its folder, and the window, file tree and panes stay exactly where they were. A muted
   line then says what `.worktreeinclude` copied ("Copied .env and 1 more"). A removable worktree offers "Remove worktree" on hover — always visible once
-  merged — → a `confirm()` → `DELETE /api/v1/git/worktrees {workspace_id, path, repo?}`.
+  merged — → an inline **Remove / Keep** confirmation → `DELETE /api/v1/git/worktrees {workspace_id, path, repo?}`.
 - **Where it lives.** `git.ts` (`createWorktree`/`removeWorktree`), `GitRepoSection.svelte`
   (`spawnInNewBranch`/`remove`); server `git/worktree.rs`, `git/include.rs`.
 - **Key behaviors.** A worktree is a dimension of the workspace it was made from, never a workspace of
@@ -175,9 +175,10 @@ repos,branches,log,show,compare}`, `GET/POST/DELETE /api/v1/git/worktrees`,
   git status.
 - **Where it lives.** `SessionChangesView.svelte`; data is `session.files_touched` × git status.
 - **Key behaviors.** If the session lives in a *linked worktree* (different `workspace_id`), the view
-  fetches that workspace's own status rather than mis-decorating every row "no change". With several
-  repositories each row takes the status of the repository that contains it. A row with a git change
-  opens the diff; a touched-but-unchanged row (a `·` dot) just opens the file. Read-only. Without a
+  fetches that workspace's own status rather than mis-decorating every row "no change". An agent working in a managed branch worktree uses that worktree's status even while it
+  stays in the original workspace. With several repositories each row takes the status of
+  the repository that contains it. A row with a git change
+  opens the diff; a touched-but-unchanged row (a `·` dot) opens its recorded edits. Read-only. Without a
   repository the rows carry no git mark. One list with or without git: each file shows its edit
   count, and a file with no uncommitted git change opens the agent's own edits for it, in order
   ([session-history.md](session-history.md#what-a-session-changed-with-or-without-git)). The
@@ -208,7 +209,7 @@ repos,branches,log,show,compare}`, `GET/POST/DELETE /api/v1/git/worktrees`,
 > be "helpfully" changed without asking.
 
 ### Why git is read-only-first
-_Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the maintainer._
+_Captured 2026-07-09 — drafted from docs/design/README.md + code, confirmed live with the maintainer._
 
 - **The stance.** Replace code-server's git panel. Read-only-first is a **deliberate** choice —
   "stage/commit stay in a terminal for now" (decision 2026-07-07) — not an unbuilt gap. A git

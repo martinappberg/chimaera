@@ -1,5 +1,7 @@
 # Remote performance: measured findings + fix plan
 
+> **Dated design record.** Current behavior is in [remote connections](../features/remote-connect.md) and [terminals](../features/terminals.md). The measurements below describe the September 2026 test topology, not every current connection; shipped fixes and open follow-ups are recorded separately.
+
 Dated 2026-09-01. Companion to the (retired) local audit `docs/perf-plan.md`
 (PRs #124–#131): that pass fixed local CPU and it held — this pass measured the
 **remote** path, which those PRs never touched, against a real HPC login node.

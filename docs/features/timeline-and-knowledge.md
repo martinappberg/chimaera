@@ -5,7 +5,7 @@ daemon (never an LLM) from signals it already receives — and **Knowledge** —
 a read-only view over what the agents themselves recorded. Chimaera writes the Timeline;
 it never writes, curates or "keeps" knowledge. Both feed the dashboard's "Since you left" and
 "Where things stand" ([dashboard.md](dashboard.md)) and the Mastermind's `read_timeline`.
-Design: [docs/timeline-knowledge-plugins-plan.md](../timeline-knowledge-plugins-plan.md) §4, §5.
+Design: [docs/design/timeline-knowledge-plugins-plan.md](../design/timeline-knowledge-plugins-plan.md) §4, §5.
 
 **Where it lives (shared):** daemon `crates/chimaera-server/src/{timeline.rs,episodes.rs,
 knowledge.rs}`; UI `web-ui/src/lib/workspace/` (`TimelineView.svelte`,
@@ -92,7 +92,7 @@ and the Mastermind-tier MCP tool `read_timeline`.
   `provides.knowledge` (today Mycelium). **Knowledge exists only while such a plugin is on in
   the workspace:** no rail row, quick-open entry or dashboard card without one, and a restored
   tab says so in one line. Redesign plan and maintainer decisions:
-  [docs/knowledge-redesign-plan.md](../knowledge-redesign-plan.md).
+  [docs/design/knowledge-redesign-plan.md](../design/knowledge-redesign-plan.md).
 - **Sources.** Whatever the plugin reads (Mycelium: `.living/findings/*.md`,
   `.living/decisions.md`, `.living/learnings.md`, `.living/conventions.md`,
   `.living/log/LOG_REGISTRY.md`, `todo/TODO_REGISTRY.md` table and sections, the newest of
@@ -180,7 +180,7 @@ _Captured 2026-09-25 (from the maintainer, via capture-feature-intent)._
 - **Do not change (or: open to change):** open to change — an addition to the core, not a core bet. Offered four candidates to freeze (nothing changes for agents unless a plugin is on; Chimaera never curates knowledge; notes never start a turn; hook trust is never silent), the maintainer answered "all can change". They are how it was built today, not locked contracts.
 
 The design's maintainer decisions (2026-09-25) are in the
-[plan](../timeline-knowledge-plugins-plan.md#decisions-maintainer-2026-09-25).
+[plan](../design/timeline-knowledge-plugins-plan.md#decisions-maintainer-2026-09-25).
 
 ### Knowledge redesign (2026-09-28) — why it exists
 _Captured 2026-09-28 from the maintainer's own words while deciding the design, and 2026-09-29 (how settled it is)._
@@ -190,4 +190,4 @@ _Captured 2026-09-28 from the maintainer's own words while deciding the design, 
 - **How settled it is (intended vs provisional):** not settled. In the maintainer's words: "Design is not settled, will change later depending on plugin or how we think this works out."
 - **Do not change (or: open to change):** open to change — an addition to the core, not a core bet. The design is expected to move with the plugin and with how it works out in use.
 
-The full reasoning and the decisions are in the [redesign plan](../knowledge-redesign-plan.md).
+The full reasoning and the decisions are in the [redesign plan](../design/knowledge-redesign-plan.md).

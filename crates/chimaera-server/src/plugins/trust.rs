@@ -1,5 +1,5 @@
 //! Trust: who approved what a plugin can do, and whether it may run here.
-//! Design: docs/plugin-platform-plan.md §2 ("Trust and verification").
+//! Design: docs/design/plugin-platform-plan.md §2 ("Trust and verification").
 //!
 //! - **Standing.** A build is *verified* when the lock covers it (the
 //!   release chimaera pins, byte for byte, or a sandboxed first-party update

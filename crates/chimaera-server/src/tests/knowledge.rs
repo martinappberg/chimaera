@@ -1,6 +1,6 @@
 //! The Knowledge route and the mycelium plugin's two MCP tools over a fixed
 //! mycelium workspace (`fixtures/living/`), pinned byte-for-byte BEFORE the
-//! reader moves out of the daemon (docs/plugin-system-plan.md, P2): that port
+//! reader moves out of the daemon (docs/design/plugin-system-plan.md, P2): that port
 //! must leave the daemon↔UI wire and what agents read unchanged.
 //!
 //! Re-bless deliberately (a real, reviewed change to the Knowledge wire):

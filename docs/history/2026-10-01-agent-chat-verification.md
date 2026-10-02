@@ -57,7 +57,7 @@ controls; Antigravity/Grok share the ACP adapter.
 ## Deliberate limits
 
 No Pi or plugin-provided agent registration is implemented in this change. The
-[extension contract](../agent-harness-design.md) describes the required registry,
+[extension contract](../agent-guides/agent-integrations.md) describes the required registry,
 installation, capability, update/rollback and history behavior. The shared UI
 catalog accepts unknown identities without impersonating a built-in, but the
 server's persisted agent registry still needs that extension work.

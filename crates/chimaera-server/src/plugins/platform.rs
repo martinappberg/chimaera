@@ -1,6 +1,6 @@
 //! The 0.2 manifest tables: `[[views]]`, `[[files]]`, `[[actions]]` and
 //! `[[settings]]`, their checks, and the path matching file kinds and
-//! actions use. Design: docs/plugin-platform-plan.md §3 (screens), §5
+//! actions use. Design: docs/design/plugin-platform-plan.md §3 (screens), §5
 //! (files) and §9 (settings).
 //!
 //! Everything here is data a manifest declares; the host acts on it

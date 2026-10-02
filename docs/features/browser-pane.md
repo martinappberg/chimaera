@@ -2,7 +2,7 @@
 
 Live web apps — Jupyter, marimo, Streamlit, RStudio — as first-class workbench panes.
 The daemon carries a ticketed reverse proxy, so an app listening on `localhost` **on the
-daemon's host** (a laptop, a dev server, an HPC login node) renders in an iframe pane
+daemon's host** (a laptop, a dev server, or a cluster compute node) renders in an iframe pane
 through the same origin and tunnel as the rest of the workbench: remote-transparent by
 construction, with a second hop to Slurm compute nodes. Click the URL Jupyter prints in
 any terminal and it opens beside your shell.
@@ -145,11 +145,11 @@ plane `ANY /proxy/{id}[/{*path}]`.
   do**, because the token grants code execution *as the user, on the daemon's host*:
   - **loopback / self-host** — the app runs as the user on that same host and can read
     the manifest token off disk. Grants nothing new.
-  - **remote workspace** (daemon on a login node, app on that login node — the common
-    HPC case) — same identity, same host. Grants nothing new, and reaches nothing on the
+  - **remote workspace** (daemon and app on the same dev server or compute node;
+    an explicit login-node override works the same way) — same identity, same host. Grants nothing new, and reaches nothing on the
     user's laptop.
-  - **compute node** — app on the node, daemon on the login node: both the user, sharing
-    `$HOME`. Negligible.
+  - **second-hop compute node** — when the daemon runs elsewhere and both hosts share
+    the user's home, the app can already read that same manifest token.
   - The one non-equivalent case is a **confirmed remote** target *in the native app*,
     where `window.parent` also reaches granted Tauri commands (`connect_host` et al) —
     a remote-app -> local-machine hop. It takes deliberately confirming a hostile app.
@@ -159,7 +159,7 @@ plane `ANY /proxy/{id}[/{*path}]`.
     yields an opaque origin whose requests count as cross-site, so the app's own
     `SameSite` cookies are withheld (`SameSite=None` needs `Secure`, impossible on http)
     and the rescue loses both its cookie and its `Referer`. It would touch every tunnel
-    path (`connect`, the Mode 2 ladder), each forwarding a single port — not worth it for
+    path (`connect`, cluster job forwards), each forwarding a single port — not worth it for
     the residual risk above unless the threat model changes.
 - **http upstream only.** The data plane opens a plain `TcpStream` and speaks clear-text
   HTTP/1.1, so a TLS-enabled app (`https://localhost:8443`) is deliberately **not**

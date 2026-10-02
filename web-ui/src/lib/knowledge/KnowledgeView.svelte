@@ -1,7 +1,7 @@
 <script lang="ts">
   /**
    * Knowledge — what the agents recorded, through the knowledge plugin that
-   * provides it (docs/knowledge-redesign-plan.md). It exists only while such
+   * provides it (docs/design/knowledge-redesign-plan.md). It exists only while such
    * a plugin is on; without one this tab says so in one line.
    *
    * Overview first (where we left off · waiting on you · what changed · open

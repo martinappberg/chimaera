@@ -26,7 +26,7 @@ owns the text; the confirm dialog shows it verbatim before anything is written.
 
 **Exception — Plugins.** A second, declared source beside `schema.ts`:
 `PluginsSettings.svelte` lists each installed plugin's `[[settings]]` (the
-0.2 platform, docs/plugin-platform-plan.md §9) through
+0.2 platform, docs/design/plugin-platform-plan.md §9) through
 `plugins/PluginSettings.svelte`, the rows its card shows too. The daemon owns
 the values (`GET`/`PUT /api/v1/plugins/{pid}/settings`, kept per plugin
 under `<data dir>/plugins/.data/`, never `settings.json`) and checks each

@@ -1,4 +1,4 @@
-//! The agent launcher's server surface (DESIGN.md "The agent launcher"):
+//! The agent launcher's server surface (docs/design/README.md "The agent launcher"):
 //!
 //! - `GET /api/v1/agents` — the known-agent catalog (Claude Code, Codex,
 //!   Gemini CLI) joined with what this host actually has: installed

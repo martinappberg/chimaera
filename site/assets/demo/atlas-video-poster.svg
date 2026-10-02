@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360" role="img" aria-label="Project Atlas weekly progress: 124 tasks complete.">
+  <rect width="640" height="360" fill="#ecf2e9"/>
+  <rect x="460" width="180" height="360" fill="#ceddd0"/>
+  <g font-family="Arial, sans-serif" fill="#203b31">
+    <text x="40" y="49" font-size="16" letter-spacing="2">PROJECT ATLAS</text>
+    <text x="38" y="110" font-size="34">A clear path ahead.</text>
+    <text x="40" y="154" font-size="14" fill="#587160">Tasks completed this week</text>
+    <text x="40" y="191" font-size="13">Design</text>
+    <text x="40" y="225" font-size="13">Product</text>
+    <text x="40" y="259" font-size="13">Engineering</text>
+    <text x="40" y="293" font-size="13">Operations</text>
+    <text x="348" y="191" font-size="13">32</text>
+    <text x="324" y="225" font-size="13">28</text>
+    <text x="396" y="259" font-size="13">40</text>
+    <text x="300" y="293" font-size="13">24</text>
+    <text x="486" y="201" font-size="48">124</text>
+    <text x="487" y="223" font-size="11" fill="#587160">COMPLETE</text>
+    <text x="40" y="335" font-size="11" fill="#587160">Weekly review / 1 October</text>
+  </g>
+  <g fill="#438366"><rect x="147" y="177" width="192" height="19"/><rect x="147" y="211" width="168" height="19"/><rect x="147" y="245" width="240" height="19"/><rect x="147" y="279" width="144" height="19"/></g>
+</svg>

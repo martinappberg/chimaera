@@ -5,8 +5,9 @@ description: Open a pull request for Chimaera correctly — the CI gates that mu
 
 # Shipping a PR on Chimaera
 
-Merges to `main` use an automated release decision: shipping prefixes publish a
-release, while docs/chore/refactor-only prefixes do not. The PR *title* and
+Merges to `main` use an automated release decision over every unreleased merge:
+shipping prefixes request a release, while docs/chore/refactor-only prefixes do
+not request one. A docs merge can still trigger an earlier pending release. The PR *title* and
 commit prefix are therefore load-bearing. See [AGENTS.md](../../../AGENTS.md) →
 "Releases" for the full rules.
 
@@ -15,11 +16,15 @@ commit prefix are therefore load-bearing. See [AGENTS.md](../../../AGENTS.md) �
 1. **Rebase on latest main.** `git fetch origin && git rebase origin/main`. (Once
    the branch is pushed, merge `origin/main` in instead — the Claude guard hook
    blocks force-pushes to the canonical repo, PR branches included.)
-2. **Gate is green:** `just check` (fmt + clippy + test). If you touched
-   `web-ui/**`, run its `check`, `test`, and `build` scripts. If you touched
+2. **Applicable gates are green:** for Rust changes, build `web-ui/dist` first on
+   a fresh checkout, then `just check` (plugin assets, fmt, clippy, and both Rust
+   workspaces' tests). If you touched `web-ui/**`, run its `check`, `test`, and
+   `build` scripts before Rust checks. If you touched
    `crates/chimaera-app/**`, run `just app-check`; `app.yml` also builds the
    Tauri bundle on the PR.
-3. **Verified live**, not just tested (see the **verify-app** skill). The PR body
+3. **Runtime changes verified live**, not just tested (see the **verify-app**
+   skill). Pure documentation changes need the doc-link and agent-asset checks;
+   public-site changes also need light/dark visual verification. The PR body
    should say what you ran and observed.
 4. **Shipping a `feat:`? It carries its docs.** A new user-facing capability must update
    its [feature-catalog](../../../docs/features/README.md) page — the **document-feature**
@@ -37,20 +42,20 @@ bump. Full rules + rationale: [docs/agent-guides/releases.md](../../../docs/agen
 |---|---|
 | `feat:` | **minor** — a genuinely new user-facing capability |
 | `fix:` / `perf:` / `revert:` | **patch** |
-| any `!:` (e.g. `feat!:`) | **major** |
-| `refactor:` / `chore:` / `docs:` / `test:` / `ci:` / `build:` / `style:` | **no release** (rebuilds, ships no version) |
+| conventional type with `!:` (e.g. `feat!:`), or `BREAKING CHANGE` / `BREAKING-CHANGE` in the subject | **major** |
+| `refactor:` / `chore:` / `docs:` / `test:` / `ci:` / `build:` / `style:` | **no release requested** by this merge |
 | anything else / no prefix | **patch** (safe default) |
 
 `feat` is reserved for new capability — mislabeling a fix or refactor as `feat` is
 what makes the minor version run away. Since `refactor:`/`chore:`/`docs:` now cut
-**no release** at all, you rarely need `[skip release]` for those.
+**no release request**, you rarely need `[skip release]` for those.
 
 ## Landing without a release
 
 Two ways, both read from the **subject** (= PR title):
 
 - **Use a no-release type** — `refactor:` / `chore:` / `docs:` / `test:` / `ci:` /
-  `build:` / `style:`. These rebuild but ship no new version. Prefer this for docs,
+  `build:` / `style:`. These request no new version. Prefer this for docs,
   chores, tooling, CI tweaks, and pure refactors.
 - **Add `[skip release]` to the PR title** when a normally-releasing type shouldn't
   ship yet, e.g. `feat: experimental thing [skip release]`.
@@ -64,8 +69,11 @@ time, verify the type/marker survived into the squash subject.
 
 ```sh
 git push -u origin HEAD            # push the branch
-gh pr create --title "chore: <what>" --body "<what changed; what you ran/observed>"
+gh pr create --title "chore: <what>" --body-file /absolute/path/to/pr-body.md
 ```
+
+Write the PR description to that file with actual newlines. When the desktop
+task exposes `attach_artifact`, attach the created PR URL to the task.
 
 End the PR body with an accurate agent trailer. For Codex:
 
@@ -86,7 +94,8 @@ fail is skipped until it's fixed.
 ## After merge
 
 Watch that the intended workflow ran: for a normal PR, `release.yml` should
-publish a release with the bumped version; for a `[skip release]` PR, the
+publish a release with the bumped version; for a no-release type or
+`[skip release]` PR, the
 `version` job should report `release=false`, all build/publish jobs should be
 skipped, and no release should be cut — unless an earlier merge since the last
 tag still wants one: the decision reads every merge since that tag, so a

@@ -8,7 +8,7 @@ description: Debug a running Chimaera daemon + web UI against a live isolated pr
 Chimaera's runtime bugs (terminal state, reconnect, resize, previews, agent
 launch) reproduce **against the real daemon + UI**, not in unit tests. This skill
 is how you observe one. Bring the app up with the **develop** skill
-(`chimaerad-isolated` preview), then read it with the `preview_*` tools.
+(`chimaerad-isolated` preview), then read it with the available inspection tools.
 
 ## Read the three surfaces
 
@@ -19,6 +19,11 @@ is how you observe one. Bring the app up with the **develop** skill
 | **API / WS** traffic | `preview_network` (`filter: failed`) | Every `/api/v1/*` call with status; pass a `requestId` to read a response body. |
 | The **rendered** state | `preview_snapshot` (structure) / `preview_screenshot` (visual) | Snapshot is text — better for asserting content/roles than a screenshot. |
 | A **CSS** value | `preview_inspect` (specific properties) | More reliable than eyeballing a screenshot. |
+
+The table describes preview tooling when it is exposed in your session. Otherwise,
+use the develop skill's manual isolated launcher and its terminal output or log
+file, plus the available browser/native-app tools. Do not assume unavailable
+`preview_*` APIs exist; name any surface you could not inspect.
 
 Use `preview_eval` for one-off inspection/repro (`window.location.reload()`, read a
 store value) — never to *implement* a change; edit source and reload.
@@ -47,10 +52,14 @@ store value) — never to *implement* a change; edit source and reload.
   ride the URL fragment; re-navigate to the `#token=…` URL from `preview_logs`.
 - **Port already in use** → another daemon is up. `chimaerad-isolated` auto-assigns a
   port, so this usually means a stale process — read the new port from `preview_logs`.
-- **WS connects then drops / replays the whole stream** → reconnect/gap-replay bug;
-  the event bus should replay only the gap (seq-numbered). See **verify-app**.
-- **Memory balloons on a big file** → a preview loaded a whole file instead of
-  streaming; a resource-discipline regression (target ~150 MB RSS).
+- **WS connects then drops / chat replays unexpectedly** → inspect auth,
+  `last_seq` and the journal head on `/ws/chat/{id}`. Chat replays the gap;
+  `/ws/events` sends full roster snapshots and PTYs reattach with screen
+  snapshots. See **verify-app** for each transport's contract.
+- **Memory balloons on a big file** → inspect which layer retains it. Large
+  ranged/paged formats must stay incremental; whole-file viewers must enforce
+  their format caps. Unbounded extraction is a resource-discipline regression
+  (daemon target ~150 MB RSS).
 
 ## Then verify
 

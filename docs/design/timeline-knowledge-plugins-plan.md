@@ -1,10 +1,13 @@
 # Timeline, Knowledge & Plugins — design & plan
 
-Status: **built** on `claude/mastermind-cross-agent-comms-19a84e`
+> **Dated design record.** Use [Timeline and Knowledge](../features/timeline-and-knowledge.md), [extensions](../features/plugins.md), and [agent communication](../features/agent-communication.md) for current behavior. Later Knowledge, platform, and communication work supersedes parts of this September 2026 snapshot.
+
+Snapshot status (2026-09-25): **built** on `claude/mastermind-cross-agent-comms-19a84e`
 (2026-09-25): A1–A3 and B1–B4 of §11, verified live against an isolated
 daemon and a mycelium 0.7.2 fixture. **B5 (Browse / marketplace) is later**,
 and the §6 contribution points `views` / `settings` / `commands` are
-specified but not built (see [plugins.md](agent-guides/plugins.md)). The
+specified but not built at that snapshot (the later platform is described in
+[plugins.md](../agent-guides/plugins.md)). The
 §12 questions took their recommended defaults. It grows out of a maintainer conversation about three
 frustrations — the Mastermind "often isn't doing anything", the dashboard
 "doesn't say much and feels redundant", and the wish for agents (claude *and*
@@ -14,7 +17,7 @@ way to attach mycelium, a plugin model generic enough for things like a LaTeX
 plugin another agent will build later, and a view of every skill the agents
 can use (a marketplace later). It builds on
 [agent-dashboard-plan.md](agent-dashboard-plan.md) (shipped through v1) and
-the unmerged Loadout plan (`docs/skills-manager-plan.md` on branch
+the then-unmerged Loadout plan (`docs/skills-manager-plan.md` on branch
 `claude/chimaera-skills-manager-4c4110`), which it absorbs. Items marked
 **[decide]** are the maintainer's call.
 

@@ -1,7 +1,7 @@
 //! The per-workspace Timeline: what happened, written by the daemon from
 //! signals it already receives (an agent finished a turn, a long command
 //! failed, a Slurm job ended, an agent recorded knowledge) — never by an LLM.
-//! Design: docs/timeline-knowledge-plugins-plan.md §4.
+//! Design: docs/design/timeline-knowledge-plugins-plan.md §4.
 //!
 //! Durable state is one append-only JSONL per workspace
 //! (`<data_dir>/workspace/<ws>/timeline.jsonl`), size-capped by compaction

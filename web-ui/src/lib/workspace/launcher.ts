@@ -1,5 +1,5 @@
 /**
- * The agent launcher's client side (DESIGN.md "The agent launcher"):
+ * The agent launcher's client side (docs/design/README.md "The agent launcher"):
  * catalog + resumables fetch, and the persisted default config that the
  * split button / Cmd+Shift+E spawn instantly.
  */

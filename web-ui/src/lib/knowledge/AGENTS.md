@@ -2,7 +2,7 @@
 
 Orientation for coding agents. The read-only view over what agents recorded
 through a knowledge plugin (design:
-[docs/knowledge-redesign-plan.md](../../../../docs/knowledge-redesign-plan.md),
+[docs/design/knowledge-redesign-plan.md](../../../../docs/design/knowledge-redesign-plan.md),
 feature page [timeline-and-knowledge.md](../../../../docs/features/timeline-and-knowledge.md)).
 Parent map: repo-root [AGENTS.md](../../../../AGENTS.md). The store it reads
 lives next door in `../workspace/knowledge.ts` (`GET /workspaces/{id}/knowledge`,

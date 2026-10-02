@@ -1,7 +1,7 @@
 <script lang="ts">
   /**
    * A cluster's page, shown in place inside the local home. You start Slurm
-   * **jobs** and open **workspaces** inside them (docs/hpc-portal-plan.md
+   * **jobs** and open **workspaces** inside them (docs/design/hpc-portal-plan.md
    * §4.2): each running or waiting job is a card holding the workspaces open
    * in it; every other workspace is "not open"; an ended job stays as one
    * line until dismissed. Nothing here runs on the login node: every action

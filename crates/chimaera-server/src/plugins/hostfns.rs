@@ -1,6 +1,6 @@
 //! The `host` interface of `chimaera:plugin`: everything a plugin may ask
 //! the daemon, each call bounded HERE so no plugin can forget a limit.
-//! Design: docs/plugin-system-plan.md ("The host", the limits table).
+//! Design: docs/design/plugin-system-plan.md ("The host", the limits table).
 //!
 //! Every function serves the workspace the instance belongs to and the
 //! context the runtime made for the call in flight (`CallScope`). The `cx`
