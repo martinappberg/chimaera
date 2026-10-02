@@ -916,6 +916,7 @@ pub(super) fn keeper_state(host: &chimaera_link::Host, tunnel: Option<&Tunnel>) 
         kept: true,
         direct_ssh: false,
         login_serve: false,
+        cluster_setup_complete: false,
         not_cluster: false,
         scheduler: None,
     };
