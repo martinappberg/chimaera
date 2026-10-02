@@ -34,6 +34,9 @@ use tokio::process::{Child, Command};
 /// connect concurrently, so a process-global "current host" would race and
 /// show one host's authentication prompt in another host's windows.
 pub const ASKPASS_ALIAS_ENV: &str = "CHIMAERA_ASKPASS_ALIAS";
+/// Local-only explicit authentication identity for a caller-gated MFA relay.
+/// This is not a remote environment variable or a bearer credential.
+pub const ASKPASS_CONTEXT_ENV: &str = "CHIMAERA_ASKPASS_CONTEXT";
 
 tokio::task_local! {
     static EXISTING_MASTER_ONLY: MasterHandle;
@@ -53,6 +56,7 @@ pub struct SshAuthentication {
     known_hosts: String,
     masters: Vec<MasterHandle>,
     fresh: bool,
+    keyboard_interactive: Option<String>,
 }
 impl SshAuthentication {
     /// Resolve and freeze one canonical destination locally, without dialing.
@@ -142,7 +146,23 @@ impl SshAuthentication {
             known_hosts,
             masters,
             fresh,
+            keyboard_interactive: None,
         })
+    }
+    /// Permit a caller's existing askpass MFA relay for this exact explicit
+    /// effect. The relay MUST check this opaque context, selected destination,
+    /// original device and a verified key-signature receipt before prompting,
+    /// then freshly authorize the answer. No password-only downgrade exists.
+    pub fn with_keyboard_interactive(mut self, context: &str) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            (32..=128).contains(&context.len())
+                && context
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte)),
+            "invalid SSH authentication context"
+        );
+        self.keyboard_interactive = Some(context.to_owned());
+        Ok(self)
     }
     /// Task-local and cancellation-safe; spawned owned work must enter its own
     /// scope. An existing-master-only scope always has stronger authority.
@@ -154,10 +174,15 @@ impl SshAuthentication {
             .masters
             .iter()
             .find(|master| master.host == host && master.route == *route);
-        let allowed = host == self.alias && *route == Route::Alias && self.fresh && !node;
+        let allowed = host == self.alias
+            && *route == Route::Alias
+            && self.fresh
+            && !node
+            && EXISTING_MASTER_ONLY.try_with(|_| ()).is_err();
         // Freeze the validated config instead of re-reading identity/proxy
         // directives after validation. Exact captured sockets preserve routing.
         let mut options = vec!["-F".into(), "/dev/null".into()];
+        let mfa = allowed && self.keyboard_interactive.is_some();
         let settings = [
             (
                 "IdentityAgent",
@@ -178,12 +203,22 @@ impl SshAuthentication {
             ("KnownHostsCommand", "none"),
             ("VerifyHostKeyDNS", "no"),
             ("UpdateHostKeys", "no"),
-            ("BatchMode", "yes"),
+            ("BatchMode", if mfa { "no" } else { "yes" }),
             ("PasswordAuthentication", "no"),
-            ("KbdInteractiveAuthentication", "no"),
+            (
+                "KbdInteractiveAuthentication",
+                if mfa { "yes" } else { "no" },
+            ),
             ("HostbasedAuthentication", "no"),
             ("GSSAPIAuthentication", "no"),
-            ("PreferredAuthentications", "publickey"),
+            (
+                "PreferredAuthentications",
+                if mfa {
+                    "publickey,keyboard-interactive"
+                } else {
+                    "publickey"
+                },
+            ),
             ("PubkeyAuthentication", "host-bound"),
             ("ProxyCommand", if allowed { "none" } else { "false" }),
             ("ProxyJump", "none"),
@@ -404,6 +439,8 @@ fn existing_master_opts(host: &str, route: &Route) -> Vec<String> {
             "-o",
             "BatchMode=yes",
             "-o",
+            "KbdInteractiveAuthentication=no",
+            "-o",
             "ProxyCommand=false",
             "-o",
             "ProxyJump=none",
@@ -581,6 +618,15 @@ fn transport_command(program: &str) -> Command {
         None => Command::new(program),
     };
     if matches!(program, "ssh" | "scp") {
+        // Inherited context must never license an unrelated/background command.
+        command.env_remove(ASKPASS_CONTEXT_ENV);
+        if EXISTING_MASTER_ONLY.try_with(|_| ()).is_err() {
+            if let Ok(Some(context)) =
+                SSH_AUTHENTICATION.try_with(|scope| scope.keyboard_interactive.clone())
+            {
+                command.env(ASKPASS_CONTEXT_ENV, context);
+            }
+        }
         if let Some(path) = SSH_CONFIG
             .read()
             .unwrap_or_else(|p| p.into_inner())
@@ -3900,6 +3946,7 @@ mod tests {
             known_hosts: "/tmp/fixture-trust".into(),
             masters: vec![fixture_master("/tmp/fixture-master")],
             fresh: true,
+            keyboard_interactive: None,
         }
     }
     #[cfg(unix)]
@@ -4039,6 +4086,83 @@ mod tests {
             )
             .contains(&"ControlPath=none".into()));
     }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicit_key_mfa_context_preserves_strict_identity_and_existing_master_overrides() {
+        let context = "fixture_explicit_context_00000000000000000000";
+        let scope = fixture_authentication()
+            .with_keyboard_interactive(context)
+            .unwrap();
+        for invalid in [
+            "short",
+            "fixture_context_with_whitespace_0000000000 x",
+            "fixture_context_with_newline_000000000000\n",
+        ] {
+            assert!(fixture_authentication()
+                .with_keyboard_interactive(invalid)
+                .is_err());
+        }
+        fn context_value(command: &Command) -> Option<String> {
+            command
+                .as_std()
+                .get_envs()
+                .find(|(key, _)| *key == ASKPASS_CONTEXT_ENV)
+                .and_then(|(_, value)| value)
+                .map(|value| value.to_string_lossy().into_owned())
+        }
+        scope
+            .with_authentication(async {
+                let mut command = ssh_base_via("fixture", &Route::Alias);
+                assert_eq!(context_value(&command).as_deref(), Some(context));
+                command.args(["-G", "fixture"]);
+                let output = output_bounded(&mut command, 5, "fixture explicit MFA configuration")
+                    .await
+                    .unwrap();
+                assert!(output.status.success());
+                let text = std::str::from_utf8(&output.stdout).unwrap();
+                for exact in [
+                    "batchmode no",
+                    "kbdinteractiveauthentication yes",
+                    "passwordauthentication no",
+                    "preferredauthentications publickey,keyboard-interactive",
+                    "pubkeyauthentication host-bound",
+                    "forwardagent no",
+                    "identityfile none",
+                    "certificatefile none",
+                    "stricthostkeychecking true",
+                ] {
+                    assert!(text.lines().any(|line| line == exact), "{exact}");
+                }
+                assert_eq!(context_value(&scp_cmd("fixture")).as_deref(), Some(context));
+                let unrelated = scope.options("other", &Route::Alias, false);
+                assert!(unrelated.contains(&"KbdInteractiveAuthentication=no".into()));
+                assert!(unrelated.contains(&"IdentityAgent=none".into()));
+                scope.masters[0]
+                    .with_existing(async {
+                        let mut command = ssh_base_via("fixture", &Route::Alias);
+                        assert!(context_value(&command).is_none());
+                        command.args(["-G", "fixture"]);
+                        let output =
+                            output_bounded(&mut command, 5, "fixture existing MFA refusal")
+                                .await
+                                .unwrap();
+                        assert!(output.status.success());
+                        let text = std::str::from_utf8(&output.stdout).unwrap();
+                        for exact in [
+                            "batchmode yes",
+                            "kbdinteractiveauthentication no",
+                            "passwordauthentication no",
+                            "identityagent none",
+                        ] {
+                            assert!(text.lines().any(|line| line == exact), "{exact}");
+                        }
+                    })
+                    .await;
+            })
+            .await;
+        assert!(context_value(&ssh_cmd("fixture")).is_none());
+    }
+
     #[tokio::test]
     async fn authentication_scope_is_nested_isolated_and_existing_master_always_wins() {
         let scope = fixture_authentication();
