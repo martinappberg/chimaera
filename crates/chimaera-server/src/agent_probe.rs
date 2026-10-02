@@ -425,10 +425,19 @@ async fn read_rpc_line<R: tokio::io::AsyncBufRead + Unpin>(
     }
 }
 
-async fn bin_of(state: &AppState, kind: AgentKind) -> Result<(PathBuf, Option<String>), String> {
+async fn bin_of(
+    state: &AppState,
+    kind: AgentKind,
+) -> Result<(PathBuf, Option<String>, crate::runtime_retention::Usage), String> {
     let det = crate::launcher::detect(state, kind, false).await;
     match det.path {
-        Ok(path) => Ok((path, det.version)),
+        Ok(path) => {
+            let (usage, mut bins) =
+                crate::runtime_retention::acquire(state, Some(kind), vec![path])
+                    .await
+                    .map_err(|error| error.to_string())?;
+            Ok((bins.remove(0), det.version, usage))
+        }
         Err(err) => Err(err),
     }
 }
@@ -516,7 +525,7 @@ async fn claude_state(state: &Arc<AppState>) -> Value {
     if let Some(hit) = state.probes.get("claude") {
         return hit;
     }
-    let (bin, version) = match bin_of(state, AgentKind::Claude).await {
+    let (bin, version, _usage) = match bin_of(state, AgentKind::Claude).await {
         Ok(found) => found,
         Err(err) => return json!({"agent": "claude", "available": false, "error": err}),
     };
@@ -593,7 +602,7 @@ async fn codex_raw(state: &Arc<AppState>, workspace_id: &str, root: &Path) -> Va
     if let Some(hit) = state.probes.get(&key) {
         return hit;
     }
-    let (bin, version) = match bin_of(state, AgentKind::Codex).await {
+    let (bin, version, _usage) = match bin_of(state, AgentKind::Codex).await {
         Ok(found) => found,
         Err(err) => return json!({"available": false, "error": err}),
     };
@@ -902,7 +911,7 @@ pub(crate) async fn trust_hooks(
         )
             .into_response();
     }
-    let (bin, _) = match bin_of(&state, AgentKind::Codex).await {
+    let (bin, _, _usage) = match bin_of(&state, AgentKind::Codex).await {
         Ok(found) => found,
         Err(err) => {
             return (StatusCode::CONFLICT, axum::Json(json!({"error": err}))).into_response()

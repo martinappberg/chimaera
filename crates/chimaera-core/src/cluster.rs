@@ -923,6 +923,7 @@ mod tests {
             started_at: 0,
             build: None,
             slurm_job_id: Some("7".into()),
+            runtime_leases: false,
         };
         std::fs::write(
             data.join("manifest.json"),

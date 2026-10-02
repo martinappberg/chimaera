@@ -40,17 +40,26 @@ export function timeLeftWords(endsAtMs: number, nowMs: number): string {
   return `${shortDuration(secs)} left`;
 }
 
-/**
- * The host row's one line (plan §4.1): "no jobs running", "1 job running ·
- * ends in 5d 22h", "2 jobs running · next ends in 3h 40m", "1 job waiting
- * for a node", "1 job running · 1 waiting".
- */
+/** A cancelled job may remain in Slurm's live queue while its tasks shut down. */
+export function isJobStopping(j: ClusterOverview["jobs"][number]): boolean {
+  return j.state !== "ended" && (j.stopping === true || j.stopped_by_user);
+}
+
+/** The host row's job counts, with stopping jobs kept out of running totals. */
 export function hostSummary(ov: ClusterOverview, nowMs: number): string {
   const live = ov.jobs.filter((j) => j.state !== "ended");
-  const running = live.filter((j) => j.state === "running" || j.state === "starting");
-  const waiting = live.filter((j) => j.state === "waiting");
+  const stopping = live.filter(isJobStopping);
+  const running = live.filter((j) => !isJobStopping(j) && (j.state === "running" || j.state === "starting"));
+  const waiting = live.filter((j) => !isJobStopping(j) && j.state === "waiting");
   const jobs = (n: number) => (n === 1 ? "1 job" : `${n} jobs`);
   if (live.length === 0) return "no jobs running";
+  if (stopping.length > 0) {
+    return [
+      running.length > 0 ? `${jobs(running.length)} running` : "",
+      waiting.length > 0 ? `${jobs(waiting.length)} waiting` : "",
+      `${jobs(stopping.length)} stopping`,
+    ].filter(Boolean).join(" · ");
+  }
   if (running.length === 0) return `${jobs(waiting.length)} waiting for a node`;
   if (waiting.length > 0) return `${jobs(running.length)} running · ${waiting.length} waiting`;
   if (running.length === 1 && running[0].state === "starting") return "1 job starting";
@@ -66,5 +75,5 @@ export function hostSummary(ov: ClusterOverview, nowMs: number): string {
 
 /** Whether any job on the cluster is running (the row's dot). */
 export function anyJobRunning(ov: ClusterOverview): boolean {
-  return ov.jobs.some((j) => j.state === "running");
+  return ov.jobs.some((j) => j.state === "running" && !isJobStopping(j));
 }

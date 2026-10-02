@@ -94,6 +94,8 @@ export interface HostState {
   /** The user said this host isn't a cluster, though Slurm is on its PATH:
    *  it connects like any remote (its row offers to undo this). */
   not_cluster: boolean;
+  /** Absent on older native shells. */
+  cluster_setup_complete?: boolean;
 }
 
 /** Progress of an in-flight connect, mirrored from chimaera-remote phases. */
@@ -430,6 +432,8 @@ export interface ClusterJob {
   ended?: string;
   ended_at_ms?: number;
   stopped_by_user: boolean;
+  /** Cancellation accepted or Slurm is completing; absent on older hosts. */
+  stopping?: boolean;
   /** Its node reaches the internet (agents can work), once probed. */
   egress?: boolean;
   /** Workspaces it opens when it starts. */

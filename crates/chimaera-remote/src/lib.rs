@@ -518,8 +518,9 @@ pub struct ConnectOpts {
     /// Explicit binary to install on the host if chimaera is missing;
     /// otherwise `~/.chimaera/dist/` is searched for a matching build.
     pub binary: Option<PathBuf>,
-    /// Replace an outdated remote daemon even when it has live sessions
-    /// (they end with it). The stop is always graceful — SIGTERM, never -9.
+    /// Reinstall the executable, even at the same build. A direct-host daemon
+    /// restarts gracefully (SIGTERM); its live sessions end. Cluster job mode
+    /// only stages the executable for future jobs, without starting a daemon.
     pub update_daemon: bool,
     /// The user allowed a daemon on this cluster's login node (the warned
     /// per-host override). Without it, a host whose login shell reaches a
@@ -1305,6 +1306,14 @@ async fn resolve_daemon(
             "{host} is a {} cluster; no daemon on its login node",
             scheduler.tag()
         );
+        if opts.update_daemon {
+            // Repair the executable for future jobs without starting anything
+            // on the login node or disrupting jobs already using their inode.
+            let binary = ops
+                .resolve_local_binary(host, opts.binary.as_deref(), progress)
+                .await?;
+            ops.deploy_binary(host, &binary, progress).await?;
+        }
         return Err(ClusterHost {
             host: host.to_string(),
             scheduler,
@@ -1383,8 +1392,17 @@ async fn resolve_daemon(
             }
         }
         _ => {
-            ops.ensure_remote_binary(host, opts.binary.as_deref(), progress)
-                .await?;
+            if opts.update_daemon {
+                // A broken/missing daemon is precisely when repair is useful;
+                // do not trust an existing on-disk binary just because it exists.
+                let binary = ops
+                    .resolve_local_binary(host, opts.binary.as_deref(), progress)
+                    .await?;
+                ops.deploy_binary(host, &binary, progress).await?;
+            } else {
+                ops.ensure_remote_binary(host, opts.binary.as_deref(), progress)
+                    .await?;
+            }
             progress(Phase::Starting);
             ops.start_remote(host).await?
         }
@@ -4256,6 +4274,10 @@ mod tests {
             _progress: &impl Fn(Phase),
         ) -> anyhow::Result<PathBuf> {
             self.record(Call::ResolveLocalBinary);
+            anyhow::ensure!(
+                self.resolved_bin != Path::new("FAIL"),
+                "replacement unavailable"
+            );
             Ok(self.resolved_bin.clone())
         }
         async fn stop_remote(&self, _host: &str, _pid: u32) -> anyhow::Result<()> {
@@ -4296,6 +4318,7 @@ mod tests {
             started_at: 0,
             build: build.map(str::to_string),
             slurm_job_id: None,
+            runtime_leases: false,
         }
     }
 
@@ -4372,7 +4395,15 @@ mod tests {
             .and_then(|c| c.login_daemon.clone())
             .expect("the old daemon is reported");
         assert_eq!((found.pid, found.alive), (42, Some(true)));
-        assert_eq!(fake.calls(), vec![Call::RemoteProbe], "no stop, no deploy");
+        assert_eq!(
+            fake.calls(),
+            vec![
+                Call::RemoteProbe,
+                Call::ResolveLocalBinary,
+                Call::DeployBinary
+            ],
+            "repair replaces the executable without stopping or starting a login daemon"
+        );
     }
 
     /// The warned override: a cluster the user allowed is a regular remote.
@@ -4413,6 +4444,32 @@ mod tests {
                 Call::EnsureRemoteBinary,
                 Call::StartRemote
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_redeploys_when_no_daemon_is_running_and_resolves_before_mutation() {
+        let fake = FakeOps::base();
+        let (result, _) = try_resolve(&fake, true).await;
+        assert!(result.is_ok());
+        assert_eq!(
+            fake.calls(),
+            vec![
+                Call::RemoteProbe,
+                Call::ResolveLocalBinary,
+                Call::DeployBinary,
+                Call::StartRemote
+            ]
+        );
+        let failed = FakeOps {
+            resolved_bin: PathBuf::from("FAIL"),
+            ..FakeOps::base()
+        };
+        let (result, _) = try_resolve(&failed, true).await;
+        assert!(result.is_err());
+        assert_eq!(
+            failed.calls(),
+            vec![Call::RemoteProbe, Call::ResolveLocalBinary]
         );
     }
 

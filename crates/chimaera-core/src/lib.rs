@@ -110,6 +110,12 @@ fn data_dir_in(home: Option<&Path>) -> PathBuf {
     }
 }
 
+/// Managed executables belong to the user on this host, not to a cluster
+/// workspace. Keep explicit/dev homes isolated, but ignore CHIMAERA_DATA_DIR.
+pub fn managed_agents_dir() -> PathBuf {
+    data_dir_in(state_home().as_deref()).join("agents")
+}
+
 /// Per-user data directory (`~/.chimaera`, or `$CHIMAERA_HOME/data` when
 /// isolated), created on demand.
 pub fn data_dir() -> PathBuf {
@@ -311,6 +317,10 @@ pub struct Manifest {
     /// other field (the probe's `sed` reads this file).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slurm_job_id: Option<String>,
+    /// This daemon protects managed agent packages with shared usage locks.
+    /// Cleanup must defer while an older daemon could still use those files.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub runtime_leases: bool,
 }
 
 impl Manifest {
@@ -598,6 +608,7 @@ mod tests {
             started_at: 1_750_000_000,
             build: Some(BUILD_ID.to_string()),
             slurm_job_id: None,
+            runtime_leases: false,
         };
         manifest.write().unwrap();
 
@@ -671,6 +682,7 @@ mod tests {
             started_at: 0,
             build: None,
             slurm_job_id: None,
+            runtime_leases: false,
         };
         assert!(manifest(&here).written_here());
         assert!(!manifest("chimaera-test-other-node.invalid").written_here());

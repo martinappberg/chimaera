@@ -300,6 +300,16 @@ describe("jobs in words", () => {
     );
   });
 
+  it("keeps a cancelled or completing job stopping and out of workspace destinations", () => {
+    for (const marker of [{ stopped_by_user: true }, { stopping: true }]) {
+      for (const state of ["waiting", "starting", "running"] as const) {
+        const stopping = job({ ...marker, state, node: "n7" });
+        expect(jobStatusLine(stopping, NOW)).toBe("Stopping on n7…");
+        expect(openPlan([stopping])).toEqual({ kind: "sheet" });
+      }
+    }
+  });
+
   it("words an ended job as one line", () => {
     expect(endedLine(job({ state: "ended", ended: "TIMEOUT", ended_at_ms: NOW - 2 * HOUR }), NOW)).toBe(
       "Long ended 2 h ago — it hit its time limit. Chats are saved.",
@@ -342,6 +352,19 @@ describe("jobs in words", () => {
       "last open 2 days ago · chats saved",
     );
     expect(workspaceActivity(ws(), NOW)).toBe("not opened yet");
+  });
+
+  it("lets job shutdown override stale workspace opening and working snapshots", () => {
+    for (const opening of [true, false]) {
+      expect(workspaceActivity(ws({ state: "queued", opening }), NOW, undefined, true)).toBe(
+        "job is stopping…",
+      );
+    }
+    for (const closing of [true, false]) {
+      expect(workspaceActivity(ws({ state: "open", working: 2, closing }), NOW, undefined, true)).toBe(
+        "closing with job…",
+      );
+    }
   });
 
   it("lets you pick where Open goes whenever a job is alive", () => {

@@ -14,6 +14,25 @@ ReauthOverlay}.svelte`, and the remote-hosts section of `HomeScreen.svelte`. Thi
 be live-verified in CI** (no remote host) — its decision phase is characterization-tested behind
 a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/host-management UI.
 
+## Connection settings and repair
+
+Every saved remote's Home row has a **⋯** connection-settings action. Detected clusters
+also show the scheduled-jobs/login-host switch on first connection; see
+[cluster setup](compute.md#detection-and-cluster-mode).
+
+**Repair Chimaera…** opens an inline confirmation in this dialog. It reinstalls the
+current app's daemon executable through `connect_host(updateDaemon: true)`, preserving
+workspaces, settings, saved chats, and agent installations. Regular remotes restart their
+daemon; the confirmation explains that running agents and shells stop. A cluster in
+scheduled-job mode only replaces its executable: no login daemon starts or stops, and
+running jobs continue on their current inode. New jobs use the repaired build. Failures
+stay in the dialog with a retry; success is reported only after the connect operation
+completes. Repair does not fix SSH credentials or cluster policy restrictions.
+
+Implementation: `RemoteSettingsDialog.svelte` + `HomeScreen.svelte`, the existing native
+connect flight, and `resolve_daemon`'s explicit-update paths (including missing daemons
+and cluster-only connections). Replacement resolution precedes any daemon stop.
+
 ## The connect flow
 
 - **What & when.** Connect to (and stand up a daemon on) a remote host, then open a tunnelled

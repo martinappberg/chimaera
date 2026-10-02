@@ -124,20 +124,26 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         started_at,
         build: Some(chimaera_core::BUILD_ID.to_string()),
         slurm_job_id: own_job.clone(),
+        runtime_leases: true,
     };
     manifest.write().context("failed to write manifest")?;
 
     println!("chimaera daemon listening on 127.0.0.1:{port}");
     println!("http://127.0.0.1:{port}/#token={token}");
 
-    let state = Arc::new(AppState::new(
+    let mut state = AppState::new(
         token,
         hostname,
         pid,
         port,
         chimaera_core::data_dir(),
         chimaera_core::config_dir(),
-    ));
+    );
+    let managed_root = chimaera_core::managed_agents_dir();
+    if state.managed_root != managed_root {
+        state.legacy_managed_root = Some(std::mem::replace(&mut state.managed_root, managed_root));
+    }
+    let state = Arc::new(state);
 
     // A cluster workspace job registers the workspace it was started for
     // (under the cluster's id) before anything — the ledger's resurrection
@@ -175,6 +181,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     crate::history::boot_close(&state).await;
     crate::history::spawn_task(state.clone());
     tokio::spawn(ledger::run(state.clone()));
+    crate::runtime_retention::boot(state.clone());
 
     // Release awareness (GET /api/v1/update + the `update` ws frame), and
     // the same question for the agent CLIs the daemon launches.
@@ -577,6 +584,7 @@ mod tests {
             started_at: 0,
             build: None,
             slurm_job_id: job.map(str::to_string),
+            runtime_leases: false,
         };
         std::fs::write(path, serde_json::to_vec(&m).unwrap()).unwrap();
     }

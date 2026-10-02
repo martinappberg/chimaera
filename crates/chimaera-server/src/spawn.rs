@@ -80,6 +80,7 @@ pub(crate) async fn spawn_session(
     // context) and, for claude, in the hook URL.
     let id = spec.id.unwrap_or_else(crate::agents::fresh_session_id);
     let cwd = spec.cwd.unwrap_or_else(|| workspace.root.clone());
+    let usage;
     // The user's environment prelude (startup ⊕ host ⊕ workspace ⊕ launch),
     // written per session and sourced once by the shell rc / agent wrapper.
     // Runs per real spawn only — reconnects reattach to the live PTY.
@@ -117,15 +118,21 @@ pub(crate) async fn spawn_session(
         // spawn. Its env lands ON TOP of the session env (shims PATH,
         // CHIMAERA_*) — the two use disjoint variable sets, so nothing is
         // clobbered.
-        SpawnKind::Shell => match chimaera_core::shellint::shell_launch() {
-            Ok(launch) => {
-                opts.command = Some(launch.argv);
-                opts.env.extend(launch.env);
+        SpawnKind::Shell => {
+            usage = crate::runtime_retention::acquire(state, None, vec![])
+                .await
+                .map_err(SpawnFailure::Internal)?
+                .0;
+            match chimaera_core::shellint::shell_launch() {
+                Ok(launch) => {
+                    opts.command = Some(launch.argv);
+                    opts.env.extend(launch.env);
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "shell integration unavailable; spawning plain shell");
+                }
             }
-            Err(err) => {
-                tracing::warn!(%err, "shell integration unavailable; spawning plain shell");
-            }
-        },
+        }
         // Agent sessions: resolve the agent binary (cached, via the login
         // shell; user install first, managed fallback), and — for claude —
         // generate the per-session settings file that wires its hooks to
@@ -140,6 +147,12 @@ pub(crate) async fn spawn_session(
                 Ok(path) => path,
                 Err(msg) => return Err(SpawnFailure::AgentUnavailable(msg)),
             };
+            let (guard, mut binaries) =
+                crate::runtime_retention::acquire(state, Some(agent_kind), vec![bin])
+                    .await
+                    .map_err(SpawnFailure::Internal)?;
+            usage = guard;
+            let bin = binaries.remove(0);
             let key = crate::agents::fresh_agent_key();
             // Hook injection is claude-only: other agents have no hook system
             // to wire, so their sessions stay honestly "unknown". The scheme
@@ -272,6 +285,7 @@ pub(crate) async fn spawn_session(
 
     match state.sessions.spawn(opts) {
         Ok(info) => {
+            crate::runtime_retention::watch(state.clone(), info.id.clone(), usage);
             crate::lock(&state.session_workspaces).insert(info.id.clone(), workspace.id.clone());
             // Remember the spawn theme: resurrection re-themes the session's
             // successor with it (there is no other durable record of it).

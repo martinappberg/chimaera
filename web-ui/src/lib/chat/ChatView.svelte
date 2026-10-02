@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { modelChoice } from "./modelPicker";
   import { onDestroy, tick, untrack } from "svelte";
   import { displayName, forkSession, rewindSession, renameSession, type Session } from "../workspace/sessions";
   import { fsValidate } from "../previews/files";
@@ -904,22 +905,7 @@
    *  model is not yet known (store.model === null, before init/ready resolves)
    *  this is undefined so the header shows a neutral loading chip — NOT a
    *  concrete "default" that would flash the wrong name (slow on remote). */
-  const currentModel = $derived.by(() => {
-    const target = store.model;
-    if (target === null) return undefined;
-    const exact = store.models.find((m) => m.id === target || m.resolved === target);
-    if (exact !== undefined) return exact;
-    const norm = (s: string) => s.replace(/\[[^\]]*\]$/, "");
-    const targetN = norm(target);
-    const named = store.models.find(
-      (m) => m.id !== "default" && m.resolved !== null && norm(m.resolved) === targetN,
-    );
-    return (
-      named ??
-      store.models.find((m) => m.resolved !== null && norm(m.resolved) === targetN) ??
-      store.models.find((m) => norm(m.id) === targetN)
-    );
-  });
+  const currentModel = $derived(modelChoice(store.models, store.model));
   /** Reasoning-effort choices: per-model when the agent reports them;
    *  codex falls back to its known ladder, claude to none (no effort knob
    *  on that model — e.g. haiku). */
@@ -2405,6 +2391,7 @@
   const quoteOwner = {};
   let quoteChip = $state<{ x: number; y: number } | null>(null);
   const composerDisabled = $derived(store.exited !== null || store.degraded || store.fatalError !== null);
+  const incompatibleRuntime = $derived(/GLIBC_[\d.]+[^\n]*not found/.test(store.fatalError ?? ""));
 
   function dropQuote(): void {
     quoteChip = null;
@@ -2792,12 +2779,14 @@
           >
         </div>
       {:else if item.block.kind === "notice"}
+        {#if !(incompatibleRuntime && item.block.text === store.fatalError)}
         <div
           class="notice"
           class:error={item.block.tone === "error"}
           data-block-index={item.index}
           data-block-uid={item.block.uid}>{item.block.text}</div
         >
+        {/if}
       {:else if item.block.kind === "turn_end"}
         {@const block = item.block}
         <div class="source-block" data-block-index={item.index} data-block-uid={item.block.uid}>
@@ -2889,7 +2878,15 @@
     {/if}
 
     {#if store.fatalError !== null}
-      <div class="notice error">{store.fatalError}</div>
+      <div class="notice error" class:runtime-error={incompatibleRuntime}>
+        {#if incompatibleRuntime}
+          <strong>This agent can't start on this host</strong>
+          <p>This agent runtime needs newer Linux system libraries than this host provides. Use a compatible host or configure a compatible runtime in Settings → Agents. Reinstalling the same package will not fix this.</p>
+          <details><summary>Startup details</summary><pre>{store.fatalError}</pre></details>
+        {:else}
+          {store.fatalError}
+        {/if}
+      </div>
     {/if}
     {#if store.degraded}
       <div class="notice">continued in terminal — this pane will switch</div>
@@ -3469,6 +3466,29 @@
   }
   .notice.error {
     color: var(--err);
+  }
+  .runtime-error {
+    max-width: 64ch;
+    margin: 24px auto 8px;
+    padding: 16px 20px;
+    border: 1px solid var(--edge);
+    border-radius: 10px;
+    text-align: left;
+  }
+  .runtime-error p {
+    color: var(--fg);
+    margin: 8px 0 12px;
+  }
+  .runtime-error details {
+    color: var(--muted);
+  }
+  .runtime-error summary {
+    cursor: pointer;
+  }
+  .runtime-error pre {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    font-size: var(--text-xs);
   }
   /* "✳ 9m 43s · 12.3k tokens · 1 running task · Running tools…" — every
      part journal-derived (turn start, turn_tokens, the live sets, the phase),
