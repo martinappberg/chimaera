@@ -112,6 +112,8 @@ impl State {
             supervisor_pending: Mutex::default(),
             #[cfg(unix)]
             maintenance_pending: Mutex::default(),
+            #[cfg(all(unix, feature = "provider-authority-prototype"))]
+            provider_pending: Mutex::default(),
             supervisor_ack: Mutex::default(),
             tick: Mutex::default(),
             changed: tokio::sync::Notify::new(),

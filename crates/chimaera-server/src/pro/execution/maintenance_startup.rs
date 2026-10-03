@@ -44,6 +44,19 @@ pub(super) struct Protection {
     synthetic: bool,
 }
 impl Protection {
+    #[cfg(all(target_os = "linux", feature = "provider-authority-prototype"))]
+    pub(super) fn startup() -> anyhow::Result<Self> {
+        protect_process()
+    }
+    #[cfg(all(target_os = "linux", feature = "provider-authority-prototype"))]
+    fn checked_copy(&self) -> anyhow::Result<Self> {
+        self.current()?;
+        Ok(Self {
+            pid: self.pid,
+            #[cfg(test)]
+            synthetic: self.synthetic,
+        })
+    }
     pub(super) fn current(&self) -> anyhow::Result<()> {
         #[cfg(test)]
         if self.synthetic {
@@ -64,6 +77,10 @@ impl Protection {
     }
 }
 impl Pending {
+    #[cfg(all(target_os = "linux", feature = "provider-authority-prototype"))]
+    pub(super) fn protection(&self) -> anyhow::Result<Protection> {
+        self._protected.checked_copy()
+    }
     pub(super) fn transferred(
         descriptor: OwnedFd,
         control: Control,

@@ -15,6 +15,11 @@ use std::{
 };
 use tower::ServiceExt;
 
+fn private_pipe() -> (OwnedFd, OwnedFd) {
+    let (reader, writer) = std::io::pipe().unwrap();
+    (reader.into(), writer.into())
+}
+
 struct Fixture {
     root: PathBuf,
     project: PathBuf,
@@ -313,14 +318,14 @@ fn parser_and_channel_reject_malformed_oversize_non_pipe_and_missing_eof() {
     let fixture = Fixture::new();
     let state = fixture.state();
     let bytes = serde_json::to_vec(&fixture.receipt(&state, 2, 1)).unwrap();
-    let (reader, writer) = nix::unistd::pipe().unwrap();
+    let (reader, writer) = private_pipe();
     let fd = reader.as_raw_fd();
     let mut writer = std::fs::File::from(writer);
     writer.write_all(&bytes).unwrap();
     drop(writer);
     assert_eq!(read_pipe(reader).unwrap().launch_generation, 2);
     assert_eq!(unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFD) }, -1);
-    let (reader, writer) = nix::unistd::pipe().unwrap();
+    let (reader, writer) = private_pipe();
     let mut writer = std::fs::File::from(writer);
     writer.write_all(&vec![b' '; 4097]).unwrap();
     drop(writer);
@@ -329,7 +334,7 @@ fn parser_and_channel_reject_malformed_oversize_non_pipe_and_missing_eof() {
     let fd: OwnedFd = file.into();
     assert!(read_pipe(fd).is_err());
     assert!(decode(b"{}").is_err());
-    let (reader, writer) = nix::unistd::pipe().unwrap();
+    let (reader, writer) = private_pipe();
     let mut writer = std::fs::File::from(writer);
     writer.write_all(&bytes).unwrap();
     let began = std::time::Instant::now();
@@ -337,6 +342,30 @@ fn parser_and_channel_reject_malformed_oversize_non_pipe_and_missing_eof() {
     assert!(began.elapsed() >= Duration::from_secs(3));
     assert!(began.elapsed() < Duration::from_secs(5));
     drop(writer);
+}
+
+#[test]
+fn provider_descriptor_requires_feature_and_cannot_alias_the_idle_channel() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let mut value = serde_json::to_value(fixture.receipt(&state, 2, 1)).unwrap();
+    value["provider_runtime"] = json!({"version":1,"fd":70});
+    #[cfg(not(feature = "provider-authority-prototype"))]
+    assert!(decode(&serde_json::to_vec(&value).unwrap()).is_err());
+    #[cfg(feature = "provider-authority-prototype")]
+    {
+        assert!(decode(&serde_json::to_vec(&value).unwrap()).is_ok());
+        value["maintenance_control"] = json!({"version":1,"fd":70,"channel_nonce":"A".repeat(43)});
+        assert!(decode(&serde_json::to_vec(&value).unwrap()).is_err());
+        value["maintenance_control"]["fd"] = json!(71);
+        assert!(decode(&serde_json::to_vec(&value).unwrap()).is_ok());
+        for fd in [0, 2, 256, -1] {
+            value["provider_runtime"]["fd"] = json!(fd);
+            assert!(decode(&serde_json::to_vec(&value).unwrap()).is_err());
+        }
+        value["provider_runtime"] = json!({"version":1,"fd":70,"capability":"A".repeat(43)});
+        assert!(decode(&serde_json::to_vec(&value).unwrap()).is_err());
+    }
 }
 
 #[tokio::test]

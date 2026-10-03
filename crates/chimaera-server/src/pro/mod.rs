@@ -633,6 +633,10 @@ pub(super) fn delegation_lapsed(state: &crate::AppState) -> bool {
 }
 
 pub(crate) fn may_execute(state: &crate::AppState, workspace: &str) -> bool {
+    #[cfg(all(unix, feature = "provider-authority-prototype"))]
+    if !execution::provider_startup::allows(state) {
+        return false;
+    }
     may_write(state, workspace) && execution::allows(state, workspace)
 }
 /// Sessions left by a previous daemon wait for this life's ownership proof, so

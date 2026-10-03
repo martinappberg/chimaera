@@ -25,6 +25,9 @@ pub(crate) struct CleanupReceipt {
     #[cfg(unix)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     maintenance_control: Option<super::maintenance_startup::Control>,
+    #[cfg(all(unix, feature = "provider-authority-prototype"))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_runtime: Option<chimaera_core::provider_runtime::StartupDescriptor>,
 }
 /// Startup is moved exactly once. Cleanup evidence remains cloneable, while a
 /// selected maintenance descriptor is an owned, protected resource.
@@ -32,6 +35,8 @@ pub(crate) struct Startup {
     receipt: CleanupReceipt,
     #[cfg(unix)]
     maintenance: Option<super::maintenance_startup::Pending>,
+    #[cfg(all(unix, feature = "provider-authority-prototype"))]
+    provider: Option<super::provider_startup::Pending>,
 }
 #[derive(Clone, serde::Serialize)]
 pub(crate) struct CleanupAck {
@@ -70,6 +75,17 @@ fn decode(bytes: &[u8]) -> Result<CleanupReceipt> {
     if let Some(control) = &receipt.maintenance_control {
         control.validate(&receipt.maintenance_binding())?;
     }
+    #[cfg(all(unix, feature = "provider-authority-prototype"))]
+    if let Some(provider) = &receipt.provider_runtime {
+        provider
+            .validate(
+                receipt
+                    .maintenance_control
+                    .as_ref()
+                    .map(|control| control.fd),
+            )
+            .map_err(|_| anyhow::anyhow!("invalid provider startup descriptor"))?;
+    }
     Ok(receipt)
 }
 #[cfg(any(target_os = "linux", test))]
@@ -90,8 +106,32 @@ impl CleanupReceipt {
     }
 }
 #[cfg(target_os = "linux")]
-fn own_startup(mut receipt: CleanupReceipt) -> Result<Startup> {
+fn own_startup_until(mut receipt: CleanupReceipt, deadline: std::time::Instant) -> Result<Startup> {
     use std::os::fd::FromRawFd;
+    #[cfg(not(feature = "provider-authority-prototype"))]
+    let _ = deadline;
+    #[cfg(feature = "provider-authority-prototype")]
+    let provider = match receipt.provider_runtime.take() {
+        None => None,
+        Some(provider) => {
+            provider
+                .validate(
+                    receipt
+                        .maintenance_control
+                        .as_ref()
+                        .map(|control| control.fd),
+                )
+                .map_err(|_| anyhow::anyhow!("invalid provider startup descriptor"))?;
+            ensure!(
+                unsafe { nix::libc::fcntl(provider.fd, nix::libc::F_GETFD) } >= 0,
+                "provider startup descriptor unavailable"
+            );
+            // Take ownership before any later protection/read failure. This
+            // startup-only path runs before children, descriptor clones or IO.
+            let descriptor = unsafe { std::os::fd::OwnedFd::from_raw_fd(provider.fd) };
+            Some((descriptor, provider))
+        }
+    };
     let maintenance = match receipt.maintenance_control.take() {
         None => None,
         Some(control) => {
@@ -110,13 +150,39 @@ fn own_startup(mut receipt: CleanupReceipt) -> Result<Startup> {
             )?)
         }
     };
+    #[cfg(feature = "provider-authority-prototype")]
+    let provider = match provider {
+        None => None,
+        Some((descriptor, control)) => {
+            let protection = match &maintenance {
+                Some(maintenance) => maintenance.protection()?,
+                None => super::maintenance_startup::Protection::startup()?,
+            };
+            Some(super::provider_startup::Pending::transferred(
+                descriptor,
+                control,
+                receipt.maintenance_binding(),
+                deadline,
+                protection,
+            )?)
+        }
+    };
     Ok(Startup {
         receipt,
         maintenance,
+        #[cfg(feature = "provider-authority-prototype")]
+        provider,
     })
 }
+#[cfg(all(test, target_os = "linux"))]
+fn own_startup(receipt: CleanupReceipt) -> Result<Startup> {
+    own_startup_until(receipt, std::time::Instant::now() + Duration::from_secs(3))
+}
 #[cfg(any(target_os = "linux", test))]
-fn read_pipe(fd: std::os::fd::OwnedFd) -> Result<CleanupReceipt> {
+fn read_pipe_until(
+    fd: std::os::fd::OwnedFd,
+    deadline: std::time::Instant,
+) -> Result<CleanupReceipt> {
     use std::os::fd::AsRawFd;
     let raw = fd.as_raw_fd();
     // The descriptor belongs to this function and is closed on every exit.
@@ -141,10 +207,13 @@ fn read_pipe(fd: std::os::fd::OwnedFd) -> Result<CleanupReceipt> {
                 == 0,
         "could not bound supervisor channel"
     );
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
     let mut bytes = Vec::new();
     let mut buffer = [0u8; 4097];
     loop {
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "supervisor cleanup channel timed out"
+        );
         match file.read(&mut buffer) {
             Ok(0) => break,
             Ok(count) => {
@@ -172,6 +241,10 @@ fn read_pipe(fd: std::os::fd::OwnedFd) -> Result<CleanupReceipt> {
     }
     decode(&bytes)
 }
+#[cfg(test)]
+fn read_pipe(fd: std::os::fd::OwnedFd) -> Result<CleanupReceipt> {
+    read_pipe_until(fd, std::time::Instant::now() + Duration::from_secs(3))
+}
 pub(crate) async fn read_startup() -> Result<Option<Startup>> {
     let Some(fd) = std::env::var_os("CHIMAERA_SUPERVISOR_CLEANUP_FD") else {
         return Ok(None);
@@ -187,9 +260,12 @@ pub(crate) async fn read_startup() -> Result<Option<Startup>> {
         );
         // The opt-in launcher transfers ownership of exactly descriptor 0.
         let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(0) };
-        tokio::task::spawn_blocking(move || own_startup(read_pipe(fd)?))
-            .await?
-            .map(Some)
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        tokio::task::spawn_blocking(move || {
+            own_startup_until(read_pipe_until(fd, deadline)?, deadline)
+        })
+        .await?
+        .map(Some)
     }
     #[cfg(not(target_os = "linux"))]
     anyhow::bail!("supervisor cleanup channel is only supported on Linux")
@@ -200,11 +276,21 @@ pub(crate) fn stage_startup(state: &AppState, startup: Option<Startup>) -> Resul
     };
     let mut pending = lock(&state.pro.execution.supervisor_pending);
     ensure!(pending.is_none(), "supervisor startup already staged");
+    #[cfg(all(unix, feature = "provider-authority-prototype"))]
+    let mut provider = {
+        let provider = lock(&state.pro.execution.provider_pending);
+        ensure!(provider.is_none(), "provider startup already staged");
+        provider
+    };
     #[cfg(unix)]
     {
         let mut maintenance = lock(&state.pro.execution.maintenance_pending);
         ensure!(maintenance.is_none(), "maintenance startup already staged");
         *maintenance = startup.maintenance;
+    }
+    #[cfg(all(unix, feature = "provider-authority-prototype"))]
+    {
+        *provider = startup.provider;
     }
     *pending = Some(startup.receipt);
     Ok(())
