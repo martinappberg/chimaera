@@ -52,7 +52,9 @@ pub(super) fn original_name(name: &str) -> Option<&str> {
 pub(super) fn local_now() -> Option<nix::libc::tm> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs()) as nix::libc::time_t;
+        .map_or(0, |d| d.as_secs())
+        .try_into()
+        .ok()?;
     let mut tm = std::mem::MaybeUninit::<nix::libc::tm>::zeroed();
     // SAFETY: `localtime_r` writes into the provided buffer and is thread safe.
     let converted = unsafe { !nix::libc::localtime_r(&now, tm.as_mut_ptr()).is_null() };
