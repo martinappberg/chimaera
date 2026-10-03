@@ -101,8 +101,13 @@ async fn same_key_replacement_refuses_new_binding_but_preserves_original_stream(
     let directory = Directory::new();
     let path = directory.0.join("agent");
     let original = AgentServer::new(&path, None);
-    let (agent, _) = UnixAgent::capture(path.clone()).await.unwrap();
-    let mut bound = agent.connect().await.unwrap();
+    let (agent, _) = UnixAgent::capture(path.clone())
+        .await
+        .unwrap_or_else(|_| panic!("synthetic agent capture refused"));
+    let mut bound = agent
+        .connect()
+        .await
+        .unwrap_or_else(|_| panic!("synthetic agent connection refused"));
     assert_eq!(original.probes.load(Ordering::SeqCst), 2);
     std::fs::remove_file(&path).unwrap();
     let replacement = AgentServer::new(&path, None);
@@ -111,7 +116,13 @@ async fn same_key_replacement_refuses_new_binding_but_preserves_original_stream(
         Err(Failure::KeyUnavailable)
     ));
     assert_eq!(replacement.probes.load(Ordering::SeqCst), 0);
-    assert_eq!(bound.exchange(&[27]).await.unwrap(), [6]);
+    assert_eq!(
+        bound
+            .exchange(&[27])
+            .await
+            .unwrap_or_else(|_| panic!("synthetic agent exchange refused")),
+        [6]
+    );
     assert_eq!(original.signs.load(Ordering::SeqCst), 1);
     assert_eq!(replacement.signs.load(Ordering::SeqCst), 0);
     // A later explicit selection can capture the new instance; the old one
@@ -128,7 +139,9 @@ async fn legal_symlink_is_preserved_but_retargeting_it_cannot_select_another_age
     let _original = AgentServer::new(&first, None);
     let replacement = AgentServer::new(&second, None);
     std::os::unix::fs::symlink(&first, &alias).unwrap();
-    let (agent, _) = UnixAgent::capture(alias.clone()).await.unwrap();
+    let (agent, _) = UnixAgent::capture(alias.clone())
+        .await
+        .unwrap_or_else(|_| panic!("synthetic agent alias capture refused"));
     assert_eq!(agent.path(), alias);
     assert!(agent.connect().await.is_ok());
     std::fs::remove_file(&alias).unwrap();
@@ -178,7 +191,9 @@ async fn original_empty_identity_reply_retains_initial_no_keys_semantics() {
         // Retain the serving peer until capture completes its PID check.
         let _ = stream.read(&mut [0]).await;
     });
-    let (_, response) = UnixAgent::capture(path).await.unwrap();
+    let (_, response) = UnixAgent::capture(path)
+        .await
+        .unwrap_or_else(|_| panic!("synthetic empty agent capture refused"));
     assert!(matches!(
         super::super::selection::identity_reply(&response),
         Err(super::super::selection::SelectionFailure::NoKeys)
