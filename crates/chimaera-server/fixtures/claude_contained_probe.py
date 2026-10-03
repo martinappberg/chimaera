@@ -27,6 +27,11 @@ from contextlib import closing
 CLI_SHA = "e4daf793d1e74fb0d9874dd09e98690bbfd7be515f78a87fd05b9e2b4bb33b03"
 LOCK = "/run/chimaera-project-isolation-fixture.lock"
 LIMIT = 128 * 1024
+BWRAP_PHASES = frozenset(
+    "bwrap-" + stage + "-" + cause
+    for stage in ("setup", "exec", "source", "unknown")
+    for cause in ("denied", "missing", "invalid", "other")
+)
 
 # Only fixed fixture phases cross process boundaries; no exception text, CLI
 # output, request bodies or credentials may become a diagnostic.
@@ -86,7 +91,7 @@ REFUSAL_PHASES = frozenset((
     'tui-route',
     'tui-target',
     'unexpected',
-))
+)) | BWRAP_PHASES
 
 
 class Refusal(RuntimeError):
@@ -103,6 +108,38 @@ def child_refusal(errors):
             if phase in REFUSAL_PHASES:
                 return phase
     return None
+
+
+def bwrap_refusal(errors):
+    # Diagnostics classify a failed fixed launcher, never prove its cause or
+    # forward a pathname. Unknown Bubblewrap wording stays a fixed category.
+    for line in errors.splitlines():
+        if not line.startswith(b"bwrap: "):
+            continue
+        message = line[len(b"bwrap: "):]
+        if message.startswith((b"execvp ", b"execv ", b"Can't exec ")):
+            stage = "exec"
+        elif message.startswith((b"Can't find source path ", b"Can't open ",
+                                 b"Can't stat ", b"Invalid fd ")):
+            stage = "source"
+        elif message.startswith((b"Can't mkdir ", b"Can't mount ", b"Can't bind mount ",
+                                 b"Can't create ", b"Can't chdir ",
+                                 b"Creating new namespace failed", b"Setting up uid map",
+                                 b"Setting up gid map", b"Failed to ", b"No permissions to ")):
+            stage = "setup"
+        else:
+            stage = "unknown"
+        if message.endswith((b": Permission denied", b": Operation not permitted")):
+            cause = "denied"
+        elif message.endswith(b": No such file or directory"):
+            cause = "missing"
+        elif message.endswith((b": Invalid argument", b": Bad file descriptor",
+                               b": Not a directory")):
+            cause = "invalid"
+        else:
+            cause = "other"
+        return "bwrap-" + stage + "-" + cause
+    return "bwrap-unknown-other"
 
 
 def require(condition, phase):
@@ -151,6 +188,8 @@ def bounded_child(args, env, timeout, pass_fds=(), cwd=None):
                     phase = child_refusal(buffers[1])
                     if phase is not None:
                         raise Refusal(phase)
+                    if args[0] == "/usr/bin/bwrap":
+                        raise Refusal(bwrap_refusal(buffers[1]))
                 return code, bytes(buffers[0]), len(buffers[1])
             require(time.monotonic() < end, "child-exit-deadline")
             time.sleep(.01)
