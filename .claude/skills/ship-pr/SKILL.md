@@ -93,6 +93,12 @@ fail is skipped until it's fixed.
 
 ## After merge
 
+Stop the previews you started for the PR and clean up its worktree using the
+[worktree-lifecycle workflow](../worktree-lifecycle/SKILL.md). This is part of
+completing the merge: stop owned previews gracefully, release build output,
+and remove the idle checkout from another checkout (or archive a managed Codex
+worktree). If another session still uses it, leave it intact and report why.
+
 Watch that the intended workflow ran: for a normal PR, `release.yml` should
 publish a release with the bumped version; for a no-release type or
 `[skip release]` PR, the

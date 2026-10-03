@@ -20,9 +20,26 @@ group and prints why:
 | Group | Meaning | What `--apply` does |
 |---|---|---|
 | **ACTIVE** | a process has its cwd or an open file inside it, it is `git worktree lock`ed, the script runs from it, or something in it changed in the last 6 h (unless its PR is merged — see REMOVE) | nothing, ever |
+| **PREVIEW** | clean and pushed, HEAD belongs to a merged PR (not already in main), and only recognized dev previews and their children use it; no lock, current session, or nested worktree | sends SIGTERM to the previews, waits up to 10 seconds, re-checks processes and git state, then removes the worktree; never SIGKILL |
 | **REMOVE** | PR merged or closed (or HEAD already in `origin/main`), no uncommitted changes, no unpushed commits. A merged PR skips the 6 h wait when the checkout *is* that PR: its own commits (not in `origin/main`) all sit in the PR's head | `git worktree remove` (never `--force`) + `git worktree prune`; the branch is kept |
 | **TRIM** | not removable, idle for more than 24 h | deletes its git-ignored `target/` and `node_modules/` dirs; source is never touched |
 | **KEEP** | everything else (an open PR idle < 24 h, unpushed commits, uncommitted changes) | nothing |
+
+PREVIEW is the narrow exception to process-based activity: the executable must
+be this checkout's `target/debug/chimaera serve`, its isolated `chimaera-dev`
+app/daemon, or Node running this checkout's Vite entrypoint from `web-ui`.
+The documented `npm run dev`, `npm --prefix web-ui run dev`, `npm exec vite`
+and `just dev-ui` launcher chains are recognized too, as is `just app-dev-isolated`,
+including their dedicated shell wrappers. Compound shell commands and wrappers with other children stay
+protected. Daemon-owned test
+agents shut down through their parent; GC never kills arbitrary `node`, `claude`,
+`codex`, shells, or editors by name. An unrelated process, a preview touching a
+sibling checkout, or an unrecognized wrapper keeps the checkout ACTIVE. A
+verified launcher chain stops from leaf to root, waiting for each child to be
+reaped before stopping its wrapper, within one shared ten-second deadline. A
+preview that will not exit, or work written during shutdown, keeps the checkout
+intact. Dry runs report PREVIEW without stopping anything; `--apply` and the
+automatic session-start cleanup perform the guarded shutdown.
 
 It judges a worktree only by its branch, that branch's PR (`gh`), git state and live
 processes (`lsof`, or `/proc`) — **never by its folder name**. Both apps reuse folders
@@ -43,17 +60,27 @@ went has no worktree.
 
 1. **Before a big build**, check `df -h ~`. Under ~50 GiB free (the session-start
    hook says so when it is), run `scripts/worktree-gc` and read the table. Its
-   `--apply` only ever acts on REMOVE and TRIM, which the hooks already apply
+   `--apply` only ever acts on PREVIEW, REMOVE and TRIM, which the hooks already apply
    automatically, so running it is safe; nothing else is yours to delete.
 2. **After your PR merges**, your worktree should go. A session can't remove the
    worktree it runs in (it is ACTIVE: "this session runs here"), so:
+   - stop every preview you started for this PR: the isolated app and daemon,
+     Vite, and any preview launcher. Use the preview tool's stop action when
+     available; otherwise verify the exact PID and executable, send SIGTERM,
+     and wait for exit. Let daemons shut down their own child agents. Never
+     use a broad process-name kill or stop another session's processes;
    - drop its build output now with `scripts/worktree-gc --self --apply`;
    - end the session. The next gc run (any session's start, at most hourly) removes
-     the worktree once nothing uses it — merged, clean and pushed is REMOVE — unless
+     the worktree once nothing uses it — merged, clean and pushed is REMOVE;
+     recognized leftover previews are PREVIEW and shut down first — unless
      automatic cleanup is off on that machine (`worktree-gc.auto`, below); then say
      so and leave the removal to the human.
    - Working from another checkout? `git worktree remove <path>` — never `--force`,
      and never on a worktree the table calls ACTIVE.
+   Treat this as part of finishing the PR, not optional housekeeping. If a
+   preview does not exit gracefully or another session keeps the worktree
+   ACTIVE, report the blocker and leave it intact. The next automatic GC is
+   a fallback for leftover previews, not a reason to keep yours running.
 3. **At session end** the SessionEnd hook runs `--self --sweep`: it deletes only the
    stale debug objects no binary in `target/` references, so the next build stays warm.
    `--self` without `--sweep` deletes this worktree's whole `target/` (the next build
@@ -63,8 +90,8 @@ went has no worktree.
 
 - touch an ACTIVE worktree: no `rm -rf` of its `target/`, no `git worktree remove`,
   no unlocking a lock you didn't take. Codex app-servers keep their cwd in a worktree
-  for hours, and `chimaera-dev.app`, `chimaera serve` and test binaries run straight
-  out of `target/debug`.
+  for hours. Only the script's explicit PREVIEW group may stop recognized dev
+  previews, after verifying the checkout is clean, pushed and merged.
 - `git worktree remove --force`, delete branches, or clean another worktree by hand —
   run the script, which re-checks each worktree right before acting.
 - trust `du` for what a delete frees. Cargo hardlinks objects between `deps/` and
@@ -78,7 +105,7 @@ went has no worktree.
 ```sh
 scripts/worktree-gc                    # dry run: the table + what --apply would do
 scripts/worktree-gc --markdown         # the same, as a markdown table (PR bodies)
-scripts/worktree-gc --apply            # remove REMOVE, trim TRIM; reports df before/after
+scripts/worktree-gc --apply            # stop PREVIEWs, remove REMOVE, trim TRIM; reports df before/after
 scripts/worktree-gc --self [--sweep] [--apply]   # this worktree's own target/
 bash scripts/worktree-gc.test.sh       # the safety rules, against a throwaway repo
 ```

@@ -9,7 +9,7 @@
 # acts only with --apply.
 #
 #   scripts/worktree-gc                  table of every worktree + what --apply does
-#   scripts/worktree-gc --apply          remove the REMOVE group, trim the TRIM group
+#   scripts/worktree-gc --apply          stop PREVIEWs, remove REMOVE, trim TRIM
 #   scripts/worktree-gc --markdown       the same table as markdown (for a PR/notes)
 #   scripts/worktree-gc --self [--sweep] [--apply]
 #                                        this worktree's own Rust build output:
@@ -27,7 +27,8 @@
 #   ACTIVE  a process has its cwd or an open file inside it; it is
 #           `git worktree lock`ed; this script runs from it; or something in
 #           it changed in the last --active-hours — unless its PR is merged
-#           (below). Never touched.
+#           (below). Known merged-worktree previews have their own PREVIEW
+#           group; everything remaining ACTIVE is never touched.
 #   REMOVE  its PR is merged or closed, or its HEAD is already in origin/main;
 #           AND no uncommitted changes AND no unpushed commits AND not ACTIVE.
 #           A merged PR skips the --active-hours wait when the checkout's own
@@ -36,6 +37,10 @@
 #           session (the Claude app detaches its branch) reads as a fresh change.
 #           `git worktree remove` (never --force), then `git worktree prune`.
 #           The branch is kept.
+#   PREVIEW a clean, pushed, merged checkout held only by known dev previews
+#           and their children. SIGTERM the previews, wait up to 10 seconds,
+#           then re-check before removal. No SIGKILL. Other processes, locks,
+#           nested worktrees, and the current checkout always block this.
 #   TRIM    not removable, and idle for more than --idle-hours: its build
 #           output (git-ignored target/ and node_modules/ dirs) is deleted.
 #           Source is never touched.
@@ -224,6 +229,165 @@ proc_reason() { # realpath
       printf "in use by %s (%d process%s)", s, n, (n == 1 ? "" : "es") }' "$TMPD/hits"
 }
 
+# A PID alone is reusable. Keep its start time and complete command alongside
+# it, and compare again immediately before signalling. Missing ps data fails
+# closed, just like missing lsof data.
+process_identity() {
+  local identity
+  identity=$(ps -ww -p "$1" -o lstart= -o args= 2>/dev/null) || return 1
+  [ -n "$identity" ] || return 1
+  printf '%s\n' "$identity"
+}
+
+# Exact executable paths (from lsof / /proc), not process names, distinguish
+# our debug daemon/app from a released app or another repo's preview. Vite
+# additionally needs its worktree-local entrypoint and web-ui cwd. Unknown
+# wrappers stay ACTIVE rather than guessing what an arbitrary node/shell does.
+is_preview() { # pid realpath
+  local pid=$1 wt=$2 args exe entry
+  args=$(ps -ww -p "$pid" -o args= 2>/dev/null) || return 1
+  for entry in target/debug/chimaera crates/chimaera-app/target/debug/chimaera-dev \
+    crates/chimaera-app/target/debug/chimaera-dev.app/Contents/MacOS/chimaera-dev; do
+    exe="$wt/$entry"
+    awk -F'\t' -v p="$pid" -v e="$exe" '$1 == p && $3 == "txt" && $4 == e { found = 1 } END { exit !found }' "$TMPD/procs" || continue
+    case "$entry" in
+      target/debug/chimaera)
+        case "$args" in "$exe serve" | "$exe serve "* | "$entry serve" | "$entry serve "* | "./$entry serve" | "./$entry serve "*) return 0 ;; esac ;;
+      *)
+        case "$args" in "$exe" | "$exe --daemon" | "$entry" | "$entry --daemon" | "./$entry" | "./$entry --daemon") return 0 ;; esac ;;
+    esac
+  done
+  is_vite "$pid" "$wt"
+}
+
+is_vite() { # pid realpath
+  local pid=$1 wt=$2 args entry
+  args=$(ps -ww -p "$pid" -o args= 2>/dev/null) || return 1
+  awk -F'\t' -v p="$pid" -v w="$wt/web-ui" '
+    $1 == p && $3 == "cwd" && $4 == w { cwd = 1 }
+    $1 == p && $3 == "txt" && $4 ~ /\/node$/ { node = 1 }
+    END { exit !(cwd && node) }' "$TMPD/procs" || return 1
+  for entry in "$wt/web-ui/node_modules/.bin/vite" "$wt/web-ui/node_modules/vite/bin/vite.js"; do
+    case "${args#* }" in "$entry" | "$entry "*) return 0 ;; esac
+  done
+  return 1
+}
+
+# Recognize only the documented launcher chain, walking outward from an
+# already verified preview process. Each wrapper must have exactly that one
+# child: a compound shell command or another running task stays protected.
+preview_wrapper_kind() { # parent child child-kind realpath
+  local pid=$1 child=$2 kind=$3 wt=$4 args cwd command
+  awk -v p="$pid" -v c="$child" '$2 == p { n++; if ($1 == c) found = 1 } END { exit !(n == 1 && found) }' "$TMPD/parents" || return 1
+  # lsof can repeat cwd records for a multithreaded process on Linux.
+  # Collapse identical paths, but conflicting cwd data still fails closed.
+  cwd=$(awk -F'\t' -v p="$pid" '$1 == p && $3 == "cwd" && !seen[$4]++ { print $4 }' "$TMPD/procs")
+  args=$(ps -ww -p "$pid" -o args= 2>/dev/null) || return 1
+  case "$kind" in
+    vite)
+      if [ "$cwd" = "$wt/web-ui" ]; then
+        case "$args" in
+          "sh -c vite" | "sh -c vite "* | "/bin/sh -c vite" | "/bin/sh -c vite "*)
+            command=${args#* -c }
+            # No shell operators, substitutions, redirections or quoting.
+            case "$command" in *[!a-zA-Z0-9_./=,:@%+\ -]*) return 1 ;; esac
+            echo vite-shell; return 0 ;;
+        esac
+      fi
+      ;;
+  esac
+  case "$kind" in
+    vite | vite-shell)
+      [ "$cwd" = "$wt" ] || [ "$cwd" = "$wt/web-ui" ] || return 1
+      awk -F'\t' -v p="$pid" '$1 == p && $3 == "txt" && $4 ~ /\/node$/ { found = 1 } END { exit !found }' "$TMPD/procs" || return 1
+      case "$args" in "npm exec vite" | "npm exec vite "* | "npm run dev" | "npm run dev "*) echo npm; return 0 ;; esac
+      ;;
+    npm | just-shell)
+      if [ "$kind" = npm ] && [ "$cwd" = "$wt/web-ui" ]; then
+        case "$args" in "sh -cu cd web-ui && npm run dev" | "/bin/sh -cu cd web-ui && npm run dev") echo just-shell; return 0 ;; esac
+      fi
+      [ "$cwd" = "$wt" ] && [ "${args#* }" = dev-ui ] || return 1
+      awk -F'\t' -v p="$pid" '$1 == p && $3 == "txt" && $4 ~ /\/just$/ { found = 1 } END { exit !found }' "$TMPD/procs" || return 1
+      echo just; return 0 ;;
+    app | app-shell)
+      [ "$cwd" = "$wt" ] || return 1
+      if [ "$kind" = app ]; then
+        case "$args" in "sh -cu bash .claude/skills/develop/run-app-isolated.sh" | "/bin/sh -cu bash .claude/skills/develop/run-app-isolated.sh") echo app-shell; return 0 ;; esac
+      fi
+      [ "${args#* }" = app-dev-isolated ] || return 1
+      awk -F'\t' -v p="$pid" '$1 == p && $3 == "txt" && $4 ~ /\/just$/ { found = 1 } END { exit !found }' "$TMPD/procs" || return 1
+      echo just; return 0 ;;
+  esac
+  return 1
+}
+
+# Emit only the preview roots to signal. Children (test agents, relays, etc.)
+# are shut down by their owning daemon, never killed by name. Any unrelated
+# holder keeps the entire checkout ACTIVE. The process-parent snapshot also
+# lets documented npm/just wrappers retire with their verified children.
+preview_roots() { # realpath
+  local wt=$1 pid parent kind next identity depth
+  : >"$TMPD/preview-roots"
+  rm -f "$TMPD/preview-wrappers"
+  ps -axo pid=,ppid= >"$TMPD/parents" 2>/dev/null || return 1
+  [ -s "$TMPD/parents" ] || return 1
+  awk -F'\t' -v w="$wt" '$1 == w { print $2 }' "$TMPD/hits" | sort -un >"$TMPD/holders"
+  [ -s "$TMPD/holders" ] || return 1
+  while IFS= read -r pid; do
+    is_preview "$pid" "$wt" && echo "$pid" >>"$TMPD/preview-roots"
+  done <"$TMPD/holders"
+  [ -s "$TMPD/preview-roots" ] || return 1
+  # npm can insert sh between itself and Vite; just can wrap npm or the
+  # isolated app in another shell. Never walk arbitrary ancestors.
+  while IFS= read -r pid; do
+    if is_vite "$pid" "$wt"; then
+      kind=vite
+    elif awk -F'\t' -v p="$pid" -v w="$wt/crates/chimaera-app/target/debug/" '
+      $1 == p && $3 == "txt" && ($4 == w "chimaera-dev" || $4 == w "chimaera-dev.app/Contents/MacOS/chimaera-dev") { found = 1 }
+      END { exit !found }' "$TMPD/procs"; then
+      kind=app
+    else
+      continue
+    fi
+    depth=0
+    while [ "$depth" -lt 4 ]; do
+      parent=$(awk -v p="$pid" '$1 == p { print $2 }' "$TMPD/parents")
+      [ -n "$parent" ] || break
+      next=$(preview_wrapper_kind "$parent" "$pid" "$kind" "$wt") || break
+      echo "$parent" >>"$TMPD/preview-wrappers"
+      pid=$parent kind=$next depth=$((depth + 1))
+    done
+  done <"$TMPD/preview-roots"
+  if [ -f "$TMPD/preview-wrappers" ]; then
+    cat "$TMPD/preview-wrappers" >>"$TMPD/preview-roots"
+    rm -f "$TMPD/preview-wrappers"
+  fi
+  sort -un "$TMPD/preview-roots" >"$TMPD/preview-pids"
+  # A preview touching a sibling checkout must not shut down that work.
+  awk -F'\t' -v roots="$TMPD/preview-pids" -v parents="$TMPD/parents" -v w="$wt" '
+    BEGIN {
+      while ((getline p < roots) > 0) R[p] = 1
+      while ((getline line < parents) > 0) { sub(/^[[:space:]]+/, "", line); split(line, a, /[[:space:]]+/); P[a[1]] = a[2] }
+    }
+    { p = $2; n = 0; while (p > 1 && !(p in R) && n++ < 100) p = P[p]
+      if (($1 == w && !(p in R)) || ($1 != w && p in R)) bad = 1 }
+    END { exit bad }' "$TMPD/hits" || return 1
+  # Stop leaves first while their wrappers are still alive to reap them.
+  # PID order is not ancestry order (PIDs wrap and can be reused).
+  awk -v parents="$TMPD/parents" '
+    BEGIN { while ((getline line < parents) > 0) { sub(/^[[:space:]]+/, "", line); split(line, a, /[[:space:]]+/); P[a[1]] = a[2] } }
+    { R[$1] = 1 }
+    END { for (p in R) {
+      q = P[p]; depth = 0; n = 0
+      while (q > 1 && n++ < 100) { if (q in R) depth++; q = P[q] }
+      print depth "\t" p
+    } }' "$TMPD/preview-pids" | sort -k1,1nr -k2,2n | cut -f2 >"$TMPD/preview-order"
+  while IFS= read -r pid; do
+    identity=$(process_identity "$pid") || return 1
+    printf '%s\t%s\n' "$pid" "$identity"
+  done <"$TMPD/preview-order"
+}
+
 # The worktrees nested inside $1 (by registered path), one per line.
 nested_in() {
   awk -F'\t' -v w="$1" 'index($1, w "/") == 1 { print $1 }' "$TMPD/wts"
@@ -324,7 +488,7 @@ head_state() { # path → HEAD's commit and the branch it names (none when detac
 classify() {
   local n=0 path rpath head branch locked prunable gd sizekb idle_s mt reason group
   local pr prs prn proid dirty unpushed in_base removable why extra lockpid self_rp
-  local recent merged at_head
+  local recent merged at_head process_only status
   self_rp=$(realdir "$CUR")
   local claude_rp="" script_rp
   script_rp=$(realdir "$HERE")
@@ -334,7 +498,7 @@ classify() {
     n=$((n + 1))
     [ "$branch" = "-" ] && branch=""
     : >"$TMPD/b.$n"
-    reason="" recent="" group="" sizekb=0 pr="-" dirty="-" unpushed="-" idle="-"
+    reason="" recent="" group="" process_only=0 sizekb=0 pr="-" dirty="-" unpushed="-" idle="-"
     if [ ! -d "$path" ]; then
       printf 'REMOVE\t0\t%s\t-\t-\t-\t-\t%s\t%s\t%s\n' "${branch:-(detached)}" "$path" "directory is gone; git worktree prune clears the entry" "$n" >>"$TMPD/rows"
       continue
@@ -368,6 +532,7 @@ classify() {
       reason="cannot read its files' times: assumed in use"
     else
       reason=$(proc_reason "$rpath")
+      [ -n "$reason" ] && process_only=1
       # Settled below: a merged PR overrides a recent change.
       if [ -z "$reason" ] && [ "$idle_s" -lt $((ACTIVE_HOURS * 3600)) ]; then
         recent="changed $idle ago (< ${ACTIVE_HOURS}h)"
@@ -376,7 +541,11 @@ classify() {
     [ -n "$reason" ] && group=ACTIVE
 
     # Git state (read-only; GIT_OPTIONAL_LOCKS=0).
-    dirty=$(git -C "$path" status --porcelain --untracked-files=normal 2>/dev/null | wc -l | tr -d ' ') || dirty="?"
+    if status=$(git -C "$path" status --porcelain --untracked-files=normal 2>/dev/null); then
+      dirty=$(printf '%s' "$status" | awk 'END { print NR }')
+    else
+      dirty="?"
+    fi
     at_head=""
     [ -n "$branch" ] || at_head=$(git -C "$path" for-each-ref --points-at HEAD --format='%(refname)' refs/heads 2>/dev/null | sed 's|^refs/heads/||' | tr '\n' ' ')
     prs=$(pr_for "$branch" "$head" "$at_head")
@@ -399,6 +568,19 @@ classify() {
     fi
     in_base=0
     git -C "$path" merge-base --is-ancestor HEAD "$BASE" 2>/dev/null && in_base=1
+
+    # Only retire a verified merged PR checkout, never a fresh checkout at
+    # main, a reused branch, a dirty tree, or one with unknown process users.
+    if [ "$process_only" = 1 ] && [ "$dirty" = 0 ] && [ "$unpushed" = 0 ] &&
+      [ "$in_base" = 0 ] && [ "${pr%% *}" = MERGED ] &&
+      [ "$path" != "$(head -1 "$TMPD/wts" | cut -f1)" ] &&
+      [ -z "$(nested_in "$path")" ] &&
+      git -C "$path" merge-base --is-ancestor HEAD "$proid" 2>/dev/null &&
+      preview_roots "$rpath" >"$TMPD/p.$n"; then
+      group=PREVIEW
+      reason="PR #$prn merged; clean; stop dev preview(s), then remove"
+      head_state "$path" >"$TMPD/m.$n"
+    fi
 
     if [ -z "$group" ]; then
       removable="" why="" merged=0
@@ -461,7 +643,7 @@ classify() {
     fi
     # du walks every file of a target/ (tens of thousands): the hooks' hourly
     # background run only sizes what it is about to delete.
-    if [ "$SIZES" = 1 ] && { [ "$AUTO" = 0 ] || [ "$group" = REMOVE ] || [ "$group" = TRIM ]; }; then
+    if [ "$SIZES" = 1 ] && { [ "$AUTO" = 0 ] || [ "$group" = REMOVE ] || [ "$group" = PREVIEW ] || [ "$group" = TRIM ]; }; then
       sizekb=$(du_kb "$TMPD/b.$n")
     fi
     [ -n "$branch" ] || branch="(detached)"
@@ -477,10 +659,10 @@ short_path() {
 }
 
 print_table() {
-  local g kb raw br pr dirty up idle path reason n order=0 total_r=0 total_t=0 c_a=0 c_r=0 c_t=0 c_k=0
+  local g kb raw br pr dirty up idle path reason n order=0 total_r=0 total_t=0 total_p=0 c_a=0 c_r=0 c_t=0 c_k=0 c_p=0
   : >"$TMPD/table"
   while IFS="$(printf '\t')" read -r g kb br pr dirty up idle path reason n; do
-    case "$g" in REMOVE) order=1 c_r=$((c_r + 1)) total_r=$((total_r + kb)) ;; TRIM) order=2 c_t=$((c_t + 1)) total_t=$((total_t + kb)) ;; KEEP) order=3 c_k=$((c_k + 1)) ;; ACTIVE) order=4 c_a=$((c_a + 1)) ;; esac
+    case "$g" in PREVIEW) order=0 c_p=$((c_p + 1)) total_p=$((total_p + kb)) ;; REMOVE) order=1 c_r=$((c_r + 1)) total_r=$((total_r + kb)) ;; TRIM) order=2 c_t=$((c_t + 1)) total_t=$((total_t + kb)) ;; KEEP) order=3 c_k=$((c_k + 1)) ;; ACTIVE) order=4 c_a=$((c_a + 1)) ;; esac
     raw=$kb
     if [ "$SIZES" = 1 ]; then kb=$(kb_h "$kb"); else kb="-"; fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$order" "$raw" "$g" "$kb" "$br" "$pr" "$dirty" "$up" "$idle" "$(short_path "$path")" "$reason" >>"$TMPD/table"
@@ -496,7 +678,7 @@ print_table() {
       END { for (r = 1; r <= NR; r++) { line = ""; for (i = 1; i <= nf[r]; i++) line = line (i < nf[r] ? sprintf("%-" w[i] "s  ", cell[r, i]) : cell[r, i]); print line } }'
   fi
   echo
-  say "ACTIVE $c_a · REMOVE $c_r ($(kb_h "$total_r") build output) · TRIM $c_t ($(kb_h "$total_t")) · KEEP $c_k — $(disk_line "$HERE")"
+  say "ACTIVE $c_a · PREVIEW $c_p ($(kb_h "$total_p")) · REMOVE $c_r ($(kb_h "$total_r") build output) · TRIM $c_t ($(kb_h "$total_t")) · KEEP $c_k — $(disk_line "$HERE")"
   local stubs
   stubs=$(codex_stubs)
   [ -n "$stubs" ] && say "Codex stub folders (only .codex-worktree-name left; the Codex app's, left alone): $stubs"
@@ -544,22 +726,71 @@ safe_rm_build_dir() { # worktree dir
   rm -rf "$d"
 }
 
+stop_previews() { # n path realpath
+  local n=$1 path=$2 rpath=$3 status pid identity current started deadline
+  list_worktrees >"$TMPD/current-wts"
+  cut -f2 "$TMPD/current-wts" >"$TMPD/roots"
+  scan_processes
+  [ "$PROC_SRC" != none ] || return 1
+  [ "$(head_state "$path")" = "$(cat "$TMPD/m.$n")" ] || return 1
+  status=$(git -C "$path" status --porcelain --untracked-files=normal 2>/dev/null) || return 1
+  [ -z "$status" ] || return 1
+  # Refresh registration as well: a lock or nested worktree can appear after
+  # the table was printed. Nothing gets signalled until every guard passes.
+  awk -F'\t' -v w="$path" '
+    $1 == w && $5 == "-" && $6 == "-" { found = 1 }
+    index($1, w "/") == 1 { nested = 1 }
+    END { exit !(found && !nested) }' "$TMPD/current-wts" || return 1
+  preview_roots "$rpath" >"$TMPD/previews.now" || return 1
+  cmp -s "$TMPD/p.$n" "$TMPD/previews.now" || return 1
+  deadline=$(($(date +%s) + 10))
+  while IFS="$(printf '\t')" read -r pid identity; do
+    # A wrapper may exit naturally when its child stops. A vanished PID is
+    # fine; a reused one must never receive SIGTERM.
+    started=$(ps -p "$pid" -o lstart= 2>/dev/null) || continue
+    [ -n "$started" ] || return 1
+    current=$(process_identity "$pid") || continue
+    [ "$current" = "$identity" ] || return 1
+    if ! kill -TERM "$pid" 2>/dev/null; then
+      process_identity "$pid" >/dev/null && return 1
+      continue
+    fi
+    say "stopping preview pid $pid in $(short_path "$path") (SIGTERM)"
+    # Wait for reaping, not just changed argv: Linux changes a zombie's
+    # command to <defunct> before its parent has reaped it. Killing that
+    # parent early leaks zombies under container init processes that do not
+    # reap orphans. Keep one shared deadline across the whole chain.
+    while [ "$(ps -p "$pid" -o lstart= 2>/dev/null)" = "$started" ]; do
+      if [ "$(date +%s)" -ge "$deadline" ]; then
+        say "preview shutdown timed out in $(short_path "$path"); leaving worktree intact"
+        return 1
+      fi
+      sleep 1
+    done
+  done <"$TMPD/p.$n"
+  return 0
+}
+
 apply_rows() {
-  local g kb br pr dirty up idle path reason n rpath before after acted=0 pruned=0 d
+  local g kb br pr dirty up idle path reason n rpath before after acted=0 pruned=0 d status
   before=$(free_kb "$HERE")
   while IFS="$(printf '\t')" read -r g kb br pr dirty up idle path reason n; do
-    case "$g" in REMOVE | TRIM) ;; *) continue ;; esac
+    case "$g" in REMOVE | PREVIEW | TRIM) ;; *) continue ;; esac
     if [ ! -d "$path" ]; then
       pruned=1
       continue
     fi
     rpath=$(realdir "$path")
+    if [ "$g" = PREVIEW ] && ! stop_previews "$n" "$path" "$rpath"; then
+      say "skip PREVIEW $(short_path "$path"): preview or worktree state changed, or shutdown incomplete"
+      continue
+    fi
     if ! still_idle "$n" "$path" "$rpath"; then
       say "skip $g $(short_path "$path"): became active"
       continue
     fi
-    if [ "$g" = REMOVE ]; then
-      if [ -n "$(git -C "$path" status --porcelain --untracked-files=normal 2>/dev/null)" ]; then
+    if [ "$g" = REMOVE ] || [ "$g" = PREVIEW ]; then
+      if ! status=$(git -C "$path" status --porcelain --untracked-files=normal 2>/dev/null) || [ -n "$status" ]; then
         say "skip REMOVE $(short_path "$path"): no longer clean"
         continue
       fi
@@ -770,5 +1001,5 @@ print_table
 if [ "$APPLY" = 1 ]; then
   apply_rows
 else
-  echo "Dry run: nothing changed. --apply removes the REMOVE group and trims the TRIM group; ACTIVE and KEEP are never touched."
+  echo "Dry run: nothing changed. --apply stops PREVIEWs before removal, removes REMOVE, and trims TRIM; ACTIVE and KEEP are never touched."
 fi
