@@ -195,7 +195,7 @@ impl Fixture {
             self.request_method("DELETE", "/api/v1/pro/configure", None)
                 .await
                 .0,
-            StatusCode::OK
+            StatusCode::NO_CONTENT
         );
         assert_eq!(active(&self.state), 0);
     }
