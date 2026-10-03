@@ -5,8 +5,8 @@ use crate::ssh_agent::{
     lifecycle::Registry,
     route::ConfigContext,
     trust::{self, Owner},
-    Failure,
 };
+use chimaera_link::ssh_auth::SshAuthFailure as Failure;
 use std::{io::Write, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{io::AsyncReadExt, time::Instant};
 

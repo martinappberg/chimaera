@@ -1,16 +1,27 @@
 //! Real Linux keeper/OpenSSH, synthetic local prompt consumer and account.
+#[path = "keeper_password.rs"]
+mod password;
+
 use crate::ssh_agent::{
     connect,
     lifecycle::Registry,
     route::ConfigContext,
     trust::{self, Owner},
-    Failure,
 };
+use chimaera_link::ssh_auth::SshAuthFailure as Failure;
 use std::{io::Write, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{io::AsyncReadExt, time::Instant};
 
 pub(super) async fn run(config: PathBuf, endpoint: String, action: String) -> Result<(), ()> {
-    if !matches!(action.as_str(), "accept" | "refuse" | "cancel" | "deadline") {
+    let mixed = matches!(
+        action.as_str(),
+        "password-accept"
+            | "password-wrong"
+            | "password-decline"
+            | "password-cancel"
+            | "password-deadline"
+    );
+    if !mixed && !matches!(action.as_str(), "accept" | "refuse" | "cancel" | "deadline") {
         return Err(());
     }
     let url = url::Url::parse(&endpoint).map_err(|_| ())?;
@@ -77,13 +88,18 @@ pub(super) async fn run(config: PathBuf, endpoint: String, action: String) -> Re
         trust::resolve_fixture("keeper-route-fixture", caps.keeper_boot, owner, context)
             .await
             .map_err(|_| ())?;
-    if selection.fixture_deadline() != Some(deadline)
-        || selection.request.legs.len() != 2
-        || selection
-            .request
-            .legs
-            .iter()
-            .any(|leg| leg.mode != chimaera_link::SshRouteMode::Key)
+    if selection.fixture_deadline() != Some(deadline) || selection.request.legs.len() != 2 {
+        return Err(());
+    }
+    if mixed {
+        return password::authenticate(client, selection, registry, attempt, deadline, &action)
+            .await;
+    }
+    if selection
+        .request
+        .legs
+        .iter()
+        .any(|leg| leg.mode != chimaera_link::SshRouteMode::Key)
         || selection.request.legs[0].user_keys != selection.request.legs[1].user_keys
     {
         return Err(());

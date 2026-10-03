@@ -500,12 +500,139 @@ class Keeper(Sources):
         print("PASS keeper4: actual router/grants/two sshd key legs; synthetic account/prompts/Slurm, no job lifetime", flush=True)
 
 
+class PasswordKeeper(Keeper):
+    """B: actual key bastion/password target; root-password, PAM-free only."""
+    def run(self):
+        from ssh_agent_loader import capture
+        for path, digest in ((LINUX_BINARY, self.digest), (LINUX_WRAPPER, self.wrapper_digest)):
+            check = self.management("/usr/bin/sha256sum " + path)
+            try:
+                if capture(check, self.end(5), 256).split() != [digest.encode(), path.encode()] or check.returncode:
+                    raise Refused("Linux fixture immutable digest")
+            finally:
+                stop_owned(check)
+        encrypted, public = self.key("password-bastion")
+        foreign, _ = self.key("password-foreign", passphrase="")
+        foreign_path = self.root / "password-foreign-agent"
+        self.spawn(["/usr/bin/ssh-agent", "-D", "-P", "", "-a", str(foreign_path)], output=False)
+        until = self.end(2)
+        while not foreign_path.exists() and time.monotonic() < until:
+            time.sleep(.02)
+        foreign_env = dict(self.env, SSH_AUTH_SOCK=str(foreign_path), SSH_ASKPASS_REQUIRE="never")
+        if self.collect(["/usr/bin/ssh-add", str(foreign)], foreign_env)[0]:
+            raise Refused("foreign seed")
+        foreign_before = self.identities(foreign_env)
+        commands = {"accept": b"GOOD\n", "wrong": b"BAD\n", "decline": b"DECLINE\n",
+                    "cancel": b"CANCEL\n", "deadline": b"HOLD\n"}
+        for action, answer in commands.items():
+            gateway = Gateway(self)
+            control = self.management("/usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin HOME=/tmp /usr/bin/python3 -I -S " + LINUX_WRAPPER,
+                                      input_pipe=True, control=True)
+            body = json.dumps({"advertised_port": gateway.server_address[1], "mixed_password": True,
+                               "public_key": "ssh-ed25519 " + public.decode()}, separators=(",", ":")).encode() + b"\n"
+            if os.write(control.stdin.fileno(), body) != len(body):
+                raise Refused("keeper bootstrap handoff")
+            ready = self.record(control, 20)
+            if (ready.get("type") != "ready" or ready.get("mixed_password") is not True
+                    or type(ready.get("pid")) is not int or ready["pid"] != ready.get("pgid")
+                    or type(ready.get("port")) is not int or not 1 <= ready["port"] <= 65535
+                    or len(ready.get("ssh_ports", [])) != 2 or len(ready.get("host_keys", [])) != 2):
+                raise Refused("password topology receipt")
+            gateway.port = ready["port"]
+            known = self.root / ("password-known-" + action)
+            rows = []
+            for port, host in zip(ready["ssh_ports"], ready["host_keys"]):
+                parts = host.split()
+                if type(port) is not int or not 1 <= port <= 65535 or len(parts) != 3 or parts[0] != "ssh-ed25519":
+                    raise Refused("sshd public receipt")
+                if len(base64.b64decode(parts[1], validate=True)) > 8192:
+                    raise Refused("sshd public bound")
+                rows.append("[127.0.0.1]:" + str(port) + " " + " ".join(parts[:2]) + "\n")
+            known.write_text("".join(rows))
+            os.chmod(known, 0o600)
+            config = self.root / ("password-config-" + action)
+            config.write_text("Host keeper-route-fixture\n HostName 127.0.0.1\n Port " + str(ready["ssh_ports"][1]) +
+                "\n ProxyJump keeper-route-hop\n IdentityFile none\n IdentityAgent none\n PubkeyAuthentication no\n"
+                " PasswordAuthentication yes\n KbdInteractiveAuthentication no\n PreferredAuthentications password\n"
+                "Host keeper-route-hop\n HostName 127.0.0.1\n Port " + str(ready["ssh_ports"][0]) +
+                "\n IdentityFile " + str(encrypted) + "\n IdentityAgent none\n IdentitiesOnly yes\n"
+                " PubkeyAuthentication yes\n PasswordAuthentication no\n KbdInteractiveAuthentication no\n PreferredAuthentications publickey\n"
+                "Host *\n User root\n UserKnownHostsFile " + str(known) + "\n GlobalKnownHostsFile none\n"
+                " GSSAPIAuthentication no\n HostbasedAuthentication no\n HostKeyAlgorithms ssh-ed25519\n"
+                " PubkeyAcceptedAlgorithms ssh-ed25519\n CASignatureAlgorithms ssh-ed25519\n ControlMaster no\n ControlPath none\n")
+            os.chmod(config, 0o600)
+            gateway.start()
+            app = self.spawn([str(self.binary), "--keeper-route-fixture", str(config), gateway.origin,
+                              "password-" + action], self.env, input_pipe=True)
+            output, receipts, loaded, remote = bytearray(), [], False, False
+            end = self.end(23)
+            try:
+                while True:
+                    if time.monotonic() >= end:
+                        raise Refused("native password case deadline")
+                    if not select.select([app.stdout], [], [], .025)[0]:
+                        continue
+                    chunk = os.read(app.stdout.fileno(), 4096)
+                    if not chunk:
+                        break
+                    if len(output) + len(chunk) > 8192:
+                        raise Refused("native password stdout bound")
+                    output.extend(chunk)
+                    if output.count(b"KEEPER_PROMPT\n") > 1 or output.count(b"KEEPER_REMOTE_PROMPT\n") > 1:
+                        raise Refused("native password prompt count")
+                    if b"KEEPER_PROMPT\n" in output and not loaded:
+                        receipts.append(self.helper_receipt(app))
+                        if os.write(app.stdin.fileno(), b"CONTINUE\n") != 9:
+                            raise Refused("private key load handoff")
+                        loaded = True
+                    if b"KEEPER_REMOTE_PROMPT\n" in output and not remote:
+                        if not loaded or os.write(app.stdin.fileno(), answer) != len(answer):
+                            raise Refused("original routed prompt handoff")
+                        app.stdin.close()
+                        remote = True
+                app.wait(timeout=max(.01, end - time.monotonic()))
+                expected = {"accept": b"KEEPER_AUTHENTICATED\n", "wrong": b"KEEPER_REFUSED password\n",
+                            "decline": b"KEEPER_REFUSED password\n", "cancel": b"KEEPER_REFUSED cancelled\n",
+                            "deadline": b"KEEPER_REFUSED expired\n"}[action]
+                if app.returncode or expected not in output or not loaded or not remote or gateway.failed:
+                    raise Refused("actual password route outcome")
+                for receipt in receipts:
+                    self.cleanup_receipt(receipt)
+                if action == "accept":
+                    os.write(control.stdin.fileno(), b"CHECK\n")
+                    retained = self.record(control, 12)
+                    if retained.get("type") != "retained" or retained.get("reads") != 3 or retained.get("jobs") != 0 or retained.get("masters", 0) < 1:
+                        raise Refused("password retained-master receipt")
+                    os.write(control.stdin.fileno(), b"RETIRE\n")
+                    if self.record(control, 8) != {"type": "retired", "masters": retained["masters"]}:
+                        raise Refused("password master retirement")
+                    os.write(control.stdin.fileno(), b"REVOKE\n")
+                    if self.record(control, 8) != {"type": "revoked", "new_auth_refused": True}:
+                        raise Refused("password owner revocation")
+                if self.identities(foreign_env) != foreign_before:
+                    raise Refused("foreign agent changed")
+                print("PASS password_" + action + " original_leg_prompt authenticated_master_or_refusal cleanup", flush=True)
+            finally:
+                if not app.stdin.closed:
+                    app.stdin.close()
+                stop_owned(app)
+                gateway.close()
+                if control.poll() is None:
+                    os.write(control.stdin.fileno(), b"EXIT\n")
+                    control.stdin.close()
+                    self.cleanup_receipts(control, expected_directories=2)
+                if control.returncode:
+                    raise Refused("password keeper cleanup refused")
+        print("PASS keeper_password5: actual key/password route; synthetic account/UI/root shadow, UsePAM=no; no MFA/job proof", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=pathlib.Path, required=True)
     parser.add_argument("--podman", type=pathlib.Path, default=pathlib.Path("/opt/homebrew/bin/podman"))
     parser.add_argument("--linux-sha256", required=True)
     parser.add_argument("--wrapper-sha256", required=True)
+    parser.add_argument("--scenario", choices=("key", "mixed-password"), default="key")
     args = parser.parse_args()
     args.podman = args.podman.resolve(strict=True)
     if sys.platform != "darwin" or any(len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest)
@@ -522,7 +649,8 @@ def main():
     signals = {signal.SIGALRM, signal.SIGTERM, signal.SIGINT, signal.SIGHUP}
     previous = signal.pthread_sigmask(signal.SIG_BLOCK, signals)
     try:
-        fixture = Keeper(args.binary, args.podman, args.linux_sha256, args.wrapper_sha256)
+        constructor = Keeper if args.scenario == "key" else PasswordKeeper
+        fixture = constructor(args.binary, args.podman, args.linux_sha256, args.wrapper_sha256)
     finally:
         signal.pthread_sigmask(signal.SIG_SETMASK, previous)
     signal.setitimer(signal.ITIMER_REAL, 120)

@@ -4,9 +4,9 @@ use crate::ssh_agent::{
     lifecycle::Registry,
     route::ConfigContext,
     trust::{self, Owner},
-    Failure,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
+use chimaera_link::ssh_auth::SshAuthFailure as Failure;
 use chimaera_link::SshRouteRequest;
 use signature::Signer;
 use ssh_key::private::{Ed25519Keypair, KeypairData};
