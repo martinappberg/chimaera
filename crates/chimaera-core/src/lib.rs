@@ -2,6 +2,7 @@
 
 pub mod cloud_providers;
 pub mod cluster;
+pub mod project_secret_idle;
 #[cfg(unix)]
 pub mod shellint;
 pub mod slurm;
