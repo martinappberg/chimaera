@@ -12,6 +12,7 @@ import { workbenchPath } from "./base";
 import { writable } from "svelte/store";
 import { getHostLabel, getJobContext, getToken } from "./api";
 import type { Workspace } from "../workspace/sessions";
+import type { SecretCommand, SecretPage, SecretResult } from "../pro/projectSecrets";
 
 interface TauriGlobal {
   core: { invoke: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T> };
@@ -1423,6 +1424,23 @@ export async function proRevokeDevice(deviceId: string): Promise<void> {
 
 export function onProChanged(handler: () => void): Promise<() => void> {
   return tauri()?.event.listen<null>("pro-changed", () => handler()) ?? Promise.resolve(() => {});
+}
+
+/** Additive account-Home IPC. There is no project-daemon/browser fallback. */
+export async function proProjectSecretsCatalog(after: string | null = null): Promise<SecretPage> {
+  const t = tauri();
+  if (t === null) throw new Error("project_secrets_unsupported");
+  return t.core.invoke<SecretPage>("pro_project_secrets_catalog", { after });
+}
+export async function proProjectSecretCommand(context: string, command: SecretCommand): Promise<SecretResult> {
+  const t = tauri();
+  if (t === null) throw new Error("project_secrets_unsupported");
+  return t.core.invoke<SecretResult>("pro_project_secret_command", { contextTag: context, payload: JSON.stringify(command) });
+}
+export async function proProjectSecretOperation(context: string, operationId: string): Promise<SecretResult> {
+  const t = tauri();
+  if (t === null) throw new Error("project_secrets_unsupported");
+  return t.core.invoke<SecretResult>("pro_project_secret_operation", { contextTag: context, operationId });
 }
 
 export type CloudProviderState = "missing" | "needs_sign_in" | "signed_in" | "unknown" | "unavailable";

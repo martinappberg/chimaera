@@ -25,6 +25,7 @@ mod credentials;
 mod installation;
 mod machine;
 mod placements;
+pub(super) mod project_secrets;
 pub(super) mod projects;
 mod recovery;
 mod signout;

@@ -48,6 +48,11 @@ On the web's Home (the account's own page, `net/base.ts` `isAccountHome`; see
 with `account` shows only Chimaera Pro, rendered in place by
 `pro/BrowserAccount.svelte` (plan, usage, the billing link and Sign out), with no
 search, JSON tab or daemon settings.
+`pro/ProjectSecrets.svelte` is a separate capability-gated account control on
+paid native/browser Home. It edits one name without reading existing values,
+carries the shown queued batch, and separates Queue until idle from confirmed
+Apply now or immediate Remove access. Project contexts navigate to account Home;
+they never send a value through a daemon or remote project transport.
 Credentials stay in the app's keychain, never in the schema or this UI.
 Account devices group only verified installation bindings; unbound older sessions
 are collapsed under Other sign-ins, retaining individual removal controls.

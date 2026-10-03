@@ -7,6 +7,7 @@
    */
   import { untrack } from "svelte";
   import AccountUsage from "./AccountUsage.svelte";
+  import ProjectSecrets from "./ProjectSecrets.svelte";
   import BrandMark from "../shared/BrandMark.svelte";
   import PlanBadge from "../shared/PlanBadge.svelte";
   import { pageVisible } from "../shared/visibility";
@@ -78,6 +79,7 @@
   {/if}
   {#if paid && status !== null}
     <AccountUsage usage={status.usage} limits={status.limits} />
+    <ProjectSecrets {visible} />
   {/if}
   <div class="actions">
     <a class="primary" href={BILLING_PATH}>{paid || due ? "Manage plan and billing" : "See plans"}</a>

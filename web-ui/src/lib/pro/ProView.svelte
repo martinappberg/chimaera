@@ -1,6 +1,7 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import ProSettings from "../settings/ProSettings.svelte";
+  import ProjectSecrets from "./ProjectSecrets.svelte";
   import CloudSetup from "../settings/CloudSetup.svelte";
   import BrandMark from "../shared/BrandMark.svelte";
   import { pageVisible } from "../shared/visibility";
@@ -58,6 +59,7 @@
       <div class="brand"><BrandMark size={44} /><span>chimaera <span class="product">Pro</span></span></div>
       {#if worker}
         <CloudSetup {visible} requiredProviders={required} contextLabel={project} workspaceId={workspace} onReady={done} />
+        <ProjectSecrets {visible} />
         {#if isBrowserGateway()}<a class="account-link" href={BILLING_PATH}>Manage account and billing</a>{/if}
       {:else if worker === null}
         <h1>Connect your cloud agents</h1>
