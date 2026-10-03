@@ -3,6 +3,9 @@
 #[path = "../ssh_agent_fixture_support/keeper.rs"]
 mod keeper;
 #[cfg(target_os = "macos")]
+#[path = "../ssh_agent_fixture_support/keeper_retention.rs"]
+mod keeper_retention;
+#[cfg(target_os = "macos")]
 #[path = "../ssh_agent_fixture_support/route.rs"]
 mod route;
 #[cfg(target_os = "macos")]
@@ -219,6 +222,46 @@ fn main() {
                 std::process::exit(2)
             }
         }
+        Some("--keeper-retention-observer") => {
+            if args.len() != 5
+                || !matches!(
+                    args[3].as_str(),
+                    "start"
+                        | "running"
+                        | "stop-attached"
+                        | "attached-ended"
+                        | "jobs-ended"
+                        | "finished"
+                )
+                || args[4].is_empty()
+                || args[4].len() > 6
+                || !args[4].bytes().all(|byte| byte.is_ascii_digit())
+            {
+                std::process::exit(2)
+            }
+            let Ok(remaining_ms) = args[4].parse::<u64>() else {
+                std::process::exit(2)
+            };
+            if remaining_ms == 0 || remaining_ms > 300_000 {
+                std::process::exit(2)
+            }
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            if runtime
+                .block_on(keeper_retention::run(
+                    args[2].clone(),
+                    args[3].clone(),
+                    remaining_ms,
+                ))
+                .is_err()
+            {
+                println!("C1_LINK_FAILED");
+                std::process::exit(2)
+            }
+        }
         Some("--keeper-route-fixture") => {
             if args.len() != 5
                 || !matches!(
@@ -232,6 +275,7 @@ fn main() {
                         | "password-decline"
                         | "password-cancel"
                         | "password-deadline"
+                        | "retention"
                 )
             {
                 std::process::exit(2)

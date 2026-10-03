@@ -91,10 +91,10 @@ def password_outcome(action, exit_code, output, loaded, remote, failed, connecti
         raise Refused("native password stdout bound")
     lines = output.splitlines()
     markers = ("KEEPER_SELECTED", "KEEPER_AUTHENTICATED", "KEEPER_FAILED",
-               "KEEPER_REFUSED password", "KEEPER_REFUSED cancelled", "KEEPER_REFUSED expired")
+               "KEEPER_AUTH_ENDED", "KEEPER_REFUSED password", "KEEPER_REFUSED cancelled", "KEEPER_REFUSED expired")
     outcomes = ("success", "unsupported", "invalid_binding", "invalid_request",
                 "key_unavailable", "agent_refused", "expired", "revoked", "unavailable", "unknown")
-    return {"action": action if action in ("accept", "wrong", "decline", "cancel", "deadline") else "unknown",
+    return {"action": action if action in ("accept", "wrong", "decline", "cancel", "deadline", "transport") else "unknown",
             "exit_code": exit_code if type(exit_code) is int and -255 <= exit_code <= 255 else None,
             "key_prompt_count": min(128, lines.count(b"KEEPER_PROMPT")),
             "remote_prompt_count": min(128, lines.count(b"KEEPER_REMOTE_PROMPT")),
@@ -106,6 +106,18 @@ def password_outcome(action, exit_code, output, loaded, remote, failed, connecti
                                     if ("KEEPER_PASSWORD_BRANCH " + name).encode("ascii") in lines), "unknown"),
             "answer_enqueued": b"KEEPER_PASSWORD_ANSWER_ENQUEUED true" in lines,
             "offline_seen": b"KEEPER_PASSWORD_OFFLINE_SEEN true" in lines}
+
+
+def password_receipt(value, expected):
+    # Diagnostic-only closed receipt. Generic control failure cannot satisfy it.
+    fields = {"type", "outcome", "settled", "offline", "prompts_retired", "agents_removed", "masters"}
+    if (type(value) is not dict or set(value) != fields
+            or value["type"] != "password_outcome"
+            or expected not in ("rejected", "declined", "inconclusive")
+            or value["outcome"] != expected
+            or any(value[key] is not True for key in ("settled", "offline", "prompts_retired", "agents_removed"))
+            or type(value["masters"]) is not int or value["masters"] != 0):
+        raise Refused("original password settlement receipt")
 
 
 VM = "chimaera-isolation-20261002"
@@ -369,8 +381,8 @@ class Keeper(Sources):
             finally:
                 signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
-    def record(self, process, seconds=5):
-        end = self.end(seconds)
+    def record(self, process, seconds=5, deadline=None):
+        end = self.end(seconds) if deadline is None else min(self.deadline, deadline)
         data = bytearray()
         while time.monotonic() < end:
             if not select.select([process.stdout], [], [], .025)[0]:
@@ -714,13 +726,16 @@ class PasswordKeeper(Keeper):
             raise Refused("foreign seed")
         foreign_before = self.identities(foreign_env)
         commands = {"accept": b"GOOD\n", "wrong": b"BAD\n", "decline": b"DECLINE\n",
-                    "cancel": b"CANCEL\n", "deadline": b"HOLD\n"}
+                    "cancel": b"CANCEL\n", "deadline": b"HOLD\n", "transport": b"BAD\n"}
         for action, answer in commands.items():
             gateway = Gateway(self)
             control = self.management("/usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin HOME=/tmp /usr/bin/python3 -I -S " + LINUX_WRAPPER,
                                       input_pipe=True, control=True)
             body = json.dumps({"advertised_port": gateway.server_address[1], "mixed_password": True,
                                "public_key": "ssh-ed25519 " + public.decode()}, separators=(",", ":")).encode() + b"\n"
+            # Begin conservatively before the Linux ready/arm emission. This
+            # receipt clock never extends native's original fifteen seconds.
+            proof_deadline = self.end(15)
             if os.write(control.stdin.fileno(), body) != len(body):
                 raise Refused("keeper bootstrap handoff")
             ready = self.record(control, 20)
@@ -754,7 +769,7 @@ class PasswordKeeper(Keeper):
             os.chmod(config, 0o600)
             gateway.start()
             app = self.spawn([str(self.binary), "--keeper-route-fixture", str(config), gateway.origin,
-                              "password-" + action], self.env, input_pipe=True)
+                              "password-" + ("wrong" if action == "transport" else action)], self.env, input_pipe=True)
             output, receipts, loaded, remote = bytearray(), [], False, False
             end = self.end(23)
             try:
@@ -777,14 +792,20 @@ class PasswordKeeper(Keeper):
                             raise Refused("private key load handoff")
                         loaded = True
                     if b"KEEPER_REMOTE_PROMPT\n" in output and not remote:
-                        if not loaded or os.write(app.stdin.fileno(), answer) != len(answer):
+                        if not loaded:
+                            raise Refused("original routed prompt handoff")
+                        if action == "transport":
+                            # Close the actual grant/HTTP bridge without an
+                            # answer. Client failure cannot prove auth denial.
+                            gateway.close()
+                        elif os.write(app.stdin.fileno(), answer) != len(answer):
                             raise Refused("original routed prompt handoff")
                         app.stdin.close()
                         remote = True
                 app.wait(timeout=max(.01, end - time.monotonic()))
-                expected = {"accept": b"KEEPER_AUTHENTICATED\n", "wrong": b"KEEPER_REFUSED password\n",
-                            "decline": b"KEEPER_REFUSED password\n", "cancel": b"KEEPER_REFUSED cancelled\n",
-                            "deadline": b"KEEPER_REFUSED expired\n"}[action]
+                expected = {"accept": b"KEEPER_AUTHENTICATED\n", "wrong": b"KEEPER_AUTH_ENDED\n",
+                            "decline": b"KEEPER_AUTH_ENDED\n", "cancel": b"KEEPER_REFUSED cancelled\n",
+                            "deadline": b"KEEPER_REFUSED expired\n", "transport": b"KEEPER_AUTH_ENDED\n"}[action]
                 if app.returncode or expected not in output or not loaded or not remote or gateway.failed:
                     # Project only fixed markers/counters; never child text or credentials.
                     with gateway.lock:
@@ -792,6 +813,15 @@ class PasswordKeeper(Keeper):
                     diagnostic = password_outcome(action, app.returncode, output, loaded, remote, failed, connections)
                     print("DIAGNOSTIC keeper_password", json.dumps(diagnostic, separators=(",", ":")), flush=True)
                     raise Refused("actual password route outcome")
+                if action in ("wrong", "decline", "transport"):
+                    if time.monotonic() >= proof_deadline:
+                        raise Refused("original password settlement deadline")
+                    if os.write(control.stdin.fileno(), b"PASSWORD_OUTCOME\n") != 17:
+                        raise Refused("original password settlement handoff")
+                    receipt = self.record(control, deadline=proof_deadline)
+                    password_receipt(receipt, {"wrong": "rejected", "decline": "declined", "transport": "inconclusive"}[action])
+                    if action == "transport" and (b"KEEPER_AUTHENTICATED\n" in output or b"KEEPER_REFUSED password\n" in output):
+                        raise Refused("transport cannot prove password rejection")
                 for receipt in receipts:
                     self.cleanup_receipt(receipt)
                 if action == "accept":
@@ -810,7 +840,7 @@ class PasswordKeeper(Keeper):
                 print("PASS password_" + action + " original_leg_prompt authenticated_master_or_refusal cleanup", flush=True)
             finally:
                 self.cleanup_case(app, gateway, control)
-        print("PASS keeper_password5: actual key/password route; synthetic account/UI/root shadow, UsePAM=no; no MFA/job proof", flush=True)
+        print("PASS keeper_password6: actual key/password route + transport-loss negative; original server/decline settlement; synthetic account/UI/root shadow, UsePAM=no; no MFA/job proof", flush=True)
 
 
 def cleanup_self_test():

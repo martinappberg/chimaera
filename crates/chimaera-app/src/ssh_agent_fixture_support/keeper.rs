@@ -13,6 +13,10 @@ use std::{io::Write, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{io::AsyncReadExt, time::Instant};
 
 pub(super) async fn run(config: PathBuf, endpoint: String, action: String) -> Result<(), ()> {
+    // C1 alone holds this original Connect while actual Link jobs establish
+    // their own keeper lifetime. Its clock starts before any native effect.
+    let retention = action == "retention";
+    let retention_deadline = retention.then(|| Instant::now() + Duration::from_secs(30));
     let mixed = matches!(
         action.as_str(),
         "password-accept"
@@ -21,7 +25,12 @@ pub(super) async fn run(config: PathBuf, endpoint: String, action: String) -> Re
             | "password-cancel"
             | "password-deadline"
     );
-    if !mixed && !matches!(action.as_str(), "accept" | "refuse" | "cancel" | "deadline") {
+    if !mixed
+        && !matches!(
+            action.as_str(),
+            "accept" | "refuse" | "cancel" | "deadline" | "retention"
+        )
+    {
         return Err(());
     }
     let url = url::Url::parse(&endpoint).map_err(|_| ())?;
@@ -40,7 +49,7 @@ pub(super) async fn run(config: PathBuf, endpoint: String, action: String) -> Re
     let context = ConfigContext::fixture(config, home).map_err(|_| ())?;
     let registry = Registry::default();
     let attempt = registry.admit(0).map_err(|_| ())?;
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = retention_deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(15));
     let owner = Owner {
         alias: "keeper-route-fixture".into(),
         guard: attempt.native_prompt(deadline),
@@ -118,6 +127,27 @@ pub(super) async fn run(config: PathBuf, endpoint: String, action: String) -> Re
                     && row.daemon.is_none()
                     && row.cluster.is_some()
                 {
+                    if retention {
+                        println!("KEEPER_CONNECTED");
+                        std::io::stdout()
+                            .flush()
+                            .map_err(|_| Failure::Unavailable)?;
+                        // Only C1 sends HELD after real public Link StartJob and
+                        // the private original-resource/account ACK corroboration.
+                        // authenticate_route still selects the original deadline
+                        // and cancellation while this exact receipt is pending.
+                        let mut held = [0; 5];
+                        let read = tokio::time::timeout_at(
+                            deadline,
+                            tokio::io::stdin().read_exact(&mut held),
+                        )
+                        .await
+                        .map_err(|_| Failure::Expired)?
+                        .map_err(|_| Failure::Unavailable)?;
+                        if read != held.len() || &held != b"HELD\n" || Instant::now() >= deadline {
+                            return Err(Failure::Unavailable);
+                        }
+                    }
                     return Ok(());
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -154,7 +184,7 @@ pub(super) async fn run(config: PathBuf, endpoint: String, action: String) -> Re
         }
     );
     match (action.as_str(), result) {
-        ("accept", Ok(())) => println!("KEEPER_AUTHENTICATED"),
+        ("accept" | "retention", Ok(())) => println!("KEEPER_AUTHENTICATED"),
         ("refuse", Err(Failure::AgentRefused)) => println!("KEEPER_REFUSED external"),
         ("cancel", Err(Failure::Revoked)) => println!("KEEPER_REFUSED cancelled"),
         ("deadline", Err(Failure::Expired)) if Instant::now() >= deadline => {

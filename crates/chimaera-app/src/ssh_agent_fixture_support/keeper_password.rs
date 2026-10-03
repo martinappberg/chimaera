@@ -181,8 +181,14 @@ pub(super) async fn authenticate(
     }
     match (action, result) {
         ("password-accept", Ok(())) => println!("KEEPER_AUTHENTICATED"),
-        ("password-wrong" | "password-decline", Err(Failure::AgentRefused)) => {
-            println!("KEEPER_REFUSED password")
+        (
+            "password-wrong" | "password-decline",
+            Err(Failure::AgentRefused | Failure::Unavailable),
+        ) => {
+            // Either owner can observe control retirement first. This marker
+            // is not rejection evidence: the wrapper must obtain the exact
+            // original keeper/server cleanup receipt before declaring PASS.
+            println!("KEEPER_AUTH_ENDED")
         }
         ("password-cancel", Err(Failure::Revoked)) => println!("KEEPER_REFUSED cancelled"),
         ("password-deadline", Err(Failure::Expired)) if Instant::now() >= deadline => {
