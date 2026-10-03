@@ -17,6 +17,7 @@ revocable delegation over the authenticated local API.
 | `execution/maintenance_startup.rs` / `maintenance_startup_tests.rs` | Disabled idle-channel bootstrap: exact closed optional launcher metadata, owned unnamed Unix stream, nonblocking/CLOEXEC, nonzero matching UID/GID, empty supplementary groups, zero retained capabilities, inherited no-new-privileges and positively verified Linux dumpable-zero before any startup helper/restore child. Only opt-in startup changes; missing protections refuse. One selected descriptor stays separate from cloneable cleanup evidence. No Ready, idle actor, process census, park or Prepared exists; Linux subprocess protection tests are a distinct explicit gate. |
 | `execution/maintenance_channel.rs` / `maintenance_channel_tests.rs` | Disabled unnamed inherited Unix-socket framing and ownership helpers: close-on-exec/nonblocking descriptors, exact current accepted launch/account generation, bounded frames/partial-frame deadlines, monotonic IDs and exact reply correlation. Invalid/canceled frames permanently shut down the captured stream; queued owners retain that exact stream's closure fence, and another channel cannot use their reply authority. Four owned request slots and one effect owner survive observer cancellation through actual blocking work. There is no Ready caller, retained attempt actor or idle/parking proof; framing alone cannot enable the capability. |
 | `execution/maintenance.rs` / `maintenance_tests.rs` | Disabled active-secret maintenance admission foundation. A sealed exact configured supervisor/account/root/revision/boot launch plus live execution epoch reserves the same bounded mutation count before closing writes, commands and launches. Only no-effect rollback releases it; possible effects or owner loss retain a counted recovery fence. Synthetic launch/count tests do not prove idle processes. No process stop, durable park, `Prepared` producer or capability advertisement exists yet. |
+| `execution/installer.rs` / `installer_tests.rs` | Exact pre-wait dispatch and shared setup-group/durable pending admission for owned noninteractive and legacy PTY installers. Final spawn and cleanup stay counted, authority loss fences promptly, and incomplete crash evidence never relaunches an installer. |
 | `execution/mutation.rs` | Bounded file/lifecycle/command commit reservations; account/epoch admission uses short in-memory locks, while clean stop and replacement wait for actual work even if its HTTP caller disappears. Reserved launches fail promptly if configuration is draining them, rather than waiting on themselves. `Dispatch` captures exact ownership and account generation before asynchronous communication reads, then reserves the final actor enqueue; worker proofs remain mandatory, while a device's expired publication lease does not block its own local work. Public bundle recovery also fences `may_write`/`may_execute`; `ImportGuard::into_resume` releases only configuration and retains its count, with captured task-local admission checked at actual PTY/chat registration. |
 | `engine.rs` | Lease renewal (own account-request budget; installs and agent stops run as their own tasks), mirror coordinator, recoverable staged hydration, deadline-bound sleep flush, three-way return and lazy return. |
 | `install.rs` / `install/tests.rs` | Durable, account/epoch/checkpoint-bound return file intents: private before/after blobs, descriptor-relative no-follow replacement, exact restart roll-forward, checkout invariants and refusal to overwrite newer user edits. |
@@ -102,8 +103,16 @@ roster after draining all agents. Truth predicates inspect the whole existing
 registry. The final synchronous agent spawn/registration window has a counted
 reservation even for legacy/device ownership, so a pre-fence launch cannot
 appear after a successful empty-workload check. Plain shells remain unaffected.
-Cloud setup shells are also counted execution: their groups and background
-descendants are fenced on authority loss and observed before stop completes.
+Cloud setup shells and both managed installer paths are also counted execution:
+their groups and background descendants are fenced on authority loss and observed before stop completes.
+Installer admission (`execution/installer.rs`) retains the exact pre-detection
+`Dispatch` through shared install-lock waits, final spawn and actual detached
+cleanup. Free unconfigured installs create no Pro state. Installers use the setup
+group registry and launch-pending marker, so lease fencing, transfer and restart
+cannot confuse an installer with an idle workspace. Caller loss cannot release a
+cleanup reservation while its group is unreaped; bounded admission capacity and a
+200 ms cleanup floor retain unknown groups until positive absence. A restored
+pending marker never relaunches an installer.
 A shared synced pending marker precedes agent/setup spawn, survives cancellation, and makes
 same-boot restart evidence unknown until group cleanup is durably settled.
 A graceful stop clears the ordinary agent evidence once they

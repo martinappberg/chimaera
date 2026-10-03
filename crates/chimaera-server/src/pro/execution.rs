@@ -1,5 +1,6 @@
 //! Managed execution authority. A passive observation can fence execution, but
 //! only an authenticated acquire/renew response can create a fresh local lease.
+pub(crate) mod installer;
 mod launch;
 mod lease;
 // Disabled maintenance primitives: opt-in startup capture, no Ready or Prepared.

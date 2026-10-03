@@ -130,6 +130,10 @@ pub(crate) async fn start(
             "Open a workspace on this host first.",
         );
     };
+    let captured = match crate::pro::mutation::Dispatch::capture(&state, &body.workspace_id) {
+        Ok(captured) => captured,
+        Err(_) => return error(StatusCode::CONFLICT, "Project execution authority changed."),
+    };
     if !matches!(body.action, Action::Install)
         && !crate::launcher::detect(&state, kind, false).await.managed
     {
@@ -141,15 +145,30 @@ pub(crate) async fn start(
             "This agent has no managed installer.",
         );
     };
-    start_script(state, kind, workspace.root, body, script).await
+    start_captured(state, kind, workspace.root, body, script, captured).await
 }
 
+#[cfg(test)]
 async fn start_script(
     state: Arc<AppState>,
     kind: AgentKind,
     cwd: PathBuf,
     body: Request,
     script: String,
+) -> Response {
+    let captured = match crate::pro::mutation::Dispatch::capture(&state, &body.workspace_id) {
+        Ok(captured) => captured,
+        Err(_) => return error(StatusCode::CONFLICT, "Project execution authority changed."),
+    };
+    start_captured(state, kind, cwd, body, script, captured).await
+}
+async fn start_captured(
+    state: Arc<AppState>,
+    kind: AgentKind,
+    cwd: PathBuf,
+    body: Request,
+    script: String,
+    captured: crate::pro::mutation::Dispatch,
 ) -> Response {
     let install_lock = match crate::runtimes::lock_install(&state.managed_root, kind).await {
         Ok(file) => file,
@@ -167,6 +186,10 @@ async fn start_script(
     if let Some(p) = snapshot(&state, kind).filter(|p| p.running() || p.id == body.request_id) {
         return Json(p).into_response();
     }
+    if captured.check(&state).is_err() {
+        return error(StatusCode::CONFLICT, "Project execution authority changed.");
+    }
+    let workspace = body.workspace_id.clone();
     let (cancel, receiver) = watch::channel(false);
     let progress = Progress {
         id: body.request_id,
@@ -185,18 +208,51 @@ async fn start_script(
     });
     lock(&state.agent_setup).insert(kind, operation.clone());
     tokio::spawn(async move {
+        let mut admitted =
+            match crate::pro::installer::Running::begin(&state, &workspace, captured).await {
+                Ok(admitted) => admitted,
+                Err(_) => {
+                    finish(
+                        &operation,
+                        Phase::Cancelled,
+                        None,
+                        "Project execution authority changed; installer was not started.",
+                    );
+                    state.changes.notify_waiters();
+                    return;
+                }
+            };
         crate::runtimes::prune_install_versions(state.managed_root.clone(), kind).await;
-        let (phase, code, message) = run(&state, &operation, receiver, cwd, script).await;
-        if phase == Phase::Succeeded {
+        let (phase, code, message) =
+            run(&state, &operation, receiver, cwd, script, &mut admitted).await;
+        if phase == Phase::Succeeded && admitted.check().is_ok() {
             crate::runtimes::prune_install_versions(state.managed_root.clone(), kind).await;
         }
         lock(&operation.progress).message = "Refreshing the installed version…".into();
         // Keep the shared lock through detection; there must be no false
         // completion while a competing workspace changes the executable.
         crate::launcher::detect(&state, kind, true).await;
-        let update = state.clone();
-        let _ =
-            tokio::task::spawn_blocking(move || crate::runtimes::regenerate_shims(&update)).await;
+        if admitted.check().is_ok() {
+            let update = state.clone();
+            let captured = admitted.captured();
+            let _ = tokio::task::spawn_blocking(move || {
+                if captured.check(&update).is_ok() {
+                    crate::runtimes::regenerate_shims(&update);
+                }
+            })
+            .await;
+        }
+        // Include the actual process-group drain in the owned operation and
+        // shared install lock, even if its HTTP observer has disappeared.
+        if admitted.finish().await.is_err() {
+            finish(
+                &operation,
+                Phase::Failed,
+                code,
+                "Installer cleanup could not be confirmed. Project execution remains fenced.",
+            );
+            return;
+        }
         drop(install_lock);
         finish(&operation, phase, code, &message);
         state.changes.notify_waiters();
@@ -267,14 +323,45 @@ impl Drop for Group {
     }
 }
 
+fn exited_unreaped(pid: u32) -> std::io::Result<bool> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let mut info = std::mem::MaybeUninit::<nix::libc::siginfo_t>::zeroed();
+        // This child remains owned and unreaped until final group cleanup.
+        let result = unsafe {
+            nix::libc::waitid(
+                nix::libc::P_PID,
+                pid,
+                info.as_mut_ptr(),
+                nix::libc::WEXITED | nix::libc::WNOHANG | nix::libc::WNOWAIT,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let info = unsafe { info.assume_init() };
+        #[cfg(target_os = "macos")]
+        let observed = info.si_pid;
+        #[cfg(target_os = "linux")]
+        let observed = unsafe { info.si_pid() };
+        Ok(observed == pid as i32)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        Err(std::io::Error::other("installer lifecycle unsupported"))
+    }
+}
+
 async fn run(
     state: &AppState,
     op: &Operation,
     mut cancel: watch::Receiver<bool>,
     cwd: PathBuf,
     script: String,
+    admitted: &mut crate::pro::installer::Running,
 ) -> (Phase, Option<i32>, String) {
-    if *cancel.borrow() {
+    if *cancel.borrow() || admitted.check().is_err() {
         return (
             Phase::Cancelled,
             None,
@@ -295,6 +382,13 @@ async fn run(
     for name in remove {
         cmd.env_remove(name);
     }
+    if admitted.check().is_err() {
+        return (
+            Phase::Cancelled,
+            None,
+            "Project execution authority changed; installer was not started.".into(),
+        );
+    }
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
@@ -305,7 +399,9 @@ async fn run(
             );
         }
     };
-    let group = Group(nix::unistd::Pid::from_raw(child.id().unwrap() as i32));
+    let pid = child.id().unwrap();
+    let group = Group(nix::unistd::Pid::from_raw(pid as i32));
+    admitted.attach(pid);
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
     let reads = async {
@@ -318,48 +414,71 @@ async fn run(
             let _ = cancel.changed().await;
         }
     };
-    let result = tokio::select! {
-        // Keep the leader unreaped while descendants hold the pipes open, so
-        // cancellation cannot signal a recycled process-group ID.
-        result = async { (&mut reads).await; child.wait().await } => Some(result),
-        _ = stopped => None,
-        _ = tokio::time::sleep(DEADLINE) => None,
-    };
-    if let Some(result) = result {
-        // The leader is reaped; do not signal a potentially recycled group ID.
-        std::mem::forget(group);
-        let code = result.ok().and_then(|s| s.code());
-        if code == Some(0) {
-            (
-                Phase::Succeeded,
-                code,
-                "Installation finished. Sign-in and chat have not been checked.".into(),
-            )
-        } else {
-            let hint = failure_hint(&lock(&op.progress).output);
-            (Phase::Failed, code, hint.into())
+    let mut logs_done = false;
+    let mut observation_failed = false;
+    let normal = {
+        let completion = async {
+            loop {
+                match exited_unreaped(pid) {
+                    Ok(true) => return true,
+                    Ok(false) => {}
+                    Err(_) => {
+                        observation_failed = true;
+                        return false;
+                    }
+                }
+                if admitted.check().is_err() {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        tokio::pin!(completion);
+        let logs_and_completion = async {
+            tokio::select! {
+                result = &mut completion => result,
+                _ = &mut reads => { logs_done = true; completion.await },
+            }
+        };
+        tokio::select! {
+            result = logs_and_completion => result,
+            _ = stopped => false,
+            _ = tokio::time::sleep(DEADLINE) => false,
         }
-    } else {
-        let cancelled = *cancel.borrow();
-        // Give EXIT traps time to remove staging downloads, then stop the
-        // entire group. Wait AFTER kill so the group ID cannot be recycled.
+    };
+    let cancelled = *cancel.borrow() || admitted.check().is_err();
+    if !normal {
         let _ = nix::sys::signal::killpg(group.0, nix::sys::signal::Signal::SIGTERM);
+        if !logs_done {
+            logs_done = tokio::time::timeout(Duration::from_secs(2), &mut reads)
+                .await
+                .is_ok();
+        }
+    }
+    // WNOWAIT retains the direct PID while signalling. Also drain background
+    // descendants on a successful shell exit, including ones that closed logs.
+    drop(group);
+    let code = child.wait().await.ok().and_then(|s| s.code());
+    if !logs_done {
         let _ = tokio::time::timeout(Duration::from_secs(2), &mut reads).await;
-        drop(group);
-        let code = child.wait().await.ok().and_then(|s| s.code());
+    }
+    if normal && code == Some(0) {
         (
-            if cancelled {
-                Phase::Cancelled
-            } else {
-                Phase::Failed
-            },
+            Phase::Succeeded,
             code,
-            if cancelled {
-                "Installation cancelled. Files may already have changed; check the installed version before retrying."
-            } else {
-                "The installer exceeded 15 minutes and was stopped. Check the output and connection, then retry."
-            }.into(),
+            "Installation finished. Sign-in and chat have not been checked.".into(),
         )
+    } else if normal {
+        (
+            Phase::Failed,
+            code,
+            failure_hint(&lock(&op.progress).output).into(),
+        )
+    } else {
+        (if cancelled { Phase::Cancelled } else { Phase::Failed }, code,
+            if cancelled { "Installation cancelled. Files may already have changed; check the installed version before retrying." }
+            else if observation_failed { "Installer process status could not be verified; it was stopped. Check the installed version before retrying." }
+            else { "The installer exceeded 15 minutes and was stopped. Check the output and connection, then retry." }.into())
     }
 }
 fn finish(op: &Operation, phase: Phase, code: Option<i32>, message: &str) {
@@ -510,5 +629,79 @@ mod tests {
     fn incompatible_libraries_do_not_offer_an_unhelpful_retry() {
         assert!(failure_hint("libc.so.6: GLIBC_2.28 not found")
             .contains("Reinstalling the same release will not fix it"));
+    }
+    #[tokio::test]
+    async fn stale_captured_install_never_starts_and_active_authority_loss_reaps() {
+        let state = state();
+        crate::pro::install_execution_fixture(&state, "test", 4).unwrap();
+        let captured = crate::pro::mutation::Dispatch::capture(&state, "test").unwrap();
+        crate::pro::mutation::local_dispatch_owner_fixture(&state, "test", 5);
+        let response = start_captured(
+            state.clone(),
+            AgentKind::Codex,
+            "/tmp".into(),
+            request("stale"),
+            "echo WRONG".into(),
+            captured,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(snapshot(&state, AgentKind::Codex).is_none());
+        let state = self::state();
+        crate::pro::install_execution_fixture(&state, "test", 6).unwrap();
+        start_script(
+            state.clone(),
+            AgentKind::Codex,
+            "/tmp".into(),
+            request("active"),
+            "echo started; sleep 120".into(),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !snapshot(&state, AgentKind::Codex)
+                .unwrap()
+                .output
+                .contains("started")
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        crate::pro::mutation::local_dispatch_owner_fixture(&state, "test", 7);
+        let p = completed(&state).await;
+        assert!(p.phase == Phase::Cancelled);
+        assert!(state.sessions.list().is_empty());
+    }
+    #[tokio::test]
+    async fn successful_shell_exit_cleans_background_children_that_closed_logs() {
+        let state = state();
+        let folder = std::env::temp_dir().join(format!(
+            "chimaera-installer-background-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir_all(&folder).unwrap();
+        let release = folder.join("release");
+        let late = folder.join("late");
+        let script = format!("(while [ ! -e '{}' ]; do sleep .02; done; echo escaped > '{}') >/dev/null 2>&1 & echo ready; exit 0", release.display(), late.display());
+        start_script(
+            state.clone(),
+            AgentKind::Codex,
+            folder.clone(),
+            request("background"),
+            script,
+        )
+        .await;
+        let p = completed(&state).await;
+        assert!(p.phase == Phase::Succeeded);
+        assert!(p.output.contains("ready"));
+        assert!(!late.exists());
+        std::fs::write(release, "release only after owned cleanup").unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !late.exists(),
+            "background child escaped successful cleanup"
+        );
+        std::fs::remove_dir_all(folder).unwrap();
     }
 }

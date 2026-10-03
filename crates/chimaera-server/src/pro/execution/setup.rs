@@ -14,6 +14,7 @@ pub(in crate::pro) struct Guard {
     epoch: u64,
     generation: u64,
     _commit: Option<mutation::Guard>,
+    installer: Option<mutation::Dispatch>,
 }
 
 fn alive(group: (u32, u64)) -> bool {
@@ -76,6 +77,7 @@ impl Guard {
             epoch,
             generation,
             _commit: commit,
+            installer: None,
         };
         guard.check()?;
         {
@@ -93,7 +95,59 @@ impl Guard {
         guard.check()?;
         Ok(guard)
     }
+    pub(super) async fn installer(
+        state: &Arc<AppState>,
+        workspace: &str,
+        captured: mutation::Dispatch,
+    ) -> Result<Option<Self>> {
+        let _configuration = state.pro.configuration.lock().await;
+        let commit = captured.begin(state)?;
+        // Free local installs do not create enrollment or durable Pro state.
+        let Some(commit) = commit else {
+            return Ok(None);
+        };
+        {
+            let mut setups = lock(&state.pro.execution.setups);
+            ensure!(
+                setups.len() < 64 && !setups.contains_key(workspace),
+                "previous project setup is still stopping"
+            );
+            setups.insert(
+                workspace.to_owned(),
+                Entry {
+                    group: None,
+                    held: true,
+                },
+            );
+        }
+        let guard = Self {
+            state: state.clone(),
+            workspace: workspace.to_owned(),
+            epoch: 0,
+            generation: mutation::generation(state),
+            _commit: Some(commit),
+            installer: Some(captured),
+        };
+        guard.check()?;
+        {
+            let mut preferences = lock(&state.pro.preferences);
+            ensure!(
+                preferences.len() < 128 || preferences.contains_key(workspace),
+                "project setup identity limit"
+            );
+            let preference = preferences.entry(workspace.to_owned()).or_default();
+            preference.execution_active = true;
+            preference.execution_boot = state.pro.execution.boot.clone();
+            preference.execution_launch_pending = true;
+        }
+        crate::pro::persist(state).await?;
+        guard.check()?;
+        Ok(Some(guard))
+    }
     pub(in crate::pro) fn check(&self) -> Result<()> {
+        if let Some(captured) = &self.installer {
+            return captured.check(&self.state);
+        }
         let managed = managed(&self.state, &self.workspace);
         // Match lease admission's proof -> ownership order.
         let proofs = lock(&self.state.pro.execution.proofs);
@@ -122,6 +176,15 @@ impl Guard {
             .get_mut(&self.workspace)
             .expect("setup reservation remains held")
             .group = Some((group, start));
+    }
+    pub(super) fn no_process(&self) {
+        let mut setups = lock(&self.state.pro.execution.setups);
+        if setups
+            .get(&self.workspace)
+            .is_some_and(|entry| entry.group.is_none())
+        {
+            setups.remove(&self.workspace);
+        }
     }
     pub(in crate::pro) fn kill(&self) {
         signal(&self.state, &self.workspace);

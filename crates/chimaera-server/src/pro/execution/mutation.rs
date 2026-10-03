@@ -303,7 +303,7 @@ impl Dispatch {
         captured.check(state)?;
         Ok(captured)
     }
-    fn check(&self, state: &AppState) -> anyhow::Result<()> {
+    pub(crate) fn check(&self, state: &AppState) -> anyhow::Result<()> {
         if self.generation != generation(state)
             || lock(&state.pro.ownership).get(&self.workspace) != self.ownership.as_ref()
             || !crate::pro::may_execute(state, &self.workspace)

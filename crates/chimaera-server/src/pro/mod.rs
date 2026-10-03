@@ -592,6 +592,7 @@ pub(crate) use execution::expired_lease_fixture as expire_execution_fixture;
 /// Execution has a stricter lease boundary than local file editing.
 #[cfg(test)]
 pub(crate) use execution::install_fixture as install_execution_fixture;
+pub(crate) use execution::installer;
 pub(crate) use execution::mutation;
 pub(crate) use execution::prepare_launch as prepare_managed_launch;
 pub(crate) use execution::recovery_context as checkpoint_recovery_context;

@@ -201,6 +201,9 @@ pub(crate) struct AppState {
     /// younger than `runtimes::INSTALL_RESERVATION_GRACE` is busy even with
     /// no visible session. Cleaned up by the install watcher.
     pub(crate) installs: Mutex<HashMap<agents::AgentKind, (String, Instant)>>,
+    /// Exact live owner through preparation and cleanup, bounded by the agent
+    /// catalog. A grace timer cannot reclaim an owner whose child is not visible.
+    pub(crate) install_owners: Mutex<HashMap<agents::AgentKind, String>>,
     /// Latest installer result per built-in agent; bounded by the catalog.
     pub(crate) install_results: Mutex<HashMap<agents::AgentKind, crate::runtimes::InstallResult>>,
     pub(crate) agent_setup: Mutex<HashMap<agents::AgentKind, Arc<crate::agent_setup::Operation>>>,
@@ -353,6 +356,7 @@ impl AppState {
             drafts_root: data_dir.join("drafts"),
             fs_touched: tokio::sync::broadcast::channel(crate::fs_watch::TOUCHED_CAPACITY).0,
             installs: Mutex::new(HashMap::new()),
+            install_owners: Mutex::new(HashMap::new()),
             install_results: Mutex::new(HashMap::new()),
             agent_setup: Mutex::new(HashMap::new()),
             claude_settings_path: home.join(".claude").join("settings.json"),

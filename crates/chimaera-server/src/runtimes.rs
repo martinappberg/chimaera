@@ -458,6 +458,10 @@ pub(crate) async fn update_agent(
         )
             .into_response();
     };
+    let captured = match crate::pro::mutation::Dispatch::capture(&state, &body.workspace_id) {
+        Ok(captured) => captured,
+        Err(_) => return *authority_changed(),
+    };
     // Cached detection (mtime-validated): the gate is what a spawn would
     // actually run, so a personal install shadowing a managed copy reads —
     // and refuses — as "yours".
@@ -519,7 +523,7 @@ pub(crate) async fn update_agent(
             managed_path,
         )),
     );
-    match start_install(&state, kind, &workspace, "update", script).await {
+    match start_install_captured(&state, kind, &workspace, "update", script, captured).await {
         Ok(session_id) => Json(json!({"session_id": session_id})).into_response(),
         Err(response) => *response,
     }
@@ -538,15 +542,86 @@ pub(crate) async fn start_install(
     action: &str,
     script: String,
 ) -> Result<String, Box<Response>> {
+    let captured = crate::pro::mutation::Dispatch::capture(state, &workspace.id)
+        .map_err(|_| authority_changed())?;
+    start_install_captured(state, kind, workspace, action, script, captured).await
+}
+fn authority_changed() -> Box<Response> {
+    Box::new(
+        (
+            StatusCode::CONFLICT,
+            Json(json!({"error":"Project execution authority changed."})),
+        )
+            .into_response(),
+    )
+}
+async fn start_install_captured(
+    state: &Arc<AppState>,
+    kind: AgentKind,
+    workspace: &crate::workspaces::Workspace,
+    action: &str,
+    script: String,
+    captured: crate::pro::mutation::Dispatch,
+) -> Result<String, Box<Response>> {
+    let state = state.clone();
+    let workspace = workspace.clone();
+    let action = action.to_owned();
+    // Observer cancellation does not drop a filesystem worker's authority or
+    // leave its install reservation unowned before the actual child is known.
+    tokio::spawn(async move {
+        start_install_owned(&state, kind, &workspace, &action, script, captured).await
+    })
+    .await
+    .map_err(|_| {
+        Box::new(
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":"Installer task stopped."})),
+            )
+                .into_response(),
+        )
+    })?
+}
+struct InstallOwner {
+    state: Arc<AppState>,
+    kind: AgentKind,
+    id: String,
+}
+impl Drop for InstallOwner {
+    fn drop(&mut self) {
+        // Match reservation -> owner lock order used by admission/uninstall.
+        let mut installs = crate::lock(&self.state.installs);
+        let mut owners = crate::lock(&self.state.install_owners);
+        if owners.get(&self.kind) == Some(&self.id) {
+            owners.remove(&self.kind);
+        }
+        if installs
+            .get(&self.kind)
+            .is_some_and(|(id, _)| id == &self.id)
+        {
+            installs.remove(&self.kind);
+        }
+    }
+}
+
+async fn start_install_owned(
+    state: &Arc<AppState>,
+    kind: AgentKind,
+    workspace: &crate::workspaces::Workspace,
+    action: &str,
+    script: String,
+    captured: crate::pro::mutation::Dispatch,
+) -> Result<String, Box<Response>> {
     let session_id = crate::agents::fresh_session_id();
     {
         // One install session per agent: replace only stale entries. Stale
-        // means no live session AND older than the reservation grace — the
-        // session is registered only after spawn, so a fresh reservation
-        // with no visible session is a spawn in flight, not a leftover.
+        // means no live session/owned task AND older than the reservation
+        // grace. Preparation and cleanup can outlive that timer; only an exact
+        // owner-loss proof allows reclaiming an invisible session.
         let mut installs = crate::lock(&state.installs);
         if let Some((existing, reserved)) = installs.get(&kind) {
             if state.sessions.get(existing).is_some()
+                || crate::lock(&state.install_owners).get(&kind) == Some(existing)
                 || reserved.elapsed() < INSTALL_RESERVATION_GRACE
             {
                 return Err(Box::new(
@@ -565,7 +640,13 @@ pub(crate) async fn start_install(
             }
         }
         installs.insert(kind, (session_id.clone(), std::time::Instant::now()));
+        crate::lock(&state.install_owners).insert(kind, session_id.clone());
     }
+    let owner = InstallOwner {
+        state: state.clone(),
+        kind,
+        id: session_id.clone(),
+    };
 
     let install_lock = match lock_install(&state.managed_root, kind).await {
         Ok(lock) => lock,
@@ -578,6 +659,17 @@ pub(crate) async fn start_install(
         }
     };
 
+    let mut admitted =
+        match crate::pro::installer::Running::begin(state, &workspace.id, captured).await {
+            Ok(admitted) => admitted,
+            Err(_) => {
+                let mut installs = crate::lock(&state.installs);
+                if installs.get(&kind).map(|(sid, _)| sid.as_str()) == Some(session_id.as_str()) {
+                    installs.remove(&kind);
+                }
+                return Err(authority_changed());
+            }
+        };
     prune_install_versions(state.managed_root.clone(), kind).await;
 
     // Installer sessions run a chimaera-authored script — never a user
@@ -597,10 +689,27 @@ pub(crate) async fn start_install(
         env_remove,
         scrollback: crate::lock(&state.settings).scrollback_lines(),
     };
-    match state.sessions.spawn(opts) {
+    if admitted.check().is_err() {
+        let mut installs = crate::lock(&state.installs);
+        if installs.get(&kind).map(|(sid, _)| sid.as_str()) == Some(session_id.as_str()) {
+            installs.remove(&kind);
+        }
+        return Err(authority_changed());
+    }
+    match state.sessions.spawn_managed(opts) {
         Ok(info) => {
+            if let Some(pid) = info.pid {
+                admitted.attach(pid);
+            }
             crate::lock(&state.session_workspaces).insert(info.id.clone(), workspace.id.clone());
-            spawn_install_watch(state.clone(), kind, info.id.clone(), install_lock);
+            spawn_install_watch(
+                state.clone(),
+                kind,
+                info.id.clone(),
+                install_lock,
+                admitted,
+                owner,
+            );
             state.changes.notify_waiters();
             Ok(info.id)
         }
@@ -710,19 +819,24 @@ fn spawn_install_watch(
     kind: AgentKind,
     session_id: String,
     install_lock: std::fs::File,
+    admitted: crate::pro::installer::Running,
+    owner: InstallOwner,
 ) {
     tokio::spawn(async move {
+        let _owner = owner;
         while state.sessions.get(&session_id).is_some() {
-            tokio::time::sleep(crate::agents::poll_interval()).await;
+            if admitted.check().is_err() {
+                let _ = state.sessions.fence(&session_id);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         let exit_status = state
             .sessions
             .last_words(&session_id)
             .and_then(|w| w.info.exit_status);
-        if exit_status == Some(0) {
+        if exit_status == Some(0) && admitted.check().is_ok() {
             prune_install_versions(state.managed_root.clone(), kind).await;
         }
-        drop(install_lock);
         let detection = crate::launcher::detect(&state, kind, true).await;
         tracing::info!(
             agent = kind.as_str(),
@@ -730,9 +844,20 @@ fn spawn_install_watch(
             "re-detected agent after install session ended"
         );
         // A managed install just landed — a shim for it should now exist.
-        regenerate_shims(&state);
-        // Clear only this watcher's own session: a stale-slot reclaim may
-        // have installed a newer reservation under the same agent.
+        if admitted.check().is_ok() {
+            let update = state.clone();
+            let captured = admitted.captured();
+            // Keep installer authority through the actual filesystem worker.
+            let _ = tokio::task::spawn_blocking(move || {
+                if captured.check(&update).is_ok() {
+                    regenerate_shims(&update);
+                }
+            })
+            .await;
+        }
+        let _ = admitted.finish().await;
+        drop(install_lock);
+        // Clear only the exact owned reservation whose result we observed.
         let mut installs = crate::lock(&state.installs);
         if installs.get(&kind).map(|(sid, _)| sid.as_str()) == Some(session_id.as_str()) {
             crate::lock(&state.install_results).insert(
@@ -784,6 +909,7 @@ pub(crate) async fn uninstall_agent(
         let installs = crate::lock(&state.installs);
         if let Some((existing, reserved)) = installs.get(&kind) {
             if state.sessions.get(existing).is_some()
+                || crate::lock(&state.install_owners).get(&kind) == Some(existing)
                 || reserved.elapsed() < INSTALL_RESERVATION_GRACE
             {
                 return (
@@ -2073,3 +2199,7 @@ esac
         assert!(!is_managed(Path::new("/home/u/.local/bin/claude"), &root));
     }
 }
+
+#[cfg(test)]
+#[path = "installer_pty_tests.rs"]
+mod installer_pty_tests;
