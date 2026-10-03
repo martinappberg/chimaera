@@ -522,6 +522,17 @@ class Keeper(Sources):
                             "cancel": b"KEEPER_REFUSED cancelled\n", "deadline": b"KEEPER_REFUSED expired\n"}[action]
                 counts = proxy.leg_counts()
                 if app.returncode or expected not in output or answered != 2 or counts != ((0, 0), (1, 1)) or proxy.failed or gateway.failed:
+                    # Fixed synthetic counters/markers only, never child bytes
+                    # or credential-bearing protocol/error text.
+                    print("DIAGNOSTIC keeper", json.dumps({
+                        "action": action, "exit_code": app.returncode,
+                        "prompts": answered, "selected": b"KEEPER_SELECTED\n" in output,
+                        "authenticated": b"KEEPER_AUTHENTICATED\n" in output,
+                        "failed_marker": b"KEEPER_FAILED\n" in output,
+                        "expected_marker": expected in output, "leg_counts": counts,
+                        "proxy_failed": proxy.failed, "gateway_failed": gateway.failed,
+                        "gateway_connections": gateway.total,
+                    }, separators=(",", ":")), flush=True)
                     raise Refused("actual keeper per-leg source/refusal")
                 for receipt in receipts:
                     self.cleanup_receipt(receipt)
