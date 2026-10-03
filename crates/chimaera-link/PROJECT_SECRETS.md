@@ -115,6 +115,49 @@ guessed value matches stored data. At most 16 requests and four pending writes
 are admitted per personal worker, with queue/backpressure limits retained until
 the actual owned work and cleanup end.
 
+### Native and browser account adapters
+
+The keeper paths and closed bodies above remain unchanged. Account Home uses
+additive native IPC or these same-origin account-gateway paths:
+`GET /home/project-secrets` (the same optional `after` cursor),
+`POST /home/project-secrets/commands`, and
+`GET /home/project-secrets/operations/{operation_id}`. They never proxy through
+a project daemon. Mutations require the existing browser origin/custom-header
+checks; native IPC is restricted to the trusted local account-Home window.
+Remote and project windows navigate to account Home instead.
+
+Each catalog page is wrapped as exactly `{version:1,context,catalog}`; `catalog`
+is one unchanged canonical keeper page. Pagination keeps its existing four-page,
+128-project bound and requires the same context on every page. Command and
+operation replies use `{version:1,context,receipt}` with the unchanged correlated
+receipt. No adapter consolidates 128 projects into a nominal 64-project page.
+Browser commands and operation reads require `X-Chimaera-Control-Context`;
+native commands and operation reads require the equivalent IPC argument. The
+command body itself is unchanged. A missing or mismatched context refuses before
+forwarding, and a changed context while awaiting a reply cannot display success.
+
+The fixed additive account `GET /v1/personal/control-context` returns exactly
+`{version:1,context}` after fresh full-device authentication; delegated access
+refuses. `context` is 64 lowercase hexadecimal characters: SHA-256 over the
+ASCII domain `chimaera-personal-control-context-v1`, then the account UUID and
+device UUID as length-prefixed UTF-8 strings (unsigned 32-bit big-endian lengths),
+then the original device session epoch as unsigned 64-bit big-endian. All three
+fields come from fresh ordinary authentication, never caller fields or a new
+refreshed-token issuance. The browser
+adapter derives the same tag from its freshly authenticated browser identity.
+It is stable across routine access-token/cookie refresh and account replicas;
+sign-out, account/device replacement or session-epoch change invalidates the
+old authority/context. Failed authentication clears the adapter's usable context.
+
+This tag is only an opaque equality check for stale views, never a selector or
+capability. Every adapter separately revalidates ordinary authentication and
+binds forwarding to that exact identity; a supplied tag cannot select an account,
+device, worker or keeper. Polling cannot admit an operation. The UI clears entered
+values when submission starts, the editor closes or its context changes, never
+persists them, and resolves ambiguous sends only through the original operation
+read under the same authenticated context. Missing adapter/version support
+refuses positively rather than falling back to a project route or resending.
+
 ### Redacted replies and catalog pagination
 
 The external catalog is exactly
