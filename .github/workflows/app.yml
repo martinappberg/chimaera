@@ -111,6 +111,12 @@ jobs:
       - name: Test the explicit native SSH signing prototype
         run: cargo test --locked --features ssh-agent-prototype
         working-directory: crates/chimaera-app
+      - name: Exercise owned SSH key loading on macOS
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --locked --features ssh-agent-fixture --bin chimaera-ssh-agent-fixture
+          python3 fixtures/ssh_agent_loader.py --binary "$PWD/target/debug/chimaera-ssh-agent-fixture"
+        working-directory: crates/chimaera-app
       # Plugin execution must also work inside the hardened, signed executable;
       # cargo test runs an ordinary test binary and cannot catch macOS kills.
       - name: Exercise plugins in the signed macOS bundle
