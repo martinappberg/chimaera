@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { NativeUiTransport, parseUiTree, safeUiHref, uiStyle, type UiRecord } from "./nativeUi";
-import { prepareClientBundle, reserveClientWorker, clientKeyEvent, clientPointerEvent } from "./modClient";
+import { prepareClientBundle, reserveClientWorker, clientKeyEvent, clientPointerEvent, clientViewport, CLIENT_CLOCK, CLIENT_WORKER } from "./modClient";
 import { decorationRuns } from "./nativeComposer";
 
 afterEach(() => vi.useRealTimers());
@@ -96,6 +96,12 @@ describe("native composer decorations", () => {
 });
 
 describe("native Client input coordinates", () => {
+  it("uses the containing pane's full height while bounding native grid dimensions", () => {
+    expect(clientViewport(600, 900, 10, 20)).toEqual({ columns: 100, rows: 45 });
+    expect(clientViewport(100_000, 100_000, 10, 20)).toEqual({ columns: 512, rows: 128 });
+    expect(clientViewport(0, 0, NaN, NaN)).toEqual({ columns: 1, rows: 1 });
+    expect(clientViewport(NaN, Infinity, 10, 20)).toEqual({ columns: 80, rows: 24 });
+  });
   it("preserves native key names and only active modifiers", () => {
     expect(clientKeyEvent({ key: "ArrowUp", ctrlKey: false, shiftKey: true, metaKey: false, altKey: true })).toEqual({ key: "up", shift: true, meta: true });
     expect(clientKeyEvent({ key: "é", ctrlKey: false, shiftKey: false, metaKey: false, altKey: false })).toEqual({ key: "é" });
@@ -106,5 +112,77 @@ describe("native Client input coordinates", () => {
     const geometry = { left: 100, top: 100, cellWidth: 10, cellHeight: 20 };
     expect(clientPointerEvent("move", event, geometry)).toEqual({ type: "move", x: -1, y: 1, fine: { x: -.5, y: 1.75 }, button: "left", ctrl: true });
     expect(clientPointerEvent("leave", event, geometry, { x: 4, y: 6 })).toEqual({ type: "leave", x: 4, y: 6, ctrl: true });
+  });
+});
+
+describe("Client presentation suspension", () => {
+  interface Clock {
+    render(): void;
+    schedule(): void;
+    startTimer(ms: number): number;
+    stopTimer(id: number): void;
+    suspend(value: boolean): void;
+  }
+  const makeClock = new Function(`return (${CLIENT_CLOCK});`)() as (callbacks: { render(): void; tick(id: number): void; error(error: unknown): void }) => Clock;
+
+  it("ships a syntactically complete worker with the tested clock", () => {
+    expect(() => new Function(CLIENT_WORKER)).not.toThrow();
+  });
+  it("pauses all scheduled callbacks, retains local state, and resumes without missed-tick replay", () => {
+    vi.useFakeTimers();
+    let state = 0;
+    const snapshots: number[] = [];
+    const tick = vi.fn((_id: number) => { state++; });
+    const clock = makeClock({ render: () => snapshots.push(state), tick, error: vi.fn() });
+    const timer = clock.startTimer(100);
+    vi.advanceTimersByTime(100);
+    expect(state).toBe(1);
+    clock.suspend(true);
+    expect(vi.getTimerCount()).toBe(0);
+    clock.schedule(); clock.render();
+    vi.advanceTimersByTime(30_000);
+    expect(state).toBe(1);
+    expect(snapshots).toEqual([]);
+    clock.suspend(false);
+    expect(snapshots).toEqual([1]);
+    expect(vi.getTimerCount()).toBe(1);
+    vi.advanceTimersByTime(134);
+    expect(state).toBe(2);
+    expect(tick.mock.calls.map(([id]) => id)).toEqual([timer, timer]);
+    expect(snapshots).toEqual([1, 2]);
+    clock.suspend(true);
+  });
+  it("supports registering and disposing timers while hidden without creating work", () => {
+    vi.useFakeTimers();
+    const tick = vi.fn();
+    const render = vi.fn();
+    const clock = makeClock({ render, tick, error: vi.fn() });
+    clock.suspend(true);
+    const discarded = clock.startTimer(100);
+    const retained = clock.startTimer(200);
+    clock.stopTimer(discarded);
+    expect(vi.getTimerCount()).toBe(0);
+    clock.suspend(false); clock.suspend(false);
+    expect(render).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(1);
+    vi.advanceTimersByTime(200);
+    expect(tick).toHaveBeenCalledExactlyOnceWith(retained);
+    clock.suspend(true);
+    clock.stopTimer(retained);
+    clock.suspend(false);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it("keeps timer limits and reports callback failures across suspension", () => {
+    vi.useFakeTimers();
+    const error = vi.fn();
+    const clock = makeClock({ render: () => { throw new Error("failed render"); }, tick: vi.fn(), error });
+    clock.suspend(true);
+    for (let i = 0; i < 32; i++) clock.startTimer(100);
+    expect(() => clock.startTimer(100)).toThrow("timer limit");
+    expect(vi.getTimerCount()).toBe(0);
+    clock.suspend(false);
+    expect(error).toHaveBeenCalledWith(expect.objectContaining({ message: "failed render" }));
+    expect(vi.getTimerCount()).toBe(32);
+    clock.suspend(true);
   });
 });

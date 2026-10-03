@@ -1,10 +1,11 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import ModNode from "./ModNode.svelte";
-  import { CLIENT_FRAME, CLIENT_WORKER, clientBundle, reserveClientWorker, clientKeyEvent, clientPointerEvent } from "./modClient";
+  import { CLIENT_FRAME, CLIENT_WORKER, clientBundle, reserveClientWorker, clientKeyEvent, clientPointerEvent, clientViewport } from "./modClient";
   import { isRecord, parseUiTree, type UiNode, type UiRecord } from "./nativeUi";
   import type { ModsController } from "./mods.svelte";
-  let { node, mods, component, instanceId, hash }: { node: UiNode; mods: ModsController; component: string; instanceId: string; hash?: unknown } = $props();
+  import { pageVisible } from "../shared/visibility";
+  let { node, mods, component, instanceId, hash, suspended = false }: { node: UiNode; mods: ModsController; component: string; instanceId: string; hash?: unknown; suspended?: boolean } = $props();
   let frame = $state<HTMLIFrameElement>();
   let tree = $state<UiNode | null>(null);
   let error = $state<string | null>(null);
@@ -24,12 +25,14 @@
   const moduleName = $derived(String(node.props.module ?? ""));
   const pluginName = $derived(node.client?.plugin);
   const clientKey = $derived(String(node.props.key ?? ""));
+  const paused = $derived(suspended || !$pageVisible);
   function viewport(): { columns: number; rows: number } {
     if (!body) return { columns: 80, rows: 24 };
     const styles = getComputedStyle(body);
     const fontSize = Number.parseFloat(styles.fontSize) || 14;
     const line = Number.parseFloat(styles.lineHeight) || fontSize * 1.45;
-    return { columns: Math.max(1, Math.min(512, Math.floor(body.clientWidth / (fontSize * .6)))), rows: Math.max(1, Math.min(128, Math.floor(Math.min(body.closest(".mod-site")?.clientHeight || innerHeight * .3, innerHeight * .36) / line))) };
+    const site = body.closest(".mod-site");
+    return clientViewport(body.clientWidth, site?.clientHeight || body.clientHeight || 24 * line, fontSize, line);
   }
   function stop(reason = "Claude Mod surface closed"): void {
     ready = false;
@@ -63,7 +66,6 @@
     const releaseWorker = reserveClientWorker();
     if (!releaseWorker) { error = "Claude Mod surface limit reached (16 active surfaces)"; return; }
     let canceled = false;
-    let heartbeat: ReturnType<typeof setInterval> | null = null;
     let startup: ReturnType<typeof setTimeout> | null = null;
     let count = 0;
     let windowStart = Date.now();
@@ -83,26 +85,43 @@
         if (data.type === "error") { fail(String(data.message ?? "Claude Mod surface failed")); return; }
         if (data.type === "ack" && typeof data.id === "number") { const request = pending.get(data.id); if (request) { clearTimeout(request.timer); pending.delete(data.id); request.resolve(); } }
         if (data.type === "response_error" && typeof data.id === "number") { const request = pending.get(data.id); if (request) { clearTimeout(request.timer); pending.delete(data.id); request.reject(new Error(String(data.message))); } }
+        if (data.type === "ready") { ready = true; if (startup) { clearTimeout(startup); startup = null; } }
         if (data.type === "tree") {
           try { tree = parseUiTree(data.tree); ready = true; keyListener = isRecord(data.listeners) && data.listeners.key === true; pointerListener = isRecord(data.listeners) && data.listeners.pointer === true; if (startup) { clearTimeout(startup); startup = null; } } catch (reason) { fail(String(reason)); }
         }
         if (data.type === "post") void mods.transport.request({ subtype: "ui_message", ...target, data: data.data }).then((reply) => { if (isRecord(reply.props)) void send({ type: "props", props: reply.props }).catch(() => {}); }).catch((reason) => fail(String(reason)));
       };
-      window.postMessage({ worker: CLIENT_WORKER, initial: JSON.parse(JSON.stringify({ type: "init", id: 0, bundle, props, ...viewport() })) }, "*", [channel.port2]);
+      window.postMessage({ worker: CLIENT_WORKER, initial: JSON.parse(JSON.stringify({ type: "init", id: 0, bundle, props, ...viewport(), suspended: untrack(() => paused) })) }, "*", [channel.port2]);
       startup = setTimeout(() => { if (!ready && !canceled) fail("Claude Mod surface did not start"); }, 5000);
-      heartbeat = setInterval(() => { if (ready) void send({ type: "ping" }).catch(() => {}); }, 2000);
     }).catch((reason) => { if (!canceled) fail(String(reason)); });
-    return () => { canceled = true; if (heartbeat) clearInterval(heartbeat); if (startup) clearTimeout(startup); stop(); releaseWorker(); };
+    return () => { canceled = true; if (startup) clearTimeout(startup); stop(); releaseWorker(); };
   });
-  $effect(() => { const props = node.props.props ?? {}; if (ready) untrack(() => { void send({ type: "props", props }).catch(() => {}); }); });
+  $effect(() => { const props = node.props.props ?? {}; if (ready && !paused) untrack(() => { void send({ type: "props", props }).catch(() => {}); }); });
   $effect(() => {
-    if (!ready || !body) return;
+    if (!ready) return;
+    const suspended = paused;
+    if (suspended) {
+      if (pointerFrame !== null) { cancelAnimationFrame(pointerFrame); pointerFrame = null; }
+      nextPointer = null;
+    }
+    untrack(() => { void send({ type: "suspend", suspended, ...(!suspended ? { props: node.props.props ?? {}, ...viewport() } : {}) }).catch(() => {}); });
+  });
+  $effect(() => {
+    if (!ready || paused) return;
+    const heartbeat = setInterval(() => { void send({ type: "ping" }).catch(() => {}); }, 2000);
+    return () => clearInterval(heartbeat);
+  });
+  $effect(() => {
+    if (!ready || paused || !body) return;
     let last = "";
     const resize = () => { const size = viewport(), key = `${size.columns}:${size.rows}`; if (key !== last) { last = key; void send({ type: "resize", ...size }).catch(() => {}); } };
     const observer = new ResizeObserver(resize); observer.observe(body);
+    const site = body.closest(".mod-site");
+    if (site) observer.observe(site);
     return () => observer.disconnect();
   });
   async function action(inner: UiNode, event: UiRecord): Promise<void> {
+    if (paused) throw new Error("This Mod surface is paused");
     if (inner.held === undefined) throw new Error("Claude Mod control is unavailable");
     await send({ type: "pin", handle: inner.held });
     try {
@@ -113,7 +132,7 @@
   }
   function keydown(event: KeyboardEvent): void {
     // Inputs, selects, links, and buttons retain their browser keyboard behavior.
-    if (!ready || event.target !== body || event.isComposing) return;
+    if (!ready || paused || event.target !== body || event.isComposing) return;
     if (event.key === "Escape") {
       event.preventDefault(); event.stopPropagation();
       (body?.closest("[role='tabpanel']") as HTMLElement | null)?.focus({ preventScroll: true });
@@ -125,7 +144,7 @@
     void send({ type: "key", event: clientKeyEvent(event) }).catch(() => {});
   }
   function pointer(type: "down" | "move" | "up" | "enter" | "leave", event: PointerEvent): void {
-    if (!ready || !pointerListener || !body) return;
+    if (!ready || paused || !pointerListener || !body) return;
     if ((event.target as Element).closest("button,input,textarea,select,a,[contenteditable='true']")) return;
     const rect = body.getBoundingClientRect(), style = getComputedStyle(body);
     const fontSize = Number.parseFloat(style.fontSize) || 14;
@@ -149,8 +168,8 @@
 {/key}
 <!-- The native Client explicitly registers its keyboard/pointer handlers; only then is this custom region focusable. -->
 <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
-<div class="client-body" bind:this={body} data-mod-key={clientKey} data-mod-plugin={pluginName} role={keyListener || pointerListener ? "application" : "group"} aria-label="Claude Mod interactive surface" tabindex={keyListener || pointerListener ? 0 : undefined} onkeydown={keydown} onpointerdown={(event) => pointer("down", event)} onpointermove={(event) => pointer("move", event)} onpointerup={(event) => pointer("up", event)} onpointerenter={(event) => pointer("enter", event)} onpointerleave={(event) => pointer("leave", event)} onpointercancel={(event) => pointer("up", event)}>
-  {#if tree && !error}<ModNode node={tree} disabled={!ready || !mods.attached} onAction={action} />{/if}
+<div class="client-body" bind:this={body} data-mod-key={clientKey} data-mod-plugin={pluginName} role={keyListener || pointerListener ? "application" : "group"} aria-label="Claude Mod interactive surface" tabindex={!paused && (keyListener || pointerListener) ? 0 : undefined} onkeydown={keydown} onpointerdown={(event) => pointer("down", event)} onpointermove={(event) => pointer("move", event)} onpointerup={(event) => pointer("up", event)} onpointerenter={(event) => pointer("enter", event)} onpointerleave={(event) => pointer("leave", event)} onpointercancel={(event) => pointer("up", event)}>
+  {#if tree && !error}<ModNode node={tree} disabled={!ready || paused || !mods.attached} onAction={action} />{/if}
   {#if error}<div class="client-error" role="status">{error}</div>{/if}
 </div>
 <style>

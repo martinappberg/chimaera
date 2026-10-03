@@ -862,7 +862,7 @@ daemon log).
 | `text` | **`text`**, `tone`, `size`, `emphasis`, `mono` |
 | `heading` | **`text`**, `level` (1–3) |
 | `markdown` | **`text`** (chat's renderer and its sanitizing) |
-| `code` | **`text`**, `language` |
+| `code` | **`text`**, `language`; syntax colors through the shared extension/Mod code renderer, bounded to 100,000 characters or 2,000 lines with a truncation notice |
 | `keyvalue` | **`items`**: `[{key, value, tone?}]` |
 | `badge` | **`text`**, `tone` |
 | `status` | **`text`**, `state` (`idle busy ok warn bad`: a spinner for busy, a check for ok), `detail` (muted, beside it) — one pill for a process's state, a build's |

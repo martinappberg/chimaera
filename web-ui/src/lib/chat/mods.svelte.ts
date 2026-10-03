@@ -85,6 +85,8 @@ export class ModsController {
     const generation = ++this.generation;
     this.attached = false;
     this.error = null;
+    this.focusRequested = null;
+    this.focused = null;
     this.clearTrees();
     try {
       await this.transport.request({ subtype: "ui_attach", answers: ["ui_copy", "ui_prompt_read", "ui_prompt_fill", "ui_prompt_suggest"] });

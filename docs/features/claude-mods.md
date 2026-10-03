@@ -18,7 +18,17 @@ selects, links, Markdown, code, and isolated SVG. The core transcript remains
 available when a render hook is absent or the corresponding native facts were
 not retained in older history.
 The pane uses the workbench's tab treatment, typography and compact controls;
-the expand button gives a larger Mod more room without hiding the composer.
+at chat-pane widths of 960px or more it docks beside the conversation. Narrower
+panes sit above the composer, with an expand button for more height. Resizing
+changes placement without remounting the Mod. Arrow keys, Home and End navigate
+its tabs. Minimize keeps the pane open while pausing its Client work; restoring
+it retains local Client state. Close still asks Claude to close the pane.
+
+Code elements share Chimaera extensions' bounded syntax renderer; native unified
+diffs show addition/removal colors and line numbers. The separate
+[review-planning fixture](../../crates/chimaera-agent/tests/fixtures/claude-mod-review/README.md)
+exercises a realistic two-pane workflow without model calls. Its example data
+and manual checkmarks make no claim that a review or tests have run.
 
 Mods can also wrap user and assistant messages, expanded tool cards, the working
 indicator, and the session mode. Composer integration supports reading a draft,
@@ -81,6 +91,11 @@ _Captured 2026-10-03 from the maintainer in this implementation conversation._
   rest of the app”. The maintainer supplied this after reviewing the first live
   pane, which had oversized spacing and controls disconnected from the workbench.
 - **Further deliberate constraints:** none supplied.
+- **Compatibility direction (verbatim):** “we can have this in a format that is
+  compatible with Claude Code mods but also have them as sort of Chimaera mods
+  (extensions) as well!” and “they work the same way [or at least are compatible]”.
+  The [compatibility design](../design/mods-extension-compatibility.md) separates
+  shared presentation already implemented from proposed portable authoring.
 
 ---
 

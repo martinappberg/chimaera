@@ -4,7 +4,8 @@ Claude Mods use `nativeUi.ts` (bounded socket RPC and tree validation),
 `mods.svelte.ts` (attached views, panes and invalidation), `ModSite.svelte`
 (render instances), `ModNode.svelte`/`ModControl.svelte` (native controls),
 `ModClient.svelte`/`modClient.ts` (isolated surface modules), and
-`ModsWorkbench.svelte` (pane tabs and status). Never journal a render tree or
+`ModsWorkbench.svelte` (responsive dock/inline panes, tabs and status). Code
+elements share `../shared/ExtensionCode.svelte` with workbench plugins. Never journal a render tree or
 replay a press; reconnect creates fresh render handles. See
 [Claude Mods](../../../../docs/features/claude-mods.md).
 

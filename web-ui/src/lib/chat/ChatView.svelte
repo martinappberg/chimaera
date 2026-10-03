@@ -155,6 +155,7 @@
   const { store, socket } = acquireChat(session.id);
   const mods = modsFor(socket.nativeUi);
   let composerApi = $state<NativeComposer>();
+  let modDockWidth = $state(0);
   // svelte-ignore state_referenced_locally
   onDestroy(() => releaseChat(session.id));
   onDestroy(() => {
@@ -2502,6 +2503,7 @@
   style:--chat-line-height={chatLineHeight}
   style:--chat-measure={`${chatContentWidth}px`}
   style:--chat-font-family={chatFontFamily}
+  style:padding-right={agentKind === "claude" && store.exited === null ? `${modDockWidth}px` : undefined}
   use:dismiss={{
     enabled: menu !== null,
     onDismiss: () => (menu = null),
@@ -3180,7 +3182,7 @@
   {/if}
 
   {#if agentKind === "claude" && store.exited === null}
-    <ModsWorkbench transport={socket.nativeUi} {visible} {focused} running={agentBusy} hasSurvey={store.questions.length > 0 || store.elicitations.length > 0} composer={composerApi} canEdit={!composerDisabled && store.pending.length === 0 && store.questions.length === 0 && store.elicitations.length === 0 && rewindIntent === null && forkIntent === null} canFocus={focused && !composerEngaged && !agentBusy && store.pending.length === 0 && store.questions.length === 0 && store.elicitations.length === 0} />
+    <ModsWorkbench transport={socket.nativeUi} host={chatEl} onDockWidth={(width) => (modDockWidth = width)} {visible} {focused} running={agentBusy} hasSurvey={store.questions.length > 0 || store.elicitations.length > 0} composer={composerApi} canEdit={!composerDisabled && store.pending.length === 0 && store.questions.length === 0 && store.elicitations.length === 0 && rewindIntent === null && forkIntent === null} canFocus={focused && !composerEngaged && !agentBusy && store.pending.length === 0 && store.questions.length === 0 && store.elicitations.length === 0 && rewindIntent === null && forkIntent === null} />
   {/if}
 
   <Composer
@@ -3207,6 +3209,7 @@
 
 <style>
   .chat {
+    box-sizing: border-box;
     position: relative; /* anchors the rewind dialog + /mcp panel overlays */
     height: 100%;
     display: flex;

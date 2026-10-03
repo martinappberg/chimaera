@@ -45,6 +45,53 @@ export function clientPointerEvent(type: "down" | "move" | "up" | "enter" | "lea
   return { type, x: crossing ? previous.x : Math.floor(fine.x), y: crossing ? previous.y : Math.floor(fine.y), ...(!crossing ? { fine } : {}), ...(button ? { button } : {}), ...(event.shiftKey ? { shift: true } : {}), ...(event.altKey ? { alt: true } : {}), ...(event.ctrlKey ? { ctrl: true } : {}) };
 }
 
+export function clientViewport(width: number, height: number, fontSize: number, lineHeight: number): { columns: number; rows: number } {
+  const font = Number.isFinite(fontSize) && fontSize > 0 ? fontSize : 14;
+  const line = Number.isFinite(lineHeight) && lineHeight > 0 ? lineHeight : font * 1.45;
+  return { columns: Math.max(1, Math.min(512, Math.floor((Number.isFinite(width) ? width : 80 * font * .6) / (font * .6)))), rows: Math.max(1, Math.min(128, Math.floor((Number.isFinite(height) ? height : 24 * line) / line))) };
+}
+
+// Shared verbatim with the worker and its clock tests. Suspension removes every
+// scheduled host callback without retiring a runtime timer's stable identity.
+export const CLIENT_CLOCK = `function makeClientClock(callbacks) {
+  let paused = false, scheduled = null, serial = 0;
+  const timers = new Map();
+  const run = (callback) => { try { callback(); } catch (error) { callbacks.error(error); } };
+  const render = () => {
+    if (scheduled !== null) { clearTimeout(scheduled); scheduled = null; }
+    if (!paused) run(callbacks.render);
+  };
+  const schedule = () => {
+    if (!paused && scheduled === null) scheduled = setTimeout(render, 34);
+  };
+  const arm = (id, timer) => {
+    timer.handle = setInterval(() => { if (!paused) run(() => { callbacks.tick(id); schedule(); }); }, timer.ms);
+  };
+  return {
+    render, schedule,
+    startTimer: (ms) => {
+      if (timers.size >= 32) throw Error('Mod timer limit reached');
+      const id = ++serial;
+      const timer = { ms: Math.max(100, Math.min(2147483647, Number.isFinite(ms) ? ms : 100)), handle: null };
+      timers.set(id, timer);
+      if (!paused) arm(id, timer);
+      return id;
+    },
+    stopTimer: (id) => { const timer = timers.get(id); if (timer) clearInterval(timer.handle); timers.delete(id); },
+    suspend: (value) => {
+      if (paused === value) return;
+      paused = value;
+      if (paused) {
+        if (scheduled !== null) { clearTimeout(scheduled); scheduled = null; }
+        for (const timer of timers.values()) { clearInterval(timer.handle); timer.handle = null; }
+      } else {
+        for (const [id, timer] of timers) arm(id, timer);
+        render();
+      }
+    }
+  };
+}`;
+
 /** Resolve only the runtime's supplied graph. A Mod cannot import code from the workbench or network. */
 export async function prepareClientBundle(value: UiRecord, module: string): Promise<ClientBundle> {
   if (!Array.isArray(value.files) || value.files.length > 512 || !Array.isArray(value.modules)) throw new Error("Invalid Claude Mod module bundle");
@@ -102,17 +149,15 @@ export const CLIENT_WORKER = `
 for (const name of ['Worker','SharedWorker','BroadcastChannel','WebSocket','EventSource','fetch','XMLHttpRequest','importScripts']) {
   try { Object.defineProperty(globalThis,name,{value:undefined,writable:false,configurable:false}); } catch {}
 }
-let runtime, bundle, held = [], scheduled = false, timerSerial = 0;
+let runtime, bundle, held = [];
 const pinned = new Set();
-const timers = new Map();
 const send = (message) => postMessage(message);
 const execute = (kind, payload) => {
   send({type:'execution',active:true});
   try { runtime.stage('client', kind, payload); return globalThis.__surface__.run(); }
   finally { send({type:'execution',active:false}); }
 };
-const render = () => {
-  scheduled = false;
+const draw = () => {
   const text = execute('render');
   if (typeof text !== 'string' || text.length > 1000000) throw Error('Mod render exceeded its size limit');
   const tree = JSON.parse(text), next = [];
@@ -120,11 +165,13 @@ const render = () => {
   walk(tree); runtime.dropHeld('client', held.filter(handle => !pinned.has(handle))); held = next;
   send({type:'tree',tree,listeners:{key:runtime.hasListener('client','key'),pointer:runtime.hasListener('client','pointer')}});
 };
-const schedule = () => { if (!scheduled) { scheduled = true; setTimeout(() => { try { render(); } catch (error) { send({type:'error',message:String(error)}); } }, 34); } };
+const clock = (${CLIENT_CLOCK})({render:draw,tick:timer => execute('tick',timer),error:error => send({type:'error',message:String(error)})});
+const render = clock.render, schedule = clock.schedule;
 onmessage = async ({data}) => {
   const id = data.id;
   try {
     if (data.type === 'init') {
+      clock.suspend(data.suspended === true);
       bundle = data.bundle;
       const files = new Map(bundle.files.map(file => [file.key,file])), urls = new Map();
       const link = key => {
@@ -137,13 +184,8 @@ onmessage = async ({data}) => {
       globalThis.h = support.h; globalThis.Fragment = support.Fragment;
       const host = {
         schedule,
-        startTimer: (_, ms) => {
-          if (timers.size >= 32) throw Error('Mod timer limit reached');
-          const timer = ++timerSerial;
-          timers.set(timer, setInterval(() => { try { execute('tick',timer); schedule(); } catch(error) { send({type:'error',message:String(error)}); } }, Math.max(100, ms)));
-          return timer;
-        },
-        stopTimer: (_, timer) => { clearInterval(timers.get(timer)); timers.delete(timer); },
+        startTimer: (_, ms) => clock.startTimer(ms),
+        stopTimer: (_, timer) => clock.stopTimer(timer),
         post: (_, text) => { if (text.length > 100000) throw Error('Mod message too large'); send({type:'post',data:JSON.parse(text)}); }
       };
       runtime = support.install(host, { ...bundle.limits, nodes: Math.min(4096, bundle.limits.nodes || 4096), chars: Math.min(1000000, bundle.limits.chars || 100000), depth: Math.min(32,bundle.limits.depth || 32) });
@@ -152,9 +194,14 @@ onmessage = async ({data}) => {
       send({type:'execution',active:false});
       runtime.mount('client', module[bundle.component], data.props);
       runtime.resize('client', data.columns || 80, data.rows || 24);
+      send({type:'ready'});
       render();
     } else if (data.type === 'props') { runtime.setProps('client',data.props); render(); }
     else if (data.type === 'resize') { runtime.resize('client',data.columns,data.rows); render(); }
+    else if (data.type === 'suspend') {
+      if (!data.suspended) { runtime.setProps('client',data.props); runtime.resize('client',data.columns,data.rows); }
+      clock.suspend(data.suspended === true);
+    }
     else if (data.type === 'pin') { if (!held.includes(data.handle)) { send({type:'response_error',id,message:'This control changed; try its refreshed version'}); return; } if (pinned.size >= 32) throw Error('Mod control limit reached'); pinned.add(data.handle); }
     else if (data.type === 'unpin') { pinned.delete(data.handle); if (!held.includes(data.handle)) runtime.dropHeld('client',[data.handle]); }
     else if (data.type === 'held') { if (!held.includes(data.handle) && !pinned.has(data.handle)) throw Error('This control changed; try its refreshed version'); execute('held',{handle:data.handle,event:data.event}); schedule(); }

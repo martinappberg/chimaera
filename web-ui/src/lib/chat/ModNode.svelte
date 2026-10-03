@@ -3,6 +3,7 @@
   import DOMPurify from "dompurify";
   import Markdown from "./Markdown.svelte";
   import ModControl from "./ModControl.svelte";
+  import ExtensionCode from "../shared/ExtensionCode.svelte";
   import { safeUiHref, uiStyle, type UiNode, type UiRecord } from "./nativeUi";
   let { node, disabled = false, onAction, engine, client }: { node: UiNode; disabled?: boolean; onAction: (node: UiNode, event: UiRecord) => Promise<void>; engine?: Snippet<[number]>; client?: Snippet<[UiNode]> } = $props();
   function svgSource(source: unknown): string {
@@ -32,10 +33,7 @@
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div class="mod-markdown" style={uiStyle(current.props, current.type)} onclickcapture={(event) => markdownPress(event, current)}><Markdown text={String(current.props.text ?? "")} /></div>
   {:else if current.type === "Code"}
-    <div class="code">
-      {#if current.props.path}<div class="code-label">{String(current.props.path)}</div>{/if}
-      <pre class:wrap={current.props.wrap === "wrap"}><code>{String(current.props.source ?? "")}</code></pre>
-    </div>
+    <ExtensionCode source={String(current.props.source ?? "")} language={typeof current.props.language === "string" ? current.props.language : undefined} path={typeof current.props.path === "string" ? current.props.path : undefined} startLine={typeof current.props.startLine === "number" ? current.props.startLine : undefined} format={current.props.format === "diff" ? "diff" : "source"} wrap={current.props.wrap === "truncate-end" ? "truncate-end" : "wrap"} />
   {:else if current.type === "Svg"}
     <img class="mod-svg" src={svgSource(current.props.source)} alt={String(current.props.alt ?? "Mod graphic")} width={typeof current.props.width === "number" ? Math.min(4096, current.props.width) : undefined} height={typeof current.props.height === "number" ? Math.min(4096, current.props.height) : undefined} />
   {:else if current.type === "Link"}
@@ -55,12 +53,10 @@
      turns template indentation into empty rows and oversized form fields. */
   .mod-element { min-width: 0; max-width: 100%; overflow-wrap: anywhere; white-space: normal; }
   span.mod-element { white-space: pre-wrap; }
-  .mod-svg { max-width: 100%; object-fit: contain; }
-  a { color: var(--accent); text-underline-offset: 2px; }
-  .code { background: var(--bg); border-radius: 5px; overflow: hidden; max-width: 100%; white-space: normal; }
-  .code-label { font-size: .85em; color: var(--muted); border-bottom: 1px solid var(--edge); padding: .4em .7em; }
-  pre { font-family: var(--mono); font-size: var(--text-sm); line-height: 1.5; white-space: pre; overflow: auto; margin: 0; padding: 8px 10px; }
-  pre.wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .mod-svg { display: block; max-width: 100%; object-fit: contain; }
+  a { color: var(--accent); text-underline-offset: 3px; text-decoration-thickness: 1px; overflow-wrap: anywhere; border-radius: 2px; }
+  a:hover { text-decoration-thickness: 2px; }
+  a:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 3px; }
   .mod-markdown { min-width: 0; white-space: normal; }
   .mod-markdown :global(.md > :first-child) { margin-top: 0; }
   .mod-markdown :global(.md > :last-child) { margin-bottom: 0; }

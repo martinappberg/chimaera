@@ -4,7 +4,7 @@
   import ModClient from "./ModClient.svelte";
   import type { ModsController, ModRender, ModSite } from "./mods.svelte";
   import { isRecord, type UiNode, type UiRecord } from "./nativeUi";
-  let { mods, component, instanceId, props = {}, active = true, children }: { mods: ModsController; component: string; instanceId: string; props?: UiRecord; active?: boolean; children?: Snippet<[UiRecord]> } = $props();
+  let { mods, component, instanceId, props = {}, active = true, suspended = false, children }: { mods: ModsController; component: string; instanceId: string; props?: UiRecord; active?: boolean; suspended?: boolean; children?: Snippet<[UiRecord]> } = $props();
   let render = $state<ModRender>({ tree: null, error: null, clientModules: {}, props: {} });
   let mount: ReturnType<ModsController["mount"]> | null = null;
   let root = $state<HTMLDivElement>();
@@ -44,7 +44,7 @@
     return { component, instance_id: instanceId, props: { ...defaults, view: {}, ...props, bodyColumns: size.columns, scroll: { offset: size.offset, bodyRows: size.rows } }, viewport: { columns: size.columns, rows: size.rows, isFullscreen: false }, content_rows: size.content, keyed };
   }
   function updateLayout(): void {
-    if (!active || !mount || !root) return;
+    if (!active || suspended || !mount || !root) return;
     if (following) setScroll(root.scrollHeight);
     const next = site(), encoded = JSON.stringify(next);
     if (encoded !== lastSpec) { lastSpec = encoded; mount.update(next); }
@@ -59,7 +59,7 @@
     lastOffset = metrics().offset;
   }
   $effect(() => {
-    if (!active) return;
+    if (!active || suspended) return;
     const registration = mods.mount(untrack(site), (next) => { render = next; });
     mount = registration;
     return () => {
@@ -73,7 +73,7 @@
   });
   $effect(() => { void props; untrack(updateLayout); });
   $effect(() => {
-    if (!active || !scrollable || !root) return;
+    if (!active || suspended || !scrollable || !root) return;
     void render.tree;
     const observer = new ResizeObserver(queueLayout);
     observer.observe(root);
@@ -133,7 +133,7 @@
     finally { scrollPending = false; updateLayout(); if (scrollDirty) void reportScroll(); }
   }
   $effect(() => mods.subscribe((event) => {
-    if (!active || event.component !== component || event.instance_id !== instanceId || !root) return;
+    if (!active || suspended || event.component !== component || event.instance_id !== instanceId || !root) return;
     const type = event.subtype ?? event.type;
     if (type === "ui_focus" && typeof event.key === "string") focusElement(event);
     if (type === "ui_scroll") {
@@ -157,7 +157,7 @@
   {#if render.tree}
     <ModNode node={render.tree} disabled={!mods.attached} onAction={action}>
       {#snippet engine(ordinal)}{#if children}{@render children(ordinal === 0 ? render.props : props)}{/if}{/snippet}
-      {#snippet client(node)}{#if active && mods.attached}<ModClient {node} {mods} {component} {instanceId} hash={node.client ? render.clientModules[node.client.plugin] : undefined} />{/if}{/snippet}
+      {#snippet client(node)}{#if active && mods.attached}<ModClient {node} {mods} {component} {instanceId} {suspended} hash={node.client ? render.clientModules[node.client.plugin] : undefined} />{/if}{/snippet}
     </ModNode>
   {:else if children}{@render children(props)}{/if}
   {#if render.error}<div class="mod-error" role="status">{render.error} <button onclick={() => mount?.refresh()}>Retry</button></div>{/if}
