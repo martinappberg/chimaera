@@ -8,6 +8,67 @@ use std::{
 };
 use tokio::net::UnixStream;
 
+#[test]
+#[ignore = "verifies the bounded synthetic native empty-agent probe receipt supplied by the explicit fixture harness"]
+fn native_empty_agent_kex_receipt_requires_positive_host_signature_and_publickey_offer() {
+    let receipt = std::env::var_os("CHIMAERA_SYNTHETIC_SSH_PROBE_RECEIPT")
+        .expect("explicit synthetic probe receipt path required");
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    fs::File::open(receipt)
+        .unwrap()
+        .take(32 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .unwrap();
+    assert!(bytes.len() <= 32 * 1024);
+    let receipt: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let host = ssh_key::PublicKey::from_openssh(receipt["public"].as_str().unwrap()).unwrap();
+    let selected = SshAuthGrantRequest {
+        version: 1,
+        keeper_boot: "synthetic-empty-agent-probe".into(),
+        destination: chimaera_link::SshAuthDestination {
+            hostname: "probe.invalid".into(),
+            user: "fixture-no-such-ssh-user".into(),
+            port: 22,
+        },
+        host_keys: vec![chimaera_link::SshAuthHostKey {
+            key: STANDARD.encode(host.to_bytes().unwrap()),
+            is_ca: false,
+        }],
+        // The parser requires a selected user key; this synthetic key is never
+        // supplied to the probe's empty agent or used for authentication.
+        user_keys: vec![STANDARD.encode(key(99).public_key().to_bytes().unwrap())],
+    };
+    let policy =
+        Policy::new(&selected).unwrap_or_else(|_| panic!("synthetic probe policy refused"));
+    let results = receipt["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    for result in results {
+        assert_eq!(result["exit"], 255);
+        assert_eq!(result["stdout_bytes"], 0);
+        assert_eq!(result["sign_requests"], 0);
+        let packets = result["binds"].as_array().unwrap();
+        if result["offered_pubkey"] == true {
+            assert_eq!(packets.len(), 1);
+            let packet = STANDARD.decode(packets[0].as_str().unwrap()).unwrap();
+            let (verified_host, session) = policy
+                .bind(&packet)
+                .unwrap_or_else(|_| panic!("synthetic probe host signature refused"));
+            assert_eq!(verified_host, host.to_bytes().unwrap());
+            assert!(!session.is_empty());
+            let mut tampered = packet;
+            let index = tampered.len() - 2;
+            tampered[index] ^= 1;
+            assert!(policy.bind(&tampered).is_err());
+        } else {
+            assert!(
+                packets.is_empty(),
+                "a password-only server provides no proof"
+            );
+        }
+    }
+}
+
 struct Fixture {
     directory: PathBuf,
     agent: Child,
