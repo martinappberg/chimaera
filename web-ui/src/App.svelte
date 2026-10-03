@@ -8,7 +8,7 @@
   import { paidPlan, proOffered } from "./lib/net/plan";
   import { listenForProReturn } from "./lib/net/proReturn";
   import { isBrowserGateway, gatewayWorkspace } from "./lib/net/base";
-  import AgentSetupDialog from "./lib/workspace/AgentSetupDialog.svelte";
+  import AgentSetupLoader from "./lib/workspace/AgentSetupLoader.svelte";
   import { agentSetup, openAgentSetup } from "./lib/workspace/agentSetup";
   import { agentCatalog } from "./lib/workspace/launcher";
   import { paneTabHasKeyboardFocus } from "./lib/shared/tabNavigation";
@@ -5311,7 +5311,7 @@
 
 {#if $agentSetup}
   {#key $agentSetup}
-    <AgentSetupDialog request={$agentSetup} onclose={() => agentSetup.set(null)} onlaunch={launcherPick} />
+    <AgentSetupLoader request={$agentSetup} onclose={() => agentSetup.set(null)} onlaunch={launcherPick} />
   {/key}
 {/if}
 
