@@ -391,7 +391,7 @@ Each submitted leg may add this immutable policy, captured from that leg's
 bounded native effective OpenSSH configuration:
 
 ```json
-{"policy":{"version":1,"methods":["publickey","keyboard-interactive","password"],"host_key_algorithms":["ssh-ed25519"],"ca_signature_algorithms":["ssh-ed25519"],"pubkey_accepted_algorithms":["ssh-ed25519"]}}
+{"policy":{"version":1,"methods":["publickey","keyboard-interactive","password"],"host_key_algorithms":["ssh-ed25519"],"ca_signature_algorithms":["ssh-ed25519"],"pubkey_accepted_algorithms":["ssh-ed25519"],"kex_algorithms":["curve25519-sha256"],"ciphers":["chacha20-poly1305@openssh.com"],"macs":["hmac-sha2-256-etm@openssh.com"]}}
 ```
 
 Methods form a nonempty ordered list of at most three distinct closed enum
@@ -414,9 +414,11 @@ at most 128 ASCII bytes consisting of letters, digits and `-@._+`. Leading
 refuse. The combined serialized policy is at most 8 KiB. Native resolution
 expands local list modifiers; only complete resolved lists cross the wire. The
 native verifier uses these same host, CA-signature and user-signature lists.
-Every generated final/hop SSH process receives their exact ordered CSV forms
-through fixed argument-vector options. Interactive legs enforce the same host
-and CA lists even though they request no native signature. A keeper incapable
+The policy also requires resolved `kex_algorithms`, `ciphers` and `macs` arrays
+with those identical per-list and combined-policy bounds. Every generated
+final/hop SSH process receives all six exact ordered CSV forms through fixed
+argument-vector options. Interactive legs enforce the same host, CA and
+transport lists even though they request no native signature. A keeper incapable
 of reproducing a selected algorithm refuses; it never falls back to defaults,
 weaker signatures, ambient trust or another authentication method. No private
 keys, policy-selected executable, configuration path or credential answer is
@@ -450,7 +452,7 @@ fallback occurs, and existing accepted masters are unaffected.
 Before advertising policy support, disposable native/keeper/OpenSSH fixtures
 cover key-only, password-only, keyboard-interactive-only and ordered
 key-plus-MFA/password policies, every locally disabled method, exact policy ACK,
-CA/host/user algorithm narrowing, and changed policies during a pending prompt.
+CA/host/user and KEX/cipher/MAC algorithm narrowing, and changed policies during a pending prompt.
 A valid session binding followed by standard unbound public-key signing must
 still refuse without consulting the local signing agent. These gates supplement
 the complete route acceptance above; this contract does not enable support.

@@ -135,6 +135,10 @@ Browser commands and operation reads require `X-Chimaera-Control-Context`;
 native commands and operation reads require the equivalent IPC argument. The
 command body itself is unchanged. A missing or mismatched context refuses before
 forwarding, and a changed context while awaiting a reply cannot display success.
+Browser errors are exactly `{version:1,error}`: the fixed keeper errors below,
+or `sign_in_required`, `context_changed` or `unconfirmed`. Native IPC returns
+only the corresponding fixed code. Errors contain no upstream body, request
+field, value, serializer source or OS/network diagnostics.
 
 The fixed additive account `GET /v1/personal/control-context` returns exactly
 `{version:1,context}` after fresh full-device authentication; delegated access

@@ -345,7 +345,7 @@ hop. Arbitrary local software/VPN routing remains explicit advanced Direct with
 the laptop connection lifetime. This contract does not advertise implementation.
 
 Separately negotiated `route_policy_v1:true` additionally acknowledges the exact
-transient per-leg method order and resolved host/CA/user algorithm lists defined
+transient per-leg method order and resolved host/CA/user/KEX/cipher/MAC lists defined
 in [SSH_AUTH.md](SSH_AUTH.md#exact-per-leg-authentication-policy). Policy-bearing
 grants require that capability and exact ordered policy echoes; missing support
 never causes policy stripping. Key-only, password-only and keyboard-interactive-
