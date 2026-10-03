@@ -303,13 +303,27 @@ per-leg aliases, strict selected public trust and one restricted IdentityAgent
 context for each key-mode leg. Each jump process must read that exact generated
 configuration: final-target command-line options are not assumed to apply to
 jump hosts. Every stanza disables agent forwarding, private/certificate files,
-agent additions, ambient trust/configuration and custom commands. Key mode
+agent additions, ambient trust/configuration and caller-selected custom commands. Key mode
 requires hostbound public-key authentication; interactive mode disables
 public-key/agent authentication. A key leg may continue to keyboard-interactive
 MFA only after its own native-verified signature receipt. Prompts identify the
 exact leg and immutable mode, remain confined to the original owner and are
 freshly authorized against the full saved route before publication and answer
 delivery. One leg's successful signature never licenses another leg's prompt.
+
+Per-leg password/MFA context cannot be inferred from prompt text or inherited
+from the final SSH process. A generated hop may invoke only the keeper's fixed
+same-binary route-leg helper, with a closed bounded argument shape identifying
+an immutable route-owned leg. The helper resolves the fixed SSH executable,
+exact generated configuration, selected hop, stdio destination and opaque
+askpass context from that live validated owner; it accepts no caller command,
+script, environment, arbitrary configuration path or replacement destination.
+It starts SSH with an argument vector and that leg's context. Any generated
+OpenSSH proxy command is entirely keeper-authored from validated safe atoms;
+arbitrary native ProxyCommand text never crosses this boundary. Helper startup
+and its pending authentication are canceled with the same whole-route owner,
+absolute deadline and retained cleanup budget. A missing, expired or replaced
+context refuses before another SSH or credential prompt.
 
 A route-owned `prompt` event retains the existing id/host/text/echo fields and
 adds mandatory
