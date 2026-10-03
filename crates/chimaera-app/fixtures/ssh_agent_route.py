@@ -48,6 +48,8 @@ class Protocol(socketserver.ThreadingMixIn, http.server.HTTPServer):
         self.slots = threading.BoundedSemaphore(8)
         self.requests = self.grants = self.ready = self.reconnects = self.deletes = 0
         self.failed = False
+        self.failure_kind = "none"
+        self.failure_lines = []
         self.deadline = time.monotonic() + 12
         super().__init__(("127.0.0.1", 0), Handler)
         self.origin = "http://127.0.0.1:" + str(self.server_port)
@@ -85,7 +87,22 @@ class Protocol(socketserver.ThreadingMixIn, http.server.HTTPServer):
             self.slots.release()
 
     def handle_error(self, request, client_address):
-        self.failed = True  # Never print protocol values, paths, or tracebacks.
+        self.failed = True
+        error = sys.exc_info()[1]
+        self.failure_kind = ("timeout" if isinstance(error, TimeoutError)
+                             else "refused" if isinstance(error, Refused)
+                             else "os" if isinstance(error, OSError)
+                             else "value" if isinstance(error, ValueError) else "other")
+        frame = error.__traceback__ if error is not None else None
+        lines = []
+        for _ in range(32):
+            if frame is None:
+                break
+            if (os.path.abspath(frame.tb_frame.f_code.co_filename) == os.path.abspath(__file__)
+                    and 0 < frame.tb_lineno <= 1000000 and len(lines) < 8):
+                lines.append(frame.tb_lineno)
+            frame = frame.tb_next
+        self.failure_lines = lines  # No text, argument, source or local values.
 
     def close(self):
         if self.closed:
@@ -312,6 +329,8 @@ class RouteFixture(Fixture):
             answered = cancelled = False
             start = time.monotonic()
             app = None
+            passed = False
+            output = bytearray()
             try:
                 app = self.spawn([str(self.binary), "--route-fixture", str(config), helper.origin, action],
                                  env, input_pipe=True)
@@ -332,7 +351,6 @@ class RouteFixture(Fixture):
                         if action != "grant-cancel":
                             app.stdin.close()
 
-                output = bytearray()
                 until = self.end(11)
                 while True:
                     if time.monotonic() >= until:
@@ -371,6 +389,7 @@ class RouteFixture(Fixture):
                 self.cleanup_receipt(receipt)
                 if self.identities(env) != before:
                     raise Refused("foreign fixture agent changed")
+                passed = True
                 print("PASS", action, "original_owner configured_identity owned_cleanup foreign_unchanged", flush=True)
             finally:
                 if app is not None and not app.stdin.closed:
@@ -380,6 +399,19 @@ class RouteFixture(Fixture):
                 finally:
                     if app is not None:
                         stop_owned(app)
+                if not passed:
+                    # Closed synthetic stage/counter facts only; never publish
+                    # child bytes, request bodies, credentials or stderr.
+                    print("DIAGNOSTIC route", json.dumps({
+                        "action": action, "exit_code": app.returncode if app is not None else None,
+                        "prompt": b"ROUTE_PROMPT\n" in output,
+                        "selected": b"ROUTE_SELECTED\n" in output,
+                        "failed_marker": b"ROUTE_FAILED\n" in output,
+                        "requests": helper.requests, "grants": helper.grants, "ready": helper.ready,
+                        "reconnects": helper.reconnects, "deletes": helper.deletes,
+                        "protocol_failed": helper.failed, "failure_kind": helper.failure_kind,
+                        "source_lines": helper.failure_lines,
+                    }, separators=(",", ":")), flush=True)
                 if helper.failed:
                     raise Refused("loopback protocol owner failed")
         print("PASS route5; simulated keeper protocol, no signing/SSH/Tauri/job acceptance", flush=True)
