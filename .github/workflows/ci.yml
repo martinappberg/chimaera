@@ -103,6 +103,13 @@ jobs:
       - run: cargo clippy --manifest-path plugins/Cargo.toml --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo test -p chimaera-link --all-features
+      - name: Check explicit personal-provider helper
+        run: cargo clippy --locked -p chimaera -p chimaera-server --all-targets --features provider-authority-prototype -- -D warnings
+      - name: Test explicit personal-provider helper
+        run: |
+          cargo test --locked -p chimaera-server --lib --features provider-authority-prototype cloud::providers
+          cargo test --locked -p chimaera-server --lib --features provider-authority-prototype pro::execution::
+          cargo test --locked -p chimaera --features provider-authority-prototype
       - run: cargo test --manifest-path plugins/Cargo.toml
 
   musl:
@@ -143,3 +150,15 @@ jobs:
         with:
           name: chimaera-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/chimaera
+      # Capture the default binary first: this optional build replaces the
+      # local output path, but never the default artifact or release inputs.
+      - name: Build explicit personal-provider ARM fixture daemon
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: cargo zigbuild --locked --release --target ${{ matrix.target }} -p chimaera --features provider-authority-prototype
+      - name: Upload explicit personal-provider ARM fixture daemon
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: chimaera-provider-authority-prototype-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/chimaera
+          if-no-files-found: error
