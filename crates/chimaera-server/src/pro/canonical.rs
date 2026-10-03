@@ -165,7 +165,7 @@ impl KeptCopies {
                     | rustix::fs::OFlags::EXCL
                     | rustix::fs::OFlags::NOFOLLOW
                     | rustix::fs::OFlags::CLOEXEC,
-                rustix::fs::Mode::from_raw_mode(metadata.permissions().mode() & 0o777),
+                rustix::fs::Mode::from_raw_mode((metadata.permissions().mode() & 0o777) as _),
             ) {
                 Ok(fd) => {
                     output = Some(std::fs::File::from(fd));
