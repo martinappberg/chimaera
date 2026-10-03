@@ -30,12 +30,16 @@ pub(super) mod provider_claude;
 #[cfg(all(unix, feature = "provider-authority-prototype"))]
 #[allow(dead_code)]
 pub(super) mod provider_claude_child;
+#[cfg(all(target_os = "linux", feature = "provider-claude-fixture"))]
+mod provider_claude_fixture;
 #[cfg(all(unix, feature = "provider-authority-prototype"))]
 #[allow(dead_code)]
 pub(super) mod provider_client;
 #[cfg(all(unix, feature = "provider-authority-prototype"))]
 #[allow(dead_code)]
 pub(super) mod provider_github;
+#[cfg(all(target_os = "linux", feature = "provider-claude-fixture"))]
+pub(crate) use provider_claude_fixture::start as start_claude_fixture;
 #[cfg(all(target_os = "linux", feature = "provider-github-fixture"))]
 mod provider_github_fixture;
 #[cfg(all(target_os = "linux", feature = "provider-github-fixture"))]

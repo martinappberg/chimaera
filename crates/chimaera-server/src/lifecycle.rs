@@ -10,14 +10,14 @@ use crate::{app, lock, AppState, ServerConfig};
 
 /// Bind on 127.0.0.1, write the manifest, and serve until SIGINT/SIGTERM.
 pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
-    run_selected(cfg, false).await
+    run_selected(cfg, false, false).await
 }
 
 /// Explicit disposable CLI selection; ordinary run never selects this task.
 #[cfg(all(target_os = "linux", feature = "provider-github-fixture"))]
 pub async fn run_provider_github_fixture(cfg: ServerConfig) -> anyhow::Result<()> {
     anyhow::ensure!(!cfg.routable_bind, "Fixture requires loopback binding");
-    run_selected(cfg, true).await
+    run_selected(cfg, true, false).await
 }
 
 #[cfg(all(not(target_os = "linux"), feature = "provider-github-fixture"))]
@@ -25,9 +25,27 @@ pub async fn run_provider_github_fixture(_: ServerConfig) -> anyhow::Result<()> 
     anyhow::bail!("Fixture requires Linux")
 }
 
-async fn run_selected(cfg: ServerConfig, github_fixture: bool) -> anyhow::Result<()> {
+/// Separate explicit print fixture; no normal startup selects it.
+#[cfg(all(target_os = "linux", feature = "provider-claude-fixture"))]
+pub async fn run_provider_claude_fixture(cfg: ServerConfig) -> anyhow::Result<()> {
+    anyhow::ensure!(!cfg.routable_bind, "Fixture requires loopback binding");
+    run_selected(cfg, false, true).await
+}
+
+#[cfg(all(not(target_os = "linux"), feature = "provider-claude-fixture"))]
+pub async fn run_provider_claude_fixture(_: ServerConfig) -> anyhow::Result<()> {
+    anyhow::bail!("Fixture requires Linux")
+}
+
+async fn run_selected(
+    cfg: ServerConfig,
+    github_fixture: bool,
+    claude_fixture: bool,
+) -> anyhow::Result<()> {
     #[cfg(not(all(target_os = "linux", feature = "provider-github-fixture")))]
     let _ = github_fixture;
+    #[cfg(not(all(target_os = "linux", feature = "provider-claude-fixture")))]
+    let _ = claude_fixture;
     // Consume the trusted launcher's one-shot pipe before restore or helpers
     // can inherit it. An opted-in idle descriptor is protected and its Linux
     // proc/ptrace gate verified here, before any startup child. Ordinary device
@@ -182,6 +200,10 @@ async fn run_selected(cfg: ServerConfig, github_fixture: bool) -> anyhow::Result
     #[cfg(all(target_os = "linux", feature = "provider-github-fixture"))]
     if github_fixture {
         crate::pro::start_github_fixture(&state)?;
+    }
+    #[cfg(all(target_os = "linux", feature = "provider-claude-fixture"))]
+    if claude_fixture {
+        crate::pro::start_claude_fixture(&state)?;
     }
 
     // Theming shims: regenerated at every daemon start (and after installs /

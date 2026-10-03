@@ -11,6 +11,7 @@ default = []
 provider-authority-prototype = ["dep:zeroize", "chimaera-core/provider-runtime"]
 # Disposable fixed synthetic GitHub pairing only; never ordinary serve selection.
 provider-github-fixture = ["provider-authority-prototype"]
+provider-claude-fixture = ["provider-authority-prototype"]
 
 [dependencies]
 anyhow.workspace = true

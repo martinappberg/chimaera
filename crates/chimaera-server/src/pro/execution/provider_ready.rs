@@ -481,7 +481,13 @@ async fn exchange(request: &wire::Request, bytes: &[u8], path: &Path) -> Result<
 
 /// Read-only fixture evidence from the actual retained Ready publisher. It does
 /// not mint a synthetic proof, alter phase or authorize ordinary execution.
-#[cfg(all(target_os = "linux", feature = "provider-github-fixture"))]
+#[cfg(all(
+    target_os = "linux",
+    any(
+        feature = "provider-github-fixture",
+        feature = "provider-claude-fixture"
+    )
+))]
 pub(super) fn fixture_verified(state: &AppState) -> Result<bool, wire::Error> {
     let pending = pending(state).ok_or(wire::Error::Inactive)?;
     pending

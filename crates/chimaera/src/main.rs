@@ -46,6 +46,14 @@ enum Command {
         #[cfg(feature = "provider-github-fixture")]
         #[arg(long, hide = true)]
         provider_github_fixture: bool,
+        /// Disposable protected fixed Claude print acceptance only.
+        #[cfg(feature = "provider-claude-fixture")]
+        #[arg(long, hide = true)]
+        #[cfg_attr(
+            feature = "provider-github-fixture",
+            arg(conflicts_with = "provider_github_fixture")
+        )]
+        provider_claude_fixture: bool,
     },
     /// Fixed supervisor-only provider control; never a daemon/project route.
     #[cfg(feature = "provider-authority-prototype")]
@@ -384,6 +392,8 @@ async fn dispatch(command: Command) -> anyhow::Result<()> {
             bind_routable,
             #[cfg(feature = "provider-github-fixture")]
             provider_github_fixture,
+            #[cfg(feature = "provider-claude-fixture")]
+            provider_claude_fixture,
             ..
         } => {
             // `--port` wins; else honor $PORT (twelve-factor) so autoPort dev
@@ -397,6 +407,11 @@ async fn dispatch(command: Command) -> anyhow::Result<()> {
             if provider_github_fixture {
                 anyhow::ensure!(!bind_routable, "Fixture requires loopback binding");
                 return chimaera_server::run_provider_github_fixture(config).await;
+            }
+            #[cfg(feature = "provider-claude-fixture")]
+            if provider_claude_fixture {
+                anyhow::ensure!(!bind_routable, "Fixture requires loopback binding");
+                return chimaera_server::run_provider_claude_fixture(config).await;
             }
             chimaera_server::run(config).await
         }
@@ -731,6 +746,42 @@ mod tests {
             "serve",
             "--provider-github-fixture",
             "https://github.com"
+        ])
+        .is_err());
+    }
+    #[cfg(feature = "provider-claude-fixture")]
+    #[test]
+    fn fixed_claude_fixture_flag_defaults_off_and_accepts_no_selector() {
+        let normal = Cli::try_parse_from(["chimaera", "serve"]).unwrap();
+        assert!(matches!(
+            normal.command,
+            Command::Serve {
+                provider_claude_fixture: false,
+                ..
+            }
+        ));
+        let selected =
+            Cli::try_parse_from(["chimaera", "serve", "--provider-claude-fixture"]).unwrap();
+        assert!(matches!(
+            selected.command,
+            Command::Serve {
+                provider_claude_fixture: true,
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from([
+            "chimaera",
+            "serve",
+            "--provider-claude-fixture",
+            "https://api.anthropic.com"
+        ])
+        .is_err());
+        #[cfg(feature = "provider-github-fixture")]
+        assert!(Cli::try_parse_from([
+            "chimaera",
+            "serve",
+            "--provider-claude-fixture",
+            "--provider-github-fixture"
         ])
         .is_err());
     }

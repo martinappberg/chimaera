@@ -13,6 +13,7 @@ path = "src/main.rs"
 # Explicit inherited-descriptor personal control helper; ordinary startup stays unchanged.
 provider-authority-prototype = ["chimaera-server/provider-authority-prototype"]
 provider-github-fixture = ["provider-authority-prototype", "chimaera-server/provider-github-fixture"]
+provider-claude-fixture = ["provider-authority-prototype", "chimaera-server/provider-claude-fixture"]
 
 [dependencies]
 anyhow.workspace = true

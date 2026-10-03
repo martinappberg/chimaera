@@ -104,12 +104,12 @@ jobs:
       - run: cargo test --workspace
       - run: cargo test -p chimaera-link --all-features
       - name: Check explicit personal-provider helper
-        run: cargo clippy --locked -p chimaera -p chimaera-server --all-targets --features provider-github-fixture -- -D warnings
+        run: cargo clippy --locked -p chimaera -p chimaera-server --all-targets --features provider-github-fixture,provider-claude-fixture -- -D warnings
       - name: Test explicit personal-provider helper
         run: |
-          cargo test --locked -p chimaera-server --lib --features provider-github-fixture cloud::providers
-          cargo test --locked -p chimaera-server --lib --features provider-github-fixture pro::execution::
-          cargo test --locked -p chimaera --features provider-github-fixture
+          cargo test --locked -p chimaera-server --lib --features provider-github-fixture,provider-claude-fixture cloud::providers
+          cargo test --locked -p chimaera-server --lib --features provider-github-fixture,provider-claude-fixture pro::execution::
+          cargo test --locked -p chimaera --features provider-github-fixture,provider-claude-fixture
       - name: Verify pinned GitHub CLI ignores project endpoint configuration
         run: |
           set -euo pipefail
@@ -167,7 +167,7 @@ jobs:
       # local output path, but never the default artifact or release inputs.
       - name: Build explicit personal-provider ARM fixture daemon
         if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: cargo zigbuild --locked --release --target ${{ matrix.target }} -p chimaera --features provider-github-fixture
+        run: cargo zigbuild --locked --release --target ${{ matrix.target }} -p chimaera --features provider-github-fixture,provider-claude-fixture
       - name: Upload explicit personal-provider ARM fixture daemon
         if: matrix.target == 'aarch64-unknown-linux-musl'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -183,7 +183,7 @@ jobs:
           set -euo pipefail
           bash scripts/build-plugins.sh
           cargo-zigbuild test --locked --release --target aarch64-unknown-linux-musl \
-            -p chimaera-server --lib --features provider-github-fixture --no-run \
+            -p chimaera-server --lib --features provider-github-fixture,provider-claude-fixture --no-run \
             --message-format=json > "$RUNNER_TEMP/provider-test-build.jsonl"
           python3 - <<'PYARTIFACT'
           import hashlib, json, os, pathlib, shutil, subprocess
