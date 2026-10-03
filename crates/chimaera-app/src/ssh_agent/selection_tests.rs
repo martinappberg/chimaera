@@ -411,9 +411,14 @@ async fn adjacent_certificate_is_selected_exactly_or_refused_before_plain_loadin
         "",
     )
     .unwrap();
-    let mut builder =
-        ssh_key::certificate::Builder::new(vec![1; 16], key(7).key_data().clone(), 0, u64::MAX)
-            .unwrap();
+    // The builder requires a representable timestamp, not OpenSSH's infinity sentinel.
+    let mut builder = ssh_key::certificate::Builder::new(
+        vec![1; 16],
+        key(7).key_data().clone(),
+        0,
+        4_102_444_800, // 2100-01-01; validity is not the subject of this test.
+    )
+    .unwrap();
     builder
         .cert_type(ssh_key::certificate::CertType::User)
         .unwrap()
