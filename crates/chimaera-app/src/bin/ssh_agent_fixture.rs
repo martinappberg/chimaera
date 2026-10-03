@@ -1,5 +1,8 @@
 //! Synthetic Mac loader fixture: unchanged production modules, no Tauri prompt claim.
 #[cfg(target_os = "macos")]
+#[path = "../ssh_agent_fixture_support/keeper.rs"]
+mod keeper;
+#[cfg(target_os = "macos")]
 #[path = "../ssh_agent_fixture_support/route.rs"]
 mod route;
 #[cfg(target_os = "macos")]
@@ -214,6 +217,33 @@ fn main() {
             if result.is_err() {
                 println!("SOURCE_FAILED");
                 std::process::exit(2)
+            }
+        }
+        Some("--keeper-route-fixture") => {
+            if args.len() != 5
+                || !matches!(
+                    args[4].as_str(),
+                    "accept" | "refuse" | "cancel" | "deadline"
+                )
+            {
+                std::process::exit(2)
+            }
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let result = runtime.block_on(keeper::run(
+                PathBuf::from(&args[2]),
+                args[3].clone(),
+                args[4].clone(),
+            ));
+            runtime.block_on(async {
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            });
+            if result.is_err() {
+                println!("KEEPER_FAILED");
+                std::process::exit(2);
             }
         }
         Some("--route-fixture") => {
