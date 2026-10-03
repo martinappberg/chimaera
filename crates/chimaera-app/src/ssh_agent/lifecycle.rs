@@ -2,7 +2,10 @@
 use super::Failure;
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex, Weak},
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc, Mutex, Weak,
+    },
 };
 use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 
@@ -11,6 +14,7 @@ struct State {
     generation: u64,
     next: u64,
     attempts: BTreeMap<u64, watch::Sender<bool>>,
+    routes: BTreeMap<u64, Weak<RoutePromptContext>>,
 }
 #[derive(Clone)]
 pub(crate) struct Registry(Arc<Mutex<State>>, Arc<Semaphore>);
@@ -23,6 +27,11 @@ impl Registry {
     pub(crate) fn advance(&self, generation: u64) {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         state.generation = generation;
+        for (_, route) in std::mem::take(&mut state.routes) {
+            if let Some(route) = route.upgrade() {
+                route.stop.send_replace(true);
+            }
+        }
         for (_, cancel) in std::mem::take(&mut state.attempts) {
             cancel.send_replace(true);
         }
@@ -53,6 +62,46 @@ impl Registry {
             _permit: permit,
         })
     }
+    pub(crate) fn route_prompt(
+        &self,
+        generation: u64,
+        host: &str,
+        auth: &chimaera_link::SshRoutePromptAuth,
+    ) -> Option<RoutePromptGuard> {
+        let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if state.generation != generation {
+            return None;
+        }
+        for (identity, route) in &state.routes {
+            let Some(context) = route.upgrade() else {
+                continue;
+            };
+            if context.host == host && auth.matches(&context.grant, &context.boot) {
+                let guard = RoutePromptGuard {
+                    registry: Arc::downgrade(&self.0),
+                    identity: *identity,
+                    context,
+                    auth: auth.clone(),
+                };
+                return guard.active_locked(&state).then_some(guard);
+            }
+        }
+        None
+    }
+    #[cfg(test)]
+    fn has_route(&self, generation: u64, host: &str) -> bool {
+        let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        state.generation == generation
+            && state
+                .routes
+                .values()
+                .filter_map(Weak::upgrade)
+                .any(|route| {
+                    route.host == host
+                        && !*route.stop.borrow()
+                        && route.deadline > tokio::time::Instant::now()
+                })
+    }
 }
 pub(crate) struct Attempt {
     registry: Weak<Mutex<State>>,
@@ -64,11 +113,52 @@ impl Attempt {
     pub(crate) fn cancellation(&self) -> watch::Receiver<bool> {
         self.cancel.clone()
     }
+    pub(crate) fn bind_route(
+        &self,
+        host: &str,
+        grant: &chimaera_link::SshRouteGrant,
+        request: &chimaera_link::SshRouteGrantRequest,
+        deadline: tokio::time::Instant,
+    ) -> Result<RoutePromptOwner, Failure> {
+        grant.validate().map_err(|_| Failure::InvalidRequest)?;
+        request.validate().map_err(|_| Failure::InvalidRequest)?;
+        if !grant.matches(request)
+            || deadline <= tokio::time::Instant::now()
+            || *self.cancel.borrow()
+        {
+            return Err(Failure::Revoked);
+        }
+        let registry = self.registry.upgrade().ok_or(Failure::Revoked)?;
+        let mut state = registry.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.attempts.contains_key(&self.identity) || state.routes.contains_key(&self.identity)
+        {
+            return Err(Failure::Revoked);
+        }
+        let (stop, _) = watch::channel(false);
+        let context = Arc::new(RoutePromptContext {
+            host: host.into(),
+            grant: grant.clone(),
+            boot: request.keeper_boot.clone(),
+            deadline,
+            signed: AtomicU8::new(0),
+            stop,
+            cancel: self.cancel.clone(),
+        });
+        state.routes.insert(self.identity, Arc::downgrade(&context));
+        Ok(RoutePromptOwner(context))
+    }
 }
 impl Drop for Attempt {
     fn drop(&mut self) {
         if let Some(registry) = self.registry.upgrade() {
             let mut state = registry.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(route) = state
+                .routes
+                .remove(&self.identity)
+                .and_then(|route| route.upgrade())
+            {
+                route.stop.send_replace(true);
+            }
             if let Some(sender) = state.attempts.remove(&self.identity) {
                 sender.send_replace(true);
             }
@@ -76,9 +166,255 @@ impl Drop for Attempt {
     }
 }
 
+struct RoutePromptContext {
+    host: String,
+    grant: chimaera_link::SshRouteGrant,
+    boot: String,
+    deadline: tokio::time::Instant,
+    signed: AtomicU8,
+    stop: watch::Sender<bool>,
+    cancel: watch::Receiver<bool>,
+}
+pub(crate) struct RoutePromptOwner(Arc<RoutePromptContext>);
+impl RoutePromptOwner {
+    pub(crate) fn proof(&self) -> RoutePromptProof {
+        RoutePromptProof(Arc::downgrade(&self.0))
+    }
+}
+impl Drop for RoutePromptOwner {
+    fn drop(&mut self) {
+        self.0.stop.send_replace(true);
+    }
+}
+pub(crate) struct RoutePromptProof(Weak<RoutePromptContext>);
+impl RoutePromptProof {
+    pub(crate) fn signed(&self, leg: u8) {
+        if let Some(context) = self.0.upgrade() {
+            if context.grant.modes.get(usize::from(leg)) == Some(&chimaera_link::SshRouteMode::Key)
+            {
+                context.signed.fetch_or(1 << leg, Ordering::SeqCst);
+            }
+        }
+    }
+}
+impl Drop for RoutePromptProof {
+    fn drop(&mut self) {
+        if let Some(context) = self.0.upgrade() {
+            context.stop.send_replace(true);
+        }
+    }
+}
+#[derive(Clone)]
+pub(crate) struct RoutePromptGuard {
+    registry: Weak<Mutex<State>>,
+    identity: u64,
+    context: Arc<RoutePromptContext>,
+    auth: chimaera_link::SshRoutePromptAuth,
+}
+impl RoutePromptGuard {
+    fn active_locked(&self, state: &State) -> bool {
+        state.attempts.contains_key(&self.identity)
+            && state
+                .routes
+                .get(&self.identity)
+                .and_then(Weak::upgrade)
+                .is_some_and(|route| Arc::ptr_eq(&route, &self.context))
+            && !*self.context.stop.borrow()
+            && !*self.context.cancel.borrow()
+            && self.context.deadline > tokio::time::Instant::now()
+            && (self.auth.mode == chimaera_link::SshRouteMode::Interactive
+                || self.context.signed.load(Ordering::SeqCst) & (1 << self.auth.leg) != 0)
+    }
+    pub(crate) fn active(&self) -> bool {
+        self.registry.upgrade().is_some_and(|registry| {
+            self.active_locked(&registry.lock().unwrap_or_else(|e| e.into_inner()))
+        })
+    }
+    pub(crate) async fn stopped(&self) {
+        let mut stop = self.context.stop.subscribe();
+        let mut cancel = self.context.cancel.clone();
+        tokio::select! {
+            biased;
+            _ = stop.wait_for(|value| *value) => {},
+            _ = cancel.wait_for(|value| *value) => {},
+            _ = tokio::time::sleep_until(self.context.deadline) => {},
+        }
+    }
+    pub(crate) fn prompt(&self, prompt: &str) -> String {
+        let destination = &self.auth.destination;
+        let mode = if self.auth.mode == chimaera_link::SshRouteMode::Interactive {
+            "password/MFA"
+        } else {
+            "MFA after SSH key verification"
+        };
+        format!(
+            "SSH to {}@{}:{} ({mode})\n{prompt}",
+            destination.user, destination.hostname, destination.port
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn request() -> chimaera_link::SshRouteGrantRequest {
+        use chimaera_link::*;
+        let leg = |host: &str, mode| SshRouteAuthLeg {
+            destination: SshAuthDestination {
+                hostname: host.into(),
+                user: "fixture".into(),
+                port: 22,
+            },
+            mode,
+            host_keys: vec![SshAuthHostKey {
+                key: "AQ==".into(),
+                is_ca: false,
+            }],
+            user_keys: if mode == SshRouteMode::Key {
+                vec!["AQ==".into()]
+            } else {
+                vec![]
+            },
+        };
+        let first = leg("jump.invalid", SshRouteMode::Key);
+        let last = leg("final.invalid", SshRouteMode::Interactive);
+        SshRouteGrantRequest {
+            version: 1,
+            keeper_boot: "boot".into(),
+            destination: last.destination.clone(),
+            route: SshRoute {
+                version: 1,
+                jumps: vec![first.destination.clone()],
+            },
+            legs: vec![first, last],
+        }
+    }
+    fn grant(request: &chimaera_link::SshRouteGrantRequest) -> chimaera_link::SshRouteGrant {
+        chimaera_link::SshRouteGrant {
+            version: 1,
+            grant_id: "grant".into(),
+            expires_in: 180,
+            destination: request.destination.clone(),
+            route: request.route.clone(),
+            modes: request.legs.iter().map(|leg| leg.mode).collect(),
+        }
+    }
+    fn auth(
+        request: &chimaera_link::SshRouteGrantRequest,
+        leg: u8,
+    ) -> chimaera_link::SshRoutePromptAuth {
+        chimaera_link::SshRoutePromptAuth {
+            grant_id: "grant".into(),
+            keeper_boot: "boot".into(),
+            leg,
+            mode: request.legs[usize::from(leg)].mode,
+            destination: request.legs[usize::from(leg)].destination.clone(),
+        }
+    }
+    #[tokio::test]
+    async fn route_prompt_requires_original_owner_exact_metadata_and_own_leg_signature() {
+        let registry = Registry::default();
+        let attempt = registry.admit(0).ok().unwrap();
+        let request = request();
+        let receipt = grant(&request);
+        assert!(registry
+            .route_prompt(0, "host", &auth(&request, 1))
+            .is_none());
+        let owner = attempt
+            .bind_route(
+                "host",
+                &receipt,
+                &request,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .ok()
+            .unwrap();
+        assert!(registry.has_route(0, "host"));
+        assert!(registry
+            .route_prompt(0, "host", &auth(&request, 0))
+            .is_none());
+        let proof = owner.proof();
+        proof.signed(1); // An interactive leg cannot manufacture a key receipt.
+        assert!(registry
+            .route_prompt(0, "host", &auth(&request, 0))
+            .is_none());
+        proof.signed(0);
+        assert!(registry
+            .route_prompt(0, "host", &auth(&request, 0))
+            .unwrap()
+            .active());
+        let guard = registry
+            .route_prompt(0, "host", &auth(&request, 1))
+            .unwrap();
+        assert!(guard
+            .prompt("Challenge?")
+            .contains("fixture@final.invalid:22 (password/MFA)"));
+        assert!(registry
+            .route_prompt(1, "host", &auth(&request, 1))
+            .is_none());
+        assert!(registry
+            .route_prompt(0, "other-host", &auth(&request, 1))
+            .is_none());
+        for field in 0..6 {
+            let mut changed = auth(&request, 1);
+            match field {
+                0 => changed.grant_id = "other".into(),
+                1 => changed.keeper_boot = "other".into(),
+                2 => changed.leg = 0,
+                3 => changed.mode = chimaera_link::SshRouteMode::Key,
+                4 => changed.destination.hostname = "other".into(),
+                _ => changed.destination.port = 2222,
+            }
+            assert!(registry.route_prompt(0, "host", &changed).is_none());
+        }
+        drop(proof); // Control verifier loss closes all legs synchronously.
+        assert!(!guard.active());
+        tokio::time::timeout(std::time::Duration::from_millis(100), guard.stopped())
+            .await
+            .unwrap();
+        assert!(!registry.has_route(0, "host"));
+        assert!(attempt
+            .bind_route(
+                "host",
+                &receipt,
+                &request,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(1)
+            )
+            .is_err());
+    }
+    #[tokio::test]
+    async fn route_prompt_permission_ends_before_detached_cleanup_and_after_expiry_or_account_change(
+    ) {
+        for exit in 0..3 {
+            let registry = Registry::default();
+            let attempt = registry.admit(0).ok().unwrap();
+            let request = request();
+            let owner = attempt
+                .bind_route(
+                    "host",
+                    &grant(&request),
+                    &request,
+                    tokio::time::Instant::now() + std::time::Duration::from_millis(50),
+                )
+                .ok()
+                .unwrap();
+            let guard = registry
+                .route_prompt(0, "host", &auth(&request, 1))
+                .unwrap();
+            match exit {
+                0 => drop(owner),
+                1 => registry.advance(1),
+                _ => tokio::time::sleep(std::time::Duration::from_millis(60)).await,
+            }
+            assert!(!guard.active());
+            tokio::time::timeout(std::time::Duration::from_millis(100), guard.stopped())
+                .await
+                .unwrap();
+            // Observer-held guards retain no authentication budget/owner.
+            drop(attempt);
+            assert!(registry.admit(if exit == 1 { 1 } else { 0 }).is_ok());
+        }
+    }
     #[tokio::test]
     async fn account_change_and_owner_loss_cancel_bounded_attempts_without_touching_replacements() {
         let registry = Registry::default();

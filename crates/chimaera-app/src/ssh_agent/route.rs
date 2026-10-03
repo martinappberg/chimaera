@@ -1,6 +1,6 @@
 //! Ordered native configuration and original per-leg cryptographic selections.
-//! This first slice supports key legs only; interactive prompts remain unbound
-//! until native event metadata and keeper route implementation are integrated.
+//! Every leg retains native host trust and its immutable initial mode; missing
+//! keys can select interactive only before any authentication has been attempted.
 use super::{
     selection::{self, Selection, SelectionFailure},
     unix::UnixAgent,
@@ -183,7 +183,7 @@ impl Resolver {
 
 pub(crate) struct RouteSelection {
     pub(crate) request: SshRouteGrantRequest,
-    legs: Vec<Selection>,
+    legs: Vec<Option<Selection>>,
 }
 impl RouteSelection {
     pub(crate) fn verifier(
@@ -192,31 +192,63 @@ impl RouteSelection {
     ) -> std::result::Result<RouteVerifier<UnixAgent>, Failure> {
         let mut legs = Vec::new();
         for leg in self.legs {
-            let (_, verifier) = leg.verifier(deadline)?;
-            legs.push(verifier);
+            legs.push(match leg {
+                Some(leg) => Some(leg.verifier(deadline)?.1),
+                None => None,
+            });
         }
-        RouteVerifier::new(self.request, legs, deadline)
+        RouteVerifier::new_selected(self.request, legs, deadline)
     }
 }
 pub(crate) async fn resolve(alias: &str, boot: String) -> Result<RouteSelection> {
-    let alias = chimaera_remote::hosts::normalize_alias(alias)
-        .map_err(|_| SelectionFailure::UnsupportedConfiguration)?;
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .ok_or(SelectionFailure::Unavailable)?;
     let agent = std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let effective = effective(alias).await?;
+        select(effective, &home, agent, boot).await
+    })
+    .await
+    .map_err(|_| SelectionFailure::Unavailable)?
+}
+async fn effective(alias: &str) -> Result<Vec<Effective>> {
+    let alias = chimaera_remote::hosts::normalize_alias(alias)
+        .map_err(|_| SelectionFailure::UnsupportedConfiguration)?;
     let mut resolver = Resolver {
         calls: 0,
         #[cfg(test)]
         config: None,
     };
+    let mut effective = Vec::new();
+    resolver
+        .walk(Jump::parse(&alias)?, None, &mut effective)
+        .await?;
+    Ok(effective)
+}
+/// Inert save resolves tuples only; it never enumerates keys, asks for trust,
+/// creates a grant, or starts a network authentication attempt.
+pub(crate) async fn registration(alias: &str) -> Result<(SshAuthDestination, SshRoute)> {
     tokio::time::timeout(Duration::from_secs(30), async {
-        let mut effective = Vec::new();
-        resolver
-            .walk(Jump::parse(&alias)?, None, &mut effective)
-            .await?;
-        select(effective, &home, agent, boot).await
+        let effective = effective(alias).await?;
+        let destination = effective
+            .last()
+            .ok_or(SelectionFailure::UnsupportedConfiguration)?
+            .destination
+            .clone();
+        let route = SshRoute {
+            version: 1,
+            jumps: effective
+                .iter()
+                .take(effective.len() - 1)
+                .map(|leg| leg.destination.clone())
+                .collect(),
+        };
+        route
+            .validate(&destination)
+            .map_err(|_| SelectionFailure::UnsupportedConfiguration)?;
+        Ok((destination, route))
     })
     .await
     .map_err(|_| SelectionFailure::Unavailable)?
@@ -246,15 +278,28 @@ async fn select(
     let mut legs = Vec::new();
     let mut requests = Vec::new();
     for leg in effective {
-        let selected =
-            selection::from_routed_config(&leg.text, home, agent.clone(), boot.clone()).await?;
-        requests.push(SshRouteAuthLeg {
-            destination: selected.request.destination.clone(),
-            mode: SshRouteMode::Key,
-            host_keys: selected.request.host_keys.clone(),
-            user_keys: selected.request.user_keys.clone(),
-        });
-        legs.push(selected);
+        match selection::from_routed_config(&leg.text, home, agent.clone(), boot.clone()).await {
+            Ok(selected) => {
+                requests.push(SshRouteAuthLeg {
+                    destination: selected.request.destination.clone(),
+                    mode: SshRouteMode::Key,
+                    host_keys: selected.request.host_keys.clone(),
+                    user_keys: selected.request.user_keys.clone(),
+                });
+                legs.push(Some(selected));
+            }
+            Err(SelectionFailure::NoKeys) => {
+                requests.push(selection::routed_interactive(&leg.text, home).await?);
+                legs.push(None);
+            }
+            Err(SelectionFailure::AgentUnavailable)
+                if selection::no_agent_selected(&leg.text, &agent)? =>
+            {
+                requests.push(selection::routed_interactive(&leg.text, home).await?);
+                legs.push(None);
+            }
+            Err(error) => return Err(error),
+        }
     }
     let request = SshRouteGrantRequest {
         version: 1,
@@ -272,10 +317,11 @@ async fn select(
 pub(crate) struct RouteVerifier<A: super::LocalAgent> {
     pub(crate) request: SshRouteGrantRequest,
     pub(crate) deadline: Instant,
-    legs: Vec<GrantVerifier<A>>,
+    legs: Vec<Option<GrantVerifier<A>>>,
     last_request: u64,
     connections: HashMap<String, u8>,
     sessions: HashSet<Vec<u8>>,
+    prompt_proof: Option<super::lifecycle::RoutePromptProof>,
 }
 impl<A: super::LocalAgent> RouteVerifier<A> {
     fn new(
@@ -283,9 +329,20 @@ impl<A: super::LocalAgent> RouteVerifier<A> {
         legs: Vec<GrantVerifier<A>>,
         deadline: Instant,
     ) -> std::result::Result<Self, Failure> {
+        Self::new_selected(request, legs.into_iter().map(Some).collect(), deadline)
+    }
+    fn new_selected(
+        request: SshRouteGrantRequest,
+        legs: Vec<Option<GrantVerifier<A>>>,
+        deadline: Instant,
+    ) -> std::result::Result<Self, Failure> {
         request.validate().map_err(|_| Failure::InvalidRequest)?;
         if request.legs.len() != legs.len()
-            || request.legs.iter().any(|leg| leg.mode != SshRouteMode::Key)
+            || request
+                .legs
+                .iter()
+                .zip(&legs)
+                .any(|(leg, verifier)| (leg.mode == SshRouteMode::Key) != verifier.is_some())
         {
             return Err(Failure::Unsupported);
         }
@@ -296,7 +353,11 @@ impl<A: super::LocalAgent> RouteVerifier<A> {
             last_request: 0,
             connections: HashMap::new(),
             sessions: HashSet::new(),
+            prompt_proof: None,
         })
+    }
+    pub(crate) fn attach_prompts(&mut self, proof: super::lifecycle::RoutePromptProof) {
+        self.prompt_proof = Some(proof);
     }
     pub(crate) async fn handle(
         &mut self,
@@ -325,6 +386,7 @@ impl<A: super::LocalAgent> RouteVerifier<A> {
                 let verifier = self
                     .legs
                     .get(usize::from(leg))
+                    .and_then(Option::as_ref)
                     .ok_or(Failure::InvalidRequest)?;
                 let bytes =
                     chimaera_link::decode_packet(&packet, chimaera_link::SSH_AUTH_PACKET_MAX)
@@ -374,9 +436,16 @@ impl<A: super::LocalAgent> RouteVerifier<A> {
         let verifier = self
             .legs
             .get_mut(usize::from(leg))
+            .and_then(Option::as_mut)
             .ok_or(Failure::InvalidRequest)?;
         verifier.deadline = self.deadline;
-        Ok(verifier.handle(ordinary).await?.map(|reply| match reply {
+        let reply = verifier.handle(ordinary).await?;
+        if matches!(reply, Some(SshAuthReply::Signature { .. })) {
+            if let Some(proof) = &self.prompt_proof {
+                proof.signed(leg);
+            }
+        }
+        Ok(reply.map(|reply| match reply {
             SshAuthReply::Bound {
                 connection_id,
                 request_id,

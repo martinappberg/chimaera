@@ -68,6 +68,8 @@ struct PendingPrompt {
     prompt: String,
     tx: oneshot::Sender<Option<String>>,
     source: PromptSource,
+    #[cfg(all(feature = "ssh-agent-prototype", unix))]
+    route_guard: Option<crate::ssh_agent::lifecycle::RoutePromptGuard>,
 }
 
 #[derive(Clone, Serialize)]
@@ -131,6 +133,8 @@ impl Askpass {
                 prompt,
                 tx,
                 source,
+                #[cfg(all(feature = "ssh-agent-prototype", unix))]
+                route_guard: None,
             },
         );
         id
@@ -156,6 +160,15 @@ impl Askpass {
         if !window_scope.allows_askpass(prompt.alias.as_deref()) {
             return AnswerResult::Forbidden;
         }
+        #[cfg(all(feature = "ssh-agent-prototype", unix))]
+        if prompt
+            .route_guard
+            .as_ref()
+            .is_some_and(|guard| !guard.active())
+        {
+            pending.remove(&id);
+            return AnswerResult::Missing;
+        }
         let prompt = pending.remove(&id).expect("prompt checked above");
         let alias = prompt.alias.clone();
         let _ = prompt.tx.send(secret);
@@ -168,6 +181,19 @@ impl Askpass {
         let mut prompts: Vec<PromptEvent> = lock(&self.pending)
             .iter()
             .filter(|(_, prompt)| window_scope.allows_askpass(prompt.alias.as_deref()))
+            .filter(|(_, _prompt)| {
+                #[cfg(all(feature = "ssh-agent-prototype", unix))]
+                {
+                    _prompt
+                        .route_guard
+                        .as_ref()
+                        .is_none_or(|guard| guard.active())
+                }
+                #[cfg(not(all(feature = "ssh-agent-prototype", unix)))]
+                {
+                    true
+                }
+            })
             .map(|(id, p)| PromptEvent {
                 id: *id,
                 alias: p.alias.clone(),
@@ -190,6 +216,59 @@ pub(crate) fn relay_keeper(
     prompt: String,
     commands: tokio::sync::mpsc::Sender<chimaera_link::EventCommand>,
 ) {
+    #[cfg(all(feature = "ssh-agent-prototype", unix))]
+    let guard = None;
+    #[cfg(not(all(feature = "ssh-agent-prototype", unix)))]
+    let guard = ();
+    relay_keeper_inner(
+        app,
+        alias,
+        host_id,
+        keeper_prompt_id,
+        prompt,
+        commands,
+        guard,
+    );
+}
+#[cfg(all(feature = "ssh-agent-prototype", unix))]
+type KeeperGuard = Option<crate::ssh_agent::lifecycle::RoutePromptGuard>;
+#[cfg(not(all(feature = "ssh-agent-prototype", unix)))]
+type KeeperGuard = ();
+
+#[cfg(all(feature = "ssh-agent-prototype", unix))]
+pub(crate) fn relay_keeper_route(
+    app: &AppHandle,
+    alias: String,
+    host_id: String,
+    keeper_prompt_id: String,
+    prompt: String,
+    commands: tokio::sync::mpsc::Sender<chimaera_link::EventCommand>,
+    guard: crate::ssh_agent::lifecycle::RoutePromptGuard,
+) {
+    let prompt = guard.prompt(&prompt);
+    relay_keeper_inner(
+        app,
+        alias,
+        host_id,
+        keeper_prompt_id,
+        prompt,
+        commands,
+        Some(guard),
+    );
+}
+fn relay_keeper_inner(
+    app: &AppHandle,
+    alias: String,
+    host_id: String,
+    keeper_prompt_id: String,
+    prompt: String,
+    commands: tokio::sync::mpsc::Sender<chimaera_link::EventCommand>,
+    _guard: KeeperGuard,
+) {
+    #[cfg(all(feature = "ssh-agent-prototype", unix))]
+    if _guard.as_ref().is_some_and(|guard| !guard.active()) {
+        return;
+    }
     let askpass = app.state::<Askpass>();
     // The remote peer cannot grow the prompt table without bound.
     if lock(&askpass.pending).len() >= 64 {
@@ -201,6 +280,10 @@ pub(crate) fn relay_keeper(
         keeper_prompt_id: keeper_prompt_id.clone(),
     };
     let id = askpass.register_source(Some(alias.clone()), prompt.clone(), tx, source.clone());
+    #[cfg(all(feature = "ssh-agent-prototype", unix))]
+    if let Some(pending) = lock(&askpass.pending).get_mut(&id) {
+        pending.route_guard = _guard.clone();
+    }
     let event = PromptEvent {
         id,
         alias: Some(alias.clone()),
@@ -210,6 +293,16 @@ pub(crate) fn relay_keeper(
     emit_scoped(app, "ssh-askpass", event, Some(&alias));
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
+        #[cfg(all(feature = "ssh-agent-prototype", unix))]
+        let answer = match &_guard {
+            Some(guard) => tokio::select! {
+                biased;
+                _ = guard.stopped() => Ok(Ok(None)),
+                result = tokio::time::timeout(PROMPT_TIMEOUT, rx) => result,
+            },
+            None => tokio::time::timeout(PROMPT_TIMEOUT, rx).await,
+        };
+        #[cfg(not(all(feature = "ssh-agent-prototype", unix)))]
         let answer = tokio::time::timeout(PROMPT_TIMEOUT, rx).await;
         app.state::<Askpass>().discard(id);
         emit_done(&app, id, Some(&alias));
@@ -217,6 +310,12 @@ pub(crate) fn relay_keeper(
             Ok(Ok(value)) => value,
             Err(_) => None,
             Ok(Err(_)) => return,
+        };
+        #[cfg(all(feature = "ssh-agent-prototype", unix))]
+        let value = if _guard.as_ref().is_some_and(|guard| !guard.active()) {
+            None
+        } else {
+            value
         };
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -779,6 +878,100 @@ mod tests {
             AnswerResult::Answered(Some("cluster".into()))
         );
         assert_eq!(rx.blocking_recv().unwrap(), None);
+    }
+
+    #[cfg(feature = "ssh-agent-prototype")]
+    #[tokio::test]
+    async fn routed_pending_prompt_cannot_be_seen_or_answered_after_connect_owner_loss() {
+        use base64::Engine;
+        use chimaera_link::{
+            SshAuthDestination, SshAuthHostKey, SshRoute, SshRouteAuthLeg, SshRouteGrant,
+            SshRouteGrantRequest, SshRouteMode, SshRoutePromptAuth,
+        };
+        let registry = crate::ssh_agent::lifecycle::Registry::default();
+        let attempt = registry.admit(0).ok().unwrap();
+        let destination = SshAuthDestination {
+            hostname: "fixture.invalid".into(),
+            user: "person".into(),
+            port: 22,
+        };
+        let request = SshRouteGrantRequest {
+            version: 1,
+            keeper_boot: "boot".into(),
+            destination: destination.clone(),
+            route: SshRoute {
+                version: 1,
+                jumps: vec![],
+            },
+            legs: vec![SshRouteAuthLeg {
+                destination: destination.clone(),
+                mode: SshRouteMode::Interactive,
+                host_keys: vec![SshAuthHostKey {
+                    key: base64::engine::general_purpose::STANDARD.encode(b"public-trust"),
+                    is_ca: false,
+                }],
+                user_keys: vec![],
+            }],
+        };
+        let receipt = SshRouteGrant {
+            version: 1,
+            grant_id: "grant".into(),
+            expires_in: 180,
+            destination: destination.clone(),
+            route: request.route.clone(),
+            modes: vec![SshRouteMode::Interactive],
+        };
+        let owner = attempt
+            .bind_route(
+                "host",
+                &receipt,
+                &request,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .ok()
+            .unwrap();
+        let auth = SshRoutePromptAuth {
+            grant_id: "grant".into(),
+            keeper_boot: "boot".into(),
+            leg: 0,
+            mode: SshRouteMode::Interactive,
+            destination,
+        };
+        let guard = registry.route_prompt(0, "host", &auth).unwrap();
+        let askpass = Askpass::default();
+        let (tx, rx) = oneshot::channel();
+        let id = askpass.register_source(
+            Some("cluster".into()),
+            guard.prompt("Password:"),
+            tx,
+            PromptSource::Keeper {
+                host_id: "host".into(),
+                keeper_prompt_id: "wire".into(),
+            },
+        );
+        askpass
+            .pending
+            .lock()
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()
+            .route_guard = Some(guard);
+        let scope = crate::shell::WindowScope::new(
+            Some("cluster".into()),
+            Some("work".into()),
+            "window".into(),
+        );
+        assert_eq!(askpass.pending_scoped(&scope).len(), 1);
+        drop(owner);
+        assert!(askpass.pending_scoped(&scope).is_empty());
+        assert_eq!(
+            askpass.answer_scoped(id, Some("synthetic-answer".into()), &scope),
+            AnswerResult::Missing
+        );
+        assert!(
+            rx.await.is_err(),
+            "owner loss cannot forward the withheld answer"
+        );
     }
 
     #[test]

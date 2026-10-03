@@ -816,27 +816,24 @@ async fn explicit_keeper_connect(
         let caps = client.ssh_auth_capabilities().await.map_err(|_| {
             "This keeper needs an update before connecting with this Mac's SSH keys"
         })?;
+        if !caps.route_supported() {
+            return Err("This keeper needs an update before native route authentication".into());
+        }
         let selection = tokio::select! {
             biased;
             _ = cancellation.wait_for(|value| *value) => return Err("Account changed while connecting".into()),
-            result = selection::resolve(&host.alias, caps.keeper_boot) => result,
-        };
-        match selection {
-            Ok(selection) => {
-                return connect::authenticate(client, &host.id, selection, attempt, || async {
-                    await_keeper_login(|| client.hosts(), &host.id, current,
-                        tokio::time::Instant::now() + KEEPER_LOGIN_WAIT, KEEPER_POLL_FIRST)
-                        .await.map_err(|_| chimaera_link::SshAuthFailure::Unavailable)
-                }).await.map_err(|_| "Couldn't authenticate this host through the keeper. Check its SSH key, host trust or authentication prompt and connect again.".into());
-            }
-            // This is an explicit password/MFA Connect with no signing grant,
-            // not a retry after a refused signature or host verification.
-            Err(selection::SelectionFailure::NoKeys | selection::SelectionFailure::AgentUnavailable) => {},
-            Err(selection::SelectionFailure::HostTrustRequired) => return Err("Confirm this host's SSH fingerprint on this Mac before connecting through the keeper".into()),
-            Err(selection::SelectionFailure::RevokedHost) => return Err("This host's SSH key is revoked on this Mac".into()),
-            Err(selection::SelectionFailure::TooManyKeys) => return Err("Choose this host's SSH identity in your SSH settings before connecting".into()),
-            Err(_) => return Err("This host's SSH settings aren't supported through the keeper. Connect directly in advanced host settings.".into()),
-        }
+            result = crate::ssh_agent::route::resolve(&host.alias, caps.keeper_boot) => result,
+        }.map_err(|error| match error {
+            selection::SelectionFailure::HostTrustRequired => "Confirm every SSH hop's fingerprint on this Mac before connecting through the keeper",
+            selection::SelectionFailure::RevokedHost => "An SSH hop's key is revoked on this Mac",
+            selection::SelectionFailure::TooManyKeys => "Choose this host's SSH identity in your SSH settings before connecting",
+            _ => "This SSH route couldn't be verified on this Mac. Check its settings or choose Direct in advanced host settings",
+        })?;
+        return connect::authenticate_route(client, &host.id, selection, attempt, || async {
+            await_keeper_login(|| client.hosts(), &host.id, current,
+                tokio::time::Instant::now() + KEEPER_LOGIN_WAIT, KEEPER_POLL_FIRST)
+                .await.map_err(|_| chimaera_link::SshAuthFailure::Unavailable)
+        }).await.map_err(|_| "Couldn't authenticate this SSH route through the keeper. Check the hop's trust, SSH key or prompt and connect again.".into());
     }
     if !current() {
         return Err("Account changed while connecting".into());

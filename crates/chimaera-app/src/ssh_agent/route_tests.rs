@@ -565,7 +565,7 @@ async fn malformed_route_frames_cancel_an_earlier_touch_before_it_can_release_a_
         let entered = Arc::new(tokio::sync::Semaphore::new(0));
         let release = Arc::new(tokio::sync::Semaphore::new(0));
         let mut checked = verifier(calls.clone());
-        for leg in &mut checked.legs {
+        for leg in checked.legs.iter_mut().flatten() {
             leg.agent.1 = Some((entered.clone(), release.clone()));
         }
         let grant = grant(&checked.request);
@@ -630,4 +630,174 @@ async fn malformed_route_frames_cancel_an_earlier_touch_before_it_can_release_a_
         assert!(!matches!(next, Some(Ok(Message::Text(_)))));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
+}
+
+#[tokio::test]
+async fn interactive_selection_requires_native_public_trust_and_never_downgrades_a_selected_agent()
+{
+    let fixture = Fixture::new();
+    let known = fixture.0.join("known");
+    std::fs::write(
+        &known,
+        format!(
+            "target.example.invalid {}\n",
+            key(3).public_key().to_openssh().unwrap()
+        ),
+    )
+    .unwrap();
+    let text = |agent: &str, trust: &Path| {
+        format!("hostname target.example.invalid\nuser person\nport 22\npubkeyauthentication true\nidentitiesonly no\nhostkeyalgorithms ssh-ed25519\npubkeyacceptedalgorithms ssh-ed25519\ncasignaturealgorithms ssh-ed25519\nidentityagent {agent}\nuserknownhostsfile {}\nglobalknownhostsfile none\nproxyjump none\n", trust.display())
+    };
+    let effective = |text| {
+        vec![Effective {
+            text,
+            destination: SshAuthDestination {
+                hostname: "target.example.invalid".into(),
+                user: "person".into(),
+                port: 22,
+            },
+        }]
+    };
+    let selected = select(
+        effective(text("none", &known)),
+        &fixture.0,
+        None,
+        "boot".into(),
+    )
+    .await
+    .unwrap();
+    assert!(selected.request.legs[0].mode == SshRouteMode::Interactive);
+    assert!(selected.request.legs[0].user_keys.is_empty());
+    assert!(selected.legs[0].is_none());
+    assert_eq!(
+        selected.request.legs[0].host_keys[0].key,
+        STANDARD.encode(public(3))
+    );
+    let mut checked = selected
+        .verifier(Instant::now() + Duration::from_secs(1))
+        .ok()
+        .unwrap();
+    assert!(
+        checked
+            .handle(bind(0, "interactive", 1, b"s", 3))
+            .await
+            .is_err(),
+        "interactive policy cannot open a signing connection"
+    );
+    let missing = fixture.0.join("missing-agent");
+    assert!(matches!(
+        select(
+            effective(text(missing.to_str().unwrap(), &known)),
+            &fixture.0,
+            None,
+            "boot".into()
+        )
+        .await,
+        Err(SelectionFailure::AgentUnavailable)
+    ));
+    for policy in [
+        "pubkeyauthentication no",
+        "pubkeyauthentication false",
+        "pubkeyauthentication true\npreferredauthentications keyboard-interactive,password",
+    ] {
+        let password_only =
+            text(missing.to_str().unwrap(), &known).replace("pubkeyauthentication true", policy);
+        let selected = select(effective(password_only), &fixture.0, None, "boot".into())
+            .await
+            .unwrap();
+        assert!(
+            selected.request.legs[0].mode == SshRouteMode::Interactive,
+            "no agent enumeration is allowed for {policy}"
+        );
+    }
+    for policy in [
+        "passwordauthentication no",
+        "kbdinteractiveauthentication no",
+        "preferredauthentications password",
+        "preferredauthentications password,keyboard-interactive",
+        "passwordauthentication unsupported",
+    ] {
+        let restricted = format!("{}{}\n", text("none", &known), policy);
+        assert!(
+            matches!(
+                select(effective(restricted), &fixture.0, None, "boot".into()).await,
+                Err(SelectionFailure::UnsupportedConfiguration)
+            ),
+            "unsupported restrictions cannot silently widen: {policy}"
+        );
+    }
+    for policy in [
+        "kbdinteractiveauthentication no",
+        "preferredauthentications keyboard-interactive,publickey,password",
+    ] {
+        let restricted = format!("{}{}\n", text(missing.to_str().unwrap(), &known), policy);
+        assert!(
+            matches!(
+                select(effective(restricted), &fixture.0, None, "boot".into()).await,
+                Err(SelectionFailure::UnsupportedConfiguration)
+            ),
+            "key-mode MFA must respect local method policy: {policy}"
+        );
+    }
+    let no_trust = fixture.0.join("missing-trust");
+    assert!(matches!(
+        select(
+            effective(text("none", &no_trust)),
+            &fixture.0,
+            None,
+            "boot".into()
+        )
+        .await,
+        Err(SelectionFailure::HostTrustRequired)
+    ));
+}
+
+#[tokio::test]
+async fn only_a_verified_signature_enables_mfa_for_its_original_leg() {
+    let registry = super::super::lifecycle::Registry::default();
+    let attempt = registry.admit(0).ok().unwrap();
+    let mut checked = verifier(Arc::new(AtomicUsize::new(0)));
+    let receipt = grant(&checked.request);
+    let owner = attempt
+        .bind_route("host", &receipt, &checked.request, checked.deadline)
+        .ok()
+        .unwrap();
+    let auth = |leg: usize| chimaera_link::SshRoutePromptAuth {
+        grant_id: receipt.grant_id.clone(),
+        keeper_boot: checked.request.keeper_boot.clone(),
+        leg: leg as u8,
+        mode: checked.request.legs[leg].mode,
+        destination: checked.request.legs[leg].destination.clone(),
+    };
+    let first = auth(0);
+    let last = auth(1);
+    checked.attach_prompts(owner.proof());
+    checked
+        .handle(bind(0, "jump", 1, b"jump-session", 1))
+        .await
+        .ok()
+        .unwrap();
+    assert!(
+        registry.route_prompt(0, "host", &first).is_none(),
+        "binding alone is not a signature receipt"
+    );
+    assert!(matches!(
+        checked
+            .handle(sign(0, "jump", 2, "visitor", b"jump-session", 1))
+            .await
+            .ok()
+            .unwrap(),
+        Some(SshRouteReply::Signature { leg: 0, .. })
+    ));
+    let guard = registry.route_prompt(0, "host", &first).unwrap();
+    assert!(guard.active());
+    assert!(
+        registry.route_prompt(0, "host", &last).is_none(),
+        "one leg cannot approve another leg's MFA"
+    );
+    drop(checked);
+    assert!(
+        !guard.active(),
+        "control verifier loss revokes an already displayed prompt"
+    );
 }

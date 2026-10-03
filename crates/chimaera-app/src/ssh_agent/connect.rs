@@ -49,9 +49,13 @@ struct RouteLease {
     host: String,
     grant: chimaera_link::SshRouteGrant,
     attempt: Option<Attempt>,
+    prompt_owner: Option<super::lifecycle::RoutePromptOwner>,
 }
 impl Drop for RouteLease {
     fn drop(&mut self) {
+        // Prompt permission ends synchronously; only the bounded cleanup slot
+        // survives while the grant DELETE request finishes.
+        drop(self.prompt_owner.take());
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
@@ -70,9 +74,9 @@ impl Drop for RouteLease {
     }
 }
 
-/// This additive key-only primitive is not wired to native Connect yet. The
-/// caller owns one original Attempt and must validate future route prompt
-/// metadata before adding interactive legs or exposing keeper prompts.
+/// The original explicit Connect owns every leg, including password/MFA.
+/// Ready binds immutable prompt authority before reconnect can emit prompts;
+/// control loss ends that authority before detached grant cleanup.
 pub(crate) async fn authenticate_route<T, F, Fut>(
     client: &Client,
     host: &str,
@@ -86,7 +90,7 @@ where
 {
     let started = Instant::now();
     let deadline = started + Duration::from_secs(chimaera_link::SSH_AUTH_LIFETIME.into());
-    let verifier = selection.verifier(deadline)?;
+    let mut verifier = selection.verifier(deadline)?;
     let request = verifier.request.clone();
     let mut cancellation = attempt.cancellation();
     let control_cancellation = attempt.cancellation();
@@ -95,11 +99,12 @@ where
             .create_ssh_route_grant(host, &request)
             .await
             .map_err(failure)?;
-        let lease = RouteLease {
+        let mut lease = RouteLease {
             client: client.clone(),
             host: host.into(),
             grant,
             attempt: Some(attempt),
+            prompt_owner: None,
         };
         let socket = timeout_at(
             deadline,
@@ -108,6 +113,14 @@ where
         .await
         .map_err(|_| Failure::Expired)?
         .map_err(failure)?;
+        let owner = lease.attempt.as_ref().ok_or(Failure::Revoked)?.bind_route(
+            host,
+            &lease.grant,
+            &request,
+            deadline,
+        )?;
+        verifier.attach_prompts(owner.proof());
+        lease.prompt_owner = Some(owner);
         let reconnect = async {
             client
                 .reconnect_host_with_ssh_route(host, &lease.grant, &request.keeper_boot)

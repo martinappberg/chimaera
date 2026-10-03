@@ -779,6 +779,7 @@ fn start_keeper(
     let state = app.state::<Shell>();
     let event_app = app.clone();
     let event_client = client.clone();
+    let event_generation = state.pro.generation();
     let events = tokio::spawn(async move {
         // The link keeps one events connection alive for as long as this
         // consumer exists; if its channel ever closes anyway, open a new one
@@ -804,9 +805,39 @@ fn start_keeper(
                         echo: _,
                         ssh_route_auth,
                     }) => {
-                        // Until the original route owner admits the exact leg,
-                        // routed prompts must never enter generic askpass UI.
-                        if ssh_route_auth.is_some() {
+                        let state = event_app.state::<Shell>();
+                        if state.pro.generation() != event_generation {
+                            continue;
+                        }
+                        #[cfg(all(feature = "ssh-agent-prototype", unix))]
+                        if let Some(auth) = &ssh_route_auth {
+                            if let Some(guard) = state.pro.ssh_authentication.route_prompt(
+                                event_generation,
+                                &host_id,
+                                auth,
+                            ) {
+                                let host = lock(&state.pro.hosts).get(&host_id).cloned();
+                                if let Some(host) = host {
+                                    crate::askpass::relay_keeper_route(
+                                        &event_app,
+                                        host.alias,
+                                        host_id,
+                                        id,
+                                        prompt,
+                                        connection.commands.clone(),
+                                        guard,
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                        // Prototype SSH prompts require the live original Connect,
+                        // even for an empty jump route; no generic fallback.
+                        #[cfg(all(feature = "ssh-agent-prototype", unix))]
+                        let refuse = true;
+                        #[cfg(not(all(feature = "ssh-agent-prototype", unix)))]
+                        let refuse = ssh_route_auth.is_some();
+                        if refuse {
                             let _ = connection
                                 .commands
                                 .try_send(chimaera_link::EventCommand::Answer { id, value: None });
@@ -2236,9 +2267,11 @@ pub async fn pro_set_host_kept(app: AppHandle, alias: String, kept: bool) -> Res
     let alias =
         chimaera_remote::hosts::normalize_alias(&alias).map_err(|error| error.to_string())?;
     if kept {
+        #[cfg(not(all(feature = "ssh-agent-prototype", unix)))]
         let (hostname, user, port) = chimaera_remote::ssh_destination(&alias)
             .await
             .map_err(|_| "Couldn't read this host's SSH settings.")?;
+        #[cfg(not(all(feature = "ssh-agent-prototype", unix)))]
         let target = chimaera_link::SshTarget {
             hostname,
             user,
@@ -2253,9 +2286,16 @@ pub async fn pro_set_host_kept(app: AppHandle, alias: String, kept: bool) -> Res
                 login_serve: entry.login_serve,
                 not_cluster: entry.not_cluster,
             });
+            let (destination, route) = crate::ssh_agent::route::registration(&alias).await.map_err(|_| "This SSH route isn't supported through the keeper. Choose Direct in advanced host settings.")?;
+            let target = chimaera_link::SshTarget {
+                hostname: destination.hostname,
+                user: Some(destination.user),
+                port: destination.port,
+            };
             client
-                .register_ssh_auth_host(&alias, target, policy)
+                .register_ssh_route_host(&alias, target, route, policy)
                 .await
+                .map(|value| value.host)
                 .map_err(|_| HOST_UPDATE_FAILED)?
         };
         #[cfg(not(all(feature = "ssh-agent-prototype", unix)))]

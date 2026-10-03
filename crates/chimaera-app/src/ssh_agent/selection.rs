@@ -81,6 +81,11 @@ pub(super) async fn from_native_config(
 ) -> Result<Selection> {
     let config = Config::parse(text)?;
     let algorithms = config.algorithms()?;
+    let (destination, host_keys) = trusted_host(&config, home, &algorithms).await?;
+    if !config.key_enabled()? {
+        return Err(SelectionFailure::NoKeys);
+    }
+    config.key_mfa_policy()?;
     let socket = match config.one("identityagent")? {
         None | Some("SSH_AUTH_SOCK") => {
             environment_agent.ok_or(SelectionFailure::AgentUnavailable)?
@@ -113,6 +118,26 @@ pub(super) async fn from_native_config(
     if user_keys.len() > SSH_AUTH_KEYS_MAX {
         return Err(SelectionFailure::TooManyKeys);
     }
+    let request = SshAuthGrantRequest {
+        version: 1,
+        keeper_boot,
+        destination,
+        host_keys,
+        user_keys,
+    };
+    Policy::new(&request).map_err(|_| SelectionFailure::UnsupportedConfiguration)?;
+    Ok(Selection {
+        request,
+        agent,
+        algorithms,
+    })
+}
+
+async fn trusted_host(
+    config: &Config<'_>,
+    home: &Path,
+    algorithms: &Algorithms,
+) -> Result<(SshAuthDestination, Vec<SshAuthHostKey>)> {
     let destination = config.destination()?;
     let lookup = config.lookup(&destination)?;
     let mut host_keys = Vec::new();
@@ -156,19 +181,7 @@ pub(super) async fn from_native_config(
     if host_keys.len() > SSH_AUTH_KEYS_MAX {
         return Err(SelectionFailure::TooManyKeys);
     }
-    let request = SshAuthGrantRequest {
-        version: 1,
-        keeper_boot,
-        destination,
-        host_keys,
-        user_keys,
-    };
-    Policy::new(&request).map_err(|_| SelectionFailure::UnsupportedConfiguration)?;
-    Ok(Selection {
-        request,
-        agent,
-        algorithms,
-    })
+    Ok((destination, host_keys))
 }
 
 /// Route resolution may accept only the separately parsed ProxyJump field.
@@ -186,6 +199,10 @@ pub(super) async fn from_routed_config(
     environment_agent: Option<PathBuf>,
     keeper_boot: String,
 ) -> Result<Selection> {
+    let text = routed_text(text)?;
+    from_native_config(&text, home, environment_agent, keeper_boot).await
+}
+fn routed_text(text: &str) -> Result<String> {
     route_settings(text)?;
     let text = text
         .lines()
@@ -198,7 +215,32 @@ pub(super) async fn from_routed_config(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    from_native_config(&text, home, environment_agent, keeper_boot).await
+    Ok(text)
+}
+pub(super) fn no_agent_selected(text: &str, environment_agent: &Option<PathBuf>) -> Result<bool> {
+    let text = routed_text(text)?;
+    let config = Config::parse(&text)?;
+    Ok(match config.one("identityagent")? {
+        None | Some("SSH_AUTH_SOCK") => environment_agent.is_none(),
+        Some("none") => true,
+        _ => false,
+    })
+}
+pub(super) async fn routed_interactive(
+    text: &str,
+    home: &Path,
+) -> Result<chimaera_link::SshRouteAuthLeg> {
+    let text = routed_text(text)?;
+    let config = Config::parse(&text)?;
+    let algorithms = config.algorithms()?;
+    config.interactive_policy()?;
+    let (destination, host_keys) = trusted_host(&config, home, &algorithms).await?;
+    Ok(chimaera_link::SshRouteAuthLeg {
+        destination,
+        mode: chimaera_link::SshRouteMode::Interactive,
+        host_keys,
+        user_keys: vec![],
+    })
 }
 
 struct Config<'a> {
@@ -244,7 +286,7 @@ impl<'a> Config<'a> {
         }
         if !matches!(
             config.one("pubkeyauthentication")?,
-            Some("true" | "yes" | "host-bound")
+            Some("true" | "yes" | "host-bound" | "false" | "no")
         ) {
             return Err(SelectionFailure::UnsupportedConfiguration);
         }
@@ -261,6 +303,75 @@ impl<'a> Config<'a> {
             return Err(SelectionFailure::UnsupportedConfiguration);
         }
         Ok(value)
+    }
+    fn preferred(&self) -> Result<Vec<&'a str>> {
+        let value = self
+            .one("preferredauthentications")?
+            .unwrap_or("publickey,keyboard-interactive,password");
+        let methods: Vec<_> = value.split(',').take(17).collect();
+        if methods.is_empty()
+            || methods.len() > 16
+            || methods.iter().any(|method| {
+                !matches!(
+                    *method,
+                    "gssapi-with-mic"
+                        | "hostbased"
+                        | "publickey"
+                        | "keyboard-interactive"
+                        | "password"
+                        | "none"
+                )
+            })
+        {
+            return Err(SelectionFailure::UnsupportedConfiguration);
+        }
+        Ok(methods)
+    }
+    fn enabled(&self, name: &str) -> Result<bool> {
+        match self.one(name)?.unwrap_or("yes") {
+            "true" | "yes" => Ok(true),
+            "false" | "no" => Ok(false),
+            _ => Err(SelectionFailure::UnsupportedConfiguration),
+        }
+    }
+    fn key_enabled(&self) -> Result<bool> {
+        Ok(
+            !matches!(self.one("pubkeyauthentication")?, Some("no" | "false"))
+                && self.preferred()?.contains(&"publickey"),
+        )
+    }
+    fn key_mfa_policy(&self) -> Result<()> {
+        let methods = self.preferred()?;
+        if !self.enabled("kbdinteractiveauthentication")?
+            || methods
+                .iter()
+                .position(|method| *method == "publickey")
+                .zip(
+                    methods
+                        .iter()
+                        .position(|method| *method == "keyboard-interactive"),
+                )
+                .is_none_or(|(key, mfa)| key > mfa)
+        {
+            return Err(SelectionFailure::UnsupportedConfiguration);
+        }
+        Ok(())
+    }
+    fn interactive_policy(&self) -> Result<()> {
+        // Version one represents both interactive methods, in this order.
+        // A narrower local policy must refuse until the DTO can preserve it.
+        let methods = self.preferred()?;
+        if !self.enabled("passwordauthentication")?
+            || !self.enabled("kbdinteractiveauthentication")?
+            || methods
+                .iter()
+                .position(|method| *method == "keyboard-interactive")
+                .zip(methods.iter().position(|method| *method == "password"))
+                .is_none_or(|(kbd, password)| kbd > password)
+        {
+            return Err(SelectionFailure::UnsupportedConfiguration);
+        }
+        Ok(())
     }
     async fn public_identities(&self, home: &Path) -> Result<BTreeSet<String>> {
         let mut keys = BTreeSet::new();

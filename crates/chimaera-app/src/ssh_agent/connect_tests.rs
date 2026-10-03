@@ -236,6 +236,7 @@ async fn route_cleanup_survives_observer_abort_and_retains_shared_budget_until_h
     let held = Arc::new(Semaphore::new(0));
     for _ in 0..4 {
         let lease = RouteLease {
+            prompt_owner: None,
             client: client.clone(),
             host: "host".into(),
             grant: chimaera_link::SshRouteGrant {
