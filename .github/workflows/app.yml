@@ -105,6 +105,12 @@ jobs:
       # beforeBuildCommand has created that directory on a clean runner.
       - run: cargo test
         working-directory: crates/chimaera-app
+      - name: Check the explicit native SSH signing prototype
+        run: cargo clippy --locked --all-targets --features ssh-agent-prototype -- -D warnings
+        working-directory: crates/chimaera-app
+      - name: Test the explicit native SSH signing prototype
+        run: cargo test --locked --features ssh-agent-prototype
+        working-directory: crates/chimaera-app
       # Plugin execution must also work inside the hardened, signed executable;
       # cargo test runs an ordinary test binary and cannot catch macOS kills.
       - name: Exercise plugins in the signed macOS bundle
