@@ -36,6 +36,8 @@ const MAX_STDERR_LINE_BYTES: usize = 16 * 1024;
 struct CappedLines<R> {
     reader: BufReader<R>,
     max: usize,
+    partial: Vec<u8>,
+    overflowed: bool,
 }
 
 impl<R: AsyncRead + Unpin> CappedLines<R> {
@@ -43,39 +45,46 @@ impl<R: AsyncRead + Unpin> CappedLines<R> {
         Self {
             reader: BufReader::new(inner),
             max,
+            partial: Vec::new(),
+            overflowed: false,
         }
     }
 
     /// Next line without its trailing `\n`. `Ok(None)` = EOF. Invalid UTF-8 is
     /// replaced lossily rather than failing the session.
     async fn next_line(&mut self) -> std::io::Result<Option<String>> {
-        let mut buf: Vec<u8> = Vec::new();
-        let mut overflowed = false;
         loop {
             let available = self.reader.fill_buf().await?;
             if available.is_empty() {
-                if buf.is_empty() && !overflowed {
+                if self.partial.is_empty() && !self.overflowed {
                     return Ok(None);
                 }
                 break;
             }
             match available.iter().position(|&b| b == b'\n') {
                 Some(pos) => {
-                    push_capped(&mut buf, &available[..pos], self.max, &mut overflowed);
+                    push_capped(
+                        &mut self.partial,
+                        &available[..pos],
+                        self.max,
+                        &mut self.overflowed,
+                    );
                     self.reader.consume(pos + 1);
                     break;
                 }
                 None => {
                     let len = available.len();
-                    push_capped(&mut buf, available, self.max, &mut overflowed);
+                    push_capped(&mut self.partial, available, self.max, &mut self.overflowed);
                     self.reader.consume(len);
                 }
             }
         }
-        if overflowed {
+        if std::mem::take(&mut self.overflowed) {
             tracing::warn!(cap = self.max, "agent output line exceeded cap; truncated");
         }
-        Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+        Ok(Some(
+            String::from_utf8_lossy(&std::mem::take(&mut self.partial)).into_owned(),
+        ))
     }
 }
 
@@ -249,6 +258,30 @@ pub struct JsonlStream {
 }
 
 impl JsonlStream {
+    /// Called only after the trusted caller confirmed the exact leader stopped.
+    /// Incomplete lines survive canceled reads and refuse a false empty tail.
+    pub(crate) fn drained(&self) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let mut pending: nix::libc::c_int = 0;
+            self.lines.partial.is_empty()
+                && !self.lines.overflowed
+                && self.lines.reader.buffer().is_empty()
+                && unsafe {
+                    nix::libc::ioctl(
+                        self.lines.reader.get_ref().as_raw_fd(),
+                        nix::libc::FIONREAD,
+                        &mut pending,
+                    )
+                } == 0
+                && pending == 0
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
     /// Next JSON frame, no deadline — an idle agent is silent for as long as
     /// the user thinks. `Ok(None)` = EOF.
     pub async fn next(&mut self) -> Result<Option<Value>> {
@@ -419,6 +452,16 @@ struct ControlState {
     fenced_at: Option<Instant>,
 }
 impl ProcessControl {
+    /// Run off-reactor. Pin while the unreaped owned Child lock excludes a
+    /// concurrent reap; a later numeric PID reuse cannot retarget the fd.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn pin_process(&self) -> Result<crate::managed_process::ManagedProcess> {
+        let state = self.state.lock().expect("process control lock");
+        anyhow::ensure!(state.fenced_at.is_none(), "managed child fenced");
+        let child = state.child.upgrade().context("managed child unavailable")?;
+        let child = child.lock().expect("child lifecycle lock");
+        crate::managed_process::ManagedProcess::pin(child.id().context("managed child exited")?)
+    }
     fn fenced(&self) -> bool {
         self.state
             .lock()
@@ -500,6 +543,35 @@ impl Drop for ChildGuard {
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn maintenance_partial_output_survives_canceled_line_reads() {
+        let (mut input, output) = tokio::io::duplex(256);
+        let mut lines = CappedLines::new(output, 32);
+        input.write_all(b"{\"proof\":").await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), lines.next_line())
+                .await
+                .is_err()
+        );
+        assert!(!lines.partial.is_empty());
+        input.write_all(b"true}\n").await.unwrap();
+        assert_eq!(
+            lines.next_line().await.unwrap().unwrap(),
+            "{\"proof\":true}"
+        );
+        assert!(lines.partial.is_empty());
+        input.write_all(&[b'x'; 64]).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), lines.next_line())
+                .await
+                .is_err()
+        );
+        assert_eq!(lines.partial.len(), 32);
+        assert!(lines.overflowed);
+        input.write_all(b"\n{}").await.unwrap();
+        assert_eq!(lines.next_line().await.unwrap().unwrap().len(), 32);
+    }
 
     #[tokio::test]
     async fn blank_stderr_lines_cannot_grow_the_diagnostic_ring() {

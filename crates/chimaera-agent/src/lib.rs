@@ -22,6 +22,9 @@ pub mod claude;
 pub mod codex;
 pub mod driver;
 pub mod journal;
+pub mod maintenance_idle;
+#[cfg(target_os = "linux")]
+pub mod managed_process;
 pub mod model;
 pub mod ndjson;
 mod send_state;
@@ -32,7 +35,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use tokio::sync::{broadcast, mpsc, watch};
@@ -637,6 +640,11 @@ struct ChatSession {
     /// the manager's FIFO in exactly the command order.
     command_order: tokio::sync::Mutex<()>,
     command_budget: Mutex<CommandBudget>,
+    maintenance_evidence: Mutex<maintenance_idle::Evidence>,
+    maintenance_protocol_verified: bool,
+    maintenance_tx: mpsc::Sender<maintenance_idle::Drain>,
+    pump_maintenance_tx: mpsc::Sender<maintenance_idle::PumpDrain>,
+    absorb_order: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// A temporary command-ingress fence for a lifecycle proof. Dropping it restores
@@ -646,6 +654,20 @@ pub struct PausedCommands {
     restore: bool,
 }
 impl PausedCommands {
+    /// Fence the captured process without depending on its registry entry.
+    /// Keep this handle until cleanup_pending() becomes false.
+    pub fn fence(&mut self) {
+        self.restore = false;
+        self.session.process_control.fence();
+        let _ = self.session.kill_tx.send(true);
+    }
+
+    /// Registry removal cannot serve as proof that the captured child reaped.
+    pub fn cleanup_pending(&self) -> bool {
+        self.session.process_control.process_group().is_some()
+            || self.session.info.lock().expect("session info lock").alive
+    }
+
     pub fn commit_kill(mut self) {
         self.restore = false;
         let _ = self.session.kill_tx.send(true);
@@ -776,6 +798,8 @@ impl ChatManager {
                 .remember(client_id.clone(), ClientIdState::Accepted);
         }
         let (cmd_tx, cmd_rx) = mpsc::channel(CMD_QUEUE);
+        let (maintenance_tx, maintenance_rx) = mpsc::channel(1);
+        let (pump_maintenance_tx, mut pump_maintenance_rx) = mpsc::channel(1);
         let (ev_tx, mut ev_rx) = mpsc::channel::<AgentEvent>(EVENT_QUEUE);
         let (events_tx, _) = broadcast::channel(BROADCAST_QUEUE);
         let (kill_tx, kill_rx) = watch::channel(false);
@@ -829,6 +853,21 @@ impl ChatManager {
             command_order: tokio::sync::Mutex::new(()),
             command_budget: Mutex::new(command_budget),
             send_state,
+            maintenance_evidence: Mutex::default(),
+            maintenance_protocol_verified: matches!(adapter.kind(), "claude" | "codex")
+                && spec.agent_version.as_deref().is_some_and(|version| {
+                    driver::version_matches_pin(
+                        version,
+                        if adapter.kind() == "claude" {
+                            claude::TESTED_CLAUDE_VERSION
+                        } else {
+                            codex::TESTED_CODEX_VERSION
+                        },
+                    )
+                }),
+            maintenance_tx,
+            pump_maintenance_tx,
+            absorb_order: Arc::new(tokio::sync::Mutex::new(())),
         });
 
         let handle = adapter
@@ -839,6 +878,7 @@ impl ChatManager {
                     commands: cmd_rx,
                     events: ev_tx,
                     kill: kill_rx,
+                    maintenance: maintenance_rx,
                 },
             )
             .context("spawn agent driver")?;
@@ -865,8 +905,45 @@ impl ChatManager {
 
         let manager = Arc::clone(self);
         tokio::spawn(async move {
-            while let Some(ev) = ev_rx.recv().await {
-                manager.absorb(&id, &session, ev).await;
+            let mut pump_kill = session.kill_tx.subscribe();
+            loop {
+                tokio::select! {
+                    Some(drain) = pump_maintenance_rx.recv() => {
+                        let positive = async {
+                            let mut count = 0usize;
+                            loop {
+                                if Instant::now() >= drain.deadline { return None; }
+                                match ev_rx.try_recv() {
+                                    Ok(event) => {
+                                        count += 1;
+                                        manager.absorb(&id, &session, event).await;
+                                        if count >= EVENT_QUEUE && !ev_rx.is_empty() { return None; }
+                                    }
+                                    Err(mpsc::error::TryRecvError::Empty) => break,
+                                    Err(mpsc::error::TryRecvError::Disconnected) => return None,
+                                }
+                            }
+                            // Absorption and journal work retain their actual
+                            // owner past caller expiry; never discard a dequeued
+                            // event by canceling its append midway.
+                            let guard = session.absorb_order.clone().lock_owned().await;
+                            (Instant::now() < drain.deadline).then_some(guard)
+                        }.await;
+                        let positive = positive.filter(|_| !*pump_kill.borrow());
+                        let ready = positive.is_some();
+                        let _ = drain.acknowledged.send(positive);
+                        if ready {
+                            tokio::select! {
+                                _ = drain.release => (),
+                                _ = pump_kill.changed() => (),
+                            }
+                        }
+                    }
+                    event = ev_rx.recv() => {
+                        let Some(event) = event else { break; };
+                        manager.absorb(&id, &session, event).await;
+                    }
+                }
             }
             session
                 .command_budget
@@ -898,6 +975,12 @@ impl ChatManager {
 
     /// Journal + broadcast one event and fold it into the session info.
     async fn absorb(&self, id: &str, session: &ChatSession, mut ev: AgentEvent) {
+        let _order = session.absorb_order.lock().await;
+        session
+            .maintenance_evidence
+            .lock()
+            .expect("maintenance evidence lock")
+            .observe(&ev);
         if matches!(ev, AgentEvent::Init { .. } | AgentEvent::UserMessage { .. }) {
             session.unused_startup.store(false, Ordering::Relaxed);
         }
@@ -1389,6 +1472,13 @@ impl ChatManager {
             // the driver is still negotiating and has not echoed it yet.
             session.unused_startup.store(false, Ordering::Relaxed);
         }
+        // An unacknowledged settings/control RPC is not strict idle proof.
+        // Requalification requires another positive completed-turn boundary.
+        session
+            .maintenance_evidence
+            .lock()
+            .expect("maintenance evidence lock")
+            .command();
         permit.send(cmd);
         if let Some(reservation) = &mut reservation {
             // The driver channel now owns the command. Keep its quota until
@@ -1398,6 +1488,31 @@ impl ChatManager {
         Ok(SendOutcome::Accepted)
     }
 
+    /// Positive current-process initialization for exact manual resurrection;
+    /// an Init replayed from an old journal is not observed by this evidence.
+    pub async fn resumed_native_ready(&self, id: &str, expected: &str) -> Result<bool> {
+        let session = self.get_session(id)?;
+        // Initialization, its info fold and journal append settle as one pump
+        // step. A caller must not observe the evidence before those writes.
+        let _order = session.absorb_order.lock().await;
+        let info = session.info.lock().expect("session info lock");
+        anyhow::ensure!(info.alive, "resumed process unavailable");
+        let initialized = session
+            .maintenance_evidence
+            .lock()
+            .expect("maintenance evidence lock")
+            .initialized();
+        if initialized {
+            anyhow::ensure!(
+                info.native_session_id.as_deref() == Some(expected),
+                "resumed native identity changed"
+            );
+        }
+        Ok(initialized)
+    }
+    pub async fn sync_resumed_journal(&self, id: &str) -> Result<()> {
+        self.get_session(id)?.journal.sync_checked().await
+    }
     /// Serialize a lifecycle proof with all accepted commands. A caller must
     /// bound waiting for a stalled enqueue; cancellation before acquisition has
     /// no effect, and dropping the returned guard always reopens ingress.
@@ -1596,8 +1711,8 @@ mod tests {
     use crate::model::ContentBlock;
     use std::time::Duration;
 
-    struct HeldCommands {
-        commands: Arc<Mutex<Option<mpsc::Receiver<AgentCommand>>>>,
+    pub(super) struct HeldCommands {
+        pub(super) commands: Arc<Mutex<Option<mpsc::Receiver<AgentCommand>>>>,
     }
     impl AgentAdapter for HeldCommands {
         fn kind(&self) -> &'static str {

@@ -203,6 +203,7 @@ enum WriteOp {
     Line(Vec<u8>),
     /// Drain barrier: ack once everything before it hit the file.
     Sync(oneshot::Sender<()>),
+    Durable(oneshot::Sender<bool>),
 }
 
 struct RingState {
@@ -296,6 +297,7 @@ impl Journal {
             size,
             caps,
             written_seq: Arc::clone(&written_seq),
+            failed: false,
         };
         let handle = std::thread::Builder::new()
             .name(format!("journal-{session_id}"))
@@ -495,6 +497,23 @@ impl Journal {
         }
     }
 
+    /// Maintenance proof must reject a lost line or failed stable-storage
+    /// barrier. Ordinary replay's cheaper flush semantics remain unchanged.
+    pub(crate) async fn sync_checked(&self) -> Result<()> {
+        let (ack, received) = oneshot::channel();
+        self.tx
+            .as_ref()
+            .context("journal writer unavailable")?
+            .send(WriteOp::Durable(ack))
+            .await
+            .context("journal writer unavailable")?;
+        anyhow::ensure!(
+            received.await.unwrap_or(false),
+            "journal durability unavailable"
+        );
+        Ok(())
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -518,6 +537,7 @@ struct WriterThread {
     size: u64,
     caps: JournalCaps,
     written_seq: Arc<AtomicU64>,
+    failed: bool,
 }
 
 impl WriterThread {
@@ -529,6 +549,7 @@ impl WriterThread {
                     match self.file.write_all(&line) {
                         Ok(()) => self.size += line.len() as u64,
                         Err(err) => {
+                            self.failed = true;
                             tracing::error!(%err, path = %self.path.display(), "journal write failed");
                             // Terminate any partial write with a newline so the
                             // next line can't glue onto a torn record.
@@ -545,6 +566,7 @@ impl WriterThread {
                     }
                     if self.size > self.caps.file_cap {
                         if let Err(err) = self.compact() {
+                            self.failed = true;
                             tracing::error!(%err, path = %self.path.display(), "journal compaction failed");
                         }
                     }
@@ -552,6 +574,11 @@ impl WriterThread {
                 WriteOp::Sync(ack) => {
                     let _ = self.file.flush();
                     let _ = ack.send(());
+                }
+                WriteOp::Durable(ack) => {
+                    let durable = self.file.flush().and_then(|_| self.file.sync_all()).is_ok();
+                    self.failed |= !durable;
+                    let _ = ack.send(!self.failed);
                 }
             }
         }
@@ -1222,6 +1249,75 @@ mod tests {
             turn_id: "t1".into(),
             text: text.into(),
         }
+    }
+
+    #[cfg(unix)]
+    fn checked_writer_fixture(file: fs::File, path: PathBuf) -> Journal {
+        let caps = JournalCaps::default();
+        let written_seq = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = mpsc::channel(WRITE_QUEUE_DEPTH);
+        let writer = WriterThread {
+            file,
+            path: path.clone(),
+            size: 0,
+            caps,
+            written_seq: written_seq.clone(),
+            failed: false,
+        };
+        let writer = std::thread::spawn(move || writer.run(rx));
+        Journal {
+            path,
+            state: Mutex::new(RingState {
+                ring: VecDeque::new(),
+                ring_bytes: 0,
+                next_seq: 1,
+            }),
+            tx: Some(tx),
+            writer: Some(writer),
+            written_seq,
+            caps,
+            client_ids: Vec::new(),
+            client_evidence: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn checked_journal_keeps_lost_write_failure_through_later_durable_barriers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("readonly.jsonl");
+        fs::write(&path, b"").unwrap();
+        let file = fs::File::open(&path).unwrap();
+        // A read-only regular file can sync successfully, but rejects a write.
+        // Later successful fsync alone must not certify the discarded line.
+        file.sync_all().unwrap();
+        let journal = checked_writer_fixture(file, path);
+        journal.sync_checked().await.unwrap();
+        journal.append(msg("synthetic refused write")).await;
+        assert!(journal.sync_checked().await.is_err());
+        assert!(journal.sync_checked().await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn checked_journal_refuses_actual_fsync_failure_and_closed_writer() {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+        let dir = tempfile::tempdir().unwrap();
+        let (writer, _reader) = UnixStream::pair().unwrap();
+        let file = fs::File::from(OwnedFd::from(writer));
+        assert!(file.sync_all().is_err());
+        let mut journal = checked_writer_fixture(file, dir.path().join("synthetic-socket"));
+        journal.append(msg("synthetic successful pipe write")).await;
+        assert!(journal.sync_checked().await.is_err());
+        assert!(journal.sync_checked().await.is_err());
+        journal.tx.take();
+        journal.writer.take().unwrap().join().unwrap();
+        assert!(journal.sync_checked().await.is_err());
+        let (closed, receiver) = mpsc::channel(1);
+        drop(receiver);
+        journal.tx = Some(closed);
+        assert!(journal.sync_checked().await.is_err());
     }
 
     #[test]

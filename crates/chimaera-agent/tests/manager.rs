@@ -51,11 +51,123 @@ fn fixture() -> Fixture {
 }
 
 fn spec(id: &str, cwd: &Path, mode: &str) -> SpawnSpec {
-    SpawnSpec::new(
-        id,
-        vec![FAKE.to_string(), mode.to_string()],
-        cwd.to_path_buf(),
-    )
+    // Cross-built fixtures run the copied fake from their disposable VM share.
+    let fake = std::env::var("CHIMAERA_TEST_FAKE_CLAUDE").unwrap_or_else(|_| FAKE.into());
+    SpawnSpec::new(id, vec![fake, mode.to_string()], cwd.to_path_buf())
+}
+
+/// The cleanup owner survives removal of the registry row. Synthetic agent,
+/// real managed process group; no provider, network or billing.
+#[cfg(unix)]
+#[tokio::test]
+async fn paused_cleanup_tracks_captured_child_after_registry_removal() {
+    let fx = fixture();
+    let mut launch = spec("s-captured-cleanup", &fx.cwd, "artifacts");
+    launch.managed_execution = true;
+    fx.manager.spawn(&ClaudeAdapter, launch).unwrap();
+    let attached = fx.manager.attach("s-captured-cleanup", 0).unwrap();
+    let mut seen = attached.replay;
+    let mut events = attached.live;
+    if !seen
+        .iter()
+        .any(|event| matches!(event.ev, AgentEvent::Init { .. }))
+    {
+        wait_for(&mut events, &mut seen, "initialization", |event| {
+            matches!(event, AgentEvent::Init { .. })
+        })
+        .await;
+    }
+    let mut captured = fx
+        .manager
+        .pause_commands("s-captured-cleanup")
+        .await
+        .unwrap();
+    assert!(captured.cleanup_pending());
+    assert!(fx.manager.remove("s-captured-cleanup").unwrap().alive);
+    assert!(fx.manager.process_group("s-captured-cleanup").is_none());
+    assert!(captured.cleanup_pending());
+    captured.fence();
+    tokio::time::timeout(WAIT, async {
+        while captured.cleanup_pending() {
+            captured.fence();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!captured.cleanup_pending());
+}
+
+/// Real Linux child/pipe/pump path, synthetic Claude protocol only. This is
+/// neither real CLI idle acceptance nor the supervisor's full process census.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn maintenance_exact_leader_drains_and_retains_ingress_until_resumed() {
+    let fx = fixture();
+    let mut launch = spec("s-maintenance", &fx.cwd, "artifacts");
+    launch.managed_execution = true;
+    launch.agent_version = Some(chimaera_agent::claude::TESTED_CLAUDE_VERSION.into());
+    fx.manager.spawn(&ClaudeAdapter, launch).unwrap();
+    let attached = fx.manager.attach("s-maintenance", 0).unwrap();
+    let mut seen = attached.replay;
+    let mut events = attached.live;
+    if !seen
+        .iter()
+        .any(|entry| matches!(entry.ev, AgentEvent::Init { .. }))
+    {
+        wait_for(&mut events, &mut seen, "initialization", |event| {
+            matches!(event, AgentEvent::Init { .. })
+        })
+        .await;
+    }
+    assert!(fx.manager.maintenance_idle("s-maintenance").await.is_err());
+    fx.manager
+        .command(
+            "s-maintenance",
+            AgentCommand::Send {
+                blocks: vec![ContentBlock::Text {
+                    text: "synthetic idle turn".into(),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+    wait_for(&mut events, &mut seen, "completed turn", |event| {
+        matches!(event, AgentEvent::TurnCompleted { .. })
+    })
+    .await;
+    let idle = fx.manager.maintenance_idle("s-maintenance").await.unwrap();
+    let (mut idle, mut leader) = tokio::task::spawn_blocking(move || {
+        let mut leader = idle.pin_process().unwrap();
+        leader.request_stop().unwrap();
+        (idle, leader)
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !leader.is_stopped().unwrap() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let old_head = fx.manager.attach("s-maintenance", 0).unwrap().head_seq;
+    idle.drain(std::time::Instant::now() + std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+    idle.check().unwrap();
+    assert!(fx
+        .manager
+        .command("s-maintenance", AgentCommand::Interrupt)
+        .await
+        .is_err());
+    assert_eq!(
+        fx.manager.attach("s-maintenance", 0).unwrap().head_seq,
+        old_head
+    );
+    leader.resume().unwrap();
+    drop(idle);
+    assert!(fx.manager.kill("s-maintenance"));
 }
 
 /// Drain live events until the predicate matches; panics on timeout.
