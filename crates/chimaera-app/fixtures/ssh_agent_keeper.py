@@ -4,8 +4,9 @@
 Only account replies, Slurm discovery and native passphrase UI are synthetic.
 No jobs are submitted. Three immediate existing-master reads fit normal idle
 retirement; this is not a held-job/compute-forward or Tauri UI certificate.
-Cleanup proves captured mux and agent-directory absence, and reaps the owned
-sshd leaders/groups; it does not census descendants that escaped those groups.
+Inner cleanup proves captured mux and original agent-directory absence. The
+fixed outer wrapper must separately prove its original cgroup empty/removed,
+including descendants that escape process groups. Runtime proof is still pending.
 The fixed task VM management transport does not carry user SSH credentials.
 """
 import argparse
@@ -30,6 +31,7 @@ from ssh_agent_route import Protocol
 
 VM = "chimaera-isolation-20261002"
 LINUX_BINARY = "/fixtures/keeper-ssh-fixture"
+LINUX_WRAPPER = "/fixtures/test-keeper-ssh-route-linux.py"
 # Closed localhost byte transport only. Buffers are hard bounded before reads;
 # neither socket destinations nor executable/source come from the test wire.
 BRIDGE = r'''
@@ -254,10 +256,10 @@ class GatewayHandler(socketserver.BaseRequestHandler):
 
 
 class Keeper(Sources):
-    def __init__(self, binary, podman, digest):
+    def __init__(self, binary, podman, digest, wrapper_digest):
         self.gateways = []
         self.controls = []
-        self.podman, self.digest = podman, digest
+        self.podman, self.digest, self.wrapper_digest = podman, digest, wrapper_digest
         self.process_lock = threading.Lock()
         super().__init__(binary)
         self.deadline = time.monotonic() + 120
@@ -314,6 +316,16 @@ class Keeper(Sources):
                 or (expected_directories is not None and value["agent_directories"] != expected_directories)):
             raise Refused("keeper cleanup receipt")
 
+    def cleanup_receipts(self, process, expected_directories=None):
+        # Inner mux/directory settlement cannot substitute for the independent
+        # outer barrier, nor can forced cgroup cleanup prove authentication.
+        self.closed_receipt(self.record(process, 23), expected_directories)
+        if self.record(process, 7) != {"type": "external_cleanup", "cgroup_empty": True, "cgroup_removed": True}:
+            raise Refused("external descendant cleanup receipt")
+        process.wait(timeout=2)
+        if process.returncode:
+            raise Refused("keeper external cleanup refused")
+
     def close(self):
         self.deadline = time.monotonic() + 30
         failed = False
@@ -334,8 +346,7 @@ class Keeper(Sources):
                 try:
                     os.write(process.stdin.fileno(), b"EXIT\n")
                     process.stdin.close()
-                    self.closed_receipt(self.record(process, 25))
-                    process.wait(timeout=2)
+                    self.cleanup_receipts(process)
                 except (Refused, OSError, TimeoutError):
                     failed = True
             stop_owned(process)
@@ -346,14 +357,15 @@ class Keeper(Sources):
                 raise Refused("keeper fixture cleanup uncertain")
 
     def run(self):
-        check = self.management("/usr/bin/sha256sum " + LINUX_BINARY)
         from ssh_agent_loader import capture
-        try:
-            output = capture(check, self.end(5), 256)
-            if check.returncode or output.split() != [self.digest.encode(), LINUX_BINARY.encode()]:
-                raise Refused("Linux fixture immutable digest")
-        finally:
-            stop_owned(check)
+        for path, digest in ((LINUX_BINARY, self.digest), (LINUX_WRAPPER, self.wrapper_digest)):
+            check = self.management("/usr/bin/sha256sum " + path)
+            try:
+                output = capture(check, self.end(5), 256)
+                if check.returncode or output.split() != [digest.encode(), path.encode()]:
+                    raise Refused("Linux fixture immutable digest")
+            finally:
+                stop_owned(check)
         encrypted, public = self.key("selected")
         duplicate = self.root / "external-duplicate"
         duplicate.write_bytes(encrypted.read_bytes())
@@ -381,7 +393,7 @@ class Keeper(Sources):
         foreign_before = self.identities(foreign_env)
         for action in ("accept", "refuse", "cancel", "deadline"):
             gateway = Gateway(self)
-            control = self.management("/usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin HOME=/tmp /usr/bin/setsid " + LINUX_BINARY + " --fixture", input_pipe=True, control=True)
+            control = self.management("/usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin HOME=/tmp /usr/bin/python3 -I -S " + LINUX_WRAPPER, input_pipe=True, control=True)
             body = json.dumps({"advertised_port": gateway.server_address[1],
                                "public_key": "ssh-ed25519 " + public.decode()}, separators=(",", ":")).encode() + b"\n"
             if os.write(control.stdin.fileno(), body) != len(body):
@@ -482,8 +494,7 @@ class Keeper(Sources):
                     control.stdin.close()
                     # Each case reached the target's real signing request, so
                     # exactly both original leg directories must be witnessed.
-                    self.closed_receipt(self.record(control, 25), expected_directories=2)
-                    control.wait(timeout=2)
+                    self.cleanup_receipts(control, expected_directories=2)
                 if control.returncode:
                     raise Refused("keeper fixture refused")
         print("PASS keeper4: actual router/grants/two sshd key legs; synthetic account/prompts/Slurm, no job lifetime", flush=True)
@@ -494,10 +505,12 @@ def main():
     parser.add_argument("--binary", type=pathlib.Path, required=True)
     parser.add_argument("--podman", type=pathlib.Path, default=pathlib.Path("/opt/homebrew/bin/podman"))
     parser.add_argument("--linux-sha256", required=True)
+    parser.add_argument("--wrapper-sha256", required=True)
     args = parser.parse_args()
     args.podman = args.podman.resolve(strict=True)
-    if sys.platform != "darwin" or len(args.linux_sha256) != 64 or any(c not in "0123456789abcdef" for c in args.linux_sha256):
-        raise Refused("Mac fixture/exact Linux digest required")
+    if sys.platform != "darwin" or any(len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest)
+                                       for digest in (args.linux_sha256, args.wrapper_sha256)):
+        raise Refused("Mac fixture/exact Linux binary and wrapper digests required")
     for path in (args.binary, args.podman):
         info = path.lstat()
         if not path.is_absolute() or not stat.S_ISREG(info.st_mode) or info.st_uid not in (0, os.getuid()) or info.st_mode & 0o022:
@@ -509,7 +522,7 @@ def main():
     signals = {signal.SIGALRM, signal.SIGTERM, signal.SIGINT, signal.SIGHUP}
     previous = signal.pthread_sigmask(signal.SIG_BLOCK, signals)
     try:
-        fixture = Keeper(args.binary, args.podman, args.linux_sha256)
+        fixture = Keeper(args.binary, args.podman, args.linux_sha256, args.wrapper_sha256)
     finally:
         signal.pthread_sigmask(signal.SIG_SETMASK, previous)
     signal.setitimer(signal.ITIMER_REAL, 120)
