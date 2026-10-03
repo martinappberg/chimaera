@@ -327,7 +327,7 @@ impl Pro {
         let _ = generation;
     }
 
-    #[cfg(feature = "ssh-agent-prototype")]
+    #[cfg(all(feature = "ssh-agent-prototype", any(unix, test)))]
     pub(super) fn ssh_authentication(
         &self,
         generation: u64,

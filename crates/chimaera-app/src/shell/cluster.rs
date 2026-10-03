@@ -1088,6 +1088,7 @@ async fn submit_job(
 /// node). `stop` ends it from a running app; at quit, its pid does.
 pub(crate) struct Attached {
     stop: tokio::sync::oneshot::Sender<()>,
+    #[cfg(unix)]
     pid: Option<u32>,
 }
 
@@ -1097,6 +1098,7 @@ fn hold_attached(app: &AppHandle, alias: &str, jid: &str, mut child: tokio::proc
     let key = (alias.to_string(), jid.to_string());
     let held = Attached {
         stop: tx,
+        #[cfg(unix)]
         pid: child.id(),
     };
     if let Some(old) = lock(&shell.attached_jobs).insert(key.clone(), held) {

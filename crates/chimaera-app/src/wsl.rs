@@ -272,6 +272,10 @@ async fn bounded_output(
 #[cfg_attr(not(windows), allow(dead_code))]
 pub enum WslState {
     /// Not a Windows build — the wizard never shows.
+    #[cfg_attr(
+        windows,
+        allow(dead_code, reason = "shared report shape includes non-Windows state")
+    )]
     Unsupported,
     /// The WSL package is not installed (needs `wsl --install`, one-time
     /// admin + reboot).
@@ -1403,12 +1407,12 @@ mod imp {
     }
 }
 
-// `detect` is only called from the windows imp + the e2e smoke; the unix
-// build re-exports it solely so the surface is identical on both platforms.
-#[cfg_attr(not(windows), allow(unused_imports))]
+// Production callers use full_report; the explicit smoke also checks the
+// synchronous detection phase before applying its version gate.
+#[cfg(all(windows, test))]
+pub use imp::detect;
 pub use imp::{
-    detect, ensure_daemon, full_report, launch_distro_install, launch_wsl_install,
-    launch_wsl_update,
+    ensure_daemon, full_report, launch_distro_install, launch_wsl_install, launch_wsl_update,
 };
 // Only the Windows shell adopts/updates a WSL daemon; unix owns its local
 // daemon in daemon.rs, never through here.
