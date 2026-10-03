@@ -605,6 +605,27 @@ finishes positive cleanup or preserves recovery-required state. A daemon restart
 retains durable parking until exact supervised recovery or an explicit user
 resumption, never inferring success from a missing live process.
 
+Suspended session rows add the nullable `manual_resume_reason` field. The fixed
+value `project_secrets_idle` means this conversation was durably parked for this
+maintenance flow; it does not say that values have been applied. Missing or null
+preserves ordinary suspension. An unknown nonnull reason remains manual and
+cannot be cleared by automatic recovery. Only the existing explicit session
+Resume action may clear the reason under ordinary current execution authority.
+For a retained manually parked session it calls the additive daemon endpoint
+`POST /api/v1/sessions/{id}/resume` with no body. This is bearer-authenticated,
+workspace-scoped and owned through ordinary exact account/execution admission;
+it cannot create a new conversation or select another native resume identity.
+Only a known deferred session with a manual reason is eligible. A successful
+response is its normal session row under the same ID. It removes the reason
+only after the original conversation and delivery journal have resumed and
+the ledger change is durable. Missing/unqualified entries refuse; a duplicate
+request for that already resumed exact session returns its normal row without
+another spawn. Ordinary recent-conversation Resume keeps its existing flow.
+Ownership recovery, provider readiness, polling and bulk workspace resumption
+exclude these sessions and never send them a pickup message. An applied receipt
+may explain that cloud secrets were updated and invite manual resumption;
+preparation, parking or uncertain cleanup must not claim an update succeeded.
+
 Enablement additionally requires real Linux process and restart fixtures: input
 and spawn races, permission/background work, plain shells, detached descendants,
 PID reuse, stale launch/root, failed drains/fsync, caller cancellation, freeze and
