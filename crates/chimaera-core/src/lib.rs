@@ -3,6 +3,7 @@
 pub mod cloud_providers;
 pub mod cluster;
 pub mod project_secret_idle;
+pub mod project_secret_status;
 #[cfg(unix)]
 pub mod shellint;
 pub mod slurm;
