@@ -96,6 +96,13 @@ take this exception. An unresolved probe returns unavailable, never an unscoped
 request or a speculative write. This is an explicit proposed exception, not a
 claim that VIEWING's blanket passive-probe requirement enables native wake today.
 
+Native admission retains its original owner and epoch through that home-first
+decision. If either changes, return `workspace_scope_changed` (close 1013 on a
+socket) before forwarding the original POST or send. Do not rewrite its epoch
+or replay its input onto the new owner. A new attachment reads fresh placement
+and obtains its own exact acknowledgment; unresolved prior input remains
+uncertain under the recovery rules below.
+
 Authorization is checked for each action, not just when a workspace screen opens.
 Authentication failure, scope change, compute unavailability and an unsupported
 route remain distinct sanitized outcomes. A missing new viewer route disables
