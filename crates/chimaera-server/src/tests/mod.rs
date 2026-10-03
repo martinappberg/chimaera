@@ -20,6 +20,8 @@ mod history;
 mod knowledge;
 mod ledger;
 mod links;
+#[cfg(unix)]
+mod manual_resume;
 mod mastermind;
 mod mcp;
 mod notebook;

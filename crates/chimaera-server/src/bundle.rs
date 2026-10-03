@@ -172,7 +172,7 @@ fn read_capped(path: &Path, cap: u64) -> Result<Vec<u8>> {
     }
     Ok(bytes)
 }
-fn native_path(state: &AppState, entry: &LedgerEntry) -> Result<Option<PathBuf>> {
+pub(crate) fn native_path(state: &AppState, entry: &LedgerEntry) -> Result<Option<PathBuf>> {
     let Some(agent) = &entry.agent else {
         return Ok(None);
     };
@@ -944,7 +944,7 @@ pub(crate) fn paused_row(entry: &LedgerEntry, label: &str) -> Value {
                 .filter(|t| !t.trim().is_empty())
         })
         .unwrap_or(label);
-    json!({"id":entry.id,"workspace_id":entry.workspace_id,"cwd":entry.cwd,"cwd_current":entry.cwd,"name":name,"display_name":name,"renamed":entry.pinned_name.is_some(),"cols":entry.cols,"rows":entry.rows,"created_at":entry.created_at,"alive":false,"exit_status":null,"title":null,"pid":null,"phase":"unknown","exec_stage":null,"kind":if agent.is_some(){"agent"}else{"shell"},"agent_kind":agent.map(|a|a.kind.as_str()),"agent_state":"finished","agent_title":agent.map(|a|a.title.as_str()),"ui":agent.map_or("term",|a|if a.ui==chimaera_agent::model::SessionUi::Chat{"chat"}else{"term"}),"chat_capable":agent.is_some(),"placement":"here","placement_available":false,"suspended":true,"last_input_ms":null})
+    json!({"id":entry.id,"workspace_id":entry.workspace_id,"cwd":entry.cwd,"cwd_current":entry.cwd,"name":name,"display_name":name,"renamed":entry.pinned_name.is_some(),"cols":entry.cols,"rows":entry.rows,"created_at":entry.created_at,"alive":false,"exit_status":null,"title":null,"pid":null,"phase":"unknown","exec_stage":null,"kind":if agent.is_some(){"agent"}else{"shell"},"agent_kind":agent.map(|a|a.kind.as_str()),"agent_state":"finished","agent_title":agent.map(|a|a.title.as_str()),"ui":agent.map_or("term",|a|if a.ui==chimaera_agent::model::SessionUi::Chat{"chat"}else{"term"}),"chat_capable":agent.is_some(),"placement":"here","placement_available":false,"suspended":true,"manual_resume_reason":entry.manual_resume_reason,"last_input_ms":null})
 }
 
 #[cfg(test)]
@@ -978,6 +978,7 @@ mod tests {
         let entry = LedgerEntry {
             id: "s-bundle".into(),
             suspended: false,
+            manual_resume_reason: None,
             handoff: None,
             workspace_id: workspace.id.clone(),
             cwd: directory.clone(),

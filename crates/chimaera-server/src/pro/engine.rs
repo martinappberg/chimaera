@@ -3457,6 +3457,7 @@ mod tests {
             crate::ledger::LedgerEntry {
                 id: "s-returned".into(),
                 suspended: true,
+                manual_resume_reason: None,
                 handoff: Some(crate::bundle::HandoffResume {
                     fork: false,
                     origin: crate::bundle::Origin::Home,

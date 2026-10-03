@@ -760,6 +760,7 @@ fn lazy_return_preserves_finished_conversation_through_real_worker_route() {
         std::fs::create_dir_all(cloud.chat.journal_dir()).unwrap();
         std::fs::write(cloud.chat.journal_dir().join(format!("{SESSION}.jsonl")), &journal).unwrap();
         crate::ledger::defer(&cloud, crate::ledger::LedgerEntry {
+            manual_resume_reason: None,
             id: SESSION.into(), workspace_id: "w-cloud".into(), cwd: source, suspended: true, handoff: None, pinned_name: Some("Finished task".into()), cols: 80, rows: 24, theme: "dark".into(), created_at: 123,
             agent: Some(crate::ledger::LedgerAgent { kind: crate::agents::AgentKind::Claude, resume: Some(NATIVE.into()), transcript: None, native_cwd: None, title: "Finished task".into(), ui: chimaera_agent::model::SessionUi::Chat, model: None, carryover: Some(chimaera_agent::Carryover::default()) }),
         }).unwrap();

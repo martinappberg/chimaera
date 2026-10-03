@@ -739,7 +739,10 @@ async fn validate_resource(
                     (method.as_str(), tail),
                     ("DELETE" | "PATCH", "")
                         | ("GET", "journal")
-                        | ("POST", "exec" | "upload" | "view" | "rewind" | "fork")
+                        | (
+                            "POST",
+                            "exec" | "upload" | "view" | "rewind" | "fork" | "resume"
+                        )
                 ),
             "route unavailable"
         );

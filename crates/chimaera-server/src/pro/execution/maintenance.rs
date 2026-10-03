@@ -1,5 +1,6 @@
-//! Disabled inherited-maintenance admission foundation. No process, journal,
-//! channel or Prepared effects exist here; launch binding is not idle proof.
+//! Inherited-maintenance admission for the optional trusted actor. The actor
+//! separately proves exact parking and durable rollback; launch binding alone
+//! is not idle evidence and ordinary startup does not enable this extension.
 use super::{mutation, AppState, Ownership};
 use crate::lock;
 use chimaera_core::project_secret_idle::{AttemptIdentity, Binding, Prepare, Request};
@@ -65,6 +66,26 @@ pub(super) struct Owner {
     launch: Launch,
 }
 impl Owner {
+    pub(super) fn current(&self) -> anyhow::Result<()> {
+        let launch = Launch::capture(&self.state, &self.launch.binding)?;
+        if launch.generation != self.launch.generation || launch.epoch != self.launch.epoch {
+            return Err(mutation::Changed.into());
+        }
+        let admission = lock(&self.state.pro.execution.commits.0);
+        if !admission
+            .maintenance
+            .get(&self.identity.binding.workspace_id)
+            .is_some_and(|entry| {
+                entry.owner == self.owner
+                    && entry.identity == self.identity
+                    && entry.deadline > Instant::now()
+                    && entry.phase != Phase::RecoveryRequired
+            })
+        {
+            return Err(mutation::Changed.into());
+        }
+        Ok(())
+    }
     pub(super) fn begin(
         state: &Arc<AppState>,
         launch: &Launch,
@@ -161,15 +182,60 @@ impl Owner {
         entry.phase = Phase::Parking;
         Ok(())
     }
-    /// Positive rollback is currently available only before any parking
-    /// effects. Later exact pidfd/metadata rollback needs its own sealed proof.
+    /// Serialize exact old-leader resumption with lease fencing. A maintenance
+    /// deadline may expire while the execution lease is still valid; the former
+    /// never renews the latter. No signal is sent after current authority fails.
+    #[cfg(target_os = "linux")]
+    pub(super) fn resume_process(
+        &self,
+        process: &mut chimaera_agent::managed_process::ManagedProcess,
+    ) -> anyhow::Result<()> {
+        if !super::supervisor::matches_maintenance(&self.state, &self.launch.binding) {
+            return Err(mutation::Changed.into());
+        }
+        let proofs = lock(&self.state.pro.execution.proofs);
+        let ownership = lock(&self.state.pro.ownership);
+        let admission = lock(&self.state.pro.execution.commits.0);
+        if mutation::generation(&self.state) != self.launch.generation
+            || !proofs
+                .get(&self.launch.binding.workspace_id)
+                .is_some_and(|proof| {
+                    !proof.stopped
+                        && proof.generation == self.launch.generation
+                        && proof.epoch == self.launch.epoch
+                        && proof.deadline.valid()
+                })
+            || !matches!(ownership.get(&self.launch.binding.workspace_id), Some(Ownership::Local { epoch }) if *epoch == self.launch.epoch)
+            || !admission
+                .maintenance
+                .get(&self.identity.binding.workspace_id)
+                .is_some_and(|entry| {
+                    entry.owner == self.owner
+                        && entry.identity == self.identity
+                        && entry.phase == Phase::Parking
+                })
+        {
+            return Err(mutation::Changed.into());
+        }
+        process.resume()
+    }
+    /// Release only a no-effect admission. Once parking starts, the owned
+    /// transaction must positively restore metadata and exact old leaders.
     pub(super) fn abort_unstarted(self) -> anyhow::Result<()> {
+        self.release(false)
+    }
+    /// Only the owned parking transaction calls this after exact pidfd resume
+    /// and durable before-image restoration have positively completed.
+    pub(super) fn restored(self) -> anyhow::Result<()> {
+        self.release(true)
+    }
+    fn release(&self, parked: bool) -> anyhow::Result<()> {
         let workspace = &self.identity.binding.workspace_id;
         let mut admission = lock(&self.state.pro.execution.commits.0);
         let matching = admission.maintenance.get(workspace).is_some_and(|entry| {
             entry.owner == self.owner
                 && entry.identity == self.identity
-                && entry.phase == Phase::Unstarted
+                && (entry.phase == Phase::Unstarted || parked && entry.phase == Phase::Parking)
         });
         if !matching || admission.counts.get(workspace) != Some(&1) {
             return Err(mutation::Changed.into());

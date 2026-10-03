@@ -1137,7 +1137,7 @@ fn project_operations(state: &crate::AppState) -> usize {
             .count()
 }
 
-async fn ensure_root(root: &std::path::Path) -> anyhow::Result<()> {
+pub(crate) async fn ensure_root(root: &std::path::Path) -> anyhow::Result<()> {
     let root = root.to_path_buf();
     tokio::task::spawn_blocking(move || {
         std::fs::create_dir_all(&root)?;
@@ -1154,6 +1154,17 @@ async fn ensure_root(root: &std::path::Path) -> anyhow::Result<()> {
     })
     .await?
 }
+
+/// The same serialized configuration boundary used by imports and parking.
+pub(crate) fn manual_resume_configuration(state: &crate::AppState) -> Arc<AsyncMutex<()>> {
+    state.pro.configuration.clone()
+}
+
+pub(crate) fn manual_resume_storage(state: &crate::AppState) -> &std::path::Path {
+    &state.pro.root
+}
+
+pub(crate) use execution::restore_manual_parking;
 
 fn projects_root(state: &crate::AppState) -> PathBuf {
     crate::lock(&state.pro.projects_root)
@@ -1433,6 +1444,7 @@ mod tests {
         let entry = crate::ledger::LedgerEntry {
             id: "s-a".into(),
             suspended: true,
+            manual_resume_reason: None,
             handoff: None,
             workspace_id: "w-a".into(),
             cwd: root.clone(),

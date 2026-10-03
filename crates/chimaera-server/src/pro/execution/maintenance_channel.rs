@@ -1,5 +1,5 @@
-//! Disabled framing/provenance helpers for the fixed-launcher maintenance
-//! socket. No startup caller, Ready advertisement or idle receipt exists here.
+//! Framing/provenance for the optional trusted fixed-launcher maintenance
+//! socket. Only the opt-in actor sends Ready and exact parking receipts.
 //! A valid frame is structure, not authenticated idle or process evidence.
 use super::AppState;
 use chimaera_core::project_secret_idle::{Binding, Ready, Reply, Request, REPLY_MAX, REQUEST_MAX};
@@ -39,8 +39,9 @@ pub(super) struct Channel {
     generation: u64,
     // The trusted startup envelope selects this handshake nonce. Merely
     // retaining/validating it never sends Ready or enables this extension.
-    _channel_nonce: String,
+    channel_nonce: String,
     last_request: u64,
+    ready_sent: bool,
     closed: Arc<AtomicBool>,
     requests: Arc<tokio::sync::Semaphore>,
     effect: Arc<tokio::sync::Mutex<()>>,
@@ -116,8 +117,9 @@ impl Channel {
             stream,
             binding,
             generation,
-            _channel_nonce: channel_nonce,
+            channel_nonce,
             last_request: 0,
+            ready_sent: false,
             closed: Arc::new(AtomicBool::new(false)),
             requests: Arc::new(tokio::sync::Semaphore::new(REQUESTS)),
             effect: Arc::new(tokio::sync::Mutex::new(())),
@@ -131,6 +133,42 @@ impl Channel {
             return Err(InvalidChannel);
         }
         Ok(())
+    }
+    /// Only the actual inherited actor, after restoration and launch checks,
+    /// may negotiate this channel. A repeated or late Ready permanently fails.
+    pub(super) async fn ready(&mut self, state: &AppState) -> Result<()> {
+        let mut frame = FrameOwner::new(self.stream.as_raw_fd(), self.closed.clone());
+        self.current(state)?;
+        if self.ready_sent || self.last_request != 0 || !*state.restored.borrow() {
+            return Err(InvalidChannel);
+        }
+        let reply = Reply::Ready(Ready {
+            version: 1,
+            binding: self.binding.clone(),
+            channel_nonce: self.channel_nonce.clone(),
+            project_secrets_idle: 1,
+        });
+        let bytes = reply.encode().map_err(|_| InvalidChannel)?;
+        tokio::time::timeout(FRAME_DEADLINE, async {
+            self.stream
+                .write_all(&(bytes.len() as u32).to_be_bytes())
+                .await
+                .map_err(|_| InvalidChannel)?;
+            self.stream
+                .write_all(&bytes)
+                .await
+                .map_err(|_| InvalidChannel)?;
+            self.stream.flush().await.map_err(|_| InvalidChannel)
+        })
+        .await
+        .map_err(|_| InvalidChannel)??;
+        self.current(state)?;
+        self.ready_sent = true;
+        frame.completed();
+        Ok(())
+    }
+    pub(super) fn binding(&self) -> &Binding {
+        &self.binding
     }
     /// One reader owns this stream. Capacity includes a partial frame and must
     /// follow any admitted work into its actual blocking/cleanup owner.
@@ -193,7 +231,7 @@ impl Channel {
     }
     /// Reply correlation is exact to the admitted request. Ready requires a
     /// separate reviewed handshake; this helper cannot advertise support.
-    /// A future producer must supply separately proved Prepared/rollback data.
+    /// The actor must supply separately proved Prepared/rollback data.
     pub(super) async fn write(
         &mut self,
         state: &AppState,

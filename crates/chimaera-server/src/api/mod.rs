@@ -11,6 +11,7 @@ use crate::AppState;
 
 mod env;
 mod exec;
+mod manual_resume;
 mod sessions;
 mod shutdown;
 mod workspaces;
@@ -20,6 +21,7 @@ pub(crate) use env::{launcher_context_env, session_env, spawn_env_remove};
 #[cfg(test)]
 pub(crate) use env::spawn_path;
 pub(crate) use exec::{exec_session, session_journal};
+pub(crate) use manual_resume::resume as resume_manual_session;
 pub(crate) use sessions::{create_session, delete_session, list_sessions, rename_session};
 pub(crate) use shutdown::{delete_all_sessions, shutdown};
 pub(crate) use workspaces::{

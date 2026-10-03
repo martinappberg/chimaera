@@ -382,6 +382,10 @@ pub(crate) async fn spawn_session(
     };
     crate::pro::mutation::check_import_resume(state, &workspace.id)
         .map_err(SpawnFailure::Internal)?;
+    if let SpawnKind::Agent { kind, .. } = &spec.kind {
+        crate::ledger::check_manual_native(state, Some(&id), *kind, native)
+            .map_err(SpawnFailure::Internal)?;
+    }
     let import_admission = state
         .bundle_imports
         .admit(&workspace.id, &id, native)

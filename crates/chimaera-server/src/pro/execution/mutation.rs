@@ -294,6 +294,11 @@ pub(crate) struct Dispatch {
     ownership: Option<Ownership>,
 }
 impl Dispatch {
+    /// Existing final spawn checks consume the originally admitted authority,
+    /// including local manual restoration where no managed lease guard exists.
+    pub(crate) async fn run<F: std::future::Future>(&self, operation: F) -> F::Output {
+        IMPORT_RESUME.scope(self.clone(), operation).await
+    }
     pub(crate) fn capture(state: &AppState, workspace: &str) -> anyhow::Result<Self> {
         let captured = Self {
             workspace: workspace.to_owned(),

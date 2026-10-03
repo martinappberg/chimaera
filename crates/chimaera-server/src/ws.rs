@@ -807,6 +807,12 @@ pub(crate) fn session_owner(state: &AppState, id: &str) -> Option<&'static str> 
 }
 
 pub(crate) fn session_writable(state: &AppState, id: &str) -> bool {
+    if crate::lock(&state.deferred_sessions)
+        .get(id)
+        .is_some_and(|entry| entry.manual_resume_reason.is_some())
+    {
+        return false;
+    }
     let workspace = crate::lock(&state.session_workspaces).get(id).cloned();
     workspace.is_none_or(|workspace| crate::pro::may_execute(state, &workspace))
 }

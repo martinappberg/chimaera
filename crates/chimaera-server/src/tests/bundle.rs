@@ -370,6 +370,7 @@ async fn suspended_ledger_never_respawns_until_verified_resume() {
     let entry = ledger::LedgerEntry {
         id: "s-deferred".into(),
         suspended: true,
+        manual_resume_reason: None,
         handoff: None,
         workspace_id: workspace.id.clone(),
         cwd: root,

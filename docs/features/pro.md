@@ -521,6 +521,23 @@ to the cloud…" while this computer hands it over — read from this daemon's o
 `GET /pro/status` ownership (`workspace/placementHints.ts`); it appears only when Pro is
 configured and the project is owned elsewhere, and never in the accent colour.
 
+### Manually parked conversations
+
+Active-idle application of custom cloud secrets remains disabled pending its
+supervisor process-census and real-runtime acceptance gates. Its daemon and UI
+support a separate manual parking reason, `project_secrets_idle`, which preserves
+the original conversation, session ID, journal and delivery receipts. Opening
+that conversation shows a neutral paused explanation; it does not claim that
+secret values were applied. **Resume** explicitly restores that same session
+through `POST /api/v1/sessions/{id}/resume` with no body. Input stays blocked until
+the new process confirms the exact native conversation and the journal and
+ledger are durable. A lost response can be retried without another spawn.
+Unknown parking reasons require updated support and remain blocked. Bulk
+workspace recovery, ordinary Recents/native resume and transfer pickup do not
+automatically restart or replace a manually parked conversation. Source:
+[`api/manual_resume.rs`](../../crates/chimaera-server/src/api/manual_resume.rs)
+and [`ledger_manual.rs`](../../crates/chimaera-server/src/ledger_manual.rs).
+
 ### When both sides changed a file
 
 When the work comes home and the cloud and this Mac both changed the same file while apart, both versions are kept: the file holds the cloud's version and this Mac's version sits right beside it as `<name>.mine-<yyyymmdd-hhmm>`. Nobody has to go looking for those names. The chat marks where the work came back with one quiet line, "Back on this Mac. The cloud and this Mac both changed 3 files while apart.", and a **Review** button; the same review opens from the "Kept both versions" line in Settings → Chimaera Pro (its **Review** link), from the "Kept both versions" notification, and from a kept copy's right-click menu in the file tree, where every such copy carries a small "from this Mac" badge that explains the name on hover. (Off a Mac the words say "this computer", and a browser view of the project says "your computer".)

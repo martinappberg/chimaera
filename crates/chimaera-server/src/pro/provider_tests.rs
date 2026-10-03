@@ -34,6 +34,7 @@ fn entry(kind: AgentKind) -> crate::ledger::LedgerEntry {
     crate::ledger::LedgerEntry {
         id: format!("s-{}", kind.as_str()),
         suspended: true,
+        manual_resume_reason: None,
         handoff: None,
         workspace_id: "w-project".into(),
         cwd: PathBuf::from("/missing-fixture-root"),

@@ -80,6 +80,7 @@ async fn ws_sessions_stopped_for_a_transfer_say_moved_not_exited() {
             crate::ledger::LedgerEntry {
                 id: id.clone(),
                 suspended: true,
+                manual_resume_reason: None,
                 handoff: None,
                 workspace_id: "w-moving".into(),
                 cwd: cwd.clone(),
@@ -133,6 +134,7 @@ async fn a_restart_deferred_session_is_paused_here_not_moved() {
     let entry = |id: &str, agent| crate::ledger::LedgerEntry {
         id: id.into(),
         suspended: true,
+        manual_resume_reason: None,
         handoff: None,
         workspace_id: workspace.id.clone(),
         cwd: cwd.clone(),

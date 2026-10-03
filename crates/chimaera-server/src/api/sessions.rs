@@ -148,6 +148,22 @@ pub(crate) async fn create_session(
         },
     };
 
+    if body.kind == SessionKind::Agent {
+        if let Some(kind) = body.agent.as_deref().map_or(
+            Some(crate::agents::AgentKind::Claude),
+            crate::agents::AgentKind::parse,
+        ) {
+            if crate::ledger::check_manual_native(&state, None, kind, body.resume.as_deref())
+                .is_err()
+            {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({"error":"manual_resume_required"})),
+                )
+                    .into_response();
+            }
+        }
+    }
     // Resuming an archived conversation brings it back: it is live again,
     // and once it ends it belongs in Recents like any other.
     if let Some(resume) = body.resume.as_deref().filter(|r| !r.is_empty()) {

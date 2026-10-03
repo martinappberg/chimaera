@@ -327,6 +327,7 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         // app drives it through the tunnel to shut a remote host down.
         .route("/shutdown", post(api::shutdown))
         .route("/sessions/{id}/exec", post(api::exec_session))
+        .route("/sessions/{id}/resume", post(api::resume_manual_session))
         // Streamed to disk with its own per-file/per-session caps (see
         // `upload`); the DefaultBodyLimit override only lifts axum's 2MB
         // buffered-body default out of the way of multi-MB screenshots.

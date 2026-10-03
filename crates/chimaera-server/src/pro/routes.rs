@@ -290,6 +290,7 @@ async fn configure_inner(
     // Only a worker is fenced by lease expiry; a device has nothing to watch.
     if managed && execution::worker(&state) {
         execution::start(&state);
+        execution::start_maintenance(&state);
     }
     response
 }

@@ -35,6 +35,10 @@ pub(crate) struct Startup {
 }
 #[derive(Clone, serde::Serialize)]
 pub(crate) struct CleanupAck {
+    // Internal recovery proof only; the health wire remains unchanged.
+    #[serde(skip_serializing)]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    previous_generation: u64,
     execution_cleanup: u16,
     workspace_id: String,
     registration_revision: u64,
@@ -360,6 +364,7 @@ pub(in crate::pro) async fn apply(
     // enrollment policy; only an authoritative account observation repairs it.
     lock(&state.pro.execution.unclean).remove(&receipt.workspace_id);
     *lock(&state.pro.execution.supervisor_ack) = Some(CleanupAck {
+        previous_generation: receipt.previous_generation,
         execution_cleanup: 1,
         workspace_id: receipt.workspace_id,
         registration_revision: receipt.registration_revision,
@@ -375,3 +380,22 @@ pub(in crate::pro) fn fixture_boot(state: &AppState) -> Option<String> {
 #[cfg(test)]
 #[path = "supervisor_tests.rs"]
 mod tests;
+
+#[cfg(target_os = "linux")]
+pub(super) fn recovered_park(
+    state: &AppState,
+    old: &chimaera_core::project_secret_idle::Binding,
+    current: &chimaera_core::project_secret_idle::Binding,
+) -> bool {
+    matches_maintenance(state, current)
+        && old.account_id == current.account_id
+        && old.workspace_id == current.workspace_id
+        && old.root_identity == current.root_identity
+        && lock(&state.pro.execution.supervisor_ack)
+            .as_ref()
+            .is_some_and(|ack| {
+                ack.launch_generation == current.launch_generation
+                    && ack.previous_generation >= old.launch_generation
+                    && ack.launch_generation > old.launch_generation
+            })
+}

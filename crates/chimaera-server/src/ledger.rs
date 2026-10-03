@@ -27,6 +27,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 
+#[cfg(unix)]
+#[path = "ledger_manual.rs"]
+pub(crate) mod manual;
+
 use crate::agents::AgentKind;
 use crate::AppState;
 use chimaera_agent::model::SessionUi;
@@ -37,6 +41,9 @@ pub(crate) struct LedgerEntry {
     pub(crate) id: String,
     /// A handoff or unverified owner retains identity without resurrecting.
     pub(crate) suspended: bool,
+    /// Fixed manual parking reason. Unknown persisted reasons stay manual;
+    /// automatic ownership/provider recovery never clears this fence.
+    pub(crate) manual_resume_reason: Option<String>,
     pub(crate) handoff: Option<crate::bundle::HandoffResume>,
     pub(crate) workspace_id: String,
     /// Last polled cwd (shells) or spawn cwd (agents).
@@ -105,6 +112,7 @@ impl LedgerEntry {
         json!({
             "id": self.id,
             "suspended": self.suspended,
+            "manual_resume_reason": self.manual_resume_reason,
             "handoff": self.handoff,
             "workspace_id": self.workspace_id,
             "cwd": self.cwd,
@@ -156,6 +164,13 @@ impl LedgerEntry {
         };
         Some(LedgerEntry {
             suspended: value["suspended"].as_bool().unwrap_or(false),
+            manual_resume_reason: match value.get("manual_resume_reason") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::String(reason)) if reason == "project_secrets_idle" => {
+                    Some(reason.clone())
+                }
+                _ => Some("unknown".into()),
+            },
             handoff: value
                 .get("handoff")
                 .and_then(|v| serde_json::from_value(v.clone()).ok()),
@@ -263,6 +278,22 @@ impl LedgerStore {
         let body = Self::body(entries, links);
         self.save(&body, true)?;
         self.last_written = Some(body);
+        Ok(())
+    }
+    /// Active maintenance needs positive rename durability. Unlike ordinary
+    /// stores, unsupported directory fsync cannot be treated as idle proof.
+    #[cfg(unix)]
+    pub(crate) fn write_maintenance_durable(
+        &mut self,
+        entries: &[LedgerEntry],
+        links: &HashMap<String, String>,
+    ) -> anyhow::Result<()> {
+        self.write_durable(entries, links)?;
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("maintenance ledger storage missing"))?;
+        std::fs::File::open(parent)?.sync_all()?;
         Ok(())
     }
     fn body(entries: &[LedgerEntry], links: &HashMap<String, String>) -> String {
@@ -430,6 +461,7 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
             });
             Some(LedgerEntry {
                 suspended: false,
+                manual_resume_reason: None,
                 handoff: None,
                 id: info.id.clone(),
                 workspace_id,
@@ -475,6 +507,7 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
                 .or_else(|| resumed.get(&c.id).cloned());
             Some(LedgerEntry {
                 suspended: false,
+                manual_resume_reason: None,
                 handoff: None,
                 id: c.id.clone(),
                 workspace_id,
@@ -507,7 +540,13 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
     drop(workspaces);
     for entry in crate::lock(&state.deferred_sessions).values() {
         if let Some(live) = entries.iter_mut().find(|live| live.id == entry.id) {
-            live.suspended = entry.suspended;
+            if entry.manual_resume_reason.is_some() {
+                // A warming or rejected Init cannot change the parked native
+                // identity before the exact owned Resume has durably landed.
+                *live = entry.clone();
+            } else {
+                live.suspended = entry.suspended;
+            }
         } else {
             entries.push(entry.clone());
         }
@@ -528,6 +567,7 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
 /// until a ledgered chat respawns it is live nowhere, yet its journal is what
 /// it resumes from.
 pub(crate) async fn consume_boot(state: &Arc<AppState>, boot: BootLedger) {
+    let boot = crate::pro::restore_manual_parking(state, boot).await;
     restore(state, boot).await;
     // Laptop first: restart-deferred work resumes even when the account never
     // answers. A verified grant usually resumes it well before this.
@@ -569,12 +609,12 @@ pub(crate) async fn restore(state: &Arc<AppState>, boot: BootLedger) {
         // daemon left, it waits for this life's ownership proof and the
         // device fallback, instead of answering "moved" forever.
         let interrupted = entry.suspended && crate::pro::interrupted_return(state, entry);
-        if entry.suspended || held {
+        if entry.suspended || entry.manual_resume_reason.is_some() || held {
             let mut deferred = entry.clone();
             deferred.suspended = true;
             if let Err(error) = defer(state, deferred) {
                 tracing::error!(session=%entry.id,%error,"deferred ledger capacity reached");
-            } else if !entry.suspended || interrupted {
+            } else if entry.manual_resume_reason.is_none() && (!entry.suspended || interrupted) {
                 crate::pro::defer_boot_session(state, &entry.id);
             }
             continue;
@@ -889,6 +929,7 @@ pub(crate) async fn resume_deferred_filtered(
     // A shell that moved to the cloud stays there; it never resumes here.
     let resumable = |entry: &LedgerEntry| {
         keep(entry)
+            && entry.manual_resume_reason.is_none()
             && !(entry.agent.is_none()
                 && entry
                     .handoff
@@ -925,7 +966,10 @@ pub(crate) async fn resume_deferred_sessions(
         .get(workspace_id)
         .ok_or_else(|| anyhow::anyhow!("unknown workspace"))?;
     for id in ids {
-        resume_one(state, &workspace, id, &|_| true).await?;
+        resume_one(state, &workspace, id, &|entry| {
+            entry.manual_resume_reason.is_none()
+        })
+        .await?;
     }
     state.changes.notify_waiters();
     Ok(())
@@ -965,14 +1009,14 @@ async fn resume_one(
 
 /// One resumer's place in a session's turn (`AppState::resuming`). Dropping
 /// it, also on cancellation, forgets the turn once nobody else holds it.
-struct ResumeTurn<'a> {
+pub(crate) struct ResumeTurn<'a> {
     state: &'a AppState,
     id: String,
     turn: Option<Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl<'a> ResumeTurn<'a> {
-    fn take(state: &'a AppState, id: &str) -> Self {
+    pub(crate) fn take(state: &'a AppState, id: &str) -> Self {
         let turn = Arc::clone(
             crate::lock(&state.resuming)
                 .entry(id.to_owned())
@@ -985,7 +1029,7 @@ impl<'a> ResumeTurn<'a> {
         }
     }
 
-    async fn wait(&self) -> tokio::sync::MutexGuard<'_, ()> {
+    pub(crate) async fn wait(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.turn
             .as_ref()
             .expect("turn held until drop")
@@ -1026,6 +1070,7 @@ mod tests {
     fn shell_entry() -> LedgerEntry {
         LedgerEntry {
             suspended: false,
+            manual_resume_reason: None,
             handoff: None,
             id: "s-1".into(),
             workspace_id: "w1".into(),
@@ -1296,4 +1341,46 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+}
+
+// Ordinary Recents/native resume cannot mint a second session while a durable
+// manual entry owns the original conversation. The exact same-ID restoration
+// path is separately authenticated and serialized by manual Resume.
+tokio::task_local! { static MANUAL_RESUME: String; }
+pub(crate) async fn manual_resumption<F: std::future::Future>(
+    id: String,
+    operation: F,
+) -> F::Output {
+    MANUAL_RESUME.scope(id, operation).await
+}
+pub(crate) fn check_manual_native(
+    state: &AppState,
+    session: Option<&str>,
+    kind: crate::agents::AgentKind,
+    native: Option<&str>,
+) -> anyhow::Result<()> {
+    let authorized = MANUAL_RESUME
+        .try_with(|id| session == Some(id.as_str()))
+        .unwrap_or(false);
+    let conflict = crate::lock(&state.deferred_sessions).values().any(|entry| {
+        if entry.manual_resume_reason.is_none() {
+            return false;
+        }
+        let exact = session == Some(entry.id.as_str());
+        let native_match = native.is_some()
+            && entry
+                .agent
+                .as_ref()
+                .is_some_and(|agent| agent.kind == kind && agent.resume.as_deref() == native);
+        (exact
+            && (!authorized
+                || entry.manual_resume_reason.as_deref() != Some("project_secrets_idle")
+                || !native_match))
+            || (!exact && native_match)
+    });
+    anyhow::ensure!(
+        !conflict,
+        "conversation requires original manual session resume"
+    );
+    Ok(())
 }

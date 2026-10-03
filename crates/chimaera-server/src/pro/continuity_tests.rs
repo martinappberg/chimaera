@@ -951,6 +951,7 @@ async fn an_unreleased_sleep_flush_waits_for_the_wake_and_resumes_locally() {
         crate::ledger::LedgerEntry {
             id: stopped.into(),
             suspended: true,
+            manual_resume_reason: None,
             handoff: None,
             workspace_id: workspace.id.clone(),
             cwd: workspace.root.clone(),
@@ -991,6 +992,7 @@ fn shell_entry(id: &str, workspace: &crate::workspaces::Workspace) -> crate::led
     crate::ledger::LedgerEntry {
         id: id.into(),
         suspended: false,
+        manual_resume_reason: None,
         handoff: None,
         workspace_id: workspace.id.clone(),
         cwd: workspace.root.clone(),

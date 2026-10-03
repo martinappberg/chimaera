@@ -310,6 +310,12 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
         .cloned()
         .collect();
     for entry in &deferred {
+        // A maintenance-parked leader can still exist stopped until the
+        // supervisor's positive cleanup. Its live registry row must not hide
+        // the durable manual-resume fence or suggest writable execution.
+        if entry.manual_resume_reason.is_some() {
+            rows.retain(|(_, row)| row["id"] != entry.id);
+        }
         if !rows.iter().any(|(_, row)| row["id"] == entry.id) {
             let label = crate::pro::paused_label(state, entry);
             let mut row = crate::bundle::paused_row(entry, label);

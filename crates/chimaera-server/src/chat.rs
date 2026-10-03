@@ -3217,6 +3217,7 @@ pub(crate) async fn spawn_chat_session(
         crate::pro::may_execute(state, &recipe.workspace_id),
         "project execution authority unavailable"
     );
+    crate::ledger::check_manual_native(state, Some(&id), recipe.kind, recipe.resume.as_deref())?;
     let chat_bin = crate::launcher::chat_executable(state, recipe.kind, &recipe.bin).await?;
     let (usage, binaries) = crate::runtime_retention::acquire(
         state,
@@ -3528,10 +3529,16 @@ pub(crate) async fn spawn_chat_session(
     );
     let intent = crate::pro::prepare_managed_launch(state, &recipe.workspace_id).await?;
     let _launch = crate::pro::mutation::begin_launch(state, &recipe.workspace_id)?;
+    crate::ledger::check_manual_native(state, Some(&id), recipe.kind, recipe.resume.as_deref())?;
     if let Some(intent) = &intent {
         intent.check()?;
     }
-    spec.managed_execution = crate::pro::managed_execution(state, &recipe.workspace_id);
+    spec.managed_execution = crate::pro::managed_execution(state, &recipe.workspace_id)
+        || crate::lock(&state.deferred_sessions)
+            .get(&id)
+            .is_some_and(|entry| {
+                entry.manual_resume_reason.as_deref() == Some("project_secrets_idle")
+            });
     crate::lock(&state.chat_recipes).insert(id.clone(), recipe.clone());
     let adapter = recipe
         .kind
@@ -3658,6 +3665,12 @@ pub(crate) async fn resurrect_chat_transfer(
         other => other.clone(),
     };
 
+    if entry.manual_resume_reason.is_some() {
+        anyhow::ensure!(
+            resume == agent.resume && resume.is_some() && !fork_head,
+            "manual conversation cannot resume fresh or fork"
+        );
+    }
     // Seed the AgentRecord BEFORE the spawn. `apply_chat_event` only UPDATES an
     // existing record — on a fresh boot there is none, so a `get_mut` here would
     // no-op and the row would come back as a bare "claude". Mirror create_session:
@@ -3705,11 +3718,13 @@ pub(crate) async fn resurrect_chat_transfer(
         rollback_turns: None,
         revert_before_turn: None,
         remote_control: match &carry {
+            _ if entry.manual_resume_reason.is_some() => RemoteControlAtStart::No,
             Some(c) if c.remote_control => RemoteControlAtStart::Yes,
             Some(_) => RemoteControlAtStart::No,
             None => RemoteControlAtStart::Setting,
         },
-        carry_ultracode: carry.as_ref().is_some_and(|c| c.ultracode),
+        carry_ultracode: entry.manual_resume_reason.is_none()
+            && carry.as_ref().is_some_and(|c| c.ultracode),
         theme: entry.theme.clone(),
         // The ledger doesn't persist launch text: a resurrected session
         // re-runs the durable scopes (host ⊕ workspace) only.
@@ -3737,7 +3752,10 @@ pub(crate) async fn resurrect_chat_transfer(
             // (the conversation survives, its processes do not). Tell the
             // agent once, as a message it can act on (see `pickup_message`).
             let enabled = crate::lock(&state.settings).resume_after_restart();
-            let pick_up = if mastermind_mode.is_some() || state.compute.is_cluster_job() {
+            let pick_up = if entry.manual_resume_reason.is_some()
+                || mastermind_mode.is_some()
+                || state.compute.is_cluster_job()
+            {
                 None
             } else if let Some(origin) = origin {
                 let recovery = crate::pro::checkpoint_recovery_context(state, &entry.workspace_id);

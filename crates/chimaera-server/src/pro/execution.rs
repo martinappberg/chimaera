@@ -3,15 +3,25 @@
 pub(crate) mod installer;
 mod launch;
 mod lease;
-// Disabled maintenance primitives: opt-in startup capture, no Ready or Prepared.
+// Optional trusted startup actor; production controller enablement remains off.
 #[allow(dead_code)]
 pub(super) mod maintenance;
+#[cfg(target_os = "linux")]
+mod maintenance_actor;
+#[cfg(all(test, target_os = "linux"))]
+mod maintenance_actor_process_tests;
 #[cfg(unix)]
 #[allow(dead_code)]
 pub(super) mod maintenance_channel;
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+mod maintenance_park;
 #[cfg(unix)]
 #[allow(dead_code)]
 pub(super) mod maintenance_startup;
+#[cfg(any(target_os = "linux", all(test, unix)))]
+#[allow(dead_code)]
+mod maintenance_store;
 pub(crate) mod mutation;
 mod restart;
 pub(super) mod setup;
@@ -951,4 +961,59 @@ fn grant_fixture(state: &AppState, workspace: &str, epoch: u64, sequence: u64) -
         state.pro.generation.load(Ordering::Acquire),
         RequestStart::now(),
     )
+}
+
+/// Read off-reactor before any boot resurrection. An unknown existing parking
+/// receipt never downgrades to an absent receipt and automatic agent restore.
+pub(crate) async fn restore_manual_parking(
+    state: &std::sync::Arc<AppState>,
+    boot: crate::ledger::BootLedger,
+) -> crate::ledger::BootLedger {
+    #[cfg(target_os = "linux")]
+    {
+        let owner = state.clone();
+        let fallback = boot.sessions.clone();
+        let fallback_links = boot.links.clone();
+        let fallback_written_at = boot.written_at;
+        let result = tokio::task::spawn_blocking(move || {
+            let mut boot = boot;
+            if maintenance_store::overlay_boot(&owner, &mut boot).is_err() {
+                for entry in &mut boot.sessions {
+                    entry.suspended = true;
+                    entry.manual_resume_reason = Some("unknown".into());
+                }
+                tracing::warn!(
+                    "maintenance parking receipt unavailable; automatic restoration fenced"
+                );
+            }
+            boot
+        })
+        .await;
+        // A panicked parser worker must not expose a previously owned roster.
+        // It normally cannot panic; retain the original roster outside it.
+        result.unwrap_or_else(|_| crate::ledger::BootLedger {
+            sessions: fallback
+                .into_iter()
+                .map(|mut entry| {
+                    entry.suspended = true;
+                    entry.manual_resume_reason = Some("unknown".into());
+                    entry
+                })
+                .collect(),
+            links: fallback_links,
+            written_at: fallback_written_at,
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = state;
+        boot
+    }
+}
+
+pub(in crate::pro) fn start_maintenance(state: &std::sync::Arc<AppState>) {
+    #[cfg(target_os = "linux")]
+    maintenance_actor::start(state);
+    #[cfg(not(target_os = "linux"))]
+    let _ = state;
 }
