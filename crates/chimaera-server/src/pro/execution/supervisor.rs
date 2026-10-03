@@ -140,6 +140,40 @@ pub(crate) fn ack(state: &AppState) -> Option<CleanupAck> {
 pub(super) fn supervised(state: &AppState) -> bool {
     lock(&state.pro.execution.supervisor_ack).is_some()
 }
+/// Compare the accepted launch only. This is not a process census or an idle
+/// assertion, and cannot enable maintenance transport by itself.
+pub(super) fn matches_maintenance(
+    state: &AppState,
+    binding: &chimaera_core::project_secret_idle::Binding,
+) -> bool {
+    if !state.pro.configured.load(Ordering::Acquire)
+        || state.pro.execution.boot.as_deref() != Some(&binding.os_boot_id)
+    {
+        return false;
+    }
+    let runtime_matches = {
+        let runtime = lock(&state.pro.runtime);
+        runtime.as_ref().is_some_and(|config| {
+            config.role == crate::pro::protocol::Role::Worker
+                && config.account_id.as_deref() == Some(&binding.account_id)
+        })
+    };
+    let ack_matches = {
+        let ack = lock(&state.pro.execution.supervisor_ack);
+        ack.as_ref().is_some_and(|ack| {
+            ack.workspace_id == binding.workspace_id
+                && ack.registration_revision == binding.registration_revision
+                && ack.launch_generation == binding.launch_generation
+        })
+    };
+    let authority_matches = {
+        let authority = lock(&state.pro.authority);
+        matches!(&*authority, crate::pro::authority::Authority::Bound(accepted)
+            if accepted.cleanup_binding(&binding.account_id, &binding.workspace_id,
+                binding.registration_revision,(binding.root_identity.device,binding.root_identity.inode)))
+    };
+    runtime_matches && ack_matches && authority_matches
+}
 /// Shared startup admission. It has no effects and does not consume the pipe
 /// receipt; both authority preparation and durable application use it.
 pub(in crate::pro) fn validate(

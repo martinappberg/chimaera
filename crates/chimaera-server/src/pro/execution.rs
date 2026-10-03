@@ -2,6 +2,9 @@
 //! only an authenticated acquire/renew response can create a fresh local lease.
 mod launch;
 mod lease;
+// Disabled maintenance primitives: no startup channel or Prepared producer.
+#[allow(dead_code)]
+pub(super) mod maintenance;
 pub(crate) mod mutation;
 mod restart;
 pub(super) mod setup;

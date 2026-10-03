@@ -8,10 +8,16 @@ use std::{
 };
 
 #[derive(Default)]
-pub(super) struct Commits(Arc<Mutex<HashMap<String, usize>>>);
+pub(super) struct Commits(pub(super) Arc<Mutex<Admission>>);
+
+#[derive(Default)]
+pub(super) struct Admission {
+    pub(super) counts: HashMap<String, usize>,
+    pub(super) maintenance: HashMap<String, super::maintenance::Entry>,
+}
 
 pub(crate) struct Guard {
-    commits: Arc<Mutex<HashMap<String, usize>>>,
+    commits: Arc<Mutex<Admission>>,
     workspace: String,
 }
 
@@ -70,11 +76,13 @@ pub(in crate::pro) async fn begin_copy(
     super::receipt::validate(&checkpoint)?;
     let commit = {
         let mut commits = lock(&state.pro.execution.commits.0);
-        if commits.get(workspace).copied().unwrap_or(0) > 0 || commits.values().sum::<usize>() >= 64
+        if commits.maintenance.contains_key(workspace)
+            || commits.counts.get(workspace).copied().unwrap_or(0) > 0
+            || commits.counts.values().sum::<usize>() >= 64
         {
             return Err(Changed.into());
         }
-        *commits.entry(workspace.to_owned()).or_default() += 1;
+        *commits.counts.entry(workspace.to_owned()).or_default() += 1;
         Guard {
             commits: state.pro.execution.commits.0.clone(),
             workspace: workspace.to_owned(),
@@ -207,10 +215,10 @@ pub(crate) async fn begin_import(
         return Err(Changed.into());
     }
     let mut commits = lock(&state.pro.execution.commits.0);
-    if commits.values().sum::<usize>() >= 64 {
+    if commits.maintenance.contains_key(workspace) || commits.counts.values().sum::<usize>() >= 64 {
         return Err(Changed.into());
     }
-    *commits.entry(workspace.to_owned()).or_default() += 1;
+    *commits.counts.entry(workspace.to_owned()).or_default() += 1;
     Ok(ImportGuard {
         _commit: Guard {
             commits: state.pro.execution.commits.0.clone(),
@@ -262,10 +270,10 @@ pub(crate) async fn resume_import<F: std::future::Future>(
 impl Drop for Guard {
     fn drop(&mut self) {
         let mut commits = lock(&self.commits);
-        if let Some(active) = commits.get_mut(&self.workspace) {
+        if let Some(active) = commits.counts.get_mut(&self.workspace) {
             *active -= 1;
             if *active == 0 {
-                commits.remove(&self.workspace);
+                commits.counts.remove(&self.workspace);
             }
         }
     }
@@ -360,10 +368,10 @@ pub(crate) fn begin_launch(state: &AppState, workspace: &str) -> anyhow::Result<
         }
     }
     let mut commits = lock(&state.pro.execution.commits.0);
-    if commits.values().sum::<usize>() >= 64 {
+    if commits.maintenance.contains_key(workspace) || commits.counts.values().sum::<usize>() >= 64 {
         return Err(Changed.into());
     }
-    *commits.entry(workspace.to_owned()).or_default() += 1;
+    *commits.counts.entry(workspace.to_owned()).or_default() += 1;
     Ok(Some(Guard {
         commits: state.pro.execution.commits.0.clone(),
         workspace: workspace.to_owned(),
@@ -398,6 +406,7 @@ pub(crate) fn capture(state: &AppState, workspace: &str) -> anyhow::Result<Optio
 }
 pub(super) fn idle(state: &AppState, workspace: &str) -> bool {
     lock(&state.pro.execution.commits.0)
+        .counts
         .get(workspace)
         .copied()
         .unwrap_or(0)
@@ -429,10 +438,10 @@ pub(crate) fn begin(
     let mut commits = lock(&state.pro.execution.commits.0);
     // At most 64 irreversible operations can be outstanding, even if a shared
     // filesystem stalls. No mutex or reactor thread waits for their I/O.
-    if commits.values().sum::<usize>() >= 64 {
+    if commits.maintenance.contains_key(workspace) || commits.counts.values().sum::<usize>() >= 64 {
         return Err(Changed.into());
     }
-    *commits.entry(workspace.to_owned()).or_default() += 1;
+    *commits.counts.entry(workspace.to_owned()).or_default() += 1;
     Ok(Guard {
         commits: state.pro.execution.commits.0.clone(),
         workspace: workspace.to_owned(),

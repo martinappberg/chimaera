@@ -536,7 +536,8 @@ pub(crate) fn local_copy_view(
 }
 
 pub(crate) fn may_write(state: &crate::AppState, workspace: &str) -> bool {
-    if execution::supervisor::pending(state)
+    if execution::maintenance::closed(state, workspace)
+        || execution::supervisor::pending(state)
         || project_copy::copy_only(state, workspace)
         || state.bundle_imports.blocks_workspace(workspace)
     {
