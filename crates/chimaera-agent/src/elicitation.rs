@@ -5,6 +5,9 @@ use serde_json::Value;
 
 pub const ELICITATION_BYTES: usize = 64 * 1024;
 pub const ELICITATION_PENDING: usize = 32;
+// The browser sends JSON numbers. Larger integers can change before they
+// reach the daemon, so defaults and submitted values share this exact range.
+const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -360,8 +363,12 @@ impl ElicitationField {
             }
             "number" | "integer" => {
                 let number = value.as_f64().ok_or("enter a number")?;
-                if self.kind == "integer" && number.fract() != 0.0 {
-                    return Err("enter a whole number");
+                if self.kind == "integer"
+                    && (number.fract() != 0.0 || number.abs() > MAX_SAFE_INTEGER)
+                {
+                    return Err(
+                        "enter a whole number between -9007199254740991 and 9007199254740991",
+                    );
                 }
                 if self.minimum.is_some_and(|n| number < n)
                     || self.maximum.is_some_and(|n| number > n)
@@ -497,6 +504,34 @@ fn valid_time(text: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn integers_and_defaults_must_survive_browser_json_without_rounding() {
+        let form = Elicitation::parse(
+            "form",
+            &json!({"type":"object","properties":{"n":{"type":"integer"}}}),
+            None,
+        );
+        for n in [
+            9_007_199_254_740_992_i64,
+            9_007_199_254_740_993,
+            -9_007_199_254_740_993,
+        ] {
+            assert!(form
+                .validate(ElicitationAction::Accept, &json!({"n":n}))
+                .is_err());
+            let default = Elicitation::parse(
+                "form",
+                &json!({"type":"object","properties":{"n":{"type":"integer","default":n}}}),
+                None,
+            );
+            assert!(default.unsupported.is_some());
+        }
+        for n in [9_007_199_254_740_991_i64, -9_007_199_254_740_991, 0] {
+            assert!(form
+                .validate(ElicitationAction::Accept, &json!({"n":n}))
+                .is_ok());
+        }
+    }
     #[test]
     fn nested_openai_form_validates_each_object() {
         let form = Elicitation::parse(

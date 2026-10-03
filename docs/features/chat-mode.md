@@ -23,7 +23,10 @@ and the TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branc
 
 Claude and Codex MCP input requests appear as answerable cards in the conversation.
 Text, numeric, boolean, enum and multiple-choice values retain their types; nested
-object forms use field groups. Submit, Decline, and Cancel remain distinct native
+object forms use field groups. Integer inputs and defaults must fit the browser's
+exact integer range (−9007199254740991 to 9007199254740991); larger values are refused
+instead of rounded. An unanswered standalone request keeps its attention badge
+when another turn starts or is stopped. Submit, Decline, and Cancel remain distinct native
 MCP decisions. Unsupported schema constraints explain the limitation and offer
 Decline/Cancel; Chimaera never accepts an empty replacement form.
 

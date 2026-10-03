@@ -13,6 +13,15 @@ describe("MCP form input", () => {
     expect(formValues([field("enabled", "boolean", {required: false}), field("n", "number", {required: false})], {})).toEqual({});
     expect(formErrors([field("n", "integer", {minimum: 0})], {n: -1})).toHaveProperty("n");
   });
+  it("refuses integer text that would change when serialized as a browser number", () => {
+    const fields = [field("n", "integer")];
+    for (const n of ["9007199254740993", "-9007199254740993", "9007199254740992", "1.5"]) {
+      expect(formErrors(fields, formValues(fields, {n}))).toHaveProperty("n");
+    }
+    for (const n of ["9007199254740991", "-9007199254740991", "0"]) {
+      expect(formErrors(fields, formValues(fields, {n}))).toEqual({});
+    }
+  });
   it("does not create an untouched optional object from child defaults", () => {
     const fields = [field("profile", "object", {required: false, fields: [field("owner", "string"), field("enabled", "boolean", {default: false})]})];
     expect(formValues(fields, {})).toEqual({});

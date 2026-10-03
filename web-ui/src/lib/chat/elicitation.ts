@@ -63,7 +63,7 @@ export function formErrors(fields: ElicitationField[], values: Record<string, un
       }
     } else if (field.kind === "number" || field.kind === "integer") {
       if (typeof value !== "number" || !Number.isFinite(value)) errors[field.name] = "Enter a number.";
-      else if (field.kind === "integer" && !Number.isInteger(value)) errors[field.name] = "Enter a whole number.";
+      else if (field.kind === "integer" && !Number.isSafeInteger(value)) errors[field.name] = "Enter a whole number between -9007199254740991 and 9007199254740991.";
       else if ((field.minimum !== null && value < field.minimum) || (field.maximum !== null && value > field.maximum)) errors[field.name] = "Number is outside the allowed range.";
     } else if (field.kind === "boolean") {
       if (typeof value !== "boolean") errors[field.name] = "Choose yes or no.";
