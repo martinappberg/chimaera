@@ -14,7 +14,9 @@ use tokio::{
 
 const QUERIES: [&str; 6] = [
     "HostKeyAlgorithms",
-    "CASignatureAlgorithms",
+    // `sig` enumerates plain signature algorithms on both OpenSSH 9.2 and
+    // newer clients. The option-name query alias was added after 9.2.
+    "sig",
     "PubkeyAcceptedAlgorithms",
     "KexAlgorithms",
     "Ciphers",
@@ -302,5 +304,19 @@ mod tests {
             assert!(parse(text).is_err());
         }
         assert!(parse(&"a".repeat(129)).is_err());
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fixed_client_signature_query_supports_ca_allowlist_without_added_algorithms() {
+        let support = SshAlgorithmSupport::capture().await.unwrap();
+        let mut original = policy();
+        original.ca_signature_algorithms = vec![
+            "fixture-unsupported-ca-signature".into(),
+            "ssh-ed25519".into(),
+        ];
+        let narrowed = support.restrict(&original).unwrap();
+        assert_eq!(narrowed.ca_signature_algorithms, vec!["ssh-ed25519"]);
+        original.ca_signature_algorithms = vec!["fixture-unsupported-ca-signature".into()];
+        assert!(support.restrict(&original).is_err());
     }
 }
