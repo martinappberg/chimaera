@@ -222,6 +222,11 @@ impl RoutePromptGuard {
             && !*self.context.stop.borrow()
             && !*self.context.cancel.borrow()
             && self.context.deadline > tokio::time::Instant::now()
+            && self.context.grant.policies.as_ref().is_none_or(|policies| {
+                policies
+                    .get(usize::from(self.auth.leg))
+                    .is_some_and(|policy| policy.permits_interaction())
+            })
             && (self.auth.mode == chimaera_link::SshRouteMode::Interactive
                 || self.context.signed.load(Ordering::SeqCst) & (1 << self.auth.leg) != 0)
     }
@@ -292,7 +297,7 @@ mod tests {
     }
     fn grant(request: &chimaera_link::SshRouteGrantRequest) -> chimaera_link::SshRouteGrant {
         chimaera_link::SshRouteGrant {
-            policies: None,
+            policies: request.legs.iter().map(|leg| leg.policy.clone()).collect(),
             version: 1,
             grant_id: "grant".into(),
             expires_in: 180,
@@ -312,6 +317,46 @@ mod tests {
             mode: request.legs[usize::from(leg)].mode,
             destination: request.legs[usize::from(leg)].destination.clone(),
         }
+    }
+    #[tokio::test]
+    async fn key_only_policy_never_opens_a_prompt_even_after_its_own_signature() {
+        let registry = Registry::default();
+        let attempt = registry.admit(0).ok().unwrap();
+        let mut request = request();
+        for leg in &mut request.legs {
+            leg.policy = Some(chimaera_link::SshRoutePolicy {
+                version: 1,
+                methods: if leg.mode == chimaera_link::SshRouteMode::Key {
+                    vec![chimaera_link::SshRouteMethod::Publickey]
+                } else {
+                    vec![chimaera_link::SshRouteMethod::Password]
+                },
+                host_key_algorithms: vec!["ssh-ed25519".into()],
+                ca_signature_algorithms: vec!["ssh-ed25519".into()],
+                pubkey_accepted_algorithms: vec!["ssh-ed25519".into()],
+                kex_algorithms: vec!["curve25519-sha256".into()],
+                ciphers: vec!["chacha20-poly1305@openssh.com".into()],
+                macs: vec!["hmac-sha2-256-etm@openssh.com".into()],
+            });
+        }
+        let receipt = grant(&request);
+        let owner = attempt
+            .bind_route(
+                "host",
+                &receipt,
+                &request,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .ok()
+            .unwrap();
+        let proof = owner.proof();
+        proof.signed(0);
+        assert!(registry
+            .route_prompt(0, "host", &auth(&request, 0))
+            .is_none());
+        assert!(registry
+            .route_prompt(0, "host", &auth(&request, 1))
+            .is_some());
     }
     #[tokio::test]
     async fn route_prompt_requires_original_owner_exact_metadata_and_own_leg_signature() {

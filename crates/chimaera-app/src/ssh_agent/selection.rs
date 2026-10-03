@@ -79,13 +79,26 @@ pub(super) async fn from_native_config(
     environment_agent: Option<PathBuf>,
     keeper_boot: String,
 ) -> Result<Selection> {
+    from_native_config_inner(text, home, environment_agent, keeper_boot, false).await
+}
+async fn from_native_config_inner(
+    text: &str,
+    home: &Path,
+    environment_agent: Option<PathBuf>,
+    keeper_boot: String,
+    routed_policy: bool,
+) -> Result<Selection> {
     let config = Config::parse(text)?;
     let algorithms = config.algorithms()?;
     let (destination, host_keys) = trusted_host(&config, home, &algorithms).await?;
     if !config.key_enabled()? {
         return Err(SelectionFailure::NoKeys);
     }
-    config.key_mfa_policy()?;
+    if routed_policy {
+        config.route_policy(chimaera_link::SshRouteMode::Key)?;
+    } else {
+        config.key_mfa_policy()?;
+    }
     let socket = match config.one("identityagent")? {
         None | Some("SSH_AUTH_SOCK") => {
             environment_agent.ok_or(SelectionFailure::AgentUnavailable)?
@@ -200,7 +213,13 @@ pub(super) async fn from_routed_config(
     keeper_boot: String,
 ) -> Result<Selection> {
     let text = routed_text(text)?;
-    from_native_config(&text, home, environment_agent, keeper_boot).await
+    from_native_config_inner(&text, home, environment_agent, keeper_boot, true).await
+}
+pub(super) fn resolved_policy(
+    text: &str,
+    mode: chimaera_link::SshRouteMode,
+) -> Result<chimaera_link::SshRoutePolicy> {
+    Config::parse_mode(text, true)?.route_policy(mode)
 }
 fn routed_text(text: &str) -> Result<String> {
     route_settings(text)?;
@@ -233,10 +252,10 @@ pub(super) async fn routed_interactive(
     let text = routed_text(text)?;
     let config = Config::parse(&text)?;
     let algorithms = config.algorithms()?;
-    config.interactive_policy()?;
+    let policy = config.route_policy(chimaera_link::SshRouteMode::Interactive)?;
     let (destination, host_keys) = trusted_host(&config, home, &algorithms).await?;
     Ok(chimaera_link::SshRouteAuthLeg {
-        policy: None,
+        policy: Some(policy),
         destination,
         mode: chimaera_link::SshRouteMode::Interactive,
         host_keys,
@@ -358,21 +377,67 @@ impl<'a> Config<'a> {
         }
         Ok(())
     }
-    fn interactive_policy(&self) -> Result<()> {
-        // Version one represents both interactive methods, in this order.
-        // A narrower local policy must refuse until the DTO can preserve it.
-        let methods = self.preferred()?;
-        if !self.enabled("passwordauthentication")?
-            || !self.enabled("kbdinteractiveauthentication")?
-            || methods
-                .iter()
-                .position(|method| *method == "keyboard-interactive")
-                .zip(methods.iter().position(|method| *method == "password"))
-                .is_none_or(|(kbd, password)| kbd > password)
-        {
-            return Err(SelectionFailure::UnsupportedConfiguration);
+    fn route_policy(
+        &self,
+        mode: chimaera_link::SshRouteMode,
+    ) -> Result<chimaera_link::SshRoutePolicy> {
+        use chimaera_link::{SshRouteMethod, SshRouteMode, SshRoutePolicy};
+        let preferred = self.preferred()?;
+        for option in ["gssapiauthentication", "hostbasedauthentication"] {
+            if self
+                .one(option)?
+                .is_some_and(|value| !matches!(value, "no" | "false"))
+            {
+                return Err(SelectionFailure::UnsupportedConfiguration);
+            }
         }
-        Ok(())
+        let mut methods = Vec::new();
+        for method in preferred {
+            let selected = match method {
+                "publickey" if mode == SshRouteMode::Key && self.key_enabled()? => {
+                    Some(SshRouteMethod::Publickey)
+                }
+                "keyboard-interactive" if self.enabled("kbdinteractiveauthentication")? => {
+                    Some(SshRouteMethod::KeyboardInteractive)
+                }
+                "password" if self.enabled("passwordauthentication")? => {
+                    Some(SshRouteMethod::Password)
+                }
+                _ => None,
+            };
+            if let Some(method) = selected {
+                methods.push(method);
+            }
+        }
+        let list = |name| -> Result<Vec<String>> {
+            let value = self
+                .one(name)?
+                .ok_or(SelectionFailure::UnsupportedConfiguration)?;
+            let mut names = Vec::new();
+            for name in value.split(',') {
+                if !names.iter().any(|existing| existing == name) {
+                    names.push(name.to_owned());
+                }
+                if names.len() > 64 {
+                    return Err(SelectionFailure::UnsupportedConfiguration);
+                }
+            }
+            Ok(names)
+        };
+        let policy = SshRoutePolicy {
+            version: 1,
+            methods,
+            host_key_algorithms: list("hostkeyalgorithms")?,
+            ca_signature_algorithms: list("casignaturealgorithms")?,
+            pubkey_accepted_algorithms: list("pubkeyacceptedalgorithms")?,
+            kex_algorithms: list("kexalgorithms")?,
+            ciphers: list("ciphers")?,
+            macs: list("macs")?,
+        };
+        policy
+            .validate(mode)
+            .map_err(|_| SelectionFailure::UnsupportedConfiguration)?;
+        Ok(policy)
     }
     async fn public_identities(&self, home: &Path) -> Result<BTreeSet<String>> {
         let mut keys = BTreeSet::new();

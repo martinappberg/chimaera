@@ -22,6 +22,47 @@ fn line(host: &str, seed: u8) -> String {
 fn encoded(seed: u8) -> String {
     STANDARD.encode(key(seed).to_bytes().unwrap())
 }
+#[test]
+fn resolved_route_policy_preserves_key_only_and_ordered_methods_and_six_crypto_lists() {
+    use chimaera_link::{SshRouteMethod::*, SshRouteMode};
+    let base = format!("{}hostkeyalgorithms ssh-ed25519,ecdsa-sha2-nistp256\npubkeyacceptedalgorithms ssh-ed25519\ncasignaturealgorithms ssh-ed25519\nkexalgorithms curve25519-sha256\nciphers chacha20-poly1305@openssh.com\nmacs hmac-sha2-256-etm@openssh.com\n", config());
+    for (setting, expected) in [
+        (
+            "kbdinteractiveauthentication no\npasswordauthentication no",
+            vec![Publickey],
+        ),
+        (
+            "passwordauthentication no",
+            vec![Publickey, KeyboardInteractive],
+        ),
+        (
+            "preferredauthentications publickey,password,keyboard-interactive",
+            vec![Publickey, Password, KeyboardInteractive],
+        ),
+    ] {
+        let policy = resolved_policy(&format!("{base}{setting}\n"), SshRouteMode::Key).unwrap();
+        assert!(policy.methods == expected);
+        assert_eq!(
+            policy.host_key_algorithms,
+            ["ssh-ed25519", "ecdsa-sha2-nistp256"]
+        );
+        assert_eq!(policy.kex_algorithms, ["curve25519-sha256"]);
+        assert_eq!(policy.ciphers, ["chacha20-poly1305@openssh.com"]);
+        assert_eq!(policy.macs, ["hmac-sha2-256-etm@openssh.com"]);
+    }
+    for setting in [
+        "preferredauthentications password,publickey",
+        "kbdinteractiveauthentication invalid",
+        "gssapiauthentication yes",
+    ] {
+        assert!(resolved_policy(&format!("{base}{setting}\n"), SshRouteMode::Key).is_err());
+    }
+    let modified = base.replace(
+        "kexalgorithms curve25519-sha256",
+        "kexalgorithms +curve25519-sha256",
+    );
+    assert!(resolved_policy(&modified, SshRouteMode::Key).is_err());
+}
 fn string(out: &mut Vec<u8>, value: &[u8]) {
     out.extend_from_slice(&(value.len() as u32).to_be_bytes());
     out.extend_from_slice(value);

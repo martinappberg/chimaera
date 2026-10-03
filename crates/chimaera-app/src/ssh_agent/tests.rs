@@ -190,6 +190,40 @@ async fn legitimate_hostbound_auth_signs_only_after_verified_local_agent_binding
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
+#[tokio::test]
+async fn valid_session_bind_never_authorizes_an_ordinary_unbound_publickey_signature() {
+    let mock = Mock::new();
+    let calls = mock.calls.clone();
+    let mut checked = verifier(mock);
+    let session = b"legacy-server-session";
+    assert!(matches!(
+        checked
+            .handle(bind_request("legacy", 1, valid_bind(session)))
+            .await,
+        Ok(Some(SshAuthReply::Bound { .. }))
+    ));
+    let user = public(&key(2));
+    let mut data = Vec::new();
+    string(&mut data, session);
+    data.push(50);
+    for value in [b"alice".as_slice(), b"ssh-connection", b"publickey"] {
+        string(&mut data, value);
+    }
+    data.push(1);
+    string(&mut data, b"ssh-ed25519");
+    string(&mut data, &user);
+    assert!(matches!(
+        checked
+            .handle(sign_request("legacy", 2, sign_packet(&user, &data, 0)))
+            .await,
+        Ok(Some(SshAuthReply::Failure { .. }))
+    ));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "only the valid binding reaches the agent; the legacy signature never does"
+    );
+}
 
 #[tokio::test]
 async fn malicious_keeper_cannot_sign_another_user_key_host_session_or_unbound_bytes() {

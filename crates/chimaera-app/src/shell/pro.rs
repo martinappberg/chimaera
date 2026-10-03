@@ -2293,7 +2293,7 @@ pub async fn pro_set_host_kept(app: AppHandle, alias: String, kept: bool) -> Res
                 port: destination.port,
             };
             client
-                .register_ssh_route_host(&alias, target, route, policy)
+                .register_ssh_policy_route_host(&alias, target, route, policy)
                 .await
                 .map(|value| value.host)
                 .map_err(|_| HOST_UPDATE_FAILED)?

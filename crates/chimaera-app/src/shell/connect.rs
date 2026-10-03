@@ -816,7 +816,7 @@ async fn explicit_keeper_connect(
         let caps = client.ssh_auth_capabilities().await.map_err(|_| {
             "This keeper needs an update before connecting with this Mac's SSH keys"
         })?;
-        if !caps.route_supported() {
+        if !caps.route_policy_supported() {
             return Err("This keeper needs an update before native route authentication".into());
         }
         let selection = tokio::select! {

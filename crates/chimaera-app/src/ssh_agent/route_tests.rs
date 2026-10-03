@@ -500,7 +500,7 @@ async fn each_leg_selects_its_own_native_agent_and_public_host_trust() {
             socket.write_u32(reply.len() as u32).await.unwrap();
             socket.write_all(&reply).await.unwrap();
         }));
-        let text = format!("hostname {hostname}\nuser {user}\nport {port}\npubkeyauthentication true\nidentitiesonly no\nhostkeyalgorithms ssh-ed25519\npubkeyacceptedalgorithms ssh-ed25519\ncasignaturealgorithms ssh-ed25519\nidentityagent {}\nuserknownhostsfile {}\nglobalknownhostsfile none\nproxyjump {}\n", socket.display(), known.display(), if n == 3 {"jump"} else {"none"});
+        let text = format!("hostname {hostname}\nuser {user}\nport {port}\npubkeyauthentication true\nidentitiesonly no\nhostkeyalgorithms ssh-ed25519\npubkeyacceptedalgorithms ssh-ed25519\ncasignaturealgorithms ssh-ed25519\nkexalgorithms curve25519-sha256\nciphers chacha20-poly1305@openssh.com\nmacs hmac-sha2-256-etm@openssh.com\nidentityagent {}\nuserknownhostsfile {}\nglobalknownhostsfile none\nproxyjump {}\n", socket.display(), known.display(), if n == 3 {"jump"} else {"none"});
         effective.push(Effective {
             text,
             destination: SshAuthDestination {
@@ -532,7 +532,7 @@ async fn each_leg_selects_its_own_native_agent_and_public_host_trust() {
 
 fn grant(request: &SshRouteGrantRequest) -> chimaera_link::SshRouteGrant {
     chimaera_link::SshRouteGrant {
-        policies: None,
+        policies: request.legs.iter().map(|leg| leg.policy.clone()).collect(),
         version: 1,
         grant_id: "synthetic".into(),
         expires_in: 180,
@@ -648,7 +648,7 @@ async fn interactive_selection_requires_native_public_trust_and_never_downgrades
     )
     .unwrap();
     let text = |agent: &str, trust: &Path| {
-        format!("hostname target.example.invalid\nuser person\nport 22\npubkeyauthentication true\nidentitiesonly no\nhostkeyalgorithms ssh-ed25519\npubkeyacceptedalgorithms ssh-ed25519\ncasignaturealgorithms ssh-ed25519\nidentityagent {agent}\nuserknownhostsfile {}\nglobalknownhostsfile none\nproxyjump none\n", trust.display())
+        format!("hostname target.example.invalid\nuser person\nport 22\npubkeyauthentication true\nidentitiesonly no\nhostkeyalgorithms ssh-ed25519\npubkeyacceptedalgorithms ssh-ed25519\ncasignaturealgorithms ssh-ed25519\nkexalgorithms curve25519-sha256\nciphers chacha20-poly1305@openssh.com\nmacs hmac-sha2-256-etm@openssh.com\nidentityagent {agent}\nuserknownhostsfile {}\nglobalknownhostsfile none\nproxyjump none\n", trust.display())
     };
     let effective = |text| {
         vec![Effective {
@@ -712,25 +712,29 @@ async fn interactive_selection_requires_native_public_trust_and_never_downgrades
             "no agent enumeration is allowed for {policy}"
         );
     }
-    for policy in [
-        "passwordauthentication no",
-        "kbdinteractiveauthentication no",
-        "preferredauthentications password",
-        "preferredauthentications password,keyboard-interactive",
-        "passwordauthentication unsupported",
+    use chimaera_link::SshRouteMethod::{KeyboardInteractive, Password};
+    for (policy, expected) in [
+        ("passwordauthentication no", vec![KeyboardInteractive]),
+        ("kbdinteractiveauthentication no", vec![Password]),
+        ("preferredauthentications password", vec![Password]),
+        (
+            "preferredauthentications password,keyboard-interactive",
+            vec![Password, KeyboardInteractive],
+        ),
     ] {
         let restricted = format!("{}{}\n", text("none", &known), policy);
+        let selected = select(effective(restricted), &fixture.0, None, "boot".into())
+            .await
+            .unwrap();
         assert!(
-            matches!(
-                select(effective(restricted), &fixture.0, None, "boot".into()).await,
-                Err(SelectionFailure::UnsupportedConfiguration)
-            ),
-            "unsupported restrictions cannot silently widen: {policy}"
+            selected.request.legs[0].policy.as_ref().unwrap().methods == expected,
+            "disabled methods and exact preference order survive: {policy}"
         );
     }
     for policy in [
-        "kbdinteractiveauthentication no",
+        "passwordauthentication unsupported",
         "preferredauthentications keyboard-interactive,publickey,password",
+        "gssapiauthentication yes",
     ] {
         let restricted = format!("{}{}\n", text(missing.to_str().unwrap(), &known), policy);
         assert!(
@@ -738,9 +742,17 @@ async fn interactive_selection_requires_native_public_trust_and_never_downgrades
                 select(effective(restricted), &fixture.0, None, "boot".into()).await,
                 Err(SelectionFailure::UnsupportedConfiguration)
             ),
-            "key-mode MFA must respect local method policy: {policy}"
+            "unsupported policy cannot widen: {policy}"
         );
     }
+    let no_interaction = format!(
+        "{}passwordauthentication no\nkbdinteractiveauthentication no\n",
+        text("none", &known)
+    );
+    assert!(matches!(
+        select(effective(no_interaction), &fixture.0, None, "boot".into()).await,
+        Err(SelectionFailure::UnsupportedConfiguration)
+    ));
     let no_trust = fixture.0.join("missing-trust");
     assert!(matches!(
         select(

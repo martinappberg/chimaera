@@ -281,7 +281,7 @@ async fn select(
         match selection::from_routed_config(&leg.text, home, agent.clone(), boot.clone()).await {
             Ok(selected) => {
                 requests.push(SshRouteAuthLeg {
-                    policy: None,
+                    policy: Some(selection::resolved_policy(&leg.text, SshRouteMode::Key)?),
                     destination: selected.request.destination.clone(),
                     mode: SshRouteMode::Key,
                     host_keys: selected.request.host_keys.clone(),
