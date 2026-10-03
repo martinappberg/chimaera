@@ -6,8 +6,11 @@ use axum::{
     http::{Request, Response},
 };
 use chimaera_core::provider_runtime as wire;
-use http_body_util::BodyExt;
-use hyper::{body::Incoming, server::conn::http1, service::service_fn};
+use hyper::{
+    body::{Body as HttpBody, Incoming},
+    server::conn::http1,
+    service::service_fn,
+};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use std::{
     convert::Infallible,
@@ -132,7 +135,8 @@ async fn listen(listener: TcpListener, state: Arc<FrontendState>) {
                         .timer(TokioTimer::new()).header_read_timeout(HEADER_TIME);
                     let connection = builder.serve_connection(TokioIo::new(socket), service);
                     let _ = state.child.wait(connection).await;
-                    if let Some(owner) = crate::lock(&retained).take() { drop(owner.observer()); }
+                    let owner = crate::lock(&retained).take();
+                    if let Some(owner) = owner { drop(owner.observer()); }
                 });
             }
         }
@@ -467,7 +471,12 @@ async fn exchange(
     let upload = async {
         let mut count = wire::BodyCount::new(declared)?;
         let work = async {
-            while let Some(frame) = owner.wait(incoming.frame()).await? {
+            while let Some(frame) = owner
+                .wait(futures::future::poll_fn(|context| {
+                    Pin::new(&mut incoming).poll_frame(context)
+                }))
+                .await?
+            {
                 if Instant::now() >= upload_deadline {
                     return Err(wire::Error::Unavailable);
                 }
