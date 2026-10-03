@@ -328,9 +328,7 @@ fn refusal(error: wire::Error) -> Response<Body> {
     };
     let body =
         wire::ClaudeErrorBody::for_status(status).and_then(|body| wire::encode_control(&body));
-    let bytes = body
-        .map(|bytes| bytes::Bytes::from_owner(bytes))
-        .unwrap_or_default();
+    let bytes = body.map(bytes::Bytes::from_owner).unwrap_or_default();
     Response::builder()
         .status(status)
         .header("Content-Type", "application/json")
