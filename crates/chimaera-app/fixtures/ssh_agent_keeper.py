@@ -530,6 +530,10 @@ class Keeper(Sources):
                         "authenticated": b"KEEPER_AUTHENTICATED\n" in output,
                         "failed_marker": b"KEEPER_FAILED\n" in output,
                         "expected_marker": expected in output, "leg_counts": counts,
+                        "outcomes": [name for name in ("success", "unsupported", "invalid_binding",
+                            "invalid_request", "key_unavailable", "agent_refused", "expired",
+                            "revoked", "unavailable", "unknown")
+                            if ("KEEPER_OUTCOME " + name + "\n").encode("ascii") in output],
                         "proxy_failed": proxy.failed, "gateway_failed": gateway.failed,
                         "gateway_connections": gateway.total,
                     }, separators=(",", ":")), flush=True)

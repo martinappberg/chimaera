@@ -138,6 +138,21 @@ pub(super) async fn run(config: PathBuf, endpoint: String, action: String) -> Re
     } else {
         authenticate.await
     };
+    println!(
+        "{}",
+        match &result {
+            Ok(()) => "KEEPER_OUTCOME success",
+            Err(Failure::Unsupported) => "KEEPER_OUTCOME unsupported",
+            Err(Failure::InvalidBinding) => "KEEPER_OUTCOME invalid_binding",
+            Err(Failure::InvalidRequest) => "KEEPER_OUTCOME invalid_request",
+            Err(Failure::KeyUnavailable) => "KEEPER_OUTCOME key_unavailable",
+            Err(Failure::AgentRefused) => "KEEPER_OUTCOME agent_refused",
+            Err(Failure::Expired) => "KEEPER_OUTCOME expired",
+            Err(Failure::Revoked) => "KEEPER_OUTCOME revoked",
+            Err(Failure::Unavailable) => "KEEPER_OUTCOME unavailable",
+            Err(Failure::Unknown) => "KEEPER_OUTCOME unknown",
+        }
+    );
     match (action.as_str(), result) {
         ("accept", Ok(())) => println!("KEEPER_AUTHENTICATED"),
         ("refuse", Err(Failure::AgentRefused)) => println!("KEEPER_REFUSED external"),
