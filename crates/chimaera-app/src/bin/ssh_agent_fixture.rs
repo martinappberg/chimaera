@@ -1,6 +1,6 @@
 //! Synthetic Mac loader fixture: unchanged production modules, no Tauri prompt claim.
 #[cfg(target_os = "macos")]
-#[path = "ssh_agent_fixture/route.rs"]
+#[path = "../ssh_agent_fixture_support/route.rs"]
 mod route;
 #[cfg(target_os = "macos")]
 #[allow(dead_code, unused_imports)]
