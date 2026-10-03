@@ -174,3 +174,72 @@ fn claude_head_and_error_mapping_are_closed_and_fixed() {
     error.error.message = "raw upstream diagnostic".into();
     assert!(error.validate(401).is_err());
 }
+
+#[test]
+fn startup_descriptor_is_closed_nonstdio_and_distinct_from_maintenance() {
+    for fd in [3, 255] {
+        let descriptor = StartupDescriptor { version: 1, fd };
+        assert!(descriptor.validate(None).is_ok());
+        assert!(descriptor.validate(Some(fd + 1)).is_ok());
+        assert!(descriptor.validate(Some(fd)).is_err());
+    }
+    for (version, fd) in [(2, 3), (1, -1), (1, 0), (1, 2), (1, 256)] {
+        assert!(StartupDescriptor { version, fd }.validate(None).is_err());
+    }
+    for value in [
+        json!({"version":1,"fd":3,"path":"/tmp/selected"}),
+        json!({"version":1}),
+        json!({"version":1,"fd":"3"}),
+    ] {
+        assert!(serde_json::from_value::<StartupDescriptor>(value).is_err());
+    }
+    assert!(serde_json::from_str::<StartupDescriptor>(r#"{"version":1,"fd":3,"fd":4}"#).is_err());
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct OptionalCleanup {
+        provider_runtime: Option<StartupDescriptor>,
+    }
+    // This models only the additive selector, not the real cleanup consumer.
+    assert!(serde_json::from_str::<OptionalCleanup>("{}")
+        .unwrap()
+        .provider_runtime
+        .is_none());
+}
+
+#[test]
+fn startup_payload_is_bounded_closed_and_matches_the_exact_expected_binding() {
+    let r = parsed(json!({"type":"ready"}));
+    let good = json!({"version":1,"binding":r.binding,"capability":"a".repeat(42)+"A"});
+    let encoded = serde_json::to_vec(&good).unwrap();
+    let payload = StartupPayload::decode(&encoded).unwrap();
+    let owned = payload.encode().unwrap();
+    assert_eq!(owned.capacity(), STARTUP_MAX);
+    assert_eq!(serde_json::from_slice::<Value>(&owned).unwrap(), good);
+    assert!(StartupPayload::decode(&vec![b' '; STARTUP_MAX + 1]).is_err());
+    assert!(StartupPayload::decode(&encoded[..encoded.len() - 1]).is_err());
+    for (pointer, value) in [
+        ("/version", json!(2)),
+        ("/binding/workspace_id", json!("sibling")),
+        ("/binding/project_revision", json!(2)),
+        ("/binding/launch_generation", json!(3)),
+        ("/binding/enrollment/holder_id", json!("replacement-worker")),
+        ("/binding/enrollment/registration_generation", json!(2)),
+    ] {
+        let mut bad = good.clone();
+        *bad.pointer_mut(pointer).unwrap() = value;
+        assert!(StartupPayload::decode(&serde_json::to_vec(&bad).unwrap())
+            .and_then(|payload| payload.validate(&r.binding))
+            .is_err());
+    }
+    let mut bad = good.clone();
+    bad["socket"] = json!("/tmp/upstream");
+    assert!(StartupPayload::decode(&serde_json::to_vec(&bad).unwrap())
+        .and_then(|payload| payload.validate(&r.binding))
+        .is_err());
+    let duplicate = String::from_utf8(encoded).unwrap().replacen(
+        "\"capability\":",
+        "\"capability\":\"synthetic\",\"capability\":",
+        1,
+    );
+    assert!(StartupPayload::decode(duplicate.as_bytes()).is_err());
+}

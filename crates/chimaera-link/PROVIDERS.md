@@ -700,6 +700,45 @@ returned access tokens cannot be erased. Successor broker startup must wait for
 positive ownership/drain of all old access/refresh effects as well as login
 cleanup. This checkpoint keeps runtime startup and capability advertisement off.
 
+### Inherited project runtime startup v1
+
+The existing closed supervisor cleanup receipt may include the optional,
+nonsecret field `provider_runtime: {version: 1, fd: <integer>}`. Its descriptor
+must be 3..255 and distinct from the optional maintenance descriptor. Omission
+preserves the legacy launch path. This field names only a supervisor-created,
+read-only one-shot pipe; it accepts no socket path, upstream, executable, user,
+provider home or other selector. The only runtime listener path is the fixed
+project-local `/run/chimaera/providers.sock`.
+
+The pipe carries one closed JSON payload `{version: 1, binding, capability}`,
+using the binding and capability above, with an exact maximum of 4096 bytes and
+EOF required. Unknown/duplicate fields, other versions, malformed or truncated
+payloads, extra bytes and mismatched bindings refuse startup. Secret-bearing
+encoding and actual read buffers reserve the complete bound before receiving
+secret bytes, are zeroized on drop, and do not grow. The moved payload and
+capability have no Debug or Clone implementation. Cloneable cleanup metadata
+retains only the nonsecret descriptor selector; no capability is placed in
+environment variables or copied into cleanup receipts.
+
+The future real consumer must share the original three-second startup deadline
+across reading the cleanup receipt and provider pipe; opening the second channel
+does not restart its budget. Before reading, it takes exclusive descriptor
+ownership, verifies an actual FIFO read end (`O_RDONLY`), marks it CLOEXEC and
+nonblocking, and refuses stdio/maintenance aliasing. It requires bounded EOF and
+closes the provider descriptor on every outcome before any child launch. The
+launcher transfers only explicit allowed descriptors and must never expose the
+bootstrap capability to children. A serialized selector or payload is not an
+admission or a descriptor protection proof.
+
+The binding's account, workspace, project revision and launch generation must
+match the exact accepted cleanup/configuration. Its complete enrollment must
+also match the actual positively Ready sealed supervisor attachment at the
+fixed listener; cleanup metadata alone cannot establish current enrollment.
+Inactive, stale or unknown attachment refuses before agents start. This pure
+codec checkpoint does not implement or verify pipe inspection, deadline
+ownership, process protection, Ready exchange or pre-child descriptor closure;
+those require consumer integration and actual inherited-FD tests.
+
 ## Migration and enablement gates
 
 Before importing an existing official cloud login, the supervisor exclusively

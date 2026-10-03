@@ -11,6 +11,7 @@ pub const ACCESS_MAX: usize = 32 * 1024;
 pub const STREAMS_GLOBAL: usize = 16;
 pub const STREAMS_PROJECT: usize = 8;
 pub const QUEUE_MAX: usize = 16;
+pub const STARTUP_MAX: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -127,6 +128,57 @@ impl<'de> Deserialize<'de> for Capability {
 impl Serialize for Capability {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(self.expose())
+    }
+}
+
+/// Nonsecret cleanup metadata only. Validation does not inspect or own an FD.
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StartupDescriptor {
+    pub version: u16,
+    pub fd: i32,
+}
+impl StartupDescriptor {
+    pub fn validate(&self, maintenance_fd: Option<i32>) -> Result<(), Error> {
+        if self.version == 1 && (3..=255).contains(&self.fd) && maintenance_fd != Some(self.fd) {
+            Ok(())
+        } else {
+            Err(Error::InvalidRequest)
+        }
+    }
+}
+
+/// Moved once from the trusted pipe. No Clone/Debug or serialized authority proof.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartupPayload {
+    pub version: u16,
+    pub binding: Binding,
+    pub capability: Capability,
+}
+impl StartupPayload {
+    pub fn validate(&self, expected: &Binding) -> Result<(), Error> {
+        self.binding.validate()?;
+        expected.validate()?;
+        if self.version == 1 && self.binding == *expected {
+            Ok(())
+        } else {
+            Err(Error::InvalidRequest)
+        }
+    }
+    /// Decode once before the consumer obtains current enrollment from Ready.
+    /// This validates structure only; the consumer must separately correlate it.
+    pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.is_empty() || bytes.len() > STARTUP_MAX {
+            return Err(Error::InvalidRequest);
+        }
+        let value: Self = serde_json::from_slice(bytes).map_err(|_| Error::InvalidRequest)?;
+        value.validate(&value.binding)?;
+        Ok(value)
+    }
+    pub fn encode(&self) -> Result<Zeroizing<Vec<u8>>, Error> {
+        self.validate(&self.binding)?;
+        encode_bounded(self, STARTUP_MAX)
     }
 }
 pub struct AccessToken(Zeroizing<String>);
@@ -517,22 +569,31 @@ fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, Error> {
 
 /// Preallocate the whole bound so secret-bearing growth cannot free old buffers.
 pub fn encode_control<T: Serialize>(value: &T) -> Result<Zeroizing<Vec<u8>>, Error> {
-    struct Writer(Zeroizing<Vec<u8>>);
+    encode_bounded(value, CONTROL_MAX)
+}
+fn encode_bounded<T: Serialize>(value: &T, limit: usize) -> Result<Zeroizing<Vec<u8>>, Error> {
+    struct Writer {
+        bytes: Zeroizing<Vec<u8>>,
+        limit: usize,
+    }
     impl std::io::Write for Writer {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if bytes.len() > CONTROL_MAX - self.0.len() {
+            if bytes.len() > self.limit - self.bytes.len() {
                 return Err(std::io::Error::other("control frame bound"));
             }
-            self.0.extend_from_slice(bytes);
+            self.bytes.extend_from_slice(bytes);
             Ok(bytes.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
     }
-    let mut writer = Writer(Zeroizing::new(Vec::with_capacity(CONTROL_MAX)));
+    let mut writer = Writer {
+        bytes: Zeroizing::new(Vec::with_capacity(limit)),
+        limit,
+    };
     serde_json::to_writer(&mut writer, value).map_err(|_| Error::InvalidRequest)?;
-    Ok(writer.0)
+    Ok(writer.bytes)
 }
 
 /// Fixed locally generated Claude errors, never upstream messages or bodies.
