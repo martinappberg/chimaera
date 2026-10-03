@@ -377,6 +377,64 @@ def outer(args):
         os.close(lock)
 
 
+def seed_synthetic_workspace_trust():
+    """Only this fresh synthetic fixture owns the original inherited config FD.
+
+    The compatibility gate does not exercise onboarding/trust UX. No path or
+    project selector is accepted: cwd already came from the checked Rust owner.
+    The renamed original directory receives the decision, never its replacement.
+    """
+    value = os.environ.get("CLAUDE_CONFIG_DIR", "")
+    prefix = "/proc/self/fd/"
+    require(value.startswith(prefix) and value[len(prefix):].isdigit(), "tui-admission")
+    descriptor = int(value[len(prefix):])
+    require(descriptor >= 3, "tui-admission")
+    directory = os.fstat(descriptor)
+    require(stat.S_ISDIR(directory.st_mode) and directory.st_uid == os.geteuid() and
+            directory.st_mode & 0o022 == 0, "tui-admission")
+    fd = None
+    try:
+        fd = os.open(".claude.json", os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                     dir_fd=descriptor)
+        metadata = os.fstat(fd)
+        require(stat.S_ISREG(metadata.st_mode) and metadata.st_uid == os.geteuid() and
+                metadata.st_nlink == 1 and metadata.st_mode & 0o022 == 0 and
+                metadata.st_size <= 4096, "tui-admission")
+        raw = bytearray()
+        while True:
+            block = os.read(fd, min(4097 - len(raw), 4096))
+            if not block:
+                break
+            raw.extend(block)
+            require(len(raw) <= 4096, "tui-admission")
+        config = json.loads(raw)
+        # Refuse any populated/shared CLI configuration rather than importing it.
+        require(isinstance(config, dict) and
+                set(config) == {"hasCompletedOnboarding", "bypassPermissionsModeAccepted"} and
+                config["hasCompletedOnboarding"] is True and
+                config["bypassPermissionsModeAccepted"] is True, "tui-admission")
+        cwd = os.getcwd()
+        require(cwd.startswith("/") and cwd != os.environ["HOME"] and
+                len(cwd.encode("utf-8")) <= 4096, "tui-admission")
+        config["projects"] = {cwd: {"hasTrustDialogAccepted": True}}
+        data = json.dumps(config, separators=(",", ":")).encode("utf-8")
+        require(len(data) <= 4096, "tui-admission")
+        os.lseek(fd, 0, os.SEEK_SET)
+        written = 0
+        while written < len(data):
+            count = os.write(fd, data[written:])
+            require(count > 0, "tui-admission")
+            written += count
+        os.ftruncate(fd, len(data))
+        os.fsync(fd)
+        return descriptor
+    except (OSError, ValueError, KeyError, TypeError):
+        raise Refusal("tui-admission") from None
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
 def tui_child():
     """Contained actual PTY + local header recorder; no generic upstream proxy."""
     import pty
@@ -388,6 +446,7 @@ def tui_child():
     target = urlsplit(os.environ["ANTHROPIC_BASE_URL"])
     require(target.scheme == "http" and target.hostname == "127.0.0.1" and
             target.port is not None and target.path == "", "tui-target")
+    config_fd = seed_synthetic_workspace_trust()
     routes = []
     safe_headers = []
     failed = []
@@ -468,7 +527,6 @@ def tui_child():
     thread.start()
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 100, 0, 0))
-    config_fd = int(os.environ["CLAUDE_CONFIG_DIR"].rsplit("/", 1)[1])
     env = dict(os.environ)
     env["TERM"] = "xterm-256color"
     env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:" + str(server.server_port)
