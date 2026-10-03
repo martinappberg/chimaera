@@ -54,6 +54,40 @@ pub(in crate::pro::execution) async fn reply(
     stream.shutdown().await.unwrap();
 }
 #[tokio::test]
+async fn child_root_requires_the_exact_accepted_workspace_authority() {
+    let fixture = Fixture::new(Duration::from_secs(1));
+    fixture.verified().await;
+    let owner = Owner::new(
+        &fixture.state,
+        wire::Command::GithubGhAccess {},
+        Instant::now() + Duration::from_secs(1),
+    )
+    .unwrap();
+    assert_eq!(owner.project_root().unwrap(), fixture.root.join("project"));
+    // Losing scoped authority cannot fall back to a default root. A changed
+    // registration cannot admit the old owner even with the same root path.
+    let original = crate::lock(&fixture.state.pro.authority).clone();
+    *crate::lock(&fixture.state.pro.authority) = crate::pro::authority::Authority::Unbound;
+    assert!(matches!(
+        owner.project_root(),
+        Err(wire::Error::StateChanged)
+    ));
+    let mut replacement = original.clone();
+    if let crate::pro::authority::Authority::Bound(accepted) = &mut replacement {
+        accepted.workspace.revision += 1;
+    } else {
+        panic!("synthetic Configure did not accept workspace authority");
+    }
+    *crate::lock(&fixture.state.pro.authority) = replacement;
+    assert!(matches!(
+        owner.project_root(),
+        Err(wire::Error::StateChanged)
+    ));
+    *crate::lock(&fixture.state.pro.authority) = original;
+    drop(owner);
+    fixture.finish().await;
+}
+#[tokio::test]
 async fn exact_reply_and_eof_return_access_without_opening_execution() {
     let fixture = Fixture::new(Duration::from_secs(1));
     fixture.verified().await;

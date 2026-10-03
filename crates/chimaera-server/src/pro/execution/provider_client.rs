@@ -84,10 +84,30 @@ impl Owner {
     }
     pub(super) fn project_root(&self) -> Result<std::path::PathBuf, wire::Error> {
         self.current()?;
-        crate::lock(&self.state.pro.runtime)
-            .as_ref()
-            .map(|config| config.workspace_root.clone())
-            .ok_or(wire::Error::StateChanged)
+        // Configure keeps the accepted directory in workspace authority, not
+        // its credential configuration. Require the exact captured launch;
+        // never use a default workspace or an unbound caller-selected cwd.
+        let root = {
+            let authority = crate::lock(&self.state.pro.authority);
+            match &*authority {
+                crate::pro::authority::Authority::Bound(accepted)
+                    if accepted.cleanup_binding(
+                        &self.pending.launch.account_id,
+                        &self.pending.launch.workspace_id,
+                        self.pending.launch.registration_revision,
+                        (
+                            self.pending.launch.root_identity.device,
+                            self.pending.launch.root_identity.inode,
+                        ),
+                    ) =>
+                {
+                    accepted.root.clone()
+                }
+                _ => return Err(wire::Error::StateChanged),
+            }
+        };
+        self.current()?;
+        Ok(root)
     }
     pub(super) fn observer(&self) -> Observer {
         Observer {
