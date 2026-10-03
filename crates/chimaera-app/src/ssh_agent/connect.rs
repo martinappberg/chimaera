@@ -44,6 +44,91 @@ fn failure(error: anyhow::Error) -> Failure {
     }
 }
 
+struct RouteLease {
+    client: Client,
+    host: String,
+    grant: chimaera_link::SshRouteGrant,
+    attempt: Option<Attempt>,
+}
+impl Drop for RouteLease {
+    fn drop(&mut self) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let client = self.client.clone();
+        let host = self.host.clone();
+        let grant = self.grant.clone();
+        let attempt = self.attempt.take();
+        runtime.spawn(async move {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(5),
+                client.delete_ssh_route_grant(&host, &grant),
+            )
+            .await;
+            drop(attempt);
+        });
+    }
+}
+
+/// This additive key-only primitive is not wired to native Connect yet. The
+/// caller owns one original Attempt and must validate future route prompt
+/// metadata before adding interactive legs or exposing keeper prompts.
+pub(crate) async fn authenticate_route<T, F, Fut>(
+    client: &Client,
+    host: &str,
+    selection: super::route::RouteSelection,
+    attempt: Attempt,
+    finish: F,
+) -> Result<T, Failure>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T, Failure>>,
+{
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(chimaera_link::SSH_AUTH_LIFETIME.into());
+    let verifier = selection.verifier(deadline)?;
+    let request = verifier.request.clone();
+    let mut cancellation = attempt.cancellation();
+    let control_cancellation = attempt.cancellation();
+    let effect = async {
+        let grant = client
+            .create_ssh_route_grant(host, &request)
+            .await
+            .map_err(failure)?;
+        let lease = RouteLease {
+            client: client.clone(),
+            host: host.into(),
+            grant,
+            attempt: Some(attempt),
+        };
+        let socket = timeout_at(
+            deadline,
+            client.ssh_route_socket(host, &lease.grant, &request.keeper_boot),
+        )
+        .await
+        .map_err(|_| Failure::Expired)?
+        .map_err(failure)?;
+        let reconnect = async {
+            client
+                .reconnect_host_with_ssh_route(host, &lease.grant, &request.keeper_boot)
+                .await
+                .map_err(failure)?;
+            finish().await
+        };
+        tokio::select! {
+            biased;
+            result = control::run_route(verifier, lease.grant.clone(), socket, control_cancellation) => Err(result.err().unwrap_or(Failure::Unavailable)),
+            result = reconnect => result,
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = cancellation.wait_for(|value| *value) => Err(Failure::Revoked),
+        _ = tokio::time::sleep_until(deadline) => Err(Failure::Expired),
+        result = effect => result,
+    }
+}
+
 /// `finish` waits for the same keeper-owned Connect result. It is invoked only
 /// after exact Ready and accepted grant-bound Reconnect, never on passive reads.
 /// The attempt remains owned here through that outcome; account change or owner

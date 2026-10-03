@@ -204,3 +204,91 @@ async fn account_change_cancels_pending_connect_without_replaying_or_removing_ho
         .iter()
         .any(|item| item.id == host.id));
 }
+
+#[tokio::test]
+async fn route_cleanup_survives_observer_abort_and_retains_shared_budget_until_http_settles() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let keeper = FakeKeeper::new(format!("http://{}", listener.local_addr().unwrap()));
+    let entered = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    let waiting = entered.clone();
+    let settled = release.clone();
+    let router = keeper.router().route(
+        "/v1/hosts/host/ssh/auth/route-grants/grant",
+        axum::routing::delete(move |headers: axum::http::HeaderMap| {
+            let waiting = waiting.clone();
+            let settled = settled.clone();
+            async move {
+                assert_eq!(
+                    headers.get("authorization").unwrap(),
+                    "Bearer fake-keeper-local-token"
+                );
+                waiting.add_permits(1);
+                settled.acquire().await.unwrap().forget();
+                axum::http::StatusCode::NO_CONTENT
+            }
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = Client::new(&keeper.endpoint, Some(FakeKeeper::tokens())).unwrap();
+    let registry = Registry::default();
+    let mut tasks = Vec::new();
+    let held = Arc::new(Semaphore::new(0));
+    for _ in 0..4 {
+        let lease = RouteLease {
+            client: client.clone(),
+            host: "host".into(),
+            grant: chimaera_link::SshRouteGrant {
+                version: 1,
+                grant_id: "grant".into(),
+                expires_in: 180,
+                destination: chimaera_link::SshAuthDestination {
+                    hostname: "synthetic.example.invalid".into(),
+                    user: "synthetic".into(),
+                    port: 22,
+                },
+                route: chimaera_link::SshRoute {
+                    version: 1,
+                    jumps: Vec::new(),
+                },
+                modes: vec![chimaera_link::SshRouteMode::Key],
+            },
+            attempt: Some(registry.admit(0).ok().unwrap()),
+        };
+        let held = held.clone();
+        tasks.push(tokio::spawn(async move {
+            let _lease = lease;
+            held.add_permits(1);
+            std::future::pending::<()>().await;
+        }));
+    }
+    tokio::time::timeout(Duration::from_secs(2), held.acquire_many(4))
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    for task in tasks {
+        task.abort();
+        let _ = task.await;
+    }
+    tokio::time::timeout(Duration::from_secs(2), entered.acquire_many(4))
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    registry.advance(1);
+    assert!(matches!(registry.admit(1), Err(Failure::Unavailable)));
+    release.add_permits(4);
+    let attempt = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(attempt) = registry.admit(1) {
+                return attempt;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!*attempt.cancellation().borrow());
+    server.abort();
+}

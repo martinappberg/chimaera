@@ -28,6 +28,9 @@ pub(crate) mod control;
 #[path = "ssh_agent/lifecycle.rs"]
 pub(crate) mod lifecycle;
 #[cfg(unix)]
+#[path = "ssh_agent/route.rs"]
+pub(crate) mod route;
+#[cfg(unix)]
 #[path = "ssh_agent/selection.rs"]
 pub(crate) mod selection;
 #[cfg(unix)]

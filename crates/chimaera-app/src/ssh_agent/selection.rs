@@ -171,11 +171,44 @@ pub(super) async fn from_native_config(
     })
 }
 
+/// Route resolution may accept only the separately parsed ProxyJump field.
+/// Every other version-one trust/routing refusal is retained before key reads.
+pub(super) fn route_settings(text: &str) -> Result<(SshAuthDestination, String)> {
+    let config = Config::parse_mode(text, true)?;
+    Ok((
+        config.destination()?,
+        config.one("proxyjump")?.unwrap_or("none").into(),
+    ))
+}
+pub(super) async fn from_routed_config(
+    text: &str,
+    home: &Path,
+    environment_agent: Option<PathBuf>,
+    keeper_boot: String,
+) -> Result<Selection> {
+    route_settings(text)?;
+    let text = text
+        .lines()
+        .map(|line| {
+            if line.starts_with("proxyjump ") {
+                "proxyjump none"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    from_native_config(&text, home, environment_agent, keeper_boot).await
+}
+
 struct Config<'a> {
     lines: Vec<(&'a str, &'a str)>,
 }
 impl<'a> Config<'a> {
     fn parse(text: &'a str) -> Result<Self> {
+        Self::parse_mode(text, false)
+    }
+    fn parse_mode(text: &'a str, routed: bool) -> Result<Self> {
         let mut lines = Vec::new();
         for line in text.lines() {
             let (name, value) = line
@@ -195,7 +228,9 @@ impl<'a> Config<'a> {
             "knownhostscommand",
             "revokedhostkeys",
         ] {
-            if config.one(name)?.is_some_and(|value| value != "none") {
+            if !(routed && name == "proxyjump")
+                && config.one(name)?.is_some_and(|value| value != "none")
+            {
                 return Err(SelectionFailure::UnsupportedConfiguration);
             }
         }
@@ -453,7 +488,7 @@ fn matching_trust(text: &str) -> Result<Vec<SshAuthHostKey>> {
     Ok(keys)
 }
 
-async fn bounded_output(
+pub(super) async fn bounded_output(
     mut command: Command,
     empty_status: i32,
     input: Option<Vec<u8>>,
