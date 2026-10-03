@@ -59,6 +59,11 @@ went has no worktree.
    automatically, so running it is safe; nothing else is yours to delete.
 2. **After your PR merges**, your worktree should go. A session can't remove the
    worktree it runs in (it is ACTIVE: "this session runs here"), so:
+   - stop every preview you started for this PR: the isolated app and daemon,
+     Vite, and any preview launcher. Use the preview tool's stop action when
+     available; otherwise verify the exact PID and executable, send SIGTERM,
+     and wait for exit. Let daemons shut down their own child agents. Never
+     use a broad process-name kill or stop another session's processes;
    - drop its build output now with `scripts/worktree-gc --self --apply`;
    - end the session. The next gc run (any session's start, at most hourly) removes
      the worktree once nothing uses it — merged, clean and pushed is REMOVE;
@@ -67,6 +72,10 @@ went has no worktree.
      so and leave the removal to the human.
    - Working from another checkout? `git worktree remove <path>` — never `--force`,
      and never on a worktree the table calls ACTIVE.
+   Treat this as part of finishing the PR, not optional housekeeping. If a
+   preview does not exit gracefully or another session keeps the worktree
+   ACTIVE, report the blocker and leave it intact. The next automatic GC is
+   a fallback for leftover previews, not a reason to keep yours running.
 3. **At session end** the SessionEnd hook runs `--self --sweep`: it deletes only the
    stale debug objects no binary in `target/` references, so the next build stays warm.
    `--self` without `--sweep` deletes this worktree's whole `target/` (the next build
