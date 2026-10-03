@@ -266,6 +266,94 @@ Passive catalog/status reads never wake, refresh a token or run a login CLI.
 Connect, Submit and explicitly confirmed Disconnect may wake through existing
 account attendance/allowance rules. Polling never repeatedly wakes a machine.
 
+### Personal UI adapters and deployment selection
+
+The canonical keeper paths and bodies above remain unchanged. The device Link
+adapter validates their closed catalog and attempt schemas before the native
+shell or account gateway maps them to the existing named Connections UI. A
+catalog requires exactly three distinct known provider rows and an exact
+version-one registration acknowledgment; each authority counter must be exactly
+representable by the consumer. A partial catalog or ordinary daemon readiness
+does not negotiate personal control.
+
+The account exposes fixed passive `GET /v1/personal/providers/mode` for a full
+device bearer and `GET /home/providers/mode` for the authenticated account
+browser. Both return exactly
+`{"version":1,"context":<64 lowercase hex>,"mode":"legacy"|"personal"}`.
+The context is the SHA-256 of the fixed UTF-8 domain
+`chimaera-personal-control-context-v1`, followed by the account ID and device ID
+(each prefixed by its four-byte big-endian UTF-8 length), followed by the
+original authenticated device session epoch as an eight-byte big-endian
+unsigned integer. IDs satisfy the account's authenticated stable-ID rules; no
+UUID-only assumption is made. Routine access-token or browser-cookie refresh
+preserves this equality tag. Signout, device revocation, account replacement or
+session-epoch change retires it. It is neither a selector nor authority; every
+request separately revalidates ordinary authentication.
+
+Mode comes only from trusted account deployment state, never optional worker
+health, successful catalog discovery or a caller field. A newly selected adapter
+requires a fresh positive mode reply. Missing, malformed or unavailable mode
+refuses selection; it never probes a legacy route as error recovery. Existing
+ordinary/free unisolated entry points remain unchanged until this new adapter
+is positively selected. Personal mode stays latched for that authenticated
+context, and all isolated project contexts use the personal account transport
+even when Connections was opened inside a project. After personal selection,
+404, unsupported capability, timeout, authentication failure or lost reply can
+never retry or downgrade through a daemon bearer or host TCP tunnel. There is
+no user-facing transport toggle.
+
+This disabled fixture increment may use an explicit in-memory account mode
+whose initial value is legacy. Production migration additionally requires
+durable, non-downgradable per-account personal selection before isolated routing
+or canonical credential import: process restart, absent configuration, an old
+image or unavailable control capability must not restore legacy refresh owners.
+Exclusive quiescence of those old owners remains necessary before import. No
+production switch, startup enablement or migration is introduced by these
+adapter definitions.
+
+The browser exposes `GET /home/providers`, `POST /home/providers/commands` and
+`GET /home/providers/operations/{operation_id}`. Native has separate personal
+IPC entry points, never a project-daemon command. Catalog replies are exactly
+`{"version":1,"context":<tag>,"catalog":<canonical keeper catalog>}`;
+command/status replies are exactly
+`{"version":1,"context":<tag>,"operation_id":<exact command or requested UUID>,"attempt":<canonical keeper attempt>}`.
+The command reply echoes the submitted command UUID; a status reply echoes
+the exact requested UUID, which may be the parent or a previously known child
+alias. Both resolve to the parent's exact attempt.
+There is one bounded catalog, with no pagination, profiles, credential values
+or control capability. Replies are at most 64 KiB and command bodies at most
+8 KiB. Browser mutations require the existing Origin/CSRF checks and exactly
+one `X-Chimaera-Control-Context` header matching fresh normal authentication;
+native mutations recheck that same tag and account generation before send and
+after completion. Passive operation reads carry and compare that original tag.
+
+The client creates and retains an original parent operation UUID before Connect
+or confirmed Disconnect. Its provider, expected connection generation, observed
+registration and context remain immutable. Each Submit or Cancel creates a
+distinct child command UUID once before its single send; reusing the parent's
+UUID for a changed command is invalid. That child remains bound to the parent's
+exact attempt ID, provider, generation, registration and context. A Submit also
+creates one submission nonce before its one send; submitted code/password bytes
+never enter durable state, status, digests or diagnostics, and clear on send,
+hide and account change. An ambiguous mutation retains only the original
+nonsecret parent identity and known child UUID. Recovery polls the original
+parent; it never creates a fresh parent, resends a code or changes an expected
+generation. A consumed submission nonce remains consumed even if a retry would
+carry a different value. Browser opening rereads the original parent attempt
+and applies the fixed provider-origin allowlist rather than accepting a caller
+URL.
+
+Account adapter errors are closed
+`{"version":1,"error":<fixed category>}` objects. Categories are
+`unsupported`, `invalid_request`, `state_changed`, `unavailable`,
+`operation_unavailable`, `limit_reached`, `sign_in_required`, `context_changed`
+and `unconfirmed`; raw keeper bodies and provider diagnostics are never exposed.
+An HTTP rejection with no valid fixed object remains unconfirmed. Missing mode
+or a missing catalog route may report unsupported before effects, but never
+authorize a legacy fallback. Accepted mutation owners retain their four writer
+and sixteen request reservations through actual HTTP completion after observer
+cancellation; account replacement cannot race that retained native owner.
+
 ## Internal fixed worker command and lease exchange
 
 The keeper's fixed adapter selects the worker address only from fresh account
