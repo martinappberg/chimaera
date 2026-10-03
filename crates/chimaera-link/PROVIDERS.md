@@ -829,8 +829,8 @@ not authorize them or enable startup.
 
 ### Supervisor-local login helper
 
-The disabled `chimaera personal-provider-control` entrypoint delegates to the
-fixed login consumer. Its only inputs are two inherited descriptors: the one-shot
+The disabled private `/usr/local/bin/chimaera-provider-login` executable owns
+the fixed login consumer; it is not a public daemon command or dependency. Its only inputs are two inherited descriptors: the one-shot
 startup pipe described above and a supervisor-private Unix socketpair. It accepts
 no path, executable, HOME, upstream, environment override or TCP listener. The
 socket is never mounted in a project. The startup pipe is consumed and closed

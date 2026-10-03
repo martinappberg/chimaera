@@ -103,9 +103,9 @@ jobs:
       - run: cargo clippy --manifest-path plugins/Cargo.toml --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo test -p chimaera-link --all-features
-      - name: Check explicit personal-provider helper
+      - name: Check explicit provider runtime consumers
         run: cargo clippy --locked -p chimaera -p chimaera-server --all-targets --features provider-github-fixture,provider-claude-fixture -- -D warnings
-      - name: Test explicit personal-provider helper
+      - name: Test explicit provider runtime consumers
         run: |
           cargo test --locked -p chimaera-server --lib --features provider-github-fixture,provider-claude-fixture cloud::providers
           cargo test --locked -p chimaera-server --lib --features provider-github-fixture,provider-claude-fixture pro::execution::

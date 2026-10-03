@@ -1,15 +1,7 @@
 //! Worker provider readiness and explicit, short-lived authentication jobs.
 //! IDs are catalog keys, never executable names supplied by a client.
-#[cfg(feature = "provider-authority-prototype")]
-pub mod authority;
 mod connect;
-#[cfg(feature = "provider-authority-prototype")]
-mod control_login;
-#[cfg(feature = "provider-authority-prototype")]
-pub(crate) mod control_service;
 mod disconnect;
-#[cfg(feature = "provider-authority-prototype")]
-mod login_home;
 pub(crate) mod process;
 /// Bounded output for probes using their own environment, with the same
 /// process-group cleanup as provider authentication subprocesses.

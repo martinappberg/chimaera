@@ -197,10 +197,6 @@ impl Rpc {
             next_id: 0,
         })
     }
-    #[cfg(feature = "provider-authority-prototype")]
-    pub async fn terminate(&mut self, original: Option<u32>) -> Result<(), &'static str> {
-        self._child.terminate(original).await
-    }
     pub async fn initialize(&mut self) -> Result<(), &'static str> {
         self.request(
             "initialize",

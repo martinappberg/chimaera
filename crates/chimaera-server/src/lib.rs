@@ -71,11 +71,6 @@ pub struct ServerConfig {
     pub routable_bind: bool,
 }
 
-/// Explicit supervisor-only provider consumer; ordinary startup never calls it.
-#[cfg(feature = "provider-authority-prototype")]
-pub use cloud::providers::authority as provider_control;
-#[cfg(feature = "provider-authority-prototype")]
-pub use cloud::providers::control_service::run as run_personal_provider_control;
 pub use job_host::run as run_job_host;
 pub use lifecycle::run;
 #[cfg(feature = "provider-claude-fixture")]

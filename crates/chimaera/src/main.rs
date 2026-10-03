@@ -55,15 +55,6 @@ enum Command {
         )]
         provider_claude_fixture: bool,
     },
-    /// Fixed supervisor-only provider control; never a daemon/project route.
-    #[cfg(feature = "provider-authority-prototype")]
-    #[command(hide = true)]
-    PersonalProviderControl {
-        #[arg(long)]
-        startup_fd: i32,
-        #[arg(long)]
-        control_fd: i32,
-    },
     /// Show daemon status, locally or on a remote ssh host. A dev build
     /// reports the dev daemon (~/.chimaera-dev) on both ends — dev-ness is
     /// the build's property, not a flag.
@@ -415,24 +406,6 @@ async fn dispatch(command: Command) -> anyhow::Result<()> {
             }
             chimaera_server::run(config).await
         }
-        #[cfg(feature = "provider-authority-prototype")]
-        Command::PersonalProviderControl {
-            startup_fd,
-            control_fd,
-        } => {
-            use std::os::fd::FromRawFd;
-            anyhow::ensure!(
-                startup_fd >= 3 && control_fd >= 3 && startup_fd != control_fd,
-                "Provider control descriptors refused"
-            );
-            // Ownership is transferred once; the library verifies pipe/socket
-            // types before any child exists and closes enrollment before serving.
-            let startup = unsafe { std::os::fd::OwnedFd::from_raw_fd(startup_fd) };
-            let control = unsafe { std::os::fd::OwnedFd::from_raw_fd(control_fd) };
-            chimaera_server::run_personal_provider_control(startup, control)
-                .await
-                .map_err(anyhow::Error::from)
-        }
         Command::Status { host } => status::run(host.as_deref()).await,
         Command::Kill => kill::run().await,
         Command::Connect {
@@ -555,38 +528,6 @@ mod tests {
     #[test]
     fn cli_definition_is_consistent() {
         Cli::command().debug_assert();
-    }
-
-    #[cfg(feature = "provider-authority-prototype")]
-    #[test]
-    fn personal_control_accepts_only_inherited_descriptor_flags() {
-        let cli = Cli::try_parse_from([
-            "chimaera",
-            "personal-provider-control",
-            "--startup-fd",
-            "3",
-            "--control-fd",
-            "4",
-        ])
-        .unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::PersonalProviderControl {
-                startup_fd: 3,
-                control_fd: 4
-            }
-        ));
-        assert!(Cli::try_parse_from([
-            "chimaera",
-            "personal-provider-control",
-            "--startup-fd",
-            "3",
-            "--control-fd",
-            "4",
-            "--home",
-            "/tmp"
-        ])
-        .is_err());
     }
 
     #[test]
