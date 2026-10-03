@@ -104,12 +104,12 @@ jobs:
       - run: cargo test --workspace
       - run: cargo test -p chimaera-link --all-features
       - name: Check explicit personal-provider helper
-        run: cargo clippy --locked -p chimaera -p chimaera-server --all-targets --features provider-authority-prototype -- -D warnings
+        run: cargo clippy --locked -p chimaera -p chimaera-server --all-targets --features provider-github-fixture -- -D warnings
       - name: Test explicit personal-provider helper
         run: |
-          cargo test --locked -p chimaera-server --lib --features provider-authority-prototype cloud::providers
-          cargo test --locked -p chimaera-server --lib --features provider-authority-prototype pro::execution::
-          cargo test --locked -p chimaera --features provider-authority-prototype
+          cargo test --locked -p chimaera-server --lib --features provider-github-fixture cloud::providers
+          cargo test --locked -p chimaera-server --lib --features provider-github-fixture pro::execution::
+          cargo test --locked -p chimaera --features provider-github-fixture
       - name: Verify pinned GitHub CLI ignores project endpoint configuration
         run: |
           set -euo pipefail
@@ -121,7 +121,7 @@ jobs:
           printf '%s  %s\n' 7e54a307f90afdc59796c325ec0c49fb09e6c18537727207a8ac7513584ea5b0 "$fixture_root/gh.deb" | sha256sum -c -
           dpkg-deb --extract "$fixture_root/gh.deb" "$fixture_root/extracted"
           CHIMAERA_TEST_GH_2102="$fixture_root/extracted/usr/bin/gh" \
-            cargo test --locked -p chimaera-server --lib --features provider-authority-prototype \
+            cargo test --locked -p chimaera-server --lib --features provider-github-fixture \
             pinned_gh_2102_ignores_project_endpoint_config_through_unlinked_directory -- --ignored
       - run: cargo test --manifest-path plugins/Cargo.toml
 
@@ -157,7 +157,7 @@ jobs:
           # its whole target dependency tree (wasmtime, cranelift, tokio).
           key: ${{ matrix.target }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo install cargo-zigbuild
+      - run: cargo install cargo-zigbuild --locked --version 0.23.0
       - run: cargo zigbuild --release --target ${{ matrix.target }} -p chimaera
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -167,7 +167,7 @@ jobs:
       # local output path, but never the default artifact or release inputs.
       - name: Build explicit personal-provider ARM fixture daemon
         if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: cargo zigbuild --locked --release --target ${{ matrix.target }} -p chimaera --features provider-authority-prototype
+        run: cargo zigbuild --locked --release --target ${{ matrix.target }} -p chimaera --features provider-github-fixture
       - name: Upload explicit personal-provider ARM fixture daemon
         if: matrix.target == 'aarch64-unknown-linux-musl'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -175,3 +175,47 @@ jobs:
           name: chimaera-provider-authority-prototype-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/chimaera
           if-no-files-found: error
+      # Cross-compile the ignored contained CLI probes without executing them.
+      # The disposable ARM VM runs these against fixed local synthetic peers.
+      - name: Build explicit provider ARM test artifact
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          set -euo pipefail
+          bash scripts/build-plugins.sh
+          cargo-zigbuild test --locked --release --target aarch64-unknown-linux-musl \
+            -p chimaera-server --lib --features provider-github-fixture --no-run \
+            --message-format=json > "$RUNNER_TEMP/provider-test-build.jsonl"
+          python3 - <<'PYARTIFACT'
+          import hashlib, json, os, pathlib, shutil, subprocess
+          root = pathlib.Path.cwd()
+          selected = []
+          with open(pathlib.Path(os.environ["RUNNER_TEMP"]) / "provider-test-build.jsonl") as records:
+              for line in records:
+                  item = json.loads(line)
+                  if (item.get("reason") == "compiler-artifact"
+                          and item.get("target", {}).get("name") == "chimaera_server"
+                          and "lib" in item["target"]["kind"]
+                          and item.get("profile", {}).get("test") is True
+                          and item.get("executable")):
+                      selected.append(pathlib.Path(item["executable"]).resolve(strict=True))
+          assert len(selected) == 1, "exact provider lib-test artifact required"
+          source = selected[0]
+          assert source.is_relative_to(root / "target/aarch64-unknown-linux-musl/release")
+          assert source.is_file() and source.stat().st_size <= 536870912
+          output = root / "target/provider-arm-tests"
+          output.mkdir()
+          binary = output / "chimaera-server-tests"
+          shutil.copyfile(source, binary)
+          binary.chmod(0o755)
+          digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+          (output / "fixture-sha256.txt").write_text(digest + "  chimaera-server-tests\n")
+          (output / "fixture-revision.txt").write_text(subprocess.check_output(["git", "rev-parse", "HEAD"], text=True))
+          PYARTIFACT
+      - name: Upload explicit provider ARM test artifact
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: chimaera-provider-tests-aarch64-unknown-linux-musl
+          path: target/provider-arm-tests/
+          if-no-files-found: error
+          retention-days: 7
