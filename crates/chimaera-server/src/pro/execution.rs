@@ -26,6 +26,12 @@ pub(crate) mod mutation;
 // No route or launch caller until all provider adapters and final overlays exist.
 #[cfg(all(unix, feature = "provider-authority-prototype"))]
 #[allow(dead_code)]
+pub(super) mod provider_claude;
+#[cfg(all(unix, feature = "provider-authority-prototype"))]
+#[allow(dead_code)]
+pub(super) mod provider_claude_child;
+#[cfg(all(unix, feature = "provider-authority-prototype"))]
+#[allow(dead_code)]
 pub(super) mod provider_client;
 #[cfg(all(unix, feature = "provider-authority-prototype"))]
 #[allow(dead_code)]

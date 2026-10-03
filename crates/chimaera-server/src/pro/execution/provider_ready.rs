@@ -32,6 +32,7 @@ struct Inner {
     payload: Option<wire::StartupPayload>,
     work: Option<Arc<Work>>,
     consumers: Vec<Arc<Work>>,
+    children: Vec<Arc<Work>>,
 }
 pub(super) struct Work {
     pub(super) generation: u64,
@@ -52,6 +53,7 @@ impl State {
                 payload: Some(payload),
                 work: None,
                 consumers: Vec::new(),
+                children: Vec::new(),
             }),
             #[cfg(test)]
             transport: Mutex::default(),
@@ -69,6 +71,7 @@ impl State {
             .work
             .iter()
             .chain(inner.consumers.iter())
+            .chain(inner.children.iter())
             .filter(|work| !*work.done.borrow())
             .count()
     }
@@ -113,6 +116,7 @@ pub(in crate::pro) async fn settle(state: &AppState) -> anyhow::Result<()> {
             .work
             .iter()
             .chain(inner.consumers.iter())
+            .chain(inner.children.iter())
             .cloned()
             .collect::<Vec<_>>()
     });
@@ -220,6 +224,9 @@ pub(in crate::pro) fn configured(state: &Arc<AppState>) {
 }
 pub(super) fn current(state: &AppState, pending: &Pending, generation: u64) -> bool {
     !state.stopping.load(Ordering::Acquire)
+        && lock(&state.pro.execution.provider_pending)
+            .as_ref()
+            .is_some_and(|row| std::ptr::eq(row.as_ref(), pending))
         && state.pro.generation.load(Ordering::Acquire) == generation
         && !super::super::drain::draining(state)
         && !super::super::delegation_lapsed(state)
@@ -230,7 +237,12 @@ pub(super) fn current(state: &AppState, pending: &Pending, generation: u64) -> b
         && pending.protection.current().is_ok()
 }
 fn cancel(inner: &Inner) {
-    for work in inner.work.iter().chain(inner.consumers.iter()) {
+    for work in inner
+        .work
+        .iter()
+        .chain(inner.consumers.iter())
+        .chain(inner.children.iter())
+    {
         work.cancel.send_replace(true);
     }
 }
@@ -242,8 +254,36 @@ pub(super) fn admit(
     deadline: Instant,
 ) -> Result<(Arc<Pending>, Arc<Work>, wire::Request), wire::Error> {
     let pending = pending(state).ok_or(wire::Error::Inactive)?;
+    admit_at(state, pending, None, command, deadline)
+}
+pub(super) fn admit_child_stream(
+    state: &Arc<AppState>,
+    pending: &Arc<Pending>,
+    child: &Arc<Work>,
+    command: wire::Command,
+    deadline: Instant,
+) -> Result<(Arc<Pending>, Arc<Work>, wire::Request), wire::Error> {
+    admit_at(state, pending.clone(), Some(child), command, deadline)
+}
+fn admit_at(
+    state: &Arc<AppState>,
+    pending: Arc<Pending>,
+    child: Option<&Arc<Work>>,
+    command: wire::Command,
+    deadline: Instant,
+) -> Result<(Arc<Pending>, Arc<Work>, wire::Request), wire::Error> {
     let mut inner = lock(&pending.ready.inner);
     let generation = inner.work.as_ref().ok_or(wire::Error::Inactive)?.generation;
+    if child.is_some_and(|child| {
+        child.generation != generation
+            || Instant::now() >= child.deadline
+            || deadline > child.deadline
+            || *child.cancel.borrow()
+            || *child.done.borrow()
+            || !inner.children.iter().any(|row| Arc::ptr_eq(row, child))
+    }) {
+        return Err(wire::Error::StateChanged);
+    }
     if inner.phase != Phase::Verified
         || Instant::now() >= deadline
         || !current(state, &pending, generation)
@@ -280,6 +320,39 @@ pub(super) fn admit(
     inner.consumers.push(work.clone());
     drop(inner);
     Ok((pending, work, request))
+}
+/// Retained actual child lifetime, separate from individual stream permits.
+/// No request or secret is minted merely by keeping a frontend alive.
+pub(super) fn admit_child(
+    state: &Arc<AppState>,
+    deadline: Instant,
+) -> Result<(Arc<Pending>, Arc<Work>), wire::Error> {
+    let pending = pending(state).ok_or(wire::Error::Inactive)?;
+    let mut inner = lock(&pending.ready.inner);
+    let generation = inner.work.as_ref().ok_or(wire::Error::Inactive)?.generation;
+    if inner.phase != Phase::Verified
+        || Instant::now() >= deadline
+        || !current(state, &pending, generation)
+    {
+        return Err(wire::Error::StateChanged);
+    }
+    inner.children.retain(|work| !*work.done.borrow());
+    if inner.children.len() >= 4 {
+        return Err(wire::Error::LimitReached);
+    }
+    let work = Arc::new(Work {
+        generation,
+        deadline,
+        cancel: watch::channel(false).0,
+        done: watch::channel(false).0,
+    });
+    inner.children.push(work.clone());
+    drop(inner);
+    Ok((pending, work))
+}
+pub(super) fn child_current(pending: &Pending, work: &Arc<Work>) -> bool {
+    let inner = lock(&pending.ready.inner);
+    inner.phase == Phase::Verified && inner.children.iter().any(|row| Arc::ptr_eq(row, work))
 }
 pub(super) fn consumer_current(pending: &Pending, work: &Arc<Work>) -> bool {
     let inner = lock(&pending.ready.inner);
