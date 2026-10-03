@@ -66,6 +66,10 @@ REFUSAL_PHASES = frozenset((
     'official-cli-version',
     'official-header-receipt',
     'official-tests',
+    'official-tests-both-failed',
+    'official-tests-incomplete',
+    'official-tests-print-failed',
+    'official-tests-tui-failed',
     'outer-address',
     'outer-canary-reached',
     'outer-platform',
@@ -140,6 +144,26 @@ def bwrap_refusal(errors):
             cause = "other"
         return "bwrap-" + stage + "-" + cause
     return "bwrap-unknown-other"
+
+
+def official_result_refusal(output):
+    prefix = b"test pro::execution::provider_claude_child::official_tests::"
+    names = (
+        b"official_print_uses_production_frontend_and_child_owner",
+        b"official_tui_counts_tokens_with_captured_config_and_ignored_hostile_settings",
+    )
+    lines = output.splitlines()
+    counts = [lines.count(prefix + name + b" ... FAILED") for name in names]
+    if any(count > 1 for count in counts):
+        return "official-tests-incomplete"
+    failed = [count == 1 for count in counts]
+    if all(failed):
+        return "official-tests-both-failed"
+    if failed[0]:
+        return "official-tests-print-failed"
+    if failed[1]:
+        return "official-tests-tui-failed"
+    return "official-tests-incomplete"
 
 
 def require(condition, phase):
@@ -322,12 +346,18 @@ def inner_run():
         require(blocked6.connect_ex(("2001:db8::1", 443)) != 0, "descendant-ipv6-canary")
     env = {"HOME": "/tmp", "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8",
            "CHIMAERA_TEST_CLAUDE_21287_CONTAINED": "1"}
-    code, version, _ = bounded_child(["/usr/local/bin/claude", "--version"], env, 5)
+    try:
+        code, version, _ = bounded_child(["/usr/local/bin/claude", "--version"], env, 5)
+    except Refusal as error:
+        if error.phase in ("child-spawn", "child-deadline", "child-exit-deadline", "child-output"):
+            raise Refusal("official-cli-version") from None
+        raise
     require(code == 0 and version.startswith(b"2.1.287 "), "official-cli-version")
     code, output, stderr_size = bounded_child(
         ["/probe/server-tests", "provider_claude_child::official_tests::",
          "--ignored", "--test-threads=1", "--nocapture"], env, 80)
-    require(code == 0 and b"2 passed" in output, "official-tests")
+    if code != 0 or b"2 passed" not in output:
+        raise Refusal(official_result_refusal(output))
     headers = [json.loads(line.split("=", 1)[1]) for line in output.decode("utf-8").splitlines()
                if line.startswith("CLAUDE_PROBE_HEADERS=")]
     require(len(headers) == 1, "official-header-receipt")
