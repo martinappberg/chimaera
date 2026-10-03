@@ -137,7 +137,7 @@ Nothing site-specific is ever coded.
   retryable error appear on the job card. The card and its workspace rows switch to
   stopping together, with workspace actions hidden while shutdown is in progress.
   Workspaces stay associated with that job while its allocation is still running,
-  even after their daemon manifests disappear. Job-host retains final closing rows in workspaces.json; connection endpoints are withheld, and ended allocations no longer claim those rows.
+  even after their daemon manifests disappear. Job-host retains final closing rows in workspaces.json; connection endpoints are withheld, and ended allocations no longer claim those rows. Workspaces whose daemons had already failed remain released, so they can start in another job.
   The card keeps “Stopping…” until Slurm finishes cancellation;
   a disappearing daemon cannot turn it back into “Starting…”. Slurm's `COMPLETING`
   state also reads as stopping, including after reopening the page. These jobs are

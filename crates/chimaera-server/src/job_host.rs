@@ -809,14 +809,16 @@ fn plain_text(line: &str) -> String {
 
 /// Keep a closing ownership row through allocation shutdown; an individual
 /// workspace close during normal operation releases its row immediately.
+/// Failed workspaces already released their leases and must stay available.
 fn finish_close(map: &mut HashMap<String, Hosted>, wid: &str, stopping: bool) {
-    if stopping {
-        if let Some(held) = map.get_mut(wid) {
-            held.state = HostedState::Closing;
-            held.port = None;
-            held.pid = None;
-            held.exited = None;
-        }
+    if let Some(held) = map
+        .get_mut(wid)
+        .filter(|h| stopping && h.state != HostedState::Failed)
+    {
+        held.state = HostedState::Closing;
+        held.port = None;
+        held.pid = None;
+        held.exited = None;
     } else {
         map.remove(wid);
     }
@@ -894,7 +896,10 @@ mod tests {
         finish_close(&mut map, "w-0000abcd", false);
         assert!(map.is_empty());
         map.insert("w-0000abcd".into(), Hosted::reserved());
-        finish_close(&mut map, "w-0000abcd", true);
+        let mut failed = Hosted::reserved();
+        failed.state = HostedState::Failed;
+        failed.exited = Some(tokio::sync::watch::channel(true).1);
+        map.insert("w-0000dead".into(), failed);
         let host = Arc::new(Host {
             job_dir: dir.clone(),
             cluster_dir: dir.join("cluster"),
@@ -909,6 +914,7 @@ mod tests {
             changed: tokio::sync::Notify::new(),
             finished: AtomicBool::new(true),
         });
+        close_all(&host).await;
         host.changed.notify_one();
         publish_hosting(host).await;
         assert!(!dir.join("host.json").exists());
@@ -917,6 +923,7 @@ mod tests {
             record.workspaces.get("w-0000abcd"),
             Some(&HostedState::Closing)
         );
+        assert!(!record.workspaces.contains_key("w-0000dead"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
