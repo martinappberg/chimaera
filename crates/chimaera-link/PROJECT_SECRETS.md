@@ -143,8 +143,9 @@ field, value, serializer source or OS/network diagnostics.
 The fixed additive account `GET /v1/personal/control-context` returns exactly
 `{version:1,context}` after fresh full-device authentication; delegated access
 refuses. `context` is 64 lowercase hexadecimal characters: SHA-256 over the
-ASCII domain `chimaera-personal-control-context-v1`, then the account UUID and
-device UUID as length-prefixed UTF-8 strings (unsigned 32-bit big-endian lengths),
+ASCII domain `chimaera-personal-control-context-v1`, then the exact authenticated
+account ID and device ID (each 1–128 ASCII letters, digits, `_` or `-`) as
+length-prefixed UTF-8 strings (unsigned 32-bit big-endian lengths),
 then the original device session epoch as unsigned 64-bit big-endian. All three
 fields come from fresh ordinary authentication, never caller fields or a new
 refreshed-token issuance. The browser
