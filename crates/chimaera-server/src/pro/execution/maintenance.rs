@@ -200,4 +200,4 @@ pub(in crate::pro) fn closed(state: &AppState, workspace: &str) -> bool {
 
 #[cfg(all(test, unix))]
 #[path = "maintenance_tests.rs"]
-mod tests;
+pub(super) mod tests;

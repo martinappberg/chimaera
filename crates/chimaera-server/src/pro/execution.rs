@@ -5,6 +5,9 @@ mod lease;
 // Disabled maintenance primitives: no startup channel or Prepared producer.
 #[allow(dead_code)]
 pub(super) mod maintenance;
+#[cfg(unix)]
+#[allow(dead_code)]
+pub(super) mod maintenance_channel;
 pub(crate) mod mutation;
 mod restart;
 pub(super) mod setup;

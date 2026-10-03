@@ -3,13 +3,13 @@ use chimaera_core::project_secret_idle::RootIdentity;
 use serde_json::json;
 use std::{os::unix::fs::MetadataExt, path::PathBuf, sync::atomic::Ordering};
 
-struct Fixture {
-    state: Arc<AppState>,
+pub(in crate::pro::execution) struct Fixture {
+    pub(in crate::pro::execution) state: Arc<AppState>,
     root: PathBuf,
-    binding: Binding,
+    pub(in crate::pro::execution) binding: Binding,
 }
 impl Fixture {
-    async fn new() -> Self {
+    pub(in crate::pro::execution) async fn new() -> Self {
         let root = std::env::temp_dir().join(format!(
             "chimaera-maintenance-{}",
             chimaera_core::generate_token()
@@ -83,7 +83,7 @@ impl Fixture {
     fn launch(&self) -> Launch {
         Launch::capture(&self.state, &self.binding).unwrap()
     }
-    fn prepare(&self) -> Prepare {
+    pub(in crate::pro::execution) fn prepare(&self) -> Prepare {
         Prepare {
             version: 1,
             request_id: 1,
