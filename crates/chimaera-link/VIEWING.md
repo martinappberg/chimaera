@@ -10,6 +10,11 @@ published. A browser gateway may still apply its separately negotiated sleeping
 worker policy ([HANDOFF](HANDOFF.md#explicit-take-over-moves-execution)). Ordinary
 SSH and non-Pro local windows keep their existing routes.
 
+The separate [native workspace viewer proposal](NATIVE_VIEWER.md) describes a
+disabled account-origin device-bearer surface that would reuse these scope and
+placement rules. It neither enables routes/capabilities nor changes the existing
+browser/desktop behavior or grants execution ownership to a phone.
+
 ## Passive placement
 
 Full device clients read `GET /v2/capabilities` before enabling the negotiated

@@ -13,6 +13,7 @@
 | `tests/project_secrets.rs` | Synthetic loopback capability withdrawal, lost reply without value replay, closed receipt correlation and four-writer cancellation ownership |
 | `src/continuity.rs` | Negotiated managed execution, immutable checkpoint receipts and exact recovery acknowledgments; recovery secrets have no Debug representation |
 | [VIEWING.md](VIEWING.md) | Passive logical project routes, target acknowledgment, path aliases and installation binding |
+| [NATIVE_VIEWER.md](NATIVE_VIEWER.md) | Disabled native device-bearer viewer proposal; exact workspace/epoch admission, narrow phase-one routes and conservative uncertain-send recovery; documentation enables no capability |
 | `src/placement.rs` | Exact passive placement/capability DTOs and native-only installation identity |
 | `src/handoff.rs` | Typed ownership and credential bodies, immutable workspace binding and bounded exact daemon acknowledgment; secrets redact Debug |
 | `src/fake_handoff.rs` | Bounded baton and credential-fencing fixture |

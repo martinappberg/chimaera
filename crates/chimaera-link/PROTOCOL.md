@@ -528,6 +528,11 @@ device host; run it with a dedicated test device.
 
 ## Additive extensions
 
+[Native workspace viewer](NATIVE_VIEWER.md) proposes a disabled account-origin
+HTTP/native-WebSocket surface with full-device bearer authentication and exact
+workspace/epoch scope. Its routes and `native_viewer:1` capability are not
+implemented or advertised by this document; existing transports are unchanged.
+
 [Handoff extension v1](HANDOFF.md) defines the workspace baton and scoped mirror
 credentials. It leaves the Link transport protocol number unchanged.
 
