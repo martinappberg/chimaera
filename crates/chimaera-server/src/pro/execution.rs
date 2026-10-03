@@ -30,6 +30,8 @@ pub(super) mod provider_claude;
 #[cfg(all(unix, feature = "provider-authority-prototype"))]
 #[allow(dead_code)]
 pub(super) mod provider_claude_child;
+#[cfg(all(unix, feature = "provider-authority-prototype"))]
+mod provider_claude_diagnostics;
 #[cfg(all(target_os = "linux", feature = "provider-claude-fixture"))]
 mod provider_claude_fixture;
 #[cfg(all(unix, feature = "provider-authority-prototype"))]

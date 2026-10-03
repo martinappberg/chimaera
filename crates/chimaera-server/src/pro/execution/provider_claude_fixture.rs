@@ -1,7 +1,12 @@
 //! Disposable protected Claude print pairing; no ordinary route selects it.
 //! Diagnostic receipt only: private independently proves actual Ready, request
 //! EOF, canonical synthetic Messages and owned drains. No TUI/vendor acceptance.
-use super::{provider_claude_child, provider_client::ChildLifetime, provider_ready};
+use super::{
+    provider_claude_child,
+    provider_claude_diagnostics::{self as diagnostics, Stage, Trace},
+    provider_client::ChildLifetime,
+    provider_ready,
+};
 use crate::{lock, AppState};
 use anyhow::{ensure, Result};
 use chimaera_core::provider_runtime as wire;
@@ -47,17 +52,25 @@ pub(crate) fn start(state: &Arc<AppState>) -> Result<()> {
         .protection
         .current()
         .map_err(|_| anyhow::anyhow!("Fixture protection refused"))?;
+    let trace =
+        Some(Trace::capture(state).map_err(|_| anyhow::anyhow!("Fixture trace binding refused"))?);
     let state = state.clone();
     tokio::spawn(async move {
         // One original finite task bound; consumer admission keeps its existing
         // per-request limits/deadlines, and retained child cleanup is unchanged.
-        if run(state, deadline).await.is_err() {
+        if let Err(error) = run(state, deadline, trace.clone()).await {
+            diagnostics::error(&trace, error);
+            diagnostics::emit(&trace, Stage::PublicRefused);
             eprintln!("provider claude fixture failure: 1");
         }
     });
     Ok(())
 }
-async fn run(state: Arc<AppState>, deadline: Instant) -> Result<(), wire::Error> {
+async fn run(
+    state: Arc<AppState>,
+    deadline: Instant,
+    trace: Option<Arc<Trace>>,
+) -> Result<(), wire::Error> {
     loop {
         if Instant::now() >= deadline || state.stopping.load(Ordering::Acquire) {
             return Err(wire::Error::StateChanged);
@@ -69,20 +82,25 @@ async fn run(state: Arc<AppState>, deadline: Instant) -> Result<(), wire::Error>
     }
     // Two finite fixture reservations: this outer current/receipt guard and
     // exercise's actual child/frontend owner. Neither changes normal launch.
+    diagnostics::emit(&trace, Stage::Verified);
     let proof = ChildLifetime::new(&state, deadline)?;
+    diagnostics::emit(&trace, Stage::OuterAdmitted);
     let root = proof.project_root()?;
     if root != Path::new("/workspace") {
         return Err(wire::Error::StateChanged);
     }
     let output = proof
-        .wait(provider_claude_child::exercise(
+        .wait(provider_claude_child::exercise_fixture(
             &state,
             Zeroizing::new(b"Respond with SYNTHETIC_OK".to_vec()),
+            trace.clone().ok_or(wire::Error::StateChanged)?,
         ))
         .await??;
     if output.len() > 128 * 1024 || !output.windows(MARKER.len()).any(|bytes| bytes == MARKER) {
+        diagnostics::emit(&trace, Stage::OutputNoMarker);
         return Err(wire::Error::Unavailable);
     }
+    diagnostics::emit(&trace, Stage::OutputMarker);
     drop(output);
     proof.current()?;
     let pending = lock(&state.pro.execution.provider_pending)
@@ -103,7 +121,9 @@ async fn run(state: Arc<AppState>, deadline: Instant) -> Result<(), wire::Error>
         })
     })
     .await
-    .map_err(|_| wire::Error::Unavailable)??;
+    .map_err(|_| wire::Error::Unavailable)?
+    .inspect_err(|_| diagnostics::emit(&trace, Stage::ReceiptRefused))?;
+    diagnostics::emit(&trace, Stage::ReceiptWritten);
     Ok(())
 }
 fn receipt(

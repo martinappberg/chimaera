@@ -1,6 +1,9 @@
 //! Private loopback Claude frontend. No daemon route, upstream URL or OAuth
 //! credential is exposed; each request owns its fixed Unix stream through EOF.
-use super::provider_client::{ChildLifetime, Owner};
+use super::{
+    provider_claude_diagnostics::{self as diagnostics, Stage, Trace},
+    provider_client::{ChildLifetime, Owner},
+};
 use axum::{
     body::Body,
     http::{Request, Response},
@@ -51,6 +54,20 @@ impl Frontend {
         request_time: Duration,
         upload_time: Duration,
     ) -> Result<Self, wire::Error> {
+        Self::start_at_diagnostic(child, request_time, upload_time, None).await
+    }
+    pub(super) async fn start_diagnostic(
+        child: Arc<ChildLifetime>,
+        trace: Option<Arc<Trace>>,
+    ) -> Result<Self, wire::Error> {
+        Self::start_at_diagnostic(child, REQUEST_TIME, UPLOAD_TIME, trace).await
+    }
+    async fn start_at_diagnostic(
+        child: Arc<ChildLifetime>,
+        request_time: Duration,
+        upload_time: Duration,
+        trace: Option<Arc<Trace>>,
+    ) -> Result<Self, wire::Error> {
         child.current()?;
         let listener = child
             .wait(TcpListener::bind("127.0.0.1:0"))
@@ -69,6 +86,7 @@ impl Frontend {
             request_time,
             upload_time,
             connections: Arc::new(Semaphore::new(16)),
+            trace,
         });
         child.current()?;
         let task = tokio::spawn(listen(listener, state));
@@ -107,6 +125,7 @@ struct FrontendState {
     request_time: Duration,
     upload_time: Duration,
     connections: Arc<Semaphore>,
+    trace: Option<Arc<Trace>>,
 }
 async fn listen(listener: TcpListener, state: Arc<FrontendState>) {
     let mut tasks = JoinSet::new();
@@ -124,7 +143,11 @@ async fn listen(listener: TcpListener, state: Arc<FrontendState>) {
                 let state = state.clone();
                 tasks.spawn(async move {
                     let _permit = permit;
-                    let Ok(socket)=header_socket(&state.child,socket,received).await else {return;};
+                    diagnostics::emit(&state.trace, Stage::FrontendAccepted);
+                    let Ok(socket)=header_socket(&state.child,socket,received).await else {
+                        diagnostics::emit(&state.trace, Stage::FrontendHeaderRefused);
+                        return;
+                    };
                     // The last owner cannot settle before the HTTP socket closes.
                     let retained = Arc::new(Mutex::new(None::<Arc<Owner>>));
                     let cell = retained.clone();
@@ -349,8 +372,13 @@ async fn handle(
 ) -> Result<Response<Body>, Infallible> {
     let (route, length, headers) = match authorized(&request, &state) {
         Ok(v) => v,
-        Err(e) => return Ok(refusal(e)),
+        Err(e) => {
+            diagnostics::error(&state.trace, e);
+            diagnostics::emit(&state.trace, Stage::FrontendRequestRefused);
+            return Ok(refusal(e));
+        }
     };
+    diagnostics::emit(&state.trace, Stage::FrontendPinned);
     let started = Instant::now();
     let owner = match Owner::for_child(
         &state.child,
@@ -362,7 +390,11 @@ async fn handle(
         started + state.request_time,
     ) {
         Ok(owner) => Arc::new(owner),
-        Err(e) => return Ok(refusal(e)),
+        Err(e) => {
+            diagnostics::error(&state.trace, e);
+            diagnostics::emit(&state.trace, Stage::FrontendOwnerRefused);
+            return Ok(refusal(e));
+        }
     };
     *crate::lock(&retained) = Some(owner.clone());
     let observer = owner.observer();
@@ -381,6 +413,8 @@ async fn handle(
         )
         .await;
         if let Err(error) = result {
+            diagnostics::error(&producer_state.trace, error);
+            diagnostics::emit(&producer_state.trace, Stage::FrontendRelayRefused);
             // Latch before publishing failure so SDK retries cause no new effects.
             producer_state.broken.store(true, Ordering::Release);
             let _ = body_tx.try_send(Err(error));
@@ -390,7 +424,10 @@ async fn handle(
         drop(producer);
     });
     let head = match owner.wait(head_rx).await {
-        Ok(Ok(Ok(head))) => head,
+        Ok(Ok(Ok(head))) => {
+            diagnostics::emit(&state.trace, Stage::FrontendResponse);
+            head
+        }
         Ok(Ok(Err(error))) => return Ok(refusal(error)),
         _ => return Ok(refusal(wire::Error::Unavailable)),
     };

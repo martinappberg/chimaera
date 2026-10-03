@@ -86,6 +86,28 @@ def refusal_frames(error):
     return ",".join(frames) or "none"
 
 
+def password_outcome(action, exit_code, output, loaded, remote, failed, connections):
+    if len(output) > 8192:
+        raise Refused("native password stdout bound")
+    lines = output.splitlines()
+    markers = ("KEEPER_SELECTED", "KEEPER_AUTHENTICATED", "KEEPER_FAILED",
+               "KEEPER_REFUSED password", "KEEPER_REFUSED cancelled", "KEEPER_REFUSED expired")
+    outcomes = ("success", "unsupported", "invalid_binding", "invalid_request",
+                "key_unavailable", "agent_refused", "expired", "revoked", "unavailable", "unknown")
+    return {"action": action if action in ("accept", "wrong", "decline", "cancel", "deadline") else "unknown",
+            "exit_code": exit_code if type(exit_code) is int and -255 <= exit_code <= 255 else None,
+            "key_prompt_count": min(128, lines.count(b"KEEPER_PROMPT")),
+            "remote_prompt_count": min(128, lines.count(b"KEEPER_REMOTE_PROMPT")),
+            "loaded": loaded is True, "remote": remote is True, "gateway_failed": failed is True,
+            "gateway_connections": min(129, max(0, connections)) if type(connections) is int else None,
+            "markers": [marker for marker in markers if marker.encode("ascii") in lines],
+            "outcomes": [name for name in outcomes if ("KEEPER_OUTCOME " + name).encode("ascii") in lines],
+            "winning_branch": next((name for name in ("authenticate", "events")
+                                    if ("KEEPER_PASSWORD_BRANCH " + name).encode("ascii") in lines), "unknown"),
+            "answer_enqueued": b"KEEPER_PASSWORD_ANSWER_ENQUEUED true" in lines,
+            "offline_seen": b"KEEPER_PASSWORD_OFFLINE_SEEN true" in lines}
+
+
 VM = "chimaera-isolation-20261002"
 LINUX_BINARY = "/fixtures/keeper-ssh-fixture"
 LINUX_WRAPPER = "/fixtures/test-keeper-ssh-route-linux.py"
@@ -316,6 +338,8 @@ class Keeper(Sources):
     def __init__(self, binary, podman, digest, wrapper_digest):
         self.gateways = []
         self.controls = []
+        self.cleanup_progress = {}
+        self.close_deadline = None
         self.podman, self.digest, self.wrapper_digest = podman, digest, wrapper_digest
         self.process_lock = threading.Lock()
         super().__init__(binary)
@@ -373,45 +397,150 @@ class Keeper(Sources):
                 or (expected_directories is not None and value["agent_directories"] != expected_directories)):
             raise Refused("keeper cleanup receipt")
 
+    def cleanup_state(self, process):
+        state = self.cleanup_progress.get(process)
+        if state is None:
+            if len(self.cleanup_progress) >= 8:
+                raise Refused("keeper fixture cleanup uncertain")
+            state = {"deadline": self.end(30), "buffer": bytearray(), "inner": None,
+                     "external": False, "waited": False, "failed": False}
+            self.cleanup_progress[process] = state
+        return state
+
+    @staticmethod
+    def cleanup_record(process, state):
+        # Partial bytes and the original deadline survive interrupted drains.
+        # Malformed/EOF data is permanent refusal, never another receipt attempt.
+        while time.monotonic() < state["deadline"]:
+            if not select.select([process.stdout], [], [], .025)[0]:
+                continue
+            byte = os.read(process.stdout.fileno(), 1)
+            if not byte or len(state["buffer"]) > 16384:
+                state["failed"] = True
+                raise Refused("keeper fixture cleanup uncertain")
+            if byte == b"\n":
+                try:
+                    value = json.loads(state["buffer"])
+                    if type(value) is not dict:
+                        raise ValueError()
+                except (ValueError, UnicodeError):
+                    state["failed"] = True
+                    raise Refused("keeper fixture cleanup uncertain") from None
+                state["buffer"].clear()
+                return value
+            state["buffer"].extend(byte)
+        state["failed"] = True
+        raise Refused("keeper fixture cleanup uncertain")
+
     def cleanup_receipts(self, process, expected_directories=None):
-        # Inner mux/directory settlement cannot substitute for the independent
-        # outer barrier, nor can forced cgroup cleanup prove authentication.
-        self.closed_receipt(self.record(process, 23), expected_directories)
-        if self.record(process, 7) != {"type": "external_cleanup", "cgroup_empty": True, "cgroup_removed": True}:
-            raise Refused("external descendant cleanup receipt")
-        process.wait(timeout=2)
-        if process.returncode:
-            raise Refused("keeper external cleanup refused")
+        state = self.cleanup_state(process)
+        if state["failed"]:
+            raise Refused("keeper fixture cleanup uncertain")
+        if state["inner"] is None:
+            value = self.cleanup_record(process, state)
+            try:
+                self.closed_receipt(value, expected_directories)
+            except Refused:
+                state["failed"] = True
+                raise
+            state["inner"] = value
+        else:
+            try:
+                self.closed_receipt(state["inner"], expected_directories)
+            except Refused:
+                state["failed"] = True
+                raise
+        if not state["external"]:
+            value = self.cleanup_record(process, state)
+            if (set(value) != {"type", "cgroup_empty", "cgroup_removed"}
+                    or value["type"] != "external_cleanup"
+                    or value["cgroup_empty"] is not True or value["cgroup_removed"] is not True):
+                state["failed"] = True
+                raise Refused("keeper fixture cleanup uncertain")
+            state["external"] = True
+        if not state["waited"]:
+            remaining = state["deadline"] - time.monotonic()
+            if remaining <= 0:
+                state["failed"] = True
+                raise Refused("keeper fixture cleanup uncertain")
+            process.wait(timeout=min(2, remaining))
+            if process.returncode:
+                state["failed"] = True
+                raise Refused("keeper fixture cleanup uncertain")
+            state["waited"] = True
+
+    def cleanup_control(self, process, expected_directories=None):
+        state = None
+        completed = False
+        try:
+            state = self.cleanup_state(process)
+            # A closed writer already delivered EOF. An exited child still owes
+            # both receipts; return code zero alone cannot discharge this owner.
+            if process.poll() is None and not process.stdin.closed:
+                try:
+                    if os.write(process.stdin.fileno(), b"EXIT\n") != 5:
+                        raise Refused("keeper fixture cleanup uncertain")
+                except BrokenPipeError:
+                    pass  # A genuine cleanup receipt must still prove closure.
+            if not process.stdin.closed:
+                process.stdin.close()
+            self.cleanup_receipts(process, expected_directories)
+            completed = True
+        finally:
+            if not completed and state is not None:
+                state["failed"] = True
+            stop_owned(process)
+
+    @staticmethod
+    def cleanup_failure(failed, original_failure):
+        if failed:
+            print("REFUSED keeper cleanup: uncertain", file=sys.stderr)
+            if not original_failure:
+                raise Refused("keeper fixture cleanup uncertain")
+
+    def cleanup_case(self, app, gateway, control, proxy=None):
+        original_failure = sys.exc_info()[0] is not None
+        failed = False
+        actions = [lambda: app.stdin.close() if not app.stdin.closed else None,
+                   lambda: stop_owned(app)]
+        if proxy is not None:
+            actions.append(proxy.close)
+        actions.extend([gateway.close, lambda: self.cleanup_control(control, expected_directories=2)])
+        for action in actions:
+            try:
+                action()
+            except Exception:
+                failed = True
+        self.cleanup_failure(failed, original_failure)
 
     def close(self):
-        self.deadline = time.monotonic() + 30
+        original_failure = sys.exc_info()[0] is not None
+        if self.close_deadline is None:
+            self.close_deadline = time.monotonic() + 30
+        self.deadline = self.close_deadline
         failed = False
         # Native/app observers die first; then bridges, then original keeper.
         for process in reversed(self.owned):
             if process not in self.controls:
                 try:
                     stop_owned(process)
-                except (Refused, OSError, TimeoutError):
+                except Exception:
                     failed = True
         for gateway in reversed(self.gateways):
             try:
                 gateway.close()
-            except (Refused, OSError):
+            except Exception:
                 failed = True
         for process in reversed(self.controls):
-            if process.poll() is None:
-                try:
-                    os.write(process.stdin.fileno(), b"EXIT\n")
-                    process.stdin.close()
-                    self.cleanup_receipts(process)
-                except (Refused, OSError, TimeoutError):
-                    failed = True
-            stop_owned(process)
+            try:
+                self.cleanup_control(process)
+            except Exception:
+                failed = True
         try:
             super().close()
-        finally:
-            if failed:
-                raise Refused("keeper fixture cleanup uncertain")
+        except Exception:
+            failed = True
+        self.cleanup_failure(failed, original_failure)
 
     def run(self):
         from ssh_agent_loader import capture
@@ -558,19 +687,7 @@ class Keeper(Sources):
                     raise Refused("synthetic agents changed")
                 print("PASS", action, "private_external_signs0 target_external_signs1 original_owner_cleanup", flush=True)
             finally:
-                if not app.stdin.closed:
-                    app.stdin.close()
-                stop_owned(app)
-                proxy.close()
-                gateway.close()
-                if control.poll() is None:
-                    os.write(control.stdin.fileno(), b"EXIT\n")
-                    control.stdin.close()
-                    # Each case reached the target's real signing request, so
-                    # exactly both original leg directories must be witnessed.
-                    self.cleanup_receipts(control, expected_directories=2)
-                if control.returncode:
-                    raise Refused("keeper fixture refused")
+                self.cleanup_case(app, gateway, control, proxy)
         print("PASS keeper4: actual router/grants/two sshd key legs; synthetic account/prompts/Slurm, no job lifetime", flush=True)
 
 
@@ -669,6 +786,11 @@ class PasswordKeeper(Keeper):
                             "decline": b"KEEPER_REFUSED password\n", "cancel": b"KEEPER_REFUSED cancelled\n",
                             "deadline": b"KEEPER_REFUSED expired\n"}[action]
                 if app.returncode or expected not in output or not loaded or not remote or gateway.failed:
+                    # Project only fixed markers/counters; never child text or credentials.
+                    with gateway.lock:
+                        connections, failed = gateway.total, gateway.failed
+                    diagnostic = password_outcome(action, app.returncode, output, loaded, remote, failed, connections)
+                    print("DIAGNOSTIC keeper_password", json.dumps(diagnostic, separators=(",", ":")), flush=True)
                     raise Refused("actual password route outcome")
                 for receipt in receipts:
                     self.cleanup_receipt(receipt)
@@ -687,20 +809,129 @@ class PasswordKeeper(Keeper):
                     raise Refused("foreign agent changed")
                 print("PASS password_" + action + " original_leg_prompt authenticated_master_or_refusal cleanup", flush=True)
             finally:
-                if not app.stdin.closed:
-                    app.stdin.close()
-                stop_owned(app)
-                gateway.close()
-                if control.poll() is None:
-                    os.write(control.stdin.fileno(), b"EXIT\n")
-                    control.stdin.close()
-                    self.cleanup_receipts(control, expected_directories=2)
-                if control.returncode:
-                    raise Refused("password keeper cleanup refused")
+                self.cleanup_case(app, gateway, control)
         print("PASS keeper_password5: actual key/password route; synthetic account/UI/root shadow, UsePAM=no; no MFA/job proof", flush=True)
 
 
+def cleanup_self_test():
+    """Local controlled pipes/processes only; no keys, agents or VM access."""
+    import contextlib
+    import io
+    import subprocess
+    from types import SimpleNamespace
+
+    inner = json.dumps({"type": "closed", "masters_absent": True,
+                        "agent_paths_absent": True, "agent_directories": 2}).encode() + b"\n"
+    outer = json.dumps({"type": "external_cleanup", "cgroup_empty": True,
+                        "cgroup_removed": True}).encode() + b"\n"
+    children = []
+
+    def owner():
+        value = Keeper.__new__(Keeper)
+        value.cleanup_progress = {}
+        value.deadline = time.monotonic() + 3
+        return value
+
+    def child(code):
+        process = subprocess.Popen([sys.executable, "-I", "-S", "-c", code],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, env={"PATH": "/usr/bin:/bin"},
+                                   start_new_session=True)
+        children.append(process)
+        return process
+
+    def refuse(action):
+        try:
+            action()
+        except Refused:
+            return
+        raise AssertionError("cleanup unexpectedly accepted")
+
+    try:
+        value = owner()
+        process = child("import os; os.read(0,1); os.write(1," + repr(inner + outer) + ")")
+        process.stdin.close()
+        value.cleanup_control(process, 2)
+        state = value.cleanup_progress[process]
+        deadline = state["deadline"]
+        assert state["inner"] is not None and state["external"] and state["waited"]
+        value.cleanup_control(process, 2)
+        assert state["deadline"] == deadline and process.stdout.closed
+
+        value = owner()
+        process = child("import os; os.write(1," + repr(inner + outer) + ")")
+        process.wait(timeout=2)  # Exit before any drain must still owe receipts.
+        value.cleanup_control(process, 2)
+        assert value.cleanup_progress[process]["waited"]
+
+        value = owner()
+        process = child("import os; os.write(1," + repr(inner + outer[:12]) +
+                        "); os.read(0,1); os.write(1," + repr(outer[12:]) + ")")
+        state = value.cleanup_state(process)
+        deadline = state["deadline"]
+        original_select = select.select
+        interrupted = False
+
+        def interrupt_select(read, write, error, timeout):
+            nonlocal interrupted
+            if process.stdout in read and state["inner"] is not None and len(state["buffer"]) == 12 and not interrupted:
+                interrupted = True
+                raise RuntimeError("synthetic drain interruption")
+            return original_select(read, write, error, timeout)
+
+        select.select = interrupt_select
+        try:
+            try:
+                value.cleanup_receipts(process, 2)
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("missing synthetic interruption")
+        finally:
+            select.select = original_select
+        assert interrupted and state["inner"] is not None and state["buffer"] == outer[:12]
+        assert not state["external"] and not state["waited"] and state["deadline"] == deadline
+        os.write(process.stdin.fileno(), b"C")
+        value.cleanup_control(process, 2)
+        assert state["external"] and state["waited"] and state["deadline"] == deadline
+
+        for data in (inner + outer[:12], inner + outer.replace(b"true", b"1"), b""):
+            value = owner()
+            process = child("import os; os.write(1," + repr(data) + ")")
+            refuse(lambda: value.cleanup_control(process, 2))
+            state = value.cleanup_progress[process]
+            deadline = state["deadline"]
+            refuse(lambda: value.cleanup_control(process, 2))
+            assert state["failed"] and not state["waited"] and state["deadline"] == deadline
+            assert process.returncode is not None and process.stdout.closed
+
+        value = owner()
+        control = child("import os; os.write(1," + repr(inner + outer[:12]) + ")")
+        app = child("pass")
+        gateway = SimpleNamespace(close=lambda: None)
+        diagnostic = io.StringIO()
+        with contextlib.redirect_stderr(diagnostic):
+            try:
+                try:
+                    raise Refused("synthetic original case failure")
+                finally:
+                    value.cleanup_case(app, gateway, control)
+            except Refused as error:
+                assert error.args == ("synthetic original case failure",)
+            else:
+                raise AssertionError("original failure was lost")
+        assert diagnostic.getvalue() == "REFUSED keeper cleanup: uncertain\n"
+        assert control.returncode is not None and control.stdout.closed
+    finally:
+        for process in reversed(children):
+            stop_owned(process)
+    print("PASS keeper cleanup retained receipt progress", flush=True)
+
+
 def main():
+    if sys.argv[1:] == ["--cleanup-self-test"]:
+        cleanup_self_test()
+        return
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=pathlib.Path, required=True)
     parser.add_argument("--podman", type=pathlib.Path, default=pathlib.Path("/opt/homebrew/bin/podman"))

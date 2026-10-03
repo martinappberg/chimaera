@@ -7,6 +7,7 @@ Uses the loader's bounded synthetic process ownership/cleanup helpers.
 """
 import argparse
 import base64
+import errno
 import hashlib
 import http.server
 import json
@@ -54,6 +55,105 @@ def response_fact(method, path, status, elapsed_ms):
                      "/v1/oauth/refresh": "refresh"}.get(path, "other"),
             "status": status if status in (200, 401, 404) else "other",
             "elapsed_ms": max(0, min(12000, elapsed_ms))}
+
+
+# Never render an exception message, argv, path or child bytes. Refused reasons
+# are projected only from closed fixture literals; unknown values stay opaque.
+def failure_fact(error):
+    fact = {"kind": "other", "errno": "none", "reason": "other"}
+    if isinstance(error, Refused):
+        fact["kind"] = "refused"
+        reasons = {
+            "child receipt shape": "receipt-shape",
+            "helper directory receipt": "receipt-directory",
+            "helper ownership receipt": "receipt-owner",
+            "helper descendant receipt": "receipt-members",
+            "missing helper receipt": "receipt-missing",
+            "process identity shape": "identity-shape",
+            "owned process group changed": "group-changed",
+            "fixed command deadline": "command-deadline",
+            "fixed command output bound": "command-output-bound",
+            "route case deadline": "case-deadline",
+            "route prompt handoff": "answer-short",
+            "route cancellation handoff": "cancel-short",
+            "route fixture interrupted or expired": "interrupted",
+            "owned helper cleanup not positive": "helper-cleanup",
+            "route case refused": "case-refused",
+            "route case output bound": "case-output-bound",
+            "positive ordered grant receipt": "grant-receipt",
+            "config revalidation escaped": "config-revalidation",
+            "late grant or reconnect escaped": "late-grant",
+            "ready deadline cleanup receipt": "ready-cleanup",
+            "original route deadline restarted": "deadline-restarted",
+            "foreign fixture agent changed": "foreign-changed",
+            "loopback protocol owner failed": "protocol-failed",
+            "loopback helper cleanup": "protocol-cleanup",
+            "fixture root identity changed": "root-changed",
+        }
+        if len(error.args) == 1 and type(error.args[0]) is str:
+            fact["reason"] = reasons.get(error.args[0], "other")
+    elif isinstance(error, (subprocess.TimeoutExpired, TimeoutError)):
+        fact["kind"] = "timeout"
+    elif isinstance(error, OSError):
+        fact["kind"] = "os"
+        fact["errno"] = {errno.ENOENT: "missing", errno.ESRCH: "gone",
+                         errno.EACCES: "permission", errno.EPERM: "permission",
+                         errno.EPIPE: "broken-pipe", errno.EBADF: "bad-fd"}.get(error.errno, "other")
+    elif isinstance(error, ValueError):
+        fact["kind"] = "value"
+    return fact
+
+
+def diagnostic_print(*fields):
+    # A closed diagnostic sink must not replace the causal fixture/cleanup error.
+    try:
+        print(*fields, flush=True)
+    except (OSError, ValueError):
+        pass
+
+
+class CaseFacts:
+    PHASES = ("case-start", "app-spawn", "helper-receipt", "receipt-complete",
+              "answer-delay", "answer-write", "answer-sent", "answer-close",
+              "answer-closed", "cancel-write", "app-wait", "receipt-cleanup",
+              "foreign-check", "case-complete")
+
+    def __init__(self, start):
+        self.start = start
+        self.phase = "case-start"
+        self.phases = []
+        self.original_error = None
+        self.cleanup_errors = []
+        self.receipt_captured = self.continue_sent = False
+        self.stdin_closed = False
+        self.member_count = 0
+        self.pre_cleanup_exit = None
+        self.stop_owned_entered = self.stop_owned_live_before = self.stop_owned_returned = False
+        self.mark("case-start")
+
+    def mark(self, phase):
+        if phase not in self.PHASES:
+            raise Refused("route diagnostic phase refused")
+        self.phase = phase
+        if len(self.phases) < 16:
+            self.phases.append({"phase": phase,
+                                "elapsed_ms": max(0, min(12000, int((time.monotonic() - self.start) * 1000)))})
+
+    def cleanup_error(self, phase, error):
+        if phase not in ("stdin-close", "protocol-close", "app-stop", "protocol-failed"):
+            raise Refused("route diagnostic cleanup phase refused")
+        if len(self.cleanup_errors) < 4:
+            self.cleanup_errors.append({"phase": phase, **failure_fact(error)})
+
+    def fact(self):
+        return {"phase": self.phase, "phases": self.phases,
+                "original_error": self.original_error, "cleanup_errors": self.cleanup_errors,
+                "receipt_captured": self.receipt_captured, "continue_sent": self.continue_sent,
+                "stdin_closed": self.stdin_closed, "member_count": self.member_count,
+                "pre_cleanup_exit": self.pre_cleanup_exit,
+                "stop_owned_entered": self.stop_owned_entered,
+                "stop_owned_live_before": self.stop_owned_live_before,
+                "stop_owned_returned": self.stop_owned_returned}
 
 
 class Protocol(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -325,18 +425,27 @@ class RouteFixture(Fixture):
         super().__init__(binary)
 
     def close(self):
-        failed = False
+        errors = []
+        facts = []
         for helper in reversed(self.protocols):
             try:
                 helper.close()
-            except (Refused, OSError):
-                failed = True
+            except BaseException as error:
+                if len(facts) < 6:
+                    facts.append({"phase": "protocol-close", **failure_fact(error)})
+                if not errors:
+                    errors.append(error)
         # Retire processes/directories even if one listener refuses cleanup.
         try:
             super().close()
-        finally:
-            if failed:
-                raise Refused("retained loopback helper cleanup")
+        except BaseException as error:
+            if len(facts) < 6:
+                facts.append({"phase": "fixture-close", **failure_fact(error)})
+            if not errors:
+                errors.append(error)
+        if errors:
+            diagnostic_print("DIAGNOSTIC route retained_cleanup", json.dumps(facts, separators=(",", ":")))
+            raise errors[0]
 
     def run(self):
         encrypted, public = self.key("selected")
@@ -374,35 +483,51 @@ class RouteFixture(Fixture):
             app = None
             passed = False
             output = bytearray()
+            facts = CaseFacts(start)
+            original_error = None
             try:
+                facts.mark("app-spawn")
                 app = self.spawn([str(self.binary), "--route-fixture", str(config), helper.origin, action],
                                  env, input_pipe=True)
 
                 def observed(output):
                     nonlocal receipt, answered
                     if b"ROUTE_PROMPT\n" in output and receipt is None:
+                        facts.mark("helper-receipt")
                         receipt = self.helper_receipt(app)
+                        facts.receipt_captured = True
+                        facts.member_count = min(16, len(receipt[4]))
+                        facts.mark("receipt-complete")
                     if receipt is not None and not answered:
                         if action == "config-change":
                             config.write_text(text.replace("fixture.example.invalid", "changed.example.invalid"))
                         # A bounded delay at unlock proves the later eight-second
                         # deadline includes time already spent before the grant.
+                        facts.mark("answer-delay")
                         time.sleep(1)
+                        facts.mark("answer-write")
                         if os.write(app.stdin.fileno(), b"CONTINUE\n") != 9:
                             raise Refused("route prompt handoff")
                         answered = True
+                        facts.continue_sent = True
+                        facts.mark("answer-sent")
                         if action != "grant-cancel":
+                            facts.mark("answer-close")
                             app.stdin.close()
+                            facts.stdin_closed = True
+                            facts.mark("answer-closed")
 
                 until = self.end(11)
                 while True:
                     if time.monotonic() >= until:
                         raise Refused("route case deadline")
                     if action == "grant-cancel" and helper.grant_entered.is_set() and not cancelled:
+                        facts.mark("cancel-write")
                         if os.write(app.stdin.fileno(), b"CANCEL\n") != 7:
                             raise Refused("route cancellation handoff")
                         cancelled = True
                         app.stdin.close()
+                        facts.stdin_closed = True
                     if not select.select([app.stdout], [], [], 0.025)[0]:
                         continue
                     chunk = os.read(app.stdout.fileno(), 4096)
@@ -412,6 +537,7 @@ class RouteFixture(Fixture):
                         raise Refused("route case output bound")
                     output.extend(chunk)
                     observed(output)
+                facts.mark("app-wait")
                 app.wait(timeout=max(0.01, until - time.monotonic()))
                 if app.returncode != 0 or receipt is None or helper.failed:
                     raise Refused("route case refused")
@@ -429,24 +555,51 @@ class RouteFixture(Fixture):
                         raise Refused("ready deadline cleanup receipt")
                     if action.endswith("expiry") and time.monotonic() - start > 10:
                         raise Refused("original route deadline restarted")
+                facts.mark("receipt-cleanup")
                 self.cleanup_receipt(receipt)
+                facts.mark("foreign-check")
                 if self.identities(env) != before:
                     raise Refused("foreign fixture agent changed")
+                facts.mark("case-complete")
                 passed = True
                 print("PASS", action, "original_owner configured_identity owned_cleanup foreign_unchanged", flush=True)
+            except BaseException as error:
+                original_error = error
+                facts.original_error = {"phase": facts.phase, **failure_fact(error)}
+                raise
             finally:
-                if app is not None and not app.stdin.closed:
-                    app.stdin.close()
-                try:
-                    helper.close()
-                finally:
-                    if app is not None:
-                        stop_owned(app)
-                if not passed:
+                # Record the original outcome before any retirement can cause
+                # -SIGKILL or mask the first exception. These are observations,
+                # not proof that stop_owned actually sent a signal.
+                facts.pre_cleanup_exit = app.poll() if app is not None else None
+                cleanup_errors = []
+                for phase, operation in (
+                    ("stdin-close", lambda: app.stdin.close() if app is not None and not app.stdin.closed else None),
+                    ("protocol-close", helper.close),
+                    ("app-stop", lambda: stop_owned(app) if app is not None else None),
+                ):
+                    try:
+                        if phase == "app-stop" and app is not None:
+                            facts.stop_owned_entered = True
+                            facts.stop_owned_live_before = app.poll() is None
+                        operation()
+                        if phase == "stdin-close" and app is not None:
+                            facts.stdin_closed = app.stdin.closed
+                        if phase == "app-stop" and app is not None:
+                            facts.stop_owned_returned = True
+                    except BaseException as error:
+                        cleanup_errors.append(error)
+                        facts.cleanup_error(phase, error)
+                if helper.failed:
+                    error = Refused("loopback protocol owner failed")
+                    cleanup_errors.append(error)
+                    facts.cleanup_error("protocol-failed", error)
+                if not passed or original_error is not None or cleanup_errors:
                     # Closed synthetic stage/counter facts only; never publish
                     # child bytes, request bodies, credentials or stderr.
-                    print("DIAGNOSTIC route", json.dumps({
+                    diagnostic_print("DIAGNOSTIC route", json.dumps({
                         "action": action, "exit_code": app.returncode if app is not None else None,
+                        "source_diagnostic": facts.fact(),
                         "prompt": b"ROUTE_PROMPT\n" in output,
                         "selected": b"ROUTE_SELECTED\n" in output,
                         "failed_marker": b"ROUTE_FAILED\n" in output,
@@ -462,9 +615,9 @@ class RouteFixture(Fixture):
                         "native_phases": native_phases(output),
                         "response_headers_started": helper.response_headers_started,
                         "response_overflow": helper.response_overflow,
-                    }, separators=(",", ":")), flush=True)
-                if helper.failed:
-                    raise Refused("loopback protocol owner failed")
+                    }, separators=(",", ":")))
+                if original_error is None and cleanup_errors:
+                    raise cleanup_errors[0]
         print("PASS route5; simulated keeper protocol, no signing/SSH/Tauri/job acceptance", flush=True)
 
 
@@ -486,20 +639,32 @@ def main():
         signal.signal(name, interrupted)
     signal.setitimer(signal.ITIMER_REAL, 60)
     fixture = RouteFixture(args.binary)
+    original_error = None
     try:
         fixture.run()
+    except BaseException as error:
+        original_error = error
+        raise
     finally:
         # Cleanup uses only fixed, independently bounded owned-process receipts;
         # a second signal must not interrupt retirement midway through a group.
         signal.setitimer(signal.ITIMER_REAL, 0)
         for name in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             signal.signal(name, signal.SIG_IGN)
-        fixture.close()
+        try:
+            fixture.close()
+        except BaseException as error:
+            diagnostic_print("DIAGNOSTIC route outer_cleanup", json.dumps({
+                "original_error": failure_fact(original_error) if original_error is not None else None,
+                "cleanup_error": failure_fact(error),
+            }, separators=(",", ":")))
+            if original_error is None:
+                raise
 
 
 if __name__ == "__main__":
     try:
         main()
     except (Refused, OSError, ValueError, subprocess.TimeoutExpired) as error:
-        print("FAIL", str(error) if isinstance(error, Refused) else "fixture operation refused", file=sys.stderr)
+        print("FAIL route", json.dumps(failure_fact(error), separators=(",", ":")), file=sys.stderr)
         sys.exit(1)

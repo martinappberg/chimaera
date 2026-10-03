@@ -223,7 +223,15 @@ fn main() {
             if args.len() != 5
                 || !matches!(
                     args[4].as_str(),
-                    "accept" | "refuse" | "cancel" | "deadline"
+                    "accept"
+                        | "refuse"
+                        | "cancel"
+                        | "deadline"
+                        | "password-accept"
+                        | "password-wrong"
+                        | "password-decline"
+                        | "password-cancel"
+                        | "password-deadline"
                 )
             {
                 std::process::exit(2)

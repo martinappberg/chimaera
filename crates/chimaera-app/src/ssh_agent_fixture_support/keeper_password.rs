@@ -10,7 +10,7 @@ use chimaera_link::{Client, Event, EventCommand, HostStatus, SshRouteMode};
 use std::{
     io::Write,
     sync::{
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         Arc,
     },
     time::Duration,
@@ -54,6 +54,8 @@ pub(super) async fn authenticate(
     let target = legs[1].destination.clone();
     let prompts = Arc::new(AtomicU8::new(0));
     let observed = prompts.clone();
+    let answer_enqueued = Arc::new(AtomicBool::new(false));
+    let offline_seen = Arc::new(AtomicBool::new(false));
     // Production Link parses frames and owns connection-local answer aliases.
     // The same Registry used by Connect alone grants exact-leg UI authority.
     let mut connection = client.events();
@@ -118,6 +120,7 @@ pub(super) async fn authenticate(
                     .send(EventCommand::Answer { id, value })
                     .await
                     .map_err(|_| Failure::Unavailable)?;
+                answer_enqueued.store(true, Ordering::SeqCst);
             }
         }
         Err(Failure::Unavailable)
@@ -137,16 +140,42 @@ pub(super) async fn authenticate(
                     return Ok(());
                 }
                 if observed.load(Ordering::SeqCst) > 0 && row.status == HostStatus::Offline {
+                    offline_seen.store(true, Ordering::SeqCst);
                     return Err(Failure::AgentRefused);
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         });
-    let result = tokio::select! {
+    let (branch, result) = tokio::select! {
         biased;
-        result = authenticate => result,
-        result = consume => result,
+        result = authenticate => ("authenticate", result),
+        result = consume => ("events", result),
     };
+    // Diagnostics describe the observed owner, not a password-error receipt.
+    println!("KEEPER_PASSWORD_BRANCH {branch}");
+    println!(
+        "KEEPER_PASSWORD_ANSWER_ENQUEUED {}",
+        answer_enqueued.load(Ordering::SeqCst)
+    );
+    println!(
+        "KEEPER_PASSWORD_OFFLINE_SEEN {}",
+        offline_seen.load(Ordering::SeqCst)
+    );
+    println!(
+        "{}",
+        match &result {
+            Ok(()) => "KEEPER_OUTCOME success",
+            Err(Failure::Unsupported) => "KEEPER_OUTCOME unsupported",
+            Err(Failure::InvalidBinding) => "KEEPER_OUTCOME invalid_binding",
+            Err(Failure::InvalidRequest) => "KEEPER_OUTCOME invalid_request",
+            Err(Failure::KeyUnavailable) => "KEEPER_OUTCOME key_unavailable",
+            Err(Failure::AgentRefused) => "KEEPER_OUTCOME agent_refused",
+            Err(Failure::Expired) => "KEEPER_OUTCOME expired",
+            Err(Failure::Revoked) => "KEEPER_OUTCOME revoked",
+            Err(Failure::Unavailable) => "KEEPER_OUTCOME unavailable",
+            Err(Failure::Unknown) => "KEEPER_OUTCOME unknown",
+        }
+    );
     if prompts.load(Ordering::SeqCst) == 0 {
         return Err(());
     }

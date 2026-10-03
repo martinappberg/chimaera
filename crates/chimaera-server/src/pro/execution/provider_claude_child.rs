@@ -1,6 +1,10 @@
 //! Closed Claude exercise, not normal PTY/chat launch routing. The final child
 //! receives only a project frontend credential, never canonical provider auth.
-use super::{provider_claude::Frontend, provider_client::ChildLifetime};
+use super::{
+    provider_claude::Frontend,
+    provider_claude_diagnostics::{self as diagnostics, Stage, Trace},
+    provider_client::ChildLifetime,
+};
 use crate::{cloud::providers::process::Child, AppState};
 use chimaera_core::provider_runtime as wire;
 use std::{
@@ -65,6 +69,32 @@ async fn exercise_at(
     home: PathBuf,
     budget: Duration,
 ) -> Result<Zeroizing<Vec<u8>>, wire::Error> {
+    exercise_at_diagnostic(state, input, executable, home, budget, None).await
+}
+#[cfg(feature = "provider-claude-fixture")]
+pub(super) async fn exercise_fixture(
+    state: &Arc<AppState>,
+    input: Zeroizing<Vec<u8>>,
+    trace: Arc<Trace>,
+) -> Result<Zeroizing<Vec<u8>>, wire::Error> {
+    exercise_at_diagnostic(
+        state,
+        input,
+        PathBuf::from(CLI),
+        PathBuf::from(HOME),
+        CHILD_TIME,
+        Some(trace),
+    )
+    .await
+}
+async fn exercise_at_diagnostic(
+    state: &Arc<AppState>,
+    input: Zeroizing<Vec<u8>>,
+    executable: PathBuf,
+    home: PathBuf,
+    budget: Duration,
+    trace: Option<Arc<Trace>>,
+) -> Result<Zeroizing<Vec<u8>>, wire::Error> {
     if input.is_empty() || input.len() > INPUT {
         return Err(wire::Error::InvalidRequest);
     }
@@ -72,7 +102,7 @@ async fn exercise_at(
     let _observer = lifetime.observer();
     let (sent, received) = oneshot::channel();
     tokio::spawn(async move {
-        let result = run(&lifetime, input, &executable, &home).await;
+        let result = run(&lifetime, input, &executable, &home, trace).await;
         drop(lifetime);
         let _ = sent.send(result);
     });
@@ -101,15 +131,22 @@ async fn run(
     input: Zeroizing<Vec<u8>>,
     executable: &Path,
     home: &Path,
+    trace: Option<Arc<Trace>>,
 ) -> Result<Zeroizing<Vec<u8>>, wire::Error> {
     let cwd = lifetime.project_root()?;
     let home_copy = home.to_path_buf();
     // This blocking continuation remains owned even after its observer retires.
     let config = tokio::task::spawn_blocking(move || Config::capture(&home_copy))
         .await
-        .map_err(|_| wire::Error::Unavailable)??;
+        .map_err(|_| wire::Error::Unavailable)
+        .inspect_err(|_| diagnostics::emit(&trace, Stage::ConfigRefused))?
+        .inspect_err(|_| diagnostics::emit(&trace, Stage::ConfigRefused))?;
     lifetime.current()?;
-    let frontend = Frontend::start(lifetime.clone()).await?;
+    diagnostics::emit(&trace, Stage::ConfigCaptured);
+    let frontend = Frontend::start_diagnostic(lifetime.clone(), trace.clone())
+        .await
+        .inspect_err(|_| diagnostics::emit(&trace, Stage::FrontendStartRefused))?;
+    diagnostics::emit(&trace, Stage::FrontendStarted);
     let result = async {
         lifetime.current()?;
         let mut command = tokio::process::Command::new(executable);
@@ -135,10 +172,12 @@ async fn run(
         let mut child = match Child::spawn(&mut command) {
             Ok(child) => child,
             Err(_) => {
+                diagnostics::emit(&trace, Stage::ChildSpawnRefused);
                 lifetime.process_pending(false);
                 return Err(wire::Error::Unavailable);
             }
         };
+        diagnostics::emit(&trace, Stage::ChildSpawned);
         let original = child.child.id();
         command.env_remove("CLAUDE_CODE_OAUTH_TOKEN");
         drop(command);
@@ -147,6 +186,7 @@ async fn run(
             let mut stdin = child.child.stdin.take().ok_or(wire::Error::Unavailable)?;
             let stdout = child.child.stdout.take().ok_or(wire::Error::Unavailable)?;
             let stderr = child.child.stderr.take().ok_or(wire::Error::Unavailable)?;
+            let input_trace = trace.clone();
             let (_, out, _, status) = lifetime
                 .wait(async {
                     tokio::try_join!(
@@ -158,6 +198,9 @@ async fn run(
                             // Unix pipe shutdown is a no-op. Close the owned
                             // writer before waiting for the CLI to consume EOF.
                             drop(stdin);
+                            if result.is_ok() {
+                                diagnostics::emit(&input_trace, Stage::StdinEof);
+                            }
                             result
                         },
                         bounded(stdout),
@@ -165,11 +208,23 @@ async fn run(
                         async { child.wait().await.map_err(|_| wire::Error::Unavailable) }
                     )
                 })
-                .await??;
+                .await
+                .inspect_err(|_| diagnostics::emit(&trace, Stage::ChildWaitRefused))?
+                .inspect_err(|_| diagnostics::emit(&trace, Stage::ChildWaitRefused))?;
             lifetime.current()?;
             if !status.success() {
+                use std::os::unix::process::ExitStatusExt;
+                diagnostics::emit(
+                    &trace,
+                    if status.signal().is_some() {
+                        Stage::ChildSignaled
+                    } else {
+                        Stage::ChildNonzero
+                    },
+                );
                 return Err(wire::Error::Unavailable);
             }
+            diagnostics::emit(&trace, Stage::ChildSuccess);
             Ok(out)
         }
         .await;
@@ -179,6 +234,7 @@ async fn run(
         }
         drop(child);
         lifetime.process_pending(false);
+        diagnostics::emit(&trace, Stage::ChildCleaned);
         result
     }
     .await;
@@ -186,8 +242,12 @@ async fn run(
     // before that cancellation; it must not turn every positive result stale.
     let current = lifetime.current();
     frontend.stop().await;
+    diagnostics::emit(&trace, Stage::FrontendCleaned);
     drop(config);
     current?;
+    if let Err(error) = result.as_ref() {
+        diagnostics::error(&trace, *error);
+    }
     result
 }
 
