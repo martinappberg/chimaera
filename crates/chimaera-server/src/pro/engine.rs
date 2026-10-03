@@ -3512,7 +3512,7 @@ mod tests {
     }
     #[test]
     fn three_way_return_preserves_local_conflicts_and_applies_unmodified_files() {
-        let root = std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "chimaera-pro-merge-{}",
             chimaera_core::generate_token()
         ));
@@ -3575,7 +3575,7 @@ mod tests {
     }
     #[test]
     fn canonical_return_uses_cloud_files_and_preserves_unpublished_local_edits() {
-        let root = std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "chimaera-canonical-return-{}",
             chimaera_core::generate_token()
         ));

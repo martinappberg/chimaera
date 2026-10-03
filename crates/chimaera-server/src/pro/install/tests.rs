@@ -56,6 +56,84 @@ fn binding() -> Binding {
 }
 
 #[test]
+fn changed_staging_images_refuse_instead_of_disappearing_from_the_write_plan() {
+    const CHILD_ROOT: &str = "CHIMAERA_TEST_INSTALL_FIFO_ROOT";
+    let Some(child_root) = std::env::var_os(CHILD_ROOT) else {
+        let fixture = Fixture::new();
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let test = format!(
+            "{}::changed_staging_images_refuse_instead_of_disappearing_from_the_write_plan",
+            module_path!().split_once("::").unwrap().1
+        );
+        let mut child = Child(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test])
+                .env(CHILD_ROOT, &fixture.0)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(status.success(), "changed staging image child failed");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "changed staging image read stalled"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            fs::read(fixture.0.join("refusals-checked")).unwrap(),
+            b"all refused"
+        );
+        return;
+    };
+    for replacement in ["missing", "fifo", "symlink"] {
+        // The watchdog parent owns this whole tree even if it must kill a
+        // child stalled in an old blocking open.
+        let fixture = Fixture(PathBuf::from(&child_root).join(replacement));
+        fs::create_dir_all(fixture.root()).unwrap();
+        let before = fixture.0.join("before");
+        let after = fixture.0.join("after");
+        fs::create_dir(&before).unwrap();
+        fs::create_dir(&after).unwrap();
+        fs::write(before.join("file"), b"original").unwrap();
+        fs::write(after.join("file"), b"incoming").unwrap();
+        let result = changes_after_walk(&fixture.root(), &before, &after, &|| {
+            fs::remove_file(after.join("file"))?;
+            match replacement {
+                "fifo" => nix::unistd::mkfifo(
+                    &after.join("file"),
+                    nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+                )?,
+                "symlink" => std::os::unix::fs::symlink(before.join("file"), after.join("file"))?,
+                _ => {}
+            }
+            Ok(())
+        });
+        assert!(result.is_err(), "a captured staging image changed");
+        assert_eq!(fs::read(before.join("file")).unwrap(), b"original");
+        assert!(!fixture.root().join("file").exists());
+    }
+    fs::write(
+        PathBuf::from(child_root).join("refusals-checked"),
+        b"all refused",
+    )
+    .unwrap();
+}
+
+#[test]
 fn overwrite_delete_failure_retains_originals_and_exact_restart_rolls_forward() {
     let fixture = Fixture::new();
     let writes = vec![

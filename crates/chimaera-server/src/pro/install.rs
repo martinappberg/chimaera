@@ -244,9 +244,21 @@ fn paths(root: &Path) -> Result<(BTreeSet<PathBuf>, BTreeSet<PathBuf>)> {
     Ok((files, directories))
 }
 pub(super) fn changes(root: &Path, before: &Path, after: &Path) -> Result<Vec<Write>> {
-    let (mut all, before_dirs) = paths(before)?;
+    changes_after_walk(root, before, after, &|| Ok(()))
+}
+fn changes_after_walk(
+    root: &Path,
+    before: &Path,
+    after: &Path,
+    after_walk: &dyn Fn() -> Result<()>,
+) -> Result<Vec<Write>> {
+    let (before_files, before_dirs) = paths(before)?;
     let (after_files, after_dirs) = paths(after)?;
-    all.extend(after_files);
+    after_walk()?;
+    let before_root = directory(before)?;
+    let after_root = directory(after)?;
+    let mut all = before_files.clone();
+    all.extend(after_files.iter().cloned());
     let mut writes = Vec::new();
     for relative in after_dirs.difference(&before_dirs) {
         writes.push(Write {
@@ -259,10 +271,28 @@ pub(super) fn changes(root: &Path, before: &Path, after: &Path) -> Result<Vec<Wr
     for relative in all {
         let old = before.join(&relative);
         let new = after.join(&relative);
-        let old = old.is_file().then_some(old);
-        let new = new.is_file().then_some(new);
-        if let (Some(old), Some(new)) = (&old, &new) {
-            if digest(&mut File::open(old)?)? == digest(&mut File::open(new)?)? {
+        // Enumeration records presence. A removed/replaced file must refuse,
+        // not turn a known before/after image into a different write intent.
+        let open = |root: &File| -> Result<File> {
+            let directory = parent(root, &relative, false)?;
+            plain(
+                &directory,
+                relative.file_name().context("invalid staged path")?,
+            )?
+            .context("staging image disappeared")
+        };
+        let mut old_file = before_files
+            .contains(&relative)
+            .then(|| open(&before_root))
+            .transpose()?;
+        let mut new_file = after_files
+            .contains(&relative)
+            .then(|| open(&after_root))
+            .transpose()?;
+        let old = old_file.as_ref().map(|_| old);
+        let new = new_file.as_ref().map(|_| new);
+        if let (Some(old), Some(new)) = (&mut old_file, &mut new_file) {
+            if digest(old)? == digest(new)? {
                 continue;
             }
         }

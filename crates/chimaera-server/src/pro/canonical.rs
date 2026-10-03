@@ -96,15 +96,34 @@ impl KeptCopies {
     /// Never overwrites an earlier copy; fails before touching the original
     /// when the bounds are reached.
     pub fn keep(&mut self, target: &Path, relative: &Path) -> Result<PathBuf> {
+        self.keep_captured(target, relative, &|| Ok(()))
+    }
+    fn keep_captured(
+        &mut self,
+        target: &Path,
+        relative: &Path,
+        after_capture: &dyn Fn() -> Result<()>,
+    ) -> Result<PathBuf> {
         ensure!(
             super::policy::allowed_path(relative),
             "unsafe conflict path"
         );
-        let metadata = std::fs::symlink_metadata(target)?;
+        let directory =
+            super::install::directory(target.parent().context("conflict parent unavailable")?)?;
+        let source = crate::download::open_beneath(
+            &directory,
+            Path::new(target.file_name().context("conflict name unavailable")?),
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK
+                | rustix::fs::OFlags::CLOEXEC,
+        )?;
+        let metadata = source.metadata()?;
         ensure!(
             metadata.is_file() && metadata.len() <= super::policy::MAX_FILE_BYTES,
             "local conflict file exceeds limit"
         );
+        after_capture()?;
         ensure!(
             self.files < MAX_FILES
                 && self
@@ -137,26 +156,28 @@ impl KeptCopies {
             } else {
                 candidate
             };
-            let path = target.with_file_name(&candidate);
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-                options.mode(metadata.permissions().mode() & 0o777);
-            }
-            match options.open(&path) {
-                Ok(file) => {
-                    output = Some(file);
+            use std::os::unix::fs::PermissionsExt;
+            match rustix::fs::openat(
+                &directory,
+                candidate.as_str(),
+                rustix::fs::OFlags::WRONLY
+                    | rustix::fs::OFlags::CREATE
+                    | rustix::fs::OFlags::EXCL
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::from_raw_mode(metadata.permissions().mode() & 0o777),
+            ) {
+                Ok(fd) => {
+                    output = Some(std::fs::File::from(fd));
                     kept = relative.with_file_name(candidate);
                     break;
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(rustix::io::Errno::EXIST) => continue,
                 Err(error) => return Err(error.into()),
             }
         }
         let mut output = output.context("too many kept copies of one file")?;
-        let mut input = std::fs::File::open(target)?.take(super::policy::MAX_FILE_BYTES + 1);
+        let mut input = source.take(super::policy::MAX_FILE_BYTES + 1);
         let copied = std::io::copy(&mut input, &mut output)?;
         ensure!(
             copied == metadata.len() && copied <= super::policy::MAX_FILE_BYTES,
@@ -179,6 +200,7 @@ mod tests {
             chimaera_core::generate_token()
         ));
         std::fs::create_dir_all(root.join("docs")).unwrap();
+        let root = root.canonicalize().unwrap();
         let file = root.join("docs/notes.md");
         std::fs::write(&file, "first local edit").unwrap();
         let mut copies = KeptCopies::new();
@@ -211,5 +233,90 @@ mod tests {
         }
         assert!(kept_copy_name("a.mine-20260928-1200-3"));
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn kept_copy_reads_the_captured_file_when_its_name_is_replaced() {
+        const CHILD_ROOT: &str = "CHIMAERA_TEST_KEPT_FIFO_ROOT";
+        let Some(root) = std::env::var_os(CHILD_ROOT) else {
+            struct Root(PathBuf);
+            impl Drop for Root {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_dir_all(&self.0);
+                }
+            }
+            let root = std::env::temp_dir().join(format!(
+                "chimaera-kept-race-{}",
+                chimaera_core::generate_token()
+            ));
+            std::fs::create_dir(&root).unwrap();
+            let root = Root(root.canonicalize().unwrap());
+            struct Child(std::process::Child);
+            impl Drop for Child {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+            let test = format!(
+                "{}::kept_copy_reads_the_captured_file_when_its_name_is_replaced",
+                module_path!().split_once("::").unwrap().1
+            );
+            let mut child = Child(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", &test])
+                    .env(CHILD_ROOT, &root.0)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    assert!(status.success(), "kept-copy child failed");
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "kept-copy read stalled"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(
+                std::fs::read(root.0.join("captured-and-refused")).unwrap(),
+                b"both checked"
+            );
+            return;
+        };
+        let root = PathBuf::from(root);
+        let target = root.join("notes.md");
+        let replacement = root.join("different.md");
+        std::fs::write(&target, b"original local bytes").unwrap();
+        std::fs::write(&replacement, b"other local content").unwrap();
+        let saved = KeptCopies::new()
+            .keep_captured(&target, Path::new("notes.md"), &|| {
+                std::fs::rename(&target, root.join("original.md"))?;
+                std::os::unix::fs::symlink(&replacement, &target)?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            std::fs::read(root.join(saved)).unwrap(),
+            b"original local bytes"
+        );
+        assert_eq!(std::fs::read(&replacement).unwrap(), b"other local content");
+        std::fs::remove_file(&target).unwrap();
+        nix::unistd::mkfifo(
+            &target,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let before = std::fs::read_dir(&root).unwrap().count();
+        assert!(KeptCopies::new()
+            .keep(&target, Path::new("notes.md"))
+            .is_err());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), before);
+        std::fs::write(root.join("captured-and-refused"), b"both checked").unwrap();
     }
 }

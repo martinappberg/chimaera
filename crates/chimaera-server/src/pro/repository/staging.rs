@@ -291,7 +291,10 @@ fn read_private(root: &Path, relative: &Path, cap: u64) -> Result<Vec<u8>> {
     let mut file = crate::download::open_beneath(
         &directory,
         relative,
-        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NONBLOCK,
     )?;
     ensure!(
         file.metadata()?.is_file() && file.metadata()?.len() <= cap,
@@ -567,7 +570,10 @@ fn verify_blob(
     let mut input = crate::download::open_beneath(
         &directory,
         &Path::new("git/blobs").join(oid),
-        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NONBLOCK,
     )?;
     let metadata = input.metadata()?;
     ensure!(
@@ -816,6 +822,68 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn fifo_index_and_blob_refuse_before_waiting_for_a_writer() {
+        const CHILD_ROOT: &str = "CHIMAERA_TEST_STAGING_FIFO_ROOT";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = PathBuf::from(root);
+            assert!(root.is_absolute());
+            let oid = "a".repeat(40);
+            fs::create_dir_all(root.join("git/blobs")).unwrap();
+            for relative in [PathBuf::from("index"), Path::new("git/blobs").join(&oid)] {
+                nix::unistd::mkfifo(
+                    &root.join(relative),
+                    nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+                )
+                .unwrap();
+            }
+            assert!(read_private(&root, Path::new("index"), 512).is_err());
+            assert!(verify_blob(&root, &oid, Format::Sha1, None, 512).is_err());
+            fs::write(root.join("fifo-refusal-checked"), b"both refused").unwrap();
+            return;
+        }
+        let fixture = Fixture::new();
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let test = format!(
+            "{}::fifo_index_and_blob_refuse_before_waiting_for_a_writer",
+            module_path!().split_once("::").unwrap().1
+        );
+        let mut child = Child(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test])
+                .env(CHILD_ROOT, &fixture.0)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(status.success(), "staging FIFO child failed");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "staging must refuse a FIFO without any writer"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // An old blocking implementation is killed and reaped by Child on the
+        // deadline assertion; no rescue writer or stranded test thread exists.
+        assert_eq!(
+            fs::read(fixture.0.join("fifo-refusal-checked")).unwrap(),
+            b"both refused"
+        );
     }
     fn git(root: &Path, args: &[&str]) -> Vec<u8> {
         let output = std::process::Command::new("git")
