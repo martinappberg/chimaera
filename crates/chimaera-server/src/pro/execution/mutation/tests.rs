@@ -539,3 +539,50 @@ fn scoped_account_authority_pins_dispatch_before_policy_or_ownership() {
     assert!(scoped.begin(&state).is_err());
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[tokio::test]
+async fn free_import_resume_keeps_original_generation_without_fencing_free_dispatch() {
+    let (state, root) = fixture();
+    let free = Dispatch::capture(&state, "free").unwrap();
+    let imported = begin_import(&state, "free", 1, generation(&state))
+        .await
+        .unwrap();
+    assert!(free.generation.is_none());
+    resume_import(imported.into_resume(), free.clone(), async {
+        assert!(!quiescent(&state, "free"));
+        assert!(check_import_resume(&state, "free").is_ok());
+        free.run(async {
+            assert!(check_import_resume(&state, "free").is_ok());
+            let unrelated = Dispatch::capture(&state, "unrelated").unwrap();
+            unrelated
+                .run(async {
+                    assert!(check_import_resume(&state, "free").is_err());
+                    assert!(check_import_resume(&state, "unrelated").is_err());
+                })
+                .await;
+            state.pro.generation.fetch_add(1, Ordering::AcqRel);
+            // Unrelated account replacement still leaves ordinary free work alone.
+            assert!(free.begin(&state).unwrap().is_none());
+            // Nested dispatch cannot discard recovery's original import identity.
+            assert!(check_import_resume(&state, "free").is_err());
+        })
+        .await;
+        assert!(check_import_resume(&state, "free").is_err());
+        assert!(!quiescent(&state, "free"));
+    })
+    .await;
+    assert!(quiescent(&state, "free"));
+
+    let imported = begin_import(&state, "free", 1, generation(&state))
+        .await
+        .unwrap();
+    let unrelated = Dispatch::capture(&state, "unrelated").unwrap();
+    resume_import(imported.into_resume(), unrelated, async {
+        assert!(check_import_resume(&state, "free").is_err());
+        assert!(check_import_resume(&state, "unrelated").is_err());
+        assert!(!quiescent(&state, "free"));
+    })
+    .await;
+    assert!(quiescent(&state, "free"));
+    std::fs::remove_dir_all(root).unwrap();
+}

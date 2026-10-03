@@ -114,14 +114,20 @@ pub(crate) struct ImportGuard {
 impl ImportGuard {
     /// Execution preparation must not reacquire our configuration lock. Keep
     /// the counted reservation until its final captured launch admission settles.
-    pub(crate) fn into_resume(self) -> Guard {
+    pub(crate) fn into_resume(self) -> ResumeGuard {
         let Self {
             _commit,
             _configuration,
+            workspace,
+            generation,
             ..
         } = self;
         drop(_configuration);
-        _commit
+        ResumeGuard {
+            commit: _commit,
+            workspace,
+            generation,
+        }
     }
     /// Publish setup only for the hydration whose durable commit we admitted.
     /// The caller retains this guard through persistence, so account replacement
@@ -230,9 +236,39 @@ pub(crate) async fn begin_import(
         generation,
     })
 }
+/// Import recovery keeps its original account generation even for a local
+/// project with no ordinary Pro enrollment. Only its admitted import can mint
+/// this consume-once owner; dropping it releases the retained commit count.
+pub(crate) struct ResumeGuard {
+    commit: Guard,
+    workspace: String,
+    generation: u64,
+}
+
+struct ResumeAdmission {
+    dispatch: Dispatch,
+    imported: Option<(String, u64)>,
+}
+impl ResumeAdmission {
+    fn check(&self, state: &AppState, workspace: &str) -> anyhow::Result<()> {
+        let import_matches = || {
+            self.imported.as_ref().is_none_or(|(original, captured)| {
+                original == workspace && *captured == generation(state)
+            })
+        };
+        if self.dispatch.workspace != workspace || !import_matches() {
+            return Err(Changed.into());
+        }
+        self.dispatch.check(state)?;
+        if !import_matches() {
+            return Err(Changed.into());
+        }
+        Ok(())
+    }
+}
 tokio::task_local! {
     static REQUEST_RESERVED: ();
-    static IMPORT_RESUME: Dispatch;
+    static IMPORT_RESUME: ResumeAdmission;
 }
 pub(crate) fn request_reserved() -> bool {
     REQUEST_RESERVED.try_with(|_| ()).is_ok()
@@ -250,21 +286,27 @@ pub(crate) async fn reserved_request<F: std::future::Future>(
 }
 pub(crate) fn check_import_resume(state: &AppState, workspace: &str) -> anyhow::Result<()> {
     IMPORT_RESUME
-        .try_with(|captured| {
-            if captured.workspace != workspace {
-                return Err(Changed.into());
-            }
-            captured.check(state)
-        })
+        .try_with(|captured| captured.check(state, workspace))
         .unwrap_or(Ok(()))
 }
 pub(crate) async fn resume_import<F: std::future::Future>(
-    guard: Guard,
+    guard: ResumeGuard,
     captured: Dispatch,
     operation: F,
 ) -> F::Output {
+    let ResumeGuard {
+        commit,
+        workspace,
+        generation,
+    } = guard;
     IMPORT_RESUME
-        .scope(captured, reserved_request(guard, operation))
+        .scope(
+            ResumeAdmission {
+                dispatch: captured,
+                imported: Some((workspace, generation)),
+            },
+            reserved_request(commit, operation),
+        )
         .await
 }
 impl Drop for Guard {
@@ -297,8 +339,20 @@ pub(crate) struct Dispatch {
 impl Dispatch {
     /// Existing final spawn checks consume the originally admitted authority,
     /// including local manual restoration where no managed lease guard exists.
+    /// A narrower dispatch cannot discard an enclosing import's original identity.
     pub(crate) async fn run<F: std::future::Future>(&self, operation: F) -> F::Output {
-        IMPORT_RESUME.scope(self.clone(), operation).await
+        let imported = IMPORT_RESUME
+            .try_with(|admission| admission.imported.clone())
+            .unwrap_or(None);
+        IMPORT_RESUME
+            .scope(
+                ResumeAdmission {
+                    dispatch: self.clone(),
+                    imported,
+                },
+                operation,
+            )
+            .await
     }
     pub(crate) fn capture(state: &AppState, workspace: &str) -> anyhow::Result<Self> {
         let generation = generation(state);
