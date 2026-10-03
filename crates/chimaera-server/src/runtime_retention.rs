@@ -151,6 +151,39 @@ fn cleanup(root: &Path, kind: AgentKind) {
     }
 }
 
+/// Caller holds the install lock. Take the broad lock first to exclude new
+/// sessions while checking every package lease, and retain all guards through
+/// removal. None means a terminal, agent, or older daemon still needs the files.
+pub(crate) fn lock_removal(root: &Path, kind: AgentKind) -> anyhow::Result<Option<Vec<File>>> {
+    let tree = root.join(kind.as_str());
+    if !tree.exists() {
+        return Ok(Some(Vec::new()));
+    }
+    let usage = open_lock(root, &format!(".{}.use", kind.as_str()))?;
+    match usage.try_lock().map_err(std::io::Error::from) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    if untracked_daemon(root)? {
+        return Ok(None);
+    }
+    let mut locks = vec![usage];
+    for entry in bounded_entries(&tree)? {
+        let name = entry.file_name();
+        let Some(version) = name.to_str().filter(|name| valid_version(name)) else {
+            continue;
+        };
+        let lease = open_lock(root, &format!(".{}-{version}.use", kind.as_str()))?;
+        match lease.try_lock().map_err(std::io::Error::from) {
+            Ok(()) => locks.push(lease),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(Some(locks))
+}
+
 /// Caller holds the install lock. Plain terminals protect the whole tree;
 /// agent sessions lease their exact packages, including companion executables.
 pub(crate) fn prune_locked(root: &Path, kind: AgentKind) -> anyhow::Result<()> {
@@ -322,7 +355,7 @@ fn untracked_daemon(root: &Path) -> anyhow::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{symlink, PermissionsExt};
 
     struct Fixture(PathBuf);
     impl Fixture {
@@ -474,9 +507,87 @@ mod tests {
         .unwrap();
         cleanup(&f.root(), AgentKind::Codex);
         assert!(old.exists());
+        assert!(lock_removal(&f.root(), AgentKind::Codex).unwrap().is_none());
         std::fs::remove_file(manifest).unwrap();
         cleanup(&f.root(), AgentKind::Codex);
         assert!(!old.exists());
+        assert!(lock_removal(&f.root(), AgentKind::Codex).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn uninstall_keeps_both_roots_while_another_workspace_uses_either() {
+        use axum::extract::{Path as UrlPath, State};
+        use axum::http::StatusCode;
+
+        let shared = Fixture::new();
+        let legacy = Fixture::new();
+        let packages: Vec<_> = [&shared, &legacy]
+            .into_iter()
+            .map(|f| {
+                let package = f.package("codex", "0.159.2");
+                std::fs::set_permissions(
+                    package.join("bin/codex"),
+                    std::fs::Permissions::from_mode(0o755),
+                )
+                .unwrap();
+                f.activate("codex", "0.159.2");
+                package
+            })
+            .collect();
+        let make_state = |name: &str| {
+            let mut state = AppState::new(
+                "token".into(),
+                "host".into(),
+                1,
+                0,
+                shared.0.join(name).join("data"),
+                shared.0.join(name).join("config"),
+            );
+            state.managed_root = shared.root();
+            state.legacy_managed_root = Some(legacy.root());
+            state
+        };
+        let owner = make_state("owner");
+        let remover = Arc::new(make_state("remover"));
+        // Exact package leases from either root, then a plain shell's broad
+        // leases. Every refusal must leave BOTH installations intact.
+        for executable in packages
+            .iter()
+            .map(|p| Some(p.join("bin/codex")))
+            .chain([None])
+        {
+            let agent = executable.as_ref().map(|_| AgentKind::Codex);
+            let (usage, _) = acquire(&owner, agent, executable.into_iter().collect())
+                .await
+                .unwrap();
+            let response =
+                crate::runtimes::uninstall_agent(State(remover.clone()), UrlPath("codex".into()))
+                    .await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            for package in &packages {
+                assert!(package.join("companion").exists());
+            }
+            drop(usage);
+        }
+        // The broad removal guard also fences a new session while deletion
+        // is in progress, closing the check-then-spawn race.
+        let removal = lock_removal(&shared.root(), AgentKind::Codex)
+            .unwrap()
+            .unwrap();
+        assert!(acquire(
+            &owner,
+            Some(AgentKind::Codex),
+            vec![packages[0].join("bin/codex")]
+        )
+        .await
+        .is_err());
+        drop(removal);
+        let response =
+            crate::runtimes::uninstall_agent(State(remover), UrlPath("codex".into())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        for package in packages {
+            assert!(!package.exists());
+        }
     }
 
     #[test]

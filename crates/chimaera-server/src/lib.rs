@@ -1,6 +1,7 @@
 mod activity;
 mod agent_docs;
 mod agent_probe;
+mod agent_setup;
 mod agent_state;
 mod agent_updates;
 mod agents;

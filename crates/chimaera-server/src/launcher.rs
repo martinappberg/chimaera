@@ -550,6 +550,9 @@ pub(crate) async fn list_agents(
             if let Some(status) = crate::runtimes::installation_status(&state, kind) {
                 row.insert("installation".into(), status);
             }
+            if let Some(setup) = crate::agent_setup::summary(&state, kind) {
+                row.insert("setup".into(), setup);
+            }
             if let Ok(path) = &detection.path {
                 row.insert("path".into(), json!(path));
             }

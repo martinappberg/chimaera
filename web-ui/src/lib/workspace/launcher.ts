@@ -46,6 +46,7 @@ export interface AgentInfo {
   /** When that probe ran, unix seconds. */
   latestCheckedAt: number | null;
   latestError?: string | null;
+  setup?: { id: string; running: boolean; phase: string };
   installation?: { sessionId: string; running: boolean; exitStatus: number | null };
   /** Installed and strictly older than `latestVersion` — the update
    *  affordance: one-click for a managed binary (POST update), quiet
@@ -144,12 +145,15 @@ export function normalizeAgentCatalog(body: unknown): AgentInfo[] {
         : {};
     const operation = typeof a.installation === "object" && a.installation !== null
       ? a.installation as Record<string, unknown> : null;
+    const setup = typeof a.setup === "object" && a.setup !== null ? a.setup as Record<string, unknown> : null;
     return [
       {
         installation: operation && typeof operation.session_id === "string" ? {
           sessionId: operation.session_id, running: operation.running === true,
           exitStatus: typeof operation.exit_status === "number" ? operation.exit_status : null,
         } : undefined,
+        setup: setup && typeof setup.id === "string" && setup.id.length <= 128 && typeof setup.phase === "string"
+          ? { id: setup.id, phase: setup.phase, running: setup.running === true } : undefined,
         id: a.id,
         name: typeof a.name === "string" ? a.name : a.id,
         installed: a.installed === true,

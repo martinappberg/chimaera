@@ -226,7 +226,7 @@
       {#each agents as a, i (a.id)}
         {@const ready = a.installed && !a.outdated && a.chatCapable}
         {#if i === 0 || ready !== (agents[i - 1].installed && !agents[i - 1].outdated && agents[i - 1].chatCapable)}
-          <div class="group-label">{ready ? "ready to start" : "set up an agent"}</div>
+          <div class="group-label">{ready ? "start a conversation" : "set up an agent"}</div>
         {/if}
         <!-- div, not button: rows contain a real link (docs) and a real
              button (update chip); interactive elements cannot nest. The
@@ -272,7 +272,7 @@
                     <button
                       class="aup"
                       tabindex="-1"
-                      title="update to {a.latestVersion} — downloads the official {a.name} build into ~/.chimaera/agents, in a terminal you can watch"
+                      title="update to {a.latestVersion} — downloads the official {a.name} build into ~/.chimaera/agents, with progress and results in agent setup"
                       onclick={(e) => {
                         e.stopPropagation();
                         onUpdate(a);
@@ -313,7 +313,7 @@
             <button
               class="achip"
               tabindex="-1"
-              title="downloads the official {a.name} build into ~/.chimaera/agents — runs in a terminal you can watch"
+              title="downloads the official {a.name} build into ~/.chimaera/agents — runs with progress and results in agent setup"
               onclick={(e) => {
                 e.stopPropagation();
                 onInstall(a);
@@ -325,7 +325,7 @@
             <button
               class="achip"
               tabindex="-1"
-              title="this build is too old to sign in — downloads the official {a.name} build into ~/.chimaera/agents — runs in a terminal you can watch"
+              title="this build is too old to sign in — downloads the official {a.name} build into ~/.chimaera/agents — runs with progress and results in agent setup"
               onclick={(e) => {
                 e.stopPropagation();
                 onInstall(a);
@@ -557,7 +557,7 @@
 
   /* Update-available: "→ <new>" appended to the version line, only when a
      strictly newer release is known. A real button (accent) when chimaera
-     manages the binary — one click runs the curated update in a visible
+     manages the binary — one click runs the curated update in a setup
      pane; quiet muted information when the binary is the user's own
      (chimaera never touches an install it doesn't own). */
   .aup {

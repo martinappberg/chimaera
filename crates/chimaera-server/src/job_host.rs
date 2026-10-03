@@ -90,7 +90,7 @@ struct Host {
     stopping: AtomicBool,
     /// Wakes the writer of `workspaces.json` after every change.
     changed: tokio::sync::Notify,
-    /// Every workspace closed: the writer removes the records and stops.
+    /// Every workspace closed: the writer removes the endpoint and stops.
     finished: AtomicBool,
 }
 
@@ -115,15 +115,17 @@ fn write_hosting(job_dir: &Path, record: &HostingRecord) {
 
 /// Keep `workspaces.json` current: one writer, so a newer state never lands
 /// under an older one; a burst of changes is one write. At the end it
-/// removes both records itself, so no write can land after them.
+/// removes the endpoint itself. The final closing rows remain on disk until
+/// the allocation ends, so a fresh browser still knows which job owns them.
 async fn publish_hosting(host: Arc<Host>) {
     loop {
         host.changed.notified().await;
         let job_dir = host.job_dir.clone();
         if host.finished.load(Ordering::Relaxed) {
+            let record = host.hosting();
             let _ = tokio::task::spawn_blocking(move || {
+                write_hosting(&job_dir, &record);
                 let _ = std::fs::remove_file(job_dir.join("host.json"));
-                let _ = std::fs::remove_file(job_dir.join("workspaces.json"));
             })
             .await;
             return;
@@ -728,7 +730,7 @@ async fn spawn_workspace(
                 .is_some_and(|h| h.state == HostedState::Closing)
                 || host.stopping.load(Ordering::Relaxed);
             if closing {
-                map.remove(&wid);
+                finish_close(&mut map, &wid, host.stopping.load(Ordering::Relaxed));
                 tracing::info!(workspace = %wid, "workspace closed");
             } else if let Some(h) = map.get_mut(&wid) {
                 h.state = HostedState::Failed;
@@ -805,6 +807,23 @@ fn plain_text(line: &str) -> String {
     out
 }
 
+/// Keep a closing ownership row through allocation shutdown; an individual
+/// workspace close during normal operation releases its row immediately.
+/// Failed workspaces already released their leases and must stay available.
+fn finish_close(map: &mut HashMap<String, Hosted>, wid: &str, stopping: bool) {
+    if let Some(held) = map
+        .get_mut(wid)
+        .filter(|h| stopping && h.state != HostedState::Failed)
+    {
+        held.state = HostedState::Closing;
+        held.port = None;
+        held.pid = None;
+        held.exited = None;
+    } else {
+        map.remove(wid);
+    }
+}
+
 /// Close one workspace: SIGTERM (its chimaera saves its chats and removes
 /// its manifest), then SIGKILL past [`CLOSE_GRACE`].
 async fn close(host: &Host, wid: &str) {
@@ -816,7 +835,7 @@ async fn close(host: &Host, wid: &str) {
         let Some(exited) = h.exited.clone().filter(|_| h.state != HostedState::Failed) else {
             // Failed, or only reserved (its open sees the slot gone and
             // starts nothing).
-            map.remove(wid);
+            finish_close(&mut map, wid, host.stopping.load(Ordering::Relaxed));
             drop(map);
             host.changed.notify_one();
             return;
@@ -864,6 +883,49 @@ fn signal(pid: Option<u32>, kill: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn allocation_shutdown_keeps_durable_ownership_without_endpoints() {
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-job-close-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("host.json"), "{}").unwrap();
+        let mut map = HashMap::from([("w-0000abcd".to_string(), Hosted::reserved())]);
+        finish_close(&mut map, "w-0000abcd", false);
+        assert!(map.is_empty());
+        map.insert("w-0000abcd".into(), Hosted::reserved());
+        let mut failed = Hosted::reserved();
+        failed.state = HostedState::Failed;
+        failed.exited = Some(tokio::sync::watch::channel(true).1);
+        map.insert("w-0000dead".into(), failed);
+        let host = Arc::new(Host {
+            job_dir: dir.clone(),
+            cluster_dir: dir.join("cluster"),
+            record: JobRecord::default(),
+            own_slurm: "77".into(),
+            replaced_slurm: None,
+            token: "token".into(),
+            exe: dir.join("chimaera"),
+            runtime_base: dir.join("runtime"),
+            workspaces: Mutex::new(map),
+            stopping: AtomicBool::new(true),
+            changed: tokio::sync::Notify::new(),
+            finished: AtomicBool::new(true),
+        });
+        close_all(&host).await;
+        host.changed.notify_one();
+        publish_hosting(host).await;
+        assert!(!dir.join("host.json").exists());
+        let record: HostingRecord = read_json(&dir.join("workspaces.json")).unwrap();
+        assert_eq!(
+            record.workspaces.get("w-0000abcd"),
+            Some(&HostedState::Closing)
+        );
+        assert!(!record.workspaces.contains_key("w-0000dead"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn the_listening_line_gives_the_port() {

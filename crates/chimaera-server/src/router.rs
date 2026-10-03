@@ -354,6 +354,14 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             post(runtimes::install_agent).delete(runtimes::uninstall_agent),
         )
         .route("/agents/{id}/update", post(runtimes::update_agent))
+        .route(
+            "/agents/{id}/setup",
+            get(crate::agent_setup::get).post(crate::agent_setup::start),
+        )
+        .route(
+            "/agents/{id}/setup/{operation}",
+            delete(crate::agent_setup::cancel),
+        )
         .route("/agents/claude/sessions", get(launcher::claude_resumables))
         .route("/recents", get(recents::list_recents))
         // Archive hides a conversation from Recents (never deletes it); it
