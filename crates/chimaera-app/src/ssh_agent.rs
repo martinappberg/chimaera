@@ -34,6 +34,9 @@ pub(crate) mod route;
 #[path = "ssh_agent/selection.rs"]
 pub(crate) mod selection;
 #[cfg(unix)]
+#[path = "ssh_agent/trust/mod.rs"]
+pub(crate) mod trust;
+#[cfg(unix)]
 #[path = "ssh_agent/unix.rs"]
 pub(crate) mod unix;
 
@@ -138,6 +141,7 @@ fn valid_time(cert: &Certificate, time: u64) -> bool {
 }
 
 /// Native effective SSH policy. It never comes from a keeper or webview.
+#[derive(Clone)]
 struct Algorithms {
     host: HashSet<String>,
     user: HashSet<String>,

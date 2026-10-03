@@ -6,6 +6,7 @@ use tokio::{
     net::UnixStream,
 };
 
+#[derive(Clone)]
 pub(crate) struct UnixAgent(PathBuf);
 impl UnixAgent {
     pub(crate) fn new(native_socket: PathBuf) -> Result<Self, Failure> {
@@ -13,6 +14,9 @@ impl UnixAgent {
             return Err(Failure::KeyUnavailable);
         }
         Ok(Self(native_socket))
+    }
+    pub(super) fn path(&self) -> &std::path::Path {
+        &self.0
     }
 }
 impl LocalAgent for UnixAgent {

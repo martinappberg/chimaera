@@ -653,7 +653,7 @@ async fn run_link_flight(
         if intent != ConnectIntent::Explicit {
             return Err(KEEPER_CONNECT_REQUIRED.into());
         }
-        host = explicit_keeper_connect(&state, &client, host, generation).await?;
+        host = explicit_keeper_connect(app, &state, &client, host, generation).await?;
     }
     if let Some(cluster) = host
         .cluster
@@ -799,6 +799,7 @@ fn keeper_host_ready(host: &chimaera_link::Host) -> bool {
 }
 
 async fn explicit_keeper_connect(
+    _app: &AppHandle,
     state: &Shell,
     client: &chimaera_link::Client,
     host: chimaera_link::Host,
@@ -819,12 +820,32 @@ async fn explicit_keeper_connect(
         if !caps.route_policy_supported() {
             return Err("This keeper needs an update before native route authentication".into());
         }
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(chimaera_link::SSH_AUTH_LIFETIME.into());
+        let prompt_app = _app.clone();
+        let prompt_alias = host.alias.clone();
+        let generation_app = _app.clone();
+        let owner = crate::ssh_agent::trust::Owner {
+            alias: host.alias.clone(),
+            guard: attempt.native_prompt(deadline),
+            account: state.pro.operation.clone(),
+            current: std::sync::Arc::new(move || {
+                generation_app.state::<Shell>().pro.generation() == generation
+            }),
+            prompt: std::sync::Arc::new(move |prompt, guard| {
+                let app = prompt_app.clone();
+                let alias = prompt_alias.clone();
+                Box::pin(async move {
+                    crate::askpass::native_owned_prompt(&app, &alias, prompt, guard).await
+                })
+            }),
+        };
         let selection = tokio::select! {
             biased;
             _ = cancellation.wait_for(|value| *value) => return Err("Account changed while connecting".into()),
-            result = crate::ssh_agent::route::resolve(&host.alias, caps.keeper_boot) => result,
+            result = crate::ssh_agent::trust::resolve(&host.alias, caps.keeper_boot, owner) => result,
         }.map_err(|error| match error {
-            selection::SelectionFailure::HostTrustRequired => "Confirm every SSH hop's fingerprint on this Mac before connecting through the keeper",
+            selection::SelectionFailure::HostTrustRequired => "This SSH hop needs a writable native known_hosts destination before fingerprint approval",
             selection::SelectionFailure::RevokedHost => "An SSH hop's key is revoked on this Mac",
             selection::SelectionFailure::TooManyKeys => "Choose this host's SSH identity in your SSH settings before connecting",
             _ => "This SSH route couldn't be verified on this Mac. Check its settings or choose Direct in advanced host settings",

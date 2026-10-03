@@ -9,9 +9,10 @@
 //!
 //! Keyboard-interactive prompts (Duo's "Passcode or option (1-3):") reach
 //! askpass too, so the same modal — prompt text over a single input — covers
-//! both password and 2FA. Host-key confirmation is not an askpass prompt and
-//! is out of scope here (a first connect to an unknown host still needs the
-//! key in `~/.ssh/known_hosts`).
+//! both password and 2FA. Prototype Connect also relays first-use fingerprint
+//! approval through its original owner. The separate native trust verifier
+//! decides whether a positively verified candidate may enter known_hosts;
+//! displaying or answering a prompt alone never grants that permission.
 //! Each child also frames its normalized host alias with the prompt, so the
 //! native relay can target only that host's windows (plus local home).
 
@@ -70,6 +71,8 @@ struct PendingPrompt {
     source: PromptSource,
     #[cfg(all(feature = "ssh-agent-prototype", unix))]
     route_guard: Option<crate::ssh_agent::lifecycle::RoutePromptGuard>,
+    #[cfg(all(feature = "ssh-agent-prototype", unix))]
+    native_guard: Option<crate::ssh_agent::lifecycle::NativePromptGuard>,
 }
 
 #[derive(Clone, Serialize)]
@@ -135,6 +138,8 @@ impl Askpass {
                 source,
                 #[cfg(all(feature = "ssh-agent-prototype", unix))]
                 route_guard: None,
+                #[cfg(all(feature = "ssh-agent-prototype", unix))]
+                native_guard: None,
             },
         );
         id
@@ -165,6 +170,10 @@ impl Askpass {
             .route_guard
             .as_ref()
             .is_some_and(|guard| !guard.active())
+            || prompt
+                .native_guard
+                .as_ref()
+                .is_some_and(|guard| !guard.active())
         {
             pending.remove(&id);
             return AnswerResult::Missing;
@@ -188,6 +197,10 @@ impl Askpass {
                         .route_guard
                         .as_ref()
                         .is_none_or(|guard| guard.active())
+                        && _prompt
+                            .native_guard
+                            .as_ref()
+                            .is_none_or(|guard| guard.active())
                 }
                 #[cfg(not(all(feature = "ssh-agent-prototype", unix)))]
                 {
@@ -204,6 +217,74 @@ impl Askpass {
         prompts.sort_by_key(|p| p.id);
         prompts
     }
+}
+
+/// First-use trust and local key unlock never borrow generic or keeper prompt
+/// authority. The original native Connect owner gates display and the answer.
+#[cfg(all(feature = "ssh-agent-prototype", unix))]
+pub(crate) async fn native_owned_prompt(
+    app: &AppHandle,
+    alias: &str,
+    prompt: String,
+    guard: crate::ssh_agent::lifecycle::NativePromptGuard,
+) -> Option<String> {
+    if !guard.active() || prompt.is_empty() || prompt.len() > 16 * 1024 {
+        return None;
+    }
+    let askpass = app.state::<Askpass>();
+    let (tx, rx) = oneshot::channel();
+    let id = {
+        let mut pending = lock(&askpass.pending);
+        if pending.len() >= 64 {
+            return None;
+        }
+        let id = askpass.seq.fetch_add(1, Ordering::Relaxed);
+        pending.insert(
+            id,
+            PendingPrompt {
+                alias: Some(alias.into()),
+                prompt: prompt.clone(),
+                tx,
+                source: PromptSource::Local,
+                route_guard: None,
+                native_guard: Some(guard.clone()),
+            },
+        );
+        id
+    };
+    struct Owner {
+        app: AppHandle,
+        alias: String,
+        id: u64,
+    }
+    impl Drop for Owner {
+        fn drop(&mut self) {
+            self.app.state::<Askpass>().discard(self.id);
+            emit_done(&self.app, self.id, Some(&self.alias));
+        }
+    }
+    let _owner = Owner {
+        app: app.clone(),
+        alias: alias.into(),
+        id,
+    };
+    emit_scoped(
+        app,
+        "ssh-askpass",
+        PromptEvent {
+            id,
+            alias: Some(alias.into()),
+            prompt,
+            source: PromptSource::Local,
+        },
+        Some(alias),
+    );
+    let answer = tokio::select! {
+        biased;
+        _ = guard.stopped() => None,
+        result = rx => result.ok().flatten(),
+    };
+    answer.filter(|answer| guard.active() && answer.len() <= 16 * 1024)
 }
 
 /// Keeper prompts share local SSH's scope and timeout, but answers travel only

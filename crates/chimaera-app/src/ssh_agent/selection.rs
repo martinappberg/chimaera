@@ -91,6 +91,30 @@ async fn from_native_config_inner(
     let config = Config::parse(text)?;
     let algorithms = config.algorithms()?;
     let (destination, host_keys) = trusted_host(&config, home, &algorithms).await?;
+    let (agent, user_keys) =
+        select_user(&config, home, environment_agent, &algorithms, routed_policy).await?;
+    let request = SshAuthGrantRequest {
+        version: 1,
+        keeper_boot,
+        destination,
+        host_keys,
+        user_keys,
+    };
+    Policy::new(&request).map_err(|_| SelectionFailure::UnsupportedConfiguration)?;
+    Ok(Selection {
+        request,
+        agent,
+        algorithms,
+    })
+}
+
+async fn select_user(
+    config: &Config<'_>,
+    home: &Path,
+    environment_agent: Option<PathBuf>,
+    algorithms: &Algorithms,
+    routed_policy: bool,
+) -> Result<(UnixAgent, Vec<String>)> {
     if !config.key_enabled()? {
         return Err(SelectionFailure::NoKeys);
     }
@@ -131,18 +155,139 @@ async fn from_native_config_inner(
     if user_keys.len() > SSH_AUTH_KEYS_MAX {
         return Err(SelectionFailure::TooManyKeys);
     }
+    Ok((agent, user_keys))
+}
+
+#[derive(Clone)]
+pub(super) struct NativeIdentity {
+    pub(super) agent: Option<UnixAgent>,
+    pub(super) user_keys: Vec<String>,
+    pub(super) mode: chimaera_link::SshRouteMode,
+    algorithms: Algorithms,
+}
+pub(super) struct ProbeDetails {
+    pub(super) lookup: String,
+    pub(super) target: Option<PathBuf>,
+    pub(super) policy: chimaera_link::SshRoutePolicy,
+}
+pub(super) fn probe_details(
+    text: &str,
+    home: &Path,
+    identity: &NativeIdentity,
+) -> Result<ProbeDetails> {
+    let config = Config::parse_mode(text, true)?;
+    let destination = config.destination()?;
+    let lookup = config.lookup(&destination)?;
+    let configured = config
+        .one("userknownhostsfile")?
+        .ok_or(SelectionFailure::UnsupportedConfiguration)?;
+    let paths = configured.split_whitespace().take(9).collect::<Vec<_>>();
+    if paths.len() > 8 {
+        return Err(SelectionFailure::UnsupportedConfiguration);
+    }
+    let target = paths
+        .iter()
+        .find(|path| **path != "none")
+        .map(|target| local_path(target, home))
+        .transpose()?;
+    Ok(ProbeDetails {
+        lookup,
+        target,
+        policy: config.route_policy(identity.mode)?,
+    })
+}
+pub(super) async fn native_identity(
+    text: &str,
+    home: &Path,
+    environment_agent: Option<PathBuf>,
+) -> Result<NativeIdentity> {
+    let text = routed_text(text)?;
+    let config = Config::parse(&text)?;
+    let algorithms = config.algorithms()?;
+    let selected = select_user(&config, home, environment_agent.clone(), &algorithms, true).await;
+    let (agent, user_keys, mode) = match selected {
+        Ok((agent, keys)) => (Some(agent), keys, chimaera_link::SshRouteMode::Key),
+        Err(SelectionFailure::NoKeys) => (None, vec![], chimaera_link::SshRouteMode::Interactive),
+        Err(SelectionFailure::AgentUnavailable)
+            if no_agent_selected(&text, &environment_agent)? =>
+        {
+            (None, vec![], chimaera_link::SshRouteMode::Interactive)
+        }
+        Err(error) => return Err(error),
+    };
+    config.route_policy(mode)?;
+    Ok(NativeIdentity {
+        agent,
+        user_keys,
+        mode,
+        algorithms,
+    })
+}
+pub(super) async fn native_trust(
+    text: &str,
+    home: &Path,
+    identity: &NativeIdentity,
+) -> Result<(SshAuthDestination, Vec<SshAuthHostKey>)> {
+    let text = routed_text(text)?;
+    let config = Config::parse(&text)?;
+    trusted_host(&config, home, &identity.algorithms).await
+}
+pub(super) async fn candidate_trust(
+    text: &str,
+    home: &Path,
+    identity: &NativeIdentity,
+    candidate: &Path,
+) -> Result<(SshAuthDestination, Vec<SshAuthHostKey>)> {
+    let path = candidate
+        .to_str()
+        .filter(|path| path.starts_with('/') && !path.chars().any(char::is_whitespace))
+        .ok_or(SelectionFailure::Unavailable)?;
+    // Original global trust, including @revoked, remains in the lookup. Only
+    // the user candidate is substituted, never an error string or keyscan.
+    let text = routed_text(text)?
+        .lines()
+        .map(|line| {
+            if line.starts_with("userknownhostsfile ") {
+                format!("userknownhostsfile {path}")
+            } else {
+                line.into()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    trusted_host(&Config::parse(&text)?, home, &identity.algorithms).await
+}
+pub(super) fn native_policy(
+    identity: &NativeIdentity,
+    destination: SshAuthDestination,
+    host_keys: Vec<SshAuthHostKey>,
+) -> Result<Policy> {
     let request = SshAuthGrantRequest {
         version: 1,
-        keeper_boot,
+        keeper_boot: "native-probe".into(),
         destination,
         host_keys,
-        user_keys,
+        user_keys: identity.user_keys.clone(),
     };
-    Policy::new(&request).map_err(|_| SelectionFailure::UnsupportedConfiguration)?;
-    Ok(Selection {
-        request,
+    let mut policy = Policy::new(&request).map_err(|_| SelectionFailure::Unavailable)?;
+    policy.algorithms = Some(identity.algorithms.clone());
+    Ok(policy)
+}
+pub(super) fn selected_identity(
+    identity: NativeIdentity,
+    request: &chimaera_link::SshRouteAuthLeg,
+    boot: String,
+) -> Option<Selection> {
+    identity.agent.map(|agent| Selection {
+        request: SshAuthGrantRequest {
+            version: 1,
+            keeper_boot: boot,
+            destination: request.destination.clone(),
+            host_keys: request.host_keys.clone(),
+            user_keys: request.user_keys.clone(),
+        },
         agent,
-        algorithms,
+        algorithms: identity.algorithms,
     })
 }
 

@@ -113,6 +113,14 @@ impl Attempt {
     pub(crate) fn cancellation(&self) -> watch::Receiver<bool> {
         self.cancel.clone()
     }
+    pub(crate) fn native_prompt(&self, deadline: tokio::time::Instant) -> NativePromptGuard {
+        NativePromptGuard {
+            registry: self.registry.clone(),
+            identity: self.identity,
+            cancel: self.cancel.clone(),
+            deadline,
+        }
+    }
     pub(crate) fn bind_route(
         &self,
         host: &str,
@@ -146,6 +154,49 @@ impl Attempt {
         });
         state.routes.insert(self.identity, Arc::downgrade(&context));
         Ok(RoutePromptOwner(context))
+    }
+}
+
+/// A native trust/unlock probe uses the original explicit Connect admission.
+/// There is no keeper grant yet; retaining this handle cannot retain or revive
+/// its parent Attempt after account replacement or caller cancellation.
+#[derive(Clone)]
+pub(crate) struct NativePromptGuard {
+    registry: Weak<Mutex<State>>,
+    identity: u64,
+    cancel: watch::Receiver<bool>,
+    deadline: tokio::time::Instant,
+}
+impl NativePromptGuard {
+    fn active_locked(&self, state: &State) -> bool {
+        !*self.cancel.borrow()
+            && self.deadline > tokio::time::Instant::now()
+            && state.attempts.contains_key(&self.identity)
+    }
+    pub(crate) fn active(&self) -> bool {
+        self.registry.upgrade().is_some_and(|registry| {
+            let state = registry.lock().unwrap_or_else(|e| e.into_inner());
+            self.active_locked(&state)
+        })
+    }
+    pub(crate) async fn stopped(&self) {
+        let mut cancel = self.cancel.clone();
+        tokio::select! {
+            biased;
+            _ = cancel.wait_for(|value| *value) => {},
+            _ = tokio::time::sleep_until(self.deadline) => {},
+        }
+    }
+    /// Only a bounded synchronous native trust append runs here. Its caller
+    /// also retains the account-operation guard; generation/Attempt removal
+    /// cannot cross the actual syscall after this final admission.
+    pub(crate) fn commit<T>(&self, action: impl FnOnce() -> T) -> Result<T, Failure> {
+        let registry = self.registry.upgrade().ok_or(Failure::Revoked)?;
+        let state = registry.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.active_locked(&state) {
+            return Err(Failure::Revoked);
+        }
+        Ok(action())
     }
 }
 impl Drop for Attempt {
@@ -484,5 +535,28 @@ mod tests {
         let mut cancel = last.cancellation();
         drop(registry);
         assert!(cancel.changed().await.is_err());
+    }
+    #[tokio::test]
+    async fn native_probe_owner_loss_account_change_and_expiry_refuse_real_commit() {
+        for exit in 0..3 {
+            let registry = Registry::default();
+            let attempt = registry.admit(0).ok().unwrap();
+            let guard = attempt
+                .native_prompt(tokio::time::Instant::now() + std::time::Duration::from_millis(30));
+            assert!(guard.active());
+            assert_eq!(guard.commit(|| 7).ok(), Some(7));
+            match exit {
+                0 => drop(attempt),
+                1 => registry.advance(1),
+                _ => tokio::time::sleep(std::time::Duration::from_millis(40)).await,
+            }
+            let mut wrote = false;
+            assert!(guard.commit(|| wrote = true).is_err());
+            assert!(!wrote);
+            tokio::time::timeout(std::time::Duration::from_millis(100), guard.stopped())
+                .await
+                .unwrap();
+            assert!(!guard.active());
+        }
     }
 }

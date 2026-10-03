@@ -108,9 +108,10 @@ impl Jump {
     }
 }
 
-struct Effective {
-    text: String,
-    destination: SshAuthDestination,
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct Effective {
+    pub(super) text: String,
+    pub(super) destination: SshAuthDestination,
 }
 struct Resolver {
     calls: usize,
@@ -183,7 +184,7 @@ impl Resolver {
 
 pub(crate) struct RouteSelection {
     pub(crate) request: SshRouteGrantRequest,
-    legs: Vec<Option<Selection>>,
+    pub(super) legs: Vec<Option<Selection>>,
 }
 impl RouteSelection {
     pub(crate) fn verifier(
@@ -213,7 +214,7 @@ pub(crate) async fn resolve(alias: &str, boot: String) -> Result<RouteSelection>
     .await
     .map_err(|_| SelectionFailure::Unavailable)?
 }
-async fn effective(alias: &str) -> Result<Vec<Effective>> {
+pub(super) async fn effective(alias: &str) -> Result<Vec<Effective>> {
     let alias = chimaera_remote::hosts::normalize_alias(alias)
         .map_err(|_| SelectionFailure::UnsupportedConfiguration)?;
     let mut resolver = Resolver {
