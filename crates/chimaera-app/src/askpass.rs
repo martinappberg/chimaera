@@ -904,6 +904,7 @@ mod tests {
                 jumps: vec![],
             },
             legs: vec![SshRouteAuthLeg {
+                policy: None,
                 destination: destination.clone(),
                 mode: SshRouteMode::Interactive,
                 host_keys: vec![SshAuthHostKey {
@@ -914,6 +915,7 @@ mod tests {
             }],
         };
         let receipt = SshRouteGrant {
+            policies: None,
             version: 1,
             grant_id: "grant".into(),
             expires_in: 180,

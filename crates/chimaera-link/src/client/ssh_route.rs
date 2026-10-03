@@ -19,6 +19,30 @@ impl Client {
         route: SshRoute,
         policy: Option<crate::ClusterPolicy>,
     ) -> Result<SshRouteHost> {
+        self.register_ssh_route_host_inner(alias, ssh, route, policy, false)
+            .await
+    }
+
+    /// Policy-aware native Connect must negotiate before its inert save too.
+    pub async fn register_ssh_policy_route_host(
+        &self,
+        alias: &str,
+        ssh: crate::SshTarget,
+        route: SshRoute,
+        policy: Option<crate::ClusterPolicy>,
+    ) -> Result<SshRouteHost> {
+        self.register_ssh_route_host_inner(alias, ssh, route, policy, true)
+            .await
+    }
+
+    async fn register_ssh_route_host_inner(
+        &self,
+        alias: &str,
+        ssh: crate::SshTarget,
+        route: SshRoute,
+        policy: Option<crate::ClusterPolicy>,
+        require_policy: bool,
+    ) -> Result<SshRouteHost> {
         let destination = crate::SshAuthDestination {
             hostname: ssh.hostname.clone(),
             user: ssh.user.clone().unwrap_or_default(),
@@ -40,7 +64,10 @@ impl Client {
             serde_json::to_vec(&body)?.len() <= crate::SSH_AUTH_FRAME_MAX,
             "SSH route registration too large"
         );
-        self.ssh_route_capabilities().await?;
+        let caps = self.ssh_route_capabilities().await?;
+        if require_policy && !caps.route_policy_supported() {
+            return Err(crate::ServiceUnsupported.into());
+        }
         if policy.is_some() {
             self.cluster_capabilities().await?;
         }
@@ -70,6 +97,9 @@ impl Client {
         anyhow::ensure!(crate::placement::valid_id(host), "invalid SSH route host");
         request.validate()?;
         let caps = self.ssh_route_capabilities().await?;
+        if request.legs.iter().any(|leg| leg.policy.is_some()) && !caps.route_policy_supported() {
+            return Err(crate::ServiceUnsupported.into());
+        }
         anyhow::ensure!(
             caps.keeper_boot == request.keeper_boot,
             "SSH route boot changed"
@@ -103,6 +133,9 @@ impl Client {
         anyhow::ensure!(crate::placement::valid_id(host), "invalid SSH route host");
         grant.validate()?;
         let caps = self.ssh_route_capabilities().await?;
+        if grant.policies.is_some() && !caps.route_policy_supported() {
+            return Err(crate::ServiceUnsupported.into());
+        }
         anyhow::ensure!(caps.keeper_boot == expected_boot, "SSH route boot changed");
         let mut socket = self
             .open_socket(
@@ -167,6 +200,9 @@ impl Client {
         anyhow::ensure!(crate::placement::valid_id(host), "invalid SSH route host");
         grant.validate()?;
         let caps = self.ssh_route_capabilities().await?;
+        if grant.policies.is_some() && !caps.route_policy_supported() {
+            return Err(crate::ServiceUnsupported.into());
+        }
         anyhow::ensure!(caps.keeper_boot == expected_boot, "SSH route boot changed");
         let response = self
             .keeper_request_raw_grant(

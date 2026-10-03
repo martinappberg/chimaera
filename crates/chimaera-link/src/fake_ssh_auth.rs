@@ -36,6 +36,7 @@ impl FixtureSshAuth {
             hostbound_v1: true,
             register_only_v1: true,
             proxyjump_v1: false,
+            route_policy_v1: false,
             keeper_boot: data.boot.clone(),
         })
     }

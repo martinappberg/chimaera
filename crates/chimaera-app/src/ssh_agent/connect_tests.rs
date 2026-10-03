@@ -240,6 +240,7 @@ async fn route_cleanup_survives_observer_abort_and_retains_shared_budget_until_h
             client: client.clone(),
             host: "host".into(),
             grant: chimaera_link::SshRouteGrant {
+                policies: None,
                 version: 1,
                 grant_id: "grant".into(),
                 expires_in: 180,

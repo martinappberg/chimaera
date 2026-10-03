@@ -28,6 +28,8 @@ pub struct SshAuthCapabilities {
     #[serde(default)]
     pub proxyjump_v1: bool,
     #[serde(default)]
+    pub route_policy_v1: bool,
+    #[serde(default)]
     pub keeper_boot: String,
 }
 impl SshAuthCapabilities {
@@ -36,6 +38,9 @@ impl SshAuthCapabilities {
     }
     pub fn route_supported(&self) -> bool {
         self.registration_supported() && self.proxyjump_v1
+    }
+    pub fn route_policy_supported(&self) -> bool {
+        self.route_supported() && self.route_policy_v1
     }
     pub fn registration_supported(&self) -> bool {
         self.supported() && self.register_only_v1
@@ -478,6 +483,7 @@ mod tests {
             hostbound_v1: true,
             register_only_v1: false,
             proxyjump_v1: false,
+            route_policy_v1: false,
             keeper_boot: "boot".into(),
         };
         assert!(caps.supported());

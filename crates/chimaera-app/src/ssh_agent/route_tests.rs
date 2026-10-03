@@ -231,6 +231,7 @@ fn verifier(calls: Arc<AtomicUsize>) -> RouteVerifier<Agent> {
         legs: selections
             .iter()
             .map(|selected| SshRouteAuthLeg {
+                policy: None,
                 destination: selected.destination.clone(),
                 mode: SshRouteMode::Key,
                 host_keys: selected.host_keys.clone(),
@@ -531,6 +532,7 @@ async fn each_leg_selects_its_own_native_agent_and_public_host_trust() {
 
 fn grant(request: &SshRouteGrantRequest) -> chimaera_link::SshRouteGrant {
     chimaera_link::SshRouteGrant {
+        policies: None,
         version: 1,
         grant_id: "synthetic".into(),
         expires_in: 180,

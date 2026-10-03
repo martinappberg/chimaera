@@ -260,6 +260,7 @@ mod tests {
     fn request() -> chimaera_link::SshRouteGrantRequest {
         use chimaera_link::*;
         let leg = |host: &str, mode| SshRouteAuthLeg {
+            policy: None,
             destination: SshAuthDestination {
                 hostname: host.into(),
                 user: "fixture".into(),
@@ -291,6 +292,7 @@ mod tests {
     }
     fn grant(request: &chimaera_link::SshRouteGrantRequest) -> chimaera_link::SshRouteGrant {
         chimaera_link::SshRouteGrant {
+            policies: None,
             version: 1,
             grant_id: "grant".into(),
             expires_in: 180,

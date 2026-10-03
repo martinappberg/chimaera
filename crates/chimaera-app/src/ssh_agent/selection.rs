@@ -236,6 +236,7 @@ pub(super) async fn routed_interactive(
     config.interactive_policy()?;
     let (destination, host_keys) = trusted_host(&config, home, &algorithms).await?;
     Ok(chimaera_link::SshRouteAuthLeg {
+        policy: None,
         destination,
         mode: chimaera_link::SshRouteMode::Interactive,
         host_keys,

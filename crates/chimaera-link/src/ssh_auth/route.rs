@@ -85,6 +85,87 @@ pub struct SshRouteAuthLeg {
     pub mode: SshRouteMode,
     pub host_keys: Vec<SshAuthHostKey>,
     pub user_keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<SshRoutePolicy>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SshRouteMethod {
+    Publickey,
+    KeyboardInteractive,
+    Password,
+}
+
+/// Resolved native policy only; no configuration expressions or directives.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SshRoutePolicy {
+    pub version: u32,
+    pub methods: Vec<SshRouteMethod>,
+    pub host_key_algorithms: Vec<String>,
+    pub ca_signature_algorithms: Vec<String>,
+    pub pubkey_accepted_algorithms: Vec<String>,
+}
+impl SshRoutePolicy {
+    pub fn validate(&self, mode: SshRouteMode) -> Result<()> {
+        ensure!(
+            self.version == 1 && !self.methods.is_empty() && self.methods.len() <= 3,
+            "invalid SSH route policy"
+        );
+        for (index, method) in self.methods.iter().enumerate() {
+            ensure!(
+                !self.methods[..index].contains(method),
+                "duplicate SSH route method"
+            );
+        }
+        match mode {
+            SshRouteMode::Key => ensure!(
+                self.methods.first() == Some(&SshRouteMethod::Publickey),
+                "key SSH route policy order mismatch"
+            ),
+            SshRouteMode::Interactive => ensure!(
+                !self.methods.contains(&SshRouteMethod::Publickey),
+                "interactive SSH route policy carries key method"
+            ),
+        }
+        for list in [
+            &self.host_key_algorithms,
+            &self.ca_signature_algorithms,
+            &self.pubkey_accepted_algorithms,
+        ] {
+            ensure!(
+                !list.is_empty() && list.len() <= 64,
+                "invalid SSH route algorithm count"
+            );
+            let mut seen = BTreeSet::new();
+            for name in list {
+                ensure!(
+                    !name.is_empty()
+                        && name.len() <= 128
+                        && !name.starts_with(['+', '-'])
+                        && name.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || b"-@._+".contains(&byte)
+                        })
+                        && seen.insert(name),
+                    "invalid SSH route algorithm"
+                );
+            }
+        }
+        ensure!(
+            serde_json::to_vec(self)?.len() <= 8 * 1024,
+            "SSH route policy too large"
+        );
+        Ok(())
+    }
+    pub fn permits_interaction(&self) -> bool {
+        self.methods.iter().any(|method| {
+            matches!(
+                method,
+                SshRouteMethod::KeyboardInteractive | SshRouteMethod::Password
+            )
+        })
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -107,6 +188,11 @@ impl SshRouteGrantRequest {
             self.legs.len() == self.route.jumps.len() + 1,
             "SSH route leg count mismatch"
         );
+        ensure!(
+            self.legs.iter().all(|leg| leg.policy.is_some())
+                || self.legs.iter().all(|leg| leg.policy.is_none()),
+            "partial SSH route policy"
+        );
         for (leg, destination) in self.legs.iter().zip(
             self.route
                 .jumps
@@ -114,6 +200,9 @@ impl SshRouteGrantRequest {
                 .chain(std::iter::once(&self.destination)),
         ) {
             ensure!(leg.destination == *destination, "SSH route leg mismatch");
+            if let Some(policy) = &leg.policy {
+                policy.validate(leg.mode)?;
+            }
             ensure!(
                 !leg.host_keys.is_empty() && leg.host_keys.len() <= SSH_AUTH_KEYS_MAX,
                 "invalid SSH route host key count"
@@ -161,6 +250,8 @@ pub struct SshRouteGrant {
     pub destination: SshAuthDestination,
     pub route: SshRoute,
     pub modes: Vec<SshRouteMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policies: Option<Vec<SshRoutePolicy>>,
 }
 impl SshRouteGrant {
     pub fn validate(&self) -> Result<()> {
@@ -175,6 +266,19 @@ impl SshRouteGrant {
             self.modes.len() == self.route.jumps.len() + 1,
             "SSH route grant mode count mismatch"
         );
+        if let Some(policies) = &self.policies {
+            ensure!(
+                policies.len() == self.modes.len(),
+                "SSH route policy count mismatch"
+            );
+            for (policy, mode) in policies.iter().zip(&self.modes) {
+                policy.validate(*mode)?;
+            }
+        }
+        ensure!(
+            serde_json::to_vec(self)?.len() <= SSH_AUTH_FRAME_MAX,
+            "SSH route grant too large"
+        );
         Ok(())
     }
     pub fn matches(&self, request: &SshRouteGrantRequest) -> bool {
@@ -185,6 +289,12 @@ impl SshRouteGrant {
                 .iter()
                 .copied()
                 .eq(request.legs.iter().map(|leg| leg.mode))
+            && self.policies
+                == request
+                    .legs
+                    .iter()
+                    .map(|leg| leg.policy.clone())
+                    .collect::<Option<Vec<_>>>()
     }
     fn key_leg(&self, leg: u8) -> Result<()> {
         ensure!(
@@ -415,6 +525,7 @@ mod tests {
             },
             legs: vec![
                 SshRouteAuthLeg {
+                    policy: None,
                     destination: jump,
                     mode: SshRouteMode::Interactive,
                     host_keys: vec![SshAuthHostKey {
@@ -424,6 +535,7 @@ mod tests {
                     user_keys: vec![],
                 },
                 SshRouteAuthLeg {
+                    policy: None,
                     destination: destination.clone(),
                     mode: SshRouteMode::Key,
                     host_keys: vec![SshAuthHostKey {
@@ -438,6 +550,7 @@ mod tests {
     }
     fn grant(request: &SshRouteGrantRequest) -> SshRouteGrant {
         SshRouteGrant {
+            policies: None,
             version: 1,
             grant_id: "grant".into(),
             expires_in: 180,
@@ -445,6 +558,94 @@ mod tests {
             route: request.route.clone(),
             modes: request.legs.iter().map(|leg| leg.mode).collect(),
         }
+    }
+    fn policy(mode: SshRouteMode) -> SshRoutePolicy {
+        SshRoutePolicy {
+            version: 1,
+            methods: if mode == SshRouteMode::Key {
+                vec![SshRouteMethod::Publickey, SshRouteMethod::Password]
+            } else {
+                vec![SshRouteMethod::KeyboardInteractive]
+            },
+            host_key_algorithms: vec!["ssh-ed25519".into()],
+            ca_signature_algorithms: vec!["ssh-ed25519".into()],
+            pubkey_accepted_algorithms: vec!["ssh-ed25519".into()],
+        }
+    }
+    #[test]
+    fn policies_are_all_leg_exact_and_method_algorithm_bounds_fail_closed() {
+        let mut request = request();
+        request.legs[0].policy = Some(policy(request.legs[0].mode));
+        assert!(request.validate().is_err());
+        request.legs[1].policy = Some(policy(request.legs[1].mode));
+        request.validate().unwrap();
+        let mut receipt = grant(&request);
+        assert!(
+            !receipt.matches(&request),
+            "absent policy is no acknowledgment"
+        );
+        receipt.policies = request.legs.iter().map(|leg| leg.policy.clone()).collect();
+        receipt.validate().unwrap();
+        assert!(receipt.matches(&request));
+        receipt.policies.as_mut().unwrap().swap(0, 1);
+        assert!(receipt.validate().is_err());
+        assert!(!receipt.matches(&request));
+        let mut key_only = policy(SshRouteMode::Key);
+        key_only.methods = vec![SshRouteMethod::Publickey];
+        key_only.validate(SshRouteMode::Key).unwrap();
+        assert!(!key_only.permits_interaction());
+        for methods in [
+            vec![SshRouteMethod::Password],
+            vec![
+                SshRouteMethod::Password,
+                SshRouteMethod::KeyboardInteractive,
+            ],
+            vec![SshRouteMethod::KeyboardInteractive],
+        ] {
+            let mut interactive = policy(SshRouteMode::Interactive);
+            interactive.methods = methods;
+            interactive.validate(SshRouteMode::Interactive).unwrap();
+            assert!(interactive.permits_interaction());
+        }
+        for methods in [
+            vec![],
+            vec![SshRouteMethod::Password, SshRouteMethod::Publickey],
+            vec![SshRouteMethod::Publickey, SshRouteMethod::Publickey],
+        ] {
+            let mut invalid = key_only.clone();
+            invalid.methods = methods;
+            assert!(invalid.validate(SshRouteMode::Key).is_err());
+        }
+        for algorithm in [
+            "+ssh-ed25519",
+            "-ssh-rsa",
+            "ssh-*",
+            "ssh-ed25519,ssh-rsa",
+            "ssh-ed25519\nProxyCommand",
+            "",
+        ] {
+            let mut invalid = key_only.clone();
+            invalid.host_key_algorithms = vec![algorithm.into()];
+            assert!(invalid.validate(SshRouteMode::Key).is_err());
+        }
+        let mut invalid = key_only.clone();
+        invalid.ca_signature_algorithms = vec!["ssh-ed25519".into(); 2];
+        assert!(invalid.validate(SshRouteMode::Key).is_err());
+        invalid.ca_signature_algorithms =
+            (0..65).map(|index| format!("algorithm-{index}")).collect();
+        assert!(invalid.validate(SshRouteMode::Key).is_err());
+        invalid.ca_signature_algorithms = (0..64)
+            .map(|index| format!("{}-{index}", "a".repeat(122)))
+            .collect();
+        invalid.host_key_algorithms = invalid.ca_signature_algorithms.clone();
+        assert!(
+            invalid.validate(SshRouteMode::Key).is_err(),
+            "total policy bytes remain bounded"
+        );
+        let mut old = grant(&request);
+        old.policies = None;
+        let value = serde_json::to_value(old).unwrap();
+        assert!(value.get("policies").is_none());
     }
     #[test]
     fn exact_order_mode_cycle_and_aggregate_bounds() {

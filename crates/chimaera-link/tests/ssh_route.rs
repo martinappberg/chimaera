@@ -85,6 +85,9 @@ async fn capabilities(State(data): State<Arc<Data>>, headers: HeaderMap) -> Json
     if data.mode != 0 {
         value["proxyjump_v1"] = json!(true);
     }
+    if data.mode >= 9 {
+        value["route_policy_v1"] = json!(true);
+    }
     Json(value)
 }
 async fn register(
@@ -125,6 +128,19 @@ async fn grant(
         .map(|leg| leg["mode"].clone())
         .collect();
     let mut value = json!({"version":1,"grant_id":"grant","expires_in":180,"destination":body["destination"],"route":body["route"],"modes":modes});
+    if data.mode >= 9 && data.mode != 10 {
+        value["policies"] = Value::Array(
+            body["legs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|leg| leg["policy"].clone())
+                .collect(),
+        );
+    }
+    if data.mode == 11 {
+        value["policies"][1]["methods"] = json!(["publickey"]);
+    }
     match data.mode {
         4 => {
             value["modes"] = json!(["key", "interactive"]);
@@ -180,6 +196,7 @@ fn request() -> SshRouteGrantRequest {
         },
         legs: vec![
             SshRouteAuthLeg {
+                policy: None,
                 destination: jump,
                 mode: SshRouteMode::Interactive,
                 host_keys: vec![SshAuthHostKey {
@@ -189,6 +206,7 @@ fn request() -> SshRouteGrantRequest {
                 user_keys: vec![],
             },
             SshRouteAuthLeg {
+                policy: None,
                 destination,
                 mode: SshRouteMode::Key,
                 host_keys: vec![SshAuthHostKey {
@@ -205,6 +223,70 @@ fn target(request: &SshRouteGrantRequest) -> SshTarget {
         hostname: request.destination.hostname.clone(),
         user: Some(request.destination.user.clone()),
         port: request.destination.port,
+    }
+}
+fn with_policy(mut request: SshRouteGrantRequest) -> SshRouteGrantRequest {
+    for leg in &mut request.legs {
+        leg.policy = Some(SshRoutePolicy {
+            version: 1,
+            methods: if leg.mode == SshRouteMode::Key {
+                vec![SshRouteMethod::Publickey, SshRouteMethod::Password]
+            } else {
+                vec![SshRouteMethod::KeyboardInteractive]
+            },
+            host_key_algorithms: vec!["ssh-ed25519".into()],
+            ca_signature_algorithms: vec!["ssh-ed25519".into()],
+            pubkey_accepted_algorithms: vec!["ssh-ed25519".into()],
+        });
+    }
+    request
+}
+#[tokio::test]
+async fn policy_capability_precedes_effects_and_exact_ack_precedes_reconnect() {
+    for mode in [0, 1] {
+        let f = Fixture::start(mode).await;
+        let request = with_policy(request());
+        let client = f.client();
+        assert!(client
+            .register_ssh_policy_route_host(
+                "cluster",
+                target(&request),
+                request.route.clone(),
+                None
+            )
+            .await
+            .err()
+            .unwrap()
+            .is::<ServiceUnsupported>());
+        assert!(client
+            .create_ssh_route_grant("host", &request)
+            .await
+            .err()
+            .unwrap()
+            .is::<ServiceUnsupported>());
+        assert_eq!(f.data.writes.load(Ordering::SeqCst), 0);
+    }
+    for mode in [9, 10, 11] {
+        let f = Fixture::start(mode).await;
+        let request = with_policy(request());
+        let client = f.client();
+        let result = client.create_ssh_route_grant("host", &request).await;
+        if mode == 9 {
+            let grant = result.unwrap();
+            assert!(grant.matches(&request));
+            let _socket = client
+                .ssh_route_socket("host", &grant, "boot")
+                .await
+                .unwrap();
+            client
+                .reconnect_host_with_ssh_route("host", &grant, "boot")
+                .await
+                .unwrap();
+            assert_eq!(f.data.reconnects.load(Ordering::SeqCst), 1);
+        } else {
+            assert!(result.is_err());
+            assert_eq!(f.data.reconnects.load(Ordering::SeqCst), 0);
+        }
     }
 }
 
