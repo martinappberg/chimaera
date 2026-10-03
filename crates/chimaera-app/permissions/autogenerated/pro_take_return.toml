@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pro-take-return"
+description = "Enables the pro_take_return command without any pre-configured scope."
+commands.allow = ["pro_take_return"]
+
+[[permission]]
+identifier = "deny-pro-take-return"
+description = "Denies the pro_take_return command without any pre-configured scope."
+commands.deny = ["pro_take_return"]

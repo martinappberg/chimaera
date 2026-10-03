@@ -221,6 +221,12 @@ struct CommsState {
     last_message: HashMap<String, u64>,
 }
 
+#[cfg(test)]
+type PreparationGate = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
 /// Agent communication's daemon-wide half (on `AppState.comms`).
 pub(crate) struct Comms {
     inner: Mutex<CommsState>,
@@ -230,6 +236,12 @@ pub(crate) struct Comms {
     /// Serializes read-state writes: each writes the state as it is when
     /// its turn comes, so an older snapshot never lands over a newer one.
     writer: tokio::sync::Mutex<()>,
+    /// Detached enqueue tasks are bounded even while actors stop draining.
+    dispatches: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    preparation_gate: Mutex<Option<PreparationGate>>,
+    #[cfg(test)]
+    dispatch_gate: Mutex<Option<PreparationGate>>,
 }
 
 impl Comms {
@@ -238,7 +250,30 @@ impl Comms {
             inner: Mutex::new(CommsState::default()),
             root,
             writer: tokio::sync::Mutex::new(()),
+            dispatches: Arc::new(tokio::sync::Semaphore::new(64)),
+            #[cfg(test)]
+            preparation_gate: Mutex::new(None),
+            #[cfg(test)]
+            dispatch_gate: Mutex::new(None),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn block_dispatches(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.dispatches.clone().try_acquire_many_owned(64).unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_message(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (resume, paused) = tokio::sync::oneshot::channel();
+        *crate::lock(&self.preparation_gate) = Some((entered, paused));
+        (ready, resume)
     }
 
     fn path(&self, ws: &str) -> PathBuf {
@@ -1067,6 +1102,12 @@ pub(crate) async fn message_agent(state: &Arc<AppState>, from_sid: &str, args: &
     let Some(from) = reader(state, from_sid) else {
         return error("this session has no workspace".into());
     };
+    // A project that runs elsewhere, or whose ownership is being verified,
+    // starts no turns here (the same fence every mutation passes).
+    let admission = match crate::pro::mutation::Dispatch::capture(state, &from.ws) {
+        Ok(admission) => admission,
+        Err(_) => return error("Project execution is paused while ownership is verified".into()),
+    };
     let body = match arg_text(args) {
         Ok(body) => body,
         Err(e) => return error(e),
@@ -1085,6 +1126,14 @@ pub(crate) async fn message_agent(state: &Arc<AppState>, from_sid: &str, args: &
         .get("expect_reply")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    #[cfg(test)]
+    {
+        let gate = crate::lock(&state.comms.preparation_gate).take();
+        if let Some((entered, paused)) = gate {
+            let _ = entered.send(());
+            let _ = paused.await;
+        }
+    }
     ensure_loaded(state, &from.ws).await;
     let msgs = messages(state, &from.ws).await;
     // A reply joins its conversation (the root's seq); a reply to a
@@ -1200,7 +1249,15 @@ pub(crate) async fn message_agent(state: &Arc<AppState>, from_sid: &str, args: &
     }
     let mut outcome = String::new();
     for (target, plan) in targets.iter().zip(plans) {
-        let said = execute(state, &from, target, plan, &posted, thread_key.clone()).await;
+        let said = execute(
+            state,
+            &from,
+            target,
+            plan,
+            &posted,
+            (&admission, thread_key.clone()),
+        )
+        .await;
         if !broadcast {
             outcome = said;
         }
@@ -1239,8 +1296,9 @@ async fn execute(
     target: &Reader,
     plan: Plan,
     posted: &Arc<Entry>,
-    thread: Option<(String, u64)>,
+    execution: (&crate::pro::mutation::Dispatch, Option<(String, u64)>),
 ) -> String {
+    let (admission, thread) = execution;
     match plan {
         Plan::Carrier if target.busy => "it's working; it reads this at its next step".into(),
         Plan::Carrier => {
@@ -1273,14 +1331,15 @@ async fn execute(
                 id: id.clone(),
                 blocks: vec![ContentBlock::Text { text: body }],
             };
-            match state
-                .chat
-                .command_as(
-                    &target.sid,
-                    command,
-                    Some(chimaera_agent::model::ORIGIN_AGENT),
-                )
-                .await
+            match send_guarded(
+                state,
+                target,
+                admission,
+                command,
+                Some(chimaera_agent::model::ORIGIN_AGENT),
+                Some((id.clone(), false)),
+            )
+            .await
             {
                 Ok(()) => "it's working; it reads this at its next step".into(),
                 Err(err) => {
@@ -1297,6 +1356,7 @@ async fn execute(
                 target,
                 Some(&why),
                 chimaera_agent::model::ORIGIN_AGENT,
+                Some(admission),
             )
             .await
             {
@@ -1334,6 +1394,7 @@ async fn execute(
                 target,
                 None,
                 chimaera_agent::model::ORIGIN_MASTERMIND,
+                Some(admission),
             )
             .await
             {
@@ -1382,6 +1443,65 @@ async fn execute(
     }
 }
 
+/// Dispatch after all asynchronous preparation, under the originally captured
+/// authority. The bounded owned enqueue retains the reservation and settles its
+/// inbox claim even when the caller disconnects during the actor queue wait.
+async fn send_guarded(
+    state: &Arc<AppState>,
+    target: &Reader,
+    admission: &crate::pro::mutation::Dispatch,
+    command: AgentCommand,
+    origin: Option<&'static str>,
+    claim: Option<(String, bool)>,
+) -> Result<(), String> {
+    let permit = match state.comms.dispatches.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            if let Some((key, _)) = &claim {
+                finish(state, key, false);
+            }
+            return Err("agent delivery capacity exhausted".into());
+        }
+    };
+    let state = state.clone();
+    let sid = target.sid.clone();
+    let workspace = target.ws.clone();
+    let admission = admission.clone();
+    tokio::spawn(async move {
+        let _permit = permit;
+        #[cfg(test)]
+        {
+            let gate = crate::lock(&state.comms.dispatch_gate).take();
+            if let Some((entered, paused)) = gate {
+                let _ = entered.send(());
+                let _ = paused.await;
+            }
+        }
+        let sent = tokio::time::timeout(
+            Duration::from_secs(5),
+            state.chat.command_as_checked(&sid, command, origin, || {
+                let guard = admission.begin(&state)?;
+                anyhow::ensure!(
+                    crate::lock(&state.session_workspaces).get(&sid) == Some(&workspace),
+                    "workspace execution authority changed"
+                );
+                Ok(guard)
+            }),
+        )
+        .await
+        .map_err(|_| "agent command queue timed out".to_string())
+        .and_then(|result| result.map_err(|_| "agent command was refused".to_string()));
+        if let Some((key, settle)) = claim {
+            if settle || sent.is_err() {
+                finish(&state, &key, settle && sent.is_ok());
+            }
+        }
+        sent
+    })
+    .await
+    .map_err(|_| "agent delivery task failed".to_string())?
+}
+
 /// Deliver every unread message to a live chat reader as ONE send (a
 /// turn when it's idle, its next step when it's working), and settle them.
 /// Err when nothing was sent.
@@ -1390,7 +1510,11 @@ async fn deliver_all(
     reader: &Reader,
     why: Option<&str>,
     origin: &'static str,
+    admission: Option<&crate::pro::mutation::Dispatch>,
 ) -> Result<usize, String> {
+    let captured = crate::pro::mutation::Dispatch::capture(state, &reader.ws)
+        .map_err(|_| "workspace execution authority changed".to_string())?;
+    let admission = admission.unwrap_or(&captured);
     if !reader.chat || !state.chat.get(&reader.sid).is_some_and(|c| c.alive) {
         return Err("not a running chat session".into());
     }
@@ -1403,12 +1527,15 @@ async fn deliver_all(
     let command = AgentCommand::Send {
         blocks: vec![ContentBlock::Text { text: body }],
     };
-    let sent = state
-        .chat
-        .command_as(&reader.sid, command, Some(origin))
-        .await;
-    finish(state, &key, sent.is_ok());
-    sent.map_err(|e| e.to_string())?;
+    send_guarded(
+        state,
+        reader,
+        admission,
+        command,
+        Some(origin),
+        Some((key, true)),
+    )
+    .await?;
     Ok(unread.len())
 }
 
@@ -1535,6 +1662,9 @@ async fn idle_check(state: &Arc<AppState>, sid: &str) {
     if !reader.chat || !reader.alive || reader.busy {
         return;
     }
+    let Ok(admission) = crate::pro::mutation::Dispatch::capture(state, &reader.ws) else {
+        return;
+    };
     let key = (reader.ws.clone(), reader.sid.clone());
     let awaiting = crate::lock(&state.comms.inner)
         .awaiting
@@ -1624,6 +1754,7 @@ async fn idle_check(state: &Arc<AppState>, sid: &str) {
                 &reader,
                 Some(&why),
                 chimaera_agent::model::ORIGIN_AGENT,
+                Some(&admission),
             )
             .await
             {
@@ -2088,7 +2219,7 @@ pub(crate) async fn post_wake(
     if !enabled(&state) {
         return fail(StatusCode::CONFLICT, OFF);
     }
-    let Some(target) = reader(&state, &req.to_sid) else {
+    let Some(target) = reader(&state, &req.to_sid).filter(|target| target.ws == id) else {
         return fail(StatusCode::CONFLICT, "that agent is gone");
     };
     // The user approved continuing: the conversation's wake count restarts.
@@ -2102,6 +2233,7 @@ pub(crate) async fn post_wake(
         &target,
         Some(why),
         chimaera_agent::model::ORIGIN_AGENT,
+        None,
     )
     .await
     {
@@ -2137,6 +2269,7 @@ pub(crate) async fn post_deliver(
         &target,
         Some(why),
         chimaera_agent::model::ORIGIN_AGENT,
+        None,
     )
     .await
     {
@@ -2167,9 +2300,20 @@ pub(crate) async fn post_deliver(
 pub(crate) async fn deliver(
     State(state): State<Arc<AppState>>,
     Path((id, seq)): Path<(String, u64)>,
+    mutation: Option<axum::Extension<crate::workspace_scope::Mutation>>,
 ) -> Response {
     let Some(workspace) = crate::lock(&state.workspaces).get(&id) else {
         return fail(StatusCode::NOT_FOUND, "unknown workspace");
+    };
+    // A project that runs elsewhere, or whose ownership is being verified,
+    // takes no new turns here (the Pro fence every mutation passes).
+    let _dispatch = match crate::workspace_scope::begin_mutation(&state, &mutation) {
+        Ok(guard) if crate::pro::may_execute(&state, &id) => guard,
+        _ => return fail(StatusCode::CONFLICT, "workspace_scope_changed"),
+    };
+    let admission = match crate::pro::mutation::Dispatch::capture(&state, &id) {
+        Ok(admission) => admission,
+        Err(_) => return fail(StatusCode::CONFLICT, "workspace_scope_changed"),
     };
     let (page, _) = state
         .timeline
@@ -2229,7 +2373,10 @@ pub(crate) async fn deliver(
         .delivery
         .is_some()
         .then_some(chimaera_agent::model::ORIGIN_AGENT);
-    match state.chat.command_as(&target, command, origin).await {
+    let Some(target_reader) = reader(&state, &target).filter(|reader| reader.ws == id) else {
+        return fail(StatusCode::CONFLICT, "workspace_scope_changed");
+    };
+    match send_guarded(&state, &target_reader, &admission, command, origin, None).await {
         Ok(()) => {
             tracing::info!(workspace = %id, note = seq, target = %target, "note delivered by the user");
             crate::history::act(
@@ -2337,6 +2484,79 @@ mod tests {
             delivery: Some("inbox".into()),
         });
         Arc::new(e)
+    }
+
+    #[tokio::test]
+    async fn cancelled_delivery_keeps_its_owned_claim_until_refusal_settles() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-comms-cancel-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let state = Arc::new(AppState::new(
+            "fixture".into(),
+            "fixture".into(),
+            4242,
+            0,
+            root.clone(),
+            root.join("config"),
+        ));
+        let target = reader("s-b");
+        let message = note_entry(1, "s-a", Some("s-b"));
+        crate::lock(&state.session_workspaces).insert(target.sid.clone(), target.ws.clone());
+        crate::lock(&state.comms.inner).in_flight.insert(
+            "owned-claim".into(),
+            InFlight {
+                ws: target.ws.clone(),
+                reader: target.sid.clone(),
+                seqs: vec![1],
+            },
+        );
+        let admission = crate::pro::mutation::Dispatch::capture(&state, "w").unwrap();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (resume, paused) = tokio::sync::oneshot::channel();
+        *crate::lock(&state.comms.dispatch_gate) = Some((entered, paused));
+        let owner = state.clone();
+        let recipient = target.clone();
+        let caller = tokio::spawn(async move {
+            send_guarded(
+                &owner,
+                &recipient,
+                &admission,
+                AgentCommand::Send {
+                    blocks: vec![ContentBlock::Text {
+                        text: "synthetic cancelled delivery".into(),
+                    }],
+                },
+                None,
+                Some(("owned-claim".into(), true)),
+            )
+            .await
+        });
+        ready.await.unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert_eq!(state.comms.dispatches.available_permits(), 63);
+        assert!(crate::lock(&state.comms.inner)
+            .unread(&target, std::slice::from_ref(&message))
+            .is_empty());
+        resume.send(()).unwrap();
+        // There is deliberately no actor. Its refusal must end the claim even
+        // though the original caller can no longer run finish().
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.comms.dispatches.available_permits() != 64 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::lock(&state.comms.inner)
+                .unread(&target, &[message])
+                .len(),
+            1
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

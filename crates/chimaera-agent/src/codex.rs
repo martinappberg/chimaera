@@ -492,7 +492,7 @@ async fn codex_handshake(
     // stdin, never argv, which anyone on a shared node can read. Codex keeps
     // a thread's opening instructions for good — neither `-c
     // developer_instructions` nor thread/resume's `developerInstructions`
-    // reach a resumed thread (live 0.157.1, Pass 41) — so this is also what
+    // reach a resumed thread (live 0.157.1, Pass 47) — so this is also what
     // tells a chat continued in a new job where it now runs. After the
     // rewind, which could otherwise drop it. Best-effort: an app-server
     // without the method still opens the chat.
@@ -700,6 +700,10 @@ fn thread_open_request(spec: &SpawnSpec, id: u64, effort: Option<&str>) -> Value
                 "cwd": spec.cwd,
                 "ephemeral": false,
             },
+        }),
+        (Some(thread_id), None) if spec.fork_head => json!({
+            "id": id, "method": "thread/fork",
+            "params": { "threadId": thread_id, "cwd": spec.cwd, "ephemeral": false },
         }),
         (Some(thread_id), None) => json!({
             "id": id, "method": "thread/resume",
@@ -2091,6 +2095,16 @@ impl CodexMapper {
                     // Promote one queued send so it isn't stranded.
                     if let Some(queued) = self.queued_sends.pop_front() {
                         self.redrive_as_fresh_turn(queued.input, queued.client_msg_id, step);
+                    } else {
+                        // The send never became a turn (a usage limit, an
+                        // expired sign-in). Say so, as the Claude driver does
+                        // for a failed turn, so nothing keeps waiting for a
+                        // turn that will not start (pause checks included).
+                        step.events.push(AgentEvent::TurnAborted {
+                            turn_id: String::new(),
+                            reason: "turn failed".into(),
+                            interrupted: false,
+                        });
                     }
                 }
             }
@@ -4344,6 +4358,7 @@ impl CodexMapper {
             queued,
             after_turn: queued && after_turn,
             origin: None,
+            client_id: None,
         });
         if queued && !after_turn && !self.turn_pending {
             self.emit_steer(input, client_msg_id, step);
@@ -4444,6 +4459,7 @@ impl CodexMapper {
                             queued: false,
                             after_turn: false,
                             origin: None,
+                            client_id: None,
                         });
                         self.dispatch_input(json!([{ "type": "text", "text": fb }]), &mut step);
                     }
@@ -5206,6 +5222,37 @@ mod tests {
             "method": "turn/started",
             "params": { "turn": { "id": "turn-A" } },
         }));
+    }
+
+    /// A send whose turn/start is refused (usage limit, expired sign-in)
+    /// ends as a failed turn, so the session is idle again rather than
+    /// waiting forever for a turn that never starts.
+    #[test]
+    fn a_refused_turn_start_ends_the_turn_it_never_began() {
+        let mut m = mapper();
+        let step = m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "hello".into(),
+            }],
+        });
+        let start = step
+            .outbound
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .expect("a fresh send starts a turn");
+        let rpc_id = start["id"].as_u64().unwrap();
+        let step = m.on_frame(&json!({
+            "id": rpc_id,
+            "error": { "code": -32000, "message": "usage limit reached" },
+        }));
+        assert!(step
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Error { fatal: false, .. })));
+        assert!(step.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::TurnAborted { interrupted: false, reason, .. } if reason == "turn failed"
+        )));
     }
 
     /// A userMessage item for `client_id` — codex taking the input into the
@@ -6532,6 +6579,7 @@ mod tests {
                 queued,
                 after_turn: _,
                 origin: _,
+                client_id: _,
             } => {
                 assert_eq!(text, "see");
                 assert_eq!(*attachments, 1);
@@ -6867,6 +6915,13 @@ mod tests {
         assert_eq!(fork["params"]["effort"], "xhigh");
         assert_eq!(fork["params"]["approvalsReviewer"], "auto_review");
 
+        spec.fork_at = None;
+        spec.fork_head = true;
+        let head = thread_open_request(&spec, 10, spec.initial_effort.as_deref());
+        assert_eq!(head["method"], "thread/fork");
+        assert!(head["params"].get("lastTurnId").is_none());
+        assert_eq!(head["params"]["threadId"], "thread-old");
+
         spec.portable_context = Some("quiet imported transcript".into());
         let contextual = thread_open_request(&spec, 10, spec.initial_effort.as_deref());
         assert_eq!(
@@ -6877,7 +6932,7 @@ mod tests {
 
     #[test]
     fn developer_note_is_one_developer_message_for_inject_items() {
-        // The live-verified shape (Pass 41): a raw Responses API item.
+        // The live-verified shape (Pass 47): a raw Responses API item.
         assert_eq!(
             developer_note_params("thr-1", "You are inside Slurm job 7."),
             json!({

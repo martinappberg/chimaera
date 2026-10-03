@@ -9,7 +9,9 @@ import { isRealModel } from "./modelPicker";
 import { isImagePath } from "../previews/files";
 import { artifactMentions, isArtifactPath, proseCovered, proseEmbedTargets } from "./artifacts";
 import { agentMessageFromEvent, isAgentOrigin, parseAgentText, type AgentMessage } from "./agentMessages";
-import type { AgentEvent, ChatSessionInfo, SeqEvent } from "./chatWs";
+import type { AgentEvent, ChatSessionInfo, ReadyAttach, SeqEvent } from "./chatWs";
+import type { MovedTo, SessionPause } from "../net/placement";
+import type { ImageAttachment } from "./images";
 import { parseCapabilities, type ChatCapabilities } from "./capabilities";
 
 /** Names a reply may use that still cover their files (a reply listing
@@ -211,6 +213,74 @@ export interface CheckpointRef {
  *  events (`UserMessage{queued}` + its `UserMessageUpdate`), so replay agrees:
  *  `sent` moves it into `blocks`, `cancelled` removes it, `dropped` keeps it
  *  here marked "not delivered". */
+/** A refused send's text and pictures, going back into the composer. */
+export interface RestoredDraft {
+  text: string;
+  images: ImageAttachment[];
+}
+
+/** A send this client made that no echo has confirmed yet. Nothing but its
+ *  own id settles it: the echo that carries the id confirms it, a refusal
+ *  that carries the id hands it back, and at a `ready` it goes out again
+ *  under the same id (the daemon accepts an id at most once). */
+interface UnconfirmedSend extends RestoredDraft {
+  /** Stable key for its pending bubble. */
+  key: number;
+  /** The id minted for it (`client_id` on its frame). */
+  id: string;
+  /** The frame that went out, kept to send again unchanged. */
+  frame: Record<string, unknown>;
+  /** Shown as a pending bubble ("sending…"). */
+  shown: boolean;
+  /** When it was made (ms). */
+  at: number;
+  /** When its frame last went out (ms), and how often it has gone out
+   *  again: what paces the next copy ({@link resendGap}). */
+  sentAt: number;
+  resends: number;
+  /** Made while attached to a daemon without send ids: that daemon's echo
+   *  carries no id, so the send's exact text confirms it. */
+  plain: boolean;
+  /** A replacement cannot prove whether the agent received this message. */
+  uncertain?: true;
+  confirmed?: true;
+}
+
+/** A send still without its echo at a `ready` is sent again while it is
+ *  younger than this, and withdrawn (`cancel_send`) once it is older: a
+ *  message must not turn up in a conversation long after it was written. */
+export const RESEND_FOR_MS = 120_000;
+
+/** The least time between two copies of one send, doubling with every copy
+ *  up to the cap. A send can be megabytes (pictures), and a `ready` resets
+ *  the reconnect backoff: without this, a path that drops the socket on that
+ *  frame would upload it again at every `ready` for two minutes. It also
+ *  gives whoever held the first copy the time to deliver it, after which no
+ *  second copy goes out at all. */
+export const RESEND_GAP_MS = 3_000;
+const RESEND_GAP_MAX_MS = 30_000;
+function resendGap(send: UnconfirmedSend): number {
+  return Math.min(RESEND_GAP_MS * 2 ** send.resends, RESEND_GAP_MAX_MS);
+}
+
+/** A send made on a connection that looks live shows no pending bubble: its
+ *  echo follows within the moment. One still without it after this long
+ *  shows as "sending…" after all, so a message that went to a machine as it
+ *  froze (nothing says so on a kept socket) is never silently absent. */
+export const SHOW_UNCONFIRMED_AFTER_MS = 3_000;
+
+/** Said when a send that was withdrawn comes back to the composer (the
+ *  words a message the agent never saw already carries in the transcript). */
+const NOT_DELIVERED = "not delivered";
+
+/** A fresh id for one send: 32 hex characters, within what the daemon takes
+ *  (8 to 64 of `[A-Za-z0-9_-]`). `getRandomValues`, not `randomUUID`: a
+ *  browser view over plain http has only the former. */
+export function mintSendId(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 export interface PendingSend {
   /** Delivery key (the wire's client-minted uuid) — the `UserMessageUpdate` /
    *  `CancelQueued` match key. */
@@ -229,6 +299,9 @@ export interface PendingSend {
    *  re-sent, until its ✕ dismisses it (the same `cancel_queued` command; the
    *  driver's tombstone `Cancelled` makes the dismissal survive replay). */
   state: "queued" | "dropped";
+  /** Its queued echo survived but the current process cannot prove it owns
+   * the send. No automatic replay or claim of nondelivery is safe. */
+  uncertain?: true;
   /** Sent with `send_after_turn`: held until the running turn ends instead of
    *  being read at the agent's next step (the wire's `after_turn`, absent =
    *  false). Fixed at the echo — Send now reads it early, never re-labels it. */
@@ -274,12 +347,18 @@ export type ChatBlock = BlockIdentity &
       /** Delivery key (the wire's client-minted uuid); null on old journals,
        *  transcript-seeded messages, and permission-feedback echoes. */
       id: string | null;
-      /** "remote" when a Remote Control client (phone / claude.ai) injected
-       *  the message through the agent's own bridge; null when this
+      /** Who sent it when nobody typed it here: "remote" (a Remote Control
+       *  client injected it through the agent's own bridge), "restart" /
+       *  "moved" / "home" / "recovered" (the daemon's own pick-up after a
+       *  restart or a transfer), "worker" (a worker's `tell_mastermind`); null when this
        *  workbench sent it. */
       origin: string | null;
       /** Inclusive journal boundary for a portable fork through this row. */
       forkSeq: number;
+      /** Journal time the agent received it (ms). Journal-backed, so replay
+       *  keeps the original time; the transcript shows it only on the
+       *  daemon's own transfer notes (`transfer.ts`). */
+      sentAtMs: number;
       /** The agent read it inside a running turn (a waiting send taken at a
        *  step boundary), so it joined that turn instead of opening one. */
       midTurn?: true;
@@ -578,6 +657,112 @@ export class ChatStore {
   exited = $state<null | { status: number | null }>(null);
   degraded = $state(false);
   connected = $state(false);
+  /** The socket is open and its owner has not answered yet, quietly: the
+   *  owner's side keeps the connection (a keeper that keeps a sleeping cloud
+   *  machine's sockets, directly or behind this computer's relay) and
+   *  delivers what is sent once the owner answers. Not live (a send shows as
+   *  "sending…") and not reconnecting. The next `ready`, a drop, "asleep" or
+   *  "cannot be reached" ends it. */
+  held = $state(false);
+  /** The project's owner (the cloud machine) is asleep; the next send wakes
+   *  it. It outlives a dropped socket — a gateway may close after saying so,
+   *  and a reconnect that finds it still asleep must not flicker through
+   *  "Reconnecting…" — and ends with the next `ready`, a wake (an accepted
+   *  send, `waking`) or a move. */
+  asleep = $state(false);
+  /** The first journal replay cannot arrive because the owner sleeps: there
+   *  is nothing to load until a send wakes it (or something else does), so the
+   *  view says so instead of showing a loading line that never ends. A wake
+   *  (`waking`, then `ready`) ends this and the ordinary loading line — with
+   *  the replay behind it — takes over. */
+  get awaitingWake(): boolean {
+    return this.hydrating && this.asleep;
+  }
+  /** The conversation is continuing on another machine (a transfer between
+   *  this computer and the cloud). The transcript stays; the next `ready`
+   *  from wherever it runs now clears this. */
+  moving = $state<MovedTo | null>(null);
+  /** The conversation has no process yet and resumes on its own (after an
+   *  update, once its agent is signed in on the cloud machine, while it
+   *  opens); the next `ready` clears this. */
+  pausedFor = $state<SessionPause | null>(null);
+  /** Sends that never reached the agent (refused, or withdrawn), oldest
+   *  first, waiting to go back into the composer
+   *  ({@link takeRestoredDrafts}). Raw: pictures are large. */
+  private restored = $state.raw<RestoredDraft[]>([]);
+  /** Every send waiting to go back into the composer, oldest first. They
+   *  wait here until the composer has room for their pictures
+   *  ({@link takeRestoredDrafts}). */
+  get restoredDrafts(): readonly RestoredDraft[] {
+    return this.restored;
+  }
+  /** The composer took the `count` oldest. */
+  takeRestoredDrafts(count: number): void {
+    if (count > 0) this.restored = this.restored.slice(count);
+  }
+  /** The composer's sends, oldest first, each until its echo proves the agent
+   *  got it. Several can wait at once (whoever keeps the socket of a sleeping
+   *  owner queues them). Raw, replaced on every change. */
+  private unconfirmed = $state.raw<UnconfirmedSend[]>([]);
+  private unconfirmedKey = 0;
+  /** Whether the daemon behind the current attach takes send ids
+   *  ({@link ReadyAttach.sendIds}); null before the first `ready`. */
+  private sendIds: boolean | null = null;
+  /** The `head` of a `ready` from a daemon with send ids whose replay has to
+   *  be applied before the unconfirmed sends go out again; null when none is
+   *  pending. */
+  private resendAt: number | null = null;
+  private queuedKeys = new Map<string, { clientId: string; seq: number }>();
+  private queuedSnapshot: { head: number; ids: Set<string> } | null = null;
+  /** Puts a frame on this chat's socket (false when it is not open). Only
+   *  the store's own unconfirmed sends, and their withdrawals, ever go
+   *  through it, and it must never redial or ask for a wake when the socket
+   *  is down: these are not the user acting. */
+  private sender: ((frame: Record<string, unknown>) => boolean) | null = null;
+  bindSender(send: (frame: Record<string, unknown>) => boolean): void {
+    this.sender = send;
+  }
+  /** Ids of sends that went out on this chat's socket from outside the
+   *  composer (a one-click prompt): nothing to confirm, send again or return,
+   *  but a refusal that names one is still said. The newest few only. */
+  private outside: string[] = [];
+  noteSentOutside(id: string): void {
+    this.outside = [...this.outside.slice(-15), id];
+  }
+  /** Fires when the next unconfirmed send is due to go out again. */
+  private resendTimer: ReturnType<typeof setTimeout> | null = null;
+  private clearResendTimer(): void {
+    if (this.resendTimer !== null) clearTimeout(this.resendTimer);
+    this.resendTimer = null;
+  }
+  /** The store is being dropped (its chat left the pool). */
+  dispose(): void {
+    this.clearResendTimer();
+    this.sender = null;
+  }
+  /** A send picked a paused project back up and it is waking; cleared by the
+   *  next `ready`, a disconnect or a move. */
+  waking = $state(false);
+  /** Acting on this conversation is bringing its work here (`here`: this
+   *  computer takes it from the other one) or to the user's computer
+   *  (`computer`: a phone's send while the cloud sleeps). The send waits for
+   *  it. It outlives the socket that closes once the work arrived (the
+   *  reconnect's `ready` ends it), a refusal from the other computer ends it,
+   *  and so do a wake or a move. */
+  bringing = $state<"here" | "computer" | null>(null);
+  /** Sends not confirmed yet that show as a pending bubble, oldest first:
+   *  one made while the conversation is not live (paused, waking,
+   *  reconnecting) shows at once, so it is never typed twice, and the others
+   *  from the moment they are known to wait (the socket dropped, `waking`,
+   *  `bringing`, sent again at a `ready`). Its echo removes one; a refusal,
+   *  a withdrawal or an exit hands its text back to the composer. */
+  get sending(): { key: number; text: string; images: number; uncertain?: true; confirmed?: true }[] {
+    return this.unconfirmed
+      .filter((send) => send.shown)
+      .map((send) => ({ key: send.key, text: send.text, images: send.images.length,
+        ...(send.uncertain ? { uncertain: true as const } : {}),
+        ...(send.confirmed ? { confirmed: true as const } : {}) }));
+  }
   fatalError = $state<string | null>(null);
   /** Where the fatal came from. A SOCKET fatal (handshake failure) is
    *  disproved by the next successful `ready` — chatPool recreates a fatal
@@ -650,8 +835,10 @@ export class ChatStore {
    *  view-toggle round-trip — starts with thinking OFF), so the view re-syncs
    *  it to that driver; the view only marks it once the `set_thinking` frame
    *  actually left the socket, so an undelivered push isn't silently lost. A
-   *  plain reconnect (same process, no new `init`) keeps it, so it isn't
-   *  re-pushed needlessly. */
+   *  plain reconnect (same process, no new `init`) keeps it: pushing again
+   *  there would let one window's default override another window's choice
+   *  at every blip. A second `ready` on one socket resets it too: whoever
+   *  kept that socket drops a push sent while nothing was attached. */
   thinkingPushed = $state(false);
   setThinking(enabled: boolean): void {
     this.thinkingEnabled = enabled;
@@ -753,8 +940,24 @@ export class ChatStore {
    *  the "made this turn" window. */
   private turnStartedAt: number | null = null;
 
-  onReady(session: ChatSessionInfo, _replayFrom: number, head: number | undefined): void {
+  /** Also a later `ready` on the same socket: a keeper kept it open while
+   *  the cloud machine slept and attached it again. Nothing here resets the
+   *  transcript for that (only a journal whose head fell below `lastSeq`
+   *  does), the gap replays through the seq guard in {@link apply}, and a
+   *  pending "sending…" bubble stays until its echo. */
+  onReady(
+    session: ChatSessionInfo,
+    _replayFrom: number,
+    head: number | undefined,
+    attach: ReadyAttach = { sendIds: false, reattach: false },
+  ): void {
     this.connected = true;
+    this.held = false;
+    this.asleep = false;
+    this.waking = false;
+    this.bringing = null;
+    this.moving = null;
+    this.pausedFor = null;
     // This handshake succeeded, which is the one fact a socket-level fatal
     // claimed was impossible; a journal fatal says nothing about the socket.
     if (this.fatalSource === "socket") this.clearFatal();
@@ -780,16 +983,332 @@ export class ChatStore {
     if (!session.alive && this.exited === null) {
       this.exited = { status: session.exit_status };
     }
+    // A reattach: a `set_thinking` sent while nothing was attached was
+    // dropped by whoever kept the socket. A plain reconnect pushes nothing.
+    if (attach.reattach) this.thinkingPushed = false;
+    this.sendIds = attach.sendIds;
+    this.queuedSnapshot = head !== undefined && attach.activeQueuedIds !== undefined
+      ? { head, ids: new Set(attach.activeQueuedIds) } : null;
+    // Only a daemon that accepts an id at most once may be sent a send twice.
+    // One without send ids is told nothing again and decides nothing here.
+    this.resendAt = attach.sendIds && head !== undefined ? head : null;
+    this.resendUnconfirmed();
   }
 
-  /** The socket dropped; we are no longer live until the next `ready`. */
+  /** The replay of a `ready` from a daemon with send ids has been applied
+   *  (through its `head`): every send still without its echo goes out again
+   *  under its own id. That is safe whatever became of the first copy: lost,
+   *  still queued in the daemon, or about to be delivered by whoever held it,
+   *  the daemon runs the id once. One older than {@link RESEND_FOR_MS} is
+   *  withdrawn instead, and {@link onSendCancelled} hears whether it had
+   *  arrived after all. */
+  private resendUnconfirmed(): void {
+    const snapshot = this.queuedSnapshot;
+    if (snapshot !== null && this.lastSeq >= snapshot.head) {
+      this.queuedSnapshot = null;
+      for (const send of this.pendingSends) {
+        const key = this.queuedKeys.get(send.id);
+        if (send.state !== "queued" || key === undefined || key.seq > snapshot.head) continue;
+        if (snapshot.ids.has(key.clientId)) delete send.uncertain;
+        else send.uncertain = true;
+      }
+    }
+    if (this.resendAt === null || this.lastSeq < this.resendAt) return;
+    this.resendAt = null;
+    this.resendDue(true);
+  }
+
+  /** Send again what is due, and come back for what is not yet
+   *  ({@link resendGap}). `atReady`: only right after a `ready` is an old
+   *  send withdrawn (whoever keeps the socket drops a `cancel_send` while
+   *  nothing is attached, and a `ready` is the proof something is). */
+  private resendDue(atReady: boolean): void {
+    this.clearResendTimer();
+    if (!this.connected || this.sendIds !== true || this.sender === null || this.unconfirmed.length === 0) return;
+    this.showUnconfirmed();
+    const now = Date.now();
+    let next: number | null = null;
+    const gone = new Set<number>();
+    for (const send of this.unconfirmed) {
+      if (send.uncertain || send.confirmed) continue;
+      if (now - send.at >= RESEND_FOR_MS) {
+        if (atReady) this.sender({ type: "cancel_send", client_id: send.id });
+        continue;
+      }
+      const due = send.sentAt + resendGap(send);
+      if (now < due) next = next === null ? due : Math.min(next, due);
+      else if (this.sender(send.frame)) gone.add(send.key);
+    }
+    if (gone.size > 0) {
+      this.unconfirmed = this.unconfirmed.map((send) =>
+        gone.has(send.key) ? { ...send, sentAt: now, resends: send.resends + 1 } : send,
+      );
+    }
+    if (next !== null) this.resendTimer = setTimeout(() => this.resendDue(false), next - now);
+  }
+
+  /** The daemon's answer to a `cancel_send`. Withdrawn: no copy of that send
+   *  will ever run, so its text goes back to the composer. Not withdrawn: a
+   *  copy had been accepted, and its echo will confirm the bubble. */
+  onSendCancelled(clientId: string, cancelled: boolean): void {
+    if (!cancelled) return;
+    const at = this.unconfirmed.findIndex((send) => send.id === clientId);
+    if (at < 0 || this.unconfirmed[at].uncertain || this.unconfirmed[at].confirmed) return;
+    this.notice(NOT_DELIVERED, "error");
+    this.handBackAt(at);
+  }
+
+  onSendUncertain(clientId: string, message: string): void {
+    const send = this.unconfirmed.find((send) => send.id === clientId);
+    if (send?.uncertain || send?.confirmed) return;
+    if (send) {
+      this.unconfirmed = this.unconfirmed.map((send) => send.id === clientId
+        ? { ...send, shown: true, uncertain: true } : send);
+      this.notice(message, "error");
+    } else if (this.outside.includes(clientId)) {
+      this.outside = this.outside.filter((id) => id !== clientId);
+      this.notice(message, "error");
+    }
+  }
+
+  /** A durable receipt can outlive the journal echo. Keep the user's text
+   *  visible as delivered until replay supplies the authoritative row. */
+  onSendConfirmed(clientId: string): void {
+    this.unconfirmed = this.unconfirmed.map((send) => send.id === clientId
+      ? { ...send, shown: true, uncertain: undefined, confirmed: true } : send);
+  }
+
+  private handBack(sends: UnconfirmedSend[]): void {
+    this.restored = [...this.restored, ...sends.map(({ text, images }) => ({ text, images }))];
+  }
+
+  private handBackAt(at: number): void {
+    if (this.unconfirmed[at].uncertain || this.unconfirmed[at].confirmed) return;
+    this.handBack([this.unconfirmed[at]]);
+    this.unconfirmed = this.unconfirmed.filter((_, index) => index !== at);
+  }
+
+  /** The socket dropped; we are no longer live until the next `ready`. An
+   *  asleep owner stays asleep: dropping the socket wakes nothing. */
   onDisconnected(): void {
     this.connected = false;
+    this.held = false;
+    this.waking = false;
+    // No echo will come on this socket any more: what is unconfirmed shows
+    // as pending until the next `ready` sends it again.
+    this.showUnconfirmed();
+    this.resendAt = null;
+    this.clearResendTimer();
+  }
+
+  /** The socket is open and kept for an owner that has not answered. */
+  onHeld(): void {
+    this.held = true;
+  }
+
+  /** The owner cannot be reached: the socket stays open while whoever keeps
+   *  it retries, but nothing sent now is heard, and a wake that was under way
+   *  did not arrive. Not live until the next `ready`. */
+  onUnreachable(): void {
+    this.held = false;
+    this.connected = false;
+    this.waking = false;
+  }
+
+  /** The owner is paused and nothing has asked it to wake yet. Said by a
+   *  relay or gateway that keeps no socket for it, possibly after this socket
+   *  had already counted as kept (a slow answer): it is not. */
+  onAsleep(): void {
+    this.asleep = true;
+    this.held = false;
+  }
+
+  /** A send picked the paused project back up; it is waking now. Whoever
+   *  said so holds that send until the owner answers: show it pending, also
+   *  when it went out on a socket that still looked live (the machine had
+   *  gone to sleep behind a connection its keeper kept open). Presentation
+   *  only: what becomes of a send is decided by its id alone. */
+  onWaking(): void {
+    this.asleep = false;
+    this.waking = true;
+    this.bringing = null;
+    this.showUnconfirmed();
+  }
+
+  /** When the oldest unconfirmed send that shows no bubble yet was made, or
+   *  null: the view shows it once it is {@link SHOW_UNCONFIRMED_AFTER_MS}
+   *  old ({@link showOverdue}). Only behind a daemon with send ids, where a
+   *  bubble always ends (its echo, a refusal, or the next `ready`); a daemon
+   *  without them confirms by text alone, and a bubble its echo failed to
+   *  match would stay for good. */
+  get unshownSince(): number | null {
+    if (this.sendIds !== true) return null;
+    return this.unconfirmed.find((send) => !send.shown)?.at ?? null;
+  }
+
+  /** Show the unconfirmed sends that have waited for their echo too long to
+   *  be on their way still. */
+  showOverdue(now = Date.now()): void {
+    if (this.sendIds !== true) return;
+    const overdue = (send: UnconfirmedSend): boolean => !send.shown && now - send.at >= SHOW_UNCONFIRMED_AFTER_MS;
+    if (this.unconfirmed.some(overdue)) {
+      this.unconfirmed = this.unconfirmed.map((send) => (overdue(send) ? { ...send, shown: true } : send));
+    }
+  }
+
+  /** Show every unconfirmed send as a pending bubble. */
+  private showUnconfirmed(): void {
+    if (this.unconfirmed.some((send) => !send.shown)) {
+      this.unconfirmed = this.unconfirmed.map((send) => (send.shown ? send : { ...send, shown: true }));
+    }
+  }
+
+  /** Acting here is bringing the work to this computer (or, from a phone, to
+   *  the user's computer). The send that asked is held until it arrives: show
+   *  it pending rather than as delivered. */
+  onBringing(to: "here" | "computer"): void {
+    this.asleep = false;
+    this.bringing = to;
+    this.showUnconfirmed();
+  }
+
+  /** The conversation moved to another machine; it did not exit. */
+  onMoved(to: MovedTo): void {
+    this.connected = false;
+    this.moving = to;
+    this.pausedFor = null;
+    this.asleep = false;
+    this.waking = false;
+    this.bringing = null;
+    // Sends still unconfirmed stay: this socket closes next, and they go out
+    // again at the `ready` from wherever the conversation runs now (its
+    // journal travelled with it, so a delivered one echoes in that replay).
+  }
+
+  /** The conversation is paused here and resumes on its own; it did not exit. */
+  onPaused(pause: SessionPause): void {
+    this.connected = false;
+    if (pause.type === "moved") {
+      this.onMoved(pause.to);
+      return;
+    }
+    this.moving = null;
+    this.pausedFor = pause;
+    this.asleep = false;
+  }
+
+  /** The composer's send went out on the socket as `frame`, under the id it
+   *  carries (`client_id`): keep it until the agent's echo proves delivery,
+   *  so it can go out again or come back. */
+  noteSent(id: string, frame: Record<string, unknown>, text: string, images: ImageAttachment[] = []): void {
+    // Sending is what picks a paused project back up: stop inviting it.
+    const live = this.connected && !this.waking && this.bringing === null;
+    this.asleep = false;
+    this.unconfirmed = [
+      ...this.unconfirmed,
+      {
+        key: this.unconfirmedKey++,
+        id,
+        frame,
+        text,
+        images,
+        shown: !live,
+        at: Date.now(),
+        sentAt: Date.now(),
+        resends: 0,
+        plain: this.sendIds === false,
+      },
+    ];
+  }
+
+  /** An echo arrived. One that carries a send id confirms exactly the send
+   *  made under it, and nothing else: not a message from another device, not
+   *  one replayed from history, not a prompt sent from outside the composer.
+   *  One without an id comes from a daemon that has no send ids, and confirms
+   *  the oldest send with exactly its text that was made against such a
+   *  daemon (`text` is null for a message this workbench's user did not
+   *  type). */
+  private confirmSend(clientId: string | null, text: string | null): void {
+    if (this.unconfirmed.length === 0) return;
+    const at =
+      clientId !== null
+        ? this.unconfirmed.findIndex((send) => send.id === clientId)
+        : text !== null
+          ? this.unconfirmed.findIndex((send) => send.text === text && (send.plain || this.sendIds !== true))
+          : -1;
+    if (at >= 0) this.unconfirmed = this.unconfirmed.filter((_, index) => index !== at);
+  }
+
+  /** One command was refused before reaching the agent. Say so, and give a
+   *  refused send's text back to the composer instead of losing it: exactly
+   *  the send the refusal names by its id (`clientId`). */
+  onCommandFailed(
+    message: string,
+    command: string | null = null,
+    reason: string | null = null,
+    clientId: string | null = null,
+  ): void {
+    // The store withdrew a send by itself and was refused (this socket may
+    // not act right now): nothing the user did, and the next `ready` asks
+    // again.
+    if (command === "cancel_send") return;
+    // Only a refused SEND hands text back: a refused interrupt, permission
+    // answer or anything else says so without resurrecting a message that
+    // may already have been delivered (a re-send would be a second turn).
+    const send = command === "send" || command === "send_after_turn";
+    const at = send && clientId !== null ? this.unconfirmed.findIndex((unconfirmed) => unconfirmed.id === clientId) : -1;
+    // A delayed refusal of another copy cannot contradict uncertain delivery.
+    if (at >= 0 && (this.unconfirmed[at].uncertain || this.unconfirmed[at].confirmed)) return;
+    if (send && clientId !== null && at < 0) {
+      // A prompt sent from outside the composer was refused: say so (there
+      // is no text to return). Anything else under an id this store does not
+      // hold answers a second copy of a send that was confirmed or returned
+      // already: nothing to say, nothing to return.
+      if (this.outside.includes(clientId)) {
+        this.outside = this.outside.filter((id) => id !== clientId);
+        this.notice(message, "error");
+      }
+      return;
+    }
+    this.notice(message, "error");
+    // The other computer kept the work: nothing is on its way here any more.
+    if (reason === "still_working") this.bringing = null;
+    if (!send || this.unconfirmed.length === 0) return;
+    if (at >= 0) {
+      this.handBackAt(at);
+      return;
+    }
+    // A refusal that names no send. A daemon without send ids never resends,
+    // so the send just made comes back, as it always did there. Behind a
+    // daemon with send ids it comes from a holder in between that predates
+    // them, and may answer anything: a second copy of a send that holder
+    // still holds and will deliver, above all. Nothing is returned on a
+    // guess, not even when one send is unconfirmed. They show as pending
+    // and the next `ready` sends or withdraws each by its id.
+    if (this.sendIds === true) this.showUnconfirmed();
+    else this.handBackAt(this.unconfirmed.length - 1);
+  }
+
+  /** A process exit proves nothing about delivery before its last echo.
+   *  Keep the message visible without replaying it or calling it unsent. */
+  private retainUnconfirmedOnExit(): void {
+    this.clearResendTimer();
+    this.markQueuedUncertain();
+    if (this.unconfirmed.length === 0) return;
+    this.unconfirmed = this.unconfirmed.map((send) => send.confirmed
+      ? send : { ...send, shown: true, uncertain: true });
+  }
+
+  private markQueuedUncertain(): void {
+    for (const send of this.pendingSends) {
+      if (send.state === "queued") send.uncertain = true;
+    }
   }
 
   /** The structured driver fell back to its terminal surface. */
   onDegraded(): void {
     this.hydrating = false;
+    this.retainUnconfirmedOnExit();
     this.degraded = true;
     this.touchTranscript();
   }
@@ -797,6 +1316,7 @@ export class ChatStore {
   /** The driver closed before (or after) an initial journal replay. */
   onExited(status: number | null): void {
     this.hydrating = false;
+    this.retainUnconfirmedOnExit();
     this.exited = { status };
     this.touchTranscript();
   }
@@ -834,6 +1354,8 @@ export class ChatStore {
     // replay re-delivers any that are still live.
     this.pending = [];
     this.pendingSends = [];
+    this.queuedKeys.clear();
+    this.queuedSnapshot = null;
     this.questions = [];
     // trimmedCount restarts with the transcript; the generation bump is what
     // tells views/cursors their old coordinates are dead (a trim delta across
@@ -893,6 +1415,11 @@ export class ChatStore {
 
   apply(entry: SeqEvent): void {
     if (entry.seq <= this.lastSeq) return;
+    this.reduce(entry);
+    this.resendUnconfirmed();
+  }
+
+  private reduce(entry: SeqEvent): void {
     this.lastSeq = entry.seq;
     if (this.hydrating && this.lastSeq >= this.replayHead) this.hydrating = false;
     const ev = entry.ev;
@@ -965,7 +1492,13 @@ export class ChatStore {
           ? (ev.attachment_paths as unknown[]).filter((p): p is string => typeof p === "string")
           : [];
         const origin = typeof ev.origin === "string" ? ev.origin : null;
+        // The agent received a send: the one it names is no longer pending
+        // and can no longer be handed back or sent again.
+        this.confirmSend(typeof ev.client_id === "string" ? ev.client_id : null, origin === null ? text : null);
         if (ev.queued === true && id !== null) {
+          if (typeof ev.client_id === "string") {
+            this.queuedKeys.set(id, { clientId: ev.client_id, seq: entry.seq });
+          }
           // Queued: park it in the pending stack, NOT in the transcript at its
           // mid-turn send position (that splice would split the agent's live
           // message in two). It enters `blocks` only once the agent reads it.
@@ -996,6 +1529,7 @@ export class ChatStore {
               id,
               origin,
               forkSeq: entry.seq,
+              sentAtMs: entry.ts,
             }),
           );
           if (id !== null) this.userIndex.set(id, this.blocks.length - 1);
@@ -1085,6 +1619,7 @@ export class ChatStore {
         const pIdx = this.pendingSends.findIndex((p) => p.id === id);
         if (pIdx === -1) break; // unknown / already resolved
         const pending = this.pendingSends[pIdx];
+        this.queuedKeys.delete(id);
         const state = ev.state as string;
         if (state === "sent") {
           // Read: leave the pending stack and enter the transcript at the
@@ -1107,6 +1642,7 @@ export class ChatStore {
               checkpoint: pending.checkpoint,
               id: pending.id,
               forkSeq: entry.seq,
+              sentAtMs: entry.ts,
               ...(this.running ? { midTurn: true as const } : {}),
             }),
           );
@@ -1119,6 +1655,7 @@ export class ChatStore {
           // dropped: the agent never got it — keep it visible as "not
           // delivered" so the text can be copied and re-sent.
           pending.state = "dropped";
+          delete pending.uncertain;
         }
         break;
       }
@@ -1672,6 +2209,7 @@ export class ChatStore {
         this.reconcileOpenTools();
         this.expirePendingAsks();
         this.pendingSends = [];
+        this.queuedKeys.clear();
         this.backgroundTasks = [];
         // A portable target received the old conversation as one hidden
         // primer. Its copied source UUIDs/turn ids do NOT exist in the fresh
@@ -1725,6 +2263,7 @@ export class ChatStore {
         this.pendingModel = null;
         this.notice(ev.message as string, "error");
         if (ev.fatal === true) {
+          this.markQueuedUncertain();
           this.fatalError = ev.message as string;
           this.fatalSource = "journal";
           // A dead driver is not running — don't strand the stop button and
@@ -1741,6 +2280,7 @@ export class ChatStore {
         }
         break;
       case "exited":
+        this.markQueuedUncertain();
         this.startupDetail = null;
         this.pendingModel = null;
         this.running = false;

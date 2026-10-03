@@ -12,6 +12,7 @@ import "@fontsource/jetbrains-mono/latin-ext-600.css";
 import "./app.css";
 import App from "./App.svelte";
 import { installReloadHook } from "./lib/layout/windowReload";
+import { isAccountHome } from "./lib/net/base";
 import { terminalWindowSession } from "./lib/net/api";
 import TerminalWindow from "./lib/terminal/TerminalWindow.svelte";
 
@@ -26,11 +27,11 @@ if (!target) {
   throw new Error("missing #app mount point");
 }
 
-// A terminal-only window (a cluster's login-node terminal) is just that
-// terminal: none of the workbench around it.
+// Account Home has no daemon; a cluster's terminal-only window has no workbench.
 const termSession = terminalWindowSession();
-const app =
-  termSession !== null
+const app = isAccountHome()
+  ? import("./lib/pro/AccountHome.svelte").then(({ default: AccountHome }) => mount(AccountHome, { target }))
+  : termSession !== null
     ? mount(TerminalWindow, { target, props: { sessionId: termSession } })
     : mount(App, { target });
 

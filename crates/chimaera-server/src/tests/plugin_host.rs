@@ -10,6 +10,21 @@ use std::time::{Duration, Instant};
 use super::support::*;
 use crate::{lock, AppState};
 
+#[test]
+fn plugins_cannot_claim_project_cloud_tools_even_without_an_active_account() {
+    let manifest = |tool: &str| {
+        format!(
+            "id = \"profile-plugin\"\nname = \"Profile plugin\"\nversion = \"1.0.0\"\n\
+             summary = \"Fixture\"\napi = \"0.1\"\n[provides]\nmcp_tools = [\"{tool}\"]\n"
+        )
+    };
+    assert!(crate::plugins::parse_manifest(&manifest("plugin_profile")).is_ok());
+    for tool in ["read_cloud_profile", "update_cloud_profile"] {
+        let error = crate::plugins::parse_manifest(&manifest(tool)).unwrap_err();
+        assert!(error.contains("reserved by chimaera"), "{error}");
+    }
+}
+
 /// A workspace with the fixture switched on and one agent session in it.
 async fn fixture_workspace(label: &str, key: &str) -> (Arc<AppState>, String, String) {
     crate::plugins::test_catalog::fixture();
@@ -162,6 +177,9 @@ async fn a_panicking_plugin_is_an_error_and_the_next_call_works() {
 async fn reads_stay_in_the_workspace_refuse_symlinks_and_stop_at_the_cap() {
     let (state, ws, sid) = fixture_workspace("host-read", "k5").await;
     let root = root_of(&state, &ws);
+    // Registration recorded the workspace id in the folder; this test lists
+    // the folder's own contents.
+    std::fs::remove_file(root.join(".chimaera-workspace")).unwrap();
     std::fs::create_dir_all(root.join("sub")).unwrap();
     std::fs::write(root.join("sub/a.txt"), "x".repeat(100)).unwrap();
     let outside = test_dir("host-read-outside");

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as net from "../net/api";
-import { acknowledgeSetupResult, getAgentSetup, pendingSetupId, recoverSetupResult, rememberSetupId, startAgentSetup, type SetupProgress, type SetupRequest } from "./agentSetup";
+import { acknowledgeSetupResult, getAgentSetup, pendingSetupId, recoverSetupResult, rememberSetupId, startAgentSetup } from "./agentSetupRequests";
+import type { SetupProgress, SetupRequest } from "./agentSetup";
 import type { AgentInfo } from "./launcher";
 
 const operation = { id: "install-1", phase: "succeeded" } as SetupProgress;
@@ -73,7 +74,7 @@ describe("setup recovery without a catalog refresh", () => {
     vi.spyOn(net, "api").mockResolvedValue(Response.json({ host: "local", root: "/agents", operation: { ...operation, phase: "running" } }));
     await getAgentSetup("codex");
     vi.resetModules();
-    const reloaded = await import("./agentSetup");
+    const reloaded = await import("./agentSetupRequests");
     expect(reloaded.recoverSetupResult(request({ installed: true }, "update"), operation, true)).toBe(true);
     reloaded.acknowledgeSetupResult("codex", operation.id);
     expect(sessionStorage.getItem("chimaera.agentSetup.codex")).toBeNull();

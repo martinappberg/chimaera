@@ -5,12 +5,15 @@
 //! that tell the user when a job is ready, about to end, or gone, and windows
 //! following a workspace that moved to another job.
 //!
-//! Nothing here keeps anything running on a cluster's login node. Every call
+//! Direct SSH keeps nothing running on a cluster's login node. Every call
 //! is a short ssh exec through the ControlMaster (`chimaera_remote::cluster`)
 //! or a request to the job's own job-host over a plain `ssh -L`; the only
 //! long-lived things are this process's own forwards to the user's jobs and,
 //! for partitions that take only interactive jobs, the foreground `srun` the
-//! user asked for — both end with this app.
+//! user asked for — both end with this app. Kept clusters use typed keeper
+//! control and exact job/workspace Link routes; the keeper holds allocations
+//! and compute forwards when this app closes. The login-node terminal remains
+//! an explicit direct local PTY, independently of keeper job continuity.
 //!
 //! Ports and tokens never reach a page: the overview's endpoints stay here,
 //! and a workspace window's URL is the only carrier of its token.
@@ -32,9 +35,28 @@ use super::restore::open_compute_window;
 use super::{authorize_scope_origin, lock, Shell};
 use crate::windows::{ComputeScope, WindowRecord};
 
+mod kept;
+use chimaera_link::{ClusterOperation as Op, ClusterReply as Reply};
+
+/// Called synchronously on account replacement/sign-out; no SSH or network.
+pub(super) fn close_kept_links(shell: &Shell) {
+    kept::close_all(shell);
+}
+pub(super) fn kept_link_endpoints(shell: &Shell) -> Vec<(String, u16, String)> {
+    kept::endpoints(shell)
+}
+pub(super) fn kept_link_current(shell: &Shell, key: &str, port: u16, token: &str) -> bool {
+    kept::current(shell, key, port, token)
+}
+
 /// Live, per-cluster state of this process.
 #[derive(Default)]
 pub(crate) struct ClusterLive {
+    kept_links: HashMap<String, kept::Held>,
+    kept_opening: HashSet<String>,
+    kept_identity: Option<(String, u64)>,
+    kept_link_epoch: u64,
+    kept_control: std::sync::Arc<kept::Control>,
     /// What the last connect found (None until a connect ran this process).
     pub(crate) info: Option<ClusterInfo>,
     /// Open workspaces' chimaeras, from the last overview.
@@ -125,6 +147,9 @@ fn valid_job(id: &str) -> Result<(), String> {
 /// lives on) and holds its ControlMaster — a connect, which on a cluster
 /// starts nothing.
 async fn ensure_cluster(app: &AppHandle, alias: &str) -> Result<(), String> {
+    if let Some(selected) = kept::select(&app.state::<Shell>(), alias).await? {
+        return selected.ensure_cluster();
+    }
     if chimaera_remote::scheduler_of(alias).is_some_and(|s| s.kind.is_cluster()) {
         return Ok(());
     }
@@ -136,6 +161,17 @@ async fn ensure_cluster(app: &AppHandle, alias: &str) -> Result<(), String> {
             s.kind.tag()
         )),
         _ => Err(format!("{alias} has no batch scheduler on its login PATH")),
+    }
+}
+
+/// Refresh never owns authentication, including the direct SSH route.
+fn require_discovered_cluster(alias: &str) -> Result<(), String> {
+    if chimaera_remote::scheduler_of(alias)
+        .is_some_and(|s| s.kind == chimaera_core::slurm::Scheduler::Slurm)
+    {
+        Ok(())
+    } else {
+        Err("This cluster needs Connect or Reconnect before refresh".into())
     }
 }
 
@@ -188,6 +224,7 @@ fn ready_words(names: &[String]) -> String {
 /// Close a tunnel by key and tell its window(s) why.
 async fn end_tunnel(app: &AppHandle, key: String, reason: &str) {
     let shell = app.state::<Shell>();
+    kept::close_key(&shell, &key);
     let tunnel = shell.compute_tunnels.lock().await.remove(&key);
     lock(&shell.unhealthy_tunnels).remove(&key);
     if let Some(t) = tunnel {
@@ -213,7 +250,19 @@ async fn end_tunnel(app: &AppHandle, key: String, reason: &str) {
 /// ended, one accounting question per ended job, and the watcher when
 /// anything is still alive.
 async fn absorb(app: &AppHandle, alias: &str, ov: &ClusterOverview) {
+    absorb_with_effects(app, alias, ov, true).await;
+}
+async fn absorb_with_effects(
+    app: &AppHandle,
+    alias: &str,
+    ov: &ClusterOverview,
+    background_effects: bool,
+) {
     let shell = app.state::<Shell>();
+    kept::reconcile(&shell, alias, ov);
+    let is_kept = lock(&shell.clusters)
+        .get(alias)
+        .is_some_and(|c| c.kept_identity.is_some());
     // (window key, reason) to end; (wid, new endpoint) to follow.
     let mut ended: Vec<(String, String)> = Vec::new();
     let mut moved: Vec<(String, String, cluster::Endpoint)> = Vec::new();
@@ -282,7 +331,7 @@ async fn absorb(app: &AppHandle, alias: &str, ov: &ClusterOverview) {
                 let queued: Vec<String> = c
                     .queued_opens
                     .iter()
-                    .filter(|(jid, _)| jid == &j.id)
+                    .filter(|(jid, _)| background_effects && jid == &j.id)
                     .map(|(_, wid)| wid.clone())
                     .collect();
                 for wid in queued {
@@ -358,7 +407,11 @@ async fn absorb(app: &AppHandle, alias: &str, ov: &ClusterOverview) {
                     }
                     ended.push((host_key(alias, &j.id), reason));
                 }
-                if j.ended.is_none() && !j.stopped_by_user && c.ended_asked.insert(j.id.clone()) {
+                if background_effects
+                    && j.ended.is_none()
+                    && !j.stopped_by_user
+                    && c.ended_asked.insert(j.id.clone())
+                {
                     if let Some(r) = ov.records.get(&j.id) {
                         // An attached job's record learns its Slurm id here,
                         // so accounting can say how it ended.
@@ -438,7 +491,7 @@ async fn absorb(app: &AppHandle, alias: &str, ov: &ClusterOverview) {
     for (wid, old_slurm, endpoint) in moved {
         follow_move(app, alias, &wid, &old_slurm, &endpoint).await;
     }
-    for (jid, wid) in ensure_open {
+    for (jid, wid) in ensure_open.into_iter().filter(|_| background_effects) {
         let Some(endpoint) = ov.hosts.get(&jid).cloned() else {
             continue;
         };
@@ -457,7 +510,7 @@ async fn absorb(app: &AppHandle, alias: &str, ov: &ClusterOverview) {
             let _ = app.emit("cluster-changed", json!({ "alias": alias }));
         });
     }
-    if !ask_end.is_empty() {
+    if !is_kept && !ask_end.is_empty() {
         let app = app.clone();
         let alias = alias.to_string();
         tauri::async_runtime::spawn(async move {
@@ -493,6 +546,7 @@ async fn follow_move(
             .and_then(|c| c.ws_names.get(wid).cloned())
             .unwrap_or_else(|| "workspace".into())
     };
+    kept::close_key(&shell, &old_key);
     let tunnel = shell.compute_tunnels.lock().await.remove(&old_key);
     if let Some(t) = tunnel {
         t.close().await;
@@ -529,14 +583,14 @@ fn ensure_watcher(app: &AppHandle, alias: &str) {
         let mut failures = 0u32;
         loop {
             tokio::time::sleep(interval).await;
-            let mut ov = match cluster::overview(&alias, home()).await {
+            let ov = match live_overview(&app, &alias).await {
                 Ok(ov) => {
                     failures = 0;
                     ov
                 }
                 Err(e) => {
                     failures += 1;
-                    tracing::debug!("cluster watch {alias}: {e:#}");
+                    tracing::debug!("cluster watch {alias}: {e}");
                     if failures >= 5 {
                         break;
                     }
@@ -544,7 +598,6 @@ fn ensure_watcher(app: &AppHandle, alias: &str) {
                     continue;
                 }
             };
-            overlay_live(&app, &alias, &mut ov).await;
             absorb(&app, &alias, &ov).await;
             let _ = app.emit("cluster-changed", json!({ "alias": alias }));
             let starting = ov.jobs.iter().any(|j| j.state == "starting");
@@ -606,7 +659,22 @@ async fn fresh_overview(alias: &str) -> Result<ClusterOverview, String> {
 
 /// A fresh overview with each running job's own word on what it holds.
 async fn live_overview(app: &AppHandle, alias: &str) -> Result<ClusterOverview, String> {
-    let mut ov = fresh_overview(alias).await?;
+    live_overview_refresh(app, alias, false).await
+}
+
+async fn live_overview_refresh(
+    app: &AppHandle,
+    alias: &str,
+    refresh: bool,
+) -> Result<ClusterOverview, String> {
+    if let Some(selected) = kept::select(&app.state::<Shell>(), alias).await? {
+        return selected.overview(&app.state::<Shell>(), refresh).await;
+    }
+    let mut ov = if refresh {
+        cluster::overview(alias, home()).await.map_err(err)?
+    } else {
+        fresh_overview(alias).await?
+    };
     overlay_live(app, alias, &mut ov).await;
     Ok(ov)
 }
@@ -647,9 +715,13 @@ async fn overlay_live(app: &AppHandle, alias: &str, ov: &mut ClusterOverview) {
 
 /// The overview as a page gets it: no endpoints, plus Slurm's start
 /// estimate for waiting jobs (asked at most every five minutes per job).
-async fn page_overview(app: &AppHandle, alias: &str) -> Result<serde_json::Value, String> {
-    let ov = live_overview(app, alias).await?;
-    absorb(app, alias, &ov).await;
+async fn page_overview(
+    app: &AppHandle,
+    alias: &str,
+    refresh: bool,
+) -> Result<serde_json::Value, String> {
+    let ov = live_overview_refresh(app, alias, refresh).await?;
+    absorb_with_effects(app, alias, &ov, !refresh).await;
     let shell = app.state::<Shell>();
     let mut wanted: Vec<String> = Vec::new();
     let mut estimates: HashMap<String, Option<u64>> = HashMap::new();
@@ -669,7 +741,20 @@ async fn page_overview(app: &AppHandle, alias: &str) -> Result<serde_json::Value
         }
     }
     for slurm in wanted {
-        let est = cluster::start_estimate(alias, &slurm).await.ok().flatten();
+        let est = if let Some(selected) = kept::select(&shell, alias).await? {
+            let job_id = ov
+                .jobs
+                .iter()
+                .find(|j| j.slurm_job_id.as_deref() == Some(&slurm))
+                .map(|j| j.id.clone())
+                .ok_or("unknown job")?;
+            match selected.read(&shell, Op::StartEstimate { job_id }).await {
+                Ok(Reply::Estimate { at_ms, .. }) => at_ms,
+                _ => None,
+            }
+        } else {
+            cluster::start_estimate(alias, &slurm).await.ok().flatten()
+        };
         estimates.insert(slurm.clone(), est);
         lock(&shell.clusters)
             .entry(alias.to_string())
@@ -696,9 +781,17 @@ async fn page_overview(app: &AppHandle, alias: &str) -> Result<serde_json::Value
 pub(super) async fn cluster_overview(
     app: AppHandle,
     alias: String,
+    refresh: Option<bool>,
 ) -> Result<serde_json::Value, String> {
+    let refresh = refresh.unwrap_or(false);
+    if refresh && kept::select(&app.state::<Shell>(), &alias).await?.is_none() {
+        require_discovered_cluster(&alias)?;
+        return chimaera_remote::with_existing_master(&alias, page_overview(&app, &alias, true))
+            .await
+            .map_err(|_| "This cluster needs Connect or Reconnect before refresh".to_string())?;
+    }
     ensure_cluster(&app, &alias).await?;
-    page_overview(&app, &alias).await
+    page_overview(&app, &alias, refresh).await
 }
 
 #[tauri::command]
@@ -707,10 +800,29 @@ pub(super) async fn cluster_facts(
     alias: String,
     refresh: Option<bool>,
 ) -> Result<chimaera_core::cluster::ClusterFacts, String> {
+    if let Some(selected) = kept::select(&app.state::<Shell>(), &alias).await? {
+        return match selected
+            .read(
+                &app.state::<Shell>(),
+                Op::Facts {
+                    refresh: refresh.unwrap_or(false),
+                },
+            )
+            .await?
+        {
+            Reply::Facts { facts } => Ok(facts),
+            _ => Err("Unsupported keeper facts reply".into()),
+        };
+    }
+    if refresh.unwrap_or(false) {
+        require_discovered_cluster(&alias)?;
+        return chimaera_remote::with_existing_master(&alias, cluster::facts(&alias, true))
+            .await
+            .map_err(|_| "This cluster needs Connect or Reconnect before refresh".to_string())?
+            .map_err(err);
+    }
     ensure_cluster(&app, &alias).await?;
-    cluster::facts(&alias, refresh.unwrap_or(false))
-        .await
-        .map_err(err)
+    cluster::facts(&alias, false).await.map_err(err)
 }
 
 #[tauri::command]
@@ -721,9 +833,26 @@ pub(super) async fn cluster_add_workspace(
     name: String,
 ) -> Result<chimaera_core::cluster::ClusterWorkspace, String> {
     ensure_cluster(&app, &alias).await?;
-    let ws = cluster::add_workspace(&alias, home(), &path, &name)
-        .await
-        .map_err(err)?;
+    let ws = if let Some(selected) = kept::select(&app.state::<Shell>(), &alias).await? {
+        match selected
+            .effect(
+                &app,
+                Op::AddWorkspace {
+                    operation_id: kept::operation_id(),
+                    path,
+                    name,
+                },
+            )
+            .await?
+        {
+            Reply::Workspace { workspace } => workspace,
+            _ => return Err("Unsupported keeper workspace reply".into()),
+        }
+    } else {
+        cluster::add_workspace(&alias, home(), &path, &name)
+            .await
+            .map_err(err)?
+    };
     let _ = app.emit("cluster-changed", json!({ "alias": alias }));
     Ok(ws)
 }
@@ -736,9 +865,21 @@ pub(super) async fn cluster_remove_workspace(
 ) -> Result<(), String> {
     valid_ws(&workspace_id)?;
     ensure_cluster(&app, &alias).await?;
-    cluster::remove_workspace(&alias, home(), &workspace_id)
-        .await
-        .map_err(err)?;
+    if let Some(selected) = kept::select(&app.state::<Shell>(), &alias).await? {
+        selected
+            .effect(
+                &app,
+                Op::RemoveWorkspace {
+                    operation_id: kept::operation_id(),
+                    workspace_id,
+                },
+            )
+            .await?;
+    } else {
+        cluster::remove_workspace(&alias, home(), &workspace_id)
+            .await
+            .map_err(err)?;
+    }
     let _ = app.emit("cluster-changed", json!({ "alias": alias }));
     Ok(())
 }
@@ -751,6 +892,15 @@ pub(super) async fn cluster_list_dir(
     path: String,
 ) -> Result<chimaera_core::cluster::DirListing, String> {
     ensure_cluster(&app, &alias).await?;
+    if let Some(selected) = kept::select(&app.state::<Shell>(), &alias).await? {
+        return match selected
+            .read(&app.state::<Shell>(), Op::ListDir { path })
+            .await?
+        {
+            Reply::Directory { directory } => Ok(directory),
+            _ => Err("Unsupported keeper directory reply".into()),
+        };
+    }
     ensure_binary(&app, &alias).await?;
     cluster::list_dir(&alias, home(), &path).await.map_err(err)
 }
@@ -825,6 +975,43 @@ async fn submit_job(
 ) -> Result<serde_json::Value, String> {
     let spec = spec.clone().normalized();
     spec.validate()?;
+    if let Some(selected) = kept::select(&app.state::<Shell>(), alias).await? {
+        let job_id = chimaera_core::cluster::new_job_id();
+        let answer = selected
+            .effect(
+                app,
+                Op::StartJob {
+                    operation_id: kept::operation_id(),
+                    job_id,
+                    name: name.map(str::to_string),
+                    spec,
+                    open: open.to_vec(),
+                    startup: run_startup.to_string(),
+                    attached,
+                    replaces: replaces.map(str::to_string),
+                    save_as: save_as.map(str::to_string),
+                },
+            )
+            .await?;
+        let Reply::Job {
+            job_id,
+            slurm_job_id,
+            attached,
+        } = answer
+        else {
+            return Err("Unsupported keeper submission reply".into());
+        };
+        lock(&app.state::<Shell>().clusters)
+            .entry(alias.to_string())
+            .or_default()
+            .last_jobs
+            .insert(job_id.clone(), "waiting");
+        let _ = app.emit("cluster-changed", json!({ "alias": alias }));
+        ensure_watcher(app, alias);
+        return Ok(
+            json!({ "kind": if attached { "attached" } else { "submitted" }, "job": job_id, "slurm_job_id": slurm_job_id }),
+        );
+    }
     let (config, _) = cluster::read_config(alias, home()).await.map_err(err)?;
     let facts = cluster::facts(alias, false).await.map_err(err)?;
     ensure_binary(app, alias).await?;
@@ -901,6 +1088,7 @@ async fn submit_job(
 /// node). `stop` ends it from a running app; at quit, its pid does.
 pub(crate) struct Attached {
     stop: tokio::sync::oneshot::Sender<()>,
+    #[cfg(unix)]
     pid: Option<u32>,
 }
 
@@ -910,6 +1098,7 @@ fn hold_attached(app: &AppHandle, alias: &str, jid: &str, mut child: tokio::proc
     let key = (alias.to_string(), jid.to_string());
     let held = Attached {
         stop: tx,
+        #[cfg(unix)]
         pid: child.id(),
     };
     if let Some(old) = lock(&shell.attached_jobs).insert(key.clone(), held) {
@@ -991,7 +1180,7 @@ pub(super) async fn cluster_start_job(
     );
     // A workspace opens in one job at a time: ones already open (or waiting
     // to) stay where they are.
-    let ov = cluster::overview(&alias, home()).await.map_err(err)?;
+    let ov = live_overview(&app, &alias).await?;
     let open: Vec<String> = open
         .into_iter()
         .filter(|w| {
@@ -1033,7 +1222,7 @@ pub(super) async fn cluster_continue_job(
         valid_ws(w)?;
     }
     ensure_cluster(&app, &alias).await?;
-    let ov = cluster::overview(&alias, home()).await.map_err(err)?;
+    let ov = live_overview(&app, &alias).await?;
     // A workspace window names its workspace; the job is the one it's in.
     let job_id = match (job_id, workspace_id) {
         (Some(j), _) => j,
@@ -1055,7 +1244,7 @@ pub(super) async fn cluster_continue_job(
     if job.state != "running" {
         return Err(format!("{} isn't running", job.name));
     }
-    if job.attached {
+    if job.attached && kept::select(&app.state::<Shell>(), &alias).await?.is_none() {
         return Err(format!(
             "{} stops when this app disconnects; start a new job when it ends",
             job.name
@@ -1103,7 +1292,22 @@ pub(super) async fn cluster_stop_job(
     valid_job(&job_id)?;
     ensure_cluster(&app, &alias).await?;
     tracing::info!("ipc: cluster_stop_job {alias} {job_id}");
-    let ov = cluster::overview(&alias, home()).await.map_err(err)?;
+    if let Some(selected) = kept::select(&state, &alias).await? {
+        selected
+            .effect(
+                &app,
+                Op::StopJob {
+                    operation_id: kept::operation_id(),
+                    job_id,
+                },
+            )
+            .await?;
+        // StopPending retains job/window authority until positive terminal
+        // evidence, rather than treating the request as completed scancel.
+        let _ = app.emit("cluster-changed", json!({ "alias": alias }));
+        return Ok(());
+    }
+    let ov = live_overview(&app, &alias).await?;
     let record = ov.records.get(&job_id).ok_or("unknown job")?;
     cluster::stop_job(&alias, home(), record)
         .await
@@ -1163,15 +1367,27 @@ pub(super) async fn cluster_dismiss_job(
 ) -> Result<(), String> {
     valid_job(&job_id)?;
     ensure_cluster(&app, &alias).await?;
-    let ov = cluster::overview(&alias, home()).await.map_err(err)?;
+    let ov = live_overview(&app, &alias).await?;
     if let Some(j) = ov.jobs.iter().find(|j| j.id == job_id) {
         if j.state != "ended" {
             return Err(format!("{} is still {}", j.name, j.state));
         }
     }
-    cluster::dismiss_job(&alias, home(), &job_id)
-        .await
-        .map_err(err)?;
+    if let Some(selected) = kept::select(&app.state::<Shell>(), &alias).await? {
+        selected
+            .effect(
+                &app,
+                Op::DismissJob {
+                    operation_id: kept::operation_id(),
+                    job_id,
+                },
+            )
+            .await?;
+    } else {
+        cluster::dismiss_job(&alias, home(), &job_id)
+            .await
+            .map_err(err)?;
+    }
     let _ = app.emit("cluster-changed", json!({ "alias": alias }));
     Ok(())
 }
@@ -1206,6 +1422,12 @@ async fn host_forward(
 ) -> Result<(u16, String), String> {
     let shell = app.state::<Shell>();
     let key = host_key(alias, jid);
+    if let Some(selected) = kept::select(&shell, alias).await? {
+        let port = selected
+            .port(&shell, alias, &key, jid, None, &endpoint.token)
+            .await?;
+        return Ok((port, endpoint.token.clone()));
+    }
     let existing = {
         let tunnels = shell.compute_tunnels.lock().await;
         tunnels.get(&key).map(|t| t.local_port)
@@ -1284,61 +1506,82 @@ async fn open_ws_window(
 ) -> Result<(), String> {
     let shell = app.state::<Shell>();
     let key = ws_key(alias, &endpoint.slurm_job_id, wid);
-    let existing = {
-        let tunnels = shell.compute_tunnels.lock().await;
-        tunnels.get(&key).map(|t| (t.local_port, t.token.clone()))
-    };
-    if let Some((port, token)) = existing {
-        if !chimaera_remote::http_alive_authed(port, &token).await {
-            let tunnel = shell.compute_tunnels.lock().await.remove(&key);
-            if let Some(tunnel) = tunnel {
-                tunnel.close().await;
-            }
-        }
-    }
-    if shell.compute_tunnels.lock().await.get(&key).is_none() {
-        {
-            let mut connecting = lock(&shell.compute_connecting);
-            if !connecting.insert(key.clone()) {
-                return Err(format!("already connecting to {name} — hold on"));
-            }
-        }
-        let built = chimaera_remote::connect_compute_node(
-            alias,
-            &endpoint.node,
-            &endpoint.slurm_job_id,
-            endpoint.port,
-            &endpoint.token,
-        )
-        .await
-        .map_err(err);
-        let result = match built {
-            Ok(tunnel) => {
-                shell
-                    .compute_tunnels
-                    .lock()
-                    .await
-                    .insert(key.clone(), tunnel);
-                Ok(())
-            }
-            Err(e) => Err(e),
-        };
-        lock(&shell.compute_connecting).remove(&key);
-        result?;
-    }
-    // Straight into the workspace (`ws=`): its chimaera registered it under
-    // the cluster's id before it listened. Without it the window lands on
-    // that chimaera's own one-workspace home.
-    let (url, node, local_port) = {
-        let tunnels = shell.compute_tunnels.lock().await;
-        let t = tunnels
-            .get(&key)
-            .ok_or_else(|| format!("{name} disconnected while connecting"))?;
+    let (url, node, local_port) = if let Some(selected) = kept::select(&shell, alias).await? {
+        let port = selected
+            .port(
+                &shell,
+                alias,
+                &key,
+                &endpoint.job,
+                Some(wid),
+                &endpoint.token,
+            )
+            .await?;
         (
-            format!("{}&ws={wid}&cws={wid}", t.url()),
-            t.node.clone(),
-            t.local_port,
+            format!(
+                "http://127.0.0.1:{port}/#token={}&ws={wid}&cws={wid}",
+                url::form_urlencoded::byte_serialize(endpoint.token.as_bytes()).collect::<String>()
+            ),
+            endpoint.node.clone(),
+            port,
         )
+    } else {
+        let existing = {
+            let tunnels = shell.compute_tunnels.lock().await;
+            tunnels.get(&key).map(|t| (t.local_port, t.token.clone()))
+        };
+        if let Some((port, token)) = existing {
+            if !chimaera_remote::http_alive_authed(port, &token).await {
+                let tunnel = shell.compute_tunnels.lock().await.remove(&key);
+                if let Some(tunnel) = tunnel {
+                    tunnel.close().await;
+                }
+            }
+        }
+        if shell.compute_tunnels.lock().await.get(&key).is_none() {
+            {
+                let mut connecting = lock(&shell.compute_connecting);
+                if !connecting.insert(key.clone()) {
+                    return Err(format!("already connecting to {name} — hold on"));
+                }
+            }
+            let built = chimaera_remote::connect_compute_node(
+                alias,
+                &endpoint.node,
+                &endpoint.slurm_job_id,
+                endpoint.port,
+                &endpoint.token,
+            )
+            .await
+            .map_err(err);
+            let result = match built {
+                Ok(tunnel) => {
+                    shell
+                        .compute_tunnels
+                        .lock()
+                        .await
+                        .insert(key.clone(), tunnel);
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            };
+            lock(&shell.compute_connecting).remove(&key);
+            result?;
+        }
+        // Straight into the workspace (`ws=`): its chimaera registered it under
+        // the cluster's id before it listened. Without it the window lands on
+        // that chimaera's own one-workspace home.
+        {
+            let tunnels = shell.compute_tunnels.lock().await;
+            let t = tunnels
+                .get(&key)
+                .ok_or_else(|| format!("{name} disconnected while connecting"))?;
+            (
+                format!("{}&ws={wid}&cws={wid}", t.url()),
+                t.node.clone(),
+                t.local_port,
+            )
+        }
     };
     authorize_scope_origin(app, Some(&key), local_port)
         .map_err(|e| format!("could not authorize {key}'s daemon origin: {e}"))?;
@@ -1576,10 +1819,23 @@ pub(super) async fn cluster_queue_open(
             job.name, job.state
         ));
     }
-    let record = ov.records.get(&job_id).ok_or("unknown job")?;
-    cluster::queue_open(&alias, home(), record, &workspace_id)
-        .await
-        .map_err(err)?;
+    if let Some(selected) = kept::select(&app.state::<Shell>(), &alias).await? {
+        selected
+            .effect(
+                &app,
+                Op::QueueOpen {
+                    operation_id: kept::operation_id(),
+                    job_id: job_id.clone(),
+                    workspace_id: workspace_id.clone(),
+                },
+            )
+            .await?;
+    } else {
+        let record = ov.records.get(&job_id).ok_or("unknown job")?;
+        cluster::queue_open(&alias, home(), record, &workspace_id)
+            .await
+            .map_err(err)?;
+    }
     lock(&app.state::<Shell>().clusters)
         .entry(alias.clone())
         .or_default()
@@ -1602,9 +1858,22 @@ pub(super) async fn cluster_set_startup(
         valid_ws(id)?;
     }
     ensure_cluster(&app, &alias).await?;
-    cluster::set_startup(&alias, home(), workspace_id.as_deref(), &text)
-        .await
-        .map_err(err)?;
+    if let Some(selected) = kept::select(&app.state::<Shell>(), &alias).await? {
+        selected
+            .effect(
+                &app,
+                Op::SetStartup {
+                    operation_id: kept::operation_id(),
+                    workspace_id,
+                    text,
+                },
+            )
+            .await?;
+    } else {
+        cluster::set_startup(&alias, home(), workspace_id.as_deref(), &text)
+            .await
+            .map_err(err)?;
+    }
     let _ = app.emit("cluster-changed", json!({ "alias": alias }));
     Ok(())
 }
@@ -1616,6 +1885,18 @@ pub(super) async fn cluster_forget_setup(
     name: String,
 ) -> Result<(), String> {
     ensure_cluster(&app, &alias).await?;
+    if let Some(selected) = kept::select(&app.state::<Shell>(), &alias).await? {
+        selected
+            .effect(
+                &app,
+                Op::ForgetSetup {
+                    operation_id: kept::operation_id(),
+                    name,
+                },
+            )
+            .await?;
+        return Ok(());
+    }
     cluster::forget_setup(&alias, home(), &name)
         .await
         .map_err(err)
@@ -1627,6 +1908,19 @@ pub(super) async fn cluster_set_agent_rules(
     rules: chimaera_core::cluster::AgentRules,
 ) -> Result<(), String> {
     ensure_cluster(&app, &alias).await?;
+    if let Some(selected) = kept::select(&app.state::<Shell>(), &alias).await? {
+        selected
+            .effect(
+                &app,
+                Op::SetAgentRules {
+                    operation_id: kept::operation_id(),
+                    text: rules.text,
+                    file: rules.file,
+                },
+            )
+            .await?;
+        return Ok(());
+    }
     cluster::set_agent_rules(&alias, home(), &rules)
         .await
         .map_err(err)
@@ -1634,11 +1928,21 @@ pub(super) async fn cluster_set_agent_rules(
 
 #[tauri::command]
 pub(super) async fn cluster_set_login_serve(
+    app: AppHandle,
     state: State<'_, Shell>,
     alias: String,
     on: bool,
 ) -> Result<HostState, String> {
     tracing::info!("ipc: cluster_set_login_serve {alias} {on}");
+    if let Some(selected) = kept::select(&state, &alias).await? {
+        let entry = selected
+            .policy(&app, &alias, kept::PolicyChange::LoginServe(on))
+            .await?;
+        let info = lock(&state.clusters)
+            .get(&alias)
+            .and_then(|c| c.info.clone());
+        return Ok(state_for(&entry, "disconnected", None).with_cluster(&entry, info.as_ref()));
+    }
     let owned = alias.clone();
     let entry = with_hosts(move |hosts| hosts.set_login_serve(&owned, on)).await?;
     lock(&state.host_entries).insert(alias.clone(), entry.clone());
@@ -1653,11 +1957,21 @@ pub(super) async fn cluster_set_login_serve(
 /// a daemon started there doesn't tell its agents they're on a login node.
 #[tauri::command]
 pub(super) async fn set_not_cluster(
+    app: AppHandle,
     state: State<'_, Shell>,
     alias: String,
     on: bool,
 ) -> Result<HostState, String> {
     tracing::info!("ipc: set_not_cluster {alias} {on}");
+    if let Some(selected) = kept::select(&state, &alias).await? {
+        let entry = selected
+            .policy(&app, &alias, kept::PolicyChange::NotCluster(on))
+            .await?;
+        let info = lock(&state.clusters)
+            .get(&alias)
+            .and_then(|c| c.info.clone());
+        return Ok(state_for(&entry, "disconnected", None).with_cluster(&entry, info.as_ref()));
+    }
     let owned = alias.clone();
     let entry = with_hosts(move |hosts| hosts.set_not_cluster(&owned, on)).await?;
     lock(&state.host_entries).insert(alias.clone(), entry.clone());
@@ -1671,10 +1985,22 @@ pub(super) async fn set_not_cluster(
 /// (never -9: it may still be saving sessions).
 #[tauri::command]
 pub(super) async fn cluster_stop_login_daemon(
+    app: AppHandle,
     state: State<'_, Shell>,
     alias: String,
 ) -> Result<(), String> {
     tracing::info!("ipc: cluster_stop_login_daemon {alias}");
+    if let Some(selected) = kept::select(&state, &alias).await? {
+        selected
+            .effect(
+                &app,
+                Op::StopLoginDaemon {
+                    operation_id: kept::operation_id(),
+                },
+            )
+            .await?;
+        return Ok(());
+    }
     if let Some((manifest, true)) = chimaera_remote::locate_daemon(&alias, home())
         .await
         .map_err(err)?

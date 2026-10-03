@@ -1,6 +1,130 @@
 use super::support::*;
 use crate::*;
 
+#[tokio::test]
+async fn codex_notify_authenticates_and_only_records_verified_terminal_identity() {
+    let data = test_dir("codex-notify-ingest");
+    let mut state = AppState::new(
+        "test-token".into(),
+        "testhost".into(),
+        4242,
+        0,
+        data.clone(),
+        data.join("config"),
+    );
+    state.codex_config_path = data.join("codex/config.toml");
+    let state = Arc::new(state);
+    let id = inject_silent_agent(&state, "notify-key");
+    lock(&state.agents).get_mut(&id).unwrap().kind = agents::AgentKind::Codex;
+    let cwd = state.sessions.get(&id).unwrap().cwd;
+    let thread = "01a0e110-de29-75e2-9262-7a8c893b2a3c";
+    let payload = serde_json::json!({"type":"agent-turn-complete", "thread-id":thread, "cwd":cwd, "input-messages":["Remember my session"], "last-assistant-message":"OK"});
+    let post = |key: &str| format!("/api/v1/agent-events/{id}?event=codex-notify&key={key}");
+    assert_eq!(
+        request(&state, Method::POST, &post("wrong"), Some(payload.clone()))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert!(lock(&state.agents)
+        .get(&id)
+        .unwrap()
+        .turn_complete_at
+        .is_none());
+    assert_eq!(
+        request(
+            &state,
+            Method::POST,
+            &post("notify-key"),
+            Some(payload.clone())
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    // The completed turn makes this silent TUI pausable at once.
+    let record = lock(&state.agents).get(&id).unwrap().clone();
+    assert!(record.turn_complete_at.is_some());
+    let info = state.sessions.get(&id).unwrap();
+    assert!(crate::agent_state::tui_at_pause(
+        &record,
+        info.alive,
+        info.last_output_at,
+        info.pid,
+        None,
+        crate::session_view::now_ms(),
+    ));
+    assert!(
+        lock(&state.agents).get(&id).unwrap().resume_id().is_none(),
+        "missing rollout must not mint resume"
+    );
+    let dated = data.join("codex/sessions/2026/09/26");
+    std::fs::create_dir_all(&dated).unwrap();
+    let rollout = dated.join(format!("rollout-date-{thread}.jsonl"));
+    std::fs::write(
+        &rollout,
+        serde_json::json!({"type":"session_meta", "payload":{"id":thread,"cwd":"/wrong"}})
+            .to_string()
+            + "\n",
+    )
+    .unwrap();
+    request(
+        &state,
+        Method::POST,
+        &post("notify-key"),
+        Some(payload.clone()),
+    )
+    .await;
+    assert!(
+        lock(&state.agents).get(&id).unwrap().resume_id().is_none(),
+        "wrong cwd must not mint resume"
+    );
+    std::fs::write(
+        &rollout,
+        serde_json::json!({"type":"session_meta", "payload":{"id":thread,"cwd":cwd}}).to_string()
+            + "\n",
+    )
+    .unwrap();
+    request(&state, Method::POST, &post("notify-key"), Some(payload)).await;
+    let record = lock(&state.agents).get(&id).unwrap().clone();
+    assert_eq!(record.resume_id().as_deref(), Some(thread));
+    assert_eq!(record.transcript_path, Some(rollout));
+    assert_eq!(record.first_prompt.as_deref(), Some("Remember my session"));
+    assert_eq!(
+        record.state,
+        crate::agent_state::AgentState::Unknown,
+        "a completion-only hook cannot model attention"
+    );
+    state.sessions.kill(&id).unwrap();
+}
+
+/// A moved terminal agent carries whether its turn was in flight, read while
+/// it still runs; an idle one carries nothing (so it resumes with no turn).
+#[tokio::test]
+async fn a_terminal_agents_bundle_records_only_a_turn_in_flight() {
+    let state = test_state();
+    let id = inject_silent_agent(&state, "carry-key");
+    // Quiet terminal, no hook yet: idle.
+    tokio::time::sleep(std::time::Duration::from_millis(
+        crate::agent_state::TUI_QUIET_MS + 100,
+    ))
+    .await;
+    assert!(bundle::tui_carryover(&state, &id).is_none());
+    for busy in [
+        crate::agent_state::AgentState::Running,
+        crate::agent_state::AgentState::NeedsPermission,
+    ] {
+        lock(&state.agents).get_mut(&id).unwrap().state = busy;
+        assert!(
+            bundle::tui_carryover(&state, &id).is_some_and(|carry| carry.turn_in_flight),
+            "{busy:?}"
+        );
+    }
+    lock(&state.agents).get_mut(&id).unwrap().state = crate::agent_state::AgentState::IdlePrompt;
+    assert!(bundle::tui_carryover(&state, &id).is_none());
+    state.sessions.kill(&id).unwrap();
+}
+
 /// Startup failures stay visible even before the first prompt, so users can
 /// read missing-library, authentication and timeout diagnostics.
 #[tokio::test]
@@ -34,6 +158,7 @@ async fn handshake_failure_for_every_provider(submit: bool) {
                 model: None,
                 resume: None,
                 fork_at: None,
+                fork_head: false,
                 rollback_turns: None,
                 revert_before_turn: None,
                 remote_control: chat::RemoteControlAtStart::No,
@@ -177,6 +302,7 @@ async fn resumed_handshake_failure_keeps_chat_for_every_provider() {
                 model: None,
                 resume: Some("saved-native-id".into()),
                 fork_at: None,
+                fork_head: false,
                 rollback_turns: None,
                 revert_before_turn: None,
                 remote_control: chat::RemoteControlAtStart::No,
@@ -1810,4 +1936,41 @@ async fn real_claude_agent_session() {
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+/// The account's cloud never offers agent updates: its agents come with its
+/// image and are updated with it, so a known-newer release stays off its rows
+/// and `?check=true` probes nothing.
+#[tokio::test]
+async fn the_cloud_never_offers_agent_updates() {
+    let state = test_state();
+    crate::pro::worker_execution_fixture(&state);
+    preset_agent(
+        &state,
+        agents::AgentKind::Claude,
+        Ok(PathBuf::from("/bin/echo")),
+        Some("2.1.196 (Claude Code)"),
+    );
+    for kind in [
+        agents::AgentKind::Codex,
+        agents::AgentKind::Gemini,
+        agents::AgentKind::Antigravity,
+    ] {
+        preset_agent(&state, kind, Err("not found (test)".to_string()), None);
+    }
+    lock(&state.agent_updates).insert(
+        agents::AgentKind::Claude,
+        agent_updates::AgentLatest {
+            version: "2.1.207".to_string(),
+            checked_at: 1_000,
+            error: None,
+        },
+    );
+    let (status, list) = request(&state, Method::GET, "/api/v1/agents?check=true", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let claude = &list.as_array().unwrap()[0];
+    assert_eq!(claude["installed"], true);
+    assert_eq!(claude["version"], "2.1.196 (Claude Code)");
+    assert!(!claude.as_object().unwrap().contains_key("latest_version"));
+    assert!(!claude.as_object().unwrap().contains_key("update_available"));
 }

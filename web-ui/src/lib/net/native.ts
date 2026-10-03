@@ -8,9 +8,12 @@
  * with crates/chimaera-app — change them in lockstep.
  */
 
+import { workbenchPath } from "./base";
 import { writable } from "svelte/store";
 import { getHostLabel, getJobContext, getToken } from "./api";
 import type { Workspace } from "../workspace/sessions";
+import type { SecretCommand, SecretPage, SecretResult } from "../pro/projectSecrets";
+import type { ProviderMode, ProviderPage, ProviderOriginal, ProviderCommand, ProviderResult } from "../pro/personalProviders";
 
 interface TauriGlobal {
   core: { invoke: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T> };
@@ -65,6 +68,11 @@ export interface ClusterHostInfo {
 
 export interface HostState {
   alias: string;
+  /** Optional when attached to a shell predating the link transport. */
+  via_pro?: boolean;
+  kept?: boolean;
+  /** Local SSH choice; absent for devices and shells without this command. */
+  direct_ssh?: boolean;
   status: HostStatus;
   /** Local end of the tunnel while connected. */
   local_port: number | null;
@@ -546,8 +554,8 @@ function shell(): TauriGlobal {
  * The cluster page's data in one ssh exec. The queue itself is asked at most
  * once a minute per host (a cached read fills in between).
  */
-export async function clusterOverview(alias: string): Promise<ClusterOverview> {
-  return shell().core.invoke<ClusterOverview>("cluster_overview", { alias });
+export async function clusterOverview(alias: string, refresh = false): Promise<ClusterOverview> {
+  return shell().core.invoke<ClusterOverview>("cluster_overview", { alias, refresh });
 }
 
 /** Partitions, limits and accounts the start sheet offers (cached a day). */
@@ -684,6 +692,11 @@ export async function clusterSetLoginServe(alias: string, on: boolean): Promise<
 /** Say a host isn't a cluster after all (`on`), or is one again. */
 export async function setNotCluster(alias: string, on: boolean): Promise<HostState> {
   return shell().core.invoke<HostState>("set_not_cluster", { alias, on });
+}
+
+/** Choose direct SSH on this computer's next connection, keeping existing work. */
+export async function setHostDirectSsh(alias: string, on: boolean): Promise<HostState> {
+  return shell().core.invoke<HostState>("set_host_direct_ssh", { alias, on });
 }
 
 /** SIGTERM a daemon an earlier connect left on the cluster's login node. */
@@ -888,6 +901,9 @@ export async function testNotification(): Promise<void> {
  */
 export interface AskpassPrompt {
   id: number;
+  source?: { type: "local" } | { type: "keeper"; host_id: string; keeper_prompt_id: string };
+  /** Only the original native Connect verifier emits a host-key confirmation. */
+  kind?: { type: "host_key"; host: string; fingerprint: string };
   /** SSH alias of the child that raised this prompt. Null only for legacy or
    *  unscoped helpers, which remain available from the home window. */
   alias?: string | null;
@@ -1006,7 +1022,7 @@ export async function openWindow(
   const hash = params.size > 0 ? `#${params.toString()}` : "";
   // The hash now carries every piece of per-window state, so severing opener
   // access is safe and avoids coupling the two app tabs.
-  window.open(`${location.origin}/${hash}`, "_blank", "noopener");
+  window.open(`${location.origin}${workbenchPath()}${hash}`, "_blank", "noopener");
 }
 
 /**
@@ -1179,8 +1195,379 @@ export function openDetachedPopup(
     `left=${Math.round(at.x)}`,
     `top=${Math.round(at.y)}`,
   ].join(",");
-  const popup = window.open(`${location.origin}/#${params.toString()}`, "_blank", features);
+  const popup = window.open(`${location.origin}${workbenchPath()}#${params.toString()}`, "_blank", features);
   if (popup === null) return false;
   popup.opener = null;
   return true;
+}
+
+export interface ProBillingAttempt {
+  id: number;
+  kind: "checkout" | "portal" | "plan_change";
+  requested_plan?: "pro" | "max" | null;
+  phase: "opening" | "waiting" | "confirming" | "confirmed" | "unconfirmed" | "canceled" | "expired" | "failed";
+  expires_at: number;
+  error: string | null;
+}
+
+/** One price from the account service; `amount_cents` is in the currency's minor unit.
+ * `cloud_time_multiple` and `storage_multiple` say how many times the plan's
+ * monthly cloud time and storage are Pro's, whole numbers (the same pair on
+ * both intervals, 1 on Pro's own entries); older services omit them. The list
+ * carries no absolute allowance. */
+export interface ProPlanPrice {
+  plan: "pro" | "max";
+  interval: "month" | "year";
+  amount_cents: number;
+  currency: string;
+  cloud_time_multiple?: number | null;
+  storage_multiple?: number | null;
+}
+
+/** Account controls are native-shell state, separate from daemon settings. */
+export interface ProStatus {
+  initializing?: boolean;
+  initialization_phase?: "keychain" | "account" | "connection" | null;
+  available: boolean;
+  signed_in: boolean;
+  email: string | null;
+  plan: "pro" | "max" | "none" | null;
+  /** A real account failure. Informational connection progress uses
+   * `connection_warning` (older shells sent two such messages here). */
+  error: string | null;
+  /** Optional: the always-on connection is still coming up. Never a failure
+   * and never an entitlement signal. Older shells omit it. */
+  connection_warning?: string | null;
+  /** Optional: the subscription's payment failed and needs the customer's
+   * attention (billing portal). Checkout must never start a second plan. */
+  payment_due?: boolean;
+  /** Optional: once the plan has ended, the RFC 3339 time until which its cloud
+   * work can still be brought home; null or absent otherwise (older shells
+   * omit it). An ended plan grants nothing (`pro/status.ts` `grantedPlan`). */
+  returning_until?: string | null;
+  /** Optional: the RFC 3339 time the always-on cloud connection restarts to
+   * update (a past time: shortly, once no Git transfer runs). The restart drops
+   * the cluster logins it holds. Null or absent when none is planned (older
+   * shells omit it); `pro/status.ts` `keeperRestartAt` reads it. */
+  keeper_restart_at?: string | null;
+  /** Optional: the account's current prices. Absent or null means the page
+   * names the plans only; amounts are never built into the app. */
+  plans?: ProPlanPrice[] | null;
+  /** Optional when connected to an older native shell. */
+  sign_in?: { phase: "waiting" | "finishing"; expires_at: number } | null;
+  /** Native owns verification even when this page is closed. Older shells omit it. */
+  billing?: ProBillingAttempt | null;
+  limits?: { cloud_hours: number; storage_bytes: number } | null;
+  usage?: { cloud_hours: number; storage_bytes: number } | null;
+  hours_exhausted?: boolean;
+}
+
+export interface CloudProvisioningStatus {
+  phase?: "keeper" | "worker" | "connecting" | null;
+  /** Whether an agent was connected in the cloud at the last catalog read,
+   * remembered by the app and never probed, so a sleeping cloud is not woken
+   * to answer it. Absent or null when the app has not seen a catalog yet. */
+  agents_connected?: boolean | null;
+  /** Whether this account's cloud has been ready before, remembered by the
+   * app: a later `preparing` (a service update, say) is not first-time setup.
+   * Older shells omit it (`presentation.ts` `cloudReadyOnce`). */
+  cloud_ready_once?: boolean;
+  /** The provider rows of the last catalog read, remembered by the app and
+   * shown at once until a live read answers (`providers.ts`
+   * `rememberedRows`). Absent when none are remembered. */
+  remembered_providers?: RememberedProvider[];
+  state: "no_plan" | "unavailable" | "preparing" | "ready" | "sleeping" | "limited" | "error";
+  reason: "provisioning_disabled" | "beta_invite_required" | "hours_exhausted" | "storage_exhausted" | "spend_limit_reached" | "provisioning_failed" | null;
+  /** Explicit actions allowed after the unattended allowance, only for
+   * limited/hours_exhausted. Absence retains older hard-limit behavior. */
+  attended_actions?: boolean;
+}
+
+export async function proCloudStatus(): Promise<CloudProvisioningStatus> {
+  const t = tauri();
+  if (t === null) throw new Error("Open the desktop app to check your cloud status.");
+  return t.core.invoke<CloudProvisioningStatus>("pro_cloud_status");
+}
+
+export async function proRefreshAccount(): Promise<void> {
+  const t = tauri();
+  if (t === null) return;
+  await t.core.invoke<void>("pro_refresh_account");
+}
+
+export interface CloudProject {
+  workspace_id: string;
+  name: string;
+  host_id?: string | null;
+  host_alias?: string | null;
+  local_root: string | null;
+  /** Saved destination binding, including interrupted copies not ready to open. */
+  destination_saved?: boolean;
+  available: boolean;
+  error: string | null;
+}
+
+export interface CloudProjectOpen {
+  workspace_id: string;
+  root: string;
+  name: string;
+  local_copy?: LocalProjectCopy;
+}
+
+export async function proCloudProjects(): Promise<CloudProject[]> {
+  return (await tauri()?.core.invoke<CloudProject[]>("pro_cloud_projects")) ?? [];
+}
+
+export async function proOpenCloudProject(workspaceId: string): Promise<CloudProjectOpen | null> {
+  const t = tauri();
+  if (t === null) throw new Error("Open the desktop app to save a local project copy.");
+  // A distinct command refuses old native shells before their legacy Open
+  // implementation can acquire execution. Never fall back to that command.
+  return t.core.invoke<CloudProjectOpen | null>("pro_copy_project", { workspaceId }).catch(reason => {
+    const detail = reason instanceof Error ? reason.message : typeof reason === "string" ? reason : "";
+    if (/^Command pro_copy_project not found$/i.test(detail)) throw new Error("project_copy_update_required");
+    throw reason;
+  });
+}
+
+export async function proTakeOverProject(workspaceId: string, expectedEpoch: number): Promise<void> {
+  const t = tauri();
+  if (t === null) throw new Error("Open the desktop app to take over execution.");
+  await t.core.invoke<void>("pro_take_over_project", { workspaceId, expectedEpoch });
+}
+
+export async function proBillingCheckout(plan: "pro" | "max", interval: "month" | "year"): Promise<void> {
+  const t = tauri();
+  if (t === null) throw new Error("Open the desktop app to choose a plan.");
+  await t.core.invoke<void>("pro_billing_checkout", { plan, interval });
+}
+
+export async function proCancelBilling(attemptId?: number): Promise<void> {
+  await tauri()?.core.invoke<void>("pro_cancel_billing", { attemptId });
+}
+
+export async function proTakeReturn(): Promise<boolean> {
+  return (await tauri()?.core.invoke<boolean>("pro_take_return")) ?? false;
+}
+
+export function onProReturn(handler: () => void): Promise<() => void> {
+  const t = tauri();
+  if (t === null) return Promise.resolve(() => {});
+  return t.webviewWindow.getCurrentWebviewWindow().listen<null>("pro-return", () => handler());
+}
+
+export async function proBillingPortal(target?: { plan: "pro" | "max"; interval: "month" | "year" }): Promise<void> {
+  const t = tauri();
+  if (t === null) throw new Error("Open the desktop app to manage billing.");
+  await t.core.invoke<void>("pro_billing_portal", { target });
+}
+
+export interface ProHost {
+  alias: string;
+  kept: boolean;
+  status: "connected" | "connecting" | "prompting" | "offline";
+  kind: "ssh" | "device" | "worker";
+}
+
+export interface ProDevice {
+  id: string;
+  installation_id?: string | null;
+  name: string;
+  last_seen: string;
+  this: boolean;
+}
+
+export async function proStatus(): Promise<ProStatus> {
+  const t = tauri();
+  if (t === null) return { available: false, signed_in: false, email: null, plan: null, error: null };
+  return t.core.invoke<ProStatus>("pro_status");
+}
+
+export type ProAuthScreenHint = "sign-up" | "sign-in";
+
+export async function proSignIn(screenHint: ProAuthScreenHint = "sign-in"): Promise<void> {
+  const t = tauri();
+  if (t === null) throw new Error("not running in the native shell");
+  await t.core.invoke<void>("pro_sign_in", { screenHint });
+}
+
+export async function proCancelSignIn(): Promise<void> {
+  const t = tauri();
+  if (t === null) return;
+  await t.core.invoke<void>("pro_cancel_sign_in");
+}
+
+export async function proSignOut(): Promise<void> {
+  await tauri()?.core.invoke<void>("pro_sign_out");
+}
+
+export async function proSignOutEverywhere(): Promise<void> {
+  await tauri()?.core.invoke<void>("pro_sign_out_everywhere");
+}
+
+export async function proHosts(): Promise<ProHost[]> {
+  return (await tauri()?.core.invoke<ProHost[]>("pro_hosts")) ?? [];
+}
+
+export async function proSetHostKept(alias: string, kept: boolean): Promise<void> {
+  const t = tauri();
+  if (t === null) throw new Error("not running in the native shell");
+  await t.core.invoke<void>("pro_set_host_kept", { alias, kept });
+}
+
+export async function proDevices(): Promise<ProDevice[]> {
+  return (await tauri()?.core.invoke<ProDevice[]>("pro_devices")) ?? [];
+}
+
+export async function proRevokeDevice(deviceId: string): Promise<void> {
+  const t = tauri();
+  if (t === null) throw new Error("not running in the native shell");
+  await t.core.invoke<void>("pro_revoke_device", { deviceId });
+}
+
+export function onProChanged(handler: () => void): Promise<() => void> {
+  return tauri()?.event.listen<null>("pro-changed", () => handler()) ?? Promise.resolve(() => {});
+}
+
+/** Additive account-Home IPC. There is no project-daemon/browser fallback. */
+export async function proProjectSecretsCatalog(after: string | null = null): Promise<SecretPage> {
+  const t = tauri();
+  if (t === null) throw new Error("project_secrets_unsupported");
+  return t.core.invoke<SecretPage>("pro_project_secrets_catalog", { after });
+}
+export async function proProjectSecretCommand(context: string, command: SecretCommand): Promise<SecretResult> {
+  const t = tauri();
+  if (t === null) throw new Error("project_secrets_unsupported");
+  return t.core.invoke<SecretResult>("pro_project_secret_command", { contextTag: context, payload: JSON.stringify(command) });
+}
+export async function proProjectSecretOperation(context: string, operationId: string): Promise<SecretResult> {
+  const t = tauri();
+  if (t === null) throw new Error("project_secrets_unsupported");
+  return t.core.invoke<SecretResult>("pro_project_secret_operation", { contextTag: context, operationId });
+}
+
+/** Personal controls retain an exact original login; no daemon fallback. */
+export async function proPersonalProviderMode(): Promise<ProviderMode> {
+  const t = tauri(); if (t === null) throw new Error("providers_unsupported");
+  return t.core.invoke<ProviderMode>("pro_personal_provider_mode");
+}
+export async function proPersonalProviderCatalog(): Promise<ProviderPage> {
+  const t = tauri(); if (t === null) throw new Error("providers_unsupported");
+  return t.core.invoke<ProviderPage>("pro_personal_provider_catalog");
+}
+export async function proPersonalProviderCommand(original: ProviderOriginal, command: ProviderCommand): Promise<ProviderResult> {
+  const t = tauri(); if (t === null) throw new Error("providers_unsupported");
+  return t.core.invoke<ProviderResult>("pro_personal_provider_command", { original, payload: JSON.stringify(command) });
+}
+export async function proPersonalProviderOperation(original: ProviderOriginal): Promise<ProviderResult> {
+  const t = tauri(); if (t === null) throw new Error("providers_unsupported");
+  return t.core.invoke<ProviderResult>("pro_personal_provider_operation", { original });
+}
+export async function proPersonalProviderOpen(original: ProviderOriginal): Promise<void> {
+  const t = tauri(); if (t === null) throw new Error("providers_unsupported");
+  await t.core.invoke<void>("pro_personal_provider_open", { original });
+}
+
+export type CloudProviderState = "missing" | "needs_sign_in" | "signed_in" | "unknown" | "unavailable";
+export interface CloudProviderStatus {
+  id: string;
+  label: string;
+  category: "agent" | "repository";
+  installed: boolean | null;
+  state: CloudProviderState;
+  reason: string | null;
+  checked_at: number | null;
+  methods: string[];
+  /** Older daemons omit this capability; never infer it from sign-in support. */
+  disconnect_supported?: boolean;
+}
+/** A provider row as the last catalog read showed it (the app's or this
+ * browser's memory): the catalog's own fields that rendering needs. */
+export type RememberedProvider = Pick<CloudProviderStatus, "id" | "label" | "category" | "state"> & Partial<Pick<CloudProviderStatus, "methods" | "disconnect_supported">>;
+export interface CloudProviderConnection {
+  id: string;
+  provider_id: string;
+  operation?: "connect" | "disconnect";
+  phase: "preparing" | "waiting" | "verifying" | "connected" | "disconnected" | "failed" | "canceled" | "expired";
+  expires_at: number;
+  action: { type: "device_code"; verification_url: string; user_code: string }
+    | { type: "browser"; url: string; input?: "authorization_code" }
+    /** A terminal on the cloud: its own agent setup while `preparing`, or an
+     * older cloud's GitHub sign-in while `waiting`. Never opened from here
+     * (`pro/providers.ts` `olderCloudSignIn`). */
+    | { type: "terminal" } | null;
+  error_code: string | null;
+}
+export interface CloudBlockedProvider {
+  id: string;
+  state: CloudProviderState;
+  reason: string | null;
+}
+export interface CloudPendingHandoff {
+  workspace_id: string;
+  name: string;
+  expected_epoch: number;
+  blocked_providers: CloudBlockedProvider[];
+}
+export interface CloudSetupInfo {
+  available?: boolean;
+  ssh_public_key?: string | null;
+  workspace_id?: string;
+  session_id?: string;
+  providers?: CloudProviderStatus[];
+  connection?: CloudProviderConnection | null;
+  handoffs?: CloudPendingHandoff[];
+}
+export type CloudSetupRequest = { operation: "info" | "start" | "providers" }
+  | { operation: "provider_connect"; provider_id: string }
+  | { operation: "provider_disconnect"; provider_id: string; acknowledge_cloud_work: true }
+  | { operation: "provider_submit"; connection_id: string; code: string }
+  | { operation: "provider_connection" | "provider_cancel" | "open_provider_browser"; connection_id: string }
+  | { operation: "resume_handoff"; workspace_id: string; expected_epoch: number }
+  | { operation: "project"; url: string; name?: string };
+export async function proCloudRequest(request: CloudSetupRequest): Promise<CloudSetupInfo> {
+  const t = tauri();
+  if (t === null) throw new Error("Cloud account setup requires the native app");
+  return t.core.invoke<CloudSetupInfo>("pro_cloud_request", { request });
+}
+
+export interface MirrorProfile {
+  setup_command: string | null;
+  /** Additive: a setup command an agent proposed. It never runs until the
+   * user confirms it (`pro/profile.ts`), which makes it `setup_command`. */
+  pending_setup_command?: string | null;
+  laptop_only: string[];
+  deferred: string[];
+  missing_environment: string[];
+}
+export interface LocalProjectCopy { state: "ready" | "pending" | "taking_over" | "recovery_needed"; ready: boolean; checkpoint?: unknown | null; owner_epoch?: number | null }
+export type GitStagingStatus = { state: "uncaptured" } | { state: "synced" } | { state: "conflicts"; paths: string[]; total: number; recovery: string };
+export interface MirrorWorkspace {
+  workspace_id: string; name: string; root: string; never_mirror: boolean; privacy_pending?: boolean;
+  checkpoint_id?: string | null;
+  local_copy?: LocalProjectCopy | null;
+  git_staging?: GitStagingStatus;
+  execution_allowed?: boolean;
+  ownership: { state: "awaiting_verification" | "local" | "remote" | "transferring" | "hydrating" | "setting_up" | "privacy_disabled"; epoch: number; holder?: string } | null;
+  mirror: { files: number; bytes: number; excluded: number; too_large: number; last_mirrored_at: number | null; storage_limit_bytes: number; error: string | null;
+    /** Additive (newer daemons): a stable code for `error`, and the files the last return kept in both versions. */
+    error_code?: string | null; kept_both?: number; kept_paths?: string[]; git_staging?: GitStagingStatus } | null;
+  profile: MirrorProfile | null;
+  git_branches?: string[] | null;
+  blocked_providers?: CloudBlockedProvider[];
+}
+export interface MirrorStatus {
+  configured: boolean; projects_root: string; projects_root_confirmed: boolean; workspaces: MirrorWorkspace[];
+  /** Additive: the account connection lapsed and the app is renewing it
+   * (then `configured` is false too). */
+  renewal_failed?: boolean;
+  sessions: { id: string; workspace_id: string; display_name?: string; name: string }[];
+}
+export async function proMirrorStatus(): Promise<MirrorStatus> {
+  const t = tauri(); if (t === null) throw new Error("Mirror settings require the native app");
+  return t.core.invoke<MirrorStatus>("pro_mirror_status");
+}
+export async function proSetNeverMirror(workspaceId: string, neverMirror: boolean): Promise<void> {
+  const t = tauri(); if (t === null) throw new Error("Mirror settings require the native app");
+  await t.core.invoke("pro_set_never_mirror", { workspaceId, neverMirror });
 }

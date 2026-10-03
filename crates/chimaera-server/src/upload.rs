@@ -13,13 +13,16 @@ use axum::body::Body;
 use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::io::AsyncWriteExt;
 
 use crate::AppState;
+mod scoped;
+#[cfg(test)]
+pub(crate) use scoped::upload_with_limits;
 
 /// A session upload lands under bounded daemon state, so one reference/drop
 /// stays comfortably below the session-wide quota.
@@ -131,6 +134,7 @@ async fn dir_usage(dir: &Path) -> (u64, usize) {
 /// Bearer-authed like every REST route.
 pub(crate) async fn upload(
     State(state): State<Arc<AppState>>,
+    mutation: Option<Extension<crate::workspace_scope::Mutation>>,
     UrlPath(id): UrlPath<String>,
     Query(query): Query<UploadQuery>,
     body: Body,
@@ -176,8 +180,9 @@ pub(crate) async fn upload(
 
     // Stream to a hidden tmp sibling, then rename — a partial upload is never
     // visible under its final name (an agent could read it mid-write).
-    let token = &chimaera_core::generate_token()[..8];
-    let tmp = dir.join(format!(".{name}.{token}.tmp"));
+    let tmp = dir.join(crate::persist::project_temp_name(std::ffi::OsStr::new(
+        &name,
+    )));
     let mut file = match tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -274,9 +279,12 @@ pub(crate) async fn upload(
         final_name = candidate;
         target = dir.join(&final_name);
     }
-    if let Err(err) = tokio::fs::rename(&tmp, &target).await {
+    if let Err(err) = finalize_upload(&state, mutation, &tmp, &target).await {
         let _ = tokio::fs::remove_file(&tmp).await;
-        return internal(&target, "failed to finalize upload", &err.into());
+        if let Some(response) = crate::workspace_scope::mutation_failure(&err) {
+            return response;
+        }
+        return internal(&target, "failed to finalize upload", &err);
     }
 
     Json(json!({
@@ -306,6 +314,8 @@ pub(crate) struct DirUploadQuery {
 /// non-directory `dir`, 413 past the per-file cap.
 pub(crate) async fn upload_to_dir(
     State(state): State<Arc<AppState>>,
+    filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
+    mutation: Option<Extension<crate::workspace_scope::Mutation>>,
     Query(query): Query<DirUploadQuery>,
     body: Body,
 ) -> Response {
@@ -316,6 +326,9 @@ pub(crate) async fn upload_to_dir(
         )
             .into_response();
     };
+    if let Some(filesystem) = filesystem {
+        return scoped::upload(state, filesystem.0, mutation, query.dir, name, body).await;
+    }
     let dir = match tokio::fs::canonicalize(&query.dir).await {
         Ok(dir) if dir.is_dir() => dir,
         Ok(_) => {
@@ -336,8 +349,9 @@ pub(crate) async fn upload_to_dir(
 
     // Hidden tmp sibling then rename — a partial upload never appears under its
     // final name.
-    let token = &chimaera_core::generate_token()[..8];
-    let tmp = dir.join(format!(".{name}.{token}.tmp"));
+    let tmp = dir.join(crate::persist::project_temp_name(std::ffi::OsStr::new(
+        &name,
+    )));
     let mut file = match tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -421,9 +435,12 @@ pub(crate) async fn upload_to_dir(
         final_name = candidate;
         target = dir.join(&final_name);
     }
-    if let Err(err) = tokio::fs::rename(&tmp, &target).await {
+    if let Err(err) = finalize_upload(&state, mutation, &tmp, &target).await {
         let _ = tokio::fs::remove_file(&tmp).await;
-        return internal(&target, "failed to finalize upload", &err.into());
+        if let Some(response) = crate::workspace_scope::mutation_failure(&err) {
+            return response;
+        }
+        return internal(&target, "failed to finalize upload", &err);
     }
     // Nudge the git watcher so the tree/panel refetch without polling (same
     // reason the fs mutations do).
@@ -435,6 +452,25 @@ pub(crate) async fn upload_to_dir(
         "size": written,
     }))
     .into_response()
+}
+
+async fn finalize_upload(
+    state: &Arc<AppState>,
+    mutation: Option<Extension<crate::workspace_scope::Mutation>>,
+    temporary: &Path,
+    target: &Path,
+) -> anyhow::Result<()> {
+    let state = state.clone();
+    let temporary = temporary.to_owned();
+    let target = target.to_owned();
+    // The blocking task owns its reservation even if the HTTP client goes away.
+    // Body streaming never holds authority or prevents a clean handoff.
+    tokio::task::spawn_blocking(move || {
+        let _commit = crate::workspace_scope::begin_mutation(&state, &mutation)?;
+        std::fs::rename(temporary, target)?;
+        Ok(())
+    })
+    .await?
 }
 
 fn internal(path: &Path, what: &str, err: &anyhow::Error) -> Response {
@@ -584,7 +620,9 @@ pub(crate) fn save_images_blocking(
         }
         let token = &chimaera_core::generate_token()[..8];
         let target = dir.join(format!("image-{token}.{ext}"));
-        let tmp = dir.join(format!(".image-{token}.{ext}.tmp"));
+        let tmp = dir.join(crate::persist::project_temp_name(
+            target.file_name().unwrap(),
+        ));
         let written = std::fs::write(&tmp, &bytes).and_then(|()| std::fs::rename(&tmp, &target));
         if let Err(err) = written {
             let _ = std::fs::remove_file(&tmp);

@@ -68,6 +68,11 @@ pub struct ExecOptions {
     pub allow_sentinel_over_running: bool,
     /// Optional stage reporting (queued -> executing) for UI mirroring.
     pub stage: Option<watch::Sender<ExecStage>>,
+    /// Whether `queue_timeout` also bounds the wait behind a previous exec on
+    /// this session. A caller acting under workspace authority (a forwarded
+    /// viewer, a managed Pro project) sets it, so its request never outlives
+    /// its budget; otherwise a queued exec waits its turn, as it always has.
+    pub bounded_lock_wait: bool,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -136,9 +141,29 @@ fn sentinel_line(command: &str) -> String {
 
 pub(crate) async fn exec(
     marks: Arc<Marks>,
-    input: tokio::sync::mpsc::Sender<Bytes>,
+    input: crate::InputSender,
     exec_lock: Arc<tokio::sync::Mutex<()>>,
     opts: ExecOptions,
+) -> Result<ExecOutcome, ExecError> {
+    exec_inner(marks, input, exec_lock, opts, None).await
+}
+
+pub(crate) async fn exec_guarded(
+    marks: Arc<Marks>,
+    input: crate::InputSender,
+    exec_lock: Arc<tokio::sync::Mutex<()>>,
+    opts: ExecOptions,
+    admission: crate::input::Admission,
+) -> Result<ExecOutcome, ExecError> {
+    exec_inner(marks, input, exec_lock, opts, Some(admission)).await
+}
+
+async fn exec_inner(
+    marks: Arc<Marks>,
+    input: crate::InputSender,
+    exec_lock: Arc<tokio::sync::Mutex<()>>,
+    opts: ExecOptions,
+    admission: Option<crate::input::Admission>,
 ) -> Result<ExecOutcome, ExecError> {
     validate(&opts.command)?;
     let set_stage = |stage: ExecStage| {
@@ -149,10 +174,23 @@ pub(crate) async fn exec(
     set_stage(ExecStage::Queued);
     let start = Instant::now();
 
-    // One exec at a time per session; queued execs wait here first.
-    let _guard = exec_lock.lock().await;
-
     let queue_deadline = start + opts.queue_timeout;
+    // One exec at a time per session. Under workspace authority the queue
+    // budget covers a previous exec too, not just the shell's prompt (a zero
+    // budget is an immediate try); otherwise queued execs wait here first.
+    let _guard = if !opts.bounded_lock_wait {
+        exec_lock.lock().await
+    } else if opts.queue_timeout.is_zero() {
+        exec_lock
+            .try_lock()
+            .map_err(|_| ExecError::Busy("another exec is queued".into()))?
+    } else {
+        tokio::time::timeout_at(queue_deadline, exec_lock.lock())
+            .await
+            .map_err(|_| {
+                ExecError::Busy("another exec did not finish before the queue timeout".into())
+            })?
+    };
     let mode = wait_ready(&marks, &opts, start, queue_deadline).await?;
     if mode == ExecMode::Sentinel {
         wait_quiet(&marks, queue_deadline).await?;
@@ -164,9 +202,16 @@ pub(crate) async fn exec(
         ExecMode::Integrated => format!("{}\r", opts.command),
         ExecMode::Sentinel => sentinel_line(&opts.command),
     };
-    if input.send(Bytes::from(line)).await.is_err() {
+    let dispatched = match admission {
+        Some(admission) => input.send_guarded(Bytes::from(line), admission).await,
+        None => input
+            .send(Bytes::from(line))
+            .await
+            .map_err(|_| ExecError::SessionGone),
+    };
+    if let Err(error) = dispatched {
         marks.clear_agent_expect(token);
-        return Err(ExecError::SessionGone);
+        return Err(error);
     }
     set_stage(ExecStage::Executing);
 
@@ -325,7 +370,7 @@ mod tests {
     #[tokio::test]
     async fn integrated_without_c_marks_degrades_to_sentinel() {
         let marks = Arc::new(Marks::new());
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(8);
+        let (tx, mut rx) = crate::input::channel(8);
         let lock = Arc::new(tokio::sync::Mutex::new(()));
         marks.feed(b"\x1b]133;A\x07$ ");
 
@@ -335,6 +380,7 @@ mod tests {
             timeout: Duration::from_millis(300),
             allow_sentinel_over_running: false,
             stage: None,
+            bounded_lock_wait: false,
         };
 
         // First exec: integrated (phase ready), types the plain command,
@@ -343,15 +389,28 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ExecError::NeverStarted(_)));
-        assert_eq!(rx.recv().await.unwrap(), Bytes::from("echo hi\r"));
+        rx.recv()
+            .await
+            .unwrap()
+            .write(|bytes| {
+                assert_eq!(bytes, b"echo hi\r");
+                Ok(())
+            })
+            .unwrap();
         assert!(marks.integration_start_broken());
 
         // Second exec on the same session: still phase ready, but typed
         // sentinel-wrapped; completes off its own printf'd marks.
         let task = tokio::spawn(exec(marks.clone(), tx.clone(), lock.clone(), opts));
-        let typed = rx.recv().await.unwrap();
-        let line = String::from_utf8(typed.to_vec()).unwrap();
-        assert!(line.starts_with("printf"), "expected sentinel line: {line}");
+        rx.recv()
+            .await
+            .unwrap()
+            .write(|bytes| {
+                let line = std::str::from_utf8(bytes).unwrap();
+                assert!(line.starts_with("printf"), "expected sentinel line: {line}");
+                Ok(())
+            })
+            .unwrap();
         marks.feed(b"\x1b]133;C\x07hi\r\n\x1b]133;D;0\x07");
         let outcome = task.await.unwrap().expect("sentinel exec completes");
         assert_eq!(outcome.mode, ExecMode::Sentinel);
@@ -359,5 +418,48 @@ mod tests {
         assert_eq!(outcome.record.command.as_deref(), Some("echo hi"));
         // The sentinel's own C did not un-degrade the session.
         assert!(marks.integration_start_broken());
+    }
+
+    /// A command queued behind another exec on the same session waits its
+    /// turn; only a caller acting under workspace authority bounds that wait
+    /// by its queue budget.
+    #[tokio::test]
+    async fn a_queued_exec_waits_its_turn_unless_its_caller_bounds_the_wait() {
+        for bounded in [false, true] {
+            let marks = Arc::new(Marks::new());
+            let (tx, mut rx) = crate::input::channel(8);
+            let lock = Arc::new(tokio::sync::Mutex::new(()));
+            marks.feed(b"\x1b]133;A\x07$ ");
+            let previous = lock.clone().lock_owned().await;
+            let opts = ExecOptions {
+                command: "echo queued".into(),
+                queue_timeout: Duration::from_millis(100),
+                timeout: Duration::from_millis(300),
+                allow_sentinel_over_running: false,
+                stage: None,
+                bounded_lock_wait: bounded,
+            };
+            let task = tokio::spawn(exec(marks.clone(), tx.clone(), lock.clone(), opts));
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            if bounded {
+                assert!(matches!(task.await.unwrap(), Err(ExecError::Busy(_))));
+                continue;
+            }
+            assert!(
+                !task.is_finished(),
+                "a free exec waits for the previous one"
+            );
+            drop(previous);
+            tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .write(|bytes| {
+                    assert_eq!(bytes, b"echo queued\r");
+                    Ok(())
+                })
+                .unwrap();
+            task.abort();
+        }
     }
 }

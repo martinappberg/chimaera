@@ -34,13 +34,21 @@ PTY snapshot-on-attach ([terminals.md](terminals.md)) and the chat seq-journal g
   continuously-reconciled `sessions.json` records each session's *semantic* identity (workspace, cwd,
   agent kind, **surface** (term/chat), native conversation/thread id + transcript path, chat model,
   pinned name, dims, theme, linked-terminal edges). On boot the daemon **resurrects**: shells respawn at
-  their last cwd, claude TUI agents respawn with `--resume`, **chat sessions respawn as chat** through
+  their last cwd, Claude TUI agents respawn with `--resume`, and Codex TUIs with a verified
+  rollout respawn with `codex resume <thread-id>`. **Chat sessions respawn as chat** through
   `chat::resurrect_chat`, retaining all four providers' native handles (Claude `--resume`, Codex
   `thread/resume`, ACP session load/resume) and replaying the on-disk journal. Native resume
   still depends on the provider accepting that handle. Sessions Chimaera cannot resurrect live retire
   into Recents; a row resumes when its native handle was captured, otherwise its tooltip honestly
   says that this specific row must start fresh. A finished Codex chat carries its `ChatInfo` thread id
   into Recents before the chat registry entry is removed.
+- **Codex terminal identity (Pro-configured projects).** After the first completed turn, a generated `notify` wrapper captures
+  the native thread id and chains the user's configured notify command with the original payload.
+  The daemon checks the rollout header's id and cwd before recording it and again on restart.
+  A missing rollout retires the row into Recents without promising resumption. The hook has only a
+  completion event, so terminal Codex attention remains unknown. Config and rollouts honor `CODEX_HOME`,
+  including one the login shell exports. In other projects a Codex TUI's argv is unchanged and it
+  retires into Recents on restart as before.
 - **How it's used.** No route — this is boot/shutdown lifecycle, gated by `daemon.restoreSessions`
   (default true). A graceful stop also writes a **handoff** (port + token) so a successor daemon rebinds
   the same port with the same token — ssh forwards stay valid and every client heals with a plain
@@ -142,8 +150,18 @@ conversation. All four chat providers retain their native resume handle through 
   overrides; users can disable with `update.autoCheck` (an explicit `?refresh=true` still runs — the
   setting governs phoning home on its own). Test knobs: `CHIMAERA_RELEASES_API`,
   `CHIMAERA_UPDATE_CURRENT` (also reported as `current`, so a dev build exercises the whole UI).
+- **The account's cloud never checks.** The service updates the cloud's daemon, so a daemon running as
+  the account's cloud (`pro::updates_managed`: started as one, or configured as the Pro worker now or
+  before) makes no release request, periodic or asked for, and reports `state: "managed"` with
+  `managed: true`, no `latest`, nothing available and no check times. Becoming the cloud moves the epoch,
+  so attached windows hear it at once. Every view of that daemon shows the one neutral line
+  "Updates for your cloud are managed for you." with no check and no update action (Settings → Updates
+  drops "check now" and the auto-check switch; the toast answers an explicit check with that line; the
+  version stamp's hover says it). Its agents' release checks stop too (`agent_updates`; no release
+  fields on its `GET /agents` rows), since they come with the cloud's image and are updated with it.
+  Its plugins' release checks are unchanged.
 - **A failed check is reported as one.** The status carries one `state` word
-  (`unchecked | current | available | failed`), `checked_at` (last attempt) vs `succeeded_at`
+  (`unchecked | current | available | failed | managed`), `checked_at` (last attempt) vs `succeeded_at`
   (last answer), the failure in plain words (`error`: curl's own diagnosis minus its prefix; a
   GitHub 403/429 is named as the rate limit a shared login-node address hits), `dev`, and
   `interval_secs`. A known newer release outranks a later failed re-check — the release didn't stop

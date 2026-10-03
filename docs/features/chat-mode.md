@@ -753,6 +753,10 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   except Mastermind and cluster workspace jobs, which reopen idle). A normally finished Codex chat
   preserves its native thread id in Recents, whose click starts `thread/resume` under a new Chimaera
   session id (see [lifecycle-and-persistence.md](lifecycle-and-persistence.md)).
+- [Pro transfers](pro.md) preserve finished conversations without starting another
+  model turn. Only a captured interrupted turn or background task receives a
+  `moved`/`home` continuation message; fresh MCP initialization supplies current-host
+  context even when the conversation stays idle.
 - Codex rewind's rollback count only sees turns the chat journal saw (TUI-interleaved turns
   undercount it — the rollback then leaves those turns in place).
 - Native same-agent branches are available only at boundaries the vendor exposes: a Claude user

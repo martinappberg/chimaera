@@ -77,6 +77,8 @@ pub(crate) struct AppState {
     /// the moment the id is in neither registry — a vanishing row would make
     /// every window prune the session's tabs mid-toggle.
     pub(crate) chat_switching: Mutex<HashMap<String, String>>,
+    /// Durable public imports gate execution before boot ledger restoration.
+    pub(crate) bundle_imports: crate::bundle::PendingImports,
     /// Workspaces with a Mastermind PUT/DELETE in flight. The routes are
     /// multi-step (retire old → bind → spawn, with rollback); two racing
     /// callers would leak the loser's spawned session and could clobber the
@@ -92,6 +94,13 @@ pub(crate) struct AppState {
     pub(crate) spawn_reservations: Mutex<HashMap<String, usize>>,
     /// session id -> workspace id.
     pub(crate) session_workspaces: Mutex<HashMap<String, String>>,
+    pub(crate) activity: Mutex<crate::activity::Activity>,
+    pub(crate) pro: crate::pro::ProState,
+    pub(crate) cloud_providers: crate::cloud::providers::Providers,
+    pub(crate) deferred_sessions: Mutex<HashMap<String, crate::ledger::LedgerEntry>>,
+    /// session id -> the turn its resumers take (`ledger::resume_one`).
+    pub(crate) resuming: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    pub(crate) session_proxy: crate::session_proxy::Store,
     /// session id -> agent wrapper state (kind "agent" sessions only).
     pub(crate) agents: Mutex<HashMap<String, agents::AgentRecord>>,
     /// session id -> polled shell display name (naming rule zero); written
@@ -192,6 +201,9 @@ pub(crate) struct AppState {
     /// younger than `runtimes::INSTALL_RESERVATION_GRACE` is busy even with
     /// no visible session. Cleaned up by the install watcher.
     pub(crate) installs: Mutex<HashMap<agents::AgentKind, (String, Instant)>>,
+    /// Exact live owner through preparation and cleanup, bounded by the agent
+    /// catalog. A grace timer cannot reclaim an owner whose child is not visible.
+    pub(crate) install_owners: Mutex<HashMap<agents::AgentKind, String>>,
     /// Latest installer result per built-in agent; bounded by the catalog.
     pub(crate) install_results: Mutex<HashMap<agents::AgentKind, crate::runtimes::InstallResult>>,
     pub(crate) agent_setup: Mutex<HashMap<agents::AgentKind, Arc<crate::agent_setup::Operation>>>,
@@ -308,9 +320,16 @@ impl AppState {
             chat_signals: Mutex::new(Some(chat_signals_rx)),
             chat_recipes: Mutex::new(HashMap::new()),
             chat_switching: Mutex::new(HashMap::new()),
+            bundle_imports: crate::bundle::PendingImports::load(&data_dir),
             mastermind_switching: Mutex::new(std::collections::HashSet::new()),
             spawn_reservations: Mutex::new(HashMap::new()),
             session_workspaces: Mutex::new(HashMap::new()),
+            activity: Mutex::new(crate::activity::Activity::default()),
+            pro: crate::pro::ProState::new(data_dir.join("pro")),
+            cloud_providers: crate::cloud::providers::Providers::default(),
+            deferred_sessions: Mutex::new(HashMap::new()),
+            resuming: Mutex::new(HashMap::new()),
+            session_proxy: crate::session_proxy::Store::default(),
             agents: Mutex::new(HashMap::new()),
             display_names: Mutex::new(HashMap::new()),
             current_cwds: Mutex::new(HashMap::new()),
@@ -337,10 +356,14 @@ impl AppState {
             drafts_root: data_dir.join("drafts"),
             fs_touched: tokio::sync::broadcast::channel(crate::fs_watch::TOUCHED_CAPACITY).0,
             installs: Mutex::new(HashMap::new()),
+            install_owners: Mutex::new(HashMap::new()),
             install_results: Mutex::new(HashMap::new()),
             agent_setup: Mutex::new(HashMap::new()),
             claude_settings_path: home.join(".claude").join("settings.json"),
-            codex_config_path: home.join(".codex").join("config.toml"),
+            codex_config_path: std::env::var_os("CODEX_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".codex"))
+                .join("config.toml"),
             timeline: timeline::TimelineService::new(data_dir.join("workspace")),
             history: crate::history::HistoryService::new(&data_dir),
             plugin_catalog,

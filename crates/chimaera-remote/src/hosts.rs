@@ -68,6 +68,13 @@ pub struct HostEntry {
     pub added_at: u64,
     #[serde(default)]
     pub last_connected_at: Option<u64>,
+    /// Cached account preference; a signed-out client can still use ordinary ssh.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub kept: bool,
+    /// Native transport choice on this computer, independent of the account's
+    /// kept login. No existing connection or remote job is stopped by changing it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub direct_ssh: bool,
     /// The user allowed a chimaera daemon on this cluster's login node (the
     /// warned per-host override). Off unless set: an older build that
     /// rewrites this file drops the field, which turns the override off —
@@ -190,6 +197,8 @@ impl HostsStore {
             binary,
             added_at: unix_now(),
             last_connected_at: None,
+            kept: false,
+            direct_ssh: false,
             login_serve: false,
             cluster_setup_complete: false,
             not_cluster: false,
@@ -198,6 +207,35 @@ impl HostsStore {
         self.items.push(entry.clone());
         self.save()?;
         Ok(entry)
+    }
+
+    /// Cache the keeper's preference without storing account or daemon tokens.
+    pub fn set_kept(&mut self, alias: &str, kept: bool) -> anyhow::Result<HostEntry> {
+        let alias = normalize_alias(alias)?;
+        self.add(&alias, None)?;
+        let entry = self
+            .items
+            .iter_mut()
+            .find(|entry| entry.alias == alias)
+            .context("host missing after add")?;
+        entry.kept = kept;
+        let result = entry.clone();
+        self.save()?;
+        Ok(result)
+    }
+
+    pub fn set_direct_ssh(&mut self, alias: &str, on: bool) -> anyhow::Result<HostEntry> {
+        let alias = normalize_alias(alias)?;
+        self.add(&alias, None)?;
+        let entry = self
+            .items
+            .iter_mut()
+            .find(|entry| entry.alias == alias)
+            .context("host missing after add")?;
+        entry.direct_ssh = on;
+        let result = entry.clone();
+        self.save()?;
+        Ok(result)
     }
 
     /// Forget `alias`. Returns whether it existed.
@@ -225,6 +263,8 @@ impl HostsStore {
                     binary: None,
                     added_at: unix_now(),
                     last_connected_at: Some(unix_now()),
+                    kept: false,
+                    direct_ssh: false,
                     login_serve: false,
                     cluster_setup_complete: false,
                     not_cluster: false,
@@ -543,5 +583,56 @@ mod tests {
         );
         assert_eq!(aliases.iter().filter(|a| *a == "cluster").count(), 1);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn kept_preference_is_additive_and_contains_no_credentials() {
+        let (mut store, dir) = tmp_store("kept");
+        let entry = store.add("cluster", None).unwrap();
+        assert!(!entry.kept);
+        assert!(store.set_kept("ssh cluster", true).unwrap().kept);
+        let saved = HostsStore::load(dir.join("hosts.json"));
+        assert!(saved.get("cluster").unwrap().kept);
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("hosts.json")).unwrap())
+                .unwrap();
+        assert!(json[0].get("token").is_none());
+        assert!(json[0].get("refresh_token").is_none());
+        store.set_kept("cluster", false).unwrap();
+        assert!(
+            !HostsStore::load(dir.join("hosts.json"))
+                .get("cluster")
+                .unwrap()
+                .kept
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn direct_ssh_is_local_additive_and_independent_of_kept_login_and_cluster_options() {
+        let (mut first, dir) = tmp_store("direct-first");
+        let (second, other_dir) = tmp_store("direct-second");
+        first.set_kept("cluster", true).unwrap();
+        first.set_login_serve("cluster", true).unwrap();
+        first.set_direct_ssh("ssh cluster", true).unwrap();
+        let mut restored = HostsStore::load(dir.join("hosts.json"));
+        let entry = restored.get("cluster").unwrap();
+        assert!(entry.direct_ssh && entry.kept && entry.login_serve);
+        assert!(second.get("cluster").is_none());
+        restored.set_kept("cluster", false).unwrap();
+        assert!(restored.get("cluster").unwrap().direct_ssh);
+        restored.set_direct_ssh("cluster", false).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("hosts.json")).unwrap())
+                .unwrap();
+        assert!(json[0].get("direct_ssh").is_none());
+        assert!(
+            !HostsStore::load(dir.join("hosts.json"))
+                .get("cluster")
+                .unwrap()
+                .direct_ssh
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(other_dir).unwrap();
     }
 }

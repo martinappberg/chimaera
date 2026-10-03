@@ -58,6 +58,14 @@ a `settings` frame on `/ws/events`. Map: [settings/AGENTS.md](../../web-ui/src/l
   agent/mode are workspace state edited in its setup card, while Environment preludes remain scoped
   records rather than being flattened into global preferences.
 
+## Native account settings
+
+The native app adds a **Chimaera Pro** category for sign-in, plan, kept hosts,
+devices and sign-out. It is absent in a plain browser and shows only availability
+when no endpoint is configured. This is app-owned state, accessed through native
+IPC; neither credentials nor the endpoint enter the daemon settings schema.
+See [Pro connections](pro.md) for the connection and token lifecycle.
+
 ## Updates status
 
 - **Updates section** (`UpdatesStatus.svelte`, above the `update.autoCheck` switch) — the one place that
@@ -66,6 +74,8 @@ a `settings` frame on `/ws/events`. Map: [settings/AGENTS.md](../../web-ui/src/l
   summary line, "Agents ↓" jumps there). Each says up to date / \<new\> available / couldn't check (with
   the reason) / not checked yet, plus when it last checked and the cadence; "check now" asks every source
   at once. Agents read "up to date" only when every installed agent has comparable versions and a successful latest check. Failed re-checks preserve the known release while displaying the failure; unknown versions never count as current. The Agents and Updates sections share the catalog, so installation and path changes refresh both.
+  On the account's cloud (a daemon reporting `managed`) the daemon line reads "Updates for your cloud are
+  managed for you." and neither "check now" nor the `update.autoCheck` switch shows.
 
 ## Activity
 

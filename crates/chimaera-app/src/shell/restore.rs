@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
-use super::connect::{do_connect, HostStatus};
+use super::connect::{restore_connect, HostStatus};
 use super::{
     authorize_daemon_origin, daemon_navigation_allowed, is_srcdoc_frame, lock, Shell, WindowScope,
 };
@@ -272,12 +272,26 @@ pub(super) fn open_shell_window(
     record: &WindowRecord,
     window_scope: WindowScope,
 ) -> tauri::Result<()> {
+    // Every window opens here. None shows the account's cloud's own page:
+    // where work runs is never the user's choice, and the cloud is not a
+    // machine to manage. Connects to it are refused too (`connect.rs`).
+    if let Some(alias) = record.alias.as_deref() {
+        if app
+            .try_state::<Shell>()
+            .is_some_and(|shell| shell.pro.is_cloud(alias))
+        {
+            tracing::info!(
+                "not opening a window on {alias}: the app never opens the cloud's own page"
+            );
+            return Err(anyhow::anyhow!("the cloud's own page never opens in the app").into());
+        }
+    }
     let url: tauri::Url = url.parse().expect("daemon url is always valid");
     let port = url
         .port()
         .expect("daemon URLs always carry an explicit loopback port");
     let label = format!("win-{}", WINDOW_SEQ.fetch_add(1, Ordering::Relaxed));
-    authorize_daemon_origin(app, &label, port)?;
+    authorize_daemon_origin(app, &label, port, window_scope.alias.is_none())?;
     let navigation_app = app.clone();
     let navigation_label = label.clone();
     let page_load_app = app.clone();
@@ -357,7 +371,12 @@ pub(super) fn open_shell_window(
     // Shell before opening any window, so every daemon window registered
     // above has an authoritative scope before its first native command.
     if let Some(shell) = app.try_state::<Shell>() {
-        lock(&shell.registry).upsert(record.clone());
+        let mut persisted = record.clone();
+        persisted.link_device |= record
+            .alias
+            .as_deref()
+            .is_some_and(|alias| shell.pro.is_device(alias));
+        lock(&shell.registry).upsert(persisted);
     }
     // A new window changes the tray's open-windows list.
     crate::tray::rebuild(app);
@@ -407,7 +426,7 @@ pub(super) fn spawn_health_monitor(handle: AppHandle) {
                         port: tunnel.local_port,
                         token: tunnel.manifest.token.clone(),
                         is_compute: false,
-                        node: tunnel.route.node().map(str::to_string),
+                        node: tunnel.node().map(str::to_string),
                     })
                     .collect()
             };
@@ -421,6 +440,15 @@ pub(super) fn spawn_health_monitor(handle: AppHandle) {
                     node: None,
                 }));
             }
+            snap.extend(super::cluster::kept_link_endpoints(&shell).into_iter().map(
+                |(key, port, token)| TunnelEndpoint {
+                    key,
+                    port,
+                    token,
+                    is_compute: true,
+                    node: None,
+                },
+            ));
             tracing::trace!(tunnels = snap.len(), "ssh health monitor snapshot");
             // Keys gone from the maps were disconnected by the user; forget
             // them without emitting a spurious `down`.
@@ -529,6 +557,9 @@ pub(super) fn spawn_health_monitor(handle: AppHandle) {
 
 async fn endpoint_is_current(shell: &Shell, endpoint: &TunnelEndpoint) -> bool {
     if endpoint.is_compute {
+        if super::cluster::kept_link_current(shell, &endpoint.key, endpoint.port, &endpoint.token) {
+            return true;
+        }
         let tunnels = shell.compute_tunnels.lock().await;
         tunnels.get(&endpoint.key).is_some_and(|tunnel| {
             tunnel.local_port == endpoint.port && tunnel.token == endpoint.token
@@ -605,7 +636,7 @@ pub(super) fn restore_windows(handle: &AppHandle, port: u16, token: &str) -> tau
             // `run_flight`), and the records survive failure: the windows
             // come back with the first connect that lands — a home-screen
             // click, a window's reconnect, or the next launch.
-            if let Err(e) = do_connect(&handle, alias.clone(), false).await {
+            if let Err(e) = restore_connect(&handle, alias.clone()).await {
                 tracing::warn!("could not reconnect {alias} to restore windows: {e}");
             }
         });

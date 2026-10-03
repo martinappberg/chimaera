@@ -129,6 +129,10 @@ export function getSize(id: string): { cols: number; rows: number } | null {
   return runtime !== null && initialized ? runtime.getSize(id) : null;
 }
 
+/** Apply an explicit watching/control choice to the warm terminal. */
+export function refreshAccess(id: string): void { void loadRuntime().then((loaded) => loaded.refreshAccess(id)); }
+export function retryTerminal(id: string): void { void loadRuntime().then((loaded) => loaded.retryTerminal(id)); }
+
 export function beginFind(id: string, results: (index: number, count: number) => void) {
   return runtime !== null && initialized ? runtime.beginFind(id, results) : null;
 }

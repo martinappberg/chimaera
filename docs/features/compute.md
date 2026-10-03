@@ -1,6 +1,6 @@
 # Clusters (HPC + Slurm)
 
-On a cluster — a host whose login shell reaches a batch scheduler — **nothing of
+With direct SSH, on a cluster — a host whose login shell reaches a batch scheduler — **nothing of
 Chimaera's keeps running on the login node**. You start Slurm **jobs**, and open
 **workspaces** inside them: each job runs `chimaera job-host` on its compute node, which
 runs one `chimaera serve` per open workspace. The app (or the CLI) starts, lists, opens and
@@ -19,6 +19,27 @@ notifications in `crates/chimaera-app/src/shell/cluster.rs`; the CLI in
 `crates/chimaera/src/compute.rs`; the UI's cluster page, start sheet and folder picker
 under `web-ui/src/lib/workspace/`; a workspace chimaera's side (its job, agent context,
 startup commands, the lease) in `crates/chimaera-server/src/{compute,lifecycle,environment}.rs`.
+
+## Kept cluster connections
+
+A capability-confirmed keeper uses the same Jobs page and job-host APIs through
+exact host/job/workspace Link routes. Its allocation hold and compute tunnel
+survive closing the Mac app, including interactive jobs. The native adapter keeps
+bearers outside page overviews, retires listeners on account changes or route
+replacement, and reconciles a lost mutation reply by its original operation ID.
+An uncertain Start is never replaced with another submission. A requested Stop
+stays pending until the keeper has positive scheduler evidence that the job ended.
+
+Regular polls and action reloads use cached keeper observations. The manual
+Refresh button may query an already established connection; it never authenticates
+SSH or wakes the cloud. A missing connection needs explicit Connect/Reconnect.
+Unsupported keepers refuse the kept flow; the advanced per-computer direct SSH
+choice remains explicit. Kept cluster capability remains disabled in the private
+startup until real SSH/Slurm and combined resource acceptance pass.
+
+The login-node terminal is still an explicit direct SSH session in the local
+PTY and ends with its native window. It is not a keeper-held job or terminal.
+The direct behavior described below remains the fallback the user selects.
 
 ## Detection and cluster mode
 

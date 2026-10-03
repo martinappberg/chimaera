@@ -1,0 +1,239 @@
+# Session bundle protocol — version 1
+
+A bundle transfers one Chimaera session between authenticated daemons. The
+public session ID, workspace ID, absolute workspace root and cwd, native
+conversation handle, journal sequence numbers, model preferences, pinned title,
+linked terminal edges, workspace fallback layout and original creation time
+survive transfer. (Placement is the system's decision: there is no per-session
+keep-running pin; a `keep_running` field in an older manifest is ignored.) It contains no process snapshot.
+
+## HTTP interface
+
+These routes require the normal daemon bearer token. A keeper's authenticated
+HTTP adapter may forward them using the target daemon's credential.
+
+- GET `/api/v1/pro/bundles/{session}`: snapshot ZIP; never stops the session.
+- POST `/api/v1/pro/bundles/{session}/export` with `{stop:true}`: durably suspend
+  and stop an agent, then return its ZIP. `{stop:false}` is a snapshot.
+- POST `/api/v1/pro/bundles?fork=false&origin=moved&epoch=7` with an
+  `application/zip` body: verify and import. `origin` is `moved` or `home`;
+  `fork` requests a native head fork for an offline takeover. Returns
+  `{id,workspace_id,paused}`. Refusals are 409 with `{error}`.
+  `defer_start=true` installs a suspended entry without spawning; the ownership
+  coordinator stages every archive at the same verified epoch, then grants local
+  ownership and resumes the complete workspace. A partial import remains fenced
+  across restart. Moved plain shells remain paused even after that grant.
+
+Only two archive operations run concurrently. Uploads and archives are bounded
+at 100,000,000 bytes, native transcripts at 90,000,000 bytes, the journal at
+4 MiB, delivery evidence at 32 KiB, and other metadata at 256 KiB. Oversized data refuses transfer; it is never
+silently truncated. Snapshot journals include complete records only. A native
+file that changes during a checked snapshot causes a retryable refusal.
+
+The internal export API returns a temporary file owned by its caller, which
+must unlink it after consumption. HTTP responses unlink the backing file as soon
+as the streaming reader owns it. Neither route buffers the whole ZIP in RAM.
+
+Automatic workspace mirrors have a narrower empty-chat exception than these
+explicit export routes. If native history is missing, the mirror can omit a live
+unstarted structured Claude chat only with a complete startup-only journal (from seq 1,
+at most 256 events / 256 KiB), no resumed/forked context, no submitted input, and
+no active or background work. Accepted input is remembered before its journal
+echo, so a just-submitted turn cannot qualify. Snapshots leave the source live.
+Clean handoff atomically pauses command ingress before proving emptiness, then
+durably suspends its ledger entry and stops its process; local ownership return
+restores the same session with a fresh empty CLI. Failed or canceled proofs
+restore ingress, and late sends receive an explicit paused error. Codex native
+history remains strict because its restore path requires an existing thread.
+Missing, truncated, corrupt or meaningful history is still a transfer error.
+
+## Archive format
+
+ZIP members use stored compression, regular-file permissions 0600, and exact
+names. Directories, symlinks, duplicate names, unexpected members, compression,
+length mismatch, and SHA-256 mismatch are rejected before installation. Stored
+compressed and uncompressed lengths must agree, and hashing counts actual bytes;
+an understated central-directory length cannot bypass these limits.
+
+`manifest.json` contains:
+
+```json
+{
+  "version": 1,
+  "workspace": {"id":"w-example","root":"/home/user/project","name":"project"},
+  "session": {"id":"s-example","workspace_id":"w-example","cwd":"/home/user/project"},
+  "source_host": "laptop",
+  "source_os": "macos",
+  "stopped": true,
+  "links": {},
+  "members": {"native.jsonl":{"bytes":1234,"sha256":"hex digest"}}
+}
+```
+
+`workspace` is the additive daemon Workspace record; `session` is the additive
+session-ledger record including agent kind, surface, native ID, model, and
+carryover. Optional members are `journal.jsonl` (unaltered complete SeqEvent
+records), `index.json` (model/effort/mode only), `view.json` (workspace fallback
+layout), `send-state.json` (bounded, session-bound delivery/withdrawal evidence),
+and `native.jsonl` (required for agents). New agent archives always include
+delivery evidence, independently of the lossy journal. Import unions it with
+local evidence and refuses contradictions; a legacy archive without it never
+clears local receipts. Older readers reject this additional member rather than
+silently losing deduplication evidence, so both transfer endpoints must be
+updated together. No member controls an extraction path. The daemon derives the native
+store path from the validated agent kind, UUID, and cwd. Codex's first
+`session_meta` record must match both native ID and cwd.
+
+Native transcripts and journals retain the user's conversation verbatim,
+including content the user pasted. Credentials/configuration files, environment
+variables, launch commands, and hook files are excluded. Project files are
+transferred separately by the workspace mirror. Never mirror disables automatic
+workspace/session transfer; the archive does not attempt to rewrite secrets
+inside a native conversation.
+
+## Ownership and recovery
+
+The internal Pro return path prepares all archives before applying any target
+file change. `bundle_prepared.rs` retains immutable original/new file versions
+and checksummed metadata under the return's durable staging directory. The file
+transaction installs native transcripts and journals before idempotent locked
+merges of shared workspace/index/view/ledger state. Local delivery evidence is
+captured before the journal can be replaced. A failed metadata write leaves the
+return fenced; an exact retry after restart uses the original preparation and
+never starts an agent. Missing or damaged preparation fails closed. The return
+commits only after every session's durable metadata is installed; profile setup
+and agent admission follow that commit. New incoming directories may be prepared
+before they exist locally, but must be canonical and present at finalization.
+Owned configuration and mutation reservations fence file application, metadata
+finalization, and commit against account replacement and ownership changes. Caller
+cancellation cannot release those reservations while an admitted write continues.
+The commit retains its reservation through the exact Hydrating→SettingUp transition
+and durable state write; initial profile setup uses the same configuration lock
+and ownership check.
+
+The public session-import route uses the same preparation and file transaction.
+It parses and bounds all index/view/delivery metadata before canonical effects,
+retains original/new native and journal versions, and installs the workspace
+identity marker in that transaction. Shared stores are merged and synced before
+its committed receipt; ordinary free/local imports need no account enrollment.
+A receipt binds the archive digest, workspace/root, account/endpoint when
+configured, epoch, fork/origin and deferred-start options. An exact committed
+retry remains idempotent after the actor exits and preserves newer canonical
+history. Legacy receipts retain their narrower live-actor retry behavior.
+
+An incomplete public import records a durable pending binding before canonical
+writes. At most 64 bindings / 256 KiB are retained; admission refuses additional
+imports instead of dropping older evidence. Startup loads this state before
+restoration. Incomplete sessions, their native identity and their workspace
+cannot spawn, resume, export or accept new local mutations; missing state leaves
+ordinary free work unchanged. Corrupt, oversized or unreadable pending state
+fails closed. An exact archive/options/account-bound retry rolls forward from
+immutable recovery data; changed options or missing/damaged recovery data refuse
+without rewriting originals. Do not delete retained originals to retry.
+
+`/api/v1/pro/status` adds optional workspace `bundle_import` recovery details:
+`{state:"recovery_needed",sessions:["session-id"],damaged:false}`. Import-related
+admission errors preserve the existing HTTP 409 `error` string and add
+`error_code:"bundle_import_pending"`, instructing the user to retry the same
+archive and import options. A damaged global record reports `damaged:true`.
+Export and import exclude each other for the same workspace or native identity.
+A bounded read token remains owned by the actual blocking exporter through
+cancellation; it never holds the hot admission mutex across filesystem I/O.
+Resumed chat journal seeding uses the same short reservation, and a live resumed
+conversation is recognized from its recipe before a native init event arrives.
+
+Caller cancellation does not abandon admitted writes: the owned operation keeps
+its bounded transfer slot, configuration/epoch admission and lifecycle guard.
+Optional process startup follows the durable commit, releases configuration to
+avoid launch preparation deadlock, and retains a counted request plus the
+original account/ownership until final actual spawn. That request scope is not
+inherited by unrelated spawned tasks.
+
+The target must already have the original canonical root/cwd unless the explicit
+`destination_root=/canonical/existing/path` import option is set. A remap keeps
+the cwd relative to the original workspace root and rejects missing directories
+or symlink escapes. It preserves the workspace ID. Native transcripts stay
+byte-for-byte intact: the ledger carries original header cwd provenance while
+the CLI resumes from the destination cwd. A new native fork uses its own header
+provenance. Existing workspace IDs must still resolve to the same destination
+root; an import never silently retargets another registered project. Import rejects
+workspace ID/root collisions, an active session with that ID, a known remote
+owner, and an ownership epoch mismatch. An exact successful archive+epoch retry
+is idempotent. Imported state is retained as a suspended ledger entry before
+spawn, so failure preserves recoverable history. After a daemon restart, a known
+Pro workspace's previous sessions stay suspended until this daemon life verifies
+its ownership. On a personal computer they resume anyway after one minute when
+the account cannot confirm (laptop first); a verified other owner keeps them
+suspended. A cloud machine always waits. Suspending and stopping for a handoff
+writes the ledger durably (file and directory synced, `F_FULLFSYNC` on macOS);
+the periodic ledger reconcile keeps its cheaper write.
+
+Clean transfer resumes the same native conversation. Offline takeover requests
+the CLI's native head fork: Claude `--fork-session`, Codex `thread/fork` without
+`lastTurnId`, or Codex TUI `fork <id>`. Native transcript IDs are never rewritten.
+Structured chats receive one attributed `moved`/`home` context message (`recovered`
+after the other machine stopped responding) only when
+the captured carryover records an interrupted turn or background work. Finished
+conversations resume idle, preserving history without starting a model turn.
+Fresh MCP initialization supplies current-host context for configured cloud
+projects, including idle chats and native TUIs. A native TUI's bundle records,
+while it still runs, whether a turn was in flight (a Claude hook state of
+running or waiting on a permission; a Codex TUI not yet at a pause, see
+`agent_state::tui_at_pause`) as `carryover.turn_in_flight`. Only then does its
+successor start with one short positional prompt ("Continuing here…", naming no
+machines; after an abrupt loss it also asks to check what already happened); an
+idle TUI resumes with no prompt and no model turn. The Mastermind remains
+reactive and receives no automatic turn.
+
+Plain terminals stay on the user's computer. Their moved bundle imports as a
+paused row, preserving tabs without restarting arbitrary foreground programs.
+Returning a shell home recreates its shell at the recorded cwd. A terminal's cwd
+is kept inside the project (`bundle::clamp_into`): on export a shell that left
+the project (`cd ~`) records the project root, and on import a folder the
+destination lacks (ignored build output, an empty folder) becomes the nearest
+existing folder inside the project. A terminal never fails a move. Plain
+terminals are never managed processes: a fence never signals them and a stop
+never waits for them; a verified other owner only refuses their input.
+
+A project copy never fails because of one conversation. One that cannot be
+exported yet (a fresh TUI with no transcript, an archive over the file limit or
+the project's remaining quota) is left out of that copy; in a clean handoff it
+is stopped and kept on the source as a paused row with its identity, resuming
+when the project is back. Project copies wait up to 30 s for one of the two
+bundle slots instead of failing when several projects flush at once; the
+single-session routes still refuse at once.
+
+A paused row is named by its pinned name, else its conversation title, else
+words for where it is shown: a verified local cloud arrival can say "Terminal
+on your computer" (a moved shell) or "Starting in the cloud" (an agent waiting
+to start). A project held by an opaque other owner says "Continuing elsewhere";
+an explicitly identified other computer can say "Continuing on another computer".
+Owner ID prefixes never identify its placement. Other suspended rows say "Paused".
+
+## Placement forwarding
+
+The local app registers a verified remote workspace with POST
+`/api/v1/pro/placements`:
+`{host_id,endpoint,token,workspace_id,epoch}`. Endpoint is literal
+`http://127.0.0.1:<port>`; tokens/listeners remain memory-only. DELETE the same
+path with `?host_id=...` removes connectivity while preserving cached unavailable
+rows. Older ownership epochs cannot replace newer routes.
+
+Session rows add `placement:"here"` or `placement:{remote:host_id}` and
+`placement_available`. The local daemon merges remote session rows under their
+stable IDs and forwards session REST, terminal WS and chat WS through the app's
+loopback link. First-frame daemon authentication is replaced at the forwarding
+boundary; local bearer tokens are never sent to the other host. Forwarding is
+bounded to 32 operations, 32 hosts and 512 remote rows. Connection changes close
+old sockets. Passive directory reads carry no wake intent.
+
+`/ws/sessions/{id}?read_only=true` and `/ws/chat/{id}?read_only=true` reject input,
+commands and terminal resizes, including auth-time dimensions. Normal writer
+sockets also re-check known workspace ownership before every mutation. An
+explicit `wake=interaction` query passes deliberate worker intent; read-only
+always suppresses it. Remote-unavailable errors never fall back to local spawn.
+
+Workspace fallback view state is bounded at 64 KiB and only installed when the
+destination has no existing fallback layout. A bundle carries at most 128 linked
+terminal edges, all touching its own session; known cross-workspace endpoints
+are rejected. Suspended entries retain their edges in the durable ledger.

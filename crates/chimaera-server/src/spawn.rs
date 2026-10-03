@@ -18,8 +18,7 @@ use crate::AppState;
 pub(crate) enum SpawnKind {
     /// The user's interactive shell, with shell integration when available.
     Shell,
-    /// An agent TUI. `resume` is a claude conversation id (`--resume <id>`);
-    /// callers guarantee it is only set for [`AgentKind::Claude`].
+    /// An agent TUI. `resume` is a Claude conversation id or Codex thread id.
     Agent {
         kind: AgentKind,
         model: Option<String>,
@@ -54,6 +53,8 @@ pub(crate) struct SpawnSpec {
     /// scopes only.
     pub(crate) prelude: Option<String>,
     pub(crate) kind: SpawnKind,
+    pub(crate) fork_head: bool,
+    pub(crate) native_cwd: Option<PathBuf>,
     /// Who started it, for an agent session's history record (shells keep
     /// none).
     pub(crate) started_by: crate::history::StartedBy,
@@ -75,6 +76,11 @@ pub(crate) async fn spawn_session(
     spec: SpawnSpec,
 ) -> Result<serde_json::Value, SpawnFailure> {
     let workspace = spec.workspace;
+    if !crate::pro::may_execute(state, &workspace.id) {
+        return Err(SpawnFailure::Internal(anyhow::anyhow!(
+            "workspace owned elsewhere"
+        )));
+    }
     // Every session gets a pre-picked id: it rides in the spawn env as
     // CHIMAERA_SESSION (shells too — typed agents need their session
     // context) and, for claude, in the hook URL.
@@ -154,8 +160,8 @@ pub(crate) async fn spawn_session(
             usage = guard;
             let bin = binaries.remove(0);
             let key = crate::agents::fresh_agent_key();
-            // Hook injection is claude-only: other agents have no hook system
-            // to wire, so their sessions stay honestly "unknown". The scheme
+            // Claude's hooks drive attention state. Codex's notify below
+            // captures identity only; its attention stays "unknown". The scheme
             // theme rides in the same settings file — unless the user's own
             // settings already set one (respect the explicit choice).
             let settings = if agent_kind == AgentKind::Claude {
@@ -209,6 +215,8 @@ pub(crate) async fn spawn_session(
             // communication is on (default) or a plugin with tools is active
             // here (`spawn_allow`); with neither, the argv and env stay
             // exactly what they were.
+            // Cloud projects also need host/profile context on the TUI surface
+            // (`pro::workspace_profile`); otherwise that opt-in boundary stands.
             let codex_plugin_tools = if agent_kind == AgentKind::Codex {
                 crate::plugins::spawn_allow(state, &workspace.id).await
             } else {
@@ -239,11 +247,27 @@ pub(crate) async fn spawn_session(
                     codex_theme,
                 )
             };
+            if spec.fork_head {
+                if resume.is_none() {
+                    return Err(SpawnFailure::Internal(anyhow::anyhow!(
+                        "native fork requires resume"
+                    )));
+                }
+                if let Err(error) = crate::launcher::fork_native_head(agent_kind, &mut argv) {
+                    return Err(SpawnFailure::Internal(error));
+                }
+            }
             if let Some(mcp) = &mcp_config {
                 argv.push("--mcp-config".to_string());
                 argv.push(mcp.to_string_lossy().into_owned());
             }
-            if !codex_plugin_tools.is_empty() {
+            if agent_kind == AgentKind::Codex {
+                argv.extend(crate::codex_notify::args_in(state, &workspace.id, &id, &key).await);
+            }
+            if !codex_plugin_tools.is_empty()
+                || (agent_kind == AgentKind::Codex
+                    && crate::pro::workspace_profile(state, &workspace.id).is_some())
+            {
                 // Pre-approved: the prompt-free tools every session gets
                 // (`notify`) plus the active plugins' own.
                 let approve: Vec<String> = crate::mcp::ALWAYS_ALLOWED_TOOLS
@@ -261,6 +285,27 @@ pub(crate) async fn spawn_session(
                 opts.env
                     .push((crate::launcher::CODEX_MCP_KEY_ENV.to_string(), key.clone()));
             }
+            if agent_kind == AgentKind::Claude && crate::pro::updates_managed(state) {
+                // The cloud's agents come with its image and are updated with
+                // it: claude's own updater could only fail there (the image
+                // prefix is not the daemon user's to write) and say so mid-turn.
+                opts.env
+                    .push(("DISABLE_AUTOUPDATER".to_string(), "1".to_string()));
+            }
+            let transferred = crate::lock(&state.deferred_sessions).get(&id).cloned();
+            if let Some(entry) = transferred.filter(|entry| entry.workspace_id == workspace.id) {
+                // A positional prompt starts a billed turn: only a terminal
+                // agent whose turn was cut off by the move gets one.
+                let pickup = entry.handoff.is_some().then(|| {
+                    tui_pickup(
+                        entry.agent.as_ref().and_then(|a| a.carryover.as_ref()),
+                        crate::pro::checkpoint_recovery_context(state, &workspace.id),
+                    )
+                });
+                if let Some(context) = pickup.flatten() {
+                    crate::launcher::append_transfer_prompt(&mut argv, &context);
+                }
+            }
             // Login-shell wrap: agents must see the user's terminal environment
             // (exported API keys, nvm PATHs) — the daemon's own env never
             // sourced their profile.
@@ -274,6 +319,31 @@ pub(crate) async fn spawn_session(
             // keeps it); remember the ancestor so recents can hide (and later
             // supersede) the old conversation either way.
             record.resumed_from = resume.clone();
+            record.native_cwd = spec.native_cwd.clone();
+            if agent_kind == AgentKind::Codex {
+                if let Some(thread) = resume.clone() {
+                    if let Some(home) = state
+                        .codex_config_path
+                        .parent()
+                        .map(std::path::Path::to_path_buf)
+                    {
+                        let cwd = record
+                            .native_cwd_for(&thread)
+                            .unwrap_or_else(|| opts.cwd.clone());
+                        let sought = thread.clone();
+                        let path = tokio::task::spawn_blocking(move || {
+                            crate::codex_notify::find_rollout(&home, &sought, &cwd)
+                        })
+                        .await
+                        .ok()
+                        .flatten();
+                        if let Some(path) = path {
+                            record.codex_thread_id = Some(thread);
+                            record.transcript_path = Some(path);
+                        }
+                    }
+                }
+            }
             // A carried-over title slots in as the provisional first-prompt
             // name: it loses to any real title the agent produces, exactly
             // like a first prompt would.
@@ -283,10 +353,62 @@ pub(crate) async fn spawn_session(
         }
     }
 
-    match state.sessions.spawn(opts) {
+    if !crate::pro::may_execute(state, &workspace.id) {
+        return Err(SpawnFailure::Internal(anyhow::anyhow!(
+            "project execution authority changed during launch"
+        )));
+    }
+    // Plain shells are never managed: no fence signals them and no stop
+    // waits for them. Only agents carry the project's execution evidence.
+    let managed = spawned_agent.is_some() && crate::pro::managed_execution(state, &workspace.id);
+    let intent = if managed {
+        crate::pro::prepare_managed_launch(state, &workspace.id)
+            .await
+            .map_err(SpawnFailure::Internal)?
+    } else {
+        None
+    };
+    let _launch = if spawned_agent.is_some() {
+        crate::pro::mutation::begin_launch(state, &workspace.id).map_err(SpawnFailure::Internal)?
+    } else {
+        None
+    };
+    if let Some(intent) = &intent {
+        intent.check().map_err(SpawnFailure::Internal)?;
+    }
+    let native = match &spec.kind {
+        SpawnKind::Agent { resume, .. } => resume.as_deref(),
+        SpawnKind::Shell => None,
+    };
+    crate::pro::mutation::check_import_resume(state, &workspace.id)
+        .map_err(SpawnFailure::Internal)?;
+    if let SpawnKind::Agent { kind, .. } = &spec.kind {
+        crate::ledger::check_manual_native(state, Some(&id), *kind, native)
+            .map_err(SpawnFailure::Internal)?;
+    }
+    let import_admission = state
+        .bundle_imports
+        .admit(&workspace.id, &id, native)
+        .map_err(SpawnFailure::Internal)?;
+    let spawned = if managed {
+        state.sessions.spawn_managed(opts)
+    } else {
+        state.sessions.spawn(opts)
+    };
+    drop(import_admission);
+    match spawned {
         Ok(info) => {
             crate::runtime_retention::watch(state.clone(), info.id.clone(), usage);
             crate::lock(&state.session_workspaces).insert(info.id.clone(), workspace.id.clone());
+            if !crate::pro::may_execute(state, &workspace.id) {
+                let _ = state.sessions.kill(&info.id);
+                return Err(SpawnFailure::Internal(anyhow::anyhow!(
+                    "project execution authority changed during launch"
+                )));
+            }
+            if let Some(intent) = intent {
+                intent.registered(info.id.clone());
+            }
             // Remember the spawn theme: resurrection re-themes the session's
             // successor with it (there is no other durable record of it).
             crate::lock(&state.session_themes).insert(info.id.clone(), spec.theme.clone());
@@ -321,6 +443,59 @@ pub(crate) async fn spawn_session(
             crate::lock(&state.agents).remove(&id);
             tracing::error!(%err, "failed to spawn session");
             Err(SpawnFailure::Internal(err))
+        }
+    }
+}
+
+/// The one message a moved terminal agent starts with, shown in its terminal
+/// as the user's own line: only when a turn was cut off by the move (idle
+/// conversations resume silently), in plain words that name no machines.
+/// After an abrupt loss (`recovery`) it also asks the agent to check what
+/// already happened before repeating anything.
+pub(crate) fn tui_pickup(
+    carry: Option<&chimaera_agent::Carryover>,
+    recovery: bool,
+) -> Option<String> {
+    let carry = carry.filter(|carry| carry.turn_in_flight || carry.interrupted_work())?;
+    let mut text = String::from(
+        "Continuing here. The previous run stopped while this task was underway; please continue it.",
+    );
+    if recovery {
+        text.push_str(
+            " Some of that work may have happened after the last saved point: check the project and any external effects before repeating a step.",
+        );
+    }
+    if !carry.background.is_empty() {
+        text.push_str(
+            " Background tasks that were running have stopped; restart the ones still needed.",
+        );
+    }
+    Some(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn only_a_cut_off_turn_gets_a_neutral_pickup_prompt() {
+        let idle = chimaera_agent::Carryover::default();
+        assert_eq!(
+            tui_pickup(None, false),
+            None,
+            "unknown means no billed turn"
+        );
+        assert_eq!(tui_pickup(None, true), None);
+        assert_eq!(tui_pickup(Some(&idle), true), None);
+        let busy = chimaera_agent::Carryover {
+            turn_in_flight: true,
+            ..Default::default()
+        };
+        for recovery in [false, true] {
+            let text = tui_pickup(Some(&busy), recovery).unwrap();
+            assert!(text.starts_with("Continuing here."));
+            for word in ["host", "transfer", "laptop", "cloud", "Chimaera"] {
+                assert!(!text.contains(word), "{word}: {text}");
+            }
         }
     }
 }

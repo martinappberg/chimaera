@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { daemonPath } from "../../net/base";
+
   /**
    * One slide of a Marp deck (`#slide=N`, 1-based) drawn exactly as the
    * slides view draws it: Marp in the browser with raw HTML and scripts off,
@@ -37,7 +39,7 @@
       try {
         const found = await resolveTargets(targets, dirname(p));
         for (const [t, r] of Object.entries(found)) {
-          if (!isMissing(r) && r.ticket !== undefined) urls.set(t, `/raw/${r.ticket}`);
+          if (!isMissing(r) && r.ticket !== undefined) urls.set(t, daemonPath(`/raw/${r.ticket}`));
         }
       } catch {
         // Images draw broken, like any markdown view with a dead link.

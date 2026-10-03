@@ -53,6 +53,9 @@ async fn ledger_resurrects_sessions_across_restart() {
     let mut boot = lock(&state2.ledger).load_boot();
     assert_eq!(boot.sessions.len(), 1);
     boot.sessions.push(ledger::LedgerEntry {
+        suspended: false,
+        manual_resume_reason: None,
+        handoff: None,
         id: "s-dead-codex".to_string(),
         workspace_id: workspace_id.clone(),
         cwd: root.clone(),
@@ -65,6 +68,7 @@ async fn ledger_resurrects_sessions_across_restart() {
             kind: agents::AgentKind::Codex,
             resume: None,
             transcript: None,
+            native_cwd: None,
             title: "port the parser".to_string(),
             ui: chimaera_agent::model::SessionUi::Term,
             model: None,
@@ -142,6 +146,9 @@ async fn ledger_restore_disabled_still_lands_recents() {
     let boot = ledger::BootLedger {
         sessions: vec![
             ledger::LedgerEntry {
+                suspended: false,
+                manual_resume_reason: None,
+                handoff: None,
                 id: "s-shell".to_string(),
                 workspace_id: workspace_id.clone(),
                 cwd: root.clone(),
@@ -153,6 +160,9 @@ async fn ledger_restore_disabled_still_lands_recents() {
                 agent: None,
             },
             ledger::LedgerEntry {
+                suspended: false,
+                manual_resume_reason: None,
+                handoff: None,
                 id: "s-claude".to_string(),
                 workspace_id: workspace_id.clone(),
                 cwd: root.clone(),
@@ -165,6 +175,7 @@ async fn ledger_restore_disabled_still_lands_recents() {
                     kind: agents::AgentKind::Claude,
                     resume: Some("conv-1".to_string()),
                     transcript: Some(transcript),
+                    native_cwd: None,
                     title: "fix the flaky tests".to_string(),
                     ui: chimaera_agent::model::SessionUi::Term,
                     model: None,
@@ -249,6 +260,9 @@ async fn journal_budget_spares_chats_the_ledger_resurrects() {
         Some("9.9.9-fake"),
     );
     let chat_entry = |id: &str| ledger::LedgerEntry {
+        suspended: false,
+        manual_resume_reason: None,
+        handoff: None,
         id: id.to_string(),
         workspace_id: workspace_id.clone(),
         cwd: root.clone(),
@@ -261,6 +275,7 @@ async fn journal_budget_spares_chats_the_ledger_resurrects() {
             kind: agents::AgentKind::Claude,
             resume: None,
             transcript: None,
+            native_cwd: None,
             title: "claude".to_string(),
             ui: chimaera_agent::model::SessionUi::Chat,
             model: None,
@@ -292,6 +307,324 @@ async fn journal_budget_spares_chats_the_ledger_resurrects() {
 
     state.chat.kill("s-chat-a");
     state.chat.kill("s-chat-b");
+}
+
+/// Laptop first across a restart: a Pro-managed project's previous agents
+/// wait for this daemon life to verify ownership (so a project the cloud took
+/// over never resumes a stale turn here), then resume anyway when the account
+/// cannot confirm in time. A verified other owner keeps them suspended. Plain
+/// shells never wait: they come back at boot.
+#[tokio::test]
+async fn restart_deferred_sessions_resume_unless_another_owner_is_verified() {
+    for remote in [false, true] {
+        let data = test_dir("ledger-verification");
+        let state = test_state_with_data_dir(0, data.clone());
+        let root = std::fs::canonicalize(test_dir("ledger-verification-root")).unwrap();
+        let workspace = lock(&state.workspaces).add(root.clone()).unwrap();
+        preset_agent(
+            &state,
+            agents::AgentKind::Claude,
+            Ok(write_fake_claude("ledger-verification-fake")),
+            Some("9.9.9-fake"),
+        );
+        // Enrolled earlier; this life has not renewed its lease yet.
+        pro::install_execution_fixture(&state, &workspace.id, 3).unwrap();
+        pro::expire_execution_fixture(&state, &workspace.id);
+        let entry = |id: &str, agent: Option<ledger::LedgerAgent>| ledger::LedgerEntry {
+            suspended: false,
+            manual_resume_reason: None,
+            handoff: None,
+            id: id.to_string(),
+            workspace_id: workspace.id.clone(),
+            cwd: root.clone(),
+            pinned_name: None,
+            cols: 80,
+            rows: 24,
+            theme: "dark".to_string(),
+            created_at: 0,
+            agent,
+        };
+        let chat = ledger::LedgerAgent {
+            kind: agents::AgentKind::Claude,
+            resume: None,
+            transcript: None,
+            native_cwd: None,
+            title: "claude".to_string(),
+            ui: chimaera_agent::model::SessionUi::Chat,
+            model: None,
+            carryover: None,
+        };
+        let boot = ledger::BootLedger {
+            sessions: vec![
+                entry("s-restart-shell", None),
+                entry("s-restart-chat", Some(chat)),
+            ],
+            links: std::collections::HashMap::new(),
+            written_at: 1_750_000_000,
+        };
+        ledger::restore(&state, boot).await;
+        assert!(
+            state.sessions.get("s-restart-shell").is_some(),
+            "a plain shell never waits"
+        );
+        assert!(
+            !state.chat.contains("s-restart-chat"),
+            "waits for verification"
+        );
+        assert!(lock(&state.deferred_sessions).contains_key("s-restart-chat"));
+        if remote {
+            pro::install_remote_owner_fixture(&state, &workspace.id, 4);
+        }
+        pro::resume_unverified(&state).await;
+        assert_eq!(
+            state.chat.contains("s-restart-chat"),
+            !remote,
+            "remote={remote}"
+        );
+        assert_eq!(
+            lock(&state.deferred_sessions).contains_key("s-restart-chat"),
+            remote
+        );
+        let _ = state.sessions.kill("s-restart-shell");
+        state.chat.kill("s-restart-chat");
+        state
+            .stopping
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// A chat a return from the cloud imported here, still waiting for that
+/// return's resume (what `finish_hydration` resumes once the project is
+/// this computer's).
+fn returned_chat(id: &str, workspace: &str, root: &std::path::Path) -> ledger::LedgerEntry {
+    ledger::LedgerEntry {
+        suspended: true,
+        manual_resume_reason: None,
+        handoff: Some(crate::bundle::HandoffResume {
+            fork: false,
+            origin: crate::bundle::Origin::Home,
+            epoch: 3,
+        }),
+        id: id.to_string(),
+        workspace_id: workspace.to_string(),
+        cwd: root.to_path_buf(),
+        pinned_name: None,
+        cols: 80,
+        rows: 24,
+        theme: "dark".to_string(),
+        created_at: 0,
+        agent: Some(ledger::LedgerAgent {
+            kind: agents::AgentKind::Claude,
+            resume: None,
+            transcript: None,
+            native_cwd: None,
+            title: "claude".to_string(),
+            ui: chimaera_agent::model::SessionUi::Chat,
+            model: None,
+            carryover: None,
+        }),
+    }
+}
+
+async fn wait_resumed(state: &Arc<AppState>, id: &str) {
+    let resumed = || {
+        state.chat.get(id).is_some_and(|chat| chat.alive)
+            && !lock(&state.deferred_sessions).contains_key(id)
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !resumed() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        resumed(),
+        "{id} stayed deferred: {:?}",
+        crate::ws::pause_state(state, id).map(|pause| pause.frame())
+    );
+}
+
+/// Sign-out right after a return: the mirror task running the return's
+/// resume is aborted and the project's `Local` ownership dropped. The
+/// returned conversation must not stay deferred as "moved to computer"
+/// forever: sign-out resumes it here, and its socket greets with `ready`.
+#[tokio::test]
+async fn sign_out_resumes_a_returned_session_instead_of_stranding_it() {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    let state = test_state();
+    let root = std::fs::canonicalize(test_dir("ledger-signout-return-root")).unwrap();
+    let workspace = lock(&state.workspaces).add(root.clone()).unwrap();
+    preset_agent(
+        &state,
+        agents::AgentKind::Claude,
+        Ok(write_fake_claude("ledger-signout-return-fake")),
+        Some("9.9.9-fake"),
+    );
+    // The return installed the project and made it this computer's; its
+    // conversation had not respawned yet when the user signed out.
+    pro::install_execution_fixture(&state, &workspace.id, 3).unwrap();
+    ledger::defer(&state, returned_chat("s-returned", &workspace.id, &root)).unwrap();
+    assert_eq!(
+        crate::ws::pause_state(&state, "s-returned").map(|pause| pause.frame()["type"].clone()),
+        Some(serde_json::json!("moved"))
+    );
+
+    let (status, _) = request(&state, Method::DELETE, "/api/v1/pro/configure", None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    wait_resumed(&state, "s-returned").await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = app(state.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let (mut socket, _) =
+        tokio_tungstenite::connect_async(format!("ws://{addr}/ws/chat/s-returned"))
+            .await
+            .unwrap();
+    socket
+        .send(WsMessage::text(
+            serde_json::json!({"type": "auth", "token": "test-token", "last_seq": 0}).to_string(),
+        ))
+        .await
+        .unwrap();
+    let frame = loop {
+        if let WsMessage::Text(text) = next_ws_frame(&mut socket).await {
+            break serde_json::from_str::<serde_json::Value>(&text).unwrap();
+        }
+    };
+    assert_eq!(frame["type"], "ready", "{frame}");
+    state.chat.kill("s-returned");
+    state
+        .stopping
+        .store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// A returned conversation a sign-out or crash left deferred comes back at
+/// the next boot like any session the previous daemon left: it waits for
+/// this life's ownership proof (paused as restarting, never "moved") and
+/// the device fallback resumes it — enrolled or not, signed in or not.
+#[tokio::test]
+async fn boot_resumes_a_returned_session_left_deferred() {
+    for enrolled in [false, true] {
+        let state = test_state();
+        let root = std::fs::canonicalize(test_dir("ledger-stranded-root")).unwrap();
+        let workspace = lock(&state.workspaces).add(root.clone()).unwrap();
+        preset_agent(
+            &state,
+            agents::AgentKind::Claude,
+            Ok(write_fake_claude("ledger-stranded-fake")),
+            Some("9.9.9-fake"),
+        );
+        if enrolled {
+            // Enrolled, then signed out: no ownership and no lease remain.
+            pro::install_execution_fixture(&state, &workspace.id, 3).unwrap();
+            let (status, _) = request(&state, Method::DELETE, "/api/v1/pro/configure", None).await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+        }
+        let boot = ledger::BootLedger {
+            sessions: vec![returned_chat("s-stranded", &workspace.id, &root)],
+            links: std::collections::HashMap::new(),
+            written_at: 1_750_000_000,
+        };
+        ledger::restore(&state, boot).await;
+        let pause = crate::ws::pause_state(&state, "s-stranded").map(|pause| pause.frame());
+        assert_eq!(
+            pause.as_ref().map(|frame| frame["reason"].clone()),
+            Some(serde_json::json!("restarting")),
+            "enrolled={enrolled}: {pause:?}"
+        );
+        pro::resume_unverified(&state).await;
+        wait_resumed(&state, "s-stranded").await;
+        state.chat.kill("s-stranded");
+        state
+            .stopping
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Two resumes racing for one deferred session (a return's own and a
+/// sign-out's) start it once. Without that, the loser's failed spawn tears
+/// down the winner's agent record and project mapping.
+#[tokio::test]
+async fn racing_resumes_start_a_deferred_session_once() {
+    let state = test_state();
+    let root = std::fs::canonicalize(test_dir("ledger-race-root")).unwrap();
+    let workspace = lock(&state.workspaces).add(root.clone()).unwrap();
+    preset_agent(
+        &state,
+        agents::AgentKind::Claude,
+        Ok(write_fake_claude("ledger-race-fake")),
+        Some("9.9.9-fake"),
+    );
+    ledger::defer(&state, returned_chat("s-raced", &workspace.id, &root)).unwrap();
+    let (first, second) = tokio::join!(
+        ledger::resume_deferred_workspace(&state, &workspace.id),
+        ledger::resume_deferred_workspace(&state, &workspace.id)
+    );
+    assert!(first.is_ok() && second.is_ok(), "{first:?} {second:?}");
+    assert!(state.chat.get("s-raced").is_some_and(|chat| chat.alive));
+    assert!(!lock(&state.deferred_sessions).contains_key("s-raced"));
+    assert!(lock(&state.agents).contains_key("s-raced"));
+    assert_eq!(
+        lock(&state.session_workspaces).get("s-raced"),
+        Some(&workspace.id)
+    );
+    state.chat.kill("s-raced");
+    state
+        .stopping
+        .store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// A conversation resumed here that has not run a turn yet (claude reports
+/// its native id only with its first turn) keeps the id it was resumed from
+/// in the ledger, so it can move on to another machine (the export finds its
+/// transcript) and survive a restart with its history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resumed_chat_keeps_its_conversation_before_its_first_turn() {
+    let state = test_state();
+    let root = std::fs::canonicalize(test_dir("ledger-resumed-tip-root")).unwrap();
+    let workspace = lock(&state.workspaces).add(root.clone()).unwrap();
+    preset_agent(
+        &state,
+        agents::AgentKind::Claude,
+        Ok(write_fake_claude("ledger-resumed-tip-fake")),
+        Some("9.9.9-fake"),
+    );
+    let native = "3f1c2b8e-0000-4000-8000-000000000001";
+    let store = state
+        .claude_projects_dir
+        .join(crate::launcher::encode_cwd(&root));
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(
+        store.join(format!("{native}.jsonl")),
+        format!("{{\"type\":\"user\",\"sessionId\":\"{native}\",\"message\":{{\"role\":\"user\",\"content\":\"hello\"}}}}\n"),
+    )
+    .unwrap();
+    let mut entry = returned_chat("s-tip", &workspace.id, &root);
+    entry.agent.as_mut().unwrap().resume = Some(native.to_string());
+    ledger::defer(&state, entry).unwrap();
+    ledger::resume_deferred_workspace(&state, &workspace.id)
+        .await
+        .unwrap();
+    wait_resumed(&state, "s-tip").await;
+    assert!(
+        state
+            .chat
+            .get("s-tip")
+            .is_some_and(|chat| chat.native_session_id.is_none()),
+        "no turn ran, so the agent has not reported its id"
+    );
+    let (entries, _) = ledger::snapshot(&state);
+    let agent = entries
+        .iter()
+        .find(|entry| entry.id == "s-tip")
+        .and_then(|entry| entry.agent.clone())
+        .expect("the resumed chat is in the ledger");
+    assert_eq!(agent.resume.as_deref(), Some(native));
+    state.chat.kill("s-tip");
+    state
+        .stopping
+        .store(true, std::sync::atomic::Ordering::Release);
 }
 
 /// The native app's hidden workspace (a cluster's login-node terminal):

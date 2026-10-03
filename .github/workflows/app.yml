@@ -75,7 +75,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
-            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev
       - run: rustup show
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -104,6 +104,42 @@ jobs:
       # derive requires web-ui/dist at compile time. Run tests after Tauri's
       # beforeBuildCommand has created that directory on a clean runner.
       - run: cargo test
+        working-directory: crates/chimaera-app
+      # Retain a compiled test input before the following runtime gates. Its
+      # artifact is not a test-pass receipt; every existing check still gates CI.
+      - name: Build the explicit macOS SSH fixture
+        if: runner.os == 'macOS'
+        run: cargo build --locked --features ssh-agent-fixture --bin chimaera-ssh-agent-fixture
+        working-directory: crates/chimaera-app
+      - name: Record the explicit macOS SSH fixture revision and digest
+        if: runner.os == 'macOS'
+        run: |
+          git rev-parse HEAD > target/debug/ssh-agent-fixture-revision.txt
+          cd target/debug
+          shasum -a 256 chimaera-ssh-agent-fixture > ssh-agent-fixture-sha256.txt
+        working-directory: crates/chimaera-app
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: runner.os == 'macOS'
+        with:
+          name: chimaera-ssh-agent-fixture-macos-arm64
+          path: |
+            crates/chimaera-app/target/debug/chimaera-ssh-agent-fixture
+            crates/chimaera-app/target/debug/ssh-agent-fixture-revision.txt
+            crates/chimaera-app/target/debug/ssh-agent-fixture-sha256.txt
+          if-no-files-found: error
+          retention-days: 7
+      - name: Check the explicit native SSH signing prototype
+        run: cargo clippy --locked --all-targets --features ssh-agent-prototype -- -D warnings
+        working-directory: crates/chimaera-app
+      - name: Test the explicit native SSH signing prototype
+        run: cargo test --locked --features ssh-agent-prototype
+        working-directory: crates/chimaera-app
+      - name: Exercise owned SSH key loading on macOS
+        if: runner.os == 'macOS'
+        run: |
+          python3 fixtures/ssh_agent_loader.py --binary "$PWD/target/debug/chimaera-ssh-agent-fixture"
+          python3 fixtures/ssh_agent_route.py --binary "$PWD/target/debug/chimaera-ssh-agent-fixture"
+          python3 fixtures/ssh_agent_sources.py --binary "$PWD/target/debug/chimaera-ssh-agent-fixture"
         working-directory: crates/chimaera-app
       # Plugin execution must also work inside the hardened, signed executable;
       # cargo test runs an ordinary test binary and cannot catch macOS kills.

@@ -91,6 +91,14 @@ pub(crate) async fn create_session(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateSession>,
 ) -> Response {
+    if !crate::pro::may_execute(&state, &body.workspace_id) {
+        let owner = crate::pro::owner_kind(&state, &body.workspace_id);
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error":"workspace_owned_elsewhere","owner":owner})),
+        )
+            .into_response();
+    }
     // Touch doubles as the lookup: activity in a workspace is what "recently
     // used" means on the home screen.
     let Some(workspace) = crate::lock(&state.workspaces).touch(&body.workspace_id) else {
@@ -140,6 +148,22 @@ pub(crate) async fn create_session(
         },
     };
 
+    if body.kind == SessionKind::Agent {
+        if let Some(kind) = body.agent.as_deref().map_or(
+            Some(crate::agents::AgentKind::Claude),
+            crate::agents::AgentKind::parse,
+        ) {
+            if crate::ledger::check_manual_native(&state, None, kind, body.resume.as_deref())
+                .is_err()
+            {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({"error":"manual_resume_required"})),
+                )
+                    .into_response();
+            }
+        }
+    }
     // Resuming an archived conversation brings it back: it is live again,
     // and once it ends it belongs in Recents like any other.
     if let Some(resume) = body.resume.as_deref().filter(|r| !r.is_empty()) {
@@ -215,6 +239,8 @@ pub(crate) async fn create_session(
     };
 
     let spec = crate::spawn::SpawnSpec {
+        native_cwd: None,
+        fork_head: false,
         workspace,
         id: None,
         name: body.name,
@@ -422,6 +448,7 @@ async fn spawn_chat_ui(
         model: body.model.clone(),
         resume: body.resume.clone(),
         fork_at: None,
+        fork_head: false,
         rollback_turns: None,
         revert_before_turn: None,
         remote_control: crate::chat::RemoteControlAtStart::Setting,

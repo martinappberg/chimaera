@@ -39,6 +39,7 @@ use axum::Json;
 use serde_json::{json, Value};
 
 use crate::AppState;
+pub(crate) mod cloud_context;
 
 /// Protocol version offered when the client's is unknown to us.
 const PROTOCOL_FALLBACK: &str = "2025-06-18";
@@ -246,16 +247,34 @@ pub(crate) async fn mcp(
             _ => (Vec::new(), Vec::new()),
         };
     let result = match method {
-        "initialize" => Ok(initialize_result(
-            &params,
-            &agent_id,
-            comms_on,
-            mastermind,
-            mastermind_here,
-            &plugin_paragraphs,
-        )),
+        "initialize" => {
+            let mut result = initialize_result(
+                &params,
+                &agent_id,
+                comms_on,
+                mastermind,
+                mastermind_here,
+                &plugin_paragraphs,
+            );
+            if let Some(workspace) = workspace_of(&state, &agent_id) {
+                let context = cloud_context::arrival(&state, &workspace.id).await;
+                if let Some(text) = result["instructions"].as_str() {
+                    result["instructions"] = Value::String(format!("{text}{context}"));
+                }
+            }
+            Ok(result)
+        }
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({ "tools": tool_defs(comms_on, mastermind, plugin_tools) })),
+        "tools/list" => {
+            let mut tools = tool_defs(comms_on, mastermind, plugin_tools);
+            if cloud_context::available(&state, &agent_id) {
+                tools
+                    .as_array_mut()
+                    .unwrap()
+                    .extend(cloud_context::definitions());
+            }
+            Ok(json!({"tools":tools}))
+        }
         "tools/call" => {
             tools_call(&state, &agent_id, comms_on, mastermind, &plugins, &params).await
         }
@@ -466,6 +485,7 @@ pub(crate) fn is_core_tool(name: &str) -> bool {
                 .as_array()
                 .expect("tool definitions are an array")
                 .iter()
+                .chain(cloud_context::definitions().iter())
                 .filter_map(|t| t["name"].as_str().map(str::to_owned))
                 .collect()
         });
@@ -689,6 +709,9 @@ async fn tools_call(
         return Ok(crate::plugins::tools::call(state, &owner, agent_id, name, &args).await);
     }
     match name {
+        "read_cloud_profile" | "update_cloud_profile" => {
+            Ok(cloud_context::call(state, agent_id, name, &args).await)
+        }
         "list_terminals" => Ok(list_terminals(state, agent_id).await),
         "run_in_terminal" => Ok(run_in_terminal(state, agent_id, &args).await),
         "read_terminal" => Ok(read_terminal(state, agent_id, &args).await),
@@ -1564,6 +1587,8 @@ async fn spawn_terminal(
         "mastermind act: spawn_terminal");
     let workspace_id = workspace.id.clone();
     let spec = crate::spawn::SpawnSpec {
+        native_cwd: None,
+        fork_head: false,
         workspace,
         id: None,
         name,

@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { isBrowserGateway } from "../net/base";
+  const browserGateway = isBrowserGateway();
   import {
     health as fetchHealth,
     refreshTokenFromHash,
@@ -48,14 +50,21 @@
       tabindex="-1"
       use:modalFocus
     >
-      <div class="auth-title">disconnected — unauthorized</div>
+      <div class="auth-title">{browserGateway ? "You're signed out" : "disconnected — unauthorized"}</div>
       <p class="auth-body">
-        The daemon rejected this window's token (it likely restarted). Paste a fresh URL from
-        <code>chimaera connect</code> into the address bar, then retry.
+        {#if browserGateway}
+          Your browser session ended. <a href="/login">Sign in again</a> to reopen your work.
+        {:else}
+          The daemon rejected this window's token (it likely restarted). Paste a fresh URL from
+          <code>chimaera connect</code> into the address bar, then retry.
+        {/if}
       </p>
-      <button class="auth-retry" use:focusOnMount disabled={authRetrying} onclick={() => void retryAuth()}>
-        {authRetrying ? "retrying…" : "retry"}
-      </button>
+      {#if !browserGateway}
+        <!-- A browser session is restored by signing in, not by re-reading a token. -->
+        <button class="auth-retry" use:focusOnMount disabled={authRetrying} onclick={() => void retryAuth()}>
+          {authRetrying ? "retrying…" : "retry"}
+        </button>
+      {/if}
       {#if authRetryMsg}
         <div class="auth-msg">{authRetryMsg}</div>
       {/if}

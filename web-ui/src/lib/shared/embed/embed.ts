@@ -1,3 +1,4 @@
+import { daemonPath } from "../../net/base";
 /**
  * Embed cards: the `POST /fs/resolve_targets` client, and the pure pieces
  * every card shares — which body a file gets, the `/raw` URLs a card loads,
@@ -265,8 +266,8 @@ export function embedKind(info: Pick<TargetInfo, "path" | "kind">): EmbedKind {
  *  daemon's folder-confined `/raw/{ticket}/{path}` route. */
 export function rawUrl(info: TargetInfo): string | null {
   if (info.ticket === undefined) return null;
-  if (embedKind(info) === "html") return `/raw/${info.ticket}/${encodeURIComponent(basename(info.path))}`;
-  return `/raw/${info.ticket}`;
+  if (embedKind(info) === "html") return daemonPath(`/raw/${info.ticket}/${encodeURIComponent(basename(info.path))}`);
+  return daemonPath(`/raw/${info.ticket}`);
 }
 
 /** A media element's source with its `#t=` moment (browsers seek natively). */

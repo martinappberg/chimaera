@@ -532,7 +532,13 @@ pub(crate) async fn list_agents(
     } else {
         detect_all.await
     };
-    let latest_by_kind = crate::agent_updates::snapshot(&state);
+    // The account's cloud never learns of agent releases: its agents come
+    // with its image and are updated with it (`pro::updates_managed`).
+    let latest_by_kind = if crate::pro::updates_managed(&state) {
+        std::collections::HashMap::new()
+    } else {
+        crate::agent_updates::snapshot(&state)
+    };
 
     let rows = detections
         .into_iter()
@@ -763,6 +769,33 @@ pub(crate) fn build_agent_resume_command(
     argv
 }
 
+/// Both native CLIs accept a trailing positional prompt on resume/fork. Keep it
+/// one argument, after an option terminator, and bound the process argv.
+pub(crate) fn append_transfer_prompt(argv: &mut Vec<String>, context: &str) {
+    argv.push("--".into());
+    argv.push(context.chars().take(8192).collect());
+}
+
+/// Native head forks isolate an offline owner without rewriting transcript IDs.
+/// Claude uses its resume flag; Codex exposes a dedicated `fork` subcommand.
+pub(crate) fn fork_native_head(kind: AgentKind, argv: &mut Vec<String>) -> anyhow::Result<()> {
+    if kind == AgentKind::Claude {
+        argv.push("--fork-session".into());
+        return Ok(());
+    }
+    if kind != AgentKind::Codex {
+        anyhow::bail!("unsupported native head fork");
+    }
+    let Some(command) = argv
+        .get_mut(1)
+        .filter(|command| command.as_str() == "resume")
+    else {
+        anyhow::bail!("head fork requires an explicit native resume");
+    };
+    *command = "fork".into();
+    Ok(())
+}
+
 /// What every CHAT spawn is told about its host — and only chat spawns: a
 /// TUI session is the agent's own screen, but a chat reply is rendered by
 /// chimaera, and the agent cannot know that a markdown image link to a local
@@ -970,13 +1003,19 @@ pub(crate) fn build_codex_chat_command(
     cmd
 }
 
-/// Escape a string for embedding in TOML basic-string quotes (`-c key="…"`).
-/// The prompt is a compile-time constant without quotes, backslashes, or
-/// control characters today; this keeps a future edit (say, a multi-line
-/// rewrite with real newlines) from silently breaking the config parse —
+/// An argv-only config override; the per-session secret stays inside the shim.
+pub(crate) fn codex_notify_args(path: &Path) -> Vec<String> {
+    vec![
+        "-c".into(),
+        format!(
+            "notify=[\"/bin/sh\",\"{}\"]",
+            toml_basic_string(&path.to_string_lossy())
+        ),
+    ]
+}
+
 /// TOML basic strings forbid raw control characters, and codex's raw-string
-/// fallback would otherwise bake the literal surrounding quotes into the
-/// value.
+/// fallback would otherwise bake the literal surrounding quotes into the value.
 fn toml_basic_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -1397,6 +1436,15 @@ mod tests {
         assert!(!safe_arg("a b"));
         assert!(!safe_arg("a;b"));
         assert!(!safe_arg("a/b"));
+    }
+
+    #[test]
+    fn transfer_context_is_one_bounded_positional_prompt() {
+        let mut argv = vec!["codex".into(), "resume".into(), "native".into()];
+        append_transfer_prompt(&mut argv, "--unsafe\n$(never a shell command)");
+        assert_eq!(&argv[3..], &["--", "--unsafe\n$(never a shell command)"]);
+        append_transfer_prompt(&mut argv, &"x".repeat(9000));
+        assert_eq!(argv.last().unwrap().len(), 8192);
     }
 
     #[test]

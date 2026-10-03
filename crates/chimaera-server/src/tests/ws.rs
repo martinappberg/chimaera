@@ -1,6 +1,201 @@
 use super::support::*;
 use crate::*;
 
+/// Stopping a session for a transfer (what a Pro handoff export does: mark
+/// it transferring, park its ledger entry, stop the process) must tell every
+/// attached view that it is elsewhere, without guessing its host kind or
+/// treating the transfer as an exit, on the live socket and on reconnect.
+#[tokio::test]
+async fn ws_sessions_stopped_for_a_transfer_say_moved_not_exited() {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    async fn next_json<S>(socket: &mut S) -> serde_json::Value
+    where
+        S: futures::Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    {
+        loop {
+            if let WsMessage::Text(text) = next_ws_frame(socket).await {
+                return serde_json::from_str(&text).unwrap();
+            }
+        }
+    }
+    let state = test_state();
+    let cwd = test_dir("ws-moved");
+    let terminal = state
+        .sessions
+        .spawn(chimaera_pty::SpawnOpts {
+            cwd: cwd.clone(),
+            name: None,
+            cols: 80,
+            rows: 24,
+            command: None,
+            id: None,
+            env: Vec::new(),
+            env_remove: Vec::new(),
+            scrollback: None,
+        })
+        .expect("spawn session")
+        .id;
+    let chat = "s-moved-chat".to_string();
+    state
+        .chat
+        .spawn(
+            &chimaera_agent::claude::ClaudeAdapter,
+            chimaera_agent::driver::SpawnSpec::new(
+                chat.clone(),
+                vec![write_fake_claude("ws-moved-agent")
+                    .to_string_lossy()
+                    .into_owned()],
+                cwd.clone(),
+            ),
+        )
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = app(state.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let connect = |path: String| async move {
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}{path}"))
+            .await
+            .unwrap();
+        socket
+            .send(WsMessage::text(
+                serde_json::json!({"type": "auth", "token": "test-token", "last_seq": 0})
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+        socket
+    };
+    for (id, path) in [
+        (terminal.clone(), format!("/ws/sessions/{terminal}")),
+        (chat.clone(), format!("/ws/chat/{chat}")),
+    ] {
+        let mut socket = connect(path.clone()).await;
+        assert_eq!(next_json(&mut socket).await["type"], "ready");
+        let guard = crate::chat::ChatSwitchGuard::acquire(&state, &id, "transfer").unwrap();
+        crate::ledger::defer(
+            &state,
+            crate::ledger::LedgerEntry {
+                id: id.clone(),
+                suspended: true,
+                manual_resume_reason: None,
+                handoff: None,
+                workspace_id: "w-moving".into(),
+                cwd: cwd.clone(),
+                pinned_name: None,
+                cols: 80,
+                rows: 24,
+                theme: "dark".into(),
+                created_at: 0,
+                agent: None,
+            },
+        )
+        .unwrap();
+        if id == chat {
+            state.chat.kill(&id);
+        } else {
+            state.sessions.kill(&id).unwrap();
+        }
+        loop {
+            let frame = next_json(&mut socket).await;
+            assert_ne!(frame["type"], "exited", "{path}: a move is not an exit");
+            if frame["type"] == "paused" {
+                assert_eq!(frame["reason"], "elsewhere");
+                break;
+            }
+        }
+        drop(guard);
+        // The project now has an opaque other owner. Reconnecting stays neutral,
+        // never replaying a stopped driver as `ready {alive:false}`.
+        crate::pro::install_remote_owner_fixture(&state, "w-moving", 5);
+        let mut again = connect(path.clone()).await;
+        let frame = next_json(&mut again).await;
+        assert_eq!(frame["type"], "paused", "{path}: {frame}");
+        assert_eq!(frame["reason"], "elsewhere", "{path}: {frame}");
+    }
+    state
+        .stopping
+        .store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// A session waiting out a daemon restart on the computer that owns its
+/// project did not move anywhere: its views say it is reconnecting after an
+/// update (`paused`, reason `restarting`), on the socket and on its row.
+#[tokio::test]
+async fn a_restart_deferred_session_is_paused_here_not_moved() {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    let state = test_state();
+    let cwd = test_dir("ws-restart-deferred");
+    let workspace = lock(&state.workspaces).add(cwd.clone()).unwrap();
+    let entry = |id: &str, agent| crate::ledger::LedgerEntry {
+        id: id.into(),
+        suspended: true,
+        manual_resume_reason: None,
+        handoff: None,
+        workspace_id: workspace.id.clone(),
+        cwd: cwd.clone(),
+        pinned_name: None,
+        cols: 80,
+        rows: 24,
+        theme: "dark".into(),
+        created_at: 0,
+        agent,
+    };
+    let agent = crate::ledger::LedgerAgent {
+        kind: crate::agents::AgentKind::Claude,
+        resume: None,
+        transcript: None,
+        native_cwd: None,
+        title: "restart".into(),
+        ui: chimaera_agent::model::SessionUi::Chat,
+        model: None,
+        carryover: None,
+    };
+    crate::ledger::defer(&state, entry("s-restart-chat", Some(agent))).unwrap();
+    crate::ledger::defer(&state, entry("s-restart-term", None)).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = app(state.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    for path in ["/ws/chat/s-restart-chat", "/ws/sessions/s-restart-term"] {
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}{path}"))
+            .await
+            .unwrap();
+        socket
+            .send(WsMessage::text(
+                serde_json::json!({"type": "auth", "token": "test-token", "last_seq": 0})
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+        let frame = loop {
+            if let WsMessage::Text(text) = next_ws_frame(&mut socket).await {
+                break serde_json::from_str::<serde_json::Value>(&text).unwrap();
+            }
+        };
+        assert_eq!(
+            frame,
+            serde_json::json!({"type":"paused","reason":"restarting"}),
+            "{path}"
+        );
+    }
+    let rows = crate::session_view::sessions_json(&state);
+    let row = rows
+        .iter()
+        .find(|row| row["id"] == "s-restart-chat")
+        .unwrap();
+    assert_eq!(row["suspended"], true);
+    assert_eq!(row["pause"]["type"], "paused");
+    assert_eq!(row["pause"]["reason"], "restarting");
+    state
+        .stopping
+        .store(true, std::sync::atomic::Ordering::Release);
+}
+
 #[tokio::test]
 async fn ws_agent_plugins_invalidation_without_session_changes() {
     use futures::SinkExt;
@@ -1006,4 +1201,310 @@ async fn ws_events_bad_token_is_rejected() {
         }
         other => panic!("expected error text frame, got {other:?}"),
     }
+}
+
+/// The chat socket's send ids, end to end against one daemon: `ready` says
+/// the daemon has them, a send's echo carries its client's id, the same id
+/// sent again starts nothing, `cancel_send` loses against an accepted send
+/// and wins against one that never arrived (which is then refused, named by
+/// its id), every refusal of a send carries the id, and the journal keeps it
+/// for the next attach.
+#[tokio::test]
+async fn ws_chat_sends_are_accepted_once_under_their_client_id() {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    async fn next_json<S>(socket: &mut S) -> serde_json::Value
+    where
+        S: futures::Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    {
+        loop {
+            if let WsMessage::Text(text) = next_ws_frame(socket).await {
+                return serde_json::from_str(&text).unwrap();
+            }
+        }
+    }
+    /// The next frame that is not journal traffic (an `ev` or a `batch`).
+    async fn next_answer<S>(socket: &mut S) -> serde_json::Value
+    where
+        S: futures::Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    {
+        loop {
+            let frame = next_json(socket).await;
+            if frame["type"] != "ev" && frame["type"] != "batch" {
+                return frame;
+            }
+        }
+    }
+    /// Every `user_message` in a frame, as (text, client_id).
+    fn echoes(frame: &serde_json::Value) -> Vec<(String, Option<String>)> {
+        frame["events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|entry| &entry["ev"])
+            .chain([&frame["ev"]])
+            .filter(|ev| ev["type"] == "user_message")
+            .map(|ev| {
+                (
+                    ev["text"].as_str().unwrap_or_default().to_owned(),
+                    ev["client_id"].as_str().map(str::to_owned),
+                )
+            })
+            .collect()
+    }
+    fn send_as(text: &str, client_id: &str) -> WsMessage {
+        WsMessage::text(
+            serde_json::json!({
+                "type":"send","blocks":[{"type":"text","text":text}],"client_id":client_id
+            })
+            .to_string(),
+        )
+    }
+    fn cancel(client_id: &str) -> WsMessage {
+        WsMessage::text(serde_json::json!({"type":"cancel_send","client_id":client_id}).to_string())
+    }
+
+    let state = test_state();
+    let cwd = test_dir("ws-send-ids");
+    let capture = cwd.join("agent-stdin.txt");
+    let fake = write_fake_claude("ws-send-ids-agent");
+    let script = std::fs::read_to_string(&fake).unwrap();
+    std::fs::write(
+        &fake,
+        script.replace("cat >/dev/null", "cat > \"$CHIMAERA_TEST_CAPTURE\""),
+    )
+    .unwrap();
+    let id = "s-send-ids".to_string();
+    chimaera_agent::journal::import_send_state(state.chat.journal_dir(), &id,
+        br#"{"version":1,"session_id":"s-send-ids","entries":[{"id":"client-crashed-1","state":"dispatching"},{"id":"client-receipt-1","state":"confirmed"}]}"#).unwrap();
+    let mut spec = chimaera_agent::driver::SpawnSpec::new(
+        id.clone(),
+        vec![fake.to_string_lossy().into_owned()],
+        cwd.clone(),
+    );
+    spec.env.push((
+        "CHIMAERA_TEST_CAPTURE".into(),
+        capture.to_string_lossy().into_owned(),
+    ));
+    state
+        .chat
+        .spawn(&chimaera_agent::claude::ClaudeAdapter, spec)
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = app(state.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let connect = |query: &'static str| {
+        let id = id.clone();
+        async move {
+            let (mut socket, _) =
+                tokio_tungstenite::connect_async(format!("ws://{addr}/ws/chat/{id}{query}"))
+                    .await
+                    .unwrap();
+            socket
+                .send(WsMessage::text(
+                    serde_json::json!({"type": "auth", "token": "test-token", "last_seq": 0})
+                        .to_string(),
+                ))
+                .await
+                .unwrap();
+            socket
+        }
+    };
+    let user_turns = |text: &str| {
+        std::fs::read_to_string(&capture)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains(r#""type":"user""#) && line.contains(text))
+            .count()
+    };
+
+    let mut socket = connect("").await;
+    let ready = next_json(&mut socket).await;
+    assert_eq!(ready["type"], "ready");
+    assert_eq!(ready["send_ids"], true, "{ready}");
+
+    // Independent evidence from a previous process survives without its echo.
+    socket
+        .send(send_as("UNCERTAIN", "client-crashed-1"))
+        .await
+        .unwrap();
+    let uncertain = next_answer(&mut socket).await;
+    assert_eq!(uncertain["code"], "send_uncertain", "{uncertain}");
+    assert_eq!(uncertain["client_id"], "client-crashed-1");
+    socket.send(cancel("client-crashed-1")).await.unwrap();
+    assert_eq!(next_answer(&mut socket).await["code"], "send_uncertain");
+    socket
+        .send(send_as("ALREADY_RECEIVED", "client-receipt-1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        next_answer(&mut socket).await,
+        serde_json::json!({"type":"send_confirmed","client_id":"client-receipt-1"})
+    );
+
+    // One send, sent three times under one id, then a second message: the
+    // journal holds the first once, with its id.
+    for _ in 0..3 {
+        socket.send(send_as("ONCE", "client-once-1")).await.unwrap();
+    }
+    socket.send(send_as("NEXT", "client-next-1")).await.unwrap();
+    let mut seen = Vec::new();
+    while !seen.iter().any(|(text, _)| text == "NEXT") {
+        let frame = next_json(&mut socket).await;
+        assert_ne!(frame["type"], "error", "{frame}");
+        seen.extend(echoes(&frame));
+    }
+    assert_eq!(
+        seen,
+        [
+            ("ONCE".to_string(), Some("client-once-1".to_string())),
+            ("NEXT".to_string(), Some("client-next-1".to_string())),
+        ]
+    );
+
+    // Too late to withdraw the accepted one; an id that never arrived is
+    // withdrawn, and a send that then arrives under it is refused by name.
+    socket.send(cancel("client-once-1")).await.unwrap();
+    assert_eq!(
+        next_answer(&mut socket).await,
+        serde_json::json!({"type":"send_confirmed","client_id":"client-once-1"})
+    );
+    socket.send(cancel("client-gone-1")).await.unwrap();
+    assert_eq!(
+        next_answer(&mut socket).await,
+        serde_json::json!({"type":"send_cancelled","client_id":"client-gone-1","cancelled":true})
+    );
+    socket.send(send_as("GONE", "client-gone-1")).await.unwrap();
+    let refused = next_answer(&mut socket).await;
+    assert_eq!(refused["type"], "error", "{refused}");
+    assert_eq!(refused["code"], "command_failed", "{refused}");
+    assert_eq!(refused["command"], "send", "{refused}");
+    assert_eq!(refused["client_id"], "client-gone-1", "{refused}");
+
+    // An id that is not well formed is refused and never echoed back; a
+    // `cancel_send` without a usable id likewise.
+    socket.send(send_as("BAD", "not an id")).await.unwrap();
+    let refused = next_answer(&mut socket).await;
+    assert_eq!(refused["code"], "invalid_command", "{refused}");
+    assert_eq!(refused["command"], "send", "{refused}");
+    assert!(refused.get("client_id").is_none(), "{refused}");
+    socket.send(cancel("short")).await.unwrap();
+    let refused = next_answer(&mut socket).await;
+    assert_eq!(refused["code"], "invalid_command", "{refused}");
+    assert_eq!(refused["command"], "cancel_send", "{refused}");
+
+    // A socket that may not act: its refusal names the send too, and it can
+    // withdraw nothing.
+    let mut watching = connect("?read_only=true").await;
+    assert_eq!(next_json(&mut watching).await["type"], "ready");
+    watching
+        .send(send_as("WATCHED", "client-watch-1"))
+        .await
+        .unwrap();
+    let refused = next_answer(&mut watching).await;
+    assert_eq!(refused["code"], "read_only", "{refused}");
+    assert_eq!(refused["command"], "send", "{refused}");
+    assert_eq!(refused["client_id"], "client-watch-1", "{refused}");
+    watching.send(cancel("client-watch-2")).await.unwrap();
+    let refused = next_answer(&mut watching).await;
+    assert_eq!(refused["code"], "read_only", "{refused}");
+    assert_eq!(refused["command"], "cancel_send", "{refused}");
+    assert_eq!(
+        state.chat.client_id_state(&id, "client-watch-2"),
+        None,
+        "a watching socket changes nothing"
+    );
+
+    // What the agent received (its turn never ends in this fixture, so the
+    // second message waits in the driver), and what the next attach replays.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while user_turns("ONCE") == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "ONCE never delivered"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(user_turns("ONCE"), 1);
+    for never in ["GONE", "BAD", "WATCHED", "UNCERTAIN", "ALREADY_RECEIVED"] {
+        assert_eq!(user_turns(never), 0, "{never}");
+    }
+    let mut again = connect("").await;
+    assert_eq!(next_json(&mut again).await["type"], "ready");
+    let mut replayed = Vec::new();
+    while replayed.len() < 2 {
+        replayed.extend(echoes(&next_json(&mut again).await));
+    }
+    assert_eq!(replayed, seen);
+    state.chat.kill(&id);
+}
+
+/// Only a writer-admitted input invalidates completion: an ownership refusal
+/// must leave the previous pause evidence untouched and never write the PTY.
+#[tokio::test]
+async fn terminal_input_invalidates_completion_only_after_admission() {
+    let state = test_state();
+    let cwd = test_dir("terminal-input-admission");
+    let workspace = lock(&state.workspaces).add(cwd.clone()).unwrap();
+    let session = state
+        .sessions
+        .spawn(chimaera_pty::SpawnOpts {
+            cwd,
+            name: None,
+            cols: 80,
+            rows: 24,
+            command: Some(vec!["/bin/cat".into()]),
+            id: None,
+            env: Vec::new(),
+            env_remove: Vec::new(),
+            scrollback: None,
+        })
+        .unwrap()
+        .id;
+    lock(&state.session_workspaces).insert(session.clone(), workspace.id.clone());
+    let mut record =
+        crate::agents::AgentRecord::new("fixture-key".into(), crate::agents::AgentKind::Codex);
+    record.turn_complete_at = Some(123);
+    lock(&state.agents).insert(session.clone(), record);
+    let input = state.sessions.attach(&session).unwrap().input;
+    crate::ws::terminal_input(&state, &session, &input, bytes::Bytes::new(), None)
+        .await
+        .unwrap();
+    assert_eq!(lock(&state.agents)[&session].turn_complete_at, Some(123));
+    crate::ws::terminal_input(
+        &state,
+        &session,
+        &input,
+        bytes::Bytes::from_static(b"accepted\n"),
+        None,
+    )
+    .await
+    .unwrap();
+    {
+        let agents = lock(&state.agents);
+        assert_eq!(agents[&session].turn_complete_at, None);
+        assert!(agents[&session].terminal_input_at.is_some());
+    }
+    {
+        let mut agents = lock(&state.agents);
+        let record = agents.get_mut(&session).unwrap();
+        record.turn_complete_at = Some(123);
+        record.terminal_input_at = None;
+    }
+    crate::pro::install_remote_owner_fixture(&state, &workspace.id, 5);
+    assert!(crate::ws::terminal_input(
+        &state,
+        &session,
+        &input,
+        bytes::Bytes::from_static(b"refused\n"),
+        None
+    )
+    .await
+    .is_err());
+    assert_eq!(lock(&state.agents)[&session].turn_complete_at, Some(123));
+    assert_eq!(lock(&state.agents)[&session].terminal_input_at, None);
+    state.sessions.kill(&session).unwrap();
 }

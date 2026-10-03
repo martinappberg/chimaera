@@ -41,6 +41,10 @@ export interface FileTab {
 export interface SettingsTab {
   surface: "settings";
 }
+/** Account view; distinct from daemon settings. */
+export interface ProTab {
+  surface: "pro";
+}
 /**
  * A Finder (Miller-columns file browser). Keyed by a stable `id` — NOT by
  * `path` — so several Finders can coexist and each navigates freely; `path` is
@@ -132,6 +136,13 @@ export interface PluginViewTab {
   view: string;
 }
 /**
+ * Both versions a Chimaera Pro return kept, for choosing between them
+ * (`pro/KeptReviewView.svelte`) — the workspace's own, a singleton view.
+ */
+export interface KeptTab {
+  surface: "kept";
+}
+/**
  * A review of the files ONE session changed — a session-scoped changes list
  * built on the same git status/diff APIs as the source-control panel. Keyed by
  * session so re-opening focuses the existing tab; it reads the session's live
@@ -161,6 +172,7 @@ export type Tab =
   | TerminalTab
   | FileTab
   | SettingsTab
+  | ProTab
   | FinderTab
   | DiffTab
   | GitDetailTab
@@ -172,6 +184,7 @@ export type Tab =
   | PluginsTab
   | PluginViewTab
   | SessionsTab
+  | KeptTab
   | BrowserTab;
 
 /** Identity key for the no-duplicates invariant (one tab per surface). */
@@ -197,9 +210,11 @@ export function tabKey(t: Tab): string {
   if (t.surface === "timeline") return "v:timeline";
   if (t.surface === "knowledge") return "v:knowledge";
   if (t.surface === "plugins") return "v:plugins";
+  if (t.surface === "pro") return "v:pro";
   // `x:` (extension) — a plugin's view, its own namespace.
   if (t.surface === "plugin") return `x:${t.plugin}/${t.view}`;
   if (t.surface === "sessions") return "v:sessions";
+  if (t.surface === "kept") return "v:kept";
   if (t.surface === "changes") return `changes:${t.sessionId}`;
   // `w:` (web) — its own namespace beside the Finder's `d:` and diff's `g:`.
   if (t.surface === "browser") return `w:${t.id}`;
@@ -338,6 +353,14 @@ export function visibleSessionIds(l: Layout): string[] {
     if (t !== undefined && t.surface === "terminal") out.push(t.sessionId);
   }
   return out;
+}
+
+/** Whether the review of both versions is on screen (a shown pane's active
+ *  tab), the way `visibleSessionIds` reads sessions. */
+export function keptReviewShown(l: Layout): boolean {
+  const zoomed = l.zoomedPaneId !== null ? findPane(l.root, l.zoomedPaneId) : null;
+  const shown = zoomed !== null ? [zoomed] : panes(l.root);
+  return shown.some((p) => p.tabs[p.active]?.surface === "kept");
 }
 
 /** Every file path shown anywhere in the tree. */
@@ -697,9 +720,18 @@ export function openSessionsList(l: Layout): Layout {
   return openTab(l, { surface: "sessions" });
 }
 
+/** Open (or focus) the review of both versions a return kept. */
+export function openKeptReview(l: Layout): Layout {
+  return openTab(l, { surface: "kept" });
+}
+
 /** Open (or focus) the session-scoped changes review. */
 export function openChanges(l: Layout, sessionId: string): Layout {
   return openTab(l, { surface: "changes", sessionId });
+}
+
+export function openPro(l: Layout): Layout {
+  return openTab(l, { surface: "pro" });
 }
 
 export function openSettings(l: Layout): Layout {
@@ -1470,8 +1502,10 @@ function serNode(node: LayoutNode): SNode {
         if (t.surface === "timeline") return { v: "timeline" };
         if (t.surface === "knowledge") return { v: "knowledge" };
         if (t.surface === "plugins") return { v: "plugins" };
+        if (t.surface === "pro") return { v: "pro" };
         if (t.surface === "plugin") return { pg: t.plugin, pgv: t.view };
         if (t.surface === "sessions") return { v: "sessions" };
+        if (t.surface === "kept") return { v: "kept" };
         if (t.surface === "changes") return { cs: t.sessionId };
         if (t.surface === "browser") return { w: t.host, wo: t.port, wi: t.id, wp: t.path };
         return { v: "settings" };
@@ -1568,6 +1602,8 @@ function deserNode(
         tab = { surface: "plugin", plugin: t.pg, view: t.pgv };
       } else if (t.v === "sessions") {
         tab = { surface: "sessions" };
+      } else if (t.v === "kept") {
+        tab = { surface: "kept" };
       } else if (typeof t.cs === "string" && t.cs.length > 0) {
         tab = { surface: "changes", sessionId: t.cs };
       } else if (
@@ -1582,6 +1618,8 @@ function deserNode(
         const id = typeof t.wi === "string" && t.wi.length > 0 ? t.wi : uid();
         const path = typeof t.wp === "string" && t.wp.length <= 4096 ? t.wp : "/";
         tab = { surface: "browser", id, host: t.w, port: t.wo, path };
+      } else if (t.v === "pro") {
+        tab = { surface: "pro" };
       } else if (t.v === "settings") {
         tab = { surface: "settings" };
       } else {

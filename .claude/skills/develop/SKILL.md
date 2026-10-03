@@ -234,6 +234,28 @@ and launches the generated `chimaera-dev` app identity. Computer Use must
 target `chimaera-dev`, which prevents it from driving the user's released app.
 Then tell the human: open a folder → start an agent → here's what to click.
 
+For a custom macOS preview, keep the actual built Mach-O as `CFBundleExecutable`.
+Do not replace it with a Python/shell launcher or rename it into an unbound nested
+executable. Put the isolated `CHIMAERA_HOME` (and required `PATH`) in the bundle's
+`LSEnvironment` before signing, or launch the intact bundle through an external
+process with that environment. Sign only the final bundle and require
+`codesign --verify --deep --strict --verbose=2 <preview.app>` to pass before
+launching. An invalid Info.plist/signature can silently prevent Keychain reads and
+writes even though the app window runs; changing login or Keychain permissions
+is not a repair for that packaging defect. Ad-hoc builds have a changing code
+identity, so any legitimate macOS access prompt still belongs to the user.
+Never change Keychain ACLs or copy credentials to avoid that prompt.
+
+Prefer each checkout's own native target directory. If a custom preview reuses
+another checkout's Cargo target cache, clean the local workspace packages before
+switching source revisions and verify the generated command permissions against
+that checkout's command manifest. A relative build-script dependency can reuse a
+stale command generator even when the embedded daemon build stamp is current.
+Capture the final signed executable and bundle in an immutable artifact directory;
+never install later from a shared `target/debug/chimaera` path that another build
+may have replaced. Signing changes executable bytes, so compare signed artifacts
+with their own recorded hashes rather than with the unsigned linker output.
+
 **2. To test against a REMOTE host from that isolated app** (e.g. an HPC cluster): a
 dev connect deploys **your** build, never a release, so a musl daemon of this
 branch must exist where THIS app looks. The trap: the in-app hint says

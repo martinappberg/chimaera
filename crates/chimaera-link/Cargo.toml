@@ -1,0 +1,41 @@
+[package]
+name = "chimaera-link"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# Test fixture and executable conformance tooling never enter the app binary.
+fixtures = ["dep:axum", "dep:clap"]
+
+[dependencies]
+chimaera-core = { path = "../chimaera-core", features = ["personal-providers"] }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+futures.workspace = true
+rand.workspace = true
+sha2.workspace = true
+base64 = "0.22"
+bytes.workspace = true
+zeroize = "1"
+url = "2"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "stream"] }
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+axum = { workspace = true, optional = true }
+clap = { workspace = true, optional = true, features = ["env"] }
+
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+time = { version = "0.3", features = ["parsing", "formatting"] }
+
+[[bin]]
+name = "fake-keeper"
+required-features = ["fixtures"]
+
+[[bin]]
+name = "link-conformance"
+required-features = ["fixtures"]

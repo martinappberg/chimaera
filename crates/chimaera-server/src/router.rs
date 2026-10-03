@@ -16,6 +16,7 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
     // Consumes the chat manager's hook signals for the daemon's lifetime
     // (no-op when already running — tests may build several routers).
     chat::spawn_signal_task(state.clone());
+    crate::session_proxy::start(state.clone());
     // Finished Slurm jobs → the Timeline (idempotent; idle without a queue).
     crate::episodes::spawn_jobs_task(state.clone());
     // Plugins' file events and watch sweep (idle without listeners).
@@ -29,6 +30,95 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
     }
     let api = Router::new()
         .route("/health", get(api::health))
+        .route(
+            "/pro/configure",
+            post(crate::pro::configure).delete(crate::pro::disconnect),
+        )
+        .route(
+            "/pro/configure/workspace",
+            post(crate::pro::configure_workspace),
+        )
+        .route(
+            "/pro/configure/execution",
+            post(crate::pro::configure_execution),
+        )
+        .route(
+            "/pro/execution/recover",
+            post(crate::pro::recover_execution),
+        )
+        .route("/pro/status", get(crate::pro::status))
+        .route("/pro/privacy", put(crate::pro::privacy))
+        .route(
+            "/pro/projects",
+            get(crate::pro::project_list).put(crate::pro::projects),
+        )
+        .route("/pro/projects/open", post(crate::pro::open_project))
+        .route("/pro/projects/copy", post(crate::pro::copy_project))
+        .route("/pro/projects/takeover", post(crate::pro::takeover_project))
+        // Both versions a return kept (`pro/kept.rs`): list, compare, choose.
+        .route("/pro/projects/{id}/kept", get(crate::pro::kept_list))
+        .route("/pro/projects/{id}/kept/file", get(crate::pro::kept_file))
+        .route(
+            "/pro/projects/{id}/kept/resolve",
+            post(crate::pro::kept_resolve),
+        )
+        .route(
+            "/pro/projects/{id}/kept/resolve_all",
+            post(crate::pro::kept_resolve_all),
+        )
+        .route(
+            "/pro/profile",
+            get(crate::pro::profile).put(crate::pro::put_profile),
+        )
+        .route("/pro/sleep", post(crate::pro::sleep))
+        .route("/pro/wake", post(crate::pro::wake))
+        .route("/pro/power", put(crate::pro::power))
+        .route("/pro/handoff", post(crate::pro::handoff))
+        .route(
+            "/pro/drain",
+            post(crate::pro::drain).delete(crate::pro::cancel_drain),
+        )
+        .route("/pro/hydrate", post(crate::pro::hydrate))
+        .route("/pro/cloud", get(crate::cloud::info))
+        .route("/pro/cloud/providers", get(crate::cloud::providers::list))
+        .route(
+            "/pro/cloud/providers/{id}/connect",
+            post(crate::cloud::providers::start),
+        )
+        .route(
+            "/pro/cloud/providers/{id}/disconnect",
+            post(crate::cloud::providers::disconnect),
+        )
+        .route(
+            "/pro/cloud/connections/{id}",
+            get(crate::cloud::providers::get),
+        )
+        .route(
+            "/pro/cloud/connections/{id}/cancel",
+            post(crate::cloud::providers::cancel),
+        )
+        .route(
+            "/pro/cloud/connections/{id}/input",
+            post(crate::cloud::providers::submit),
+        )
+        .route("/pro/cloud/project", post(crate::cloud::project))
+        .route("/pro/bundles/{id}", get(crate::bundle::snapshot_route))
+        .route(
+            "/pro/bundles/{id}/export",
+            post(crate::bundle::export_route),
+        )
+        .route(
+            "/pro/bundles",
+            post(crate::bundle::import_route).layer(axum::extract::DefaultBodyLimit::max(
+                crate::bundle::MAX_ARCHIVE as usize,
+            )),
+        )
+        .route(
+            "/pro/placements",
+            get(crate::session_proxy::inventory)
+                .post(crate::session_proxy::register)
+                .delete(crate::session_proxy::remove),
+        )
         .route(
             "/workspaces",
             get(api::list_workspaces).post(api::create_workspace),
@@ -237,6 +327,7 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         // app drives it through the tunnel to shut a remote host down.
         .route("/shutdown", post(api::shutdown))
         .route("/sessions/{id}/exec", post(api::exec_session))
+        .route("/sessions/{id}/resume", post(api::resume_manual_session))
         // Streamed to disk with its own per-file/per-session caps (see
         // `upload`); the DefaultBodyLimit override only lifts axum's 2MB
         // buffered-body default out of the way of multi-MB screenshots.
@@ -368,6 +459,14 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/proxy", get(proxy::list_proxies).post(proxy::create_proxy))
         .route("/proxy/{id}", delete(proxy::delete_proxy))
         .route("/proxy/{id}/health", get(proxy::proxy_health))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::session_proxy::api_proxy,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::workspace_scope::middleware,
+        ))
         .route_layer(middleware::from_fn_with_state(state.clone(), api::auth))
         // Registered after route_layer, so hook ingestion is NOT behind bearer
         // auth: claude's hooks cannot know the daemon token, so the random
@@ -397,6 +496,14 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         // An HTML report's relative assets, confined to its folder.
         .route("/raw/{ticket}/{*rest}", get(fs::raw_asset))
         .route("/download/{ticket}", get(download::download))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::workspace_scope::ticket_middleware,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::session_proxy::ticket_proxy,
+        ))
         // Three spellings because `{*path}` refuses an EMPTY tail: the bare
         // form redirects to the slashed form, the slashed form IS the app's
         // root document, and the wildcard carries everything deeper.
@@ -412,5 +519,6 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         // requests from proxied apps (cookie/Referer), and applies the SPA
         // index.html rules — see proxy::fallback.
         .fallback_service(axum::routing::any(proxy::fallback).with_state(state))
+        .layer(middleware::from_fn(crate::workspace_scope::reject_unbound))
         .layer(TraceLayer::new_for_http())
 }

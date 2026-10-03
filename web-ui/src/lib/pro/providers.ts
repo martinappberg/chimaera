@@ -1,0 +1,250 @@
+import type { CloudProviderConnection, CloudProviderState, CloudProviderStatus, CloudSetupInfo } from "../net/native";
+import catalog from "../../../../crates/chimaera-core/src/cloud-providers.json";
+
+export function pendingConnection(connection: CloudProviderConnection | null): boolean {
+  return connection !== null && ["preparing", "waiting", "verifying"].includes(connection.phase);
+}
+
+export function disconnectConnection(connection: CloudProviderConnection | null): boolean {
+  return connection?.operation === "disconnect";
+}
+
+export function sameConnection(expected: CloudProviderConnection, received: CloudProviderConnection | null | undefined): boolean {
+  return received != null && received.id === expected.id && received.provider_id === expected.provider_id
+    && (received.operation ?? "connect") === (expected.operation ?? "connect");
+}
+
+export function canDisconnect(provider: CloudProviderStatus): boolean {
+  return provider.disconnect_supported === true && (provider.state === "signed_in" || provider.installed === true && provider.state === "unknown");
+}
+
+export function connectionSuccessCurrent(connection: CloudProviderConnection | null, providers: CloudProviderStatus[], fresh: boolean): boolean {
+  if (!fresh || !connection) return false;
+  const state = providers.find(provider => provider.id === connection.provider_id)?.state;
+  return connection.phase === "connected" ? state === "signed_in"
+    : connection.phase === "disconnected" && (state === "needs_sign_in" || state === "missing");
+}
+
+/** Catalog recovery must neither replace another pending job nor roll a known
+ * terminal outcome back to a delayed in-flight snapshot of the same job. */
+export function recoverDisconnect(current: CloudProviderConnection | null, observed: CloudProviderConnection | null | undefined): CloudProviderConnection | null {
+  if (!observed || !disconnectConnection(observed)) return current;
+  if (current && (current.id === observed.id ? !pendingConnection(current) : pendingConnection(current))) return current;
+  return observed;
+}
+
+/** An expired local polling deadline is not proof that the server job finished. */
+export function canStartConnection(connection: CloudProviderConnection | null, fresh: boolean): boolean {
+  return fresh && !pendingConnection(connection);
+}
+
+/** Initial setup needs one agent; continuing a handoff needs every actual
+ * provider used by its sessions. Installation and unknown auth never qualify. */
+export function providersReady(providers: CloudProviderStatus[], required: string[] = []): boolean {
+  const connected = new Set(providers.filter(p => p.category === "agent" && p.state === "signed_in").map(p => p.id));
+  return required.length > 0 ? required.every(id => connected.has(id)) : connected.size > 0;
+}
+
+export type ProviderHandoff = NonNullable<CloudSetupInfo["handoffs"]>[number];
+export function handoffKey(handoff: ProviderHandoff): string {
+  return JSON.stringify([handoff.workspace_id, handoff.expected_epoch]);
+}
+
+/** Only an existing provider-blocked transfer may continue automatically. A
+ * generic connected agent never authorizes a new move or an unscoped hydrate. */
+export function nextReadyHandoff(providers: CloudProviderStatus[], handoffs: ProviderHandoff[], attempted: string[], current: boolean): ProviderHandoff | undefined {
+  if (!current) return undefined;
+  return handoffs.find(handoff => handoff.workspace_id.length > 0
+    && Number.isSafeInteger(handoff.expected_epoch) && handoff.expected_epoch > 0
+    && handoff.blocked_providers.length > 0
+    && !attempted.includes(handoffKey(handoff))
+    && providersReady(providers, handoff.blocked_providers.map(provider => provider.id)));
+}
+
+/** A provider's display name from the shared catalog, for ids the daemon did
+ * not list (never a raw id when a name is known). */
+export function providerLabel(id: string): string {
+  return catalog.providers.find(provider => provider.id === id)?.label ?? id;
+}
+
+const SAFE_ID = /^[a-zA-Z0-9_-]{1,128}$/;
+
+/** What a paused session waits for, from the daemon's additive
+ * `blocked_provider` on its row: the agent to connect (named from the catalog)
+ * and its project, for the shared connection flow. Null for any row without
+ * one, so a row from an older daemon or a free user's session is unchanged. */
+export function pausedConnect(row: unknown): { providerId: string; label: string; workspaceId?: string } | null {
+  if (typeof row !== "object" || row === null) return null;
+  const { suspended, blocked_provider: providerId, workspace_id: workspaceId } = row as Record<string, unknown>;
+  if (suspended !== true || typeof providerId !== "string" || !SAFE_ID.test(providerId)) return null;
+  return {
+    providerId,
+    label: providerLabel(providerId),
+    ...(typeof workspaceId === "string" && SAFE_ID.test(workspaceId) ? { workspaceId } : {}),
+  };
+}
+
+const PROVIDER_STATES: ReadonlySet<string> = new Set<CloudProviderState>(["missing", "needs_sign_in", "signed_in", "unknown", "unavailable"]);
+const SAFE_TOKEN = /^[a-zA-Z0-9_-]{1,32}$/;
+
+/** Remembered provider rows (the app's `remembered_providers`, or this
+ * browser's `catalogMemory`) as the panel renders catalog rows: well-formed
+ * rows only, each id once, at most 16; a state this app does not know reads
+ * as unknown. Null when nothing usable is remembered. */
+export function rememberedRows(value: unknown): CloudProviderStatus[] | null {
+  if (!Array.isArray(value)) return null;
+  const rows: CloudProviderStatus[] = [];
+  for (const entry of value.slice(0, 16)) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const row = entry as Record<string, unknown>;
+    const { id, category } = row;
+    if (typeof id !== "string" || !SAFE_TOKEN.test(id) || rows.some(known => known.id === id)) continue;
+    if (category !== "agent" && category !== "repository") continue;
+    const label = typeof row.label === "string" && row.label.trim() !== "" && row.label.length <= 64 && !/[\x00-\x1f\x7f]/.test(row.label) ? row.label.trim() : providerLabel(id);
+    const state = typeof row.state === "string" && PROVIDER_STATES.has(row.state) ? row.state as CloudProviderState : "unknown";
+    const methods = Array.isArray(row.methods) ? row.methods.filter((method): method is string => typeof method === "string" && SAFE_TOKEN.test(method)).slice(0, 8) : [];
+    rows.push({ id, label, category, state, installed: null, reason: null, checked_at: null, methods, ...(typeof row.disconnect_supported === "boolean" ? { disconnect_supported: row.disconnect_supported } : {}) });
+  }
+  return rows.length ? rows : null;
+}
+
+/** The shared catalog's providers by name only (`unchecked`), for a panel
+ * with nothing read or remembered whose look found the cloud idle: Connect,
+ * which wakes it, stays one press away, and no row claims a state. */
+export function catalogRows(): CloudProviderStatus[] {
+  return catalog.providers
+    .filter(provider => provider.category === "agent" || provider.category === "repository")
+    .map(provider => ({ id: provider.id, label: provider.label, category: provider.category as CloudProviderStatus["category"], installed: null, state: "unknown", reason: null, checked_at: null, methods: [] }));
+}
+
+/** Which rows the connections panel shows, and how they read. Before any
+ * live read answers, the remembered rows show at once (`fromMemory`); after
+ * one, its rows stay, including while the cloud is idle again (`asleep`).
+ * With nothing read or remembered, a look that found the cloud idle shows
+ * the catalog's names (`unchecked`, `catalogRows`). `settled` rows read as
+ * they are, with no "checking" words: a fresh read, the remembered rows, or
+ * the last read while idle. `known` false is the neutral loading state:
+ * nothing read, nothing remembered, no answer yet. */
+export function panelRows(state: { providers: CloudProviderStatus[]; remembered: CloudProviderStatus[] | null; liveAnswered: boolean; loaded: boolean; current: boolean; asleep: boolean }): { rows: CloudProviderStatus[]; fromMemory: boolean; unchecked: boolean; known: boolean; settled: boolean } {
+  const fromMemory = !state.liveAnswered && (state.remembered?.length ?? 0) > 0;
+  const unchecked = !state.loaded && !fromMemory && state.asleep;
+  return {
+    rows: fromMemory && state.remembered ? state.remembered : unchecked ? catalogRows() : state.providers,
+    fromMemory,
+    unchecked,
+    known: state.loaded || fromMemory || unchecked,
+    settled: state.current || fromMemory || state.asleep,
+  };
+}
+
+/** Whether rows show a connected agent: one signed in is enough, an agent
+ * whose sign-in is unknown leaves it unknown, otherwise none. */
+export function agentsConnected(rows: CloudProviderStatus[]): boolean | null {
+  const agents = rows.filter(row => row.category === "agent");
+  return agents.some(row => row.state === "signed_in") ? true : agents.some(row => row.state === "unknown") ? null : false;
+}
+
+/** The sign-in methods this panel guides: a one-time code (Codex, GitHub)
+ * and a browser code (Claude Code). */
+const GUIDED_METHODS: readonly string[] = ["device_code", "browser_code"];
+/** An older cloud's sign-in: a login terminal on the cloud, which the app
+ * never opens. Its daemon is updated by the service, never by the user. */
+const OLDER_CLOUD_METHOD = "terminal";
+
+/** Whether a catalog row offers a sign-in this panel guides. */
+export function signInGuided(provider: Pick<CloudProviderStatus, "methods">): boolean {
+  return (provider.methods ?? []).some(method => GUIDED_METHODS.includes(method));
+}
+
+/** A catalog row from an older cloud, whose only sign-in for it is a login
+ * terminal: the row waits for the cloud's update instead of offering Connect. */
+export function awaitingCloudUpdate(provider: Pick<CloudProviderStatus, "methods">): boolean {
+  return !signInGuided(provider) && (provider.methods ?? []).includes(OLDER_CLOUD_METHOD);
+}
+
+/** A Connect an older cloud answered with its login terminal (the sign-in
+ * step, `waiting`). Setting up an agent (`preparing`) is not a sign-in. */
+export function olderCloudSignIn(connection: CloudProviderConnection | null | undefined): boolean {
+  return connection?.phase === "waiting" && connection.action?.type === OLDER_CLOUD_METHOD;
+}
+
+/** The cloud is installing the agent before its sign-in (a first Connect on
+ * a cloud without it): the daemon runs that install in a session of its own
+ * while the attempt is still `preparing`. The row says so, since it is the
+ * one wait that takes a while. */
+export function installingAgent(connection: CloudProviderConnection | null | undefined): boolean {
+  return connection?.phase === "preparing" && connection.action?.type === OLDER_CLOUD_METHOD;
+}
+
+/** The providers still waiting for the cloud's update after a Connect found
+ * an older cloud: each stays until fresh catalog rows offer it a guided
+ * sign-in (the one-time code), and only then does Connect come back. */
+export function stillAwaitingUpdate(waiting: string[], fresh: CloudProviderStatus[]): string[] {
+  return waiting.filter(id => !fresh.some(provider => provider.id === id && signInGuided(provider)));
+}
+
+/** A row's line while its sign-in waits for the cloud's update. */
+export function cloudUpdateLine(label: string): string {
+  return `Your cloud is being updated. ${label} sign-in is available again in a few minutes.`;
+}
+
+/** What a Connect button says while its press is in flight, including while
+ * the cloud comes up behind it: the action, never how the cloud gets there. */
+export function connectingLabel(provider: Pick<CloudProviderStatus, "label" | "category">): string {
+  return provider.category === "repository" ? `Opening ${provider.label}’s sign-in…` : `Connecting ${provider.label}…`;
+}
+
+export function providerStateLabel(provider: CloudProviderStatus): string {
+  switch (provider.state) {
+    case "signed_in": return "Connected";
+    case "needs_sign_in": return "Not connected";
+    case "missing": return "Not connected";
+    case "unavailable": return "Unavailable";
+    default: return "Couldn't confirm connection";
+  }
+}
+
+/** Browser clients enforce the same vendor destinations as the native bridge.
+ * Adding a provider never grants arbitrary external navigation. */
+export function providerLoginUrl(providerId: string, value: string): string | null {
+  const origins = catalog.providers.find(provider => provider.id === providerId)?.auth_origins ?? [];
+  if (value.length > 4096) return null;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && !url.username && !url.password && !url.hash && (!url.port || url.port === "443") && origins.includes(url.origin) ? url.href : null;
+  } catch { return null; }
+}
+
+export function connectionError(code: string | null, operation: "connect" | "disconnect" = "connect"): string {
+  if (operation === "disconnect") {
+    switch (code) {
+      case "provider_busy": return "This service has another connection request in progress. Check its status before trying again.";
+      case "external_auth_unverified": return "This connection uses access managed outside Chimaera. Chimaera couldn't confirm its removal.";
+      case "disconnect_not_confirmed": return "The service still reports a connection. Check its status before trying again.";
+      case "expired": case "connection_expired": return "This request timed out before disconnection could be confirmed. Check the connection before trying again.";
+      case "invalid_status": return "The service couldn't confirm its connection status. Check again before trying to disconnect.";
+      default: return "Disconnection couldn't be confirmed. Check the connection before trying again. Sign-in on your computer hasn't changed.";
+    }
+  }
+  switch (code) {
+    case "provider_busy": return "This service has another connection request in progress. Check its status before trying again.";
+    case "invalid_status": return "The service couldn't confirm its connection status. Check again before starting sign-in.";
+    case "expired": case "connection_expired": return "This sign-in request expired. Start again for a fresh request.";
+    case "canceled": case "connection_canceled": return "Sign-in was canceled. Your existing connections haven't changed.";
+    case "device_login_unavailable": return "Sign-in with a one-time code couldn't start. Check that your account allows it, then try again.";
+    // The cloud's sign-in never showed a one-time code.
+    case "sign_in_unavailable": return "Sign-in didn't start in your cloud. Try again in a moment.";
+    case "sign_in_failed": return "Sign-in didn't finish. If the code expired or access wasn't approved, start again for a fresh code.";
+    // Signed in, but Git there can't use the account yet; Try again repeats only that step.
+    case "git_setup_failed": return "You're signed in, but Git in your cloud couldn't be set up to use this account. Try again.";
+    case "installation_failed": case "install_failed": return "Sign-in couldn't be prepared in your cloud. Try again in a moment.";
+    case "installation_unavailable": return "Sign-in isn't available for this connection right now. Try again later.";
+    case "probe_timeout": return "Confirming sign-in took too long. Check the connection again in a moment.";
+    case "sign_in_not_confirmed": return "Sign-in wasn't confirmed. Start again to finish.";
+    // Claude's page shows `code#state`; half of it keeps the sign-in waiting.
+    case "authorization_code_incomplete": return "Paste the whole code, including the part after #.";
+    case "browser_login_unavailable": return "Guided sign-in isn't available for this service right now. Try again later.";
+    case "unsupported": case "unsupported_auth": return "Guided sign-in isn't available for this service yet.";
+    default: return "Sign-in couldn't finish in the cloud. You can try again; sign-in on your computer hasn't changed.";
+  }
+}

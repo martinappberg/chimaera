@@ -168,6 +168,15 @@ pub(crate) fn session_json(
     serde_json::Value::Object(map)
 }
 
+/// Additive `needs_permission` on chat rows: a permission or question is
+/// waiting on the user. A cloud machine's supervisor keeps itself awake on it
+/// for a bounded time, so the question is still there when the answer comes.
+/// PTY rows omit it (a Claude TUI reports `agent_state: "needs_permission"`).
+fn chat_row(info: &chimaera_agent::ChatInfo, mut row: serde_json::Value) -> serde_json::Value {
+    row["needs_permission"] = json!(info.alive && info.pending_permission);
+    row
+}
+
 /// The full session list as JSON values (shared by GET /sessions and the
 /// /ws/events snapshots): PTY rows plus synthetic rows for structured chat
 /// sessions, sorted by creation time so the rail interleaves them honestly.
@@ -223,11 +232,14 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
     rows.extend(chats.iter().map(|info| {
         (
             info.created_at_ms / 1000,
-            crate::chat::chat_session_json(
+            chat_row(
                 info,
-                workspaces.get(&info.id).cloned(),
-                agents.get(&info.id),
-                is_mastermind(&info.id),
+                crate::chat::chat_session_json(
+                    info,
+                    workspaces.get(&info.id).cloned(),
+                    agents.get(&info.id),
+                    is_mastermind(&info.id),
+                ),
             ),
         )
     }));
@@ -281,30 +293,84 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
             }),
         ));
     }
-    rows.sort_by_key(|(created, _)| *created);
-    rows.into_iter()
-        .map(|(_, mut row)| {
-            // Additive: `git` ({repo, worktree, branch, detached, head} or
-            // null outside a repository), and an agent's hook-reported cwd
-            // as its `cwd_current` (a shell's polled cwd is already there).
-            if let serde_json::Value::Object(map) = &mut row {
-                let facts = map
-                    .get("id")
-                    .and_then(|id| id.as_str())
-                    .and_then(|id| git_rows.get(id));
-                if let Some(cwd) = facts.and_then(|f| f.hook_cwd.as_ref()) {
-                    if map.get("kind").and_then(|k| k.as_str()) == Some("agent") {
-                        map.insert("cwd_current".to_string(), json!(cwd));
-                    }
-                }
-                map.insert(
-                    "git".to_string(),
-                    facts.map_or(serde_json::Value::Null, |f| f.git.clone()),
-                );
+    let activity = crate::lock(&state.activity)
+        .snapshot(rows.iter().filter_map(|(_, row)| row["id"].as_str()));
+    for (_, row) in &mut rows {
+        let at = row["id"].as_str().and_then(|id| activity.get(id)).copied();
+        row["last_input_ms"] = json!(at);
+        row["placement"] = json!("here");
+    }
+    drop(execs);
+    drop(cwds);
+    drop(names);
+    drop(agents);
+    drop(workspaces);
+    let deferred: Vec<_> = crate::lock(&state.deferred_sessions)
+        .values()
+        .cloned()
+        .collect();
+    for entry in &deferred {
+        // A maintenance-parked leader can still exist stopped until the
+        // supervisor's positive cleanup. Its live registry row must not hide
+        // the durable manual-resume fence or suggest writable execution.
+        if entry.manual_resume_reason.is_some() {
+            rows.retain(|(_, row)| row["id"] != entry.id);
+        }
+        if !rows.iter().any(|(_, row)| row["id"] == entry.id) {
+            let label = crate::pro::paused_label(state, entry);
+            let mut row = crate::bundle::paused_row(entry, label);
+            // Additive: why it is paused, the same shape its socket says it
+            // in, so a pane that shows no socket (a paused terminal) can too.
+            if let Some(pause) = crate::ws::pause_for(state, &entry.id, Some(entry)) {
+                row["pause"] = pause.frame();
             }
-            row
-        })
-        .collect()
+            // Additive: the provider this paused session waits for (its
+            // project otherwise runs), so the page can say what to connect.
+            if let Some(provider) = crate::pro::blocking_provider(state, entry) {
+                row["blocked_provider"] = json!(provider);
+            }
+            rows.push((entry.created_at, row));
+        }
+    }
+    finish_rows(rows, state.session_proxy.rows(), |row| {
+        // Additive: `git` ({repo, worktree, branch, detached, head} or
+        // null outside a repository), and an agent's hook-reported cwd
+        // as its `cwd_current` (a shell's polled cwd is already there).
+        if let serde_json::Value::Object(map) = row {
+            let facts = map
+                .get("id")
+                .and_then(|id| id.as_str())
+                .and_then(|id| git_rows.get(id));
+            if let Some(cwd) = facts.and_then(|f| f.hook_cwd.as_ref()) {
+                if map.get("kind").and_then(|k| k.as_str()) == Some("agent") {
+                    map.insert("cwd_current".to_string(), json!(cwd));
+                }
+            }
+            map.insert(
+                "git".to_string(),
+                facts.map_or(serde_json::Value::Null, |f| f.git.clone()),
+            );
+        }
+    })
+}
+
+fn finish_rows(
+    mut rows: Vec<(u64, serde_json::Value)>,
+    remote: Vec<serde_json::Value>,
+    mut enrich_local: impl FnMut(&mut serde_json::Value),
+) -> Vec<serde_json::Value> {
+    // Local tracker facts belong only to rows assembled on this daemon.
+    // A verified owner row supersedes them intact, including its Git and cwd.
+    for (_, row) in &mut rows {
+        enrich_local(row);
+    }
+    for remote in remote {
+        rows.retain(|(_, row)| row["id"] != remote["id"]);
+        let created = remote["created_at"].as_u64().unwrap_or(0);
+        rows.push((created, remote));
+    }
+    rows.sort_by_key(|(created, _)| *created);
+    rows.into_iter().map(|(_, row)| row).collect()
 }
 
 /// How long a built events-bus sessions frame stays reusable within one
@@ -436,6 +502,34 @@ pub(crate) fn display_name_now(state: &AppState, id: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::agent_state::{AgentKind, AgentRecord};
+
+    #[test]
+    fn routed_owner_git_and_cwd_survive_stale_local_enrichment() {
+        let owner = json!({"id":"s-shared", "created_at":2, "kind":"agent",
+            "cwd_current":"/owner/worktree", "git":{"branch":"owner"},
+            "placement":{"remote":"verified-host"}});
+        let fresh = json!({"id":"s-remote-only", "created_at":3,
+            "git":{"branch":"owner-new"}, "cwd_current":"/owner/new"});
+        let rows = finish_rows(
+            vec![
+                (1, json!({"id":"s-shared","kind":"agent","git":null})),
+                (0, json!({"id":"s-local","kind":"agent"})),
+            ],
+            vec![owner.clone(), fresh.clone()],
+            |row| {
+                if row["id"] == "s-shared" || row["id"] == "s-local" {
+                    row["cwd_current"] = json!("/local/stale");
+                    row["git"] = json!({"branch":"local"});
+                } else {
+                    row["git"] = serde_json::Value::Null;
+                }
+            },
+        );
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["git"]["branch"], "local");
+        assert_eq!(rows[1], owner);
+        assert_eq!(rows[2], fresh);
+    }
 
     fn info(alive: bool, last_output_at: u64) -> chimaera_pty::SessionInfo {
         chimaera_pty::SessionInfo {

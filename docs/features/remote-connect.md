@@ -86,6 +86,17 @@ and cluster-only connections). Replacement resolution precedes any daemon stop.
 
 ## Key behaviors & gotchas
 
+- **Direct SSH on this computer.** In a host's Home actions, expand **Advanced**
+  and choose **Connect directly from this computer** when its site forbids a
+  keeper connection, requires this computer's VPN, or needs local SSH settings.
+  The native `set_host_direct_ssh` command saves additive `hosts.json`
+  `direct_ssh`; it overrides a known kept SSH route even while signed in.
+  Existing connections remain until reconnect, and running jobs and other
+  computers are unaffected. This does not change account-wide **Keep connected**.
+  Device connections have no SSH fallback and do not offer the preference.
+  The choice appears with an active Pro plan; a saved direct preference remains
+  visible while signed out so it can still be cleared.
+
 - **One ControlMaster per host.** Every ssh/scp call rides one chimaera-owned master
   (`ControlMaster=auto`, `ControlPersist=10m`, `Compression=yes`): the user authenticates **once**
   (password or 2FA/Duo, inherited from `~/.ssh/config` — the ssh client is never reimplemented),
@@ -203,6 +214,11 @@ and cluster-only connections). Replacement resolution precedes any daemon stop.
   control-plane output is collected concurrently under 8 MiB stdout / 1 MiB stderr and wall-clock
   limits; overflow or timeout kills and reaps the process. Fetched daemons are cached per
   triple-and-version.
+- **Attached job output stays bounded while it drains.** Each stdout/stderr reader keeps at most
+  a 4 KiB line prefix, discards an oversized line's remainder, and continues through invalid UTF-8.
+  The diagnostic tail retains eight sanitized lines of at most 300 characters each. Explicit
+  ControlMaster closure attempts both routed legs within bounded deadlines, including after its
+  caller is cancelled; it succeeds only on an acknowledged exit or a verified absent control socket.
 - **Tunnel teardown cannot hold the app hostage.** Tunnel objects are removed from shared maps
   before any process/network wait, so one dead host cannot block health checks or commands for
   another. Child reaping gets a two-second ceiling; ControlMaster forward cancellation is

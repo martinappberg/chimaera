@@ -1,0 +1,489 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ProStatus } from "./native";
+
+const bridge = vi.hoisted(() => ({
+  isNativeShell: vi.fn(),
+  onProChanged: vi.fn(),
+  proStatus: vi.fn(),
+}));
+const gateway = vi.hoisted(() => ({
+  isAccountHome: vi.fn(() => false),
+  isBrowserGateway: vi.fn(),
+  workbenchPath: vi.fn(() => "/app/fixture-host/"),
+}));
+const host = vi.hoisted(() => ({ getHostLabel: vi.fn(() => "local") }));
+vi.mock("./native", () => bridge);
+vi.mock("./base", () => gateway);
+vi.mock("./api", () => host);
+
+import { accountPlan, accountSignedOut, paidPlan, proOffered, type AccountPlan, type PaidPlan } from "./plan";
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  return { promise: new Promise<T>((done) => { resolve = done; }), resolve };
+}
+function status(plan: ProStatus["plan"], signedIn = true): ProStatus {
+  return { available: true, signed_in: signedIn, plan, email: null, error: null };
+}
+function response(plan: string | null, code = 200): Response {
+  return new Response(null, {
+    status: code,
+    headers: plan === null ? {} : { "X-Chimaera-Plan": plan },
+  });
+}
+const flush = async (): Promise<void> => { await vi.advanceTimersByTimeAsync(0); };
+
+describe("shared paid plan", () => {
+  let page: EventTarget & { visibilityState: "visible" | "hidden" };
+  let changed: () => void;
+  let unlisten: ReturnType<typeof vi.fn<() => void>>;
+  let fetcher: ReturnType<typeof vi.fn>;
+  let subscriptions: Array<() => void>;
+
+  function subscribe(): PaidPlan[] {
+    const values: PaidPlan[] = [];
+    subscriptions.push(paidPlan.subscribe((value) => values.push(value)));
+    return values;
+  }
+  function subscribeAccount(): AccountPlan[] {
+    const values: AccountPlan[] = [];
+    subscriptions.push(accountPlan.subscribe((value) => values.push(value)));
+    return values;
+  }
+  function visibility(value: "visible" | "hidden"): void {
+    page.visibilityState = value;
+    page.dispatchEvent(new Event("visibilitychange"));
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.clearAllMocks();
+    subscriptions = [];
+    changed = () => {};
+    page = Object.assign(new EventTarget(), { visibilityState: "visible" as "visible" | "hidden" });
+    vi.stubGlobal("document", page);
+    unlisten = vi.fn();
+    fetcher = vi.fn().mockResolvedValue(response("pro"));
+    vi.stubGlobal("fetch", fetcher);
+    bridge.isNativeShell.mockReturnValue(true);
+    gateway.isBrowserGateway.mockReturnValue(false);
+    bridge.proStatus.mockReset().mockResolvedValue(status("pro"));
+    bridge.onProChanged.mockReset().mockImplementation((handler: () => void) => {
+      changed = handler;
+      return Promise.resolve(unlisten);
+    });
+  });
+
+  afterEach(() => {
+    for (const stop of subscriptions) stop();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it("shares native reads, retains branding until the response, and stops only after the last subscriber", async () => {
+    const first = subscribe();
+    const second = subscribe();
+    await flush();
+    expect(first).toEqual([null, "pro"]);
+    expect(second).toEqual([null, "pro"]);
+    expect(bridge.proStatus).toHaveBeenCalledTimes(1);
+    expect(bridge.onProChanged).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(180_000);
+    expect(bridge.proStatus).toHaveBeenCalledTimes(1);
+    expect(fetcher).not.toHaveBeenCalled();
+
+    bridge.proStatus.mockResolvedValue(status("max"));
+    changed();
+    expect(first.at(-1)).toBe("pro");
+    await flush();
+    expect(first.at(-1)).toBe("max");
+    bridge.proStatus.mockResolvedValue(status("max", false));
+    changed();
+    await flush();
+    expect(first.at(-1)).toBeNull();
+
+    subscriptions.shift()!();
+    expect(unlisten).not.toHaveBeenCalled();
+    subscriptions.shift()!();
+    expect(unlisten).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("keeps the paid badge mounted through repeated background checks and visibility changes", async () => {
+    const account = subscribeAccount();
+    const badge = subscribe();
+    await flush();
+    for (let i = 0; i < 3; i += 1) {
+      const checking = deferred<ProStatus>();
+      bridge.proStatus.mockReturnValueOnce(checking.promise);
+      changed();
+      await vi.advanceTimersByTimeAsync(500);
+      expect(account).toEqual(["loading", "pro"]);
+      expect(badge).toEqual([null, "pro"]);
+      checking.resolve(status("pro"));
+      await flush();
+    }
+    visibility("hidden");
+    visibility("visible");
+    await flush();
+    expect(account).toEqual(["loading", "pro"]);
+    expect(badge).toEqual([null, "pro"]);
+    bridge.proStatus.mockResolvedValue(status("none", false));
+    changed();
+    await flush();
+    expect(account).toEqual(["loading", "pro", "free"]);
+    expect(badge).toEqual([null, "pro", null]);
+  });
+
+  it("says signed out only on a settled native answer, never for a free plan or a browser view", async () => {
+    const signedOut: boolean[] = [];
+    subscriptions.push(accountSignedOut.subscribe((value) => signedOut.push(value)));
+    await flush();
+    expect(signedOut).toEqual([false]);
+    bridge.proStatus.mockResolvedValue(status("none"));
+    changed();
+    await flush();
+    expect(signedOut.at(-1)).toBe(false);
+    bridge.proStatus.mockResolvedValue({ ...status(null, false), sign_in: { phase: "waiting", expires_at: 1 } });
+    changed();
+    await flush();
+    expect(signedOut.at(-1)).toBe(false);
+    bridge.proStatus.mockResolvedValue(status(null, false));
+    changed();
+    await flush();
+    expect(signedOut.at(-1)).toBe(true);
+    bridge.proStatus.mockResolvedValue(status("pro"));
+    changed();
+    await flush();
+    expect(signedOut.at(-1)).toBe(false);
+  });
+
+  it("rejects an older native response after sign-out and clears failures", async () => {
+    const stale = deferred<ProStatus>();
+    bridge.proStatus.mockReturnValueOnce(stale.promise);
+    const values = subscribe();
+    await flush();
+    bridge.proStatus.mockResolvedValue(status("none", false));
+    changed();
+    await flush();
+    stale.resolve(status("pro"));
+    await flush();
+    expect(values).toEqual([null]);
+
+    bridge.proStatus.mockResolvedValue(status("pro"));
+    changed();
+    await flush();
+    expect(values.at(-1)).toBe("pro");
+    bridge.proStatus.mockRejectedValue(new Error("native unavailable"));
+    changed();
+    expect(values.at(-1)).toBe("pro");
+    await flush();
+    expect(values.at(-1)).toBeNull();
+  });
+
+  it("does not let a previous subscription overwrite a new account read", async () => {
+    const old = deferred<ProStatus>();
+    bridge.proStatus.mockReturnValueOnce(old.promise);
+    subscribe();
+    await flush();
+    subscriptions.shift()!();
+    bridge.proStatus.mockResolvedValue(status("max"));
+    const current = subscribe();
+    await flush();
+    old.resolve(status("pro"));
+    await flush();
+    expect(current).toEqual([null, "max"]);
+  });
+
+  it("disposes native registration that resolves after the last subscriber leaves", async () => {
+    const registration = deferred<() => void>();
+    bridge.onProChanged.mockReturnValueOnce(registration.promise);
+    subscribe();
+    subscriptions.shift()!();
+    registration.resolve(unlisten);
+    await flush();
+    expect(unlisten).toHaveBeenCalledTimes(1);
+    expect(bridge.proStatus).not.toHaveBeenCalled();
+    visibility("visible");
+    expect(bridge.proStatus).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("refreshes gateway entitlement only while visible using cookie-authenticated HEAD", async () => {
+    bridge.isNativeShell.mockReturnValue(false);
+    gateway.isBrowserGateway.mockReturnValue(true);
+    const values = subscribe();
+    await flush();
+    expect(values.at(-1)).toBe("pro");
+    expect(fetcher).toHaveBeenCalledWith("/app/fixture-host/", expect.objectContaining({
+      method: "HEAD", credentials: "same-origin", cache: "no-store", redirect: "error",
+    }));
+    expect(bridge.proStatus).not.toHaveBeenCalled();
+    expect(bridge.onProChanged).not.toHaveBeenCalled();
+    fetcher.mockResolvedValue(response("max"));
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(values.at(-1)).toBe("max");
+    expect(fetcher).toHaveBeenCalledTimes(2);
+
+    visibility("hidden");
+    await vi.advanceTimersByTimeAsync(180_000);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    fetcher.mockResolvedValue(response(null, 401));
+    visibility("visible");
+    await flush();
+    expect(fetcher).toHaveBeenCalledTimes(3);
+    expect(values.at(-1)).toBeNull();
+    subscriptions.shift()!();
+    expect(vi.getTimerCount()).toBe(0);
+    visibility("visible");
+    await flush();
+    expect(fetcher).toHaveBeenCalledTimes(3);
+  });
+
+  it("reads the account's own Home the way it reads a project view", async () => {
+    bridge.isNativeShell.mockReturnValue(false);
+    gateway.isAccountHome.mockReturnValueOnce(true);
+    gateway.workbenchPath.mockReturnValue("/");
+    const offered: Array<boolean | null> = [];
+    subscriptions.push(proOffered.subscribe((value) => offered.push(value)));
+    const values = subscribe();
+    await flush();
+    expect(offered.at(-1)).toBe(true);
+    expect(values.at(-1)).toBe("pro");
+    expect(fetcher).toHaveBeenCalledWith("/", expect.objectContaining({ method: "HEAD", credentials: "same-origin" }));
+    expect(bridge.proStatus).not.toHaveBeenCalled();
+    gateway.workbenchPath.mockReturnValue("/app/fixture-host/");
+  });
+
+  it("times out gateway requests, rejects late responses, and treats unknown headers as unpaid", async () => {
+    bridge.isNativeShell.mockReturnValue(false);
+    gateway.isBrowserGateway.mockReturnValue(true);
+    const hanging = deferred<Response>();
+    const values = subscribe();
+    await flush();
+    fetcher.mockReturnValueOnce(hanging.promise);
+    await vi.advanceTimersByTimeAsync(60_000);
+    const signal = fetcher.mock.calls[1][1].signal as AbortSignal;
+    expect(values).toEqual([null, "pro"]);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(signal.aborted).toBe(true);
+    hanging.resolve(response("max"));
+    await flush();
+    expect(values).toEqual([null, "pro", null]);
+    fetcher.mockResolvedValue(response("unknown-paid-plan"));
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(values).toEqual([null, "pro", null]);
+    fetcher.mockResolvedValue(response("pro"));
+    visibility("visible");
+    await flush();
+    expect(values.at(-1)).toBe("pro");
+    fetcher.mockRejectedValue(new Error("connection lost"));
+    visibility("visible");
+    expect(values.at(-1)).toBe("pro");
+    await flush();
+    expect(values.at(-1)).toBeNull();
+  });
+
+
+  it("distinguishes free, paid and uncertain native account state without another read", async () => {
+    const firstRead = deferred<ProStatus>();
+    bridge.proStatus.mockReturnValueOnce(firstRead.promise);
+    const account = subscribeAccount();
+    const badge = subscribe();
+    await flush();
+    expect(account).toEqual(["loading"]);
+    expect(badge).toEqual([null]);
+    expect(bridge.proStatus).toHaveBeenCalledTimes(1);
+    firstRead.resolve(status(null, false));
+    await flush();
+    expect(account.at(-1)).toBe("free");
+
+    for (const plan of ["none", "pro", "max"] as const) {
+      bridge.proStatus.mockResolvedValue(status(plan));
+      const confirmed = account.at(-1);
+      changed();
+      expect(account.at(-1)).toBe(confirmed);
+      await flush();
+      expect(account.at(-1)).toBe(plan === "none" ? "free" : plan);
+      expect(badge.at(-1)).toBe(plan === "none" ? null : plan);
+    }
+    for (const uncertain of [
+      { ...status(null, false), initializing: true },
+      { ...status("pro"), initializing: true },
+      { ...status(null, false), sign_in: { phase: "waiting", expires_at: 1000 } },
+    ]) {
+      bridge.proStatus.mockResolvedValue(uncertain);
+      changed();
+      await flush();
+      expect(account.at(-1)).toBe("loading");
+      expect(badge.at(-1)).toBeNull();
+    }
+    for (const unknown of [
+      status(null),
+      { ...status("pro"), error: "Account could not be checked" },
+      { ...status("none"), error: "Account could not be checked" },
+    ]) {
+      bridge.proStatus.mockResolvedValue(unknown);
+      changed();
+      await flush();
+      expect(account.at(-1)).toBe("unknown");
+      expect(badge.at(-1)).toBeNull();
+    }
+    bridge.proStatus.mockRejectedValue(new Error("connection failed"));
+    changed();
+    await flush();
+    expect(account.at(-1)).toBe("unknown");
+    expect(bridge.onProChanged).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps an overdue account neutral: no Get Pro offer and no paid badge without a plan", async () => {
+    const account = subscribeAccount();
+    const badge = subscribe();
+    await flush();
+    bridge.proStatus.mockResolvedValue({ ...status("none"), payment_due: true });
+    changed();
+    await flush();
+    expect(account.at(-1)).toBe("unknown");
+    expect(badge.at(-1)).toBeNull();
+    bridge.proStatus.mockResolvedValue({ ...status("pro"), payment_due: true });
+    changed();
+    await flush();
+    expect(account.at(-1)).toBe("pro");
+    expect(badge.at(-1)).toBe("pro");
+  });
+
+  it("shows an ended plan as no paid badge, even while the account still names the plan", async () => {
+    const account = subscribeAccount();
+    const badge = subscribe();
+    await flush();
+    const returning_until = "2026-11-03T09:30:00Z";
+    for (const plan of ["pro", "max", "none"] as const) {
+      bridge.proStatus.mockResolvedValue({ ...status(plan), returning_until });
+      changed();
+      await flush();
+      expect(account.at(-1)).toBe("free");
+      expect(badge.at(-1)).toBeNull();
+    }
+    bridge.proStatus.mockResolvedValue({ ...status("pro"), returning_until: null });
+    changed();
+    await flush();
+    expect(badge.at(-1)).toBe("pro");
+  });
+
+  it("keeps the confirmed plan while the connection behind cloud features comes up", async () => {
+    const account = subscribeAccount();
+    const badge = subscribe();
+    await flush();
+    for (const warning of [
+      { ...status("pro"), connection_warning: "starting" },
+      { ...status("pro"), error: "You're signed in. Your Pro connection is preparing; Chimaera will reconnect automatically." },
+      { ...status("max"), error: "Your account is up to date. The Pro connection is not ready yet; Chimaera will retry automatically." },
+      { ...status("none"), connection_warning: "starting" },
+    ]) {
+      bridge.proStatus.mockResolvedValue(warning);
+      changed();
+      await flush();
+      expect(account.at(-1)).toBe(warning.plan === "none" ? "free" : warning.plan);
+      expect(badge.at(-1)).toBe(warning.plan === "none" ? null : warning.plan);
+    }
+  });
+
+  it("requires a confirmed gateway none header before offering a plan", async () => {
+    bridge.isNativeShell.mockReturnValue(false);
+    gateway.isBrowserGateway.mockReturnValue(true);
+    fetcher.mockResolvedValue(response("none"));
+    const account = subscribeAccount();
+    const badge = subscribe();
+    await flush();
+    expect(account.at(-1)).toBe("free");
+    expect(badge.at(-1)).toBeNull();
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    for (const [header, code] of [[null, 200], ["future-plan", 200], ["none", 401]] as const) {
+      fetcher.mockResolvedValue(response(header, code));
+      visibility("visible");
+      await flush();
+      expect(account.at(-1)).toBe("unknown");
+    }
+  });
+
+  it("marks an endpoint-less build unavailable before any Pro entry can show, and keeps availability through refreshes", async () => {
+    const offered: Array<boolean | null> = [];
+    const first = deferred<ProStatus>();
+    bridge.proStatus.mockReturnValueOnce(first.promise);
+    const account = subscribeAccount();
+    subscriptions.push(proOffered.subscribe((value) => offered.push(value)));
+    await flush();
+    expect(offered).toEqual([null]);
+    first.resolve({ ...status(null, false), available: false });
+    await flush();
+    expect(account.at(-1)).toBe("unavailable");
+    expect(offered).toEqual([null, false]);
+
+    // A shell with an endpoint is offered even while the keychain prompt waits.
+    bridge.proStatus.mockResolvedValue({ ...status(null, false), initializing: true });
+    changed();
+    await flush();
+    expect(account.at(-1)).toBe("loading");
+    expect(offered.at(-1)).toBe(true);
+    const slow = deferred<ProStatus>();
+    bridge.proStatus.mockReturnValueOnce(slow.promise);
+    changed();
+    await flush();
+    expect(offered.at(-1)).toBe(true);
+    slow.resolve(status("none"));
+    await flush();
+    expect(account.at(-1)).toBe("free");
+    bridge.proStatus.mockRejectedValue(new Error("native unavailable"));
+    changed();
+    await flush();
+    expect(account.at(-1)).toBe("unknown");
+    expect(offered.at(-1)).toBe(true);
+  });
+
+  it("offers Pro in an account gateway before its first plan read", async () => {
+    bridge.isNativeShell.mockReturnValue(false);
+    gateway.isBrowserGateway.mockReturnValue(true);
+    const pending = deferred<Response>();
+    fetcher.mockReturnValueOnce(pending.promise);
+    const offered: Array<boolean | null> = [];
+    subscriptions.push(proOffered.subscribe((value) => offered.push(value)));
+    expect(offered.at(-1)).toBe(true);
+    pending.resolve(response("none"));
+    await flush();
+    expect(offered.at(-1)).toBe(true);
+  });
+
+  it("does no account work in an ordinary browser", async () => {
+    bridge.isNativeShell.mockReturnValue(false);
+    const account = subscribeAccount();
+    const offered: Array<boolean | null> = [];
+    subscriptions.push(proOffered.subscribe((value) => offered.push(value)));
+    expect(account.at(-1)).toBe("unavailable");
+    expect(offered.at(-1)).toBe(false);
+    const values = subscribe();
+    visibility("hidden");
+    visibility("visible");
+    await vi.advanceTimersByTimeAsync(180_000);
+    expect(values).toEqual([null]);
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(bridge.proStatus).not.toHaveBeenCalled();
+    expect(bridge.onProChanged).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("never offers Pro in a native window that shows another host", () => {
+    bridge.isNativeShell.mockReturnValue(true);
+    gateway.isBrowserGateway.mockReturnValue(false);
+    host.getHostLabel.mockReturnValue("hpc-login");
+    bridge.proStatus.mockRejectedValue(new Error("command not allowed"));
+    const seen: AccountPlan[] = [];
+    const stop = accountPlan.subscribe((plan) => { seen.push(plan); });
+    let offered: boolean | null = null;
+    const stopOffered = proOffered.subscribe((value) => { offered = value; });
+    expect(seen.at(-1)).toBe("unavailable");
+    expect(offered).toBe(false);
+    expect(bridge.proStatus).not.toHaveBeenCalled();
+    stop(); stopOffered();
+    host.getHostLabel.mockReturnValue("local");
+  });
+});

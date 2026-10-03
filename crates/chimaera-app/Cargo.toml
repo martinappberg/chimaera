@@ -1,5 +1,6 @@
 [package]
 name = "chimaera-app"
+default-run = "chimaera"
 version = "0.0.1"
 edition = "2021"
 license = "AGPL-3.0-only"
@@ -9,17 +10,40 @@ repository = "https://github.com/martinappberg/chimaera"
 # enter the daemon workspace (musl CI, HPC login-node builds stay lean).
 [workspace]
 
+[dev-dependencies]
+chimaera-link = { path = "../chimaera-link", features = ["fixtures"] }
+axum = { version = "0.8", features = ["ws"] }
+
 # The shipped binary is just "chimaera" (matches productName) so the dock,
 # menu bar, and `ps` read the brand — not "chimaera-app".
 [[bin]]
 name = "chimaera"
 path = "src/main.rs"
 
+# Explicit synthetic runtime proof, excluded from ordinary binaries/tests.
+[[bin]]
+name = "chimaera-ssh-agent-fixture"
+path = "src/bin/ssh_agent_fixture.rs"
+required-features = ["ssh-agent-fixture"]
+test = false
+bench = false
+
+[features]
+# Enabled only for destination-bound signing verification until native/keeper gates pass.
+ssh-agent-prototype = ["dep:ssh-key", "dep:signature", "dep:base64", "dep:futures-util", "dep:tokio-tungstenite", "dep:zeroize"]
+ssh-agent-fixture = ["ssh-agent-prototype"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
 anyhow = "1"
+ssh-key = { version = "0.6.7", features = ["crypto"], optional = true }
+signature = { version = "2", optional = true }
+base64 = { version = "0.22", optional = true }
+zeroize = { version = "1", optional = true }
+futures-util = { version = "0.3", features = ["sink"], optional = true }
+tokio-tungstenite = { version = "0.29", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
@@ -41,12 +65,17 @@ tauri-plugin-updater = "2"
 # non-gesture navigator.clipboard.writeText (agent OSC 52 / copy-on-select), so
 # those writes run in the Rust process instead, where there is no gesture gate.
 tauri-plugin-clipboard-manager = "2"
+tauri-plugin-dialog = "2"
 # Hand external web URLs to the user's real browser (`open_external`): the
 # shell's navigation guard admits only the daemon origin, so a rendered link
 # has nowhere else to go. Same crate the CLI uses to open the UI.
 open = "5"
 ureq = { version = "3", features = ["json"] }
 urlencoding = "2"
+url = "2"
+chimaera-link = { path = "../chimaera-link" }
+# Native credential stores only: account tokens must never enter app JSON.
+keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 
 chimaera-core = { path = "../chimaera-core" }
 chimaera-remote = { path = "../chimaera-remote" }
@@ -56,7 +85,7 @@ chimaera-remote = { path = "../chimaera-remote" }
 # the daemon is the Linux musl binary inside WSL2, so the whole server stack
 # (and its PTY/unix surface) must stay out of that build.
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", features = ["signal"] }
+nix = { version = "0.31", features = ["signal", "resource"] }
 chimaera-server = { path = "../chimaera-server" }
 
 # macOS notifications: UNUserNotificationCenter (the modern API — click
@@ -77,11 +106,15 @@ objc2-user-notifications = { version = "0.3", default-features = false, features
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 notify-rust = "4.18"
 
+# System sleep signals and bounded logind delay inhibition; app-only.
+[target.'cfg(target_os = "linux")'.dependencies]
+dbus = "0.9"
+
 # Windows-only: registry-first WSL detection (never poke wsl.exe blind — the
 # 24H2 stub can block 60s interactively when WSL is absent).
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56"
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_System_Power", "Win32_UI_WindowsAndMessaging"] }
 
 # The root workspace's dev profile (see the comment there): file:line debug
 # info for our code, none for dependencies. Here the chimaera crates are path

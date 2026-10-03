@@ -10,7 +10,8 @@
    * invisibly. The chrome stays quiet: back/reload/external + an address
    * field, with honest overlay states instead of raw browser error pages.
    */
-  import { onDestroy, untrack } from "svelte";
+  import { onDestroy, untrack, tick } from "svelte";
+  import { isBrowserGateway } from "../net/base";
   import { get } from "svelte/store";
   import Spinner from "../previews/Spinner.svelte";
   import { pageVisible } from "../shared/visibility";
@@ -18,6 +19,8 @@
   import { isWebUrl, openInSystemBrowser } from "../shared/urlOpen";
   import {
     ConfirmRequired,
+    browserPreviewLease,
+    claimBrowserPreview,
     isLoopbackHost,
     mintProxy,
     parseAddress,
@@ -54,6 +57,8 @@
     | { kind: "unreachable"; detail: string }
     | { kind: "ready" };
 
+  const browserGateway = isBrowserGateway();
+  const frameName = `chimaera-preview-${crypto.randomUUID()}`;
   let phase = $state<Phase>({ kind: "blank" });
   /** `/proxy/{id}` once minted (the iframe URL base). */
   let base = $state<string | null>(null);
@@ -140,6 +145,7 @@
 
   /** Serial number guarding async flows against target changes mid-flight. */
   let epoch = 0;
+  let leaseRenewedAt = 0;
 
   async function connect(): Promise<void> {
     const mine = ++epoch;
@@ -163,8 +169,20 @@
         };
         return;
       }
-      iframeSrc = `${session.base}${path.startsWith("/") ? path : `/${path}`}`;
-      phase = { kind: "ready" };
+      if (browserGateway) {
+        const lease = await browserPreviewLease(session.id);
+        if (mine !== epoch) return;
+        base = `${new URL(lease.claim_url).origin}/proxy/${session.id}`;
+        iframeSrc = "about:blank";
+        phase = { kind: "ready" };
+        await tick();
+        if (mine !== epoch || iframeEl === null) return;
+        claimBrowserPreview(frameName, lease, path);
+        leaseRenewedAt = Date.now();
+      } else {
+        iframeSrc = `${session.base}${path.startsWith("/") ? path : `/${path}`}`;
+        phase = { kind: "ready" };
+      }
     } catch (e) {
       if (mine !== epoch) return;
       if (e instanceof ConfirmRequired) {
@@ -212,7 +230,7 @@
   $effect(() => {
     const p = path;
     untrack(() => {
-      if (phase.kind !== "ready" || base === null || livePath === null) return;
+      if (phase.kind !== "ready" || base === null || (!browserGateway && livePath === null)) return;
       if (p === livePath) return;
       iframeSrc = `${base}${p.startsWith("/") ? p : `/${p}`}`;
     });
@@ -261,6 +279,31 @@
     return () => clearInterval(t);
   });
 
+  // Refresh the HttpOnly preview cookie without navigating the app. The keeper
+  // answers this POST with 204. Leases stay short if the pane closes; live
+  // sockets independently revalidate parent device revocation.
+  $effect(() => {
+    if (!browserGateway || !visible || phase.kind !== "ready") return;
+    let pending = false;
+    let cancelled = false;
+    const renew = async () => {
+      const id = proxyId;
+      const mine = epoch;
+      if (pending || id === null || Date.now() - leaseRenewedAt < 300_000) return;
+      pending = true;
+      try {
+        const lease = await browserPreviewLease(id);
+        if (cancelled || mine !== epoch) return;
+        claimBrowserPreview(frameName, lease, "/", true);
+        leaseRenewedAt = Date.now();
+      } catch { if (!cancelled && mine === epoch) degraded = true; }
+      finally { pending = false; }
+    };
+    void renew();
+    const timer = setInterval(() => void renew(), 60_000);
+    return () => { cancelled = true; clearInterval(timer); };
+  });
+
   // --- iframe navigation tracking -------------------------------------------
 
   let titleObserver: MutationObserver | null = null;
@@ -275,6 +318,7 @@
    * do its heavier onload-only work (the title observer).
    */
   function syncLocation(): Window | null {
+    if (browserGateway) return null;
     const el = iframeEl;
     const b = base;
     if (el === null || b === null) return null;
@@ -340,7 +384,7 @@
   // same-origin property access, no I/O). untrack: syncLocation reads AND
   // writes `livePath` — tracking it would loop the effect.
   $effect(() => {
-    if (!visible || !$pageVisible || phase.kind !== "ready") return;
+    if (browserGateway || !visible || !$pageVisible || phase.kind !== "ready") return;
     untrack(() => syncLocation());
     const t = setInterval(syncLocation, 5000);
     return () => clearInterval(t);
@@ -380,6 +424,7 @@
   }
 
   function reload(): void {
+    if (browserGateway) { void connect(); return; }
     if (phase.kind === "unreachable" || phase.kind === "blank") {
       void connect();
       return;
@@ -396,6 +441,14 @@
    *  so it works for remote localhost too). */
   function openExternal(): void {
     if (base === null) return;
+    if (browserGateway && proxyId !== null) {
+      const target = `chimaera-preview-${crypto.randomUUID()}`;
+      const popup = window.open("about:blank", target);
+      if (popup === null) { degraded = true; return; }
+      popup.opener = null;
+      void browserPreviewLease(proxyId).then((lease) => claimBrowserPreview(target, lease, livePath ?? path)).catch(() => { popup.close(); degraded = true; });
+      return;
+    }
     // Through the shell in the native app — a bare window.open goes nowhere
     // there (the navigation guard admits only the daemon origin).
     openInSystemBrowser(`${location.origin}${base}${livePath ?? path}`);
@@ -418,6 +471,7 @@
     if (parsed.host === host && parsed.port === port) {
       if (base !== null && phase.kind === "ready") {
         iframeSrc = `${base}${parsed.path}`;
+        if (browserGateway) { livePath = parsed.path; onNavigate(parsed.path); }
       } else {
         onNavigate(parsed.path);
         void connect();
@@ -442,12 +496,12 @@
 
 <div class="browser">
   <div class="chrome">
-    <button class="nav" title="back" aria-label="back" onclick={back} disabled={phase.kind !== "ready"}>
+    <button class="nav" title="back" aria-label="back" onclick={back} disabled={browserGateway || phase.kind !== "ready"}>
       <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
         <path d="M10 3 5 8l5 5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
       </svg>
     </button>
-    <button class="nav" title="forward" aria-label="forward" onclick={forward} disabled={phase.kind !== "ready"}>
+    <button class="nav" title="forward" aria-label="forward" onclick={forward} disabled={browserGateway || phase.kind !== "ready"}>
       <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
         <path d="m6 3 5 5-5 5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
       </svg>
@@ -534,8 +588,12 @@
         <button class="action" onclick={() => void connect()}>retry now</button>
       </div>
     {/if}
+    {#if browserGateway && phase.kind === "ready"}
+      <div class="isolated-note">Preview runs in an isolated origin. If this browser blocks it, <button onclick={openExternal}>open in a separate tab</button>.</div>
+    {/if}
     {#if iframeSrc !== null && (phase.kind === "ready" || phase.kind === "connecting")}
       <iframe
+        name={frameName}
         class="frame"
         class:hidden={phase.kind !== "ready"}
         src={iframeSrc}
@@ -549,6 +607,8 @@
 </div>
 
 <style>
+  .isolated-note { padding: 6px 10px; color: var(--muted); font-size: var(--text-xs); }
+  .isolated-note button { font: inherit; color: var(--accent); background: none; border: 0; cursor: pointer; }
   .browser {
     position: absolute;
     inset: 0;

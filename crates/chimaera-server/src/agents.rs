@@ -470,6 +470,98 @@ pub(crate) async fn ingest(
     } else {
         query.key.as_str()
     };
+    // Codex 0.157.1 notify: agent-turn-complete, thread-id, cwd, and
+    // input-messages. Authenticate before any disk work, and do not feed
+    // this partial hook into Claude's attention state machine.
+    if query.event.as_deref() == Some("codex-notify") {
+        {
+            let agents = crate::lock(&state.agents);
+            let Some(record) = agents.get(&id) else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
+            if record.key != presented_key {
+                return StatusCode::FORBIDDEN.into_response();
+            }
+            if record.kind != AgentKind::Codex {
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+        }
+        let Some(thread) = payload
+            .get("thread-id")
+            .and_then(|value| value.as_str())
+            .filter(|id| crate::codex_notify::valid_thread_id(id))
+        else {
+            return Json(json!({})).into_response();
+        };
+        if payload["type"] != "agent-turn-complete" {
+            return Json(json!({})).into_response();
+        }
+        let Some(info) = state.sessions.get(&id) else {
+            return Json(json!({})).into_response();
+        };
+        let cwd = info.cwd;
+        if payload["cwd"]
+            .as_str()
+            .is_none_or(|value| std::path::Path::new(value) != cwd)
+        {
+            return Json(json!({})).into_response();
+        }
+        // The turn ended: with no output after it, this TUI is at a safe
+        // pause (see `agent_state::tui_at_pause`).
+        if let Some(record) = crate::lock(&state.agents)
+            .get_mut(&id)
+            .filter(|record| record.key == presented_key)
+        {
+            record.turn_complete_at = Some(crate::session_view::now_ms());
+        }
+        let home = crate::codex_notify::codex_home(&state).await;
+        let (known, native_cwd) = crate::lock(&state.agents)
+            .get(&id)
+            .map(|record| {
+                (
+                    record.transcript_path.clone(),
+                    record.native_cwd_for(thread),
+                )
+            })
+            .unwrap_or_default();
+        let cwd = native_cwd.unwrap_or(cwd);
+        let Ok(_permit) = crate::codex_notify::ROLLOUT_WORK.try_acquire() else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        let thread = thread.to_string();
+        let sought = thread.clone();
+        let rollout = tokio::task::spawn_blocking(move || {
+            known
+                .filter(|path| crate::codex_notify::verify_rollout(path, &sought, &cwd))
+                .or_else(|| crate::codex_notify::find_rollout(&home, &sought, &cwd))
+        })
+        .await
+        .ok()
+        .flatten();
+        if let Some(path) = rollout {
+            let mut agents = crate::lock(&state.agents);
+            // The session may have switched/retired while the filesystem was busy.
+            if let Some(record) = agents
+                .get_mut(&id)
+                .filter(|record| record.key == presented_key)
+            {
+                let changed = record.codex_thread_id.as_ref() != Some(&thread);
+                record.codex_thread_id = Some(thread);
+                record.transcript_path = Some(path);
+                if record.first_prompt.is_none() {
+                    record.first_prompt = payload["input-messages"]
+                        .as_array()
+                        .and_then(|messages| messages.iter().find_map(|value| value.as_str()))
+                        .map(truncate_prompt);
+                }
+                if changed {
+                    tracing::info!(session = %id, "captured verified Codex terminal thread");
+                    state.changes.notify_waiters();
+                }
+            }
+        }
+        return Json(json!({})).into_response();
+    }
     // Statusline heartbeat (the generated wrapper posts the TUI's statusline
     // JSON with `?event=statusline`): quantized usage telemetry only — it
     // never touches the hook state machine. Liberal ingest: an unknown shape
@@ -831,7 +923,10 @@ pub(crate) fn spawn_agent_watch(
                 let Some(record) = agents.get(&session_id) else {
                     return; // record withdrawn elsewhere
                 };
-                record.transcript_path.clone()
+                // Codex's rollout is an identity proof, not a Claude title log.
+                (record.kind == AgentKind::Claude)
+                    .then(|| record.transcript_path.clone())
+                    .flatten()
             };
             let Some(path) = path else { continue };
             if tailed.as_ref() != Some(&path) {

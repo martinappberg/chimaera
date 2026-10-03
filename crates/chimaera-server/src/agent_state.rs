@@ -119,6 +119,57 @@ impl AgentState {
     }
 }
 
+/// Quiet this long, a terminal agent with no reliable hook state is idle: a
+/// working Claude or Codex TUI repaints its spinner and elapsed time at least
+/// once a second, including while it waits on the model or a tool.
+pub(crate) const TUI_QUIET_MS: u64 = if cfg!(test) { 300 } else { 10_000 };
+/// Output this close after a turn-complete notify is that turn's last render.
+const TURN_SETTLE_MS: u64 = 2_000;
+
+/// Whether a terminal (PTY) agent sits at a safe pause, where its project may
+/// move or its machine suspend. Hook states decide for Claude; a Codex TUI
+/// (always `Unknown`) is paused once its turn-complete notify arrived and no
+/// output followed, or once its terminal has been quiet for a while with the
+/// agent itself in the foreground (no program it launched took the terminal).
+/// `now`, `last_output_at` are the PTY output clock (ms).
+pub(crate) fn tui_at_pause(
+    record: &AgentRecord,
+    alive: bool,
+    last_output_at: u64,
+    pid: Option<u32>,
+    foreground: Option<i32>,
+    now: u64,
+) -> bool {
+    if !alive {
+        return true;
+    }
+    match record.state {
+        AgentState::IdlePrompt
+        | AgentState::Finished
+        | AgentState::NeedsPermission
+        | AgentState::Errored
+        | AgentState::RateLimited => true,
+        AgentState::Running => false,
+        AgentState::Unknown => {
+            let own_terminal = match (foreground, pid) {
+                (Some(foreground), Some(pid)) => u32::try_from(foreground) == Ok(pid),
+                _ => true,
+            };
+            if !own_terminal {
+                return false;
+            }
+            if record.turn_complete_at.is_some_and(|at| {
+                record.terminal_input_at.is_none_or(|input| input < at)
+                    && last_output_at <= at.saturating_add(TURN_SETTLE_MS)
+            }) {
+                return true;
+            }
+            let last_activity = last_output_at.max(record.terminal_input_at.unwrap_or(0));
+            now.saturating_sub(last_activity) >= TUI_QUIET_MS
+        }
+    }
+}
+
 /// Cap on the per-session touched-files list.
 const FILES_TOUCHED_CAP: usize = 100;
 
@@ -179,6 +230,17 @@ pub(crate) struct AgentRecord {
     pub(crate) state: AgentState,
     /// Latest transcript path reported by any hook payload.
     pub(crate) transcript_path: Option<PathBuf>,
+    /// Original immutable native header cwd after an authenticated path remap.
+    pub(crate) native_cwd: Option<PathBuf>,
+    /// Codex notify's thread-id, captured only after its rollout is verified.
+    pub(crate) codex_thread_id: Option<String>,
+    /// When an authenticated Codex `agent-turn-complete` notify arrived (ms,
+    /// the PTY output clock). A Codex TUI has no hook state; this, with the
+    /// PTY's own output recency, tells whether it sits at a safe pause.
+    pub(crate) turn_complete_at: Option<u64>,
+    /// Nonempty input admitted by the PTY writer, never a refused viewer frame.
+    /// A new turn must not inherit the previous notify's safe-pause evidence.
+    pub(crate) terminal_input_at: Option<u64>,
     /// Latest `customTitle` transcript record (wins over `ai_title`).
     pub(crate) custom_title: Option<String>,
     /// Latest `{"type":"ai-title"}` transcript record.
@@ -274,12 +336,21 @@ pub(crate) fn notice_line(text: &str) -> String {
 }
 
 impl AgentRecord {
+    pub(crate) fn native_cwd_for(&self, native_id: &str) -> Option<PathBuf> {
+        (self.resumed_from.as_deref() == Some(native_id))
+            .then(|| self.native_cwd.clone())
+            .flatten()
+    }
     pub(crate) fn new(key: String, kind: AgentKind) -> Self {
         AgentRecord {
             key,
             kind,
             state: AgentState::Unknown,
             transcript_path: None,
+            native_cwd: None,
+            codex_thread_id: None,
+            turn_complete_at: None,
+            terminal_input_at: None,
             custom_title: None,
             ai_title: None,
             first_prompt: None,
@@ -384,6 +455,9 @@ impl AgentRecord {
     /// The session id `claude --resume` accepts: the transcript filename stem
     /// (hooks report the transcript as `<store>/<cwd-key>/<session-id>.jsonl`).
     pub(crate) fn resume_id(&self) -> Option<String> {
+        if self.kind == AgentKind::Codex {
+            return self.codex_thread_id.clone();
+        }
         self.transcript_path
             .as_ref()
             .and_then(|p| p.file_stem())
@@ -640,6 +714,97 @@ pub(crate) fn apply_title_line(line: &str, record: &mut AgentRecord) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// A Codex TUI never reports hook state; its turn-complete notify and its
+    /// terminal's own quiet make it pausable, while output after the notify
+    /// (a new turn) or a program in the foreground keeps it busy.
+    #[test]
+    fn a_terminal_agent_is_at_a_pause_by_notify_or_by_a_quiet_terminal() {
+        use super::{tui_at_pause, AgentKind, AgentRecord, AgentState, TUI_QUIET_MS};
+        let now = 1_000_000;
+        let mut codex = AgentRecord::new("k".into(), AgentKind::Codex);
+        // Working: the spinner repaints every second.
+        assert!(!tui_at_pause(
+            &codex,
+            true,
+            now - TUI_QUIET_MS / 2,
+            Some(7),
+            Some(7),
+            now
+        ));
+        // Quiet with the agent itself in the foreground: idle.
+        assert!(tui_at_pause(
+            &codex,
+            true,
+            now - TUI_QUIET_MS,
+            Some(7),
+            Some(7),
+            now
+        ));
+        // Quiet but a program it launched holds the terminal.
+        assert!(!tui_at_pause(
+            &codex,
+            true,
+            now - TUI_QUIET_MS,
+            Some(7),
+            Some(9),
+            now
+        ));
+        // The turn-complete notify: paused at once, until output resumes.
+        codex.turn_complete_at = Some(now - 100);
+        assert!(tui_at_pause(&codex, true, now - 50, Some(7), Some(7), now));
+        assert!(!tui_at_pause(
+            &codex,
+            true,
+            now + 5_000,
+            Some(7),
+            Some(7),
+            now + 5_000
+        ));
+        // A previous completion cannot override a newly foreground tool.
+        assert!(!tui_at_pause(&codex, true, now - 50, Some(7), Some(9), now));
+        // Even before the new turn produces output, admitted input is activity.
+        codex.turn_complete_at = None;
+        codex.terminal_input_at = Some(now);
+        assert!(!tui_at_pause(
+            &codex,
+            true,
+            now - TUI_QUIET_MS,
+            Some(7),
+            Some(7),
+            now
+        ));
+        assert!(tui_at_pause(
+            &codex,
+            true,
+            now,
+            Some(7),
+            Some(7),
+            now + TUI_QUIET_MS
+        ));
+        // Claude's hook states decide; rate limiting is a pause, running is not.
+        let mut claude = AgentRecord::new("k".into(), AgentKind::Claude);
+        claude.state = AgentState::RateLimited;
+        assert!(tui_at_pause(&claude, true, now, Some(7), Some(7), now));
+        claude.state = AgentState::Running;
+        assert!(!tui_at_pause(
+            &claude,
+            true,
+            now - TUI_QUIET_MS * 10,
+            Some(7),
+            Some(7),
+            now
+        ));
+        // An exited process holds nothing.
+        assert!(tui_at_pause(&claude, false, now, None, None, now));
+    }
+    #[test]
+    fn imported_native_cwd_only_applies_to_the_verified_parent_conversation() {
+        let mut record = super::AgentRecord::new("fixture".into(), super::AgentKind::Codex);
+        record.resumed_from = Some("parent".into());
+        record.native_cwd = Some(std::path::PathBuf::from("/original/project"));
+        assert_eq!(record.native_cwd_for("parent"), record.native_cwd);
+        assert_eq!(record.native_cwd_for("new-fork"), None);
+    }
     #[test]
     fn notice_line_drops_markup_but_keeps_issue_refs() {
         assert_eq!(

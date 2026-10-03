@@ -1,3 +1,4 @@
+mod activity;
 mod agent_docs;
 mod agent_probe;
 mod agent_setup;
@@ -6,7 +7,10 @@ mod agent_updates;
 mod agents;
 mod api;
 mod assets;
+mod bundle;
 mod chat;
+mod cloud;
+mod codex_notify;
 mod comms;
 mod compute;
 mod doc_check;
@@ -32,6 +36,7 @@ mod notebook;
 mod notices;
 mod persist;
 mod plugins;
+mod pro;
 mod proxy;
 mod quickopen;
 mod recents;
@@ -39,6 +44,7 @@ mod recents_archive;
 mod router;
 mod runtime_retention;
 mod runtimes;
+mod session_proxy;
 mod session_view;
 mod settings;
 mod spawn;
@@ -48,6 +54,7 @@ mod update;
 mod upload;
 mod view_state;
 mod voice;
+mod workspace_scope;
 mod workspaces;
 mod ws;
 
@@ -64,8 +71,17 @@ pub struct ServerConfig {
     pub routable_bind: bool,
 }
 
+/// Explicit supervisor-only provider consumer; ordinary startup never calls it.
+#[cfg(feature = "provider-authority-prototype")]
+pub use cloud::providers::authority as provider_control;
+#[cfg(feature = "provider-authority-prototype")]
+pub use cloud::providers::control_service::run as run_personal_provider_control;
 pub use job_host::run as run_job_host;
 pub use lifecycle::run;
+#[cfg(feature = "provider-claude-fixture")]
+pub use lifecycle::run_provider_claude_fixture;
+#[cfg(feature = "provider-github-fixture")]
+pub use lifecycle::run_provider_github_fixture;
 /// `chimaera plugin caps <plugin.toml>`: a manifest's tier, capability
 /// digest and Can list, as the lock and the card record them.
 pub use plugins::capabilities::describe_manifest as plugin_capabilities;

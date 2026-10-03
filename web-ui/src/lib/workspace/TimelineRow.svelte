@@ -11,6 +11,8 @@
    * go through inlineMarkdown (escape-then-format, safe by construction),
    * never raw.
    */
+  import { pickupNote } from "../chat/transfer";
+  import { isBrowserGateway } from "../net/base";
   import { inlineMarkdown } from "../shared/inlineMarkdown";
   import type { Session } from "./sessions";
   import type { TimelineEntry } from "./timeline.svelte";
@@ -90,6 +92,10 @@
   const name = $derived(
     sid !== null ? (names.get(sid) ?? sessions.get(sid)?.name ?? first.name ?? sid) : (first.name ?? ""),
   );
+  /** A turn the daemon opened itself (a transfer's or a restart's pick-up)
+   *  quotes its agent-facing message as the "prompt"; say what happened, as
+   *  the chat's divider does, instead of showing it as the person's words. */
+  const pickup = $derived(first.kind === "episode" ? pickupNote(first.title ?? "", isBrowserGateway()) : null);
   const evidence = $derived(groupEvidence(group));
   const durationMs = $derived(groupDurationMs(group));
 
@@ -195,7 +201,9 @@
       {:else}
         <span class="name">{name}</span>
       {/if}
-      {#if first.title}
+      {#if pickup !== null}
+        <span class="title quiet">{pickup}</span>
+      {:else if first.title}
         <!-- eslint-disable-next-line svelte/no-at-html-tags -- sanitized in inlineMarkdown -->
         <span class="title">“{@html inlineMarkdown(first.title)}”</span>
       {:else}

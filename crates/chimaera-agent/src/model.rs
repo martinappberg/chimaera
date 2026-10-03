@@ -47,6 +47,25 @@ pub const UNHANDLED_REQUEST_NAME_MAX: usize = 80;
 /// `UserMessage.origin` for the message the daemon sends a resurrected
 /// session when a restart cut its work off (see `ChatManager::command_as`).
 pub const ORIGIN_RESTART: &str = "restart";
+/// `UserMessage.origin` for the pick-up message the daemon sends a
+/// conversation a Chimaera Pro transfer interrupted: [`ORIGIN_MOVED`] when it
+/// arrives in the cloud, [`ORIGIN_HOME`] when it is back on the user's
+/// computer, and [`ORIGIN_RECOVERED`] (either direction) when the other
+/// machine stopped responding and the conversation continues from the last
+/// saved point (often in a forked copy). The UI keys its divider on these
+/// exact strings; they are a stable public wire value.
+pub const ORIGIN_MOVED: &str = "moved";
+pub const ORIGIN_HOME: &str = "home";
+pub const ORIGIN_RECOVERED: &str = "recovered";
+
+/// Whether `origin` tags a pick-up the daemon itself sent (after a restart
+/// or a transfer): each one resets the carryover's pick-up clock.
+pub fn is_pickup_origin(origin: &str) -> bool {
+    matches!(
+        origin,
+        ORIGIN_RESTART | ORIGIN_MOVED | ORIGIN_HOME | ORIGIN_RECOVERED
+    )
+}
 /// `UserMessage.origin` for a worker's `tell_mastermind` message the daemon
 /// delivered to an auto-mode Mastermind — journals written before agent
 /// communication replaced it; nothing sends it any more.
@@ -268,11 +287,19 @@ pub enum AgentEvent {
         /// `"remote"` = a Remote Control client (phone / claude.ai) injected
         /// it through the agent's own bridge, so it never crossed chimaera's
         /// composer; [`ORIGIN_RESTART`] = the daemon sent it itself after a
-        /// restart cut work off; [`ORIGIN_WORKER`] = a worker's message the
-        /// daemon delivered to the Mastermind. Absent = this workbench's
-        /// composer. Additive.
+        /// restart cut work off; [`ORIGIN_MOVED`] / [`ORIGIN_HOME`] /
+        /// [`ORIGIN_RECOVERED`] = the daemon's pick-up after a Pro transfer;
+        /// [`ORIGIN_WORKER`] = a worker's message the daemon delivered to the
+        /// Mastermind. Absent = this workbench's composer. Additive.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<String>,
+        /// The id the sending client minted for the `send` this echoes (see
+        /// [`valid_client_id`]). It is how that client knows this very send
+        /// arrived, and how the manager refuses to run the same send twice.
+        /// Stamped by the manager, never by a driver. Absent on a send
+        /// without one and on every message no client sent. Additive.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_id: Option<String>,
     },
     ToolCall {
         id: String,
@@ -961,6 +988,25 @@ pub enum AgentCommand {
         id: String,
         blocks: Vec<ContentBlock>,
     },
+}
+
+/// Length bounds of a client-minted send id (`client_id` on a `send` /
+/// `send_after_turn` frame).
+pub const CLIENT_ID_MIN: usize = 8;
+pub const CLIENT_ID_MAX: usize = 64;
+/// How many send ids a session remembers (the newest), in memory and when it
+/// reads them back from its journal. Far more than the sends a client can
+/// still have unconfirmed, and under 10 KiB a session at the id length cap.
+pub const CLIENT_IDS_REMEMBERED: usize = 128;
+
+/// Whether `id` is a well-formed client-minted send id: 8 to 64 characters
+/// from `[A-Za-z0-9_-]`. The bound is what keeps a session's record of ids
+/// small; the alphabet keeps an id safe to echo in any frame.
+pub fn valid_client_id(id: &str) -> bool {
+    (CLIENT_ID_MIN..=CLIENT_ID_MAX).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 /// A client command exceeded one of the daemon's bounded-ingress budgets.
@@ -1922,6 +1968,7 @@ mod tests {
             queued: false,
             after_turn: false,
             origin: None,
+            client_id: None,
         };
         let json = serde_json::to_value(&with).unwrap();
         assert_eq!(
@@ -2064,6 +2111,19 @@ mod tests {
             answers,
         };
         assert!(too_many_answers.validate_ingress().is_err());
+    }
+
+    #[test]
+    fn client_send_ids_are_short_and_plain() {
+        assert!(valid_client_id("abcdEFGH"));
+        assert!(valid_client_id("0f8fad5b-d9cb-469f-a165-70867728950e"));
+        assert!(valid_client_id(&"a".repeat(CLIENT_ID_MAX)));
+        assert!(valid_client_id("with_under-score"));
+        assert!(!valid_client_id("short"));
+        assert!(!valid_client_id(&"a".repeat(CLIENT_ID_MAX + 1)));
+        assert!(!valid_client_id("has space1"));
+        assert!(!valid_client_id("quote\"12345"));
+        assert!(!valid_client_id("ünïcödé-id"));
     }
 
     #[test]

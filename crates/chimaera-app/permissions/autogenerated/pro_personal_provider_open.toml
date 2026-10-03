@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pro-personal-provider-open"
+description = "Enables the pro_personal_provider_open command without any pre-configured scope."
+commands.allow = ["pro_personal_provider_open"]
+
+[[permission]]
+identifier = "deny-pro-personal-provider-open"
+description = "Denies the pro_personal_provider_open command without any pre-configured scope."
+commands.deny = ["pro_personal_provider_open"]

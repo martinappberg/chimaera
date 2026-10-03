@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pro-hosts"
+description = "Enables the pro_hosts command without any pre-configured scope."
+commands.allow = ["pro_hosts"]
+
+[[permission]]
+identifier = "deny-pro-hosts"
+description = "Denies the pro_hosts command without any pre-configured scope."
+commands.deny = ["pro_hosts"]

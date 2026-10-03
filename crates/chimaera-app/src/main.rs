@@ -14,19 +14,27 @@ mod http;
 mod menu;
 mod notify;
 mod shell;
+#[cfg(feature = "ssh-agent-prototype")]
+#[allow(dead_code)] // No native Connect path advertises signing before live acceptance.
+mod ssh_agent;
 mod tray;
 mod update;
 mod windows;
 mod wsl;
 
 fn main() {
-    // Triple role. `--askpass <prompt>` is the tiny SSH_ASKPASS helper ssh
+    // `--askpass <prompt>` is the tiny SSH_ASKPASS helper ssh
     // runs to prompt for a password / 2FA: it relays to the running app over
     // a socket and prints the answer, no Tauri init. Checked first — it must
     // stay lightweight and never spawn a daemon or a window.
     if std::env::args().any(|a| a == "--askpass") {
         askpass::run_helper();
         return;
+    }
+
+    #[cfg(all(unix, feature = "ssh-agent-prototype"))]
+    if std::env::args().nth(1).as_deref() == Some("--native-key-agent") {
+        std::process::exit(ssh_agent::key_agent::run_helper());
     }
 
     // `chimaera-app --daemon` IS the local daemon (headless, no Tauri init),
@@ -57,5 +65,23 @@ fn main() {
         .with_writer(std::io::stderr)
         .init();
 
+    #[cfg(unix)]
+    raise_open_file_limit();
     shell::run();
+}
+
+/// macOS starts GUI apps with a 256-descriptor soft limit. Every forwarded
+/// terminal, chat or file view through a Pro connection costs two sockets,
+/// so a busy workbench can exhaust it and lose its connections. Raise the
+/// soft limit toward the hard limit (macOS rejects values above 10240).
+#[cfg(unix)]
+fn raise_open_file_limit() {
+    use nix::sys::resource::{getrlimit, setrlimit, Resource};
+    const WANTED: u64 = 8192;
+    if let Ok((soft, hard)) = getrlimit(Resource::RLIMIT_NOFILE) {
+        let target = WANTED.min(hard);
+        if soft < target && setrlimit(Resource::RLIMIT_NOFILE, target, hard).is_err() {
+            tracing::debug!("could not raise the open-file limit from {soft}");
+        }
+    }
 }

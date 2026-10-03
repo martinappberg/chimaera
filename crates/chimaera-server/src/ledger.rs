@@ -27,6 +27,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 
+#[cfg(unix)]
+#[path = "ledger_manual.rs"]
+pub(crate) mod manual;
+
 use crate::agents::AgentKind;
 use crate::AppState;
 use chimaera_agent::model::SessionUi;
@@ -35,6 +39,12 @@ use chimaera_agent::model::SessionUi;
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct LedgerEntry {
     pub(crate) id: String,
+    /// A handoff or unverified owner retains identity without resurrecting.
+    pub(crate) suspended: bool,
+    /// Fixed manual parking reason. Unknown persisted reasons stay manual;
+    /// automatic ownership/provider recovery never clears this fence.
+    pub(crate) manual_resume_reason: Option<String>,
+    pub(crate) handoff: Option<crate::bundle::HandoffResume>,
     pub(crate) workspace_id: String,
     /// Last polled cwd (shells) or spawn cwd (agents).
     pub(crate) cwd: PathBuf,
@@ -56,7 +66,7 @@ pub(crate) struct LedgerEntry {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct LedgerAgent {
     pub(crate) kind: AgentKind,
-    /// Claude conversation id (`--resume <id>`), when known. A recorded id
+    /// Claude conversation id or Codex thread id, when known. A recorded id
     /// is a CLAIM, not a promise: claude 2.1.204 interactive sessions do
     /// not persist their transcripts (verified 2026-07-07 — print mode
     /// does; 2.1.19x did), and `--resume` against a conversation with no
@@ -66,6 +76,8 @@ pub(crate) struct LedgerAgent {
     /// The transcript path claude's hooks reported, when any — the exact
     /// file `--resume` needs to exist.
     pub(crate) transcript: Option<PathBuf>,
+    /// Header provenance; launch cwd may move while native bytes stay intact.
+    pub(crate) native_cwd: Option<PathBuf>,
     /// Current display title — carried onto the successor session (or a
     /// Recents row) so the conversation stays recognizable either way.
     pub(crate) title: String,
@@ -96,9 +108,12 @@ pub(crate) struct BootLedger {
 }
 
 impl LedgerEntry {
-    fn to_json(&self) -> serde_json::Value {
+    pub(crate) fn to_json(&self) -> serde_json::Value {
         json!({
             "id": self.id,
+            "suspended": self.suspended,
+            "manual_resume_reason": self.manual_resume_reason,
+            "handoff": self.handoff,
             "workspace_id": self.workspace_id,
             "cwd": self.cwd,
             "pinned_name": self.pinned_name,
@@ -110,6 +125,7 @@ impl LedgerEntry {
                 "kind": a.kind.as_str(),
                 "resume": a.resume,
                 "transcript": a.transcript,
+                "native_cwd": a.native_cwd,
                 "title": a.title,
                 "ui": a.ui,
                 "model": a.model,
@@ -118,11 +134,15 @@ impl LedgerEntry {
         })
     }
 
-    fn from_json(value: &serde_json::Value) -> Option<LedgerEntry> {
+    pub(crate) fn from_json(value: &serde_json::Value) -> Option<LedgerEntry> {
         let agent = match value.get("agent") {
             None | Some(serde_json::Value::Null) => None,
             Some(a) => Some(LedgerAgent {
                 kind: AgentKind::parse(a.get("kind")?.as_str()?)?,
+                native_cwd: a
+                    .get("native_cwd")
+                    .and_then(|v| v.as_str())
+                    .map(PathBuf::from),
                 resume: a.get("resume").and_then(|r| r.as_str()).map(str::to_string),
                 transcript: a
                     .get("transcript")
@@ -143,6 +163,17 @@ impl LedgerEntry {
             }),
         };
         Some(LedgerEntry {
+            suspended: value["suspended"].as_bool().unwrap_or(false),
+            manual_resume_reason: match value.get("manual_resume_reason") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::String(reason)) if reason == "project_secrets_idle" => {
+                    Some(reason.clone())
+                }
+                _ => Some("unknown".into()),
+            },
+            handoff: value
+                .get("handoff")
+                .and_then(|v| serde_json::from_value(v.clone()).ok()),
             id: value.get("id")?.as_str()?.to_string(),
             workspace_id: value.get("workspace_id")?.as_str()?.to_string(),
             cwd: PathBuf::from(value.get("cwd")?.as_str()?),
@@ -231,31 +262,75 @@ impl LedgerStore {
         entries: &[LedgerEntry],
         links: &HashMap<String, String>,
     ) {
+        if let Err(error) = self.write_checked(entries, links) {
+            tracing::error!(%error, "failed to persist session ledger");
+        }
+    }
+    /// A handoff's ledger write (a suspended session, a stopped agent) must
+    /// survive a power cut: it is what keeps two machines from resuming the
+    /// same conversation.
+    pub(crate) fn write_durable(
+        &mut self,
+        entries: &[LedgerEntry],
+        links: &HashMap<String, String>,
+    ) -> anyhow::Result<()> {
+        // Always written: an unchanged body may still sit in a cache only.
+        let body = Self::body(entries, links);
+        self.save(&body, true)?;
+        self.last_written = Some(body);
+        Ok(())
+    }
+    /// Active maintenance needs positive rename durability. Unlike ordinary
+    /// stores, unsupported directory fsync cannot be treated as idle proof.
+    #[cfg(unix)]
+    pub(crate) fn write_maintenance_durable(
+        &mut self,
+        entries: &[LedgerEntry],
+        links: &HashMap<String, String>,
+    ) -> anyhow::Result<()> {
+        self.write_durable(entries, links)?;
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("maintenance ledger storage missing"))?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    }
+    fn body(entries: &[LedgerEntry], links: &HashMap<String, String>) -> String {
         // BTreeMap orders the links so an unchanged snapshot compares equal.
         let links: std::collections::BTreeMap<&String, &String> = links.iter().collect();
-        let body = json!({
+        json!({
             "sessions": entries.iter().map(LedgerEntry::to_json).collect::<Vec<_>>(),
             "links": links,
         })
-        .to_string();
+        .to_string()
+    }
+    pub(crate) fn write_checked(
+        &mut self,
+        entries: &[LedgerEntry],
+        links: &HashMap<String, String>,
+    ) -> anyhow::Result<()> {
+        let body = Self::body(entries, links);
         if self.last_written.as_deref() == Some(body.as_str()) {
-            return;
+            return Ok(());
         }
-        if let Err(err) = self.save(&body) {
-            tracing::error!(%err, "failed to persist session ledger");
-            return;
-        }
+        self.save(&body, false)?;
         self.last_written = Some(body);
+        Ok(())
     }
 
-    fn save(&self, body: &str) -> anyhow::Result<()> {
+    fn save(&self, body: &str, durable: bool) -> anyhow::Result<()> {
         let full = {
             let mut value: serde_json::Value = serde_json::from_str(body)?;
             value["v"] = json!(1);
             value["written_at"] = json!(unix_now());
             value.to_string()
         };
-        crate::persist::atomic_write_json(&self.path, full)
+        if durable {
+            crate::persist::atomic_write_json_durable(&self.path, full)
+        } else {
+            crate::persist::atomic_write_json(&self.path, full)
+        }
     }
 }
 
@@ -318,6 +393,28 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
         .filter(|c| c.alive)
         .filter_map(|c| Some((c.id.clone(), state.chat.carryover(&c.id)?)))
         .collect();
+    // A chat resumed without a fork reports its native id only once its first
+    // turn runs (`system/init`); until then the conversation's tip is still
+    // the one it was resumed from. Without it, a conversation that arrived
+    // (or restarted) and was not used yet could neither move on to another
+    // machine nor survive another restart with its history. Read before the
+    // state locks below, like `carries`.
+    let resumed: HashMap<String, String> = {
+        let recipes = crate::lock(&state.chat_recipes);
+        chats
+            .iter()
+            .filter(|c| c.native_session_id.is_none())
+            .filter_map(|c| {
+                let recipe = recipes.get(&c.id)?;
+                (recipe.fork_at.is_none()
+                    && !recipe.fork_head
+                    && recipe.rollback_turns.is_none()
+                    && recipe.revert_before_turn.is_none())
+                .then(|| Some((c.id.clone(), recipe.resume.clone()?)))
+                .flatten()
+            })
+            .collect()
+    };
     // Live ids across BOTH surfaces: the theme map is pruned to these, and a
     // session id belongs to at most one surface at a time.
     let live_ids: std::collections::HashSet<String> = infos
@@ -353,12 +450,19 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
                 kind: record.kind,
                 resume: record.resume_id().or_else(|| record.resumed_from.clone()),
                 transcript: record.transcript_path.clone(),
+                native_cwd: record
+                    .resume_id()
+                    .or_else(|| record.resumed_from.clone())
+                    .and_then(|id| record.native_cwd_for(&id)),
                 title: record.display_name(info.title.as_deref()),
                 ui: SessionUi::Term,
                 model: None,
                 carryover: None,
             });
             Some(LedgerEntry {
+                suspended: false,
+                manual_resume_reason: None,
+                handoff: None,
                 id: info.id.clone(),
                 workspace_id,
                 cwd: cwds
@@ -397,7 +501,14 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
             let title = record
                 .map(|r| r.display_name(None))
                 .unwrap_or_else(|| kind.as_str().to_string());
+            let resume = c
+                .native_session_id
+                .clone()
+                .or_else(|| resumed.get(&c.id).cloned());
             Some(LedgerEntry {
+                suspended: false,
+                manual_resume_reason: None,
+                handoff: None,
                 id: c.id.clone(),
                 workspace_id,
                 cwd: cwds.get(&c.id).cloned().unwrap_or_else(|| c.cwd.clone()),
@@ -408,8 +519,11 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
                 created_at: c.created_at_ms / 1000,
                 agent: Some(LedgerAgent {
                     kind,
-                    resume: c.native_session_id.clone(),
-                    transcript: None,
+                    native_cwd: resume
+                        .as_deref()
+                        .and_then(|id| record.and_then(|r| r.native_cwd_for(id))),
+                    resume,
+                    transcript: record.and_then(|r| r.transcript_path.clone()),
                     title,
                     ui: SessionUi::Chat,
                     model: c.model.clone(),
@@ -420,10 +534,29 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
         .collect();
     drop(pty_ids);
     entries.extend(chat_entries);
+    drop(themes);
+    drop(cwds);
+    drop(agents);
+    drop(workspaces);
+    for entry in crate::lock(&state.deferred_sessions).values() {
+        if let Some(live) = entries.iter_mut().find(|live| live.id == entry.id) {
+            if entry.manual_resume_reason.is_some() {
+                // A warming or rejected Init cannot change the parked native
+                // identity before the exact owned Resume has durably landed.
+                *live = entry.clone();
+            } else {
+                live.suspended = entry.suspended;
+            }
+        } else {
+            entries.push(entry.clone());
+        }
+    }
 
+    let retained_ids: std::collections::HashSet<_> =
+        entries.iter().map(|entry| entry.id.as_str()).collect();
     let links = crate::lock(&state.links)
         .iter()
-        .filter(|(t, a)| live_ids.contains(t.as_str()) && live_ids.contains(a.as_str()))
+        .filter(|(t, a)| retained_ids.contains(t.as_str()) && retained_ids.contains(a.as_str()))
         .map(|(t, a)| (t.clone(), a.clone()))
         .collect();
     (entries, links)
@@ -434,7 +567,17 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
 /// until a ledgered chat respawns it is live nowhere, yet its journal is what
 /// it resumes from.
 pub(crate) async fn consume_boot(state: &Arc<AppState>, boot: BootLedger) {
+    let boot = crate::pro::restore_manual_parking(state, boot).await;
     restore(state, boot).await;
+    // Laptop first: restart-deferred work resumes even when the account never
+    // answers. A verified grant usually resumes it well before this.
+    let owner = state.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(crate::pro::BOOT_VERIFICATION_GRACE).await;
+        if !owner.stopping.load(std::sync::atomic::Ordering::Acquire) {
+            crate::pro::resume_unverified(&owner).await;
+        }
+    });
     // Serving started concurrently; sessions snapshots held back by
     // `wait_restored` may flow now that the roster is whole.
     state.restored.send_replace(true);
@@ -454,6 +597,28 @@ pub(crate) async fn restore(state: &Arc<AppState>, boot: BootLedger) {
     let mut respawned = 0usize;
     let mut retired = 0usize;
     for entry in &boot.sessions {
+        // Only agents wait for this life's ownership proof; a plain shell is
+        // never managed and comes back unless its project runs elsewhere.
+        let held = if entry.agent.is_some() {
+            !crate::pro::may_restore(state, &entry.workspace_id)
+        } else {
+            !crate::pro::may_execute(state, &entry.workspace_id)
+        };
+        // A returned session whose resume a sign-out or crash cut short is
+        // no hand-off in flight any more: like any session the previous
+        // daemon left, it waits for this life's ownership proof and the
+        // device fallback, instead of answering "moved" forever.
+        let interrupted = entry.suspended && crate::pro::interrupted_return(state, entry);
+        if entry.suspended || entry.manual_resume_reason.is_some() || held {
+            let mut deferred = entry.clone();
+            deferred.suspended = true;
+            if let Err(error) = defer(state, deferred) {
+                tracing::error!(session=%entry.id,%error,"deferred ledger capacity reached");
+            } else if entry.manual_resume_reason.is_none() && (!entry.suspended || interrupted) {
+                crate::pro::defer_boot_session(state, &entry.id);
+            }
+            continue;
+        }
         let workspace = crate::lock(&state.workspaces).get(&entry.workspace_id);
         let plan = plan_restore(entry, restore, workspace.is_some());
         match plan {
@@ -463,14 +628,14 @@ pub(crate) async fn restore(state: &Arc<AppState>, boot: BootLedger) {
                     Ok(()) => respawned += 1,
                     Err(err) => {
                         tracing::warn!(session = %entry.id, %err, "resurrection failed");
-                        if retire_to_recents(state, entry, boot.written_at) {
+                        if retire_to_recents(state, entry, boot.written_at).await {
                             retired += 1;
                         }
                     }
                 }
             }
             RestorePlan::Retire => {
-                if retire_to_recents(state, entry, boot.written_at) {
+                if retire_to_recents(state, entry, boot.written_at).await {
                     retired += 1;
                 }
             }
@@ -479,8 +644,14 @@ pub(crate) async fn restore(state: &Arc<AppState>, boot: BootLedger) {
     }
     // Linked-terminal edges survive only when both endpoints did.
     {
-        let live: std::collections::HashSet<String> =
-            state.sessions.list().into_iter().map(|i| i.id).collect();
+        let mut live: std::collections::HashSet<String> = state
+            .sessions
+            .list()
+            .into_iter()
+            .map(|i| i.id)
+            .chain(state.chat.list().into_iter().map(|i| i.id))
+            .collect();
+        live.extend(crate::lock(&state.deferred_sessions).keys().cloned());
         let mut links = crate::lock(&state.links);
         for (terminal, agent) in &boot.links {
             if live.contains(terminal) && live.contains(agent) {
@@ -513,10 +684,9 @@ enum RestorePlan {
 
 /// Pure restore policy, split out for tests: shells and claude respawn
 /// (claude resumes its conversation; a claude that never got a transcript
-/// has nothing to lose and boots fresh). The ledger does not capture a fresh
-/// Codex TUI's native thread id, so it cannot target `codex resume <id>`
-/// precisely; respawning fresh while pretending continuity would be a lie,
-/// so that entry retires into Recents instead.
+/// has nothing to lose and boots fresh). Codex TUIs respawn only with a captured
+/// thread id; the disk check in respawn refuses a missing rollout rather than
+/// silently replacing its conversation with a fresh one.
 ///
 /// A **chat** session respawns for BOTH agents: the chat drivers resume
 /// in-band (claude `--resume`, codex `thread/resume`) and the on-disk journal
@@ -535,7 +705,11 @@ fn plan_restore(entry: &LedgerEntry, restore_enabled: bool, workspace_exists: bo
             }
         }
         Some(agent) => {
-            if restore_enabled && workspace_exists && agent.kind == AgentKind::Claude {
+            if restore_enabled
+                && workspace_exists
+                && (agent.kind == AgentKind::Claude
+                    || (agent.kind == AgentKind::Codex && agent.resume.is_some()))
+            {
                 RestorePlan::Respawn
             } else {
                 RestorePlan::Retire
@@ -553,6 +727,19 @@ fn plan_restore(entry: &LedgerEntry, restore_enabled: bool, workspace_exists: bo
 fn resolve_resume(claude_projects_dir: &std::path::Path, entry: &LedgerEntry) -> Option<String> {
     let agent = entry.agent.as_ref()?;
     let id = agent.resume.as_deref()?;
+    if agent.kind == AgentKind::Codex {
+        return agent
+            .transcript
+            .as_deref()
+            .filter(|path| {
+                crate::codex_notify::verify_rollout(
+                    path,
+                    id,
+                    agent.native_cwd.as_deref().unwrap_or(&entry.cwd),
+                )
+            })
+            .map(|_| id.to_string());
+    }
     let recorded = agent
         .transcript
         .as_deref()
@@ -565,11 +752,34 @@ fn resolve_resume(claude_projects_dir: &std::path::Path, entry: &LedgerEntry) ->
     (recorded || derived).then(|| id.to_string())
 }
 
-async fn respawn(
+pub(crate) async fn respawn(
     state: &Arc<AppState>,
     entry: &LedgerEntry,
     workspace: crate::workspaces::Workspace,
 ) -> anyhow::Result<()> {
+    let (fork, origin) = entry.handoff.as_ref().map_or((false, None), |handoff| {
+        (handoff.fork, Some(handoff.origin.as_str()))
+    });
+    if entry.handoff.as_ref().is_some_and(|handoff| {
+        crate::pro::owned_epoch(state, &entry.workspace_id)
+            .is_some_and(|epoch| epoch != handoff.epoch)
+    }) {
+        anyhow::bail!("deferred bundle epoch is stale");
+    }
+    respawn_transfer(state, entry, workspace, fork, origin).await
+}
+
+pub(crate) async fn respawn_transfer(
+    state: &Arc<AppState>,
+    entry: &LedgerEntry,
+    workspace: crate::workspaces::Workspace,
+    fork_head: bool,
+    origin: Option<&'static str>,
+) -> anyhow::Result<()> {
+    state.bundle_imports.check_session(
+        &entry.id,
+        entry.agent.as_ref().and_then(|a| a.resume.as_deref()),
+    )?;
     // Chat sessions resurrect through the chat spawn path (regenerate the
     // per-session settings/mcp files against THIS daemon, resume the native
     // conversation, reuse the existing on-disk journal) — a wholly different
@@ -579,7 +789,11 @@ async fn respawn(
         .as_ref()
         .is_some_and(|a| a.ui == SessionUi::Chat)
     {
-        return crate::chat::resurrect_chat(state, entry, workspace).await;
+        return if origin.is_some() || fork_head {
+            crate::chat::resurrect_chat_transfer(state, entry, workspace, fork_head, origin).await
+        } else {
+            crate::chat::resurrect_chat(state, entry, workspace).await
+        };
     }
     // A cwd deleted while the daemon was down falls back to the workspace
     // root — a shell somewhere beats no shell.
@@ -592,7 +806,13 @@ async fn respawn(
     let kind = match &entry.agent {
         None => crate::spawn::SpawnKind::Shell,
         Some(agent) => {
-            let resume = resolve_resume(&state.claude_projects_dir, entry);
+            let projects = state.claude_projects_dir.clone();
+            let recorded = entry.clone();
+            let resume =
+                tokio::task::spawn_blocking(move || resolve_resume(&projects, &recorded)).await?;
+            if agent.kind == AgentKind::Codex && resume.is_none() {
+                anyhow::bail!("Codex rollout is missing; retiring without a resume promise");
+            }
             if resume.is_none() && agent.resume.is_some() {
                 tracing::info!(session = %entry.id,
                     "conversation transcript is gone; respawning fresh instead of --resume");
@@ -609,6 +829,8 @@ async fn respawn(
         }
     };
     let spec = crate::spawn::SpawnSpec {
+        native_cwd: entry.agent.as_ref().and_then(|a| a.native_cwd.clone()),
+        fork_head,
         workspace,
         id: Some(entry.id.clone()),
         name: entry.pinned_name.clone(),
@@ -633,7 +855,7 @@ async fn respawn(
 /// Remember a non-resurrectable agent conversation in its workspace's
 /// Recents, honoring `retire()`'s rules (untitled claude boots carry
 /// nothing recognizable and are skipped). Returns whether a row landed.
-fn retire_to_recents(state: &Arc<AppState>, entry: &LedgerEntry, last_active: u64) -> bool {
+async fn retire_to_recents(state: &Arc<AppState>, entry: &LedgerEntry, last_active: u64) -> bool {
     let Some(agent) = &entry.agent else {
         return false; // shells have no conversation to remember
     };
@@ -645,6 +867,16 @@ fn retire_to_recents(state: &Arc<AppState>, entry: &LedgerEntry, last_active: u6
         return false;
     }
     let is_chat = agent.ui == SessionUi::Chat;
+    let resume = if is_chat && agent.kind != AgentKind::Claude {
+        agent.resume.clone()
+    } else {
+        let projects = state.claude_projects_dir.clone();
+        let recorded = entry.clone();
+        tokio::task::spawn_blocking(move || resolve_resume(&projects, &recorded))
+            .await
+            .ok()
+            .flatten()
+    };
     let recent = crate::recents::RecentEntry {
         kind: agent.kind,
         title,
@@ -653,11 +885,7 @@ fn retire_to_recents(state: &Arc<AppState>, entry: &LedgerEntry, last_active: u6
         // native id passes straight through; claude (chat or TUI) needs the
         // transcript on disk (`resolve_resume`), else the row honestly starts
         // fresh (existing UI rule).
-        resume: if is_chat && agent.kind != AgentKind::Claude {
-            agent.resume.clone()
-        } else {
-            resolve_resume(&state.claude_projects_dir, entry)
-        },
+        resume,
         supersedes: Vec::new(),
         last_active: if last_active > 0 {
             last_active
@@ -675,12 +903,175 @@ fn retire_to_recents(state: &Arc<AppState>, entry: &LedgerEntry, last_active: u6
     true
 }
 
+/// A verified local grant is the only path that resumes restart-deferred work.
+pub(crate) async fn resume_deferred_workspace(
+    state: &Arc<AppState>,
+    workspace_id: &str,
+) -> anyhow::Result<()> {
+    resume_deferred_filtered(state, workspace_id, |_| true).await
+}
+
+/// Like [`resume_deferred_workspace`], for the entries `keep` accepts (a
+/// provider still signing in holds only its own sessions back). One session
+/// that fails to resume does not stop the others; the first error is
+/// returned after every session was tried.
+pub(crate) async fn resume_deferred_filtered(
+    state: &Arc<AppState>,
+    workspace_id: &str,
+    keep: impl Fn(&LedgerEntry) -> bool,
+) -> anyhow::Result<()> {
+    if !crate::pro::may_execute(state, workspace_id) {
+        anyhow::bail!("workspace ownership has not been verified");
+    }
+    let workspace = crate::lock(&state.workspaces)
+        .get(workspace_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown workspace"))?;
+    // A shell that moved to the cloud stays there; it never resumes here.
+    let resumable = |entry: &LedgerEntry| {
+        keep(entry)
+            && entry.manual_resume_reason.is_none()
+            && !(entry.agent.is_none()
+                && entry
+                    .handoff
+                    .as_ref()
+                    .is_some_and(|handoff| handoff.origin == crate::bundle::Origin::Moved))
+    };
+    let ids: Vec<_> = crate::lock(&state.deferred_sessions)
+        .values()
+        .filter(|entry| entry.workspace_id == workspace_id && resumable(entry))
+        .map(|entry| entry.id.clone())
+        .collect();
+    state.session_proxy.clear_workspace(workspace_id);
+    let mut failure = None;
+    for id in ids {
+        if let Err(error) = resume_one(state, &workspace, &id, &resumable).await {
+            tracing::warn!(session = %id, %error, "deferred session could not resume");
+            failure.get_or_insert(error);
+        }
+    }
+    state.changes.notify_waiters();
+    failure.map_or(Ok(()), Err)
+}
+
+/// Resume only the named restart-deferred sessions of one workspace.
+pub(crate) async fn resume_deferred_sessions(
+    state: &Arc<AppState>,
+    workspace_id: &str,
+    ids: &[String],
+) -> anyhow::Result<()> {
+    if !crate::pro::may_execute(state, workspace_id) {
+        anyhow::bail!("workspace is owned elsewhere");
+    }
+    let workspace = crate::lock(&state.workspaces)
+        .get(workspace_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown workspace"))?;
+    for id in ids {
+        resume_one(state, &workspace, id, &|entry| {
+            entry.manual_resume_reason.is_none()
+        })
+        .await?;
+    }
+    state.changes.notify_waiters();
+    Ok(())
+}
+
+/// Respawn one deferred session of `workspace` and take it out of the
+/// deferred set, once however many resumers race for it: a return's own
+/// resume can still be respawning a session when sign-out resumes the same
+/// project. Resumers of one session take turns, and each rechecks under its
+/// turn, so a later one finds the session live (or no longer deferred) and
+/// does nothing, or retries after an earlier failure. Without turns both
+/// respawn, and the loser's failed spawn tears down the winner's agent record.
+async fn resume_one(
+    state: &Arc<AppState>,
+    workspace: &crate::workspaces::Workspace,
+    id: &str,
+    keep: &impl Fn(&LedgerEntry) -> bool,
+) -> anyhow::Result<()> {
+    let turn = ResumeTurn::take(state, id);
+    let _turn = turn.wait().await;
+    let Some(entry) = crate::lock(&state.deferred_sessions)
+        .get(id)
+        .filter(|entry| entry.workspace_id == workspace.id && keep(entry))
+        .cloned()
+    else {
+        return Ok(());
+    };
+    if state.chat.get(id).is_some_and(|s| s.alive)
+        || state.sessions.get(id).is_some_and(|s| s.alive)
+    {
+        return Ok(());
+    }
+    respawn(state, &entry, workspace.clone()).await?;
+    crate::lock(&state.deferred_sessions).remove(id);
+    Ok(())
+}
+
+/// One resumer's place in a session's turn (`AppState::resuming`). Dropping
+/// it, also on cancellation, forgets the turn once nobody else holds it.
+pub(crate) struct ResumeTurn<'a> {
+    state: &'a AppState,
+    id: String,
+    turn: Option<Arc<tokio::sync::Mutex<()>>>,
+}
+
+impl<'a> ResumeTurn<'a> {
+    pub(crate) fn take(state: &'a AppState, id: &str) -> Self {
+        let turn = Arc::clone(
+            crate::lock(&state.resuming)
+                .entry(id.to_owned())
+                .or_default(),
+        );
+        Self {
+            state,
+            id: id.to_owned(),
+            turn: Some(turn),
+        }
+    }
+
+    pub(crate) async fn wait(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.turn
+            .as_ref()
+            .expect("turn held until drop")
+            .lock()
+            .await
+    }
+}
+
+impl Drop for ResumeTurn<'_> {
+    fn drop(&mut self) {
+        // Every clone and drop happens under this lock, so a single
+        // remaining reference is the map's own: no resumer holds or awaits it.
+        let mut resuming = crate::lock(&self.state.resuming);
+        drop(self.turn.take());
+        if resuming
+            .get(&self.id)
+            .is_some_and(|turn| Arc::strong_count(turn) == 1)
+        {
+            resuming.remove(&self.id);
+        }
+    }
+}
+
+/// Imported/remote histories are bounded just like the live session roster.
+pub(crate) fn defer(state: &AppState, entry: LedgerEntry) -> anyhow::Result<()> {
+    let mut deferred = crate::lock(&state.deferred_sessions);
+    if !deferred.contains_key(&entry.id) && deferred.len() >= 512 {
+        anyhow::bail!("suspended session limit reached");
+    }
+    deferred.insert(entry.id.clone(), entry);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn shell_entry() -> LedgerEntry {
         LedgerEntry {
+            suspended: false,
+            manual_resume_reason: None,
+            handoff: None,
             id: "s-1".into(),
             workspace_id: "w1".into(),
             cwd: PathBuf::from("/tmp"),
@@ -699,6 +1090,7 @@ mod tests {
                 kind,
                 resume: resume.map(str::to_string),
                 transcript: None,
+                native_cwd: None,
                 title: "fix the tests".into(),
                 ui: SessionUi::Term,
                 model: None,
@@ -776,6 +1168,10 @@ mod tests {
             plan_restore(&agent_entry(AgentKind::Codex, None), true, true),
             RestorePlan::Retire
         );
+        assert_eq!(
+            plan_restore(&agent_entry(AgentKind::Codex, Some("thread")), true, true),
+            RestorePlan::Respawn
+        );
         // Chat sessions respawn for BOTH agents (both chat drivers resume
         // in-band; the journal replays regardless) — unlike the TUI codex above.
         assert_eq!(
@@ -804,6 +1200,38 @@ mod tests {
             plan_restore(&agent_entry(AgentKind::Claude, Some("abc")), true, false),
             RestorePlan::Retire
         );
+    }
+
+    #[test]
+    fn codex_resume_requires_the_correct_rollout_header() {
+        let id = "01a0e110-de29-75e2-9262-7a8c893b2a3c";
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-codex-ledger-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rollout.jsonl");
+        let mut entry = agent_entry(AgentKind::Codex, Some(id));
+        entry.cwd = PathBuf::from("/project");
+        entry.agent.as_mut().unwrap().transcript = Some(path.clone());
+        assert_eq!(resolve_resume(&dir, &entry), None);
+        std::fs::write(&path, "{}\n").unwrap();
+        assert_eq!(resolve_resume(&dir, &entry), None);
+        std::fs::write(
+            &path,
+            serde_json::json!({"type":"session_meta", "payload":{"id":id,"cwd":"/project"}})
+                .to_string()
+                + "\n",
+        )
+        .unwrap();
+        assert_eq!(resolve_resume(&dir, &entry), Some(id.into()));
+        entry.cwd = PathBuf::from("/other-project");
+        assert_eq!(resolve_resume(&dir, &entry), None);
+        entry.agent.as_mut().unwrap().native_cwd = Some(PathBuf::from("/project"));
+        assert_eq!(resolve_resume(&dir, &entry), Some(id.into()));
+        let restored = LedgerEntry::from_json(&entry.to_json()).unwrap();
+        assert_eq!(resolve_resume(&dir, &restored), Some(id.into()));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -913,4 +1341,46 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+}
+
+// Ordinary Recents/native resume cannot mint a second session while a durable
+// manual entry owns the original conversation. The exact same-ID restoration
+// path is separately authenticated and serialized by manual Resume.
+tokio::task_local! { static MANUAL_RESUME: String; }
+pub(crate) async fn manual_resumption<F: std::future::Future>(
+    id: String,
+    operation: F,
+) -> F::Output {
+    MANUAL_RESUME.scope(id, operation).await
+}
+pub(crate) fn check_manual_native(
+    state: &AppState,
+    session: Option<&str>,
+    kind: crate::agents::AgentKind,
+    native: Option<&str>,
+) -> anyhow::Result<()> {
+    let authorized = MANUAL_RESUME
+        .try_with(|id| session == Some(id.as_str()))
+        .unwrap_or(false);
+    let conflict = crate::lock(&state.deferred_sessions).values().any(|entry| {
+        if entry.manual_resume_reason.is_none() {
+            return false;
+        }
+        let exact = session == Some(entry.id.as_str());
+        let native_match = native.is_some()
+            && entry
+                .agent
+                .as_ref()
+                .is_some_and(|agent| agent.kind == kind && agent.resume.as_deref() == native);
+        (exact
+            && (!authorized
+                || entry.manual_resume_reason.as_deref() != Some("project_secrets_idle")
+                || !native_match))
+            || (!exact && native_match)
+    });
+    anyhow::ensure!(
+        !conflict,
+        "conversation requires original manual session resume"
+    );
+    Ok(())
 }

@@ -52,6 +52,18 @@ export const NUDGE_SPREAD_MS = 2_000;
 export const UNKNOWN_SESSION_RETRIES = 12;
 
 /**
+ * A chat or terminal socket that authenticated and has heard nothing for this
+ * long is open and kept, not reconnecting. A browser cannot read the mark a
+ * keeper puts on a socket it keeps (`X-Chimaera-Sockets: kept`), so this
+ * silence is how the UI knows: a keeper that keeps a sleeping cloud machine's
+ * sockets (directly, or behind this computer's relay) takes what is sent and
+ * delivers it once the machine answers, and says nothing until then. A
+ * connection that closes sooner was refused. Shorter than the 2 s grace
+ * before a view says "Reconnecting…", so a kept socket never shows it.
+ */
+export const QUIET_OPEN_MS = 1500;
+
+/**
  * The actual delay for one retry: the backoff, floored at the slow tier while
  * the document is hidden — but only once `attempt` (1-based count of
  * consecutive failures) has spent the grace attempts — then jittered ±JITTER
@@ -97,6 +109,79 @@ export function nudgeReconnectors(rand: () => number = Math.random): void {
   if (now - lastNudgeAt < NUDGE_DAMP_MS) return;
   lastNudgeAt = now;
   for (const r of [...down]) r.nudge(Math.round(rand() * NUDGE_SPREAD_MS));
+}
+
+/** Sockets parked because their project's owner (a cloud machine) is
+ *  asleep. No timer runs for them: retrying a sleeping owner on a backoff
+ *  only churns (each attempt is answered "asleep" again). A user action dials
+ *  its own socket with wake intent; {@link ownerAwake} dials them all. */
+const parked = new Set<() => void>();
+
+/** Park one socket until its owner answers again; returns the unpark (call
+ *  it when the socket dials, or closes for good). */
+export function parkUntilAwake(retry: () => void): () => void {
+  parked.add(retry);
+  return () => {
+    parked.delete(retry);
+  };
+}
+
+/** Re-read a surface (the file tree, the Timeline) once its project answers
+ *  again, after a read of it met a project state (its owner asleep,
+ *  reconnecting, unreachable). It parks like a socket — no timer, no backoff
+ *  churn against a sleeping owner — and, since a re-read costs a request,
+ *  waits for the document to be visible: a hidden tab reads once when it is
+ *  next seen. `pollMs` adds one slow recheck for a state no sign announces the
+ *  end of (a project routed elsewhere that has come home: nothing on this
+ *  computer says so). `refetch` that meets the state again calls this again.
+ *  Returns the cancel (call it when the surface goes away or reads some other
+ *  way first). */
+export function refetchWhenOwnerAwake(refetch: () => void, { pollMs }: { pollMs?: number } = {}): () => void {
+  let done = false;
+  let unpark: () => void = () => {};
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let onVisible: (() => void) | null = null;
+  const cancel = (): void => {
+    done = true;
+    unpark();
+    if (timer !== null) clearTimeout(timer);
+    timer = null;
+    if (onVisible !== null) document.removeEventListener("visibilitychange", onVisible);
+    onVisible = null;
+  };
+  const fire = (): void => {
+    if (done) return;
+    if (documentHidden()) {
+      if (onVisible === null) {
+        onVisible = () => {
+          if (!documentHidden()) fire();
+        };
+        document.addEventListener("visibilitychange", onVisible);
+      }
+      return;
+    }
+    cancel();
+    refetch();
+  };
+  unpark = parkUntilAwake(fire);
+  if (pollMs !== undefined) {
+    timer = setTimeout(() => {
+      timer = null;
+      fire();
+    }, pollMs);
+  }
+  return cancel;
+}
+
+/** A sign the owner answers again (a placement read says owned, a project
+ *  view's events socket is up, a row became reachable): dial every parked
+ *  socket once, passively, each on its own 0–2s slot out of the caller's
+ *  stack. One that finds the owner still asleep parks again. */
+export function ownerAwake(rand: () => number = Math.random): void {
+  for (const retry of [...parked]) {
+    parked.delete(retry);
+    setTimeout(retry, Math.round(rand() * NUDGE_SPREAD_MS));
+  }
 }
 
 /**

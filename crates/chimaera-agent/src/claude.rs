@@ -2218,6 +2218,7 @@ impl ClaudeMapper {
             queued: false,
             after_turn: false,
             origin: Some("remote".into()),
+            client_id: None,
         });
     }
 
@@ -3392,6 +3393,7 @@ impl ClaudeMapper {
             queued,
             after_turn: queued && after_turn,
             origin: None,
+            client_id: None,
         });
         if queued {
             // Its rewind boundary (if it opens a turn rather than joining
@@ -3599,6 +3601,7 @@ impl ClaudeMapper {
                         queued: false,
                         after_turn: false,
                         origin: None,
+                        client_id: None,
                     });
                 }
             }
@@ -5215,6 +5218,7 @@ pub(crate) mod tests {
                 queued,
                 after_turn: _,
                 origin: _,
+                client_id: _,
             } => {
                 assert_eq!(text, "hello");
                 assert_eq!(*attachments, 0);
@@ -6953,6 +6957,7 @@ pub(crate) mod tests {
                 queued: false,
                 after_turn: false,
                 origin: None,
+                client_id: None,
             }
         );
 
@@ -9073,6 +9078,7 @@ pub(crate) mod tests {
                 queued: false,
                 after_turn: false,
                 origin: Some("remote".into()),
+                client_id: None,
             }
         );
         // A `--replay-user-messages` echo of a message is not a new one.

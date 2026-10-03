@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::response::Response;
 use bytes::Bytes;
 use serde::Deserialize;
@@ -132,6 +132,8 @@ enum ClientMessage {
         /// out from under a visible one).
         #[serde(default)]
         parked: bool,
+        #[serde(flatten)]
+        scope: crate::workspace_scope::Fields,
     },
     Resize {
         cols: u16,
@@ -165,37 +167,711 @@ enum ClientMessage {
     },
 }
 
+/// The first authenticated frame fixes both project scope and account generation.
+/// A later account with an equal workspace/epoch cannot revive this connection.
+#[derive(Clone)]
+pub(crate) struct SocketScope {
+    scope: crate::workspace_scope::Scope,
+    admission: crate::workspace_scope::Mutation,
+}
+impl std::ops::Deref for SocketScope {
+    type Target = crate::workspace_scope::Scope;
+    fn deref(&self) -> &Self::Target {
+        &self.scope
+    }
+}
+impl SocketScope {
+    /// The first frame's scope. One this machine cannot admit yet only because
+    /// it just thawed and its own renewal of exactly that epoch is still out
+    /// waits for the renewal (bounded by the resume window) instead of being
+    /// refused, so the socket that woke the machine is the one that gets in.
+    /// `waking` tells a viewer that understands the frame why it is quiet. A
+    /// refused or unanswered renewal, or any other scope, is refused at once.
+    async fn admit(
+        state: &AppState,
+        fields: crate::workspace_scope::Fields,
+        waking: Option<&mut WebSocket>,
+    ) -> anyhow::Result<Option<Self>> {
+        let Some(scope) = fields.scope()? else {
+            return Ok(None);
+        };
+        let first = Self::bind(state, scope.clone());
+        if first.is_ok() || !scope.renewing(state) {
+            return first.map(Some);
+        }
+        if let Some(socket) = waking {
+            // A viewer that already left needs no wait.
+            send_json(socket, &json!({"type":"waking"})).await?;
+        }
+        if !scope.await_renewal(state).await {
+            return first.map(Some);
+        }
+        Self::bind(state, scope).map(Some)
+    }
+    fn bind(state: &AppState, scope: crate::workspace_scope::Scope) -> anyhow::Result<Self> {
+        let admission = crate::workspace_scope::Mutation::for_scope(state, scope.clone())?;
+        Ok(Self { scope, admission })
+    }
+    fn validate(&self, state: &AppState) -> anyhow::Result<()> {
+        self.admission.validate(state)
+    }
+    fn session(&self, state: &AppState, id: &str) -> anyhow::Result<()> {
+        self.admission.session(state, id)?;
+        self.validate(state)
+    }
+    fn begin_session(
+        &self,
+        state: &AppState,
+        id: &str,
+    ) -> anyhow::Result<crate::pro::mutation::Guard> {
+        self.admission.session(state, id)?;
+        self.admission.begin(state)
+    }
+}
+
+pub(crate) async fn terminal_input(
+    state: &Arc<AppState>,
+    id: &str,
+    input: &chimaera_pty::InputSender,
+    bytes: Bytes,
+    scope: Option<&SocketScope>,
+) -> Result<(), chimaera_pty::ExecError> {
+    let key = crate::lock(&state.agents)
+        .get(id)
+        .map(|record| record.key.clone());
+    if scope.is_none() && key.is_none() {
+        return input
+            .send(bytes)
+            .await
+            .map_err(|_| chimaera_pty::ExecError::SessionGone);
+    }
+    let scope = scope.cloned();
+    let state = Arc::clone(state);
+    let id = id.to_owned();
+    let nonempty = !bytes.is_empty();
+    input
+        .send_authorized(bytes, move || {
+            let refused = || chimaera_pty::ExecError::Busy("project connection changed".into());
+            let guard = if let Some(scope) = scope {
+                Some(scope.begin_session(&state, &id).map_err(|_| refused())?)
+            } else {
+                let workspace = crate::lock(&state.session_workspaces).get(&id).cloned();
+                match workspace {
+                    Some(workspace) => crate::pro::mutation::begin_launch(&state, &workspace)
+                        .map_err(|_| refused())?,
+                    None => None,
+                }
+            };
+            if let Some(key) = key {
+                let mut agents = crate::lock(&state.agents);
+                let record = agents
+                    .get_mut(&id)
+                    .filter(|record| record.key == key)
+                    .ok_or_else(refused)?;
+                if nonempty {
+                    record.terminal_input_at = Some(crate::session_view::now_ms());
+                    record.turn_complete_at = None;
+                }
+            }
+            Ok(guard)
+        })
+        .await
+}
+
+/// `client_id`: the id the client minted for this send (already checked), so
+/// the session runs it at most once however often it arrives.
+async fn chat_command(
+    state: &Arc<AppState>,
+    id: &str,
+    command: chimaera_agent::model::AgentCommand,
+    client_id: Option<&str>,
+    scope: Option<&SocketScope>,
+) -> anyhow::Result<chimaera_agent::SendOutcome> {
+    let Some(scope) = scope else {
+        return state.chat.send_from_client(id, command, client_id).await;
+    };
+    let guard = scope.begin_session(state, id)?;
+    let state = Arc::clone(state);
+    let id = id.to_owned();
+    let client_id = client_id.map(str::to_owned);
+    let keyed = client_id.is_some();
+    // Keep admitted enqueue work owned if its viewer disconnects. The bounded
+    // wait is cancellable before enqueue; an accepted item belongs to the old
+    // driver, which must be fenced before replacement authority can activate.
+    tokio::spawn(async move {
+        let _guard = guard;
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            state
+                .chat
+                .send_from_client(&id, command, client_id.as_deref()),
+        )
+        .await;
+        match outcome {
+            Ok(result) => result,
+            Err(_) if client_id.is_some() => Err(chimaera_agent::SendUncertain.into()),
+            Err(error) => Err(error.into()),
+        }
+    })
+    .await
+    .unwrap_or_else(|error| {
+        if keyed {
+            Err(chimaera_agent::SendUncertain.into())
+        } else {
+            Err(error.into())
+        }
+    })
+}
+
+/// Why a session with no process here is not an exit. `Moved`: it continues on
+/// another machine (`to` is where it is going, in the viewer's words;
+/// `"other"` is another of the user's computers, sent as `to:"computer"` with
+/// the additive `other:true`).
+/// `Paused`: it stays here and resumes on its own — after this daemon restarts
+/// (`restarting`), once its agent is signed in on this cloud machine
+/// (`needs_provider`), while its transfer finishes opening it (`importing`), or
+/// never here at all (`stays_on_computer`: a plain terminal that moved with its
+/// project waits for the computer). Both frames are additive; older clients
+/// ignore them and reconnect. Only Pro transfer and ownership paths ever
+/// populate the registries this reads, so free users never see either.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Pause {
+    Moved(&'static str),
+    Paused {
+        reason: &'static str,
+        provider: Option<String>,
+    },
+}
+impl Pause {
+    pub(crate) fn frame(&self) -> serde_json::Value {
+        match self {
+            Pause::Moved("other") => json!({"type":"moved","to":"computer","other":true}),
+            Pause::Moved(to) => json!({"type":"moved","to":to}),
+            Pause::Paused { reason, provider } => {
+                let mut frame = json!({"type":"paused","reason":reason});
+                if let Some(provider) = provider {
+                    frame["provider"] = json!(provider);
+                }
+                frame
+            }
+        }
+    }
+}
+
+/// What [`classify_pause`] decides from, gathered from daemon state.
+#[derive(Clone, Debug, Default)]
+struct PauseFacts {
+    /// This daemon is a cloud machine; its own arriving sessions are known.
+    worker: bool,
+    /// The project's work left this computer for another of the user's
+    /// computers (acting there brought it there), not for the cloud.
+    other: bool,
+    /// A transfer holds this session's lifecycle right now: the source is
+    /// exporting it, or the destination is opening it.
+    transfer: bool,
+    /// The session's process is known to this daemon life.
+    known: bool,
+    entry: Option<EntryFacts>,
+}
+#[derive(Clone, Debug, Default)]
+struct EntryFacts {
+    /// Waiting at boot for this daemon life's ownership proof (a restart or
+    /// update), not moving anywhere.
+    restarting: bool,
+    /// Its project is arriving here (files installing, setup running): the
+    /// entry left from the original move is about to be replaced.
+    arriving: bool,
+    /// Imported here by a transfer and not started yet.
+    arrived: bool,
+    /// A plain terminal that moved with its project; it only runs on a computer.
+    moved_shell: bool,
+    /// The agent CLI this session runs, when it is an agent.
+    provider: Option<String>,
+    /// That agent is not ready on this cloud machine.
+    blocked: bool,
+    /// This machine may run the project right now.
+    writable: bool,
+}
+
+/// Decide what a viewer of a stopped session is told. Deliberately pure so
+/// every transfer phase is covered by unit tests without Pro fixtures.
+///
+/// A session that stopped HERE (no import) moved away only while a transfer
+/// exports it or when this machine may no longer run its project; one this
+/// machine still owns is waiting out a restart check. A cloud machine cannot
+/// tell "restart awaiting verification" from "returned to the computer" by
+/// ownership alone (both refuse writes): a session that ran in this daemon
+/// life was stopped by a hand-back, one that did not is restart-deferred.
+/// [`ProState`](crate::pro) exposing the ownership phase would settle both
+/// without that inference.
+fn classify_pause(facts: &PauseFacts, ran_here: impl FnOnce() -> bool) -> Option<Pause> {
+    let away = if facts.other {
+        Pause::Moved("other")
+    } else {
+        // New reason on the existing paused frame: old clients stay neutral
+        // instead of interpreting an unknown moved destination as cloud.
+        Pause::Paused {
+            reason: "elsewhere",
+            provider: None,
+        }
+    };
+    let Some(entry) = &facts.entry else {
+        // Opening a transfer before its entry is recorded: say so rather than
+        // "unknown session", which a client gives up on after a few retries.
+        return (facts.transfer && !facts.known).then_some(Pause::Paused {
+            reason: "importing",
+            provider: None,
+        });
+    };
+    if entry.restarting {
+        return Some(Pause::Paused {
+            reason: "restarting",
+            provider: None,
+        });
+    }
+    if !facts.worker && entry.arriving && !entry.arrived {
+        // Taking its work back: the old entry says so until the import lands.
+        return Some(Pause::Moved("computer"));
+    }
+    if entry.arrived {
+        return Some(if facts.worker && entry.moved_shell {
+            Pause::Paused {
+                reason: "stays_on_computer",
+                provider: None,
+            }
+        } else if facts.worker && entry.blocked {
+            Pause::Paused {
+                reason: "needs_provider",
+                provider: entry.provider.clone(),
+            }
+        } else if !facts.worker {
+            // Work coming back to this computer.
+            Pause::Moved("computer")
+        } else {
+            Pause::Paused {
+                reason: "importing",
+                provider: None,
+            }
+        });
+    }
+    if facts.transfer {
+        return Some(away);
+    }
+    if entry.writable || (facts.worker && !ran_here()) {
+        return Some(Pause::Paused {
+            reason: "restarting",
+            provider: None,
+        });
+    }
+    Some(away)
+}
+
+fn entry_facts(state: &AppState, entry: &crate::ledger::LedgerEntry) -> EntryFacts {
+    let provider = entry
+        .agent
+        .as_ref()
+        .map(|agent| agent.kind.as_str().to_owned());
+    let blocked = provider.as_deref().is_some_and(|provider| {
+        crate::pro::workspace_provider_blocks(state, &entry.workspace_id)
+            .as_array()
+            .is_some_and(|blocks| blocks.iter().any(|block| block["id"] == provider))
+    });
+    EntryFacts {
+        // Recorded ownership decides the words, never a guess from which
+        // processes this daemon life happens to remember.
+        restarting: crate::pro::restart_deferred(state, &entry.id),
+        arriving: crate::pro::ownership_phase(state, &entry.workspace_id)
+            == crate::pro::Phase::Arriving,
+        arrived: entry.handoff.is_some(),
+        moved_shell: entry.agent.is_none()
+            && entry
+                .handoff
+                .as_ref()
+                .is_some_and(|handoff| handoff.origin == crate::bundle::Origin::Moved),
+        provider,
+        blocked,
+        writable: crate::pro::may_write(state, &entry.workspace_id),
+    }
+}
+
+/// The pause state of session `id`, if it has no process here for a reason
+/// that is not an exit.
+pub(crate) fn pause_state(state: &AppState, id: &str) -> Option<Pause> {
+    let entry = crate::lock(&state.deferred_sessions).get(id).cloned();
+    pause_for(state, id, entry.as_ref())
+}
+
+/// [`pause_state`] for a deferred entry the caller already holds (a paused
+/// session row).
+pub(crate) fn pause_for(
+    state: &AppState,
+    id: &str,
+    entry: Option<&crate::ledger::LedgerEntry>,
+) -> Option<Pause> {
+    let facts = PauseFacts {
+        worker: crate::pro::is_worker(state),
+        other: crate::lock(&state.session_workspaces)
+            .get(id)
+            .or(entry.map(|entry| &entry.workspace_id))
+            .is_some_and(|workspace| crate::pro::other_computer(state, workspace)),
+        transfer: crate::lock(&state.chat_switching)
+            .get(id)
+            .map(String::as_str)
+            == Some("transfer"),
+        known: state.chat.get(id).is_some() || state.sessions.get(id).is_some(),
+        entry: entry.map(|entry| entry_facts(state, entry)),
+    };
+    classify_pause(&facts, || {
+        state.chat.get(id).is_some()
+            || state.sessions.get(id).is_some()
+            || state.sessions.last_words(id).is_some()
+    })
+}
+
+fn pause_frame(state: &AppState, id: &str) -> Option<serde_json::Value> {
+    pause_state(state, id).map(|pause| pause.frame())
+}
+
+/// This computer's own user acted in session `id` (a chat command or typing
+/// on this daemon's unscoped socket): see `pro::acted_here`.
+fn acted_here(state: &AppState, id: &str) {
+    let workspace = crate::lock(&state.session_workspaces).get(id).cloned();
+    if let Some(workspace) = workspace {
+        crate::pro::acted_here(state, &workspace);
+    }
+}
+
+/// How long the frames a relay held get, together, for the resumed session
+/// to come up after its project arrived.
+pub(crate) const HELD_DELIVERY: Duration = if cfg!(test) {
+    Duration::from_secs(2)
+} else {
+    Duration::from_secs(20)
+};
+
+/// Delivers, once, input a viewer relay held while it brought the work to this
+/// computer (`session_proxy`): the chat commands and typing the user sent
+/// before the session ran here. Each goes through the same checks as input on
+/// this daemon's own socket. `deadline`: until when the session may still be
+/// starting; the caller sets one for the whole batch (see [`HELD_DELIVERY`]),
+/// so a session that never comes up costs one wait, not one per frame. `Err`
+/// when the session cannot take it (nothing was delivered for that frame).
+pub(crate) async fn deliver_held(
+    state: &Arc<AppState>,
+    id: &str,
+    chat: bool,
+    frame: axum::extract::ws::Message,
+    deadline: tokio::time::Instant,
+) -> anyhow::Result<()> {
+    // The resumed session may need a moment to come up after its project
+    // arrived; the relay is still holding the input meanwhile.
+    while !(if chat {
+        state.chat.get(id).is_some_and(|chat| chat.alive)
+    } else {
+        state.sessions.get(id).is_some_and(|session| session.alive)
+    }) {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "the session did not start here"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    anyhow::ensure!(session_writable(state, id), "the project is not here");
+    match (chat, frame) {
+        (true, Message::Text(text)) => {
+            let mut command = serde_json::from_str::<chimaera_agent::model::AgentCommand>(&text)?;
+            command.validate_ingress()?;
+            // The send keeps its client's id here too: the viewer reconnects
+            // to this session next and may send it again before its echo.
+            let client_id = command_tag(&text).client_id;
+            let saved = crate::upload::save_send_images(state, id, &mut command).await;
+            let interaction = crate::activity::is_interaction(&command);
+            match chat_command(state, id, command, client_id.as_deref(), None).await {
+                Ok(chimaera_agent::SendOutcome::Accepted) => {}
+                // Already accepted from the viewer's own resend.
+                Ok(chimaera_agent::SendOutcome::Duplicate) => {
+                    crate::upload::discard_saved_images(saved);
+                    return Ok(());
+                }
+                Err(error) => {
+                    crate::upload::discard_saved_images(saved);
+                    return Err(error);
+                }
+            }
+            if interaction {
+                crate::activity::record(state, id);
+                acted_here(state, id);
+            }
+            Ok(())
+        }
+        (false, Message::Binary(bytes)) => {
+            let attachment = state.sessions.attach_quiet(id)?;
+            for chunk in bytes.chunks(TERMINAL_INPUT_CHUNK) {
+                terminal_input(
+                    state,
+                    id,
+                    &attachment.input,
+                    Bytes::copy_from_slice(chunk),
+                    None,
+                )
+                .await
+                .map_err(|error| anyhow::anyhow!("terminal input failed: {error}"))?;
+            }
+            crate::activity::record(state, id);
+            acted_here(state, id);
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// What a chat command frame says about itself, read without building the
+/// command: a refused frame may be one this daemon cannot parse, and a relay
+/// that only needs a frame's kind must not copy a send's pictures to learn it.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct CommandTag {
+    /// Its `type` (`send`, `interrupt`, `permission`…); `None` for anything
+    /// that is not a small command tag.
+    pub(crate) kind: Option<String>,
+    /// The id its client minted for it (`client_id`), when well formed
+    /// (`chimaera_agent::model::valid_client_id`).
+    pub(crate) client_id: Option<String>,
+    /// It carries a `client_id` that is not well formed.
+    pub(crate) bad_client_id: bool,
+    /// A `rewind` that only asks what it would do.
+    pub(crate) dry_run: bool,
+    /// The `server` an MCP setting names, when it is short enough to be one.
+    pub(crate) server: Option<String>,
+}
+
+/// One of a frame's tag fields, whatever JSON it turned out to be: a field
+/// of the wrong type must not make the others unreadable (a refusal still
+/// has to name the send it answers), and nothing longer than a tag can be is
+/// kept.
+enum Probe {
+    Bool(bool),
+    Text(String),
+    Other,
+}
+/// The longest text a tag field can hold (an MCP server's name).
+const TAG_TEXT_MAX: usize = chimaera_agent::model::COMMAND_MCP_SERVER_MAX;
+impl<'de> Deserialize<'de> for Probe {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Any;
+        impl<'de> serde::de::Visitor<'de> for Any {
+            type Value = Probe;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("any value")
+            }
+            fn visit_str<E>(self, v: &str) -> Result<Probe, E> {
+                Ok(if v.len() <= TAG_TEXT_MAX {
+                    Probe::Text(v.to_owned())
+                } else {
+                    Probe::Other
+                })
+            }
+            fn visit_bool<E>(self, v: bool) -> Result<Probe, E> {
+                Ok(Probe::Bool(v))
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Probe, E> {
+                Ok(Probe::Other)
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Probe, E> {
+                Ok(Probe::Other)
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Probe, E> {
+                Ok(Probe::Other)
+            }
+            fn visit_unit<E>(self) -> Result<Probe, E> {
+                Ok(Probe::Other)
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Probe, A::Error> {
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(Probe::Other)
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Probe, A::Error> {
+                while map
+                    .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                    .is_some()
+                {}
+                Ok(Probe::Other)
+            }
+        }
+        deserializer.deserialize_any(Any)
+    }
+}
+impl Probe {
+    fn text(self) -> Option<String> {
+        match self {
+            Probe::Text(text) => Some(text),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) fn command_tag(text: &str) -> CommandTag {
+    // Every other field (a send's `blocks` above all) is skipped unread, and
+    // each of these is read by itself: one of the wrong type is only absent.
+    #[derive(Deserialize)]
+    struct Tag {
+        #[serde(rename = "type", default)]
+        kind: Option<Probe>,
+        #[serde(default)]
+        client_id: Option<Probe>,
+        #[serde(default)]
+        dry_run: Option<Probe>,
+        #[serde(default)]
+        server: Option<Probe>,
+    }
+    let Ok(tag) = serde_json::from_str::<Tag>(text) else {
+        return CommandTag::default();
+    };
+    let small =
+        |kind: &str| kind.len() <= 32 && kind.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
+    let sent_as = tag.client_id.is_some();
+    let client_id = tag
+        .client_id
+        .and_then(Probe::text)
+        .filter(|id| chimaera_agent::model::valid_client_id(id));
+    CommandTag {
+        bad_client_id: sent_as && client_id.is_none(),
+        client_id,
+        dry_run: matches!(tag.dry_run, Some(Probe::Bool(true))),
+        server: tag.server.and_then(Probe::text),
+        kind: tag.kind.and_then(Probe::text).filter(|kind| small(kind)),
+    }
+}
+
+/// What a frame whose `client_id` is not well formed is told. Only a client
+/// that mints its own ids wrongly ever reads it.
+const BAD_CLIENT_ID: &str = "client_id must be 8 to 64 characters of A-Z, a-z, 0-9, _ or -";
+
+/// A chat refusal naming the command it answers (additive `command`) and,
+/// for a command sent under a client's id, that id (additive `client_id`):
+/// a client hands text back to the composer only for a refused send, and
+/// with the id it hands back exactly the send that was refused.
+pub(crate) fn command_refusal(mut answer: serde_json::Value, text: &str) -> serde_json::Value {
+    let tag = command_tag(text);
+    if let Some(command) = tag.kind {
+        answer["command"] = json!(command);
+    }
+    if let Some(client_id) = tag.client_id {
+        answer["client_id"] = json!(client_id);
+    }
+    answer
+}
+
+/// Input this socket may not deliver. The additive `reason` lets a client say
+/// why in its own words (`watching`: the viewer chose to watch; `elsewhere`:
+/// the project runs on the other machine right now), and the additive
+/// `owner` (`"cloud"` | `"computer"` | null, [`session_owner`]) where it runs, so the
+/// words need no guess; `message` stays plain.
+fn refusal(state: &AppState, id: &str, watching: bool) -> serde_json::Value {
+    let owner = session_owner(state, id);
+    if watching {
+        json!({"type":"error","code":"read_only","reason":"watching","owner":owner,
+               "message":"You're watching. Take control to type."})
+    } else {
+        let workspace = crate::lock(&state.session_workspaces)
+            .get(id)
+            .cloned()
+            .unwrap_or_default();
+        let place = if owner == Some("cloud") {
+            "in the cloud"
+        } else if crate::pro::other_computer(state, &workspace) {
+            "on your other computer"
+        } else if owner == Some("computer") {
+            "on your computer"
+        } else {
+            "elsewhere"
+        };
+        json!({"type":"error","code":"read_only","reason":"elsewhere","owner":owner,
+               "message":format!("This project is running {place} right now. That was not sent.")})
+    }
+}
+
+/// Where the project of session `id` runs now, when known (otherwise null):
+/// (`pro::owner_kind`; a session with no project runs where this daemon is).
+pub(crate) fn session_owner(state: &AppState, id: &str) -> Option<&'static str> {
+    let workspace = crate::lock(&state.session_workspaces)
+        .get(id)
+        .cloned()
+        .unwrap_or_default();
+    crate::pro::owner_kind(state, &workspace)
+}
+
+pub(crate) fn session_writable(state: &AppState, id: &str) -> bool {
+    if crate::lock(&state.deferred_sessions)
+        .get(id)
+        .is_some_and(|entry| entry.manual_resume_reason.is_some())
+    {
+        return false;
+    }
+    let workspace = crate::lock(&state.session_workspaces).get(id).cloned();
+    workspace.is_none_or(|workspace| crate::pro::may_execute(state, &workspace))
+}
+
 /// GET /ws/sessions/{id}
 pub(crate) async fn session_ws(
     ws: WebSocketUpgrade,
     Path(id): Path<String>,
     State(state): State<Arc<AppState>>,
+    Query(options): Query<crate::session_proxy::SocketOptions>,
 ) -> Response {
     ws.max_message_size(MAX_TERMINAL_INPUT_MESSAGE)
         .max_frame_size(MAX_TERMINAL_INPUT_MESSAGE)
-        .on_upgrade(move |socket| handle(socket, id, state))
+        .on_upgrade(move |socket| handle(socket, id, state, options))
 }
 
-async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
-    let auth = match authenticate(&mut socket, &state).await {
-        Some(auth) => auth,
-        None => {
-            let _ = send_json(
-                &mut socket,
-                &json!({"type": "error", "message": "unauthorized"}),
-            )
-            .await;
+async fn handle(
+    mut socket: WebSocket,
+    id: String,
+    state: Arc<AppState>,
+    options: crate::session_proxy::SocketOptions,
+) {
+    let auth = match authenticate(&mut socket, &state, true).await {
+        Ok(auth) => auth,
+        Err(denied) => {
+            denied.answer(&mut socket).await;
             return;
         }
     };
-    let auth_dims = if auth.parked { None } else { auth.dims };
+    let scope = auth.scope.clone();
+    if scope
+        .as_ref()
+        .is_some_and(|scope| scope.session(&state, &id).is_err())
+    {
+        scope_changed(&mut socket).await;
+        return;
+    }
+    let remote_auth = json!({"type":"auth", "token":"", "cols":auth.dims.map(|d| d.0), "rows":auth.dims.map(|d| d.1), "parked":auth.parked});
+    if scope.is_none()
+        && crate::session_proxy::socket(&state, &id, "sessions", &options, remote_auth, &mut socket)
+            .await
+    {
+        return;
+    }
+    let auth_dims = if auth.parked || options.read_only || !session_writable(&state, &id) {
+        None
+    } else {
+        auth.dims
+    };
 
     // Adopt the client's grid BEFORE attaching so the snapshot below is
     // rendered at the size the client will actually display it. A parked
     // attach adopts nothing: a hidden window's stale dims must never reflow
     // the grid out from under a visible one.
     if let Some((cols, rows)) = auth_dims {
-        resize_off_reactor(&state, &id, cols, rows, "pre-attach resize").await;
+        if !resize_off_reactor(&state, &id, cols, rows, "pre-attach resize", scope.as_ref()).await {
+            scope_changed(&mut socket).await;
+            return;
+        }
     }
 
     let attach_res = match attach_off_reactor(&state, &id, auth.parked).await {
@@ -209,8 +885,22 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
         }
     };
     let mut attachment = match attach_res {
+        // A stopped process still registered for a moment after a transfer
+        // stop is not an exit to replay: the viewer follows the session.
+        Ok(attachment) if !attachment.info.alive && pause_frame(&state, &id).is_some() => {
+            if let Some(frame) = pause_frame(&state, &id) {
+                let _ = send_json(&mut socket, &frame).await;
+            }
+            return;
+        }
         Ok(attachment) => attachment,
         Err(err) => {
+            // Paused for a transfer: not an exit, and its last screen is not
+            // its last words. The viewer follows it to its new owner.
+            if let Some(frame) = pause_frame(&state, &id) {
+                let _ = send_json(&mut socket, &frame).await;
+                return;
+            }
             // A session that died before this client could attach (fast
             // agent failures — a missing API key kills codex in ~400ms)
             // still gets an honest pane: replay the final screen once,
@@ -222,10 +912,14 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                 };
                 ready.insert("type".to_string(), json!("ready"));
                 ready.insert("cwd_current".to_string(), json!(words.info.cwd.clone()));
-                if send_json(&mut socket, &serde_json::Value::Object(ready))
-                    .await
-                    .is_err()
+                let mut ready = serde_json::Value::Object(ready);
+                if let Some(alias) = scope
+                    .as_ref()
+                    .and_then(|scope| scope.alias(&state).ok().flatten())
                 {
+                    alias.session(&mut ready);
+                }
+                if send_json(&mut socket, &ready).await.is_err() {
                     return;
                 }
                 // A parked client discards any snapshot on this connection
@@ -273,10 +967,14 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
         .cloned()
         .unwrap_or_else(|| attachment.info.cwd.clone());
     ready.insert("cwd_current".to_string(), json!(cwd_current));
-    if send_json(&mut socket, &serde_json::Value::Object(ready))
-        .await
-        .is_err()
+    let mut ready = serde_json::Value::Object(ready);
+    if let Some(alias) = scope
+        .as_ref()
+        .and_then(|scope| scope.alias(&state).ok().flatten())
     {
+        alias.session(&mut ready);
+    }
+    if send_json(&mut socket, &ready).await.is_err() {
         return;
     }
 
@@ -331,8 +1029,13 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
     tokio::pin!(resync_sleep);
     let flush_sleep = tokio::time::sleep(Duration::ZERO);
     tokio::pin!(flush_sleep);
+    let mut scope_tick = tokio::time::interval(Duration::from_secs(1));
+    scope_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
+            _ = scope_tick.tick(), if scope.is_some() => {
+                if scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) { scope_changed(&mut socket).await; return; }
+            },
             _ = &mut resync_sleep, if resync_at.is_some() => {
                 resync_at = None;
                 if !repaint(&mut socket, &id, &state, &mut attachment,
@@ -416,6 +1119,20 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
             },
             event = attachment.events.recv(), if events_open => match event {
                 Ok(event) => {
+                    // Stopped for a transfer: say it moved (after its final
+                    // output), not that it exited. A scoped viewer whose
+                    // project connection changed hears that first: it must
+                    // re-read where the project runs before following it.
+                    if matches!(event, chimaera_pty::SessionEvent::Exited { .. }) {
+                        if scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) {
+                            scope_changed(&mut socket).await;
+                            return;
+                        }
+                        if let Some(frame) = pause_frame(&state, &id) {
+                            let _ = send_ordered_json(&mut socket, &mut batch, &frame).await;
+                            return;
+                        }
+                    }
                     let resized_to = match &event {
                         chimaera_pty::SessionEvent::Resized { cols, rows } => Some((*cols, *rows)),
                         _ => None,
@@ -462,28 +1179,44 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
             },
             msg = socket.recv() => match msg {
                 Some(Ok(Message::Binary(bytes))) => {
+                    if scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) { scope_changed(&mut socket).await; return; }
+                    if options.read_only || !session_writable(&state, &id) {
+                        let _ = send_ordered_json(&mut socket, &mut batch, &refusal(&state, &id, options.read_only)).await;
+                        continue;
+                    }
+                    let mut interacted = false;
                     for chunk in bytes.chunks(TERMINAL_INPUT_CHUNK) {
-                        if attachment
-                            .input
-                            .send(Bytes::copy_from_slice(chunk))
-                            .await
-                            .is_err()
-                        {
+                        if !session_writable(&state, &id) || scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) { scope_changed(&mut socket).await; return; }
+                        if let Err(error) = terminal_input(&state, &id, &attachment.input, Bytes::copy_from_slice(chunk), scope.as_ref()).await {
+                            if scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) {
+                                scope_changed(&mut socket).await;
+                                return;
+                            }
+                            if matches!(error, chimaera_pty::ExecError::Busy(_)) {
+                                let _ = send_ordered_json(&mut socket, &mut batch, &json!({"type":"error","code":"read_only","reason":"busy","owner":session_owner(&state, &id),"message":"Your project is busy. Wait a moment before typing again."})).await;
+                                break;
+                            }
                             // Session is gone; flush the batched tail (its
                             // last words), tell the client, and hang up.
-                            let _ = send_ordered_json(
-                                &mut socket,
-                                &mut batch,
-                                &json!({"type": "exited", "status": null}),
-                            )
-                            .await;
+                            let gone = pause_frame(&state, &id)
+                                .unwrap_or_else(|| json!({"type": "exited", "status": null}));
+                            let _ = send_ordered_json(&mut socket, &mut batch, &gone).await;
                             return;
+                        }
+                        if !interacted {
+                            crate::activity::record(&state, &id);
+                            // This computer's own user typed (not a forwarded
+                            // viewer): the last actor keeps the work here.
+                            if scope.is_none() { acted_here(&state, &id); }
+                            interacted = true;
                         }
                     }
                 }
                 Some(Ok(Message::Text(text))) => {
+                    if scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) { scope_changed(&mut socket).await; return; }
                     match serde_json::from_str::<ClientMessage>(&text) {
                         Ok(ClientMessage::Resize { cols, rows }) => {
+                            if options.read_only || !session_writable(&state, &id) { continue; }
                             client_dims = Some((cols, rows));
                             // Flush output rendered at the old width before
                             // the grid reflows under it — the initiator is
@@ -492,7 +1225,10 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                             if !send_batch(&mut socket, &mut batch).await {
                                 return;
                             }
-                            resize_off_reactor(&state, &id, cols, rows, "ws resize").await;
+                            if !resize_off_reactor(&state, &id, cols, rows, "ws resize", scope.as_ref()).await {
+                                scope_changed(&mut socket).await;
+                                return;
+                            }
                         }
                         Ok(ClientMessage::Park) => {
                             if !parked {
@@ -576,14 +1312,32 @@ async fn attach_off_reactor(
 /// term lock the snapshot render holds — off the reactor for the same
 /// reason. Failures are logged, not fatal (resizes are advisory; a dead or
 /// unknown session simply ignores them).
-async fn resize_off_reactor(state: &Arc<AppState>, id: &str, cols: u16, rows: u16, what: &str) {
+async fn resize_off_reactor(
+    state: &Arc<AppState>,
+    id: &str,
+    cols: u16,
+    rows: u16,
+    what: &str,
+    scope: Option<&SocketScope>,
+) -> bool {
     let state = Arc::clone(state);
     let task_id = id.to_string();
-    match tokio::task::spawn_blocking(move || state.sessions.resize(&task_id, cols, rows)).await {
+    let scope = scope.cloned();
+    match tokio::task::spawn_blocking(move || {
+        let _guard = scope
+            .as_ref()
+            .map(|scope| scope.begin_session(&state, &task_id))
+            .transpose()?;
+        state.sessions.resize(&task_id, cols, rows)
+    })
+    .await
+    {
         Ok(Ok(())) => {}
+        Ok(Err(err)) if err.is::<crate::pro::mutation::Changed>() => return false,
         Ok(Err(err)) => tracing::debug!(%id, %err, "{what} failed"),
         Err(err) => tracing::warn!(%id, %err, "{what} task failed"),
     }
+    true
 }
 
 /// Send the batched output as one frame, if any; false = socket gone.
@@ -670,10 +1424,11 @@ pub(crate) async fn chat_ws(
     ws: WebSocketUpgrade,
     Path(id): Path<String>,
     State(state): State<Arc<AppState>>,
+    Query(options): Query<crate::session_proxy::SocketOptions>,
 ) -> Response {
     ws.max_message_size(MAX_CHAT_COMMAND_MESSAGE)
         .max_frame_size(MAX_CHAT_COMMAND_MESSAGE)
-        .on_upgrade(move |socket| handle_chat(socket, id, state))
+        .on_upgrade(move |socket| handle_chat(socket, id, state, options))
 }
 
 /// Chat replay batch size: bounds per-frame size without flooding the socket
@@ -685,16 +1440,49 @@ const CHAT_BATCH: usize = 128;
 /// the journal's 256 KiB cap; otherwise frames stay near this ceiling.
 const CHAT_BATCH_BYTES: usize = 512 * 1024;
 
-async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
-    let Some(last_seq) = chat_authenticate(&mut socket, &state).await else {
-        let _ = send_json(
-            &mut socket,
-            &json!({"type": "error", "message": "unauthorized"}),
-        )
-        .await;
-        return;
+async fn handle_chat(
+    mut socket: WebSocket,
+    id: String,
+    state: Arc<AppState>,
+    options: crate::session_proxy::SocketOptions,
+) {
+    let (last_seq, scope) = match chat_authenticate(&mut socket, &state).await {
+        Ok(auth) => auth,
+        Err(denied) => {
+            denied.answer(&mut socket).await;
+            return;
+        }
     };
 
+    if scope
+        .as_ref()
+        .is_some_and(|s| s.session(&state, &id).is_err())
+    {
+        scope_changed(&mut socket).await;
+        return;
+    }
+    if scope.is_none()
+        && crate::session_proxy::socket(
+            &state,
+            &id,
+            "chat",
+            &options,
+            json!({"type":"auth","token":"","last_seq":last_seq}),
+            &mut socket,
+        )
+        .await
+    {
+        return;
+    }
+
+    // A conversation paused for a transfer continues elsewhere: never greet
+    // the viewer with its stopped driver (`alive:false` reads as "exited").
+    if !state.chat.get(&id).is_some_and(|chat| chat.alive) {
+        if let Some(frame) = pause_frame(&state, &id) {
+            let _ = send_json(&mut socket, &frame).await;
+            return;
+        }
+    }
     // Replay may read the journal file — keep it off the reactor.
     let attachment = {
         let state = state.clone();
@@ -725,6 +1513,13 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
         // this is stale (the journal was recreated and numbering restarted);
         // it hard-resets rather than silently dropping every replayed event.
         "head": attachment.head_seq,
+        // This daemon accepts a `send` under one `client_id` at most once and
+        // answers `cancel_send`, so a client may resend what it could not
+        // confirm. Additive: a daemon without it must never be resent to.
+        "send_ids": true,
+        // Only these keyed sends still belong to the attached driver's queue.
+        // Replayed queued echoes outside this set cannot promise future delivery.
+        "active_queued_ids": state.chat.active_queued_ids(&id),
     });
     if send_json(&mut socket, &ready).await.is_err() {
         return;
@@ -740,8 +1535,13 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
     }
 
     let mut live = attachment.live;
+    let mut scope_tick = tokio::time::interval(Duration::from_secs(1));
+    scope_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
+            _ = scope_tick.tick(), if scope.is_some() => {
+                if scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) { scope_changed(&mut socket).await; return; }
+            },
             event = live.recv() => match event {
                 Ok(entry) => {
                     // The replay tail can overlap the subscription start.
@@ -784,8 +1584,15 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                     // - a PTY already under this id: it degraded/toggled to a
                     //   terminal.
                     // - otherwise: the session genuinely exited.
+                    // - stopped for a transfer: it moved, it did not exit
+                    //   (a scoped viewer whose connection changed hears that
+                    //   first, to re-read where the project runs).
+                    if scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) {
+                        scope_changed(&mut socket).await;
+                        return;
+                    }
                     let switching = crate::lock(&state.chat_switching).get(&id).cloned();
-                    let frame = match switching.as_deref() {
+                    let frame = pause_frame(&state, &id).unwrap_or_else(|| match switching.as_deref() {
                         Some("term") => json!({"type": "degraded"}),
                         Some("closed") => json!({"type": "exited", "status": null}),
                         Some(_) => json!({"type": "error", "code": "unknown_session",
@@ -793,15 +1600,70 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                         None if state.sessions.get(&id).is_some() => json!({"type": "degraded"}),
                         None => json!({"type": "exited",
                                        "status": state.chat.get(&id).and_then(|c| c.exit_status)}),
-                    };
+                    });
                     let _ = send_json(&mut socket, &frame).await;
                     return;
                 }
             },
             msg = socket.recv() => match msg {
                 Some(Ok(Message::Text(text))) => {
+                    if scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) { scope_changed(&mut socket).await; return; }
+                    let tag = command_tag(&text);
+                    if tag.kind.as_deref() == Some("cancel_send") {
+                        // A forwarded viewer changes this session's record
+                        // under the same admission as its commands.
+                        let _admitted = match scope.as_ref().map(|s| s.begin_session(&state, &id)) {
+                            Some(Err(_)) => { scope_changed(&mut socket).await; return; }
+                            Some(Ok(guard)) => Some(guard),
+                            None => None,
+                        };
+                        let answer = cancel_send(&state, &id, &tag, options.read_only, &text).await;
+                        if send_json(&mut socket, &answer).await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
                     match serde_json::from_str::<chimaera_agent::model::AgentCommand>(&text) {
                         Ok(mut cmd) => {
+                            use chimaera_agent::model::AgentCommand;
+                            let is_send = matches!(cmd, AgentCommand::Send { .. } | AgentCommand::SendAfterTurn { .. });
+                            let client_id = tag.client_id.filter(|_| is_send);
+                            if let Some(client_id) = client_id.as_deref().filter(|client_id| {
+                                state.chat.client_id_state(&id, client_id)
+                                    == Some(chimaera_agent::ClientIdState::Confirmed)
+                            }) {
+                                let _ = send_json(&mut socket, &json!({"type":"send_confirmed","client_id":client_id})).await;
+                                continue;
+                            }
+                            // A repeat of a send this session already accepted
+                            // is dropped before anything can refuse it: a
+                            // refusal would hand back text that is delivered.
+                            if client_id.as_deref().is_some_and(|client_id| {
+                                state.chat.client_id_state(&id, client_id)
+                                    == Some(chimaera_agent::ClientIdState::Accepted)
+                            }) {
+                                continue;
+                            }
+                            if client_id.as_deref().is_some_and(|client_id| {
+                                state.chat.client_id_state(&id, client_id)
+                                    == Some(chimaera_agent::ClientIdState::Uncertain)
+                            }) {
+                                let _ = send_json(&mut socket, &uncertain_send(&text)).await;
+                                continue;
+                            }
+                            if options.read_only || !session_writable(&state, &id) {
+                                let _ = send_json(&mut socket, &command_refusal(refusal(&state, &id, options.read_only), &text)).await;
+                                continue;
+                            }
+                            if is_send && tag.bad_client_id {
+                                let _ = send_json(
+                                    &mut socket,
+                                    &command_refusal(json!({"type": "error", "code": "invalid_command",
+                                            "message": BAD_CLIENT_ID}), &text),
+                                )
+                                .await;
+                                continue;
+                            }
                             if let Err(err) = cmd.validate_ingress() {
                                 tracing::debug!(%id, %err, "chat command exceeds ingress budget");
                                 // Reject only this command. The authenticated
@@ -809,8 +1671,8 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                                 // can correct the payload and retry.
                                 let _ = send_json(
                                     &mut socket,
-                                    &json!({"type": "error", "code": "invalid_command",
-                                            "message": err.to_string()}),
+                                    &command_refusal(json!({"type": "error", "code": "invalid_command",
+                                            "message": err.to_string()}), &text),
                                 )
                                 .await;
                                 continue;
@@ -818,9 +1680,34 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                             // A send's images get a saved copy the echoed
                             // message can show after replay.
                             let saved = crate::upload::save_send_images(&state, &id, &mut cmd).await;
-                            if let Err(err) = state.chat.command(&id, cmd).await {
-                                // The send never happened: neither do its copies.
+                            if !session_writable(&state, &id) || scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) {
                                 crate::upload::discard_saved_images(saved);
+                                scope_changed(&mut socket).await;
+                                return;
+                            }
+                            let interaction = crate::activity::is_interaction(&cmd);
+                            let outcome = chat_command(&state, &id, cmd, client_id.as_deref(), scope.as_ref()).await;
+                            if let Ok(chimaera_agent::SendOutcome::Duplicate) = outcome {
+                                // The first copy owns its saved images.
+                                crate::upload::discard_saved_images(saved);
+                                if let Some(client_id) = client_id.as_deref().filter(|client_id| {
+                                    state.chat.client_id_state(&id, client_id)
+                                        == Some(chimaera_agent::ClientIdState::Confirmed)
+                                }) {
+                                    let _ = send_json(&mut socket, &json!({"type":"send_confirmed","client_id":client_id})).await;
+                                }
+                            } else if let Err(err) = outcome {
+                                // These are this attempt's image copies. An
+                                // uncertain earlier attempt retains its own.
+                                crate::upload::discard_saved_images(saved);
+                                if err.is::<chimaera_agent::SendUncertain>() {
+                                    let _ = send_json(&mut socket, &uncertain_send(&text)).await;
+                                    continue;
+                                }
+                                if err.is::<crate::pro::mutation::Changed>() {
+                                    scope_changed(&mut socket).await;
+                                    return;
+                                }
                                 tracing::debug!(%id, %err, "chat command failed");
                                 // code=command_failed: one refused command is
                                 // NOT a dead socket — without the code the
@@ -838,10 +1725,15 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                                 };
                                 let _ = send_json(
                                     &mut socket,
-                                    &json!({"type": "error", "code": code,
-                                            "message": message}),
+                                    &command_refusal(json!({"type": "error", "code": code,
+                                            "message": message}), &text),
                                 )
                                 .await;
+                            } else if interaction {
+                                crate::activity::record(&state, &id);
+                                if scope.is_none() {
+                                    acted_here(&state, &id);
+                                }
                             }
                         }
                         Err(err) => {
@@ -854,6 +1746,66 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
             },
         }
     }
+}
+
+/// Answer a `cancel_send`: one `send_cancelled` saying whether the id was
+/// withdrawn (no send under it was accepted, and none will be), or the same
+/// refusal a send would get where this socket may not act or the session
+/// does not answer in time (the client asks again at its next `ready`). It is
+/// not the user acting: nothing is recorded as interaction.
+async fn cancel_send(
+    state: &Arc<AppState>,
+    id: &str,
+    tag: &CommandTag,
+    read_only: bool,
+    text: &str,
+) -> serde_json::Value {
+    if let Some(client_id) = tag.client_id.as_deref().filter(|client_id| {
+        state.chat.client_id_state(id, client_id) == Some(chimaera_agent::ClientIdState::Confirmed)
+    }) {
+        return json!({"type":"send_confirmed","client_id":client_id});
+    }
+    if tag.client_id.as_deref().is_some_and(|client_id| {
+        state.chat.client_id_state(id, client_id) == Some(chimaera_agent::ClientIdState::Uncertain)
+    }) {
+        return uncertain_send(text);
+    }
+    if read_only || !session_writable(state, id) {
+        return command_refusal(refusal(state, id, read_only), text);
+    }
+    let Some(client_id) = tag.client_id.as_deref() else {
+        return command_refusal(
+            json!({"type": "error", "code": "invalid_command",
+                   "message": BAD_CLIENT_ID}),
+            text,
+        );
+    };
+    // It waits its turn behind a send that is being queued, which a driver
+    // that takes nothing can stall: bounded like a forwarded viewer's send,
+    // because the caller may hold that viewer's admission while it waits.
+    let answer = tokio::time::timeout(
+        Duration::from_secs(5),
+        state.chat.cancel_send(id, client_id),
+    )
+    .await;
+    match answer {
+        Ok(Ok(cancelled)) => {
+            json!({"type": "send_cancelled", "client_id": client_id, "cancelled": cancelled})
+        }
+        Ok(Err(error)) if error.is::<chimaera_agent::SendUncertain>() => uncertain_send(text),
+        _ => command_refusal(
+            json!({"type": "error", "code": "command_failed", "message": "agent unavailable"}),
+            text,
+        ),
+    }
+}
+
+fn uncertain_send(text: &str) -> serde_json::Value {
+    command_refusal(
+        json!({"type":"error", "code":"send_uncertain",
+            "message":"Delivery could not be confirmed. Check the conversation before sending this again."}),
+        text,
+    )
 }
 
 /// Ship replay entries in bounded batches, advancing `sent_seq`.
@@ -909,7 +1861,10 @@ fn chat_batch_end(replay: &[Arc<chimaera_agent::journal::SeqEvent>], start: usiz
 
 /// First-frame auth for the chat channel: carries `last_seq` instead of grid
 /// dims. `None` = rejected.
-async fn chat_authenticate(socket: &mut WebSocket, state: &AppState) -> Option<u64> {
+async fn chat_authenticate(
+    socket: &mut WebSocket,
+    state: &AppState,
+) -> Result<(u64, Option<SocketScope>), Denied> {
     #[derive(Deserialize)]
     struct ChatAuth {
         #[serde(rename = "type")]
@@ -917,13 +1872,21 @@ async fn chat_authenticate(socket: &mut WebSocket, state: &AppState) -> Option<u
         token: String,
         #[serde(default)]
         last_seq: u64,
+        #[serde(flatten)]
+        scope: crate::workspace_scope::Fields,
     }
-    match tokio::time::timeout(AUTH_TIMEOUT, socket.recv()).await {
-        Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<ChatAuth>(&text) {
-            Ok(auth) if auth.kind == "auth" && auth.token == state.token => Some(auth.last_seq),
-            _ => None,
-        },
-        _ => None,
+    let Ok(Some(Ok(Message::Text(text)))) = tokio::time::timeout(AUTH_TIMEOUT, socket.recv()).await
+    else {
+        return Err(Denied::Token);
+    };
+    match serde_json::from_str::<ChatAuth>(&text) {
+        Ok(auth) if auth.kind == "auth" && auth.token == state.token => Ok((
+            auth.last_seq,
+            SocketScope::admit(state, auth.scope, Some(socket))
+                .await
+                .map_err(|_| Denied::Scope)?,
+        )),
+        _ => Err(Denied::Token),
     }
 }
 
@@ -940,6 +1903,158 @@ pub(crate) async fn events_ws(
         .on_upgrade(move |socket| handle_events(socket, state))
 }
 
+/// The retryable project-scope refusal. Every caller returns right after, so
+/// it closes the socket properly too: without a close frame the viewer (or
+/// the gateway relaying it) saw a reset without a closing handshake.
+async fn scope_changed(socket: &mut WebSocket) {
+    let _ = send_json(socket, &json!({"type":"error","code":"workspace_scope_changed","message":"Your project connection changed. Reconnecting…"})).await;
+    let _ = socket
+        .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+            code: axum::extract::ws::close_code::AGAIN,
+            reason: "workspace_scope_changed".into(),
+        })))
+        .await;
+}
+
+async fn scoped_events(mut socket: WebSocket, state: Arc<AppState>, scope: SocketScope) {
+    if scope.validate(&state).is_err() {
+        scope_changed(&mut socket).await;
+        return;
+    }
+    state.wait_restored().await;
+    let alias = match scope.alias(&state) {
+        Ok(alias) => alias,
+        Err(_) => return,
+    };
+    let mut watch = crate::git::WatchGuard::new(state.clone());
+    watch.set(Some(scope.workspace_id.clone()));
+    let mut files = crate::fs_watch::FsWatch::new();
+    let mut last = String::new();
+    let mut settings = None;
+    let mut epochs_sent = std::collections::HashMap::new();
+    let mut recents = None;
+    let mut last_notice = state.notices.head();
+    let mut tick = tokio::time::interval(EVENTS_TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        if scope.validate(&state).is_err() {
+            scope_changed(&mut socket).await;
+            return;
+        }
+        let frame = json!({"type":"sessions","sessions":crate::workspace_scope::sessions(&state,&scope),"links":crate::workspace_scope::links(&state,&scope)}).to_string();
+        if frame != last {
+            if socket
+                .send(Message::Text(frame.clone().into()))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            last = frame;
+        }
+        if send_settings_snapshot(&mut socket, &state, &mut settings)
+            .await
+            .is_err()
+        {
+            return;
+        }
+        for (kind, epochs) in [
+            ("git", state.git.epochs_snapshot()),
+            ("timeline", state.timeline.epochs_snapshot()),
+        ] {
+            let own: std::collections::BTreeMap<_, _> = epochs
+                .into_iter()
+                .filter(|(id, _)| id == &scope.workspace_id)
+                .collect();
+            let value = json!({"type":kind,"epochs":own});
+            if epochs_sent.get(kind) != Some(&value) {
+                if send_json(&mut socket, &value).await.is_err() {
+                    return;
+                }
+                epochs_sent.insert(kind, value);
+            }
+        }
+        if send_recents_snapshot(&mut socket, &state, &mut recents)
+            .await
+            .is_err()
+        {
+            return;
+        }
+        if let Some(frame) = crate::notices::frame_since(&state, &mut last_notice) {
+            if let Ok(mut frame) = serde_json::from_str::<serde_json::Value>(&frame) {
+                if let Some(rows) = frame["notices"].as_array_mut() {
+                    rows.retain(|row| row["workspace_id"].as_str() == Some(&scope.workspace_id));
+                    if !rows.is_empty() && send_json(&mut socket, &frame).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+        let mut changes = files.poll(false).await;
+        if let Some(alias) = &alias {
+            for paths in [
+                &mut changes.files,
+                &mut changes.removed,
+                &mut changes.dirs,
+                &mut changes.removed_dirs,
+            ] {
+                for path in paths {
+                    *path = alias.output(path);
+                }
+            }
+        }
+        if send_fs_changes(&mut socket, changes).await.is_err() {
+            return;
+        }
+        tokio::select! {
+            _ = tick.tick() => {},
+            message = socket.recv() => match message {
+                Some(Ok(Message::Text(text))) => {
+                    if let Ok(ClientMessage::Watch {workspace_id, files: mut wanted_files, mut dirs, git_repos: _}) = serde_json::from_str(&text) {
+                        if workspace_id.as_deref().is_some_and(|id| id != scope.workspace_id) { return; }
+                        if let Some(alias)=&alias { for path in wanted_files.iter_mut().chain(dirs.iter_mut()) { *path=alias.input(path); } }
+                        // A path this viewer may not read is dropped, never a
+                        // reason to close: its window watches that one itself.
+                        let (wanted_files, dirs) = readable_watch(&state, &scope, wanted_files, dirs).await;
+                        if scope.validate(&state).is_err() { scope_changed(&mut socket).await; return; }
+                        files.set(wanted_files,dirs);
+                        tokio::time::sleep(EVENTS_THROTTLE).await;
+                    }
+                },
+                Some(Ok(Message::Ping(payload))) => { if socket.send(Message::Pong(payload)).await.is_err() { return; } },
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
+                _ => {},
+            },
+        }
+    }
+}
+
+/// The part of a scoped window's watch registration its viewer may read.
+async fn readable_watch(
+    state: &AppState,
+    scope: &SocketScope,
+    files: Vec<String>,
+    dirs: Vec<String>,
+) -> (Vec<String>, Vec<String>) {
+    let split = files.len();
+    let paths: Vec<String> = files.into_iter().chain(dirs).collect();
+    let readable = scope
+        .readable(state, paths.clone())
+        .await
+        .unwrap_or_default();
+    let mut kept = (Vec::new(), Vec::new());
+    for (index, path) in paths.into_iter().enumerate() {
+        if readable.get(index) == Some(&true) {
+            if index < split {
+                kept.0.push(path);
+            } else {
+                kept.1.push(path);
+            }
+        }
+    }
+    kept
+}
+
 /// Minimum gap between snapshot frames (<= 4/s). Also the reuse window of
 /// the shared sessions-snapshot cache (`session_view::EVENTS_SNAPSHOT_REUSE`
 /// is defined AS this constant so the two can't drift apart).
@@ -948,13 +2063,132 @@ pub(crate) const EVENTS_THROTTLE: Duration = Duration::from_millis(250);
 /// child exiting on its own).
 const EVENTS_TICK: Duration = Duration::from_secs(1);
 
+/// First retry after a project feed ends, doubling up to [`FEED_RETRY_MAX`].
+const FEED_RETRY_MIN: Duration = Duration::from_secs(1);
+const FEED_RETRY_MAX: Duration = Duration::from_secs(30);
+
+/// How the local watchers must change for the watched project.
+enum LocalWatch {
+    /// The project runs elsewhere: its owner's feed replaces local watching
+    /// of the project's own paths; the window's other paths stay watched here.
+    Park(Vec<String>, Vec<String>),
+    /// The project is local again: resume watching it here.
+    Restore(String, Vec<String>, Vec<String>),
+}
+
+/// A window watching a project that currently runs on another machine gets
+/// that project's session, file, Git and Timeline frames from its owner,
+/// merged into this window's own loop; everything else (settings, recents,
+/// notices, updates, plugins) stays this daemon's. When the owner changes
+/// the feed ends and restarts, and so it does for a sleeping owner whose
+/// transport refuses the feed (one that keeps a sleeping cloud machine's
+/// sockets leaves it open and quiet instead); the window's socket never
+/// closes for it. A project with no route (every free user's) stays in local
+/// mode.
+struct ProjectView {
+    /// The window's watched project and its mounted/listed paths.
+    watched: Option<(String, Vec<String>, Vec<String>)>,
+    feed: Option<crate::session_proxy::Feed>,
+    /// Local git/fs watching is parked because the project is routed.
+    remote: bool,
+    retry_at: Option<tokio::time::Instant>,
+    backoff: Duration,
+    git: Option<(String, u64)>,
+    timeline: Option<(String, u64)>,
+}
+impl ProjectView {
+    fn new() -> Self {
+        Self {
+            watched: None,
+            feed: None,
+            remote: false,
+            retry_at: None,
+            backoff: FEED_RETRY_MIN,
+            git: None,
+            timeline: None,
+        }
+    }
+    fn stop_feed(&mut self) {
+        self.feed = None;
+        self.git = None;
+        self.timeline = None;
+        self.retry_at = None;
+        self.backoff = FEED_RETRY_MIN;
+    }
+    /// A new watch registration from the window.
+    fn watch(&mut self, workspace: Option<&str>, files: &[String], dirs: &[String]) {
+        match (&self.feed, workspace) {
+            (Some(feed), Some(workspace)) if feed.workspace == workspace => {
+                feed.watch(files.to_vec(), dirs.to_vec());
+            }
+            (Some(_), _) => self.stop_feed(),
+            (None, _) => {}
+        }
+        self.watched = workspace.map(|w| (w.to_owned(), files.to_vec(), dirs.to_vec()));
+    }
+    /// Re-decide local vs routed for the watched project; start (or retry) its
+    /// feed while routed.
+    fn reconcile(&mut self, state: &Arc<AppState>) -> Option<LocalWatch> {
+        let Some((workspace, files, dirs)) = &self.watched else {
+            self.stop_feed();
+            self.remote = false;
+            return None;
+        };
+        if !state.session_proxy.routed(workspace) {
+            if !self.remote {
+                return None;
+            }
+            let restore = LocalWatch::Restore(workspace.clone(), files.clone(), dirs.clone());
+            self.remote = false;
+            self.stop_feed();
+            return Some(restore);
+        }
+        let parked = !std::mem::replace(&mut self.remote, true);
+        let park = parked.then(|| {
+            LocalWatch::Park(
+                state.session_proxy.outside_project(workspace, files),
+                state.session_proxy.outside_project(workspace, dirs),
+            )
+        });
+        if self.feed.is_none()
+            && self
+                .retry_at
+                .is_none_or(|at| tokio::time::Instant::now() >= at)
+        {
+            self.retry_at = None;
+            self.feed = Some(crate::session_proxy::Feed::start(
+                Arc::clone(state),
+                workspace.clone(),
+                files.clone(),
+                dirs.clone(),
+            ));
+        }
+        park
+    }
+    async fn next(&mut self) -> Option<crate::session_proxy::FeedFrame> {
+        match self.feed.as_mut() {
+            Some(feed) => feed.next().await,
+            None => std::future::pending().await,
+        }
+    }
+    /// The feed ended (owner change, a refused sleeping owner, transient failure).
+    fn ended(&mut self) {
+        self.feed = None;
+        self.retry_at = Some(tokio::time::Instant::now() + self.backoff);
+        self.backoff = (self.backoff * 2).min(FEED_RETRY_MAX);
+    }
+}
+
 async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
-    if authenticate(&mut socket, &state).await.is_none() {
-        let _ = send_json(
-            &mut socket,
-            &json!({"type": "error", "message": "unauthorized"}),
-        )
-        .await;
+    let auth = match authenticate(&mut socket, &state, false).await {
+        Ok(auth) => auth,
+        Err(denied) => {
+            denied.answer(&mut socket).await;
+            return;
+        }
+    };
+    if let Some(scope) = auth.scope {
+        scoped_events(socket, state, scope).await;
         return;
     }
 
@@ -968,6 +2202,7 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
     // missed (the poll would still catch it, just later).
     let mut touched = state.fs_touched.subscribe();
     let mut touched_open = true;
+    let mut project = ProjectView::new();
 
     let mut last_sent: Option<Arc<String>> = None;
     let mut last_settings_gen: Option<u64> = None;
@@ -1008,7 +2243,7 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
     {
         return;
     }
-    if send_git_snapshot(&mut socket, &state, &mut last_git)
+    if send_git_snapshot(&mut socket, &state, &mut last_git, None)
         .await
         .is_err()
     {
@@ -1026,7 +2261,7 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
     {
         return;
     }
-    if send_timeline_snapshot(&mut socket, &state, &mut last_timeline)
+    if send_timeline_snapshot(&mut socket, &state, &mut last_timeline, None)
         .await
         .is_err()
     {
@@ -1078,6 +2313,24 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
                 // iteration) nor outrun the throttle below, which bounds
                 // these passes to four a second per window.
             }
+            // The watched project's frames from where it runs now.
+            frame = project.next() => match frame {
+                Some(crate::session_proxy::FeedFrame::Fs(value)) => {
+                    project.backoff = FEED_RETRY_MIN;
+                    if send_json(&mut socket, &value).await.is_err() {
+                        return;
+                    }
+                }
+                Some(crate::session_proxy::FeedFrame::Git(epoch)) => {
+                    project.backoff = FEED_RETRY_MIN;
+                    project.git = project.watched.as_ref().map(|(w, ..)| (w.clone(), epoch));
+                }
+                Some(crate::session_proxy::FeedFrame::Timeline(epoch)) => {
+                    project.backoff = FEED_RETRY_MIN;
+                    project.timeline = project.watched.as_ref().map(|(w, ..)| (w.clone(), epoch));
+                }
+                None => project.ended(),
+            },
             msg = socket.recv() => match msg {
                 // The only client frame on this bus: which workspace this window
                 // shows + the exact mounted paths whose disk state it renders.
@@ -1085,15 +2338,39 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
                     if let Ok(ClientMessage::Watch { workspace_id, files, dirs, git_repos }) =
                         serde_json::from_str::<ClientMessage>(&text)
                     {
-                        watch.set(workspace_id);
-                        watch.set_repos(git_repos);
-                        if fs_watch.set(files, dirs) {
-                            // Establish new metadata baselines immediately when
-                            // the two-second client-I/O ceiling allows it. New
-                            // directory name baselines are separately batched.
-                            let changes = fs_watch.poll(false).await;
-                            if send_fs_changes(&mut socket, changes).await.is_err() {
-                                return;
+                        project.watch(workspace_id.as_deref(), &files, &dirs);
+                        let routed = workspace_id
+                            .as_deref()
+                            .is_some_and(|w| state.session_proxy.routed(w));
+                        if routed {
+                            // The owner's feed replaces local watching of a
+                            // project that runs elsewhere; this computer's own
+                            // files outside it (an upload, a note in the home
+                            // folder) are still watched here.
+                            let _ = project.reconcile(&state);
+                            watch.set(None);
+                            let workspace = workspace_id.as_deref().unwrap_or_default();
+                            let outside_files = state.session_proxy.outside_project(workspace, &files);
+                            let outside_dirs = state.session_proxy.outside_project(workspace, &dirs);
+                            if fs_watch.set(outside_files, outside_dirs) {
+                                let changes = fs_watch.poll(false).await;
+                                if send_fs_changes(&mut socket, changes).await.is_err() {
+                                    return;
+                                }
+                            }
+                        } else {
+                            project.stop_feed();
+                            project.remote = false;
+                            watch.set(workspace_id);
+                            watch.set_repos(git_repos);
+                            if fs_watch.set(files, dirs) {
+                                // Establish new metadata baselines immediately when
+                                // the two-second client-I/O ceiling allows it. New
+                                // directory name baselines are separately batched.
+                                let changes = fs_watch.poll(false).await;
+                                if send_fs_changes(&mut socket, changes).await.is_err() {
+                                    return;
+                                }
                             }
                         }
                     }
@@ -1102,6 +2379,19 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
                 Some(Ok(_)) => continue,
                 Some(Err(_)) | None => return,
             },
+        }
+        // A registration or an owner change may have moved the watched project
+        // between this daemon and another machine.
+        match project.reconcile(&state) {
+            Some(LocalWatch::Park(files, dirs)) => {
+                watch.set(None);
+                fs_watch.set(files, dirs);
+            }
+            Some(LocalWatch::Restore(workspace, files, dirs)) => {
+                watch.set(Some(workspace));
+                fs_watch.set(files, dirs);
+            }
+            None => {}
         }
         if send_settings_snapshot(&mut socket, &state, &mut last_settings_gen)
             .await
@@ -1115,7 +2405,7 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
         {
             return;
         }
-        if send_git_snapshot(&mut socket, &state, &mut last_git)
+        if send_git_snapshot(&mut socket, &state, &mut last_git, project.git.as_ref())
             .await
             .is_err()
         {
@@ -1133,9 +2423,14 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
         {
             return;
         }
-        if send_timeline_snapshot(&mut socket, &state, &mut last_timeline)
-            .await
-            .is_err()
+        if send_timeline_snapshot(
+            &mut socket,
+            &state,
+            &mut last_timeline,
+            project.timeline.as_ref(),
+        )
+        .await
+        .is_err()
         {
             return;
         }
@@ -1228,7 +2523,7 @@ async fn send_update_snapshot(
     if *last_epoch == Some(epoch) {
         return Ok(());
     }
-    let mut frame = crate::lock(&state.update).to_json();
+    let mut frame = crate::update::status_json(state);
     frame["type"] = serde_json::json!("update");
     socket.send(Message::Text(frame.to_string().into())).await?;
     *last_epoch = Some(epoch);
@@ -1263,9 +2558,14 @@ async fn send_timeline_snapshot(
     socket: &mut WebSocket,
     state: &AppState,
     last: &mut Option<String>,
+    remote: Option<&(String, u64)>,
 ) -> Result<(), axum::Error> {
-    let epochs: std::collections::BTreeMap<String, u64> =
+    let mut epochs: std::collections::BTreeMap<String, u64> =
         state.timeline.epochs_snapshot().into_iter().collect();
+    // A project running elsewhere reports its owner's Timeline epoch.
+    if let Some((workspace, epoch)) = remote {
+        epochs.insert(workspace.clone(), *epoch);
+    }
     let frame = json!({"type": "timeline", "epochs": epochs}).to_string();
     if last.as_deref() == Some(frame.as_str()) {
         return Ok(());
@@ -1332,9 +2632,14 @@ async fn send_git_snapshot(
     socket: &mut WebSocket,
     state: &AppState,
     last: &mut Option<String>,
+    remote: Option<&(String, u64)>,
 ) -> Result<(), axum::Error> {
-    let epochs: std::collections::BTreeMap<String, u64> =
+    let mut epochs: std::collections::BTreeMap<String, u64> =
         state.git.epochs_snapshot().into_iter().collect();
+    // A project running elsewhere reports its owner's Git epoch.
+    if let Some((workspace, epoch)) = remote {
+        epochs.insert(workspace.clone(), *epoch);
+    }
     let repos: std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>> = state
         .git
         .repo_epochs_snapshot()
@@ -1388,23 +2693,58 @@ async fn send_sessions_snapshot(
 struct AuthParams {
     dims: Option<(u16, u16)>,
     parked: bool,
+    scope: Option<SocketScope>,
 }
 
-async fn authenticate(socket: &mut WebSocket, state: &AppState) -> Option<AuthParams> {
-    match tokio::time::timeout(AUTH_TIMEOUT, socket.recv()).await {
-        Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<ClientMessage>(&text) {
-            Ok(ClientMessage::Auth {
-                token,
-                cols,
-                rows,
-                parked,
-            }) if token == state.token => Some(AuthParams {
-                dims: cols.zip(rows),
-                parked,
-            }),
-            _ => None,
-        },
-        _ => None,
+/// Why a first frame was refused. A wrong or missing token is final for the
+/// client; a project scope the daemon cannot admit right now (an owner that
+/// just woke and has not renewed yet, a changed epoch) is retryable, and the
+/// UI already reconnects on `workspace_scope_changed`. Answering it
+/// `unauthorized` made the first sockets after a cloud wake fail for good.
+enum Denied {
+    Token,
+    Scope,
+}
+
+impl Denied {
+    async fn answer(self, socket: &mut WebSocket) {
+        match self {
+            Denied::Token => {
+                let _ =
+                    send_json(socket, &json!({"type": "error", "message": "unauthorized"})).await;
+            }
+            Denied::Scope => scope_changed(socket).await,
+        }
+    }
+}
+
+/// `waking`: the socket's viewer understands the `waking` frame (terminals;
+/// the events feed does not), sent while a thawed owner renews (see
+/// `SocketScope::admit`).
+async fn authenticate(
+    socket: &mut WebSocket,
+    state: &AppState,
+    waking: bool,
+) -> Result<AuthParams, Denied> {
+    let Ok(Some(Ok(Message::Text(text)))) = tokio::time::timeout(AUTH_TIMEOUT, socket.recv()).await
+    else {
+        return Err(Denied::Token);
+    };
+    match serde_json::from_str::<ClientMessage>(&text) {
+        Ok(ClientMessage::Auth {
+            token,
+            cols,
+            rows,
+            parked,
+            scope,
+        }) if token == state.token => Ok(AuthParams {
+            dims: cols.zip(rows),
+            parked,
+            scope: SocketScope::admit(state, scope, waking.then_some(socket))
+                .await
+                .map_err(|_| Denied::Scope)?,
+        }),
+        _ => Err(Denied::Token),
     }
 }
 
@@ -1430,6 +2770,258 @@ mod tests {
                 text: text.to_string(),
             },
         })
+    }
+
+    #[test]
+    fn a_refusal_names_the_command_it_answers() {
+        let kind = |text: &str| command_tag(text).kind;
+        assert_eq!(
+            kind(r#"{"type":"send","blocks":[]}"#).as_deref(),
+            Some("send")
+        );
+        assert_eq!(
+            kind(r#"{"type":"interrupt"}"#).as_deref(),
+            Some("interrupt")
+        );
+        for text in ["", "{}", r#"{"type":"Send"}"#, r#"{"type":7}"#, "not json"] {
+            assert_eq!(kind(text), None, "{text}");
+        }
+        let refused = command_refusal(
+            json!({"type":"error","code":"command_failed"}),
+            r#"{"type":"permission","request_id":"r","option_id":"o"}"#,
+        );
+        assert_eq!(refused["command"], "permission");
+        assert!(refused.get("client_id").is_none());
+    }
+
+    /// A refused send says which send it was, by the id its client minted,
+    /// so the client hands back exactly that one. An id that is not well
+    /// formed is never echoed.
+    #[test]
+    fn a_refused_send_carries_its_client_id() {
+        let refused = command_refusal(
+            json!({"type":"error","code":"command_failed"}),
+            r#"{"type":"send","blocks":[],"client_id":"client-0001"}"#,
+        );
+        assert_eq!(refused["command"], "send");
+        assert_eq!(refused["client_id"], "client-0001");
+        let after_turn = command_refusal(
+            json!({"type":"error","code":"read_only"}),
+            r#"{"type":"send_after_turn","client_id":"client-0002","blocks":[]}"#,
+        );
+        assert_eq!(after_turn["command"], "send_after_turn");
+        assert_eq!(after_turn["client_id"], "client-0002");
+
+        for bad in [
+            r#"{"type":"send","blocks":[],"client_id":"short"}"#,
+            r#"{"type":"send","blocks":[],"client_id":"has a space"}"#,
+            r#"{"type":"send","blocks":[],"client_id":12345678}"#,
+        ] {
+            let tag = command_tag(bad);
+            assert_eq!(tag.kind.as_deref(), Some("send"), "{bad}");
+            assert_eq!(tag.client_id, None, "{bad}");
+            assert!(tag.bad_client_id, "{bad}");
+            let refused = command_refusal(json!({"type":"error"}), bad);
+            assert!(refused.get("client_id").is_none(), "{bad}");
+        }
+        assert!(!command_tag(r#"{"type":"send","blocks":[]}"#).bad_client_id);
+        // A sibling field of the wrong type never hides the id (or the kind):
+        // the refusal of such a frame still names the send.
+        for odd in [
+            r#"{"type":"send","client_id":"client-0001","dry_run":"yes","blocks":[]}"#,
+            r#"{"type":"send","dry_run":{"a":[1]},"server":7,"client_id":"client-0001"}"#,
+            r#"{"server":["x"],"client_id":"client-0001","type":"send"}"#,
+        ] {
+            let tag = command_tag(odd);
+            assert_eq!(tag.kind.as_deref(), Some("send"), "{odd}");
+            assert_eq!(tag.client_id.as_deref(), Some("client-0001"), "{odd}");
+            assert!(!tag.dry_run && tag.server.is_none(), "{odd}");
+        }
+        // And a `type` that is no tag leaves the id readable.
+        let tag = command_tag(r#"{"type":7,"client_id":"client-0001"}"#);
+        assert_eq!(
+            (tag.kind, tag.client_id.as_deref()),
+            (None, Some("client-0001"))
+        );
+        let tag = command_tag(r#"{"type":"rewind","dry_run":true,"user_message_id":"u"}"#);
+        assert!(tag.dry_run);
+        let tag = command_tag(r#"{"type":"reconnect_mcp","server":"files"}"#);
+        assert_eq!(tag.server.as_deref(), Some("files"));
+        // An older daemon's parser: the additive field does not break a send.
+        assert!(serde_json::from_str::<AgentCommand>(
+            r#"{"type":"send","blocks":[],"client_id":"client-0001"}"#
+        )
+        .is_ok());
+    }
+
+    fn paused(reason: &'static str) -> Option<Pause> {
+        Some(Pause::Paused {
+            reason,
+            provider: None,
+        })
+    }
+
+    #[test]
+    fn work_that_left_for_another_computer_says_so() {
+        // Acting on another of the user's computers brought the work there:
+        // this computer's own views say it continues on the other computer
+        // (older clients read `to:"computer"`), never "in the cloud".
+        let left = |transfer, writable| PauseFacts {
+            other: true,
+            transfer,
+            entry: Some(EntryFacts {
+                writable,
+                provider: Some("claude".into()),
+                ..EntryFacts::default()
+            }),
+            ..PauseFacts::default()
+        };
+        for (transfer, writable) in [(true, true), (false, false)] {
+            let pause = classify_pause(&left(transfer, writable), || true);
+            assert_eq!(pause, Some(Pause::Moved("other")));
+            assert_eq!(
+                pause.unwrap().frame(),
+                json!({"type":"moved","to":"computer","other":true})
+            );
+        }
+        // The explicit move destination remains known on either source role.
+        let worker = PauseFacts {
+            worker: true,
+            ..left(true, true)
+        };
+        assert_eq!(
+            classify_pause(&worker, || true),
+            Some(Pause::Moved("other"))
+        );
+    }
+
+    #[test]
+    fn an_unknown_move_uses_a_neutral_backward_compatible_pause() {
+        let facts = PauseFacts {
+            transfer: true,
+            entry: Some(EntryFacts::default()),
+            ..PauseFacts::default()
+        };
+        for worker in [false, true] {
+            let pause = classify_pause(
+                &PauseFacts {
+                    worker,
+                    ..facts.clone()
+                },
+                || true,
+            )
+            .unwrap();
+            assert_eq!(pause.frame(), json!({"type":"paused","reason":"elsewhere"}));
+        }
+    }
+
+    #[test]
+    fn only_a_real_transfer_says_moved_and_it_names_where_the_session_goes() {
+        let stopped = |worker, writable| PauseFacts {
+            worker,
+            entry: Some(EntryFacts {
+                writable,
+                provider: Some("claude".into()),
+                ..EntryFacts::default()
+            }),
+            ..PauseFacts::default()
+        };
+        // Exporting for a transfer: away from this machine.
+        let exporting = |worker| PauseFacts {
+            transfer: true,
+            ..stopped(worker, true)
+        };
+        assert_eq!(
+            classify_pause(&exporting(false), || true),
+            paused("elsewhere")
+        );
+        assert_eq!(
+            classify_pause(&exporting(true), || true),
+            paused("elsewhere")
+        );
+        // Stopped because another machine now runs the project.
+        assert_eq!(
+            classify_pause(&stopped(false, false), || true),
+            paused("elsewhere")
+        );
+        assert_eq!(
+            classify_pause(&stopped(true, false), || true),
+            paused("elsewhere")
+        );
+        // Waiting out a restart on the machine that owns the project: after
+        // every Pro update, a computer's own chats are not "in the cloud".
+        assert_eq!(
+            classify_pause(&stopped(false, true), || false),
+            paused("restarting")
+        );
+        // A cloud machine that restarted refuses writes until verified, yet
+        // its sessions did not go anywhere.
+        assert_eq!(
+            classify_pause(&stopped(true, false), || false),
+            paused("restarting")
+        );
+        // No entry and no transfer: an ordinary session, nothing to say.
+        assert_eq!(classify_pause(&PauseFacts::default(), || true), None);
+        // A transfer opening a session before its entry exists.
+        let opening = PauseFacts {
+            transfer: true,
+            ..PauseFacts::default()
+        };
+        assert_eq!(classify_pause(&opening, || false), paused("importing"));
+        let snapshot_of_a_live_session = PauseFacts {
+            known: true,
+            ..opening
+        };
+        assert_eq!(classify_pause(&snapshot_of_a_live_session, || true), None);
+    }
+
+    #[test]
+    fn work_arriving_is_opening_or_waiting_never_moving_away() {
+        let arrived = |worker, blocked, moved_shell| PauseFacts {
+            worker,
+            transfer: true,
+            entry: Some(EntryFacts {
+                arrived: true,
+                blocked,
+                moved_shell,
+                provider: (!moved_shell).then(|| "codex".to_owned()),
+                ..EntryFacts::default()
+            }),
+            ..PauseFacts::default()
+        };
+        assert_eq!(
+            classify_pause(&arrived(true, false, false), || true),
+            paused("importing")
+        );
+        assert_eq!(
+            classify_pause(&arrived(true, true, false), || true),
+            Some(Pause::Paused {
+                reason: "needs_provider",
+                provider: Some("codex".into())
+            })
+        );
+        assert_eq!(
+            classify_pause(&arrived(true, false, true), || true),
+            paused("stays_on_computer")
+        );
+        // A computer receiving its work back.
+        assert_eq!(
+            classify_pause(&arrived(false, false, false), || true),
+            Some(Pause::Moved("computer"))
+        );
+        let frame = Pause::Paused {
+            reason: "needs_provider",
+            provider: Some("claude".into()),
+        }
+        .frame();
+        assert_eq!(
+            frame,
+            json!({"type":"paused","reason":"needs_provider","provider":"claude"})
+        );
+        assert_eq!(
+            Pause::Moved("cloud").frame(),
+            json!({"type":"moved","to":"cloud"})
+        );
     }
 
     #[test]

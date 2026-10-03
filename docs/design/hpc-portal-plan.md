@@ -306,7 +306,7 @@ the per-launch line, so a workspace that needs `R/4.3` and one that needs
 ## 7. What agents are told
 
 Delivered once per chat (claude: the hook carrier; codex: a developer note
-added when its chat opens — built, PROTOCOL.md Pass 41), and refreshed when a
+added when its chat opens — built, PROTOCOL.md Pass 47), and refreshed when a
 chat reopens in a new job. Generic text, filled from the job and §5's facts:
 
 ```text

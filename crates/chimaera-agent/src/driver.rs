@@ -52,6 +52,8 @@ pub const IDLE_FLUSH_GRACE_TICKS: u32 = (1500 / COALESCE_INTERVAL_MS) as u32;
 /// protocol.
 #[derive(Clone, Debug)]
 pub struct SpawnSpec {
+    /// Opt-in owner-controlled process group, independent of protocol progress.
+    pub managed_execution: bool,
     pub session_id: String,
     pub argv: Vec<String>,
     pub cwd: PathBuf,
@@ -99,6 +101,9 @@ pub struct SpawnSpec {
     /// argv (`--fork-session --resume-session-at`); Codex opens with
     /// `thread/fork {threadId,lastTurnId}` instead of `thread/resume`.
     pub fork_at: Option<String>,
+    /// Fork the complete native conversation when a disconnected owner may
+    /// still be writing the source. Mutually exclusive with `fork_at`.
+    pub fork_head: bool,
     /// Quiet portable-fork context. Codex passes it as thread-open developer
     /// instructions; Claude receives the same text through the launcher's
     /// `--append-system-prompt-file`. ACP holds it until the first real send.
@@ -153,6 +158,7 @@ pub struct McpAutoApprove {
 impl SpawnSpec {
     pub fn new(session_id: impl Into<String>, argv: Vec<String>, cwd: PathBuf) -> Self {
         Self {
+            managed_execution: false,
             session_id: session_id.into(),
             argv,
             cwd,
@@ -166,6 +172,7 @@ impl SpawnSpec {
             agent_version: None,
             rollback_turns: None,
             fork_at: None,
+            fork_head: false,
             portable_context: None,
             developer_note: None,
             mcp_servers: Vec::new(),
@@ -181,6 +188,8 @@ impl SpawnSpec {
 /// Channels a driver runs on. Command-channel closure or a `kill` signal
 /// both mean "shut the child down politely, then hard".
 pub struct DriverIo {
+    pub(crate) maintenance: mpsc::Receiver<crate::maintenance_idle::Drain>,
+    pub process_control: std::sync::Arc<crate::ndjson::ProcessControl>,
     pub commands: mpsc::Receiver<AgentCommand>,
     pub events: mpsc::Sender<AgentEvent>,
     pub kill: watch::Receiver<bool>,
@@ -344,7 +353,7 @@ async fn deliver(sink: &mut JsonlSink, io: &DriverIo, step: DriverStep) -> Deliv
 /// the CLI's own phrasing ("2.1.204 (Claude Code)", "codex-cli 0.142.5"), so
 /// compare whole tokens: a substring test passes 0.157.10 against a 0.157.1
 /// pin.
-fn version_matches_pin(detected: &str, tested: &str) -> bool {
+pub(crate) fn version_matches_pin(detected: &str, tested: &str) -> bool {
     detected
         .split(|c: char| c.is_whitespace() || c == '(' || c == ')')
         .any(|token| token.strip_prefix('v').unwrap_or(token) == tested)
@@ -403,12 +412,13 @@ pub const FAILURE_AT_BIRTH_WINDOW: Duration = Duration::from_secs(10);
 pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo) -> DriverExit {
     let mut env = spec.env.clone();
     env.extend(driver.env_extra());
-    let child = match JsonlChild::spawn(
+    let child = match JsonlChild::spawn_controlled(
         &spec.argv[0],
         &spec.argv[1..],
         &spec.cwd,
         &env,
         &spec.env_remove,
+        spec.managed_execution.then_some(&io.process_control),
     ) {
         Ok(child) => child,
         Err(err) => {
@@ -528,6 +538,34 @@ pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo)
 
     let exit = loop {
         tokio::select! {
+            Some(drain) = io.maintenance.recv() => {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+                let positive = tokio::time::timeout_at(deadline, async {
+                    let mut positive = io.commands.is_empty();
+                    let mut frames = 0usize;
+                    while positive && !stream.drained() {
+                        frames += 1;
+                        if frames > 256 { positive = false; break; }
+                        match stream.next().await {
+                            Ok(Some(frame)) => {
+                                if !matches!(deliver(&mut sink, &io, mapper.on_frame(&frame)).await, Delivery::Ok) {
+                                    positive = false;
+                                }
+                            }
+                            _ => positive = false,
+                        }
+                    }
+                    if let Some(event) = mapper.flush() {
+                        positive &= io.events.send(event).await.is_ok();
+                    }
+                    positive
+                }).await.unwrap_or(false);
+                let _ = drain.acknowledged.send(positive);
+                tokio::select! {
+                    _ = drain.release => {},
+                    _ = io.kill.changed() => break DriverExit::Killed,
+                }
+            },
             frame = stream.next() => match frame {
                 Ok(Some(frame)) => {
                     let out = mapper.on_frame(&frame);

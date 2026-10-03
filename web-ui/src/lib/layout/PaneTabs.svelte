@@ -396,12 +396,14 @@
   function label(tab: Tab): string {
     if (tab.surface === "terminal") return sessionLabel(tab.sessionId);
     if (tab.surface === "settings") return "Settings";
+    if (tab.surface === "pro") return "Chimaera Pro";
     if (tab.surface === "dashboard") return "Dashboard";
     if (tab.surface === "timeline") return "Timeline";
     if (tab.surface === "knowledge") return "Knowledge";
     if (tab.surface === "plugins") return "Extensions";
     if (tab.surface === "plugin") return pluginViewTitle($workspacePlugins?.plugins, tab.plugin, tab.view);
     if (tab.surface === "sessions") return "All sessions";
+    if (tab.surface === "kept") return "Both versions";
     if (tab.surface === "finder") return basename(tab.path) || "Finder";
     if (tab.surface === "git") return "Source Control";
     if (tab.surface === "diff") {
@@ -771,6 +773,8 @@
               size={10}
               title={s ? dotTitle(s) : "terminal"}
             />
+          {:else if tab.surface === "pro"}
+            <svg class="glyph" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M8 1.5 13.6 4.7v6.6L8 14.5l-5.6-3.2V4.7Z" fill="none" stroke="currentColor" stroke-width="1.2" /></svg>
           {:else if tab.surface === "settings"}
             <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
               <title>settings</title>
@@ -868,6 +872,14 @@
             <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
               <title>all sessions</title>
               <path d="M3 4h10M3 8h10M3 12h6" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+            </svg>
+          {:else if tab.surface === "kept"}
+            <!-- Two sheets side by side: one file, both versions. -->
+            <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+              <title>both versions</title>
+              <rect x="1.8" y="2.6" width="5.4" height="10.8" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.3" />
+              <rect x="8.8" y="2.6" width="5.4" height="10.8" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.3" />
+              <path d="M3.6 6h1.8M3.6 8.4h1.8M10.6 6h1.8M10.6 8.4h1.8" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" />
             </svg>
           {:else if tab.surface === "plugins" || tab.surface === "plugin"}
             <!-- Extensions: three cells and a plus (plugins/glyph.ts), at its

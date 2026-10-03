@@ -14,7 +14,7 @@ use std::path::Path;
 use anyhow::Context;
 use axum::extract::Query;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
@@ -76,22 +76,29 @@ pub(crate) struct NotebookQuery {
 /// joined) and capped — an oversize payload is listed under `omitted` with
 /// its byte size instead. A page may hold fewer than `limit` cells when its
 /// payload budget fills; the next page starts at `offset + cells.len()`.
-pub(crate) async fn notebook(Query(query): Query<NotebookQuery>) -> Response {
+pub(crate) async fn notebook(
+    filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
+    Query(query): Query<NotebookQuery>,
+) -> Response {
     let limit = query
         .limit
         .unwrap_or(DEFAULT_NOTEBOOK_CELLS)
         .clamp(1, MAX_NOTEBOOK_CELLS);
-    let _permit = NOTEBOOK_WORK
+    let permit = NOTEBOOK_WORK
         .acquire()
         .await
         .expect("notebook semaphore is never closed");
     blocking_response(move || {
-        read_notebook(&query.path, query.offset, limit, MAX_NOTEBOOK_PAGE_BYTES)
+        let _permit = permit;
+        let source =
+            crate::fs::FileSource::new(&query.path, filesystem.as_ref().map(|scope| &scope.0))?;
+        read_notebook_source(&source, query.offset, limit, MAX_NOTEBOOK_PAGE_BYTES)
             .map(|body| Json(body).into_response())
     })
     .await
 }
 
+#[cfg(test)]
 fn read_notebook(
     raw: &str,
     offset: usize,
@@ -106,6 +113,7 @@ fn read_notebook(
 /// [`crate::fs::open_regular`]: a FIFO swapped in after `canonical_file`'s
 /// check must not park this worker while it holds the only
 /// [`NOTEBOOK_WORK`] permit.
+#[cfg(test)]
 fn read_notebook_at(
     path: &Path,
     offset: usize,
@@ -114,6 +122,26 @@ fn read_notebook_at(
 ) -> anyhow::Result<Value> {
     let (file, meta) = crate::fs::open_regular(path)
         .with_context(|| format!("{}: failed to open", path.display()))?;
+    parse_notebook(path, file, meta, offset, limit, page_budget)
+}
+fn read_notebook_source(
+    source: &crate::fs::FileSource,
+    offset: usize,
+    limit: usize,
+    page_budget: usize,
+) -> anyhow::Result<Value> {
+    let file = source.open()?;
+    let meta = file.metadata()?;
+    parse_notebook(&source.path, file, meta, offset, limit, page_budget)
+}
+fn parse_notebook(
+    path: &Path,
+    file: std::fs::File,
+    meta: std::fs::Metadata,
+    offset: usize,
+    limit: usize,
+    page_budget: usize,
+) -> anyhow::Result<Value> {
     let size = meta.len();
     if size > MAX_NOTEBOOK_BYTES {
         anyhow::bail!(

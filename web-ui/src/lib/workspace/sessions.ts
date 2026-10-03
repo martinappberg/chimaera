@@ -10,6 +10,8 @@ export interface Workspace {
   name: string;
   /** Unix seconds of the last open/activity; 0/absent on old daemons. */
   last_opened_at?: number;
+  /** Additive exact local-copy role; absence is an ordinary workspace. */
+  local_copy?: import("../net/native").LocalProjectCopy;
   /**
    * The workspace's Mastermind binding: the privileged chat session's id +
    * the ask/auto gating mode its act tools were spawned with. Absent when
@@ -31,6 +33,14 @@ export type AgentState =
   | "unknown";
 
 export interface Session {
+  placement?: "here" | { remote: string };
+  placement_available?: boolean;
+  suspended?: boolean;
+  /** A parked conversation requires explicit resume under its existing ID.
+   * Unknown non-null reasons must never enter ordinary Recents resume. */
+  manual_resume_reason?: string | null;
+  keep_running?: boolean;
+  last_input_ms?: number | null;
   id: string;
   name: string;
   cwd: string;
@@ -160,6 +170,18 @@ export interface Session {
   chat_capable?: boolean;
   view_switchable?: boolean;
   /**
+   * Chat rows: a permission or question is waiting on the user, straight
+   * from the conversation's driver rather than the agent record behind
+   * `agent_state`. Either one marks the row the same way (see {@link
+   * awaitsDecision}). Absent on PTY rows and old daemons.
+   */
+  needs_permission?: boolean;
+  /**
+   * A paused row waiting for an agent sign-in on the cloud: that provider's
+   * catalog id (`pro/providers.ts` `pausedConnect`). Absent otherwise.
+   */
+  blocked_provider?: string | null;
+  /**
    * The repository checkout this session is in, from its current folder (a
    * shell's cwd, an agent's hook-reported cwd, else its spawn folder). Null
    * outside a repository; absent on old daemons.
@@ -234,7 +256,16 @@ export function isMastermind(s: Session): boolean {
  * news" — finished and waiting-for-input sessions wear the unread mark.
  */
 export function needsApproval(s: Session): boolean {
-  return s.agent_state === "needs_permission";
+  return awaitsDecision(s);
+}
+
+/**
+ * The agent is blocked on a permission, plan approval or question: its state
+ * says so, or (chat rows) its driver does through the additive
+ * `needs_permission`, which is only ever true on a live conversation.
+ */
+export function awaitsDecision(s: Session): boolean {
+  return s.agent_state === "needs_permission" || s.needs_permission === true;
 }
 
 /**
@@ -244,7 +275,7 @@ export function needsApproval(s: Session): boolean {
  */
 export function needsAttention(s: Session): boolean {
   return (
-    s.agent_state === "needs_permission" ||
+    awaitsDecision(s) ||
     s.agent_state === "idle_prompt" ||
     s.agent_state === "errored"
   );
@@ -295,6 +326,7 @@ export function isBusy(s: Session): boolean {
  * session strip; see the SessionGlyph state styles).
  */
 export function dotState(s: Session): string {
+  if (s.manual_resume_reason != null) return "idle";
   if (s.kind !== "agent") {
     if (!s.alive) return "";
     // A terminal is "active" (accent) ONLY while a foreground command runs —
@@ -303,6 +335,7 @@ export function dotState(s: Session): string {
     // perpetual green.
     return s.phase === "running" || s.exec_stage === "executing" ? "alive" : "idle";
   }
+  if (awaitsDecision(s)) return "attn";
   switch (s.agent_state) {
     case "running":
       // The hooks tier's inverse liveness check: a claude TUI that claims
@@ -360,6 +393,7 @@ export function backgrounded(s: Session): boolean {
  * facts are independent ("finished · 2 running in the background").
  */
 export function dotTitle(s: Session): string {
+  if (s.manual_resume_reason != null) return "paused · resume required";
   const base = turnDotTitle(s);
   const running = s.background_running ?? 0;
   if (!s.alive || running === 0) return base;
@@ -374,6 +408,7 @@ function turnDotTitle(s: Session): string {
     if (s.exec_stage === "executing") return "agent is running a command here";
     return "at the prompt"; // idle: alive but not doing work
   }
+  if (awaitsDecision(s)) return "needs permission";
   switch (s.agent_state) {
     case "running":
       return s.stalled === true ? "agent says working — no output for a while" : "agent working";

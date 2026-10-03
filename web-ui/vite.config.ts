@@ -81,21 +81,27 @@ function entryBundleBudget(): Plugin {
   const maxBytes = 500_000;
   return {
     name: "chimaera-entry-bundle-budget",
-    generateBundle(_options, bundle) {
-      for (const output of Object.values(bundle)) {
-        if (output.type !== "chunk" || !output.isEntry) continue;
-        const bytes = new TextEncoder().encode(output.code).byteLength;
-        if (bytes > maxBytes) {
-          const largest = Object.entries(output.modules)
-            .sort(([, a], [, b]) => b.renderedLength - a.renderedLength)
-            .slice(0, 8)
-            .map(([id, module]) => `  ${(module.renderedLength / 1000).toFixed(1)} kB  ${id}`)
-            .join("\n");
-          this.error(
-            `${output.fileName} is ${(bytes / 1000).toFixed(1)} kB; the always-loaded entry budget is ${maxBytes / 1000} kB\nlargest entry modules:\n${largest}`,
-          );
+    enforce: "post",
+    // Vite adds its preload dependency table in generateBundle. Measure after
+    // that insertion so the limit covers the bytes actually written to disk.
+    generateBundle: {
+      order: "post",
+      handler(_options, bundle) {
+        for (const output of Object.values(bundle)) {
+          if (output.type !== "chunk" || !output.isEntry) continue;
+          const bytes = new TextEncoder().encode(output.code).byteLength;
+          if (bytes > maxBytes) {
+            const largest = Object.entries(output.modules)
+              .sort(([, a], [, b]) => b.renderedLength - a.renderedLength)
+              .slice(0, 8)
+              .map(([id, module]) => `  ${(module.renderedLength / 1000).toFixed(1)} kB  ${id}`)
+              .join("\n");
+            this.error(
+              `${output.fileName} is ${(bytes / 1000).toFixed(1)} kB; the always-loaded entry budget is ${maxBytes / 1000} kB\nlargest entry modules:\n${largest}`,
+            );
+          }
         }
-      }
+      },
     },
   };
 }
@@ -127,6 +133,8 @@ const MARP_HLJS_KEEP = [
 ];
 
 export default defineConfig({
+  // The same bundle runs directly or below a per-tab browser gateway prefix.
+  base: "./",
   plugins: [svelte(), devManifest(), entryBundleBudget(), pdfjsAssets(), marpSharesKatex()],
   resolve: {
     // Marp (the slides view, its own lazy chunk) imports all of MathJax and

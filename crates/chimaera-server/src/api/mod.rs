@@ -11,6 +11,7 @@ use crate::AppState;
 
 mod env;
 mod exec;
+mod manual_resume;
 mod sessions;
 mod shutdown;
 mod workspaces;
@@ -20,6 +21,7 @@ pub(crate) use env::{launcher_context_env, session_env, spawn_env_remove};
 #[cfg(test)]
 pub(crate) use env::spawn_path;
 pub(crate) use exec::{exec_session, session_journal};
+pub(crate) use manual_resume::resume as resume_manual_session;
 pub(crate) use sessions::{create_session, delete_session, list_sessions, rename_session};
 pub(crate) use shutdown::{delete_all_sessions, shutdown};
 pub(crate) use workspaces::{
@@ -36,6 +38,9 @@ pub(crate) async fn auth(State(state): State<Arc<AppState>>, req: Request, next:
         .is_some_and(|v| v == format!("Bearer {}", state.token));
 
     if authorized {
+        if crate::activity::is_change(req.method(), req.uri().path()) {
+            crate::activity::touch(&state);
+        }
         next.run(req).await
     } else {
         (
@@ -48,7 +53,7 @@ pub(crate) async fn auth(State(state): State<Arc<AppState>>, req: Request, next:
 
 /// GET /api/v1/health
 pub(crate) async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    Json(json!({
+    let mut value = json!({
         "name": "chimaera",
         "version": chimaera_core::VERSION,
         // The build id lets clients spot daemon/client skew (semver is the
@@ -57,5 +62,16 @@ pub(crate) async fn health(State(state): State<Arc<AppState>>) -> Json<serde_jso
         "hostname": state.hostname,
         "pid": state.pid,
         "uptime_secs": state.started.elapsed().as_secs(),
-    }))
+    });
+    if let Some(ack) = crate::pro::supervisor_cleanup_ack(&state) {
+        value["supervisor_cleanup"] = json!(ack);
+    }
+    if crate::cloud::enabled() {
+        value["pro_cloud_operations"] =
+            json!(crate::cloud::active_operations() + crate::pro::active_operations(&state));
+        // Additive: the last user change that is not session input (saves,
+        // uploads, Git operations), for the machine's idle decision.
+        value["last_activity_ms"] = json!(crate::activity::last_change(&state));
+    }
+    Json(value)
 }

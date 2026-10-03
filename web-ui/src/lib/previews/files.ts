@@ -1,3 +1,4 @@
+import { daemonPath } from "../net/base";
 /**
  * Client for the daemon's file service (M3 wave 1):
  *   GET  /fs/list?path=&hidden=      directory listing (dirs first, sorted)
@@ -631,7 +632,7 @@ export async function fsRawTicket(path: string): Promise<{ url: string; name: st
       body: JSON.stringify({ path }),
     }),
   );
-  return { url: `/raw/${body.ticket}`, name: typeof body.name === "string" ? body.name : null };
+  return { url: daemonPath(`/raw/${body.ticket}`), name: typeof body.name === "string" ? body.name : null };
 }
 
 /**
@@ -800,7 +801,7 @@ export async function fsDownload(path: string): Promise<void> {
     }),
   );
   const a = document.createElement("a");
-  a.href = `/download/${body.ticket}`;
+  a.href = daemonPath(`/download/${body.ticket}`);
   a.rel = "noopener";
   // The `download` attribute forces a download even for a showable MIME (a
   // .md is text/*): without it the Tauri WKWebView navigates the main webview

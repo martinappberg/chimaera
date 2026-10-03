@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pro-status"
+description = "Enables the pro_status command without any pre-configured scope."
+commands.allow = ["pro_status"]
+
+[[permission]]
+identifier = "deny-pro-status"
+description = "Denies the pro_status command without any pre-configured scope."
+commands.deny = ["pro_status"]

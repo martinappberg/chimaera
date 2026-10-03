@@ -768,3 +768,40 @@ async fn agent_docs_install_announces_the_write() {
         "a no-op install is not a write"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn a_scoped_main_document_replaced_after_the_scope_proof_stays_private() {
+    use std::os::unix::fs::symlink;
+    let dir = fixture("dc-confined-main");
+    let project = dir.join("project");
+    std::fs::create_dir(&project).unwrap();
+    let document = project.join("doc.md");
+    std::fs::write(&document, "# Public\n").unwrap();
+    assert!(document.canonicalize().unwrap().starts_with(&project));
+    let private = dir.join("private.md");
+    std::fs::write(
+        &private,
+        "# Synthetic private heading\n[x](#synthetic-private-probe)\n",
+    )
+    .unwrap();
+    std::fs::remove_file(&document).unwrap();
+    symlink(&private, &document).unwrap();
+    assert!(
+        crate::doc_check::check_path_within(&document, Some(&project), Some(&project)).is_err()
+    );
+    // The unrestricted local/MCP checker still has its existing access.
+    let local = check_path(&document, None).unwrap();
+    assert!(local
+        .issues
+        .iter()
+        .any(|issue| issue.fix.contains("synthetic-private-heading")));
+    std::fs::remove_file(&document).unwrap();
+    std::fs::write(&document, "[inside](alias.md#public)\n").unwrap();
+    std::fs::write(project.join("target.md"), "# Public\n").unwrap();
+    symlink("target.md", project.join("alias.md")).unwrap();
+    let report =
+        crate::doc_check::check_path_within(&document, Some(&project), Some(&project)).unwrap();
+    assert!(report.issues.is_empty(), "{:?}", report.issues);
+    std::fs::remove_dir_all(dir).unwrap();
+}

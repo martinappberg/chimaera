@@ -8,8 +8,9 @@
 use std::collections::VecDeque;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -18,6 +19,8 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 /// stderr kept for diagnostics only — a runaway child must not grow memory.
 const STDERR_TAIL_BUDGET: usize = 8 * 1024;
+// Empty lines still allocate ring entries; byte limits alone do not bound them.
+const STDERR_TAIL_LINES: usize = 256;
 /// Hard ceiling on a single stdout line. A real stream-json / app-server frame
 /// (diffs, small inline images) fits well under this; a child that emits bytes
 /// without a newline (binary garbage, a wedged CLI) must never grow the read
@@ -33,6 +36,8 @@ const MAX_STDERR_LINE_BYTES: usize = 16 * 1024;
 struct CappedLines<R> {
     reader: BufReader<R>,
     max: usize,
+    partial: Vec<u8>,
+    overflowed: bool,
 }
 
 impl<R: AsyncRead + Unpin> CappedLines<R> {
@@ -40,39 +45,46 @@ impl<R: AsyncRead + Unpin> CappedLines<R> {
         Self {
             reader: BufReader::new(inner),
             max,
+            partial: Vec::new(),
+            overflowed: false,
         }
     }
 
     /// Next line without its trailing `\n`. `Ok(None)` = EOF. Invalid UTF-8 is
     /// replaced lossily rather than failing the session.
     async fn next_line(&mut self) -> std::io::Result<Option<String>> {
-        let mut buf: Vec<u8> = Vec::new();
-        let mut overflowed = false;
         loop {
             let available = self.reader.fill_buf().await?;
             if available.is_empty() {
-                if buf.is_empty() && !overflowed {
+                if self.partial.is_empty() && !self.overflowed {
                     return Ok(None);
                 }
                 break;
             }
             match available.iter().position(|&b| b == b'\n') {
                 Some(pos) => {
-                    push_capped(&mut buf, &available[..pos], self.max, &mut overflowed);
+                    push_capped(
+                        &mut self.partial,
+                        &available[..pos],
+                        self.max,
+                        &mut self.overflowed,
+                    );
                     self.reader.consume(pos + 1);
                     break;
                 }
                 None => {
                     let len = available.len();
-                    push_capped(&mut buf, available, self.max, &mut overflowed);
+                    push_capped(&mut self.partial, available, self.max, &mut self.overflowed);
                     self.reader.consume(len);
                 }
             }
         }
-        if overflowed {
+        if std::mem::take(&mut self.overflowed) {
             tracing::warn!(cap = self.max, "agent output line exceeded cap; truncated");
         }
-        Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+        Ok(Some(
+            String::from_utf8_lossy(&std::mem::take(&mut self.partial)).into_owned(),
+        ))
     }
 }
 
@@ -105,7 +117,26 @@ impl JsonlChild {
         env: &[(String, String)],
         env_remove: &[String],
     ) -> Result<Self> {
+        Self::spawn_controlled(bin, args, cwd, env, env_remove, None)
+    }
+    pub(crate) fn spawn_controlled(
+        bin: &str,
+        args: &[String],
+        cwd: &Path,
+        env: &[(String, String)],
+        env_remove: &[String],
+        control: Option<&Arc<ProcessControl>>,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            control.is_none_or(|c| !c.fenced()),
+            "managed process was fenced before spawn"
+        );
         let mut cmd = Command::new(bin);
+        #[cfg(unix)]
+        if control.is_some() {
+            cmd.process_group(0);
+        }
+
         cmd.args(args)
             .current_dir(cwd)
             .stdin(Stdio::piped())
@@ -122,6 +153,8 @@ impl JsonlChild {
         for k in env_remove {
             cmd.env_remove(k);
         }
+        // Startup-only supervisor input is consumed by the daemon, never an agent.
+        cmd.env_remove("CHIMAERA_SUPERVISOR_CLEANUP_FD");
         let mut child = cmd
             .spawn()
             .with_context(|| format!("failed to spawn {bin}"))?;
@@ -138,7 +171,7 @@ impl JsonlChild {
                 let mut tail = tail.lock().expect("stderr tail lock");
                 tail.push_back(line);
                 let mut total: usize = tail.iter().map(|l| l.len()).sum();
-                while total > STDERR_TAIL_BUDGET {
+                while total > STDERR_TAIL_BUDGET || tail.len() > STDERR_TAIL_LINES {
                     match tail.pop_front() {
                         Some(dropped) => total -= dropped.len(),
                         None => break,
@@ -147,12 +180,17 @@ impl JsonlChild {
             }
         });
 
+        let child = Arc::new(Mutex::new(child));
+        if let Some(control) = control {
+            control.attach(&child);
+        }
         Ok(Self {
             sink: JsonlSink { stdin },
             stream: JsonlStream {
                 lines: CappedLines::new(stdout, MAX_STDOUT_LINE_BYTES),
             },
             guard: ChildGuard {
+                managed_group: control.is_some(),
                 child,
                 stderr_tail,
                 stderr_task,
@@ -220,6 +258,30 @@ pub struct JsonlStream {
 }
 
 impl JsonlStream {
+    /// Called only after the trusted caller confirmed the exact leader stopped.
+    /// Incomplete lines survive canceled reads and refuse a false empty tail.
+    pub(crate) fn drained(&self) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let mut pending: nix::libc::c_int = 0;
+            self.lines.partial.is_empty()
+                && !self.lines.overflowed
+                && self.lines.reader.buffer().is_empty()
+                && unsafe {
+                    nix::libc::ioctl(
+                        self.lines.reader.get_ref().as_raw_fd(),
+                        nix::libc::FIONREAD,
+                        &mut pending,
+                    )
+                } == 0
+                && pending == 0
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
     /// Next JSON frame, no deadline — an idle agent is silent for as long as
     /// the user thinks. `Ok(None)` = EOF.
     pub async fn next(&mut self) -> Result<Option<Value>> {
@@ -248,7 +310,8 @@ const STDERR_SETTLE: Duration = Duration::from_secs(1);
 
 /// Owns the child for lifecycle: bounded shutdown, kill, stderr diagnostics.
 pub struct ChildGuard {
-    child: Child,
+    managed_group: bool,
+    child: Arc<Mutex<Child>>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
     stderr_task: tokio::task::JoinHandle<()>,
 }
@@ -264,7 +327,7 @@ impl ChildGuard {
     /// (PROTOCOL.md Pass 32). A no-op once the child has been reaped (tokio
     /// clears the pid then, so a recycled pid is never signalled).
     pub fn terminate(&self) {
-        if let Some(pid) = self.child.id() {
+        if let Some(pid) = self.child.lock().expect("child lifecycle lock").id() {
             let _ = nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(pid as i32),
                 nix::sys::signal::Signal::SIGTERM,
@@ -284,12 +347,48 @@ impl ChildGuard {
     /// after the child died. A fast-crashing child otherwise loses the race
     /// and its failure diagnostics read as an empty tail.
     pub async fn shutdown_with_stderr(mut self, grace: Duration) -> (Option<i32>, String) {
-        let status = match tokio::time::timeout(grace, self.child.wait()).await {
-            Ok(Ok(status)) => status.code(),
-            _ => {
-                self.child.start_kill().ok();
-                self.child.wait().await.ok().and_then(|s| s.code())
+        if self.managed_group {
+            // Wait for the child to exit or the deadline, whichever comes
+            // first (a clean stop takes ~0.3 s; every stop, view switch and
+            // rewind used to wait the full two seconds), then end whatever
+            // else is left in its process group.
+            // The exit is observed without reaping (WNOWAIT), so the group id
+            // cannot be recycled before the group kill below.
+            let deadline = Instant::now() + grace.min(Duration::from_secs(2));
+            let pid = self.child.lock().expect("child lifecycle lock").id();
+            while Instant::now() < deadline && !pid.is_some_and(exited_unreaped) {
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }
+            let child = self.child.lock().expect("child lifecycle lock");
+            #[cfg(unix)]
+            if let Some(pid) = child.id() {
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(pid as i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+        }
+        let deadline = Instant::now() + grace;
+        let status = loop {
+            let observed = self.child.lock().expect("child lifecycle lock").try_wait();
+            match observed {
+                Ok(Some(status)) => break status.code(),
+                Err(_) => break None,
+                Ok(None) => {}
+            }
+            if Instant::now() >= deadline {
+                let _ = self
+                    .child
+                    .lock()
+                    .expect("child lifecycle lock")
+                    .start_kill();
+            }
+            // Keep the synchronous control lock free while waiting. A lease
+            // watchdog can stop the owned handle during handshake or IO stalls.
+            if Instant::now() >= deadline + Duration::from_secs(5) {
+                break None;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         };
         let _ = tokio::time::timeout(STDERR_SETTLE, &mut self.stderr_task).await;
         let tail = self.stderr_tail();
@@ -302,9 +401,282 @@ impl ChildGuard {
     }
 }
 
+/// Whether our direct child has exited, without reaping it (its pid, and so
+/// its process-group id, stays reserved until the real wait).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn exited_unreaped(pid: u32) -> bool {
+    let mut info = std::mem::MaybeUninit::<nix::libc::siginfo_t>::zeroed();
+    // SAFETY: waitid writes into `info`; WNOWAIT leaves the child waitable.
+    let result = unsafe {
+        nix::libc::waitid(
+            nix::libc::P_PID,
+            pid,
+            info.as_mut_ptr(),
+            nix::libc::WEXITED | nix::libc::WNOHANG | nix::libc::WNOWAIT,
+        )
+    };
+    if result != 0 {
+        // Already reaped or not our child: nothing left to wait for.
+        return true;
+    }
+    // SAFETY: zero-initialised and possibly written by waitid above.
+    let info = unsafe { info.assume_init() };
+    #[cfg(target_os = "macos")]
+    let observed = info.si_pid;
+    #[cfg(target_os = "linux")]
+    // SAFETY: si_pid is valid for a WEXITED waitid result.
+    let observed = unsafe { info.si_pid() };
+    observed == pid as i32
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn exited_unreaped(_: u32) -> bool {
+    false
+}
+
 fn truncate(s: &str, max: usize) -> &str {
     match s.char_indices().nth(max) {
         Some((idx, _)) => &s[..idx],
         None => s,
+    }
+}
+
+/// Opt-in managed-process fence; ordinary CLI/probe shutdown retains its normal
+/// SIGTERM behavior. No cached PID is signalled after the Child was reaped.
+#[derive(Default)]
+pub struct ProcessControl {
+    state: Mutex<ControlState>,
+}
+#[derive(Default)]
+struct ControlState {
+    child: Weak<Mutex<Child>>,
+    fenced_at: Option<Instant>,
+}
+impl ProcessControl {
+    /// Run off-reactor. Pin while the unreaped owned Child lock excludes a
+    /// concurrent reap; a later numeric PID reuse cannot retarget the fd.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn pin_process(&self) -> Result<crate::managed_process::ManagedProcess> {
+        let state = self.state.lock().expect("process control lock");
+        anyhow::ensure!(state.fenced_at.is_none(), "managed child fenced");
+        let child = state.child.upgrade().context("managed child unavailable")?;
+        let child = child.lock().expect("child lifecycle lock");
+        crate::managed_process::ManagedProcess::pin(child.id().context("managed child exited")?)
+    }
+    fn fenced(&self) -> bool {
+        self.state
+            .lock()
+            .expect("process control lock")
+            .fenced_at
+            .is_some()
+    }
+    fn attach(&self, child: &Arc<Mutex<Child>>) {
+        let mut state = self.state.lock().expect("process control lock");
+        state.child = Arc::downgrade(child);
+        if state.fenced_at.is_some() {
+            Self::signal(&state);
+        }
+    }
+    /// The owned process group's id (the child's pid) while it is attached and
+    /// unreaped, so a daemon can record restart evidence for it.
+    pub fn process_group(&self) -> Option<u32> {
+        let child = self
+            .state
+            .lock()
+            .expect("process control lock")
+            .child
+            .upgrade()?;
+        let id = child.lock().expect("child lifecycle lock").id();
+        id
+    }
+    /// Called repeatedly during the bounded stop window. First SIGTERM lets
+    /// the official CLI stop detached helpers; the owned group gets SIGKILL
+    /// after two seconds. This is not containment of arbitrary setsid children.
+    pub fn fence(&self) {
+        let mut state = self.state.lock().expect("process control lock");
+        state.fenced_at.get_or_insert_with(Instant::now);
+        Self::signal(&state);
+    }
+    fn signal(state: &ControlState) {
+        let Some(child) = state.child.upgrade() else {
+            return;
+        };
+        let mut child = child.lock().expect("child lifecycle lock");
+        let Some(pid) = child.id() else {
+            return;
+        };
+        let force = state
+            .fenced_at
+            .is_some_and(|at| at.elapsed() >= Duration::from_secs(2));
+        #[cfg(unix)]
+        {
+            let signal = if force {
+                nix::sys::signal::Signal::SIGKILL
+            } else {
+                nix::sys::signal::Signal::SIGTERM
+            };
+            let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid as i32), signal);
+        }
+        if force {
+            let _ = child.start_kill();
+        }
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        // A detached descendant may retain stderr after the bounded drain.
+        // The reader belongs to this guard, including canceled shutdowns.
+        self.stderr_task.abort();
+        if !self.managed_group {
+            return;
+        }
+        #[cfg(unix)]
+        if let Some(pid) = self.child.lock().expect("child lifecycle lock").id() {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn maintenance_partial_output_survives_canceled_line_reads() {
+        let (mut input, output) = tokio::io::duplex(256);
+        let mut lines = CappedLines::new(output, 32);
+        input.write_all(b"{\"proof\":").await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), lines.next_line())
+                .await
+                .is_err()
+        );
+        assert!(!lines.partial.is_empty());
+        input.write_all(b"true}\n").await.unwrap();
+        assert_eq!(
+            lines.next_line().await.unwrap().unwrap(),
+            "{\"proof\":true}"
+        );
+        assert!(lines.partial.is_empty());
+        input.write_all(&[b'x'; 64]).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), lines.next_line())
+                .await
+                .is_err()
+        );
+        assert_eq!(lines.partial.len(), 32);
+        assert!(lines.overflowed);
+        input.write_all(b"\n{}").await.unwrap();
+        assert_eq!(lines.next_line().await.unwrap().unwrap().len(), 32);
+    }
+
+    #[tokio::test]
+    async fn blank_stderr_lines_cannot_grow_the_diagnostic_ring() {
+        let child = JsonlChild::spawn(
+            "/bin/sh",
+            &["-c".into(), "i=0; while [ $i -lt 10000 ]; do printf '\\n' >&2; i=$((i+1)); done; printf 'tail-marker\\n' >&2".into()],
+            Path::new("/"),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let (sink, _stream, guard) = child.split();
+        drop(sink);
+        let (status, tail) = guard.shutdown_with_stderr(Duration::from_secs(5)).await;
+        assert_eq!(status, Some(0));
+        assert!(tail.ends_with("tail-marker"));
+        assert!(tail.lines().count() <= STDERR_TAIL_LINES);
+    }
+
+    #[tokio::test]
+    async fn dropping_a_guard_cancels_its_owned_stderr_reader() {
+        let child = JsonlChild::spawn(
+            "/bin/sh",
+            &["-c".into(), "read ignored".into()],
+            Path::new("/"),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let (_sink, _stream, mut guard) = child.split();
+        // Model a pipe kept open by a detached descendant: killing the direct
+        // child cannot make this reader finish by itself.
+        let reader = std::mem::replace(
+            &mut guard.stderr_task,
+            tokio::spawn(std::future::pending::<()>()),
+        );
+        reader.abort();
+        let reader = guard.stderr_task.abort_handle();
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !reader.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    /// A managed child that exits on its own is reaped at once (a stop, view
+    /// switch or rewind no longer waits out a fixed two seconds), and what it
+    /// left running in its process group is still ended.
+    #[tokio::test]
+    async fn a_managed_child_that_exits_is_reaped_at_once_and_its_group_ended() {
+        let control = Arc::new(ProcessControl::default());
+        let child = JsonlChild::spawn_controlled(
+            "/bin/sh",
+            &["-c".into(), "sleep 30 & exit 3".into()],
+            Path::new("/"),
+            &[],
+            &[],
+            Some(&control),
+        )
+        .unwrap();
+        let (_sink, _stream, guard) = child.split();
+        let group = guard
+            .child
+            .lock()
+            .expect("child lifecycle lock")
+            .id()
+            .unwrap() as i32;
+        let started = Instant::now();
+        let status = guard.shutdown(Duration::from_secs(10)).await;
+        assert_eq!(status, Some(3));
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "{:?}",
+            started.elapsed()
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while nix::sys::signal::killpg(nix::unistd::Pid::from_raw(group), None).is_ok() {
+            assert!(Instant::now() < deadline, "the background sleep survived");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod supervisor_channel_tests {
+    use super::*;
+    #[tokio::test]
+    async fn startup_cleanup_marker_never_reaches_agent_child() {
+        let mut child = JsonlChild::spawn(
+            "/bin/sh",
+            &[
+                "-c".into(),
+                r#"printf '{"marker":"%s"}\n' "${CHIMAERA_SUPERVISOR_CLEANUP_FD-absent}""#.into(),
+            ],
+            &std::env::temp_dir(),
+            &[("CHIMAERA_SUPERVISOR_CLEANUP_FD".into(), "0".into())],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            child.recv(Duration::from_secs(5)).await.unwrap().unwrap()["marker"],
+            "absent"
+        );
+        child.shutdown(Duration::from_secs(1)).await.unwrap();
     }
 }

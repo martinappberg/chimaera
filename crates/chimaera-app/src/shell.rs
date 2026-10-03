@@ -14,28 +14,34 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use chimaera_remote::Tunnel;
+use self::tunnel::Tunnel;
 use tauri::ipc::CapabilityBuilder;
 use tauri::{AppHandle, Manager};
 
 use crate::daemon::LocalDaemon;
 use crate::windows::{WindowRecord, WindowRegistry};
 
+mod cloud;
 mod cluster;
 mod commands;
 mod connect;
 mod drag;
 pub(crate) mod notices;
+mod power;
 #[cfg(target_os = "macos")]
 mod print_frame;
+mod pro;
+mod quit;
 mod restore;
+mod tunnel;
 mod unsaved;
 
 pub use restore::open_ui_window;
 
 /// Permissions exposed to a daemon-served workbench window. These grants are
 /// installed at runtime for one volatile window label and one exact loopback
-/// origin; the only static capability is the shell-local WSL wizard.
+/// origin; the only static capabilities are the shell-local WSL wizard and
+/// the quit handover window (`quit`, which may only close itself).
 const DAEMON_UI_CORE_PERMISSIONS: &[&str] = &[
     "core:default",
     "core:window:allow-close",
@@ -64,6 +70,7 @@ type ConnectFlight = tokio::sync::watch::Receiver<Option<Result<(), String>>>;
 pub struct Shell {
     /// The local daemon (mutable: the update affordance replaces it).
     pub local: Mutex<LocalDaemon>,
+    pro: pro::Pro,
     /// Live tunnels by host alias.
     tunnels: tokio::sync::Mutex<HashMap<String, Tunnel>>,
     /// Tunnels that still have an owned forward but missed enough
@@ -146,6 +153,9 @@ pub struct Shell {
     /// Each window's unsaved-file count and the close/quit prompts it is
     /// answering (see `unsaved`).
     unsaved: Mutex<unsaved::Guard>,
+    /// Whether a quit is asking (or handing work to the cloud) because an
+    /// agent is working on this computer (see `quit`).
+    quit_gate: Mutex<quit::Gate>,
     /// Live cross-window drags: source label → the sibling its pointer
     /// currently hovers (None over desktop). Entries live for one drag;
     /// `done_drags` is what fences late per-frame updates, so the entry
@@ -294,6 +304,12 @@ impl WindowScope {
         askpass_scope_matches(&self.askpass_scope, prompt_alias)
     }
 
+    /// Closing this window when it is the last one opens local Home rather
+    /// than ending the app: a workspace, remote or torn-off window.
+    pub(crate) fn reopens_home(&self) -> bool {
+        self.alias.is_some() || self.ws.is_some() || self.detached
+    }
+
     /// Stable host identity for shell-owned per-host caches. Compute windows
     /// display a composite job alias but authenticate through (and inherit
     /// appearance from) their login host.
@@ -405,11 +421,13 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// Grant one daemon window the shell bridge on one exact loopback origin and
 /// make that origin its sole navigation target. The capability identifier is
 /// always fresh because Tauri's runtime authority is additive and rejects an
-/// identifier collision.
+/// identifier collision. `local`: the origin is this computer's own daemon
+/// (window scope without a host alias), the only UI given account commands.
 pub(super) fn authorize_daemon_origin(
     app: &AppHandle,
     window_label: &str,
     port: u16,
+    local: bool,
 ) -> tauri::Result<()> {
     let shell = app.state::<Shell>();
     if lock(&shell.allowed_daemon_ports).get(window_label) == Some(&port) {
@@ -424,7 +442,15 @@ pub(super) fn authorize_daemon_origin(
     for permission in DAEMON_UI_CORE_PERMISSIONS {
         capability = capability.permission(*permission);
     }
-    for command in crate::command_manifest::DAEMON_UI_COMMANDS {
+    let account: &[&str] = if local {
+        crate::command_manifest::LOCAL_ACCOUNT_COMMANDS
+    } else {
+        &[]
+    };
+    for command in crate::command_manifest::DAEMON_UI_COMMANDS
+        .iter()
+        .chain(account)
+    {
         capability = capability.permission(format!("allow-{}", command.replace('_', "-")));
     }
     app.add_capability(capability)?;
@@ -446,7 +472,7 @@ pub(super) fn authorize_scope_origin(
         .map(|(label, _)| label.clone())
         .collect();
     for label in labels {
-        authorize_daemon_origin(app, &label, port)?;
+        authorize_daemon_origin(app, &label, port, scope_alias.is_none())?;
     }
     Ok(())
 }
@@ -528,6 +554,15 @@ pub(crate) fn request_quit(app: &AppHandle) {
 /// flag is what tells "the user quit" from "the user closed the last window").
 pub(crate) fn finish_quit(app: &AppHandle) {
     if let Some(shell) = app.try_state::<Shell>() {
+        if shell.quitting.load(Ordering::Relaxed) {
+            return;
+        }
+        // Past the unsaved-edits guard: an agent working on this computer
+        // may continue in the cloud instead (`quit`). A held quit comes
+        // back here once the question is settled.
+        if quit::hold_quit(app) {
+            return;
+        }
         // Idempotent: do the exit once however many paths arrive here.
         if shell.quitting.swap(true, Ordering::Relaxed) {
             return;
@@ -535,6 +570,16 @@ pub(crate) fn finish_quit(app: &AppHandle) {
         lock(&shell.registry).save_if_dirty();
     }
     app.exit(0);
+}
+
+/// Whether closing `label` ends the app: it is the only window left, and not
+/// one whose last close opens Home instead (`last_close_needs_home`).
+fn closing_ends_app(app: &AppHandle, shell: &Shell, label: &str) -> bool {
+    !shell.quitting.load(Ordering::Relaxed)
+        && app.webview_windows().keys().all(|other| other == label)
+        && !lock(&shell.windows)
+            .get(label)
+            .is_some_and(WindowScope::reopens_home)
 }
 
 /// Activate the app the way a macOS app conventionally answers a Dock click
@@ -714,7 +759,7 @@ pub(crate) fn navigate_home_hub(
         &HOME_NAV_SEQ.fetch_add(1, Ordering::Relaxed).to_string(),
     );
 
-    authorize_daemon_origin(app, window.label(), port)?;
+    authorize_daemon_origin(app, window.label(), port, alias.is_none())?;
     {
         let mut windows = lock(&shell.windows);
         let scope = windows
@@ -745,7 +790,10 @@ pub(crate) fn navigate_home_hub(
         return Err(error);
     }
     if ws.is_some() && !stable_id.is_empty() {
-        lock(&shell.registry).set_scope(&stable_id, alias.clone(), ws);
+        let link_device = alias
+            .as_deref()
+            .is_some_and(|alias| shell.pro.is_device(alias));
+        lock(&shell.registry).set_scope(&stable_id, alias.clone(), ws, link_device);
     }
 
     let title = alias.map_or_else(
@@ -813,11 +861,9 @@ pub(crate) fn show_local_home(
     Ok(())
 }
 
-/// Whether the currently-focused window has a workspace open (vs the home
-/// screen or no window focused). Drives the menu's Settings item, which is
-/// workspace/daemon-scoped. Reads the scope map (populated by `open_ui_window`
-/// and `report_window_scope`); false before startup or for the WSL wizard.
-pub(crate) fn focused_ws_open(app: &AppHandle) -> bool {
+/// Whether focus belongs to a managed daemon window. The setup wizard has no
+/// scope-map entry and cannot show the daemon-served Settings surface.
+pub(crate) fn focused_daemon_open(app: &AppHandle) -> bool {
     let Some(focused) = app
         .webview_windows()
         .into_values()
@@ -826,11 +872,7 @@ pub(crate) fn focused_ws_open(app: &AppHandle) -> bool {
         return false;
     };
     app.try_state::<Shell>()
-        .map(|shell| {
-            lock(&shell.windows)
-                .get(focused.label())
-                .is_some_and(|s| s.ws.is_some())
-        })
+        .map(|shell| lock(&shell.windows).contains_key(focused.label()))
         .unwrap_or(false)
 }
 
@@ -903,6 +945,7 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
     if fresh {
         handle.manage(Shell {
             local: Mutex::new(local),
+            pro: pro::Pro::load(),
             tunnels: tokio::sync::Mutex::new(HashMap::new()),
             unhealthy_tunnels: Mutex::new(HashSet::new()),
             wedge_suspects: Mutex::new(HashSet::new()),
@@ -923,6 +966,7 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
             quitting: AtomicBool::new(false),
             last_close_needs_home: AtomicBool::new(false),
             unsaved: Mutex::new(unsaved::Guard::default()),
+            quit_gate: Mutex::new(quit::Gate::default()),
             drags: Mutex::new(HashMap::new()),
             done_drags: Mutex::new(HashMap::new()),
             transfers: Mutex::new(HashMap::new()),
@@ -930,11 +974,18 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
         });
     } else {
         *lock(&handle.state::<Shell>().local) = local;
+        let app = handle.clone();
+        tauri::async_runtime::spawn(async move {
+            pro::refresh_serve(&app.state::<Shell>()).await;
+        });
     }
     if fresh {
         // Before any window opens: the watchers start polling right away,
         // and a window's first scope report may already owe it a focus.
         notices::start(handle);
+        pro::start(handle.clone());
+        // Work handed to the cloud on the last quit may come home again.
+        quit::welcome_back(handle);
     }
     // Reopen last session's windows. Restore itself registers a home surface
     // before launching any remote ssh that may need askpass, and also covers
@@ -990,9 +1041,41 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
+            cloud::pro_cloud_request,
+            cloud::pro_cloud_status,
+            pro::pro_status,
+            pro::pro_refresh_account,
+            pro::projects::pro_cloud_projects,
+            pro::projects::pro_open_cloud_project,
+            pro::projects::pro_copy_project,
+            pro::projects::pro_take_over_project,
+            pro::project_secrets::pro_project_secrets_catalog,
+            pro::project_secrets::pro_project_secret_command,
+            pro::project_secrets::pro_project_secret_operation,
+            pro::personal_providers::pro_personal_provider_mode,
+            pro::personal_providers::pro_personal_provider_catalog,
+            pro::personal_providers::pro_personal_provider_command,
+            pro::personal_providers::pro_personal_provider_operation,
+            pro::personal_providers::pro_personal_provider_open,
+            pro::billing::pro_billing_checkout,
+            pro::billing::pro_billing_portal,
+            pro::billing::pro_cancel_billing,
+            pro::pro_take_return,
+            pro::pro_mirror_status,
+            pro::pro_set_never_mirror,
+            pro::pro_sign_in,
+            pro::pro_cancel_sign_in,
+            pro::pro_sign_out,
+            pro::pro_sign_out_everywhere,
+            pro::pro_hosts,
+            pro::pro_set_host_kept,
+            pro::pro_devices,
+            pro::pro_revoke_device,
             commands::list_hosts,
             commands::add_host,
+            commands::set_host_direct_ssh,
             commands::remove_host,
             commands::connect_host,
             commands::disconnect_host,
@@ -1063,7 +1146,19 @@ pub fn run() {
                 // goes (Save all / Don't save / Cancel); one with nothing
                 // unsaved closes as it always has.
                 tauri::WindowEvent::CloseRequested { api, .. } => {
-                    if unsaved::hold_window_close(window.app_handle(), window.label()) {
+                    let app = window.app_handle();
+                    if window.label() == quit::HANDOFF_WINDOW {
+                        // Its Quit button or title bar: quit now; the daemon
+                        // finishes (or already ended) the handover itself.
+                        api.prevent_close();
+                        quit::handoff_window_closing(app);
+                    } else if unsaved::hold_window_close(app, window.label()) {
+                        api.prevent_close();
+                    } else if closing_ends_app(app, &shell, window.label())
+                        && quit::hold_last_close(app, window.label())
+                    {
+                        // Unsaved edits were settled first; this asks whether
+                        // working agents continue in the cloud.
                         api.prevent_close();
                     }
                 }
@@ -1115,9 +1210,7 @@ pub fn run() {
                         // the actual destroyed scope, after any unsaved prompt,
                         // and let ExitRequested decide whether it was the last.
                         shell.last_close_needs_home.store(
-                            scope.as_ref().is_some_and(|scope| {
-                                scope.alias.is_some() || scope.ws.is_some() || scope.detached
-                            }),
+                            scope.as_ref().is_some_and(WindowScope::reopens_home),
                             Ordering::Relaxed,
                         );
                         // The tray lists open windows; drop the closed one, and
@@ -1310,6 +1403,7 @@ pub fn run() {
                     cluster::end_all_terminals(app);
                     cluster::end_attached_jobs(app);
                     tauri::async_runtime::block_on(async {
+                        pro::stop(&state).await;
                         let tunnels: Vec<_> =
                             state.tunnels.lock().await.drain().map(|(_, t)| t).collect();
                         for tunnel in tunnels {

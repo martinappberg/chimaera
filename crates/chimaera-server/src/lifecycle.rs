@@ -10,6 +10,47 @@ use crate::{app, lock, AppState, ServerConfig};
 
 /// Bind on 127.0.0.1, write the manifest, and serve until SIGINT/SIGTERM.
 pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
+    run_selected(cfg, false, false).await
+}
+
+/// Explicit disposable CLI selection; ordinary run never selects this task.
+#[cfg(all(target_os = "linux", feature = "provider-github-fixture"))]
+pub async fn run_provider_github_fixture(cfg: ServerConfig) -> anyhow::Result<()> {
+    anyhow::ensure!(!cfg.routable_bind, "Fixture requires loopback binding");
+    run_selected(cfg, true, false).await
+}
+
+#[cfg(all(not(target_os = "linux"), feature = "provider-github-fixture"))]
+pub async fn run_provider_github_fixture(_: ServerConfig) -> anyhow::Result<()> {
+    anyhow::bail!("Fixture requires Linux")
+}
+
+/// Separate explicit print fixture; no normal startup selects it.
+#[cfg(all(target_os = "linux", feature = "provider-claude-fixture"))]
+pub async fn run_provider_claude_fixture(cfg: ServerConfig) -> anyhow::Result<()> {
+    anyhow::ensure!(!cfg.routable_bind, "Fixture requires loopback binding");
+    run_selected(cfg, false, true).await
+}
+
+#[cfg(all(not(target_os = "linux"), feature = "provider-claude-fixture"))]
+pub async fn run_provider_claude_fixture(_: ServerConfig) -> anyhow::Result<()> {
+    anyhow::bail!("Fixture requires Linux")
+}
+
+async fn run_selected(
+    cfg: ServerConfig,
+    github_fixture: bool,
+    claude_fixture: bool,
+) -> anyhow::Result<()> {
+    #[cfg(not(all(target_os = "linux", feature = "provider-github-fixture")))]
+    let _ = github_fixture;
+    #[cfg(not(all(target_os = "linux", feature = "provider-claude-fixture")))]
+    let _ = claude_fixture;
+    // Consume the trusted launcher's one-shot pipe before restore or helpers
+    // can inherit it. An opted-in idle descriptor is protected and its Linux
+    // proc/ptrace gate verified here, before any startup child. Ordinary device
+    // and cluster startup have no such channel.
+    let supervisor_cleanup = crate::pro::read_supervisor_cleanup().await?;
     // A cluster workspace job: its data dir is the workspace's folder on the
     // shared filesystem, and the manifest there is the workspace's lease. A
     // previous job of the same workspace may still be shutting down (a
@@ -155,6 +196,16 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
                 .await;
     }
 
+    crate::pro::stage_supervisor_cleanup(&state, supervisor_cleanup)?;
+    #[cfg(all(target_os = "linux", feature = "provider-github-fixture"))]
+    if github_fixture {
+        crate::pro::start_github_fixture(&state)?;
+    }
+    #[cfg(all(target_os = "linux", feature = "provider-claude-fixture"))]
+    if claude_fixture {
+        crate::pro::start_claude_fixture(&state)?;
+    }
+
     // Theming shims: regenerated at every daemon start (and after installs /
     // uninstalls / settings edits) so they always match this build's resolution
     // and the current managed-install + explicit-path picture.
@@ -198,6 +249,9 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     // (crashes, unclean stops) — swept once restore has decided which
     // sessions still exist.
     crate::upload::spawn_boot_prune(state.clone());
+    // Transfer leftovers (staging copies, Git locks, temporary archives) from
+    // a previous daemon life that never finished them.
+    crate::pro::sweep_leftovers(&state);
 
     // `state.clone()` (not a move) so the post-serve ledger snapshot + handoff
     // below still own it after graceful shutdown returns.
@@ -254,6 +308,9 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     // live chat agents cleanly so their own teardown stops their background
     // work (see `chat::stop_all_for_exit`); they resurrect from the ledger.
     crate::chat::stop_all_for_exit(&state).await;
+    // Managed agents are proven stopped here, so a same-boot successor (an
+    // update or restart) does not treat their launch evidence as a crash.
+    crate::pro::shutdown(&state).await;
     // Plugins' programs end with the daemon, their whole process groups (a
     // build is started again on the next save; nothing resumes it).
     state.plugin_platform.jobs.kill_all();
@@ -499,6 +556,8 @@ async fn shutdown_signal(state: Arc<AppState>) {
     state
         .stopping
         .store(true, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(all(unix, feature = "provider-authority-prototype"))]
+    crate::pro::retire_provider_startup(&state);
     state.changes.notify_waiters();
 }
 

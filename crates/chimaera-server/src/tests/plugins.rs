@@ -351,11 +351,7 @@ esac
 
     std::fs::write(root.join("release-install"), "").unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            request(&state, Method::GET, &report_url, None).await;
-            if probe_calls() == "probe\nprobe\n" {
-                break;
-            }
+        while state.probes.changed_epoch() == 0 {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
@@ -363,6 +359,11 @@ esac
     .expect("completion did not invalidate probes before terminal dismissal");
     assert_eq!(state.probes.changed_epoch(), 1);
     assert!(state.sessions.get(sid).is_some());
+    // CLI probes share a global semaphore with unrelated tests. Measure the
+    // completion watcher's deadline independently of that probe queue.
+    let (status, _) = request(&state, Method::GET, &report_url, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(probe_calls(), "probe\nprobe\n");
     state.sessions.kill(sid).unwrap();
 }
 

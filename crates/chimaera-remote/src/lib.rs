@@ -11,9 +11,18 @@
 //! opening new things on the host stays instant. The same options set a
 //! trust-on-first-use host-key policy, so a freshly installed app can connect
 //! to a host it has never seen without a tty to confirm the key.
+//! An explicit [`SshAuthentication`] scope instead freezes strict caller-selected
+//! public trust and a destination-bound agent for one effect. Unsupported local
+//! identity/proxy configuration cannot silently widen that authority; background
+//! captured-master scopes remain unable to authenticate.
+//! `ssh_algorithms` captures one bounded fixed-binary supported snapshot for all
+//! legs. Policy-bearing effects emit its ordered intersection with native lists,
+//! retain locally disabled methods, and refuse if that binary identity changes.
 
 pub mod cluster;
 pub mod hosts;
+mod ssh_algorithms;
+pub use ssh_algorithms::SshAlgorithmSupport;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -30,9 +39,754 @@ use tokio::process::{Child, Command};
 /// connect concurrently, so a process-global "current host" would race and
 /// show one host's authentication prompt in another host's windows.
 pub const ASKPASS_ALIAS_ENV: &str = "CHIMAERA_ASKPASS_ALIAS";
+/// Local-only explicit authentication identity for a caller-gated MFA relay.
+/// This is not a remote environment variable or a bearer credential.
+pub const ASKPASS_CONTEXT_ENV: &str = "CHIMAERA_ASKPASS_CONTEXT";
+
+tokio::task_local! {
+    static EXISTING_MASTER_ONLY: MasterHandle;
+    static SSH_AUTHENTICATION: SshAuthentication;
+}
+
+/// One explicit destination-bound authentication effect. Paths belong to the
+/// caller, which must retain its agent/trust-file lease until the effect ends.
+/// No Debug implementation: socket paths and selected identity stay private.
+#[derive(Clone)]
+pub struct SshAuthentication {
+    alias: String,
+    hostname: String,
+    user: String,
+    port: u16,
+    socket: String,
+    known_hosts: String,
+    masters: Vec<MasterHandle>,
+    fresh: bool,
+    keyboard_interactive: Option<String>,
+    route_helper: Option<String>,
+    interactive_only: bool,
+    policy: Option<SshAuthenticationPolicy>,
+    support: Option<SshAlgorithmSupport>,
+}
+/// Closed resolved options for one original route leg; never native directives.
+#[derive(Clone, serde::Serialize)]
+pub struct SshAuthenticationPolicy {
+    pub methods: Vec<String>,
+    pub host_key_algorithms: Vec<String>,
+    pub ca_signature_algorithms: Vec<String>,
+    pub pubkey_accepted_algorithms: Vec<String>,
+    pub kex_algorithms: Vec<String>,
+    pub ciphers: Vec<String>,
+    pub macs: Vec<String>,
+}
+impl SshAuthenticationPolicy {
+    fn validate(&self, interactive: bool) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.methods.is_empty() && self.methods.len() <= 3,
+            "invalid SSH authentication methods"
+        );
+        for (index, method) in self.methods.iter().enumerate() {
+            anyhow::ensure!(
+                matches!(
+                    method.as_str(),
+                    "publickey" | "keyboard-interactive" | "password"
+                ) && !self.methods[..index].contains(method),
+                "invalid SSH authentication method"
+            );
+        }
+        anyhow::ensure!(
+            if interactive {
+                !self.methods.iter().any(|method| method == "publickey")
+            } else {
+                self.methods
+                    .first()
+                    .is_some_and(|method| method == "publickey")
+            },
+            "SSH authentication mode mismatch"
+        );
+        for list in [
+            &self.host_key_algorithms,
+            &self.ca_signature_algorithms,
+            &self.pubkey_accepted_algorithms,
+            &self.kex_algorithms,
+            &self.ciphers,
+            &self.macs,
+        ] {
+            anyhow::ensure!(
+                !list.is_empty() && list.len() <= 64,
+                "invalid SSH authentication algorithms"
+            );
+            let mut names = std::collections::HashSet::new();
+            for name in list {
+                anyhow::ensure!(
+                    !name.is_empty()
+                        && name.len() <= 128
+                        && !name.starts_with(['+', '-'])
+                        && name
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || b"-@._+".contains(&byte))
+                        && names.insert(name),
+                    "invalid SSH authentication algorithm"
+                );
+            }
+        }
+        anyhow::ensure!(
+            serde_json::to_vec(self)?.len() <= 8 * 1024,
+            "SSH authentication policy too large"
+        );
+        Ok(())
+    }
+}
+impl SshAuthentication {
+    /// The caller retains original-grant prompt/signature guards. This only
+    /// restricts the fixed SSH effect; it cannot grant credential UI authority.
+    pub fn with_policy(
+        mut self,
+        policy: SshAuthenticationPolicy,
+        support: &SshAlgorithmSupport,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            self.keyboard_interactive.is_some(),
+            "SSH route context missing"
+        );
+        policy.validate(self.interactive_only)?;
+        self.policy = Some(support.restrict(&policy)?);
+        self.support = Some(support.clone());
+        Ok(self)
+    }
+    /// Resolve and freeze one canonical destination locally, without dialing.
+    /// Configured private keys/certificates are unsupported. Configured jump or
+    /// proxy routing is usable only through an already established captured mux.
+    pub async fn new(
+        alias: &str,
+        hostname: &str,
+        user: &str,
+        port: u16,
+        agent_socket: &Path,
+        known_hosts: &Path,
+    ) -> anyhow::Result<Self> {
+        Self::new_inner(alias, hostname, user, port, agent_socket, known_hosts, None).await
+    }
+    /// A keeper's own immutable generated route, never a native ProxyCommand.
+    /// The same executable implements the closed --ssh-route-leg helper; its
+    /// context resolves only the original live owner, not a caller command.
+    pub async fn new_route(
+        alias: &str,
+        destination: (&str, &str, u16),
+        files: (&Path, &Path),
+        context: &str,
+        jump_aliases: &[String],
+        interactive_only: bool,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            (32..=128).contains(&context.len())
+                && context
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+                && jump_aliases.len() <= 3
+                && jump_aliases
+                    .iter()
+                    .all(|alias| hosts::normalize_alias(alias).ok().as_ref() == Some(alias)),
+            "invalid SSH route authentication context"
+        );
+        Self::new_inner(
+            alias,
+            destination.0,
+            destination.1,
+            destination.2,
+            files.0,
+            files.1,
+            Some((context, jump_aliases, interactive_only)),
+        )
+        .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn new_inner(
+        alias: &str,
+        hostname: &str,
+        user: &str,
+        port: u16,
+        agent_socket: &Path,
+        known_hosts: &Path,
+        route_context: Option<(&str, &[String], bool)>,
+    ) -> anyhow::Result<Self> {
+        let alias = hosts::normalize_alias(alias)?;
+        anyhow::ensure!(
+            auth_word(hostname) && auth_word(user) && port != 0,
+            "invalid SSH authentication destination"
+        );
+        let socket = authentication_path(agent_socket)?;
+        let known_hosts = authentication_path(known_hosts)?;
+        validate_authentication_files(agent_socket, Path::new(&known_hosts)).await?;
+        let mut command = transport_command("ssh");
+        command.args(ssh_opts());
+        command.args([
+            "-o",
+            "IdentityFile=none",
+            "-o",
+            "CertificateFile=none",
+            "-G",
+        ]);
+        command.arg(&alias);
+        let output = output_bounded(&mut command, 5, "SSH authentication configuration")
+            .await
+            .map_err(|_| anyhow::anyhow!("SSH authentication configuration unavailable"))?;
+        anyhow::ensure!(
+            output.status.success(),
+            "SSH authentication configuration unavailable"
+        );
+        let config = std::str::from_utf8(&output.stdout)
+            .map_err(|_| anyhow::anyhow!("SSH authentication configuration invalid"))?;
+        let (mut fresh, master) =
+            authentication_snapshot(&alias, Route::Alias, config, hostname, user, port)?;
+        let route_helper = if let Some((context, jumps, _)) = route_context {
+            let helper = authentication_route_helper(config, context, jumps)?;
+            fresh = true;
+            helper
+        } else {
+            None
+        };
+        // Destination and mux identity must come from the same resolution:
+        // a second config read could bind an old grant to a different master.
+        let mut masters = vec![master];
+        let route = route_of(&alias);
+        if route != Route::Alias && route.node() == Some(hostname) {
+            let mut command = transport_command("ssh");
+            command.args(route_opts(&alias, &route));
+            command.args(["-o", &format!("User={user}"), "-o", &format!("Port={port}")]);
+            command.args(ssh_opts());
+            command.args([
+                "-o",
+                "IdentityFile=none",
+                "-o",
+                "CertificateFile=none",
+                "-G",
+            ]);
+            command.arg(&alias);
+            let output = output_bounded(&mut command, 5, "SSH authentication route")
+                .await
+                .map_err(|_| anyhow::anyhow!("SSH authentication route unavailable"))?;
+            anyhow::ensure!(
+                output.status.success(),
+                "SSH authentication route unavailable"
+            );
+            let config = std::str::from_utf8(&output.stdout)
+                .map_err(|_| anyhow::anyhow!("SSH authentication route invalid"))?;
+            masters.push(authentication_snapshot(&alias, route, config, hostname, user, port)?.1);
+        }
+        if !fresh {
+            let mut established = false;
+            for master in &masters {
+                established |= master.present().await?;
+            }
+            anyhow::ensure!(
+                established,
+                "SSH authentication routing requires an existing master"
+            );
+        }
+        Ok(Self {
+            alias,
+            hostname: hostname.into(),
+            user: user.into(),
+            port,
+            socket,
+            known_hosts,
+            masters,
+            fresh,
+            keyboard_interactive: route_context.map(|(context, _, _)| context.into()),
+            route_helper,
+            interactive_only: route_context.is_some_and(|(_, _, interactive)| interactive),
+            policy: None,
+            support: None,
+        })
+    }
+    /// Permit a caller's existing askpass MFA relay for this exact explicit
+    /// effect. The relay MUST check this opaque context, selected destination,
+    /// original device and a verified key-signature receipt before prompting,
+    /// then freshly authorize the answer. Configured continuation methods never
+    /// authorize a prompt after key refusal; the original owner still decides.
+    pub fn with_keyboard_interactive(mut self, context: &str) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            (32..=128).contains(&context.len())
+                && context
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte)),
+            "invalid SSH authentication context"
+        );
+        self.keyboard_interactive = Some(context.to_owned());
+        Ok(self)
+    }
+    /// Task-local and cancellation-safe; spawned owned work must enter its own
+    /// scope. An existing-master-only scope always has stronger authority.
+    pub async fn with_authentication<F: std::future::Future>(&self, future: F) -> F::Output {
+        SSH_AUTHENTICATION.scope(self.clone(), future).await
+    }
+    fn options(&self, host: &str, route: &Route, node: bool) -> Vec<String> {
+        let captured = self
+            .masters
+            .iter()
+            .find(|master| master.host == host && master.route == *route);
+        let allowed = host == self.alias
+            && *route == Route::Alias
+            && self.fresh
+            && !node
+            && EXISTING_MASTER_ONLY.try_with(|_| ()).is_err();
+        // Freeze the validated config instead of re-reading identity/proxy
+        // directives after validation. Exact captured sockets preserve routing.
+        let mut options = vec!["-F".into(), "/dev/null".into()];
+        let mfa = allowed && self.keyboard_interactive.is_some();
+        let methods = self.policy.as_ref().map(|policy| policy.methods.join(","));
+        let permits = |method: &str| {
+            mfa && self.policy.as_ref().map_or_else(
+                || method == "keyboard-interactive" || self.interactive_only,
+                |policy| policy.methods.iter().any(|name| name == method),
+            )
+        };
+        let settings = [
+            (
+                "IdentityAgent",
+                if allowed {
+                    self.socket.as_str()
+                } else {
+                    "none"
+                },
+            ),
+            ("IdentityFile", "none"),
+            ("CertificateFile", "none"),
+            ("IdentitiesOnly", "no"),
+            ("ForwardAgent", "no"),
+            ("AddKeysToAgent", "no"),
+            ("GlobalKnownHostsFile", "/dev/null"),
+            ("UserKnownHostsFile", self.known_hosts.as_str()),
+            ("StrictHostKeyChecking", "yes"),
+            ("KnownHostsCommand", "none"),
+            ("VerifyHostKeyDNS", "no"),
+            ("UpdateHostKeys", "no"),
+            ("BatchMode", if mfa { "no" } else { "yes" }),
+            (
+                "PasswordAuthentication",
+                if permits("password") { "yes" } else { "no" },
+            ),
+            (
+                "KbdInteractiveAuthentication",
+                if permits("keyboard-interactive") {
+                    "yes"
+                } else {
+                    "no"
+                },
+            ),
+            ("HostbasedAuthentication", "no"),
+            ("GSSAPIAuthentication", "no"),
+            (
+                "PreferredAuthentications",
+                if let Some(methods) = &methods {
+                    methods.as_str()
+                } else if mfa && self.interactive_only {
+                    "keyboard-interactive,password"
+                } else if mfa {
+                    "publickey,keyboard-interactive"
+                } else {
+                    "publickey"
+                },
+            ),
+            (
+                "PubkeyAuthentication",
+                if self.interactive_only {
+                    "no"
+                } else {
+                    "host-bound"
+                },
+            ),
+            (
+                "ProxyCommand",
+                if allowed {
+                    self.route_helper.as_deref().unwrap_or("none")
+                } else {
+                    "false"
+                },
+            ),
+            ("ProxyJump", "none"),
+        ];
+        for (key, value) in settings {
+            options.extend(["-o".into(), format!("{key}={value}")]);
+        }
+        if let Some(policy) = &self.policy {
+            for (key, list) in [
+                ("HostKeyAlgorithms", &policy.host_key_algorithms),
+                ("CASignatureAlgorithms", &policy.ca_signature_algorithms),
+                (
+                    "PubkeyAcceptedAlgorithms",
+                    &policy.pubkey_accepted_algorithms,
+                ),
+                ("KexAlgorithms", &policy.kex_algorithms),
+                ("Ciphers", &policy.ciphers),
+                ("MACs", &policy.macs),
+            ] {
+                options.extend(["-o".into(), format!("{key}={}", list.join(","))]);
+            }
+        }
+        options.extend([
+            "-o".into(),
+            format!(
+                "ControlPath={}",
+                captured
+                    .filter(|_| !node)
+                    .map_or("none", |master| master.path.as_str())
+            ),
+        ]);
+        if allowed {
+            for (key, value) in [
+                ("HostName", self.hostname.clone()),
+                ("User", self.user.clone()),
+                ("Port", self.port.to_string()),
+            ] {
+                options.extend(["-o".into(), format!("{key}={value}")]);
+            }
+        } else {
+            options.extend([
+                "-o".into(),
+                "ControlMaster=no".into(),
+                "-o".into(),
+                "ControlPersist=no".into(),
+            ]);
+        }
+        options
+    }
+}
+fn authentication_route_helper(
+    config: &str,
+    context: &str,
+    jumps: &[String],
+) -> anyhow::Result<Option<String>> {
+    anyhow::ensure!(
+        (32..=128).contains(&context.len())
+            && context
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+            && jumps.len() <= 3
+            && jumps
+                .iter()
+                .all(|alias| hosts::normalize_alias(alias).ok().as_ref() == Some(alias)),
+        "invalid SSH route authentication context"
+    );
+    let expected = if jumps.is_empty() {
+        "none".into()
+    } else {
+        jumps.join(",")
+    };
+    let mut resolved = config
+        .lines()
+        .filter_map(|line| line.strip_prefix("proxyjump "));
+    let actual = resolved.next().unwrap_or("none");
+    anyhow::ensure!(
+        actual == expected
+            && resolved.next().is_none()
+            && config
+                .lines()
+                .filter_map(|line| line.strip_prefix("proxycommand "))
+                .all(|value| value == "none"),
+        "SSH route configuration changed"
+    );
+    if jumps.is_empty() {
+        return Ok(None);
+    }
+    let executable = authentication_path(&std::env::current_exe()?)?;
+    Ok(Some(fixed_route_helper(
+        &executable,
+        context,
+        jumps.len() - 1,
+    )?))
+}
+fn fixed_route_helper(executable: &str, context: &str, leg: usize) -> anyhow::Result<String> {
+    // ProxyCommand is parsed by OpenSSH's shell. These paths were validated for
+    // argv use; quote the complete executable so allowed shell metacharacters
+    // retain their literal filesystem meaning. Single quotes are forbidden by
+    // authentication_path, and the two remaining arguments are closed atoms.
+    let executable = authentication_path(Path::new(executable))?;
+    anyhow::ensure!(
+        (32..=128).contains(&context.len())
+            && context
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+            && leg < 3,
+        "invalid SSH route helper arguments"
+    );
+    Ok(format!("'{executable}' --ssh-route-leg {context} {leg}"))
+}
+fn authentication_opts(host: &str, route: &Route, node: bool) -> Vec<String> {
+    SSH_AUTHENTICATION
+        .try_with(|scope| scope.options(host, route, node))
+        .unwrap_or_default()
+}
+fn auth_word(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && !value.starts_with('-')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-@:[]".contains(&byte))
+}
+fn authentication_path(path: &Path) -> anyhow::Result<String> {
+    let text = path
+        .to_str()
+        .filter(|text| {
+            path.is_absolute()
+                && text.len() <= 1024
+                && text
+                    .bytes()
+                    .all(|byte| byte.is_ascii_graphic() && !b"%$\"'\\".contains(&byte))
+        })
+        .context("invalid SSH authentication path")?;
+    Ok(text.into())
+}
+async fn validate_authentication_files(socket: &Path, known_hosts: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        let socket = tokio::fs::symlink_metadata(socket)
+            .await
+            .map_err(|_| anyhow::anyhow!("SSH authentication socket unavailable"))?;
+        let trust = tokio::fs::symlink_metadata(known_hosts)
+            .await
+            .map_err(|_| anyhow::anyhow!("SSH authentication trust unavailable"))?;
+        anyhow::ensure!(
+            socket.file_type().is_socket() && trust.is_file() && trust.len() <= 128 * 1024,
+            "invalid SSH authentication files"
+        );
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (socket, known_hosts);
+        bail!("SSH authentication scope unsupported")
+    }
+}
+fn authentication_config(
+    config: &str,
+    hostname: &str,
+    user: &str,
+    port: u16,
+) -> anyhow::Result<bool> {
+    let destination = parse_ssh_destination(config)?;
+    anyhow::ensure!(
+        destination == (hostname.into(), Some(user.into()), port),
+        "SSH authentication destination changed"
+    );
+    let values = |key: &'static str| {
+        config
+            .lines()
+            .filter_map(move |line| line.strip_prefix(key))
+    };
+    for key in ["identityfile ", "certificatefile "] {
+        let mut found = false;
+        for value in values(key) {
+            found = true;
+            anyhow::ensure!(
+                value == "none",
+                "SSH authentication configuration uses local identities"
+            );
+        }
+        anyhow::ensure!(
+            found,
+            "SSH authentication identity configuration unavailable"
+        );
+    }
+    Ok(!values("proxyjump ")
+        .chain(values("proxycommand "))
+        .any(|value| value != "none"))
+}
+fn authentication_snapshot(
+    alias: &str,
+    route: Route,
+    config: &str,
+    hostname: &str,
+    user: &str,
+    port: u16,
+) -> anyhow::Result<(bool, MasterHandle)> {
+    let fresh = authentication_config(config, hostname, user, port)?;
+    let master = capture_master_config(alias, route, config)?;
+    authentication_path(Path::new(&master.path))?;
+    Ok((fresh, master))
+}
+
+/// Opaque identity of the actual expanded OpenSSH control socket. Alias names
+/// and configured hostname tuples cannot identify a routed/shared master.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MasterIdentity([u8; 32]);
+
+/// An exact captured mux leg, with no credential or authority to authenticate.
+/// Deliberately no Debug: control paths and routing metadata stay out of logs.
+#[derive(Clone)]
+pub struct MasterHandle {
+    host: String,
+    route: Route,
+    path: String,
+    identity: MasterIdentity,
+}
+impl MasterHandle {
+    pub fn identity(&self) -> MasterIdentity {
+        self.identity
+    }
+    pub async fn present(&self) -> anyhow::Result<bool> {
+        let mut command = self.command();
+        command.args(["-O", "check"]).arg(&self.host);
+        master_presence(command, 5).await
+    }
+    /// Owned teardown is pinned before spawning; a later route/config change
+    /// cannot redirect it, and caller cancellation does not abandon the leg.
+    pub async fn close(&self) -> anyhow::Result<()> {
+        let mut command = self.command();
+        command.args(["-O", "exit"]).arg(&self.host);
+        captured_master_close(command).await
+    }
+    fn command(&self) -> Command {
+        let mut command = mux_prologue(&self.host, &self.route);
+        // -S sets the exact socket after the ordinary %C option, without
+        // recomputing it from a changed hostname/jump/configuration.
+        command.arg("-S").arg(&self.path);
+        command
+    }
+    pub async fn with_existing<F: std::future::Future>(&self, future: F) -> F::Output {
+        EXISTING_MASTER_ONLY.scope(self.clone(), future).await
+    }
+}
+async fn captured_master_close(command: Command) -> anyhow::Result<()> {
+    tokio::spawn(master_exit(command, Duration::from_secs(5)))
+        .await
+        .map_err(|_| anyhow::anyhow!("SSH captured login cleanup unavailable"))?
+}
+
+/// Run SSH helpers using an already authenticated ControlMaster only. If its
+/// socket disappears, SSH must fail rather than dial, run a configured proxy,
+/// or ask for credentials. Ordinary explicit connections retain their defaults.
+///
+/// This scope follows the current async task, including nested helpers, and is
+/// restored on cancellation. Spawned tasks do not inherit it: an owned worker
+/// must establish the scope inside that task before constructing SSH commands.
+pub async fn with_existing_master<F: std::future::Future>(
+    host: &str,
+    future: F,
+) -> anyhow::Result<F::Output> {
+    let host = hosts::normalize_alias(host)?;
+    let handle = capture_master(&host, route_of(&host)).await?;
+    Ok(handle.with_existing(future).await)
+}
+
+fn scoped_master(host: &str, route: &Route) -> anyhow::Result<Option<MasterHandle>> {
+    match EXISTING_MASTER_ONLY.try_with(Clone::clone) {
+        Ok(handle) => {
+            anyhow::ensure!(
+                handle.host == host && handle.route == *route,
+                "SSH captured login route changed"
+            );
+            Ok(Some(handle))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+fn existing_master_opts(host: &str, route: &Route) -> Vec<String> {
+    if let Ok(handle) = EXISTING_MASTER_ONLY.try_with(Clone::clone) {
+        // First values win in OpenSSH. BatchMode alone still allows a fresh
+        // public-key login and ProxyJump; the failed proxy prevents all fallback
+        // transport after the mux lookup, including its disappearance race.
+        let mut options: Vec<String> = [
+            "-o",
+            "ControlMaster=no",
+            "-o",
+            "ControlPersist=no",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "KbdInteractiveAuthentication=no",
+            "-o",
+            "ProxyCommand=false",
+            "-o",
+            "ProxyJump=none",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        options.extend([
+            "-o".into(),
+            format!(
+                "ControlPath={}",
+                if handle.host == host && handle.route == *route {
+                    &handle.path
+                } else {
+                    "none"
+                }
+            ),
+        ]);
+        options
+    } else {
+        vec![]
+    }
+}
+
+/// Capture the routed and alias legs while the caller owns its SSH effect gate.
+/// Resolution is a bounded local ssh -G, never a network/authentication attempt.
+pub async fn master_handles(host: &str) -> anyhow::Result<Vec<MasterHandle>> {
+    let host = hosts::normalize_alias(host)?;
+    let route = route_of(&host);
+    let first = capture_master(&host, route.clone()).await?;
+    let mut handles = vec![first];
+    if route != Route::Alias {
+        let alias = capture_master(&host, Route::Alias).await?;
+        if alias.identity != handles[0].identity {
+            handles.push(alias);
+        }
+    }
+    Ok(handles)
+}
+async fn capture_master(host: &str, route: Route) -> anyhow::Result<MasterHandle> {
+    // Do not inherit a surrounding existing-only scope: ProxyJump contributes
+    // to %C. Resolve the original socket before replacing fallback transport.
+    let mut command = transport_command("ssh");
+    command
+        .args(route_opts(host, &route))
+        .args(ssh_opts())
+        .args(["-T", "-G"])
+        .arg(host);
+    capture_master_command(host, route, command).await
+}
+async fn capture_master_command(
+    host: &str,
+    route: Route,
+    mut command: Command,
+) -> anyhow::Result<MasterHandle> {
+    let output = output_bounded(&mut command, 5, "SSH master identity")
+        .await
+        .map_err(|_| anyhow::anyhow!("SSH master identity unavailable"))?;
+    anyhow::ensure!(output.status.success(), "SSH master identity unavailable");
+    let text = std::str::from_utf8(&output.stdout)
+        .map_err(|_| anyhow::anyhow!("SSH master identity invalid"))?;
+    capture_master_config(host, route, text)
+}
+fn capture_master_config(host: &str, route: Route, text: &str) -> anyhow::Result<MasterHandle> {
+    let paths: Vec<_> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("controlpath "))
+        .take(2)
+        .collect();
+    anyhow::ensure!(
+        paths.len() == 1
+            && paths[0].starts_with('/')
+            && paths[0].len() <= 1024
+            && !paths[0].chars().any(char::is_control)
+            && !paths[0].contains('%'),
+        "SSH master identity invalid"
+    );
+    use sha2::Digest;
+    Ok(MasterHandle {
+        host: host.into(),
+        route,
+        path: paths[0].into(),
+        identity: MasterIdentity(sha2::Sha256::digest(paths[0].as_bytes()).into()),
+    })
+}
 
 /// The ssh ControlMaster socket path pattern for chimaera connections. `%C`
-/// is ssh's own hash of (localhost, remotehost, port, user): unique per
+/// is ssh's own hash of (localhost, remotehost, port, user, ProxyJump): unique per
 /// destination and short. The parent dir is created on demand (ssh will not
 /// create it for the socket).
 ///
@@ -74,6 +828,14 @@ pub struct WslTransport {
 }
 
 static WSL_TRANSPORT: std::sync::RwLock<Option<WslTransport>> = std::sync::RwLock::new(None);
+static SSH_CONFIG: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
+
+/// Select a process-owned SSH config for a sandbox. Ordinary clients leave this
+/// unset and inherit their own config; a single-account service can supply only
+/// explicitly approved host metadata without reading an operator's SSH config.
+pub fn set_ssh_config(path: Option<PathBuf>) {
+    *SSH_CONFIG.write().unwrap_or_else(|p| p.into_inner()) = path;
+}
 
 pub fn set_wsl_transport(t: Option<WslTransport>) {
     *WSL_TRANSPORT.write().unwrap_or_else(|p| p.into_inner()) = t;
@@ -99,7 +861,35 @@ pub fn wsl_transport_ready() -> bool {
 /// pinned with `-u` so a later change of the distro's default user (Ubuntu
 /// OOBE) can never silently re-home ssh's config/keys/sockets mid-flight.
 fn transport_command(program: &str) -> Command {
-    match wsl_transport() {
+    // A policy-bearing effect must use the same trusted binary whose closed
+    // supported-algorithm snapshot narrowed its arguments. Replacement refuses
+    // rather than applying that snapshot to a different SSH implementation.
+    if matches!(program, "ssh" | "scp") {
+        if let Ok(Some(support)) = SSH_AUTHENTICATION.try_with(|scope| scope.support.clone()) {
+            let mut command = if support.current() {
+                Command::new(if program == "ssh" {
+                    "/usr/bin/ssh"
+                } else {
+                    "/usr/bin/scp"
+                })
+            } else {
+                Command::new("/usr/bin/false")
+            };
+            if program == "scp" {
+                command.args(["-S", "/usr/bin/ssh"]);
+            }
+            command.env_remove(ASKPASS_CONTEXT_ENV);
+            if EXISTING_MASTER_ONLY.try_with(|_| ()).is_err() {
+                if let Ok(Some(context)) =
+                    SSH_AUTHENTICATION.try_with(|scope| scope.keyboard_interactive.clone())
+                {
+                    command.env(ASKPASS_CONTEXT_ENV, context);
+                }
+            }
+            return command;
+        }
+    }
+    let mut command = match wsl_transport() {
         Some(t) => {
             let mut c = Command::new("wsl.exe");
             c.args(["-d", &t.distro, "-u", &t.user, "--exec", program]);
@@ -112,7 +902,26 @@ fn transport_command(program: &str) -> Command {
             c
         }
         None => Command::new(program),
+    };
+    if matches!(program, "ssh" | "scp") {
+        // Inherited context must never license an unrelated/background command.
+        command.env_remove(ASKPASS_CONTEXT_ENV);
+        if EXISTING_MASTER_ONLY.try_with(|_| ()).is_err() {
+            if let Ok(Some(context)) =
+                SSH_AUTHENTICATION.try_with(|scope| scope.keyboard_interactive.clone())
+            {
+                command.env(ASKPASS_CONTEXT_ENV, context);
+            }
+        }
+        if let Some(path) = SSH_CONFIG
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+        {
+            command.arg("-F").arg(path);
+        }
     }
+    command
 }
 
 /// A `curl` invocation with the same no-console discipline as every other
@@ -323,6 +1132,8 @@ fn ssh_base(host: &str) -> Command {
 fn ssh_base_via(host: &str, route: &Route) -> Command {
     let mut c = transport_command("ssh");
     c.env(ASKPASS_ALIAS_ENV, host);
+    c.args(existing_master_opts(host, route));
+    c.args(authentication_opts(host, route, false));
     c.args(route_opts(host, route));
     c.args(ssh_opts());
     c
@@ -345,6 +1156,8 @@ fn ssh_cmd(host: &str) -> Command {
 /// when it isn't.
 pub fn interactive_ssh_argv(host: &str) -> Vec<String> {
     let mut argv = vec!["ssh".to_string()];
+    argv.extend(existing_master_opts(host, &route_of(host)));
+    argv.extend(authentication_opts(host, &route_of(host), false));
     argv.extend(route_opts(host, &route_of(host)));
     argv.extend(ssh_opts());
     argv.push("-t".into());
@@ -358,6 +1171,8 @@ pub fn interactive_ssh_argv(host: &str) -> Vec<String> {
 fn scp_cmd(host: &str) -> Command {
     let mut c = transport_command("scp");
     c.env(ASKPASS_ALIAS_ENV, host);
+    c.args(existing_master_opts(host, &route_of(host)));
+    c.args(authentication_opts(host, &route_of(host), false));
     c.args(route_opts(host, &route_of(host)));
     c.args(ssh_opts());
     c
@@ -780,12 +1595,36 @@ impl Tunnel {
 /// forward must cancel it by the exact spec it was opened with, on the
 /// master (the `route`) it was registered with.
 async fn cancel_master_forward(host: &str, route: &Route, spec: &str) {
-    if bounded_mux_ssh(host, route, &["-O", "cancel", "-L", spec], &[], 10)
-        .await
-        .is_none()
-    {
-        tracing::warn!("ssh -O cancel -L {spec} to {host} did not finish within 10s");
+    let command = scoped_master(host, route)
+        .and_then(|captured| forward_cancel_command(host, route, spec, captured.as_ref()));
+    if let Ok(command) = command {
+        if forward_cancel(command, Duration::from_secs(10))
+            .await
+            .is_ok()
+        {
+            return;
+        }
     }
+    tracing::warn!("SSH forward cleanup unavailable");
+}
+
+fn forward_cancel_command(
+    host: &str,
+    route: &Route,
+    spec: &str,
+    captured: Option<&MasterHandle>,
+) -> anyhow::Result<Command> {
+    let mut command = if let Some(handle) = captured {
+        anyhow::ensure!(
+            handle.host == host && handle.route == *route,
+            "SSH captured forward route changed"
+        );
+        handle.command()
+    } else {
+        mux_prologue(host, route)
+    };
+    command.args(["-O", "cancel", "-L", spec]).arg(host);
+    Ok(command)
 }
 
 /// Detect and `-O exit` a ControlMaster to `host` whose TCP link is dead:
@@ -823,6 +1662,113 @@ pub async fn clear_wedged_master(host: &str, session_bound_secs: u64) -> bool {
         cleared |= clear_wedged_master_via(host, &Route::Alias, session_bound_secs).await;
     }
     cleared
+}
+
+/// Close the authenticated SSH logins owned by this state directory for a host.
+/// Closing a forward alone intentionally preserves ControlPersist; account-wide
+/// revocation must also terminate both legs of a routed login.
+pub async fn close_master(host: &str) -> anyhow::Result<()> {
+    let host = hosts::normalize_alias(host)?;
+    let route = route_of(&host);
+    // Dropping a caller must not abandon the alias leg after closing its node.
+    close_masters_owned(route, move |route| {
+        let host = host.clone();
+        async move {
+            let mut command = mux_prologue(&host, &route);
+            command.args(["-O", "exit"]).arg(&host);
+            master_exit(command, Duration::from_secs(5)).await
+        }
+    })
+    .await
+    .context("SSH login cleanup task did not finish")?
+}
+
+/// Bounded local mux evidence only; no network session, authentication or
+/// destructive wedge check. `false` requires the exact absent-socket receipt;
+/// an unknown/refused/stalled check is an error, never disappearance proof.
+pub async fn master_present(host: &str) -> anyhow::Result<bool> {
+    let host = hosts::normalize_alias(host)?;
+    capture_master(&host, route_of(&host))
+        .await?
+        .present()
+        .await
+}
+
+async fn master_presence(mut command: Command, seconds: u64) -> anyhow::Result<bool> {
+    command.env("LC_ALL", "C").env("LANG", "C");
+    let output = output_bounded(&mut command, seconds, "SSH master check")
+        .await
+        .map_err(|_| anyhow::anyhow!("SSH master check unavailable"))?;
+    if master_already_absent(&output) {
+        return Ok(false);
+    }
+    let running = output.status.success()
+        && output.stdout.is_empty()
+        && output.stderr.len() <= 128
+        && std::str::from_utf8(&output.stderr)
+            .ok()
+            .is_some_and(|stderr| {
+                let line = stderr.strip_suffix('\n').unwrap_or(stderr);
+                line.strip_suffix('\r')
+                    .unwrap_or(line)
+                    .strip_prefix("Master running (pid=")
+                    .and_then(|rest| rest.strip_suffix(')'))
+                    .is_some_and(|pid| {
+                        !pid.is_empty()
+                            && pid.bytes().all(|b| b.is_ascii_digit())
+                            && pid.parse::<u32>().ok().is_some_and(|pid| pid > 0)
+                    })
+            });
+    anyhow::ensure!(running, "SSH master check unverified");
+    Ok(true)
+}
+
+fn close_masters_owned<F, Fut>(
+    route: Route,
+    mut close: F,
+) -> tokio::task::JoinHandle<anyhow::Result<()>>
+where
+    F: FnMut(Route) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = anyhow::Result<()>> + Send,
+{
+    tokio::spawn(async move {
+        let first = close(route.clone()).await;
+        let alias = if route != Route::Alias {
+            close(Route::Alias).await
+        } else {
+            Ok(())
+        };
+        first.and(alias)
+    })
+}
+
+async fn master_exit(mut command: Command, deadline: Duration) -> anyhow::Result<()> {
+    // OpenSSH's explicit ENOENT diagnostic distinguishes an absent master from
+    // a refused request, invalid config or failed spawn. Other locales fail
+    // closed rather than turning an arbitrary nonzero exit into success.
+    command.env("LC_ALL", "C");
+    let output = tokio::time::timeout(
+        deadline,
+        output_bounded(&mut command, 10, "SSH login closure"),
+    )
+    .await
+    .context("SSH login did not acknowledge closure within the deadline")?
+    .map_err(|_| anyhow::anyhow!("SSH login closure could not be completed"))?;
+    if !output.status.success() && !master_already_absent(&output) {
+        bail!("SSH login did not acknowledge closure");
+    }
+    Ok(())
+}
+
+fn master_already_absent(output: &std::process::Output) -> bool {
+    output.status.code() == Some(255)
+        && output.stdout.is_empty()
+        && std::str::from_utf8(&output.stderr).is_ok_and(|stderr| {
+            let line = stderr.trim();
+            line.starts_with("Control socket connect(")
+                && line.ends_with("): No such file or directory")
+                && !line.contains(['\n', '\r'])
+        })
 }
 
 async fn clear_wedged_master_via(host: &str, route: &Route, session_bound_secs: u64) -> bool {
@@ -866,6 +1812,8 @@ fn mux_prologue(host: &str, route: &Route) -> Command {
     let mut command = transport_command("ssh");
     command
         .env(ASKPASS_ALIAS_ENV, host)
+        .args(existing_master_opts(host, route))
+        .args(authentication_opts(host, route, false))
         .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"])
         .args(route_opts(host, route))
         .args(ssh_opts());
@@ -1859,11 +2807,15 @@ fn parse_probe_output(stdout: &str) -> anyhow::Result<Option<Probe>> {
         Ok(manifest) => manifest,
         Err(err) => {
             if trailer_pid(trailer).is_some() && trailer_verdict(trailer) == Some(true) {
-                bail!("the manifest is unparsable ({err}) yet its pid is alive; refusing to start a second daemon");
+                bail!(
+                    "the manifest is unparsable ({err}) yet its pid is alive; refusing to start a second daemon"
+                );
             }
             let written_on = trailer_field(trailer, "host").unwrap_or_default();
             if !written_on.is_empty() && !node.is_empty() && !same_node(written_on, &node) {
-                bail!("the manifest is unparsable ({err}) and names node {written_on}, not {node}; refusing to start a second daemon");
+                bail!(
+                    "the manifest is unparsable ({err}) and names node {written_on}, not {node}; refusing to start a second daemon"
+                );
             }
             return Ok(None);
         }
@@ -2850,10 +3802,14 @@ pub struct ComputeTunnel {
     /// the ssh-adopt rung — `node_ssh_base` pins `ControlPath=none`, so that
     /// child owns its forward end-to-end and dies with it.
     master_forward: Option<String>,
+    /// Captured before an existing-only scope ends. Cleanup's owned task must
+    /// never recompute a %C socket from later SSH config or task-local state.
+    master_handle: Option<MasterHandle>,
     /// The login alias's [`Route`] when the tunnel opened — which master
     /// holds `master_forward`.
     route: Route,
-    child: Child,
+    child: std::sync::Arc<tokio::sync::Mutex<Child>>,
+    closing: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl ComputeTunnel {
@@ -2869,18 +3825,116 @@ impl ComputeTunnel {
     /// Wait for the tunnel child (never returns for a healthy ssh-adopt
     /// forward; quickly when the direct rung delegated to the master).
     pub async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        self.child.wait().await
+        self.child.lock().await.wait().await
     }
 
     /// Kill the tunnel; a master-held forward is also cancelled so local
     /// ports don't leak past the window that opened them.
     pub async fn close(mut self) {
-        let _ = self.child.start_kill();
-        let _ = tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await;
-        if let Some(spec) = &self.master_forward {
-            cancel_master_forward(&self.host, &self.route, spec).await;
-        }
+        let _ = self.try_close().await;
     }
+
+    /// Reap the tunnel child and positively acknowledge cancellation of its
+    /// exact captured forward. Failure retains the cleanup identity for retry;
+    /// an aborted caller cannot cancel the bounded owned cleanup task.
+    pub async fn try_close(&mut self) -> anyhow::Result<()> {
+        let permit = self
+            .closing
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| anyhow::anyhow!("compute tunnel cleanup already in progress"))?;
+        let child = self.child.clone();
+        let host = self.host.clone();
+        let route = self.route.clone();
+        let spec = self.master_forward.clone();
+        let captured = self.master_handle.clone();
+        compute_cleanup_owned(child, permit, route, spec, move |route, spec| {
+            let host = host.clone();
+            async move {
+                let command = forward_cancel_command(&host, &route, &spec, captured.as_ref())?;
+                forward_cancel(command, Duration::from_secs(10)).await
+            }
+        })
+        .await
+        .context("compute tunnel cleanup task did not finish")?
+    }
+}
+
+fn compute_cleanup_owned<F, Fut>(
+    child: std::sync::Arc<tokio::sync::Mutex<Child>>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    route: Route,
+    spec: Option<String>,
+    cancel: F,
+) -> tokio::task::JoinHandle<anyhow::Result<()>>
+where
+    F: FnOnce(Route, String) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = anyhow::Result<()>> + Send,
+{
+    tokio::spawn(async move {
+        let _permit = permit;
+        let reaped = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut child = child.lock().await;
+            if child
+                .try_wait()
+                .map_err(|_| anyhow::anyhow!("compute child status unavailable"))?
+                .is_none()
+            {
+                let _ = child.start_kill();
+                child
+                    .wait()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("compute child could not be reaped"))?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("compute child did not finish cleanup"))
+        .and_then(|result| result);
+        // A failed child reap must not prevent attempting the captured mux
+        // forward. Both proofs are necessary before a held allocation is freed.
+        let canceled = if let Some(spec) = spec {
+            cancel(route, spec).await
+        } else {
+            Ok(())
+        };
+        reaped.and(canceled)
+    })
+}
+
+async fn forward_cancel(mut command: Command, deadline: Duration) -> anyhow::Result<()> {
+    command.env("LC_ALL", "C").env("LANG", "C");
+    let output = tokio::time::timeout(
+        deadline,
+        output_bounded(&mut command, 10, "compute forward cleanup"),
+    )
+    .await
+    .context("compute forward cleanup did not finish")?
+    .map_err(|_| anyhow::anyhow!("compute forward cleanup could not be completed"))?;
+    // OpenSSH distinguishes an absent requested forward from a refused cancel.
+    // Unknown/localized/mixed diagnostics remain uncertain, never success.
+    let diagnostics = std::str::from_utf8(&output.stderr).ok().map(str::trim);
+    // OpenSSH's cancel branch can exit zero even after MUX_S_FAILURE. Its
+    // fixed error pair distinguishes an absent exact request from refusal.
+    let absent = matches!(output.status.code(), Some(0 | 255))
+        && output.stdout.is_empty()
+        && diagnostics.is_some_and(|diagnostics| {
+            let mut lines = diagnostics.lines();
+            lines.next()
+                == Some("mux_client_forward: forwarding request failed: port not forwarded")
+                && matches!(
+                    lines.next(),
+                    None | Some("muxclient: master cancel forward request failed")
+                )
+                && lines.next().is_none()
+        });
+    anyhow::ensure!(
+        (output.status.success() && output.stdout.is_empty() && diagnostics == Some(""))
+            || absent
+            || master_already_absent(&output),
+        "compute forward cleanup was not acknowledged"
+    );
+    Ok(())
 }
 
 /// The `-W`-relay ProxyCommand that carries a node-bound ssh's first leg
@@ -2930,9 +3984,14 @@ fn node_proxy_command(host: &str, route: &Route) -> String {
 fn node_ssh_base(host: &str, route: &Route) -> Command {
     let mut c = transport_command("ssh");
     c.env(ASKPASS_ALIAS_ENV, host);
+    // The node rung is a different endpoint, not another mux session on the
+    // login master. Never substitute that master for the intended node leg.
+    c.args(["-o", "ControlPath=none"]);
+    // This rung owns a fresh node connection rather than a mux. It must not
+    // turn a background existing-only scope into node authentication.
+    c.args(existing_master_opts(host, route));
+    c.args(authentication_opts(host, route, true));
     c.args([
-        "-o",
-        "ControlPath=none",
         "-o",
         "BatchMode=yes",
         "-o",
@@ -2966,6 +4025,40 @@ async fn node_target(host: &str, node: &str) -> String {
         Some(user) if !user.is_empty() => format!("{user}@{node}"),
         _ => node.to_string(),
     }
+}
+
+/// Resolve only the portable destination from the user's local SSH config.
+/// Private keys, proxy commands and every other executable option stay local.
+/// The app uses this when asking its optional account service to keep an alias
+/// connected; on Windows resolution runs inside the configured WSL transport.
+pub async fn ssh_destination(host: &str) -> anyhow::Result<(String, Option<String>, u16)> {
+    let alias = hosts::normalize_alias(host)?;
+    let mut command = transport_command("ssh");
+    command.arg("-G").arg(&alias);
+    let output = output_bounded(&mut command, 15, "ssh configuration resolution").await?;
+    if !output.status.success() {
+        bail!("could not resolve SSH destination for {alias}");
+    }
+    parse_ssh_destination(&String::from_utf8(output.stdout)?)
+}
+
+fn parse_ssh_destination(config: &str) -> anyhow::Result<(String, Option<String>, u16)> {
+    let value = |key: &str| {
+        config
+            .lines()
+            .find_map(|line| line.strip_prefix(key).map(str::trim))
+    };
+    let hostname = value("hostname ")
+        .filter(|value| !value.is_empty())
+        .context("SSH destination has no hostname")?;
+    let user = value("user ")
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let port = value("port ").unwrap_or("22").parse::<u16>()?;
+    if port == 0 || hostname.starts_with('-') || hostname.chars().any(char::is_whitespace) {
+        bail!("invalid SSH destination");
+    }
+    Ok((hostname.to_string(), user, port))
 }
 
 fn spawn_node_tunnel(
@@ -3028,6 +4121,7 @@ pub async fn connect_compute_node(
     // own close) must reach the same one even if a login reconnect re-routes
     // the alias meanwhile.
     let route = route_of(host);
+    let master_handle = scoped_master(host, &route)?;
     let mk = |local_port, rung, master_forward, child| ComputeTunnel {
         host: host.to_string(),
         node: node.to_string(),
@@ -3037,8 +4131,10 @@ pub async fn connect_compute_node(
         token: token.to_string(),
         rung,
         master_forward,
+        master_handle: master_handle.clone(),
         route: route.clone(),
-        child,
+        child: std::sync::Arc::new(tokio::sync::Mutex::new(child)),
+        closing: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
     };
 
     // Direct — the login master forwards to the node's port.
@@ -3144,6 +4240,1245 @@ async fn tunnel_proven(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn fixture_authentication() -> SshAuthentication {
+        SshAuthentication {
+            alias: "fixture".into(),
+            hostname: "login.example.invalid".into(),
+            user: "person".into(),
+            port: 2222,
+            socket: "/tmp/fixture-agent".into(),
+            known_hosts: "/tmp/fixture-trust".into(),
+            masters: vec![fixture_master("/tmp/fixture-master")],
+            fresh: true,
+            keyboard_interactive: None,
+            route_helper: None,
+            interactive_only: false,
+            policy: None,
+            support: None,
+        }
+    }
+    #[test]
+    fn routed_authentication_freezes_exact_jump_order_and_a_closed_same_binary_helper() {
+        let context = "a".repeat(96);
+        let jumps = vec!["cxjump-first".into(), "cxjump-second".into()];
+        let helper =
+            authentication_route_helper("proxyjump cxjump-first,cxjump-second\n", &context, &jumps)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            helper,
+            format!(
+                "'{}' --ssh-route-leg {context} 1",
+                std::env::current_exe().unwrap().display()
+            )
+        );
+        assert!(
+            authentication_route_helper("", &context, &[])
+                .unwrap()
+                .is_none(),
+            "OpenSSH omits the default none field"
+        );
+        for config in [
+            "proxyjump cxjump-second,cxjump-first\n",
+            "proxyjump cxjump-first,cxjump-second\nproxyjump other\n",
+            "proxyjump cxjump-first,cxjump-second\nproxycommand /bin/false\n",
+        ] {
+            assert!(authentication_route_helper(config, &context, &jumps).is_err());
+        }
+        for context in ["short", "a;command", "a b", "a%h"] {
+            assert!(authentication_route_helper("", context, &[]).is_err());
+        }
+        let mut scope = fixture_authentication();
+        scope.fresh = true;
+        scope.keyboard_interactive = Some(context);
+        scope.route_helper = Some(helper.clone());
+        scope.interactive_only = true;
+        let options = scope.options("fixture", &Route::Alias, false);
+        assert!(options.contains(&format!("ProxyCommand={helper}")));
+        assert!(options.contains(&"PasswordAuthentication=yes".into()));
+        assert!(options.contains(&"PubkeyAuthentication=no".into()));
+        assert!(options.contains(&"PreferredAuthentications=keyboard-interactive,password".into()));
+        assert!(
+            scope
+                .options("other", &Route::Alias, false)
+                .contains(&"ProxyCommand=false".into()),
+            "an unrelated effect receives no route authentication"
+        );
+        scope.interactive_only = false;
+        let options = scope.options("fixture", &Route::Alias, false);
+        assert!(options.contains(&"PasswordAuthentication=no".into()));
+        assert!(options.contains(&"PubkeyAuthentication=host-bound".into()));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn same_binary_helper_path_is_a_literal_shell_word_even_with_metacharacters() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "cx-helper-word-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let context = "a".repeat(96);
+        for name in [
+            "keeper;false",
+            "keeper`false`",
+            "keeper&false",
+            "keeper(false)",
+        ] {
+            let executable = root.join(name);
+            std::fs::write(&executable, b"#!/bin/sh\nprintf '%s\n' \"$@\"\n").unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let command = fixed_route_helper(executable.to_str().unwrap(), &context, 2).unwrap();
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", &command])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                format!("--ssh-route-leg\n{context}\n2\n")
+            );
+        }
+        assert!(fixed_route_helper("/tmp/keeper'unsafe", &context, 0).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn authentication_files_are_exact_caller_owned_leases_not_symlinks_or_fifos() {
+        use std::os::unix::{fs::symlink, net::UnixListener};
+        let root = std::env::temp_dir().join(format!(
+            "cx-auth-files-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let socket = root.join("agent");
+        let trust = root.join("trust");
+        let listener = UnixListener::bind(&socket).unwrap();
+        std::fs::write(&trust, b"public trust fixture").unwrap();
+        validate_authentication_files(&socket, &trust)
+            .await
+            .unwrap();
+        let link = root.join("link");
+        symlink(&trust, &link).unwrap();
+        assert!(validate_authentication_files(&socket, &link).await.is_err());
+        assert!(validate_authentication_files(&trust, &trust).await.is_err());
+        let fifo = root.join("fifo");
+        let mut command = Command::new("mkfifo");
+        command.arg(&fifo);
+        assert!(output_bounded(&mut command, 5, "fixture FIFO")
+            .await
+            .unwrap()
+            .status
+            .success());
+        assert!(tokio::time::timeout(
+            Duration::from_secs(1),
+            validate_authentication_files(&socket, &fifo)
+        )
+        .await
+        .unwrap()
+        .is_err());
+        let oversized = std::fs::File::create(&trust).unwrap();
+        oversized.set_len(128 * 1024 + 1).unwrap();
+        assert!(validate_authentication_files(&socket, &trust)
+            .await
+            .is_err());
+        assert!(
+            socket.exists() && trust.exists(),
+            "validation never removes caller leases"
+        );
+        drop(listener);
+        drop(oversized);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn authentication_config_refuses_accumulated_keys_and_destination_changes() {
+        let config = "hostname login.example.invalid\nuser person\nport 2222\nidentityfile none\ncertificatefile none\n";
+        assert!(authentication_config(config, "login.example.invalid", "person", 2222).unwrap());
+        for extra in [
+            "identityfile /tmp/private-key\n",
+            "certificatefile /tmp/certificate\n",
+        ] {
+            assert!(authentication_config(
+                &format!("{config}{extra}"),
+                "login.example.invalid",
+                "person",
+                2222
+            )
+            .is_err());
+        }
+        assert!(!authentication_config(
+            &format!("{config}proxyjump jump.example.invalid\n"),
+            "login.example.invalid",
+            "person",
+            2222
+        )
+        .unwrap());
+        assert!(
+            authentication_config(config, "different.example.invalid", "person", 2222).is_err()
+        );
+        for path in [
+            "relative",
+            "/tmp/%h",
+            "/tmp/${SOCKET}",
+            "/tmp/a b",
+            "/tmp/a\nb",
+            "/tmp/'quoted'",
+        ] {
+            assert!(authentication_path(Path::new(path)).is_err());
+        }
+    }
+    #[test]
+    fn authentication_snapshot_correlates_destination_and_master_before_config_changes() {
+        let original = "hostname login.example.invalid\nuser person\nport 2222\nidentityfile none\ncertificatefile none\ncontrolpath /tmp/original-master\n";
+        let (_, master) = authentication_snapshot(
+            "fixture",
+            Route::Alias,
+            original,
+            "login.example.invalid",
+            "person",
+            2222,
+        )
+        .unwrap();
+        let changed = original
+            .replace("login.example.invalid", "other.example.invalid")
+            .replace("original-master", "other-master");
+        let expanded = original.replace("original-master", "${OTHER_MASTER}");
+        assert!(authentication_snapshot(
+            "fixture",
+            Route::Alias,
+            &expanded,
+            "login.example.invalid",
+            "person",
+            2222
+        )
+        .is_err());
+        assert!(authentication_snapshot(
+            "fixture",
+            Route::Alias,
+            &changed,
+            "login.example.invalid",
+            "person",
+            2222
+        )
+        .is_err());
+        assert_eq!(master.path, "/tmp/original-master");
+        let mut scope = fixture_authentication();
+        scope.masters = vec![master];
+        assert!(scope
+            .options("fixture", &Route::Alias, false)
+            .contains(&"ControlPath=/tmp/original-master".into()));
+        assert!(scope
+            .options(
+                "fixture",
+                &Route::Node("other.example.invalid".into()),
+                false
+            )
+            .contains(&"ControlPath=none".into()));
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolved_policy_arguments_preserve_native_order_and_disable_unowned_credentials() {
+        let support = SshAlgorithmSupport::capture().await.unwrap();
+        let policy = SshAuthenticationPolicy {
+            methods: vec![
+                "publickey".into(),
+                "password".into(),
+                "keyboard-interactive".into(),
+            ],
+            host_key_algorithms: vec!["ssh-ed25519".into()],
+            ca_signature_algorithms: vec!["ssh-ed25519".into()],
+            pubkey_accepted_algorithms: vec![
+                "webauthn-sk-ecdsa-sha2-nistp256@openssh.com".into(),
+                "ssh-ed25519".into(),
+            ],
+            kex_algorithms: vec!["future-native-kex".into(), "curve25519-sha256".into()],
+            ciphers: vec!["chacha20-poly1305@openssh.com".into()],
+            macs: vec!["hmac-sha2-256-etm@openssh.com".into()],
+        };
+        let scope = fixture_authentication()
+            .with_keyboard_interactive("fixture_original_owner_context_000000000000")
+            .unwrap()
+            .with_policy(policy, &support)
+            .unwrap();
+        scope
+            .with_authentication(async {
+                let mut command = ssh_base_via("fixture", &Route::Alias);
+                command.args(["-G", "fixture"]);
+                let output = output_bounded(&mut command, 5, "fixture resolved policy")
+                    .await
+                    .unwrap();
+                assert!(output.status.success());
+                let text = std::str::from_utf8(&output.stdout).unwrap();
+                for exact in [
+                    "preferredauthentications publickey,password,keyboard-interactive",
+                    "passwordauthentication yes",
+                    "kbdinteractiveauthentication yes",
+                    "hostkeyalgorithms ssh-ed25519",
+                    "casignaturealgorithms ssh-ed25519",
+                    "kexalgorithms curve25519-sha256",
+                    "ciphers chacha20-poly1305@openssh.com",
+                    "macs hmac-sha2-256-etm@openssh.com",
+                ] {
+                    assert!(text.lines().any(|line| line == exact), "{exact}");
+                }
+                for options in [
+                    scope.options("other", &Route::Alias, false),
+                    scope.options("fixture", &Route::Alias, true),
+                ] {
+                    assert!(options.contains(&"IdentityAgent=none".into()));
+                    assert!(options.contains(&"PasswordAuthentication=no".into()));
+                    assert!(options.contains(&"KbdInteractiveAuthentication=no".into()));
+                }
+                scope.masters[0]
+                    .with_existing(async {
+                        let options = scope.options("fixture", &Route::Alias, false);
+                        assert!(options.contains(&"PasswordAuthentication=no".into()));
+                        assert!(options.contains(&"KbdInteractiveAuthentication=no".into()));
+                    })
+                    .await;
+            })
+            .await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicit_key_mfa_context_preserves_strict_identity_and_existing_master_overrides() {
+        let context = "fixture_explicit_context_00000000000000000000";
+        let scope = fixture_authentication()
+            .with_keyboard_interactive(context)
+            .unwrap();
+        for invalid in [
+            "short",
+            "fixture_context_with_whitespace_0000000000 x",
+            "fixture_context_with_newline_000000000000\n",
+        ] {
+            assert!(fixture_authentication()
+                .with_keyboard_interactive(invalid)
+                .is_err());
+        }
+        fn context_value(command: &Command) -> Option<String> {
+            command
+                .as_std()
+                .get_envs()
+                .find(|(key, _)| *key == ASKPASS_CONTEXT_ENV)
+                .and_then(|(_, value)| value)
+                .map(|value| value.to_string_lossy().into_owned())
+        }
+        scope
+            .with_authentication(async {
+                let mut command = ssh_base_via("fixture", &Route::Alias);
+                assert_eq!(context_value(&command).as_deref(), Some(context));
+                command.args(["-G", "fixture"]);
+                let output = output_bounded(&mut command, 5, "fixture explicit MFA configuration")
+                    .await
+                    .unwrap();
+                assert!(output.status.success());
+                let text = std::str::from_utf8(&output.stdout).unwrap();
+                for exact in [
+                    "batchmode no",
+                    "kbdinteractiveauthentication yes",
+                    "passwordauthentication no",
+                    "preferredauthentications publickey,keyboard-interactive",
+                    "pubkeyauthentication host-bound",
+                    "forwardagent no",
+                    "identityfile none",
+                    "certificatefile none",
+                    "stricthostkeychecking true",
+                ] {
+                    assert!(text.lines().any(|line| line == exact), "{exact}");
+                }
+                assert_eq!(context_value(&scp_cmd("fixture")).as_deref(), Some(context));
+                let unrelated = scope.options("other", &Route::Alias, false);
+                assert!(unrelated.contains(&"KbdInteractiveAuthentication=no".into()));
+                assert!(unrelated.contains(&"IdentityAgent=none".into()));
+                scope.masters[0]
+                    .with_existing(async {
+                        let mut command = ssh_base_via("fixture", &Route::Alias);
+                        assert!(context_value(&command).is_none());
+                        command.args(["-G", "fixture"]);
+                        let output =
+                            output_bounded(&mut command, 5, "fixture existing MFA refusal")
+                                .await
+                                .unwrap();
+                        assert!(output.status.success());
+                        let text = std::str::from_utf8(&output.stdout).unwrap();
+                        for exact in [
+                            "batchmode yes",
+                            "kbdinteractiveauthentication no",
+                            "passwordauthentication no",
+                            "identityagent none",
+                        ] {
+                            assert!(text.lines().any(|line| line == exact), "{exact}");
+                        }
+                    })
+                    .await;
+            })
+            .await;
+        assert!(context_value(&ssh_cmd("fixture")).is_none());
+    }
+
+    #[tokio::test]
+    async fn authentication_scope_is_nested_isolated_and_existing_master_always_wins() {
+        let scope = fixture_authentication();
+        let mut nested = scope.clone();
+        nested.socket = "/tmp/nested-agent".into();
+        assert!(authentication_opts("fixture", &Route::Alias, false).is_empty());
+        scope
+            .with_authentication(async {
+                assert!(authentication_opts("fixture", &Route::Alias, false)
+                    .contains(&"IdentityAgent=/tmp/fixture-agent".into()));
+                nested
+                    .with_authentication(async {
+                        assert!(authentication_opts("fixture", &Route::Alias, false)
+                            .contains(&"IdentityAgent=/tmp/nested-agent".into()));
+                    })
+                    .await;
+                assert!(authentication_opts("fixture", &Route::Alias, false)
+                    .contains(&"IdentityAgent=/tmp/fixture-agent".into()));
+                assert!(tokio::spawn(async {
+                    authentication_opts("fixture", &Route::Alias, false).is_empty()
+                })
+                .await
+                .unwrap());
+                let protected = fixture_master("/tmp/protected-master");
+                protected
+                    .with_existing(async {
+                        let command = ssh_base_via("fixture", &Route::Alias);
+                        let args: Vec<_> = command
+                            .as_std()
+                            .get_args()
+                            .map(|a| a.to_string_lossy().into_owned())
+                            .collect();
+                        for expected in [
+                            "ProxyCommand=false",
+                            "ControlMaster=no",
+                            "ControlPath=/tmp/protected-master",
+                        ] {
+                            let prefix = expected.split('=').next().unwrap().to_string() + "=";
+                            assert_eq!(
+                                args.iter()
+                                    .find(|value| value.starts_with(&prefix))
+                                    .unwrap(),
+                                expected
+                            );
+                        }
+                    })
+                    .await;
+                for (host, route, node) in [
+                    ("different", Route::Alias, false),
+                    ("fixture", Route::Node("changed".into()), false),
+                    ("fixture", Route::Alias, true),
+                ] {
+                    let args = authentication_opts(host, &route, node);
+                    for expected in [
+                        "IdentityAgent=none",
+                        "ProxyCommand=false",
+                        "ControlPath=none",
+                        "ForwardAgent=no",
+                    ] {
+                        assert!(args.contains(&expected.into()));
+                    }
+                }
+            })
+            .await;
+        assert!(authentication_opts("fixture", &Route::Alias, false).is_empty());
+        assert!(tokio::time::timeout(
+            Duration::from_millis(1),
+            scope.with_authentication(std::future::pending::<()>())
+        )
+        .await
+        .is_err());
+        assert!(authentication_opts("fixture", &Route::Alias, false).is_empty());
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn authentication_effective_ssh_config_never_loads_extra_keys_or_dials_on_scope_loss() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-auth-scope-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let config = root.join("config");
+        std::fs::write(&config, "Host fixture\n HostName login.example.invalid\n User person\n Port 2222\n IdentityFile /tmp/forbidden-key\n CertificateFile /tmp/forbidden-cert\n ProxyJump jump.example.invalid\n").unwrap();
+        let mut command = Command::new("/usr/bin/ssh");
+        command.arg("-F").arg(&config).args([
+            "-o",
+            "IdentityFile=none",
+            "-o",
+            "CertificateFile=none",
+            "-G",
+            "fixture",
+        ]);
+        let output = output_bounded(&mut command, 5, "fixture configuration")
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        assert!(authentication_config(
+            std::str::from_utf8(&output.stdout).unwrap(),
+            "login.example.invalid",
+            "person",
+            2222
+        )
+        .is_err());
+        let mut scope = fixture_authentication();
+        scope.masters[0].path = root.join("missing-master").to_str().unwrap().into();
+        scope
+            .with_authentication(async {
+                let mut command = ssh_base_via("fixture", &Route::Alias);
+                command.args(["-G", "fixture"]);
+                let output = output_bounded(&mut command, 5, "fixture frozen configuration")
+                    .await
+                    .unwrap();
+                assert!(output.status.success());
+                let text = std::str::from_utf8(&output.stdout).unwrap();
+                assert!(
+                    authentication_config(text, "login.example.invalid", "person", 2222).unwrap()
+                );
+                assert!(text
+                    .lines()
+                    .any(|line| line == "stricthostkeychecking true"));
+                assert!(text.lines().any(|line| line == "forwardagent no"));
+                let mut command = ssh_base_via("fixture", &Route::Node("127.0.0.1".into()));
+                command.args(["-o", "ConnectTimeout=1", "fixture", "true"]);
+                let output = output_bounded(&mut command, 5, "fixture changed route")
+                    .await
+                    .unwrap();
+                assert!(!output.status.success());
+            })
+            .await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    fn fixture_master(path: &str) -> MasterHandle {
+        use sha2::Digest;
+        MasterHandle {
+            host: "fixture".into(),
+            route: Route::Alias,
+            path: path.into(),
+            identity: MasterIdentity(sha2::Sha256::digest(path.as_bytes()).into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn existing_master_scope_is_nested_cancel_safe_and_task_local() {
+        let handle = fixture_master("/tmp/fixture-master");
+        assert!(existing_master_opts("fixture", &Route::Alias).is_empty());
+        let (protected, ordinary) = tokio::join!(
+            handle.with_existing(async {
+                assert!(!existing_master_opts("fixture", &Route::Alias).is_empty());
+                handle
+                    .with_existing(async {
+                        tokio::task::yield_now().await;
+                        assert!(!existing_master_opts("fixture", &Route::Alias).is_empty());
+                    })
+                    .await;
+                assert!(!existing_master_opts("fixture", &Route::Alias).is_empty());
+                // An owned task must opt in itself; parent scopes do not leak.
+                tokio::spawn(async { existing_master_opts("fixture", &Route::Alias).is_empty() })
+                    .await
+                    .unwrap()
+            }),
+            async {
+                tokio::task::yield_now().await;
+                existing_master_opts("fixture", &Route::Alias).is_empty()
+            }
+        );
+        assert!(protected && ordinary);
+        let timed = tokio::time::timeout(
+            Duration::from_millis(1),
+            handle.with_existing(async {
+                assert!(!existing_master_opts("fixture", &Route::Alias).is_empty());
+                std::future::pending::<()>().await;
+            }),
+        )
+        .await;
+        assert!(timed.is_err());
+        assert!(existing_master_opts("fixture", &Route::Alias).is_empty());
+    }
+
+    #[tokio::test]
+    async fn existing_master_restrictions_precede_route_and_shared_options() {
+        let handle = fixture_master("/tmp/fixture-master");
+        handle
+            .with_existing(async {
+                for command in [
+                    ssh_base_via("fixture", &Route::NodeViaAlias("node-fixture".into())),
+                    scp_cmd("fixture"),
+                    node_ssh_base("fixture", &Route::Alias),
+                ] {
+                    let args: Vec<_> = command
+                        .as_std()
+                        .get_args()
+                        .map(|arg| arg.to_string_lossy().into_owned())
+                        .collect();
+                    let first = |prefix: &str| {
+                        args.iter()
+                            .find(|arg| arg.starts_with(prefix))
+                            .cloned()
+                            .unwrap()
+                    };
+                    assert_eq!(first("ControlMaster="), "ControlMaster=no");
+                    assert_eq!(first("BatchMode="), "BatchMode=yes");
+                    assert_eq!(first("ProxyCommand="), "ProxyCommand=false");
+                    assert_eq!(first("ProxyJump="), "ProxyJump=none");
+                }
+            })
+            .await;
+        assert!(ssh_base("fixture")
+            .as_std()
+            .get_args()
+            .any(|arg| arg == "ControlMaster=auto"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn master_presence_requires_bounded_exact_receipts() {
+        for (script, expected) in [
+            ("printf 'Master running (pid=123)\\n' >&2", Some(true)),
+            ("printf 'Master running (pid=123)\\r\\n' >&2", Some(true)),
+            ("printf 'Control socket connect(/tmp/fixture): No such file or directory\\n' >&2; exit 255", Some(false)),
+            ("printf 'Master running (pid=0)\\n' >&2", None),
+            ("printf 'Master running (pid=4294967296)\\n' >&2", None),
+            ("printf 'Master running (pid=123)\\nnoise\\n' >&2", None),
+            ("printf 'fixture-secret'; printf 'Master running (pid=123)\\n' >&2", None),
+            ("printf 'fixture-secret refusal\\n' >&2; exit 255", None),
+            ("exit 0", None),
+        ] {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", script]);
+            let result = master_presence(command, 2).await;
+            assert_eq!(result.as_ref().ok().copied(), expected);
+            if let Err(error) = result { assert!(!error.to_string().contains("fixture-secret")); }
+        }
+        assert!(master_presence(Command::new("/fixture-missing-ssh"), 1)
+            .await
+            .is_err());
+        let mut stalled = Command::new("/bin/sh");
+        stalled.args(["-c", "exec sleep 10"]);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), master_presence(stalled, 1))
+                .await
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_openssh_mux_disappearance_never_dials_proxies_or_askpass() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let fixture = Fixture(PathBuf::from(format!(
+            "/tmp/chimaera-mux-{}",
+            &chimaera_core::generate_token()[..12]
+        )));
+        std::fs::create_dir(&fixture.0).unwrap();
+        let socket = fixture.0.join("control");
+        let config = fixture.0.join("config");
+        let proxy = fixture.0.join("proxy-ran");
+        let askpass = fixture.0.join("askpass");
+        let asked = fixture.0.join("askpass-ran");
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        std::fs::write(&config, format!("Host fixture\n HostName 127.0.0.1\n Port {}\n User fixture\n ControlPath {}\n ControlMaster auto\n BatchMode no\n ProxyCommand sh -c 'printf attempted > {}'\n",
+            tcp.local_addr().unwrap().port(), socket.display(), proxy.display())).unwrap();
+        std::fs::write(
+            &askpass,
+            format!("#!/bin/sh\nprintf attempted > {}\n", asked.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&askpass, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        // Minimal OpenSSH mux v4 hello/alive exchange with the actual client;
+        // no SSH server, real user key, remote process or network account.
+        let mux = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            async fn read_packet(stream: &mut tokio::net::UnixStream) -> Vec<u8> {
+                let length = stream.read_u32().await.unwrap();
+                assert!(length <= 1024);
+                let mut bytes = vec![0; length as usize];
+                stream.read_exact(&mut bytes).await.unwrap();
+                bytes
+            }
+            let hello = read_packet(&mut stream).await;
+            assert_eq!(&hello[..8], &[0, 0, 0, 1, 0, 0, 0, 4]);
+            stream
+                .write_all(&[0, 0, 0, 8, 0, 0, 0, 1, 0, 0, 0, 4])
+                .await
+                .unwrap();
+            let alive = read_packet(&mut stream).await;
+            assert_eq!(&alive[..4], &[0x10, 0, 0, 4]);
+            let mut reply = vec![0, 0, 0, 12, 0x80, 0, 0, 5];
+            reply.extend_from_slice(&alive[4..8]);
+            reply.extend_from_slice(&123u32.to_be_bytes());
+            stream.write_all(&reply).await.unwrap();
+        });
+        let handle = fixture_master(socket.to_str().unwrap());
+        let mut check = Command::new("ssh");
+        check
+            .arg("-F")
+            .arg(&config)
+            .args(["-O", "check"])
+            .arg("fixture");
+        assert!(master_presence(check, 5).await.unwrap());
+        mux.await.unwrap();
+        std::fs::remove_file(&socket).unwrap();
+        handle
+            .with_existing(async {
+                for node in [false, true] {
+                    let mut command = if node {
+                        node_ssh_base("fixture", &Route::Alias)
+                    } else {
+                        ssh_base_via("fixture", &Route::Alias)
+                    };
+                    command
+                        .arg("-F")
+                        .arg(&config)
+                        .arg("-S")
+                        .arg(&socket)
+                        .arg("fixture")
+                        .arg("true")
+                        .env("SSH_ASKPASS", &askpass)
+                        .env("SSH_ASKPASS_REQUIRE", "force")
+                        .env("DISPLAY", "fixture");
+                    assert!(!output_bounded(&mut command, 5, "fixture SSH")
+                        .await
+                        .unwrap()
+                        .status
+                        .success());
+                }
+            })
+            .await;
+        assert!(!proxy.exists());
+        assert!(!asked.exists());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), tcp.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn captured_master_keeps_original_proxyjump_socket_and_close_leg() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let fixture = Fixture(PathBuf::from(format!(
+            "/tmp/chimaera-captured-{}",
+            &chimaera_core::generate_token()[..8]
+        )));
+        std::fs::create_dir(&fixture.0).unwrap();
+        let config = fixture.0.join("config");
+        let pattern = fixture.0.join("%C");
+        std::fs::write(&config, format!("Host fixture\n HostName 127.0.0.1\n User fixture\n ProxyJump jump-one.invalid\n ControlPath {}\n", pattern.display())).unwrap();
+        let resolve = |guarded: bool| {
+            let mut command = Command::new("ssh");
+            if guarded {
+                command.args(["-o", "ProxyCommand=false", "-o", "ProxyJump=none"]);
+            }
+            command
+                .arg("-F")
+                .arg(&config)
+                .args(["-T", "-G"])
+                .arg("fixture");
+            command
+        };
+        let captured = capture_master_command("fixture", Route::Alias, resolve(false))
+            .await
+            .unwrap();
+        let altered = capture_master_command("fixture", Route::Alias, resolve(true))
+            .await
+            .unwrap();
+        assert!(captured.identity != altered.identity); // %C includes ProxyJump.
+        captured
+            .with_existing(async {
+                let command = ssh_base_via("fixture", &Route::Alias);
+                let control = command
+                    .as_std()
+                    .get_args()
+                    .find(|arg| arg.to_string_lossy().starts_with("ControlPath="))
+                    .unwrap();
+                assert_eq!(
+                    control.to_string_lossy(),
+                    format!("ControlPath={}", captured.path)
+                );
+                let wrong_route = ssh_base_via("fixture", &Route::Node("new-node.invalid".into()));
+                assert!(wrong_route
+                    .as_std()
+                    .get_args()
+                    .any(|arg| arg == "ControlPath=none"));
+            })
+            .await;
+        let listener = tokio::net::UnixListener::bind(&captured.path).unwrap();
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let (e, r) = (entered.clone(), release.clone());
+        let mux = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let length = stream.read_u32().await.unwrap();
+            assert!(length <= 1024);
+            let mut hello = vec![0; length as usize];
+            stream.read_exact(&mut hello).await.unwrap();
+            stream
+                .write_all(&[0, 0, 0, 8, 0, 0, 0, 1, 0, 0, 0, 4])
+                .await
+                .unwrap();
+            let length = stream.read_u32().await.unwrap();
+            assert!(length <= 1024);
+            let mut request = vec![0; length as usize];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request[..4], &[0x10, 0, 0, 5]); // exact terminate, not check/dial
+            e.notify_one();
+            r.acquire().await.unwrap().forget();
+            let mut reply = vec![0, 0, 0, 8, 0x80, 0, 0, 1];
+            reply.extend_from_slice(&request[4..8]);
+            stream.write_all(&reply).await.unwrap();
+        });
+        // Retargeting config no longer selects the socket used by this handle.
+        std::fs::write(&config, format!("Host fixture\n HostName changed.invalid\n User changed\n ProxyJump jump-two.invalid\n ControlPath {}\n", fixture.0.join("different").display())).unwrap();
+        let mut command = captured.command();
+        command
+            .arg("-F")
+            .arg(&config)
+            .args(["-O", "exit"])
+            .arg("fixture");
+        let caller = tokio::spawn(captured_master_close(command));
+        tokio::time::timeout(Duration::from_secs(3), entered.notified())
+            .await
+            .unwrap();
+        caller.abort();
+        let _ = caller.await;
+        release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(3), mux)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!fixture.0.join("different").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn compute_captured_forward_ignores_config_drift_and_survives_caller_abort() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let fixture = Fixture(PathBuf::from(format!(
+            "/tmp/chimaera-forward-{}",
+            &chimaera_core::generate_token()[..8]
+        )));
+        std::fs::create_dir(&fixture.0).unwrap();
+        let config = fixture.0.join("config");
+        let old = fixture.0.join("old.sock");
+        let new = fixture.0.join("new.sock");
+        let write_config = |path: &Path| {
+            std::fs::write(
+                &config,
+                format!(
+                    "Host fixture\n HostName old-login.invalid\n User fixture\n ControlPath {}\n",
+                    path.display()
+                ),
+            )
+            .unwrap();
+        };
+        write_config(&old);
+        let mut resolve = Command::new("ssh");
+        resolve.arg("-F").arg(&config).args(["-T", "-G", "fixture"]);
+        let captured = capture_master_command("fixture", Route::Alias, resolve)
+            .await
+            .unwrap();
+        let pinned = captured
+            .with_existing(async { scoped_master("fixture", &Route::Alias).unwrap().unwrap() })
+            .await;
+        assert!(scoped_master("fixture", &Route::Alias).unwrap().is_none());
+        assert!(captured
+            .with_existing(async { scoped_master("fixture", &Route::Node("changed-login".into())) })
+            .await
+            .is_err());
+        write_config(&new);
+        let listener = tokio::net::UnixListener::bind(&old).unwrap();
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let (e, r) = (entered.clone(), release.clone());
+        let mux = tokio::spawn(async move {
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let length = stream.read_u32().await.unwrap();
+                assert!(length <= 1024);
+                let mut hello = vec![0; length as usize];
+                stream.read_exact(&mut hello).await.unwrap();
+                stream
+                    .write_all(&[0, 0, 0, 8, 0, 0, 0, 1, 0, 0, 0, 4])
+                    .await
+                    .unwrap();
+                let length = stream.read_u32().await.unwrap();
+                assert!(length <= 1024);
+                let mut request = vec![0; length as usize];
+                stream.read_exact(&mut request).await.unwrap();
+                assert_eq!(&request[..4], &0x10000007u32.to_be_bytes());
+                let mut expected = Vec::new();
+                expected.extend(1u32.to_be_bytes()); // local forward
+                expected.extend(0u32.to_be_bytes()); // default listening host
+                expected.extend(50001u32.to_be_bytes());
+                expected.extend(15u32.to_be_bytes());
+                expected.extend(b"compute-fixture");
+                expected.extend(9000u32.to_be_bytes());
+                assert_eq!(&request[8..], expected);
+                if index == 1 {
+                    e.notify_one();
+                    r.acquire().await.unwrap().forget();
+                }
+                let mut response = Vec::from(8u32.to_be_bytes());
+                response.extend(0x80000001u32.to_be_bytes());
+                response.extend(&request[4..8]);
+                stream.write_all(&response).await.unwrap();
+            }
+        });
+        // Failed-rung cleanup happens while the existing-only scope is active.
+        captured
+            .with_existing(async {
+                cancel_master_forward("fixture", &Route::Alias, "50001:compute-fixture:9000").await
+            })
+            .await;
+        let child = Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let child = std::sync::Arc::new(tokio::sync::Mutex::new(child));
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let mut tunnel = ComputeTunnel {
+            host: "fixture".into(),
+            node: "compute-fixture".into(),
+            job_id: "123".into(),
+            local_port: 50001,
+            port: 9000,
+            token: "fixture".into(),
+            rung: ComputeRung::Direct,
+            master_forward: Some("50001:compute-fixture:9000".into()),
+            master_handle: Some(pinned),
+            route: Route::Alias,
+            child: child.clone(),
+            closing: budget.clone(),
+        };
+        // Successful opens retain their captured leg after the scope has ended.
+        let caller = tokio::spawn(async move { tunnel.try_close().await });
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        caller.abort();
+        let _ = caller.await;
+        assert_eq!(budget.available_permits(), 0);
+        release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), mux)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while budget.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(child.lock().await.try_wait().unwrap().is_some());
+        assert!(!new.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn compute_forward_cancel_requires_positive_proof_even_with_zero_exit() {
+        for (script, succeeds) in [
+            ("exit 0", true),
+            ("exit 1", false),
+            ("printf 'mux_client_forward: forwarding request failed: port not forwarded\\r\\nmuxclient: master cancel forward request failed\\r\\n' >&2; exit 0", true),
+            ("printf 'Master refused forwarding request: Permission denied\n' >&2; exit 0", false),
+            ("printf 'mux_client_forward: forwarding request failed: port not forwarded\nmuxclient: master cancel forward request failed\n' >&2; exit 0", true),
+            ("printf 'Control socket connect(/tmp/fixture): No such file or directory\n' >&2; exit 255", true),
+            ("printf 'mux_client_forward: forwarding request failed: port not in permitted opens\nmuxclient: master cancel forward request failed\n' >&2; exit 0", false),
+            ("printf 'other failure\nmux_client_forward: forwarding request failed: port not forwarded\n' >&2; exit 255", false),
+            ("printf 'untrusted output'; printf 'mux_client_forward: forwarding request failed: port not forwarded\n' >&2; exit 255", false),
+        ] {
+            let mut command=Command::new("/bin/sh");command.args(["-c",script]);
+            assert_eq!(forward_cancel(command,Duration::from_secs(2)).await.is_ok(),succeeds);
+        }
+        assert!(
+            forward_cancel(Command::new("/fixture-missing-ssh"), Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+        let mut slow = Command::new("/bin/sleep");
+        slow.arg("30");
+        assert!(forward_cancel(slow, Duration::from_millis(20))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn compute_cleanup_retains_exact_route_and_forward_across_failure_and_retry() {
+        let child = Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let child = std::sync::Arc::new(tokio::sync::Mutex::new(child));
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let route = Route::NodeViaAlias("captured-login".into());
+        let spec = "50001:compute-fixture:9000".to_owned();
+        for succeeds in [false, true] {
+            let output = seen.clone();
+            let result = compute_cleanup_owned(
+                child.clone(),
+                budget.clone().try_acquire_owned().unwrap(),
+                route.clone(),
+                Some(spec.clone()),
+                move |route, spec| async move {
+                    output.lock().unwrap().push((route, spec));
+                    anyhow::ensure!(succeeds, "fixture cancel unavailable");
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.is_ok(), succeeds);
+            assert!(child.lock().await.try_wait().unwrap().is_some());
+            assert_eq!(budget.available_permits(), 1);
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(route.clone(), spec.clone()), (route, spec)]
+        );
+    }
+
+    #[tokio::test]
+    async fn compute_cleanup_bounds_child_lock_and_still_cancels_forward() {
+        let child = Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let child = std::sync::Arc::new(tokio::sync::Mutex::new(child));
+        let locked = child.clone().lock_owned().await;
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let proof = cancelled.clone();
+        let result = tokio::time::timeout(
+            Duration::from_secs(4),
+            compute_cleanup_owned(
+                child.clone(),
+                budget.clone().try_acquire_owned().unwrap(),
+                Route::Alias,
+                Some("50001:compute-fixture:9000".into()),
+                move |route, spec| async move {
+                    assert_eq!(route, Route::Alias);
+                    assert_eq!(spec, "50001:compute-fixture:9000");
+                    proof.store(true, std::sync::atomic::Ordering::Release);
+                    Ok(())
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(result.is_err());
+        assert!(cancelled.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(budget.available_permits(), 1);
+        drop(locked);
+        let mut child = child.lock().await;
+        child.kill().await.unwrap();
+        child.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compute_cleanup_finishes_captured_forward_after_caller_abort() {
+        let child = Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let child = std::sync::Arc::new(tokio::sync::Mutex::new(child));
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let finished = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (e, r, f) = (entered.clone(), release.clone(), finished.clone());
+        let cleanup = compute_cleanup_owned(
+            child.clone(),
+            budget.clone().try_acquire_owned().unwrap(),
+            Route::Node("captured-login".into()),
+            Some("50001:compute-fixture:9000".into()),
+            move |route, spec| async move {
+                assert_eq!(route, Route::Node("captured-login".into()));
+                assert_eq!(spec, "50001:compute-fixture:9000");
+                e.notify_one();
+                r.acquire().await.unwrap().forget();
+                f.notify_one();
+                Ok(())
+            },
+        );
+        let caller = tokio::spawn(cleanup);
+        entered.notified().await;
+        caller.abort();
+        let _ = caller.await;
+        assert_eq!(budget.available_permits(), 0);
+        release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(2), finished.notified())
+            .await
+            .unwrap();
+        assert!(child.lock().await.try_wait().unwrap().is_some());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while budget.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn master_exit_requires_acknowledgment_or_an_explicit_absent_socket() {
+        for (script, succeeds) in [
+            ("exit 0", true),
+            ("exit 1", false),
+            (
+                "printf 'Control socket connect(/tmp/fixture): No such file or directory\\n' >&2; exit 255",
+                true,
+            ),
+            (
+                "printf 'Control socket connect(/tmp/fixture): Permission denied\\n' >&2; exit 255",
+                false,
+            ),
+            (
+                "printf 'unrelated failure\\nControl socket connect(/tmp/fixture): No such file or directory\\n' >&2; exit 255",
+                false,
+            ),
+            (
+                "printf 'untrusted output'; printf 'Control socket connect(/tmp/fixture): No such file or directory\\n' >&2; exit 255",
+                false,
+            ),
+        ] {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", script]);
+            assert_eq!(
+                master_exit(command, Duration::from_secs(2)).await.is_ok(),
+                succeeds
+            );
+        }
+        let missing = Command::new("/chimaera-fixture-missing-ssh");
+        assert!(master_exit(missing, Duration::from_secs(1)).await.is_err());
+        let mut stalled = Command::new("/bin/sleep");
+        stalled.arg("30");
+        assert!(master_exit(stalled, Duration::from_millis(20))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn master_cleanup_attempts_both_routes_even_when_the_node_refuses() {
+        for route in [
+            Route::Node("n".into()),
+            Route::NodeViaAlias("n".into()),
+            Route::Alias,
+        ] {
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let output = seen.clone();
+            let result = close_masters_owned(route.clone(), move |leg| {
+                output.lock().unwrap().push(leg.clone());
+                async move {
+                    if leg != Route::Alias {
+                        bail!("fixture refused closure");
+                    }
+                    Ok(())
+                }
+            })
+            .await
+            .unwrap();
+            let expected = if route == Route::Alias {
+                vec![Route::Alias]
+            } else {
+                vec![route, Route::Alias]
+            };
+            assert_eq!(*seen.lock().unwrap(), expected);
+            assert_eq!(result.is_ok(), expected.len() == 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn master_cleanup_finishes_the_alias_after_its_caller_is_cancelled() {
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let proceed = std::sync::Arc::new(tokio::sync::Notify::new());
+        let finished = std::sync::Arc::new(tokio::sync::Notify::new());
+        let caller = {
+            let (started, proceed, finished) = (started.clone(), proceed.clone(), finished.clone());
+            tokio::spawn(async move {
+                close_masters_owned(Route::NodeViaAlias("n".into()), move |leg| {
+                    let (started, proceed, finished) =
+                        (started.clone(), proceed.clone(), finished.clone());
+                    async move {
+                        if leg != Route::Alias {
+                            started.notify_one();
+                            proceed.notified().await;
+                        } else {
+                            finished.notify_one();
+                        }
+                        Ok(())
+                    }
+                })
+                .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        proceed.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), finished.notified())
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn keeper_ssh_destination_retains_only_address_user_and_port() {
+        let config = "host work\nhostname login.example.test\nuser scientist\nport 2202\nidentityfile /secret/key\nproxycommand sensitive command\n";
+        assert_eq!(
+            parse_ssh_destination(config).unwrap(),
+            ("login.example.test".into(), Some("scientist".into()), 2202)
+        );
+        assert_eq!(
+            parse_ssh_destination("hostname localhost\n").unwrap(),
+            ("localhost".into(), None, 22)
+        );
+        for config in [
+            "user only",
+            "hostname -option",
+            "hostname bad host",
+            "hostname okay\nport 0",
+            "hostname okay\nport 65536",
+        ] {
+            assert!(parse_ssh_destination(config).is_err());
+        }
+    }
 
     /// The probe and start-wait frame the manifest on BOTH sides and print
     /// the pid they tested: noise around the frame (an echoing ~/.bashrc) is
@@ -4896,7 +7231,9 @@ mod tests {
             false,
             Some(true),
             |_, _| {
-                ssh_failed("ssh: Could not resolve hostname ln01.cluster.edu: nodename nor servname provided")
+                ssh_failed(
+                    "ssh: Could not resolve hostname ln01.cluster.edu: nodename nor servname provided",
+                )
             },
         );
         let (out, _) = try_resolve(&fake, false).await;
