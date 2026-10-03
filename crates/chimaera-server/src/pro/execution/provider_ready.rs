@@ -31,12 +31,13 @@ struct Inner {
     // Moved into the one task while Checking, returned only by exact Ready.
     payload: Option<wire::StartupPayload>,
     work: Option<Arc<Work>>,
+    consumers: Vec<Arc<Work>>,
 }
-struct Work {
-    generation: u64,
-    deadline: Instant,
-    cancel: watch::Sender<bool>,
-    done: watch::Sender<bool>,
+pub(super) struct Work {
+    pub(super) generation: u64,
+    pub(super) deadline: Instant,
+    pub(super) cancel: watch::Sender<bool>,
+    pub(super) done: watch::Sender<bool>,
 }
 pub(super) struct State {
     inner: Mutex<Inner>,
@@ -50,6 +51,7 @@ impl State {
                 phase: Phase::Staged,
                 payload: Some(payload),
                 work: None,
+                consumers: Vec::new(),
             }),
             #[cfg(test)]
             transport: Mutex::default(),
@@ -59,17 +61,16 @@ impl State {
         let mut inner = lock(&self.inner);
         inner.phase = Phase::Closed;
         inner.payload = None;
-        if let Some(work) = &inner.work {
-            work.cancel.send_replace(true);
-        }
+        cancel(&inner);
     }
     fn active(&self) -> usize {
-        usize::from(
-            lock(&self.inner)
-                .work
-                .as_ref()
-                .is_some_and(|work| !*work.done.borrow()),
-        )
+        let inner = lock(&self.inner);
+        inner
+            .work
+            .iter()
+            .chain(inner.consumers.iter())
+            .filter(|work| !*work.done.borrow())
+            .count()
     }
     #[cfg(test)]
     pub(super) fn inspect_fixture(&self, inspect: impl FnOnce(&wire::StartupPayload)) {
@@ -97,9 +98,7 @@ pub(in crate::pro) fn replacing(state: &AppState) {
         if inner.phase != Phase::Staged {
             inner.phase = Phase::Closed;
             inner.payload = None;
-            if let Some(work) = &inner.work {
-                work.cancel.send_replace(true);
-            }
+            cancel(&inner);
         }
     }
 }
@@ -108,23 +107,30 @@ pub(in crate::pro) async fn stop(state: &AppState) -> anyhow::Result<()> {
     settle(state).await
 }
 pub(in crate::pro) async fn settle(state: &AppState) -> anyhow::Result<()> {
-    let work = pending(state).and_then(|pending| {
-        let work = lock(&pending.ready.inner).work.clone();
-        work
+    let works = pending(state).map_or_else(Vec::new, |pending| {
+        let inner = lock(&pending.ready.inner);
+        inner
+            .work
+            .iter()
+            .chain(inner.consumers.iter())
+            .cloned()
+            .collect::<Vec<_>>()
     });
-    let Some(work) = work else { return Ok(()) };
-    let mut done = work.done.subscribe();
     // This bounds cleanup observation only. Cancellation has already closed
-    // authority; the task's IO never extends its original five-second budget.
+    // authority. Ready keeps its original five seconds; consumers retain their
+    // own bounded IO and any unresolved child cleanup until a positive receipt.
     tokio::time::timeout(Duration::from_secs(1), async {
-        while !*done.borrow_and_update() {
-            done.changed().await.map_err(|_| ())?;
+        for work in works {
+            let mut done = work.done.subscribe();
+            while !*done.borrow_and_update() {
+                done.changed().await.map_err(|_| ())?;
+            }
         }
         Ok::<_, ()>(())
     })
     .await
-    .map_err(|_| anyhow::anyhow!("provider Ready cleanup unconfirmed"))?
-    .map_err(|_| anyhow::anyhow!("provider Ready cleanup unconfirmed"))
+    .map_err(|_| anyhow::anyhow!("provider runtime cleanup unconfirmed"))?
+    .map_err(|_| anyhow::anyhow!("provider runtime cleanup unconfirmed"))
 }
 
 /// Called only at the first successful real Configure tail, not by polls or
@@ -212,7 +218,7 @@ pub(in crate::pro) fn configured(state: &Arc<AppState>) {
         // may hold it while waiting for this actual continuation to finish.
     });
 }
-fn current(state: &AppState, pending: &Pending, generation: u64) -> bool {
+pub(super) fn current(state: &AppState, pending: &Pending, generation: u64) -> bool {
     !state.stopping.load(Ordering::Acquire)
         && state.pro.generation.load(Ordering::Acquire) == generation
         && !super::super::drain::draining(state)
@@ -222,6 +228,68 @@ fn current(state: &AppState, pending: &Pending, generation: u64) -> bool {
             .as_ref()
             .is_some_and(|config| config.execution.is_some())
         && pending.protection.current().is_ok()
+}
+fn cancel(inner: &Inner) {
+    for work in inner.work.iter().chain(inner.consumers.iter()) {
+        work.cancel.send_replace(true);
+    }
+}
+/// Admission is minted only from the retained exact Ready. The original Ready
+/// deadline is not a credential lifetime; each consumer has its own bounded work.
+pub(super) fn admit(
+    state: &Arc<AppState>,
+    command: wire::Command,
+    deadline: Instant,
+) -> Result<(Arc<Pending>, Arc<Work>, wire::Request), wire::Error> {
+    let pending = pending(state).ok_or(wire::Error::Inactive)?;
+    let mut inner = lock(&pending.ready.inner);
+    let generation = inner.work.as_ref().ok_or(wire::Error::Inactive)?.generation;
+    if inner.phase != Phase::Verified
+        || Instant::now() >= deadline
+        || !current(state, &pending, generation)
+    {
+        return Err(wire::Error::StateChanged);
+    }
+    inner.consumers.retain(|work| !*work.done.borrow());
+    if inner.consumers.len() >= wire::STREAMS_PROJECT {
+        return Err(wire::Error::LimitReached);
+    }
+    let payload = inner.payload.as_ref().ok_or(wire::Error::StateChanged)?;
+    let token = chimaera_core::generate_token();
+    let request = wire::Request {
+        version: 1,
+        binding: payload.binding.clone(),
+        capability: wire::Capability::new(payload.capability.expose().to_owned())?,
+        request_id: format!(
+            "{}-{}-{}-{}-{}",
+            &token[..8],
+            &token[8..12],
+            &token[12..16],
+            &token[16..20],
+            &token[20..32]
+        ),
+        command,
+    };
+    request.validate()?;
+    let work = Arc::new(Work {
+        generation,
+        deadline,
+        cancel: watch::channel(false).0,
+        done: watch::channel(false).0,
+    });
+    inner.consumers.push(work.clone());
+    drop(inner);
+    Ok((pending, work, request))
+}
+pub(super) fn consumer_current(pending: &Pending, work: &Arc<Work>) -> bool {
+    let inner = lock(&pending.ready.inner);
+    inner.phase == Phase::Verified && inner.consumers.iter().any(|row| Arc::ptr_eq(row, work))
+}
+#[cfg(test)]
+pub(super) fn socket_fixture(pending: &Pending) -> Option<std::path::PathBuf> {
+    lock(&pending.ready.transport)
+        .as_ref()
+        .map(|(path, _)| path.clone())
 }
 struct Owner {
     state: Arc<AppState>,
@@ -340,4 +408,4 @@ async fn exchange(request: &wire::Request, bytes: &[u8], path: &Path) -> Result<
 
 #[cfg(test)]
 #[path = "provider_ready_tests.rs"]
-mod tests;
+pub(super) mod tests;

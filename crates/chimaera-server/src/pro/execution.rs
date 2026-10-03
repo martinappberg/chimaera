@@ -23,6 +23,13 @@ pub(super) mod maintenance_startup;
 #[allow(dead_code)]
 mod maintenance_store;
 pub(crate) mod mutation;
+// No route or launch caller until all provider adapters and final overlays exist.
+#[cfg(all(unix, feature = "provider-authority-prototype"))]
+#[allow(dead_code)]
+pub(super) mod provider_client;
+#[cfg(all(unix, feature = "provider-authority-prototype"))]
+#[allow(dead_code)]
+pub(super) mod provider_github;
 #[cfg(all(unix, feature = "provider-authority-prototype"))]
 pub(super) mod provider_ready;
 #[cfg(all(unix, feature = "provider-authority-prototype"))]

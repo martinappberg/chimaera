@@ -19,14 +19,14 @@ use std::{
 use tokio::net::UnixListener;
 use tower::ServiceExt;
 
-struct Fixture {
-    root: PathBuf,
-    state: Arc<AppState>,
-    pending: Arc<Pending>,
-    listener: UnixListener,
+pub(in crate::pro::execution) struct Fixture {
+    pub(in crate::pro::execution) root: PathBuf,
+    pub(in crate::pro::execution) state: Arc<AppState>,
+    pub(in crate::pro::execution) pending: Arc<Pending>,
+    pub(in crate::pro::execution) listener: UnixListener,
 }
 impl Fixture {
-    fn new(budget: Duration) -> Self {
+    pub(in crate::pro::execution) fn new(budget: Duration) -> Self {
         // Keep the socket within sockaddr_un on macOS too.
         let root = PathBuf::from("/tmp").join(format!(
             "chimaera-ready-{}-{}",
@@ -109,6 +109,20 @@ impl Fixture {
             listener: UnixListener::bind(socket).unwrap(),
         }
     }
+    pub(in crate::pro::execution) async fn verified(&self) {
+        self.configure().await;
+        let (mut socket, request) = self.peer().await;
+        let reply = wire::Response {
+            version: 1,
+            binding: request.binding.clone(),
+            request_id: request.request_id.clone(),
+            result: wire::Reply::Ready { ready: true },
+        };
+        frame(&mut socket, 3, &wire::encode_control(&reply).unwrap()).await;
+        socket.shutdown().await.unwrap();
+        drop(socket);
+        self.completed(Phase::Verified).await;
+    }
     fn config(&self) -> Value {
         json!({"account_id":"a-fixture","role":"worker","endpoint":"http://127.0.0.1:9",
             "keeper_url":"","workspace_root":self.root.join("project"),
@@ -190,7 +204,7 @@ impl Fixture {
         assert!(!crate::pro::may_execute(&self.state, "w-other"));
         assert!(!crate::pro::may_restore(&self.state, "w-a"));
     }
-    async fn finish(&self) {
+    pub(in crate::pro::execution) async fn finish(&self) {
         assert_eq!(
             self.request_method("DELETE", "/api/v1/pro/configure", None)
                 .await

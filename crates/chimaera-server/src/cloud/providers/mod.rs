@@ -10,7 +10,7 @@ pub(crate) mod control_service;
 mod disconnect;
 #[cfg(feature = "provider-authority-prototype")]
 mod login_home;
-mod process;
+pub(crate) mod process;
 /// Bounded output for probes using their own environment, with the same
 /// process-group cleanup as provider authentication subprocesses.
 pub(crate) async fn bounded_process_output(

@@ -110,6 +110,19 @@ jobs:
           cargo test --locked -p chimaera-server --lib --features provider-authority-prototype cloud::providers
           cargo test --locked -p chimaera-server --lib --features provider-authority-prototype pro::execution::
           cargo test --locked -p chimaera --features provider-authority-prototype
+      - name: Verify pinned GitHub CLI ignores project endpoint configuration
+        run: |
+          set -euo pipefail
+          fixture_root="$RUNNER_TEMP/chimaera-gh-2.102.0"
+          mkdir -p "$fixture_root"
+          # Same official release asset/digest as the private worker image.
+          curl --proto '=https' --tlsv1.2 --max-time 60 --max-filesize 33554432 -fsSL \
+            -o "$fixture_root/gh.deb" https://github.com/cli/cli/releases/download/v2.102.0/gh_2.102.0_linux_amd64.deb
+          printf '%s  %s\n' 7e54a307f90afdc59796c325ec0c49fb09e6c18537727207a8ac7513584ea5b0 "$fixture_root/gh.deb" | sha256sum -c -
+          dpkg-deb --extract "$fixture_root/gh.deb" "$fixture_root/extracted"
+          CHIMAERA_TEST_GH_2102="$fixture_root/extracted/usr/bin/gh" \
+            cargo test --locked -p chimaera-server --lib --features provider-authority-prototype \
+            pinned_gh_2102_ignores_project_endpoint_config_through_unlinked_directory -- --ignored
       - run: cargo test --manifest-path plugins/Cargo.toml
 
   musl:

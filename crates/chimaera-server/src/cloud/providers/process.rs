@@ -5,7 +5,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 pub(super) const LIMIT: usize = 64 * 1024;
 pub(super) const TIMEOUT: Duration = Duration::from_secs(8);
-pub(super) struct Child {
+pub(crate) struct Child {
     pub child: tokio::process::Child,
     #[cfg(unix)]
     group: Option<rustix::process::Pid>,
