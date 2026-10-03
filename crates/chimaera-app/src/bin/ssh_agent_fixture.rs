@@ -3,6 +3,9 @@
 #[path = "../ssh_agent_fixture_support/route.rs"]
 mod route;
 #[cfg(target_os = "macos")]
+#[path = "../ssh_agent_fixture_support/source.rs"]
+mod source;
+#[cfg(target_os = "macos")]
 #[allow(dead_code, unused_imports)]
 #[path = "../ssh_agent.rs"]
 mod ssh_agent;
@@ -183,6 +186,33 @@ fn main() {
             });
             if result.is_err() {
                 println!("REFUSED");
+                std::process::exit(2)
+            }
+        }
+        Some("--source-packets") => {
+            if args.len() != 3 || source::prepare(std::path::Path::new(&args[2])).is_err() {
+                std::process::exit(2)
+            }
+        }
+        Some("--source-fixture") => {
+            if args.len() != 5 || !matches!(args[4].as_str(), "accept" | "refuse") {
+                std::process::exit(2)
+            }
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let result = runtime.block_on(source::run(
+                PathBuf::from(&args[2]),
+                args[3].clone(),
+                args[4].clone(),
+            ));
+            runtime.block_on(async {
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            });
+            if result.is_err() {
+                println!("SOURCE_FAILED");
                 std::process::exit(2)
             }
         }

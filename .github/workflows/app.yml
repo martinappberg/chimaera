@@ -117,6 +117,7 @@ jobs:
           cargo build --locked --features ssh-agent-fixture --bin chimaera-ssh-agent-fixture
           python3 fixtures/ssh_agent_loader.py --binary "$PWD/target/debug/chimaera-ssh-agent-fixture"
           python3 fixtures/ssh_agent_route.py --binary "$PWD/target/debug/chimaera-ssh-agent-fixture"
+          python3 fixtures/ssh_agent_sources.py --binary "$PWD/target/debug/chimaera-ssh-agent-fixture"
         working-directory: crates/chimaera-app
       # Plugin execution must also work inside the hardened, signed executable;
       # cargo test runs an ordinary test binary and cannot catch macOS kills.
