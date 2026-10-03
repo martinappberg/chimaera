@@ -637,8 +637,15 @@ fn build(
                 }
             }
             // Graceful shutdown removes manifests before Slurm finishes.
-            // job-host retains its final closing rows for this interval.
-            if let Some(job) = jobs.iter().find(|j| j.stopping && held_in(&j.id).is_some()) {
+            // A failed row already released ownership, even if this snapshot
+            // predates job-host's final closing rows.
+            if let Some(job) = jobs.iter().find(|j| {
+                j.stopping
+                    && matches!(
+                        held_in(&j.id),
+                        Some(HostedState::Starting | HostedState::Open | HostedState::Closing)
+                    )
+            }) {
                 v.state = "open";
                 v.job = Some(job.id.clone());
                 v.closing = true;
@@ -2301,22 +2308,57 @@ mod tests {
         }
         // Both live endpoint records disappear on graceful shutdown. The
         // durable closing row still owns the workspace until Slurm is done.
-        state.manifests.clear();
+        let previous_manifests = std::mem::take(&mut state.manifests);
         state.jobs[0].host = None;
         state.jobs[0].hosting = Some(chimaera_core::cluster::HostingRecord {
             workspaces: [("w-0000abcd".into(), HostedState::Closing)]
                 .into_iter()
                 .collect(),
         });
-        for (cancelled, slurm_state) in [(true, "RUNNING"), (false, "COMPLETING")] {
-            state.jobs[0].record.stopped_by_user = cancelled;
-            let queue = [queue_row("77", slurm_state, "n042", "1:00:00", "None")];
-            let stopping = build(&config, &state, &queue, true, NOW);
-            let workspace = &stopping.workspaces[0];
-            assert_eq!(workspace.job.as_deref(), Some("j-0000aaaa"));
-            assert!(workspace.closing);
-            assert!(stopping.endpoints.is_empty());
-            assert!(stopping.hosts.is_empty());
+        for held in [
+            HostedState::Starting,
+            HostedState::Open,
+            HostedState::Closing,
+        ] {
+            state.jobs[0]
+                .hosting
+                .as_mut()
+                .unwrap()
+                .workspaces
+                .insert("w-0000abcd".into(), held);
+            for (cancelled, slurm_state) in [(true, "RUNNING"), (false, "COMPLETING")] {
+                state.jobs[0].record.stopped_by_user = cancelled;
+                let queue = [queue_row("77", slurm_state, "n042", "1:00:00", "None")];
+                let stopping = build(&config, &state, &queue, true, NOW);
+                let workspace = &stopping.workspaces[0];
+                assert_eq!(workspace.job.as_deref(), Some("j-0000aaaa"));
+                assert!(workspace.closing);
+                assert!(stopping.endpoints.is_empty());
+                assert!(stopping.hosts.is_empty());
+            }
+        }
+        // The final snapshot may not have landed yet (or job-host crashed).
+        // A stale failed row must never reclaim a released workspace, even
+        // if its old daemon manifest also remains on disk.
+        for manifests in [Default::default(), previous_manifests] {
+            state.manifests = manifests;
+            state.jobs[0]
+                .hosting
+                .as_mut()
+                .unwrap()
+                .workspaces
+                .insert("w-0000abcd".into(), HostedState::Failed);
+            for (cancelled, slurm_state) in [(true, "RUNNING"), (false, "COMPLETING")] {
+                state.jobs[0].record.stopped_by_user = cancelled;
+                let queue = [queue_row("77", slurm_state, "n042", "1:00:00", "None")];
+                let stopping = build(&config, &state, &queue, true, NOW);
+                let workspace = &stopping.workspaces[0];
+                assert_eq!(workspace.state, "closed");
+                assert!(!workspace.closing);
+                assert!(!workspace.opening);
+                assert!(workspace.failed.is_some());
+                assert!(stopping.endpoints.is_empty());
+            }
         }
         let ended = build(&config, &state, &[], true, NOW);
         assert_eq!(ended.workspaces[0].state, "closed");
