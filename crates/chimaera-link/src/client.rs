@@ -29,6 +29,7 @@ use tokio_tungstenite::{
 use url::Url;
 
 mod project_secrets;
+mod providers;
 mod ssh_route;
 
 #[derive(Clone, Copy)]
@@ -53,6 +54,8 @@ struct Inner {
     streams: Arc<Semaphore>,
     secret_requests: Arc<Semaphore>,
     secret_writers: Arc<Semaphore>,
+    provider_requests: Arc<Semaphore>,
+    provider_writers: Arc<Semaphore>,
 }
 impl Client {
     /// Does not contact the endpoint. No background work starts before the
@@ -84,6 +87,8 @@ impl Client {
                 streams: Arc::new(Semaphore::new(MAX_STREAMS)),
                 secret_requests: Arc::new(Semaphore::new(16)),
                 secret_writers: Arc::new(Semaphore::new(4)),
+                provider_requests: Arc::new(Semaphore::new(16)),
+                provider_writers: Arc::new(Semaphore::new(4)),
             }),
         })
     }
