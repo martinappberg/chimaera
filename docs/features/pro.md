@@ -50,6 +50,9 @@ and remaining acceptance gates, see the [integration review guide](../agent-guid
    through Pro waits at most ten seconds, then reports that its keeper route is
    unavailable. **Connect directly from this computer** in the host's advanced
    settings is the explicit alternative; outages never silently switch routes.
+   A previously kept SSH host retains that choice after sign-out, when its plan
+   ends, or when the account service is unavailable. Direct SSH never requires
+   an account or a subscription.
    Launch restore attaches an existing keeper connection. A new authentication
    exchange requires **Connect** or **Reconnect**.
 3. Signed-out and confirmed no-plan accounts see an illustrated introduction:

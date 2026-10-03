@@ -284,13 +284,14 @@ pub(crate) fn local_dispatch_owner_fixture(state: &AppState, workspace: &str, ep
     lock(&state.pro.ownership).insert(workspace.to_owned(), Ownership::Local { epoch });
 }
 
-/// An asynchronous daemon send retains its original account and exact ownership.
+/// An asynchronous daemon send retains this project's original account participation
+/// and exact ownership; unrelated account changes cannot fence free local work.
 /// Local devices still use ownership alone; workers additionally need a live proof
 /// when begin() reserves the final dispatch. No presentation phase is authority.
 #[derive(Clone)]
 pub(crate) struct Dispatch {
     workspace: String,
-    generation: u64,
+    generation: Option<u64>,
     ownership: Option<Ownership>,
 }
 impl Dispatch {
@@ -300,19 +301,27 @@ impl Dispatch {
         IMPORT_RESUME.scope(self.clone(), operation).await
     }
     pub(crate) fn capture(state: &AppState, workspace: &str) -> anyhow::Result<Self> {
+        let generation = generation(state);
+        let ownership = lock(&state.pro.ownership).get(workspace).cloned();
         let captured = Self {
             workspace: workspace.to_owned(),
-            generation: generation(state),
-            ownership: lock(&state.pro.ownership).get(workspace).cloned(),
+            generation: account_bound(state, workspace, &ownership).then_some(generation),
+            ownership,
         };
         captured.check(state)?;
         Ok(captured)
     }
     pub(crate) fn check(&self, state: &AppState) -> anyhow::Result<()> {
-        if self.generation != generation(state)
-            || lock(&state.pro.ownership).get(&self.workspace) != self.ownership.as_ref()
+        let ownership = lock(&state.pro.ownership).get(&self.workspace).cloned();
+        if self
+            .generation
+            .is_some_and(|captured| captured != generation(state))
+            || ownership != self.ownership
+            || self.generation.is_some() != account_bound(state, &self.workspace, &ownership)
             || !crate::pro::may_execute(state, &self.workspace)
-            || self.generation != generation(state)
+            || self
+                .generation
+                .is_some_and(|captured| captured != generation(state))
         {
             return Err(Changed.into());
         }
@@ -326,6 +335,22 @@ impl Dispatch {
         self.check(state)?;
         Ok(guard)
     }
+}
+
+// Only this project's account participation pins the daemon-wide generation.
+// A free installer must survive an unrelated Configure/sign-out, but cannot
+// silently adopt this project's first enrollment while its child is running.
+fn account_bound(state: &AppState, workspace: &str, ownership: &Option<Ownership>) -> bool {
+    ownership.is_some()
+        || super::managed(state, workspace)
+        || lock(&state.pro.preferences)
+            .get(workspace)
+            .is_some_and(|preference| preference.account.is_some())
+        || lock(&state.pro.adoptions).contains_key(workspace)
+        || {
+            let authority = lock(&state.pro.authority);
+            authority.restricted() && authority.allows(workspace)
+        }
 }
 
 /// Count the final synchronous spawn/registration window so a clean transfer

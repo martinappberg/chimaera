@@ -718,7 +718,7 @@
 </script>
 
 {#snippet directPreference(host: HostState)}
-  {#if host.direct_ssh !== undefined && ($paidPlan !== null || host.direct_ssh === true)}
+  {#if host.direct_ssh !== undefined && ($paidPlan !== null || host.kept === true || host.direct_ssh === true)}
     <details class="host-advanced">
       <summary>Advanced</summary>
       <label><input type="checkbox" checked={host.direct_ssh} disabled={savingDirect.has(host.alias)} onchange={event => void setDirect(host, event.currentTarget)} />Connect directly from this computer</label>

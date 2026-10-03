@@ -400,6 +400,9 @@ fn asynchronous_dispatch_keeps_exact_ownership_account_and_worker_deadline() {
     let free = Dispatch::capture(&state, "free").unwrap();
     assert!(free.begin(&state).unwrap().is_none());
     state.pro.generation.fetch_add(1, Ordering::AcqRel);
+    assert!(free.begin(&state).unwrap().is_none());
+    assert!(admission.begin(&state).is_err());
+    install_fixture(&state, "free", 9).unwrap();
     assert!(free.begin(&state).is_err());
     std::fs::remove_dir_all(root).unwrap();
     let (state, root) = fixture();
@@ -463,5 +466,76 @@ async fn cancelled_import_resume_releases_count_only_after_its_owned_future_is_d
     task.abort();
     assert!(task.await.is_err());
     assert!(super::super::quiescent(&state, "w-a"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn free_dispatch_refuses_same_project_account_enrollment_and_copy_transition() {
+    for transition in 0..4 {
+        let (state, root) = fixture();
+        let captured = Dispatch::capture(&state, "free").unwrap();
+        match transition {
+            0 => {
+                lock(&state.pro.preferences)
+                    .entry("free".into())
+                    .or_default()
+                    .account = Some("https://account.invalid/a-fixture".into());
+            }
+            1 => {
+                lock(&state.pro.execution.latched).insert("free".into());
+            }
+            2 => {
+                lock(&state.pro.ownership).insert("free".into(), Ownership::Local { epoch: 1 });
+            }
+            _ => {
+                lock(&state.pro.preferences)
+                    .entry("free".into())
+                    .or_default()
+                    .copy = Some(crate::pro::project_copy::CopyState {
+                    checkpoint: None,
+                    pending: None,
+                    ready: false,
+                    takeover_requested: false,
+                    takeover_request: None,
+                    owner_epoch: None,
+                });
+            }
+        }
+        assert!(captured.begin(&state).is_err(), "transition {transition}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn scoped_account_authority_pins_dispatch_before_policy_or_ownership() {
+    let (state, root) = fixture();
+    let unbound = Dispatch::capture(&state, "free").unwrap();
+    assert!(unbound.begin(&state).unwrap().is_none());
+    std::fs::create_dir_all(&state.pro.root).unwrap();
+    let path = state.pro.root.join("workspace-authority.json");
+    std::fs::write(
+        path,
+        serde_json::to_vec(&serde_json::json!({
+            "workspace": {"workspace_id": "free", "revision": 1},
+            "account_id": "a-fixture", "endpoint": "http://127.0.0.1:9",
+            "root": root, "identity": [1, 1]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    *lock(&state.pro.authority) = crate::pro::authority::Authority::load(&state.pro.root);
+    state.pro.configured.store(true, Ordering::Release);
+    assert!(lock(&state.pro.authority).restricted());
+    assert!(lock(&state.pro.authority).allows("free"));
+    assert!(!super::super::managed(&state, "free"));
+    assert!(!lock(&state.pro.preferences).contains_key("free"));
+    assert!(!lock(&state.pro.ownership).contains_key("free"));
+    // The accepted scoped record is already account authority: no old free
+    // dispatch may adopt it, even before ownership/policy publication.
+    assert!(unbound.begin(&state).is_err());
+    let scoped = Dispatch::capture(&state, "free").unwrap();
+    assert!(scoped.begin(&state).unwrap().is_none());
+    state.pro.generation.fetch_add(1, Ordering::AcqRel);
+    assert!(scoped.begin(&state).is_err());
     std::fs::remove_dir_all(root).unwrap();
 }

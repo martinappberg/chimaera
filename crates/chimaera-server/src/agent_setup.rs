@@ -631,6 +631,81 @@ mod tests {
             .contains("Reinstalling the same release will not fix it"));
     }
     #[tokio::test]
+    async fn free_installer_survives_unrelated_pro_configure_and_disconnect() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-free-installer-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let state = Arc::new(AppState::new(
+            "token".into(),
+            "test".into(),
+            1,
+            0,
+            root.join("data"),
+            root.join("config"),
+        ));
+        let release = root.join("release");
+        let script = format!(
+            "echo started; for i in $(seq 1 100); do [ -e '{}' ] && {{ echo completed; exit 0; }}; sleep .05; done; exit 23",
+            release.display()
+        );
+        assert_eq!(
+            start_script(
+                state.clone(),
+                AgentKind::Codex,
+                root.clone(),
+                request("free"),
+                script
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !snapshot(&state, AgentKind::Codex)
+                .unwrap()
+                .output
+                .contains("started")
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // Real Configure starts its coordinator with an unreachable loopback
+        // account; no project is enrolled and no provider call can grant work.
+        let config = serde_json::from_value(serde_json::json!({
+            "endpoint": "http://127.0.0.1:9", "keeper_url": "", "role": "device",
+            "account_id": "a-fixture", "delegation": {
+                "access_token": "synthetic", "expires_at": "2099-01-01T00:00:00Z",
+                "scope": ["baton", "mirror"], "device_id": "d-fixture"
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            crate::pro::configure(State(state.clone()), Json(config))
+                .await
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            crate::pro::disconnect(State(state.clone())).await.status(),
+            StatusCode::NO_CONTENT
+        );
+        // Cross the real install owner's authority polling cutpoint. The
+        // original child must complete successfully, not merely remain listed.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        std::fs::write(&release, b"release original child").unwrap();
+        let progress = completed(&state).await;
+        assert!(progress.phase == Phase::Succeeded);
+        assert_eq!(progress.exit_status, Some(0));
+        assert!(progress.output.contains("completed"));
+        assert!(state.sessions.list().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn stale_captured_install_never_starts_and_active_authority_loss_reaps() {
         let state = state();
         crate::pro::install_execution_fixture(&state, "test", 4).unwrap();
