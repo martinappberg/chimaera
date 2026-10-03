@@ -26,7 +26,15 @@ use tokio::{process::Command, sync::Mutex, time::Instant};
 
 const SCOPE_FRAME: &str = "chimaera-askpass-scope-v1";
 type Result<T> = std::result::Result<T, SelectionFailure>;
-type Prompt = dyn Fn(String, NativePromptGuard) -> Pin<Box<dyn Future<Output = Option<String>> + Send>>
+pub(crate) struct HostKey {
+    pub(crate) host: String,
+    pub(crate) fingerprint: String,
+}
+pub(crate) struct NativePrompt {
+    pub(crate) text: String,
+    pub(crate) host_key: Option<HostKey>,
+}
+type Prompt = dyn Fn(NativePrompt, NativePromptGuard) -> Pin<Box<dyn Future<Output = Option<String>> + Send>>
     + Send
     + Sync;
 /// Constructed only by the native explicit-Connect caller; it is not a wire or
@@ -149,6 +157,7 @@ fn command(
             },
         ),
         ("HashKnownHosts", "no".into()),
+        ("FingerprintHash", "sha256".into()),
         ("GlobalKnownHostsFile", "/dev/null".into()),
         ("UserKnownHostsFile", known.to_string_lossy().into_owned()),
         ("KnownHostsCommand", "none".into()),

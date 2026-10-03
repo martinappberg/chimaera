@@ -901,6 +901,8 @@ export async function testNotification(): Promise<void> {
 export interface AskpassPrompt {
   id: number;
   source?: { type: "local" } | { type: "keeper"; host_id: string; keeper_prompt_id: string };
+  /** Only the original native Connect verifier emits a host-key confirmation. */
+  kind?: { type: "host_key"; host: string; fingerprint: string };
   /** SSH alias of the child that raised this prompt. Null only for legacy or
    *  unscoped helpers, which remain available from the home window. */
   alias?: string | null;

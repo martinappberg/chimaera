@@ -102,6 +102,15 @@ pub(super) fn candidate_bytes(path: &Path) -> Result<Vec<u8>> {
     }
     Ok(bytes)
 }
+pub(super) fn candidate_empty(path: &Path) -> Result<bool> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|_| refused())?;
+    Ok(read(&mut file)?.is_empty())
+}
 
 pub(super) struct Target {
     path: PathBuf,

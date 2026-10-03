@@ -20,6 +20,60 @@ use tokio::{
     time::Instant,
 };
 
+fn host_key(
+    prompt: &str,
+    destination: &chimaera_link::SshAuthDestination,
+) -> Option<super::HostKey> {
+    use base64::engine::general_purpose::STANDARD_NO_PAD;
+    let mut fingerprints = prompt.lines().filter_map(|line| {
+        let (_, value) = line.split_once(" key fingerprint is SHA256:")?;
+        let value = value.strip_suffix('.')?;
+        (value.len() == 43).then_some(value)
+    });
+    let value = fingerprints.next()?;
+    if fingerprints.next().is_some() {
+        return None;
+    }
+    let decoded = STANDARD_NO_PAD.decode(value).ok()?;
+    if decoded.len() != 32 || STANDARD_NO_PAD.encode(&decoded) != value {
+        return None;
+    }
+    let host = if destination.port == 22 {
+        destination.hostname.clone()
+    } else if destination.hostname.contains(':') {
+        format!(
+            "[{}]:{}",
+            destination.hostname.trim_matches(['[', ']']),
+            destination.port
+        )
+    } else {
+        format!("{}:{}", destination.hostname, destination.port)
+    };
+    Some(super::HostKey {
+        host,
+        fingerprint: format!("SHA256:{value}"),
+    })
+}
+fn initial_host_key(
+    prompt: &str,
+    destination: &chimaera_link::SshAuthDestination,
+    unknown: bool,
+    prompted: &mut bool,
+    candidate: &Path,
+) -> Result<Option<super::HostKey>, SelectionFailure> {
+    if !unknown || *prompted || !prompt.starts_with("The authenticity of host ") {
+        return Ok(None);
+    }
+    // A remote keyboard-interactive challenge can repeat any prose. Only the
+    // first native host check, before OpenSSH writes its candidate, is approval.
+    if !super::storage::candidate_empty(candidate)? {
+        return Ok(None);
+    }
+    let key = host_key(prompt, destination).ok_or(SelectionFailure::Unavailable)?;
+    *prompted = true;
+    Ok(Some(key))
+}
+
 pub(super) struct Bridge {
     tasks: JoinSet<()>,
     pub(super) bound: Arc<AtomicBool>,
@@ -195,6 +249,8 @@ impl Bridge {
         let bound = Arc::new(AtomicBool::new(false));
         let signed = Arc::new(AtomicBool::new(false));
         let receipt = Arc::new(std::sync::Mutex::new(None));
+        let prompt_candidate = candidate.clone();
+        let destination = leg.destination.clone();
         let state = Arc::new(Mutex::new(Agent {
             identity,
             verifier,
@@ -242,6 +298,7 @@ impl Bridge {
         let unknown = leg.host_keys.is_empty();
         let policy = leg.policy.clone().ok_or(SelectionFailure::Unavailable)?;
         tasks.spawn(async move {
+            let mut trust_prompted = false;
             for _ in 0..32 {
                 let (mut stream, _) = tokio::select! {
                     biased;
@@ -265,13 +322,18 @@ impl Bridge {
                     if claimed_alias != alias {
                         return None;
                     }
-                    let trust = prompt.starts_with("The authenticity of host ");
+                    let host_key = initial_host_key(
+                        prompt,
+                        &destination,
+                        unknown,
+                        &mut trust_prompted,
+                        &prompt_candidate,
+                    )
+                    .ok()?;
+                    let trust = host_key.is_some();
                     let interactive = !empty
                         && (mode == chimaera_link::SshRouteMode::Interactive
                             || signed_prompt.load(Ordering::Acquire));
-                    if trust && !unknown {
-                        return None;
-                    }
                     if !trust
                         && (!interactive
                             || (!policy
@@ -283,7 +345,14 @@ impl Bridge {
                     {
                         return None;
                     }
-                    let answer = (owner.prompt)(prompt.into(), guard.clone()).await?;
+                    let answer = (owner.prompt)(
+                        super::NativePrompt {
+                            text: prompt.into(),
+                            host_key,
+                        },
+                        guard.clone(),
+                    )
+                    .await?;
                     if !guard.active() {
                         return None;
                     }
@@ -305,5 +374,72 @@ impl Bridge {
 impl Drop for Bridge {
     fn drop(&mut self) {
         self.tasks.abort_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn host_confirmation_is_once_before_candidate_and_never_later_mfa_prose() {
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "cx-trust-kind-{}",
+                &chimaera_core::generate_token()[..24]
+            ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let candidate = root.join("known");
+        std::fs::write(&candidate, b"").unwrap();
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let destination = chimaera_link::SshAuthDestination {
+            hostname: "actual.fixture.invalid".into(),
+            user: "fixture".into(),
+            port: 2222,
+        };
+        let fingerprint = base64::engine::general_purpose::STANDARD_NO_PAD.encode([42u8; 32]);
+        let prompt = format!("The authenticity of host 'untrusted display prose' can't be established.\nED25519 key fingerprint is SHA256:{fingerprint}.\nAre you sure you want to continue connecting (yes/no/[fingerprint])?");
+        let mut prompted = false;
+        let first = initial_host_key(&prompt, &destination, true, &mut prompted, &candidate)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.host, "actual.fixture.invalid:2222");
+        assert_eq!(first.fingerprint, format!("SHA256:{fingerprint}"));
+        assert!(
+            initial_host_key(&prompt, &destination, true, &mut prompted, &candidate)
+                .unwrap()
+                .is_none()
+        );
+        std::fs::write(&candidate, b"already approved candidate\n").unwrap();
+        prompted = false;
+        assert!(
+            initial_host_key(&prompt, &destination, true, &mut prompted, &candidate)
+                .unwrap()
+                .is_none()
+        );
+        std::fs::write(&candidate, b"").unwrap();
+        assert!(
+            initial_host_key(&prompt, &destination, false, &mut prompted, &candidate)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            initial_host_key("Password:", &destination, true, &mut prompted, &candidate)
+                .unwrap()
+                .is_none()
+        );
+        let malformed = prompt.replace(&fingerprint, "invalid");
+        assert!(
+            initial_host_key(&malformed, &destination, true, &mut prompted, &candidate).is_err()
+        );
+        assert!(!prompted);
+        let duplicate = format!("{prompt}\nED25519 key fingerprint is SHA256:{fingerprint}.");
+        assert!(
+            initial_host_key(&duplicate, &destination, true, &mut prompted, &candidate).is_err()
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

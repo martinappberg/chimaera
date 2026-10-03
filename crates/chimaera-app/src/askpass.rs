@@ -69,6 +69,7 @@ struct PendingPrompt {
     prompt: String,
     tx: oneshot::Sender<Option<String>>,
     source: PromptSource,
+    kind: Option<PromptKind>,
     #[cfg(all(feature = "ssh-agent-prototype", unix))]
     route_guard: Option<crate::ssh_agent::lifecycle::RoutePromptGuard>,
     #[cfg(all(feature = "ssh-agent-prototype", unix))]
@@ -85,6 +86,15 @@ pub enum PromptSource {
     },
 }
 
+/// Only the original native Connect verifier constructs host-key approval.
+/// Generic local and keeper challenges never infer this from prompt prose.
+#[derive(Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PromptKind {
+    #[cfg(all(feature = "ssh-agent-prototype", unix))]
+    HostKey { host: String, fingerprint: String },
+}
+
 #[derive(Debug, PartialEq)]
 pub(crate) enum AnswerResult {
     Answered(Option<String>),
@@ -99,6 +109,8 @@ pub struct PromptEvent {
     alias: Option<String>,
     prompt: String,
     source: PromptSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<PromptKind>,
 }
 
 impl PromptEvent {
@@ -136,6 +148,7 @@ impl Askpass {
                 prompt,
                 tx,
                 source,
+                kind: None,
                 #[cfg(all(feature = "ssh-agent-prototype", unix))]
                 route_guard: None,
                 #[cfg(all(feature = "ssh-agent-prototype", unix))]
@@ -212,6 +225,7 @@ impl Askpass {
                 alias: p.alias.clone(),
                 prompt: p.prompt.clone(),
                 source: p.source.clone(),
+                kind: p.kind.clone(),
             })
             .collect();
         prompts.sort_by_key(|p| p.id);
@@ -225,9 +239,14 @@ impl Askpass {
 pub(crate) async fn native_owned_prompt(
     app: &AppHandle,
     alias: &str,
-    prompt: String,
+    prompt: crate::ssh_agent::trust::NativePrompt,
     guard: crate::ssh_agent::lifecycle::NativePromptGuard,
 ) -> Option<String> {
+    let kind = prompt.host_key.map(|key| PromptKind::HostKey {
+        host: key.host,
+        fingerprint: key.fingerprint,
+    });
+    let prompt = prompt.text;
     if !guard.active() || prompt.is_empty() || prompt.len() > 16 * 1024 {
         return None;
     }
@@ -246,6 +265,7 @@ pub(crate) async fn native_owned_prompt(
                 prompt: prompt.clone(),
                 tx,
                 source: PromptSource::Local,
+                kind: kind.clone(),
                 route_guard: None,
                 native_guard: Some(guard.clone()),
             },
@@ -276,6 +296,7 @@ pub(crate) async fn native_owned_prompt(
             alias: Some(alias.into()),
             prompt,
             source: PromptSource::Local,
+            kind,
         },
         Some(alias),
     );
@@ -370,6 +391,7 @@ fn relay_keeper_inner(
         alias: Some(alias.clone()),
         prompt,
         source,
+        kind: None,
     };
     emit_scoped(app, "ssh-askpass", event, Some(&alias));
     let app = app.clone();
@@ -716,6 +738,7 @@ async fn resolve_prompt(app: &AppHandle, alias: Option<String>, prompt: String) 
         alias,
         prompt,
         source: PromptSource::Local,
+        kind: None,
     };
     // Emit only to matching windows that are ALREADY listening. Windows that
     // mount later find this prompt through the equally scoped list command;

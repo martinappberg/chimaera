@@ -883,6 +883,33 @@ hostnames are not evidence of separate devices. Each other sign-in can be
 removed explicitly without signing out the current one. Grouping never merges
 or revokes credentials automatically.
 
+## Native SSH authentication under development
+
+**Status: partial; `ssh-agent-prototype` is off by default.** Explicit Connect
+captures the Mac's effective SSH destination, authentication methods, public host
+trust and selected agent keys for each supported route leg. Common ProxyJump
+routes support at most three jump hosts. The keeper receives scoped signing
+authority and public policy; private keys remain on the Mac. Arbitrary local
+ProxyCommand programs require the explicit Advanced Direct option.
+
+First-use trust is owned by the original Connect attempt. A native OpenSSH probe
+asks for approval and verifies the candidate before an append to the selected
+native known-hosts file. Key mode requires a signed key-exchange receipt;
+interactive mode requires a positively authenticated private connection. Cancel,
+account replacement, changed configuration or failed proof refuses a grant.
+Cancellation before the append leaves trust unchanged; a failure after an approved
+append can retain that verified entry while still refusing the connection.
+
+The native implementation lives in
+[`ssh_agent/trust`](../../crates/chimaera-app/src/ssh_agent/trust/mod.rs), with
+attempt ownership in
+[`ssh_agent/lifecycle.rs`](../../crates/chimaera-app/src/ssh_agent/lifecycle.rs)
+and scoped prompts in
+[`askpass.rs`](../../crates/chimaera-app/src/askpass.rs).
+First-use UI, configured but unloaded keys and complete keeper-held route/Slurm
+journeys still require integration acceptance. The prototype does not change
+ordinary direct SSH or advertise completed keeper support.
+
 ## Intent — human-authored ground truth
 
 ### Viewing anywhere, execution at home while available
@@ -942,6 +969,23 @@ _Captured 2026-09-28 from the maintainer's instructions in this conversation._
 - **Extension:** The maintainer explicitly wants other providers to fit later,
   giving Grok as an example. This addition is intended to evolve; no fixed
   provider list or immutable interface was requested.
+
+### Keeper SSH and Slurm continuity
+_Captured 2026-10-03 from the maintainer's direct answers in this conversation._
+
+- **Continuity:** “Yes, keeper should keep interactive jobs connected too!”
+  The maintainer also explicitly requires the app-created compute-node forward
+  to remain held for the length of the Slurm job.
+- **HPC policy:** “infinite ssh we can have to a remote but NOT a HPC login
+  node, unless the user enables this”, using the existing opt-in behavior.
+- **Experience and compatibility:** “you dont want to have to set up the keeper
+  to have ssh keys etc.” Asked about jump hosts, the maintainer answered:
+  “I have no idea but I feel like we should support most things”. The requested
+  experience is broad compatibility with the Mac's existing SSH setup; the exact
+  implementation remains open to improvement.
+- **Explicit fallback:** The maintainer requested a direct connection choice in
+  Advanced settings for workspaces or sites where keeper access is not allowed.
+  This is a deliberate user choice, not a silent fallback.
 
 _Broader Pro intent capture remains pending. The behavior above the divider is
 derived from code; the statements here record the maintainer's instructions._
