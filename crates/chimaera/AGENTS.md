@@ -19,7 +19,7 @@ is a thin delegation to a sibling library crate. Parent map: repo-root
 
 | File | Command / role |
 |---|---|
-| `main.rs` | Feature-gated hidden `personal-provider-control` delegates owned inherited startup/control descriptors to the fixed server helper; ordinary startup unchanged. Clap `Cli`/`Command` defs, all flags, `main()` dispatch, `parse_port` (`$PORT` fallback), `#[global_allocator]` mimalloc, tracing→stderr, and the tokio runtime's explicit sizing (4 workers / 128 blocking — see the invariants below). The crate's only tests (CLI parse assertions). |
+| `main.rs` | Feature-gated hidden `personal-provider-control` delegates owned inherited startup/control descriptors to the fixed server helper; ordinary startup unchanged. Separate required-feature hidden `serve --provider-github-fixture` selects only the fixed protected synthetic GitHub pairing task, with no origin/path/token/command argument. Clap `Cli`/`Command` defs, all flags, `main()` dispatch, `parse_port` (`$PORT` fallback), `#[global_allocator]` mimalloc, tracing→stderr, and the tokio runtime's explicit sizing (4 workers / 128 blocking — see the invariants below). The crate's only tests (CLI parse assertions). |
 | `connect.rs` | `connect <host>`: calls `chimaera_remote::connect` with a progress closure, records the host, opens the tunnel URL, holds until Ctrl-C. |
 | `daemonize.rs` | `serve --daemonize`: fork + `setsid` + re-exec so the daemon outlives its launching shell/ssh channel; re-points non-regular-file stdio at `/dev/null` (a caller's log redirect is kept). |
 | `status.rs` | `status [host]`: local reads `chimaera_core::Manifest`; remote goes through `chimaera_remote`. A manifest another login node wrote is reported as registered there, never as running or stale. |

@@ -264,3 +264,7 @@ impl Config {
 #[cfg(test)]
 #[path = "provider_claude_child_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "provider_claude_official_tests.rs"]
+mod official_tests;

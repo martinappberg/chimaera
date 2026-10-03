@@ -78,6 +78,8 @@ pub use cloud::providers::authority as provider_control;
 pub use cloud::providers::control_service::run as run_personal_provider_control;
 pub use job_host::run as run_job_host;
 pub use lifecycle::run;
+#[cfg(feature = "provider-github-fixture")]
+pub use lifecycle::run_provider_github_fixture;
 /// `chimaera plugin caps <plugin.toml>`: a manifest's tier, capability
 /// digest and Can list, as the lock and the card record them.
 pub use plugins::capabilities::describe_manifest as plugin_capabilities;

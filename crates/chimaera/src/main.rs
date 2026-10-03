@@ -42,6 +42,10 @@ enum Command {
         /// the bearer token is the gate.
         #[arg(long)]
         bind_routable: bool,
+        /// Disposable protected fixed GitHub consumer acceptance only.
+        #[cfg(feature = "provider-github-fixture")]
+        #[arg(long, hide = true)]
+        provider_github_fixture: bool,
     },
     /// Fixed supervisor-only provider control; never a daemon/project route.
     #[cfg(feature = "provider-authority-prototype")]
@@ -378,16 +382,23 @@ async fn dispatch(command: Command) -> anyhow::Result<()> {
         Command::Serve {
             port,
             bind_routable,
+            #[cfg(feature = "provider-github-fixture")]
+            provider_github_fixture,
             ..
         } => {
             // `--port` wins; else honor $PORT (twelve-factor) so autoPort dev
             // tooling and PaaS can assign it; else the OS picks a free port.
             let port = port.or_else(|| parse_port(std::env::var("PORT").ok()));
-            chimaera_server::run(chimaera_server::ServerConfig {
+            let config = chimaera_server::ServerConfig {
                 port,
                 routable_bind: bind_routable,
-            })
-            .await
+            };
+            #[cfg(feature = "provider-github-fixture")]
+            if provider_github_fixture {
+                anyhow::ensure!(!bind_routable, "Fixture requires loopback binding");
+                return chimaera_server::run_provider_github_fixture(config).await;
+            }
+            chimaera_server::run(config).await
         }
         #[cfg(feature = "provider-authority-prototype")]
         Command::PersonalProviderControl {
@@ -694,5 +705,33 @@ mod tests {
             Command::Connect { update_daemon, .. } => assert!(!update_daemon),
             _ => panic!("expected connect"),
         }
+    }
+    #[cfg(feature = "provider-github-fixture")]
+    #[test]
+    fn fixed_github_fixture_flag_defaults_off_and_accepts_no_selector() {
+        let normal = Cli::try_parse_from(["chimaera", "serve"]).unwrap();
+        assert!(matches!(
+            normal.command,
+            Command::Serve {
+                provider_github_fixture: false,
+                ..
+            }
+        ));
+        let selected =
+            Cli::try_parse_from(["chimaera", "serve", "--provider-github-fixture"]).unwrap();
+        assert!(matches!(
+            selected.command,
+            Command::Serve {
+                provider_github_fixture: true,
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from([
+            "chimaera",
+            "serve",
+            "--provider-github-fixture",
+            "https://github.com"
+        ])
+        .is_err());
     }
 }

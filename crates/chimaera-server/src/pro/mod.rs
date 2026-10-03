@@ -21,6 +21,8 @@ mod shadow_cache;
 mod transport;
 mod trash;
 pub(crate) use drain::{cancel as cancel_drain, start as drain};
+#[cfg(all(target_os = "linux", feature = "provider-github-fixture"))]
+pub(crate) use execution::start_github_fixture;
 pub(crate) use kept::{
     file as kept_file, list as kept_list, resolve as kept_resolve, resolve_all as kept_resolve_all,
 };

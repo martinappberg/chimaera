@@ -36,6 +36,10 @@ pub(super) mod provider_client;
 #[cfg(all(unix, feature = "provider-authority-prototype"))]
 #[allow(dead_code)]
 pub(super) mod provider_github;
+#[cfg(all(target_os = "linux", feature = "provider-github-fixture"))]
+mod provider_github_fixture;
+#[cfg(all(target_os = "linux", feature = "provider-github-fixture"))]
+pub(crate) use provider_github_fixture::start as start_github_fixture;
 #[cfg(all(unix, feature = "provider-authority-prototype"))]
 pub(super) mod provider_ready;
 #[cfg(all(unix, feature = "provider-authority-prototype"))]

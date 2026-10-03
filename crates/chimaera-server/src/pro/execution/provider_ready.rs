@@ -479,6 +479,34 @@ async fn exchange(request: &wire::Request, bytes: &[u8], path: &Path) -> Result<
     Ok(inactive)
 }
 
+/// Read-only fixture evidence from the actual retained Ready publisher. It does
+/// not mint a synthetic proof, alter phase or authorize ordinary execution.
+#[cfg(all(target_os = "linux", feature = "provider-github-fixture"))]
+pub(super) fn fixture_verified(state: &AppState) -> Result<bool, wire::Error> {
+    let pending = pending(state).ok_or(wire::Error::Inactive)?;
+    pending
+        .protection
+        .current()
+        .map_err(|_| wire::Error::StateChanged)?;
+    let inner = lock(&pending.ready.inner);
+    match inner.phase {
+        Phase::Staged | Phase::Checking => Ok(false),
+        Phase::Closed => Err(wire::Error::StateChanged),
+        Phase::Verified => {
+            let generation = inner
+                .work
+                .as_ref()
+                .ok_or(wire::Error::StateChanged)?
+                .generation;
+            if current(state, &pending, generation) {
+                Ok(true)
+            } else {
+                Err(wire::Error::StateChanged)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "provider_ready_tests.rs"]
 pub(super) mod tests;
