@@ -104,6 +104,8 @@ provides the exact supported restrictions. Values are nonempty UTF-8, at most
 escaping, and rejects duplicate and unknown fields. Value-bearing types have
 no debug representation; request/error logging must not include their bytes.
 Catalog/status bodies have a 1 MiB ceiling and contain no values or value hashes.
+Catalog pages contain at most 64 projects so the maximum name lengths and both
+applied/pending lists fit that ceiling; pagination is passive.
 
 An operation UUID never authorizes re-submitting a value. Once accepted, the
 trusted worker owns bounded persistence and cleanup even if the caller leaves.
@@ -112,6 +114,74 @@ payload under an old operation ID refuses; responses never reveal whether a
 guessed value matches stored data. At most 16 requests and four pending writes
 are admitted per personal worker, with queue/backpressure limits retained until
 the actual owned work and cleanup end.
+
+### Redacted replies and catalog pagination
+
+The external catalog is exactly
+`{version:1,project_secrets:1,name_policy,projects,next}`. A project is exactly
+`{workspace_id,revision,applied_names,pending,state}`. `revision` is its current
+positive registered grant revision; this is the `expected_revision` used by a
+command. `applied_names` and every pending name list are sorted and distinct,
+with the existing 32-name limit. `pending` is required and is either JSON null
+or `{operation_id,base_revision,names}`; the base revision must equal the shown
+project revision. It describes staged additions/replacements, never values.
+
+The closed project `state` is `ready`, `applying` or `unavailable`. Ready means
+the registered grant may receive a fresh authorized command, not that a daemon
+is running, idle or reachable. Applying means an owned durable transition is
+incomplete. Its revision and names describe the stored transition, not usable
+runtime values or an applied receipt. Unavailable covers a revoked, unenrolled or otherwise unusable
+registration without exposing process/storage details. Neither non-ready state
+permits a new command. A failed catalog request must not be rendered as an empty
+project list or as removed access.
+
+`name_policy` is exactly
+`{max_name_bytes:128,max_value_bytes:8192,max_names:32,reserved_names,reserved_prefixes}`.
+Both restriction lists contain at most 128 distinct sorted uppercase ASCII
+names/prefixes, each at most 128 bytes; they are the actual worker restrictions,
+not a client-maintained guess. The existing syntax rules remain mandatory. A
+missing, malformed or unknown policy refuses value entry until a fresh supported
+catalog is available. The worker still validates the name at the final command.
+
+Rows are ordered by stable workspace ID. The first page has no cursor; a later
+request uses the single optional query `after=<previous next>`, containing one
+valid stable ID. `next` is required, null at the end or the last returned ID when
+more rows existed. It is a pagination position, not a capability. A nonterminal
+page must make progress. Clients collect at most four pages and 128 distinct
+projects, rejecting duplicate IDs, reversed cursors or inconsistent policy.
+Changes between pages may require an explicit refresh; pagination is not an
+atomic catalog snapshot and cannot bypass command CAS. A status refresh never
+starts, wakes, enrolls or changes a project.
+
+A successful command or original-device operation read returns exactly
+`{version:1,operation_id,workspace_id,base_revision,result_revision,names,outcome}`.
+The names are the complete batch affected by that original decision. Required
+`result_revision` is JSON null for queued/canceled outcomes, and the positive new
+revision for applying/applied outcomes. An applying revision is still fenced;
+only `applied` confirms cleanup and the remote floor. The closed outcome is `queued`, `applying`, `applied` or
+`canceled`. A canceled queue keeps its original base revision and does not claim
+an environment change. Unknown/invalid replies cannot become success. Clients
+correlate the exact operation/workspace and original base revision before
+displaying a receipt. Queued/applying reads may later advance; polling does not
+advance them. A lost response remains visibly unconfirmed until such a receipt
+establishes the result.
+
+A stale-state command returns HTTP409 and exactly
+`{version:1,error:"state_changed",project:<current redacted project or null>}`.
+Null means no current usable catalog row was obtained, not deletion or cleanup
+proof. The supplied operation remains unaccepted unless its original receipt
+independently says otherwise. Missing, expired or wrong-device receipts share
+the same fixed HTTP404 `operation_unavailable` response; never reveal another
+device's operation. Other fixed errors are `unsupported`, `invalid_request`,
+`limit_reached` and `unavailable`. Error bodies contain only `{version:1,error}`;
+they never echo input, a value digest, OS output or serializer diagnostics.
+
+The private catalog uses these same redacted rows, policy and pagination, plus
+the exact `project_secrets_control` acknowledgment below. It never serializes
+the registry's internal project state directly. Keeper strips that private
+acknowledgment before external replies. Private command/receipt replies use the
+same receipt shape; the keeper rechecks original device ownership and current
+registration before exposing them.
 
 ## Durable queue and application
 
@@ -277,6 +347,37 @@ authenticated current personal-worker registration, with a separately negotiated
 catalog or the worker's ordinary shared daemon cannot supply that acknowledgment.
 Replacing or withdrawing the registration immediately closes command admission.
 No ordinary startup enables this bridge before the acceptance gate below.
+
+The optional worker registration field is a closed
+`project_secrets_control:{version:1,account_id,holder_id,process_boot,registration_generation,worker_credential_digest,capability}`.
+IDs use the bounds above, process boot is a canonical UUID, and the registration
+generation is positive, nonwrapping and durably advanced before a new control
+lifetime. The digest is the lowercase SHA-256 of the current worker credential.
+Capability is an independent random 256-bit, 43-character unpadded base64url
+secret, retained only by this supervisor and its keeper; provider capabilities
+cannot be reused. It never reaches a project, public reply or log.
+
+Keeper accepts this field only from the account-validated current personal
+worker, through its existing fixed registration route/address. It probes the
+fixed private catalog with both that worker bearer and
+`X-Chimaera-Project-Secrets-Control: <capability>`, then requires the exact closed
+acknowledgment `{version:1,account_id,holder_id,process_boot,registration_generation,worker_credential_digest}`
+before acknowledging registration with that same object. Every private route
+requires both credentials without duplicate headers. Before registration ACK,
+only this passive catalog probe is allowed; commands and receipt reads refuse.
+Provider-only registration and the ordinary shared daemon cannot answer it.
+
+A registration exchange owns one original five-second deadline including the
+probe. Late replies cannot activate an expired/replaced registration. Exact
+same-generation replay requires identical credential, capability, boot and
+address; mismatched or lower generations refuse. Replacing or withdrawing the
+current worker closes the previous shared revocation guard before subsequent
+commands/callbacks. The worker's one-use authorization proof captures that same
+guard and rechecks it at its serialized final effect, including after blocking
+registry waits. An already durable Applying continuation retains cleanup
+ownership but never restores the old registration. Process boot and control
+generation are transient ingress bindings; they do not change the durable
+queue's original admission tuple or invalidate it on an ordinary worker restart.
 
 The worker exposes only these fixed supervisor routes to its authenticated
 keeper. They are not forwarded into a project namespace:
