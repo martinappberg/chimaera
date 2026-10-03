@@ -316,8 +316,14 @@ keeper/worker authority for the same account, plus the exact original tuple and
 hashed admission authority, but not a still-live original device or old project
 revision. This permits cleanup after revocation without resurrecting authority.
 It marks the row terminal irreversibly and is idempotent while the tombstone is
-retained. A retired or missing row cannot authorize application; retirement of a
-missing row refuses. Admission never re-creates a retained retired operation.
+retained. A retired or missing row cannot authorize application. Retirement of a
+missing row creates a terminal tombstone for the exact supplied tuple and hashed
+authority, under the same current-service checks and transaction locks as an
+existing retirement. This is cleanup of an already durable worker preparation,
+not a new personal admission or execution grant. The account enforces the same
+1024 retained-row bound before creating this tombstone. Admission never
+re-creates a retained retired operation, including when an earlier admission RPC
+only reaches its transaction after cleanup.
 After all bounded receipts have expired, a genuinely new explicit full-device
 decision is required; status, recovery and automatic application cannot create
 an admission. UUIDs alone do not prove an unlimited replay history. The worker
@@ -430,12 +436,80 @@ the change. Expiry before that effect leaves the queue unchanged. Once durable
 application begins, its cleanup and floor-confirmation continuation remains
 owned even when the observer disconnects or the proof subsequently expires.
 
-Only the trusted encrypted queue stores the admission tuple and authority.
+Only the trusted encrypted Registry durably stores the admission tuple and authority.
 Automatic application reuses that exact original bundle after restart, while
 retirement preserves it until positive account acknowledgment. A lost admission
 or queue response never causes value resubmission. Catalog and operation reads
 remain passive; controller recovery may finish an already durable applying
 transition but cannot manufacture a new queued intent or execution grant.
+
+## Durable preparation before account admission
+
+Before the keeper's first account admission RPC for a `set`, the exact tuple and
+random authority must already have a durable encrypted cleanup owner in the
+worker Registry. The preparation contains no custom value or value fingerprint,
+does not change applied or pending values, and is not a queued receipt. Only the
+current supervisor's separately negotiated secret control accepts these fixed
+private routes, with both worker bearer and secret-control capability as above:
+
+| Method and path | Closed body and acknowledgment |
+| --- | --- |
+| `POST /internal/v1/personal/project-secrets/preparations` | `{version:1,authorization,device_authority,expires_in_ms}` → `{version:1,prepared:true,authorization,remaining_ms}` |
+| `POST /internal/v1/personal/project-secrets/preparations/close` | `{version:1,authorization,device_authority}` → `{version:1,closed:true,authorization}` |
+
+Both bodies and replies are at most 12 KiB. `authorization` is the exact closed
+`set` tuple above; `device_authority` is its canonical 43-byte authority.
+`expires_in_ms` and a successful `remaining_ms` are integers in `1..30000`.
+The keeper supplies only the remaining original 30-second explicit-command
+budget and retains its own original deadline. The worker fixes a monotonic
+deadline from preparation request intake, including body, queue and storage
+waits. Transit cannot extend keeper command authority: every eventual queue
+still needs the original live keeper command and fresh account callback.
+
+Preparation checks the current project revision, pending identity, resulting
+name list and unchanged supervisor enrollment under the Registry's exclusive
+writer. It fsyncs its exact immutable tuple and encrypted authority before
+acknowledgment. The keeper must receive a positive exact preparation reply
+before sending any account admission RPC. A retry for the same tuple and
+authority can return only the existing remaining lifetime; it cannot restart
+the deadline. A different tuple or authority, an expired/closed preparation or
+a retained operation receipt refuses. Unsupported or lost preparation replies
+never fall back to account admission or an older worker command.
+
+The final queue write requires that same preparation to remain open after fresh
+callback proof consumption. One Registry transaction promotes it into the
+existing encrypted pending batch and real original-device receipt, preserving
+the exact revision/pending/name CAS and reused-operation checks. The preparation
+cannot be separately deleted before this promotion. A successfully queued batch
+has no time expiry and retains the existing durable application/retirement flow.
+Until promotion, external status remains unconfirmed: neither a preparation nor
+its cleanup tombstone fabricates a queued, canceled or applied receipt.
+
+Restart and secret-control withdrawal/replacement permanently close every
+unpromoted preparation. The bounded monotonic preparation deadline also closes
+it; a stored preparation cannot restore a deadline after restart. Explicit close
+is an actor-serialized barrier: it persists the closed fence before acknowledging
+and forbids later promotion under that operation. If a real operation receipt
+already exists, close refuses and the real queued transition owns retirement.
+Unknown or mismatched close requests also refuse. Preparation, close, expiry and
+recovery never wake, launch, stop or edit a project.
+
+The worker retains the closed encrypted cleanup recipe through lost replies,
+outages and restart until the current keeper/account positively acknowledges
+exact retirement. Only after closing/serializing against final promotion may it
+send that retirement. The account's missing-row tombstone ensures a late old
+admission RPC cannot recreate a live row. A keeper closes its original callback
+decision before asking the worker to close; an ambiguous queue response first
+resolves the original worker receipt, never resubmits the value. Recovery can
+retire a preparation but cannot create or refresh a personal admission.
+
+Preparing operations plus actual pending batches have a combined bound of 128;
+all retained preparations and operation receipts have a combined bound of 1024.
+Capacity refusal preserves older live work and cleanup recipes. Closed
+preparation tombstones remain for at least 24 hours and are eligible for bounded
+eviction only after positive retirement acknowledgment. An unresolved recipe is
+never removed because its deadline or a correlation window expired. These
+limits supplement the Registry's existing whole-file byte ceiling.
 
 ## Active-runtime automatic idle fence
 
