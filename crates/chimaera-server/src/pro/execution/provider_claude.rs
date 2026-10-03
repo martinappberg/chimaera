@@ -259,7 +259,7 @@ async fn header_socket(
 fn authorized(
     request: &Request<Incoming>,
     state: &FrontendState,
-) -> Result<(wire::ClaudeRoute, u64), wire::Error> {
+) -> Result<(wire::ClaudeRoute, u64, wire::ClaudeRequestHeaders), wire::Error> {
     if state.broken.load(Ordering::Acquire) {
         return Err(wire::Error::StateChanged);
     }
@@ -316,7 +316,13 @@ fn authorized(
     }
     let length = length.parse().map_err(|_| wire::Error::InvalidRequest)?;
     wire::BodyCount::new(length)?;
-    Ok((route, length))
+    let headers = wire::ClaudeRequestHeaders::from_http(
+        one("anthropic-version")?,
+        one("anthropic-beta")?,
+        one("user-agent")?,
+        route,
+    )?;
+    Ok((route, length, headers))
 }
 fn refusal(error: wire::Error) -> Response<Body> {
     let status = match error {
@@ -341,16 +347,17 @@ async fn handle(
     state: Arc<FrontendState>,
     retained: Arc<Mutex<Option<Arc<Owner>>>>,
 ) -> Result<Response<Body>, Infallible> {
-    let (route, length) = match authorized(&request, &state) {
+    let (route, length, headers) = match authorized(&request, &state) {
         Ok(v) => v,
         Err(e) => return Ok(refusal(e)),
     };
     let started = Instant::now();
     let owner = match Owner::for_child(
         &state.child,
-        wire::Command::ClaudeStream {
+        wire::Command::ClaudeStreamPinned {
             route,
             content_length: length,
+            headers,
         },
         started + state.request_time,
     ) {

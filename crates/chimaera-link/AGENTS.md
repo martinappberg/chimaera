@@ -6,7 +6,7 @@
 | [SSH_AUTH.md](SSH_AUTH.md) | Disabled-until-verified destination-bound native signing grants; no general agent forwarding |
 | [CLUSTER.md](CLUSTER.md) | Capability-gated typed cluster control, job-scoped transports and account rollout job holds; implementation advertises only verified support |
 | [HANDOFF.md](HANDOFF.md) | Additive baton, mirror credential and scoped daemon delegation contracts |
-| [PROVIDERS.md](PROVIDERS.md) | Optional fixed personal-control login adapter and separate project-runtime provider authority; neither is enabled by contract publication |
+| [PROVIDERS.md](PROVIDERS.md) | Optional fixed personal-control login adapter and separate project-runtime provider authority, including additive bounded pinned Claude request metadata; neither is enabled by contract publication |
 | `src/providers.rs` / `src/client/providers.rs` / `tests/providers.rs` | Core closed personal-provider DTO reexports, positive deployment mode/context and exact registration/generation preflight, bounded owned one-shot sends and original-parent recovery; synthetic loopback does not establish provider vendor or startup acceptance. |
 | [PROJECT_SECRETS.md](PROJECT_SECRETS.md) | Disabled selected-project secret control, durable idle queue, explicit apply/removal and personal-authority boundaries |
 | `src/project_secrets.rs` / `src/client/project_secrets.rs` | Closed write-only personal secret commands, fresh catalog/policy/CAS preflight, fixed errors, bounded owned single send and original-operation reads; adapter context is equality only |

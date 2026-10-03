@@ -175,14 +175,16 @@ async fn frame(socket: &mut UnixStream, kind: u8, body: &[u8]) {
 }
 
 async fn answer(socket: &mut UnixStream, req: &wire::Request) -> wire::ClaudeRoute {
-    let wire::Command::ClaudeStream {
+    let wire::Command::ClaudeStreamPinned {
         route,
         content_length,
+        headers,
     } = &req.command
     else {
         panic!("unexpected official CLI fixture command")
     };
     let (route, content_length) = (*route, *content_length);
+    assert!(headers.validate(route).is_ok());
     assert!(content_length <= 1024 * 1024);
     let mut uploaded = Zeroizing::new(Vec::with_capacity(1024 * 1024));
     loop {

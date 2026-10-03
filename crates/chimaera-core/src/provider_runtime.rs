@@ -215,6 +215,200 @@ pub enum ClaudeRoute {
     Messages,
     CountTokens,
 }
+/// Nonsecret compatibility metadata for the exact reviewed CLI, never auth.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClaudeVersion {
+    #[serde(rename = "2023-06-01")]
+    V20230601,
+}
+impl ClaudeVersion {
+    pub fn as_str(self) -> &'static str {
+        "2023-06-01"
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClaudeUserAgent {
+    #[serde(rename = "claude-cli/2.1.287 (external, cli)")]
+    Cli21287,
+}
+impl ClaudeUserAgent {
+    pub fn as_str(self) -> &'static str {
+        "claude-cli/2.1.287 (external, cli)"
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClaudeBeta {
+    #[serde(rename = "claude-code-20250219")]
+    ClaudeCode,
+    #[serde(rename = "oauth-2025-04-20")]
+    Oauth,
+    #[serde(rename = "interleaved-thinking-2025-05-14")]
+    InterleavedThinking,
+    #[serde(rename = "redact-thinking-2026-02-12")]
+    RedactThinking,
+    #[serde(rename = "thinking-token-count-2026-05-13")]
+    ThinkingTokenCount,
+    #[serde(rename = "context-management-2025-06-27")]
+    ContextManagement,
+    #[serde(rename = "prompt-caching-scope-2026-01-05")]
+    PromptCachingScope,
+    #[serde(rename = "mid-conversation-system-2026-04-07")]
+    MidConversationSystem,
+    #[serde(rename = "per-turn-control-2026-07-01")]
+    PerTurnControl,
+    #[serde(rename = "mid-conversation-tool-changes-2026-07-01")]
+    MidConversationToolChanges,
+    #[serde(rename = "effort-2025-11-24")]
+    Effort,
+    #[serde(rename = "structured-outputs-2025-12-15")]
+    StructuredOutputs,
+    #[serde(rename = "dangerous-tool-use-2026-09-03")]
+    DangerousToolUse,
+    #[serde(rename = "thinking-display-updates-2026-08-18")]
+    ThinkingDisplayUpdates,
+    #[serde(rename = "afk-mode-2026-01-31")]
+    AfkMode,
+    #[serde(rename = "extended-cache-ttl-2025-04-11")]
+    ExtendedCacheTtl,
+    #[serde(rename = "token-counting-2024-11-01")]
+    TokenCounting,
+}
+impl ClaudeBeta {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude-code-20250219",
+            Self::Oauth => "oauth-2025-04-20",
+            Self::InterleavedThinking => "interleaved-thinking-2025-05-14",
+            Self::RedactThinking => "redact-thinking-2026-02-12",
+            Self::ThinkingTokenCount => "thinking-token-count-2026-05-13",
+            Self::ContextManagement => "context-management-2025-06-27",
+            Self::PromptCachingScope => "prompt-caching-scope-2026-01-05",
+            Self::MidConversationSystem => "mid-conversation-system-2026-04-07",
+            Self::PerTurnControl => "per-turn-control-2026-07-01",
+            Self::MidConversationToolChanges => "mid-conversation-tool-changes-2026-07-01",
+            Self::Effort => "effort-2025-11-24",
+            Self::StructuredOutputs => "structured-outputs-2025-12-15",
+            Self::DangerousToolUse => "dangerous-tool-use-2026-09-03",
+            Self::ThinkingDisplayUpdates => "thinking-display-updates-2026-08-18",
+            Self::AfkMode => "afk-mode-2026-01-31",
+            Self::ExtendedCacheTtl => "extended-cache-ttl-2025-04-11",
+            Self::TokenCounting => "token-counting-2024-11-01",
+        }
+    }
+    fn parse(value: &str) -> Result<Self, Error> {
+        match value {
+            "claude-code-20250219" => Ok(Self::ClaudeCode),
+            "oauth-2025-04-20" => Ok(Self::Oauth),
+            "interleaved-thinking-2025-05-14" => Ok(Self::InterleavedThinking),
+            "redact-thinking-2026-02-12" => Ok(Self::RedactThinking),
+            "thinking-token-count-2026-05-13" => Ok(Self::ThinkingTokenCount),
+            "context-management-2025-06-27" => Ok(Self::ContextManagement),
+            "prompt-caching-scope-2026-01-05" => Ok(Self::PromptCachingScope),
+            "mid-conversation-system-2026-04-07" => Ok(Self::MidConversationSystem),
+            "per-turn-control-2026-07-01" => Ok(Self::PerTurnControl),
+            "mid-conversation-tool-changes-2026-07-01" => Ok(Self::MidConversationToolChanges),
+            "effort-2025-11-24" => Ok(Self::Effort),
+            "structured-outputs-2025-12-15" => Ok(Self::StructuredOutputs),
+            "dangerous-tool-use-2026-09-03" => Ok(Self::DangerousToolUse),
+            "thinking-display-updates-2026-08-18" => Ok(Self::ThinkingDisplayUpdates),
+            "afk-mode-2026-01-31" => Ok(Self::AfkMode),
+            "extended-cache-ttl-2025-04-11" => Ok(Self::ExtendedCacheTtl),
+            "token-counting-2024-11-01" => Ok(Self::TokenCounting),
+            _ => Err(Error::InvalidRequest),
+        }
+    }
+}
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaudeRequestHeaders {
+    pub version: ClaudeVersion,
+    pub user_agent: ClaudeUserAgent,
+    pub beta: Vec<ClaudeBeta>,
+}
+impl ClaudeRequestHeaders {
+    pub fn from_http(
+        version: &str,
+        beta: &str,
+        user_agent: &str,
+        route: ClaudeRoute,
+    ) -> Result<Self, Error> {
+        if version != ClaudeVersion::V20230601.as_str()
+            || user_agent != ClaudeUserAgent::Cli21287.as_str()
+            || beta.is_empty()
+            || beta.len() > 512
+            || beta.split(',').count() > 17
+        {
+            return Err(Error::InvalidRequest);
+        }
+        let headers = Self {
+            version: ClaudeVersion::V20230601,
+            user_agent: ClaudeUserAgent::Cli21287,
+            beta: beta
+                .split(',')
+                .map(ClaudeBeta::parse)
+                .collect::<Result<_, _>>()?,
+        };
+        headers.validate(route)?;
+        Ok(headers)
+    }
+    fn validate_atoms(&self) -> Result<usize, Error> {
+        if self.beta.is_empty() || self.beta.len() > 17 {
+            return Err(Error::InvalidRequest);
+        }
+        let mut seen = 0u32;
+        let mut length = self.beta.len() - 1;
+        for beta in &self.beta {
+            let bit = 1u32 << (*beta as u32);
+            if seen & bit != 0 {
+                return Err(Error::InvalidRequest);
+            }
+            seen |= bit;
+            length += beta.as_str().len();
+        }
+        if length > 512 {
+            return Err(Error::InvalidRequest);
+        }
+        Ok(length)
+    }
+    pub fn validate(&self, route: ClaudeRoute) -> Result<(), Error> {
+        self.validate_atoms()?;
+        use ClaudeBeta::*;
+        if !self.beta.contains(&ClaudeCode) || !self.beta.contains(&Oauth) {
+            return Err(Error::InvalidRequest);
+        }
+        match route {
+            ClaudeRoute::Messages if self.beta.contains(&TokenCounting) => {
+                Err(Error::InvalidRequest)
+            }
+            ClaudeRoute::CountTokens
+                if self.beta
+                    != [
+                        ClaudeCode,
+                        Oauth,
+                        InterleavedThinking,
+                        ContextManagement,
+                        TokenCounting,
+                    ] =>
+            {
+                Err(Error::InvalidRequest)
+            }
+            _ => Ok(()),
+        }
+    }
+    /// Bounded fixed atoms only; callers separately validate the admitted route.
+    pub fn beta_header(&self) -> Result<String, Error> {
+        let length = self.validate_atoms()?;
+        let mut value = String::with_capacity(length);
+        for beta in &self.beta {
+            if !value.is_empty() {
+                value.push(',');
+            }
+            value.push_str(beta.as_str());
+        }
+        Ok(value)
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
@@ -229,9 +423,15 @@ pub enum Command {
         protocol: String,
         host: String,
     },
+    // Preserved wire shape; canonical subscription adapters refuse headerless requests.
     ClaudeStream {
         route: ClaudeRoute,
         content_length: u64,
+    },
+    ClaudeStreamPinned {
+        route: ClaudeRoute,
+        content_length: u64,
+        headers: ClaudeRequestHeaders,
     },
 }
 impl Command {
@@ -249,10 +449,12 @@ impl Command {
                 Err(Error::InvalidRequest)
             }
             Self::ClaudeStream { content_length, .. }
+            | Self::ClaudeStreamPinned { content_length, .. }
                 if *content_length == 0 || *content_length > BODY_MAX =>
             {
                 Err(Error::InvalidRequest)
             }
+            Self::ClaudeStreamPinned { route, headers, .. } => headers.validate(*route),
             _ => Ok(()),
         }
     }
@@ -428,9 +630,10 @@ impl Response {
                 Reply::GithubAccess { access },
                 Command::GithubGhAccess {} | Command::GithubHttpsCredentials { .. },
             ) => access.validate(),
-            (Reply::ClaudeHead { head }, Command::ClaudeStream { route, .. }) => {
-                head.validate(*route)
-            }
+            (
+                Reply::ClaudeHead { head },
+                Command::ClaudeStream { route, .. } | Command::ClaudeStreamPinned { route, .. },
+            ) => head.validate(*route),
             _ => Err(Error::StateChanged),
         }
     }

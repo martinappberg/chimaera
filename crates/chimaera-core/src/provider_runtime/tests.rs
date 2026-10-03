@@ -243,3 +243,105 @@ fn startup_payload_is_bounded_closed_and_matches_the_exact_expected_binding() {
     );
     assert!(StartupPayload::decode(duplicate.as_bytes()).is_err());
 }
+
+fn pinned_headers_value() -> Value {
+    json!({"version":"2023-06-01", "user_agent":"claude-cli/2.1.287 (external, cli)", "beta":["claude-code-20250219","oauth-2025-04-20"]})
+}
+#[test]
+fn pinned_claude_metadata_preserves_order_and_refuses_unknown_duplicate_or_transport_values() {
+    let command = json!({"type":"claude_stream_pinned","route":"messages","content_length":10,"headers":pinned_headers_value()});
+    let good = request(command);
+    let r = Request::decode(&serde_json::to_vec(&good).unwrap()).unwrap();
+    let Command::ClaudeStreamPinned { headers, route, .. } = &r.command else {
+        panic!("wrong command");
+    };
+    assert!(headers.validate(*route).is_ok());
+    assert_eq!(
+        headers.beta_header().unwrap(),
+        "claude-code-20250219,oauth-2025-04-20"
+    );
+    for (path, value) in [
+        ("/command/headers/version", json!("2024-01-01")),
+        (
+            "/command/headers/user_agent",
+            json!("claude-cli/2.1.288 (external, cli)"),
+        ),
+        (
+            "/command/headers/beta",
+            json!(["claude-code-20250219", "oauth-2025-04-20", "arbitrary"]),
+        ),
+        (
+            "/command/headers/beta",
+            json!([
+                "claude-code-20250219",
+                "oauth-2025-04-20",
+                "oauth-2025-04-20"
+            ]),
+        ),
+        ("/command/headers/beta", json!(["oauth-2025-04-20"])),
+        (
+            "/command/headers/beta",
+            json!([
+                "claude-code-20250219",
+                "oauth-2025-04-20",
+                "token-counting-2024-11-01"
+            ]),
+        ),
+        ("/command/content_length", json!(BODY_MAX + 1)),
+        ("/command/route", json!("count_tokens")),
+    ] {
+        let mut bad = good.clone();
+        *bad.pointer_mut(path).unwrap() = value;
+        assert!(Request::decode(&serde_json::to_vec(&bad).unwrap()).is_err());
+    }
+    for name in ["authorization", "upstream", "x-api-key"] {
+        let mut bad = good.clone();
+        bad["command"]["headers"][name] = json!("selected");
+        assert!(Request::decode(&serde_json::to_vec(&bad).unwrap()).is_err());
+    }
+    let duplicate =
+        serde_json::to_string(&good)
+            .unwrap()
+            .replacen("\"beta\":", "\"beta\":[],\"beta\":", 1);
+    assert!(Request::decode(duplicate.as_bytes()).is_err());
+    // Existing v1 shape stays decodable; only the canonical adapter refuses it.
+    assert!(
+        parsed(json!({"type":"claude_stream","route":"messages","content_length":10}))
+            .validate()
+            .is_ok()
+    );
+}
+#[test]
+fn pinned_claude_http_metadata_is_bounded_and_count_tokens_has_its_exact_profile() {
+    let ua = "claude-cli/2.1.287 (external, cli)";
+    let count="claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,token-counting-2024-11-01";
+    let h =
+        ClaudeRequestHeaders::from_http("2023-06-01", count, ua, ClaudeRoute::CountTokens).unwrap();
+    assert_eq!(h.beta_header().unwrap(), count);
+    for bad in [
+        count.replacen(
+            "claude-code-20250219,oauth-2025-04-20",
+            "oauth-2025-04-20,claude-code-20250219",
+            1,
+        ),
+        "x".repeat(513),
+        "claude-code-20250219, oauth-2025-04-20".into(),
+        "claude-code-20250219,oauth-2025-04-20\r\nHost: other".into(),
+        "claude-code-20250219,oauth-2025-04-20,".into(),
+        std::iter::repeat_n("oauth-2025-04-20", 18)
+            .collect::<Vec<_>>()
+            .join(","),
+    ] {
+        assert!(
+            ClaudeRequestHeaders::from_http("2023-06-01", &bad, ua, ClaudeRoute::CountTokens)
+                .is_err()
+        );
+    }
+    let r = parsed(
+        json!({"type":"claude_stream_pinned","route":"count_tokens","content_length":10,"headers":h}),
+    );
+    let mut response = json!({"version":1,"binding":r.binding,"request_id":r.request_id,"result":{"type":"claude_head","head":{"status":200,"headers":{"content_type":"application/json","retry_after_seconds":null}}}});
+    assert!(Response::decode(&serde_json::to_vec(&response).unwrap(), &r).is_ok());
+    response["result"]["head"]["headers"]["content_type"] = json!("text/event-stream");
+    assert!(Response::decode(&serde_json::to_vec(&response).unwrap(), &r).is_err());
+}

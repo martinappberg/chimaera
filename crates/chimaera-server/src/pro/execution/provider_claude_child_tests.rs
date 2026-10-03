@@ -27,7 +27,7 @@ if {stall}:time.sleep(60)
 u=urllib.parse.urlsplit(os.environ['ANTHROPIC_BASE_URL'])
 assert u.hostname=='127.0.0.1'
 c=http.client.HTTPConnection(u.hostname,u.port,timeout=5)
-c.request('POST','/v1/messages?beta=true',body=b'{{}}',headers={{'Content-Type':'application/json','Authorization':'Bearer '+os.environ['CLAUDE_CODE_OAUTH_TOKEN']}})
+c.request('POST','/v1/messages?beta=true',body=b'{{}}',headers={{'Content-Type':'application/json','Anthropic-Version':'2023-06-01','Anthropic-Beta':'claude-code-20250219,oauth-2025-04-20','User-Agent':'claude-cli/2.1.287 (external, cli)','Authorization':'Bearer '+os.environ['CLAUDE_CODE_OAUTH_TOKEN']}})
 r=c.getresponse();assert r.status==200
 data=r.read(131073);assert len(data)<=131072
 sys.stdout.buffer.write(data)
@@ -99,7 +99,10 @@ async fn synthetic_child_uses_frontend_only_and_closes_group_before_activity_set
     });
     let (mut peer, req) = request(&fixture.listener).await;
     assert_eq!(std::fs::read(home.join("input-closed")).unwrap(), b"eof");
-    assert!(matches!(req.command, wire::Command::ClaudeStream { .. }));
+    assert!(matches!(
+        req.command,
+        wire::Command::ClaudeStreamPinned { .. }
+    ));
     answer(&mut peer, &req).await;
     let result = tokio::time::timeout(Duration::from_secs(8), task)
         .await

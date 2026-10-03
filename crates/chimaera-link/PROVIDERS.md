@@ -630,7 +630,52 @@ Only these closed commands exist (empty variants still reject extra fields):
   permits only that literal HTTPS Git helper target. URL/userinfo/port/path,
   another host/protocol and helper/argv/exec fields refuse.
 - `{type:"claude_stream",route:"messages"|"count_tokens",content_length}`
-  starts only the fixed subscription gateway route; content_length is1..16777216.
+  preserves the original headerless v1 shape. The canonical subscription adapter
+  refuses it as Unsupported; it cannot silently choose a beta profile.
+- `{type:"claude_stream_pinned",route:"messages"|"count_tokens",content_length,
+  headers:{version,user_agent,beta}}` carries only the reviewed pinned metadata;
+  content_length is1..16777216. `version` is exactly `"2023-06-01"`,
+  `user_agent` exactly `"claude-cli/2.1.287 (external, cli)"`, and `beta` an ordered
+  array of1..17 distinct closed atoms whose comma-joined value is at most512bytes.
+  Claude-code and OAuth atoms are mandatory. There are no caller-selected header
+  names, credentials, upstreams, TLS/proxy options or other metadata fields.
+
+The closed beta atoms are `claude-code-20250219`, `oauth-2025-04-20`,
+`interleaved-thinking-2025-05-14`, `redact-thinking-2026-02-12`,
+`thinking-token-count-2026-05-13`, `context-management-2025-06-27`,
+`prompt-caching-scope-2026-01-05`, `mid-conversation-system-2026-04-07`,
+`per-turn-control-2026-07-01`, `mid-conversation-tool-changes-2026-07-01`,
+`effort-2025-11-24`, `structured-outputs-2025-12-15`,
+`dangerous-tool-use-2026-09-03`, `thinking-display-updates-2026-08-18`,
+`afk-mode-2026-01-31`, `extended-cache-ttl-2025-04-11` and
+`token-counting-2024-11-01`. Messages refuses token-counting. CountTokens requires
+exactly the ordered five-atom array: claude-code, OAuth, interleaved-thinking,
+context-management, token-counting (with the full literal atoms above). The
+frontend requires exactly one of each version/beta/user-agent HTTP header and
+preserves the actual validated beta order. Missing, duplicate, unknown, oversized,
+control-bearing or changed-CLI metadata refuses before canonical credential or
+upstream effects; there is no headerless or ordinary provider fallback.
+
+This additive command keeps protocol version1 and all original commands intact.
+An older receiver rejects the new variant; Ready attests exact project authority,
+not support for a Claude command or credential availability. Matched adapter
+versions and actual canonical pairing are enablement gates. The contained
+2.1.287 CLI exercised print and actual TUI Messages/CountTokens against synthetic
+responses; its TUI emitted two distinct Messages beta sets and the CountTokens
+set. This does not establish real subscription, vendor, account entitlement or
+onboarding acceptance. Current managed2.1.288 compatibility must be separately
+verified before enablement, rather than accepting a changed User-Agent.
+
+The private receiver retains its original accept-time five-second budget for
+first-frame authentication and Ready/GitHub. Only authenticated
+`claude_stream_pinned` may use the original accept-time600-second maximum; gate
+and authentication time is included, never reseeded. Whole upload is at most
+30seconds and upstream idle reads at most60seconds, additionally bounded by the
+original request and exact project/connection lifetime. It checks exact upload
+end and client EOF before publishing a response head, without full-body
+buffering. One pull-driven at-most64KiB frame supplies upstream backpressure;
+there is no unbounded queue, redirect or inference replay. No status, body or
+metadata introduces additional authority.
 
 response_begin is exactly `{version:1,binding,request_id,result}`. The binding and
 request ID must match the accepted request. Closed result variants are:

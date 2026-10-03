@@ -68,7 +68,7 @@ impl Owner {
         deadline: Instant,
     ) -> Result<Self, wire::Error> {
         child.current()?;
-        if !matches!(command, wire::Command::ClaudeStream { .. }) {
+        if !matches!(command, wire::Command::ClaudeStreamPinned { .. }) {
             return Err(wire::Error::Unsupported);
         }
         let permit = WORK.try_acquire().map_err(|_| wire::Error::LimitReached)?;
