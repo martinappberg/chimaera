@@ -599,7 +599,7 @@ pub(crate) use execution::recovery_context as checkpoint_recovery_context;
 pub(crate) use execution::remote_owner_fixture as install_remote_owner_fixture;
 pub(crate) use execution::supervisor::{
     ack as supervisor_cleanup_ack, read_startup as read_supervisor_cleanup,
-    stage as stage_supervisor_cleanup,
+    stage_startup as stage_supervisor_cleanup,
 };
 #[cfg(test)]
 pub(crate) use execution::{

@@ -22,6 +22,16 @@ pub(crate) struct CleanupReceipt {
     launch_generation: u64,
     previous_generation: u64,
     os_boot_id: String,
+    #[cfg(unix)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    maintenance_control: Option<super::maintenance_startup::Control>,
+}
+/// Startup is moved exactly once. Cleanup evidence remains cloneable, while a
+/// selected maintenance descriptor is an owned, protected resource.
+pub(crate) struct Startup {
+    receipt: CleanupReceipt,
+    #[cfg(unix)]
+    maintenance: Option<super::maintenance_startup::Pending>,
 }
 #[derive(Clone, serde::Serialize)]
 pub(crate) struct CleanupAck {
@@ -52,7 +62,54 @@ fn decode(bytes: &[u8]) -> Result<CleanupReceipt> {
                 .all(|b| b.is_ascii_hexdigit() || b == b'-'),
         "invalid supervisor cleanup binding"
     );
+    #[cfg(unix)]
+    if let Some(control) = &receipt.maintenance_control {
+        control.validate(&receipt.maintenance_binding())?;
+    }
     Ok(receipt)
+}
+#[cfg(any(target_os = "linux", test))]
+impl CleanupReceipt {
+    fn maintenance_binding(&self) -> chimaera_core::project_secret_idle::Binding {
+        use chimaera_core::project_secret_idle::{Binding, RootIdentity};
+        Binding {
+            account_id: self.account_id.clone(),
+            workspace_id: self.workspace_id.clone(),
+            root_identity: RootIdentity {
+                device: self.root_identity.device,
+                inode: self.root_identity.inode,
+            },
+            registration_revision: self.registration_revision,
+            launch_generation: self.launch_generation,
+            os_boot_id: self.os_boot_id.clone(),
+        }
+    }
+}
+#[cfg(target_os = "linux")]
+fn own_startup(mut receipt: CleanupReceipt) -> Result<Startup> {
+    use std::os::fd::FromRawFd;
+    let maintenance = match receipt.maintenance_control.take() {
+        None => None,
+        Some(control) => {
+            let binding = receipt.maintenance_binding();
+            control.validate(&binding)?;
+            ensure!(
+                unsafe { nix::libc::fcntl(control.fd, nix::libc::F_GETFD) } >= 0,
+                "maintenance startup descriptor unavailable"
+            );
+            // The fixed envelope, read once before any child, transfers exactly
+            // this non-stdio descriptor. Cloneable receipt metadata retains no
+            // live descriptor and cannot perform this transfer a second time.
+            let descriptor = unsafe { std::os::fd::OwnedFd::from_raw_fd(control.fd) };
+            Some(super::maintenance_startup::Pending::transferred(
+                descriptor, control, binding,
+            )?)
+        }
+    };
+    Ok(Startup {
+        receipt,
+        maintenance,
+    })
 }
 #[cfg(any(target_os = "linux", test))]
 fn read_pipe(fd: std::os::fd::OwnedFd) -> Result<CleanupReceipt> {
@@ -111,7 +168,7 @@ fn read_pipe(fd: std::os::fd::OwnedFd) -> Result<CleanupReceipt> {
     }
     decode(&bytes)
 }
-pub(crate) async fn read_startup() -> Result<Option<CleanupReceipt>> {
+pub(crate) async fn read_startup() -> Result<Option<Startup>> {
     let Some(fd) = std::env::var_os("CHIMAERA_SUPERVISOR_CLEANUP_FD") else {
         return Ok(None);
     };
@@ -119,15 +176,36 @@ pub(crate) async fn read_startup() -> Result<Option<CleanupReceipt>> {
     #[cfg(target_os = "linux")]
     {
         use std::os::fd::FromRawFd;
+        static READ: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        ensure!(
+            !READ.swap(true, Ordering::AcqRel),
+            "supervisor startup already consumed"
+        );
         // The opt-in launcher transfers ownership of exactly descriptor 0.
         let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(0) };
-        tokio::task::spawn_blocking(move || read_pipe(fd))
+        tokio::task::spawn_blocking(move || own_startup(read_pipe(fd)?))
             .await?
             .map(Some)
     }
     #[cfg(not(target_os = "linux"))]
     anyhow::bail!("supervisor cleanup channel is only supported on Linux")
 }
+pub(crate) fn stage_startup(state: &AppState, startup: Option<Startup>) -> Result<()> {
+    let Some(startup) = startup else {
+        return Ok(());
+    };
+    let mut pending = lock(&state.pro.execution.supervisor_pending);
+    ensure!(pending.is_none(), "supervisor startup already staged");
+    #[cfg(unix)]
+    {
+        let mut maintenance = lock(&state.pro.execution.maintenance_pending);
+        ensure!(maintenance.is_none(), "maintenance startup already staged");
+        *maintenance = startup.maintenance;
+    }
+    *pending = Some(startup.receipt);
+    Ok(())
+}
+#[cfg(test)]
 pub(crate) fn stage(state: &AppState, receipt: Option<CleanupReceipt>) {
     *lock(&state.pro.execution.supervisor_pending) = receipt;
 }

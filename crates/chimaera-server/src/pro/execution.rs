@@ -2,12 +2,15 @@
 //! only an authenticated acquire/renew response can create a fresh local lease.
 mod launch;
 mod lease;
-// Disabled maintenance primitives: no startup channel or Prepared producer.
+// Disabled maintenance primitives: opt-in startup capture, no Ready or Prepared.
 #[allow(dead_code)]
 pub(super) mod maintenance;
 #[cfg(unix)]
 #[allow(dead_code)]
 pub(super) mod maintenance_channel;
+#[cfg(unix)]
+#[allow(dead_code)]
+pub(super) mod maintenance_startup;
 pub(crate) mod mutation;
 mod restart;
 pub(super) mod setup;
@@ -53,6 +56,8 @@ pub(super) struct State {
     /// Cleanup cannot repair unreadable enrollment or ownership state.
     supervisor_state_invalid: bool,
     supervisor_pending: Mutex<Option<supervisor::CleanupReceipt>>,
+    #[cfg(unix)]
+    maintenance_pending: Mutex<Option<maintenance_startup::Pending>>,
     supervisor_ack: Mutex<Option<supervisor::CleanupAck>>,
     /// The watchdog's latest tick (see `thawed`).
     tick: Mutex<Option<std::time::Instant>>,

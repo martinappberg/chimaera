@@ -110,6 +110,8 @@ impl State {
             boot,
             supervisor_state_invalid: unknown,
             supervisor_pending: Mutex::default(),
+            #[cfg(unix)]
+            maintenance_pending: Mutex::default(),
             supervisor_ack: Mutex::default(),
             tick: Mutex::default(),
             changed: tokio::sync::Notify::new(),

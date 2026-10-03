@@ -19,6 +19,38 @@ struct Fixture {
     root: PathBuf,
     project: PathBuf,
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn ordinary_startup_keeps_cleanup_metadata_without_process_hardening_or_duplicate_stage() {
+    let f = Fixture::new();
+    let state = f.state();
+    let mut absent = f.receipt(&state, 1, 0);
+    absent.maintenance_control = Some(super::super::maintenance_startup::Control {
+        version: 1,
+        fd: i32::MAX,
+        channel_nonce: "A".repeat(43),
+    });
+    assert!(own_startup(absent).is_err());
+    let dumpable = unsafe { nix::libc::prctl(nix::libc::PR_GET_DUMPABLE, 0, 0, 0, 0) };
+    let startup = own_startup(f.receipt(&state, 1, 0)).unwrap();
+    assert!(startup.maintenance.is_none());
+    assert!(startup.receipt.maintenance_control.is_none());
+    stage_startup(&state, Some(startup)).unwrap();
+    assert!(lock(&state.pro.execution.maintenance_pending).is_none());
+    assert!(stage_startup(&state, Some(own_startup(f.receipt(&state, 2, 1)).unwrap())).is_err());
+    assert_eq!(
+        lock(&state.pro.execution.supervisor_pending)
+            .as_ref()
+            .unwrap()
+            .launch_generation,
+        1
+    );
+    assert_eq!(
+        unsafe { nix::libc::prctl(nix::libc::PR_GET_DUMPABLE, 0, 0, 0, 0) },
+        dumpable
+    );
+}
 impl Fixture {
     fn new() -> Self {
         let root = std::env::temp_dir().join(format!(
