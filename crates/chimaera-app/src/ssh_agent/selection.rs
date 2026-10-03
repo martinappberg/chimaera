@@ -1,8 +1,11 @@
 //! Native-only SSH configuration, public host trust and agent identity selection.
-//! No private-key file or keeper-supplied path participates in this selection.
+//! Configured private files are captured only by the original native Connect.
+//! No keeper-supplied path participates in selection or loading.
 use super::{
-    packet::Reader, unix::UnixAgent, AgentConnection, Algorithms, GrantVerifier, Key, LocalAgent,
-    Policy,
+    key_agent::{Admission, Agent, CertificateFile, SelectedFile, Session},
+    packet::Reader,
+    unix::UnixAgent,
+    AgentConnection, Algorithms, GrantVerifier, Key, LocalAgent, Policy,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use chimaera_link::{
@@ -33,14 +36,14 @@ type Result<T> = std::result::Result<T, SelectionFailure>;
 
 pub(crate) struct Selection {
     pub(crate) request: SshAuthGrantRequest,
-    pub(crate) agent: UnixAgent,
+    pub(crate) agent: Agent,
     algorithms: Algorithms,
 }
 impl Selection {
     pub(crate) fn verifier(
         self,
         deadline: tokio::time::Instant,
-    ) -> std::result::Result<(SshAuthGrantRequest, GrantVerifier<UnixAgent>), super::Failure> {
+    ) -> std::result::Result<(SshAuthGrantRequest, GrantVerifier<Agent>), super::Failure> {
         let mut verifier = GrantVerifier::new(&self.request, deadline, self.agent)?;
         verifier.policy.algorithms = Some(self.algorithms);
         Ok((self.request, verifier))
@@ -103,7 +106,7 @@ async fn from_native_config_inner(
     Policy::new(&request).map_err(|_| SelectionFailure::UnsupportedConfiguration)?;
     Ok(Selection {
         request,
-        agent,
+        agent: Agent::external(agent),
         algorithms,
     })
 }
@@ -160,7 +163,7 @@ async fn select_user(
 
 #[derive(Clone)]
 pub(super) struct NativeIdentity {
-    pub(super) agent: Option<UnixAgent>,
+    pub(super) agent: Option<Agent>,
     pub(super) user_keys: Vec<String>,
     pub(super) mode: chimaera_link::SshRouteMode,
     algorithms: Algorithms,
@@ -196,31 +199,185 @@ pub(super) fn probe_details(
         policy: config.route_policy(identity.mode)?,
     })
 }
-pub(super) async fn native_identity(
+/// Every leg is parsed and captured before any unlock or host-trust effect.
+pub(super) struct PreparedIdentity {
+    pub(super) identity: NativeIdentity,
+    external: Option<UnixAgent>,
+    files: Vec<SelectedFile>,
+    certificates: Vec<CertificateFile>,
+    admission: Admission,
+}
+impl PreparedIdentity {
+    pub(super) fn needs_loading(&self) -> bool {
+        !self.files.is_empty()
+    }
+    pub(super) async fn finish(
+        self,
+        session: Option<&Session>,
+        owner: &super::trust::Owner,
+        deadline: tokio::time::Instant,
+    ) -> Result<NativeIdentity> {
+        if self.identity.mode == chimaera_link::SshRouteMode::Interactive {
+            return Ok(self.identity);
+        }
+        for certificate in &self.certificates {
+            certificate.check(&self.admission).await?;
+        }
+        let mut identity = self.identity;
+        let external_keys = identity.user_keys.clone();
+        let mut loaded = Vec::new();
+        for file in self.files {
+            let session = session.ok_or(SelectionFailure::Unavailable)?;
+            for certificate in &self.certificates {
+                certificate.check(&self.admission).await?;
+            }
+            let public = session.load(&file, owner, deadline).await?;
+            for certificate in &self.certificates {
+                certificate.check(&self.admission).await?;
+            }
+            let key = Key::parse(public.clone())
+                .map_err(|_| SelectionFailure::UnsupportedConfiguration)?;
+            if !identity.algorithms.offered(&key, false) {
+                return Err(SelectionFailure::UnsupportedConfiguration);
+            }
+            let encoded = STANDARD.encode(&public);
+            if !identity.user_keys.contains(&encoded) {
+                identity.user_keys.push(encoded);
+            }
+            if identity.user_keys.len() > SSH_AUTH_KEYS_MAX {
+                return Err(SelectionFailure::TooManyKeys);
+            }
+            loaded.push((public, file));
+        }
+        identity.agent = Some(
+            Agent::selected(
+                self.external,
+                &external_keys,
+                if loaded.is_empty() {
+                    None
+                } else {
+                    session.cloned()
+                },
+                &loaded,
+                owner.clone(),
+                deadline,
+            )
+            .map_err(|_| SelectionFailure::Unavailable)?
+            .with_certificates(self.admission, self.certificates),
+        );
+        Ok(identity)
+    }
+}
+pub(super) async fn prepare_identity(
     text: &str,
     home: &Path,
     environment_agent: Option<PathBuf>,
-) -> Result<NativeIdentity> {
+    admission: &Admission,
+) -> Result<PreparedIdentity> {
     let text = routed_text(text)?;
     let config = Config::parse(&text)?;
     let algorithms = config.algorithms()?;
+    if config
+        .lines
+        .iter()
+        .filter(|(name, value)| {
+            matches!(*name, "identityfile" | "certificatefile") && *value != "none"
+        })
+        .count()
+        > 32
+    {
+        return Err(SelectionFailure::UnsupportedConfiguration);
+    }
     let selected = select_user(&config, home, environment_agent.clone(), &algorithms, true).await;
-    let (agent, user_keys, mode) = match selected {
-        Ok((agent, keys)) => (Some(agent), keys, chimaera_link::SshRouteMode::Key),
-        Err(SelectionFailure::NoKeys) => (None, vec![], chimaera_link::SshRouteMode::Interactive),
+    let (external, keys) = match selected {
+        Ok((agent, keys)) => (Some(agent), keys),
+        Err(SelectionFailure::NoKeys) => (None, Vec::new()),
         Err(SelectionFailure::AgentUnavailable)
             if no_agent_selected(&text, &environment_agent)? =>
         {
-            (None, vec![], chimaera_link::SshRouteMode::Interactive)
+            (None, Vec::new())
         }
         Err(error) => return Err(error),
     };
+    let mut certificates = Vec::new();
+    if config.key_enabled()? {
+        for (name, value) in &config.lines {
+            if *name != "certificatefile" || *value == "none" {
+                continue;
+            }
+            let certificate = CertificateFile::capture(local_path(value, home)?, admission)
+                .await?
+                .ok_or(SelectionFailure::UnsupportedConfiguration)?;
+            if !keys.contains(&certificate.public) {
+                return Err(SelectionFailure::UnsupportedConfiguration);
+            }
+            certificates.push(certificate);
+        }
+    }
+    let explicit_certificate = !certificates.is_empty();
+    let mut files = Vec::new();
+    if config.key_enabled()? {
+        for (name, value) in &config.lines {
+            if *name != "identityfile" || *value == "none" {
+                continue;
+            }
+            let path = local_path(value, home)?;
+            if path.extension().is_some_and(|value| value == "pub") {
+                continue;
+            }
+            if config.implicit_certificates() {
+                let mut adjacent = path.clone();
+                adjacent.as_mut_os_string().push("-cert.pub");
+                if let Some(certificate) = CertificateFile::capture(adjacent, admission).await? {
+                    if !keys.contains(&certificate.public) {
+                        return Err(SelectionFailure::UnsupportedConfiguration);
+                    }
+                    certificates.push(certificate);
+                    continue;
+                }
+            }
+            // Explicit selected certificates use their original external
+            // backend. The stdin -k loader never substitutes a plain key.
+            if explicit_certificate {
+                continue;
+            }
+            let mut public = path.clone();
+            public.as_mut_os_string().push(".pub");
+            if public_identity(&public)
+                .await?
+                .is_some_and(|key| keys.contains(&key))
+            {
+                continue;
+            }
+            let retained = admission.clone();
+            let captured = tokio::task::spawn_blocking(move || {
+                let _retained = retained;
+                SelectedFile::capture(path)
+            })
+            .await
+            .map_err(|_| SelectionFailure::Unavailable)??;
+            if let Some(file) = captured {
+                files.push(file);
+            }
+        }
+    }
+    let mode = if keys.is_empty() && files.is_empty() {
+        chimaera_link::SshRouteMode::Interactive
+    } else {
+        chimaera_link::SshRouteMode::Key
+    };
     config.route_policy(mode)?;
-    Ok(NativeIdentity {
-        agent,
-        user_keys,
-        mode,
-        algorithms,
+    Ok(PreparedIdentity {
+        identity: NativeIdentity {
+            agent: None,
+            user_keys: keys,
+            mode,
+            algorithms,
+        },
+        external,
+        files,
+        certificates,
+        admission: admission.clone(),
     })
 }
 pub(super) async fn native_trust(
@@ -587,6 +744,14 @@ impl<'a> Config<'a> {
             .map_err(|_| SelectionFailure::UnsupportedConfiguration)?;
         Ok(policy)
     }
+    fn implicit_certificates(&self) -> bool {
+        // OpenSSH ssh.c load_public_identity_files skips implicit variants
+        // whenever CertificateFile was explicitly listed, including none.
+        !self
+            .lines
+            .iter()
+            .any(|(name, _)| *name == "certificatefile")
+    }
     async fn public_identities(&self, home: &Path) -> Result<BTreeSet<String>> {
         let mut keys = BTreeSet::new();
         let mut count = 0;
@@ -602,6 +767,22 @@ impl<'a> Config<'a> {
             // For a private IdentityFile consult only its public sibling. A
             // missing public sibling never triggers private key loading.
             if *name == "identityfile" && path.extension().is_none_or(|value| value != "pub") {
+                if self.implicit_certificates() {
+                    let mut adjacent = path.clone();
+                    adjacent.as_mut_os_string().push("-cert.pub");
+                    if let Some(key) = public_identity(&adjacent).await? {
+                        let blob = chimaera_link::decode_packet(&key, SSH_AUTH_KEY_MAX)
+                            .map_err(|_| SelectionFailure::UnsupportedConfiguration)?;
+                        if Key::parse(blob)
+                            .map_err(|_| SelectionFailure::UnsupportedConfiguration)?
+                            .certificate
+                            .is_none()
+                        {
+                            return Err(SelectionFailure::UnsupportedConfiguration);
+                        }
+                        keys.insert(key);
+                    }
+                }
                 path.as_mut_os_string().push(".pub");
             }
             if let Some(key) = public_identity(&path).await? {

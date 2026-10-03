@@ -394,23 +394,29 @@ async fn commit(
 }
 
 pub(crate) async fn resolve(alias: &str, boot: String, owner: Owner) -> Result<RouteSelection> {
-    let deadline = Instant::now() + Duration::from_secs(chimaera_link::SSH_AUTH_LIFETIME.into());
+    let deadline = owner
+        .guard
+        .deadline()
+        .min(Instant::now() + Duration::from_secs(chimaera_link::SSH_AUTH_LIFETIME.into()));
     let operation = async {
+        let admission = super::key_agent::Admission::acquire()?;
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .filter(|path| path.is_absolute())
             .ok_or(SelectionFailure::Unavailable)?;
         let agent = std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from);
         let effective = route::effective(alias).await?;
-        let mut identities = Vec::new();
+        let mut prepared = Vec::new();
         let mut requests = Vec::new();
         let mut unknown = Vec::new();
         // Fix every mode/key/allow-list before the first host prompt or network
         // attempt. A refused key operation never becomes an interactive retry.
         for leg in &effective {
-            let identity = selection::native_identity(&leg.text, &home, agent.clone()).await?;
-            let details = selection::probe_details(&leg.text, &home, &identity)?;
-            let (hosts, missing) = match selection::native_trust(&leg.text, &home, &identity).await
+            let capture =
+                selection::prepare_identity(&leg.text, &home, agent.clone(), &admission).await?;
+            let identity = &capture.identity;
+            let details = selection::probe_details(&leg.text, &home, identity)?;
+            let (hosts, missing) = match selection::native_trust(&leg.text, &home, identity).await
             {
                 Ok((destination, hosts)) if destination == leg.destination => (hosts, false),
                 Err(SelectionFailure::HostTrustRequired) => (vec![], true),
@@ -424,8 +430,28 @@ pub(crate) async fn resolve(alias: &str, boot: String, owner: Owner) -> Result<R
                 user_keys: identity.user_keys.clone(),
                 policy: Some(details.policy),
             });
-            identities.push(identity);
+            prepared.push(capture);
             unknown.push(missing);
+        }
+        if !owner.guard.active()
+            || !(owner.current)()
+            || route::effective(alias).await? != effective
+        {
+            return Err(SelectionFailure::Unavailable);
+        }
+        let session = if prepared
+            .iter()
+            .any(selection::PreparedIdentity::needs_loading)
+        {
+            Some(super::key_agent::Session::spawn(&owner, deadline, &admission).await?)
+        } else {
+            None
+        };
+        let mut identities = Vec::new();
+        for (index, capture) in prepared.into_iter().enumerate() {
+            let identity = capture.finish(session.as_ref(), &owner, deadline).await?;
+            requests[index].user_keys = identity.user_keys.clone();
+            identities.push(identity);
         }
         if let Some(last) = unknown.iter().rposition(|missing| *missing) {
             let support = chimaera_remote::SshAlgorithmSupport::capture()
@@ -577,7 +603,11 @@ pub(crate) async fn resolve(alias: &str, boot: String, owner: Owner) -> Result<R
         request
             .validate()
             .map_err(|_| SelectionFailure::UnsupportedConfiguration)?;
-        Ok(RouteSelection { request, legs })
+        Ok(RouteSelection {
+            request,
+            legs,
+            native_deadline: Some(deadline),
+        })
     };
     tokio::select! {
         biased;

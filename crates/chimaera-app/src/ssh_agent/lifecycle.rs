@@ -119,6 +119,7 @@ impl Attempt {
             identity: self.identity,
             cancel: self.cancel.clone(),
             deadline,
+            local_stop: None,
         }
     }
     pub(crate) fn bind_route(
@@ -166,10 +167,26 @@ pub(crate) struct NativePromptGuard {
     identity: u64,
     cancel: watch::Receiver<bool>,
     deadline: tokio::time::Instant,
+    local_stop: Option<watch::Receiver<bool>>,
 }
 impl NativePromptGuard {
+    pub(crate) fn deadline(&self) -> tokio::time::Instant {
+        self.deadline
+    }
+    pub(crate) fn restricted(&self, stop: watch::Receiver<bool>) -> Result<Self, Failure> {
+        if self.local_stop.is_some() {
+            return Err(Failure::Revoked);
+        }
+        let mut guard = self.clone();
+        guard.local_stop = Some(stop);
+        Ok(guard)
+    }
     fn active_locked(&self, state: &State) -> bool {
         !*self.cancel.borrow()
+            && self
+                .local_stop
+                .as_ref()
+                .is_none_or(|stop| !*stop.borrow() && stop.has_changed().is_ok())
             && self.deadline > tokio::time::Instant::now()
             && state.attempts.contains_key(&self.identity)
     }
@@ -185,6 +202,10 @@ impl NativePromptGuard {
             biased;
             _ = cancel.wait_for(|value| *value) => {},
             _ = tokio::time::sleep_until(self.deadline) => {},
+            _ = async { match self.local_stop.clone() {
+                Some(mut stop) => { let _=stop.wait_for(|value|*value).await; }
+                None => std::future::pending::<()>().await,
+            }} => {},
         }
     }
     /// Only a bounded synchronous native trust append runs here. Its caller
@@ -535,6 +556,28 @@ mod tests {
         let mut cancel = last.cancellation();
         drop(registry);
         assert!(cancel.changed().await.is_err());
+    }
+    #[tokio::test]
+    async fn cancelled_key_load_closes_its_prompt_without_cancelling_original_attempt() {
+        let registry = Registry::default();
+        let attempt = registry.admit(0).ok().unwrap();
+        let original =
+            attempt.native_prompt(tokio::time::Instant::now() + std::time::Duration::from_secs(1));
+        let (stop, stopped) = watch::channel(false);
+        let load = original.restricted(stopped).ok().unwrap();
+        assert!(load.active());
+        assert!(load.restricted(watch::channel(false).1).is_err());
+        stop.send_replace(true);
+        let mut wrote = false;
+        assert!(load.commit(|| wrote = true).is_err());
+        assert!(!wrote);
+        tokio::time::timeout(std::time::Duration::from_millis(100), load.stopped())
+            .await
+            .unwrap();
+        assert!(original.active());
+        assert!(!*attempt.cancellation().borrow());
+        drop(attempt);
+        assert!(!original.active());
     }
     #[tokio::test]
     async fn native_probe_owner_loss_account_change_and_expiry_refuse_real_commit() {

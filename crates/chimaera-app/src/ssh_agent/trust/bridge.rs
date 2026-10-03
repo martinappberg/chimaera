@@ -100,7 +100,7 @@ pub(super) struct Bridge {
 }
 struct Agent {
     identity: NativeIdentity,
-    verifier: Option<GrantVerifier<super::super::unix::UnixAgent>>,
+    verifier: Option<GrantVerifier<super::super::key_agent::Agent>>,
     text: String,
     home: PathBuf,
     candidate: PathBuf,

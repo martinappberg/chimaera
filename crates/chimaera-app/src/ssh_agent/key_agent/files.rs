@@ -47,6 +47,7 @@ pub(super) struct Captured {
     name: CString,
     file: File,
     identity: Identity,
+    limit: u64,
 }
 fn directory(path: &Path) -> Result<File> {
     if !path.is_absolute() || path.as_os_str().len() > 4096 {
@@ -95,6 +96,12 @@ fn directory(path: &Path) -> Result<File> {
 }
 impl Captured {
     pub(super) fn capture(path: PathBuf) -> Result<Option<Self>> {
+        Self::capture_inner(path, true)
+    }
+    pub(super) fn certificate(path: PathBuf) -> Result<Option<Self>> {
+        Self::capture_inner(path, false)
+    }
+    fn capture_inner(path: PathBuf, private: bool) -> Result<Option<Self>> {
         let parent_path = path
             .parent()
             .ok_or(SelectionFailure::UnsupportedConfiguration)?;
@@ -127,11 +134,13 @@ impl Captured {
         }
         let file = unsafe { File::from_raw_fd(fd) };
         let stat = file.metadata().map_err(|_| SelectionFailure::Unavailable)?;
+        let limit = if private { MAX_KEY } else { 32 * 1024 };
+        let owner = unsafe { nix::libc::geteuid() };
         if !stat.is_file()
-            || stat.uid() != unsafe { nix::libc::geteuid() }
-            || stat.mode() & 0o077 != 0
+            || (stat.uid() != owner && (private || stat.uid() != 0))
+            || stat.mode() & if private { 0o077 } else { 0o022 } != 0
             || stat.len() == 0
-            || stat.len() > MAX_KEY
+            || stat.len() > limit
         {
             return Err(SelectionFailure::UnsupportedConfiguration);
         }
@@ -141,6 +150,7 @@ impl Captured {
             name,
             file,
             identity: Identity::new(&stat),
+            limit,
         };
         captured.check()?;
         Ok(Some(captured))
@@ -194,13 +204,13 @@ impl Captured {
         self.file
             .seek(SeekFrom::Start(0))
             .map_err(|_| SelectionFailure::Unavailable)?;
-        let mut bytes = Zeroizing::new(Vec::with_capacity(MAX_KEY as usize + 1));
+        let mut bytes = Zeroizing::new(Vec::with_capacity(self.limit as usize + 1));
         self.file
             .by_ref()
-            .take(MAX_KEY + 1)
+            .take(self.limit + 1)
             .read_to_end(&mut bytes)
             .map_err(|_| SelectionFailure::Unavailable)?;
-        if bytes.len() as u64 > MAX_KEY || bytes.len() as u64 != self.identity.len {
+        if bytes.len() as u64 > self.limit || bytes.len() as u64 != self.identity.len {
             return Err(SelectionFailure::Unavailable);
         }
         self.check()?;

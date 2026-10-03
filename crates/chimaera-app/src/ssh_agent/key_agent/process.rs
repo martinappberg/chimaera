@@ -14,13 +14,16 @@ use std::{
     },
     path::PathBuf,
     process::{Child as BlockingChild, Stdio},
-    sync::{Arc, LazyLock},
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc, LazyLock, Mutex,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::AsyncReadExt,
     process::{Child, Command},
-    sync::{watch, Semaphore},
+    sync::{watch, OwnedSemaphorePermit, Semaphore},
     time::Instant,
 };
 
@@ -28,6 +31,18 @@ static SLOTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::ne
 const READY: &[u8; 8] = b"agent-v1";
 const PREFIX: &str = "cx-native-key-agent-";
 type Result<T> = std::result::Result<T, SelectionFailure>;
+#[derive(Clone)]
+pub(super) struct Admission(Arc<OwnedSemaphorePermit>);
+impl Admission {
+    pub(super) fn acquire() -> Result<Self> {
+        Ok(Self(Arc::new(
+            SLOTS
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| SelectionFailure::Unavailable)?,
+        )))
+    }
+}
 struct Directory(PathBuf, File);
 impl Directory {
     fn create() -> Result<Self> {
@@ -50,7 +65,7 @@ impl Directory {
 }
 impl Drop for Directory {
     fn drop(&mut self) {
-        for name in [c"agent", c"askpass", c"askpass.sh"] {
+        for name in [c"agent", c"load", c"askpass", c"askpass.sh"] {
             unsafe {
                 nix::libc::unlinkat(self.1.as_raw_fd(), name.as_ptr(), 0);
             }
@@ -67,24 +82,175 @@ pub(super) struct Lease(Arc<Retained>);
 struct Retained {
     socket: PathBuf,
     stop: watch::Sender<bool>,
+    root: File,
+    group: u32,
+    agent: AtomicU32,
+    retired: Arc<Mutex<bool>>,
+    owner: Owner,
+    deadline: Instant,
+    _permit: Arc<OwnedSemaphorePermit>,
+    load: Arc<tokio::sync::Mutex<()>>,
+}
+impl Retained {
+    fn revoke(&self) {
+        let retired = self.retired.lock().unwrap_or_else(|e| e.into_inner());
+        self.stop.send_replace(true);
+        if !*retired {
+            // The cleanup owner marks retired before reaping the group leader.
+            unsafe {
+                nix::libc::kill(-(self.group as i32), nix::libc::SIGKILL);
+            }
+        }
+    }
 }
 impl Drop for Retained {
     fn drop(&mut self) {
-        self.stop.send_replace(true);
+        self.revoke();
+    }
+}
+struct Helper {
+    child: Child,
+    retired: Arc<Mutex<bool>>,
+    stop: watch::Sender<bool>,
+}
+impl Helper {
+    fn retire(&mut self) {
+        let mut retired = self.retired.lock().unwrap_or_else(|e| e.into_inner());
+        if !*retired {
+            *retired = true;
+            self.stop.send_replace(true);
+            kill(&mut self.child);
+        }
+    }
+}
+impl Drop for Helper {
+    fn drop(&mut self) {
+        self.retire();
     }
 }
 impl Lease {
     pub(super) fn path(&self) -> &std::path::Path {
         &self.0.socket
     }
-    pub(super) async fn spawn(owner: &Owner, deadline: Instant) -> Result<Self> {
+    pub(super) async fn serialize(&self) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+        let guard = self.0.load.clone().lock_owned().await;
+        self.check()?;
+        Ok(guard)
+    }
+    pub(super) fn unlink(&self, name: &std::ffi::CStr) {
+        unsafe {
+            nix::libc::unlinkat(self.0.root.as_raw_fd(), name.as_ptr(), 0);
+        }
+    }
+    pub(super) fn socket_mode(&self, name: &std::ffi::CStr) -> Result<()> {
+        self.check()?;
+        // The literal bind is checked against our pin before any credential
+        // exchange. Permission changes remain descriptor-rooted even if an
+        // external process renames the task directory between those checks.
+        if unsafe {
+            nix::libc::fchmodat(
+                self.0.root.as_raw_fd(),
+                name.as_ptr(),
+                0o600,
+                nix::libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(SelectionFailure::Unavailable);
+        }
+        self.check()
+    }
+    pub(super) fn shim(&self, bytes: &[u8]) -> Result<()> {
+        use std::os::fd::FromRawFd;
+        self.check()?;
+        if bytes.len() > 8192 {
+            return Err(SelectionFailure::Unavailable);
+        }
+        let fd = unsafe {
+            nix::libc::openat(
+                self.0.root.as_raw_fd(),
+                c"askpass.sh".as_ptr(),
+                nix::libc::O_WRONLY
+                    | nix::libc::O_CREAT
+                    | nix::libc::O_EXCL
+                    | nix::libc::O_NOFOLLOW
+                    | nix::libc::O_CLOEXEC,
+                0o700,
+            )
+        };
+        if fd < 0 {
+            return Err(SelectionFailure::Unavailable);
+        }
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        file.write_all(bytes)
+            .map_err(|_| SelectionFailure::Unavailable)?;
+        self.check()
+    }
+    pub(super) fn root(&self) -> &std::path::Path {
+        self.0.socket.parent().expect("fixed private-agent path")
+    }
+    pub(super) fn group(&self) -> Result<u32> {
+        self.check()?;
+        Ok(self.0.group)
+    }
+    pub(super) fn revoke(&self) {
+        self.0.revoke();
+    }
+    pub(super) fn check(&self) -> Result<()> {
+        if *self.0.stop.borrow()
+            || self.0.deadline <= Instant::now()
+            || !self.0.owner.guard.active()
+            || !(self.0.owner.current)()
+        {
+            return Err(SelectionFailure::Unavailable);
+        }
+        {
+            let retired = self.0.retired.lock().unwrap_or_else(|e| e.into_inner());
+            if *retired || exited_pid(self.0.group).unwrap_or(true) {
+                return Err(SelectionFailure::Unavailable);
+            }
+        }
+        let pin = self
+            .0
+            .root
+            .metadata()
+            .map_err(|_| SelectionFailure::Unavailable)?;
+        let entry =
+            std::fs::symlink_metadata(self.root()).map_err(|_| SelectionFailure::Unavailable)?;
+        if !entry.is_dir()
+            || entry.dev() != pin.dev()
+            || entry.ino() != pin.ino()
+            || entry.uid() != pin.uid()
+            || entry.mode() & 0o777 != 0o700
+        {
+            return Err(SelectionFailure::Unavailable);
+        }
+        Ok(())
+    }
+    pub(super) async fn connect(&self) -> Result<tokio::net::UnixStream> {
+        self.check()?;
+        let socket = tokio::net::UnixStream::connect(self.path())
+            .await
+            .map_err(|_| SelectionFailure::Unavailable)?;
+        let (pid, uid) = peer(&socket)?;
+        if pid == 0
+            || pid != self.0.agent.load(Ordering::Acquire)
+            || uid != unsafe { nix::libc::geteuid() }
+        {
+            return Err(SelectionFailure::Unavailable);
+        }
+        self.check()?;
+        Ok(socket)
+    }
+    pub(super) async fn spawn(
+        owner: &Owner,
+        deadline: Instant,
+        admission: &Admission,
+    ) -> Result<Self> {
         if !owner.guard.active() || !(owner.current)() || deadline <= Instant::now() {
             return Err(SelectionFailure::Unavailable);
         }
-        let permit = SLOTS
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| SelectionFailure::Unavailable)?;
+        let permit = admission.0.clone();
         let directory = Directory::create()?;
         let milliseconds = deadline
             .saturating_duration_since(Instant::now())
@@ -116,17 +282,42 @@ impl Lease {
         let pipe = child.stdin.take();
         let ready = child.stdout.take();
         let (stop, mut stopped) = watch::channel(false);
-        let lease = Self(Arc::new(Retained {
-            socket: directory.0.join("agent"),
-            stop,
-        }));
+        let retired = Arc::new(Mutex::new(false));
+        let root = directory
+            .1
+            .try_clone()
+            .map_err(|_| SelectionFailure::Unavailable);
+        let mut helper = Helper {
+            child,
+            retired: retired.clone(),
+            stop: stop.clone(),
+        };
+        let group = helper.child.id().ok_or(SelectionFailure::Unavailable)?;
+        let lease = root.map(|root| {
+            Self(Arc::new(Retained {
+                socket: directory.0.join("agent"),
+                stop,
+                root,
+                group,
+                agent: AtomicU32::new(0),
+                retired,
+                owner: owner.clone(),
+                deadline,
+                _permit: permit.clone(),
+                load: Arc::default(),
+            }))
+        });
+
+        if lease.is_err() {
+            helper.stop.send_replace(true);
+        }
         let owner_task = owner.clone();
         tokio::spawn(async move {
             let _permit = permit;
             let _directory = directory;
             let _pipe = pipe;
             loop {
-                if exited(&child).unwrap_or(true)
+                if exited(&helper.child).unwrap_or(true)
                     || !owner_task.guard.active()
                     || !(owner_task.current)()
                 {
@@ -139,24 +330,39 @@ impl Lease {
                     _=tokio::time::sleep(Duration::from_millis(25))=>{},
                 }
             }
-            kill(&mut child);
-            let _ = child.wait().await;
+            helper.retire();
+            let _ = helper.child.wait().await;
         });
+        let lease = lease?;
         let mut ready = ready.ok_or(SelectionFailure::Unavailable)?;
-        let mut frame = [0u8; 8];
+        let mut frame = [0u8; 12];
         tokio::select! { biased;
             _=owner.guard.stopped()=>return Err(SelectionFailure::Unavailable),
             _=tokio::time::sleep_until(deadline.min(Instant::now()+Duration::from_secs(5)))=>return Err(SelectionFailure::Unavailable),
             result=ready.read_exact(&mut frame)=>{result.map_err(|_| SelectionFailure::Unavailable)?;}
         }
-        if &frame != READY || !owner.guard.active() || !(owner.current)() {
+        let agent = u32::from_be_bytes(
+            frame[8..]
+                .try_into()
+                .map_err(|_| SelectionFailure::Unavailable)?,
+        );
+        if &frame[..8] != READY
+            || agent == 0
+            || agent > i32::MAX as u32
+            || !owner.guard.active()
+            || !(owner.current)()
+        {
             return Err(SelectionFailure::Unavailable);
         }
+        lease.0.agent.store(agent, Ordering::Release);
+        lease.check()?;
         Ok(lease)
     }
 }
 fn exited(child: &Child) -> Result<bool> {
-    let pid = child.id().ok_or(SelectionFailure::Unavailable)?;
+    exited_pid(child.id().ok_or(SelectionFailure::Unavailable)?)
+}
+fn exited_pid(pid: u32) -> Result<bool> {
     let mut info = std::mem::MaybeUninit::<nix::libc::siginfo_t>::zeroed();
     if unsafe {
         nix::libc::waitid(
@@ -193,7 +399,70 @@ impl Drop for Agent {
         let _ = self.0.wait();
     }
 }
+pub(super) fn peer(socket: &tokio::net::UnixStream) -> Result<(u32, u32)> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut uid = 0;
+        let mut gid = 0;
+        let mut pid = 0i32;
+        let mut len = std::mem::size_of::<i32>() as nix::libc::socklen_t;
+        if unsafe { nix::libc::getpeereid(socket.as_raw_fd(), &mut uid, &mut gid) } != 0
+            || unsafe {
+                nix::libc::getsockopt(
+                    socket.as_raw_fd(),
+                    0,
+                    2,
+                    (&mut pid as *mut i32).cast(),
+                    &mut len,
+                )
+            } != 0
+            || len as usize != std::mem::size_of::<i32>()
+            || pid <= 0
+        {
+            return Err(SelectionFailure::Unavailable);
+        }
+        Ok((pid as u32, uid))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let cred = socket
+            .peer_cred()
+            .map_err(|_| SelectionFailure::Unavailable)?;
+        let pid = cred
+            .pid()
+            .filter(|pid| *pid > 0)
+            .ok_or(SelectionFailure::Unavailable)?;
+        Ok((pid as u32, cred.uid()))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = socket;
+        Err(SelectionFailure::UnsupportedConfiguration)
+    }
+}
+struct Group<'a>(&'a File, &'a std::path::Path);
+impl Drop for Group<'_> {
+    fn drop(&mut self) {
+        // This cleanup runs BEFORE self-kill; no later finalizer is promised.
+        for name in [c"agent", c"load", c"askpass", c"askpass.sh"] {
+            unsafe {
+                nix::libc::unlinkat(self.0.as_raw_fd(), name.as_ptr(), 0);
+            }
+        }
+        if let (Ok(pin), Ok(entry)) = (self.0.metadata(), std::fs::symlink_metadata(self.1)) {
+            if entry.is_dir() && pin.dev() == entry.dev() && pin.ino() == entry.ino() {
+                let _ = std::fs::remove_dir(self.1);
+            }
+        }
+        unsafe {
+            nix::libc::kill(0, nix::libc::SIGKILL);
+        }
+    }
+}
 fn helper() -> std::io::Result<()> {
+    if unsafe { nix::libc::getpgrp() } != unsafe { nix::libc::getpid() } {
+        return Err(std::io::ErrorKind::PermissionDenied.into());
+    }
     let mut args = std::env::args_os();
     let _ = args.next();
     if args.next().as_deref() != Some(std::ffi::OsStr::new("--native-key-agent")) {
@@ -268,6 +537,7 @@ fn helper() -> std::io::Result<()> {
             .stderr(Stdio::null())
             .spawn()?,
     );
+    let _group = Group(&root, &path);
     let startup = std::time::Instant::now() + Duration::from_secs(3);
     let mut announced = false;
     loop {
@@ -318,6 +588,7 @@ fn helper() -> std::io::Result<()> {
                 return Err(std::io::ErrorKind::PermissionDenied.into());
             }
             std::io::stdout().write_all(READY)?;
+            std::io::stdout().write_all(&agent.0.id().to_be_bytes())?;
             std::io::stdout().flush()?;
             announced = true;
         }

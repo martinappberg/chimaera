@@ -2,8 +2,8 @@
 //! Every leg retains native host trust and its immutable initial mode; missing
 //! keys can select interactive only before any authentication has been attempted.
 use super::{
+    key_agent::Agent,
     selection::{self, Selection, SelectionFailure},
-    unix::UnixAgent,
     Failure, GrantVerifier, SshAuthReply, SshAuthRequest,
 };
 use chimaera_link::{
@@ -185,12 +185,16 @@ impl Resolver {
 pub(crate) struct RouteSelection {
     pub(crate) request: SshRouteGrantRequest,
     pub(super) legs: Vec<Option<Selection>>,
+    pub(super) native_deadline: Option<Instant>,
 }
 impl RouteSelection {
     pub(crate) fn verifier(
         self,
         deadline: Instant,
-    ) -> std::result::Result<RouteVerifier<UnixAgent>, Failure> {
+    ) -> std::result::Result<RouteVerifier<Agent>, Failure> {
+        let deadline = self
+            .native_deadline
+            .map_or(deadline, |original| original.min(deadline));
         let mut legs = Vec::new();
         for leg in self.legs {
             legs.push(match leg {
@@ -313,7 +317,11 @@ async fn select(
     request
         .validate()
         .map_err(|_| SelectionFailure::UnsupportedConfiguration)?;
-    Ok(RouteSelection { request, legs })
+    Ok(RouteSelection {
+        request,
+        legs,
+        native_deadline: None,
+    })
 }
 
 pub(crate) struct RouteVerifier<A: super::LocalAgent> {

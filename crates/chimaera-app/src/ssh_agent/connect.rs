@@ -89,7 +89,12 @@ where
     Fut: Future<Output = Result<T, Failure>>,
 {
     let started = Instant::now();
-    let deadline = started + Duration::from_secs(chimaera_link::SSH_AUTH_LIFETIME.into());
+    let deadline = selection.native_deadline.map_or(
+        started + Duration::from_secs(chimaera_link::SSH_AUTH_LIFETIME.into()),
+        |original| {
+            original.min(started + Duration::from_secs(chimaera_link::SSH_AUTH_LIFETIME.into()))
+        },
+    );
     let mut verifier = selection.verifier(deadline)?;
     let request = verifier.request.clone();
     let mut cancellation = attempt.cancellation();

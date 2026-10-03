@@ -352,3 +352,116 @@ async fn real_null_is_only_an_empty_trust_source_and_never_an_identity_or_append
         Some(known)
     );
 }
+
+#[tokio::test]
+async fn configured_private_file_fixes_key_mode_without_sidecar_or_ambient_agent() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!(
+            "cx-key-selection-{}",
+            chimaera_core::generate_token()
+        ));
+    std::fs::create_dir(&root).unwrap();
+    let path = root.join("selected");
+    std::fs::write(&path, b"captured fixture; parser validation occurs at load").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let config = format!("{}identityagent none\nidentityfile {}\nhostkeyalgorithms ssh-ed25519\npubkeyacceptedalgorithms ssh-ed25519\ncasignaturealgorithms ssh-ed25519\nkexalgorithms curve25519-sha256\nciphers chacha20-poly1305@openssh.com\nmacs hmac-sha2-256-etm@openssh.com\n", config(), path.display());
+    let admission = Admission::acquire().unwrap();
+    let prepared = prepare_identity(&config, &root, None, &admission)
+        .await
+        .unwrap();
+    assert!(prepared.identity.mode == chimaera_link::SshRouteMode::Key);
+    assert!(prepared.needs_loading());
+    assert!(prepared.external.is_none());
+    assert!(prepared.identity.user_keys.is_empty());
+    assert!(prepare_identity(
+        &format!(
+            "{config}certificatefile {}\n",
+            root.join("cert.pub").display()
+        ),
+        &root,
+        None,
+        &admission
+    )
+    .await
+    .is_err());
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(prepare_identity(&config, &root, None, &admission)
+        .await
+        .is_err());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn adjacent_certificate_is_selected_exactly_or_refused_before_plain_loading() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!(
+            "cx-cert-selection-{}",
+            chimaera_core::generate_token()
+        ));
+    std::fs::create_dir(&root).unwrap();
+    let private = root.join("selected");
+    std::fs::write(&private, b"synthetic captured file").unwrap();
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let signer = PrivateKey::new(
+        KeypairData::Ed25519(Ed25519Keypair::from_seed(&[8; 32])),
+        "",
+    )
+    .unwrap();
+    let mut builder =
+        ssh_key::certificate::Builder::new(vec![1; 16], key(7).key_data().clone(), 0, u64::MAX)
+            .unwrap();
+    builder
+        .cert_type(ssh_key::certificate::CertType::User)
+        .unwrap()
+        .valid_principal("alice")
+        .unwrap();
+    let certificate = builder.sign(&signer).unwrap();
+    let path = root.join("selected-cert.pub");
+    std::fs::write(&path, certificate.to_openssh().unwrap()).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let text=format!("{}identityagent none\nidentityfile {}\nhostkeyalgorithms ssh-ed25519\npubkeyacceptedalgorithms ssh-ed25519-cert-v01@openssh.com,ssh-ed25519\ncasignaturealgorithms ssh-ed25519\nkexalgorithms curve25519-sha256\nciphers chacha20-poly1305@openssh.com\nmacs hmac-sha2-256-etm@openssh.com\n",config(),private.display());
+    let admission = Admission::acquire().unwrap();
+    let allowed = Config::parse(&text)
+        .unwrap()
+        .public_identities(&root)
+        .await
+        .unwrap();
+    assert_eq!(
+        allowed,
+        BTreeSet::from([STANDARD.encode(certificate.to_bytes().unwrap())])
+    );
+    assert!(prepare_identity(&text, &root, None, &admission)
+        .await
+        .is_err());
+    let captured = CertificateFile::capture(path.clone(), &admission)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(captured.check(&admission).await.is_ok());
+    std::fs::write(&path, format!("{}\n", certificate.to_openssh().unwrap())).unwrap();
+    assert!(captured.check(&admission).await.is_err());
+    std::fs::write(&path, b"stale unused certificate sibling").unwrap();
+    let disabled = format!("{text}certificatefile none\n");
+    let prepared = prepare_identity(&disabled, &root, None, &admission)
+        .await
+        .unwrap();
+    assert!(prepared.needs_loading());
+    assert!(Config::parse(&disabled)
+        .unwrap()
+        .public_identities(&root)
+        .await
+        .unwrap()
+        .is_empty());
+    let explicit = format!("{text}certificatefile /synthetic/explicit-cert.pub\n");
+    assert!(Config::parse(&explicit)
+        .unwrap()
+        .public_identities(&root)
+        .await
+        .unwrap()
+        .is_empty());
+    std::fs::remove_dir_all(root).unwrap();
+}

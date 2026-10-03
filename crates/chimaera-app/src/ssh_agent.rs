@@ -1,6 +1,8 @@
 //! Native-only SSH signing. A keeper packet is never authority: every signature
 //! is checked against the native caller's original destination/trust selection.
 //! The owner must drop this verifier on signout or control-channel loss.
+//! Original prototype Connect may load captured software keys into its bounded
+//! task-private agent; legacy external-agent selection never reads private files.
 use base64::{engine::general_purpose::STANDARD, Engine};
 use chimaera_link::ssh_auth::{
     decode_packet, SshAuthFailure as Failure, SshAuthGrantRequest, SshAuthReply, SshAuthRequest,
