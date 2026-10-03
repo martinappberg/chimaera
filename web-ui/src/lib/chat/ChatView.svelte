@@ -73,6 +73,8 @@
   import { isTransferOrigin } from "./transfer";
   import { keptReviews, requestKeptReview, waitingReview } from "../pro/keptReviews.svelte";
   import Composer from "./Composer.svelte";
+  import ManualResume from "./ManualResume.svelte";
+  import { manualResumeNote } from "../workspace/manualResume";
   import SameFileNotice from "../workspace/SameFileNotice.svelte";
   import { sameFile } from "../workspace/sameFile.svelte";
   import ReferenceChip from "../shared/ReferenceChip.svelte";
@@ -2139,11 +2141,12 @@
    *  exit: its row is paused, or its socket said it moved or is paused and it
    *  has not been reached since. The transcript stays mounted. */
   const rowPause = $derived(sessionPause(session));
+  const manualPause = $derived(manualResumeNote(session));
   const continuing = $derived(
-    session.suspended === true || ((store.moving !== null || store.pausedFor !== null) && !store.connected),
+    manualPause !== null || session.suspended === true || ((store.moving !== null || store.pausedFor !== null) && !store.connected),
   );
   const continuingLabel = $derived(
-    pauseLabel(
+    manualPause ?? pauseLabel(
       store.moving !== null && !store.connected
         ? { type: "moved", to: store.moving }
         : store.pausedFor !== null && !store.connected
@@ -2161,7 +2164,7 @@
    *  a backoff — or, for a socket waiting on a sleeping owner, instead of
    *  waiting for a send. */
   const reachKey = $derived(
-    `${session.suspended === true}|${rowPause?.type ?? ""}|${typeof session.placement === "object" ? session.placement.remote : "here"}|${session.placement_available !== false}`,
+    `${session.suspended === true}|${session.manual_resume_reason ?? ""}|${rowPause?.type ?? ""}|${typeof session.placement === "object" ? session.placement.remote : "here"}|${session.placement_available !== false}`,
   );
   let lastReachKey: string | null = null;
   $effect(() => {
@@ -3386,7 +3389,9 @@
     </div>
   {/if}
 
-  {#if continuing}
+  {#if manualPause !== null}
+    <ManualResume {session} onResumed={() => socket.retrySoon()} />
+  {:else if continuing}
     <div class="connection-status"><span role="status">{continuingLabel}</span>{#if connect !== null}<button type="button" class="connect" onclick={() => cloudOnboarding.request({ providerIds: [connect.providerId], workspaceId: connect.workspaceId })}>Connect {connect.label} to continue</button>{/if}</div>
   {:else if store.bringing !== null}
     <!-- Acting here is bringing the work over; the send waits for it. -->

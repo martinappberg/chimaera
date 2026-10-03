@@ -36,6 +36,9 @@ export interface Session {
   placement?: "here" | { remote: string };
   placement_available?: boolean;
   suspended?: boolean;
+  /** A parked conversation requires explicit resume under its existing ID.
+   * Unknown non-null reasons must never enter ordinary Recents resume. */
+  manual_resume_reason?: string | null;
   keep_running?: boolean;
   last_input_ms?: number | null;
   id: string;
@@ -323,6 +326,7 @@ export function isBusy(s: Session): boolean {
  * session strip; see the SessionGlyph state styles).
  */
 export function dotState(s: Session): string {
+  if (s.manual_resume_reason != null) return "idle";
   if (s.kind !== "agent") {
     if (!s.alive) return "";
     // A terminal is "active" (accent) ONLY while a foreground command runs —
@@ -389,6 +393,7 @@ export function backgrounded(s: Session): boolean {
  * facts are independent ("finished · 2 running in the background").
  */
 export function dotTitle(s: Session): string {
+  if (s.manual_resume_reason != null) return "paused · resume required";
   const base = turnDotTitle(s);
   const running = s.background_running ?? 0;
   if (!s.alive || running === 0) return base;
