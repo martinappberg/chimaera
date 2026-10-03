@@ -5,7 +5,7 @@ use super::{
     key_agent::{Admission, Agent, CertificateFile, SelectedFile, Session},
     packet::Reader,
     unix::UnixAgent,
-    AgentConnection, Algorithms, GrantVerifier, Key, LocalAgent, Policy,
+    Algorithms, GrantVerifier, Key, Policy,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use chimaera_link::{
@@ -133,8 +133,10 @@ async fn select_user(
         Some("none") => return Err(SelectionFailure::AgentUnavailable),
         Some(path) => local_path(path, home)?,
     };
-    let agent = UnixAgent::new(socket).map_err(|_| SelectionFailure::AgentUnavailable)?;
-    let mut user_keys = identities(&agent).await?;
+    let (agent, response) = UnixAgent::capture(socket)
+        .await
+        .map_err(|_| SelectionFailure::AgentUnavailable)?;
+    let mut user_keys = identity_reply(&response)?;
     user_keys.retain(|encoded| {
         chimaera_link::decode_packet(encoded, SSH_AUTH_KEY_MAX)
             .ok()
@@ -978,17 +980,7 @@ async fn public_identity(path: &Path) -> Result<Option<String>> {
     Ok(Some(STANDARD.encode(blob)))
 }
 
-async fn identities(agent: &impl LocalAgent) -> Result<Vec<String>> {
-    let response = tokio::time::timeout(Duration::from_secs(5), async {
-        let mut connection = agent.connect().await?;
-        connection.exchange(&[11]).await
-    })
-    .await
-    .map_err(|_| SelectionFailure::AgentUnavailable)?
-    .map_err(|_| SelectionFailure::AgentUnavailable)?;
-    identity_reply(&response)
-}
-fn identity_reply(bytes: &[u8]) -> Result<Vec<String>> {
+pub(super) fn identity_reply(bytes: &[u8]) -> Result<Vec<String>> {
     let parse = || {
         let mut reader = Reader::new(bytes)?;
         reader.byte_is(12)?;

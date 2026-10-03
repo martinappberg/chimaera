@@ -1,5 +1,8 @@
 //! Synthetic Mac loader fixture: unchanged production modules, no Tauri prompt claim.
 #[cfg(target_os = "macos")]
+#[path = "ssh_agent_fixture/route.rs"]
+mod route;
+#[cfg(target_os = "macos")]
 #[allow(dead_code, unused_imports)]
 #[path = "../ssh_agent.rs"]
 mod ssh_agent;
@@ -180,6 +183,33 @@ fn main() {
             });
             if result.is_err() {
                 println!("REFUSED");
+                std::process::exit(2)
+            }
+        }
+        Some("--route-fixture") => {
+            if args.len() != 5
+                || !matches!(
+                    args[4].as_str(),
+                    "accept" | "grant-expiry" | "grant-cancel" | "ready-expiry" | "config-change"
+                )
+            {
+                std::process::exit(2)
+            }
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let result = runtime.block_on(route::run(
+                PathBuf::from(&args[2]),
+                args[3].clone(),
+                args[4].clone(),
+            ));
+            runtime.block_on(async {
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            });
+            if result.is_err() {
+                println!("ROUTE_FAILED");
                 std::process::exit(2)
             }
         }

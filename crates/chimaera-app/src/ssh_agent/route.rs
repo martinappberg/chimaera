@@ -113,9 +113,40 @@ pub(super) struct Effective {
     pub(super) text: String,
     pub(super) destination: SshAuthDestination,
 }
+/// Native callers always use the ordinary configuration. The explicit fixture
+/// target can resolve only its passed configuration/home, without changing any
+/// process-global SSH settings or consulting an ambient agent.
+#[derive(Default)]
+pub(crate) struct ConfigContext {
+    #[cfg(feature = "ssh-agent-fixture")]
+    fixture: Option<(PathBuf, PathBuf)>,
+}
+impl ConfigContext {
+    #[cfg(feature = "ssh-agent-fixture")]
+    #[allow(dead_code)] // The ordinary app target never creates fixture contexts.
+    pub(crate) fn fixture(config: PathBuf, home: PathBuf) -> Result<Self> {
+        if !config.is_absolute() || !home.is_absolute() || !config.starts_with(&home) {
+            return Err(SelectionFailure::UnsupportedConfiguration);
+        }
+        Ok(Self {
+            fixture: Some((config, home)),
+        })
+    }
+    pub(super) fn inputs(&self) -> Result<(PathBuf, Option<PathBuf>)> {
+        #[cfg(feature = "ssh-agent-fixture")]
+        if let Some((_, home)) = &self.fixture {
+            return Ok((home.clone(), None));
+        }
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .ok_or(SelectionFailure::Unavailable)?;
+        Ok((home, std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from)))
+    }
+}
 struct Resolver {
     calls: usize,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "ssh-agent-fixture"))]
     config: Option<PathBuf>,
 }
 impl Resolver {
@@ -126,7 +157,7 @@ impl Resolver {
         self.calls += 1;
         let mut command = Command::new("/usr/bin/ssh");
         command.arg("-G");
-        #[cfg(test)]
+        #[cfg(any(test, feature = "ssh-agent-fixture"))]
         if let Some(config) = &self.config {
             command.arg("-F").arg(config);
         }
@@ -188,6 +219,11 @@ pub(crate) struct RouteSelection {
     pub(super) native_deadline: Option<Instant>,
 }
 impl RouteSelection {
+    #[cfg(feature = "ssh-agent-fixture")]
+    #[allow(dead_code)] // Used only by the separate opt-in fixture target.
+    pub(crate) fn fixture_deadline(&self) -> Option<Instant> {
+        self.native_deadline
+    }
     pub(crate) fn verifier(
         self,
         deadline: Instant,
@@ -219,12 +255,29 @@ pub(crate) async fn resolve(alias: &str, boot: String) -> Result<RouteSelection>
     .map_err(|_| SelectionFailure::Unavailable)?
 }
 pub(super) async fn effective(alias: &str) -> Result<Vec<Effective>> {
+    effective_with_context(alias, &ConfigContext::default()).await
+}
+pub(super) async fn effective_with_context(
+    alias: &str,
+    context: &ConfigContext,
+) -> Result<Vec<Effective>> {
+    // A normal build has no alternate configuration field at all.
+    let _ = context;
     let alias = chimaera_remote::hosts::normalize_alias(alias)
         .map_err(|_| SelectionFailure::UnsupportedConfiguration)?;
     let mut resolver = Resolver {
         calls: 0,
-        #[cfg(test)]
-        config: None,
+        #[cfg(any(test, feature = "ssh-agent-fixture"))]
+        config: {
+            #[cfg(feature = "ssh-agent-fixture")]
+            {
+                context.fixture.as_ref().map(|(config, _)| config.clone())
+            }
+            #[cfg(not(feature = "ssh-agent-fixture"))]
+            {
+                None
+            }
+        },
     };
     let mut effective = Vec::new();
     resolver
@@ -486,6 +539,47 @@ impl<A: super::LocalAgent> RouteVerifier<A> {
             },
         }))
     }
+}
+
+#[cfg(all(test, feature = "ssh-agent-fixture"))]
+#[tokio::test]
+async fn fixture_context_reuses_its_explicit_config_and_never_selects_an_ambient_agent() {
+    struct Directory(PathBuf);
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let root = Directory(std::env::temp_dir().join(format!(
+        "cx-route-context-{}",
+        &chimaera_core::generate_token()[..16]
+    )));
+    std::fs::create_dir(&root.0).unwrap();
+    let config = root.0.join("config");
+    let write = |host| {
+        std::fs::write(
+            &config,
+            format!("Host fixture-context\n HostName {host}\n User fixture\n IdentityAgent none\n IdentityFile none\n"),
+        )
+        .unwrap();
+    };
+    write("first.example.invalid");
+    let context = ConfigContext::fixture(config.clone(), root.0.clone()).unwrap();
+    let (home, agent) = context.inputs().unwrap();
+    assert_eq!(home, root.0);
+    assert!(agent.is_none());
+    let first = effective_with_context("fixture-context", &context)
+        .await
+        .unwrap();
+    assert_eq!(first[0].destination.hostname, "first.example.invalid");
+    write("changed.example.invalid");
+    let changed = effective_with_context("fixture-context", &context)
+        .await
+        .unwrap();
+    assert_eq!(changed[0].destination.hostname, "changed.example.invalid");
+    assert!(first != changed);
+    assert!(ConfigContext::fixture(PathBuf::from("relative"), root.0.clone()).is_err());
+    assert!(ConfigContext::fixture(config, PathBuf::from("relative")).is_err());
 }
 
 #[cfg(test)]

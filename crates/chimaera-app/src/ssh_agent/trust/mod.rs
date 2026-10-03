@@ -348,6 +348,7 @@ async fn commit(
     owner: &Owner,
     alias: &str,
     expected: &[route::Effective],
+    context: &route::ConfigContext,
     target: storage::Destination,
     entry: Vec<u8>,
     evidence: Evidence<'_>,
@@ -357,7 +358,10 @@ async fn commit(
         _ = owner.guard.stopped() => return Err(SelectionFailure::Unavailable),
         guard = owner.account.clone().lock_owned() => guard,
     };
-    if !owner.guard.active() || !(owner.current)() || route::effective(alias).await? != expected {
+    if !owner.guard.active()
+        || !(owner.current)()
+        || route::effective_with_context(alias, context).await? != expected
+    {
         return Err(SelectionFailure::Unavailable);
     }
     let (_, hosts) = selection::candidate_trust(
@@ -394,18 +398,36 @@ async fn commit(
 }
 
 pub(crate) async fn resolve(alias: &str, boot: String, owner: Owner) -> Result<RouteSelection> {
+    resolve_with_context(alias, boot, owner, route::ConfigContext::default()).await
+}
+
+/// Only the opt-in synthetic target supplies this context. Every later config
+/// check, including a real trust append, retains the same explicit source.
+#[cfg(feature = "ssh-agent-fixture")]
+#[allow(dead_code)] // Used only by the separate opt-in fixture target.
+pub(crate) async fn resolve_fixture(
+    alias: &str,
+    boot: String,
+    owner: Owner,
+    context: route::ConfigContext,
+) -> Result<RouteSelection> {
+    resolve_with_context(alias, boot, owner, context).await
+}
+
+async fn resolve_with_context(
+    alias: &str,
+    boot: String,
+    owner: Owner,
+    context: route::ConfigContext,
+) -> Result<RouteSelection> {
     let deadline = owner
         .guard
         .deadline()
         .min(Instant::now() + Duration::from_secs(chimaera_link::SSH_AUTH_LIFETIME.into()));
     let operation = async {
         let admission = super::key_agent::Admission::acquire()?;
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .ok_or(SelectionFailure::Unavailable)?;
-        let agent = std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from);
-        let effective = route::effective(alias).await?;
+        let (home, agent) = context.inputs()?;
+        let effective = route::effective_with_context(alias, &context).await?;
         let mut prepared = Vec::new();
         let mut requests = Vec::new();
         let mut unknown = Vec::new();
@@ -416,8 +438,7 @@ pub(crate) async fn resolve(alias: &str, boot: String, owner: Owner) -> Result<R
                 selection::prepare_identity(&leg.text, &home, agent.clone(), &admission).await?;
             let identity = &capture.identity;
             let details = selection::probe_details(&leg.text, &home, identity)?;
-            let (hosts, missing) = match selection::native_trust(&leg.text, &home, identity).await
-            {
+            let (hosts, missing) = match selection::native_trust(&leg.text, &home, identity).await {
                 Ok((destination, hosts)) if destination == leg.destination => (hosts, false),
                 Err(SelectionFailure::HostTrustRequired) => (vec![], true),
                 Err(error) => return Err(error),
@@ -435,7 +456,7 @@ pub(crate) async fn resolve(alias: &str, boot: String, owner: Owner) -> Result<R
         }
         if !owner.guard.active()
             || !(owner.current)()
-            || route::effective(alias).await? != effective
+            || route::effective_with_context(alias, &context).await? != effective
         {
             return Err(SelectionFailure::Unavailable);
         }
@@ -506,6 +527,7 @@ pub(crate) async fn resolve(alias: &str, boot: String, owner: Owner) -> Result<R
                         &owner,
                         alias,
                         &effective,
+                        &context,
                         target,
                         bytes,
                         Evidence {
@@ -571,7 +593,7 @@ pub(crate) async fn resolve(alias: &str, boot: String, owner: Owner) -> Result<R
         }
         if !owner.guard.active()
             || !(owner.current)()
-            || route::effective(alias).await? != effective
+            || route::effective_with_context(alias, &context).await? != effective
         {
             return Err(SelectionFailure::Unavailable);
         }

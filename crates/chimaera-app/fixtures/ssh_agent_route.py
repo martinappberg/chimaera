@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+"""Mac encrypted configured identity -> real Link grant/Ready lifecycle.
+
+The keeper/account HTTP and WebSocket protocol is simulated on loopback. This
+does not prove real keeper SSH signing, Tauri prompts, or retained HPC jobs.
+Uses the loader's bounded synthetic process ownership/cleanup helpers.
+"""
+import argparse
+import base64
+import hashlib
+import http.server
+import json
+import os
+import pathlib
+import select
+import signal
+import socketserver
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+from ssh_agent_loader import Fixture, Refused, stop_owned
+
+TOKEN = "synthetic-route-device-token"
+BOOT = "synthetic-route-keeper-boot"
+GRANT = "synthetic-route-grant"
+GRANT_PATH = "/v1/hosts/fixture-host/ssh/auth/route-grants"
+DESTINATION = {"hostname": "fixture.example.invalid", "user": "fixture", "port": 22}
+
+
+class Protocol(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = False
+    block_on_close = True
+
+    def __init__(self, owner, action, public, host):
+        self.thread = None
+        self.started = False
+        self.closed = False
+        # Retain this partial owner before bind or thread creation can fail.
+        owner.protocols.append(self)
+        self.action, self.public, self.host = action, public, host
+        self.stopped = threading.Event()
+        self.grant_entered = threading.Event()
+        self.ready_entered = threading.Event()
+        self.lock = threading.Lock()
+        self.slots = threading.BoundedSemaphore(8)
+        self.requests = self.grants = self.ready = self.reconnects = self.deletes = 0
+        self.failed = False
+        self.deadline = time.monotonic() + 12
+        super().__init__(("127.0.0.1", 0), Handler)
+        self.origin = "http://127.0.0.1:" + str(self.server_port)
+        self.thread = threading.Thread(target=self.serve_forever, kwargs={"poll_interval": 0.025})
+
+    def start(self):
+        # Defer delivered fixture signals only through the tiny start/receipt
+        # transition: cleanup must know whether shutdown has a serving owner.
+        signals = {signal.SIGALRM, signal.SIGTERM, signal.SIGINT, signal.SIGHUP}
+        previous = signal.pthread_sigmask(signal.SIG_BLOCK, signals)
+        try:
+            self.thread.start()
+            self.started = True
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+    def process_request(self, request, client_address):
+        with self.lock:
+            self.requests += 1
+            refused = self.requests > 64
+        if refused or not self.slots.acquire(blocking=False):
+            self.failed = True
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
+    def handle_error(self, request, client_address):
+        self.failed = True  # Never print protocol values, paths, or tracebacks.
+
+    def close(self):
+        if self.closed:
+            return
+        # Safe even when construction failed before bind or start.
+        stopped = getattr(self, "stopped", None)
+        if stopped is not None:
+            stopped.set()
+        if self.started and self.thread.is_alive():
+            self.shutdown()
+        if hasattr(self, "socket"):
+            self.server_close()
+        if self.started:
+            self.thread.join(timeout=1)
+            if self.thread.is_alive():
+                raise Refused("loopback helper cleanup")
+        self.closed = True
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):
+        pass
+
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(1)
+
+    def reply(self, status, body=None):
+        payload = b"" if body is None else json.dumps(body, separators=(",", ":")).encode()
+        if len(payload) > 131072:
+            raise Refused("loopback response bound")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        self.wfile.write(payload)
+        self.wfile.flush()
+
+    def allowed(self):
+        return (not self.server.stopped.is_set() and time.monotonic() < self.server.deadline
+                and self.headers.get("Authorization") == "Bearer " + TOKEN)
+
+    def wait(self):
+        while not self.server.stopped.wait(0.025):
+            if time.monotonic() >= self.server.deadline:
+                return
+
+    def do_GET(self):
+        if not self.allowed():
+            return self.reply(401)
+        if self.path == "/v1/me":
+            return self.reply(200, {
+                "account_id": "synthetic-route-account", "device_id": "synthetic-route-device",
+                "email": "synthetic@example.invalid", "plan": "pro", "protocol": 0,
+                "keeper_url": self.server.origin, "hours_exhausted": False,
+                "limits": {"cloud_hours": 1, "storage_bytes": 1},
+                "usage": {"cloud_hours": 0.0, "storage_bytes": 0},
+            })
+        if self.path == "/v1/ssh/auth/capabilities":
+            return self.reply(200, {
+                "version": 1, "hostbound_v1": True, "register_only_v1": True,
+                "proxyjump_v1": True, "route_policy_v1": True, "keeper_boot": BOOT,
+            })
+        if self.path != GRANT_PATH + "/" + GRANT + "/ws":
+            return self.reply(404)
+        if self.server.grants != 1:
+            return self.reply(409)
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        if (self.headers.get("Upgrade", "").lower() != "websocket"
+                or len(key) != 24 or len(base64.b64decode(key, validate=True)) != 16):
+            return self.reply(400)
+        self.send_response(101)
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", base64.b64encode(hashlib.sha1(
+            (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode())
+        self.end_headers()
+        self.close_connection = True
+        self.server.ready_entered.set()
+        if self.server.action == "ready-expiry":
+            self.wait()
+            return
+        with self.server.lock:
+            self.frame(1, json.dumps({
+                "type": "ready", "version": 1, "grant_id": GRANT,
+                "keeper_boot": BOOT, "legs": 1,
+            }, separators=(",", ":")).encode())
+            self.server.ready += 1
+        # No sign request is fabricated. Keep the real native pump alive until
+        # its owner closes it; accept only bounded WS control/close traffic.
+        while not self.server.stopped.is_set() and time.monotonic() < self.server.deadline:
+            if not select.select([self.connection], [], [], 0.025)[0]:
+                continue
+            head = self.rfile.read(2)
+            if not head:
+                return
+            if len(head) != 2 or head[0] not in (0x88, 0x89, 0x8A) or not head[1] & 128:
+                raise Refused("unexpected simulated control traffic")
+            length = head[1] & 127
+            if length > 125:
+                raise Refused("simulated control frame bound")
+            mask = self.rfile.read(4)
+            data = self.rfile.read(length)
+            if len(mask) != 4 or len(data) != length:
+                raise Refused("partial simulated control frame")
+            if head[0] == 0x88:
+                return
+            if head[0] == 0x89:
+                self.frame(10, bytes(byte ^ mask[i % 4] for i, byte in enumerate(data)))
+
+    def frame(self, opcode, payload):
+        if len(payload) > 65535:
+            raise Refused("simulated websocket output bound")
+        prefix = bytes([128 | opcode])
+        prefix += bytes([len(payload)]) if len(payload) < 126 else b"\x7e" + struct.pack("!H", len(payload))
+        self.wfile.write(prefix + payload)
+        self.wfile.flush()
+
+    def do_POST(self):
+        if not self.allowed():
+            return self.reply(401)
+        if self.path == "/v1/hosts/fixture-host/reconnect":
+            with self.server.lock:
+                if (self.server.ready != 1 or self.server.grants != 1
+                        or self.headers.get("x-chimaera-ssh-auth-route-grant") != GRANT):
+                    return self.reply(409)
+                self.server.reconnects += 1
+            return self.reply(204)
+        if self.path != GRANT_PATH:
+            return self.reply(404)
+        raw_length = self.headers.get("Content-Length", "")
+        if not raw_length.isdecimal() or not 1 <= int(raw_length) <= 131072:
+            return self.reply(400)
+        body = self.rfile.read(int(raw_length))
+        if len(body) != int(raw_length):
+            return self.reply(400)
+        request = json.loads(body)
+        legs = request.get("legs", [])
+        if (request.get("version") != 1 or request.get("keeper_boot") != BOOT
+                or request.get("destination") != DESTINATION
+                or request.get("route") != {"version": 1, "jumps": []}
+                or len(legs) != 1 or legs[0].get("destination") != DESTINATION
+                or legs[0].get("mode") != "key"
+                or legs[0].get("user_keys") != [self.server.public]
+                or legs[0].get("host_keys") != [{"key": self.server.host, "is_ca": False}]
+                or not isinstance(legs[0].get("policy"), dict)):
+            raise Refused("configured identity grant mismatch")
+        with self.server.lock:
+            self.server.grants += 1
+            if self.server.grants != 1:
+                raise Refused("grant replay")
+        self.server.grant_entered.set()
+        if self.server.action in ("grant-expiry", "grant-cancel"):
+            self.wait()
+            return
+        return self.reply(201, {
+            "version": 1, "grant_id": GRANT, "expires_in": 180,
+            "destination": request["destination"], "route": request["route"],
+            "modes": [leg["mode"] for leg in legs], "policies": [leg["policy"] for leg in legs],
+        })
+
+    def do_DELETE(self):
+        if not self.allowed() or self.path != GRANT_PATH + "/" + GRANT:
+            return self.reply(401)
+        with self.server.lock:
+            self.server.deletes += 1
+        return self.reply(204)
+
+
+class RouteFixture(Fixture):
+    def __init__(self, binary):
+        self.protocols = []
+        super().__init__(binary)
+
+    def close(self):
+        failed = False
+        for helper in reversed(self.protocols):
+            try:
+                helper.close()
+            except (Refused, OSError):
+                failed = True
+        # Retire processes/directories even if one listener refuses cleanup.
+        try:
+            super().close()
+        finally:
+            if failed:
+                raise Refused("retained loopback helper cleanup")
+
+    def run(self):
+        encrypted, public = self.key("selected")
+        _, host = self.key("host", passphrase="")
+        foreign_key, _ = self.key("foreign", passphrase="")
+        foreign_socket = self.root / "foreign-agent"
+        self.spawn(["/usr/bin/ssh-agent", "-D", "-P", "", "-a", str(foreign_socket)], output=False)
+        until = self.end(2)
+        while not foreign_socket.exists() and time.monotonic() < until:
+            time.sleep(0.02)
+        env = dict(self.env, SSH_AUTH_SOCK=str(foreign_socket), SSH_ASKPASS_REQUIRE="never")
+        if self.collect(["/usr/bin/ssh-add", str(foreign_key)], env)[0]:
+            raise Refused("foreign seed refused")
+        before = self.identities(env)
+        known = self.root / "known"
+        known.write_text("fixture.example.invalid ssh-ed25519 " + host.decode() + "\n")
+        os.chmod(known, 0o600)
+        config = self.root / "config"
+        text = ("Host route-fixture\n HostName fixture.example.invalid\n User fixture\n Port 22\n"
+                " IdentityAgent none\n IdentitiesOnly yes\n IdentityFile " + str(encrypted) + "\n"
+                " UserKnownHostsFile " + str(known) + "\n GlobalKnownHostsFile none\n"
+                " PubkeyAuthentication yes\n PasswordAuthentication no\n KbdInteractiveAuthentication no\n"
+                " GSSAPIAuthentication no\n HostbasedAuthentication no\n"
+                " PreferredAuthentications publickey\n HostKeyAlgorithms ssh-ed25519\n"
+                " PubkeyAcceptedAlgorithms ssh-ed25519\n CASignatureAlgorithms ssh-ed25519\n"
+                " ControlMaster no\n ControlPath none\n")
+        for action in ("accept", "grant-expiry", "grant-cancel", "ready-expiry", "config-change"):
+            config.write_text(text)
+            os.chmod(config, 0o600)
+            helper = Protocol(self, action, public.decode(), host.decode())
+            helper.start()
+            receipt = None
+            answered = cancelled = False
+            start = time.monotonic()
+            app = None
+            try:
+                app = self.spawn([str(self.binary), "--route-fixture", str(config), helper.origin, action],
+                                 env, input_pipe=True)
+
+                def observed(output):
+                    nonlocal receipt, answered
+                    if b"ROUTE_PROMPT\n" in output and receipt is None:
+                        receipt = self.helper_receipt(app)
+                    if receipt is not None and not answered:
+                        if action == "config-change":
+                            config.write_text(text.replace("fixture.example.invalid", "changed.example.invalid"))
+                        # A bounded delay at unlock proves the later eight-second
+                        # deadline includes time already spent before the grant.
+                        time.sleep(1)
+                        if os.write(app.stdin.fileno(), b"CONTINUE\n") != 9:
+                            raise Refused("route prompt handoff")
+                        answered = True
+                        if action != "grant-cancel":
+                            app.stdin.close()
+
+                output = bytearray()
+                until = self.end(11)
+                while True:
+                    if time.monotonic() >= until:
+                        raise Refused("route case deadline")
+                    if action == "grant-cancel" and helper.grant_entered.is_set() and not cancelled:
+                        if os.write(app.stdin.fileno(), b"CANCEL\n") != 7:
+                            raise Refused("route cancellation handoff")
+                        cancelled = True
+                        app.stdin.close()
+                    if not select.select([app.stdout], [], [], 0.025)[0]:
+                        continue
+                    chunk = os.read(app.stdout.fileno(), 4096)
+                    if not chunk:
+                        break
+                    if len(output) + len(chunk) > 8192:
+                        raise Refused("route case output bound")
+                    output.extend(chunk)
+                    observed(output)
+                app.wait(timeout=max(0.01, until - time.monotonic()))
+                if app.returncode != 0 or receipt is None or helper.failed:
+                    raise Refused("route case refused")
+                if action == "accept":
+                    if b"ROUTE_ACCEPTED\n" not in output or (helper.grants, helper.ready, helper.reconnects, helper.deletes) != (1, 1, 1, 1):
+                        raise Refused("positive ordered grant receipt")
+                elif action == "config-change":
+                    if b"ROUTE_REFUSED config\n" not in output or helper.grants or helper.reconnects:
+                        raise Refused("config revalidation escaped")
+                else:
+                    expected = b"ROUTE_REFUSED revoked\n" if action == "grant-cancel" else b"ROUTE_REFUSED expiry\n"
+                    if expected not in output or helper.grants != 1 or helper.reconnects:
+                        raise Refused("late grant or reconnect escaped")
+                    if action == "ready-expiry" and (not helper.ready_entered.is_set() or helper.deletes != 1):
+                        raise Refused("ready deadline cleanup receipt")
+                    if action.endswith("expiry") and time.monotonic() - start > 10:
+                        raise Refused("original route deadline restarted")
+                self.cleanup_receipt(receipt)
+                if self.identities(env) != before:
+                    raise Refused("foreign fixture agent changed")
+                print("PASS", action, "original_owner configured_identity owned_cleanup foreign_unchanged", flush=True)
+            finally:
+                if app is not None and not app.stdin.closed:
+                    app.stdin.close()
+                try:
+                    helper.close()
+                finally:
+                    if app is not None:
+                        stop_owned(app)
+                if helper.failed:
+                    raise Refused("loopback protocol owner failed")
+        print("PASS route5; simulated keeper protocol, no signing/SSH/Tauri/job acceptance", flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--binary", type=pathlib.Path, required=True)
+    args = parser.parse_args()
+    if sys.platform != "darwin" or not args.binary.is_absolute():
+        raise Refused("Mac fixture and absolute binary required")
+    import stat
+    info = args.binary.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+        raise Refused("fixture binary ownership")
+
+    def interrupted(*_):
+        raise Refused("route fixture interrupted or expired")
+
+    for name in (signal.SIGALRM, signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(name, interrupted)
+    signal.setitimer(signal.ITIMER_REAL, 60)
+    fixture = RouteFixture(args.binary)
+    try:
+        fixture.run()
+    finally:
+        # Cleanup uses only fixed, independently bounded owned-process receipts;
+        # a second signal must not interrupt retirement midway through a group.
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        for name in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(name, signal.SIG_IGN)
+        fixture.close()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (Refused, OSError, ValueError, subprocess.TimeoutExpired) as error:
+        print("FAIL", str(error) if isinstance(error, Refused) else "fixture operation refused", file=sys.stderr)
+        sys.exit(1)
