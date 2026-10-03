@@ -10,6 +10,28 @@ use chimaera_link::ssh_auth::SshAuthFailure as Failure;
 use std::{io::Write, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{io::AsyncReadExt, time::Instant};
 
+#[derive(Clone, Copy)]
+enum Phase {
+    ClientBuild,
+    Me,
+    CapResponse,
+    CapValidate,
+}
+fn phase(phase: Phase, result: &str, origin: Instant) -> Result<(), ()> {
+    let phase = match phase {
+        Phase::ClientBuild => "client_build",
+        Phase::Me => "me",
+        Phase::CapResponse => "cap_response",
+        Phase::CapValidate => "cap_validate",
+    };
+    let elapsed = Instant::now()
+        .saturating_duration_since(origin)
+        .as_millis()
+        .min(12_000);
+    println!("ROUTE_PHASE {phase} {result} {elapsed}");
+    std::io::stdout().flush().map_err(|_| ())
+}
+
 pub(super) async fn run(config: PathBuf, endpoint: String, action: String) -> Result<(), ()> {
     let url = url::Url::parse(&endpoint).map_err(|_| ())?;
     if url.scheme() != "http"
@@ -53,7 +75,9 @@ pub(super) async fn run(config: PathBuf, endpoint: String, action: String) -> Re
             })
         }),
     };
-    let client = chimaera_link::Client::new(
+    let origin = deadline - Duration::from_secs(8);
+    phase(Phase::ClientBuild, "begin", origin)?;
+    let client = match chimaera_link::Client::new(
         &endpoint,
         Some(chimaera_link::Tokens {
             access_token: "synthetic-route-device-token".into(),
@@ -61,18 +85,63 @@ pub(super) async fn run(config: PathBuf, endpoint: String, action: String) -> Re
             token_type: "Bearer".into(),
             expires_in: 3600,
         }),
-    )
-    .map_err(|_| ())?;
-    let caps = tokio::time::timeout_at(deadline, async {
-        client.me().await?;
-        client.ssh_auth_capabilities().await
+    ) {
+        Ok(client) => client,
+        Err(_) => {
+            phase(Phase::ClientBuild, "request", origin)?;
+            return Err(());
+        }
+    };
+    phase(Phase::ClientBuild, "ok", origin)?;
+    let mut current_phase = Phase::Me;
+    let result = tokio::time::timeout_at(deadline, async {
+        phase(Phase::Me, "begin", origin)?;
+        if let Err(error) = client.me().await {
+            let result = if error
+                .downcast_ref::<chimaera_link::ServiceUnsupported>()
+                .is_some()
+            {
+                "unsupported"
+            } else {
+                "request"
+            };
+            phase(Phase::Me, result, origin)?;
+            return Err(());
+        }
+        phase(Phase::Me, "ok", origin)?;
+        current_phase = Phase::CapResponse;
+        phase(Phase::CapResponse, "begin", origin)?;
+        let caps = match client.ssh_auth_capabilities().await {
+            Ok(caps) => caps,
+            Err(error) => {
+                let result = if error
+                    .downcast_ref::<chimaera_link::ServiceUnsupported>()
+                    .is_some()
+                {
+                    "unsupported"
+                } else {
+                    "request"
+                };
+                phase(Phase::CapResponse, result, origin)?;
+                return Err(());
+            }
+        };
+        phase(Phase::CapResponse, "ok", origin)?;
+        Ok(caps)
     })
-    .await
-    .map_err(|_| ())?
-    .map_err(|_| ())?;
+    .await;
+    let caps = match result {
+        Ok(caps) => caps?,
+        Err(_) => {
+            phase(current_phase, "deadline", origin)?;
+            return Err(());
+        }
+    };
     if !caps.route_policy_supported() {
+        phase(Phase::CapValidate, "unsupported", origin)?;
         return Err(());
     }
+    phase(Phase::CapValidate, "ok", origin)?;
     println!("ROUTE_STAGE capabilities");
     std::io::stdout().flush().map_err(|_| ())?;
     let selection = trust::resolve_fixture("route-fixture", caps.keeper_boot, owner, context).await;

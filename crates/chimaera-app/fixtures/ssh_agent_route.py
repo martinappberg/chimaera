@@ -30,6 +30,32 @@ GRANT_PATH = "/v1/hosts/fixture-host/ssh/auth/route-grants"
 DESTINATION = {"hostname": "fixture.example.invalid", "user": "fixture", "port": 22}
 
 
+def native_phases(output):
+    facts = []
+    # Ignore incomplete/unknown child text, including a partial last marker.
+    for line in output.split(b"\n")[:-1]:
+        fields = line.split(b" ")
+        if (len(fields) != 4 or fields[0] != b"ROUTE_PHASE"
+                or fields[1] not in (b"client_build", b"me", b"cap_response", b"cap_validate")
+                or fields[2] not in (b"begin", b"ok", b"request", b"deadline", b"unsupported")
+                or not 1 <= len(fields[3]) <= 5 or not fields[3].isdigit()
+                or int(fields[3]) > 12000):
+            continue
+        facts.append({"phase": fields[1].decode("ascii"), "result": fields[2].decode("ascii"),
+                      "elapsed_ms": int(fields[3])})
+        if len(facts) == 10:
+            break
+    return facts
+
+
+def response_fact(method, path, status, elapsed_ms):
+    return {"method": method if method in ("GET", "POST", "DELETE") else "other",
+            "path": {"/v1/me": "me", "/v1/ssh/auth/capabilities": "capabilities",
+                     "/v1/oauth/refresh": "refresh"}.get(path, "other"),
+            "status": status if status in (200, 401, 404) else "other",
+            "elapsed_ms": max(0, min(12000, elapsed_ms))}
+
+
 class Protocol(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = False
     block_on_close = True
@@ -45,15 +71,28 @@ class Protocol(socketserver.ThreadingMixIn, http.server.HTTPServer):
         self.grant_entered = threading.Event()
         self.ready_entered = threading.Event()
         self.lock = threading.Lock()
+        # reply() can run under self.lock; this independent lock never spans IO.
+        self.diagnostic_lock = threading.Lock()
+        self.response_headers_started = []
+        self.response_overflow = 0
         self.slots = threading.BoundedSemaphore(8)
         self.requests = self.grants = self.ready = self.reconnects = self.deletes = 0
         self.failed = False
         self.failure_kind = "none"
         self.failure_lines = []
-        self.deadline = time.monotonic() + 12
+        self.created_at = time.monotonic()
+        self.deadline = self.created_at + 12
         super().__init__(("127.0.0.1", 0), Handler)
         self.origin = "http://127.0.0.1:" + str(self.server_port)
         self.thread = threading.Thread(target=self.serve_forever, kwargs={"poll_interval": 0.025})
+
+    def response_started(self, method, path, status):
+        fact = response_fact(method, path, status, int((time.monotonic() - self.created_at) * 1000))
+        with self.diagnostic_lock:
+            if len(self.response_headers_started) < 8:
+                self.response_headers_started.append(fact)
+            else:
+                self.response_overflow = min(64, self.response_overflow + 1)
 
     def start(self):
         # Defer delivered fixture signals only through the tiny start/receipt
@@ -131,6 +170,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def setup(self):
         super().setup()
         self.connection.settimeout(1)
+
+    def send_response(self, code, message=None):
+        self.server.response_started(getattr(self, "command", None), getattr(self, "path", None), code)
+        super().send_response(code, message)
 
     def reply(self, status, body=None):
         payload = b"" if body is None else json.dumps(body, separators=(",", ":")).encode()
@@ -416,6 +459,9 @@ class RouteFixture(Fixture):
                         "reconnects": helper.reconnects, "deletes": helper.deletes,
                         "protocol_failed": helper.failed, "failure_kind": helper.failure_kind,
                         "source_lines": helper.failure_lines,
+                        "native_phases": native_phases(output),
+                        "response_headers_started": helper.response_headers_started,
+                        "response_overflow": helper.response_overflow,
                     }, separators=(",", ":")), flush=True)
                 if helper.failed:
                     raise Refused("loopback protocol owner failed")
