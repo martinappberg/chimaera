@@ -809,19 +809,17 @@ async fn explicit_keeper_connect(
     #[cfg(all(feature = "ssh-agent-prototype", unix))]
     if host.kind == chimaera_link::HostKind::Ssh {
         use crate::ssh_agent::{connect, selection};
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(chimaera_link::SSH_AUTH_LIFETIME.into());
         let attempt = state
             .pro
             .ssh_authentication(generation)
             .map_err(|_| "Account changed while connecting")?;
         let mut cancellation = attempt.cancellation();
-        let caps = client.ssh_auth_capabilities().await.map_err(|_| {
-            "This keeper needs an update before connecting with this Mac's SSH keys"
-        })?;
+        let caps = native_keeper_capabilities(client, &attempt, deadline, current).await?;
         if !caps.route_policy_supported() {
             return Err("This keeper needs an update before native route authentication".into());
         }
-        let deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_secs(chimaera_link::SSH_AUTH_LIFETIME.into());
         let prompt_app = _app.clone();
         let prompt_alias = host.alias.clone();
         let generation_app = _app.clone();
@@ -871,6 +869,39 @@ async fn explicit_keeper_connect(
         KEEPER_POLL_FIRST,
     )
     .await
+}
+
+/// The first negotiation spends the original Connect lifetime too. No native
+/// key capture or prompt may follow a reply from a retired account/attempt.
+#[cfg(all(feature = "ssh-agent-prototype", unix))]
+async fn native_keeper_capabilities(
+    client: &chimaera_link::Client,
+    attempt: &crate::ssh_agent::lifecycle::Attempt,
+    deadline: tokio::time::Instant,
+    current: impl Fn() -> bool,
+) -> Result<chimaera_link::SshAuthCapabilities, LinkFailure> {
+    let mut cancellation = attempt.cancellation();
+    if !current() || *cancellation.borrow() {
+        return Err("Account changed while connecting".into());
+    }
+    if tokio::time::Instant::now() >= deadline {
+        return Err("SSH authentication expired; connect again".into());
+    }
+    let caps = tokio::select! {
+        biased;
+        _ = cancellation.wait_for(|value| *value) => return Err("Account changed while connecting".into()),
+        result = tokio::time::timeout_at(deadline, client.ssh_auth_capabilities()) => {
+            result.map_err(|_| LinkFailure::Final("SSH authentication expired; connect again".into()))?
+                .map_err(|_| LinkFailure::Final("This keeper needs an update before connecting with this Mac's SSH keys".into()))?
+        },
+    };
+    if !current() || *cancellation.borrow() {
+        return Err("Account changed while connecting".into());
+    }
+    if tokio::time::Instant::now() >= deadline {
+        return Err("SSH authentication expired; connect again".into());
+    }
+    Ok(caps)
 }
 
 /// A keeper login can wait minutes for a password or Duo answer.
@@ -1163,6 +1194,100 @@ mod tests {
     use crate::shell::lock;
     use chimaera_link::{Daemon, Host, HostKind, HostStatus};
     use std::time::Duration;
+
+    #[cfg(all(feature = "ssh-agent-prototype", unix))]
+    #[tokio::test]
+    async fn native_capability_wait_obeys_original_deadline_and_account_retirement() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        use tokio::sync::Semaphore;
+
+        struct Server(tokio::task::JoinHandle<()>);
+        impl Drop for Server {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        // Stall the real capability HTTP response after the Link client has
+        // discovered its keeper. Neither sign-out nor expiry waits for Link's
+        // separate thirty-second HTTP timeout; a positive late reply cannot
+        // admit selection under a replaced account either.
+        for case in 0..3 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let keeper = chimaera_link::fake::FakeKeeper::new(format!(
+                "http://{}",
+                listener.local_addr().unwrap()
+            ));
+            keeper.set_ssh_auth_supported(true).await;
+            let entered = Arc::new(Semaphore::new(0));
+            let release = Arc::new(Semaphore::new(0));
+            let arrived = entered.clone();
+            let resume = release.clone();
+            let router = keeper.router().layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let entered = arrived.clone();
+                    let release = resume.clone();
+                    async move {
+                        if request.uri().path() == "/v1/ssh/auth/capabilities" {
+                            entered.add_permits(1);
+                            release.acquire().await.unwrap().forget();
+                        }
+                        next.run(request).await
+                    }
+                },
+            ));
+            let _server = Server(tokio::spawn(async move {
+                axum::serve(listener, router).await.unwrap();
+            }));
+            let client = chimaera_link::Client::new(
+                &keeper.endpoint,
+                Some(chimaera_link::fake::FakeKeeper::tokens()),
+            )
+            .unwrap();
+            client.me().await.unwrap();
+            let registry = crate::ssh_agent::lifecycle::Registry::default();
+            let attempt = registry.admit(0).ok().unwrap();
+            let current = AtomicBool::new(true);
+            let deadline = tokio::time::Instant::now()
+                + if case == 0 {
+                    Duration::from_secs(1)
+                } else {
+                    Duration::from_secs(30)
+                };
+            let guard = attempt.native_prompt(deadline);
+            let result = tokio::time::timeout(Duration::from_secs(3), async {
+                let request =
+                    super::native_keeper_capabilities(&client, &attempt, deadline, || {
+                        current.load(Ordering::Acquire)
+                    });
+                let retire = async {
+                    entered.acquire().await.unwrap().forget();
+                    match case {
+                        0 => {} // Keep the server stalled past the original deadline.
+                        1 => registry.advance(1),
+                        _ => {
+                            current.store(false, Ordering::Release);
+                            release.add_permits(1);
+                        }
+                    }
+                };
+                tokio::join!(request, retire).0
+            })
+            .await
+            .expect("a stalled capability request must settle within its original admission");
+            let Err(LinkFailure::Final(message)) = result else {
+                panic!("retired negotiation must refuse before native selection");
+            };
+            if case == 0 {
+                assert_eq!(message, "SSH authentication expired; connect again");
+                assert!(!guard.active());
+            } else {
+                assert_eq!(message, "Account changed while connecting");
+            }
+        }
+    }
 
     #[test]
     fn saved_direct_choice_overrides_known_keeper_without_changing_kept_state() {
