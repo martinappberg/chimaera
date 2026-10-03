@@ -59,11 +59,15 @@ fn refusal_phase(stderr: &[u8]) -> Option<&str> {
         "tui-admission",
         "tui-auth",
         "tui-body-bound",
+        "tui-cli-early-exit",
         "tui-complete-body",
         "tui-header-bound",
         "tui-length",
         "tui-messages-receipt",
         "tui-no-other-auth",
+        "tui-no-count-tokens",
+        "tui-no-messages",
+        "tui-no-rendered-response",
         "tui-output-bound",
         "tui-recorder-cleanup",
         "tui-reply-bound",
@@ -80,6 +84,15 @@ fn refusal_phase(stderr: &[u8]) -> Option<&str> {
 
 #[test]
 fn diagnostic_forwarding_accepts_only_fixed_refusal_phases() {
+    for phase in [
+        "tui-cli-early-exit",
+        "tui-no-messages",
+        "tui-no-rendered-response",
+        "tui-no-count-tokens",
+    ] {
+        let stderr = format!("contained Claude probe refused: {phase}\n");
+        assert_eq!(refusal_phase(stderr.as_bytes()), Some(phase));
+    }
     assert_eq!(
         refusal_phase(b"contained Claude probe refused: run-caps\n"),
         Some("run-caps")

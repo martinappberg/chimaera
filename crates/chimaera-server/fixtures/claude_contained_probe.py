@@ -83,11 +83,15 @@ REFUSAL_PHASES = frozenset((
     'tui-admission',
     'tui-auth',
     'tui-body-bound',
+    'tui-cli-early-exit',
     'tui-complete-body',
     'tui-header-bound',
     'tui-length',
     'tui-messages-receipt',
     'tui-no-other-auth',
+    'tui-no-count-tokens',
+    'tui-no-messages',
+    'tui-no-rendered-response',
     'tui-output-bound',
     'tui-recorder-cleanup',
     'tui-reply-bound',
@@ -164,6 +168,18 @@ def official_result_refusal(output):
     if failed[1]:
         return "official-tests-tui-failed"
     return "official-tests-incomplete"
+
+
+def tui_result_refusal(exited, messages, rendered, count_tokens):
+    if messages and rendered and count_tokens:
+        return None
+    if exited:
+        return "tui-cli-early-exit"
+    if not messages:
+        return "tui-no-messages"
+    if not rendered:
+        return "tui-no-rendered-response"
+    return "tui-no-count-tokens"
 
 
 def require(condition, phase):
@@ -609,8 +625,10 @@ def tui_child():
     env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:" + str(server.server_port)
     process = None
     try:
+        # Pinned 2.1.287 rejects --no-session-persistence without --print.
+        # Interactive session files remain within this disposable private HOME.
         process = subprocess.Popen(["/usr/local/bin/claude", "Respond with the fixture's short success response.",
-            "--no-session-persistence", "--setting-sources", "", "--tools", "",
+            "--setting-sources", "", "--tools", "",
             "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}'],
             env=env, stdin=slave, stdout=slave, stderr=slave, pass_fds=(config_fd,))
         os.close(slave)
@@ -636,10 +654,14 @@ def tui_child():
                 context_sent = True
             if failed:
                 raise Refusal(failed[0])
-            if count_tokens_complete.is_set():
+            if context_sent and messages_complete.is_set() and count_tokens_complete.is_set():
                 break
-        require(not failed and context_sent and messages_complete.is_set() and
-                count_tokens_complete.is_set(), "actual-tui-count-tokens")
+        if failed:
+            raise Refusal(failed[0])
+        phase = tui_result_refusal(process.poll() is not None, messages_complete.is_set(),
+                                   context_sent, count_tokens_complete.is_set())
+        if phase is not None:
+            raise Refusal(phase)
     finally:
         if process is not None:
             process.terminate()
