@@ -5,7 +5,7 @@
   import { pageVisible } from "../shared/visibility";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import { agentCatalog, pollAgents, type LaunchPick } from "./launcher";
-  import { cancelAgentSetup, getAgentSetup, recoverSetupResult, setupRunning, startAgentSetup, type SetupDetails, type SetupRequest } from "./agentSetup";
+  import { acknowledgeSetupResult, cancelAgentSetup, getAgentSetup, pendingSetupId, recoverSetupResult, setupRunning, startAgentSetup, type SetupDetails, type SetupRequest } from "./agentSetup";
 
   let { request, onclose, onlaunch }: { request: SetupRequest; onclose(): void; onlaunch(pick: LaunchPick): void } = $props();
   let details = $state<SetupDetails | null>(null);
@@ -30,7 +30,7 @@
     try {
       const next = await getAgentSetup(agent.id);
       if (disposed) return;
-      if (next.operation && !setupRunning(next.operation) && (initial || next.operation.phase !== details?.operation?.phase)) {
+      if (next.operation && !setupRunning(next.operation) && (initial || next.operation.phase !== details?.operation?.phase || pendingSetupId(agent.id) === next.operation.id)) {
         // Refresh before deciding whether this is an old result: nobody polls
         // the catalog while the dialog and Settings are both closed.
         const catalog = await pollAgents(AbortSignal.timeout(15_000));
@@ -45,6 +45,7 @@
       details = next;
       connected = true;
       refreshError = null;
+      if (next.operation && !setupRunning(next.operation)) acknowledgeSetupResult(agent.id, next.operation.id);
     } catch (e) {
       if (!disposed) {
         connected = false;
@@ -67,6 +68,7 @@
       if (!disposed) details = { ...details, operation: next };
       requestId = null;
       void pollAgents(AbortSignal.timeout(15_000)).catch(() => {});
+      if (!disposed && !setupRunning(next)) void check();
     } catch (e) {
       if (!disposed) {
         error = e instanceof Error ? e.message : "Couldn't start installation.";
@@ -79,7 +81,10 @@
   async function cancel(): Promise<void> {
     if (!operation || !details || busy) return;
     busy = true;
-    try { details = { ...details, operation: await cancelAgentSetup(agent.id, operation.id) }; }
+    try {
+      details = { ...details, operation: await cancelAgentSetup(agent.id, operation.id) };
+      if (!setupRunning(details.operation)) void check();
+    }
     catch (e) { error = e instanceof Error ? e.message : "Couldn't stop the installer."; }
     finally { busy = false; }
   }

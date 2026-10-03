@@ -82,3 +82,7 @@ wakes row always shows.
   when you touch the persist path.
 - **UI quality is an acceptance criterion.** Use the theme tokens; light and dark
   both hold.
+- **Setup survives a missed catalog refresh.** `workspace/agentSetup.ts` remembers
+  each pending operation in the window's session storage before POST, replacing
+  its ID when it joins existing work. Clear it only after showing the result;
+  closing the dialog or a lost response must not discard a failure or update.
