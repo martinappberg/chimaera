@@ -388,7 +388,7 @@
   import ContextMenuHost from "./lib/shared/ContextMenuHost.svelte";
   import { contextMenu } from "./lib/shared/contextMenu.svelte";
   import ConfirmDialog from "./lib/shared/ConfirmDialog.svelte";
-  import CloseDirtyDialog from "./lib/layout/CloseDirtyDialog.svelte";
+  import CloseDirtyLoader from "./lib/layout/CloseDirtyLoader.svelte";
   import { WindowCloseGuard } from "./lib/layout/windowClose.svelte";
   import { fsDeleteOp, lastFsMutation, notifyCreated, pendingDelete } from "./lib/workspace/fsEvents";
   import {
@@ -424,7 +424,7 @@
   import { sameFile, setSameFileOpener } from "./lib/workspace/sameFile.svelte";
   import { requestSettingsSection } from "./lib/settings/jump";
   import { setAgentNames } from "./lib/chat/toolLabels";
-  import QuickOpen from "./lib/workspace/QuickOpen.svelte";
+  import QuickOpenLoader from "./lib/workspace/QuickOpenLoader.svelte";
   import FileTree from "./lib/workspace/FileTree.svelte";
   import SplitTree from "./lib/layout/SplitNode.svelte";
   import Pane from "./lib/layout/Pane.svelte";
@@ -6373,7 +6373,7 @@
 {/if}
 
 {#if quickOpenOpen && activeWsId !== null}
-  <QuickOpen
+  <QuickOpenLoader
     workspaceId={activeWsId}
     sessions={wsSessions}
     sessionNames={displayNames}
@@ -6461,7 +6461,7 @@
 <!-- The native window close / app quit over every unsaved file here; it takes
      precedence over a tab close already asking (whose files it includes). -->
 {#if windowClose.prompt !== null}
-  <CloseDirtyDialog
+  <CloseDirtyLoader
     paths={windowClose.prompt.paths}
     saving={windowClose.saving}
     error={windowClose.error}
@@ -6472,7 +6472,7 @@
   />
 <!-- Closing tabs whose files hold unsaved edits: save / don't save / cancel. -->
 {:else if pendingClosePaths.length > 0}
-  <CloseDirtyDialog
+  <CloseDirtyLoader
     paths={pendingClosePaths}
     saving={closeSaving}
     error={closeError}
