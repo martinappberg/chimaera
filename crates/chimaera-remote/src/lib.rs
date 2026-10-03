@@ -15,9 +15,14 @@
 //! public trust and a destination-bound agent for one effect. Unsupported local
 //! identity/proxy configuration cannot silently widen that authority; background
 //! captured-master scopes remain unable to authenticate.
+//! `ssh_algorithms` captures one bounded fixed-binary supported snapshot for all
+//! legs. Policy-bearing effects emit its ordered intersection with native lists,
+//! retain locally disabled methods, and refuse if that binary identity changes.
 
 pub mod cluster;
 pub mod hosts;
+mod ssh_algorithms;
+pub use ssh_algorithms::SshAlgorithmSupport;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -59,8 +64,95 @@ pub struct SshAuthentication {
     keyboard_interactive: Option<String>,
     route_helper: Option<String>,
     interactive_only: bool,
+    policy: Option<SshAuthenticationPolicy>,
+    support: Option<SshAlgorithmSupport>,
+}
+/// Closed resolved options for one original route leg; never native directives.
+#[derive(Clone, serde::Serialize)]
+pub struct SshAuthenticationPolicy {
+    pub methods: Vec<String>,
+    pub host_key_algorithms: Vec<String>,
+    pub ca_signature_algorithms: Vec<String>,
+    pub pubkey_accepted_algorithms: Vec<String>,
+    pub kex_algorithms: Vec<String>,
+    pub ciphers: Vec<String>,
+    pub macs: Vec<String>,
+}
+impl SshAuthenticationPolicy {
+    fn validate(&self, interactive: bool) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.methods.is_empty() && self.methods.len() <= 3,
+            "invalid SSH authentication methods"
+        );
+        for (index, method) in self.methods.iter().enumerate() {
+            anyhow::ensure!(
+                matches!(
+                    method.as_str(),
+                    "publickey" | "keyboard-interactive" | "password"
+                ) && !self.methods[..index].contains(method),
+                "invalid SSH authentication method"
+            );
+        }
+        anyhow::ensure!(
+            if interactive {
+                !self.methods.iter().any(|method| method == "publickey")
+            } else {
+                self.methods
+                    .first()
+                    .is_some_and(|method| method == "publickey")
+            },
+            "SSH authentication mode mismatch"
+        );
+        for list in [
+            &self.host_key_algorithms,
+            &self.ca_signature_algorithms,
+            &self.pubkey_accepted_algorithms,
+            &self.kex_algorithms,
+            &self.ciphers,
+            &self.macs,
+        ] {
+            anyhow::ensure!(
+                !list.is_empty() && list.len() <= 64,
+                "invalid SSH authentication algorithms"
+            );
+            let mut names = std::collections::HashSet::new();
+            for name in list {
+                anyhow::ensure!(
+                    !name.is_empty()
+                        && name.len() <= 128
+                        && !name.starts_with(['+', '-'])
+                        && name
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || b"-@._+".contains(&byte))
+                        && names.insert(name),
+                    "invalid SSH authentication algorithm"
+                );
+            }
+        }
+        anyhow::ensure!(
+            serde_json::to_vec(self)?.len() <= 8 * 1024,
+            "SSH authentication policy too large"
+        );
+        Ok(())
+    }
 }
 impl SshAuthentication {
+    /// The caller retains original-grant prompt/signature guards. This only
+    /// restricts the fixed SSH effect; it cannot grant credential UI authority.
+    pub fn with_policy(
+        mut self,
+        policy: SshAuthenticationPolicy,
+        support: &SshAlgorithmSupport,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            self.keyboard_interactive.is_some(),
+            "SSH route context missing"
+        );
+        policy.validate(self.interactive_only)?;
+        self.policy = Some(support.restrict(&policy)?);
+        self.support = Some(support.clone());
+        Ok(self)
+    }
     /// Resolve and freeze one canonical destination locally, without dialing.
     /// Configured private keys/certificates are unsupported. Configured jump or
     /// proxy routing is usable only through an already established captured mux.
@@ -203,12 +295,15 @@ impl SshAuthentication {
             keyboard_interactive: route_context.map(|(context, _, _)| context.into()),
             route_helper,
             interactive_only: route_context.is_some_and(|(_, _, interactive)| interactive),
+            policy: None,
+            support: None,
         })
     }
     /// Permit a caller's existing askpass MFA relay for this exact explicit
     /// effect. The relay MUST check this opaque context, selected destination,
     /// original device and a verified key-signature receipt before prompting,
-    /// then freshly authorize the answer. No password-only downgrade exists.
+    /// then freshly authorize the answer. Configured continuation methods never
+    /// authorize a prompt after key refusal; the original owner still decides.
     pub fn with_keyboard_interactive(mut self, context: &str) -> anyhow::Result<Self> {
         anyhow::ensure!(
             (32..=128).contains(&context.len())
@@ -239,6 +334,13 @@ impl SshAuthentication {
         // directives after validation. Exact captured sockets preserve routing.
         let mut options = vec!["-F".into(), "/dev/null".into()];
         let mfa = allowed && self.keyboard_interactive.is_some();
+        let methods = self.policy.as_ref().map(|policy| policy.methods.join(","));
+        let permits = |method: &str| {
+            mfa && self.policy.as_ref().map_or_else(
+                || method == "keyboard-interactive" || self.interactive_only,
+                |policy| policy.methods.iter().any(|name| name == method),
+            )
+        };
         let settings = [
             (
                 "IdentityAgent",
@@ -262,21 +364,23 @@ impl SshAuthentication {
             ("BatchMode", if mfa { "no" } else { "yes" }),
             (
                 "PasswordAuthentication",
-                if mfa && self.interactive_only {
+                if permits("password") { "yes" } else { "no" },
+            ),
+            (
+                "KbdInteractiveAuthentication",
+                if permits("keyboard-interactive") {
                     "yes"
                 } else {
                     "no"
                 },
             ),
-            (
-                "KbdInteractiveAuthentication",
-                if mfa { "yes" } else { "no" },
-            ),
             ("HostbasedAuthentication", "no"),
             ("GSSAPIAuthentication", "no"),
             (
                 "PreferredAuthentications",
-                if mfa && self.interactive_only {
+                if let Some(methods) = &methods {
+                    methods.as_str()
+                } else if mfa && self.interactive_only {
                     "keyboard-interactive,password"
                 } else if mfa {
                     "publickey,keyboard-interactive"
@@ -304,6 +408,21 @@ impl SshAuthentication {
         ];
         for (key, value) in settings {
             options.extend(["-o".into(), format!("{key}={value}")]);
+        }
+        if let Some(policy) = &self.policy {
+            for (key, list) in [
+                ("HostKeyAlgorithms", &policy.host_key_algorithms),
+                ("CASignatureAlgorithms", &policy.ca_signature_algorithms),
+                (
+                    "PubkeyAcceptedAlgorithms",
+                    &policy.pubkey_accepted_algorithms,
+                ),
+                ("KexAlgorithms", &policy.kex_algorithms),
+                ("Ciphers", &policy.ciphers),
+                ("MACs", &policy.macs),
+            ] {
+                options.extend(["-o".into(), format!("{key}={}", list.join(","))]);
+            }
         }
         options.extend([
             "-o".into(),
@@ -742,6 +861,34 @@ pub fn wsl_transport_ready() -> bool {
 /// pinned with `-u` so a later change of the distro's default user (Ubuntu
 /// OOBE) can never silently re-home ssh's config/keys/sockets mid-flight.
 fn transport_command(program: &str) -> Command {
+    // A policy-bearing effect must use the same trusted binary whose closed
+    // supported-algorithm snapshot narrowed its arguments. Replacement refuses
+    // rather than applying that snapshot to a different SSH implementation.
+    if matches!(program, "ssh" | "scp") {
+        if let Ok(Some(support)) = SSH_AUTHENTICATION.try_with(|scope| scope.support.clone()) {
+            let mut command = if support.current() {
+                Command::new(if program == "ssh" {
+                    "/usr/bin/ssh"
+                } else {
+                    "/usr/bin/scp"
+                })
+            } else {
+                Command::new("/usr/bin/false")
+            };
+            if program == "scp" {
+                command.args(["-S", "/usr/bin/ssh"]);
+            }
+            command.env_remove(ASKPASS_CONTEXT_ENV);
+            if EXISTING_MASTER_ONLY.try_with(|_| ()).is_err() {
+                if let Ok(Some(context)) =
+                    SSH_AUTHENTICATION.try_with(|scope| scope.keyboard_interactive.clone())
+                {
+                    command.env(ASKPASS_CONTEXT_ENV, context);
+                }
+            }
+            return command;
+        }
+    }
     let mut command = match wsl_transport() {
         Some(t) => {
             let mut c = Command::new("wsl.exe");
@@ -4106,6 +4253,8 @@ mod tests {
             keyboard_interactive: None,
             route_helper: None,
             interactive_only: false,
+            policy: None,
+            support: None,
         }
     }
     #[test]
@@ -4329,6 +4478,70 @@ mod tests {
                 false
             )
             .contains(&"ControlPath=none".into()));
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolved_policy_arguments_preserve_native_order_and_disable_unowned_credentials() {
+        let support = SshAlgorithmSupport::capture().await.unwrap();
+        let policy = SshAuthenticationPolicy {
+            methods: vec![
+                "publickey".into(),
+                "password".into(),
+                "keyboard-interactive".into(),
+            ],
+            host_key_algorithms: vec!["ssh-ed25519".into()],
+            ca_signature_algorithms: vec!["ssh-ed25519".into()],
+            pubkey_accepted_algorithms: vec![
+                "webauthn-sk-ecdsa-sha2-nistp256@openssh.com".into(),
+                "ssh-ed25519".into(),
+            ],
+            kex_algorithms: vec!["future-native-kex".into(), "curve25519-sha256".into()],
+            ciphers: vec!["chacha20-poly1305@openssh.com".into()],
+            macs: vec!["hmac-sha2-256-etm@openssh.com".into()],
+        };
+        let scope = fixture_authentication()
+            .with_keyboard_interactive("fixture_original_owner_context_000000000000")
+            .unwrap()
+            .with_policy(policy, &support)
+            .unwrap();
+        scope
+            .with_authentication(async {
+                let mut command = ssh_base_via("fixture", &Route::Alias);
+                command.args(["-G", "fixture"]);
+                let output = output_bounded(&mut command, 5, "fixture resolved policy")
+                    .await
+                    .unwrap();
+                assert!(output.status.success());
+                let text = std::str::from_utf8(&output.stdout).unwrap();
+                for exact in [
+                    "preferredauthentications publickey,password,keyboard-interactive",
+                    "passwordauthentication yes",
+                    "kbdinteractiveauthentication yes",
+                    "hostkeyalgorithms ssh-ed25519",
+                    "casignaturealgorithms ssh-ed25519",
+                    "kexalgorithms curve25519-sha256",
+                    "ciphers chacha20-poly1305@openssh.com",
+                    "macs hmac-sha2-256-etm@openssh.com",
+                ] {
+                    assert!(text.lines().any(|line| line == exact), "{exact}");
+                }
+                for options in [
+                    scope.options("other", &Route::Alias, false),
+                    scope.options("fixture", &Route::Alias, true),
+                ] {
+                    assert!(options.contains(&"IdentityAgent=none".into()));
+                    assert!(options.contains(&"PasswordAuthentication=no".into()));
+                    assert!(options.contains(&"KbdInteractiveAuthentication=no".into()));
+                }
+                scope.masters[0]
+                    .with_existing(async {
+                        let options = scope.options("fixture", &Route::Alias, false);
+                        assert!(options.contains(&"PasswordAuthentication=no".into()));
+                        assert!(options.contains(&"KbdInteractiveAuthentication=no".into()));
+                    })
+                    .await;
+            })
+            .await;
     }
     #[cfg(unix)]
     #[tokio::test]

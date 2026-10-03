@@ -237,6 +237,9 @@ fn with_policy(mut request: SshRouteGrantRequest) -> SshRouteGrantRequest {
             host_key_algorithms: vec!["ssh-ed25519".into()],
             ca_signature_algorithms: vec!["ssh-ed25519".into()],
             pubkey_accepted_algorithms: vec!["ssh-ed25519".into()],
+            kex_algorithms: vec!["curve25519-sha256".into()],
+            ciphers: vec!["chacha20-poly1305@openssh.com".into()],
+            macs: vec!["hmac-sha2-256-etm@openssh.com".into()],
         });
     }
     request
