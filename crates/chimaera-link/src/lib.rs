@@ -12,6 +12,7 @@ mod oauth;
 mod placement;
 pub use handoff::*;
 pub use placement::*;
+pub mod project_secrets;
 pub mod protocol;
 pub mod ssh_auth;
 pub use ssh_auth::*;

@@ -481,6 +481,7 @@ dependencies = [
  "anyhow",
  "axum",
  "base64 0.22.1",
+ "bytes",
  "chimaera-core",
  "clap",
  "futures",
@@ -495,6 +496,7 @@ dependencies = [
  "tokio-tungstenite 0.29.0",
  "url",
  "webpki-roots 1.0.9",
+ "zeroize",
 ]
 
 [[package]]
