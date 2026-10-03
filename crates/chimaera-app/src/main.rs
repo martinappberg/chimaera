@@ -23,13 +23,18 @@ mod windows;
 mod wsl;
 
 fn main() {
-    // Triple role. `--askpass <prompt>` is the tiny SSH_ASKPASS helper ssh
+    // `--askpass <prompt>` is the tiny SSH_ASKPASS helper ssh
     // runs to prompt for a password / 2FA: it relays to the running app over
     // a socket and prints the answer, no Tauri init. Checked first — it must
     // stay lightweight and never spawn a daemon or a window.
     if std::env::args().any(|a| a == "--askpass") {
         askpass::run_helper();
         return;
+    }
+
+    #[cfg(all(unix, feature = "ssh-agent-prototype"))]
+    if std::env::args().nth(1).as_deref() == Some("--native-key-agent") {
+        std::process::exit(ssh_agent::key_agent::run_helper());
     }
 
     // `chimaera-app --daemon` IS the local daemon (headless, no Tauri init),

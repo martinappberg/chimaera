@@ -25,6 +25,9 @@ use packet::Reader;
 pub(crate) mod connect;
 #[path = "ssh_agent/control.rs"]
 pub(crate) mod control;
+#[cfg(unix)]
+#[path = "ssh_agent/key_agent/mod.rs"]
+pub(crate) mod key_agent;
 #[path = "ssh_agent/lifecycle.rs"]
 pub(crate) mod lifecycle;
 #[cfg(unix)]
