@@ -13,23 +13,34 @@ pub(crate) struct PumpDrain {
     pub(crate) acknowledged: oneshot::Sender<Option<OwnedMutexGuard<()>>>,
     pub(crate) release: oneshot::Receiver<()>,
 }
+// Portable parking/manual Resume consumes native UUIDs: the daemon's existing
+// bundle and parking-record validators require exactly 36 bytes. Evidence may
+// accept smaller synthetic IDs, but must not retain a larger untrusted Init ID.
+const NATIVE_EVIDENCE_MAX: usize = 36;
+
 #[derive(Default)]
 pub(crate) struct Evidence {
-    initialized: bool,
+    native_init: Option<String>,
     completed: bool,
     failed: bool,
     tasks_present: bool,
 }
 impl Evidence {
-    pub(crate) fn initialized(&self) -> bool {
-        self.initialized
+    pub(crate) fn native_init(&self) -> Option<&str> {
+        self.native_init.as_deref()
     }
     pub(crate) fn command(&mut self) {
         self.completed = false;
     }
     pub(crate) fn observe(&mut self, event: &AgentEvent) {
         match event {
-            AgentEvent::Init { .. } => self.initialized = true,
+            AgentEvent::Init {
+                native_session_id, ..
+            } => {
+                self.native_init = (!native_session_id.is_empty()
+                    && native_session_id.len() <= NATIVE_EVIDENCE_MAX)
+                    .then(|| native_session_id.clone());
+            }
             AgentEvent::TurnStarted { .. } => self.completed = false,
             AgentEvent::TurnCompleted { .. } | AgentEvent::TurnAborted { .. } => {
                 self.completed = true;
@@ -84,11 +95,29 @@ impl MaintenanceIdle {
                 && !carry.remote_control
                 && !carry.ultracode
                 && carry.background.is_empty()
-                && idle.initialized
+                && idle.native_init.as_deref() == info.native_session_id.as_deref()
                 && idle.completed
                 && !idle.failed
                 && !idle.tasks_present,
             "structured session idle proof unavailable"
+        );
+        Ok(())
+    }
+    /// Only after the positive pump drain owns absorption: match the retained
+    /// ledger conversation to the nonempty Init actually emitted by this child.
+    /// Pinned/inherited info alone never supplies current-process evidence.
+    pub fn check_native(&self, expected: &str) -> Result<()> {
+        anyhow::ensure!(self.pump.is_some(), "structured native drain unavailable");
+        self.check()?;
+        anyhow::ensure!(
+            self.session
+                .maintenance_evidence
+                .lock()
+                .expect("maintenance evidence lock")
+                .native_init()
+                == Some(expected)
+                && !expected.is_empty(),
+            "structured native identity changed"
         );
         Ok(())
     }
@@ -171,6 +200,136 @@ mod tests {
     use super::*;
     use crate::tests::HeldCommands;
 
+    fn init(native: &str) -> AgentEvent {
+        AgentEvent::Init {
+            native_session_id: native.into(),
+            model: None,
+            modes: Vec::new(),
+            current_mode: None,
+            slash_commands: Vec::new(),
+            models: Vec::new(),
+            agent_version: None,
+            remote_control_available: false,
+            remote_control_auto_enable: false,
+            remote_control: None,
+        }
+    }
+    #[tokio::test]
+    async fn native_proof_rejects_preseeded_empty_init_and_changed_final_pump_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(ChatManager::new(
+            dir.path().join("chat"),
+            Box::new(|_, _| {}),
+            Box::new(|_, _| {}),
+        ));
+        let adapter = HeldCommands {
+            commands: Arc::new(Mutex::new(None)),
+        };
+        let mut spec = SpawnSpec::new(
+            "native-cutpoint",
+            vec!["synthetic".into()],
+            dir.path().into(),
+        );
+        spec.agent_version = Some(crate::claude::TESTED_CLAUDE_VERSION.into());
+        spec.pinned_native_id = Some("original-native".into());
+        manager.spawn(&adapter, spec).unwrap();
+        let session = manager.get_session("native-cutpoint").unwrap();
+        let events = session.annotate_tx.upgrade().unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        tokio::time::timeout_at(deadline, async {
+            while session.journal.last_seq() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let oversized = "n".repeat(NATIVE_EVIDENCE_MAX + 1);
+        for native in ["", oversized.as_str(), "original-native"] {
+            let before = session.journal.last_seq();
+            events.try_send(init(native)).unwrap();
+            tokio::time::timeout_at(deadline, async {
+                while session.journal.last_seq() <= before {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                manager
+                    .resumed_native_ready("native-cutpoint", "original-native")
+                    .await
+                    .unwrap(),
+                native == "original-native"
+            );
+            if native.is_empty() {
+                assert_eq!(
+                    session.info.lock().unwrap().native_session_id.as_deref(),
+                    Some("original-native")
+                );
+                assert!(manager.maintenance_idle("native-cutpoint").await.is_err());
+            }
+            if native != "original-native" {
+                assert!(manager.maintenance_idle("native-cutpoint").await.is_err());
+                assert!(session
+                    .maintenance_evidence
+                    .lock()
+                    .unwrap()
+                    .native_init()
+                    .is_none());
+            }
+        }
+        let before = session.journal.last_seq();
+        events
+            .try_send(AgentEvent::TurnAborted {
+                turn_id: "completed-idle".into(),
+                reason: "synthetic completion".into(),
+                interrupted: false,
+            })
+            .unwrap();
+        tokio::time::timeout_at(deadline, async {
+            while session.journal.last_seq() <= before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut idle = manager.maintenance_idle("native-cutpoint").await.unwrap();
+        // The ledger original was captured before this final protocol tail.
+        // Positive pump draining must fold it before certifying native identity.
+        let blocker = session.absorb_order.clone().lock_owned().await;
+        events.try_send(init("different-native")).unwrap();
+        tokio::time::timeout_at(deadline, async {
+            while events.capacity() != EVENT_QUEUE {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let task = tokio::spawn(async move {
+            idle.drain_pump(deadline.into_std()).await.unwrap();
+            assert!(idle.check_native("original-native").is_err());
+            idle.check_native("different-native").unwrap();
+        });
+        tokio::time::timeout_at(deadline, async {
+            while session.pump_maintenance_tx.capacity() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!task.is_finished());
+        drop(blocker);
+        tokio::time::timeout_at(deadline, task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(manager
+            .resumed_native_ready("native-cutpoint", "original-native")
+            .await
+            .is_err());
+        manager.kill("native-cutpoint");
+    }
+
     #[tokio::test]
     async fn pump_barrier_folds_dequeued_final_event_before_idle_proof() {
         let dir = tempfile::tempdir().unwrap();
@@ -198,7 +357,7 @@ mod tests {
         let blocker = session.absorb_order.clone().lock_owned().await;
         session.info.lock().unwrap().native_session_id = Some("native-fixture".into());
         *session.maintenance_evidence.lock().unwrap() = Evidence {
-            initialized: true,
+            native_init: Some("native-fixture".into()),
             completed: true,
             ..Default::default()
         };
@@ -257,7 +416,7 @@ mod tests {
         assert!(!session.command_budget.lock().unwrap().commands_paused);
         session.info.lock().unwrap().native_session_id = Some("native-fixture".into());
         *session.maintenance_evidence.lock().unwrap() = Evidence {
-            initialized: true,
+            native_init: Some("native-fixture".into()),
             completed: true,
             ..Default::default()
         };

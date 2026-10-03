@@ -1497,18 +1497,18 @@ impl ChatManager {
         let _order = session.absorb_order.lock().await;
         let info = session.info.lock().expect("session info lock");
         anyhow::ensure!(info.alive, "resumed process unavailable");
-        let initialized = session
+        let evidence = session
             .maintenance_evidence
             .lock()
-            .expect("maintenance evidence lock")
-            .initialized();
-        if initialized {
+            .expect("maintenance evidence lock");
+        let native = evidence.native_init();
+        if let Some(native) = native {
             anyhow::ensure!(
-                info.native_session_id.as_deref() == Some(expected),
+                native == expected && info.native_session_id.as_deref() == Some(expected),
                 "resumed native identity changed"
             );
         }
-        Ok(initialized)
+        Ok(native.is_some())
     }
     pub async fn sync_resumed_journal(&self, id: &str) -> Result<()> {
         self.get_session(id)?.journal.sync_checked().await
