@@ -279,7 +279,9 @@ is_vite() { # pid realpath
 vite_wrapper_kind() { # parent child child-kind realpath
   local pid=$1 child=$2 kind=$3 wt=$4 args cwd command
   awk -v p="$pid" -v c="$child" '$2 == p { n++; if ($1 == c) found = 1 } END { exit !(n == 1 && found) }' "$TMPD/parents" || return 1
-  cwd=$(awk -F'\t' -v p="$pid" '$1 == p && $3 == "cwd" { print $4 }' "$TMPD/procs")
+  # lsof can repeat cwd records for a multithreaded process on Linux.
+  # Collapse identical paths, but conflicting cwd data still fails closed.
+  cwd=$(awk -F'\t' -v p="$pid" '$1 == p && $3 == "cwd" && !seen[$4]++ { print $4 }' "$TMPD/procs")
   args=$(ps -ww -p "$pid" -o args= 2>/dev/null) || return 1
   case "$kind" in
     vite)

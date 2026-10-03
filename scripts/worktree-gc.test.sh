@@ -407,11 +407,21 @@ EOF
   fi
 done
 sleep 1
+# Linux lsof may emit repeated cwd records for Node's threads. Exercise that
+# shape on every platform so wrappers are not accidentally kept ACTIVE.
+real_lsof=$(command -v lsof)
+export GC_TEST_LSOF="$real_lsof"
+cat >"$T/bin/lsof" <<'EOF'
+#!/bin/sh
+"$GC_TEST_LSOF" "$@" | awk '/^f/ { fd = $0 } { print } /^n/ && fd == "fcwd" { print }'
+EOF
+chmod +x "$T/bin/lsof"
 bash "$GC" --no-fetch --no-sizes >"$T/out" 2>&1
 for name in previewdaemon previewapp previewvite previewnpm previewstubborn previewwrites $real_previews; do expect "b/$name" PREVIEW "stop dev preview"; done
 expect b/previewnpmcompound ACTIVE
 for name in previewmixed previewdirty previewunpushed previewlocked previewopen previewclosed previewforeign previewrelease previewnested; do expect "b/$name" ACTIVE; done
 for pid in "$daemon_pid" "$app_pid" "$vite_pid" "$npm_pid"; do kill -0 "$pid" 2>/dev/null && ok || no "dry run stopped preview $pid"; done
+rm "$T/bin/lsof"
 GH_FAKE_FAIL=1 bash "$GC" --no-fetch --no-sizes >"$T/out" 2>&1
 expect b/previewdaemon ACTIVE
 # Running in the merged checkout itself still protects it.
