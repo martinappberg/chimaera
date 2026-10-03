@@ -46,7 +46,7 @@ Two aliases sharing the same canonical SSH connection share its hold count;
 closing one cannot invalidate the other's job.
 
 A service using this single placement setting refuses a new `set_policy` with
-`not_cluster:true` as unsupported before admitting or applying it. It must not
+`not_cluster:true` with `400 unsupported_cluster_policy` before admitting or applying it. It must not
 silently apply a canonical pair that an older caller cannot acknowledge. Reading
 an already saved legacy opt-in still preserves its login-host placement.
 

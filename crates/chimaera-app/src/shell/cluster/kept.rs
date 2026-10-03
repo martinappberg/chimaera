@@ -145,7 +145,11 @@ fn failure(error: anyhow::Error) -> String {
     if error.is::<chimaera_link::ServiceUnsupported>() {
         "This keeper needs an update to manage cluster jobs".into()
     } else if let Some(error) = error.downcast_ref::<chimaera_link::ClusterRequestError>() {
-        error.to_string()
+        if error.code == chimaera_link::ClusterErrorCode::UnsupportedClusterPolicy {
+            "Update Chimaera to use this keeper’s scheduled-job or login-host setting.".into()
+        } else {
+            error.to_string()
+        }
     } else {
         "Couldn't read the cluster through Chimaera Pro. Try again or reconnect.".into()
     }
@@ -915,6 +919,28 @@ mod tests {
         assert_eq!(budget.available_permits(), 31);
         drop(new_account);
         assert_eq!(budget.available_permits(), 32);
+    }
+    #[tokio::test]
+    async fn unsupported_policy_clears_pending_and_explains_the_required_update() {
+        let fixture = Fixture::new().await;
+        let selected = fixture.selected().await;
+        let error = selected
+            .settle(
+                || 7,
+                Op::SetPolicy {
+                    operation_id: "unsupported-policy".into(),
+                    login_serve: false,
+                    not_cluster: true,
+                },
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            error,
+            "Update Chimaera to use this keeper’s scheduled-job or login-host setting."
+        );
+        assert!(selected.control.pending.lock().await.is_empty());
     }
     #[tokio::test]
     async fn lost_reply_reconciles_exact_original_job_without_resubmission() {

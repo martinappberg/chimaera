@@ -281,6 +281,15 @@ async fn operation(
     {
         return error(StatusCode::CONFLICT, "unsupported");
     }
+    if matches!(
+        operation,
+        ClusterOperation::SetPolicy {
+            not_cluster: true,
+            ..
+        }
+    ) {
+        return error(StatusCode::BAD_REQUEST, "unsupported_cluster_policy");
+    }
     let global_holders = data
         .hosts
         .values()
