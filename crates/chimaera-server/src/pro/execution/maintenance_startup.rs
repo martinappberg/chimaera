@@ -37,7 +37,32 @@ pub(super) struct Pending {
     channel_nonce: String,
     _protected: Protection,
 }
-struct Protection;
+/// Sealed to this trusted startup; synthetic actors cannot mint it at runtime.
+pub(super) struct Protection {
+    pid: u32,
+    #[cfg(test)]
+    synthetic: bool,
+}
+impl Protection {
+    pub(super) fn current(&self) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if self.synthetic {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            self.pid == std::process::id(),
+            "maintenance process changed"
+        );
+        verify_process()
+    }
+    #[cfg(test)]
+    pub(super) fn synthetic() -> Self {
+        Self {
+            pid: std::process::id(),
+            synthetic: true,
+        }
+    }
+}
 impl Pending {
     pub(super) fn transferred(
         descriptor: OwnedFd,
@@ -70,11 +95,12 @@ impl Pending {
         self,
         state: &crate::AppState,
     ) -> anyhow::Result<super::maintenance_channel::Channel> {
-        super::maintenance_channel::Channel::from_inherited(
+        super::maintenance_channel::Channel::from_protected(
             state,
             self.descriptor,
             self.binding,
             self.channel_nonce,
+            self._protected,
         )
         .map_err(|_| anyhow::anyhow!("maintenance accepted launch changed"))
     }
@@ -203,7 +229,27 @@ fn protect_process() -> anyhow::Result<Protection> {
             && unsafe { nix::libc::prctl(nix::libc::PR_GET_DUMPABLE, 0, 0, 0, 0) } == 0,
         "maintenance process protections unavailable"
     );
-    Ok(Protection)
+    verify_process()?;
+    Ok(Protection {
+        pid: std::process::id(),
+        #[cfg(test)]
+        synthetic: false,
+    })
+}
+
+/// Never repairs changed protections. A Prepared receipt must come from the
+/// same protected process, independently of the supervisor's kernel census.
+fn verify_process() -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    anyhow::ensure!(
+        unsafe { nix::libc::prctl(nix::libc::PR_GET_DUMPABLE, 0, 0, 0, 0) } == 0
+            && unsafe { nix::libc::prctl(nix::libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } == 1,
+        "maintenance process protections changed"
+    );
+    #[cfg(not(target_os = "linux"))]
+    anyhow::bail!("maintenance process protections require Linux");
+    #[cfg(target_os = "linux")]
+    Ok(())
 }
 
 #[cfg(test)]

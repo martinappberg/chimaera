@@ -45,14 +45,34 @@ pub(super) struct Channel {
     closed: Arc<AtomicBool>,
     requests: Arc<tokio::sync::Semaphore>,
     effect: Arc<tokio::sync::Mutex<()>>,
+    protection: super::maintenance_startup::Protection,
 }
 impl Channel {
+    /// Synthetic protocol/process fixtures deliberately lack a trusted startup.
+    /// This constructor does not exist in a production daemon.
+    #[cfg(test)]
     pub(super) fn from_inherited(
         state: &AppState,
         descriptor: OwnedFd,
         binding: Binding,
         channel_nonce: String,
     ) -> Result<Self> {
+        Self::from_protected(
+            state,
+            descriptor,
+            binding,
+            channel_nonce,
+            super::maintenance_startup::Protection::synthetic(),
+        )
+    }
+    pub(super) fn from_protected(
+        state: &AppState,
+        descriptor: OwnedFd,
+        binding: Binding,
+        channel_nonce: String,
+        protection: super::maintenance_startup::Protection,
+    ) -> Result<Self> {
+        protection.current().map_err(|_| InvalidChannel)?;
         Reply::Ready(Ready {
             version: 1,
             binding: binding.clone(),
@@ -123,9 +143,14 @@ impl Channel {
             closed: Arc::new(AtomicBool::new(false)),
             requests: Arc::new(tokio::sync::Semaphore::new(REQUESTS)),
             effect: Arc::new(tokio::sync::Mutex::new(())),
+            protection,
         })
     }
+    pub(super) fn process_protected(&self) -> bool {
+        self.protection.current().is_ok()
+    }
     fn current(&self, state: &AppState) -> Result<()> {
+        self.protection.current().map_err(|_| InvalidChannel)?;
         if self.closed.load(Ordering::Acquire)
             || self.generation != super::mutation::generation(state)
             || !super::supervisor::matches_maintenance(state, &self.binding)

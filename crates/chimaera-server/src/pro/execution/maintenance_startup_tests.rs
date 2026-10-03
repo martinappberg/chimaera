@@ -198,6 +198,22 @@ fn linux_protection_child() {
         unsafe { nix::libc::prctl(nix::libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) },
         1
     );
+    pending._protected.current().unwrap();
+    assert_eq!(
+        unsafe { nix::libc::prctl(nix::libc::PR_SET_DUMPABLE, 1, 0, 0, 0) },
+        0
+    );
+    assert!(pending._protected.current().is_err());
+    // Verification must refuse without silently resetting dumpability.
+    assert_eq!(
+        unsafe { nix::libc::prctl(nix::libc::PR_GET_DUMPABLE, 0, 0, 0, 0) },
+        1
+    );
+    assert_eq!(
+        unsafe { nix::libc::prctl(nix::libc::PR_SET_DUMPABLE, 0, 0, 0, 0) },
+        0
+    );
+    pending._protected.current().unwrap();
 }
 
 #[cfg(target_os = "linux")]

@@ -65,12 +65,20 @@ async fn rollback(attempt: &mut Attempt, request: &Request, expired: bool) {
         response!(request, RecoveryRequired, reason: RecoveryReason::ParkingCleanupUnknown)
     };
 }
-async fn prepare(state: &Arc<AppState>, effect: &EffectOwner) -> Attempt {
+async fn prepare(state: &Arc<AppState>, effect: &EffectOwner, channel: &Channel) -> Attempt {
     let request = effect.owner().request();
     let Request::Prepare(prepare) = request else {
         unreachable!()
     };
     let deadline = effect.owner().deadline();
+    if !channel.process_protected() {
+        return Attempt {
+            identity: request.identity(),
+            outcome: response!(request, Busy, reason: BusyReason::ProcessUnknown),
+            parking: None,
+            deadline,
+        };
+    }
     let parking = Parking::admit(state, prepare, deadline).await;
     let mut parking = match parking {
         Ok(parking) => parking,
@@ -83,7 +91,13 @@ async fn prepare(state: &Arc<AppState>, effect: &EffectOwner) -> Attempt {
             }
         }
     };
-    let result = parking.prepare().await;
+    let result = parking.prepare().await.and_then(|leaders| {
+        if channel.process_protected() {
+            Ok(leaders)
+        } else {
+            Err(BusyReason::ProcessUnknown)
+        }
+    });
     let remaining = deadline
         .checked_duration_since(Instant::now())
         .map(|v| v.as_millis() as u64)
@@ -201,7 +215,7 @@ pub(super) async fn run(state: Arc<AppState>, mut channel: Channel) {
                         continue;
                     }
                     _ => {
-                        retained = Some(prepare(&state, &effect).await);
+                        retained = Some(prepare(&state, &effect, &channel).await);
                     }
                 }
                 let attempt = retained.as_ref().unwrap();
