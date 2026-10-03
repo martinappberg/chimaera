@@ -11,6 +11,9 @@
   import { copyText } from "../shared/clipboard";
   import { openInSystemBrowser } from "../shared/urlOpen";
   import type { ChatStore } from "./store.svelte";
+  import ModSite from "./ModSite.svelte";
+  import type { ModsController } from "./mods.svelte";
+  import { pageVisible } from "../shared/visibility";
 
   import { modelChoice, type ModelChoice } from "./modelPicker";
 
@@ -18,6 +21,8 @@
     store: ChatStore;
     agentKind: string;
     agentName: string;
+    mods?: ModsController;
+    visible?: boolean;
     /** The one-of-N open overlay; two-way so the host can open /mcp and the
      *  outside-dismiss action can close everything. */
     menu: "model" | "mode" | "effort" | "mcp" | "remote" | "options" | null;
@@ -48,6 +53,8 @@
     store,
     agentKind,
     agentName,
+    mods,
+    visible = true,
     menu = $bindable(),
     canPickModel,
     canPickMode,
@@ -181,6 +188,7 @@
   </div>
   {#if canPickMode && store.modes.length > 0}
     <div class="menu-host primary-picker mode-picker">
+      {#snippet modeButton(label: string)}
       <button
         class="chip pick"
         title={`Permission mode: ${modeLabel ?? "mode"}`}
@@ -189,9 +197,15 @@
         aria-expanded={menu === "mode"}
         onclick={() => (menu = menu === "mode" ? null : "mode")}
       >
-        <span class="pick-label">{modeLabel ?? "mode"}</span>
+        <span class="pick-label">{label}</span>
         {@render caret()}
       </button>
+      {/snippet}
+      {#if mods}
+        <ModSite {mods} component="SessionMode" instanceId="session-mode" active={visible && $pageVisible} props={{ modes: modeLabel ? [modeLabel] : [] }}>
+          {#snippet children(draw)}{@render modeButton(Array.isArray(draw.modes) ? draw.modes.filter((mode) => typeof mode === "string").join(" · ") : modeLabel ?? "mode")}{/snippet}
+        </ModSite>
+      {:else}{@render modeButton(modeLabel ?? "mode")}{/if}
       {#if menu === "mode"}
         <div class="overlay-surface menu" use:toolbarPopover={{ onClose: () => (menu = null) }} role="menu" aria-label="permission mode">
           {#each store.modes as m (m.id)}

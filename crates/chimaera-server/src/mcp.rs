@@ -1036,7 +1036,8 @@ fn render_journal_tail(
         };
         match entry.ev {
             AgentEvent::PermissionResolved { request_id, .. }
-            | AgentEvent::QuestionResolved { request_id, .. } => {
+            | AgentEvent::QuestionResolved { request_id, .. }
+            | AgentEvent::ElicitationResolved { request_id, .. } => {
                 resolved.insert(request_id);
             }
             _ => {}
@@ -1080,6 +1081,19 @@ fn render_journal_tail(
                 items.push(format!(
                     "permission asked ({mark}): {}",
                     head(&title, ITEM_HEAD_CHARS)
+                ));
+            }
+            AgentEvent::ElicitationRequest {
+                request_id, server, ..
+            } => {
+                let mark = if resolved.contains(&request_id) {
+                    "answered"
+                } else {
+                    "unanswered"
+                };
+                items.push(format!(
+                    "MCP input requested by {} ({mark})",
+                    head(&server, ITEM_HEAD_CHARS)
                 ));
             }
             AgentEvent::QuestionRequest { request_id, .. } => {

@@ -12,12 +12,43 @@ and the TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branc
 `QuestionCard`, `RewindDialog`, `ForkDialog`, `McpPanel`, `UsagePanel`, `store.svelte.ts`, `chatWs.ts`,
 `paths.ts`). Engine `crates/chimaera-agent/src/` (`driver.rs`, `claude.rs`, `codex.rs`, `acp.rs`,
 `model.rs`, `journal.rs`). Daemon glue `crates/chimaera-server/src/chat.rs`, WS
-`ws.rs::chat_ws`. Wire: `GET /ws/chat/{id}` (events + the 23 `AgentCommand`s),
+`ws.rs::chat_ws`. Wire: `GET /ws/chat/{id}` (events + `AgentCommand`s),
 `POST /api/v1/sessions/{id}/view`, `POST /api/v1/sessions/{id}/rewind`,
 `POST /api/v1/sessions/{id}/fork`. Deep protocol facts:
 [PROTOCOL.md](../../crates/chimaera-agent/PROTOCOL.md); rules:
 [rules/agent-protocol.md](../../.claude/rules/agent-protocol.md); working skill:
 [chat-mode](../../.claude/skills/chat-mode/SKILL.md).
+
+## MCP forms and browser requests
+
+Claude and Codex MCP input requests appear as answerable cards in the conversation.
+Text, numeric, boolean, enum and multiple-choice values retain their types; nested
+object forms use field groups. Integer inputs and defaults must fit the browser's
+exact integer range (−9007199254740991 to 9007199254740991); larger values are refused
+instead of rounded. An unanswered standalone request keeps its attention badge
+when another turn starts or is stopped. Submit, Decline, and Cancel remain distinct native
+MCP decisions. Unsupported schema constraints explain the limitation and offer
+Decline/Cancel; Chimaera never accepts an empty replacement form.
+
+Browser requests show the destination, an explicit system-browser button and a copy
+link. A loopback address explains that it belongs to the agent's host. Continue
+acknowledges the request; opening a page is not proof of authentication. Claude's
+`/mcp` panel offers **sign in again** on needs-auth servers using the existing
+[connection flow](plugins.md), then reconnects the session only after the
+provider confirms success.
+
+`elicitation_request` / `elicitation_resolved` events and the `elicitation` command
+ride the chat socket and ordinary gap replay. Driver validation checks answers
+against the retained request; stale replies cannot run twice. Only the decision is
+recorded in the resolution event, never the submitted values. Provider/model output
+may still repeat those values independently. Requests expire when their native
+reply route disappears. Tool permission allowlists apply only to native tool-call
+approval requests, never to MCP forms or browser requests.
+
+Implementation: `crates/chimaera-agent/src/elicitation.rs`, both native drivers,
+`web-ui/src/lib/chat/ElicitationCard.svelte`, `ElicitationFields.svelte`,
+`elicitation.ts`, `store.svelte.ts`, and `ChatView.svelte`. Schemas/answers are bounded
+at 64 KiB, pending asks at 32 per process, object nesting at eight levels.
 
 ## Model selection after provider errors
 
@@ -789,7 +820,37 @@ You can write and queue a message while it starts. User-configured hooks and
 cloud-backed workspace files can delay readiness; Chimaera keeps those hooks
 intact rather than bypassing them.
 
+### Runtime steering and background lifetimes
+
+Settings → Chat → **Codex Steering Timing** controls new and resumed structured
+Codex processes. **Agent default** leaves the user's native configuration alone;
+**Next step** disables `features.instant_interrupt`; **Immediate (experimental)**
+enables it (Codex 0.159.0+). Immediate steering can interrupt a model response or
+code-mode call to read a steer, including one delivered by another agent. It does
+not promote messages queued for a later turn. Changing the setting does not
+restart a running chat. The daemon reads
+`chat.codexSteering` in `settings.rs` and passes the override through
+`launcher.rs` at `chat.rs`'s spawn boundary.
+
+Claude 2.1.288 applies its background command time limit to `-p` / SDK sessions,
+which includes Chimaera structured chats. Keeping the daemon alive does not
+remove that upstream limit. Use a linked Chimaera terminal for a dev server or
+other process that must outlive the agent's command, and a scheduler job for
+cluster work. The tray continues to reflect Claude's actual task lifecycle;
+closing a view keeps the agent running, while stopping/restarting the agent ends
+its process-owned background work.
+
 ## Intent — human-authored ground truth
+
+### October runtime compatibility — why it exists
+_Captured 2026-10-03 from the maintainer in the implementation chat._
+
+- **Problem it solves:** “We need to do all of these” in response to the Claude
+  Code / Codex update assessment, including runtime compatibility and immediate
+  steering.
+- **Addition to the core:** detailed behavior and UI constraints for this
+  setting are pending; the existing queue and steering contract remains the
+  starting point.
 
 > Captured from the people who built these features via the **capture-feature-intent**
 > skill when a `feat:` ships in this area. **Never** inferred from code. Everything above
@@ -1026,3 +1087,9 @@ _Captured 2026-09-28 from the maintainer's own words in the session that built i
 - **Quality bar (verbatim):** "Make sure UI / UX for this is GREAT too. We don't want it to be a poor experience (and too verbose etc.)"
 - **Codex (verbatim):** "I think for Codex though, are you sure there is no voice mode ? like what if you open from the terminal ? If not then it should be excluded". Codex's own `/voice` is a spoken realtime conversation, not dictation; dictation is offered in Codex chats because the words only become composer text — whether to hide it there is pending.
 - **How settled it is / what must not change:** _pending_.
+
+### MCP input requests — why they exist
+_Captured 2026-10-03 from the maintainer in this session._
+
+- **Problem it solves (verbatim):** “We need to do all of these” in response to the runtime compatibility assessment, including MCP forms, browser requests, and reauthentication.
+- **How settled it is / deliberate limits:** pending specific MCP intent. The maintainer's “Use your judgment; the UI can evolve” answer concerned Claude Mods; it is not a separate promise about MCP forms.

@@ -438,6 +438,11 @@ fn note_for_notices(record: &mut crate::agent_state::AgentRecord, ev: &AgentEven
             };
             record.set_notice_note(&line, false);
         }
+        AgentEvent::ElicitationRequest {
+            server, message, ..
+        } => {
+            record.set_notice_note(&format!("{server}: {message}"), true);
+        }
         AgentEvent::QuestionRequest { questions, .. } => {
             let text = questions.first().map_or("", |q| q.question.as_str());
             record.set_notice_note(text, true);
@@ -502,15 +507,60 @@ fn apply_chat_event(state: &Arc<AppState>, id: &str, ev: &AgentEvent) {
         }
         // Structured questions block the turn on a human exactly like
         // permission prompts — the rail badges both the same way.
-        AgentEvent::PermissionRequest { .. } | AgentEvent::QuestionRequest { .. } => {
-            Some(AgentState::NeedsPermission)
-        }
-        AgentEvent::PermissionResolved { .. } | AgentEvent::QuestionResolved { .. } => {
-            Some(AgentState::Running)
-        }
+        AgentEvent::PermissionRequest { .. }
+        | AgentEvent::QuestionRequest { .. }
+        | AgentEvent::ElicitationRequest { .. } => Some(AgentState::NeedsPermission),
+        AgentEvent::PermissionResolved { .. } | AgentEvent::QuestionResolved { .. } => Some(
+            if state
+                .chat
+                .get(id)
+                .is_some_and(|info| info.pending_permission)
+            {
+                AgentState::NeedsPermission
+            } else {
+                AgentState::Running
+            },
+        ),
+        AgentEvent::ElicitationResolved { .. } => Some(
+            if state
+                .chat
+                .get(id)
+                .is_some_and(|info| info.pending_permission)
+            {
+                AgentState::NeedsPermission
+            } else if state
+                .chat
+                .carryover(id)
+                .is_some_and(|live| live.turn_in_flight)
+            {
+                AgentState::Running
+            } else {
+                AgentState::Finished
+            },
+        ),
         AgentEvent::Error { fatal: true, .. } => Some(AgentState::Errored),
-        AgentEvent::TurnStarted { .. } => Some(AgentState::Running),
-        AgentEvent::TurnCompleted { .. } => Some(AgentState::Finished),
+        AgentEvent::TurnStarted { .. } => Some(
+            if state
+                .chat
+                .get(id)
+                .is_some_and(|info| info.pending_permission)
+            {
+                AgentState::NeedsPermission
+            } else {
+                AgentState::Running
+            },
+        ),
+        AgentEvent::TurnCompleted { .. } => Some(
+            if state
+                .chat
+                .get(id)
+                .is_some_and(|info| info.pending_permission)
+            {
+                AgentState::NeedsPermission
+            } else {
+                AgentState::Finished
+            },
+        ),
         // A deliberate user interrupt (Stop/Esc) is not a failure: the rail
         // should read idle, matching the chat surface's quiet "interrupted"
         // notice. The wire's `interrupted` flag is the drivers' structural
@@ -521,7 +571,17 @@ fn apply_chat_event(state: &Arc<AppState>, id: &str, ev: &AgentEvent) {
             interrupted,
             reason,
             ..
-        } if *interrupted || reason == "interrupted" => Some(AgentState::Finished),
+        } if *interrupted || reason == "interrupted" => Some(
+            if state
+                .chat
+                .get(id)
+                .is_some_and(|info| info.pending_permission)
+            {
+                AgentState::NeedsPermission
+            } else {
+                AgentState::Finished
+            },
+        ),
         AgentEvent::TurnAborted { .. } => Some(AgentState::Errored),
         // Telemetry says the account limit is actually blocking requests —
         // the same rail state the TUI hooks derive from StopFailure.
@@ -3241,6 +3301,7 @@ pub(crate) async fn spawn_chat_session(
                     spawn_bin,
                     mcp_url.as_deref(),
                     recipe.mastermind,
+                    crate::lock(&state.settings).codex_instant_interrupt(),
                 ),
                 recipe.resume.clone(),
             )
@@ -4796,6 +4857,115 @@ mod tests {
                 mode: Some("acceptEdits".into()),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn standalone_mcp_attention_survives_start_and_interrupt() {
+        use chimaera_agent::driver::{AgentAdapter, DriverIo, SpawnSpec};
+
+        struct IdleAdapter;
+        impl AgentAdapter for IdleAdapter {
+            fn kind(&self) -> &'static str {
+                "claude"
+            }
+            fn spawn(
+                &self,
+                _: SpawnSpec,
+                mut io: DriverIo,
+            ) -> anyhow::Result<tokio::task::JoinHandle<DriverExit>> {
+                Ok(tokio::spawn(async move {
+                    let _ = io.kill.changed().await;
+                    let _ = io.events.send(AgentEvent::Exited { status: None }).await;
+                    DriverExit::Killed
+                }))
+            }
+        }
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-mcp-attention-{}-{nonce}",
+            std::process::id()
+        ));
+        let config = dir.join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        let state = Arc::new(AppState::new(
+            "test-token".into(),
+            "test-host".into(),
+            std::process::id(),
+            0,
+            dir.join("data"),
+            config,
+        ));
+        let id = "standalone-mcp";
+        state
+            .chat
+            .spawn(&IdleAdapter, SpawnSpec::new(id, Vec::new(), dir.clone()))
+            .unwrap();
+        crate::lock(&state.agents).insert(
+            id.into(),
+            crate::agent_state::AgentRecord::new("test-key".into(), AgentKind::Claude),
+        );
+        let mut live = state.chat.attach(id, 0).unwrap().live;
+        let start = || AgentEvent::TurnStarted {
+            turn_id: "turn".into(),
+        };
+        let stop = || AgentEvent::TurnAborted {
+            turn_id: "turn".into(),
+            reason: "interrupted".into(),
+            interrupted: true,
+        };
+        for (event, expected) in [
+            (
+                AgentEvent::ElicitationRequest {
+                    request_id: "form".into(),
+                    server: "fixture".into(),
+                    message: "Standalone input".into(),
+                    elicitation: chimaera_agent::elicitation::Elicitation::parse(
+                        "url",
+                        &serde_json::Value::Null,
+                        Some("https://example.com"),
+                    ),
+                },
+                AgentState::NeedsPermission,
+            ),
+            (start(), AgentState::NeedsPermission),
+            (stop(), AgentState::NeedsPermission),
+            (
+                AgentEvent::ElicitationResolved {
+                    request_id: "form".into(),
+                    action: "cancel".into(),
+                },
+                AgentState::Finished,
+            ),
+            (start(), AgentState::Running),
+            (stop(), AgentState::Finished),
+        ] {
+            state.chat.annotate(id, event.clone()).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if live.recv().await.unwrap().ev == event {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            apply_chat_event(&state, id, &event);
+            assert_eq!(crate::lock(&state.agents)[id].state, expected);
+        }
+        state.chat.kill(id);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while state.chat.get(id).is_some_and(|info| info.alive) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        state.chat.remove(id);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

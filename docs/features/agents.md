@@ -24,6 +24,12 @@ on the remote host. Chimaera adds workspace integration through session-scoped
 settings, hooks, and MCP tools. Chat controls select the model and permissions
 for the current session; see [chat mode](chat-mode.md) for provider behavior.
 
+Claude Code 2.1.277+ reads `AGENTS.md` as a fallback when `CLAUDE.md` is absent.
+Existing explicit `CLAUDE.md` → `AGENTS.md` bridges remain useful for older
+runtimes and Claude-specific additions; Chimaera does not rewrite them at launch.
+Before the first live model catalog arrives, Codex's curated fallback starts with
+GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
+
 ## Launching an agent
 
 - **What & when.** Start a coding agent in the focused pane, as a TUI or a chat session.

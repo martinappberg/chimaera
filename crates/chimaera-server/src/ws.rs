@@ -685,6 +685,31 @@ const CHAT_BATCH: usize = 128;
 /// the journal's 256 KiB cap; otherwise frames stay near this ceiling.
 const CHAT_BATCH_BYTES: usize = 512 * 1024;
 
+/// A browser view owns its native Mod attachment; closing the view must not
+/// stop the conversation, but must release the window's callbacks and focus.
+struct NativeUiAttachment {
+    state: Arc<AppState>,
+    session: String,
+    client: String,
+}
+
+#[derive(Deserialize)]
+struct ChatFrameKind<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: &'a str,
+}
+
+impl Drop for NativeUiAttachment {
+    fn drop(&mut self) {
+        let state = self.state.clone();
+        let session = self.session.clone();
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            state.chat.detach_native_ui(&session, &client).await;
+        });
+    }
+}
+
 async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
     let Some(last_seq) = chat_authenticate(&mut socket, &state).await else {
         let _ = send_json(
@@ -740,8 +765,25 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
     }
 
     let mut live = attachment.live;
+    let mut native_ui = attachment.native_ui;
+    let mut native_ui_open = true;
+    let client_id = chimaera_core::generate_token();
+    let _native_attachment = NativeUiAttachment {
+        state: state.clone(),
+        session: id.clone(),
+        client: client_id.clone(),
+    };
     loop {
         tokio::select! {
+            event = native_ui.recv(), if native_ui_open => {
+                let frame = match event {
+                    Ok(event) if event.for_client(&client_id) => json!({"type":"native_ui","event":event}),
+                    Ok(_) => continue,
+                    Err(RecvError::Lagged(_)) => json!({"type":"native_ui_reset"}),
+                    Err(RecvError::Closed) => { native_ui_open = false; continue },
+                };
+                if send_json(&mut socket, &frame).await.is_err() { return }
+            },
             event = live.recv() => match event {
                 Ok(entry) => {
                     // The replay tail can overlap the subscription start.
@@ -800,6 +842,22 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
             },
             msg = socket.recv() => match msg {
                 Some(Ok(Message::Text(text))) => {
+                    if serde_json::from_str::<ChatFrameKind<'_>>(&text).is_ok_and(|f| f.kind == "native_ui") {
+                        // Reject before allocating the UI request tree. Normal
+                        // sends may carry images and have a separate budget.
+                        if text.len() > chimaera_agent::native_ui::UI_REQUEST_BYTES + 1024 { return }
+                        if let Ok(frame) = serde_json::from_str::<serde_json::Value>(&text) {
+                            let request_id = frame["request_id"].as_str().unwrap_or_default();
+                            let result = chimaera_agent::native_ui::NativeUiCommand::new(&client_id, request_id, frame["request"].clone())
+                                .and_then(|command| state.chat.native_ui(&id, command));
+                            if let Err(error) = result {
+                                let frame = json!({"type":"native_ui","event":{"kind":"response","client_id":client_id,
+                                    "request_id":request_id.chars().take(64).collect::<String>(),"error":error.to_string()}});
+                                if send_json(&mut socket, &frame).await.is_err() { return }
+                            }
+                            continue;
+                        }
+                    }
                     match serde_json::from_str::<chimaera_agent::model::AgentCommand>(&text) {
                         Ok(mut cmd) => {
                             if let Err(err) = cmd.validate_ingress() {

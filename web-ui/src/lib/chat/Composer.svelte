@@ -11,6 +11,8 @@
   } from "./composerHeight";
   import AttachmentStrip from "./AttachmentStrip.svelte";
   import ComposerMentions from "./ComposerMentions.svelte";
+  import { composerInputKey, composerKey, decorationRuns, fillComposerDraft, type NativeComposerKey } from "./nativeComposer";
+  import { uiStyle, type UiRecord } from "./nativeUi";
   import ImagePreview from "./ImagePreview.svelte";
   import { registerComposer, registerComposerAttach } from "./composerBus";
   import {
@@ -82,6 +84,7 @@
     /** Words dictation should favor (project and agent names). */
     voiceTerms?: string[];
     imageInput?: boolean;
+    onNativeEdit?: (request: UiRecord) => Promise<UiRecord>;
   }
 
   let {
@@ -101,6 +104,7 @@
     onDraftState,
     voiceTerms = [],
     imageInput = true,
+    onNativeEdit,
   }: Props = $props();
 
   const uid = $props.id();
@@ -161,6 +165,62 @@
     saveDraft(sessionId, text, imgs);
   });
   let el = $state<HTMLTextAreaElement | null>(null);
+  let nativeSuggestion = $state("");
+  let nativeDecorations = $state<unknown>([]);
+  let decoratedMirror = $state<HTMLDivElement | null>(null);
+  let nativeRevision = 0;
+  let lastNativeText: string | null = null;
+  let nativeTimer: ReturnType<typeof setTimeout> | null = null;
+  let pendingNativeKey: NativeComposerKey | undefined;
+  let nativeComposing = false;
+  const decoratedRuns = $derived(decorationRuns(draft, nativeDecorations));
+  const hasNativeDecorations = $derived(Array.isArray(nativeDecorations) && nativeDecorations.length > 0);
+  export function nativeRead(): { text: string; cursor: number } { return { text: draft, cursor: el?.selectionStart ?? caret }; }
+  export function nativeFill(text: string, mode: string, decorations?: unknown): boolean {
+    if (!el || disabled || !visible || spoken !== null || nativeComposing || text.length > 64_000) return false;
+    const next = fillComposerDraft(draft, text, mode, el.selectionStart, el.selectionEnd, decorations);
+    if (!next) return false;
+    draft = next.text; caret = next.cursor; nativeDecorations = next.decorations;
+    nativeSuggestion = "";
+    // Even an identical-text fill supersedes a pending person's edit response.
+    editNative("app", true);
+    const revision = nativeRevision;
+    void tick().then(() => { if (revision === nativeRevision && draft === next.text) el?.setSelectionRange(next.cursor, next.cursor); });
+    return true;
+  }
+  export function nativeSuggest(text: string): boolean {
+    if (disabled || !visible || running || draft.length || images.length || text.length > 64_000) return false;
+    nativeSuggestion = text; return true;
+  }
+  function editNative(by: "person" | "app", preserveDecorations = false, key?: NativeComposerKey): void {
+    const revision = ++nativeRevision;
+    if (nativeTimer) { clearTimeout(nativeTimer); nativeTimer = null; }
+    if (!preserveDecorations) nativeDecorations = [];
+    if (!onNativeEdit || !visible || disabled || nativeComposing) return;
+    const text = draft, cursor = by === "app" ? caret : el?.selectionStart ?? caret;
+    const selectionEnd = el?.selectionEnd ?? cursor;
+    lastNativeText = text;
+    nativeTimer = setTimeout(() => {
+      nativeTimer = null;
+      void onNativeEdit!({ subtype: "ui_prompt_edit", text, cursor, by, ...(key ? { key } : {}) }).then((result) => {
+        // App edits only synchronize Claude's previous-box state. Its ack has
+        // no decoration runs and must not erase the fill the app just painted.
+        if (by === "app") return;
+        if (revision !== nativeRevision || draft !== text || result.superseded || typeof result.text !== "string") return;
+        // Arrows and selection change the person's intent without editing the
+        // draft. An old hook must not put their caret back where it used to be.
+        if (el && (el.selectionStart !== cursor || el.selectionEnd !== selectionEnd)) return;
+        if (result.text.length > 64_000) return;
+        lastNativeText = result.text; draft = result.text;
+        caret = Math.max(0, Math.min(draft.length, Number(result.cursor) || 0));
+        nativeDecorations = result.decorations ?? [];
+        void tick().then(() => { if (el && document.activeElement === el) el.setSelectionRange(caret, caret); });
+      }).catch(() => {});
+    }, by === "person" ? 35 : 0);
+  }
+  $effect(() => { const text = draft; if (onNativeEdit && visible) untrack(() => { if (text !== lastNativeText) editNative("app"); }); });
+  $effect(() => () => { if (nativeTimer) clearTimeout(nativeTimer); ++nativeRevision; });
+  $effect(() => { if (draft.length || running) nativeSuggestion = ""; });
   // svelte-ignore state_referenced_locally
   let caret = $state(draft.length);
   let paneHeight = $state(0);
@@ -775,10 +835,14 @@
   );
 
   function onKeydown(e: KeyboardEvent) {
+    pendingNativeKey = composerKey(e);
     // IME composition: Enter/arrows select a conversion candidate, not a chat
     // action. WebKit (the Tauri shell's WKWebView) fires the committing Enter
     // after compositionend with isComposing=false but keyCode 229 — check both.
     if (e.isComposing || e.keyCode === 229) return;
+    if (e.key === "Tab" && !e.shiftKey && nativeSuggestion && !draft.length && !running) {
+      e.preventDefault(); nativeFill(nativeSuggestion, "replace"); return;
+    }
     if (voiceKey(e)) return;
     if (popover !== null) {
       const items =
@@ -969,12 +1033,27 @@
       bind:value={draft}
       {@attach uploadChips(uploadTokens, trackCaret)}
       onkeydown={onKeydown}
-      onkeyup={trackCaret}
+      onkeyup={() => { trackCaret(); pendingNativeKey = undefined; }}
       onselect={trackCaret}
-      oninput={trackCaret}
+      onblur={() => (pendingNativeKey = undefined)}
+      oncompositionstart={() => {
+        nativeComposing = true; pendingNativeKey = undefined;
+        // A hook must never rewrite the browser's unfinished IME candidate.
+        editNative("person");
+      }}
+      oncompositionend={(event) => {
+        nativeComposing = false; pendingNativeKey = undefined;
+        draft = event.currentTarget.value; trackCaret(); editNative("person");
+      }}
+      oninput={(event) => {
+        const key = composerInputKey(pendingNativeKey, event instanceof InputEvent ? event : {}, nativeTimer !== null);
+        pendingNativeKey = undefined;
+        draft = event.currentTarget.value; trackCaret(); editNative("person", false, key);
+      }}
       onpaste={onPaste}
       onscroll={() => {
         if (ghost !== null && el !== null) ghost.scrollTop = el.scrollTop;
+        if (decoratedMirror !== null && el !== null) decoratedMirror.scrollTop = el.scrollTop;
       }}
       role="combobox"
       aria-expanded={popover !== null}
@@ -983,6 +1062,7 @@
       aria-activedescendant={popover !== null ? `${uid}-opt-${selected}` : undefined}
       class:voice={voiceOn}
       class:dictating={spoken !== null}
+      class:mod-decorated={hasNativeDecorations && spoken === null}
       readonly={spoken !== null}
       placeholder={disabled
         ? "chat ended"
@@ -994,10 +1074,13 @@
             ? afterTurnHint !== ""
               ? `add to this turn… (${afterTurnHint} after it ends · Esc to stop)`
               : "add to this turn… (Esc to stop)"
-            : "message the agent… (Enter to send · / commands · @ files)"}
+            : nativeSuggestion ? `${nativeSuggestion} (Tab to accept)` : "message the agent… (Enter to send · / commands · @ files)"}
       rows={1}
       {disabled}
     ></textarea>
+    {#if hasNativeDecorations && spoken === null}
+      <div class="ghost mod-decoration" bind:this={decoratedMirror} aria-hidden="true">{#each decoratedRuns as run, index (index)}<span style={uiStyle(run.props, "Text")}>{run.text}</span>{/each}&#8203;</div>
+    {/if}
     {#if spoken !== null}
       <div class="ghost" bind:this={ghost} aria-hidden="true">{spoken.before}<span class="g-final"
           >{spoken.finals}</span
@@ -1214,6 +1297,9 @@
     color: transparent;
     caret-color: transparent;
   }
+  textarea.mod-decorated { color: transparent; caret-color: var(--fg); }
+  .ghost.mod-decoration { padding-right: 38px; }
+  textarea.voice ~ .ghost.mod-decoration { padding-right: 66px; }
   .ghost {
     position: absolute;
     inset: 0;

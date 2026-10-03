@@ -1,5 +1,10 @@
 # chimaera-server — the daemon's HTTP/WS surface + business logic
 
+The authenticated chat WebSocket also carries transient `native_ui` frames for
+Claude Mods. `ws.rs` mints each window's client ID, filters addressed replies and
+host callbacks, sends `native_ui_reset` on UI ring lag, and detaches the native
+window when the socket closes. This lane never participates in journal replay.
+
 Orientation for coding agents. This crate is the daemon: every HTTP route, every
 WebSocket, and the logic behind them. It embeds `web-ui/dist` and serves it.
 Parent map: repo-root [AGENTS.md](../../AGENTS.md). Architecture + rationale:
@@ -162,6 +167,10 @@ One privileged chat session per workspace (the dashboard plan §6/§7 —
 Codex chat sessions get the per-session chimaera MCP injected at spawn via
 `-c mcp_servers.chimaera.url=…` + `bearer_token_env_var` — the key rides the
 spawn env, never world-readable argv (`launcher::build_codex_chat_command`).
+The launch-only `chat.codexSteering` preference adds an explicit true/false
+`features.instant_interrupt` override only for its Next step / Immediate choices;
+Agent default preserves the runtime's configuration. Ordinary queued sends keep
+their existing delivery policy.
 Codex TUIs get the same injection while agent communication is on or a
 workbench plugin with tools is active in the workspace (`plugins::spawn_allow`
 → `launcher::codex_tui_mcp_args`, `spawn.rs`), with a per-tool
