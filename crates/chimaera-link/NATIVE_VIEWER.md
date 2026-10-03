@@ -61,6 +61,16 @@ mismatching scope is refused before upstream effects. A query/body workspace or
 session reference cannot widen it. Account/device revocation and account-generation
 replacement invalidate admission even when workspace and epoch remain equal.
 
+A successful native WebSocket upgrade returns singleton response headers
+`X-Chimaera-Scope-Version: 1`, `X-Chimaera-Workspace: <workspace>` and
+`X-Chimaera-Epoch: <epoch>`, matching the exact admitted request. The client
+validates all three before its first authentication frame. Missing, duplicate
+(including comma-combined) or mismatching acknowledgments fail the connection;
+there is no unscoped fallback. These acknowledge gateway admission after its
+scoped target-health and session checks, not agent readiness or input delivery.
+They do not replace the target's health acknowledgment, first-frame scope check,
+or continuous authorization. The existing browser upgrade is unchanged.
+
 Reapply [VIEWING's forwarded-request rules](VIEWING.md#forwarded-requests):
 
 - Resolve an `owned` or `suspended` placement with a current routable owner.
@@ -271,7 +281,8 @@ The implementation must prove all of the following before advertising
 insufficient:
 
 1. Native iOS and Android WebSocket clients actually send the single bearer and
-   scope headers, reject redirects/downgrades, enforce bounds/cancellation, and
+   scope headers, verify exact singleton upgrade acknowledgments, reject
+   redirects/downgrades, enforce bounds/cancellation, and
    reconnect without putting credentials in a URL or first frame. If either
    platform lacks this support, keep the surface disabled; do not weaken auth.
 2. Full-device authentication, cross-account/device denial, workspace/session
