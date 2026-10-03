@@ -315,7 +315,7 @@ implies signing support.
 | Method and path | Request | Response |
 | --- | --- | --- |
 | `GET /v1/hosts` | — | Host array |
-| `POST /v1/hosts` | `{alias,ssh?}` | `201` host; an existing alias may return `200` |
+| `POST /v1/hosts` | `{alias,ssh?,register_only?,ssh_route?}` | `201` host; an existing alias may return `200`; optional fields require their explicit capability and acknowledgment |
 | `DELETE /v1/hosts/{id}` | — | `204`; close that host's streams/login |
 | `POST /v1/hosts/{id}/reconnect` | — | `204`; start reconnect asynchronously |
 
@@ -325,6 +325,24 @@ output, then send only this destination tuple. A keeper validates each field and
 writes a strict SSH configuration containing only HostName, User and Port.
 Never copy IdentityFile, ProxyCommand, credentials or arbitrary local SSH options.
 Without `ssh`, the alias must already be a resolvable host on the keeper.
+
+The optional disabled common ProxyJump extension is specified in
+[SSH_AUTH.md](SSH_AUTH.md#common-proxyjump-routes). Only positive
+`proxyjump_v1:true` together with the existing signing/inert-registration flags
+permits `ssh_route:{version:1,jumps:[<resolved hostname/user/port tuples>]}` on
+inert registration. `ssh` remains the final target; at most three jumps appear
+in actual connection order, excluding the final target. The protected host reply
+must echo the entire exact route and tuple. Missing capability or acknowledgment
+refuses before Connect; older keepers never receive a routed save. Omission
+cannot silently erase an existing route or change its final target. No executable
+ProxyCommand text or Mac-local dependency is transported. Each hop has separate
+selected trust and immutable key/interactive authentication mode under a bounded
+explicit route grant; a refused key never becomes password fallback. Generated
+OpenSSH hop configuration is distinct from the ordinary tuple-only configuration
+above. Established target masters retain their captured full route and existing
+shared cluster worker/job lifetime; passive activity never reconnects a missing
+hop. Arbitrary local software/VPN routing remains explicit advanced Direct with
+the laptop connection lifetime. This contract does not advertise implementation.
 
 Host rows:
 
@@ -388,6 +406,15 @@ connection-local opaque prompt IDs to its consumer and translates them back on
 this wire; consumers answer the ID from the received prompt, not a keeper REST
 response. A queued answer to an older connection is discarded even if the keeper
 reuses its original ID.
+
+Negotiated route-authentication prompts additionally require the exact
+`ssh_route_auth:{grant_id,keeper_boot,leg,mode,destination}` metadata in
+[SSH_AUTH](SSH_AUTH.md#common-proxyjump-routes). Only their original device and
+live native Connect owner may display or answer them; missing or mismatched
+metadata refuses before credential UI. The existing prompt id/answer/close wire
+and connection-local alias rules remain unchanged. A key-mode leg's MFA requires
+that leg's own signature receipt, and an initially interactive leg never results
+from a refused key attempt.
 
 Service behaviour clients must expect: the keeper closes every device stream and
 drops every held cluster login when the account's session epoch changes (sign-out

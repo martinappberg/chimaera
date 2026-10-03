@@ -186,6 +186,155 @@ only fallback after a failed signing attempt. Separate explicit password/Duo
 connections retain their existing path, and no unattended monitor opens either
 authentication channel.
 
+## Common ProxyJump routes
+
+This is a separate additive, disabled route contract. Authenticated capabilities
+may add `proxyjump_v1:true` only after the route acceptance gates below. It also
+requires the existing `hostbound_v1:true` and `register_only_v1:true` flags. An
+absent/false flag, different version or missing route endpoint refuses before
+registration or authentication. Ordinary tuple-only version 1 stays unchanged;
+a client never submits a routed host to an older keeper or falls back to direct
+SSH after a route refusal.
+
+Inert `POST /v1/hosts` may add:
+
+```json
+{"alias":"cluster","ssh":{"hostname":"login.example.invalid","user":"person","port":22},"register_only":true,"ssh_route":{"version":1,"jumps":[{"hostname":"bastion.example.invalid","user":"visitor","port":2222}]}}
+```
+
+`ssh` remains the final destination. `jumps` is the complete resolved transit
+order, from the first host reached by the keeper to the last bastion before the
+final destination. The final destination is not repeated in `jumps`. At most
+three jumps/four total endpoints are permitted. Every endpoint has an explicit
+nonempty user, a positive `u16` port and the existing safe-atom hostname/user
+bounds; duplicate canonical tuples and cycles refuse. The complete registration
+body is at most 128 KiB. No endpoint, alias or field is an SSH directive, shell
+command, local path or executable selector.
+
+The returned protected host row must positively echo the exact `ssh` tuple and
+`ssh_route` version/ordered jumps before the native client proceeds. Unknown or
+missing acknowledgments refuse; a normal success status alone is insufficient.
+Saving creates no SSH, prompt, daemon or cloud wake. A new host is offline.
+Changing an existing route observes the existing held-master/job mutation
+fences; refusal leaves that route intact. Omitted `ssh_route` preserves an
+existing routed identity only when its final tuple is unchanged; it cannot
+silently erase routing or retarget that host. An explicit negotiated empty
+`jumps` list clears a route through the same mutation fences. Any route change
+invalidates its pending authentication grants.
+
+The native app delegates configuration resolution to bounded local `ssh -G`,
+then transports only these resolved tuples. Common OpenSSH
+`[user@]host[:port]`, SSH URI and comma-separated ProxyJump forms are supported
+when they resolve to the bounded route. The effective configuration of every
+jump is resolved separately. A nested ProxyJump is flattened before the endpoint
+that uses it, retaining OpenSSH's actual connection order, with the same total
+three-jump limit and cycle detection. It is never resolved afresh by the keeper.
+Ambiguous or unrepresentable routing refuses explicitly. Arbitrary ProxyCommand,
+VPN dependencies and Mac-local programs stay on the explicit advanced Direct
+path, with its laptop connection lifetime. Local trust commands, revocation
+policies and other unsupported settings retain their version 1 refusal behavior;
+they are not dropped from the selected route.
+
+Authenticated native-only
+`POST /v1/hosts/{host_id}/ssh/auth/route-grants` accepts:
+
+```json
+{"version":1,"keeper_boot":"...","destination":{"hostname":"login.example.invalid","user":"person","port":22},"route":{"version":1,"jumps":[{"hostname":"bastion.example.invalid","user":"visitor","port":2222}]},"legs":[{"destination":{"hostname":"bastion.example.invalid","user":"visitor","port":2222},"mode":"interactive","host_keys":[{"key":"<base64 SSH public key blob>","is_ca":false}],"user_keys":[]},{"destination":{"hostname":"login.example.invalid","user":"person","port":22},"mode":"key","host_keys":[{"key":"<base64 SSH public key blob>","is_ca":false}],"user_keys":["<base64 SSH public key blob>"]}]}
+```
+
+There is exactly one ordered leg for every jump and then the final destination.
+Each leg must equal that endpoint of the exact saved route. A leg's mode is
+immutable for this explicit Connect: `key` requires the existing nonempty
+selected user-key set and hostbound verification; `interactive` requires an
+empty user-key set and the separately explicit password/keyboard-interactive
+flow. Initial native selection may choose interactive when no usable local key
+is selected, and the Connect presentation must disclose credential interaction.
+It never chooses interactive after a key, binding, host-trust, agent constraint
+or signature refusal. Such a refusal ends the whole chain.
+
+Every leg requires this device's exact selected public host trust, including
+certificate principal/validity and algorithm policy. Unknown or revoked trust
+blocks both modes; an interactive leg is not permission to accept an unknown
+host. Each leg retains the eight host-key/eight user-key and 16 KiB decoded-key
+limits. The full request is at most 128 KiB; a selection that cannot fit refuses
+without dropping keys or legs. Values, private keys and arbitrary SSH options
+are absent. Password/MFA answers use the existing confidential transient keeper
+prompt handling and are never placed in this request or durable state.
+Interactive mode retains that trusted-keeper policy; it does not claim a
+native-verified key signature or cryptographic proof of a password prompt's
+source.
+
+Success is
+`{version:1,grant_id:<opaque id>,expires_in:180,destination:<exact tuple>,route:<exact route>,modes:<exact ordered mode array>}`.
+The client validates the complete submitted identity/mode acknowledgment. The
+memory-only grant has the same original device/session/account/boot binding,
+unpredictability, absolute lifetime and four-per-device/thirty-two-per-keeper
+grant ceilings as version 1. Its total connection budget remains thirty-two
+and its shared in-flight signing budget remains eight; these are aggregate
+limits for the whole chain, not multiplied per leg. No leg is independently
+renewed or replaced. A changed saved tuple, order, mode or grant owner refuses.
+
+Its dedicated authenticated native-only WebSocket is
+`/v1/hosts/{host_id}/ssh/auth/route-grants/{grant_id}/ws`. The first exact Ready
+frame adds `legs:<exact endpoint count>` to the version 1 Ready fields. The
+client checks that count, the original keeper boot and this exact grant before
+Reconnect. All existing upgrade, frame, queue, monotonic request and timeout
+rules apply. Route bind/sign/closed requests and their replies additionally
+contain `leg:<zero-based endpoint index>`. A connection identity permanently
+belongs to one leg; closing it does not make that identity or its session
+identifier reusable anywhere in the grant. An absent/out-of-range/changed leg,
+cross-leg reply, duplicate binding or unselected key ends the grant. Key-mode
+legs reuse the exact single-destination native verifier and local agent
+constraints. The keeper's leg number does not authorize a signature. An
+interactive leg accepts no bind/sign request and exposes no selected user keys
+or agent connection.
+
+Only explicit Reconnect may consume exactly one
+`X-Chimaera-SSH-Auth-Route-Grant` header. It is mutually exclusive with
+`X-Chimaera-SSH-Auth-Grant` and forbidden on every other endpoint. Before any
+first-hop dial, the owned Connect task revalidates the complete current saved
+route and live exact grant/control channel. An existing authenticated master
+may be reused only through its captured complete route identity; it cannot
+substitute for a changed route. There is no latest grant, per-account agent or
+partial-chain fallback.
+
+The keeper generates a private bounded OpenSSH configuration with opaque
+per-leg aliases, strict selected public trust and one restricted IdentityAgent
+context for each key-mode leg. Each jump process must read that exact generated
+configuration: final-target command-line options are not assumed to apply to
+jump hosts. Every stanza disables agent forwarding, private/certificate files,
+agent additions, ambient trust/configuration and custom commands. Key mode
+requires hostbound public-key authentication; interactive mode disables
+public-key/agent authentication. A key leg may continue to keyboard-interactive
+MFA only after its own native-verified signature receipt. Prompts identify the
+exact leg and immutable mode, remain confined to the original owner and are
+freshly authorized against the full saved route before publication and answer
+delivery. One leg's successful signature never licenses another leg's prompt.
+
+A route-owned `prompt` event retains the existing id/host/text/echo fields and
+adds mandatory
+`ssh_route_auth:{grant_id,keeper_boot,leg,mode,destination}`. It is delivered
+only to the original device. Before showing credential UI, the native owner
+checks every field against its live local route selection/grant and current
+account generation; missing/changed metadata or no owning Connect refuses the
+prompt. It displays the verified endpoint and whether this is initial
+interactive authentication or key-mode MFA. The connection-local prompt id and
+existing `answer`/`prompt_closed` messages remain unchanged. There is no answer
+replay after control/event replacement. The keeper rechecks the original device,
+full route, grant lifetime and that leg's mode/signature admission before an
+answer returns to the exact waiting process.
+
+The generated config, trust files, agent sockets, prompts and grant are one
+owned first-Connect context. Cancellation, retarget, channel loss, sign-out or
+expiry stops pending hop authentication and drains/removes its files under the
+existing bounded ownership rules. Established target masters and their transit
+connections outlive this short grant. The captured master identity includes the
+complete ordered resolved route; later native configuration edits cannot change
+its selection. Ordinary input, cluster workers, job forwards and their lifetimes
+are unchanged. Passive reads, overview/facts, job streams and background
+reconciliation use only that captured established master; a missing transit leg
+never authorizes a new dial or credential prompt.
+
 ## Acceptance before advertisement
 
 Disposable fixtures exercise exact destination/device/epoch/boot binding,
@@ -201,3 +350,16 @@ remain functional. A real keeper/native Connect then interactive/batch allocatio
 survives laptop disconnect and grant expiry; reconnect requires a fresh explicit
 grant while passive refresh never prompts. These are enablement gates, not claims
 of completed testing in this contract-only checkpoint.
+
+ProxyJump advertisement additionally requires real one-bastion and two-bastion
+OpenSSH fixtures with distinct users, keys, ports and host trust/certificates,
+plus bounded nested-route resolution and equivalent final master capture. Test
+mixed key/interactive modes and per-leg MFA, refusal without authentication
+downgrade, changed/revoked trust on every hop, cross-leg key/user/session/reply
+substitution, retarget/sign-out/cancellation during an intermediate hop, exact
+Ready and aggregate bounds. Prove no ambient private-key/configuration access,
+no effects before a routed registration/grant acknowledgment, and no routed
+request to an older keeper. Target/shared cluster worker/job sessions must
+survive native disconnect and grant expiry; background activity after a missing
+master must never reconnect. The common route contract does not certify arbitrary
+Mac-local ProxyCommand/VPN compatibility or enable current services.
