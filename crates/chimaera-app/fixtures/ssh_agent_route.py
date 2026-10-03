@@ -160,6 +160,13 @@ class Protocol(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = False
     block_on_close = True
 
+    def server_bind(self):
+        # HTTPServer resolves its name before construction returns. Ambient
+        # reverse DNS must not consume this literal-loopback fixture's deadline.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "127.0.0.1"
+        self.server_port = self.server_address[1]
+
     def __init__(self, owner, action, public, host):
         self.thread = None
         self.started = False
