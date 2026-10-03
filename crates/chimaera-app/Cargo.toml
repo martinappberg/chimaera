@@ -1,5 +1,6 @@
 [package]
 name = "chimaera-app"
+default-run = "chimaera"
 version = "0.0.1"
 edition = "2021"
 license = "AGPL-3.0-only"
@@ -19,9 +20,18 @@ axum = { version = "0.8", features = ["ws"] }
 name = "chimaera"
 path = "src/main.rs"
 
+# Explicit synthetic runtime proof, excluded from ordinary binaries/tests.
+[[bin]]
+name = "chimaera-ssh-agent-fixture"
+path = "src/bin/ssh_agent_fixture.rs"
+required-features = ["ssh-agent-fixture"]
+test = false
+bench = false
+
 [features]
 # Enabled only for destination-bound signing verification until native/keeper gates pass.
 ssh-agent-prototype = ["dep:ssh-key", "dep:signature", "dep:base64", "dep:futures-util", "dep:tokio-tungstenite", "dep:zeroize"]
+ssh-agent-fixture = ["ssh-agent-prototype"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
