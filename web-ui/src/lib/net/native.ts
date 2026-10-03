@@ -13,6 +13,7 @@ import { writable } from "svelte/store";
 import { getHostLabel, getJobContext, getToken } from "./api";
 import type { Workspace } from "../workspace/sessions";
 import type { SecretCommand, SecretPage, SecretResult } from "../pro/projectSecrets";
+import type { ProviderMode, ProviderPage, ProviderOriginal, ProviderCommand, ProviderResult } from "../pro/personalProviders";
 
 interface TauriGlobal {
   core: { invoke: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T> };
@@ -1443,6 +1444,28 @@ export async function proProjectSecretOperation(context: string, operationId: st
   const t = tauri();
   if (t === null) throw new Error("project_secrets_unsupported");
   return t.core.invoke<SecretResult>("pro_project_secret_operation", { contextTag: context, operationId });
+}
+
+/** Personal controls retain an exact original login; no daemon fallback. */
+export async function proPersonalProviderMode(): Promise<ProviderMode> {
+  const t = tauri(); if (t === null) throw new Error("providers_unsupported");
+  return t.core.invoke<ProviderMode>("pro_personal_provider_mode");
+}
+export async function proPersonalProviderCatalog(): Promise<ProviderPage> {
+  const t = tauri(); if (t === null) throw new Error("providers_unsupported");
+  return t.core.invoke<ProviderPage>("pro_personal_provider_catalog");
+}
+export async function proPersonalProviderCommand(original: ProviderOriginal, command: ProviderCommand): Promise<ProviderResult> {
+  const t = tauri(); if (t === null) throw new Error("providers_unsupported");
+  return t.core.invoke<ProviderResult>("pro_personal_provider_command", { original, payload: JSON.stringify(command) });
+}
+export async function proPersonalProviderOperation(original: ProviderOriginal): Promise<ProviderResult> {
+  const t = tauri(); if (t === null) throw new Error("providers_unsupported");
+  return t.core.invoke<ProviderResult>("pro_personal_provider_operation", { original });
+}
+export async function proPersonalProviderOpen(original: ProviderOriginal): Promise<void> {
+  const t = tauri(); if (t === null) throw new Error("providers_unsupported");
+  await t.core.invoke<void>("pro_personal_provider_open", { original });
 }
 
 export type CloudProviderState = "missing" | "needs_sign_in" | "signed_in" | "unknown" | "unavailable";

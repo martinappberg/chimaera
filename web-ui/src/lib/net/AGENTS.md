@@ -24,3 +24,7 @@ Viewing a project that runs elsewhere is passive: sockets attach without `wake=i
 Never put browser credentials in JavaScript, storage, URLs or proxy pages. Gateway requests use an HttpOnly cookie and same-origin proof; account browser sessions are distinct from daemon bearer tokens. Host choice belongs to the URL, never a shared cookie. Keep direct/native URLs unchanged, and preserve nonsecret workspace/window bootstrap metadata when switching hosts. Arbitrary preview apps must run on their isolated preview origin; their opaque proxy ids are capabilities, never raw daemon tokens. No user-selected upstream origin is accepted by the gateway helper.
 
 Checks: `npm --prefix web-ui run check`, targeted `base.test.ts`, and live shared-UI HTTP + terminal/event WebSocket verification through the gateway. A passing direct-daemon check alone does not exercise gateway prefixes.
+
+Personal provider wrappers use separate `pro_personal_provider_*` IPCs with closed
+original parent identity and one-shot command payloads. There is no daemon or
+URL fallback; personal account transport selection belongs to `pro/personalProviderTransport.ts`.

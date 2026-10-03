@@ -2,7 +2,8 @@
   import { onDestroy, tick, untrack } from "svelte";
   import { pageVisible } from "../shared/visibility";
   import { isNativeShell, writeClipboard, type CloudProviderConnection, type CloudProviderStatus, type CloudSetupInfo } from "../net/native";
-  import { cloudAction, cloudRequest, peekCatalog } from "./cloudTransport";
+  import { ProviderTransport } from "./personalProviderTransport";
+  import { onProChanged } from "../net/native";
   import { rememberCatalog } from "./catalogMemory";
   import { CHECKING_AFTER_MS, CLOUD_ASLEEP, cloudAsleep, friendlyError } from "./presentation";
   import { agentsConnected, awaitingCloudUpdate, canDisconnect, cloudUpdateLine, connectingLabel, connectionError, connectionSuccessCurrent, disconnectConnection, handoffKey, installingAgent, nextReadyHandoff, olderCloudSignIn, panelRows, pendingConnection, providerLabel, providerLoginUrl, providersReady, providerStateLabel, recoverDisconnect, sameConnection, stillAwaitingUpdate } from "./providers";
@@ -69,6 +70,38 @@
   let catalogMutation = $state(-1);
   let catalogVisibility = $state(-1);
   const native = isNativeShell();
+  let transport = new ProviderTransport();
+  let personal = $state(false);
+  let unlisten: (() => void) | undefined;
+  function retireContext(): void {
+    transport.clear(); transport = new ProviderTransport();
+    mutation += 1; authorizationCode = ""; connection = null; providers = [];
+    handoffs = []; disconnectCandidate = null; current = false; loaded = false;
+    liveAnswered = false; busy = null; error = null; operationError = null;
+    personal = false; if (alive && visible && $pageVisible) void load();
+  }
+  void onProChanged(() => {
+    const selected = transport;
+    void selected.revalidate().catch(cause => {
+      // Ordinary cloud/status events and routine token refresh never abandon
+      // an original attempt. Only confirmed account-context retirement does.
+      if (alive && selected === transport && cause instanceof Error && ["providers_context_changed", "providers_sign_in_required"].includes(cause.message)) retireContext();
+    });
+  }).then(stop => { if (alive) unlisten = stop; else stop(); });
+  function contextFailure(cause: unknown): void {
+    if (!(cause instanceof Error) || !["providers_context_changed", "providers_sign_in_required"].includes(cause.message)) return;
+    authorizationCode = ""; disconnectCandidate = null; connection = null;
+    providers = []; handoffs = []; current = false; liveAnswered = false;
+  }
+  async function cloudRequest(request: Parameters<ProviderTransport["request"]>[0], signal?: AbortSignal): Promise<CloudSetupInfo> {
+    try { return await transport.request(request, signal); } catch (cause) { contextFailure(cause); throw cause; }
+  }
+  async function cloudAction(request: Parameters<ProviderTransport["action"]>[0], wanted: () => boolean): Promise<CloudSetupInfo | null> {
+    try { return await transport.action(request, wanted); } catch (cause) { contextFailure(cause); throw cause; }
+  }
+  async function peekCatalog(signal?: AbortSignal): Promise<CloudSetupInfo> {
+    try { return await transport.catalog(signal); } catch (cause) { contextFailure(cause); throw cause; }
+  }
   const required = $derived(requiredProviders.length ? requiredProviders : focusedHandoff?.blocked_providers.map(p => p.id) ?? []);
   const projectName = $derived(contextLabel ?? focusedHandoff?.name);
   /** Remembered rows until a live read answers; see `panelRows`. */
@@ -176,6 +209,7 @@
     const visibility = visibilityGeneration;
     try {
       const result = await peekCatalog(signal);
+      personal = transport.personal;
       if (!alive || signal?.aborted || visibility !== visibilityGeneration) return;
       if (operation !== mutation) { catalogAgain = true; return; }
       // A look while the cloud is idle that finds no catalog changes nothing.
@@ -183,7 +217,8 @@
       providers = result.providers ?? [];
       handoffs = result.handoffs ?? [];
       current = result.available === true && result.providers !== undefined;
-      catalogDisconnectBusy = current && result.connection?.operation === "disconnect";
+      catalogDisconnectBusy = current && result.connection?.operation === "disconnect" && (!personal || pendingConnection(result.connection));
+      if (personal && result.connection) connection = result.connection;
       if (catalogDisconnectBusy) {
         connection = recoverDisconnect(connection, result.connection);
         disconnectCandidate = null;
@@ -204,7 +239,7 @@
         if (operation !== mutation) catalogAgain = true;
         // Asleep or still starting is a state, and a look while the cloud is
         // idle is never an alarm: the rows stay as they were, with no words.
-        else if (cloudAsleep(cause) || !live) { current = false; asleep = true; error = null; }
+        else if (!transport.personalRequired && (cloudAsleep(cause) || !live)) { current = false; asleep = true; error = null; }
         else { loaded = true; current = false; asleep = false; error = "We couldn't check your agent sign-ins. We'll try again shortly."; }
       }
     } finally {
@@ -225,6 +260,7 @@
       if (olderCloudSignIn(result.connection)) { awaitUpdate(result.connection); return; }
       connection = result.connection;
       connectionNotice = null;
+      if (personal) operationError = null;
       if (!pendingConnection(connection)) { current = false; void load(); }
     } catch {
       if (alive && !signal?.aborted && operation === mutation && connection?.id === id) connectionNotice = disconnecting ? "We couldn't confirm this disconnection yet. Check its status before trying again." : `We couldn't check this sign-in yet. ${connectingName} may still be waiting for you.`;
@@ -256,7 +292,7 @@
   });
   $effect(() => { if (!visible || !$pageVisible || connectionId === null) authorizationCode = ""; });
   $effect(() => { if (!visible || !$pageVisible) disconnectCandidate = null; });
-  onDestroy(() => { alive = false; mutation += 1; authorizationCode = ""; });
+  onDestroy(() => { alive = false; mutation += 1; authorizationCode = ""; transport.clear(); unlisten?.(); });
 
   async function connect(providerId: string, operation: "connect" | "disconnect" = "connect"): Promise<void> {
     if (operation === "connect" ? !canStart : !canManage) return;
@@ -284,6 +320,8 @@
       }
     } catch (cause) {
       if (alive && request === mutation) {
+        personal = transport.personal;
+        if (personal) connection = transport.pending();
         operationError = cause === "provider_busy" || cause instanceof Error && cause.message === "provider_busy"
           ? connectionError("provider_busy", operation)
           : pressFailure(cause, operation);
@@ -408,10 +446,10 @@
       {:else if connection.phase === "verifying"}
         <p class="muted small" role="status">Confirming…</p>
       {:else if action?.type === "device_code"}
-        <div class="code-row"><code aria-label="One-time sign-in code">{action.user_code}</code><button class="button secondary" onclick={() => void copyCode()}>{copied ? "Copied" : "Copy"}</button>{#if native}<button class="button" disabled={busy !== null} onclick={() => void openSignIn()}>Open {label}</button>{:else if loginUrl}<a class="button" href={loginUrl} target="_blank" rel="noopener noreferrer">Open {label}</a>{:else}<span class="error small">This sign-in link couldn't be verified.</span>{/if}</div>
+        <div class="code-row"><code aria-label="One-time sign-in code">{action.user_code}</code><button class="button secondary" onclick={() => void copyCode()}>{copied ? "Copied" : "Copy"}</button>{#if native || personal}<button class="button" disabled={busy !== null} onclick={() => void openSignIn()}>Open {label}</button>{:else if loginUrl}<a class="button" href={loginUrl} target="_blank" rel="noopener noreferrer">Open {label}</a>{:else}<span class="error small">This sign-in link couldn't be verified.</span>{/if}</div>
         <p class="muted small" role="status">Enter the code on {label}'s sign-in page and approve. Waiting for you… <button class="text-button" disabled={busy !== null} onclick={() => void cancel()}>{busy === "cancel" ? "Canceling…" : "Cancel"}</button></p>
       {:else if action?.type === "browser"}
-        <div class="code-row">{#if native}<button class="button" disabled={busy !== null} onclick={() => void openSignIn()}>Open {label} sign-in</button>{:else if loginUrl}<a class="button" href={loginUrl} target="_blank" rel="noopener noreferrer">Open {label} sign-in</a>{:else}<span class="error small">This sign-in link couldn't be verified.</span>{/if}</div>
+        <div class="code-row">{#if native || personal}<button class="button" disabled={busy !== null} onclick={() => void openSignIn()}>Open {label} sign-in</button>{:else if loginUrl}<a class="button" href={loginUrl} target="_blank" rel="noopener noreferrer">Open {label} sign-in</a>{:else}<span class="error small">This sign-in link couldn't be verified.</span>{/if}</div>
         {#if action.input === "authorization_code"}
           <form class="authorization" onsubmit={(event) => { event.preventDefault(); void submitCode(); }}>
             <!-- Visible so a paste can be checked; still cleared on submit, cancel, hide and teardown. -->

@@ -24,6 +24,7 @@ mod catalog;
 mod credentials;
 mod installation;
 mod machine;
+pub(super) mod personal_providers;
 mod placements;
 pub(super) mod project_secrets;
 pub(super) mod projects;
