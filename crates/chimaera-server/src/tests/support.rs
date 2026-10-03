@@ -41,6 +41,7 @@ pub(super) fn test_state_with_data_dir(port: u16, data_dir: PathBuf) -> Arc<AppS
 fn fixture_state(port: u16, data_dir: PathBuf) -> AppState {
     let config_dir = data_dir.join("config");
     let provider_home = data_dir.join("provider-home");
+    let managed_root = data_dir.join("managed-agents");
     let mut state = AppState::new(
         "test-token".to_string(),
         "testhost".to_string(),
@@ -52,6 +53,9 @@ fn fixture_state(port: u16, data_dir: PathBuf) -> AppState {
     state.claude_projects_dir = provider_home.join(".claude/projects");
     state.claude_settings_path = provider_home.join(".claude/settings.json");
     state.codex_config_path = provider_home.join(".codex/config.toml");
+    // Spawns acquire runtime leases even for synthetic executables.
+    state.managed_root = managed_root;
+    state.legacy_managed_root = None;
     state
 }
 
