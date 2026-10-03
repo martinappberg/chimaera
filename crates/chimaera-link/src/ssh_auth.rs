@@ -4,6 +4,9 @@ use anyhow::{ensure, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
 
+pub mod route;
+pub use route::*;
+
 pub const SSH_AUTH_VERSION: u32 = 1;
 pub const SSH_AUTH_FRAME_MAX: usize = 128 * 1024;
 pub const SSH_AUTH_PACKET_MAX: usize = 64 * 1024;
@@ -23,11 +26,16 @@ pub struct SshAuthCapabilities {
     #[serde(default)]
     pub register_only_v1: bool,
     #[serde(default)]
+    pub proxyjump_v1: bool,
+    #[serde(default)]
     pub keeper_boot: String,
 }
 impl SshAuthCapabilities {
     pub fn supported(&self) -> bool {
         self.version == SSH_AUTH_VERSION && self.hostbound_v1 && opaque(&self.keeper_boot)
+    }
+    pub fn route_supported(&self) -> bool {
+        self.registration_supported() && self.proxyjump_v1
     }
     pub fn registration_supported(&self) -> bool {
         self.supported() && self.register_only_v1
@@ -469,6 +477,7 @@ mod tests {
             version: 1,
             hostbound_v1: true,
             register_only_v1: false,
+            proxyjump_v1: false,
             keeper_boot: "boot".into(),
         };
         assert!(caps.supported());

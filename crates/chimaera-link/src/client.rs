@@ -28,6 +28,14 @@ use tokio_tungstenite::{
 };
 use url::Url;
 
+mod ssh_route;
+
+#[derive(Clone, Copy)]
+enum SshGrantHeader<'a> {
+    Single(&'a str),
+    Route(&'a str),
+}
+
 #[derive(Clone)]
 pub struct Client {
     inner: Arc<Inner>,
@@ -703,7 +711,7 @@ impl Client {
         method: Method,
         segments: &[&str],
         body: Option<serde_json::Value>,
-        grant: Option<&str>,
+        grant: Option<SshGrantHeader<'_>>,
     ) -> Result<reqwest::Response> {
         let url = path(&self.keeper().await?, segments);
         for attempt in 0..2 {
@@ -716,7 +724,11 @@ impl Client {
             if let Some(grant) = grant {
                 // This helper is private; only the exact reconnect method below
                 // selects a grant. No mutable global/header inheritance exists.
-                request = request.header(crate::SSH_AUTH_GRANT_HEADER, grant);
+                let (header, value) = match grant {
+                    SshGrantHeader::Single(value) => (crate::SSH_AUTH_GRANT_HEADER, value),
+                    SshGrantHeader::Route(value) => (crate::SSH_AUTH_ROUTE_GRANT_HEADER, value),
+                };
+                request = request.header(header, value);
             }
             if let Some(body) = &body {
                 request = request.json(body);
@@ -925,7 +937,7 @@ impl Client {
                 Method::POST,
                 &["v1", "hosts", host, "reconnect"],
                 None,
-                Some(&grant.grant_id),
+                Some(SshGrantHeader::Single(&grant.grant_id)),
             )
             .await?;
         anyhow::ensure!(
