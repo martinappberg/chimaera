@@ -207,9 +207,11 @@ decision and settings controls require separate capability/acceptance work.
 
 Reuse the daemon's `ready`, ordered `batch`/`ev` replay, sequence cursor and receipt
 frames; do not translate session IDs or invent network success from a demo receipt.
-Apply replay through `head` before concluding anything about pending sends;
-discard already-applied sequences and handle a journal reset as the existing
-chat protocol requires. A second `ready` is a reattach, not a new conversation.
+Apply replay through `head` before reconciling pending sends from replay absence
+or a queued-input snapshot. Exact keyed confirmation or nondelivery receipts
+retain their existing semantics; absence is never such a receipt. Discard
+already-applied sequences and handle a journal reset as the existing chat
+protocol requires. A second `ready` is a reattach, not a new conversation.
 Correlate a `user_message` echo and `send_confirmed` to their original `client_id`.
 A queued echo alone is not proof of durable delivery. `send_uncertain` keeps the
 text visible as uncertain; it does not prove nondelivery. Restore a refused send
