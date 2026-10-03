@@ -325,10 +325,27 @@ async fn real_null_is_only_an_empty_trust_source_and_never_an_identity_or_append
             .is_err()
     );
     std::fs::write(&known, format!("{raw}@revoked {raw}")).unwrap();
-    assert!(matches!(
-        trusted_host(&parsed, &fixture.0, &algorithms).await,
-        Err(SelectionFailure::RevokedHost)
-    ));
+    let snapshot = public_file(&known, 1024 * 1024).await.unwrap().unwrap();
+    let mut command = Command::new("/usr/bin/ssh-keygen");
+    command.args(["-F", "[hpc.example.invalid]:2222", "-f", "/dev/stdin"]);
+    let matching = bounded_output(command, 1, Some(snapshot)).await;
+    assert!(
+        matching.is_ok(),
+        "revoked lookup category: {:?}",
+        matching.as_ref().err()
+    );
+    let entries = matching_trust(matching.as_ref().unwrap());
+    assert!(
+        matches!(entries, Err(SelectionFailure::RevokedHost)),
+        "revoked parser category: {:?}",
+        entries.as_ref().err()
+    );
+    let result = trusted_host(&parsed, &fixture.0, &algorithms).await;
+    assert!(
+        matches!(result, Err(SelectionFailure::RevokedHost)),
+        "revoked trust category: {:?}",
+        result.as_ref().err()
+    );
 
     let null_text = text.replace(&known.display().to_string(), "/dev/null");
     let null_config = Config::parse(&null_text).unwrap();
