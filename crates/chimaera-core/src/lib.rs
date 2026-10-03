@@ -6,6 +6,8 @@ pub mod cluster;
 pub mod personal_providers;
 pub mod project_secret_idle;
 pub mod project_secret_status;
+#[cfg(feature = "provider-runtime")]
+pub mod provider_runtime;
 #[cfg(unix)]
 pub mod shellint;
 pub mod slurm;

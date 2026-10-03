@@ -584,6 +584,122 @@ provider activity participates in supervisor drain/idle publication. Passive
 status does not wake or refresh credentials, and refresh is never a periodic
 reason to wake an idle worker.
 
+### Closed project-local runtime protocol v1
+
+The optional Core `provider-runtime` feature defines pure closed DTOs and frame
+bounds. It does not activate a listener, advertise `provider_runtime:1`, launch a
+CLI or create controller authority. Ordinary/free behavior remains unchanged.
+
+A nonsecret `binding` has exactly `version:1`, `account_id`, `workspace_id`,
+positive JS-safe `project_revision` and `launch_generation`, and `enrollment`
+(the existing exact personal-control registration without its capability).
+Binding account equals enrollment account; boot/request IDs are canonical
+nonnil UUIDs. The serialized tuple only correlates messages. Activation requires
+the retained opaque Controller ProjectAdmission and the current supervisor
+enrollment, matched after the actual Configure receipt. Prepare is inert; failed
+launches destroy their pending socket/capability and reconnect never activates a
+recovered preparation. A positive Ready is impossible before that activation.
+
+A distinct 256-bit project capability is exactly 43 canonical unpadded base64url
+bytes, delivered only through the trusted inherited startup FD. Its representation
+and access-token representations have no Debug and own zeroizing storage. It is
+absent from readiness, listings, URLs, journals and browser/native replies; it
+grants no personal-login permission. No request selects a UID, namespace, HOME,
+store, executable, upstream or ordinary daemon bearer.
+
+Each Unix connection carries one request and one reply or stream; there is no
+multiplexer or durable stream record. Every frame has one kind byte followed by
+four-byte unsigned big-endian payload length. Kinds are request_begin=0,
+request_data=1, request_end=2, response_begin=3, response_data=4, response_end=5,
+error=6. Strict UTF-8 JSON controls are at most128KiB; raw nonempty data frames
+are at most64KiB, with at most16 queued frames. Unknown kind/version/field,
+duplicate fields, wrong order/correlation, zero/oversized/truncated frames
+refuse. Secret-bearing serialization preallocates its full bounded buffer.
+
+request_begin is exactly `{version:1,binding,request_id,capability,command}`.
+Only these closed commands exist (empty variants still reject extra fields):
+
+- `{type:"ready"}` asks for exact active readiness only.
+- `{type:"codex_access"}` asks for current access-only bootstrap.
+- `{type:"codex_refresh",connection_generation,observed_revision}` binds the
+  current positive connection generation and nonnegative JS-safe observed
+  credential revision; it carries no refresh token or replacement identity.
+- `{type:"github_gh_access"}` supplies the fixed trusted gh child launcher;
+  token delivery is per child, never a permanent agent-shell environment.
+- `{type:"github_https_credentials",protocol:"https",host:"github.com"}`
+  permits only that literal HTTPS Git helper target. URL/userinfo/port/path,
+  another host/protocol and helper/argv/exec fields refuse.
+- `{type:"claude_stream",route:"messages"|"count_tokens",content_length}`
+  starts only the fixed subscription gateway route; content_length is1..16777216.
+
+response_begin is exactly `{version:1,binding,request_id,result}`. The binding and
+request ID must match the accepted request. Closed result variants are:
+
+- `{type:"ready",ready:true}`; false or mismatched readiness refuses.
+- `{type:"codex_access",access:{access_token,connection_generation,
+  credential_revision,expires_at,chatgpt_user_id,chatgpt_account_id,
+  chatgpt_plan_type}}`. Token is nonempty printable ASCII at most32KiB;
+  generation/revision/Unix expiry are positive JS-safe counters, user/account
+  are nonempty bounded512-byte identity strings, and plan is required-nullable
+  with the same bound. These match the pinned0.159.3 external-auth bootstrap and
+  refresh identity. Refresh success must preserve its exact connection generation
+  and return a credential revision greater than the observed one. Neither
+  refresh token nor ID token/raw claims/configuration enters a project reply.
+- `{type:"github_access",access:{access_token,username:"x-access-token",
+  connection_generation,credential_revision,expires_at}}`. The token and
+  positive counters use those bounds; expiry is required-nullable or a positive
+  JS-safe Unix timestamp. This result is only for the two GitHub commands.
+- `{type:"claude_head",head:{status,headers}}`. No Claude token is exposed.
+  Status is200,400,401,403,429,500,502,503,504; upstream529 becomes503 and any
+  unlisted status becomes502. Headers are exactly
+  `{content_type:"application/json"|"text/event-stream",retry_after_seconds}`;
+  retry_after_seconds is required-nullable or integer1..3600. Token-count and
+  non200 replies require application/json. No generic headers, redirect,
+  Set-Cookie, auth/TLS/proxy or upstream selection is allowed.
+
+Non-Claude response_begin is the complete single reply, followed by connection
+closure. Only Claude uses request/response data and end frames. Its declared
+16MiB maximum and route are checked before upstream effects. Each request_data
+frame contributes to a checked running total bounded by that declaration and
+16MiB. request_end is exactly `{version:1,binding,request_id,bytes}`, matching the
+actual total and declaration. Chunks may be forwarded while reading; complete
+body validation before effects or16MiB buffering is not promised. An incomplete
+or oversized body closes the upstream request without automatic replay.
+
+Only fixed Anthropic messages/token-count paths and pinned subscription OAuth
+header/body normalization are permitted. Body model/tool/content belongs to the
+provider API; it cannot choose transport/auth configuration. Response data is
+streamed permitted provider content/SSE. For a non200 reply the body is generated
+locally as exactly `{type:"error",error:{type,message}}`, with fixed pairs:
+400 invalid_request_error/"The provider request was refused."; 401
+authentication_error/"The provider connection needs sign-in."; 403
+permission_error/"The provider connection refused this request."; 429
+rate_limit_error/"The provider request is rate limited."; 503
+overloaded_error/"The provider is temporarily unavailable."; and500/502/504
+api_error/"The provider request is unavailable." Raw upstream diagnostics/bodies
+never substitute for these errors.
+
+response_end repeats `{version:1,binding,request_id,bytes}` with the actual
+JS-safe response-data total. Absence of this exact end means incomplete output.
+Before response_begin a failure sends at most one closed
+`{version:1,binding,request_id,error}` frame with only unsupported,
+invalid_request, inactive, state_changed, unavailable, needs_sign_in or
+limit_reached. After response_begin an error terminates the connection without
+another JSON error or inference replay. Actual transport must enforce frame
+order, checked totals, deadlines, upstream policy and ownership; DTO validation
+alone is not acceptance.
+
+Runtime streams are capped16 globally and8 per project with no waiting queue.
+Reservations follow real completion even after observer cancellation, independently
+of the broker's16 owned credential effects. Before credential return or a new
+upstream effect, check sealed admission/current enrollment/provider generation
+and expiry. Their lifetime signals close a stream on project expiry/revocation,
+enrollment replacement, provider disconnect/reconnect, NeedsSignIn or store/owner
+ambiguity; same-generation token rotation preserves healthy streams. Already
+returned access tokens cannot be erased. Successor broker startup must wait for
+positive ownership/drain of all old access/refresh effects as well as login
+cleanup. This checkpoint keeps runtime startup and capability advertisement off.
+
 ## Migration and enablement gates
 
 Before importing an existing official cloud login, the supervisor exclusively
