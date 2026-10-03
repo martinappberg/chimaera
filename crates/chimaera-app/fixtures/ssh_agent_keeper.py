@@ -29,6 +29,44 @@ from ssh_agent_loader import Refused, stop_owned
 from ssh_agent_sources import Sources, Proxy, agent_frame
 from ssh_agent_route import Protocol
 
+# Explicit fixture literals only. Exception/source/child text is never forwarded.
+KNOWN_REFUSALS = frozenset({
+    'Linux fixture management check failed',
+    'Linux fixture immutable digest',
+    'fixed command deadline',
+    'fixed command output bound',
+    'fixture process budget',
+    'owned session receipt',
+    'synthetic key generation',
+    'synthetic public identity',
+    'synthetic duplicate preparation',
+    'external seed',
+    'foreign seed',
+    'foreign identity receipt',
+    'fixed binary ownership',
+    'Mac fixture/exact Linux binary and wrapper digests required',
+    'keeper fixture interrupted or expired',
+    'keeper fixture cleanup uncertain',
+    'fixture root identity changed',
+})
+
+
+def refusal_phase(error):
+    if isinstance(error, Refused):
+        if len(error.args) == 1 and type(error.args[0]) is str and error.args[0] in KNOWN_REFUSALS:
+            return error.args[0]
+        return "fixture-refused-unknown"
+    if isinstance(error, TimeoutError):
+        return "fixture-timeout"
+    if isinstance(error, FileNotFoundError):
+        return "fixture-os-missing"
+    if isinstance(error, PermissionError):
+        return "fixture-os-denied"
+    if isinstance(error, OSError):
+        return "fixture-os-other"
+    return "fixture-value-invalid"
+
+
 VM = "chimaera-isolation-20261002"
 LINUX_BINARY = "/fixtures/keeper-ssh-fixture"
 LINUX_WRAPPER = "/fixtures/test-keeper-ssh-route-linux.py"
@@ -362,7 +400,9 @@ class Keeper(Sources):
             check = self.management("/usr/bin/sha256sum " + path)
             try:
                 output = capture(check, self.end(5), 256)
-                if check.returncode or output.split() != [digest.encode(), path.encode()]:
+                if check.returncode:
+                    raise Refused("Linux fixture management check failed")
+                if output.split() != [digest.encode(), path.encode()]:
                     raise Refused("Linux fixture immutable digest")
             finally:
                 stop_owned(check)
@@ -666,6 +706,6 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except (Refused, OSError, ValueError, TimeoutError):
-        print("REFUSED keeper fixture", file=sys.stderr)
+    except (Refused, OSError, ValueError, TimeoutError) as error:
+        print("REFUSED keeper fixture:", refusal_phase(error), file=sys.stderr)
         raise SystemExit(2)
