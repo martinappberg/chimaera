@@ -1,5 +1,10 @@
 # chimaera-server — the daemon's HTTP/WS surface + business logic
 
+The authenticated chat WebSocket also carries transient `native_ui` frames for
+Claude Mods. `ws.rs` mints each window's client ID, filters addressed replies and
+host callbacks, sends `native_ui_reset` on UI ring lag, and detaches the native
+window when the socket closes. This lane never participates in journal replay.
+
 Orientation for coding agents. This crate is the daemon: every HTTP route, every
 WebSocket, and the logic behind them. It embeds `web-ui/dist` and serves it.
 Parent map: repo-root [AGENTS.md](../../AGENTS.md). Architecture + rationale:

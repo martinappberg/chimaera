@@ -23,6 +23,7 @@ pub mod codex;
 pub mod driver;
 pub mod journal;
 pub mod model;
+pub mod native_ui;
 pub mod ndjson;
 pub mod transcript;
 
@@ -39,6 +40,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 use driver::{AgentAdapter, DriverExit, DriverIo, SpawnSpec};
 use journal::{Journal, JournalIndex, SeqEvent};
 use model::{AgentCommand, AgentEvent, ModelInfo};
+use native_ui::{NativeUiCommand, NativeUiEvent, UI_EVENT_QUEUE, UI_QUEUE};
 
 /// Called after every journaled event (server: derive AgentState, poke the
 /// event bus). Runs on the pump task — keep it cheap.
@@ -490,6 +492,8 @@ struct ChatSession {
     journal: Arc<Journal>,
     cmd_tx: mpsc::Sender<AgentCommand>,
     events_tx: broadcast::Sender<Arc<SeqEvent>>,
+    native_ui_tx: mpsc::Sender<NativeUiCommand>,
+    native_ui_events: broadcast::Sender<Arc<NativeUiEvent>>,
     kill_tx: watch::Sender<bool>,
     /// Serializes reservations with channel enqueue so driver echoes consume
     /// the manager's FIFO in exactly the command order.
@@ -506,6 +510,7 @@ pub struct ChatAttachment {
     pub info: ChatInfo,
     pub replay: Vec<Arc<SeqEvent>>,
     pub live: broadcast::Receiver<Arc<SeqEvent>>,
+    pub native_ui: broadcast::Receiver<Arc<NativeUiEvent>>,
     /// Effective replay cursor. Usually the caller's `last_seq`; reset to 0
     /// when that cursor is ahead of a recreated journal's head. The WS bridge
     /// must dedupe live events against THIS value, not the stale client value
@@ -602,6 +607,8 @@ impl ChatManager {
         let (cmd_tx, cmd_rx) = mpsc::channel(CMD_QUEUE);
         let (ev_tx, mut ev_rx) = mpsc::channel::<AgentEvent>(EVENT_QUEUE);
         let (events_tx, _) = broadcast::channel(BROADCAST_QUEUE);
+        let (native_ui_tx, native_ui_rx) = mpsc::channel(UI_QUEUE);
+        let (native_ui_events, _) = broadcast::channel(UI_EVENT_QUEUE);
         let (kill_tx, kill_rx) = watch::channel(false);
 
         // Background work survives TURNS, not driver processes. A hard daemon
@@ -647,6 +654,8 @@ impl ChatManager {
             journal: Arc::clone(&journal),
             cmd_tx,
             events_tx: events_tx.clone(),
+            native_ui_tx,
+            native_ui_events: native_ui_events.clone(),
             kill_tx,
             command_order: tokio::sync::Mutex::new(()),
             command_budget: Mutex::new(CommandBudget::default()),
@@ -659,6 +668,8 @@ impl ChatManager {
                     commands: cmd_rx,
                     events: ev_tx,
                     kill: kill_rx,
+                    native_ui_commands: native_ui_rx,
+                    native_ui_events,
                 },
             )
             .context("spawn agent driver")?;
@@ -944,6 +955,7 @@ impl ChatManager {
             info,
             replay,
             live,
+            native_ui: session.native_ui_events.subscribe(),
             replay_from: from,
             head_seq,
         })
@@ -951,6 +963,34 @@ impl ChatManager {
 
     pub async fn command(&self, id: &str, cmd: AgentCommand) -> Result<()> {
         self.command_as(id, cmd, None).await
+    }
+
+    /// Ephemeral UI requests never reserve a turn or enter the journal.
+    pub fn native_ui(&self, id: &str, command: NativeUiCommand) -> Result<()> {
+        self.get_session(id)?
+            .native_ui_tx
+            .try_send(command)
+            .map_err(|_| anyhow::anyhow!("Native UI is busy or disconnected"))
+    }
+
+    pub async fn detach_native_ui(&self, id: &str, client_id: &str) {
+        let Ok(session) = self.get_session(id) else {
+            return;
+        };
+        let Ok(command) = NativeUiCommand::new(
+            client_id,
+            "detach",
+            serde_json::json!({"subtype":"ui_detach"}),
+        ) else {
+            return;
+        };
+        // Socket teardown must release Claude's attached window even when a
+        // burst of renders has temporarily filled the command queue.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            session.native_ui_tx.send(command),
+        )
+        .await;
     }
 
     /// [`Self::command`] for a send the DAEMON makes on its own (not a

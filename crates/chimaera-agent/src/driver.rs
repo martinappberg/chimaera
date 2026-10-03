@@ -8,13 +8,15 @@
 
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::model::{cap_output, AgentCommand, AgentEvent, COALESCE_INTERVAL_MS};
+use crate::native_ui::{NativeUiCommand, NativeUiEvent};
 use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
 
 /// Login setup, workspace hooks and MCP discovery can precede initialization
@@ -184,6 +186,8 @@ pub struct DriverIo {
     pub commands: mpsc::Receiver<AgentCommand>,
     pub events: mpsc::Sender<AgentEvent>,
     pub kill: watch::Receiver<bool>,
+    pub native_ui_commands: mpsc::Receiver<NativeUiCommand>,
+    pub native_ui_events: broadcast::Sender<Arc<NativeUiEvent>>,
 }
 
 /// How a driver task ended — the server's degrade logic keys on this. Clone
@@ -223,6 +227,12 @@ pub trait Mapper: Send {
     fn on_frame(&mut self, frame: &Value) -> DriverStep;
     /// Translate one client command.
     fn on_command(&mut self, cmd: AgentCommand) -> DriverStep;
+    fn on_native_ui(&mut self, command: NativeUiCommand) -> DriverStep {
+        DriverStep {
+            native_ui: vec![command.failed("This agent does not provide native UI")],
+            ..DriverStep::default()
+        }
+    }
     /// Emit any buffered coalesced text (the harness's timer tick + teardown).
     fn flush(&mut self) -> Option<AgentEvent>;
     /// Resolution events for asks whose reply route dies with this mapper.
@@ -250,6 +260,7 @@ pub trait Mapper: Send {
 pub struct DriverStep {
     pub events: Vec<AgentEvent>,
     pub outbound: Vec<Value>,
+    pub native_ui: Vec<NativeUiEvent>,
 }
 
 /// What a concrete driver hands back from its handshake: the built mapper and
@@ -336,6 +347,9 @@ async fn deliver(sink: &mut JsonlSink, io: &DriverIo, step: DriverStep) -> Deliv
         if io.events.send(ev).await.is_err() {
             return Delivery::ReceiverGone;
         }
+    }
+    for event in step.native_ui {
+        let _ = io.native_ui_events.send(Arc::new(event));
     }
     Delivery::Ok
 }
@@ -555,6 +569,13 @@ pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo)
                 None => break DriverExit::Killed,
             },
             _ = io.kill.changed() => break DriverExit::Killed,
+            Some(command) = io.native_ui_commands.recv() => {
+                match deliver(&mut sink, &io, mapper.on_native_ui(command)).await {
+                    Delivery::Ok => {}
+                    Delivery::WriteFailed(reason) => break DriverExit::ProtocolError(reason),
+                    Delivery::ReceiverGone => break DriverExit::Killed,
+                }
+            },
             _ = tick.tick() => {
                 if let Some(ev) = mapper.flush() {
                     if io.events.send(ev).await.is_err() {

@@ -224,6 +224,12 @@ pub enum AgentEvent {
         turn_id: String,
         text: String,
     },
+    /// Stable provider identity for subsequent prose in this turn. Allows
+    /// native render hooks to address a message without replaying UI handles.
+    MessageIdentity {
+        turn_id: String,
+        message_id: String,
+    },
     /// Streamed reasoning/thinking; the same chunking contract as `MessageChunk`.
     ThoughtChunk {
         turn_id: String,
@@ -302,6 +308,17 @@ pub enum AgentEvent {
         status: ToolStatus,
         #[serde(skip_serializing_if = "Option::is_none")]
         content: Option<ToolContent>,
+    },
+    /// Optional provider facts for native render hooks. Input is retained only
+    /// when complete within its budget; never fabricate a truncated object.
+    ToolRenderData {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<Value>,
     },
     /// Live tool-output append (codex streams command output as it runs).
     /// Clients append to the tool's output; a later `ToolCallUpdate` with

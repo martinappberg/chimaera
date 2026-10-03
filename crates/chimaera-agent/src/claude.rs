@@ -754,6 +754,7 @@ struct ClaudeMapper {
     /// `assistant` frames must not be emitted again.
     streamed: HashSet<String>,
     current_stream_msg: Option<String>,
+    render_message_id: Option<String>,
     /// The streaming `thinking` block whose kind is still unknown — reasoning
     /// or narration (the prose between tool calls, which Opus 5.5+ ships as a
     /// thinking block; [`signature_is_narration`]). Its text waits HERE,
@@ -776,6 +777,7 @@ struct ClaudeMapper {
     /// completed result string; "dismiss" cancels).
     pending_dialogs: HashMap<String, ()>,
     pending_controls: HashMap<String, PendingControl>,
+    native_ui: crate::native_ui::ClaudeUi,
     /// CLI→client control subtypes we don't handle and have already said so
     /// about — the notice fires once per subtype, not per frame.
     noticed_controls: HashSet<String>,
@@ -1000,6 +1002,7 @@ impl ClaudeMapper {
             turn_active: false,
             streamed: HashSet::new(),
             current_stream_msg: None,
+            render_message_id: None,
             held_thinking: None,
             thinking_route: None,
             tool_kinds: HashMap::new(),
@@ -1007,6 +1010,7 @@ impl ClaudeMapper {
             pending_questions: HashMap::new(),
             pending_dialogs: HashMap::new(),
             pending_controls: HashMap::new(),
+            native_ui: crate::native_ui::ClaudeUi::default(),
             noticed_controls: HashSet::new(),
             task_rows: HashMap::new(),
             agent_tools: HashMap::new(),
@@ -1328,6 +1332,20 @@ impl ClaudeMapper {
     }
 
     fn on_system(&mut self, frame: &Value, step: &mut DriverStep) {
+        if self.native_ui.notification(frame, step) {
+            return;
+        }
+        if frame["subtype"] == "ui_log" {
+            self.flush_prose(step);
+            step.events.push(AgentEvent::Notice {
+                text: format!(
+                    "{}: {}",
+                    truncate_label(frame["plugin"].as_str().unwrap_or("Mod"), 120),
+                    truncate_label(frame["text"].as_str().unwrap_or_default(), 4096)
+                ),
+            });
+            return;
+        }
         match frame["subtype"].as_str() {
             Some("init") => {
                 if let Some(id) = frame["session_id"].as_str() {
@@ -2150,7 +2168,7 @@ impl ClaudeMapper {
         if let Some(uuid) = frame["uuid"].as_str() {
             self.last_msg_uuid = Some(uuid.to_string());
         }
-        self.on_tool_results(&frame["message"], step);
+        self.on_tool_results(&frame["message"], frame.get("tool_use_result"), step);
         self.on_remote_user_text(frame, step);
     }
 
@@ -2269,11 +2287,15 @@ impl ClaudeMapper {
                 let turn = self.turn_id();
                 let delta = &event["delta"];
                 let (kind, text) = match delta["type"].as_str() {
-                    Some("text_delta") => (ChunkKind::Message, delta["text"].as_str()),
+                    Some("text_delta") => {
+                        self.identify_message(self.current_stream_msg.clone().as_deref(), step);
+                        (ChunkKind::Message, delta["text"].as_str())
+                    }
                     Some("thinking_delta") => {
                         let Some(text) = delta["thinking"].as_str() else {
                             return;
                         };
+                        self.identify_message(self.current_stream_msg.clone().as_deref(), step);
                         if let Some(id) = &self.current_stream_msg {
                             self.streamed.insert(id.clone());
                         }
@@ -2435,6 +2457,7 @@ impl ClaudeMapper {
             match block["type"].as_str() {
                 Some("text") if !streamed => {
                     if let Some(text) = block["text"].as_str().filter(|t| !t.is_empty()) {
+                        self.identify_message(Some(msg_id), step);
                         // Same boundary rule as the streamed path; the
                         // coalescer no-ops the break before the first block.
                         let turn = self.turn_id();
@@ -2447,6 +2470,7 @@ impl ClaudeMapper {
                 }
                 Some("thinking") if !streamed => {
                     if let Some(text) = block["thinking"].as_str().filter(|t| !t.is_empty()) {
+                        self.identify_message(Some(msg_id), step);
                         let kind = if is_narration(i, block) {
                             ChunkKind::Message
                         } else {
@@ -2538,14 +2562,27 @@ impl ClaudeMapper {
         });
         if let Some(diff) = edit_diff_content(name, input) {
             step.events.push(AgentEvent::ToolCallUpdate {
-                id,
+                id: id.clone(),
                 status: ToolStatus::InProgress,
                 content: Some(diff),
             });
         }
+        if input.is_object() && serde_json::to_vec(input).is_ok_and(|v| v.len() <= 32 * 1024) {
+            step.events.push(AgentEvent::ToolRenderData {
+                id,
+                name: Some(truncate_label(name, 256)),
+                input: Some(input.clone()),
+                output: None,
+            });
+        }
     }
 
-    fn on_tool_results(&mut self, message: &Value, step: &mut DriverStep) {
+    fn on_tool_results(
+        &mut self,
+        message: &Value,
+        native_output: Option<&Value>,
+        step: &mut DriverStep,
+    ) {
         let Some(blocks) = message["content"].as_array() else {
             return;
         };
@@ -2587,7 +2624,7 @@ impl ClaudeMapper {
                 Some(ToolContent::Output { text, truncated })
             };
             step.events.push(AgentEvent::ToolCallUpdate {
-                id,
+                id: id.clone(),
                 status: if failed {
                     ToolStatus::Failed
                 } else {
@@ -2595,10 +2632,30 @@ impl ClaudeMapper {
                 },
                 content,
             });
+            let native = if failed {
+                Some(json!(cap_output(&tool_result_text(block)).0))
+            } else if blocks.iter().filter(|v| v["type"] == "tool_result").count() == 1 {
+                native_output
+                    .filter(|value| serde_json::to_vec(value).is_ok_and(|v| v.len() <= 64 * 1024))
+                    .cloned()
+            } else {
+                None
+            };
+            if let Some(output) = native {
+                step.events.push(AgentEvent::ToolRenderData {
+                    id,
+                    name: None,
+                    input: None,
+                    output: Some(output),
+                });
+            }
         }
     }
 
     fn on_control_request(&mut self, frame: &Value, step: &mut DriverStep) {
+        if self.native_ui.host_request(frame, step) {
+            return;
+        }
         let request = &frame["request"];
         let request_id = frame["request_id"].as_str().unwrap_or_default().to_string();
         if request["subtype"] == "request_user_dialog" {
@@ -2851,7 +2908,25 @@ impl ClaudeMapper {
         });
     }
 
+    fn identify_message(&mut self, id: Option<&str>, step: &mut DriverStep) {
+        let Some(id) = id.filter(|id| !id.is_empty() && id.len() <= 256) else {
+            return;
+        };
+        if self.render_message_id.as_deref() == Some(id) {
+            return;
+        }
+        self.flush_prose(step);
+        self.render_message_id = Some(id.into());
+        step.events.push(AgentEvent::MessageIdentity {
+            turn_id: self.turn_id(),
+            message_id: id.into(),
+        });
+    }
+
     fn on_control_response(&mut self, frame: &Value, step: &mut DriverStep) {
+        if self.native_ui.response(frame, step) {
+            return;
+        }
         let id = frame["response"]["request_id"]
             .as_str()
             .unwrap_or_default()
@@ -4046,6 +4121,7 @@ impl ClaudeMapper {
     /// result, so there is no coalesced surplus for a timer to reconcile.
     fn tick(&mut self) -> DriverStep {
         let mut step = self.interrupt_watchdog();
+        self.native_ui.tick(&mut step);
         // A thinking block still streaming past the hold is reasoning —
         // narration arrives whole, signature included, in one burst.
         if let Some(held) = self.held_thinking.as_mut().filter(|h| !h.text.is_empty()) {
@@ -4118,6 +4194,9 @@ impl ClaudeMapper {
 /// forward the harness's generic calls to them (inherent methods win in
 /// `self.x()` resolution, so there is no recursion).
 impl Mapper for ClaudeMapper {
+    fn on_native_ui(&mut self, command: crate::native_ui::NativeUiCommand) -> DriverStep {
+        self.native_ui.command(command)
+    }
     fn init_event(&self) -> AgentEvent {
         self.init_event()
     }
@@ -6830,7 +6909,14 @@ pub(crate) mod tests {
             "event": { "type": "content_block_delta",
                        "delta": { "type": "text_delta", "text": "hi" } },
         }));
-        assert!(step.events.is_empty(), "small delta stays buffered");
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::MessageIdentity {
+                turn_id: "t1".into(),
+                message_id: "m1".into()
+            }],
+            "identity precedes buffered prose"
+        );
 
         // The complete assistant frame for the same message must be skipped…
         let step = m.on_frame(&json!({
@@ -9354,6 +9440,7 @@ pub(crate) mod tests {
         steps.push(DriverStep {
             events: m.flush().into_iter().collect(),
             outbound: Vec::new(),
+            native_ui: Vec::new(),
         });
         assert_eq!(
             message_text(&steps, ""),
@@ -9376,6 +9463,7 @@ pub(crate) mod tests {
         steps.push(DriverStep {
             events: m.flush().into_iter().collect(),
             outbound: Vec::new(),
+            native_ui: Vec::new(),
         });
         assert_eq!(thought_text(&steps), "Considering the options carefully.");
         assert!(message_text(&steps, "").is_empty());
@@ -9401,6 +9489,7 @@ pub(crate) mod tests {
         steps.push(DriverStep {
             events: m.flush().into_iter().collect(),
             outbound: Vec::new(),
+            native_ui: Vec::new(),
         });
         assert_eq!(message_text(&steps, ""), "Checking the config next.");
         assert!(thought_text(&steps).is_empty());
@@ -9424,6 +9513,7 @@ pub(crate) mod tests {
             DriverStep {
                 events: m.flush().into_iter().collect(),
                 outbound: Vec::new(),
+                native_ui: Vec::new(),
             },
         ];
         assert_eq!(message_text(&steps, ""), "Reading the log now.");

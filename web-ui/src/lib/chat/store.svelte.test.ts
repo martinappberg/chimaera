@@ -26,6 +26,42 @@ const QUEUED_MID_TURN: Record<string, unknown>[] = [
   { type: "user_message_update", id: "q1", state: "sent" },
 ];
 
+describe("native Mod render identities", () => {
+  it("keeps distinct native assistant messages separate within one turn", () => {
+    const store = fold([
+      { type: "turn_started", turn_id: "t" },
+      { type: "message_identity", turn_id: "t", message_id: "m1" },
+      { type: "message_chunk", turn_id: "t", text: "one" },
+      { type: "message_chunk", turn_id: "t", text: " continued" },
+      { type: "message_identity", turn_id: "t", message_id: "m2" },
+      { type: "message_chunk", turn_id: "t", text: "two" },
+      { type: "message_chunk", turn_id: "next", text: "old journal" },
+    ]);
+    const messages = store.blocks.filter((block) => block.kind === "message");
+    expect(messages.map((block) => [block.text, block.nativeMessageId])).toEqual([["one continued", "m1"], ["two", "m2"], ["old journal", undefined]]);
+  });
+  it("retains exact native tool data without replacing core tool state", () => {
+    const store = fold([
+      { type: "tool_call", id: "tool", tool: "execute", title: "pwd", status: "in_progress" },
+      { type: "tool_render_data", id: "tool", name: "Bash", input: { command: "pwd" } },
+      { type: "tool_render_data", id: "tool", output: { stdout: "/tmp", stderr: "" } },
+      { type: "tool_render_data", id: "absent", name: "Ignored" },
+    ]);
+    expect(store.blocks.find((block) => block.kind === "tool")).toMatchObject({ id: "tool", title: "pwd", nativeName: "Bash", nativeInput: { command: "pwd" }, nativeOutput: { stdout: "/tmp", stderr: "" } });
+    expect(store.blocks.filter((block) => block.kind === "tool")).toHaveLength(1);
+  });
+  it("only marks the first prose block of one native reply as its opening", () => {
+    const store = fold([
+      { type: "message_identity", turn_id: "t", message_id: "m" },
+      { type: "message_chunk", turn_id: "t", text: "first" },
+      { type: "thought_chunk", turn_id: "t", text: "reason" },
+      { type: "message_identity", turn_id: "t", message_id: "m" },
+      { type: "message_chunk", turn_id: "t", text: "continued" },
+    ]);
+    expect(store.blocks.filter((block) => block.kind === "message").map((block) => block.nativeFirstOfReply)).toEqual([true, false]);
+  });
+});
+
 describe("ChatStore block-boundary normalization", () => {
   it("strips driver separators that open a NEW block and drops whitespace-only chunks", () => {
     const store = fold([

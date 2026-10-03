@@ -2870,3 +2870,37 @@ into the model picker. Such placeholders must not produce `ModelSwitched` or ent
 resume/pref state. Real assistant-message model observations use `reason: "reported"`;
 only the successful `set_model` acknowledgement uses `reason: null` to persist a user
 preference. The catalog's `value` remains the exact argument sent to `set_model`.
+
+### Claude Mods native UI (2.1.288, 2026-10-03)
+
+Verified without model turns using `tests/native_ui_live.rs` and its local
+`tests/fixtures/claude-mod` plugin: initialize, desktop `ui_attach`, pane roster,
+`ui_render` for Pane and AbovePrompt, `ui_press`, `ui_input`, `ui_select`,
+`ui_client_module`, close, detach, and reattach with plugin state retained.
+The complete billed smoke gate hit the account's weekly quota; the overall
+Claude driver pin remains unchanged until that gate passes.
+
+`ui_attach {surface:"desktop",client_id,answers}` acknowledges before asynchronous
+`session.attach` hooks finish. A pane can appear in a later `system/ui_panes`.
+`ui_render {component,instance_id,props}` returns `{tree,props,hooked,rewritten,
+client_modules?}`. The native cache may return its old tree before a coalesced
+`system/ui_invalidate` (100ms); render again on invalidation. A no-hook site
+returns an engine reference and `hooked:false`. `engine.ref=0` means original
+props. Returned rewritten props belong to the first engine node only; later
+references whose process-local props are unavailable use the original core view.
+
+Buttons carry a plugin and process-local numeric handle. Input/select requests
+also carry their key, component and instance, allowing Claude to re-resolve a
+field after redraw. `handled:false` means refresh the control, never replay the
+side effect. `ui_client_module` returns the hash, entry/export names, keyed JS
+files, and `claude:surface-runtime`; the runtime exports h/Fragment/install.
+Client closures stay in the isolated surface runtime. `ui_client_press` runs the
+native hook chain before its `reached` event reaches the local closure.
+
+The authenticated WebSocket owns the client ID. UI responses and addressed
+notifications go only to that window, over a separate bounded transient lane.
+Host `ui_copy` and `ui_prompt_read/fill/suggest` requests have five-second native
+timeouts and typed success answers; another window's answer cannot resolve them.
+A Mod's render tree, JS module, and callback handle are never conversation data.
+Only stable `message_identity` and bounded complete `tool_render_data` facts are
+journaled to preserve render-site identities across normal history replay.

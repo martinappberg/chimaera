@@ -65,6 +65,11 @@
   import AgentMessageMeta from "./AgentMessageMeta.svelte";
   import Composer from "./Composer.svelte";
   import SameFileNotice from "../workspace/SameFileNotice.svelte";
+  import ModsWorkbench from "./ModsWorkbench.svelte";
+  import ModSite from "./ModSite.svelte";
+  import { modsFor } from "./mods.svelte";
+  import type { NativeComposer } from "./nativeComposer";
+  import { pageVisible } from "../shared/visibility";
   import { sameFile } from "../workspace/sameFile.svelte";
   import ReferenceChip from "../shared/ReferenceChip.svelte";
   import { activeSelection, clearSelection, setSelection } from "../shared/reference";
@@ -144,6 +149,8 @@
   // the pool disposes them when the session ends or toggles to a PTY.
   // svelte-ignore state_referenced_locally
   const { store, socket } = acquireChat(session.id);
+  const mods = modsFor(socket.nativeUi);
+  let composerApi = $state<NativeComposer>();
   // svelte-ignore state_referenced_locally
   onDestroy(() => releaseChat(session.id));
   onDestroy(() => {
@@ -2497,6 +2504,8 @@
     {store}
     {agentKind}
     {agentName}
+    mods={agentKind === "claude" ? mods : undefined}
+    {visible}
     bind:menu
     canPickModel={supports("set_model") && modelChoices.length > 0 && store.connected && store.exited === null && store.fatalError === null && store.pendingModel === null}
     canPickMode={supports("set_mode")}
@@ -2593,6 +2602,7 @@
           resolvePaths={prosePaths}
           onBackground={supports("background_tool") ? backgroundTool : undefined}
           onStopTask={supports("stop_task") ? stopTask : undefined}
+          mods={agentKind === "claude" ? mods : undefined}
         />
       {:else}
         <ThoughtRow
@@ -2662,11 +2672,11 @@
               {@render sentImages(block.attachmentPaths)}
             {:else}
               <div class="bubble">
-                <UserText
-                  text={block.text}
-                  onOpenPath={openProsePath}
-                  resolvePaths={prosePaths}
-                />
+                {#if agentKind === "claude" && block.checkpoint?.id}
+                  <ModSite {mods} component="UserMessage" instanceId={block.checkpoint.id} active={visible && $pageVisible} props={{ text: block.text, origin: { kind: block.origin ? "unclassified" : "composer" }, isExpanded: true }}>
+                    {#snippet children(draw)}<UserText text={typeof draw.text === "string" ? draw.text : block.text} onOpenPath={openProsePath} resolvePaths={prosePaths} />{/snippet}
+                  </ModSite>
+                {:else}<UserText text={block.text} onOpenPath={openProsePath} resolvePaths={prosePaths} />{/if}
               </div>
             {/if}
           </div>
@@ -2702,6 +2712,7 @@
           sourceUid={item.block.uid}
         />
       {:else if item.block.kind === "message"}
+        {@const message = item.block}
         <div
           class="msg agent"
           class:streaming={store.running && item.block.uid === lastInlineUid}
@@ -2713,8 +2724,9 @@
                the live segment DOM in place instead of paying a synchronous
                whole-message canonical parse at tab-switch-away, and thaw
                resumes the reveal cursor instead of re-animating the row. -->
+          {#snippet assistantProse(text: string)}
           <Markdown
-            text={item.block.text}
+            {text}
             streaming={store.running && item.block.uid === lastInlineUid}
             {visible}
             onOpenPath={openProsePath}
@@ -2725,6 +2737,12 @@
               if (visible && atBottom && !composerEngaged) queueBottomScroll();
             }}
           />
+          {/snippet}
+          {#if agentKind === "claude" && item.block.nativeMessageId}
+            <ModSite {mods} component="AssistantMessage" instanceId={item.block.nativeMessageId} active={visible && $pageVisible} props={{ text: item.block.text, isFirstOfReply: item.block.nativeFirstOfReply === true }}>
+              {#snippet children(draw)}{@render assistantProse(typeof draw.text === "string" ? draw.text : message.text)}{/snippet}
+            </ModSite>
+          {:else}{@render assistantProse(item.block.text)}{/if}
           <AgentMessageMeta
             text={item.block.text}
             sentAtMs={item.block.sentAtMs}
@@ -2868,7 +2886,11 @@
         {#if runningTasks > 0}
           <span class="status-part">{runningTasks} running task{runningTasks === 1 ? "" : "s"}</span>
         {/if}
-        <span class="status-label" title={activityDetail}>{activityLabel}</span>
+        {#if agentKind === "claude"}
+          <ModSite {mods} component="Spinner" instanceId="spinner" active={visible && $pageVisible} props={{ word: activityLabel, message: null, suffix: "…", mode: store.activity?.kind === "thinking" ? "thinking" : store.activity?.kind === "writing" ? "responding" : store.activity?.kind === "tool" ? "tool-use" : "requesting" }}>
+            {#snippet children(draw)}<span class="status-label" title={activityDetail}>{typeof draw.message === "string" ? draw.message : typeof draw.word === "string" ? draw.word : activityLabel}</span>{/snippet}
+          </ModSite>
+        {:else}<span class="status-label" title={activityDetail}>{activityLabel}</span>{/if}
         {#if store.compacting}
           <span class="compaction-progress" role="progressbar" aria-label="Compacting conversation">
             <span></span>
@@ -3138,7 +3160,13 @@
     </div>
   {/if}
 
+  {#if agentKind === "claude" && store.exited === null}
+    <ModsWorkbench transport={socket.nativeUi} {visible} {focused} running={agentBusy} hasSurvey={store.questions.length > 0} composer={composerApi} canEdit={!composerDisabled && store.pending.length === 0 && store.questions.length === 0 && rewindIntent === null && forkIntent === null} canFocus={focused && !composerEngaged && !agentBusy && store.pending.length === 0 && store.questions.length === 0} />
+  {/if}
+
   <Composer
+    bind:this={composerApi}
+    onNativeEdit={agentKind === "claude" && mods.attached ? (request) => socket.nativeUi.request(request) : undefined}
     sessionId={session.id}
     imageInput={capabilities.image_input}
     view={quoteOwner}

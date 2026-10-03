@@ -260,6 +260,7 @@ impl Driver for CodexDriver {
                 chosen: false,
             }],
             outbound: Vec::new(),
+            native_ui: Vec::new(),
         }];
         // A failed conversation rewind degrades to a notice, not a dead pane:
         // the thread resumed whole, only the rollback was refused/ignored.
@@ -271,6 +272,7 @@ impl Driver for CodexDriver {
                     ),
                 }],
                 outbound: Vec::new(),
+            native_ui: Vec::new(),
             });
         }
         let mut mapper = CodexMapper::new(
