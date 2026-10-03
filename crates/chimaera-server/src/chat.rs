@@ -3241,6 +3241,7 @@ pub(crate) async fn spawn_chat_session(
                     spawn_bin,
                     mcp_url.as_deref(),
                     recipe.mastermind,
+                    crate::lock(&state.settings).codex_instant_interrupt(),
                 ),
                 recipe.resume.clone(),
             )

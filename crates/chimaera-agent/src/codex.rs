@@ -29,9 +29,10 @@ use serde_json::{json, Value};
 
 use crate::ndjson::JsonlChild;
 
-/// CLI version these frame shapes were verified against (2026-09-25,
-/// full chat-smoke 23/23 + generated-schema diff; PROTOCOL.md Pass 33).
-pub const TESTED_CODEX_VERSION: &str = "0.159.3";
+/// CLI version these frame shapes were verified against (2026-10-03,
+/// ten existing Codex live cases + generated-schema diff; PROTOCOL.md's
+/// October runtime refresh records the pending experimental-steering probe).
+pub const TESTED_CODEX_VERSION: &str = "0.160.0";
 
 /// The `initialize` request both the probe client and the driver handshake
 /// send. Declares `experimentalApi` so `thread/settings/update` is available

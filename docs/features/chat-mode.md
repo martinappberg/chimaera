@@ -789,7 +789,37 @@ You can write and queue a message while it starts. User-configured hooks and
 cloud-backed workspace files can delay readiness; Chimaera keeps those hooks
 intact rather than bypassing them.
 
+### Runtime steering and background lifetimes
+
+Settings → Chat → **Codex Steering Timing** controls new and resumed structured
+Codex processes. **Agent default** leaves the user's native configuration alone;
+**Next step** disables `features.instant_interrupt`; **Immediate (experimental)**
+enables it (Codex 0.159.0+). Immediate steering can interrupt a model response or
+code-mode call to read a steer, including one delivered by another agent. It does
+not promote messages queued for a later turn. Changing the setting does not
+restart a running chat. The daemon reads
+`chat.codexSteering` in `settings.rs` and passes the override through
+`launcher.rs` at `chat.rs`'s spawn boundary.
+
+Claude 2.1.288 applies its background command time limit to `-p` / SDK sessions,
+which includes Chimaera structured chats. Keeping the daemon alive does not
+remove that upstream limit. Use a linked Chimaera terminal for a dev server or
+other process that must outlive the agent's command, and a scheduler job for
+cluster work. The tray continues to reflect Claude's actual task lifecycle;
+closing a view keeps the agent running, while stopping/restarting the agent ends
+its process-owned background work.
+
 ## Intent — human-authored ground truth
+
+### October runtime compatibility — why it exists
+_Captured 2026-10-03 from the maintainer in the implementation chat._
+
+- **Problem it solves:** “We need to do all of these” in response to the Claude
+  Code / Codex update assessment, including runtime compatibility and immediate
+  steering.
+- **Addition to the core:** detailed behavior and UI constraints for this
+  setting are pending; the existing queue and steering contract remains the
+  starting point.
 
 > Captured from the people who built these features via the **capture-feature-intent**
 > skill when a `feat:` ships in this area. **Never** inferred from code. Everything above

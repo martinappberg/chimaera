@@ -2904,3 +2904,46 @@ timeouts and typed success answers; another window's answer cannot resolve them.
 A Mod's render tree, JS module, and callback handle are never conversation data.
 Only stable `message_identity` and bounded complete `tool_render_data` facts are
 journaled to preserve render-site identities across normal history replay.
+## 2026-10-03: October runtime refresh
+
+**Codex 0.160.0.** A temporary official npm installation (the user's global CLI
+was unchanged) emitted an experimental TypeScript schema byte-identical to
+0.159.3. All ten existing Codex cases in `just chat-smoke` passed, including
+streaming, subagent lifecycle, permissions/settings, fork/rollback/compact,
+summary configuration, resume instructions and mid-turn message delivery.
+The tested Codex pin advances to 0.160.0.
+
+`model/list` returned `gpt-6.1-sol` with `isDefault: true`, followed by Astra,
+Sol, Luna and the older models; the daemon's pre-handshake fallback now leads
+with that id. Runtime catalogs remain authoritative for account availability.
+
+`instant_interrupt` is a runtime feature flag, not a `turn/steer` field.
+An app-server launched with `-c features.instant_interrupt=true` reported
+`experimentalFeature/list` entry `{name:"instant_interrupt", enabled:true,
+defaultEnabled:false, stage:"underDevelopment"}`; `config/read` also returned
+the true flag. Chimaera's launch setting either omits the override or passes
+true/false. It does not alter the ordinary queue, expected-turn precondition,
+or native read acknowledgement. The new billed regression
+`driver_codex_instant_steering_reads_during_a_response` remains **pending**:
+the maintainer paused model-backed tests until usage resets, and automatic
+approval review also held that additional billed probe. Draft review can proceed.
+The daemon-backed settings UI was verified separately without model calls:
+all three choices, persistence after reload, reset to native configuration,
+light/dark rendering, and an empty browser error log.
+
+**Claude 2.1.288 is not yet fully verified.** The full suite ran 27 tests:
+17 passed and 10 failed. A separate diagnostic confirmed the Claude failures
+were an account weekly-limit response (`api_error_status:429`, `is_error:true`,
+zero model usage), with reset reported as October 6 at 8pm America/Los_Angeles.
+No background task was actually started, so absence of its frames does not
+establish wire drift. The Claude tested pin stays 2.1.287; re-run the full billed
+gate after reset before shipping or advancing it. No-model handshake controls
+worked on 2.1.288.
+
+The [official Claude changelog](https://code.claude.com/docs/en/changelog#21288)
+states that background command time limits apply to `-p` / SDK, CI and cloud
+sessions; Chimaera structured chats use that protocol. We do not impersonate
+the desktop entry point or disable that policy. Durable services belong in a
+linked daemon-owned terminal (or a scheduler job), and agent-owned work follows
+the runtime's actual lifecycle. The precise limit and expiry frame remain
+unverified until a billed background-task probe can run.

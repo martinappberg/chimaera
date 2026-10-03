@@ -135,6 +135,7 @@ export type SettingsMap = {
   "daemon.restoreSessions": boolean;
   "chat.remoteControlAtStart": boolean;
   "chat.toolSummaries": boolean;
+  "chat.codexSteering": "agent" | "next_step" | "immediate";
   "chat.resumeAfterRestart": boolean;
   "chat.voice": boolean;
   "chat.voiceMicrophone": string;
@@ -770,6 +771,20 @@ const DEFS = {
     step: 1000,
     scope: "daemon",
     note: "Applies to sessions started after the change.",
+  },
+  "chat.codexSteering": {
+    title: "Codex Steering Timing",
+    category: "Chat",
+    description: "When Codex reads messages steered into an active turn, including messages from another agent. Agent default uses your Codex configuration (normally the next step). Immediate lets Codex interrupt its current model response or code-mode call. Messages queued for the next turn still wait.",
+    type: "enum",
+    default: "agent",
+    options: [
+      { value: "agent", label: "Agent default" },
+      { value: "next_step", label: "Next step" },
+      { value: "immediate", label: "Immediate (experimental)" },
+    ],
+    scope: "daemon",
+    note: "Requires Codex 0.159.0 or later. Applies when a chat starts or resumes; running chats keep their current setting.",
   },
   "chat.remoteControlAtStart": {
     title: "Remote Control at Start (Claude)",

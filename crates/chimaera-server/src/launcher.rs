@@ -52,11 +52,10 @@ pub(crate) fn models(kind: AgentKind) -> &'static [(&'static str, &'static str)]
             ("sonnet", "Sonnet"),
             ("haiku", "Haiku"),
         ],
-        // The 0.156.1 `model/list` on a Pro account (live-probed 2026-09-23),
-        // default first: GPT-6 Astra (frontier), Sol (workhorse), Luna (fast),
-        // then the previous generation's workhorse. The ids are what
-        // `thread/start.model` accepts.
+        // Fresh-launch fallback; the account's model/list replaces it after
+        // a handshake. GPT-6.1 Sol is the September 2026 workhorse default.
         AgentKind::Codex => &[
+            ("gpt-6.1-sol", "GPT-6.1 Sol"),
             ("gpt-6-astra", "GPT-6 Astra"),
             ("gpt-6-sol", "GPT-6 Sol"),
             ("gpt-6-luna", "GPT-6 Luna"),
@@ -948,8 +947,12 @@ pub(crate) fn build_codex_chat_command(
     bin: &Path,
     mcp_url: Option<&str>,
     mastermind: Option<crate::workspaces::MastermindMode>,
+    instant_interrupt: Option<bool>,
 ) -> Vec<String> {
     let mut cmd = vec![bin.to_string_lossy().into_owned(), "app-server".to_string()];
+    if let Some(enabled) = instant_interrupt {
+        cmd.extend(["-c".into(), format!("features.instant_interrupt={enabled}")]);
+    }
     if let Some(url) = mcp_url {
         cmd.extend(codex_mcp_overrides(url));
     }
@@ -1747,13 +1750,13 @@ mod tests {
             "developer_instructions=\"{}\"",
             toml_basic_string(CHAT_HOST_PROMPT)
         );
-        let bare = build_codex_chat_command(Path::new("/usr/bin/codex"), None, None);
+        let bare = build_codex_chat_command(Path::new("/usr/bin/codex"), None, None, None);
         assert_eq!(bare, ["/usr/bin/codex", "app-server", "-c", host.as_str()]);
 
         // The URL must be SECRET-FREE (argv is world-readable in /proc); the
         // key rides the spawn env via bearer_token_env_var instead.
         let url = "http://127.0.0.1:4200/api/v1/mcp/s-1a2b3c4d";
-        let cmd = build_codex_chat_command(Path::new("/usr/bin/codex"), Some(url), None);
+        let cmd = build_codex_chat_command(Path::new("/usr/bin/codex"), Some(url), None, None);
         assert_eq!(
             cmd,
             [
@@ -1767,6 +1770,20 @@ mod tests {
                 host.as_str(),
             ]
         );
+    }
+
+    #[test]
+    fn codex_steering_override_is_explicit_and_launch_scoped() {
+        for enabled in [false, true] {
+            let cmd =
+                build_codex_chat_command(Path::new("/usr/bin/codex"), None, None, Some(enabled));
+            assert_eq!(cmd[2], "-c");
+            assert_eq!(cmd[3], format!("features.instant_interrupt={enabled}"));
+        }
+        let inherited = build_codex_chat_command(Path::new("/usr/bin/codex"), None, None, None);
+        assert!(!inherited
+            .iter()
+            .any(|arg| arg.contains("instant_interrupt")));
     }
 
     /// Codex TUI plugin injection: endpoint + key-by-env, and a per-tool
@@ -1811,7 +1828,8 @@ mod tests {
             crate::workspaces::MastermindMode::Ask,
             crate::workspaces::MastermindMode::Auto,
         ] {
-            let cmd = build_codex_chat_command(Path::new("/usr/bin/codex"), Some(url), Some(mode));
+            let cmd =
+                build_codex_chat_command(Path::new("/usr/bin/codex"), Some(url), Some(mode), None);
             assert_eq!(
                 cmd,
                 [
@@ -2111,7 +2129,7 @@ mod tests {
         assert!(!is_outdated(AgentKind::Claude, Some("0.1.99")));
         // The curated FALLBACK lists (the live Init catalog wins once seen):
         // claude's family aliases, which the CLI resolves itself; codex's
-        // 0.153 defaults, whose ids thread/start accepts verbatim.
+        // 0.160 defaults, whose ids thread/start accepts verbatim.
         assert_eq!(
             models(AgentKind::Claude),
             [
@@ -2124,6 +2142,7 @@ mod tests {
         assert_eq!(
             models(AgentKind::Codex),
             [
+                ("gpt-6.1-sol", "GPT-6.1 Sol"),
                 ("gpt-6-astra", "GPT-6 Astra"),
                 ("gpt-6-sol", "GPT-6 Sol"),
                 ("gpt-6-luna", "GPT-6 Luna"),

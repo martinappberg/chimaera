@@ -72,6 +72,29 @@ async fn settings_round_trip_and_validation() {
 }
 
 #[tokio::test]
+async fn codex_steering_setting_preserves_native_defaults_and_rejects_unknown_overrides() {
+    let state = test_state();
+    assert_eq!(lock(&state.settings).codex_instant_interrupt(), None);
+    for (value, expected) in [
+        (serde_json::json!("immediate"), Some(true)),
+        (serde_json::json!("next_step"), Some(false)),
+        (serde_json::json!("agent"), None),
+        (serde_json::json!("future_mode"), None),
+        (serde_json::json!(true), None),
+    ] {
+        let (status, _) = request(
+            &state,
+            Method::PUT,
+            "/api/v1/settings",
+            Some(serde_json::json!({"chat.codexSteering": value})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(lock(&state.settings).codex_instant_interrupt(), expected);
+    }
+}
+
+#[tokio::test]
 async fn settings_hand_edit_on_disk_is_picked_up() {
     let data_dir = test_dir("settings-disk");
     let state = test_state_with_data_dir(0, data_dir.clone());

@@ -167,6 +167,10 @@ One privileged chat session per workspace (the dashboard plan §6/§7 —
 Codex chat sessions get the per-session chimaera MCP injected at spawn via
 `-c mcp_servers.chimaera.url=…` + `bearer_token_env_var` — the key rides the
 spawn env, never world-readable argv (`launcher::build_codex_chat_command`).
+The launch-only `chat.codexSteering` preference adds an explicit true/false
+`features.instant_interrupt` override only for its Next step / Immediate choices;
+Agent default preserves the runtime's configuration. Ordinary queued sends keep
+their existing delivery policy.
 Codex TUIs get the same injection while agent communication is on or a
 workbench plugin with tools is active in the workspace (`plugins::spawn_allow`
 → `launcher::codex_tui_mcp_args`, `spawn.rs`), with a per-tool
