@@ -25,13 +25,32 @@ fn host_key(
     destination: &chimaera_link::SshAuthDestination,
 ) -> Option<super::HostKey> {
     use base64::engine::general_purpose::STANDARD_NO_PAD;
+    // The fixed-C OpenSSH host challenge changed punctuation in 10.3.
+    // Count declarations before parsing so same-line or malformed duplicates refuse.
+    if prompt.matches(" key fingerprint is: SHA256:").count()
+        + prompt.matches(" key fingerprint is SHA256:").count()
+        != 1
+    {
+        return None;
+    }
     let mut fingerprints = prompt.lines().filter_map(|line| {
-        let (_, value) = line.split_once(" key fingerprint is SHA256:")?;
-        let value = value.strip_suffix('.')?;
-        (value.len() == 43).then_some(value)
+        line.split_once(" key fingerprint is: SHA256:")
+            .map(|(_, value)| (value, false))
+            .or_else(|| {
+                line.split_once(" key fingerprint is SHA256:")
+                    .map(|(_, value)| (value, true))
+            })
     });
-    let value = fingerprints.next()?;
+    let (value, period) = fingerprints.next()?;
     if fingerprints.next().is_some() {
+        return None;
+    }
+    let value = if period {
+        value.strip_suffix('.')?
+    } else {
+        value
+    };
+    if value.len() != 43 {
         return None;
     }
     let decoded = STANDARD_NO_PAD.decode(value).ok()?;
@@ -381,6 +400,36 @@ impl Drop for Bridge {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn fingerprint_accepts_fixed_openssh_92_and_103_grammar_and_refuses_duplicates() {
+        let destination = chimaera_link::SshAuthDestination {
+            hostname: "native.fixture.invalid".into(),
+            user: "fixture".into(),
+            port: 22,
+        };
+        let fingerprint = base64::engine::general_purpose::STANDARD_NO_PAD.encode([42u8; 32]);
+        let older = format!("ED25519 key fingerprint is SHA256:{fingerprint}.");
+        let current = format!("ED25519 key fingerprint is: SHA256:{fingerprint}");
+        for prompt in [&older, &current] {
+            let key = host_key(prompt, &destination).unwrap();
+            assert_eq!(key.host, "native.fixture.invalid");
+            assert_eq!(key.fingerprint, format!("SHA256:{fingerprint}"));
+        }
+        for prompt in [
+            format!("{older}\n{current}"),
+            format!("{older} {current}"),
+            format!("{current} {older}"),
+            format!("{current}\nED25519 key fingerprint is SHA256:invalid."),
+            format!("{older}\nED25519 key fingerprint is: SHA256:invalid"),
+            current.clone() + ".",
+            older.trim_end_matches('.').to_owned(),
+            current.replace(&fingerprint, &(fingerprint.clone() + "=")),
+            current.replace(&fingerprint, &"?".repeat(43)),
+        ] {
+            assert!(host_key(&prompt, &destination).is_none());
+        }
+    }
 
     #[test]
     fn host_confirmation_is_once_before_candidate_and_never_later_mfa_prose() {

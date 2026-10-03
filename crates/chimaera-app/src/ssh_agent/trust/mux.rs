@@ -69,6 +69,33 @@ async fn send(stream: &mut UnixStream, values: &[u32]) -> Result<(), SelectionFa
     stream.write_all(&bytes).await.map_err(|_| refused())?;
     stream.flush().await.map_err(|_| refused())
 }
+fn hello(bytes: &[u8]) -> bool {
+    if !(8..=4096).contains(&bytes.len()) || bytes[..8] != words(&[1, 4]) {
+        return false;
+    }
+    fn string<'a>(rest: &mut &'a [u8]) -> Option<&'a [u8]> {
+        let (length, tail) = rest.split_at_checked(4)?;
+        let length = u32::from_be_bytes(length.try_into().ok()?) as usize;
+        let (value, tail) = tail.split_at_checked(length)?;
+        *rest = tail;
+        Some(value)
+    }
+    let mut rest = &bytes[8..];
+    let mut names = Vec::new();
+    // Protocol4 permits additive extension pairs. They carry no admission
+    // authority here; the subsequent exact owned-PID ALIVE receipt is required.
+    // Every iteration consumes at least8 bytes under the existing4KiB frame cap.
+    while !rest.is_empty() {
+        let Some(name) = string(&mut rest) else {
+            return false;
+        };
+        if names.contains(&name) || string(&mut rest).is_none() {
+            return false;
+        }
+        names.push(name);
+    }
+    true
+}
 pub(super) async fn alive(path: &Path, owned_pid: u32) -> Result<bool, SelectionFailure> {
     let before = match std::fs::symlink_metadata(path) {
         Ok(stat) => stat,
@@ -81,7 +108,7 @@ pub(super) async fn alive(path: &Path, owned_pid: u32) -> Result<bool, Selection
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         let mut stream = UnixStream::connect(path).await.map_err(|_| refused())?;
         send(&mut stream, &[1, 4]).await?;
-        if frame(&mut stream).await? != words(&[1, 4]) {
+        if !hello(&frame(&mut stream).await?) {
             return Err(refused());
         }
         send(&mut stream, &[0x10000004, 1]).await?;
@@ -101,6 +128,43 @@ pub(super) async fn alive(path: &Path, owned_pid: u32) -> Result<bool, Selection
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hello_accepts_additive_pairs_and_refuses_ambiguous_or_partial_extensions() {
+        let base = words(&[1, 4]);
+        let mut captured_shape = base.clone();
+        captured_shape.extend_from_slice(&4u32.to_be_bytes());
+        captured_shape.extend_from_slice(b"info");
+        captured_shape.extend_from_slice(&1u32.to_be_bytes());
+        captured_shape.extend_from_slice(b"0");
+        assert_eq!(captured_shape.len(), 21);
+        assert!(hello(&base));
+        assert!(hello(&captured_shape));
+        let mut unknown = base.clone();
+        unknown.extend_from_slice(&5u32.to_be_bytes());
+        unknown.extend_from_slice(b"other");
+        unknown.extend_from_slice(&0u32.to_be_bytes());
+        assert!(hello(&unknown));
+        let mut duplicate = captured_shape.clone();
+        duplicate.extend_from_slice(&captured_shape[8..]);
+        let mut wrong_version = captured_shape.clone();
+        wrong_version[7] = 3;
+        let mut wrong_type = captured_shape.clone();
+        wrong_type[3] = 2;
+        for bytes in [
+            duplicate,
+            wrong_version,
+            wrong_type,
+            captured_shape[..12].to_vec(),
+            captured_shape[..17].to_vec(),
+            captured_shape[..20].to_vec(),
+            [captured_shape.clone(), vec![0]].concat(),
+            [base.clone(), u32::MAX.to_be_bytes().to_vec()].concat(),
+            vec![0; 4097],
+        ] {
+            assert!(!hello(&bytes));
+        }
+    }
+
     #[test]
     fn forwarding_has_no_fresh_network_or_agent_fallback_and_quotes_paths() {
         let upstream = chimaera_link::SshAuthDestination {
@@ -135,7 +199,7 @@ mod tests {
     }
     #[tokio::test]
     async fn alive_requires_exact_owned_pid_complete_version_and_response() {
-        for mismatch in 0..4 {
+        for mismatch in 0..5 {
             let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
             let path = base.join(format!(
                 "cx-mux-receipt-{}",
@@ -149,7 +213,17 @@ mod tests {
                     send(&mut stream, &[1, 99]).await.unwrap();
                     return;
                 }
-                send(&mut stream, &[1, 4]).await.unwrap();
+                if mismatch == 4 {
+                    let mut extension = words(&[1, 4]);
+                    extension.extend_from_slice(&4u32.to_be_bytes());
+                    extension.extend_from_slice(b"info");
+                    extension.extend_from_slice(&1u32.to_be_bytes());
+                    extension.extend_from_slice(b"0");
+                    stream.write_u32(extension.len() as u32).await.unwrap();
+                    stream.write_all(&extension).await.unwrap();
+                } else {
+                    send(&mut stream, &[1, 4]).await.unwrap();
+                }
                 let _ = frame(&mut stream).await.unwrap();
                 if mismatch == 2 {
                     send(&mut stream, &[0x80000005, 1, 456]).await.unwrap();
@@ -161,7 +235,7 @@ mod tests {
                 }
             });
             let result = alive(&path, 123).await;
-            if mismatch == 0 {
+            if mismatch == 0 || mismatch == 4 {
                 assert!(result.unwrap());
             } else {
                 assert!(result.is_err());
