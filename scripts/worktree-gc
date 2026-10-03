@@ -257,6 +257,12 @@ is_preview() { # pid realpath
         case "$args" in "$exe" | "$exe --daemon" | "$entry" | "$entry --daemon" | "./$entry" | "./$entry --daemon") return 0 ;; esac ;;
     esac
   done
+  is_vite "$pid" "$wt"
+}
+
+is_vite() { # pid realpath
+  local pid=$1 wt=$2 args entry
+  args=$(ps -ww -p "$pid" -o args= 2>/dev/null) || return 1
   awk -F'\t' -v p="$pid" -v w="$wt/web-ui" '
     $1 == p && $3 == "cwd" && $4 == w { cwd = 1 }
     $1 == p && $3 == "txt" && $4 ~ /\/node$/ { node = 1 }
@@ -267,12 +273,50 @@ is_preview() { # pid realpath
   return 1
 }
 
+# Recognize only the documented launcher chain, walking outward from an
+# already verified Vite process. Each wrapper must have exactly that one
+# child: a compound shell command or another running task stays protected.
+vite_wrapper_kind() { # parent child child-kind realpath
+  local pid=$1 child=$2 kind=$3 wt=$4 args cwd command
+  awk -v p="$pid" -v c="$child" '$2 == p { n++; if ($1 == c) found = 1 } END { exit !(n == 1 && found) }' "$TMPD/parents" || return 1
+  cwd=$(awk -F'\t' -v p="$pid" '$1 == p && $3 == "cwd" { print $4 }' "$TMPD/procs")
+  args=$(ps -ww -p "$pid" -o args= 2>/dev/null) || return 1
+  case "$kind" in
+    vite)
+      if [ "$cwd" = "$wt/web-ui" ]; then
+        case "$args" in
+          "sh -c vite" | "sh -c vite "* | "/bin/sh -c vite" | "/bin/sh -c vite "*)
+            command=${args#* -c }
+            # No shell operators, substitutions, redirections or quoting.
+            case "$command" in *[!a-zA-Z0-9_./=,:@%+\ -]*) return 1 ;; esac
+            echo vite-shell; return 0 ;;
+        esac
+      fi
+      ;;
+  esac
+  case "$kind" in
+    vite | vite-shell)
+      [ "$cwd" = "$wt" ] || [ "$cwd" = "$wt/web-ui" ] || return 1
+      awk -F'\t' -v p="$pid" '$1 == p && $3 == "txt" && $4 ~ /\/node$/ { found = 1 } END { exit !found }' "$TMPD/procs" || return 1
+      case "$args" in "npm exec vite" | "npm exec vite "* | "npm run dev" | "npm run dev "*) echo npm; return 0 ;; esac
+      ;;
+    npm | just-shell)
+      if [ "$kind" = npm ] && [ "$cwd" = "$wt/web-ui" ]; then
+        case "$args" in "sh -cu cd web-ui && npm run dev" | "/bin/sh -cu cd web-ui && npm run dev") echo just-shell; return 0 ;; esac
+      fi
+      [ "$cwd" = "$wt" ] && [ "${args#* }" = dev-ui ] || return 1
+      awk -F'\t' -v p="$pid" '$1 == p && $3 == "txt" && $4 ~ /\/just$/ { found = 1 } END { exit !found }' "$TMPD/procs" || return 1
+      echo just; return 0 ;;
+  esac
+  return 1
+}
+
 # Emit only the preview roots to signal. Children (test agents, relays, etc.)
 # are shut down by their owning daemon, never killed by name. Any unrelated
 # holder keeps the entire checkout ACTIVE. The process-parent snapshot also
 # lets a known npm Vite wrapper retire with its verified child.
 preview_roots() { # realpath
-  local wt=$1 pid parent args identity
+  local wt=$1 pid parent kind next identity depth
   : >"$TMPD/preview-roots"
   rm -f "$TMPD/preview-wrappers"
   ps -axo pid=,ppid= >"$TMPD/parents" 2>/dev/null || return 1
@@ -283,14 +327,18 @@ preview_roots() { # realpath
     is_preview "$pid" "$wt" && echo "$pid" >>"$TMPD/preview-roots"
   done <"$TMPD/holders"
   [ -s "$TMPD/preview-roots" ] || return 1
-  # npm sometimes rewrites its process title; require a verified Vite child
-  # plus its own cwd in this exact web-ui, not merely a matching title.
+  # npm can insert sh between itself and Vite; just can wrap npm in another
+  # shell. Walk only those known transitions, never arbitrary ancestors.
   while IFS= read -r pid; do
-    parent=$(awk -v p="$pid" '$1 == p { print $2 }' "$TMPD/parents")
-    [ -n "$parent" ] || continue
-    awk -F'\t' -v p="$parent" -v w="$wt/web-ui" '$1 == p && $3 == "cwd" && $4 == w { found = 1 } END { exit !found }' "$TMPD/procs" || continue
-    args=$(ps -ww -p "$parent" -o args= 2>/dev/null) || continue
-    case "$args" in "npm exec vite" | "npm exec vite "*) echo "$parent" >>"$TMPD/preview-wrappers" ;; esac
+    is_vite "$pid" "$wt" || continue
+    kind=vite depth=0
+    while [ "$depth" -lt 4 ]; do
+      parent=$(awk -v p="$pid" '$1 == p { print $2 }' "$TMPD/parents")
+      [ -n "$parent" ] || break
+      next=$(vite_wrapper_kind "$parent" "$pid" "$kind" "$wt") || break
+      echo "$parent" >>"$TMPD/preview-wrappers"
+      pid=$parent kind=$next depth=$((depth + 1))
+    done
   done <"$TMPD/preview-roots"
   if [ -f "$TMPD/preview-wrappers" ]; then
     cat "$TMPD/preview-wrappers" >>"$TMPD/preview-roots"

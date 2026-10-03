@@ -5,6 +5,9 @@
 # Run: bash scripts/worktree-gc.test.sh
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
+real_node=$(command -v node)
+real_npm=$(command -v npm)
+real_just=$(command -v just || true)
 T=$(mktemp -d "${TMPDIR:-/tmp}/worktree-gc-test.XXXXXX")
 T=$(cd "$T" && pwd -P)
 pids=""
@@ -347,7 +350,7 @@ vite_pid=$!
 pids="$pids $vite_pid"
 disown "$vite_pid" 2>/dev/null
 mkdir -p "$W/previewnpm/web-ui/node_modules/.bin"
-(cd "$W/previewnpm/web-ui" && PREVIEW_CHILD=1 VITE_NODE="$T/bin/node" VITE_ENTRY="$W/previewnpm/web-ui/node_modules/.bin/vite" VITE_READY="$T/vite-ready" exec bash -c 'exec -a "npm exec vite" "$1"' _ "$T/preview") &
+(cd "$W/previewnpm/web-ui" && PREVIEW_CHILD=1 VITE_NODE="$T/bin/node" VITE_ENTRY="$W/previewnpm/web-ui/node_modules/.bin/vite" VITE_READY="$T/vite-ready" exec bash -c 'exec -a "npm exec vite" "$1"' _ "$T/bin/node") &
 npm_pid=$!
 pids="$pids $npm_pid"
 disown "$npm_pid" 2>/dev/null
@@ -356,9 +359,57 @@ disown "$npm_pid" 2>/dev/null
 i=0
 while [ "$i" -lt 15 ] && [ ! -f "$T/vite-ready" ]; do sleep 1; i=$((i + 1)); done
 [ -f "$T/vite-ready" ] && ok || no "npm fixture's Vite child did not start"
+
+# Real npm builds the OS-specific shell chain used by launch.json and the
+# dev-ui recipe. The local Vite stand-in needs no dependency installation.
+real_previews="previewnpmrun previewnpmprefix"
+[ -z "$real_just" ] || real_previews="$real_previews previewjust"
+real_preview_pids=""
+for name in $real_previews previewnpmcompound; do
+  new_wt "$name"
+  mkdir -p "$W/$name/web-ui/node_modules/.bin"
+  dev=vite
+  [ "$name" != previewnpmcompound ] || dev='vite & wait'
+  printf '{"private":true,"scripts":{"dev":"%s"}}\n' "$dev" >"$W/$name/web-ui/package.json"
+  printf 'dev-ui:\n    cd web-ui && npm run dev\n' >"$W/$name/justfile"
+  git -C "$W/$name" add web-ui/package.json justfile
+  commit "$W/$name" "$name"
+  git -C "$W/$name" push -q origin "b/$name"
+  printf '%s\tMERGED\t31\t%s\n' "b/$name" "$(git -C "$W/$name" rev-parse HEAD)" >>"$T/prs.tsv"
+  cat >"$W/$name/web-ui/node_modules/.bin/vite" <<'EOF'
+#!/usr/bin/env node
+require('fs').writeFileSync(process.env.GC_VITE_READY, String(process.pid));
+setInterval(() => {}, 1000);
+process.on('SIGTERM', () => process.exit(0));
+EOF
+  chmod +x "$W/$name/web-ui/node_modules/.bin/vite"
+  (
+    PATH="$(dirname "$real_node"):$PATH"
+    export PATH GC_VITE_READY="$T/$name.ready"
+    case "$name" in
+      previewnpmprefix) cd "$W/$name" && exec "$real_npm" --prefix web-ui run dev -- --port 0 ;;
+      previewjust) cd "$W/$name" && exec "$real_just" dev-ui ;;
+      *) cd "$W/$name/web-ui" && exec "$real_npm" run dev ;;
+    esac
+  ) >"$T/$name.log" 2>&1 &
+  real_pid=$!
+  pids="$pids $real_pid"
+  disown "$real_pid" 2>/dev/null
+  i=0
+  while [ "$i" -lt 15 ] && [ ! -f "$T/$name.ready" ]; do sleep 1; i=$((i + 1)); done
+  if [ -f "$T/$name.ready" ]; then
+    real_child=$(cat "$T/$name.ready")
+    pids="$pids $real_child"
+    [ "$name" = previewnpmcompound ] || real_preview_pids="$real_preview_pids $real_pid $real_child"
+    ok
+  else
+    no "$name did not start: $(cat "$T/$name.log")"
+  fi
+done
 sleep 1
 bash "$GC" --no-fetch --no-sizes >"$T/out" 2>&1
-for name in previewdaemon previewapp previewvite previewnpm previewstubborn previewwrites; do expect "b/$name" PREVIEW "stop dev preview"; done
+for name in previewdaemon previewapp previewvite previewnpm previewstubborn previewwrites $real_previews; do expect "b/$name" PREVIEW "stop dev preview"; done
+expect b/previewnpmcompound ACTIVE
 for name in previewmixed previewdirty previewunpushed previewlocked previewopen previewclosed previewforeign previewrelease previewnested; do expect "b/$name" ACTIVE; done
 for pid in "$daemon_pid" "$app_pid" "$vite_pid" "$npm_pid"; do kill -0 "$pid" 2>/dev/null && ok || no "dry run stopped preview $pid"; done
 GH_FAKE_FAIL=1 bash "$GC" --no-fetch --no-sizes >"$T/out" 2>&1
@@ -379,8 +430,9 @@ bash "$GC" --no-fetch --no-sizes >"$T/out" 2>&1
 expect b/previewdaemon ACTIVE
 rm "$T/bin/ps"
 bash "$GC" --apply --no-fetch --no-sizes >"$T/apply-previews" 2>&1
-for name in previewdaemon previewapp previewvite previewnpm; do [ ! -e "$W/$name" ] && ok || no "$name not removed: $(cat "$T/apply-previews")"; done
-for pid in "$daemon_pid" "$app_pid" "$vite_pid" "$npm_pid"; do kill -0 "$pid" 2>/dev/null && no "preview $pid survived cleanup" || ok; done
+for name in previewdaemon previewapp previewvite previewnpm $real_previews; do [ ! -e "$W/$name" ] && ok || no "$name not removed: $(cat "$T/apply-previews")"; done
+for pid in "$daemon_pid" "$app_pid" "$vite_pid" "$npm_pid" $real_preview_pids; do kill -0 "$pid" 2>/dev/null && no "preview $pid survived cleanup" || ok; done
+[ -d "$W/previewnpmcompound" ] && ok || no "compound npm script was removed"
 for name in previewmixed previewdirty previewunpushed previewlocked previewopen previewclosed previewforeign previewrelease previewstubborn previewwrites previewnested; do [ -d "$W/$name" ] && ok || no "protected $name removed"; done
 kill -0 "$mixed_pid" 2>/dev/null && ok || no "preview was stopped despite an unrelated holder"
 kill -0 "$stubborn" 2>/dev/null && ok || no "stubborn preview was forcibly killed"
