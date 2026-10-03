@@ -65,7 +65,7 @@ pub struct CloudProject {
 #[derive(Deserialize, Serialize)]
 pub struct CloudProjectOpen {
     workspace_id: String,
-    root: PathBuf,
+    root: String,
     name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     local_copy: Option<serde_json::Value>,
@@ -244,6 +244,8 @@ pub async fn pro_copy_project(
             generation == state.pro.generation(),
             open_code::ACCOUNT_CHANGED
         );
+        let local = super::lock(&state.local).clone();
+        let target = crate::wsl::CopyTarget::capture(&local)?;
         let saved = project.destination_saved || project.local_root.is_some();
         let chosen = if saved {
             None
@@ -252,10 +254,13 @@ pub async fn pro_copy_project(
         };
         let selected = match chosen {
             Some(chosen) => {
+                target.check(&super::lock(&state.local))?;
+                target.validate_chosen(&chosen)?;
                 let name = project.name.clone();
                 let (path, _) =
                     tokio::task::spawn_blocking(move || destination(&chosen, &name)).await??;
-                Some(path)
+                target.check(&super::lock(&state.local))?;
+                Some(target.destination(path).await?)
             }
             None => None,
         };
@@ -268,17 +273,19 @@ pub async fn pro_copy_project(
             generation == state.pro.generation() && state.pro.client().await.is_some(),
             open_code::ACCOUNT_CHANGED
         );
+        target.check(&super::lock(&state.local))?;
         // Even a failed request may have enrolled this inode durably. Keep the
         // destination for an explicit retry; an HTTP error cannot prove it is
         // unbound, and an empty replacement folder would no longer be ours.
-        let opened = super::daemon_request_guarded(
-            &state,
+        let opened = super::local_daemon_request(
+            local,
             "POST",
             "/pro/projects/copy",
             Some(body),
             _operation,
         )
         .await?;
+        target.check(&super::lock(&state.local))?;
         let imported = copy_ack(opened, &workspace_id)?;
         ensure!(
             generation == state.pro.generation(),
@@ -328,11 +335,7 @@ fn copy_ack(value: serde_json::Value, workspace: &str) -> Result<CloudProjectOpe
     }
     ensure!(
         result.workspace_id == workspace
-            && result.root.is_absolute()
-            && !result
-                .root
-                .components()
-                .any(|part| matches!(part, std::path::Component::ParentDir))
+            && crate::wsl::valid_daemon_root(&result.root)
             && !result.name.is_empty()
             && result.name.len() <= 1024,
         open_code::UPDATE_REQUIRED
@@ -535,8 +538,8 @@ mod tests {
 
     #[test]
     fn opening_requires_the_exact_copy_acknowledgment() {
-        let root = std::env::temp_dir().join("chimaera-copy-acknowledgment");
-        assert!(root.is_absolute());
+        // A Windows native shell receives POSIX paths from its WSL daemon.
+        let root = "/home/user/chimaera-copy-acknowledgment";
         let good = json!({"copy_version":1,"state":"local_copy","workspace_id":"w-one","root":root,"name":"One"});
         assert_eq!(
             copy_ack(good.clone(), "w-one").unwrap().local_copy,
@@ -565,6 +568,10 @@ mod tests {
             ("state", json!("hydrating")),
             ("workspace_id", json!("w-other")),
             ("root", json!("relative")),
+            ("root", json!(r"C:\Users\user\project")),
+            ("root", json!("/home/user/../other")),
+            ("root", json!("/home/user/\0other")),
+            ("root", json!(format!("/{}", "x".repeat(4096)))),
         ] {
             let mut bad = good.clone();
             bad[key] = value;

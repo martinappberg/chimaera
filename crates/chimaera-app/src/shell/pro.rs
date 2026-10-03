@@ -1369,6 +1369,47 @@ pub async fn pro_cancel_sign_in(app: AppHandle) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn project_target_verification_uses_the_exact_linux_presentation() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            for root in ["/project", r"C:\project", "/project/../other"] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    assert!(request.len() < 8192);
+                    let mut byte = [0];
+                    socket.read_exact(&mut byte).await.unwrap();
+                    request.push(byte[0]);
+                }
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                assert!(request.contains("authorization: bearer fixture-local"));
+                assert!(request.contains("x-chimaera-workspace: w-fixture"));
+                assert!(request.contains("x-chimaera-epoch: 7"));
+                let body = serde_json::json!([{"id":"w-fixture", "root":root}]).to_string();
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nX-Chimaera-Scope-Version: 1\r\nX-Chimaera-Workspace: w-fixture\r\nX-Chimaera-Epoch: 7\r\nConnection: close\r\n\r\n{body}", body.len());
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+        super::verify_project_target(port, "fixture-local", "w-fixture", 7)
+            .await
+            .unwrap();
+        assert!(
+            super::verify_project_target(port, "fixture-local", "w-fixture", 7)
+                .await
+                .is_err()
+        );
+        assert!(
+            super::verify_project_target(port, "fixture-local", "w-fixture", 7)
+                .await
+                .is_err()
+        );
+        server.await.unwrap();
+    }
+
     #[test]
     fn direct_ssh_never_accepts_a_known_device_identity() {
         let pro = super::Pro::new(None);
@@ -2949,10 +2990,8 @@ async fn verify_project_target(port: u16, token: &str, workspace: &str, epoch: u
             "project metadata scope mismatch"
         );
         let root = rows[0]["root"].as_str().context("project root missing")?;
-        anyhow::ensure!(
-            root.len() <= 4096 && std::path::Path::new(root).is_absolute() && !root.contains('\0'),
-            "invalid project root"
-        );
+        // This is the Linux namespace's fixed presentation on Windows too.
+        // Exact equality validates it without native-host path semantics.
         anyhow::ensure!(root == "/project", "project presentation mismatch");
         Ok(())
     })

@@ -40,6 +40,232 @@ use serde::Serialize;
 
 use crate::daemon::LocalDaemon;
 
+/// Daemon paths are POSIX on every supported desktop host, including Windows
+/// where the local daemon runs inside WSL. Backslashes are legitimate names.
+pub(crate) fn valid_daemon_root(root: &str) -> bool {
+    root.len() <= 4096
+        && root.starts_with('/')
+        && !root.contains('\0')
+        && !root.split('/').any(|part| part == "..")
+}
+
+/// A copy stays attached to the daemon selected before its native picker opens.
+/// In particular, a later WSL setup must not reinterpret that folder in another
+/// distro or route the request to a replacement daemon.
+pub(crate) struct CopyTarget {
+    local: LocalDaemon,
+    #[cfg(windows)]
+    adoption: std::sync::Arc<Adoption>,
+}
+
+impl CopyTarget {
+    pub(crate) fn capture(local: &LocalDaemon) -> anyhow::Result<Self> {
+        Ok(Self {
+            local: local.clone(),
+            #[cfg(windows)]
+            adoption: imp::capture(local)?,
+        })
+    }
+
+    pub(crate) fn check(&self, local: &LocalDaemon) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.local.port == local.port && self.local.token == local.token,
+            "project_open_failed"
+        );
+        #[cfg(windows)]
+        imp::check(&self.adoption)?;
+        Ok(())
+    }
+
+    pub(crate) fn validate_chosen(&self, chosen: &std::path::Path) -> anyhow::Result<()> {
+        #[cfg(windows)]
+        picked_path(
+            chosen
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("project_open_failed"))?,
+            &self.adoption.target.distro,
+        )?;
+        #[cfg(not(windows))]
+        anyhow::ensure!(chosen.is_absolute(), "project_open_failed");
+        Ok(())
+    }
+
+    pub(crate) async fn destination(
+        &self,
+        chosen: std::path::PathBuf,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        self.validate_chosen(&chosen)?;
+        #[cfg(windows)]
+        return imp::destination(&self.adoption, &chosen).await;
+        #[cfg(not(windows))]
+        Ok(chosen)
+    }
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug, PartialEq, Eq)]
+enum PickedPath {
+    Drive(String),
+    Distro(String),
+}
+
+/// UNC paths belong to the pinned daemon distro, not whichever distro happens
+/// to be the user's current WSL default. Other network/device paths refuse.
+#[cfg(any(windows, test))]
+fn picked_path(path: &str, distro: &str) -> anyhow::Result<PickedPath> {
+    anyhow::ensure!(
+        path.len() <= 4096 && !path.chars().any(char::is_control),
+        "project_open_failed"
+    );
+    let path = path
+        .strip_prefix(r"\\?\UNC\")
+        .map(|tail| format!(r"\\{tail}"))
+        .unwrap_or_else(|| path.strip_prefix(r"\\?\").unwrap_or(path).to_owned())
+        .replace('\\', "/");
+    let safe_parts = |parts: &str| {
+        !parts
+            .split('/')
+            .any(|part| matches!(part, "." | "..") || part.contains(':'))
+    };
+    if path.len() >= 3
+        && path.as_bytes()[0].is_ascii_alphabetic()
+        && path.as_bytes()[1..3] == *b":/"
+        && safe_parts(&path[3..])
+    {
+        return Ok(PickedPath::Drive(path));
+    }
+    if let Some(unc) = path.strip_prefix("//") {
+        let mut parts = unc.splitn(3, '/');
+        let host = parts.next().unwrap_or_default();
+        let selected = parts.next().unwrap_or_default();
+        let tail = parts.next().unwrap_or_default();
+        anyhow::ensure!(
+            (host.eq_ignore_ascii_case("wsl.localhost") || host.eq_ignore_ascii_case("wsl$"))
+                && selected.eq_ignore_ascii_case(distro)
+                && safe_parts(tail),
+            "project_open_failed"
+        );
+        return Ok(PickedPath::Distro(format!("/{tail}")));
+    }
+    anyhow::bail!("project_open_failed")
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, PartialEq, Eq)]
+struct Target {
+    distro: String,
+    user: String,
+    home: String,
+}
+
+#[cfg(any(windows, test))]
+struct Adoption {
+    target: Target,
+    manifest: chimaera_core::Manifest,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Default)]
+struct Adoptions {
+    current: Option<std::sync::Arc<Adoption>>,
+}
+
+#[cfg(any(windows, test))]
+impl Adoptions {
+    fn publish(&mut self, target: Target, manifest: chimaera_core::Manifest) {
+        if self.current.as_ref().is_some_and(|row| {
+            row.target == target
+                && row.manifest.pid == manifest.pid
+                && row.manifest.started_at == manifest.started_at
+                && row.manifest.port == manifest.port
+                && row.manifest.token == manifest.token
+        }) {
+            return;
+        }
+        self.current = Some(std::sync::Arc::new(Adoption { target, manifest }));
+    }
+
+    fn capture(&self, local: &LocalDaemon) -> anyhow::Result<std::sync::Arc<Adoption>> {
+        self.current
+            .as_ref()
+            .filter(|row| row.manifest.port == local.port && row.manifest.token == local.token)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("project_open_failed"))
+    }
+
+    fn check(&self, captured: &std::sync::Arc<Adoption>) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.current
+                .as_ref()
+                .is_some_and(|row| std::sync::Arc::ptr_eq(row, captured)),
+            "project_open_failed"
+        );
+        Ok(())
+    }
+}
+
+/// Cap each pipe before collecting it: a broken manifest/WSL command must not
+/// allocate through a large file or keep reading a FIFO beyond its deadline.
+#[cfg(any(windows, test))]
+async fn bounded_output(
+    mut command: tokio::process::Command,
+    timeout: std::time::Duration,
+    limit: usize,
+) -> anyhow::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    command
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|_| anyhow::anyhow!("project_open_failed"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("project_open_failed"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("project_open_failed"))?;
+    async fn read(
+        pipe: impl tokio::io::AsyncRead + Unpin,
+        limit: usize,
+    ) -> std::io::Result<Vec<u8>> {
+        let mut bytes = Vec::with_capacity(limit + 1);
+        pipe.take((limit + 1) as u64)
+            .read_to_end(&mut bytes)
+            .await?;
+        if bytes.len() > limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "output limit",
+            ));
+        }
+        Ok(bytes)
+    }
+    let outcome = tokio::time::timeout(timeout, async {
+        let pipes = async { tokio::try_join!(read(stdout, limit), read(stderr, limit)) };
+        let ((out, _), status) = tokio::try_join!(pipes, child.wait())?;
+        if !status.success() {
+            return Err(std::io::Error::other("command failed"));
+        }
+        Ok(out)
+    })
+    .await;
+    match outcome {
+        Ok(Ok(out)) => Ok(out),
+        _ => {
+            // Closing the readers stops cat/wslpath from forwarding more data.
+            // Bound the actual local launcher cleanup too, without raw output.
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await;
+            anyhow::bail!("project_open_failed")
+        }
+    }
+}
+
 /// Setup states the first-run wizard renders. Kebab-case on the wire.
 #[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "kebab-case")]
@@ -256,15 +482,104 @@ mod imp {
     /// after sleep/resume (fixed by the ICTIMESYNCFLAG_SYNC patch).
     const MIN_WSL: (u64, u64, u64) = (2, 1, 1);
 
-    /// The resolved place the daemon lives: distro + PINNED user + $HOME.
-    /// The user is pinned because the distro's default can change under us
-    /// (Ubuntu's OOBE flips it on first interactive launch) — every spawn
-    /// passes `-u` so the daemon's home never silently moves.
-    #[derive(Clone, Debug)]
-    pub struct Target {
-        pub distro: String,
-        pub user: String,
-        pub home: String,
+    // Serialized lifecycle owners prevent a late older adoption from replacing
+    // the receipt. A positively unchanged adoption preserves pending pickers.
+    static LIFECYCLE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    static ACTIVE: std::sync::Mutex<Adoptions> = std::sync::Mutex::new(Adoptions { current: None });
+
+    fn invalidate() {
+        ACTIVE.lock().unwrap_or_else(|p| p.into_inner()).current = None;
+    }
+
+    struct AdoptionAttempt(bool);
+
+    impl Drop for AdoptionAttempt {
+        fn drop(&mut self) {
+            if !self.0 {
+                invalidate();
+            }
+        }
+    }
+
+    fn prepare_target(target: &Target) {
+        let mut rows = ACTIVE.lock().unwrap_or_else(|p| p.into_inner());
+        if rows
+            .current
+            .as_ref()
+            .is_some_and(|row| row.target != *target)
+        {
+            rows.current = None;
+        }
+    }
+
+    fn publish(target: &Target, manifest: Manifest) {
+        ACTIVE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .publish(target.clone(), manifest);
+    }
+
+    pub(super) fn capture(local: &LocalDaemon) -> anyhow::Result<std::sync::Arc<Adoption>> {
+        ACTIVE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .capture(local)
+    }
+
+    pub(super) fn check(captured: &std::sync::Arc<Adoption>) -> anyhow::Result<()> {
+        ACTIVE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .check(captured)
+    }
+
+    pub(super) async fn destination(
+        captured: &std::sync::Arc<Adoption>,
+        path: &std::path::Path,
+    ) -> anyhow::Result<PathBuf> {
+        check(captured)?;
+        let selected = picked_path(
+            path.to_str().context("project_open_failed")?,
+            &captured.target.distro,
+        )?;
+        let root = match selected {
+            PickedPath::Distro(root) => root,
+            PickedPath::Drive(path) => {
+                let mut cmd = wsl_command();
+                cmd.args([
+                    "-d",
+                    &captured.target.distro,
+                    "-u",
+                    &captured.target.user,
+                    "--exec",
+                    "/usr/bin/wslpath",
+                    "-a",
+                    "-u",
+                    &path,
+                ]);
+                let out = bounded_output(cmd, Duration::from_secs(10), 8192).await?;
+                let root = std::str::from_utf8(&out).context("project_open_failed")?;
+                let root = root.strip_suffix('\n').unwrap_or(root);
+                let root = root.strip_suffix('\r').unwrap_or(root);
+                anyhow::ensure!(!root.contains(['\r', '\n']), "project_open_failed");
+                root.to_owned()
+            }
+        };
+        anyhow::ensure!(valid_daemon_root(&root), "project_open_failed");
+        // The conversion uses the captured distro/user. Confirm its manifest
+        // still names the positively adopted process, not only a reused port.
+        let observed = probe(&captured.target)
+            .await
+            .context("project_open_failed")?;
+        anyhow::ensure!(
+            observed.pid == captured.manifest.pid
+                && observed.started_at == captured.manifest.started_at
+                && observed.port == captured.manifest.port
+                && observed.token == captured.manifest.token,
+            "project_open_failed"
+        );
+        check(captured)?;
+        Ok(PathBuf::from(root))
     }
 
     /// What survives restarts (wsl.json next to the manifest): which distro/
@@ -686,14 +1001,24 @@ mod imp {
     /// — and doubles as the liveness check (a 200 from the token handshake
     /// proves the daemon better than any kill -0 could, without the extra
     /// wsl.exe spawn per poll).
+    async fn read_manifest(t: &Target) -> anyhow::Result<Manifest> {
+        let mut cmd = wsl_command();
+        cmd.args([
+            "-d",
+            &t.distro,
+            "-u",
+            &t.user,
+            "--exec",
+            "/bin/sh",
+            "-c",
+            script::READ_MANIFEST,
+        ]);
+        let out = bounded_output(cmd, SCRIPT_TIMEOUT, 16384).await?;
+        serde_json::from_slice(&out).map_err(|_| anyhow::anyhow!("project_open_failed"))
+    }
+
     async fn probe(t: &Target) -> Option<Manifest> {
-        let out = target_script(t, script::READ_MANIFEST, None, SCRIPT_TIMEOUT)
-            .await
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let m: Manifest = serde_json::from_str(decode_wsl_output(&out.stdout).trim()).ok()?;
+        let m = read_manifest(t).await.ok()?;
         health(&m).await.then_some(m)
     }
 
@@ -706,6 +1031,7 @@ mod imp {
 
     /// Graceful stop: one in-distro TERM+wait invocation, never KILL.
     async fn stop(t: &Target, pid: u32) -> anyhow::Result<()> {
+        invalidate();
         tracing::info!("stopping WSL daemon (pid {pid} in {})", t.distro);
         let out = target_script(t, &script::stop_and_wait(pid), None, STOP_TIMEOUT).await?;
         match out.status.code() {
@@ -778,10 +1104,7 @@ mod imp {
         for _ in 0..50 {
             tokio::time::sleep(Duration::from_millis(300)).await;
             if manifest.is_none() {
-                let out = target_script(t, script::READ_MANIFEST, None, SCRIPT_TIMEOUT).await?;
-                if out.status.success() {
-                    manifest = serde_json::from_str(decode_wsl_output(&out.stdout).trim()).ok();
-                }
+                manifest = read_manifest(t).await.ok();
             }
             let healthy = match &manifest {
                 Some(m) => health(m).await,
@@ -790,6 +1113,7 @@ mod imp {
             if healthy {
                 let m = manifest.take().expect("checked above");
                 tracing::info!("WSL daemon up in {} on 127.0.0.1:{}", t.distro, m.port);
+                publish(t, m.clone());
                 return Ok(crate::daemon::attached(m, false, None));
             }
         }
@@ -805,7 +1129,10 @@ mod imp {
     /// anything that needs provisioning/replacing runs there, visibly, not
     /// invisibly inside a window-less startup.
     pub async fn adopt_daemon() -> anyhow::Result<LocalDaemon> {
+        let _lifecycle = LIFECYCLE.lock().await;
+        let mut attempt = AdoptionAttempt(false);
         let target = resolve_target(None).await?;
+        prepare_target(&target);
         let Some(m) = probe(&target).await else {
             return Err(anyhow::Error::new(WslNotReady(full_report().await)));
         };
@@ -815,6 +1142,7 @@ mod imp {
         } else {
             crate::daemon::live_session_count(m.port, &m.token).await
         };
+        let receipt = m.clone();
         let local = match chimaera_remote::update_decision(
             local_build,
             m.build.as_deref(),
@@ -839,6 +1167,8 @@ mod imp {
             }
         };
         wire_connect(&target).await;
+        publish(&target, receipt);
+        attempt.0 = true;
         Ok(local)
     }
 
@@ -852,7 +1182,10 @@ mod imp {
         force_replace: bool,
         progress: &(dyn Fn(&str) + Send + Sync),
     ) -> anyhow::Result<LocalDaemon> {
+        let _lifecycle = LIFECYCLE.lock().await;
+        let mut attempt = AdoptionAttempt(false);
         let target = resolve_target(distro).await?;
+        prepare_target(&target);
         progress("checking");
         if let Some(m) = probe(&target).await {
             let local_build = chimaera_core::BUILD_ID;
@@ -869,6 +1202,8 @@ mod imp {
             ) {
                 Decision::Reuse => {
                     wire_connect(&target).await;
+                    publish(&target, m.clone());
+                    attempt.0 = true;
                     return Ok(crate::daemon::attached(m, false, sessions));
                 }
                 Decision::Update => {
@@ -881,18 +1216,24 @@ mod imp {
                 }
                 Decision::ConnectOutdated => {
                     wire_connect(&target).await;
+                    publish(&target, m.clone());
+                    attempt.0 = true;
                     return Ok(crate::daemon::attached(m, true, sessions));
                 }
             }
-        } else if !has_binary(&target).await? {
-            progress("downloading");
-            let staged = fetch_binary(&target).await?;
-            progress("installing");
-            install_binary(&target, &staged).await?;
+        } else {
+            invalidate();
+            if !has_binary(&target).await? {
+                progress("downloading");
+                let staged = fetch_binary(&target).await?;
+                progress("installing");
+                install_binary(&target, &staged).await?;
+            }
         }
         progress("starting");
         let local = start_and_adopt(&target).await?;
         wire_connect(&target).await;
+        attempt.0 = true;
         Ok(local)
     }
 
@@ -1078,6 +1419,151 @@ pub use imp::{adopt_daemon, update_daemon};
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bounded_wsl_transport_refuses_oversized_and_stalled_pipes() {
+        use std::time::{Duration, Instant};
+        for script in [
+            "printf '012345678901234567890123456789'; exec sleep 30",
+            "printf '012345678901234567890123456789' >&2; exec sleep 30",
+            "exec sleep 30",
+        ] {
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command.args(["-c", script]);
+            let started = Instant::now();
+            let result = bounded_output(command, Duration::from_millis(50), 16).await;
+            assert_eq!(result.unwrap_err().to_string(), "project_open_failed");
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "bounded read and cleanup must finish"
+            );
+        }
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", "printf '{\"port\":7}'"]);
+        assert_eq!(
+            bounded_output(command, Duration::from_secs(1), 16)
+                .await
+                .unwrap(),
+            b"{\"port\":7}"
+        );
+    }
+
+    #[test]
+    fn daemon_roots_use_posix_rules_on_every_desktop() {
+        for root in ["/project", "/home/user/project", r"/home/a\..\b"] {
+            assert!(valid_daemon_root(root));
+        }
+        for root in [
+            "",
+            "relative",
+            r"C:\Users\user\project",
+            "/home/../other",
+            "/bad\0name",
+        ] {
+            assert!(!valid_daemon_root(root));
+        }
+        assert!(!valid_daemon_root(&format!("/{}", "a".repeat(4096))));
+    }
+
+    #[test]
+    fn picked_windows_folders_require_a_drive_or_the_pinned_distro() {
+        assert_eq!(
+            picked_path(r"C:\Users\First Last\project", "Ubuntu").unwrap(),
+            PickedPath::Drive("C:/Users/First Last/project".into())
+        );
+        assert_eq!(
+            picked_path(r"\\?\D:\Projects\O'Brien", "Ubuntu").unwrap(),
+            PickedPath::Drive("D:/Projects/O'Brien".into())
+        );
+        for path in [
+            r"\\wsl.localhost\Ubuntu\home\user\project",
+            r"\\wsl$\ubuntu\home\user\project",
+            r"\\?\UNC\wsl.localhost\Ubuntu\home\user\project",
+        ] {
+            assert_eq!(
+                picked_path(path, "Ubuntu").unwrap(),
+                PickedPath::Distro("/home/user/project".into())
+            );
+        }
+        for path in [
+            r"\\wsl.localhost\Debian\home\user",
+            r"\\server\share\project",
+            r"\\.\C:\project",
+            r"\\?\GLOBALROOT\Device\project",
+            r"C:project",
+            r"\project",
+            r"C:\a\..\project",
+            r"\\wsl$\Ubuntu\..\other",
+            "C:/a\0b",
+        ] {
+            assert!(picked_path(path, "Ubuntu").is_err(), "accepted {path}");
+        }
+    }
+
+    #[test]
+    fn a_copy_receipt_survives_unchanged_adoption_but_refuses_replacement() {
+        let mut rows = Adoptions::default();
+        let target = Target {
+            distro: "Ubuntu".into(),
+            user: "user".into(),
+            home: "/home/user".into(),
+        };
+        let manifest = chimaera_core::Manifest {
+            hostname: "fixture".into(),
+            port: 23456,
+            token: "synthetic-token".into(),
+            pid: 42,
+            version: "fixture".into(),
+            started_at: 7,
+            build: None,
+            slurm_job_id: None,
+            runtime_leases: false,
+        };
+        let local = crate::daemon::attached(manifest.clone(), false, None);
+        rows.publish(target.clone(), manifest.clone());
+        let first = rows.capture(&local).unwrap();
+        assert_eq!(first.target.user, "user");
+        assert_eq!(first.target.home, "/home/user");
+        assert!(rows.check(&first).is_ok());
+        rows.publish(target.clone(), manifest.clone());
+        assert!(
+            rows.check(&first).is_ok(),
+            "normal authenticated readoption preserves the picker"
+        );
+        let mut changed = local.clone();
+        changed.token = "replacement".into();
+        assert!(rows.capture(&changed).is_err());
+        rows.current = None;
+        assert!(rows.check(&first).is_err());
+        rows.publish(target.clone(), manifest.clone());
+        assert!(
+            rows.check(&first).is_err(),
+            "a cleared receipt never revives after uncertainty"
+        );
+        let second = rows.capture(&local).unwrap();
+        let mut restarted = manifest.clone();
+        restarted.pid += 1;
+        restarted.started_at += 1;
+        rows.publish(target, restarted);
+        assert!(
+            rows.check(&second).is_err(),
+            "same target and endpoint cannot hide process restart"
+        );
+        rows.publish(
+            Target {
+                distro: "Debian".into(),
+                user: "other".into(),
+                home: "/home/other".into(),
+            },
+            manifest,
+        );
+        assert!(rows.check(&second).is_err());
+        assert_eq!(
+            first.target.distro, "Ubuntu",
+            "captured path authority never follows a new default"
+        );
+    }
+
     fn raw(name: &str, version: u32, ready: bool, is_default: bool) -> RawDistro {
         RawDistro {
             name: name.to_string(),
@@ -1220,6 +1706,44 @@ mod e2e {
             .expect("ensure daemon");
         eprintln!("[smoke] daemon on 127.0.0.1:{}", local.port);
 
+        // A native picker chooses Windows paths, while every daemon ACK uses
+        // Linux spelling. Ask WSL itself so custom automount roots are honored.
+        let copy_target = CopyTarget::capture(&local).expect("verified copy target");
+        let native = std::env::temp_dir().join(format!("chimaera-wsl-copy-{}", std::process::id()));
+        std::fs::create_dir_all(&native).expect("native copy folder");
+        let translated = copy_target
+            .destination(native.clone())
+            .await
+            .expect("pinned wslpath conversion");
+        assert!(valid_daemon_root(translated.to_str().unwrap()));
+        let marker = native.join("native-marker.txt");
+        std::fs::write(&marker, "synthetic WSL picker marker").unwrap();
+        let t = &copy_target.adoption.target;
+        let quoted = translated.to_str().unwrap().replace('\'', "'\\''");
+        let out = imp::run_script(
+            &t.distro,
+            Some(&t.user),
+            &format!(
+                "test \"$(cat '{quoted}/native-marker.txt')\" = 'synthetic WSL picker marker'"
+            ),
+            None,
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .expect("read exact picked folder in pinned distro");
+        assert!(
+            out.status.success(),
+            "translated picker folder must be the original native folder"
+        );
+        let unc = std::path::PathBuf::from(format!(
+            r"\\wsl.localhost\{}{}",
+            t.distro,
+            translated.to_str().unwrap().replace('/', "\\")
+        ));
+        assert_eq!(copy_target.destination(unc).await.unwrap(), translated);
+        std::fs::remove_file(marker).unwrap();
+        std::fs::remove_dir(native).unwrap();
+
         // The daemon API through the forward — a real workspace and a real
         // PTY session prove the whole stack, not just a socket accept.
         let auth = format!("Bearer {}", local.token);
@@ -1249,6 +1773,10 @@ mod e2e {
             .await
             .expect("re-ensure");
         assert_eq!(again.port, local.port, "second ensure adopted the daemon");
+        assert!(
+            copy_target.check(&again).is_ok(),
+            "unchanged readoption preserves a pending picker"
+        );
         let adopted = adopt_daemon().await.expect("adopt-only attach");
         assert_eq!(
             adopted.port, local.port,
@@ -1283,6 +1811,10 @@ mod e2e {
         let revived = ensure_daemon(None, false, &progress)
             .await
             .expect("revive after wsl --shutdown");
+        assert!(
+            copy_target.check(&revived).is_err(),
+            "a restarted daemon must refuse the original picker receipt"
+        );
         eprintln!("[smoke] revived on 127.0.0.1:{}", revived.port);
         assert!(
             crate::daemon::health_ok(revived.port, &revived.token),
