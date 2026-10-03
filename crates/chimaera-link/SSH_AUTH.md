@@ -416,12 +416,22 @@ expands local list modifiers; only complete resolved lists cross the wire. The
 native verifier uses these same host, CA-signature and user-signature lists.
 The policy also requires resolved `kex_algorithms`, `ciphers` and `macs` arrays
 with those identical per-list and combined-policy bounds. Every generated
-final/hop SSH process receives all six exact ordered CSV forms through fixed
-argument-vector options. Interactive legs enforce the same host, CA and
-transport lists even though they request no native signature. A keeper incapable
-of reproducing a selected algorithm refuses; it never falls back to defaults,
-weaker signatures, ambient trust or another authentication method. No private
-keys, policy-selected executable, configuration path or credential answer is
+final/hop SSH process receives all six ordered CSV forms through fixed
+argument-vector options. The keeper first captures one bounded supported-algorithm
+snapshot from its fixed SSH binary, shared by every leg of this attempt. For each
+list it emits only the intersection with that snapshot, preserving the native
+order. Unsupported preferences are omitted; no algorithm is added or reordered.
+Any empty list refuses before authentication leases, prompts or SSH effects. The
+six closed `ssh -Q` queries share one five-second deadline and a 64 KiB aggregate
+output ceiling, with owned cancellation-safe cleanup and capacity. No caller
+query, executable, configuration or environment participates. The request and
+acknowledgment retain the full original policy rather than the emitted subset.
+Interactive legs enforce the same host, CA and transport restrictions even
+though they request no native signature. This supports a newer native client's
+defaults on an older keeper without silently widening a strict policy. It never
+adds algorithms outside the native allow-lists, substitutes keeper defaults,
+uses ambient trust, or enables another authentication method. No private keys, policy-selected executable,
+configuration path or credential answer is
 included. Policies are transient grant metadata, not account host settings.
 
 A policy-bearing request includes a policy on every leg. Its grant response

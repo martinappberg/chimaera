@@ -348,8 +348,11 @@ Separately negotiated `route_policy_v1:true` additionally acknowledges the exact
 transient per-leg method order and resolved host/CA/user/KEX/cipher/MAC lists defined
 in [SSH_AUTH.md](SSH_AUTH.md#exact-per-leg-authentication-policy). Policy-bearing
 grants require that capability and exact ordered policy echoes; missing support
-never causes policy stripping. Key-only, password-only and keyboard-interactive-
-only selections retain their disabled methods. Key-mode credential continuation
+never causes policy stripping. Fixed keeper SSH arguments use only its supported
+subset of each native algorithm list, preserving order;
+an empty intersection refuses before effects. The full original lists remain in
+the exact acknowledgment, as specified in SSH_AUTH.md. Key-only, password-only
+and keyboard-interactive-only selections retain their disabled methods. Key-mode credential continuation
 requires its own verified hostbound signature and original Connect owner. A
 server lacking hostbound support cannot use keeper-originated key signing;
 session binding alone never authorizes unbound public-key signatures.
