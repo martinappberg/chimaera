@@ -8,7 +8,9 @@ here=$(cd "$(dirname "$0")" && pwd)
 T=$(mktemp -d "${TMPDIR:-/tmp}/worktree-gc-test.XXXXXX")
 T=$(cd "$T" && pwd -P)
 pids=""
+stubborn=""
 cleanup() {
+  [ -z "$stubborn" ] || kill -KILL "$stubborn" 2>/dev/null
   for p in $pids; do kill "$p" 2>/dev/null; done
   rm -rf "$T"
 }
@@ -246,6 +248,169 @@ for n in localbare dirty aftermerge locked inuse recentclosed recentbase reused 
 [ -f "$W/dirty/notes.txt" ] && ok || no "dirty lost its uncommitted file"
 [ -z "$(git -C "$M" worktree list --porcelain | grep -F "$W/merged")" ] && ok || no "merged still registered"
 grep -q "df free: " "$T/apply" && ok || no "apply did not report df: $(tail -3 "$T/apply")"
+
+# Real preview processes: executables, cwd, parentage, and SIGTERM handlers
+# exercise the same OS inspection as a live daemon. Copying system binaries
+# breaks macOS code signing, so compile a tiny local fixture instead.
+cat >"$T/preview.c" <<'EOF'
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/wait.h>
+#include <unistd.h>
+static volatile sig_atomic_t stopping;
+static void stop(int sig) { (void)sig; stopping = 1; }
+int main(void) {
+  signal(SIGTERM, getenv("IGNORE_TERM") ? SIG_IGN : stop);
+  if (getenv("HOLD_FILE") && !fopen(getenv("HOLD_FILE"), "r")) return 1;
+  pid_t child = -1;
+  if (getenv("PREVIEW_CHILD")) {
+    child = fork();
+    if (!child) {
+      if (getenv("VITE_ENTRY")) {
+        unsetenv("PREVIEW_CHILD");
+        execl(getenv("VITE_NODE"), "node", getenv("VITE_ENTRY"), (char *)NULL);
+      } else { execlp("sleep", "sleep", "300", (char *)NULL); }
+      _exit(1);
+    }
+  }
+  if (getenv("VITE_READY") && !getenv("PREVIEW_CHILD")) {
+    FILE *f = fopen(getenv("VITE_READY"), "w");
+    if (f) fclose(f);
+  }
+  while (!stopping) sleep(1);
+  if (child > 0) { kill(child, SIGTERM); waitpid(child, NULL, 0); }
+  if (getenv("DIRTY_ON_STOP")) {
+    FILE *f = fopen("shutdown-notes.txt", "w");
+    if (f) { fputs("preserve this work", f); fclose(f); }
+  }
+  return 0;
+}
+EOF
+cc "$T/preview.c" -o "$T/preview" || exit 1
+preview_wt() { # name [state]
+  new_wt "$1"
+  commit "$W/$1" "$1"
+  git -C "$W/$1" push -q origin "b/$1"
+  printf '%s\t%s\t%s\t%s\n' "b/$1" "${2:-MERGED}" 30 "$(git -C "$W/$1" rev-parse HEAD)" >>"$T/prs.tsv"
+  fake_target "$W/$1"
+  cp "$T/preview" "$W/$1/target/debug/chimaera"
+}
+start_preview() { # name [env settings...]
+  local name=$1
+  shift
+  (cd "$W/$name" && exec env "$@" target/debug/chimaera serve --port 0) &
+  preview_pid=$!
+  pids="$pids $preview_pid"
+  disown "$preview_pid" 2>/dev/null
+}
+for name in previewdaemon previewapp previewvite previewnpm previewmixed previewdirty previewunpushed previewlocked previewstubborn previewwrites previewforeign previewrelease previewnested; do preview_wt "$name"; done
+preview_wt previewopen OPEN
+preview_wt previewclosed CLOSED
+start_preview previewdaemon PREVIEW_CHILD=1
+daemon_pid=$preview_pid
+start_preview previewmixed
+mixed_pid=$preview_pid
+(cd "$W/previewmixed" && exec sleep 300) &
+pids="$pids $!"
+disown $! 2>/dev/null
+echo notes >"$W/previewdirty/notes.txt"
+start_preview previewdirty
+commit "$W/previewunpushed" unpushed
+start_preview previewunpushed
+git -C "$M" worktree lock "$W/previewlocked"
+start_preview previewlocked
+start_preview previewopen
+start_preview previewclosed
+git -C "$M" worktree add -q --detach "$W/previewnested/child" main
+start_preview previewnested
+start_preview previewstubborn IGNORE_TERM=1
+stubborn=$preview_pid
+start_preview previewwrites DIRTY_ON_STOP=1
+start_preview previewforeign HOLD_FILE="$W/previewmixed/target/debug/deps/libx.rlib"
+mkdir -p "$W/previewrelease/target/release"
+cp "$T/preview" "$W/previewrelease/target/release/chimaera"
+(cd "$W/previewrelease" && exec target/release/chimaera serve --port 0) &
+pids="$pids $!"
+disown $! 2>/dev/null
+app_exe="$W/previewapp/crates/chimaera-app/target/debug/chimaera-dev.app/Contents/MacOS/chimaera-dev"
+mkdir -p "$(dirname "$app_exe")"
+cp "$T/preview" "$app_exe"
+(cd "$W/previewapp" && exec "$app_exe" --daemon) &
+app_pid=$!
+pids="$pids $app_pid"
+disown "$app_pid" 2>/dev/null
+mkdir -p "$W/previewvite/web-ui/node_modules/.bin"
+cp "$T/preview" "$T/bin/node"
+(cd "$W/previewvite/web-ui" && exec "$T/bin/node" "$W/previewvite/web-ui/node_modules/.bin/vite" --port 0) &
+vite_pid=$!
+pids="$pids $vite_pid"
+disown "$vite_pid" 2>/dev/null
+mkdir -p "$W/previewnpm/web-ui/node_modules/.bin"
+(cd "$W/previewnpm/web-ui" && PREVIEW_CHILD=1 VITE_NODE="$T/bin/node" VITE_ENTRY="$W/previewnpm/web-ui/node_modules/.bin/vite" VITE_READY="$T/vite-ready" exec bash -c 'exec -a "npm exec vite" "$1"' _ "$T/preview") &
+npm_pid=$!
+pids="$pids $npm_pid"
+disown "$npm_pid" 2>/dev/null
+# The child must have exec'd before lsof takes its snapshot; process startup
+# (notably macOS code-signature validation) need not finish in a fixed second.
+i=0
+while [ "$i" -lt 15 ] && [ ! -f "$T/vite-ready" ]; do sleep 1; i=$((i + 1)); done
+[ -f "$T/vite-ready" ] && ok || no "npm fixture's Vite child did not start"
+sleep 1
+bash "$GC" --no-fetch --no-sizes >"$T/out" 2>&1
+for name in previewdaemon previewapp previewvite previewnpm previewstubborn previewwrites; do expect "b/$name" PREVIEW "stop dev preview"; done
+for name in previewmixed previewdirty previewunpushed previewlocked previewopen previewclosed previewforeign previewrelease previewnested; do expect "b/$name" ACTIVE; done
+for pid in "$daemon_pid" "$app_pid" "$vite_pid" "$npm_pid"; do kill -0 "$pid" 2>/dev/null && ok || no "dry run stopped preview $pid"; done
+GH_FAKE_FAIL=1 bash "$GC" --no-fetch --no-sizes >"$T/out" 2>&1
+expect b/previewdaemon ACTIVE
+# Running in the merged checkout itself still protects it.
+(cd "$W/previewdaemon" && bash "$GC" --no-fetch --no-sizes) >"$T/out" 2>&1
+expect b/previewdaemon ACTIVE "this session runs here"
+# Failure to inspect parentage must not weaken normal process protection.
+real_ps=$(command -v ps)
+export GC_TEST_PS="$real_ps"
+cat >"$T/bin/ps" <<'EOF'
+#!/bin/sh
+[ "$1" != -axo ] || exit 1
+exec "$GC_TEST_PS" "$@"
+EOF
+chmod +x "$T/bin/ps"
+bash "$GC" --no-fetch --no-sizes >"$T/out" 2>&1
+expect b/previewdaemon ACTIVE
+rm "$T/bin/ps"
+bash "$GC" --apply --no-fetch --no-sizes >"$T/apply-previews" 2>&1
+for name in previewdaemon previewapp previewvite previewnpm; do [ ! -e "$W/$name" ] && ok || no "$name not removed: $(cat "$T/apply-previews")"; done
+for pid in "$daemon_pid" "$app_pid" "$vite_pid" "$npm_pid"; do kill -0 "$pid" 2>/dev/null && no "preview $pid survived cleanup" || ok; done
+for name in previewmixed previewdirty previewunpushed previewlocked previewopen previewclosed previewforeign previewrelease previewstubborn previewwrites previewnested; do [ -d "$W/$name" ] && ok || no "protected $name removed"; done
+kill -0 "$mixed_pid" 2>/dev/null && ok || no "preview was stopped despite an unrelated holder"
+kill -0 "$stubborn" 2>/dev/null && ok || no "stubborn preview was forcibly killed"
+grep -q 'preview shutdown timed out' "$T/apply-previews" && ok || no "missing shutdown timeout diagnostic"
+[ -f "$W/previewwrites/shutdown-notes.txt" ] && ok || no "lost file written during shutdown"
+kill -KILL "$stubborn" 2>/dev/null
+stubborn=""
+
+# A new file between the initial process scan and apply must prevent even
+# SIGTERM. Inject the edit at the second scan, using the real lsof otherwise.
+preview_wt previewrace
+start_preview previewrace
+race_pid=$preview_pid
+real_lsof=$(command -v lsof)
+export GC_TEST_LSOF="$real_lsof" GC_TEST_SCAN="$T/scans" GC_TEST_EDIT="$W/previewrace/notes.txt"
+cat >"$T/bin/lsof" <<'EOF'
+#!/bin/sh
+n=0
+[ ! -f "$GC_TEST_SCAN" ] || n=$(cat "$GC_TEST_SCAN")
+n=$((n + 1))
+echo "$n" >"$GC_TEST_SCAN"
+[ "$n" != 2 ] || echo 'new work' >"$GC_TEST_EDIT"
+exec "$GC_TEST_LSOF" "$@"
+EOF
+chmod +x "$T/bin/lsof"
+sleep 1
+bash "$GC" --apply --no-fetch --no-sizes >"$T/race" 2>&1
+[ -f "$W/previewrace/notes.txt" ] && ok || no "race edit was lost"
+kill -0 "$race_pid" 2>/dev/null && ok || no "preview was stopped after the checkout became dirty"
+rm "$T/bin/lsof"
 
 # --self --sweep: only unreferenced, old objects go; referenced and young stay.
 S="$W/localbare"
