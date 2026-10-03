@@ -376,11 +376,19 @@ def outer(args):
                        "--cap-add", "CAP_SETPCAP",
                        "--ro-bind", "/usr", "/usr", "--ro-bind", root + "/etc", "/etc",
                        "--bind", root + "/tmp", "/tmp", "--tmpfs", "/run",
-                       "--dev", "/dev", "--proc", "/proc", "--dir", "/probe",
-                       "--tmpfs", "/usr/local/bin",
+                       "--dev", "/dev", "--proc", "/proc", "--dir", "/probe"]
+            if os.path.islink("/usr/local"):
+                require(os.readlink("/usr/local") == "../var/usrlocal", "system-symlink")
+                # CoreOS points here outside the read-only /usr image. Supply
+                # empty private targets, never the host's mutable /var tree.
+                command.extend(("--dir", "/var", "--dir", "/var/usrlocal",
+                                "--dir", "/var/usrlocal/bin"))
+            else:
+                require(os.path.isdir("/usr/local"), "system-symlink")
+            command.extend(("--tmpfs", "/usr/local/bin",
                        "--ro-bind-fd", str(test), "/probe/server-tests",
                        "--ro-bind-fd", str(cli), "/usr/local/bin/claude",
-                       "--ro-bind-fd", str(source), "/probe/wrapper.py"]
+                       "--ro-bind-fd", str(source), "/probe/wrapper.py"))
             for name in ("bin", "sbin", "lib", "lib64"):
                 if os.path.islink("/" + name):
                     target = os.readlink("/" + name)
