@@ -57,6 +57,8 @@ pub struct SshAuthentication {
     masters: Vec<MasterHandle>,
     fresh: bool,
     keyboard_interactive: Option<String>,
+    route_helper: Option<String>,
+    interactive_only: bool,
 }
 impl SshAuthentication {
     /// Resolve and freeze one canonical destination locally, without dialing.
@@ -69,6 +71,51 @@ impl SshAuthentication {
         port: u16,
         agent_socket: &Path,
         known_hosts: &Path,
+    ) -> anyhow::Result<Self> {
+        Self::new_inner(alias, hostname, user, port, agent_socket, known_hosts, None).await
+    }
+    /// A keeper's own immutable generated route, never a native ProxyCommand.
+    /// The same executable implements the closed --ssh-route-leg helper; its
+    /// context resolves only the original live owner, not a caller command.
+    pub async fn new_route(
+        alias: &str,
+        destination: (&str, &str, u16),
+        files: (&Path, &Path),
+        context: &str,
+        jump_aliases: &[String],
+        interactive_only: bool,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            (32..=128).contains(&context.len())
+                && context
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+                && jump_aliases.len() <= 3
+                && jump_aliases
+                    .iter()
+                    .all(|alias| hosts::normalize_alias(alias).ok().as_ref() == Some(alias)),
+            "invalid SSH route authentication context"
+        );
+        Self::new_inner(
+            alias,
+            destination.0,
+            destination.1,
+            destination.2,
+            files.0,
+            files.1,
+            Some((context, jump_aliases, interactive_only)),
+        )
+        .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn new_inner(
+        alias: &str,
+        hostname: &str,
+        user: &str,
+        port: u16,
+        agent_socket: &Path,
+        known_hosts: &Path,
+        route_context: Option<(&str, &[String], bool)>,
     ) -> anyhow::Result<Self> {
         let alias = hosts::normalize_alias(alias)?;
         anyhow::ensure!(
@@ -97,8 +144,15 @@ impl SshAuthentication {
         );
         let config = std::str::from_utf8(&output.stdout)
             .map_err(|_| anyhow::anyhow!("SSH authentication configuration invalid"))?;
-        let (fresh, master) =
+        let (mut fresh, master) =
             authentication_snapshot(&alias, Route::Alias, config, hostname, user, port)?;
+        let route_helper = if let Some((context, jumps, _)) = route_context {
+            let helper = authentication_route_helper(config, context, jumps)?;
+            fresh = true;
+            helper
+        } else {
+            None
+        };
         // Destination and mux identity must come from the same resolution:
         // a second config read could bind an old grant to a different master.
         let mut masters = vec![master];
@@ -146,7 +200,9 @@ impl SshAuthentication {
             known_hosts,
             masters,
             fresh,
-            keyboard_interactive: None,
+            keyboard_interactive: route_context.map(|(context, _, _)| context.into()),
+            route_helper,
+            interactive_only: route_context.is_some_and(|(_, _, interactive)| interactive),
         })
     }
     /// Permit a caller's existing askpass MFA relay for this exact explicit
@@ -204,7 +260,14 @@ impl SshAuthentication {
             ("VerifyHostKeyDNS", "no"),
             ("UpdateHostKeys", "no"),
             ("BatchMode", if mfa { "no" } else { "yes" }),
-            ("PasswordAuthentication", "no"),
+            (
+                "PasswordAuthentication",
+                if mfa && self.interactive_only {
+                    "yes"
+                } else {
+                    "no"
+                },
+            ),
             (
                 "KbdInteractiveAuthentication",
                 if mfa { "yes" } else { "no" },
@@ -213,14 +276,30 @@ impl SshAuthentication {
             ("GSSAPIAuthentication", "no"),
             (
                 "PreferredAuthentications",
-                if mfa {
+                if mfa && self.interactive_only {
+                    "keyboard-interactive,password"
+                } else if mfa {
                     "publickey,keyboard-interactive"
                 } else {
                     "publickey"
                 },
             ),
-            ("PubkeyAuthentication", "host-bound"),
-            ("ProxyCommand", if allowed { "none" } else { "false" }),
+            (
+                "PubkeyAuthentication",
+                if self.interactive_only {
+                    "no"
+                } else {
+                    "host-bound"
+                },
+            ),
+            (
+                "ProxyCommand",
+                if allowed {
+                    self.route_helper.as_deref().unwrap_or("none")
+                } else {
+                    "false"
+                },
+            ),
             ("ProxyJump", "none"),
         ];
         for (key, value) in settings {
@@ -253,6 +332,66 @@ impl SshAuthentication {
         }
         options
     }
+}
+fn authentication_route_helper(
+    config: &str,
+    context: &str,
+    jumps: &[String],
+) -> anyhow::Result<Option<String>> {
+    anyhow::ensure!(
+        (32..=128).contains(&context.len())
+            && context
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+            && jumps.len() <= 3
+            && jumps
+                .iter()
+                .all(|alias| hosts::normalize_alias(alias).ok().as_ref() == Some(alias)),
+        "invalid SSH route authentication context"
+    );
+    let expected = if jumps.is_empty() {
+        "none".into()
+    } else {
+        jumps.join(",")
+    };
+    let mut resolved = config
+        .lines()
+        .filter_map(|line| line.strip_prefix("proxyjump "));
+    let actual = resolved.next().unwrap_or("none");
+    anyhow::ensure!(
+        actual == expected
+            && resolved.next().is_none()
+            && config
+                .lines()
+                .filter_map(|line| line.strip_prefix("proxycommand "))
+                .all(|value| value == "none"),
+        "SSH route configuration changed"
+    );
+    if jumps.is_empty() {
+        return Ok(None);
+    }
+    let executable = authentication_path(&std::env::current_exe()?)?;
+    Ok(Some(fixed_route_helper(
+        &executable,
+        context,
+        jumps.len() - 1,
+    )?))
+}
+fn fixed_route_helper(executable: &str, context: &str, leg: usize) -> anyhow::Result<String> {
+    // ProxyCommand is parsed by OpenSSH's shell. These paths were validated for
+    // argv use; quote the complete executable so allowed shell metacharacters
+    // retain their literal filesystem meaning. Single quotes are forbidden by
+    // authentication_path, and the two remaining arguments are closed atoms.
+    let executable = authentication_path(Path::new(executable))?;
+    anyhow::ensure!(
+        (32..=128).contains(&context.len())
+            && context
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+            && leg < 3,
+        "invalid SSH route helper arguments"
+    );
+    Ok(format!("'{executable}' --ssh-route-leg {context} {leg}"))
 }
 fn authentication_opts(host: &str, route: &Route, node: bool) -> Vec<String> {
     SSH_AUTHENTICATION
@@ -3965,7 +4104,94 @@ mod tests {
             masters: vec![fixture_master("/tmp/fixture-master")],
             fresh: true,
             keyboard_interactive: None,
+            route_helper: None,
+            interactive_only: false,
         }
+    }
+    #[test]
+    fn routed_authentication_freezes_exact_jump_order_and_a_closed_same_binary_helper() {
+        let context = "a".repeat(96);
+        let jumps = vec!["cxjump-first".into(), "cxjump-second".into()];
+        let helper =
+            authentication_route_helper("proxyjump cxjump-first,cxjump-second\n", &context, &jumps)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            helper,
+            format!(
+                "'{}' --ssh-route-leg {context} 1",
+                std::env::current_exe().unwrap().display()
+            )
+        );
+        assert!(
+            authentication_route_helper("", &context, &[])
+                .unwrap()
+                .is_none(),
+            "OpenSSH omits the default none field"
+        );
+        for config in [
+            "proxyjump cxjump-second,cxjump-first\n",
+            "proxyjump cxjump-first,cxjump-second\nproxyjump other\n",
+            "proxyjump cxjump-first,cxjump-second\nproxycommand /bin/false\n",
+        ] {
+            assert!(authentication_route_helper(config, &context, &jumps).is_err());
+        }
+        for context in ["short", "a;command", "a b", "a%h"] {
+            assert!(authentication_route_helper("", context, &[]).is_err());
+        }
+        let mut scope = fixture_authentication();
+        scope.fresh = true;
+        scope.keyboard_interactive = Some(context);
+        scope.route_helper = Some(helper.clone());
+        scope.interactive_only = true;
+        let options = scope.options("fixture", &Route::Alias, false);
+        assert!(options.contains(&format!("ProxyCommand={helper}")));
+        assert!(options.contains(&"PasswordAuthentication=yes".into()));
+        assert!(options.contains(&"PubkeyAuthentication=no".into()));
+        assert!(options.contains(&"PreferredAuthentications=keyboard-interactive,password".into()));
+        assert!(
+            scope
+                .options("other", &Route::Alias, false)
+                .contains(&"ProxyCommand=false".into()),
+            "an unrelated effect receives no route authentication"
+        );
+        scope.interactive_only = false;
+        let options = scope.options("fixture", &Route::Alias, false);
+        assert!(options.contains(&"PasswordAuthentication=no".into()));
+        assert!(options.contains(&"PubkeyAuthentication=host-bound".into()));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn same_binary_helper_path_is_a_literal_shell_word_even_with_metacharacters() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "cx-helper-word-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let context = "a".repeat(96);
+        for name in [
+            "keeper;false",
+            "keeper`false`",
+            "keeper&false",
+            "keeper(false)",
+        ] {
+            let executable = root.join(name);
+            std::fs::write(&executable, b"#!/bin/sh\nprintf '%s\n' \"$@\"\n").unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let command = fixed_route_helper(executable.to_str().unwrap(), &context, 2).unwrap();
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", &command])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                format!("--ssh-route-leg\n{context}\n2\n")
+            );
+        }
+        assert!(fixed_route_helper("/tmp/keeper'unsafe", &context, 0).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[cfg(unix)]
     #[tokio::test]
