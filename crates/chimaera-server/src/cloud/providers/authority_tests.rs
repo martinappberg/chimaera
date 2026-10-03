@@ -5,6 +5,12 @@ const BOOT: &str = "01234567-89ab-4def-8012-3456789abcde";
 const OPERATION: &str = "01234567-89ab-4def-8012-3456789abcd0";
 const NONCE: &str = "01234567-89ab-4def-8012-3456789abcd1";
 const CAPABILITY: &str = "synthetic-private-control-capability-not-runtime-00000";
+// The standard library supplies close-on-exec pipes on both macOS and Linux;
+// raw pipe() readers can otherwise survive in parallel CLI fixture children.
+fn private_pipe() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+    let (reader, writer) = std::io::pipe().unwrap();
+    (reader.into(), writer.into())
+}
 fn startup() -> Vec<u8> {
     serde_json::to_vec(&json!({"version":1,"account_id":"a-one","holder_id":"worker-one","process_boot":BOOT,"registration_generation":3,"worker_credential_digest":"0000000000000000000000000000000000000000000000000000000000000000","capability":CAPABILITY})).unwrap()
 }
@@ -26,7 +32,7 @@ fn consume(action: serde_json::Value) -> Result<ControlCommand, Error> {
 
 #[tokio::test]
 async fn private_pipe_requires_exact_binding_and_eof() {
-    let (reader, writer) = rustix::pipe::pipe().unwrap();
+    let (reader, writer) = private_pipe();
     let bytes = startup();
     assert_eq!(rustix::io::write(&writer, &bytes).unwrap(), bytes.len());
     drop(writer);
@@ -45,7 +51,7 @@ async fn startup_refuses_regular_files_and_oversized_pipes() {
         read_control_startup(input).await,
         Err(Error::InvalidStartup)
     ));
-    let (reader, writer) = rustix::pipe::pipe().unwrap();
+    let (reader, writer) = private_pipe();
     assert_eq!(
         rustix::io::write(&writer, &vec![b' '; STARTUP_BYTES + 1]).unwrap(),
         STARTUP_BYTES + 1
@@ -59,7 +65,7 @@ async fn startup_refuses_regular_files_and_oversized_pipes() {
 
 #[tokio::test]
 async fn startup_deadline_closes_a_pipe_whose_writer_never_finishes() {
-    let (reader, writer) = rustix::pipe::pipe().unwrap();
+    let (reader, writer) = private_pipe();
     let bytes = startup();
     assert_eq!(rustix::io::write(&writer, &bytes).unwrap(), bytes.len());
     let before = std::time::Instant::now();

@@ -249,3 +249,41 @@ async fn fixed_login_overlay_removes_synthetic_token_and_proxy_overrides_in_a_re
         0o600
     );
 }
+
+#[test]
+fn first_start_creates_private_root_and_preserves_existing_credentials() {
+    let parent = Root::new();
+    let path = parent.0.join("provider-login");
+    LoginHome::prepare_root_at(&path).unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o700);
+    let home = LoginHome::prepare_at(&path, &command("claude")).unwrap();
+    seed(&home);
+    let leaf = home.path().join(".claude/.credentials.json");
+    let original = std::fs::read(&leaf).unwrap();
+    let inode = std::fs::metadata(&path).unwrap().ino();
+    LoginHome::prepare_root_at(&path).unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+    assert_eq!(std::fs::read(&leaf).unwrap(), original);
+    assert_eq!(home.claude_leaf().unwrap().identity.user, "user-one");
+}
+
+#[test]
+fn root_creation_refuses_unsafe_leaf_and_parent_without_repair() {
+    let parent = Root::new();
+    let path = parent.0.join("provider-login");
+    write(&path, b"preserved");
+    assert!(LoginHome::prepare_root_at(&path).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), b"preserved");
+    std::fs::remove_file(&path).unwrap();
+    symlink(&parent.0, &path).unwrap();
+    assert!(LoginHome::prepare_root_at(&path).is_err());
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(LoginHome::prepare_root_at(&path).is_err());
+    assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o755);
+    let alias = parent.0.join("alias");
+    symlink(&path, &alias).unwrap();
+    assert!(LoginHome::prepare_root_at(&alias.join("login")).is_err());
+    assert!(!path.join("login").exists());
+}

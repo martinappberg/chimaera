@@ -39,7 +39,7 @@ fn directory(file: &File, private: bool) -> Result<(), Error> {
     }
     Ok(())
 }
-fn pin(path: &Path) -> Result<File, Error> {
+fn pin_directory(path: &Path, private: bool) -> Result<File, Error> {
     if !path.is_absolute() {
         return Err(Error::InvalidStartup);
     }
@@ -60,8 +60,11 @@ fn pin(path: &Path) -> Result<File, Error> {
             _ => return Err(Error::InvalidStartup),
         }
     }
-    directory(&current, true)?;
+    directory(&current, private)?;
     Ok(current)
+}
+fn pin(path: &Path) -> Result<File, Error> {
+    pin_directory(path, true)
 }
 fn regular(file: &File) -> Result<(), Error> {
     let m = file.metadata().map_err(|_| Error::InvalidCommand)?;
@@ -82,6 +85,32 @@ pub struct LoginHome {
     provider: Provider,
 }
 impl LoginHome {
+    /// Establish the fixed private login root before readiness. Its existing
+    /// state parent is descriptor-pinned; unsafe leaves are never repaired.
+    pub(super) fn prepare_root() -> Result<(), Error> {
+        Self::prepare_root_at(Path::new(LOGIN_ROOT))
+    }
+    pub(super) fn prepare_root_at(path: &Path) -> Result<(), Error> {
+        let parent_path = path.parent().ok_or(Error::InvalidStartup)?;
+        let name = path.file_name().ok_or(Error::InvalidStartup)?;
+        let parent = pin_directory(parent_path, false)?;
+        let created = match rustix::fs::mkdirat(&parent, name, Mode::from_raw_mode(0o700)) {
+            Ok(()) => true,
+            Err(rustix::io::Errno::EXIST) => false,
+            Err(_) => return Err(Error::InvalidStartup),
+        };
+        let root = File::from(
+            openat(&parent, name, flags() | OFlags::DIRECTORY, Mode::empty())
+                .map_err(|_| Error::InvalidStartup)?,
+        );
+        directory(&root, true)?;
+        if created {
+            root.sync_all().map_err(|_| Error::InvalidStartup)?;
+            parent.sync_all().map_err(|_| Error::InvalidStartup)?;
+        }
+        Ok(())
+    }
+
     /// The caller must retain its registered control admission/cleanup owner.
     /// This path is fixed in production; clients never supply it.
     pub fn prepare(command: &ControlCommand) -> Result<Self, Error> {

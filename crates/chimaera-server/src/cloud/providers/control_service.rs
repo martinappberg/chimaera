@@ -464,6 +464,21 @@ async fn run_inner(
         .set_nonblocking(true)
         .map_err(|_| Error::InvalidStartup)?;
     let mut socket = UnixStream::from_std(stream).map_err(|_| Error::InvalidStartup)?;
+    #[cfg(test)]
+    let test_root = fixture.is_none().then(tests::Root::new);
+    #[cfg(test)]
+    let fixture = fixture.or_else(|| test_root.as_ref().map(|root| root.0.clone()));
+    #[cfg(test)]
+    let root_path = fixture.clone();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if let Some(path) = root_path {
+            return super::login_home::LoginHome::prepare_root_at(&path);
+        }
+        super::login_home::LoginHome::prepare_root()
+    })
+    .await
+    .map_err(|_| Error::InvalidStartup)??;
     send(
         &mut socket,
         &Reply::Ready {
@@ -669,11 +684,35 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::{io::Write, os::fd::AsRawFd};
+    pub(super) struct Root(pub(super) std::path::PathBuf);
+    impl Root {
+        pub(super) fn new() -> Self {
+            let path = std::env::temp_dir().canonicalize().unwrap().join(format!(
+                "chimaera-provider-helper-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            Self(path)
+        }
+    }
+    impl Drop for Root {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
     pub(super) const CAP: &str = "synthetic-private-capability-no-real-credential-000000";
     pub(super) fn registration() -> serde_json::Value {
         json!({"version":1,"account_id":"fixture","holder_id":"worker-fixture","process_boot":"00000000-0000-4000-8000-000000000001","registration_generation":7,"worker_credential_digest":"0".repeat(64)})
     }
     async fn fixture() -> (UnixStream, tokio::task::JoinHandle<Result<(), Error>>) {
+        fixture_at(None).await
+    }
+    async fn fixture_at(
+        root: Option<std::path::PathBuf>,
+    ) -> (UnixStream, tokio::task::JoinHandle<Result<(), Error>>) {
         let (read, write) = nix::unistd::pipe().unwrap();
         let mut startup = registration();
         startup["capability"] = json!(CAP);
@@ -683,7 +722,7 @@ mod tests {
         let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
         client.set_nonblocking(true).unwrap();
         let client = UnixStream::from_std(client).unwrap();
-        (client, tokio::spawn(run(read, server.into())))
+        (client, tokio::spawn(run_inner(read, server.into(), root)))
     }
     pub(super) async fn reply(socket: &mut UnixStream) -> serde_json::Value {
         let size = socket.read_u32().await.unwrap() as usize;
@@ -700,6 +739,21 @@ mod tests {
         socket.write_u32(bytes.len() as u32).await.unwrap();
         socket.write_all(&bytes).await.unwrap();
         reply(socket).await
+    }
+    #[tokio::test]
+    async fn unsafe_login_root_refuses_before_ready() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = Root::new();
+        std::fs::create_dir(&root.0).unwrap();
+        std::fs::set_permissions(&root.0, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (mut socket, task) = fixture_at(Some(root.0.clone())).await;
+        assert!(matches!(task.await.unwrap(), Err(Error::InvalidStartup)));
+        let mut byte = [0];
+        assert_eq!(socket.read(&mut byte).await.unwrap(), 0);
+        assert_eq!(
+            std::fs::metadata(&root.0).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
     }
     #[tokio::test]
     async fn exact_startup_ack_capability_closed_frames_and_shutdown() {

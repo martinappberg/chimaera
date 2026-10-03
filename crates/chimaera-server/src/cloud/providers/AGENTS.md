@@ -18,6 +18,11 @@ Worker-only readiness and explicitly requested provider authentication. Parent:
 | `control_service.rs` | Default-off inherited startup-pipe/private-socket consumer delegated by the hidden CLI: exact capability, bounded frames/records, original monotonic lease transfer, redacted status and supervisor-only cleaned credential completion; no daemon/project HTTP route. |
 | `control_login.rs`, `control_login_tests.rs` | Default-off fixed official login runner: exact opaque pending admission, renewable 30-second lease within a 15-minute attempt, owned cleanup across observer cancellation and one-use code nonce; typed private completion awaits a separate fresh canonical-publication authorization. |
 
+The private helper establishes `/state/provider-login` with mode 0700 through
+its pinned safe existing `/state` descriptor before `Ready`. Existing roots must
+already satisfy owner/mode/no-symlink checks; startup never repairs, replaces or
+clears existing credentials. Filesystem enrollment runs off the async reactor.
+
 ## Contract
 
 All routes are behind the daemon bearer middleware, under `/api/v1/pro/cloud`:
