@@ -344,6 +344,16 @@ shared cluster worker/job lifetime; passive activity never reconnects a missing
 hop. Arbitrary local software/VPN routing remains explicit advanced Direct with
 the laptop connection lifetime. This contract does not advertise implementation.
 
+Separately negotiated `route_policy_v1:true` additionally acknowledges the exact
+transient per-leg method order and resolved host/CA/user algorithm lists defined
+in [SSH_AUTH.md](SSH_AUTH.md#exact-per-leg-authentication-policy). Policy-bearing
+grants require that capability and exact ordered policy echoes; missing support
+never causes policy stripping. Key-only, password-only and keyboard-interactive-
+only selections retain their disabled methods. Key-mode credential continuation
+requires its own verified hostbound signature and original Connect owner. A
+server lacking hostbound support cannot use keeper-originated key signing;
+session binding alone never authorizes unbound public-key signatures.
+
 Host rows:
 
 ```json

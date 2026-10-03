@@ -377,3 +377,80 @@ request to an older keeper. Target/shared cluster worker/job sessions must
 survive native disconnect and grant expiry; background activity after a missing
 master must never reconnect. The common route contract does not certify arbitrary
 Mac-local ProxyCommand/VPN compatibility or enable current services.
+
+## Exact per-leg authentication policy
+
+The separately negotiated, disabled `route_policy_v1:true` capability extends
+`proxyjump_v1`. A client sending a policy requires both flags before any inert
+registration or grant request. It never removes a policy to retry an older
+keeper. Omitted/false capability or absent/mismatched policy acknowledgment
+refuses before Reconnect. Existing policy-absent route version 1 retains only its
+explicitly limited method behavior; it does not acknowledge a narrower policy.
+
+Each submitted leg may add this immutable policy, captured from that leg's
+bounded native effective OpenSSH configuration:
+
+```json
+{"policy":{"version":1,"methods":["publickey","keyboard-interactive","password"],"host_key_algorithms":["ssh-ed25519"],"ca_signature_algorithms":["ssh-ed25519"],"pubkey_accepted_algorithms":["ssh-ed25519"]}}
+```
+
+Methods form a nonempty ordered list of at most three distinct closed enum
+values: `publickey`, `keyboard-interactive`, `password`. A key leg requires
+`publickey` first and may retain either or both interactive methods after it in
+their configured order. Every later credential prompt still requires this
+exact leg's native-verified hostbound signature, live original Connect owner and
+fresh keeper authorization. If public-key authentication never produced that
+eligible signature, enabling a configured password fallback does not grant a
+prompt. There is no key-refusal downgrade. A key-only policy offers no credential
+prompt. An interactive leg contains no `publickey` method or selected user keys
+and retains its nonempty configured subset/order of password and
+keyboard-interactive. Password-first mixed key policies are explicitly
+unsupported rather than reordered. Methods locally disabled or omitted from
+the configured preference list cannot be re-enabled by the keeper.
+
+Each algorithm list is nonempty, at most 64 distinct resolved names, with names
+at most 128 ASCII bytes consisting of letters, digits and `-@._+`. Leading
+`+`/`-`, wildcards, comma-separated expressions, whitespace and SSH directives
+refuse. The combined serialized policy is at most 8 KiB. Native resolution
+expands local list modifiers; only complete resolved lists cross the wire. The
+native verifier uses these same host, CA-signature and user-signature lists.
+Every generated final/hop SSH process receives their exact ordered CSV forms
+through fixed argument-vector options. Interactive legs enforce the same host
+and CA lists even though they request no native signature. A keeper incapable
+of reproducing a selected algorithm refuses; it never falls back to defaults,
+weaker signatures, ambient trust or another authentication method. No private
+keys, policy-selected executable, configuration path or credential answer is
+included. Policies are transient grant metadata, not account host settings.
+
+A policy-bearing request includes a policy on every leg. Its grant response
+adds `policies:<exact ordered policy array>` alongside the existing `modes`;
+the client requires exact policy equality before consuming Ready or requesting
+Reconnect. Mixed missing/present leg policies, malformed lists and absent,
+shortened, reordered or changed response policies refuse. Existing total
+128 KiB request/response and aggregate grant resource bounds remain unchanged.
+The existing prompt provenance remains bound to the original grant/boot/leg/
+mode/destination. Policy agreement is an additional gate, never a replacement
+for original-owner, signature, trust or deadline verification.
+
+Key-mode compatibility requires the server's positive
+`publickey-hostbound@openssh.com` extension advertisement. OpenSSH introduced
+that extension in 8.9; a version banner alone is not proof because vendors may
+backport features. A server without it cannot use keeper-originated key-mode
+signing on any leg. Even an otherwise valid signed session binding and matching
+session identifier cannot authorize an ordinary unbound `publickey` signature:
+the host identity must also be inside the signed user-authentication request.
+OpenSSH's trusted-origin first-hop exception does not apply when the SSH client
+and key exchange run on the remote keeper. This avoids the re-signing attack
+described in [OpenSSH's destination restriction design](https://www.openssh.org/agent-restrict.html).
+Explicit initially selected password/MFA may remain compatible with such a
+server under its exact host trust/method policy; otherwise the advanced Direct
+path uses the laptop's own SSH client and connection lifetime. No automatic
+fallback occurs, and existing accepted masters are unaffected.
+
+Before advertising policy support, disposable native/keeper/OpenSSH fixtures
+cover key-only, password-only, keyboard-interactive-only and ordered
+key-plus-MFA/password policies, every locally disabled method, exact policy ACK,
+CA/host/user algorithm narrowing, and changed policies during a pending prompt.
+A valid session binding followed by standard unbound public-key signing must
+still refuse without consulting the local signing agent. These gates supplement
+the complete route acceptance above; this contract does not enable support.
