@@ -327,6 +327,21 @@ one `X-Chimaera-Control-Context` header matching fresh normal authentication;
 native mutations recheck that same tag and account generation before send and
 after completion. Passive operation reads carry and compare that original tag.
 
+The browser command body is the closed adapter-only envelope
+`{"original":<original selector>,"command":<canonical keeper command>}`,
+with the same 8 KiB total limit. The original selector is exactly
+`{context,operation_id,provider,operation,expected_connection_generation,registration,attempt_id}`;
+`attempt_id` is required nullable, and registration is the exact observed
+`providers_control` tuple. An original-parent operation GET requires exactly
+one `X-Chimaera-Provider-Original` JSON header, at most 4 KiB, carrying this
+same closed selector; the path UUID must equal its parent `operation_id`.
+These fields grant no authority. The adapter independently reauthenticates,
+checks the context and account, and validates exact provider, generation,
+registration and known attempt on the returned status. Status recovery does
+not require a current catalog whose generation may already have advanced.
+Duplicate headers, unknown fields and malformed selectors refuse with fixed
+errors; headers and bodies are never logged. Canonical keeper wire is unchanged.
+
 The client creates and retains an original parent operation UUID before Connect
 or confirmed Disconnect. Its provider, expected connection generation, observed
 registration and context remain immutable. Each Submit or Cancel creates a
