@@ -1,5 +1,4 @@
 <script lang="ts">
-  import RemoteSettingsDialog from "./RemoteSettingsDialog.svelte";
   import { onMount } from "svelte";
   import HomeNavigation from "./HomeNavigation.svelte";
   import HomeActions from "./HomeActions.svelte";
@@ -1249,13 +1248,27 @@
   {@const host = hosts.find((h) => h.alias === remoteSettings?.alias)}
   {#if host}
     {#key remoteSettings.alias}
-      <RemoteSettingsDialog {host} firstSetup={remoteSettings.firstSetup} phase={phases.get(host.alias) ?? null}
-        onSave={(hpc) => saveRemoteSettings(host.alias, hpc)} onRepair={() => repairRemote(host.alias)} onClose={() => (remoteSettings = null)} />
+      <!-- Keep connection setup out of every local workspace's entry bundle. -->
+      {#await import("./RemoteSettingsDialog.svelte")}
+        <div class="remote-settings-notice" role="status">
+          <span>Loading connection settings…</span>
+          <button class="side" onclick={() => (remoteSettings = null)}>Cancel</button>
+        </div>
+      {:then { default: RemoteSettingsDialog }}
+        <RemoteSettingsDialog {host} firstSetup={remoteSettings.firstSetup} phase={phases.get(host.alias) ?? null}
+          onSave={(hpc) => saveRemoteSettings(host.alias, hpc)} onRepair={() => repairRemote(host.alias)} onClose={() => (remoteSettings = null)} />
+      {:catch}
+        <div class="remote-settings-notice" role="alert">
+          <span>Connection settings couldn’t load. Reload this window and try again.</span>
+          <button class="side" onclick={() => (remoteSettings = null)}>Dismiss</button>
+        </div>
+      {/await}
     {/key}
   {/if}
 {/if}
 
 <style>
+  .remote-settings-notice { position: fixed; bottom: 16px; right: 16px; z-index: 100; display: flex; align-items: center; gap: 12px; max-width: min(420px, calc(100vw - 32px)); padding: 12px 16px; border: 1px solid var(--edge); border-radius: 8px; background: var(--bg); color: var(--fg); font-size: var(--text-sm); }
   .host-advanced { max-width: 320px; padding: 8px 10px; color: var(--fg); font-size: var(--text-sm); }
   .host-advanced summary { cursor: pointer; color: var(--muted); }
   .host-advanced label { display: flex; align-items: flex-start; gap: 8px; margin-top: 10px; }
