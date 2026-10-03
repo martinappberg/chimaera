@@ -73,7 +73,24 @@ pub(super) async fn run(config: PathBuf, endpoint: String, action: String) -> Re
     if !caps.route_policy_supported() {
         return Err(());
     }
+    println!("ROUTE_STAGE capabilities");
+    std::io::stdout().flush().map_err(|_| ())?;
     let selection = trust::resolve_fixture("route-fixture", caps.keeper_boot, owner, context).await;
+    use crate::ssh_agent::selection::SelectionFailure;
+    println!(
+        "{}",
+        match &selection {
+            Ok(_) => "ROUTE_SELECTION success",
+            Err(SelectionFailure::UnsupportedConfiguration) =>
+                "ROUTE_SELECTION unsupported_configuration",
+            Err(SelectionFailure::AgentUnavailable) => "ROUTE_SELECTION agent_unavailable",
+            Err(SelectionFailure::NoKeys) => "ROUTE_SELECTION no_keys",
+            Err(SelectionFailure::TooManyKeys) => "ROUTE_SELECTION too_many_keys",
+            Err(SelectionFailure::HostTrustRequired) => "ROUTE_SELECTION host_trust_required",
+            Err(SelectionFailure::RevokedHost) => "ROUTE_SELECTION revoked_host",
+            Err(SelectionFailure::Unavailable) => "ROUTE_SELECTION unavailable",
+        }
+    );
     if action == "config-change" {
         if selection.is_ok() {
             return Err(());

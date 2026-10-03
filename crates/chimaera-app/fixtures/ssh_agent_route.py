@@ -407,6 +407,11 @@ class RouteFixture(Fixture):
                         "prompt": b"ROUTE_PROMPT\n" in output,
                         "selected": b"ROUTE_SELECTED\n" in output,
                         "failed_marker": b"ROUTE_FAILED\n" in output,
+                        "capabilities_accepted": b"ROUTE_STAGE capabilities\n" in output,
+                        "selection_outcomes": [name for name in ("success", "unsupported_configuration",
+                            "agent_unavailable", "no_keys", "too_many_keys", "host_trust_required",
+                            "revoked_host", "unavailable")
+                            if ("ROUTE_SELECTION " + name + "\n").encode("ascii") in output],
                         "requests": helper.requests, "grants": helper.grants, "ready": helper.ready,
                         "reconnects": helper.reconnects, "deletes": helper.deletes,
                         "protocol_failed": helper.failed, "failure_kind": helper.failure_kind,
