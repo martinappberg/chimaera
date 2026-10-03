@@ -243,17 +243,19 @@ mod tests {
 
         let zsh = shell_launch_for("/bin/zsh", &base).unwrap();
         assert_eq!(zsh.argv, vec!["/bin/zsh"]);
-        assert!(zsh
-            .env
-            .iter()
-            .any(|(k, v)| k == "ZDOTDIR" && v.ends_with("shell-integration/zsh")));
+        assert!(
+            zsh.env
+                .iter()
+                .any(|(k, v)| k == "ZDOTDIR" && v.ends_with("shell-integration/zsh"))
+        );
 
         let fish = shell_launch_for("/opt/homebrew/bin/fish", &base).unwrap();
         assert_eq!(fish.argv, vec!["/opt/homebrew/bin/fish"]);
-        assert!(fish
-            .env
-            .iter()
-            .any(|(k, v)| k == "XDG_DATA_DIRS" && v.contains("fish-xdg")));
+        assert!(
+            fish.env
+                .iter()
+                .any(|(k, v)| k == "XDG_DATA_DIRS" && v.contains("fish-xdg"))
+        );
 
         // Unknown shells spawn plain.
         let other = shell_launch_for("/bin/tcsh", &base).unwrap();
@@ -412,5 +414,32 @@ PROMPT_COMMAND='RET=$?; : logger-standin'
             out.contains("\x1b]133;C\x07recovered"),
             "re-arm did not keep the hook: {out:?}"
         );
+    }
+
+    /// Modern distro rc files use indexed PROMPT_COMMAND arrays. A scalar
+    /// replacement only changes index zero, so a later entry would consume the
+    /// preexec arm while the prompt is still rendering. Preserve sparse entries
+    /// in execution order and the status observed by their first handler.
+    #[test]
+    #[cfg(unix)]
+    fn bash_prompt_command_array_keeps_order_status_and_final_arm() {
+        let prelude = r#"
+first_prompt() { local status=$?; printf 'FIRST:%s\n' "$status"; return "$status"; }
+second_prompt() { printf 'SECOND\n'; }
+PROMPT_COMMAND=([0]="first_prompt # keep this comment" [5]=second_prompt)
+"#;
+        let out = bash_probe(
+            "prompt-array",
+            prelude,
+            "",
+            r#"if [[ ${#PROMPT_COMMAND[@]} = 1 && $PROMPT_COMMAND = '__chimaera_precmd'*'first_prompt # keep this comment'*'second_prompt'*'trap "$__chimaera_debug_chain" DEBUG; __chimaera_arm' ]]; then printf '\nARRAY_LAYOUT_OK\n'; fi
+(exit 7)
+printf '\nCOMMAND_OUTPUT\n'
+"#,
+        );
+        assert!(out.lines().any(|line| line == "ARRAY_LAYOUT_OK"), "{out:?}");
+        assert!(out.contains("FIRST:7\nSECOND\n"), "{out:?}");
+        assert!(out.contains("\x1b]133;D;7\x07"), "{out:?}");
+        assert!(out.lines().any(|line| line == "COMMAND_OUTPUT"), "{out:?}");
     }
 }

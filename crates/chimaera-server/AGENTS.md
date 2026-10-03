@@ -12,6 +12,7 @@ the module you need and read its header doc.
 
 | Module | What it owns |
 |---|---|
+| `tests/exec.rs` | Real PTY + authenticated exec API regressions. The indexed Bash prompt-array case requires the exact original command, output and zero/nonzero status in the correlated completion, preventing a prompt hook from claiming the pending exec token. The real PTY/HTTP zero/nonzero regression passes on macOS (0.07s), alongside eight core shell tests; whole Linux live metadata verification remains pending. |
 | `fixtures/claude_contained_probe.py` + `pro/execution/provider_claude_official_tests.rs` | Opt-in pinned Claude 2.1.287 compatibility fixture, never a normal launch caller. A shared VM lock owns the private PID/mount/network namespace through exit; loopback/route/privilege and external-listener canaries precede official CLI execution. Two ignored tests exercise production print/frontend ownership and a real PTY/header recorder/CountTokens trigger with hostile disabled settings and captured config-directory replacement. Package hash, test-image hash and fixed local peers are synthetic evidence; source presence or ordinary feature CI does not mean the official CLI/containment/private subscription pairing has passed. |
 | `lib.rs` | Crate wiring only: `mod` tree + re-exports (`AppState`, `lock`, `app`, `run`) + `ServerConfig`. |
 | `state.rs` | `AppState` (every shared handle) + `lock()`. |
