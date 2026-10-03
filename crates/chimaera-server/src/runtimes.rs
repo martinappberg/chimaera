@@ -275,14 +275,12 @@ if [ -z "$version" ]; then echo "chimaera: could not read the codex version" >&2
 case "$version" in
   *[!0-9.A-Za-z-]*|'') echo "chimaera: unexpected codex version string" >&2; exit 1 ;;
 esac
-dest="$root/codex/$version"
-# Reinstalling the version already installed is the repair path, so it must
-# not rm -rf a tree sessions still resolve: swing the old one aside, rename
-# the new one in, then drop it (two syscalls, not an extraction-long gap).
-if [ -e "$dest" ]; then mv -f "$dest" "$stage.old"; fi
-mv -f "$stage" "$dest"
-rm -rf "$stage.old"
-swap codex "$version"
+# Every activation has its own tree, including a same-version repair. A
+# running session can still open companions relative to its original binary.
+package="$version-$(date +%s)-$$"
+dest="$root/codex/$package"
+mv "$stage" "$dest"
+swap codex "$package"
 echo "chimaera: installed codex -> $root/bin/codex"
 "$root/bin/codex" --version
 "#,
@@ -626,7 +624,7 @@ pub(crate) async fn start_install(
     }
 }
 
-async fn prune_install_versions(root: PathBuf, kind: AgentKind) {
+pub(crate) async fn prune_install_versions(root: PathBuf, kind: AgentKind) {
     // Cleanup is best-effort; a read-only/stale manifest must not turn a
     // working install into a failure. The caller retains the install lock.
     match tokio::task::spawn_blocking(move || crate::runtime_retention::prune_locked(&root, kind))
@@ -639,7 +637,10 @@ async fn prune_install_versions(root: PathBuf, kind: AgentKind) {
 
 /// All workspace daemons share this advisory lock. The descriptor stays alive
 /// until the installer exits; process death releases it without a stale lockdir.
-async fn lock_install(root: &Path, kind: AgentKind) -> Result<std::fs::File, Box<Response>> {
+pub(crate) async fn lock_install(
+    root: &Path,
+    kind: AgentKind,
+) -> Result<std::fs::File, Box<Response>> {
     let lock_root = root.to_path_buf();
     let result = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
         std::fs::create_dir_all(&lock_root)?;
@@ -762,11 +763,10 @@ fn remove_dir_if_exists(path: &Path) -> anyhow::Result<()> {
 /// DELETE /api/v1/agents/{id}/install — uninstall a chimaera-MANAGED agent: the
 /// active symlink plus its version tree under `~/.chimaera/agents`. Only ever
 /// touches chimaera's own prefix — the user's own install (and its auth in
-/// `$HOME`) is never touched. A running session keeps its already-exec'd binary
-/// (the inode survives the unlink), but NOT companions its package resolves by
-/// path later: a live codex loses its code-mode host and bundled rg/zsh the
-/// moment its tree goes. 404 unknown id; 409 while an install for the
-/// same agent is in flight; 200 `{"removed": bool}` otherwise (`false` = nothing
+/// `$HOME`) is never touched. Usage leases protect companions a running agent
+/// resolves by path later, including sessions in other workspace daemons.
+/// 404 unknown id; 409 while an install or a session using the package is
+/// in flight; 200 `{"removed": bool}` otherwise (`false` = nothing
 /// chimaera-managed to remove).
 pub(crate) async fn uninstall_agent(
     State(state): State<Arc<AppState>>,
@@ -809,8 +809,17 @@ pub(crate) async fn uninstall_agent(
             Err(response) => return *response,
         }
     }
-    let removed = match tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+    let removed = match tokio::task::spawn_blocking(move || -> anyhow::Result<Option<bool>> {
         let _locks = locks;
+        // Check every root before removing anything: a lease in the legacy
+        // tree must not leave the shared installation partially uninstalled.
+        let mut _usage = Vec::new();
+        for root in &roots {
+            let Some(leases) = crate::runtime_retention::lock_removal(root, kind)? else {
+                return Ok(None);
+            };
+            _usage.extend(leases);
+        }
         let mut removed = false;
         for root in roots {
             let bin = managed_bin_dir(&root);
@@ -824,11 +833,21 @@ pub(crate) async fn uninstall_agent(
             remove_dir_if_exists(&root.join(kind.as_str()))?;
             removed = true;
         }
-        Ok(removed)
+        Ok(Some(removed))
     })
     .await
     {
-        Ok(Ok(removed)) => removed,
+        Ok(Ok(Some(removed))) => removed,
+        Ok(Ok(None)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error": format!(
+                    "{} is still in use. Close sessions and terminals using this installation, then try again.",
+                    kind.product_name()
+                )})),
+            )
+                .into_response();
+        }
         error => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1302,7 +1321,14 @@ mod tests {
             assert!(script.contains("mv -f \"$root/bin/.$1.new\" \"$root/bin/$1\""));
             let agent = kind.as_str();
             assert!(
-                script.contains(&format!("swap {agent} \"$version\"")),
+                script.contains(&format!(
+                    "swap {agent} \"${}\"",
+                    if kind == AgentKind::Codex {
+                        "package"
+                    } else {
+                        "version"
+                    }
+                )),
                 "{kind:?}"
             );
             // Ends by printing the installed version through the new link.
@@ -1355,8 +1381,9 @@ mod tests {
         );
         // Activation renames the staged tree in; reinstalling the version
         // already on disk (the repair path) never rm -rf's a live one.
-        assert!(codex.contains(r#"if [ -e "$dest" ]; then mv -f "$dest" "$stage.old"; fi"#));
-        assert!(codex.contains(r#"mv -f "$stage" "$dest""#));
+        assert!(codex.contains(r#"package="$version-$(date +%s)-$$""#));
+        assert!(!codex.contains(r#"mv -f "$dest""#));
+        assert!(codex.contains(r#"mv "$stage" "$dest""#));
         let agy = install_script(AgentKind::Antigravity, &root).unwrap();
         assert!(agy.contains(AGY_MANIFEST_BASE));
         assert!(agy.contains("sha512"), "agy verifies the manifest checksum");
@@ -1489,32 +1516,58 @@ esac
                 Some(root.join("bin/codex")),
                 "{pass}"
             );
-            assert_eq!(
-                std::fs::read_link(root.join("bin/codex")).unwrap(),
-                PathBuf::from(format!("../codex/{version}/bin/codex")),
+            let target = std::fs::read_link(root.join("bin/codex")).unwrap();
+            assert!(
+                target
+                    .to_string_lossy()
+                    .starts_with(&format!("../codex/{version}-")),
                 "{pass}"
             );
             assert!(!root.join("codex/.staging").exists(), "{pass}");
             assert!(!root.join("codex/.staging.old").exists(), "{pass}");
         };
 
+        let activated = || {
+            root.join("bin/codex")
+                .canonicalize()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        };
         install("fresh install");
-        assert_complete("9.9.9", "fresh install");
+        let first = activated();
+        assert_complete(&first, "fresh install");
         assert_activated("9.9.9", "fresh install");
 
-        // The repair path: the version on disk is the one being installed.
+        // Keep a marker and inode at the original path: repair must leave a
+        // running session's package untouched, not just reconstruct its files.
+        let companion = root
+            .join("codex")
+            .join(&first)
+            .join("bin/codex-code-mode-host");
+        std::fs::write(&companion, "running-session companion").unwrap();
         install("same-version reinstall");
-        assert_complete("9.9.9", "same-version reinstall");
+        let repaired = activated();
+        assert_ne!(first, repaired);
+        assert_complete(&repaired, "same-version reinstall");
         assert_activated("9.9.9", "same-version reinstall");
+        assert_eq!(
+            std::fs::read_to_string(&companion).unwrap(),
+            "running-session companion"
+        );
 
-        // A new release. The superseded tree must SURVIVE — a running codex
-        // spawns its code-mode host and bundled rg/zsh from it by path, so
-        // an update that reclaimed it would break live sessions.
         pack("9.9.10");
         install("upgrade");
-        assert_complete("9.9.10", "upgrade");
+        assert_complete(&activated(), "upgrade");
         assert_activated("9.9.10", "upgrade");
-        assert_complete("9.9.9", "upgrade keeps the superseded tree");
+        assert_complete(&first, "upgrade keeps the original tree");
+        assert_complete(&repaired, "upgrade keeps the repaired tree");
 
         std::fs::remove_dir_all(&dir).ok();
     }

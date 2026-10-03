@@ -53,7 +53,7 @@ wakes row always shows.
 | `schema.ts` | The settings schema: keys, types, defaults, labels, groups. Ground truth. |
 | `store.svelte.ts` | The reactive settings store: load/patch/persist against `/api/v1/settings`, sparse-map semantics, the `dirtySince` echo-guard, and document-wide theme/interface/editor CSS variables. |
 | `themes.ts` | The curated light/dark theme definitions + `applyAppearance`. |
-| `AgentsSettings.svelte` | Agent readiness/install/update cards; Advanced paths and removal. Tracks installer exit, polls only while visible, preserves unfinished edits. |
+| `AgentsSettings.svelte` | Installed-agent cards; Advanced paths and removal. Opens the shared `../workspace/AgentSetupDialog.svelte` through `agentSetup.ts` for install/update/reinstall and recoverable progress/results; the compact dialog keeps technical output under Details and separates Sign in from Open chat. Polls only while visible and preserves unfinished edits. |
 | `agentStatus.ts` | Honest update and installer status rules; unknown/failure never means up to date or installed. |
 | `EnvironmentSettings.svelte` | The Environment prelude panel (bespoke, `/api/v1/environment`-backed — see the exception above). |
 | `environment.ts` | Wire types + `getEnvironment`/`putEnvironment` for the prelude map. |
@@ -82,3 +82,7 @@ wakes row always shows.
   when you touch the persist path.
 - **UI quality is an acceptance criterion.** Use the theme tokens; light and dark
   both hold.
+- **Setup survives a missed catalog refresh.** `workspace/agentSetup.ts` remembers
+  each pending operation in the window's session storage before POST, replacing
+  its ID when it joins existing work. Clear it only after showing the result;
+  closing the dialog or a lost response must not discard a failure or update.

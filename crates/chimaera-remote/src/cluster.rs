@@ -607,14 +607,18 @@ fn build(
             if let Some(m) = state.manifests.get(&ws.id) {
                 if let Some(job) = jobs.iter().find(|j| {
                     j.state == "running"
-                        && !j.stopping
                         && j.slurm_job_id.is_some()
                         && j.slurm_job_id == m.slurm_job_id
                         && held_in(&j.id) != Some(HostedState::Failed)
                 }) {
                     v.state = "open";
                     v.job = Some(job.id.clone());
-                    v.closing = held_in(&job.id) == Some(HostedState::Closing);
+                    v.closing = job.stopping || held_in(&job.id) == Some(HostedState::Closing);
+                    // Keep ownership visible while Slurm finishes cancellation,
+                    // but never offer a connection into a stopping allocation.
+                    if job.stopping {
+                        return v;
+                    }
                     endpoints.insert(
                         ws.id.clone(),
                         Endpoint {
@@ -631,6 +635,21 @@ fn build(
                     );
                     return v;
                 }
+            }
+            // Graceful shutdown removes manifests before Slurm finishes.
+            // A failed row already released ownership, even if this snapshot
+            // predates job-host's final closing rows.
+            if let Some(job) = jobs.iter().find(|j| {
+                j.stopping
+                    && matches!(
+                        held_in(&j.id),
+                        Some(HostedState::Starting | HostedState::Open | HostedState::Closing)
+                    )
+            }) {
+                v.state = "open";
+                v.job = Some(job.id.clone());
+                v.closing = true;
+                return v;
             }
             // Opening in a running job, or opening when a job starts. A
             // running job's start list says nothing once its job-host
@@ -2221,7 +2240,7 @@ mod tests {
         };
         let mut waiting = record("j-0000bbbb", Some("78"), NOW);
         waiting.open = vec!["w-2222abcd".into()];
-        let state = BrowseState {
+        let mut state = BrowseState {
             config: config.clone(),
             jobs: vec![
                 JobFiles {
@@ -2275,6 +2294,75 @@ mod tests {
         );
         assert_eq!(b.hosts["j-0000aaaa"].port, 41000);
         assert!(!b.hosts.contains_key("j-0000bbbb"));
+        for (cancelled, slurm_state) in [(true, "RUNNING"), (false, "COMPLETING")] {
+            state.jobs[0].record.stopped_by_user = cancelled;
+            let queue = [queue_row("77", slurm_state, "n042", "1:00:00", "None")];
+            let stopping = build(&config, &state, &queue, true, NOW);
+            let workspace = &stopping.workspaces[0];
+            assert_eq!(workspace.state, "open");
+            assert_eq!(workspace.job.as_deref(), Some("j-0000aaaa"));
+            assert!(workspace.closing);
+            assert!(!workspace.opening);
+            assert!(!stopping.endpoints.contains_key("w-0000abcd"));
+            assert!(!stopping.hosts.contains_key("j-0000aaaa"));
+        }
+        // Both live endpoint records disappear on graceful shutdown. The
+        // durable closing row still owns the workspace until Slurm is done.
+        let previous_manifests = std::mem::take(&mut state.manifests);
+        state.jobs[0].host = None;
+        state.jobs[0].hosting = Some(chimaera_core::cluster::HostingRecord {
+            workspaces: [("w-0000abcd".into(), HostedState::Closing)]
+                .into_iter()
+                .collect(),
+        });
+        for held in [
+            HostedState::Starting,
+            HostedState::Open,
+            HostedState::Closing,
+        ] {
+            state.jobs[0]
+                .hosting
+                .as_mut()
+                .unwrap()
+                .workspaces
+                .insert("w-0000abcd".into(), held);
+            for (cancelled, slurm_state) in [(true, "RUNNING"), (false, "COMPLETING")] {
+                state.jobs[0].record.stopped_by_user = cancelled;
+                let queue = [queue_row("77", slurm_state, "n042", "1:00:00", "None")];
+                let stopping = build(&config, &state, &queue, true, NOW);
+                let workspace = &stopping.workspaces[0];
+                assert_eq!(workspace.job.as_deref(), Some("j-0000aaaa"));
+                assert!(workspace.closing);
+                assert!(stopping.endpoints.is_empty());
+                assert!(stopping.hosts.is_empty());
+            }
+        }
+        // The final snapshot may not have landed yet (or job-host crashed).
+        // A stale failed row must never reclaim a released workspace, even
+        // if its old daemon manifest also remains on disk.
+        for manifests in [Default::default(), previous_manifests] {
+            state.manifests = manifests;
+            state.jobs[0]
+                .hosting
+                .as_mut()
+                .unwrap()
+                .workspaces
+                .insert("w-0000abcd".into(), HostedState::Failed);
+            for (cancelled, slurm_state) in [(true, "RUNNING"), (false, "COMPLETING")] {
+                state.jobs[0].record.stopped_by_user = cancelled;
+                let queue = [queue_row("77", slurm_state, "n042", "1:00:00", "None")];
+                let stopping = build(&config, &state, &queue, true, NOW);
+                let workspace = &stopping.workspaces[0];
+                assert_eq!(workspace.state, "closed");
+                assert!(!workspace.closing);
+                assert!(!workspace.opening);
+                assert!(workspace.failed.is_some());
+                assert!(stopping.endpoints.is_empty());
+            }
+        }
+        let ended = build(&config, &state, &[], true, NOW);
+        assert_eq!(ended.workspaces[0].state, "closed");
+        assert!(ended.workspaces[0].job.is_none());
     }
 
     /// A running job's job-host says what it holds: a workspace it is
