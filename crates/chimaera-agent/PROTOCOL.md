@@ -2905,6 +2905,15 @@ A Mod's render tree, JS module, and callback handle are never conversation data.
 Only stable `message_identity` and bounded complete `tool_render_data` facts are
 journaled to preserve render-site identities across normal history replay.
 
+Browser verification covered Client state/press/post, pointer capture and native
+key names (`space`, `right`), clipboard forwarding, draft fill/append decorations,
+Tab acceptance of suggestions, reload, and light/dark rendering. `ui_focus`'s
+native element table contains Button/Input/Select, not Client controls; report
+only `is_held` for Client focus. Supplying its key resolves to null and would
+incorrectly move the browser focus back to the site container. Client module
+workers use a classic bootstrap with dynamic imports, which works inside the
+opaque sandbox; a module Worker failed before startup in the tested web view.
+
 ## 2026-10-03: October runtime refresh
 
 **Codex 0.160.0.** A temporary official npm installation (the user's global CLI

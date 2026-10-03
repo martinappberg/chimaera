@@ -93,9 +93,13 @@
     siteHeld = held;
     const keyed = target instanceof Element ? target.closest<HTMLElement>("[data-mod-key][data-mod-plugin]") : null;
     const element = keyed?.dataset.modKey && keyed.dataset.modPlugin ? { key: keyed.dataset.modKey, plugin: keyed.dataset.modPlugin } : null;
+    // Claude's native focus table contains Button/Input/Select, not Client's
+    // local controls. Report ownership alone there: reporting the Client key
+    // resolves to null upstream and would pull focus back to this container.
+    const localClient = target instanceof Element && target.closest(".client-body") !== null;
     const revision = ++focusRevision;
-    void mods.transport.request({ subtype: "ui_focus", component, instance_id: instanceId, is_held: held, element, by: "person" }).then((reply) => {
-      if (revision !== focusRevision || !held || !root?.contains(document.activeElement)) return;
+    void mods.transport.request({ subtype: "ui_focus", component, instance_id: instanceId, is_held: held, ...(!localClient && { element }), by: "person" }).then((reply) => {
+      if (localClient || revision !== focusRevision || !held || !root?.contains(document.activeElement)) return;
       focusElement(isRecord(reply.element) ? reply.element : null);
     }).catch(() => {});
     queueLayout();

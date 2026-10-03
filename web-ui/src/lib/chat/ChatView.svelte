@@ -3180,7 +3180,7 @@
   {/if}
 
   {#if agentKind === "claude" && store.exited === null}
-    <ModsWorkbench transport={socket.nativeUi} {visible} {focused} running={agentBusy} hasSurvey={store.questions.length > 0} composer={composerApi} canEdit={!composerDisabled && store.pending.length === 0 && store.questions.length === 0 && rewindIntent === null && forkIntent === null} canFocus={focused && !composerEngaged && !agentBusy && store.pending.length === 0 && store.questions.length === 0} />
+    <ModsWorkbench transport={socket.nativeUi} {visible} {focused} running={agentBusy} hasSurvey={store.questions.length > 0 || store.elicitations.length > 0} composer={composerApi} canEdit={!composerDisabled && store.pending.length === 0 && store.questions.length === 0 && store.elicitations.length === 0 && rewindIntent === null && forkIntent === null} canFocus={focused && !composerEngaged && !agentBusy && store.pending.length === 0 && store.questions.length === 0 && store.elicitations.length === 0} />
   {/if}
 
   <Composer
