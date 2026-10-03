@@ -535,7 +535,9 @@ mod tests {
 
     #[test]
     fn opening_requires_the_exact_copy_acknowledgment() {
-        let good = json!({"copy_version":1,"state":"local_copy","workspace_id":"w-one","root":"/tmp/copied","name":"One"});
+        let root = std::env::temp_dir().join("chimaera-copy-acknowledgment");
+        assert!(root.is_absolute());
+        let good = json!({"copy_version":1,"state":"local_copy","workspace_id":"w-one","root":root,"name":"One"});
         assert_eq!(
             copy_ack(good.clone(), "w-one").unwrap().local_copy,
             Some(json!({"state":"ready","ready":true}))
@@ -568,11 +570,9 @@ mod tests {
             bad[key] = value;
             assert!(copy_ack(bad, "w-one").is_err());
         }
-        assert!(copy_ack(
-            json!({"workspace_id":"w-one","root":"/tmp/copied","name":"One"}),
-            "w-one"
-        )
-        .is_err());
+        let mut missing_ack = good;
+        missing_ack.as_object_mut().unwrap().remove("copy_version");
+        assert!(copy_ack(missing_ack, "w-one").is_err());
     }
     #[test]
     fn a_passive_catalog_project_needs_no_inferred_host_identity() {
