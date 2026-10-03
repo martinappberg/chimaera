@@ -349,6 +349,18 @@ pub enum AgentEvent {
         request_id: String,
         option_id: String,
     },
+    /// MCP input and browser requests have their own reply shape. Answers
+    /// are absent from resolution events so private form values are not journaled.
+    ElicitationRequest {
+        request_id: String,
+        server: String,
+        message: String,
+        elicitation: crate::elicitation::Elicitation,
+    },
+    ElicitationResolved {
+        request_id: String,
+        action: String,
+    },
     /// The agent asked the user structured questions (claude AskUserQuestion
     /// via can_use_tool; codex item/tool/requestUserInput). Answered with
     /// the `Answer` command.
@@ -853,6 +865,12 @@ pub enum AgentCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         feedback: Option<String>,
     },
+    Elicitation {
+        request_id: String,
+        action: crate::elicitation::ElicitationAction,
+        #[serde(default)]
+        content: Value,
+    },
     Interrupt,
     SetMode {
         mode_id: String,
@@ -1091,6 +1109,18 @@ impl AgentCommand {
                 if let Some(feedback) = feedback {
                     check_command_len("permission feedback", feedback.len(), COMMAND_FEEDBACK_MAX)?;
                 }
+            }
+            Self::Elicitation {
+                request_id,
+                content,
+                ..
+            } => {
+                check_command_len("request_id", request_id.len(), COMMAND_ID_MAX)?;
+                check_command_len(
+                    "MCP form data",
+                    serde_json::to_vec(content).map_or(usize::MAX, |v| v.len()),
+                    crate::elicitation::ELICITATION_BYTES,
+                )?;
             }
             Self::SetMode { mode_id } => {
                 check_command_len("mode_id", mode_id.len(), COMMAND_SELECTOR_MAX)?;

@@ -55,10 +55,14 @@
   import { resolveTargets } from "../shared/embed/embed";
   import { HoverPreviews } from "../previews/doc/hoverController.svelte";
   import PermissionCard from "./PermissionCard.svelte";
+  import ElicitationCard from "./ElicitationCard.svelte";
+  import type { PendingElicitation } from "./elicitation";
   import PlanApprovalCard from "./PlanApprovalCard.svelte";
   import QuestionCard from "./QuestionCard.svelte";
   import UsagePanel from "./UsagePanel.svelte";
   import McpPanel from "./McpPanel.svelte";
+  import ConnectionDialog from "../plugins/ConnectionDialog.svelte";
+  let authServer = $state<string | null>(null);
   import RewindDialog from "./RewindDialog.svelte";
   import AttachmentStrip from "./AttachmentStrip.svelte";
   import ForkDialog from "./ForkDialog.svelte";
@@ -1351,6 +1355,7 @@
   $effect(() => {
     void store.blocks.length;
     void store.pending.length;
+    void store.elicitations.length;
     void store.lastSeq;
     if (!visible || store.hydrating || !renderReady || !atBottom || composerEngaged) return;
     queueBottomScroll();
@@ -2156,6 +2161,7 @@
   let pinnedPlan = $state.raw<PlanEntry[]>([]);
   let pinnedPermissions = $state.raw<PendingPermission[]>([]);
   let pinnedQuestions = $state.raw<PendingQuestion[]>([]);
+  let pinnedElicitations = $state.raw<PendingElicitation[]>([]);
   let pinnedSends = $state.raw<PendingSend[]>([]);
   $effect(() => {
     if (!visible) {
@@ -2165,6 +2171,7 @@
         pinnedPlan = $state.snapshot(store.plan);
         pinnedPermissions = $state.snapshot(store.pending);
         pinnedQuestions = $state.snapshot(store.questions);
+        pinnedElicitations = $state.snapshot(store.elicitations);
         pinnedSends = $state.snapshot(store.pendingSends);
       });
       return;
@@ -2174,6 +2181,7 @@
     pinnedPlan = store.plan;
     pinnedPermissions = store.pending;
     pinnedQuestions = store.questions;
+    pinnedElicitations = store.elicitations;
     pinnedSends = store.pendingSends;
   });
 
@@ -2872,7 +2880,11 @@
       <QuestionCard {request} {visible} onAnswer={(answers) => answer(request.requestId, answers)} />
     {/each}
 
-    {#if agentBusy && pinnedPermissions.length === 0 && pinnedQuestions.length === 0}
+    {#each pinnedElicitations as request (request.requestId)}
+      <ElicitationCard {request} {visible} onRespond={(action, content) => sendCommand({type: "elicitation", request_id: request.requestId, action, content}, "MCP response not sent")} />
+    {/each}
+
+    {#if agentBusy && pinnedPermissions.length === 0 && pinnedQuestions.length === 0 && pinnedElicitations.length === 0}
       <div class="status-row" aria-live={visible ? "polite" : "off"}>
         <span class="status-spark">
           <SessionGlyph kind="agent" {agentKind} size={12} state="alive" />
@@ -3114,12 +3126,19 @@
     />
   {/if}
 
+  {#if authServer !== null && session.workspace_id && agentKind === "claude"}
+    <ConnectionDialog wsId={session.workspace_id} agent="claude" name={authServer} {visible}
+      onClose={() => { authServer = null; sendCommand({type: "get_mcp"}, "MCP refresh not sent"); }}
+      onConnected={() => { if (authServer) sendCommand({type: "reconnect_mcp", server: authServer}, "reconnect not sent"); }} />
+  {/if}
+
   {#if menu === "mcp"}
     <McpPanel
       servers={store.mcpServers}
-      onReconnect={(server) => socket.send({ type: "reconnect_mcp", server })}
+      onReconnect={(server) => sendCommand({ type: "reconnect_mcp", server }, "reconnect not sent")}
+      onAuthenticate={session.workspace_id && agentKind === "claude" ? (server) => { authServer = server; menu = null; } : undefined}
       onToggleEnabled={(server, enabled) =>
-        socket.send({ type: "set_mcp_enabled", server, enabled })}
+        sendCommand({ type: "set_mcp_enabled", server, enabled }, "MCP change not sent")}
     />
   {/if}
 

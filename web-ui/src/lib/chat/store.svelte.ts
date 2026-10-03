@@ -1,3 +1,4 @@
+import type { PendingElicitation } from "./elicitation";
 /**
  * Per-session chat state: a pure reducer over the normalized agent-event
  * stream. Journal replay and live frames go through the SAME `apply` path
@@ -120,6 +121,8 @@ const TRANSCRIPT_EVENTS = new Set([
   "permission_resolved",
   "question_request",
   "question_resolved",
+  "elicitation_request",
+  "elicitation_resolved",
   "usage_report",
   "messages_superseded",
   "notice",
@@ -553,6 +556,7 @@ export class ChatStore {
   /** Structured questions from the agent (claude AskUserQuestion / codex
    *  requestUserInput) — rendered as QuestionCards. */
   questions = $state<PendingQuestion[]>([]);
+  elicitations = $state<PendingElicitation[]>([]);
   plan = $state<PlanEntry[]>([]);
   initialized = $state(false);
   startupDetail = $state<string | null>(null);
@@ -843,6 +847,7 @@ export class ChatStore {
     this.pending = [];
     this.pendingSends = [];
     this.questions = [];
+    this.elicitations = [];
     // trimmedCount restarts with the transcript; the generation bump is what
     // tells views/cursors their old coordinates are dead (a trim delta across
     // a reset would be a comparison between unrelated numbering systems).
@@ -1409,6 +1414,21 @@ export class ChatStore {
         const existing = this.pending.findIndex((p) => p.requestId === requestId);
         if (existing === -1) this.pending.push(request);
         else this.pending[existing] = request;
+        break;
+      }
+      case "elicitation_request": {
+        const requestId = (ev.request_id as string) ?? "";
+        if (!requestId) break;
+        const request: PendingElicitation = { requestId, server: ev.server as string, message: ev.message as string, elicitation: ev.elicitation as PendingElicitation["elicitation"] };
+        const index = this.elicitations.findIndex((request) => request.requestId === requestId);
+        if (index < 0) this.elicitations.push(request);
+        else this.elicitations[index] = request;
+        break;
+      }
+      case "elicitation_resolved": {
+        const request = this.elicitations.find((request) => request.requestId === ev.request_id);
+        this.elicitations = this.elicitations.filter((request) => request.requestId !== ev.request_id);
+        if (request) this.notice(`${request.server} request — ${ev.action === "accept" ? "submitted" : ev.action === "decline" ? "declined" : ev.action === "cancel" ? "cancelled" : "no longer active"}`, "info");
         break;
       }
       case "question_request": {
@@ -2018,6 +2038,7 @@ export class ChatStore {
       if (block !== undefined && block.kind === "question") block.resolved = true;
     }
     this.questions = [];
+    this.elicitations = [];
     for (const p of this.pending) {
       this.notice(`${p.title} — no longer active`, "info");
     }

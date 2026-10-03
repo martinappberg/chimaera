@@ -24,6 +24,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use crate::elicitation::{Elicitation, ElicitationAction, ELICITATION_PENDING};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
@@ -1223,6 +1224,7 @@ struct CodexMapper {
     /// Outstanding server approval requests: our request_id →
     /// (JSON-RPC id, option_id → prebuilt decision payload).
     pending_approvals: HashMap<String, (Value, HashMap<String, Value>)>,
+    pending_elicitations: HashMap<String, (Value, Elicitation)>,
     /// Outstanding item/tool/requestUserInput prompts by request_id.
     /// Answers go back as {answers:{questionId:{answers:[label,…]}}}.
     pending_questions: HashMap<String, PendingQuestion>,
@@ -1348,6 +1350,7 @@ impl CodexMapper {
             last_msg_item: None,
             last_thought_item: None,
             pending_approvals: HashMap::new(),
+            pending_elicitations: HashMap::new(),
             pending_questions: HashMap::new(),
             noticed_requests: HashSet::new(),
             safety_notified: false,
@@ -1720,7 +1723,12 @@ impl CodexMapper {
             // client answered, interrupt): withdraw the matching card.
             "serverRequest/resolved" => {
                 let request_id = format!("codex-{}", frame["params"]["requestId"]);
-                if self.pending_questions.remove(&request_id).is_some() {
+                if self.pending_elicitations.remove(&request_id).is_some() {
+                    step.events.push(AgentEvent::ElicitationResolved {
+                        request_id,
+                        action: "cancel".into(),
+                    });
+                } else if self.pending_questions.remove(&request_id).is_some() {
                     step.events.push(AgentEvent::QuestionResolved {
                         request_id,
                         answers: Default::default(),
@@ -3613,6 +3621,12 @@ impl CodexMapper {
                 answers: Default::default(),
             });
         }
+        for request_id in std::mem::take(&mut self.pending_elicitations).into_keys() {
+            events.push(AgentEvent::ElicitationResolved {
+                request_id,
+                action: "expired".into(),
+            });
+        }
         for request_id in std::mem::take(&mut self.pending_approvals).into_keys() {
             events.push(AgentEvent::PermissionResolved {
                 request_id,
@@ -3741,6 +3755,32 @@ impl CodexMapper {
         // shapes decline silently, so nothing unverified may ship).
         if method == "mcpServer/elicitation/request" {
             let server = params["serverName"].as_str().unwrap_or("mcp");
+            if params["_meta"]["codex_approval_kind"] != "mcp_tool_call" {
+                if request_id.len() > crate::model::COMMAND_ID_MAX
+                    || self.pending_elicitations.len() >= ELICITATION_PENDING
+                {
+                    step.outbound.push(json!({"id":rpc_id,"result":{"action":"cancel","content":null,"_meta":null}}));
+                    step.events.push(AgentEvent::Notice {
+                        text: "MCP input request cancelled: too many unanswered requests.".into(),
+                    });
+                    return;
+                }
+                let elicitation = Elicitation::parse(
+                    params["mode"].as_str().unwrap_or("form"),
+                    &params["requestedSchema"],
+                    params["url"].as_str(),
+                );
+                self.pending_elicitations
+                    .insert(request_id.clone(), (rpc_id, elicitation.clone()));
+                step.events.push(AgentEvent::ElicitationRequest {
+                    request_id,
+                    server: truncate_label(server, 256),
+                    message: truncate_label(params["message"].as_str().unwrap_or_default(), 8192),
+                    elicitation,
+                });
+                return;
+            }
+
             let raw_title = params["message"]
                 .as_str()
                 .filter(|m| !m.is_empty())
@@ -4389,6 +4429,38 @@ impl CodexMapper {
                         state: UserMessageState::Dropped,
                     });
                 }
+            }
+            AgentCommand::Elicitation {
+                request_id,
+                action,
+                content,
+            } => {
+                let Some((_, request)) = self.pending_elicitations.get(&request_id) else {
+                    step.events.push(AgentEvent::ElicitationResolved {
+                        request_id,
+                        action: "expired".into(),
+                    });
+                    return step;
+                };
+                if let Err(error) = request.validate(action, &content) {
+                    step.events.push(AgentEvent::Notice {
+                        text: format!("MCP form not sent: {error}"),
+                    });
+                    return step;
+                }
+                let content = if action == ElicitationAction::Accept && request.mode != "url" {
+                    content
+                } else {
+                    Value::Null
+                };
+                let (rpc_id, _) = self.pending_elicitations.remove(&request_id).unwrap();
+                step.outbound.push(
+                    json!({"id":rpc_id,"result":{"action":action,"content":content,"_meta":null}}),
+                );
+                step.events.push(AgentEvent::ElicitationResolved {
+                    request_id,
+                    action: action.as_str().into(),
+                });
             }
             AgentCommand::Permission {
                 request_id,
@@ -5221,6 +5293,59 @@ mod tests {
                 "content": [{ "type": "text", "text": "…" }],
             } },
         })
+    }
+
+    #[test]
+    fn mcp_form_validates_preserves_types_and_settles_once() {
+        let mut m = mapper();
+        let frame = json!({"id":91,"method":"mcpServer/elicitation/request","params":{"threadId":"thr-1","serverName":"fixture","mode":"form","message":"Configure","requestedSchema":{"type":"object","required":["n"],"properties":{"n":{"type":"integer","minimum":0}}}}});
+        let step = m.on_frame(&frame);
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::ElicitationRequest { .. }
+        ));
+        let invalid = m.on_command(AgentCommand::Elicitation {
+            request_id: "codex-91".into(),
+            action: ElicitationAction::Accept,
+            content: json!({"n":"0"}),
+        });
+        assert!(invalid.outbound.is_empty());
+        assert!(!m.pending_elicitations.is_empty());
+        let valid = m.on_command(AgentCommand::Elicitation {
+            request_id: "codex-91".into(),
+            action: ElicitationAction::Accept,
+            content: json!({"n":0}),
+        });
+        assert_eq!(valid.outbound[0]["result"]["content"], json!({"n":0}));
+        assert!(m.pending_elicitations.is_empty());
+        assert!(!serde_json::to_string(&valid.events)
+            .unwrap()
+            .contains("content"));
+        let stale = m.on_command(AgentCommand::Elicitation {
+            request_id: "codex-91".into(),
+            action: ElicitationAction::Accept,
+            content: json!({"n":1}),
+        });
+        assert!(stale.outbound.is_empty());
+        m.on_frame(&frame);
+        let cancelled =
+            m.on_frame(&json!({"method":"serverRequest/resolved","params":{"requestId":91}}));
+        assert!(
+            matches!(&cancelled.events[0], AgentEvent::ElicitationResolved { action, .. } if action == "cancel")
+        );
+        for action in [ElicitationAction::Cancel, ElicitationAction::Decline] {
+            m.on_frame(&frame);
+            let reply = m.on_command(AgentCommand::Elicitation {
+                request_id: "codex-91".into(),
+                action,
+                content: Value::Null,
+            });
+            assert_eq!(reply.outbound[0]["result"]["action"], action.as_str());
+        }
+        m.on_frame(&frame);
+        assert!(m.drain_pending().iter().any(
+            |e| matches!(e, AgentEvent::ElicitationResolved { action, .. } if action == "expired")
+        ));
     }
 
     #[test]

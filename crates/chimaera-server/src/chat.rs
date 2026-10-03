@@ -438,6 +438,11 @@ fn note_for_notices(record: &mut crate::agent_state::AgentRecord, ev: &AgentEven
             };
             record.set_notice_note(&line, false);
         }
+        AgentEvent::ElicitationRequest {
+            server, message, ..
+        } => {
+            record.set_notice_note(&format!("{server}: {message}"), true);
+        }
         AgentEvent::QuestionRequest { questions, .. } => {
             let text = questions.first().map_or("", |q| q.question.as_str());
             record.set_notice_note(text, true);
@@ -502,15 +507,50 @@ fn apply_chat_event(state: &Arc<AppState>, id: &str, ev: &AgentEvent) {
         }
         // Structured questions block the turn on a human exactly like
         // permission prompts — the rail badges both the same way.
-        AgentEvent::PermissionRequest { .. } | AgentEvent::QuestionRequest { .. } => {
-            Some(AgentState::NeedsPermission)
-        }
-        AgentEvent::PermissionResolved { .. } | AgentEvent::QuestionResolved { .. } => {
-            Some(AgentState::Running)
-        }
+        AgentEvent::PermissionRequest { .. }
+        | AgentEvent::QuestionRequest { .. }
+        | AgentEvent::ElicitationRequest { .. } => Some(AgentState::NeedsPermission),
+        AgentEvent::PermissionResolved { .. } | AgentEvent::QuestionResolved { .. } => Some(
+            if state
+                .chat
+                .get(id)
+                .is_some_and(|info| info.pending_permission)
+            {
+                AgentState::NeedsPermission
+            } else {
+                AgentState::Running
+            },
+        ),
+        AgentEvent::ElicitationResolved { .. } => Some(
+            if state
+                .chat
+                .get(id)
+                .is_some_and(|info| info.pending_permission)
+            {
+                AgentState::NeedsPermission
+            } else if state
+                .chat
+                .carryover(id)
+                .is_some_and(|live| live.turn_in_flight)
+            {
+                AgentState::Running
+            } else {
+                AgentState::Finished
+            },
+        ),
         AgentEvent::Error { fatal: true, .. } => Some(AgentState::Errored),
         AgentEvent::TurnStarted { .. } => Some(AgentState::Running),
-        AgentEvent::TurnCompleted { .. } => Some(AgentState::Finished),
+        AgentEvent::TurnCompleted { .. } => Some(
+            if state
+                .chat
+                .get(id)
+                .is_some_and(|info| info.pending_permission)
+            {
+                AgentState::NeedsPermission
+            } else {
+                AgentState::Finished
+            },
+        ),
         // A deliberate user interrupt (Stop/Esc) is not a failure: the rail
         // should read idle, matching the chat surface's quiet "interrupted"
         // notice. The wire's `interrupted` flag is the drivers' structural

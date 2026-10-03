@@ -31,6 +31,7 @@ use crate::driver::{
     run_driver, AgentAdapter, Driver, DriverExit, DriverIo, DriverStep, Handshake, Mapper,
     SpawnSpec, INTERRUPT_GRACE_TICKS,
 };
+use crate::elicitation::{Elicitation, ElicitationAction, ELICITATION_PENDING};
 use crate::model::{
     cap_head_tail, cap_output, clip_command, fmt_elapsed_secs, truncate_label, AgentCommand,
     AgentEvent, BackgroundTask, BackgroundTaskClose, ChunkKind, Coalescer, CompactionPhase,
@@ -770,6 +771,7 @@ struct ClaudeMapper {
     tool_kinds: HashMap<String, ToolKind>,
     /// Outstanding can_use_tool requests, keyed by request_id.
     pending_permissions: HashMap<String, PendingPermission>,
+    pending_elicitations: HashMap<String, Elicitation>,
     /// Outstanding AskUserQuestion prompts: request_id → original input
     /// (echoed back inside updatedInput.questions with the answers).
     pending_questions: HashMap<String, Value>,
@@ -1007,6 +1009,7 @@ impl ClaudeMapper {
             thinking_route: None,
             tool_kinds: HashMap::new(),
             pending_permissions: HashMap::new(),
+            pending_elicitations: HashMap::new(),
             pending_questions: HashMap::new(),
             pending_dialogs: HashMap::new(),
             pending_controls: HashMap::new(),
@@ -1276,7 +1279,12 @@ impl ClaudeMapper {
             Some("control_request") => self.on_control_request(frame, &mut step),
             Some("control_cancel_request") => {
                 let id = frame["request_id"].as_str().unwrap_or_default().to_string();
-                if self.pending_questions.remove(&id).is_some() {
+                if self.pending_elicitations.remove(&id).is_some() {
+                    step.events.push(AgentEvent::ElicitationResolved {
+                        request_id: id,
+                        action: "cancel".into(),
+                    });
+                } else if self.pending_questions.remove(&id).is_some() {
                     step.events.push(AgentEvent::QuestionResolved {
                         request_id: id,
                         answers: Default::default(),
@@ -2658,6 +2666,31 @@ impl ClaudeMapper {
         }
         let request = &frame["request"];
         let request_id = frame["request_id"].as_str().unwrap_or_default().to_string();
+        if request["subtype"] == "elicitation" {
+            if request_id.len() > COMMAND_ID_MAX
+                || self.pending_elicitations.len() >= ELICITATION_PENDING
+            {
+                step.outbound.push(json!({"type":"control_response","response":{"subtype":"success","request_id":request_id,"response":{"action":"cancel"}}}));
+                step.events.push(AgentEvent::Notice {
+                    text: "MCP input request cancelled: too many unanswered requests.".into(),
+                });
+                return;
+            }
+            let elicitation = Elicitation::parse(
+                request["mode"].as_str().unwrap_or("form"),
+                &request["requested_schema"],
+                request["url"].as_str(),
+            );
+            self.pending_elicitations
+                .insert(request_id.clone(), elicitation.clone());
+            step.events.push(AgentEvent::ElicitationRequest {
+                request_id,
+                server: truncate_label(request["mcp_server_name"].as_str().unwrap_or("mcp"), 256),
+                message: truncate_label(request["message"].as_str().unwrap_or_default(), 8192),
+                elicitation,
+            });
+            return;
+        }
         if request["subtype"] == "request_user_dialog" {
             self.on_user_dialog(&request_id, request, step);
             return;
@@ -2667,7 +2700,7 @@ impl ClaudeMapper {
             // request until its own deadline (or another attached client)
             // settles it, and an error reply here could break flows that work
             // via that fallback (mined subtypes: hook_callback, mcp_message,
-            // elicitation, oauth refreshes). But never park SILENTLY — the
+            // oauth refreshes). But never park SILENTLY — the
             // agent's later "I was blocked" prose must not be the only trace
             // the ask existed. One notice per subtype, not per frame.
             // `subtype` is agent-influenced; bound the once-per-subtype dedupe
@@ -3539,6 +3572,35 @@ impl ClaudeMapper {
                     state: UserMessageState::Dropped,
                 });
             }
+            AgentCommand::Elicitation {
+                request_id,
+                action,
+                content,
+            } => {
+                let Some(request) = self.pending_elicitations.get(&request_id) else {
+                    step.events.push(AgentEvent::ElicitationResolved {
+                        request_id,
+                        action: "expired".into(),
+                    });
+                    return step;
+                };
+                if let Err(error) = request.validate(action, &content) {
+                    step.events.push(AgentEvent::Notice {
+                        text: format!("MCP form not sent: {error}"),
+                    });
+                    return step;
+                }
+                let mut result = json!({"action":action});
+                if action == ElicitationAction::Accept && request.mode != "url" {
+                    result["content"] = content;
+                }
+                self.pending_elicitations.remove(&request_id);
+                step.outbound.push(json!({"type":"control_response","response":{"subtype":"success","request_id":request_id,"response":result}}));
+                step.events.push(AgentEvent::ElicitationResolved {
+                    request_id,
+                    action: action.as_str().into(),
+                });
+            }
             AgentCommand::Permission {
                 request_id,
                 option_id,
@@ -4044,6 +4106,12 @@ impl ClaudeMapper {
             events.push(AgentEvent::QuestionResolved {
                 request_id,
                 answers: Default::default(),
+            });
+        }
+        for request_id in std::mem::take(&mut self.pending_elicitations).into_keys() {
+            events.push(AgentEvent::ElicitationResolved {
+                request_id,
+                action: "expired".into(),
             });
         }
         let permissions = std::mem::take(&mut self.pending_permissions).into_keys();
@@ -5191,6 +5259,64 @@ pub(crate) mod tests {
             None,
             &json!({ "commands": [{ "name": "compact", "description": "Compact history" }] }),
         )
+    }
+
+    #[test]
+    fn mcp_form_validates_preserves_types_and_settles_once() {
+        let mut m = mapper();
+        let frame = json!({"type":"control_request","request_id":"form-1","request":{"subtype":"elicitation","mcp_server_name":"fixture","mode":"form","message":"Configure","requested_schema":{"type":"object","required":["n"],"properties":{"n":{"type":"integer","minimum":0}}}}});
+        let step = m.on_frame(&frame);
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::ElicitationRequest { .. }
+        ));
+        let invalid = m.on_command(AgentCommand::Elicitation {
+            request_id: "form-1".into(),
+            action: ElicitationAction::Accept,
+            content: json!({"n":"0"}),
+        });
+        assert!(invalid.outbound.is_empty());
+        assert!(!m.pending_elicitations.is_empty());
+        let valid = m.on_command(AgentCommand::Elicitation {
+            request_id: "form-1".into(),
+            action: ElicitationAction::Accept,
+            content: json!({"n":0}),
+        });
+        assert_eq!(
+            valid.outbound[0]["response"]["response"]["content"],
+            json!({"n":0})
+        );
+        assert!(m.pending_elicitations.is_empty());
+        assert!(!serde_json::to_string(&valid.events)
+            .unwrap()
+            .contains("content"));
+        let stale = m.on_command(AgentCommand::Elicitation {
+            request_id: "form-1".into(),
+            action: ElicitationAction::Accept,
+            content: json!({"n":1}),
+        });
+        assert!(stale.outbound.is_empty());
+        m.on_frame(&frame);
+        let cancelled = m.on_frame(&json!({"type":"control_cancel_request","request_id":"form-1"}));
+        assert!(
+            matches!(&cancelled.events[0], AgentEvent::ElicitationResolved { action, .. } if action == "cancel")
+        );
+        for action in [ElicitationAction::Cancel, ElicitationAction::Decline] {
+            m.on_frame(&frame);
+            let reply = m.on_command(AgentCommand::Elicitation {
+                request_id: "form-1".into(),
+                action,
+                content: Value::Null,
+            });
+            assert_eq!(
+                reply.outbound[0]["response"]["response"]["action"],
+                action.as_str()
+            );
+        }
+        m.on_frame(&frame);
+        assert!(m.drain_pending().iter().any(
+            |e| matches!(e, AgentEvent::ElicitationResolved { action, .. } if action == "expired")
+        ));
     }
 
     #[test]

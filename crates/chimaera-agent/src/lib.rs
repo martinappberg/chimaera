@@ -21,6 +21,7 @@ pub mod capabilities;
 pub mod claude;
 pub mod codex;
 pub mod driver;
+pub mod elicitation;
 pub mod journal;
 pub mod model;
 pub mod native_ui;
@@ -488,6 +489,7 @@ struct ChatSession {
     annotate_tx: mpsc::WeakSender<AgentEvent>,
     info: Mutex<ChatInfo>,
     background_work: Mutex<BackgroundWork>,
+    pending_asks: Mutex<HashSet<(u8, String)>>,
     carryover: Mutex<Carryover>,
     journal: Arc<Journal>,
     cmd_tx: mpsc::Sender<AgentCommand>,
@@ -650,6 +652,7 @@ impl ChatManager {
             annotate_tx: ev_tx.downgrade(),
             info: Mutex::new(info.clone()),
             background_work: Mutex::new(BackgroundWork::default()),
+            pending_asks: Mutex::new(HashSet::new()),
             carryover: Mutex::new(Carryover::default()),
             journal: Arc::clone(&journal),
             cmd_tx,
@@ -747,6 +750,43 @@ impl ChatManager {
             .lock()
             .expect("background work lock")
             .observe(&ev);
+        // MCP requests may be standalone and outlive a model turn. Keep
+        // attention until the final native ask settles, including across tabs.
+        let pending_permission = {
+            let mut asks = session.pending_asks.lock().expect("pending asks lock");
+            match &ev {
+                AgentEvent::PermissionRequest { request_id, .. } => {
+                    if asks.len() < 256 {
+                        asks.insert((0, request_id.clone()));
+                    }
+                }
+                AgentEvent::QuestionRequest { request_id, .. } => {
+                    if asks.len() < 256 {
+                        asks.insert((1, request_id.clone()));
+                    }
+                }
+                AgentEvent::ElicitationRequest { request_id, .. } => {
+                    if asks.len() < 256 {
+                        asks.insert((2, request_id.clone()));
+                    }
+                }
+                AgentEvent::PermissionResolved { request_id, .. } => {
+                    asks.remove(&(0, request_id.clone()));
+                }
+                AgentEvent::QuestionResolved { request_id, .. } => {
+                    asks.remove(&(1, request_id.clone()));
+                }
+                AgentEvent::ElicitationResolved { request_id, .. } => {
+                    asks.remove(&(2, request_id.clone()));
+                }
+                AgentEvent::TurnCompleted { .. } | AgentEvent::TurnAborted { .. } => {
+                    asks.retain(|(kind, _)| *kind == 2)
+                }
+                AgentEvent::Init { .. } | AgentEvent::Exited { .. } => asks.clear(),
+                _ => {}
+            }
+            !asks.is_empty()
+        };
         // Native id to record in the resume index, captured under the info
         // lock but recorded AFTER it drops: index.record does a blocking
         // atomic write on possibly-NFS `~/.chimaera`, and holding the info
@@ -759,6 +799,7 @@ impl ChatManager {
         {
             let mut info = session.info.lock().expect("info lock");
             fold_session_metadata(&mut info, &ev);
+            info.pending_permission = pending_permission;
             info.background_running = background_running;
             match &ev {
                 AgentEvent::Init {
@@ -848,21 +889,10 @@ impl ChatManager {
                         });
                     }
                 }
-                // "Pending permission" really means "waiting on a human
-                // decision" — structured questions block the turn exactly
-                // like permission prompts, so they set the same flag.
-                AgentEvent::PermissionRequest { .. } | AgentEvent::QuestionRequest { .. } => {
-                    info.pending_permission = true
-                }
-                AgentEvent::PermissionResolved { .. }
-                | AgentEvent::QuestionResolved { .. }
-                | AgentEvent::TurnCompleted { .. }
-                | AgentEvent::TurnAborted { .. } => info.pending_permission = false,
                 // A new turn also clears the "needs action" flag — the user
                 // acted — while the status LINE stays as context until the
                 // next summary supersedes it (latest-wins).
                 AgentEvent::TurnStarted { .. } => {
-                    info.pending_permission = false;
                     info.status_needs_action = false;
                 }
                 AgentEvent::SessionStatus {

@@ -2133,3 +2133,18 @@ describe("model recovery after quota errors", () => {
     expect(store.pendingModel).toBe("sonnet");
   });
 });
+
+describe("MCP input request lifecycle", () => {
+  const request = {type: "elicitation_request", request_id: "mcp-1", server: "fixture", message: "Configure", elicitation: {mode: "form", fields: [], url: null, unsupported: null}};
+  it("upserts replayed asks and records only the decision", () => {
+    const store = fold([request, request]);
+    expect(store.elicitations).toHaveLength(1);
+    store.apply({seq: 3, ts: 3, ev: {type: "elicitation_resolved", request_id: "mcp-1", action: "accept"}});
+    expect(store.elicitations).toHaveLength(0);
+    expect(JSON.stringify(store.blocks)).toContain("fixture request — submitted");
+  });
+  it("expires asks at process boundaries", () => {
+    expect(fold([request, {type: "exited", status: 0}]).elicitations).toHaveLength(0);
+    expect(fold([request, {type: "forked", source_agent: "claude", source_seq: 1, native: true}]).elicitations).toHaveLength(0);
+  });
+});

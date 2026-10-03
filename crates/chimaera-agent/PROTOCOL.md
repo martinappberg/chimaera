@@ -269,7 +269,7 @@ happened BELOW chimaera's event layer and no permission card can exist:
   strings for unmined kinds are unknown — cancel is the safe floor) but
   now with a visible Notice naming the kind.
 - **claude unknown control_request subtypes** (hook_callback,
-  mcp_message, elicitation, oauth refreshes…) are deliberately left
+  mcp_message, oauth refreshes…) are deliberately left
   unanswered — the CLI parks them until its own deadline or another
   client settles them, and an error reply could break flows that rely on
   that fallback — but a once-per-subtype Notice names what is waiting.
@@ -2904,6 +2904,7 @@ timeouts and typed success answers; another window's answer cannot resolve them.
 A Mod's render tree, JS module, and callback handle are never conversation data.
 Only stable `message_identity` and bounded complete `tool_render_data` facts are
 journaled to preserve render-site identities across normal history replay.
+
 ## 2026-10-03: October runtime refresh
 
 **Codex 0.160.0.** A temporary official npm installation (the user's global CLI
@@ -2926,7 +2927,7 @@ true/false. It does not alter the ordinary queue, expected-turn precondition,
 or native read acknowledgement. The new billed regression
 `driver_codex_instant_steering_reads_during_a_response` remains **pending**:
 the maintainer paused model-backed tests until usage resets, and automatic
-approval review also held that additional billed probe. Draft review can proceed.
+approval review also held that additional billed probe. PR review can proceed.
 The daemon-backed settings UI was verified separately without model calls:
 all three choices, persistence after reload, reset to native configuration,
 light/dark rendering, and an empty browser error log.
@@ -2947,3 +2948,33 @@ the desktop entry point or disable that policy. Durable services belong in a
 linked daemon-owned terminal (or a scheduler job), and agent-owned work follows
 the runtime's actual lifecycle. The precise limit and expiry frame remain
 unverified until a billed background-task probe can run.
+
+## MCP elicitation follow-up (2026-10-03 — Claude 2.1.288; Codex 0.159.3 schema)
+
+- Claude's native `control_request.request` for elicitation carries
+  `subtype:"elicitation", mcp_server_name, message, mode:"form"|"url"`, plus
+  `requested_schema` for forms or `url, elicitation_id` for browser requests.
+  Reply inside `control_response.response.response` with
+  `{action:"accept",content:{…}}`, `{action:"decline"}`, or `{action:"cancel"}`.
+- **No-model live probe:** `python3 scripts/probe-claude-elicitation.py`; a disposable stdio MCP server called through the
+  real CLI's `mcp_call {tool:"mcp__elicit__request_input",arguments:{mode}}`
+  control produced the native asks and received exact replies: form accept
+  preserved integer zero, boolean false, text and a string array; a second form
+  received decline; a URL request received cancel. MCP array enum `items` must
+  include `type:"string"`; Claude rejects the malformed fixture before asking.
+- Generated Codex 0.159.3 app-server TypeScript confirms
+  `mcpServer/elicitation/request` modes `form`, `openai/form`, `openaiForm`, `url`.
+  Replies are `{action,content:null|JSON,_meta:null|JSON}`. Only
+  `_meta.codex_approval_kind:"mcp_tool_call"` uses the existing permission path;
+  forms/URLs cannot inherit that path's standing consent.
+- The shared normalized schema accepts standard scalar/enum/multiple-choice
+  forms plus nested objects. Unknown constraints refuse acceptance visibly.
+  Driver pending maps retain the normalized constraints, validate replies, and
+  withdraw asks on native cancellation or driver teardown. Resolution events
+  contain the action, not private form values.
+- Live isolated daemon UI: submitted a typed form including a nested object,
+  reloaded a pending browser request, then cancelled it; replay preserved the
+  card and decision, and browser diagnostics reported no errors/warnings.
+- Required billed `just chat-smoke` remains pending for this change: the account
+  hit its Claude weekly quota during the parallel runtime-update check. Do not
+  bump Claude's tested-version pin or merge this change until the gate passes.
