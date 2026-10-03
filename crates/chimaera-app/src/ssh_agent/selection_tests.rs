@@ -280,3 +280,75 @@ async fn effective_ed25519_policy_does_not_offer_loaded_or_known_rsa_keys() {
     assert_eq!(selection.request.host_keys.len(), 1);
     assert_eq!(selection.request.host_keys[0].key, encoded(1));
 }
+
+#[tokio::test]
+async fn real_null_is_only_an_empty_trust_source_and_never_an_identity_or_append_target() {
+    let fixture = Fixture::new();
+    let known = fixture.0.join("known_hosts");
+    let raw = line("[hpc.example.invalid]:2222", 1);
+    std::fs::write(&known, &raw).unwrap();
+    let text = format!("{}hostkeyalgorithms ssh-ed25519\npubkeyacceptedalgorithms ssh-ed25519\ncasignaturealgorithms ssh-ed25519\nkexalgorithms curve25519-sha256\nciphers chacha20-poly1305@openssh.com\nmacs hmac-sha2-256-etm@openssh.com\nuserknownhostsfile {}\nglobalknownhostsfile /dev/null\n", config(), known.display());
+    let parsed = Config::parse(&text).unwrap();
+    let algorithms = parsed.algorithms().unwrap();
+    let (_, hosts) = trusted_host(&parsed, &fixture.0, &algorithms)
+        .await
+        .unwrap();
+    assert_eq!(hosts.len(), 1);
+    assert_eq!(hosts[0].key, encoded(1));
+    assert_eq!(
+        trust_source(Path::new("/dev/null")).await.unwrap(),
+        Some(vec![])
+    );
+    assert!(public_file(Path::new("/dev/null"), 32 * 1024)
+        .await
+        .is_err());
+    assert!(trust_source(Path::new("/dev/zero")).await.is_err());
+    assert!(!real_null(&std::fs::metadata("/dev/zero").unwrap()));
+    assert!(!real_null(&std::fs::metadata(&known).unwrap()));
+    let alias = fixture.0.join("null");
+    std::os::unix::fs::symlink("/dev/null", &alias).unwrap();
+    assert!(trust_source(&alias).await.is_err());
+    let fifo = fixture.0.join("fifo");
+    let mut command = Command::new("/usr/bin/mkfifo");
+    command.arg(&fifo);
+    bounded_output(command, 0, None).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), trust_source(&fifo))
+            .await
+            .unwrap()
+            .is_err()
+    );
+    std::fs::write(&known, format!("{raw}@revoked {raw}")).unwrap();
+    assert!(matches!(
+        trusted_host(&parsed, &fixture.0, &algorithms).await,
+        Err(SelectionFailure::RevokedHost)
+    ));
+
+    let null_text = text.replace(&known.display().to_string(), "/dev/null");
+    let null_config = Config::parse(&null_text).unwrap();
+    let null_algorithms = null_config.algorithms().unwrap();
+    assert!(matches!(
+        trusted_host(&null_config, &fixture.0, &null_algorithms).await,
+        Err(SelectionFailure::HostTrustRequired)
+    ));
+    let identity = NativeIdentity {
+        agent: None,
+        user_keys: vec![],
+        mode: chimaera_link::SshRouteMode::Interactive,
+        algorithms: null_algorithms,
+    };
+    assert!(probe_details(&null_text, &fixture.0, &identity)
+        .unwrap()
+        .target
+        .is_none());
+    let writable = null_text.replace(
+        "userknownhostsfile /dev/null",
+        &format!("userknownhostsfile /dev/null {}", known.display()),
+    );
+    assert_eq!(
+        probe_details(&writable, &fixture.0, &identity)
+            .unwrap()
+            .target,
+        Some(known)
+    );
+}

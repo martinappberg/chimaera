@@ -187,7 +187,7 @@ pub(super) fn probe_details(
     }
     let target = paths
         .iter()
-        .find(|path| **path != "none")
+        .find(|path| !matches!(**path, "none" | "/dev/null"))
         .map(|target| local_path(target, home))
         .transpose()?;
     Ok(ProbeDetails {
@@ -313,9 +313,12 @@ async fn trusted_host(
                 continue;
             }
             let path = local_path(path, home)?;
-            let Some(snapshot) = public_file(&path, 1024 * 1024).await? else {
+            let Some(snapshot) = trust_source(&path).await? else {
                 continue;
             };
+            if snapshot.is_empty() {
+                continue;
+            }
             let mut command = Command::new("/usr/bin/ssh-keygen");
             command.args(["-F", &lookup, "-f", "/dev/stdin"]);
             let matching = bounded_output(command, 1, Some(snapshot)).await?;
@@ -671,6 +674,79 @@ fn local_path(value: &str, home: &Path) -> Result<PathBuf> {
         return Err(SelectionFailure::UnsupportedConfiguration);
     }
     Ok(path)
+}
+
+/// OpenSSH commonly uses the real null device to disable a trust source.
+/// This exception is read-only and never applies to IdentityFile or append targets.
+async fn trust_source(path: &Path) -> Result<Option<Vec<u8>>> {
+    if path.as_os_str() != std::ffi::OsStr::new("/dev/null") {
+        return public_file(path, 1024 * 1024).await;
+    }
+    use std::os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::fs::{MetadataExt, OpenOptionsExt},
+    };
+    let dev = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open("/dev")
+        .map_err(|_| SelectionFailure::UnsupportedConfiguration)?;
+    let fd = unsafe {
+        nix::libc::openat(
+            dev.as_raw_fd(),
+            c"null".as_ptr(),
+            nix::libc::O_RDONLY
+                | nix::libc::O_NONBLOCK
+                | nix::libc::O_NOFOLLOW
+                | nix::libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(SelectionFailure::UnsupportedConfiguration);
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let stat = file.metadata().map_err(|_| SelectionFailure::Unavailable)?;
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    return Err(SelectionFailure::UnsupportedConfiguration);
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        if !real_null(&stat) {
+            return Err(SelectionFailure::UnsupportedConfiguration);
+        }
+        // Compare the pinned inode with the directory entry without following
+        // a replacement symlink. A mismatch refuses, though no device is read.
+        let mut entry = std::mem::MaybeUninit::<nix::libc::stat>::uninit();
+        if unsafe {
+            nix::libc::fstatat(
+                dev.as_raw_fd(),
+                c"null".as_ptr(),
+                entry.as_mut_ptr(),
+                nix::libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(SelectionFailure::UnsupportedConfiguration);
+        }
+        let entry = unsafe { entry.assume_init() };
+        #[cfg(target_os = "macos")]
+        let entry_dev = entry.st_dev as u64;
+        #[cfg(target_os = "linux")]
+        let entry_dev = entry.st_dev;
+        if stat.dev() != entry_dev || stat.ino() != entry.st_ino {
+            return Err(SelectionFailure::UnsupportedConfiguration);
+        }
+        Ok(Some(Vec::new()))
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn real_null(stat: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    #[cfg(target_os = "macos")]
+    let rdev = nix::libc::makedev(3, 2) as u64;
+    #[cfg(target_os = "linux")]
+    let rdev = nix::libc::makedev(1, 3);
+    stat.file_type().is_char_device() && stat.uid() == 0 && stat.rdev() == rdev
 }
 
 async fn public_file(path: &Path, limit: u64) -> Result<Option<Vec<u8>>> {
