@@ -84,13 +84,12 @@ async fn capability_absence_mismatch_and_false_flags_prevent_submission() {
         }),
     ] {
         f.keeper.set_cluster_capabilities(caps).await;
-        assert!(
-            c.cluster_operation(&h.id, &op)
-                .await
-                .err()
-                .unwrap()
-                .is::<ServiceUnsupported>()
-        );
+        assert!(c
+            .cluster_operation(&h.id, &op)
+            .await
+            .err()
+            .unwrap()
+            .is::<ServiceUnsupported>());
         assert!(c.cluster_tcp(&h.id, jid(&op), None).await.is_err());
         assert_eq!(f.keeper.cluster_submissions(&h.id).await, 0);
     }
@@ -175,10 +174,10 @@ async fn mismatched_completed_reply_and_unknown_discriminants_fail_closed() {
         serde_json::from_str::<ClusterOperation>("{\"operation\":\"exec\",\"argv\":[\"sh\"]}")
             .is_err()
     );
-    assert!(
-        serde_json::from_str::<ClusterOperation>("{\"operation\":\"read_config\",\"argv\":[]}")
-            .is_err()
-    );
+    assert!(serde_json::from_str::<ClusterOperation>(
+        "{\"operation\":\"read_config\",\"argv\":[]}"
+    )
+    .is_err());
 }
 #[tokio::test]
 async fn bodies_are_bounded_and_unknown_state_cannot_authorize_a_route() {
@@ -216,13 +215,11 @@ async fn bodies_are_bounded_and_unknown_state_cannot_authorize_a_route() {
             sessions: 0,
         },
     });
-    assert!(
-        ClusterReply::Overview {
-            overview: Box::new(snapshot)
-        }
-        .validate()
-        .is_err()
-    );
+    assert!(ClusterReply::Overview {
+        overview: Box::new(snapshot)
+    }
+    .validate()
+    .is_err());
     assert!(c.tcp(&h.id).await.is_err());
     let old:Host=serde_json::from_value(serde_json::json!({"id":"h-old","alias":"ordinary","kind":"ssh","status":"offline","daemon":null,"error":null})).unwrap();
     assert!(old.cluster.is_none());
@@ -458,12 +455,11 @@ async fn fixture_workspace_route_requires_exact_job_association_and_moving_close
         c.cluster_operation(&h.id, op).await.unwrap();
     }
     let address = "127.0.0.1:9".parse().unwrap();
-    assert!(
-        f.keeper
-            .set_cluster_target(&h.id, jid(&a), Some(&ids[1]), address)
-            .await
-            .is_err()
-    );
+    assert!(f
+        .keeper
+        .set_cluster_target(&h.id, jid(&a), Some(&ids[1]), address)
+        .await
+        .is_err());
     f.keeper
         .set_cluster_target(&h.id, jid(&a), Some(&ids[0]), address)
         .await
@@ -532,14 +528,13 @@ async fn positive_batch_refusal_replays_exact_non_submission_without_a_holder() 
         matches!(c.cluster_operation(&h.id,&op).await.unwrap(),ClusterReply::Refused {job_id,refusal:BatchRefusalKind::BatchNotAllowed,..} if job_id==jid(&op))
     );
     assert_eq!(f.keeper.cluster_submissions(&h.id).await, 0);
-    assert!(
-        f.keeper
-            .cluster_snapshot(&h.id)
-            .await
-            .unwrap()
-            .records
-            .is_empty()
-    );
+    assert!(f
+        .keeper
+        .cluster_snapshot(&h.id)
+        .await
+        .unwrap()
+        .records
+        .is_empty());
     f.keeper
         .set_cluster_batch_refusal(&h.id, None)
         .await
@@ -615,19 +610,15 @@ fn positive_refusal_is_exact_batch_only_and_unknown_classification_is_not_proof(
     .unwrap();
     assert!(!operation.accepts(&unknown));
     assert!(unknown.validate().is_err());
-    assert!(
-        serde_json::from_value::<ClusterReply>(
-            serde_json::json!({"result":"refused","job_id":jid(&operation)})
-        )
-        .is_err()
-    );
-    assert!(
-        ClusterOperationState::Completed {
-            reply: Box::new(unknown)
-        }
-        .validate_for(&operation)
-        .is_err()
-    );
+    assert!(serde_json::from_value::<ClusterReply>(
+        serde_json::json!({"result":"refused","job_id":jid(&operation)})
+    )
+    .is_err());
+    assert!(ClusterOperationState::Completed {
+        reply: Box::new(unknown)
+    }
+    .validate_for(&operation)
+    .is_err());
 }
 
 #[test]
@@ -657,12 +648,10 @@ async fn scheduler_identity_in_refusal_is_refused_over_http_and_history() {
     f.keeper.set_cluster_reply(&host.id, Some(serde_json::json!({
         "result":"refused", "job_id":jid(&operation), "refusal":"other", "slurm_job_id":"12345"
     }))).await;
-    assert!(
-        client
-            .cluster_operation(&host.id, &operation)
-            .await
-            .is_err()
-    );
+    assert!(client
+        .cluster_operation(&host.id, &operation)
+        .await
+        .is_err());
     assert_eq!(f.keeper.cluster_submissions(&host.id).await, 1);
     f.keeper
         .set_cluster_operation_state(
@@ -677,11 +666,9 @@ async fn scheduler_identity_in_refusal_is_refused_over_http_and_history() {
             },
         )
         .await;
-    assert!(
-        client
-            .cluster_operation_state(&host.id, &operation)
-            .await
-            .is_err()
-    );
+    assert!(client
+        .cluster_operation_state(&host.id, &operation)
+        .await
+        .is_err());
     assert!(client.delete_host(&host.id).await.is_err());
 }

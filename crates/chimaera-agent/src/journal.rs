@@ -1350,11 +1350,9 @@ mod tests {
         assert_eq!(reloaded.settings("native-1").effort, None);
         fs::remove_file(dir.path().join("index.json")).unwrap();
         fs::create_dir(dir.path().join("index.json")).unwrap();
-        assert!(
-            index
-                .record_settings_checked("native-1", "s-index", |_| {})
-                .is_err()
-        );
+        assert!(index
+            .record_settings_checked("native-1", "s-index", |_| {})
+            .is_err());
         assert!(dir.path().join("index.json").is_dir());
     }
 

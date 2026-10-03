@@ -1,6 +1,6 @@
 //! Capability-gated cluster operations. Protected routes are native memory only.
 use crate::{Daemon, Host};
-use anyhow::{Result, bail, ensure};
+use anyhow::{bail, ensure, Result};
 use chimaera_core::{
     cluster::{self, ClusterConfig, ClusterFacts, ClusterWorkspace, DirListing, JobRecord},
     slurm::LaunchSpec,

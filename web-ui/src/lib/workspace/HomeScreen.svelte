@@ -1252,7 +1252,7 @@
       {#await import("./RemoteSettingsDialog.svelte")}
         <div class="remote-settings-notice" role="status">
           <span>Loading connection settings…</span>
-          <button class="side" onclick={() => (remoteSettings = null)}>Cancel</button>
+          <button class="side shown" onclick={() => (remoteSettings = null)}>Cancel</button>
         </div>
       {:then { default: RemoteSettingsDialog }}
         <RemoteSettingsDialog {host} firstSetup={remoteSettings.firstSetup} phase={phases.get(host.alias) ?? null}
@@ -1260,7 +1260,7 @@
       {:catch}
         <div class="remote-settings-notice" role="alert">
           <span>Connection settings couldn’t load. Reload this window and try again.</span>
-          <button class="side" onclick={() => (remoteSettings = null)}>Dismiss</button>
+          <button class="side shown" onclick={() => (remoteSettings = null)}>Dismiss</button>
         </div>
       {/await}
     {/key}

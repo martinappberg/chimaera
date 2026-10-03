@@ -26,13 +26,11 @@ async fn codex_notify_authenticates_and_only_records_verified_terminal_identity(
             .0,
         StatusCode::FORBIDDEN
     );
-    assert!(
-        lock(&state.agents)
-            .get(&id)
-            .unwrap()
-            .turn_complete_at
-            .is_none()
-    );
+    assert!(lock(&state.agents)
+        .get(&id)
+        .unwrap()
+        .turn_complete_at
+        .is_none());
     assert_eq!(
         request(
             &state,
@@ -536,18 +534,14 @@ async fn agents_endpoint_lists_catalog_with_installed_and_missing() {
     assert_eq!(claude["latest_version"], "2.1.207");
     assert_eq!(claude["latest_checked_at"], 1_000);
     assert_eq!(claude["update_available"], true);
-    assert!(
-        claude["install"]["command"]
-            .as_str()
-            .unwrap()
-            .starts_with("curl ")
-    );
-    assert!(
-        claude["install"]["url"]
-            .as_str()
-            .unwrap()
-            .starts_with("https://")
-    );
+    assert!(claude["install"]["command"]
+        .as_str()
+        .unwrap()
+        .starts_with("curl "));
+    assert!(claude["install"]["url"]
+        .as_str()
+        .unwrap()
+        .starts_with("https://"));
 
     // Installed but legacy (npm-era codex, no `codex login`): flagged so
     // the UI offers the install command as an update. No upstream check has
@@ -574,18 +568,14 @@ async fn agents_endpoint_lists_catalog_with_installed_and_missing() {
     let obj = agy.as_object().unwrap();
     assert!(!obj.contains_key("path"), "{agy}");
     assert!(!obj.contains_key("version"), "{agy}");
-    assert!(
-        agy["install"]["command"]
-            .as_str()
-            .unwrap()
-            .contains("antigravity.google")
-    );
-    assert!(
-        agy["install"]["url"]
-            .as_str()
-            .unwrap()
-            .starts_with("https://")
-    );
+    assert!(agy["install"]["command"]
+        .as_str()
+        .unwrap()
+        .contains("antigravity.google"));
+    assert!(agy["install"]["url"]
+        .as_str()
+        .unwrap()
+        .starts_with("https://"));
 }
 
 #[tokio::test]

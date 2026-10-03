@@ -14,10 +14,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -26,8 +26,8 @@ use chimaera_agent::journal::SeqEvent;
 use chimaera_agent::model::AgentEvent;
 use chimaera_agent::{ChatInfo, ChatManager};
 
-use crate::AppState;
 use crate::agent_state::{AgentKind, AgentState};
+use crate::AppState;
 
 /// What the ChatManager hooks emit; consumed by the signal task.
 pub(crate) enum ChatSignal {
@@ -4068,10 +4068,9 @@ mod tests {
         ] {
             assert!(ask.iter().any(|t| t == tool), "{tool} in {ask:?}");
         }
-        assert!(
-            !ask.iter()
-                .any(|t| t == "spawn_agent" || t == "run_in_terminal")
-        );
+        assert!(!ask
+            .iter()
+            .any(|t| t == "spawn_agent" || t == "run_in_terminal"));
         assert_eq!(
             codex_mcp_auto_approve(Some(MastermindMode::Auto), Vec::new()).tools,
             None
@@ -4156,11 +4155,10 @@ mod tests {
                 .unwrap();
         assert_eq!(portable.events.len(), 5, "four copied events + fork marker");
         assert!(portable.native.is_none());
-        assert!(
-            portable.portable_context.as_deref().is_some_and(
-                |context| context.contains(r#"{"role":"assistant","content":"answer"}"#)
-            )
-        );
+        assert!(portable
+            .portable_context
+            .as_deref()
+            .is_some_and(|context| context.contains(r#"{"role":"assistant","content":"answer"}"#)));
         assert!(
             portable.events.iter().all(|event| !matches!(
                 event,
@@ -4176,13 +4174,9 @@ mod tests {
             .enumerate()
             .map(|(index, event)| seq_event(index as u64 + 1, event))
             .collect();
-        assert!(
-            recover_portable_context(&durable, AgentKind::Codex)
-                .as_deref()
-                .is_some_and(
-                    |context| context.contains(r#"{"role":"assistant","content":"answer"}"#)
-                )
-        );
+        assert!(recover_portable_context(&durable, AgentKind::Codex)
+            .as_deref()
+            .is_some_and(|context| context.contains(r#"{"role":"assistant","content":"answer"}"#)));
         for target in [AgentKind::Antigravity, AgentKind::Grok] {
             let mut resumed = durable.clone();
             assert!(recover_portable_context(&resumed, target).is_some());
@@ -4325,13 +4319,11 @@ mod tests {
             event,
             AgentEvent::Checkpoint { user_message_id, .. } if user_message_id == "u2"
         )));
-        assert!(
-            !branch
-                .portable_context
-                .as_deref()
-                .unwrap_or_default()
-                .contains("edit me")
-        );
+        assert!(!branch
+            .portable_context
+            .as_deref()
+            .unwrap_or_default()
+            .contains("edit me"));
     }
 
     #[test]
@@ -5393,7 +5385,7 @@ mod tests {
     /// arrival is a recovery after the other machine stopped responding.
     #[test]
     fn transfer_pickups_carry_a_stable_origin_tag() {
-        use chimaera_agent::model::{ORIGIN_RECOVERED, is_pickup_origin};
+        use chimaera_agent::model::{is_pickup_origin, ORIGIN_RECOVERED};
         assert_eq!(transfer_origin("moved", false), "moved");
         assert_eq!(transfer_origin("home", false), "home");
         assert_eq!(transfer_origin("moved", true), "recovered");
