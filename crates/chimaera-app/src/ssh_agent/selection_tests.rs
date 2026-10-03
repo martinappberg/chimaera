@@ -260,6 +260,13 @@ async fn effective_ed25519_policy_does_not_offer_loaded_or_known_rsa_keys() {
         assert_eq!(stream.read_u8().await.unwrap(), 11);
         stream.write_u32(reply.len() as u32).await.unwrap();
         stream.write_all(&reply).await.unwrap();
+        // Keep the synthetic responder alive for the post-reply kernel peer check.
+        let mut extra = [0; 1];
+        let eof = tokio::time::timeout(std::time::Duration::from_secs(3), stream.read(&mut extra))
+            .await
+            .expect("synthetic agent client did not close")
+            .expect("synthetic agent EOF read failed");
+        assert_eq!(eof, 0, "unexpected extra synthetic agent request");
     });
     let hosts = fixture.0.join("known_hosts");
     std::fs::write(
@@ -272,10 +279,9 @@ async fn effective_ed25519_policy_does_not_offer_loaded_or_known_rsa_keys() {
     )
     .unwrap();
     let config=format!("hostname hpc.example.invalid\nuser alice\nport 22\npubkeyauthentication true\nidentitiesonly no\nhostkeyalgorithms ssh-ed25519\npubkeyacceptedalgorithms ssh-ed25519\ncasignaturealgorithms ssh-ed25519\nidentityagent {}\nuserknownhostsfile {}\nglobalknownhostsfile none\n",socket.display(),hosts.display());
-    let selection = from_native_config(&config, &fixture.0, None, "boot".into())
-        .await
-        .unwrap();
+    let selection = from_native_config(&config, &fixture.0, None, "boot".into()).await;
     server.await.unwrap();
+    let selection = selection.unwrap();
     assert_eq!(selection.request.user_keys, vec![encoded(1)]);
     assert_eq!(selection.request.host_keys.len(), 1);
     assert_eq!(selection.request.host_keys[0].key, encoded(1));

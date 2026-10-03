@@ -75,13 +75,20 @@ impl Fixture {
             response.extend_from_slice(&0u32.to_be_bytes());
             socket.write_u32(response.len() as u32).await.unwrap();
             socket.write_all(&response).await.unwrap();
+            // Keep the synthetic responder alive for the post-reply kernel peer check.
+            let mut extra = [0; 1];
+            let eof =
+                tokio::time::timeout(std::time::Duration::from_secs(3), socket.read(&mut extra))
+                    .await
+                    .expect("synthetic agent client did not close")
+                    .expect("synthetic agent EOF read failed");
+            assert_eq!(eof, 0, "unexpected extra synthetic agent request");
         });
         let config=format!("hostname hpc.example.invalid\nuser alice\nport 22\npubkeyauthentication true\nidentitiesonly no\nhostkeyalgorithms ssh-ed25519\npubkeyacceptedalgorithms ssh-ed25519\ncasignaturealgorithms ssh-ed25519\nidentityagent {}\nuserknownhostsfile {}\nglobalknownhostsfile none\n",socket.display(),known.display());
         let boot = client.ssh_auth_capabilities().await.unwrap().keeper_boot;
-        let selection = selection::from_native_config(&config, &self.directory, None, boot)
-            .await
-            .unwrap();
+        let selection = selection::from_native_config(&config, &self.directory, None, boot).await;
         agent.await.unwrap();
+        let selection = selection.unwrap();
         (host, selection)
     }
 }

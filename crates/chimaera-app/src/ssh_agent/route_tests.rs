@@ -499,6 +499,14 @@ async fn each_leg_selects_its_own_native_agent_and_public_host_trust() {
             string(&mut reply, b"synthetic");
             socket.write_u32(reply.len() as u32).await.unwrap();
             socket.write_all(&reply).await.unwrap();
+            // Keep the synthetic responder alive for the post-reply kernel peer check.
+            let mut extra = [0; 1];
+            let eof =
+                tokio::time::timeout(std::time::Duration::from_secs(3), socket.read(&mut extra))
+                    .await
+                    .expect("synthetic agent client did not close")
+                    .expect("synthetic agent EOF read failed");
+            assert_eq!(eof, 0, "unexpected extra synthetic agent request");
         }));
         let text = format!("hostname {hostname}\nuser {user}\nport {port}\npubkeyauthentication true\nidentitiesonly no\nhostkeyalgorithms ssh-ed25519\npubkeyacceptedalgorithms ssh-ed25519\ncasignaturealgorithms ssh-ed25519\nkexalgorithms curve25519-sha256\nciphers chacha20-poly1305@openssh.com\nmacs hmac-sha2-256-etm@openssh.com\nidentityagent {}\nuserknownhostsfile {}\nglobalknownhostsfile none\nproxyjump {}\n", socket.display(), known.display(), if n == 3 {"jump"} else {"none"});
         effective.push(Effective {
@@ -510,12 +518,11 @@ async fn each_leg_selects_its_own_native_agent_and_public_host_trust() {
             },
         });
     }
-    let selection = select(effective, &fixture.0, None, "boot".into())
-        .await
-        .unwrap();
+    let selection = select(effective, &fixture.0, None, "boot".into()).await;
     for agent in agents {
         agent.await.unwrap();
     }
+    let selection = selection.unwrap();
     assert_eq!(selection.request.legs.len(), 2);
     for (leg, seed) in selection.request.legs.iter().zip([1, 3]) {
         assert_eq!(leg.host_keys[0].key, STANDARD.encode(public(seed)));
