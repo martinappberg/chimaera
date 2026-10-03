@@ -274,9 +274,9 @@ is_vite() { # pid realpath
 }
 
 # Recognize only the documented launcher chain, walking outward from an
-# already verified Vite process. Each wrapper must have exactly that one
+# already verified preview process. Each wrapper must have exactly that one
 # child: a compound shell command or another running task stays protected.
-vite_wrapper_kind() { # parent child child-kind realpath
+preview_wrapper_kind() { # parent child child-kind realpath
   local pid=$1 child=$2 kind=$3 wt=$4 args cwd command
   awk -v p="$pid" -v c="$child" '$2 == p { n++; if ($1 == c) found = 1 } END { exit !(n == 1 && found) }' "$TMPD/parents" || return 1
   # lsof can repeat cwd records for a multithreaded process on Linux.
@@ -309,6 +309,14 @@ vite_wrapper_kind() { # parent child child-kind realpath
       [ "$cwd" = "$wt" ] && [ "${args#* }" = dev-ui ] || return 1
       awk -F'\t' -v p="$pid" '$1 == p && $3 == "txt" && $4 ~ /\/just$/ { found = 1 } END { exit !found }' "$TMPD/procs" || return 1
       echo just; return 0 ;;
+    app | app-shell)
+      [ "$cwd" = "$wt" ] || return 1
+      if [ "$kind" = app ]; then
+        case "$args" in "sh -cu bash .claude/skills/develop/run-app-isolated.sh" | "/bin/sh -cu bash .claude/skills/develop/run-app-isolated.sh") echo app-shell; return 0 ;; esac
+      fi
+      [ "${args#* }" = app-dev-isolated ] || return 1
+      awk -F'\t' -v p="$pid" '$1 == p && $3 == "txt" && $4 ~ /\/just$/ { found = 1 } END { exit !found }' "$TMPD/procs" || return 1
+      echo just; return 0 ;;
   esac
   return 1
 }
@@ -316,7 +324,7 @@ vite_wrapper_kind() { # parent child child-kind realpath
 # Emit only the preview roots to signal. Children (test agents, relays, etc.)
 # are shut down by their owning daemon, never killed by name. Any unrelated
 # holder keeps the entire checkout ACTIVE. The process-parent snapshot also
-# lets a known npm Vite wrapper retire with its verified child.
+# lets documented npm/just wrappers retire with their verified children.
 preview_roots() { # realpath
   local wt=$1 pid parent kind next identity depth
   : >"$TMPD/preview-roots"
@@ -329,15 +337,23 @@ preview_roots() { # realpath
     is_preview "$pid" "$wt" && echo "$pid" >>"$TMPD/preview-roots"
   done <"$TMPD/holders"
   [ -s "$TMPD/preview-roots" ] || return 1
-  # npm can insert sh between itself and Vite; just can wrap npm in another
-  # shell. Walk only those known transitions, never arbitrary ancestors.
+  # npm can insert sh between itself and Vite; just can wrap npm or the
+  # isolated app in another shell. Never walk arbitrary ancestors.
   while IFS= read -r pid; do
-    is_vite "$pid" "$wt" || continue
-    kind=vite depth=0
+    if is_vite "$pid" "$wt"; then
+      kind=vite
+    elif awk -F'\t' -v p="$pid" -v w="$wt/crates/chimaera-app/target/debug/" '
+      $1 == p && $3 == "txt" && ($4 == w "chimaera-dev" || $4 == w "chimaera-dev.app/Contents/MacOS/chimaera-dev") { found = 1 }
+      END { exit !found }' "$TMPD/procs"; then
+      kind=app
+    else
+      continue
+    fi
+    depth=0
     while [ "$depth" -lt 4 ]; do
       parent=$(awk -v p="$pid" '$1 == p { print $2 }' "$TMPD/parents")
       [ -n "$parent" ] || break
-      next=$(vite_wrapper_kind "$parent" "$pid" "$kind" "$wt") || break
+      next=$(preview_wrapper_kind "$parent" "$pid" "$kind" "$wt") || break
       echo "$parent" >>"$TMPD/preview-wrappers"
       pid=$parent kind=$next depth=$((depth + 1))
     done
@@ -356,10 +372,20 @@ preview_roots() { # realpath
     { p = $2; n = 0; while (p > 1 && !(p in R) && n++ < 100) p = P[p]
       if (($1 == w && !(p in R)) || ($1 != w && p in R)) bad = 1 }
     END { exit bad }' "$TMPD/hits" || return 1
+  # Stop leaves first while their wrappers are still alive to reap them.
+  # PID order is not ancestry order (PIDs wrap and can be reused).
+  awk -v parents="$TMPD/parents" '
+    BEGIN { while ((getline line < parents) > 0) { sub(/^[[:space:]]+/, "", line); split(line, a, /[[:space:]]+/); P[a[1]] = a[2] } }
+    { R[$1] = 1 }
+    END { for (p in R) {
+      q = P[p]; depth = 0; n = 0
+      while (q > 1 && n++ < 100) { if (q in R) depth++; q = P[q] }
+      print depth "\t" p
+    } }' "$TMPD/preview-pids" | sort -k1,1nr -k2,2n | cut -f2 >"$TMPD/preview-order"
   while IFS= read -r pid; do
     identity=$(process_identity "$pid") || return 1
     printf '%s\t%s\n' "$pid" "$identity"
-  done <"$TMPD/preview-pids"
+  done <"$TMPD/preview-order"
 }
 
 # The worktrees nested inside $1 (by registered path), one per line.
@@ -701,7 +727,7 @@ safe_rm_build_dir() { # worktree dir
 }
 
 stop_previews() { # n path realpath
-  local n=$1 path=$2 rpath=$3 status pid identity current i waiting
+  local n=$1 path=$2 rpath=$3 status pid identity current started deadline
   list_worktrees >"$TMPD/current-wts"
   cut -f2 "$TMPD/current-wts" >"$TMPD/roots"
   scan_processes
@@ -717,9 +743,12 @@ stop_previews() { # n path realpath
     END { exit !(found && !nested) }' "$TMPD/current-wts" || return 1
   preview_roots "$rpath" >"$TMPD/previews.now" || return 1
   cmp -s "$TMPD/p.$n" "$TMPD/previews.now" || return 1
+  deadline=$(($(date +%s) + 10))
   while IFS="$(printf '\t')" read -r pid identity; do
-    # An earlier root (npm or the app shell) may already have stopped this
-    # child. A vanished PID is fine; a reused one must never receive SIGTERM.
+    # A wrapper may exit naturally when its child stops. A vanished PID is
+    # fine; a reused one must never receive SIGTERM.
+    started=$(ps -p "$pid" -o lstart= 2>/dev/null) || continue
+    [ -n "$started" ] || return 1
     current=$(process_identity "$pid") || continue
     [ "$current" = "$identity" ] || return 1
     if ! kill -TERM "$pid" 2>/dev/null; then
@@ -727,21 +756,19 @@ stop_previews() { # n path realpath
       continue
     fi
     say "stopping preview pid $pid in $(short_path "$path") (SIGTERM)"
+    # Wait for reaping, not just changed argv: Linux changes a zombie's
+    # command to <defunct> before its parent has reaped it. Killing that
+    # parent early leaks zombies under container init processes that do not
+    # reap orphans. Keep one shared deadline across the whole chain.
+    while [ "$(ps -p "$pid" -o lstart= 2>/dev/null)" = "$started" ]; do
+      if [ "$(date +%s)" -ge "$deadline" ]; then
+        say "preview shutdown timed out in $(short_path "$path"); leaving worktree intact"
+        return 1
+      fi
+      sleep 1
+    done
   done <"$TMPD/p.$n"
-  # Bound the wait across all roots. A stubborn preview leaves the checkout
-  # intact; never turn disk GC into a forced kill of live work.
-  i=0
-  while [ "$i" -lt 10 ]; do
-    waiting=0
-    while IFS="$(printf '\t')" read -r pid identity; do
-      [ "$(process_identity "$pid")" = "$identity" ] && waiting=1
-    done <"$TMPD/p.$n"
-    [ "$waiting" = 0 ] && return 0
-    sleep 1
-    i=$((i + 1))
-  done
-  say "preview shutdown timed out in $(short_path "$path"); leaving worktree intact"
-  return 1
+  return 0
 }
 
 apply_rows() {

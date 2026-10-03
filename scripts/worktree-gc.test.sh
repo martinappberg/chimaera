@@ -279,9 +279,16 @@ int main(void) {
   }
   if (getenv("VITE_READY") && !getenv("PREVIEW_CHILD")) {
     FILE *f = fopen(getenv("VITE_READY"), "w");
-    if (f) fclose(f);
+    if (f) { fprintf(f, "%d", getpid()); fclose(f); }
   }
-  while (!stopping) sleep(1);
+  while (!stopping) {
+    sleep(1);
+    if (getenv("REAP_ORDER_ERROR") && child > 0 && waitpid(child, NULL, WNOHANG) == child) child = -1;
+  }
+  if (getenv("REAP_ORDER_ERROR") && child > 0 && waitpid(child, NULL, WNOHANG) == 0) {
+    FILE *f = fopen(getenv("REAP_ORDER_ERROR"), "w");
+    if (f) { fputs("wrapper stopped before child", f); fclose(f); }
+  }
   if (child > 0) { kill(child, SIGTERM); waitpid(child, NULL, 0); }
   if (getenv("DIRTY_ON_STOP")) {
     FILE *f = fopen("shutdown-notes.txt", "w");
@@ -350,7 +357,7 @@ vite_pid=$!
 pids="$pids $vite_pid"
 disown "$vite_pid" 2>/dev/null
 mkdir -p "$W/previewnpm/web-ui/node_modules/.bin"
-(cd "$W/previewnpm/web-ui" && PREVIEW_CHILD=1 VITE_NODE="$T/bin/node" VITE_ENTRY="$W/previewnpm/web-ui/node_modules/.bin/vite" VITE_READY="$T/vite-ready" exec bash -c 'exec -a "npm exec vite" "$1"' _ "$T/bin/node") &
+(cd "$W/previewnpm/web-ui" && PREVIEW_CHILD=1 REAP_ORDER_ERROR="$T/reap-order-error" VITE_NODE="$T/bin/node" VITE_ENTRY="$W/previewnpm/web-ui/node_modules/.bin/vite" VITE_READY="$T/vite-ready" exec bash -c 'exec -a "npm exec vite" "$1"' _ "$T/bin/node") &
 npm_pid=$!
 pids="$pids $npm_pid"
 disown "$npm_pid" 2>/dev/null
@@ -363,7 +370,7 @@ while [ "$i" -lt 15 ] && [ ! -f "$T/vite-ready" ]; do sleep 1; i=$((i + 1)); don
 # Real npm builds the OS-specific shell chain used by launch.json and the
 # dev-ui recipe. The local Vite stand-in needs no dependency installation.
 real_previews="previewnpmrun previewnpmprefix"
-[ -z "$real_just" ] || real_previews="$real_previews previewjust"
+[ -z "$real_just" ] || real_previews="$real_previews previewjust previewjustapp"
 real_preview_pids=""
 for name in $real_previews previewnpmcompound; do
   new_wt "$name"
@@ -372,6 +379,13 @@ for name in $real_previews previewnpmcompound; do
   [ "$name" != previewnpmcompound ] || dev='vite & wait'
   printf '{"private":true,"scripts":{"dev":"%s"}}\n' "$dev" >"$W/$name/web-ui/package.json"
   printf 'dev-ui:\n    cd web-ui && npm run dev\n' >"$W/$name/justfile"
+  if [ "$name" = previewjustapp ]; then
+    printf 'app-dev-isolated:\n    bash .claude/skills/develop/run-app-isolated.sh\n' >"$W/$name/justfile"
+    mkdir -p "$W/$name/.claude/skills/develop" "$W/$name/crates/chimaera-app/target/debug"
+    cp "$T/preview" "$W/$name/crates/chimaera-app/target/debug/chimaera-dev"
+    printf 'exec "$PWD/crates/chimaera-app/target/debug/chimaera-dev"\n' >"$W/$name/.claude/skills/develop/run-app-isolated.sh"
+    git -C "$W/$name" add .claude/skills/develop/run-app-isolated.sh
+  fi
   git -C "$W/$name" add web-ui/package.json justfile
   commit "$W/$name" "$name"
   git -C "$W/$name" push -q origin "b/$name"
@@ -385,10 +399,11 @@ EOF
   chmod +x "$W/$name/web-ui/node_modules/.bin/vite"
   (
     PATH="$(dirname "$real_node"):$PATH"
-    export PATH GC_VITE_READY="$T/$name.ready"
+    export PATH GC_VITE_READY="$T/$name.ready" VITE_READY="$T/$name.ready"
     case "$name" in
       previewnpmprefix) cd "$W/$name" && exec "$real_npm" --prefix web-ui run dev -- --port 0 ;;
       previewjust) cd "$W/$name" && exec "$real_just" dev-ui ;;
+      previewjustapp) cd "$W/$name" && exec "$real_just" app-dev-isolated ;;
       *) cd "$W/$name/web-ui" && exec "$real_npm" run dev ;;
     esac
   ) >"$T/$name.log" 2>&1 &
@@ -442,6 +457,7 @@ rm "$T/bin/ps"
 bash "$GC" --apply --no-fetch --no-sizes >"$T/apply-previews" 2>&1
 for name in previewdaemon previewapp previewvite previewnpm $real_previews; do [ ! -e "$W/$name" ] && ok || no "$name not removed: $(cat "$T/apply-previews")"; done
 for pid in "$daemon_pid" "$app_pid" "$vite_pid" "$npm_pid" $real_preview_pids; do kill -0 "$pid" 2>/dev/null && no "preview $pid survived cleanup" || ok; done
+[ ! -e "$T/reap-order-error" ] && ok || no "launcher stopped before its child was reaped"
 [ -d "$W/previewnpmcompound" ] && ok || no "compound npm script was removed"
 for name in previewmixed previewdirty previewunpushed previewlocked previewopen previewclosed previewforeign previewrelease previewstubborn previewwrites previewnested; do [ -d "$W/$name" ] && ok || no "protected $name removed"; done
 kill -0 "$mixed_pid" 2>/dev/null && ok || no "preview was stopped despite an unrelated holder"

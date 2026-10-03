@@ -29,12 +29,14 @@ PREVIEW is the narrow exception to process-based activity: the executable must
 be this checkout's `target/debug/chimaera serve`, its isolated `chimaera-dev`
 app/daemon, or Node running this checkout's Vite entrypoint from `web-ui`.
 The documented `npm run dev`, `npm --prefix web-ui run dev`, `npm exec vite`
-and `just dev-ui` launcher chains are recognized too, including their dedicated
-shell wrappers. Compound shell commands and wrappers with other children stay
+and `just dev-ui` launcher chains are recognized too, as is `just app-dev-isolated`,
+including their dedicated shell wrappers. Compound shell commands and wrappers with other children stay
 protected. Daemon-owned test
 agents shut down through their parent; GC never kills arbitrary `node`, `claude`,
 `codex`, shells, or editors by name. An unrelated process, a preview touching a
 sibling checkout, or an unrecognized wrapper keeps the checkout ACTIVE. A
+verified launcher chain stops from leaf to root, waiting for each child to be
+reaped before stopping its wrapper, within one shared ten-second deadline. A
 preview that will not exit, or work written during shutdown, keeps the checkout
 intact. Dry runs report PREVIEW without stopping anything; `--apply` and the
 automatic session-start cleanup perform the guarded shutdown.
