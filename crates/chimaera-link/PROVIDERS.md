@@ -635,8 +635,9 @@ Only these closed commands exist (empty variants still reject extra fields):
 - `{type:"claude_stream_pinned",route:"messages"|"count_tokens",content_length,
   headers:{version,user_agent,beta}}` carries only the reviewed pinned metadata;
   content_length is1..16777216. `version` is exactly `"2023-06-01"`,
-  `user_agent` exactly `"claude-cli/2.1.287 (external, cli)"`, and `beta` an ordered
-  array of1..17 distinct closed atoms whose comma-joined value is at most512bytes.
+  `user_agent` exactly `"claude-cli/2.1.287 (external, cli)"` (TUI) or
+  `"claude-cli/2.1.287 (external, sdk-cli)"` (observed print Messages), and `beta`
+  an ordered array of1..17 distinct closed atoms whose comma-joined value is at most512bytes.
   Claude-code and OAuth atoms are mandatory. There are no caller-selected header
   names, credentials, upstreams, TLS/proxy options or other metadata fields.
 
@@ -662,8 +663,15 @@ not support for a Claude command or credential availability. Matched adapter
 versions and actual canonical pairing are enablement gates. The contained
 2.1.287 CLI exercised print and actual TUI Messages/CountTokens against synthetic
 responses; its TUI emitted two distinct Messages beta sets and the CountTokens
-set. This does not establish real subscription, vendor, account entitlement or
-onboarding acceptance. Current managed2.1.288 compatibility must be separately
+set. A separately contained exact 2.1.287 print probe, using the same fixed argv,
+clean environment and descriptor-bound fresh configuration as the composed child,
+observed `sdk-cli` and version 2023-06-01 with positive child/namespace cleanup.
+The `sdk-cli` atom is supported for Messages only; CountTokens still requires the
+original `cli` atom and exact beta profile. Other versions, SDK/client/workload
+suffixes and arbitrary User-Agent text remain refused; the actual observed atom
+is preserved rather than rewritten. Older receivers refuse the added atom, so
+matched public/private versions remain required. This does not establish real
+subscription, vendor, account entitlement or onboarding acceptance. Current managed2.1.288 compatibility must be separately
 verified before enablement, rather than accepting a changed User-Agent.
 
 The private receiver retains its original accept-time five-second budget for

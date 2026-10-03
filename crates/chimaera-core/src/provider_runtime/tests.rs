@@ -345,3 +345,67 @@ fn pinned_claude_http_metadata_is_bounded_and_count_tokens_has_its_exact_profile
     response["result"]["head"]["headers"]["content_type"] = json!("text/event-stream");
     assert!(Response::decode(&serde_json::to_vec(&response).unwrap(), &r).is_err());
 }
+
+#[test]
+fn observed_print_user_agent_is_exact_preserved_and_messages_only() {
+    let beta = "claude-code-20250219,oauth-2025-04-20";
+    for (agent, expected) in [
+        (
+            "claude-cli/2.1.287 (external, cli)",
+            ClaudeUserAgent::Cli21287,
+        ),
+        (
+            "claude-cli/2.1.287 (external, sdk-cli)",
+            ClaudeUserAgent::SdkCli21287,
+        ),
+    ] {
+        let h = ClaudeRequestHeaders::from_http("2023-06-01", beta, agent, ClaudeRoute::Messages)
+            .unwrap();
+        assert!(h.user_agent == expected);
+        assert_eq!(h.user_agent.as_str(), agent);
+        let value = json!({"type":"claude_stream_pinned","route":"messages","content_length":10,"headers":h});
+        let r = parsed(value);
+        let Command::ClaudeStreamPinned { headers, .. } = &r.command else {
+            panic!("wrong command")
+        };
+        assert_eq!(headers.user_agent.as_str(), agent);
+        assert_eq!(headers.beta_header().unwrap(), beta);
+    }
+    for agent in [
+        "claude-cli/2.1.288 (external, sdk-cli)",
+        "claude-cli/2.1.287 (external, sdk-cli, agent-sdk/1)",
+        "claude-cli/2.1.287 (external, sdk-cli, workload/cron)",
+        "claude-cli/2.1.287 (external, sdk)",
+        "claude-cli/2.1.287 (external, cli) ",
+        "claude-cli/2.1.287 (external, sdk-cli)\r\nHost: other",
+    ] {
+        assert!(
+            ClaudeRequestHeaders::from_http("2023-06-01", beta, agent, ClaudeRoute::Messages)
+                .is_err()
+        );
+        let mut value = pinned_headers_value();
+        value["user_agent"] = json!(agent);
+        assert!(Request::decode(&serde_json::to_vec(&request(json!({"type":"claude_stream_pinned","route":"messages","content_length":10,"headers":value}))).unwrap()).is_err());
+    }
+    let count = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,token-counting-2024-11-01";
+    assert!(ClaudeRequestHeaders::from_http(
+        "2023-06-01",
+        count,
+        ClaudeUserAgent::SdkCli21287.as_str(),
+        ClaudeRoute::CountTokens
+    )
+    .is_err());
+    let print = ClaudeUserAgent::SdkCli21287.as_str();
+    for (version, atoms) in [
+        ("2024-01-01", beta),
+        ("2023-06-01", "oauth-2025-04-20"),
+        (
+            "2023-06-01",
+            "claude-code-20250219,oauth-2025-04-20,unknown",
+        ),
+    ] {
+        assert!(
+            ClaudeRequestHeaders::from_http(version, atoms, print, ClaudeRoute::Messages).is_err()
+        );
+    }
+}

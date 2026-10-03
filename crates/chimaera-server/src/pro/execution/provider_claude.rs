@@ -144,8 +144,10 @@ async fn listen(listener: TcpListener, state: Arc<FrontendState>) {
                 tasks.spawn(async move {
                     let _permit = permit;
                     diagnostics::emit(&state.trace, Stage::FrontendAccepted);
-                    let Ok(socket)=header_socket(&state.child,socket,received).await else {
+                    diagnostics::counter(&state.trace, diagnostics::Counter::Accepted);
+                    let Ok(socket)=header_socket(&state.child,socket,received,&state.trace).await else {
                         diagnostics::emit(&state.trace, Stage::FrontendHeaderRefused);
+                        diagnostics::counter(&state.trace, diagnostics::Counter::RawRefused);
                         return;
                     };
                     // The last owner cannot settle before the HTTP socket closes.
@@ -211,25 +213,29 @@ async fn header_socket(
     child: &ChildLifetime,
     mut socket: TcpStream,
     received: Instant,
+    trace: &Option<Arc<diagnostics::Trace>>,
 ) -> Result<PrefixSocket, wire::Error> {
+    use diagnostics::Refusal;
+    let refused = |reason, error| diagnostics::refusal(trace, reason, error);
     let work = async {
         if Instant::now() >= received + HEADER_TIME {
-            return Err(wire::Error::Unavailable);
+            return Err(refused(Refusal::RawDeadline, wire::Error::Unavailable));
         }
         let mut bytes = Zeroizing::new(vec![0; HEADERS]);
         let mut n = 0;
         loop {
             let count = child
                 .wait(socket.read(&mut bytes[n..]))
-                .await?
-                .map_err(|_| wire::Error::Unavailable)?;
+                .await
+                .map_err(|error| refused(Refusal::RawOwner, error))?
+                .map_err(|_| refused(Refusal::RawIo, wire::Error::Unavailable))?;
             if count == 0 {
-                return Err(wire::Error::InvalidRequest);
+                return Err(refused(Refusal::RawEof, wire::Error::InvalidRequest));
             }
             n += count;
             if let Some(end) = bytes[..n].windows(4).position(|w| w == b"\r\n\r\n") {
-                let header =
-                    std::str::from_utf8(&bytes[..end]).map_err(|_| wire::Error::InvalidRequest)?;
+                let header = std::str::from_utf8(&bytes[..end])
+                    .map_err(|_| refused(Refusal::RawUtf8, wire::Error::InvalidRequest))?;
                 let mut length = 0;
                 let mut auth = 0;
                 let mut host = 0;
@@ -237,7 +243,9 @@ async fn header_socket(
                 let mut count = 0;
                 for line in header.split("\r\n").skip(1) {
                     count += 1;
-                    let (name, _) = line.split_once(':').ok_or(wire::Error::InvalidRequest)?;
+                    let (name, _) = line
+                        .split_once(':')
+                        .ok_or_else(|| refused(Refusal::RawLine, wire::Error::InvalidRequest))?;
                     if name.eq_ignore_ascii_case("content-length") {
                         length += 1;
                     }
@@ -250,18 +258,42 @@ async fn header_socket(
                     if name.eq_ignore_ascii_case("content-type") {
                         content += 1;
                     }
-                    if name.eq_ignore_ascii_case("transfer-encoding")
-                        || name.eq_ignore_ascii_case("origin")
-                        || name.eq_ignore_ascii_case("x-api-key")
-                    {
-                        return Err(wire::Error::InvalidRequest);
+                    for (selector, reason) in [
+                        ("transfer-encoding", Refusal::RawTransfer),
+                        ("origin", Refusal::RawOrigin),
+                        ("x-api-key", Refusal::RawApiKey),
+                    ] {
+                        if name.eq_ignore_ascii_case(selector) {
+                            return Err(refused(reason, wire::Error::InvalidRequest));
+                        }
                     }
                 }
-                if count > 32 || length != 1 || auth != 1 || host != 1 || content != 1 {
-                    return Err(wire::Error::InvalidRequest);
+                if count > 32 {
+                    return Err(refused(Refusal::RawCount, wire::Error::InvalidRequest));
+                }
+                for (count, missing, duplicate) in [
+                    (
+                        length,
+                        Refusal::RawLengthMissing,
+                        Refusal::RawLengthDuplicate,
+                    ),
+                    (auth, Refusal::RawAuthMissing, Refusal::RawAuthDuplicate),
+                    (host, Refusal::RawHostMissing, Refusal::RawHostDuplicate),
+                    (
+                        content,
+                        Refusal::RawContentMissing,
+                        Refusal::RawContentDuplicate,
+                    ),
+                ] {
+                    if count != 1 {
+                        return Err(refused(
+                            if count == 0 { missing } else { duplicate },
+                            wire::Error::InvalidRequest,
+                        ));
+                    }
                 }
                 if Instant::now() >= received + HEADER_TIME {
-                    return Err(wire::Error::Unavailable);
+                    return Err(refused(Refusal::RawDeadline, wire::Error::Unavailable));
                 }
                 bytes.truncate(n);
                 return Ok(PrefixSocket {
@@ -271,53 +303,90 @@ async fn header_socket(
                 });
             }
             if n == HEADERS {
-                return Err(wire::Error::LimitReached);
+                return Err(refused(Refusal::RawCap, wire::Error::LimitReached));
             }
         }
     };
     tokio::time::timeout_at((received + HEADER_TIME).into(), work)
         .await
-        .map_err(|_| wire::Error::Unavailable)?
+        .map_err(|_| refused(Refusal::RawDeadline, wire::Error::Unavailable))?
 }
 fn authorized(
     request: &Request<Incoming>,
     state: &FrontendState,
 ) -> Result<(wire::ClaudeRoute, u64, wire::ClaudeRequestHeaders), wire::Error> {
+    use diagnostics::Refusal;
+    let refused = |reason, error| diagnostics::refusal(&state.trace, reason, error);
     if state.broken.load(Ordering::Acquire) {
-        return Err(wire::Error::StateChanged);
+        return Err(refused(Refusal::RequestOwner, wire::Error::StateChanged));
     }
-    state.child.current()?;
+    state
+        .child
+        .current()
+        .map_err(|error| refused(Refusal::RequestOwner, error))?;
     let one = |name: &str| -> Result<&str, wire::Error> {
         let all = request.headers().get_all(name);
+        let metadata_reason = match name {
+            "anthropic-version" => Some(Refusal::RequestVersionHeader),
+            "anthropic-beta" => Some(Refusal::RequestBetaHeader),
+            "user-agent" => Some(Refusal::RequestUserAgentHeader),
+            _ => None,
+        };
         if all.iter().count() != 1 {
-            return Err(wire::Error::InvalidRequest);
+            return Err(refused(
+                metadata_reason.unwrap_or(Refusal::RequestHeaderCount),
+                wire::Error::InvalidRequest,
+            ));
         }
         all.iter()
             .next()
             .and_then(|v| v.to_str().ok())
-            .ok_or(wire::Error::InvalidRequest)
+            .ok_or_else(|| {
+                refused(
+                    metadata_reason.unwrap_or(Refusal::RequestHeaderText),
+                    wire::Error::InvalidRequest,
+                )
+            })
     };
-    if request.method() != "POST"
-        || request.uri().scheme().is_some()
-        || request.uri().authority().is_some()
-        || one("host")? != state.host
-        || request.headers().contains_key("transfer-encoding")
-        || request.headers().contains_key("origin")
-        || request.headers().contains_key("x-api-key")
-        || request.headers().len() > 32
-        || request
-            .headers()
-            .iter()
-            .map(|(k, v)| k.as_str().len() + v.as_bytes().len() + 4)
-            .sum::<usize>()
-            > HEADERS
-        || one("content-type")? != "application/json"
+    if request.method() != "POST" {
+        return Err(refused(Refusal::RequestMethod, wire::Error::InvalidRequest));
+    }
+    if request.uri().scheme().is_some() || request.uri().authority().is_some() {
+        return Err(refused(Refusal::RequestUri, wire::Error::InvalidRequest));
+    }
+    if one("host")? != state.host {
+        return Err(refused(Refusal::RequestHost, wire::Error::InvalidRequest));
+    }
+    for (selector, reason) in [
+        ("transfer-encoding", Refusal::RequestTransfer),
+        ("origin", Refusal::RequestOrigin),
+        ("x-api-key", Refusal::RequestApiKey),
+    ] {
+        if request.headers().contains_key(selector) {
+            return Err(refused(reason, wire::Error::InvalidRequest));
+        }
+    }
+    if request.headers().len() > 32 {
+        return Err(refused(Refusal::RequestCount, wire::Error::InvalidRequest));
+    }
+    if request
+        .headers()
+        .iter()
+        .map(|(k, v)| k.as_str().len() + v.as_bytes().len() + 4)
+        .sum::<usize>()
+        > HEADERS
     {
-        return Err(wire::Error::InvalidRequest);
+        return Err(refused(Refusal::RequestCap, wire::Error::InvalidRequest));
+    }
+    if one("content-type")? != "application/json" {
+        return Err(refused(
+            Refusal::RequestContent,
+            wire::Error::InvalidRequest,
+        ));
     }
     let auth = one("authorization")?
         .strip_prefix("Bearer ")
-        .ok_or(wire::Error::InvalidRequest)?;
+        .ok_or_else(|| refused(Refusal::RequestAuthShape, wire::Error::InvalidRequest))?;
     // Fixed-size opaque frontend equality; no canonical provider token is here.
     if auth.len() != state.token.len()
         || auth
@@ -326,25 +395,41 @@ fn authorized(
             .fold(0u8, |d, (a, b)| d | (a ^ b))
             != 0
     {
-        return Err(wire::Error::InvalidRequest);
+        return Err(refused(
+            Refusal::RequestAuthMismatch,
+            wire::Error::InvalidRequest,
+        ));
     }
     let route = match request.uri().path_and_query().map(|p| p.as_str()) {
         Some("/v1/messages?beta=true") => wire::ClaudeRoute::Messages,
         Some("/v1/messages/count_tokens?beta=true") => wire::ClaudeRoute::CountTokens,
-        _ => return Err(wire::Error::InvalidRequest),
+        _ => return Err(refused(Refusal::RequestRoute, wire::Error::InvalidRequest)),
     };
     let length = one("content-length")?;
     if length.is_empty() || !length.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(wire::Error::InvalidRequest);
+        return Err(refused(Refusal::RequestLength, wire::Error::InvalidRequest));
     }
-    let length = length.parse().map_err(|_| wire::Error::InvalidRequest)?;
-    wire::BodyCount::new(length)?;
-    let headers = wire::ClaudeRequestHeaders::from_http(
-        one("anthropic-version")?,
-        one("anthropic-beta")?,
-        one("user-agent")?,
-        route,
-    )?;
+    let length = length
+        .parse()
+        .map_err(|_| refused(Refusal::RequestLength, wire::Error::InvalidRequest))?;
+    wire::BodyCount::new(length).map_err(|error| refused(Refusal::RequestBodyCount, error))?;
+    let version = one("anthropic-version")?;
+    let beta = one("anthropic-beta")?;
+    let agent = one("user-agent")?;
+    let headers =
+        wire::ClaudeRequestHeaders::from_http(version, beta, agent, route).map_err(|error| {
+            let reason = if version != wire::ClaudeVersion::V20230601.as_str() {
+                Refusal::RequestVersion
+            } else if wire::ClaudeUserAgent::from_http(agent).is_err()
+                || (route == wire::ClaudeRoute::CountTokens
+                    && agent == wire::ClaudeUserAgent::SdkCli21287.as_str())
+            {
+                Refusal::RequestUserAgent
+            } else {
+                Refusal::RequestBeta
+            };
+            refused(reason, error)
+        })?;
     Ok((route, length, headers))
 }
 fn refusal(error: wire::Error) -> Response<Body> {
@@ -375,6 +460,7 @@ async fn handle(
         Err(e) => {
             diagnostics::error(&state.trace, e);
             diagnostics::emit(&state.trace, Stage::FrontendRequestRefused);
+            diagnostics::counter(&state.trace, diagnostics::Counter::RequestRefused);
             return Ok(refusal(e));
         }
     };

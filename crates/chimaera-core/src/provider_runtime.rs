@@ -230,10 +230,22 @@ impl ClaudeVersion {
 pub enum ClaudeUserAgent {
     #[serde(rename = "claude-cli/2.1.287 (external, cli)")]
     Cli21287,
+    #[serde(rename = "claude-cli/2.1.287 (external, sdk-cli)")]
+    SdkCli21287,
 }
 impl ClaudeUserAgent {
     pub fn as_str(self) -> &'static str {
-        "claude-cli/2.1.287 (external, cli)"
+        match self {
+            Self::Cli21287 => "claude-cli/2.1.287 (external, cli)",
+            Self::SdkCli21287 => "claude-cli/2.1.287 (external, sdk-cli)",
+        }
+    }
+    pub fn from_http(value: &str) -> Result<Self, Error> {
+        match value {
+            "claude-cli/2.1.287 (external, cli)" => Ok(Self::Cli21287),
+            "claude-cli/2.1.287 (external, sdk-cli)" => Ok(Self::SdkCli21287),
+            _ => Err(Error::InvalidRequest),
+        }
     }
 }
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -333,7 +345,6 @@ impl ClaudeRequestHeaders {
         route: ClaudeRoute,
     ) -> Result<Self, Error> {
         if version != ClaudeVersion::V20230601.as_str()
-            || user_agent != ClaudeUserAgent::Cli21287.as_str()
             || beta.is_empty()
             || beta.len() > 512
             || beta.split(',').count() > 17
@@ -342,7 +353,7 @@ impl ClaudeRequestHeaders {
         }
         let headers = Self {
             version: ClaudeVersion::V20230601,
-            user_agent: ClaudeUserAgent::Cli21287,
+            user_agent: ClaudeUserAgent::from_http(user_agent)?,
             beta: beta
                 .split(',')
                 .map(ClaudeBeta::parse)
@@ -378,6 +389,9 @@ impl ClaudeRequestHeaders {
         }
         match route {
             ClaudeRoute::Messages if self.beta.contains(&TokenCounting) => {
+                Err(Error::InvalidRequest)
+            }
+            ClaudeRoute::CountTokens if self.user_agent == ClaudeUserAgent::SdkCli21287 => {
                 Err(Error::InvalidRequest)
             }
             ClaudeRoute::CountTokens

@@ -360,23 +360,28 @@ async fn child_budget_is_separate_from_expired_ready_and_stream_quota() {
 
 #[tokio::test]
 async fn observed_messages_beta_sets_survive_the_http_to_unix_boundary() {
-    for beta in [
+    for agent in [
+        "claude-cli/2.1.287 (external, cli)",
+        "claude-cli/2.1.287 (external, sdk-cli)",
+    ] {
+        for beta in [
         "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,effort-2025-11-24,structured-outputs-2025-12-15",
         "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,effort-2025-11-24,dangerous-tool-use-2026-09-03,thinking-display-updates-2026-08-18,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11",
     ] {
         let fixture=Fixture::new(Duration::from_secs(1)); fixture.verified().await;
         let child=ChildLifetime::new(&fixture.state,Instant::now()+Duration::from_secs(3)).unwrap();
         let frontend=Arc::new(Frontend::start(child.clone()).await.unwrap()); let caller=frontend.clone();
-        let headers=format!("Anthropic-Version: 2023-06-01\r\nAnthropic-Beta: {beta}\r\nUser-Agent: claude-cli/2.1.287 (external, cli)\r\n");
+        let headers=format!("Anthropic-Version: 2023-06-01\r\nAnthropic-Beta: {beta}\r\nUser-Agent: {agent}\r\n");
         let task=tokio::spawn(async move { http_at(&caller,"/v1/messages?beta=true",caller.token(),&headers,"").await });
         let(mut peer,req)=request(&fixture.listener).await;
         let wire::Command::ClaudeStreamPinned{headers,route,..}=&req.command else {panic!("missing pinned metadata")};
         assert!(*route==wire::ClaudeRoute::Messages); assert_eq!(headers.beta_header().unwrap(),beta);
-        assert_eq!(headers.version.as_str(),"2023-06-01"); assert_eq!(headers.user_agent.as_str(),"claude-cli/2.1.287 (external, cli)");
+        assert_eq!(headers.version.as_str(),"2023-06-01"); assert_eq!(headers.user_agent.as_str(),agent);
         uploaded(&mut peer,&req).await; response(&mut peer,&req,b"{}",false).await;
         assert!(task.await.unwrap().starts_with(b"HTTP/1.1 200"));
         Arc::try_unwrap(frontend).ok().unwrap().stop().await; drop(child);
         assert_eq!(provider_ready::active(&fixture.state),0); fixture.finish().await;
+    }
     }
 }
 #[tokio::test]
@@ -392,6 +397,9 @@ async fn unknown_missing_or_changed_cli_metadata_never_claims_a_provider_stream(
         good.replace("2023-06-01", "2024-01-01"),
         good.replace("oauth-2025-04-20", "oauth-2025-04-20,unknown-beta"),
         good.replace("2.1.287", "2.1.288"),
+        good.replace("(external, cli)", "(external, sdk-cli, agent-sdk/1)"),
+        good.replace("(external, cli)", "(external, sdk-cli, workload/cron)"),
+        good.replace("(external, cli)", "(external, sdk)"),
         good.replace("oauth-2025-04-20", "oauth-2025-04-20,oauth-2025-04-20"),
     ] {
         let bytes = http_at(
@@ -410,8 +418,110 @@ async fn unknown_missing_or_changed_cli_metadata_never_claims_a_provider_stream(
         );
         assert_eq!(provider_ready::active(&fixture.state), 1);
     }
+    let count_headers = metadata("/v1/messages/count_tokens?beta=true")
+        .replace("(external, cli)", "(external, sdk-cli)");
+    let bytes = http_at(
+        &frontend,
+        "/v1/messages/count_tokens?beta=true",
+        frontend.token(),
+        &count_headers,
+        "",
+    )
+    .await;
+    assert!(bytes.starts_with(b"HTTP/1.1 400"));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), fixture.listener.accept())
+            .await
+            .is_err()
+    );
+    assert_eq!(provider_ready::active(&fixture.state), 1);
     frontend.stop().await;
     drop(child);
     assert_eq!(provider_ready::active(&fixture.state), 0);
     fixture.finish().await;
+}
+
+#[tokio::test]
+async fn diagnostic_reasons_separate_actual_raw_and_metadata_refusals_before_owner() {
+    let fixture = Fixture::new(Duration::from_secs(1));
+    fixture.verified().await;
+    let child =
+        ChildLifetime::new(&fixture.state, Instant::now() + Duration::from_secs(3)).unwrap();
+    let trace = diagnostics::Trace::synthetic();
+    let frontend = Frontend::start_diagnostic(child, Some(trace.clone()))
+        .await
+        .unwrap();
+    let path = "/v1/messages?beta=true";
+    assert!(
+        http(&frontend, path, frontend.token(), "Content-Length: 2\r\n")
+            .await
+            .is_empty()
+    );
+    let response = http_at(
+        &frontend,
+        path,
+        frontend.token(),
+        &metadata(path).replace("2023-06-01", "synthetic-unsupported"),
+        "",
+    )
+    .await;
+    assert!(response.starts_with(b"HTTP/1.1 400"));
+    assert_eq!(
+        trace.reasons(),
+        (
+            diagnostics::Refusal::RawLengthDuplicate as u8 + 1,
+            diagnostics::Refusal::RequestVersion as u8 + 1
+        )
+    );
+    assert_eq!(trace.counts(), (2, 1, 1));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), fixture.listener.accept())
+            .await
+            .is_err()
+    );
+    frontend.stop().await;
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn actual_request_metadata_diagnostics_never_accept_unknown_or_missing_profiles() {
+    use diagnostics::Refusal;
+    let path = "/v1/messages?beta=true";
+    for (headers, expected) in [
+        (String::new(), Refusal::RequestVersionHeader),
+        (
+            metadata(path).replace(
+                "claude-cli/2.1.287 (external, cli)",
+                "synthetic-unsupported",
+            ),
+            Refusal::RequestUserAgent,
+        ),
+        (
+            metadata(path).replace(
+                "claude-code-20250219,oauth-2025-04-20",
+                "synthetic-unsupported",
+            ),
+            Refusal::RequestBeta,
+        ),
+    ] {
+        let fixture = Fixture::new(Duration::from_secs(1));
+        fixture.verified().await;
+        let child =
+            ChildLifetime::new(&fixture.state, Instant::now() + Duration::from_secs(3)).unwrap();
+        let trace = diagnostics::Trace::synthetic();
+        let frontend = Frontend::start_diagnostic(child, Some(trace.clone()))
+            .await
+            .unwrap();
+        let response = http_at(&frontend, path, frontend.token(), &headers, "").await;
+        assert!(response.starts_with(b"HTTP/1.1 400"));
+        assert_eq!(trace.reasons(), (0, expected as u8 + 1));
+        assert_eq!(trace.counts(), (1, 0, 1));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), fixture.listener.accept())
+                .await
+                .is_err()
+        );
+        frontend.stop().await;
+        fixture.finish().await;
+    }
 }
