@@ -68,7 +68,7 @@ def refusal_phase(error):
 
 
 # Only exact task-owned module names and positive source line numbers may leave
-# an unknown refusal. The walk/output are bounded; frame text and locals stay local.
+# a refusal. The walk/output are bounded; frame text and locals stay local.
 def refusal_frames(error):
     names = frozenset({"ssh_agent_keeper.py", "ssh_agent_loader.py",
                        "ssh_agent_sources.py", "ssh_agent_route.py"})
@@ -743,6 +743,6 @@ if __name__ == "__main__":
     except (Refused, OSError, ValueError, TimeoutError) as error:
         phase = refusal_phase(error)
         print("REFUSED keeper fixture:", phase, file=sys.stderr)
-        if phase == "fixture-refused-unknown":
+        if phase in ("fixture-refused-unknown", "fixture-value-invalid"):
             print("REFUSED source frames:", refusal_frames(error), file=sys.stderr)
         raise SystemExit(2)
