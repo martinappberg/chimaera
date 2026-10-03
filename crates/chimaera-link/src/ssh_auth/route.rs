@@ -37,6 +37,47 @@ pub enum SshRouteMode {
     Interactive,
 }
 
+/// Prompt provenance is checked again by the original native Connect owner;
+/// syntactic validity never grants permission to display credential UI.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SshRoutePromptAuth {
+    pub grant_id: String,
+    pub keeper_boot: String,
+    pub leg: u8,
+    pub mode: SshRouteMode,
+    pub destination: SshAuthDestination,
+}
+impl std::fmt::Debug for SshRoutePromptAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SshRoutePromptAuth(..)")
+    }
+}
+impl SshRoutePromptAuth {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            opaque(&self.grant_id)
+                && opaque(&self.keeper_boot)
+                && usize::from(self.leg) <= SSH_AUTH_JUMPS_MAX,
+            "invalid SSH route prompt identity"
+        );
+        self.destination.validate()
+    }
+    pub fn matches(&self, grant: &SshRouteGrant, keeper_boot: &str) -> bool {
+        self.validate().is_ok()
+            && grant.validate().is_ok()
+            && self.grant_id == grant.grant_id
+            && self.keeper_boot == keeper_boot
+            && grant.modes.get(usize::from(self.leg)) == Some(&self.mode)
+            && grant
+                .route
+                .jumps
+                .iter()
+                .chain(std::iter::once(&grant.destination))
+                .nth(usize::from(self.leg))
+                == Some(&self.destination)
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SshRouteAuthLeg {
@@ -440,6 +481,50 @@ mod tests {
             changed.validate().is_err(),
             "aggregate ceiling, not just per-key ceiling"
         );
+    }
+    #[test]
+    fn prompt_metadata_requires_exact_grant_boot_leg_mode_and_destination() {
+        let request = request();
+        let grant = grant(&request);
+        let good = SshRoutePromptAuth {
+            grant_id: grant.grant_id.clone(),
+            keeper_boot: request.keeper_boot.clone(),
+            leg: 1,
+            mode: grant.modes[1],
+            destination: grant.destination.clone(),
+        };
+        assert!(good.matches(&grant, &request.keeper_boot));
+        assert!(!good.matches(&grant, "changed-boot"));
+        for changed in [
+            SshRoutePromptAuth {
+                grant_id: "other".into(),
+                ..good.clone()
+            },
+            SshRoutePromptAuth {
+                keeper_boot: "other".into(),
+                ..good.clone()
+            },
+            SshRoutePromptAuth {
+                leg: 0,
+                ..good.clone()
+            },
+            SshRoutePromptAuth {
+                mode: SshRouteMode::Interactive,
+                ..good.clone()
+            },
+            SshRoutePromptAuth {
+                destination: destination("other"),
+                ..good.clone()
+            },
+        ] {
+            assert!(!changed.matches(&grant, &request.keeper_boot));
+        }
+        let mut changed = good.clone();
+        changed.leg = 4;
+        assert!(changed.validate().is_err());
+        changed = good;
+        changed.grant_id = "x".repeat(129);
+        assert!(changed.validate().is_err());
     }
     #[test]
     fn receipt_and_ready_do_not_accept_changed_identity_mode_or_legacy_hello() {

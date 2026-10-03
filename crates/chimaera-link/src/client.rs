@@ -1220,12 +1220,7 @@ impl Client {
                             },
                             message = rx.next() => match message {
                                 Some(Ok(Message::Text(text))) => {
-                                    let event = match serde_json::from_str::<Event>(&text) {
-                                        Ok(Event::Unknown) | Err(_) => continue,
-                                        Ok(Event::Host { host }) if host.kind == HostKind::Unknown => continue,
-                                        Ok(event) => event,
-                                    };
-                                    let Some(event) = prompts.receive(event)? else { continue; };
+                                    let Some(event) = prompts.receive_frame(&text)? else { continue; };
                                     match tokio::time::timeout(Duration::from_secs(10), out.send(Ok(event))).await {
                                         Ok(Ok(())) => {}
                                         Ok(Err(_)) => return Ok(()),
@@ -1283,8 +1278,32 @@ struct LocalPrompt {
     id: String,
     expires: Instant,
     answered: bool,
+    host_id: String,
+    ssh_route_auth: Option<crate::SshRoutePromptAuth>,
 }
 impl ConnectionPrompts {
+    fn receive_frame(&mut self, text: &str) -> Result<Option<Event>> {
+        let result = (|| {
+            anyhow::ensure!(text.len() <= MAX_CONTROL_FRAME, "events frame too large");
+            let value: serde_json::Value =
+                serde_json::from_str(text).map_err(|_| anyhow!("invalid events frame"))?;
+            let prompt = value.get("type").and_then(serde_json::Value::as_str) == Some("prompt");
+            let event = match serde_json::from_value::<Event>(value) {
+                Ok(Event::Unknown) => return Ok(None),
+                Ok(Event::Host { host }) if host.kind == HostKind::Unknown => return Ok(None),
+                Ok(event) => event,
+                // Unknown service extensions remain ignorable, but malformed
+                // prompt provenance cannot leave an older alias answerable.
+                Err(_) if prompt => bail!("invalid events prompt"),
+                Err(_) => return Ok(None),
+            };
+            self.receive(event)
+        })();
+        if result.is_err() {
+            self.by_wire.clear();
+        }
+        result
+    }
     fn receive(&mut self, event: Event) -> Result<Option<Event>> {
         Ok(Some(match event {
             Event::Prompt {
@@ -1292,7 +1311,11 @@ impl ConnectionPrompts {
                 host_id,
                 prompt,
                 echo,
+                ssh_route_auth,
             } => {
+                if let Some(auth) = &ssh_route_auth {
+                    auth.validate()?;
+                }
                 if !self.by_wire.contains_key(&id) && self.by_wire.len() >= 64 {
                     bail!("events prompt limit");
                 }
@@ -1303,12 +1326,21 @@ impl ConnectionPrompts {
                     ),
                     expires: Instant::now() + Duration::from_secs(180),
                     answered: false,
+                    host_id: host_id.clone(),
+                    ssh_route_auth: ssh_route_auth.clone(),
                 });
+                if local.ssh_route_auth.is_some() || ssh_route_auth.is_some() {
+                    anyhow::ensure!(
+                        local.host_id == host_id && local.ssh_route_auth == ssh_route_auth,
+                        "SSH route prompt identity changed"
+                    );
+                }
                 Event::Prompt {
                     id: local.id.clone(),
                     host_id,
                     prompt,
                     echo,
+                    ssh_route_auth,
                 }
             }
             Event::PromptClosed { id } => {
@@ -1922,7 +1954,145 @@ mod connection_prompt_tests {
             host_id: "host".into(),
             prompt: "Synthetic?".into(),
             echo: false,
+            ssh_route_auth: None,
         }
+    }
+    fn route_event(id: &str) -> Event {
+        Event::Prompt {
+            id: id.into(),
+            host_id: "host".into(),
+            prompt: "Synthetic?".into(),
+            echo: false,
+            ssh_route_auth: Some(crate::SshRoutePromptAuth {
+                grant_id: "grant".into(),
+                keeper_boot: "boot".into(),
+                leg: 0,
+                mode: crate::SshRouteMode::Interactive,
+                destination: crate::SshAuthDestination {
+                    hostname: "jump.invalid".into(),
+                    user: "test".into(),
+                    port: 22,
+                },
+            }),
+        }
+    }
+    #[test]
+    fn malformed_route_prompt_frames_retire_prior_alias_before_an_answer() {
+        for routed in [false, true] {
+            for bad in [
+                serde_json::json!({"grant_id":"grant","keeper_boot":"boot","leg":0,"mode":"unknown","destination":{"hostname":"jump.invalid","user":"test","port":22}}),
+                serde_json::json!({"grant_id":"grant","keeper_boot":"boot","leg":256,"mode":"interactive","destination":{"hostname":"jump.invalid","user":"test","port":22}}),
+                serde_json::json!({"grant_id":"grant","keeper_boot":"boot","leg":0,"mode":"interactive","destination":"secret-synthetic"}),
+                serde_json::json!({"grant_id":"grant","keeper_boot":"boot","leg":4,"mode":"interactive","destination":{"hostname":"jump.invalid","user":"test","port":22}}),
+            ] {
+                let mut map = ConnectionPrompts::default();
+                let original = if routed {
+                    route_event("wire")
+                } else {
+                    event("wire")
+                };
+                let Some(Event::Prompt { id, .. }) = map
+                    .receive_frame(&serde_json::to_string(&original).unwrap())
+                    .unwrap()
+                else {
+                    unreachable!()
+                };
+                let mut changed = serde_json::to_value(event("wire")).unwrap();
+                changed["ssh_route_auth"] = bad;
+                let error = map.receive_frame(&changed.to_string()).unwrap_err();
+                assert!(!format!("{error:#?}").contains("secret-synthetic"));
+                assert!(map.by_wire.is_empty());
+                assert!(map
+                    .answer(EventCommand::Answer {
+                        id,
+                        value: Some("not-sent".into())
+                    })
+                    .is_none());
+            }
+        }
+        let mut map = ConnectionPrompts::default();
+        let Some(Event::Prompt { id, .. }) = map
+            .receive_frame(&serde_json::to_string(&event("wire")).unwrap())
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert!(map
+            .receive_frame(r#"{"type":"future_event","ssh_route_auth":"future"}"#)
+            .unwrap()
+            .is_none());
+        assert!(map
+            .answer(EventCommand::Answer { id, value: None })
+            .is_some());
+    }
+    #[test]
+    fn invalid_route_provenance_never_consumes_prompt_capacity() {
+        let mut map = ConnectionPrompts::default();
+        for field in 0..4 {
+            let mut changed = route_event("wire");
+            let Event::Prompt {
+                ssh_route_auth: Some(auth),
+                ..
+            } = &mut changed
+            else {
+                unreachable!()
+            };
+            match field {
+                0 => auth.grant_id = "x".repeat(129),
+                1 => auth.keeper_boot.clear(),
+                2 => auth.leg = 4,
+                _ => auth.destination.user = "unsafe user".into(),
+            }
+            assert!(map.receive(changed).is_err());
+            assert!(map.by_wire.is_empty());
+        }
+    }
+    #[test]
+    fn route_prompt_provenance_survives_aliasing_and_cannot_change_on_reused_wire_id() {
+        let mut map = ConnectionPrompts::default();
+        let Some(Event::Prompt {
+            id,
+            ssh_route_auth: Some(auth),
+            ..
+        }) = map.receive(route_event("wire")).unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(auth.keeper_boot, "boot");
+        assert_eq!(auth.destination.hostname, "jump.invalid");
+        assert_ne!(id, "wire");
+        for field in 0..7 {
+            let mut changed = route_event("wire");
+            let Event::Prompt {
+                host_id,
+                ssh_route_auth,
+                ..
+            } = &mut changed
+            else {
+                unreachable!()
+            };
+            if field == 0 {
+                *host_id = "other".into();
+            } else if field == 1 {
+                *ssh_route_auth = None;
+            } else {
+                let auth = ssh_route_auth.as_mut().unwrap();
+                match field {
+                    2 => auth.grant_id = "other".into(),
+                    3 => auth.keeper_boot = "other".into(),
+                    4 => auth.leg = 1,
+                    5 => auth.mode = crate::SshRouteMode::Key,
+                    _ => auth.destination.port = 2222,
+                }
+            }
+            assert!(map.receive(changed).is_err());
+        }
+        assert!(
+            matches!(map.answer(EventCommand::Answer { id, value: None }), Some(EventCommand::Answer { id, .. }) if id == "wire")
+        );
+        let mut legacy = ConnectionPrompts::default();
+        legacy.receive(event("wire")).unwrap();
+        assert!(legacy.receive(route_event("wire")).is_err());
     }
     #[test]
     fn prompt_map_is_bounded_expires_and_answers_only_once() {

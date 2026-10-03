@@ -1113,6 +1113,7 @@ async fn prompt(State(keeper): State<FakeKeeper>, Json(request): Json<PromptRequ
         host_id: request.host_id.clone(),
         prompt: request.prompt.clone(),
         echo: request.echo,
+        ssh_route_auth: None,
     };
     {
         let mut data = keeper.inner.state.lock().await;

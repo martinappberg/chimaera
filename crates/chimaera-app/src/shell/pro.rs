@@ -802,7 +802,16 @@ fn start_keeper(
                         host_id,
                         prompt,
                         echo: _,
+                        ssh_route_auth,
                     }) => {
+                        // Until the original route owner admits the exact leg,
+                        // routed prompts must never enter generic askpass UI.
+                        if ssh_route_auth.is_some() {
+                            let _ = connection
+                                .commands
+                                .try_send(chimaera_link::EventCommand::Answer { id, value: None });
+                            continue;
+                        }
                         let host = lock(&event_app.state::<Shell>().pro.hosts)
                             .get(&host_id)
                             .cloned();

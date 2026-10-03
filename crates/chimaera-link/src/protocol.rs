@@ -420,6 +420,8 @@ pub enum Event {
         host_id: String,
         prompt: String,
         echo: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ssh_route_auth: Option<crate::SshRoutePromptAuth>,
     },
     PromptClosed {
         id: String,
@@ -467,6 +469,40 @@ fn is_false(value: &bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn route_prompt_metadata_is_additive_and_preserved_without_debug_disclosure() {
+        let legacy = serde_json::json!({"type":"prompt","id":"p","host_id":"h","prompt":"Synthetic?","echo":false});
+        let event: Event = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(matches!(
+            &event,
+            Event::Prompt {
+                ssh_route_auth: None,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(event).unwrap(), legacy);
+        let mut routed = legacy;
+        routed["ssh_route_auth"] = serde_json::json!({"grant_id":"grant","keeper_boot":"boot","leg":0,"mode":"interactive","destination":{"hostname":"jump.invalid","user":"test","port":22},"future":true});
+        let event: Event = serde_json::from_value(routed).unwrap();
+        let Event::Prompt {
+            ssh_route_auth: Some(auth),
+            ..
+        } = &event
+        else {
+            unreachable!()
+        };
+        auth.validate().unwrap();
+        assert!(!format!("{auth:?}").contains("jump.invalid"));
+        let roundtrip: Event =
+            serde_json::from_value(serde_json::to_value(event).unwrap()).unwrap();
+        assert!(matches!(
+            roundtrip,
+            Event::Prompt {
+                ssh_route_auth: Some(_),
+                ..
+            }
+        ));
+    }
     fn account(extra: serde_json::Value) -> Account {
         let mut value = serde_json::json!({"account_id":"a","email":"a@example.invalid","plan":"pro","device_id":"d","protocol":0,"keeper_url":"","limits":{"cloud_hours":1,"storage_bytes":1},"usage":{"cloud_hours":0,"storage_bytes":0},"hours_exhausted":false});
         value
