@@ -512,6 +512,8 @@ async fn shutdown_signal(state: Arc<AppState>) {
     state
         .stopping
         .store(true, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(all(unix, feature = "provider-authority-prototype"))]
+    crate::pro::retire_provider_startup(&state);
     state.changes.notify_waiters();
 }
 

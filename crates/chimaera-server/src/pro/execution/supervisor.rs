@@ -290,7 +290,7 @@ pub(crate) fn stage_startup(state: &AppState, startup: Option<Startup>) -> Resul
     }
     #[cfg(all(unix, feature = "provider-authority-prototype"))]
     {
-        *provider = startup.provider;
+        *provider = startup.provider.map(std::sync::Arc::new);
     }
     *pending = Some(startup.receipt);
     Ok(())

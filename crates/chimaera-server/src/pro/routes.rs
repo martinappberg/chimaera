@@ -286,6 +286,8 @@ async fn configure_inner(
     *lock(&state.pro.runtime) = Some(config);
     state.pro.delegation_refused.store(false, Ordering::Release);
     state.pro.configured.store(true, Ordering::Release);
+    #[cfg(all(unix, feature = "provider-authority-prototype"))]
+    execution::provider_ready::configured(&state);
     engine::start(state.clone());
     // Only a worker is fenced by lease expiry; a device has nothing to watch.
     if managed && execution::worker(&state) {
@@ -295,6 +297,8 @@ async fn configure_inner(
     response
 }
 async fn stop_tasks(state: &Arc<AppState>) -> anyhow::Result<()> {
+    #[cfg(all(unix, feature = "provider-authority-prototype"))]
+    execution::provider_ready::replacing(state);
     // Captured before the runtime changes: replacing or removing a device's
     // configuration never stops its local work (laptop first).
     let worker = execution::worker(state);
@@ -309,6 +313,8 @@ async fn stop_tasks(state: &Arc<AppState>) -> anyhow::Result<()> {
     for task in [lease_task, mirror_task].into_iter().flatten() {
         let _ = task.await;
     }
+    #[cfg(all(unix, feature = "provider-authority-prototype"))]
+    execution::provider_ready::settle(state).await?;
     if worker {
         execution::stop(state, &stopping).await?;
     }
@@ -317,6 +323,8 @@ async fn stop_tasks(state: &Arc<AppState>) -> anyhow::Result<()> {
 }
 pub(crate) async fn disconnect(State(state): State<Arc<AppState>>) -> Response {
     let _configuration = state.pro.configuration.lock().await;
+    #[cfg(all(unix, feature = "provider-authority-prototype"))]
+    execution::provider_ready::retire(&state);
     if let Err(error) = stop_tasks(&state).await {
         return failure(error);
     }

@@ -24,6 +24,8 @@ pub(super) mod maintenance_startup;
 mod maintenance_store;
 pub(crate) mod mutation;
 #[cfg(all(unix, feature = "provider-authority-prototype"))]
+pub(super) mod provider_ready;
+#[cfg(all(unix, feature = "provider-authority-prototype"))]
 pub(super) mod provider_startup;
 mod restart;
 pub(super) mod setup;
@@ -72,7 +74,7 @@ pub(super) struct State {
     #[cfg(unix)]
     maintenance_pending: Mutex<Option<maintenance_startup::Pending>>,
     #[cfg(all(unix, feature = "provider-authority-prototype"))]
-    provider_pending: Mutex<Option<provider_startup::Pending>>,
+    provider_pending: Mutex<Option<std::sync::Arc<provider_startup::Pending>>>,
     supervisor_ack: Mutex<Option<supervisor::CleanupAck>>,
     /// The watchdog's latest tick (see `thawed`).
     tick: Mutex<Option<std::time::Instant>>,

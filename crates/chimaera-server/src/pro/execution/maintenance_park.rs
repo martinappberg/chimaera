@@ -68,6 +68,10 @@ impl Parking {
         })
     }
     fn current(&self) -> Result<(), BusyReason> {
+        #[cfg(all(unix, feature = "provider-authority-prototype"))]
+        if super::provider_ready::active(&self.state) != 0 {
+            return Err(BusyReason::LifecycleOrTransfer);
+        }
         if Instant::now() >= self.deadline {
             return Err(BusyReason::Expired);
         }

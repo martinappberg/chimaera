@@ -60,6 +60,10 @@ pub(super) fn refusal() -> detached::Outcome {
 }
 
 fn quiet(state: &AppState) -> bool {
+    #[cfg(all(unix, feature = "provider-authority-prototype"))]
+    if super::execution::provider_ready::active(state) != 0 {
+        return false;
+    }
     detached::running(state) == 0
         && lock(&state.pro.sleeping).is_empty()
         && lock(&state.pro.caches)
@@ -109,6 +113,8 @@ pub(crate) async fn start(State(state): State<Arc<AppState>>, body: axum::body::
         since: SystemTime::now(),
         _jobs: jobs,
     });
+    #[cfg(all(unix, feature = "provider-authority-prototype"))]
+    super::execution::provider_ready::retire(&state);
     // A transfer admitted just before this drain, still waiting for the
     // reservation, now refuses itself instead of holding the drain open.
     state.pro.drain_started.notify_waiters();

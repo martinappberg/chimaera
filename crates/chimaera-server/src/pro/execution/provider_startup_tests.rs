@@ -68,11 +68,10 @@ fn deadline() -> Instant {
 fn inherited_payload_requires_eof_exact_launch_and_closed_schema() {
     let encoded = payload().encode().unwrap();
     let pending = consume(pipe(&encoded), launch(), deadline()).unwrap();
-    assert!(pending.payload.binding == payload().binding);
-    assert_eq!(
-        pending.payload.capability.expose(),
-        payload().capability.expose()
-    );
+    pending.ready.inspect_fixture(|value| {
+        assert!(value.binding == payload().binding);
+        assert_eq!(value.capability.expose(), payload().capability.expose());
+    });
     for field in 0..4 {
         let mut changed = launch();
         match field {
@@ -155,8 +154,9 @@ fn unverified_provider_startup_cannot_restore_or_launch_through_local_fallback()
         .stopping
         .store(true, std::sync::atomic::Ordering::Release);
     assert!(crate::pro::may_execute(&state, "w-fixture"));
-    *crate::lock(&state.pro.execution.provider_pending) =
-        Some(consume(pipe(&payload().encode().unwrap()), launch(), deadline()).unwrap());
+    *crate::lock(&state.pro.execution.provider_pending) = Some(Arc::new(
+        consume(pipe(&payload().encode().unwrap()), launch(), deadline()).unwrap(),
+    ));
     assert!(!crate::pro::may_execute(&state, "w-fixture"));
     assert!(!crate::pro::may_execute(&state, "w-other"));
     assert!(!crate::pro::may_restore(&state, "w-fixture"));

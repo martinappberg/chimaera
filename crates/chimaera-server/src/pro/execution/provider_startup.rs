@@ -14,14 +14,10 @@ use zeroize::Zeroizing;
 
 /// No Clone/Debug/serialization: the secret is moved once and never joins the
 /// cleanup receipt, health response, environment or durable project state.
-#[expect(
-    dead_code,
-    reason = "exact Ready transport is the next disabled integration gate"
-)]
 pub(super) struct Pending {
-    payload: wire::StartupPayload,
-    launch: Binding,
-    protection: super::maintenance_startup::Protection,
+    pub(super) launch: Binding,
+    pub(super) protection: super::maintenance_startup::Protection,
+    pub(super) ready: super::provider_ready::State,
 }
 impl Pending {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -56,9 +52,9 @@ impl Pending {
             "provider startup channel timed out"
         );
         Ok(Self {
-            payload,
             launch,
             protection,
+            ready: super::provider_ready::State::new(payload),
         })
     }
 }
