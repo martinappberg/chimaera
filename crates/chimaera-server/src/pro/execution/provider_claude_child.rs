@@ -150,12 +150,15 @@ async fn run(
             let (_, out, _, status) = lifetime
                 .wait(async {
                     tokio::try_join!(
-                        async {
-                            stdin
+                        async move {
+                            let result = stdin
                                 .write_all(&input)
                                 .await
-                                .map_err(|_| wire::Error::Unavailable)?;
-                            stdin.shutdown().await.map_err(|_| wire::Error::Unavailable)
+                                .map_err(|_| wire::Error::Unavailable);
+                            // Unix pipe shutdown is a no-op. Close the owned
+                            // writer before waiting for the CLI to consume EOF.
+                            drop(stdin);
+                            result
                         },
                         bounded(stdout),
                         bounded(stderr),
