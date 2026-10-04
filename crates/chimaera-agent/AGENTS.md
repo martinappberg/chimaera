@@ -113,6 +113,10 @@ gap-replay idea as the PTY transport, realized for structured streams.
   fires for stdin `user` messages; `Stop` misses). The **protocol is
   authoritative** for the session lifecycle in chat mode — derive state from
   events, not hooks.
+- Codex `turn/started` precedes its blocking startup hooks and does not prove the
+  opening input reached native history. `hook/started|completed` exposes synchronous
+  SessionStart/UserPromptSubmit progress; `userMessage.clientId` confirms delivery.
+  An interrupt before that confirmation warns the user to resend the original input.
 - Background work is cross-turn but process-owned. Every successful driver
   spawn journals an empty `BackgroundTasks` level-set before its first event;
   this is the crash/restart boundary that keeps a reused journal from reviving

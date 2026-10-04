@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::ndjson::JsonlChild;
 
@@ -1154,6 +1155,17 @@ struct CodexMapper {
     /// this window must NOT fire a second turn/start (the server rejects it and
     /// the already-echoed user message is lost) — they buffer instead.
     turn_pending: bool,
+    /// A turn/start acknowledgement precedes SessionStart hooks and does not
+    /// prove the opening input reached native conversation history.
+    unread_opening_message: Option<String>,
+    /// Activity in a turn adopted after an RPC rejection cannot confirm the
+    /// opening input. Its exact user echo remains authoritative.
+    opening_turn_owned: bool,
+    /// Only synchronous pre-prompt hooks block delivery. Keep their progress
+    /// separate from model activity, bounded even if a runtime misses closes.
+    startup_hooks: BTreeMap<[u8; 32], (String, String)>,
+    /// A resumed mapper restarts its counter; retain uniqueness in the journal.
+    startup_hook_namespace: u128,
     /// Follow-ups for a later turn, FIFO: `SendAfterTurn` messages (each
     /// opens the next turn, one per turn — Codex's own queue semantics), plus
     /// plain sends made in the `turn/start` → `turn/started` window, marked
@@ -1332,6 +1344,10 @@ impl CodexMapper {
             turn_id: String::new(),
             turn_active: false,
             turn_pending: false,
+            unread_opening_message: None,
+            opening_turn_owned: false,
+            startup_hooks: BTreeMap::new(),
+            startup_hook_namespace: rand::random(),
             queued_sends: VecDeque::new(),
             deferred_steer_redrives: BTreeMap::new(),
             unread_steers: BTreeMap::new(),
@@ -1500,7 +1516,30 @@ impl CodexMapper {
             }
         }
 
+        let current_turn = self.opening_turn_owned
+            && self.turn_active
+            && !self.turn_pending
+            && frame["params"]["turnId"].as_str() == Some(self.turn_id.as_str());
+        if current_turn
+            && matches!(
+                method,
+                "item/agentMessage/delta"
+                    | "item/reasoning/textDelta"
+                    | "item/reasoning/summaryTextDelta"
+                    | "item/plan/delta"
+                    | "item/commandExecution/outputDelta"
+            )
+            && frame["params"]["delta"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty())
+        {
+            self.unread_opening_message = None;
+        }
+
         match method {
+            "hook/started" | "hook/completed" => {
+                self.on_startup_hook(frame, method == "hook/completed", &mut step);
+            }
             "thread/settings/updated" => {
                 let settings = &frame["params"]["threadSettings"];
                 if let Some(value) = settings.get("effort") {
@@ -1548,6 +1587,9 @@ impl CodexMapper {
             // break_paragraph is deferred + guarded, so a turn's FIRST part
             // no longer buffers a stray leading break.
             "item/reasoning/summaryPartAdded" => {
+                if current_turn {
+                    self.unread_opening_message = None;
+                }
                 let turn = self.turn_id.clone();
                 self.coalescer.break_paragraph(&turn, ChunkKind::Thought);
             }
@@ -1624,14 +1666,21 @@ impl CodexMapper {
                     text,
                 });
             }
-            "item/started" => self.on_item(&frame["params"]["item"], false, &mut step),
-            "item/completed" => self.on_item(&frame["params"]["item"], true, &mut step),
+            "item/started" => {
+                self.on_item(&frame["params"]["item"], false, current_turn, &mut step)
+            }
+            "item/completed" => {
+                self.on_item(&frame["params"]["item"], true, current_turn, &mut step)
+            }
             // Live wholesale-replace of a fileChange item's patch (PROTOCOL.md:
             // item/fileChange/patchUpdated). Re-upsert the row's locations and
             // title so an approval arriving after it names the right files.
             "item/fileChange/patchUpdated" => {
                 let params = &frame["params"];
                 if let Some(item_id) = params["itemId"].as_str() {
+                    if current_turn {
+                        self.unread_opening_message = None;
+                    }
                     let changes = params["changes"].as_array().cloned().unwrap_or_default();
                     self.file_change_upsert(item_id, &changes, &mut step);
                 }
@@ -1639,6 +1688,9 @@ impl CodexMapper {
             // The turn's todo list (entries {step, status}).
             "turn/plan/updated" => {
                 if let Some(plan) = frame["params"]["plan"].as_array() {
+                    if current_turn {
+                        self.unread_opening_message = None;
+                    }
                     let entries = plan
                         .iter()
                         .filter_map(|p| {
@@ -1932,11 +1984,14 @@ impl CodexMapper {
                         // status "interrupted" only follows a turn/interrupt
                         // RPC — codex's wire carries the user-stop fact
                         // structurally.
-                        Some("interrupted") => step.events.push(AgentEvent::TurnAborted {
-                            turn_id,
-                            reason: "interrupted".into(),
-                            interrupted: true,
-                        }),
+                        Some("interrupted") => {
+                            step.events.push(AgentEvent::TurnAborted {
+                                turn_id,
+                                reason: "interrupted".into(),
+                                interrupted: true,
+                            });
+                            self.warn_unreceived_input(&mut step);
+                        }
                         // A failed turn is `turn/completed {status: "failed",
                         // error}` on current app-servers (the 0.153/0.156
                         // schemas have no `turn/failed`); rendering it
@@ -2021,9 +2076,135 @@ impl CodexMapper {
         }
     }
 
+    /// These hooks run after turn/started but before Codex records the user
+    /// input. Ignoring their native progress hid a minutes-long SessionStart
+    /// stall behind "Starting" and made an interrupt look safe to resume.
+    fn on_startup_hook(&mut self, frame: &Value, completed: bool, step: &mut DriverStep) {
+        let params = &frame["params"];
+        if params["threadId"].as_str() != Some(self.thread_id.as_str()) {
+            return;
+        }
+        if let Some(turn) = params["turnId"].as_str() {
+            if turn != self.turn_id {
+                return;
+            }
+        }
+        let run = &params["run"];
+        let event = match run["eventName"].as_str() {
+            Some("sessionStart") => "SessionStart",
+            Some("userPromptSubmit") => "UserPromptSubmit",
+            _ => return,
+        };
+        if !self.turn_active || run["executionMode"] != "sync" {
+            return;
+        }
+        let Some(id) = run["id"].as_str().filter(|id| !id.is_empty()) else {
+            return;
+        };
+        // Configuration-derived IDs include source paths. Hash rather than
+        // dropping long paths, which would hide legitimate blocking hooks.
+        let id: [u8; 32] = Sha256::digest(id.as_bytes()).into();
+        if completed {
+            let Some((tool_id, _)) = self.startup_hooks.remove(&id) else {
+                return;
+            };
+            step.events.push(AgentEvent::ToolCallUpdate {
+                id: tool_id,
+                status: if matches!(
+                    run["status"].as_str(),
+                    Some("failed" | "blocked" | "stopped")
+                ) {
+                    ToolStatus::Failed
+                } else {
+                    ToolStatus::Completed
+                },
+                content: Self::startup_hook_output(run),
+            });
+        } else {
+            if self.startup_hooks.contains_key(&id) || self.startup_hooks.len() >= 32 {
+                return;
+            }
+            // Native hook IDs repeat across turns, and native turn IDs can be
+            // huge. A local monotonic ID bounds rows and keeps history unique.
+            let row_id = self.rpc_id();
+            let tool_id = format!("codex-hook-{:032x}-{row_id}", self.startup_hook_namespace);
+            let label = format!("Running {event} hook");
+            self.startup_hooks.insert(id, (tool_id.clone(), label));
+            step.events.push(AgentEvent::ToolCall {
+                id: tool_id,
+                kind: ToolKind::Other,
+                title: format!("{event} hook"),
+                locations: run["sourcePath"]
+                    .as_str()
+                    .map(|path| truncate_label(path, 4096))
+                    .into_iter()
+                    .collect(),
+                status: ToolStatus::InProgress,
+                cross_turn: false,
+                command: None,
+            });
+        }
+        step.events.push(AgentEvent::ActivityLine {
+            detail: self
+                .startup_hooks
+                .values()
+                .next()
+                .map(|(_, label)| label.clone()),
+        });
+    }
+
+    fn startup_hook_output(run: &Value) -> Option<ToolContent> {
+        // Entries carry diagnostics; statusMessage is only a progress label.
+        // Never expose injected context, and cap while joining rather than
+        // allocating every hook's output before truncating it.
+        const DIAGNOSTIC_CAP: usize = 16 * 1024;
+        let mut text = String::new();
+        let mut truncated = false;
+        for entry in run["entries"].as_array().into_iter().flatten() {
+            if !matches!(
+                entry["kind"].as_str(),
+                Some("error" | "feedback" | "stop" | "warning")
+            ) {
+                continue;
+            }
+            let Some(message) = entry["text"].as_str().filter(|s| !s.trim().is_empty()) else {
+                continue;
+            };
+            let room = DIAGNOSTIC_CAP.saturating_sub(text.len() + usize::from(!text.is_empty()));
+            if room == 0 {
+                truncated = true;
+                break;
+            }
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            let mut end = room.min(message.len());
+            while !message.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.push_str(&message[..end]);
+            if end < message.len() {
+                truncated = true;
+                break;
+            }
+        }
+        (!text.is_empty()).then_some(ToolContent::Output { text, truncated })
+    }
+
+    fn warn_unreceived_input(&mut self, step: &mut DriverStep) {
+        if self.unread_opening_message.take().is_some() {
+            step.events.push(AgentEvent::Notice {
+                text: "Message may not have arrived. Please resend.".into(),
+            });
+        }
+    }
+
     /// Clear everything scoped to a single turn. Called at every turn end
     /// (completed OR failed) so nothing leaks across the turn boundary.
     fn reset_turn_state(&mut self) {
+        self.unread_opening_message = None;
+        self.opening_turn_owned = false;
+        self.startup_hooks.clear();
         self.streamed.clear();
         self.out_streamed.clear();
         self.safety_notified = false;
@@ -2070,6 +2251,7 @@ impl CodexMapper {
         let error = frame.get("error").filter(|e| !e.is_null());
         match (pending, error) {
             (PendingRpc::TurnStart, Some(err)) => {
+                self.opening_turn_owned = false;
                 self.turn_pending = false;
                 let msg = err["message"].as_str().unwrap_or_default();
                 // If a turn was already active, the error names it: adopt that
@@ -2114,6 +2296,9 @@ impl CodexMapper {
                 }
                 match parse_expected_turn_id(msg) {
                     Some(live_turn) => {
+                        if live_turn != self.turn_id {
+                            self.opening_turn_owned = false;
+                        }
                         self.turn_id = live_turn.clone();
                         // Adopted id ⇒ fresh boundary state (see turn/start).
                         self.last_msg_item = None;
@@ -2394,8 +2579,46 @@ impl CodexMapper {
         });
     }
 
-    fn on_item(&mut self, item: &Value, completed: bool, step: &mut DriverStep) {
+    fn on_item(
+        &mut self,
+        item: &Value,
+        completed: bool,
+        current_turn: bool,
+        step: &mut DriverStep,
+    ) {
         let id = item["id"].as_str().unwrap_or_default().to_string();
+        if completed
+            && item["type"] == "userMessage"
+            && item["clientId"].as_str().is_some()
+            && item["clientId"].as_str() == self.unread_opening_message.as_deref()
+        {
+            self.unread_opening_message = None;
+        }
+        // Older servers may omit clientId on the user echo; actual model
+        // activity also proves we passed the pre-prompt hook barrier.
+        if current_turn
+            && matches!(
+                item["type"].as_str(),
+                Some(
+                    "reasoning"
+                        | "agentMessage"
+                        | "commandExecution"
+                        | "mcpToolCall"
+                        | "webSearch"
+                        | "fileChange"
+                        | "imageGeneration"
+                        | "imageView"
+                        | "dynamicToolCall"
+                        | "collabAgentToolCall"
+                        | "subAgentActivity"
+                        | "functionCallOutput"
+                        | "plan"
+                        | "sleep"
+                )
+            )
+        {
+            self.unread_opening_message = None;
+        }
         match item["type"].as_str() {
             Some("userMessage") if !completed => self.on_user_message_item(item, step),
             Some("agentMessage") if completed => {
@@ -3410,6 +3633,10 @@ impl CodexMapper {
         let Some(client_id) = item["clientId"].as_str() else {
             return;
         };
+        if self.unread_opening_message.as_deref() == Some(client_id) {
+            self.unread_opening_message = None;
+            return;
+        }
         let unread = self
             .unread_steers
             .iter()
@@ -3641,6 +3868,22 @@ impl CodexMapper {
         let params = &frame["params"];
         let method = frame["method"].as_str().unwrap_or_default();
         let request_id = format!("codex-{}", rpc_id);
+        if self.opening_turn_owned
+            && self.turn_active
+            && !self.turn_pending
+            && params["threadId"].as_str() == Some(self.thread_id.as_str())
+            && params["turnId"].as_str() == Some(self.turn_id.as_str())
+            && matches!(
+                method,
+                "item/fileChange/requestApproval"
+                    | "item/commandExecution/requestApproval"
+                    | "item/permissions/requestApproval"
+                    | "item/tool/requestUserInput"
+                    | "item/tool/call"
+            )
+        {
+            self.unread_opening_message = None;
+        }
 
         // Codex asking the user structured questions (mined: answers keyed
         // by question id, each {answers:[string,…]}).
@@ -4153,6 +4396,8 @@ impl CodexMapper {
     /// Open a fresh turn. Sets turn_pending so a fast second send buffers
     /// instead of racing a second turn/start into the same window.
     fn emit_turn_start(&mut self, input: Value, client_msg_id: String, step: &mut DriverStep) {
+        self.unread_opening_message = Some(client_msg_id.clone());
+        self.opening_turn_owned = true;
         let id = self.rpc_id();
         let mut params = json!({
             "threadId": self.thread_id,
@@ -4783,6 +5028,7 @@ impl CodexMapper {
             reason: "interrupted".into(),
             interrupted: true,
         });
+        self.warn_unreceived_input(&mut step);
         step.events.extend(self.drain_queued_sends());
         self.reset_turn_state();
         step
@@ -5202,6 +5448,7 @@ mod tests {
     }
 
     fn active_turn(m: &mut CodexMapper) {
+        m.opening_turn_owned = true;
         m.on_frame(&json!({
             "method": "turn/started",
             "params": { "turn": { "id": "turn-A" } },
@@ -5218,6 +5465,415 @@ mod tests {
                 "content": [{ "type": "text", "text": "…" }],
             } },
         })
+    }
+
+    fn startup_hook(id: &str, completed: bool) -> Value {
+        json!({
+            "method": if completed { "hook/completed" } else { "hook/started" },
+            "params": {
+                "threadId": "thr-1", "turnId": "turn-A",
+                "run": {
+                    "id": id, "eventName": "sessionStart", "executionMode": "sync",
+                    "sourcePath": "/tmp/plugin/hooks/hooks.json",
+                    "status": if completed { "completed" } else { "running" },
+                },
+            },
+        })
+    }
+
+    #[test]
+    fn blocking_startup_hooks_surface_and_settle_without_hiding_a_sibling() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let first = m.on_frame(&startup_hook("a", false));
+        assert!(first.events.iter().any(|e| matches!(e,
+            AgentEvent::ToolCall { title, locations, .. }
+                if title == "SessionStart hook" && locations == &["/tmp/plugin/hooks/hooks.json"]
+        )));
+        assert!(first.events.contains(&AgentEvent::ActivityLine {
+            detail: Some("Running SessionStart hook".into()),
+        }));
+        assert!(m.on_frame(&startup_hook("a", false)).events.is_empty());
+        m.on_frame(&startup_hook("b", false));
+        let closed = m.on_frame(&startup_hook("a", true));
+        assert!(closed.events.contains(&AgentEvent::ActivityLine {
+            detail: Some("Running SessionStart hook".into()),
+        }));
+        let closed = m.on_frame(&startup_hook("b", true));
+        assert!(closed
+            .events
+            .contains(&AgentEvent::ActivityLine { detail: None }));
+        assert!(m.startup_hooks.is_empty());
+    }
+
+    #[test]
+    fn startup_hook_progress_is_scoped_and_bounded() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        for (field, value) in [("threadId", "child"), ("turnId", "old-turn")] {
+            let mut frame = startup_hook("foreign", false);
+            frame["params"][field] = json!(value);
+            assert!(m.on_frame(&frame).events.is_empty());
+        }
+        let mut frame = startup_hook("async", false);
+        frame["params"]["run"]["executionMode"] = json!("async");
+        assert!(m.on_frame(&frame).events.is_empty());
+        for i in 0..40 {
+            m.on_frame(&startup_hook(&i.to_string(), false));
+        }
+        assert_eq!(m.startup_hooks.len(), 32);
+        m.reset_turn_state();
+        assert!(m.startup_hooks.is_empty());
+    }
+
+    #[test]
+    fn long_configuration_ids_remain_visible_and_settle_independently() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let prefix = format!("session-start:0:{}", "/nested/α".repeat(1000));
+        for suffix in ["first", "second"] {
+            let id = format!("{prefix}/{suffix}");
+            assert!(m
+                .on_frame(&startup_hook(&id, false))
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolCall { .. })));
+        }
+        assert_eq!(m.startup_hooks.len(), 2);
+        for suffix in ["first", "second"] {
+            let id = format!("{prefix}/{suffix}");
+            assert!(m
+                .on_frame(&startup_hook(&id, true))
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolCallUpdate { .. })));
+        }
+        assert!(m.startup_hooks.is_empty());
+    }
+
+    #[test]
+    fn model_work_confirms_opening_input_but_pre_prompt_items_do_not() {
+        for kind in [
+            "reasoning",
+            "agentMessage",
+            "commandExecution",
+            "mcpToolCall",
+            "webSearch",
+            "fileChange",
+            "imageGeneration",
+            "imageView",
+            "dynamicToolCall",
+            "collabAgentToolCall",
+            "subAgentActivity",
+            "functionCallOutput",
+            "plan",
+            "sleep",
+        ] {
+            for completed in [false, true] {
+                let mut m = mapper();
+                active_turn(&mut m);
+                m.unread_opening_message = Some("opening".into());
+                m.on_frame(&json!({
+                    "method": if completed {"item/completed"} else {"item/started"},
+                    "params": {"threadId": "thr-1", "turnId": "turn-A", "item": {"type": kind, "id": "work"}},
+                }));
+                assert!(m.unread_opening_message.is_none(), "{kind}");
+            }
+        }
+        for kind in [
+            "userMessage",
+            "hookPrompt",
+            "contextCompaction",
+            "enteredReviewMode",
+            "exitedReviewMode",
+        ] {
+            let mut m = mapper();
+            active_turn(&mut m);
+            m.unread_opening_message = Some("opening".into());
+            m.on_frame(&json!({
+                "method": "item/started",
+                "params": {"threadId": "thr-1", "turnId": "turn-A", "item": {"type": kind, "id": "setup"}},
+            }));
+            assert!(m.unread_opening_message.is_some(), "{kind}");
+        }
+    }
+
+    #[test]
+    fn model_deltas_and_parent_tool_requests_confirm_input() {
+        for method in ["item/plan/delta", "item/commandExecution/outputDelta"] {
+            let mut m = mapper();
+            active_turn(&mut m);
+            m.unread_opening_message = Some("opening".into());
+            m.on_frame(&json!({"method": method,
+                "params": {"threadId": "thr-1", "turnId": "turn-A", "itemId": "work", "delta": "working"},
+            }));
+            assert!(m.unread_opening_message.is_none());
+        }
+        for thread in ["thr-1", "child"] {
+            let mut m = mapper();
+            active_turn(&mut m);
+            m.unread_opening_message = Some("opening".into());
+            m.on_frame(
+                &json!({"id": 42, "method": "item/fileChange/requestApproval",
+                    "params": {"threadId": thread, "turnId": "turn-A", "itemId": "work"},
+                }),
+            );
+            assert_eq!(m.unread_opening_message.is_none(), thread == "thr-1");
+        }
+    }
+
+    #[test]
+    fn confirmation_notifications_require_the_current_turn() {
+        for method in [
+            "item/started",
+            "item/completed",
+            "item/plan/delta",
+            "item/reasoning/textDelta",
+            "item/reasoning/summaryPartAdded",
+            "item/commandExecution/outputDelta",
+            "item/fileChange/patchUpdated",
+            "turn/plan/updated",
+        ] {
+            for (turn, pending) in [
+                (json!("turn-A"), false),
+                (json!("old-turn"), false),
+                (Value::Null, false),
+                (json!("turn-A"), true),
+            ] {
+                let mut m = mapper();
+                active_turn(&mut m);
+                m.turn_pending = pending;
+                m.unread_opening_message = Some("opening".into());
+                m.on_frame(&json!({"method": method, "params": {
+                    "threadId": "thr-1", "turnId": turn, "itemId": "work", "delta": "working",
+                    "item": {"id": "work", "type": "commandExecution"},
+                    "changes": [], "plan": [],
+                }}));
+                assert_eq!(
+                    m.unread_opening_message.is_none(),
+                    turn == "turn-A" && !pending,
+                    "{method}: {turn}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_opening_is_not_confirmed_by_the_adopted_turn() {
+        for echo_phase in [None, Some("item/started"), Some("item/completed")] {
+            let mut m = mapper();
+            let sent = m.on_command(AgentCommand::Send {
+                blocks: vec![ContentBlock::Text {
+                    text: "original request".into(),
+                }],
+            });
+            let client = m.unread_opening_message.clone().unwrap();
+            let rpc = sent
+                .outbound
+                .iter()
+                .find(|frame| frame["method"] == "turn/start")
+                .unwrap()["id"]
+                .clone();
+            m.on_frame(&json!({"id": rpc, "error": {
+                "message": "expected active turn id `new` but found `turn-A`",
+            }}));
+            assert!(m.turn_active && !m.turn_pending && !m.opening_turn_owned);
+            for method in [
+                "item/started",
+                "item/reasoning/textDelta",
+                "item/fileChange/patchUpdated",
+                "turn/plan/updated",
+                "item/fileChange/requestApproval",
+            ] {
+                let mut frame = json!({"method": method, "params": {
+                    "threadId": "thr-1", "turnId": "turn-A", "delta": "old work",
+                    "itemId": "old", "item": {"id": "old", "type": "reasoning"},
+                    "changes": [], "plan": [],
+                }});
+                if method.ends_with("requestApproval") {
+                    frame["id"] = json!(90);
+                }
+                m.on_frame(&frame);
+                assert_eq!(m.unread_opening_message.as_deref(), Some(client.as_str()));
+            }
+            if let Some(method) = echo_phase {
+                let mut echo = read_item(&client);
+                echo["method"] = json!(method);
+                m.on_frame(&echo);
+            }
+            let end = m.on_frame(&json!({"method": "turn/completed",
+                "params": {"turn": {"id": "turn-A", "status": "interrupted"}},
+            }));
+            assert_eq!(end.events.iter().any(|e| matches!(e,
+                AgentEvent::Notice {text} if text == "Message may not have arrived. Please resend."
+            )), echo_phase.is_none());
+        }
+    }
+
+    #[test]
+    fn unsuccessful_startup_hooks_keep_entry_diagnostics() {
+        for (status, kind) in [
+            ("failed", "error"),
+            ("blocked", "feedback"),
+            ("stopped", "stop"),
+        ] {
+            let mut m = mapper();
+            active_turn(&mut m);
+            let mut frame = startup_hook("a", false);
+            frame["params"]["run"]["eventName"] = json!("userPromptSubmit");
+            m.on_frame(&frame);
+            frame["method"] = json!("hook/completed");
+            frame["params"]["run"]["status"] = json!(status);
+            frame["params"]["run"]["statusMessage"] = json!("Checking policy");
+            frame["params"]["run"]["entries"] = json!([
+                {"kind": "context", "text": "private injected context"},
+                {"kind": kind, "text": "Request rejected"},
+                {"kind": "warning", "text": "Check configuration"},
+            ]);
+            let step = m.on_frame(&frame);
+            assert!(step.events.iter().any(|e| matches!(e,
+                AgentEvent::ToolCallUpdate {
+                    status: ToolStatus::Failed,
+                    content: Some(ToolContent::Output { text, truncated: false }), ..
+                } if text == "Request rejected\nCheck configuration"
+            )));
+        }
+    }
+
+    #[test]
+    fn startup_hook_diagnostics_are_bounded_while_accumulating() {
+        let run = json!({"entries": [
+            {"kind": "error", "text": "α".repeat(20_000)},
+            {"kind": "feedback", "text": "later entry"},
+        ]});
+        let Some(ToolContent::Output { text, truncated }) = CodexMapper::startup_hook_output(&run)
+        else {
+            panic!("missing diagnostic");
+        };
+        assert_eq!(text.len(), 16 * 1024);
+        assert!(truncated);
+        assert!(!text.contains("later entry"));
+        assert!(CodexMapper::startup_hook_output(&json!({"entries": [
+            {"kind": "context", "text": "private"},
+            {"kind": "error", "text": "  "},
+        ]}))
+        .is_none());
+    }
+
+    #[test]
+    fn configuration_derived_hook_ids_do_not_overwrite_previous_turns() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let first = m.on_frame(&startup_hook("session-start:0:path", false));
+        m.reset_turn_state();
+        m.turn_id = "turn-B".into();
+        let mut frame = startup_hook("session-start:0:path", false);
+        frame["params"]["turnId"] = Value::Null;
+        let second = m.on_frame(&frame);
+        let id = |step: DriverStep| {
+            step.events
+                .into_iter()
+                .find_map(|e| match e {
+                    AgentEvent::ToolCall { id, .. } => Some(id),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_ne!(id(first), id(second));
+    }
+
+    #[test]
+    fn oversized_native_turn_ids_cannot_expand_hook_rows() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        m.turn_id = "α".repeat(100_000);
+        let mut started = startup_hook("same-hook", false);
+        started["params"]["turnId"] = Value::Null;
+        let first = m.on_frame(&started);
+        let id = first
+            .events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::ToolCall { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(id.len() < 64);
+        let mut completed = started.clone();
+        completed["method"] = json!("hook/completed");
+        assert!(m.on_frame(&completed).events.iter().any(|e| matches!(e,
+            AgentEvent::ToolCallUpdate { id: update_id, .. } if update_id == &id
+        )));
+        m.reset_turn_state();
+        m.turn_id.push('β');
+        assert!(m.on_frame(&started).events.iter().any(|e| matches!(e,
+            AgentEvent::ToolCall { id: next_id, .. } if next_id != &id && next_id.len() < 64
+        )));
+        let mut resumed = mapper();
+        active_turn(&mut resumed);
+        assert!(resumed.on_frame(&started).events.iter().any(|e| matches!(e,
+            AgentEvent::ToolCall { id: resumed_id, .. } if resumed_id != &id && resumed_id.len() < 64
+        )));
+    }
+
+    #[test]
+    fn interrupt_before_native_user_echo_warns_that_keep_going_loses_the_request() {
+        for received in [false, true] {
+            let mut m = mapper();
+            m.on_command(AgentCommand::Send {
+                blocks: vec![ContentBlock::Text {
+                    text: "original request".into(),
+                }],
+            });
+            let client_id = m.unread_opening_message.clone().unwrap();
+            active_turn(&mut m);
+            m.on_frame(&startup_hook("startup", false));
+            if received {
+                m.on_frame(&startup_hook("startup", true));
+                m.on_frame(&read_item(&client_id));
+            }
+            let end = m.on_frame(&json!({
+                "method": "turn/completed",
+                "params": { "turn": { "id": "turn-A", "status": "interrupted" } },
+            }));
+            assert_eq!(
+                end.events.iter().any(|e| matches!(e,
+                    AgentEvent::Notice { text } if text == "Message may not have arrived. Please resend."
+                )),
+                !received
+            );
+            assert!(m.unread_opening_message.is_none());
+            assert!(m.startup_hooks.is_empty());
+            assert!(end.outbound.iter().all(|f| f["method"] != "turn/start"));
+        }
+    }
+
+    #[test]
+    fn startup_interrupt_watchdog_warns_once_and_model_activity_prevents_false_warning() {
+        for model_activity in [false, true] {
+            let mut m = mapper();
+            m.on_command(AgentCommand::Send {
+                blocks: vec![ContentBlock::Text {
+                    text: "original request".into(),
+                }],
+            });
+            active_turn(&mut m);
+            if model_activity {
+                m.on_frame(&json!({
+                    "method": "item/started",
+                    "params": { "turnId": "turn-A", "item": { "type": "reasoning", "id": "r" } },
+                }));
+            }
+            m.interrupt_grace = Some(1);
+            let end = m.interrupt_watchdog();
+            assert_eq!(
+                end.events.iter().any(|e| matches!(e,
+                    AgentEvent::Notice { text } if text == "Message may not have arrived. Please resend."
+                )),
+                !model_activity
+            );
+            assert!(m.interrupt_watchdog().events.is_empty());
+        }
     }
 
     #[test]
