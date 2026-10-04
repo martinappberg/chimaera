@@ -119,7 +119,7 @@ fn bounded(value: &Value) -> Result<()> {
     Ok(())
 }
 fn configuration(value: &Value) -> Result<Configure> {
-    bounded(&value)?;
+    bounded(value)?;
     let config: Configure = serde_json::from_value(value.clone())?;
     let endpoint: std::net::SocketAddr = config
         .endpoint
