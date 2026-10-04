@@ -21,20 +21,25 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_runtime(None)
+    }
+    fn with_runtime(runtime: Option<Arc<dyn crate::daemon_extension::Runtime>>) -> Self {
         let root = std::env::temp_dir().join(format!(
             "chimaera-authority-{}",
             chimaera_core::generate_token()
         ));
         std::fs::create_dir_all(root.join("project")).unwrap();
         let root = root.canonicalize().unwrap();
-        let state = Arc::new(AppState::new(
+        let mut state = AppState::new(
             "fixture-token".into(),
             "fixture".into(),
             4242,
             0,
             root.clone(),
             root.join("config"),
-        ));
+        );
+        state.daemon_extension = runtime;
+        let state = Arc::new(state);
         state.stopping.store(true, Ordering::Release);
         Self {
             project: root.join("project"),
@@ -305,9 +310,17 @@ async fn foreign_workspace_fails_before_network_files_or_local_mutation() {
             .is_err());
     }
     let cache = fixture.root.join("forbidden-cache");
-    assert!(engine::fetch_snapshot(&config, "w-b", &cache)
-        .await
-        .is_err());
+    let cache_guard = Arc::new(fixture.state.pro.cache("w-b").unwrap().lock_owned().await);
+    assert!(engine::fetch_snapshot(
+        &fixture.state,
+        &config,
+        "w-b",
+        &cache,
+        cache_guard,
+        fixture.state.pro.generation.load(Ordering::Acquire),
+    )
+    .await
+    .is_err());
     assert!(!cache.exists());
     for (path, method, body) in [
         (
@@ -568,4 +581,106 @@ async fn supervised_revision_comparison_preserves_every_other_latched_identity()
             .revision,
         7
     );
+}
+
+// A finite admission probe stops before Git or installation. The actual composed
+// companion journey remains the materialization/runtime acceptance gate.
+#[tokio::test]
+async fn initial_hydrate_retains_transfer_owner_after_read_admission() {
+    use crate::daemon_extension::{self, transfer, Runtime};
+    struct Probe {
+        calls: Arc<AtomicUsize>,
+    }
+    impl Runtime for Probe {
+        fn coordinate(
+            &self,
+            _owner: daemon_extension::CoordinatorOwner,
+        ) -> daemon_extension::RuntimeFuture {
+            Box::pin(async {})
+        }
+        fn transfer<'a>(
+            &'a self,
+            host: Arc<transfer::TransferHost>,
+            operation: transfer::TransferRequest<'a>,
+        ) -> transfer::TransferFuture<'a> {
+            Box::pin(async move {
+                host.current()?;
+                match operation {
+                    transfer::TransferRequest::Initialize { path, format } => {
+                        anyhow::ensure!(
+                            path == host.cache().join("incoming.git") && format == "sha1",
+                            "wrong initial repository"
+                        );
+                        self.calls.fetch_add(1, Ordering::SeqCst);
+                        anyhow::bail!("fixture_initial_repository_admitted")
+                    }
+                    _ => anyhow::bail!("unexpected initial transfer operation"),
+                }
+            })
+        }
+    }
+    for changed in [false, true] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fixture = Fixture::with_runtime(Some(Arc::new(Probe {
+            calls: calls.clone(),
+        })));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let owner = fixture.state.clone();
+        let url = endpoint.clone();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let observed = reads.clone();
+        let peer = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/v1/mirror/credentials", axum::routing::post(move || {
+                let owner = owner.clone();
+                let url = url.clone();
+                let observed = observed.clone();
+                async move {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    if changed {
+                        owner.pro.generation.fetch_add(1, Ordering::AcqRel);
+                    }
+                    axum::Json(json!({"workspace_id":"w-a","repository_url":url,"working_tree_url":url,
+                        "username":"fixture","password":"synthetic","read_only":true,
+                        "storage_limit_bytes":1024,"max_file_bytes":1024}))
+                }
+            }))).await.unwrap();
+        });
+        let mut body = fixture.body();
+        body["endpoint"] = endpoint.into();
+        assert_eq!(
+            request(
+                &fixture.state,
+                Method::POST,
+                "/api/v1/pro/configure/workspace",
+                Some(body)
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        assert!(crate::lock(&fixture.state.workspaces).get("w-a").is_none());
+        let (status, reply) = request(
+            &fixture.state,
+            Method::POST,
+            "/api/v1/pro/hydrate",
+            Some(json!({
+                "workspace_id":"w-a","expected_epoch":0,"destination_root":fixture.project,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        if changed {
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(reply["code"], "account_changed");
+        } else {
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(reply["error"], "fixture_initial_repository_admitted");
+        }
+        assert!(!fixture.state.pro.root.join("w-a/incoming.git").exists());
+        assert!(crate::lock(&fixture.state.workspaces).get("w-a").is_none());
+        peer.abort();
+        let _ = peer.await;
+    }
 }

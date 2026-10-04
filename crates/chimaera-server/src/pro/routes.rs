@@ -1017,7 +1017,14 @@ async fn hydrate_owned(state: Arc<AppState>, mut request: Hydrate) -> detached::
     let manifest = match super::transport::cache_scope(
         &request.workspace_id,
         cache_guard.clone(),
-        engine::fetch_snapshot(&config, &request.workspace_id, &cache),
+        engine::fetch_snapshot(
+            &state,
+            &config,
+            &request.workspace_id,
+            &cache,
+            cache_guard.clone(),
+            generation,
+        ),
     )
     .await
     {

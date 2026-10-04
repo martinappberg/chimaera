@@ -642,12 +642,29 @@ async fn read_snapshot_at(
     })
 }
 pub(super) async fn fetch_snapshot(
+    state: &Arc<AppState>,
     config: &Configure,
     workspace: &str,
     cache: &Path,
+    cache_guard: Arc<tokio::sync::OwnedMutexGuard<()>>,
+    generation: u64,
 ) -> Result<Manifest> {
     let admission = read_snapshot(config, workspace).await?;
-    fetch_snapshot_admitted(workspace, cache, admission).await
+    // Initial HTTP hydration has no existing project transfer scope. Admit the
+    // read first, then retain its original cache and generation for materialization.
+    let transfer = super::transfer_dispatch::TransferScope::capture(
+        state,
+        workspace,
+        None,
+        cache_guard,
+        generation,
+    )
+    .await?;
+    super::transfer_dispatch::scope(
+        transfer,
+        fetch_snapshot_admitted(workspace, cache, admission),
+    )
+    .await
 }
 pub(super) async fn fetch_snapshot_at(
     config: &Configure,
