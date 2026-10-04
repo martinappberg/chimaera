@@ -160,8 +160,10 @@ visible without retaining large IDs. For runtimes without a user `clientId`, mod
 work items (including all tool types, plan and sleep), output deltas, patch updates,
 turn/plan/updated, and parent-turn tool requests confirm receipt. Work notifications
 must carry the current turnId; late frames from a prior turn cannot confirm a new
-opening message. Setup items such as hookPrompt and
-contextCompaction, and child-thread activity, do not establish parent delivery.
+opening message. Setup items such as hookPrompt and contextCompaction, and
+child-thread activity, do not establish parent delivery.
+Activity in a turn adopted after a rejected start (or a stale-target steer) cannot
+confirm an opening message from a different turn; only its exact user echo can.
 Run statuses `failed`, `blocked`, and `stopped` all represent unsuccessful hooks.
 Diagnostics live in `entries[{kind,text}]` (`error`, `feedback`, `stop`, `warning`);
 `statusMessage` is a configured progress label. Join diagnostics with a byte cap

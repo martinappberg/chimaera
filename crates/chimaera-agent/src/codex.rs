@@ -1158,6 +1158,9 @@ struct CodexMapper {
     /// A turn/start acknowledgement precedes SessionStart hooks and does not
     /// prove the opening input reached native conversation history.
     unread_opening_message: Option<String>,
+    /// Activity in a turn adopted after an RPC rejection cannot confirm the
+    /// opening input. Its exact user echo remains authoritative.
+    opening_turn_owned: bool,
     /// Only synchronous pre-prompt hooks block delivery. Keep their progress
     /// separate from model activity, bounded even if a runtime misses closes.
     startup_hooks: BTreeMap<[u8; 32], (String, String)>,
@@ -1342,6 +1345,7 @@ impl CodexMapper {
             turn_active: false,
             turn_pending: false,
             unread_opening_message: None,
+            opening_turn_owned: false,
             startup_hooks: BTreeMap::new(),
             startup_hook_namespace: rand::random(),
             queued_sends: VecDeque::new(),
@@ -1512,7 +1516,8 @@ impl CodexMapper {
             }
         }
 
-        let current_turn = self.turn_active
+        let current_turn = self.opening_turn_owned
+            && self.turn_active
             && !self.turn_pending
             && frame["params"]["turnId"].as_str() == Some(self.turn_id.as_str());
         if current_turn
@@ -2198,6 +2203,7 @@ impl CodexMapper {
     /// (completed OR failed) so nothing leaks across the turn boundary.
     fn reset_turn_state(&mut self) {
         self.unread_opening_message = None;
+        self.opening_turn_owned = false;
         self.startup_hooks.clear();
         self.streamed.clear();
         self.out_streamed.clear();
@@ -2245,6 +2251,7 @@ impl CodexMapper {
         let error = frame.get("error").filter(|e| !e.is_null());
         match (pending, error) {
             (PendingRpc::TurnStart, Some(err)) => {
+                self.opening_turn_owned = false;
                 self.turn_pending = false;
                 let msg = err["message"].as_str().unwrap_or_default();
                 // If a turn was already active, the error names it: adopt that
@@ -2289,6 +2296,9 @@ impl CodexMapper {
                 }
                 match parse_expected_turn_id(msg) {
                     Some(live_turn) => {
+                        if live_turn != self.turn_id {
+                            self.opening_turn_owned = false;
+                        }
                         self.turn_id = live_turn.clone();
                         // Adopted id ⇒ fresh boundary state (see turn/start).
                         self.last_msg_item = None;
@@ -2577,6 +2587,13 @@ impl CodexMapper {
         step: &mut DriverStep,
     ) {
         let id = item["id"].as_str().unwrap_or_default().to_string();
+        if completed
+            && item["type"] == "userMessage"
+            && item["clientId"].as_str().is_some()
+            && item["clientId"].as_str() == self.unread_opening_message.as_deref()
+        {
+            self.unread_opening_message = None;
+        }
         // Older servers may omit clientId on the user echo; actual model
         // activity also proves we passed the pre-prompt hook barrier.
         if current_turn
@@ -3851,7 +3868,8 @@ impl CodexMapper {
         let params = &frame["params"];
         let method = frame["method"].as_str().unwrap_or_default();
         let request_id = format!("codex-{}", rpc_id);
-        if self.turn_active
+        if self.opening_turn_owned
+            && self.turn_active
             && !self.turn_pending
             && params["threadId"].as_str() == Some(self.thread_id.as_str())
             && params["turnId"].as_str() == Some(self.turn_id.as_str())
@@ -4379,6 +4397,7 @@ impl CodexMapper {
     /// instead of racing a second turn/start into the same window.
     fn emit_turn_start(&mut self, input: Value, client_msg_id: String, step: &mut DriverStep) {
         self.unread_opening_message = Some(client_msg_id.clone());
+        self.opening_turn_owned = true;
         let id = self.rpc_id();
         let mut params = json!({
             "threadId": self.thread_id,
@@ -5429,6 +5448,7 @@ mod tests {
     }
 
     fn active_turn(m: &mut CodexMapper) {
+        m.opening_turn_owned = true;
         m.on_frame(&json!({
             "method": "turn/started",
             "params": { "turn": { "id": "turn-A" } },
@@ -5635,6 +5655,58 @@ mod tests {
                     "{method}: {turn}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn rejected_opening_is_not_confirmed_by_the_adopted_turn() {
+        for echo_phase in [None, Some("item/started"), Some("item/completed")] {
+            let mut m = mapper();
+            let sent = m.on_command(AgentCommand::Send {
+                blocks: vec![ContentBlock::Text {
+                    text: "original request".into(),
+                }],
+            });
+            let client = m.unread_opening_message.clone().unwrap();
+            let rpc = sent
+                .outbound
+                .iter()
+                .find(|frame| frame["method"] == "turn/start")
+                .unwrap()["id"]
+                .clone();
+            m.on_frame(&json!({"id": rpc, "error": {
+                "message": "expected active turn id `new` but found `turn-A`",
+            }}));
+            assert!(m.turn_active && !m.turn_pending && !m.opening_turn_owned);
+            for method in [
+                "item/started",
+                "item/reasoning/textDelta",
+                "item/fileChange/patchUpdated",
+                "turn/plan/updated",
+                "item/fileChange/requestApproval",
+            ] {
+                let mut frame = json!({"method": method, "params": {
+                    "threadId": "thr-1", "turnId": "turn-A", "delta": "old work",
+                    "itemId": "old", "item": {"id": "old", "type": "reasoning"},
+                    "changes": [], "plan": [],
+                }});
+                if method.ends_with("requestApproval") {
+                    frame["id"] = json!(90);
+                }
+                m.on_frame(&frame);
+                assert_eq!(m.unread_opening_message.as_deref(), Some(client.as_str()));
+            }
+            if let Some(method) = echo_phase {
+                let mut echo = read_item(&client);
+                echo["method"] = json!(method);
+                m.on_frame(&echo);
+            }
+            let end = m.on_frame(&json!({"method": "turn/completed",
+                "params": {"turn": {"id": "turn-A", "status": "interrupted"}},
+            }));
+            assert_eq!(end.events.iter().any(|e| matches!(e,
+                AgentEvent::Notice {text} if text == "Message may not have arrived. Please resend."
+            )), echo_phase.is_none());
         }
     }
 
