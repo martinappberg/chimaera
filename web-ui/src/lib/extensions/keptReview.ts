@@ -1,6 +1,7 @@
 /** Finite presentation domain for the original kept-review workspace. No URL,
  * token or generic request crosses this boundary. The existing host owns IO. */
 import { toStore } from "svelte/store";
+import type { ApiGuard } from "../net/api";
 import { fetchKeptFile, resolveKept, resolveAllKept } from "../pro/kept";
 import { keptReviews } from "../pro/keptReviews.svelte";
 import type { KeptChoice, KeptFile, KeptPair, KeptReview, KeptSide } from "../pro/kept";
@@ -31,6 +32,8 @@ export interface KeptReviewBackend {
   set(workspaceId: string, review: KeptReview): void;
 }
 export interface KeptReviewBinding {
+  /** New route owners must establish a guarded list, never adopt old cache. */
+  requireFresh?: boolean;
   workspaceId: string;
   current(): boolean;
   hereName: KeptReviewDomain["hereName"];
@@ -101,6 +104,7 @@ export function bindKeptReview(binding: KeptReviewBinding, backend: KeptReviewBa
   const isCurrent = binding.current;
   let live = true, revision = 1, digest = "initial", review: KeptReview | null | undefined;
   let error: "invalid" | null = null;
+  let fresh = binding.requireFresh !== true;
   let busy = false, reads = 0, stop: (() => void) | null = null;
   const listeners = new Set<(value: KeptViewSnapshot) => void>();
   const confirmations = new Set<KeptConfirmation>();
@@ -124,6 +128,7 @@ export function bindKeptReview(binding: KeptReviewBinding, backend: KeptReviewBa
     try { next = value == null ? value : keptReviewProjection(value, workspaceId); }
     catch { next = null; nextError = "invalid"; }
     lastSeen = next; lastError = nextError;
+    if (!fresh) return;
     // An unrelated host-store notification cannot revive a pair already
     // disproved by its file read. Only changed metadata or explicit refresh can.
     if (blockedDigest === JSON.stringify(next)) return;
@@ -161,7 +166,7 @@ export function bindKeptReview(binding: KeptReviewBinding, backend: KeptReviewBa
       current(); start(); await backend.refresh(workspaceId); current();
       // A deliberate refresh also retries a failed read with unchanged metadata.
       // It retires old read/confirmation revisions, never replays a mutation.
-      blockedDigest = null; accept(lastSeen, lastError, true);
+      fresh = true; blockedDigest = null; accept(lastSeen, lastError, true);
     },
     async read(minePath, at, signal) {
       const original = expected(at, minePath)!;
@@ -217,11 +222,13 @@ export function bindKeptReview(binding: KeptReviewBinding, backend: KeptReviewBa
 
 /** Adapter to the existing singleton and four existing routes. The private
  * module never imports them; owner IO/daemon validation semantics stay here. */
-export function bindExistingKeptReview(binding: KeptReviewBinding): KeptReviewDomain {
+export function bindExistingKeptReview(binding: KeptReviewBinding, guard?: ApiGuard): KeptReviewDomain {
   return bindKeptReview(binding, {
     observe: (workspace) => toStore(() => keptReviews.byWorkspace[workspace]),
-    refresh: (workspace) => keptReviews.refresh(workspace),
-    read: fetchKeptFile, choose: resolveKept, chooseAll: resolveAllKept,
+    refresh: (workspace) => keptReviews.refresh(workspace, guard),
+    read: (workspace, minePath, signal) => fetchKeptFile(workspace, minePath, signal, guard),
+    choose: (workspace, minePath, choice) => resolveKept(workspace, minePath, choice, guard),
+    chooseAll: (workspace, choice) => resolveAllKept(workspace, choice, guard),
     set: (workspace, answer) => keptReviews.set(workspace, answer),
   });
 }

@@ -481,7 +481,8 @@ When the chat's project came back from the cloud with files both sides changed w
 (Pro's kept-both report, `pro/keptReviews.svelte.ts`, read once per project and again on a
 `kept_both` notice or a choice), `KeptNote.svelte` draws one more such line — "Back on this
 Mac. The cloud and this Mac both changed 3 files while apart." with **Review**, which opens the
-review of both versions (`pro/KeptReviewView.svelte`). It is not a block: ChatView places it by
+review of both versions through `extensions/KeptApplicationView.svelte` and the optional
+private presentation; without it, the same tab offers Close/Open project folder. It is not a block: ChatView places it by
 the report's `returned_at` before the first user/assistant row sent after the return (after the
 last row at the live edge when nothing followed), never in a chat that began after the return or
 whose return point is outside the mounted window; a `home` pick-up at that point carries the

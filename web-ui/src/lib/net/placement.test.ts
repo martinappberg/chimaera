@@ -185,3 +185,68 @@ describe("where a routed session runs", () => {
     for (const [, options] of fetch.mock.calls) expect(options.method).toBeUndefined();
   });
 });
+
+import { invalidatePlacementOwner, placementOwner } from "./placement";
+describe("captured logical route identity", () => {
+  it.each([200, 503])("retains unread response cancellation after status %i until actual settlement", async (status) => {
+    invalidatePlacementOwner(); vi.stubGlobal("location", new URL("https://fixture.invalid/workspace/w-one/"));
+    vi.stubGlobal("history", { replaceState: vi.fn() });
+    const auth = await import("./api"); auth.clearUnauthorized();
+    let requested!: () => void, finishCancellation!: () => void;
+    const started = new Promise<void>((resolve) => { requested = resolve; });
+    const cancelPending = new Promise<void>((resolve) => { finishCancellation = resolve; });
+    const stream = new ReadableStream({ cancel() { requested(); return cancelPending; } });
+    const fetch = vi.fn().mockResolvedValueOnce(new Response(stream, { status })).mockResolvedValueOnce(Response.json(live));
+    vi.stubGlobal("fetch", fetch);
+    const original = readPlacement(); let settled = false;
+    void original.then(() => { settled = true; }, () => { settled = true; });
+    if (status === 200) invalidatePlacementOwner();
+    await started;
+    for (let cycle = 0; cycle < 8; cycle += 1) {
+      auth.notifyUnauthorized(); auth.clearUnauthorized();
+      await expect(readPlacement()).rejects.toMatchObject({ status: 503 });
+    }
+    expect(fetch).toHaveBeenCalledTimes(1); expect(settled).toBe(false);
+    finishCancellation(); await expect(original).rejects.toMatchObject({ status: status === 200 ? 409 : 503 });
+    await readPlacement(); expect(fetch).toHaveBeenCalledTimes(2); expect(get(placementOwner)?.current()).toBe(true);
+    invalidatePlacementOwner();
+  });
+  it("retains the actual placement request through repeated auth retirement until settlement", async () => {
+    invalidatePlacementOwner(); vi.stubGlobal("location", new URL("https://fixture.invalid/workspace/w-one/"));
+    vi.stubGlobal("history", { replaceState: vi.fn() });
+    const auth = await import("./api"); auth.clearUnauthorized();
+    let finish!: (response: Response) => void;
+    const fetch = vi.fn().mockImplementationOnce(() => new Promise<Response>((resolve) => { finish = resolve; }))
+      .mockResolvedValueOnce(Response.json(live));
+    vi.stubGlobal("fetch", fetch);
+    const original = readPlacement();
+    for (let cycle = 0; cycle < 8; cycle += 1) {
+      auth.notifyUnauthorized(); auth.clearUnauthorized();
+      await expect(readPlacement()).rejects.toMatchObject({ status: 503 });
+    }
+    expect(fetch).toHaveBeenCalledTimes(1);
+    finish(Response.json(live)); await expect(original).rejects.toThrow();
+    expect(get(placementOwner)).toBeNull();
+    await readPlacement(); expect(fetch).toHaveBeenCalledTimes(2); expect(get(placementOwner)?.current()).toBe(true);
+    invalidatePlacementOwner();
+  });
+  it("keeps the same owner across awake/suspended renewal and refuses a successor epoch", async () => {
+    invalidatePlacementOwner(); vi.stubGlobal("location", new URL("https://fixture.invalid/workspace/w-one/"));
+    const row = { ...live, holder_id: "wk", route_host_id: "worker-wk" };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(Response.json(row))
+      .mockResolvedValueOnce(Response.json({ ...row, availability: "suspended", expires_at: null }))
+      .mockResolvedValueOnce(Response.json({ ...row, epoch: 5 })));
+    await readPlacement(); const original = get(placementOwner)!;
+    await workspaceHeaders(new Headers(), original); expect(get(placementOwner)).toBe(original); expect(original.current()).toBe(true);
+    const headers = new Headers(); await expect(workspaceHeaders(headers, original)).rejects.toThrow();
+    expect(headers.has("X-Chimaera-Epoch")).toBe(false); expect(original.current()).toBe(false);
+    invalidatePlacementOwner();
+  });
+  it("auth invalidation prevents a delayed placement result publishing into recovery", async () => {
+    invalidatePlacementOwner(); vi.stubGlobal("location", new URL("https://fixture.invalid/workspace/w-one/"));
+    let finish!: (response: Response) => void;
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>((resolve) => { finish = resolve; })));
+    const pending = readPlacement(); invalidatePlacementOwner(); finish(Response.json(live));
+    await expect(pending).rejects.toThrow(); expect(get(placementOwner)).toBeNull();
+  });
+});

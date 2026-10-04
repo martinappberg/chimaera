@@ -137,7 +137,8 @@ export interface PluginViewTab {
 }
 /**
  * Both versions a Chimaera Pro return kept, for choosing between them
- * (`pro/KeptReviewView.svelte`) — the workspace's own, a singleton view.
+ * (`extensions/KeptApplicationView.svelte`) — the workspace's own singleton
+ * tab; absent private presentation retains Close/folder recovery.
  */
 export interface KeptTab {
   surface: "kept";

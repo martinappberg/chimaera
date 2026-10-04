@@ -146,7 +146,33 @@ function elsewherePause(signedOut: boolean): { status: string; detail: null } {
 export class PlacementError extends Error {
   constructor(readonly status: number) { super("Your project is reconnecting. This action was not sent."); }
 }
-let pending: { workspace: string; promise: Promise<WorkspacePlacement> } | null = null;
+let pending: { workspace: string; context: object; promise: Promise<WorkspacePlacement> } | null = null;
+export interface PlacementOwner {
+  readonly workspace_id: string; readonly epoch: number;
+  readonly holder_id: string | null; readonly route_host_id: string | null;
+  current(): boolean;
+}
+let placementContext: object = {};
+let currentPlacement: PlacementOwner | null = null;
+const placementOwnerStore = writable<PlacementOwner | null>(null);
+export const placementOwner: Readable<PlacementOwner | null> = { subscribe: placementOwnerStore.subscribe };
+/** Auth retirement cannot let an older coalesced request publish a successor. */
+export function invalidatePlacementOwner(): void {
+  // Retire publication, not the actual request slot. A successor cannot lose
+  // accounting for a predecessor still reading its bounded response body.
+  placementContext = {}; currentPlacement = null; placementOwnerStore.set(null);
+}
+function samePlacement(a: Pick<PlacementOwner, "workspace_id" | "epoch" | "holder_id" | "route_host_id">, b: WorkspacePlacement): boolean {
+  return a.workspace_id === b.workspace_id && a.epoch === b.epoch && a.holder_id === b.holder_id && a.route_host_id === b.route_host_id;
+}
+function admitPlacement(row: WorkspacePlacement): void {
+  if (currentPlacement !== null && samePlacement(currentPlacement, row)) return;
+  const context = placementContext;
+  const original: PlacementOwner = Object.freeze({ workspace_id: row.workspace_id, epoch: row.epoch,
+    holder_id: row.holder_id, route_host_id: row.route_host_id,
+    current: () => placementContext === context && currentPlacement === original });
+  currentPlacement = original; placementOwnerStore.set(original);
+}
 
 /** Where this browser view's project runs and whether it is asleep there. */
 export interface ProjectWhere {
@@ -202,10 +228,21 @@ export function projectWhereLabel(project: ProjectWhere | null, { state = false 
 export function readPlacement(): Promise<WorkspacePlacement> {
   const workspace = gatewayWorkspace();
   if (workspace === null) return Promise.reject(new PlacementError(409));
-  if (pending?.workspace === workspace) return pending.promise;
+  if (pending !== null) {
+    if (pending.workspace === workspace && pending.context === placementContext) return pending.promise;
+    return Promise.reject(new PlacementError(503));
+  }
+  const context = placementContext;
   const promise = (async () => {
     const response = await fetch(`${gatewayPrefix()}/placement`, { cache: "no-store", redirect: "error", signal: AbortSignal.timeout(2500) });
-    if (!response.ok) throw new PlacementError(response.status);
+    const refuse = async (status: number): Promise<never> => {
+      // Headers do not prove network/body cleanup. Keep the original slot
+      // until cancellation settles, including retired and failed responses.
+      try { await response.body?.cancel(); } catch { /* Preserve the fixed original refusal. */ }
+      throw new PlacementError(status);
+    };
+    if (placementContext !== context) return refuse(409);
+    if (!response.ok) return refuse(response.status);
     const reader = response.body?.getReader();
     if (!reader) throw new PlacementError(503);
     const chunks: Uint8Array[] = [];
@@ -220,21 +257,28 @@ export function readPlacement(): Promise<WorkspacePlacement> {
     const bytes = new Uint8Array(size);
     let offset = 0;
     for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
-    const placement = parsePlacement(JSON.parse(new TextDecoder().decode(bytes)), workspace);
+    if (placementContext !== context) throw new PlacementError(409);
+    let placement: WorkspacePlacement;
+    try { placement = parsePlacement(JSON.parse(new TextDecoder().decode(bytes)), workspace); }
+    catch (error) { currentPlacement = null; placementOwnerStore.set(null); throw error; }
     // A sleeping owner is routed like an awake one; the transport wakes it
     // for a request or socket that carries wake intent, never for a read.
-    if (placement.availability !== "owned" && placement.availability !== "suspended") throw new PlacementError(503);
+    if (placement.availability !== "owned" && placement.availability !== "suspended") {
+      currentPlacement = null; placementOwnerStore.set(null); throw new PlacementError(503);
+    }
+    admitPlacement(placement);
     noteProjectWhere(placement);
     return placement;
   })();
-  pending = { workspace, promise };
+  pending = { workspace, context, promise };
   void promise.finally(() => { if (pending?.promise === promise) pending = null; }).catch(() => {});
   return promise;
 }
 
-export async function workspaceHeaders(headers: Headers): Promise<void> {
+export async function workspaceHeaders(headers: Headers, expected?: PlacementOwner): Promise<void> {
   if (gatewayWorkspace() === null) return;
   const placement = await readPlacement();
+  if (expected !== undefined && (!expected.current() || !samePlacement(expected, placement))) throw new PlacementError(409);
   headers.set("X-Chimaera-Workspace", placement.workspace_id);
   headers.set("X-Chimaera-Epoch", String(placement.epoch));
   // A portable presentation alias: no real filesystem path leaves this tab.

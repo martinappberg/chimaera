@@ -22,6 +22,7 @@
     requestAssetReload,
   } from "./assetTransition";
   import Spinner from "../previews/Spinner.svelte";
+  import { modalFocus } from "../shared/modalFocus";
   import { findTargetsChanged, targetIn } from "../shared/find";
   import type { DashCtx } from "../dashboard/dash";
 
@@ -562,14 +563,23 @@
       <Spinner />
     {/if}
   {:else if tab.surface === "kept"}
-    {@const KeptReviewView = views.kept}
-    {#if KeptReviewView !== undefined}
-      <KeptReviewView
-        {wsId}
-        {wsRoot}
-        visible={active}
-        onOpenFile={(p: string) => ctrl.openFileFrom(node.id, p, false)}
-      />
+    {@const KeptApplicationView = views.kept}
+    {#if KeptApplicationView !== undefined}
+      <KeptApplicationView {wsId} {wsRoot} visible={active} {tab} paneId={node.id}
+        currentTab={(original: object, pane: string) => node.id === pane && node.tabs.some((candidate) => candidate === original)}
+        callbacks={{
+          openFile: (pane: string, path: string) => ctrl.openFileFrom(pane, path, false),
+          openFolder: (pane: string, path: string) => ctrl.openPathFrom(pane, path, "dir", false),
+          close: (original: object, pane: string) => {
+            if (node.id !== pane) return;
+            const index = node.tabs.findIndex((candidate) => candidate === original);
+            if (index >= 0) ctrl.closeTab(pane, index);
+          },
+          modal: (element: HTMLElement) => {
+            const handle = modalFocus(element);
+            return { destroy: () => handle?.destroy?.() };
+          },
+        }} />
     {:else if viewErrors.kept}
       {@render loadFailure("kept", "the review of both versions")}
     {:else}

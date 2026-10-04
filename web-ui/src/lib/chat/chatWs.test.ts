@@ -183,33 +183,49 @@ it("work that went to another of the user's computers says so", async () => {
   socket.close();
 });
 
-it("a send into a browser view whose socket is down reconnects once with wake intent", () => {
+it("a send into a browser view whose socket is down reconnects once with wake intent", async () => {
   vi.stubGlobal("location", new URL("https://fixture.invalid/workspace/w-one/"));
-  vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>(() => {})));
+  let retire!: (error: Error) => void;
+  const held = new Promise<Response>((_resolve, reject) => { retire = reject; });
+  vi.stubGlobal("fetch", vi.fn(() => held));
   const socket = new ChatSocket("s-chat", handlers());
   Socket.all[0].onopen?.();
-  // Not authenticated yet: the send is refused (the composer keeps the text).
-  expect(socket.send({ type: "send", blocks: [] })).toBe(false);
-  expect(socket.send({ type: "send", blocks: [] })).toBe(false);
-  expect(Socket.all).toHaveLength(2);
-  expect(Socket.all[1].url).toContain("?wake=interaction");
-  expect(Socket.all.flatMap((s) => s.sent)).toHaveLength(0);
-  socket.close();
+  const pending = readPlacement();
+  try {
+    // Not authenticated yet: the send is refused (the composer keeps the text).
+    expect(socket.send({ type: "send", blocks: [] })).toBe(false);
+    expect(socket.send({ type: "send", blocks: [] })).toBe(false);
+    expect(Socket.all).toHaveLength(2);
+    expect(Socket.all[1].url).toContain("?wake=interaction");
+    expect(Socket.all.flatMap((s) => s.sent)).toHaveLength(0);
+  } finally {
+    socket.close();
+    retire(new Error("Fixture placement retired"));
+    await expect(pending).rejects.toThrow("Fixture placement retired");
+  }
 });
 
-it("a frame the store sends by itself never redials or asks for a wake", () => {
+it("a frame the store sends by itself never redials or asks for a wake", async () => {
   vi.stubGlobal("location", new URL("https://fixture.invalid/workspace/w-one/"));
-  vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>(() => {})));
+  let retire!: (error: Error) => void;
+  const held = new Promise<Response>((_resolve, reject) => { retire = reject; });
+  vi.stubGlobal("fetch", vi.fn(() => held));
   const socket = new ChatSocket("s-chat", handlers());
   Socket.all[0].onopen?.();
-  // Down (not authenticated yet): the user's own send would dial with wake
-  // intent here; a resend or a withdrawal is simply not written.
-  expect(socket.sendQuietly({ type: "send", blocks: [], client_id: "client-0001" })).toBe(false);
-  expect(socket.sendQuietly({ type: "cancel_send", client_id: "client-0001" })).toBe(false);
-  expect(Socket.all).toHaveLength(1);
-  expect(Socket.all[0].url).not.toContain("wake=");
-  expect(Socket.all.flatMap((s) => s.sent)).toHaveLength(0);
-  socket.close();
+  const pending = readPlacement();
+  try {
+    // Down (not authenticated yet): the user's own send would dial with wake
+    // intent here; a resend or a withdrawal is simply not written.
+    expect(socket.sendQuietly({ type: "send", blocks: [], client_id: "client-0001" })).toBe(false);
+    expect(socket.sendQuietly({ type: "cancel_send", client_id: "client-0001" })).toBe(false);
+    expect(Socket.all).toHaveLength(1);
+    expect(Socket.all[0].url).not.toContain("wake=");
+    expect(Socket.all.flatMap((s) => s.sent)).toHaveLength(0);
+  } finally {
+    socket.close();
+    retire(new Error("Fixture placement retired"));
+    await expect(pending).rejects.toThrow("Fixture placement retired");
+  }
 });
 
 it("a native window's send never reconnects early", () => {
@@ -268,8 +284,7 @@ it("a parked socket dials passively when its row says the owner answers again", 
 });
 
 it("a project view parks when its placement says the owner sleeps, and dials once it is owned again", async () => {
-  // Its own project: an earlier test left a never-answered read for w-one,
-  // and reads of one project coalesce.
+  // Earlier controlled placement reads settled during their owning teardown.
   vi.stubGlobal("location", new URL("https://fixture.invalid/workspace/w-two/"));
   const suspended = { workspace_id: "w-two", holder_id: "wk", route_host_id: "worker-wk", epoch: 3, policy_revision: 1, availability: "suspended", server_now: "2026-09-28T19:00:00Z", expires_at: "2026-09-28T18:00:00Z" };
   const owned = { ...suspended, availability: "owned", expires_at: "2026-09-28T19:01:30Z" };

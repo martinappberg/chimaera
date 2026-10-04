@@ -11,7 +11,7 @@ const file: KeptFile = { path: original.pairs[0].path, mine_path: original.pairs
   mine: { size: 4, changed_at: 3, text: "mine" }, cloud: { size: 3, changed_at: 2, text: "new" } };
 function deferred<T>() { let resolve!: (v: T) => void; let reject!: (e: unknown) => void;
   const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
-function fixture() {
+function fixture(requireFresh = false) {
   let observer: ((v: KeptReview | null | undefined) => void) | null = null;
   let current = true; let snapshot!: KeptViewSnapshot;
   const stop = vi.fn();
@@ -21,7 +21,7 @@ function fixture() {
     refresh: vi.fn(async () => {}), read: vi.fn(async () => file), choose: vi.fn(async () => answer),
     chooseAll: vi.fn(async () => answer), set: vi.fn(),
   };
-  const domain = bindKeptReview({ workspaceId: original.workspace_id, current: () => current, hereName: "this Mac",
+  const domain = bindKeptReview({ workspaceId: original.workspace_id, current: () => current, requireFresh, hereName: "this Mac",
     editor: { fontSize: 13, lineHeight: 1.5, tabSize: 2, lineNumbers: true } }, backend);
   const unsubscribe = domain.subscribe((value) => { snapshot = value; });
   return { backend, domain, stop, unsubscribe, snapshot: () => snapshot,
@@ -55,6 +55,15 @@ describe("original kept review host domain", () => {
     const fresh = f.domain.confirmAll("use_cloud", f.snapshot().revision);
     await f.domain.chooseAll(fresh); await expect(f.domain.chooseAll(fresh)).rejects.toMatchObject({ code: "changed" });
     expect(f.backend.chooseAll).toHaveBeenCalledTimes(1); f.domain.dispose();
+  });
+  it("a recovered owner cannot choose cached pairs before its successful fresh list", async () => {
+    const f = fixture(true);
+    expect(f.snapshot().review).toBeUndefined();
+    expect(() => f.domain.confirmAll("keep_both", f.snapshot().revision)).toThrow();
+    f.backend.refresh = vi.fn().mockRejectedValueOnce(new Error("refused")).mockResolvedValueOnce(undefined);
+    await expect(f.domain.refresh()).rejects.toThrow(); expect(f.snapshot().review).toBeUndefined();
+    await f.domain.refresh(); const confirmation = f.domain.confirmAll("keep_both", f.snapshot().revision);
+    await f.domain.chooseAll(confirmation); expect(f.backend.chooseAll).toHaveBeenCalledTimes(1); f.domain.dispose();
   });
   it("explicit Refresh retries a failed read even when listed metadata is unchanged", async () => {
     const f = fixture(); const at = f.snapshot().revision;

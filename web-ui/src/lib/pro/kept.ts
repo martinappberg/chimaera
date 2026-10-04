@@ -11,7 +11,7 @@
  * "your computer" in a browser view of the project), "both versions".
  */
 
-import { api, isRemoteHost } from "../net/api";
+import { api, isRemoteHost, type ApiGuard } from "../net/api";
 import { isBrowserGateway } from "../net/base";
 import { isMac } from "../shared/keys";
 
@@ -193,8 +193,12 @@ function base(workspaceId: string): string {
   return `/pro/projects/${encodeURIComponent(workspaceId)}/kept`;
 }
 
-async function read<T>(response: Response): Promise<T> {
-  if (response.ok) return (await response.json()) as T;
+async function read<T>(response: Response, guard?: ApiGuard): Promise<T> {
+  if (response.ok) {
+    const value = (await response.json()) as T;
+    if (guard !== undefined && !guard.current()) throw new KeptError(409, "not_here");
+    return value;
+  }
   let code = "failed";
   try {
     const body = (await response.json()) as { error_code?: unknown };
@@ -205,32 +209,32 @@ async function read<T>(response: Response): Promise<T> {
   throw new KeptError(response.status, code);
 }
 
-export async function fetchKept(workspaceId: string, signal?: AbortSignal): Promise<KeptReview> {
-  return read<KeptReview>(await api(base(workspaceId), { signal }));
+export async function fetchKept(workspaceId: string, signal?: AbortSignal, guard?: ApiGuard): Promise<KeptReview> {
+  return read<KeptReview>(await api(base(workspaceId), { signal }, guard), guard);
 }
 
-export async function fetchKeptFile(workspaceId: string, minePath: string, signal?: AbortSignal): Promise<KeptFile> {
+export async function fetchKeptFile(workspaceId: string, minePath: string, signal?: AbortSignal, guard?: ApiGuard): Promise<KeptFile> {
   const query = new URLSearchParams({ mine_path: minePath });
-  return read<KeptFile>(await api(`${base(workspaceId)}/file?${query}`, { signal }));
+  return read<KeptFile>(await api(`${base(workspaceId)}/file?${query}`, { signal }, guard), guard);
 }
 
-export async function resolveKept(workspaceId: string, minePath: string, choice: KeptChoice): Promise<KeptReview> {
+export async function resolveKept(workspaceId: string, minePath: string, choice: KeptChoice, guard?: ApiGuard): Promise<KeptReview> {
   return read<KeptReview>(
     await api(`${base(workspaceId)}/resolve`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ mine_path: minePath, choice }),
-    }),
+    }, guard), guard,
   );
 }
 
-export async function resolveAllKept(workspaceId: string, choice: KeptChoice): Promise<KeptReview> {
+export async function resolveAllKept(workspaceId: string, choice: KeptChoice, guard?: ApiGuard): Promise<KeptReview> {
   return read<KeptReview>(
     await api(`${base(workspaceId)}/resolve_all`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ choice }),
-    }),
+    }, guard), guard,
   );
 }
 

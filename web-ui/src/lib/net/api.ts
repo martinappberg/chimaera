@@ -1,8 +1,8 @@
 import { daemonPath, gatewayPrefix, gatewayWorkspace, isBrowserGateway } from "./base";
 
-import { PlacementError, workspaceHeaders } from "./placement";
+import { PlacementError, workspaceHeaders, invalidatePlacementOwner, type PlacementOwner } from "./placement";
 
-import { writable } from "svelte/store";
+import { writable, type Readable } from "svelte/store";
 
 import { healthPollDelayMs, startVisibilityPoll, type PollHandle } from "./poll";
 import { recordLinkRtt } from "./rtt";
@@ -207,9 +207,29 @@ export function reclaimHomeHub(): void {
  * latch via {@link clearUnauthorized} instead.
  */
 export const unauthorized = writable(false);
+export interface ApiOwner { current(): boolean }
+export interface ApiGuard extends ApiOwner { readonly owner: ApiOwner; readonly placement?: PlacementOwner }
+let blocked = false;
+const ownerStore = writable<ApiOwner | null>(null);
+export const apiOwner: Readable<ApiOwner | null> = { subscribe: ownerStore.subscribe };
+let currentOwner: ApiOwner;
+function replaceApiOwner(): void {
+  invalidatePlacementOwner();
+  const origin = location.origin, prefix = gatewayPrefix();
+  const original: ApiOwner = Object.freeze({ current: () => !blocked && currentOwner === original &&
+    location.origin === origin && gatewayPrefix() === prefix });
+  currentOwner = original; ownerStore.set(blocked ? null : original);
+}
+replaceApiOwner();
+export function captureApiGuard(placement?: PlacementOwner): ApiGuard {
+  const original = currentOwner;
+  return Object.freeze({ owner: original, current: () => original.current() && (placement === undefined || placement.current()),
+    ...(placement === undefined ? {} : { placement }) });
+}
 
 /** Mark this window's auth as dead (401 from REST or a WS auth error). */
 export function notifyUnauthorized(): void {
+  if (!blocked) { blocked = true; replaceApiOwner(); }
   unauthorized.set(true);
 }
 
@@ -217,6 +237,7 @@ export function notifyUnauthorized(): void {
  *  window's in-place tunnel heal). Every other recovery navigates, which
  *  resets the latch by itself. */
 export function clearUnauthorized(): void {
+  if (blocked) { blocked = false; replaceApiOwner(); }
   unauthorized.set(false);
 }
 
@@ -231,6 +252,7 @@ export function refreshTokenFromHash(): boolean {
   const fresh = params.get("token");
   if (fresh === null || fresh === token) return false;
   token = fresh;
+  replaceApiOwner();
   sessionStorage.setItem(TOKEN_KEY, fresh);
   history.replaceState(null, "", location.pathname + location.search);
   return true;
@@ -410,7 +432,10 @@ export class ApiError extends Error {
 }
 
 /** Fetch wrapper for /api/v1 that attaches the Bearer token. */
-export async function api(path: string, init: RequestInit = {}): Promise<Response> {
+export async function api(path: string, init: RequestInit = {}, guard?: ApiGuard): Promise<Response> {
+  const owner = currentOwner;
+  const check = () => { if (guard !== undefined && !guard.current()) throw new ApiError(409, "workspace_scope_changed"); };
+  check();
   const headers = new Headers(init.headers);
   if (token) {
     headers.set("Authorization", `Bearer ${token}`);
@@ -420,10 +445,15 @@ export async function api(path: string, init: RequestInit = {}): Promise<Respons
     const workspace=getActiveWorkspaceId();
     if (workspace !== null && /^[A-Za-z0-9_-]{1,128}$/.test(workspace)) headers.set("X-Chimaera-Viewer-Workspace",workspace);
   }
-  try { await workspaceHeaders(headers); }
-  catch (error) { if (error instanceof PlacementError && error.status === 401) notifyUnauthorized(); throw error; }
+  try { await workspaceHeaders(headers, guard?.placement); }
+  catch (error) { if (error instanceof PlacementError && error.status === 401 && owner === currentOwner) notifyUnauthorized(); throw error; }
+  check();
   const res = await fetch(daemonPath(`/api/v1${path}`), { ...init, headers });
-  if (res.status === 401) notifyUnauthorized();
+  if (res.status === 401 && owner === currentOwner) notifyUnauthorized();
+  if (guard !== undefined && !guard.current()) {
+    try { await res.body?.cancel(); } catch { /* Preserve original retirement refusal. */ }
+    check();
+  }
   return res;
 }
 

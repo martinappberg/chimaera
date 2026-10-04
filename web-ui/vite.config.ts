@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { defineConfig, type Plugin } from "vite";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
+import { applicationEntryPlugin } from "./scripts/application-entry.mjs";
 
 /**
  * Dev-only: serve the local daemon's manifest (port + token) at
@@ -135,7 +136,8 @@ const MARP_HLJS_KEEP = [
 export default defineConfig({
   // The same bundle runs directly or below a per-tab browser gateway prefix.
   base: "./",
-  plugins: [svelte(), devManifest(), entryBundleBudget(), pdfjsAssets(), marpSharesKatex()],
+  plugins: [svelte(), devManifest(), entryBundleBudget(), pdfjsAssets(), marpSharesKatex(),
+    applicationEntryPlugin(fileURLToPath(new URL(".", import.meta.url)))],
   resolve: {
     // Marp (the slides view, its own lazy chunk) imports all of MathJax and
     // every highlight.js grammar up front: stubs for those — slides render

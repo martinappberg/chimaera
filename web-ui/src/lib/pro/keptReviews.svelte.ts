@@ -10,11 +10,12 @@
  */
 
 import { fetchKept, type KeptReview } from "./kept";
+import { captureApiGuard, type ApiGuard } from "../net/api";
 
-class KeptReviews {
+export class KeptReviews {
   /** Per project: its last answer; null = nothing to review or no answer. */
   byWorkspace = $state<Record<string, KeptReview | null>>({});
-  #inflight = new Map<string, Promise<void>>();
+  #inflight = new Map<string, { promise: Promise<void>; guard?: ApiGuard }>();
 
   /** Read the project's answer once (a later `refresh` reads it again). */
   ensure(workspaceId: string): void {
@@ -22,19 +23,35 @@ class KeptReviews {
     void this.refresh(workspaceId);
   }
 
-  refresh(workspaceId: string): Promise<void> {
+  refresh(workspaceId: string, guard?: ApiGuard): Promise<void> {
     const running = this.#inflight.get(workspaceId);
-    if (running !== undefined) return running;
-    const request = fetchKept(workspaceId)
-      .then(
-        (review) => this.set(workspaceId, review),
-        () => {
-          // Keep what was known; a first read that fails reads as nothing.
-          if (!(workspaceId in this.byWorkspace)) this.set(workspaceId, null);
-        },
-      )
-      .finally(() => this.#inflight.delete(workspaceId));
-    this.#inflight.set(workspaceId, request);
+    if (running !== undefined) {
+      // Keep one retained request slot. A successor cannot adopt a predecessor
+      // answer as a fresh read, or bypass its cleanup by creating another map.
+      if (guard !== undefined) {
+        if (running.guard === undefined || running.guard.owner !== guard.owner || running.guard.placement !== guard.placement) {
+          return Promise.reject(new Error("Kept refresh still settling"));
+        }
+        return running.promise.then(() => { if (!guard.current()) throw new Error("Kept route retired"); });
+      }
+      return running.promise;
+    }
+    const original = guard ?? captureApiGuard();
+    let entry!: { promise: Promise<void>; guard?: ApiGuard };
+    const request = fetchKept(workspaceId, guard === undefined ? undefined : AbortSignal.timeout(4000), guard)
+      .then((review) => {
+        if (!original.current()) throw new Error("Kept route retired");
+        this.set(workspaceId, review);
+      })
+      .catch((error: unknown) => {
+        if (guard !== undefined) throw error;
+        // Ordinary readers retain known data; a stale predecessor never
+        // clears a recovered owner's store or publishes an initial null.
+        if (original.current() && !(workspaceId in this.byWorkspace)) this.set(workspaceId, null);
+      })
+      .finally(() => { if (this.#inflight.get(workspaceId) === entry) this.#inflight.delete(workspaceId); });
+    entry = { promise: request, ...(guard === undefined ? {} : { guard }) };
+    this.#inflight.set(workspaceId, entry);
     return request;
   }
 
