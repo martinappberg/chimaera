@@ -50,7 +50,7 @@ fn consume(reader: OwnedFd, binding: Binding, deadline: Instant) -> Result<Pendi
         control,
         binding,
         deadline,
-        super::super::maintenance_startup::Protection::synthetic(),
+        super::super::provider_protection::Protection::synthetic(),
     )
 }
 fn pipe(bytes: &[u8]) -> OwnedFd {

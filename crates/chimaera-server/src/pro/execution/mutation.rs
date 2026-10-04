@@ -13,7 +13,6 @@ pub(super) struct Commits(pub(super) Arc<Mutex<Admission>>);
 #[derive(Default)]
 pub(super) struct Admission {
     pub(super) counts: HashMap<String, usize>,
-    pub(super) maintenance: HashMap<String, super::maintenance::Entry>,
     workspace_maintenance: std::collections::HashSet<String>,
 }
 
@@ -77,8 +76,7 @@ pub(in crate::pro) async fn begin_copy(
     super::receipt::validate(&checkpoint)?;
     let commit = {
         let mut commits = lock(&state.pro.execution.commits.0);
-        if commits.maintenance.contains_key(workspace)
-            || commits.workspace_maintenance.contains(workspace)
+        if commits.workspace_maintenance.contains(workspace)
             || commits.counts.get(workspace).copied().unwrap_or(0) > 0
             || commits.counts.values().sum::<usize>() >= 64
         {
@@ -223,8 +221,7 @@ pub(crate) async fn begin_import(
         return Err(Changed.into());
     }
     let mut commits = lock(&state.pro.execution.commits.0);
-    if commits.maintenance.contains_key(workspace)
-        || commits.workspace_maintenance.contains(workspace)
+    if commits.workspace_maintenance.contains(workspace)
         || commits.counts.values().sum::<usize>() >= 64
     {
         return Err(Changed.into());
@@ -474,8 +471,7 @@ fn begin_launch_admission(
         }
     }
     let mut commits = lock(&state.pro.execution.commits.0);
-    if commits.maintenance.contains_key(workspace)
-        || commits.workspace_maintenance.contains(workspace)
+    if commits.workspace_maintenance.contains(workspace)
         || commits.counts.values().sum::<usize>() >= 64
     {
         return Err(Changed.into());
@@ -547,8 +543,7 @@ pub(crate) fn begin(
     let mut commits = lock(&state.pro.execution.commits.0);
     // At most 64 irreversible operations can be outstanding, even if a shared
     // filesystem stalls. No mutex or reactor thread waits for their I/O.
-    if commits.maintenance.contains_key(workspace)
-        || commits.workspace_maintenance.contains(workspace)
+    if commits.workspace_maintenance.contains(workspace)
         || commits.counts.values().sum::<usize>() >= 64
     {
         return Err(Changed.into());
@@ -598,8 +593,7 @@ pub(crate) fn begin_workspace_maintenance(
         return Err(Changed.into());
     }
     let mut commits = lock(&state.pro.execution.commits.0);
-    if commits.maintenance.contains_key(workspace)
-        || commits.workspace_maintenance.contains(workspace)
+    if commits.workspace_maintenance.contains(workspace)
         || commits.counts.get(workspace).copied().unwrap_or(0) != 0
         || commits.counts.values().sum::<usize>() >= 64
     {

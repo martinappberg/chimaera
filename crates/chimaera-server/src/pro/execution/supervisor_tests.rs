@@ -30,19 +30,13 @@ struct Fixture {
 fn ordinary_startup_keeps_cleanup_metadata_without_process_hardening_or_duplicate_stage() {
     let f = Fixture::new();
     let state = f.state();
-    let mut absent = f.receipt(&state, 1, 0);
-    absent.maintenance_control = Some(super::super::maintenance_startup::Control {
-        version: 1,
-        fd: i32::MAX,
-        channel_nonce: "A".repeat(43),
-    });
-    assert!(own_startup(absent).is_err());
+    let mut retired = serde_json::to_value(f.receipt(&state, 1, 0)).unwrap();
+    retired["maintenance_control"] =
+        json!({"version":1,"fd":i32::MAX,"channel_nonce":"A".repeat(43)});
+    assert!(decode(&serde_json::to_vec(&retired).unwrap()).is_err());
     let dumpable = unsafe { nix::libc::prctl(nix::libc::PR_GET_DUMPABLE, 0, 0, 0, 0) };
     let startup = own_startup(f.receipt(&state, 1, 0)).unwrap();
-    assert!(startup.maintenance.is_none());
-    assert!(startup.receipt.maintenance_control.is_none());
     stage_startup(&state, Some(startup)).unwrap();
-    assert!(lock(&state.pro.execution.maintenance_pending).is_none());
     assert!(stage_startup(&state, Some(own_startup(f.receipt(&state, 2, 1)).unwrap())).is_err());
     assert_eq!(
         lock(&state.pro.execution.supervisor_pending)
@@ -345,7 +339,7 @@ fn parser_and_channel_reject_malformed_oversize_non_pipe_and_missing_eof() {
 }
 
 #[test]
-fn provider_descriptor_requires_feature_and_cannot_alias_the_idle_channel() {
+fn provider_descriptor_requires_feature_and_refuses_retired_idle_metadata() {
     let fixture = Fixture::new();
     let state = fixture.state();
     let mut value = serde_json::to_value(fixture.receipt(&state, 2, 1)).unwrap();
@@ -358,7 +352,8 @@ fn provider_descriptor_requires_feature_and_cannot_alias_the_idle_channel() {
         value["maintenance_control"] = json!({"version":1,"fd":70,"channel_nonce":"A".repeat(43)});
         assert!(decode(&serde_json::to_vec(&value).unwrap()).is_err());
         value["maintenance_control"]["fd"] = json!(71);
-        assert!(decode(&serde_json::to_vec(&value).unwrap()).is_ok());
+        assert!(decode(&serde_json::to_vec(&value).unwrap()).is_err());
+        value.as_object_mut().unwrap().remove("maintenance_control");
         for fd in [0, 2, 256, -1] {
             value["provider_runtime"]["fd"] = json!(fd);
             assert!(decode(&serde_json::to_vec(&value).unwrap()).is_err());

@@ -22,28 +22,18 @@ pub(crate) struct CleanupReceipt {
     launch_generation: u64,
     previous_generation: u64,
     os_boot_id: String,
-    #[cfg(unix)]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    maintenance_control: Option<super::maintenance_startup::Control>,
     #[cfg(all(unix, feature = "provider-authority-prototype"))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     provider_runtime: Option<chimaera_core::provider_runtime::StartupDescriptor>,
 }
-/// Startup is moved exactly once. Cleanup evidence remains cloneable, while a
-/// selected maintenance descriptor is an owned, protected resource.
+/// Startup moves once; provider credentials stay separate from cleanup metadata.
 pub(crate) struct Startup {
     receipt: CleanupReceipt,
-    #[cfg(unix)]
-    maintenance: Option<super::maintenance_startup::Pending>,
     #[cfg(all(unix, feature = "provider-authority-prototype"))]
     provider: Option<super::provider_startup::Pending>,
 }
 #[derive(Clone, serde::Serialize)]
 pub(crate) struct CleanupAck {
-    // Internal recovery proof only; the health wire remains unchanged.
-    #[serde(skip_serializing)]
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    previous_generation: u64,
     execution_cleanup: u16,
     workspace_id: String,
     registration_revision: u64,
@@ -71,26 +61,17 @@ fn decode(bytes: &[u8]) -> Result<CleanupReceipt> {
                 .all(|b| b.is_ascii_hexdigit() || b == b'-'),
         "invalid supervisor cleanup binding"
     );
-    #[cfg(unix)]
-    if let Some(control) = &receipt.maintenance_control {
-        control.validate(&receipt.maintenance_binding())?;
-    }
     #[cfg(all(unix, feature = "provider-authority-prototype"))]
     if let Some(provider) = &receipt.provider_runtime {
         provider
-            .validate(
-                receipt
-                    .maintenance_control
-                    .as_ref()
-                    .map(|control| control.fd),
-            )
+            .validate(None)
             .map_err(|_| anyhow::anyhow!("invalid provider startup descriptor"))?;
     }
     Ok(receipt)
 }
-#[cfg(any(target_os = "linux", test))]
+#[cfg(all(target_os = "linux", feature = "provider-authority-prototype"))]
 impl CleanupReceipt {
-    fn maintenance_binding(&self) -> chimaera_core::project_secret_idle::Binding {
+    fn provider_binding(&self) -> chimaera_core::project_secret_idle::Binding {
         use chimaera_core::project_secret_idle::{Binding, RootIdentity};
         Binding {
             account_id: self.account_id.clone(),
@@ -106,8 +87,11 @@ impl CleanupReceipt {
     }
 }
 #[cfg(target_os = "linux")]
-fn own_startup_until(mut receipt: CleanupReceipt, deadline: std::time::Instant) -> Result<Startup> {
+fn own_startup_until(receipt: CleanupReceipt, deadline: std::time::Instant) -> Result<Startup> {
+    #[cfg(feature = "provider-authority-prototype")]
     use std::os::fd::FromRawFd;
+    #[cfg(feature = "provider-authority-prototype")]
+    let mut receipt = receipt;
     #[cfg(not(feature = "provider-authority-prototype"))]
     let _ = deadline;
     #[cfg(feature = "provider-authority-prototype")]
@@ -115,12 +99,7 @@ fn own_startup_until(mut receipt: CleanupReceipt, deadline: std::time::Instant) 
         None => None,
         Some(provider) => {
             provider
-                .validate(
-                    receipt
-                        .maintenance_control
-                        .as_ref()
-                        .map(|control| control.fd),
-                )
+                .validate(None)
                 .map_err(|_| anyhow::anyhow!("invalid provider startup descriptor"))?;
             ensure!(
                 unsafe { nix::libc::fcntl(provider.fd, nix::libc::F_GETFD) } >= 0,
@@ -132,36 +111,15 @@ fn own_startup_until(mut receipt: CleanupReceipt, deadline: std::time::Instant) 
             Some((descriptor, provider))
         }
     };
-    let maintenance = match receipt.maintenance_control.take() {
-        None => None,
-        Some(control) => {
-            let binding = receipt.maintenance_binding();
-            control.validate(&binding)?;
-            ensure!(
-                unsafe { nix::libc::fcntl(control.fd, nix::libc::F_GETFD) } >= 0,
-                "maintenance startup descriptor unavailable"
-            );
-            // The fixed envelope, read once before any child, transfers exactly
-            // this non-stdio descriptor. Cloneable receipt metadata retains no
-            // live descriptor and cannot perform this transfer a second time.
-            let descriptor = unsafe { std::os::fd::OwnedFd::from_raw_fd(control.fd) };
-            Some(super::maintenance_startup::Pending::transferred(
-                descriptor, control, binding,
-            )?)
-        }
-    };
     #[cfg(feature = "provider-authority-prototype")]
     let provider = match provider {
         None => None,
         Some((descriptor, control)) => {
-            let protection = match &maintenance {
-                Some(maintenance) => maintenance.protection()?,
-                None => super::maintenance_startup::Protection::startup()?,
-            };
+            let protection = super::provider_protection::Protection::startup()?;
             Some(super::provider_startup::Pending::transferred(
                 descriptor,
                 control,
-                receipt.maintenance_binding(),
+                receipt.provider_binding(),
                 deadline,
                 protection,
             )?)
@@ -169,7 +127,6 @@ fn own_startup_until(mut receipt: CleanupReceipt, deadline: std::time::Instant) 
     };
     Ok(Startup {
         receipt,
-        maintenance,
         #[cfg(feature = "provider-authority-prototype")]
         provider,
     })
@@ -282,12 +239,6 @@ pub(crate) fn stage_startup(state: &AppState, startup: Option<Startup>) -> Resul
         ensure!(provider.is_none(), "provider startup already staged");
         provider
     };
-    #[cfg(unix)]
-    {
-        let mut maintenance = lock(&state.pro.execution.maintenance_pending);
-        ensure!(maintenance.is_none(), "maintenance startup already staged");
-        *maintenance = startup.maintenance;
-    }
     #[cfg(all(unix, feature = "provider-authority-prototype"))]
     {
         *provider = startup.provider.map(std::sync::Arc::new);
@@ -314,9 +265,9 @@ pub(crate) fn ack(state: &AppState) -> Option<CleanupAck> {
 pub(super) fn supervised(state: &AppState) -> bool {
     lock(&state.pro.execution.supervisor_ack).is_some()
 }
-/// Compare the accepted launch only. This is not a process census or an idle
-/// assertion, and cannot enable maintenance transport by itself.
-pub(super) fn matches_maintenance(
+/// Compare the accepted provider launch; this is not a process census.
+#[cfg(all(unix, feature = "provider-authority-prototype"))]
+pub(super) fn matches_provider_launch(
     state: &AppState,
     binding: &chimaera_core::project_secret_idle::Binding,
 ) -> bool {
@@ -456,7 +407,6 @@ pub(in crate::pro) async fn apply(
     // enrollment policy; only an authoritative account observation repairs it.
     lock(&state.pro.execution.unclean).remove(&receipt.workspace_id);
     *lock(&state.pro.execution.supervisor_ack) = Some(CleanupAck {
-        previous_generation: receipt.previous_generation,
         execution_cleanup: 1,
         workspace_id: receipt.workspace_id,
         registration_revision: receipt.registration_revision,
@@ -472,22 +422,3 @@ pub(in crate::pro) fn fixture_boot(state: &AppState) -> Option<String> {
 #[cfg(test)]
 #[path = "supervisor_tests.rs"]
 mod tests;
-
-#[cfg(target_os = "linux")]
-pub(super) fn recovered_park(
-    state: &AppState,
-    old: &chimaera_core::project_secret_idle::Binding,
-    current: &chimaera_core::project_secret_idle::Binding,
-) -> bool {
-    matches_maintenance(state, current)
-        && old.account_id == current.account_id
-        && old.workspace_id == current.workspace_id
-        && old.root_identity == current.root_identity
-        && lock(&state.pro.execution.supervisor_ack)
-            .as_ref()
-            .is_some_and(|ack| {
-                ack.launch_generation == current.launch_generation
-                    && ack.previous_generation >= old.launch_generation
-                    && ack.launch_generation > old.launch_generation
-            })
-}

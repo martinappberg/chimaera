@@ -230,7 +230,7 @@ pub(super) fn current(state: &AppState, pending: &Pending, generation: u64) -> b
         && state.pro.generation.load(Ordering::Acquire) == generation
         && !super::super::drain::draining(state)
         && !super::super::delegation_lapsed(state)
-        && super::supervisor::matches_maintenance(state, &pending.launch)
+        && super::supervisor::matches_provider_launch(state, &pending.launch)
         && lock(&state.pro.runtime)
             .as_ref()
             .is_some_and(|config| config.execution.is_some())

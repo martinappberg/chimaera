@@ -23,62 +23,16 @@ fn fixed_launcher_status_requires_complete_unprivileged_evidence() {
     assert!(!unprivileged_status(&vec![b'x'; 16 * 1024 + 1]));
 }
 
-#[tokio::test]
-async fn closed_control_metadata_is_bounded_and_cannot_replace_launch_identity() {
-    let f = super::super::maintenance::tests::Fixture::new().await;
-    let good = serde_json::json!({"version":1,"fd":3,"channel_nonce":"A".repeat(43)});
-    let control: Control = serde_json::from_value(good.clone()).unwrap();
-    control.validate(&f.binding).unwrap();
-    for key in ["version", "fd", "channel_nonce"] {
-        let mut missing = good.clone();
-        missing.as_object_mut().unwrap().remove(key);
-        assert!(serde_json::from_value::<Control>(missing).is_err());
-    }
-    for bad in [
-        serde_json::json!({"version":2,"fd":3,"channel_nonce":"A".repeat(43)}),
-        serde_json::json!({"version":1,"fd":2,"channel_nonce":"A".repeat(43)}),
-        serde_json::json!({"version":1,"fd":3,"channel_nonce":"A".repeat(42)}),
-    ] {
-        assert!(serde_json::from_value::<Control>(bad)
-            .unwrap()
-            .validate(&f.binding)
-            .is_err());
-    }
-    let mut extra = good;
-    extra["workspace_id"] = serde_json::json!("another");
-    assert!(serde_json::from_value::<Control>(extra).is_err());
-    assert!(serde_json::from_str::<Control>(r#"{"version":1,"version":1,"fd":3,"channel_nonce":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#).is_err());
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn startup_socket_gate_refuses_other_fd_kinds_without_mutating_process() {
-    use std::os::unix::net::{UnixDatagram, UnixStream};
-    let (socket, _) = UnixStream::pair().unwrap();
-    let descriptor: OwnedFd = socket.into();
-    validate_socket(&descriptor).unwrap();
-    assert_ne!(
-        unsafe { nix::libc::fcntl(descriptor.as_raw_fd(), nix::libc::F_GETFD) }
-            & nix::libc::FD_CLOEXEC,
-        0
-    );
-    let (datagram, _) = UnixDatagram::pair().unwrap();
-    assert!(validate_socket(&datagram.into()).is_err());
-    let (reader, _) = nix::unistd::pipe().unwrap();
-    assert!(validate_socket(&reader).is_err());
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-    let (_server, _) = listener.accept().unwrap();
-    assert!(validate_socket(&client.into()).is_err());
-}
-
 /// Explicit root Linux fixture: only a disposable helper changes UID/protection;
 /// neither this parent harness nor unrelated local work is hardened or stopped.
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "requires disposable Linux root fixture; changes only helper credentials"]
 fn linux_process_protection_and_child_exec_descriptor_exclusion() {
-    use std::os::unix::{net::UnixStream, process::CommandExt};
+    use std::os::{
+        fd::AsRawFd,
+        unix::{net::UnixStream, process::CommandExt},
+    };
     assert_eq!(
         unsafe { nix::libc::geteuid() },
         0,
@@ -90,7 +44,7 @@ fn linux_process_protection_and_child_exec_descriptor_exclusion() {
     command
         .args([
             "--exact",
-            "pro::execution::maintenance_startup::tests::linux_protection_child",
+            "pro::execution::provider_protection::tests::linux_protection_child",
             "--ignored",
             "--nocapture",
         ])
@@ -133,37 +87,20 @@ fn linux_process_protection_and_child_exec_descriptor_exclusion() {
 #[test]
 #[ignore = "only launched by linux_process_protection_and_child_exec_descriptor_exclusion"]
 fn linux_protection_child() {
-    use std::os::fd::FromRawFd;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     let raw: i32 = std::env::var("CHIMAERA_IDLE_PROTECTION_TEST_FD")
         .unwrap()
         .parse()
         .unwrap();
     let descriptor = unsafe { OwnedFd::from_raw_fd(raw) };
-    let binding = Binding {
-        account_id: "a-fixture".into(),
-        workspace_id: "w-fixture".into(),
-        root_identity: chimaera_core::project_secret_idle::RootIdentity {
-            device: 1,
-            inode: 1,
-        },
-        registration_revision: 1,
-        launch_generation: 1,
-        os_boot_id: std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-            .unwrap()
-            .trim()
-            .into(),
-    };
-    let pending = Pending::transferred(
-        descriptor,
-        Control {
-            version: 1,
-            fd: raw,
-            channel_nonce: "A".repeat(43),
-        },
-        binding,
-    )
-    .unwrap();
-    assert_eq!(pending.descriptor.as_raw_fd(), raw);
+    let flags = unsafe { nix::libc::fcntl(raw, nix::libc::F_GETFD) };
+    assert!(flags >= 0);
+    assert_eq!(
+        unsafe { nix::libc::fcntl(raw, nix::libc::F_SETFD, flags | nix::libc::FD_CLOEXEC) },
+        0
+    );
+    let protected = protect_process().unwrap();
+    assert_eq!(descriptor.as_raw_fd(), raw);
     let pid = std::process::id();
     // Same-UID child exec must neither inherit the exact socket nor inspect the
     // daemon's descriptor directory or memory through proc/ptrace permissions.
@@ -171,7 +108,7 @@ fn linux_protection_child() {
     command
         .args([
             "--exact",
-            "pro::execution::maintenance_startup::tests::linux_same_uid_access_child",
+            "pro::execution::provider_protection::tests::linux_same_uid_access_child",
             "--ignored",
             "--nocapture",
         ])
@@ -198,12 +135,12 @@ fn linux_protection_child() {
         unsafe { nix::libc::prctl(nix::libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) },
         1
     );
-    pending._protected.current().unwrap();
+    protected.current().unwrap();
     assert_eq!(
         unsafe { nix::libc::prctl(nix::libc::PR_SET_DUMPABLE, 1, 0, 0, 0) },
         0
     );
-    assert!(pending._protected.current().is_err());
+    assert!(protected.current().is_err());
     // Verification must refuse without silently resetting dumpability.
     assert_eq!(
         unsafe { nix::libc::prctl(nix::libc::PR_GET_DUMPABLE, 0, 0, 0, 0) },
@@ -213,7 +150,7 @@ fn linux_protection_child() {
         unsafe { nix::libc::prctl(nix::libc::PR_SET_DUMPABLE, 0, 0, 0, 0) },
         0
     );
-    pending._protected.current().unwrap();
+    protected.current().unwrap();
 }
 
 #[cfg(target_os = "linux")]

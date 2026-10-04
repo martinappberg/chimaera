@@ -1,4 +1,5 @@
-//! Closed inherited maintenance messages from PROJECT_SECRETS.md.
+//! Historical v1 parking-record validation and retained provider launch identity.
+//! The namespace-idle transport is retired; these types decode existing records.
 //! Parsing establishes bounded structure only, never idle or execution proof.
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;

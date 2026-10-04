@@ -97,7 +97,7 @@ impl Fixture {
                 descriptor,
                 launch.clone(),
                 Instant::now() + Duration::from_secs(1),
-                super::super::maintenance_startup::Protection::synthetic(),
+                super::super::provider_protection::Protection::synthetic(),
             )
             .unwrap(),
         );

@@ -6,11 +6,13 @@ use chimaera_core::project_secret_idle::{Leader, Prepare, Prepared, Reply};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
-    fs::{File, OpenOptions},
-    io::{Read, Write},
+    fs::OpenOptions,
+    io::Read,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::PathBuf,
 };
+#[cfg(test)]
+use std::{fs::File, io::Write};
 const MAX: usize = 1024 * 1024;
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -22,6 +24,7 @@ pub(super) struct Record {
     entries: Vec<serde_json::Value>,
 }
 impl Record {
+    #[cfg(test)]
     pub(super) fn new(
         prepare: Prepare,
         fence_id: String,
@@ -119,6 +122,7 @@ pub(super) fn read(state: &AppState) -> Result<Option<Record>> {
     record.validate()?;
     Ok(Some(record))
 }
+#[cfg(test)]
 pub(super) fn write(state: &AppState, record: &Record) -> Result<()> {
     record.validate()?;
     let bytes = serde_json::to_vec(record)?;
@@ -159,6 +163,7 @@ pub(super) fn write(state: &AppState, record: &Record) -> Result<()> {
     let _ = std::fs::remove_file(temporary);
     result
 }
+#[cfg(test)]
 pub(super) fn remove(state: &AppState, record: &Record) -> Result<()> {
     if let Some(current) = read(state)? {
         ensure!(
@@ -209,7 +214,7 @@ pub(in crate::pro) fn overlay_boot(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::pro::execution::maintenance::tests::Fixture;
+    use crate::pro::execution::legacy_parking_fixture::Fixture;
     use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
     fn record(fixture: &Fixture) -> Record {
         // No agent is still positive process-census work for the supervisor;

@@ -3,26 +3,14 @@
 pub(crate) mod installer;
 mod launch;
 mod lease;
-// Optional trusted startup actor; production controller enablement remains off.
-#[allow(dead_code)]
-pub(super) mod maintenance;
-#[cfg(target_os = "linux")]
-mod maintenance_actor;
-#[cfg(all(test, target_os = "linux"))]
-mod maintenance_actor_process_tests;
-#[cfg(unix)]
-#[allow(dead_code)]
-pub(super) mod maintenance_channel;
-#[cfg(target_os = "linux")]
-#[allow(dead_code)]
-mod maintenance_park;
-#[cfg(unix)]
-#[allow(dead_code)]
-pub(super) mod maintenance_startup;
+// Read old disk before-images before automatic restoration; no active channel.
+#[cfg(all(test, unix))]
+mod legacy_parking_fixture;
 #[cfg(any(target_os = "linux", all(test, unix)))]
-#[allow(dead_code)]
 mod maintenance_store;
 pub(crate) mod mutation;
+#[cfg(any(test, all(unix, feature = "provider-authority-prototype")))]
+pub(super) mod provider_protection;
 // Original protected admission remains host-owned; vendor consumers are private.
 #[cfg(all(unix, feature = "provider-authority-prototype"))]
 #[allow(dead_code)]
@@ -81,8 +69,6 @@ pub(super) struct State {
     /// Cleanup cannot repair unreadable enrollment or ownership state.
     supervisor_state_invalid: bool,
     supervisor_pending: Mutex<Option<supervisor::CleanupReceipt>>,
-    #[cfg(unix)]
-    maintenance_pending: Mutex<Option<maintenance_startup::Pending>>,
     #[cfg(all(unix, feature = "provider-authority-prototype"))]
     provider_pending: Mutex<Option<std::sync::Arc<provider_startup::Pending>>>,
     supervisor_ack: Mutex<Option<supervisor::CleanupAck>>,
@@ -1025,11 +1011,4 @@ pub(crate) async fn restore_manual_parking(
         let _ = state;
         boot
     }
-}
-
-pub(in crate::pro) fn start_maintenance(state: &std::sync::Arc<AppState>) {
-    #[cfg(target_os = "linux")]
-    maintenance_actor::start(state);
-    #[cfg(not(target_os = "linux"))]
-    let _ = state;
 }

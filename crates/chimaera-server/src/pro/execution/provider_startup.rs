@@ -16,7 +16,7 @@ use zeroize::Zeroizing;
 /// cleanup receipt, health response, environment or durable project state.
 pub(super) struct Pending {
     pub(super) launch: Binding,
-    pub(super) protection: super::maintenance_startup::Protection,
+    pub(super) protection: super::provider_protection::Protection,
     pub(super) ready: super::provider_ready::State,
 }
 impl Pending {
@@ -26,7 +26,7 @@ impl Pending {
         control: wire::StartupDescriptor,
         launch: Binding,
         deadline: Instant,
-        protection: super::maintenance_startup::Protection,
+        protection: super::provider_protection::Protection,
     ) -> Result<Self> {
         control
             .validate(None)
@@ -69,7 +69,7 @@ pub(in crate::pro) fn allows(state: &crate::AppState) -> bool {
 fn read_pipe(
     descriptor: OwnedFd,
     deadline: Instant,
-    protection: &super::maintenance_startup::Protection,
+    protection: &super::provider_protection::Protection,
 ) -> Result<Zeroizing<Vec<u8>>> {
     let raw = descriptor.as_raw_fd();
     let flags = unsafe { nix::libc::fcntl(raw, nix::libc::F_GETFD) };
