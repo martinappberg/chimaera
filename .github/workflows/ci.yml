@@ -61,6 +61,8 @@ jobs:
       - run: bash scripts/version-bump.test.sh
       - run: bash .claude/hooks/guard-bash.test.sh
       - run: bash scripts/worktree-gc.test.sh
+      - name: Test pure keeper revocation receipts and cleanup ownership
+        run: python3 crates/chimaera-app/fixtures/ssh_agent_keeper_revoke_test.py
       - run: node scripts/check-doc-links.mjs
       - run: node scripts/check-site.mjs
       - run: node scripts/check-agent-assets.mjs

@@ -746,8 +746,8 @@ mod tests {
     use super::*;
     use chimaera_core::{cluster::new_job_id, slurm::LaunchSpec};
     use chimaera_link::{
-        ClusterCapabilities, ClusterJobState, ClusterJobView, ClusterRoute, ClusterScheduler,
-        Daemon, fake::FakeKeeper,
+        fake::FakeKeeper, ClusterCapabilities, ClusterJobState, ClusterJobView, ClusterRoute,
+        ClusterScheduler, Daemon,
     };
     struct Fixture {
         keeper: FakeKeeper,
@@ -994,18 +994,16 @@ mod tests {
             fixture.keeper.cluster_submissions(&selected.host.id).await,
             1
         );
-        assert!(
-            selected
-                .settle(
-                    || 8,
-                    Op::StopJob {
-                        operation_id: operation_id(),
-                        job_id: job.clone()
-                    }
-                )
-                .await
-                .is_err()
-        );
+        assert!(selected
+            .settle(
+                || 8,
+                Op::StopJob {
+                    operation_id: operation_id(),
+                    job_id: job.clone()
+                }
+            )
+            .await
+            .is_err());
         selected
             .settle(
                 || 7,

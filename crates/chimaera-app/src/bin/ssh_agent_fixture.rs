@@ -6,6 +6,9 @@ mod keeper;
 #[path = "../ssh_agent_fixture_support/keeper_retention.rs"]
 mod keeper_retention;
 #[cfg(target_os = "macos")]
+#[path = "../ssh_agent_fixture_support/keeper_revoke.rs"]
+mod keeper_revoke;
+#[cfg(target_os = "macos")]
 #[path = "../ssh_agent_fixture_support/route.rs"]
 mod route;
 #[cfg(target_os = "macos")]
@@ -219,6 +222,33 @@ fn main() {
             });
             if result.is_err() {
                 println!("SOURCE_FAILED");
+                std::process::exit(2)
+            }
+        }
+        Some("--keeper-revocation-observer") => {
+            if args.len() != 4
+                || args[3].is_empty()
+                || args[3].len() > 6
+                || !args[3].bytes().all(|byte| byte.is_ascii_digit())
+            {
+                std::process::exit(2)
+            }
+            let Ok(remaining_ms) = args[3].parse::<u64>() else {
+                std::process::exit(2)
+            };
+            if remaining_ms == 0 || remaining_ms > 300_000 {
+                std::process::exit(2)
+            }
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            if runtime
+                .block_on(keeper_revoke::run(args[2].clone(), remaining_ms))
+                .is_err()
+            {
+                println!("C2_LINK_FAILED");
                 std::process::exit(2)
             }
         }

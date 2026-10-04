@@ -31,6 +31,7 @@ def causal_diagnostic(phase, error):
               "native-settle", "proxy-retire", "running", "malformed",
               "stop-attached", "uncertain", "restore", "attached-ended",
               "jobs-ended", "quiet", "finished", "final-check",
+              "revoke-arm", "revoke-observer", "revoke-held", "revoke-proof",
               "case-cleanup", "outer-run", "outer-cleanup")
     kind = ("refused" if isinstance(error, Refused)
             else "timeout" if isinstance(error, (TimeoutError, subprocess.TimeoutExpired))
@@ -75,6 +76,62 @@ def held_refusal(value):
             or value["stage"] not in stages or type(value["timeout"]) is not bool):
         return None
     return {"stage": value["stage"], "timeout": value["timeout"]}
+
+
+
+def revoke_refusal(value):
+    # Closed facts remain refusal-only; raw scheduler strings are never rendered.
+    stages = ("start", "retained-preflight", "runtime", "journal-before", "revoke", "authority",
+              "journal-after", "scheduler", "allocation-hold", "route-absence", "master-absence",
+              "resource-group", "pty-absence", "forward-absence", "hop-absence", "auth-absence", "invalid-stage")
+    if (type(value) is not dict or value.get("type") != "c2_revoke_refused"
+            or type(value.get("stage")) is not str or value["stage"] not in stages
+            or type(value.get("timeout")) is not bool):
+        return None
+    fact = {"stage": value["stage"], "timeout": value["timeout"]}
+    if value["stage"] not in ("allocation-hold", "pty-absence"):
+        return fact if set(value) == {"type", "stage", "timeout"} else None
+    predicates = ("not-observed", "passed", "journal-changed", "journal-cardinality", "hold-revision",
+                  "hold-state", "scheduler-cardinality", "job-identity", "job-phase", "job-attached",
+                  "job-scheduler-id", "scheduler-identity", "batch-state", "attached-state", "invalid")
+    batch = ("not-observed", "running", "cancelled", "timeout", "stale-cause", "other", "invalid")
+    attached = ("not-observed", "running", "cancelled-hup", "cancelled-term", "cancelled-stop",
+                "cancelled-unattributed", "timeout", "stale-cause", "other", "invalid")
+    allocation = value.get("allocation")
+    keys = {"type", "stage", "timeout", "allocation"}
+    if value["stage"] == "pty-absence":
+        keys.add("pidfd")
+    if (set(value) != keys or type(allocation) is not dict
+            or set(allocation) != {"predicate", "batch", "attached"}
+            or any(type(allocation[key]) is not str or allocation[key] not in allowed
+                   for key, allowed in (("predicate", predicates), ("batch", batch), ("attached", attached)))):
+        return None
+    if value["stage"] == "pty-absence":
+        pidfd = ("not-observed", "waiting", "exited", "descriptor-error", "registration-error",
+                 "readiness-error", "poll-error", "not-exited")
+        if (allocation["predicate"] != "passed" or allocation["batch"] != "running"
+                or allocation["attached"] not in ("running", "cancelled-hup", "cancelled-term")
+                or type(value.get("pidfd")) is not str or value["pidfd"] not in pidfd):
+            return None
+        fact["pidfd"] = value["pidfd"]
+    fact["allocation"] = dict(allocation)
+    return fact
+
+
+def revoke_positive(value):
+    # These are private fixture receipts, never scheduler authority. Both durable
+    # jobs remain Submitted/Held; only the batch must survive account revocation.
+    expected = {"type": "c2_revoked", "authority_revoked": True, "journal_nonterminal": 2,
+                "batch_scheduler_running": True, "attached_pty_absent": True, "forwards_absent": True,
+                "masters_absent": True, "hop_helpers_absent": True, "agent_paths_absent": True,
+                "account_held": True, "submissions": 2}
+    if (type(value) is not dict or set(value) != set(expected) | {"attached_scheduler"}
+            or any(type(value[key]) is not type(wanted) or value[key] != wanted
+                   for key, wanted in expected.items())
+            or type(value["attached_scheduler"]) is not str
+            or value["attached_scheduler"] not in ("running", "cancelled-hup", "cancelled-term")):
+        return None
+    return value["attached_scheduler"]
 
 
 def observer_stages():
@@ -139,7 +196,8 @@ def observer_diagnostic(fact):
 
 
 class RetentionKeeper(Keeper):
-    def __init__(self, *args):
+    def __init__(self, *args, revoke=False):
+        self.revoke = revoke
         original = time.monotonic() + 300
         super().__init__(*args)
         # Parent constructors keep their legacy bounds; C1 restores the exact
@@ -149,7 +207,8 @@ class RetentionKeeper(Keeper):
     def control(self, process, command, expected, seconds=5):
         # Neither selectors nor scheduler authority arrive from this input.
         if command not in (b"HELD\n", b"RETAINED\n", b"MALFORMED\n", b"UNCERTAIN\n",
-                           b"RESTORE\n", b"ATTACHED_ENDED\n", b"JOBS_ENDED\n", b"FINISHED\n"):
+                           b"RESTORE\n", b"ATTACHED_ENDED\n", b"JOBS_ENDED\n", b"FINISHED\n",
+                           b"REVOKE_ARM\n", b"REVOKE_HELD\n"):
             raise Refused("c1 control invalid")
         if process.poll() is not None or os.write(process.stdin.fileno(), command) != len(command):
             raise Refused("c1 control unavailable")
@@ -162,6 +221,22 @@ class RetentionKeeper(Keeper):
                 except (OSError, ValueError):
                     pass
                 raise Refused("c1 held proof refused")
+        if command == b"REVOKE_HELD\n":
+            refusal = revoke_refusal(value)
+            if refusal is not None:
+                try:
+                    print("DIAGNOSTIC C2 revoke refusal", json.dumps(refusal, separators=(",", ":")), flush=True)
+                except (OSError, ValueError):
+                    pass
+                raise Refused("c2 original revocation proof refused")
+            category = revoke_positive(value)
+            if category is None or {key: item for key, item in value.items() if key != "attached_scheduler"} != expected:
+                raise Refused("c2 captured allocation receipt")
+            try:
+                print("DIAGNOSTIC C2 verified allocation", json.dumps({"batch": "running", "attached": category}, separators=(",", ":")), flush=True)
+            except (OSError, ValueError):
+                pass
+            return
         if (type(value) is not dict or set(value) != set(expected)
                 or any(type(value[key]) is not type(wanted) or value[key] != wanted
                        for key, wanted in expected.items())):
@@ -203,6 +278,52 @@ class RetentionKeeper(Keeper):
             stop_owned(process)
             if self.connections(gateway) - before > budget:
                 raise Refused("c1 observer bridge budget")
+
+    def revoke_case(self, gateway, control):
+        # One actual production Link WS remains open while the fixed private
+        # command invokes account revocation. Timeout is never closure proof.
+        self.control(control, b"REVOKE_ARM\n", {"type": "c2_armed", "held_stream_seconds": 15})
+        remaining_ms = int(max(0, self.deadline - 15 - time.monotonic()) * 1000)
+        if not 1 <= remaining_ms <= 300000:
+            raise Refused("c2 original observer budget")
+        before = self.connections(gateway)
+        observer = self.spawn([str(self.binary), "--keeper-revocation-observer", gateway.origin,
+                               str(remaining_ms)], self.env)
+        original_error = None
+        try:
+            end = self.end(17)
+            opened = bytearray()
+            until = min(end, self.end(5))
+            while len(opened) < len(b"C2_LINK_OPENED\n"):
+                if time.monotonic() >= until:
+                    raise Refused("c2 stream admission deadline")
+                if select.select([observer.stdout], [], [], .025)[0]:
+                    byte = os.read(observer.stdout.fileno(), 1)
+                    if not byte:
+                        raise Refused("c2 stream admission EOF")
+                    opened.extend(byte)
+            if opened != b"C2_LINK_OPENED\n":
+                raise Refused("c2 stream admission marker")
+            self.control(control, b"REVOKE_HELD\n", {"type": "c2_revoked", "authority_revoked": True,
+                "journal_nonterminal": 2, "batch_scheduler_running": True, "attached_pty_absent": True, "forwards_absent": True,
+                "masters_absent": True, "hop_helpers_absent": True, "agent_paths_absent": True,
+                "account_held": True, "submissions": 2})
+            output = capture(observer, end, 256)
+            if observer.returncode or output != b"C2_LINK_REVOKED\n":
+                raise Refused("c2 close and fresh refusal proof")
+        except BaseException as error:
+            original_error = error
+            causal_diagnostic("revoke-proof", error)
+            raise
+        finally:
+            try:
+                stop_owned(observer)
+                if self.connections(gateway) - before > 10:
+                    raise Refused("c2 observer bridge budget")
+            except Exception as error:
+                causal_diagnostic("case-cleanup", error)
+                if original_error is None:
+                    raise
 
     def run(self):
         for path, digest in ((LINUX_BINARY, self.digest), (LINUX_WRAPPER, self.wrapper_digest)):
@@ -349,61 +470,65 @@ class RetentionKeeper(Keeper):
                 self.control(control, b"RETAINED\n", retained)
             if time.monotonic() - observation < 5:
                 raise Refused("c1 retained observation duration")
-            phase = "malformed"
-            self.control(control, b"MALFORMED\n", {"type": "c1_malformed", "selected": True})
-            phase = "stop-attached"
-            self.observer(gateway, "stop-attached")
-            phase = "uncertain"
-            self.control(control, b"UNCERTAIN\n", {"type": "c1_uncertain", "attached_nonterminal": True,
-                "attached_alive": True, "attached_forward_same": True, "account_held": True, "submissions": 2})
-            phase = "restore"
-            self.control(control, b"RESTORE\n", {"type": "c1_restored", "selected": True})
-            phase = "attached-ended"
-            self.observer(gateway, "attached-ended")
-            self.control(control, b"ATTACHED_ENDED\n", {"type": "c1_attached_ended", "attached_pty_absent": True,
-                "attached_forward_absent": True, "batch_forward_same": True, "master_same": True,
-                "account_held": True, "submissions": 2})
-            # The scheduler's original 60-second batch deadline advances itself.
-            # No expiry-control command or batch StopJob can fabricate TIMEOUT.
-            phase = "jobs-ended"
-            jobs_ended = False
-            for round_ in range(8):
-                if time.monotonic() >= self.deadline - 15:
-                    break
-                if self.observer(gateway, "jobs-ended"):
-                    jobs_ended = True
-                    break
-                if control.poll() is not None or gateway.failed or proxy.failed:
-                    raise Refused("c1 expiry observer failed")
-                if round_ < 7:
-                    if time.monotonic() + 8 >= self.deadline - 15:
+            if self.revoke:
+                phase = "revoke-held"
+                self.revoke_case(gateway, control)
+            else:
+                phase = "malformed"
+                self.control(control, b"MALFORMED\n", {"type": "c1_malformed", "selected": True})
+                phase = "stop-attached"
+                self.observer(gateway, "stop-attached")
+                phase = "uncertain"
+                self.control(control, b"UNCERTAIN\n", {"type": "c1_uncertain", "attached_nonterminal": True,
+                    "attached_alive": True, "attached_forward_same": True, "account_held": True, "submissions": 2})
+                phase = "restore"
+                self.control(control, b"RESTORE\n", {"type": "c1_restored", "selected": True})
+                phase = "attached-ended"
+                self.observer(gateway, "attached-ended")
+                self.control(control, b"ATTACHED_ENDED\n", {"type": "c1_attached_ended", "attached_pty_absent": True,
+                    "attached_forward_absent": True, "batch_forward_same": True, "master_same": True,
+                    "account_held": True, "submissions": 2})
+                # The scheduler's original 60-second batch deadline advances itself.
+                # No expiry-control command or batch StopJob can fabricate TIMEOUT.
+                phase = "jobs-ended"
+                jobs_ended = False
+                for round_ in range(8):
+                    if time.monotonic() >= self.deadline - 15:
                         break
-                    time.sleep(8)
-            if not jobs_ended:
-                raise Refused("c1 independent batch expiry")
-            # Terminal resources settle independently of normal login grace.
-            last_refresh_done = time.monotonic()
-            self.control(control, b"JOBS_ENDED\n", {"type": "c1_jobs_ended", "terminal": 2,
-                "attached_pty_absent": True, "forwards_absent": True, "submissions": 2})
-            #120s seed + up to60s normal background poll +5s ACK margin.
-            # No refresh/auth/target-health/control requests occur in this quiet
-            # interval. A passive view afterward cannot renew that original seed.
-            phase = "quiet"
-            quiet_until = last_refresh_done + 185
-            if quiet_until + 10 >= self.deadline - 15:
-                raise Refused("c1 original quiet observation budget")
-            quiet_connections = self.connections(gateway)
-            while time.monotonic() < quiet_until:
-                if control.poll() is not None or gateway.failed or proxy.failed:
-                    raise Refused("c1 quiet owner failed")
-                time.sleep(max(0, min(.25, quiet_until - time.monotonic())))
-            if self.connections(gateway) != quiet_connections:
-                raise Refused("c1 quiet observation made a request")
-            phase = "finished"
-            self.observer(gateway, "finished")
-            self.control(control, b"FINISHED\n", {"type": "c1_finished", "terminal": 2,
-                "attached_pty_absent": True, "forwards_absent": True, "masters_absent": True,
-                "hop_helpers_absent": True, "account_idle": True, "login_opt_in": False, "submissions": 2})
+                    if self.observer(gateway, "jobs-ended"):
+                        jobs_ended = True
+                        break
+                    if control.poll() is not None or gateway.failed or proxy.failed:
+                        raise Refused("c1 expiry observer failed")
+                    if round_ < 7:
+                        if time.monotonic() + 8 >= self.deadline - 15:
+                            break
+                        time.sleep(8)
+                if not jobs_ended:
+                    raise Refused("c1 independent batch expiry")
+                # Terminal resources settle independently of normal login grace.
+                last_refresh_done = time.monotonic()
+                self.control(control, b"JOBS_ENDED\n", {"type": "c1_jobs_ended", "terminal": 2,
+                    "attached_pty_absent": True, "forwards_absent": True, "submissions": 2})
+                #120s seed + up to60s normal background poll +5s ACK margin.
+                # No refresh/auth/target-health/control requests occur in this quiet
+                # interval. A passive view afterward cannot renew that original seed.
+                phase = "quiet"
+                quiet_until = last_refresh_done + 185
+                if quiet_until + 10 >= self.deadline - 15:
+                    raise Refused("c1 original quiet observation budget")
+                quiet_connections = self.connections(gateway)
+                while time.monotonic() < quiet_until:
+                    if control.poll() is not None or gateway.failed or proxy.failed:
+                        raise Refused("c1 quiet owner failed")
+                    time.sleep(max(0, min(.25, quiet_until - time.monotonic())))
+                if self.connections(gateway) != quiet_connections:
+                    raise Refused("c1 quiet observation made a request")
+                phase = "finished"
+                self.observer(gateway, "finished")
+                self.control(control, b"FINISHED\n", {"type": "c1_finished", "terminal": 2,
+                    "attached_pty_absent": True, "forwards_absent": True, "masters_absent": True,
+                    "hop_helpers_absent": True, "account_idle": True, "login_opt_in": False, "submissions": 2})
             phase = "final-check"
             if (not proxy.closed or proxy.path.exists() or gateway.failed or proxy.failed
                     or self.connections(gateway) > 128 or self.identities(external_env) != before):
@@ -434,11 +559,15 @@ class RetentionKeeper(Keeper):
                 causal_diagnostic("case-cleanup", error)
                 if original_error is None:
                     raise
+        if self.revoke:
+            print("PASS retention C2 actual account revoke closes original held stream/resources and refuses new authority; nonterminal journal/account Held preserved; synthetic account/scheduler; positive inner/external cleanup", flush=True)
+            return
         print("PASS retention C1 actual Link job/forward across native exit; no original agent endpoint; explicit attached stop, independent batch timeout and passive post-grace retirement; synthetic account/scheduler; positive inner/external cleanup", flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--revoke", action="store_true", help="separate C2 held-resource account-revocation case")
     parser.add_argument("--binary", type=pathlib.Path, required=True)
     parser.add_argument("--podman", type=pathlib.Path, default=pathlib.Path("/opt/homebrew/bin/podman"))
     parser.add_argument("--linux-sha256", required=True)
@@ -459,7 +588,7 @@ def main():
     signals = {signal.SIGALRM, signal.SIGTERM, signal.SIGINT, signal.SIGHUP}
     previous = signal.pthread_sigmask(signal.SIG_BLOCK, signals)
     try:
-        fixture = RetentionKeeper(args.binary, args.podman, args.linux_sha256, args.wrapper_sha256)
+        fixture = RetentionKeeper(args.binary, args.podman, args.linux_sha256, args.wrapper_sha256, revoke=args.revoke)
     finally:
         signal.pthread_sigmask(signal.SIG_SETMASK, previous)
     signal.setitimer(signal.ITIMER_REAL, max(.001, fixture.deadline - time.monotonic()))
