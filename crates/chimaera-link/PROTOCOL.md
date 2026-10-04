@@ -372,7 +372,7 @@ Host rows:
 
 `kind` is `ssh`, `device` or `worker`; `status` is `connected`, `connecting`,
 `prompting` or `offline`. `daemon` is null until authenticated daemon metadata is
-available. `build` is the daemon build-id string, `sessions` a count. The daemon
+available. `build` is the daemon build-id string, `sessions` a count. For cluster routes, it is copied from the exact job-host record or workspace manifest; it is never the keeper or client build. The authenticated job-host workspace status may add an optional `build` beside `token` and `port`, read from the same manifest. Older status records omit it; missing build identity remains unknown and is not substituted from another producer. The daemon
 token is delivered only to authorized devices over the protected link and retained
 in memory only. `error` is null or a short user-safe explanation, never SSH output
 containing passwords or key material. Host ids are opaque path segments; clients

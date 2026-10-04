@@ -284,6 +284,7 @@ pub struct HostEndpoint {
     pub node: String,
     pub port: u16,
     pub token: String,
+    pub build: String,
 }
 
 /// Where an open workspace's chimaera listens — kept by the client.
@@ -294,6 +295,7 @@ pub struct Endpoint {
     pub node: String,
     pub port: u16,
     pub token: String,
+    pub build: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -638,6 +640,7 @@ fn build(
                             },
                             port: m.port,
                             token: m.token.clone(),
+                            build: m.build.clone().unwrap_or_default(),
                         },
                     );
                     return v;
@@ -736,6 +739,7 @@ fn job_view(
         },
         port: h.port,
         token: h.token.clone(),
+        build: h.build.clone(),
     };
     match row {
         Some(job) if slurm::is_live_state(&job.state) => {
@@ -2428,6 +2432,7 @@ pub fn endpoint_from(status: &JobHostStatus, jid: &str, wid: &str) -> Option<End
         node: status.node.clone(),
         port: w.port?,
         token: w.token.clone()?,
+        build: w.build.clone().unwrap_or_default(),
     })
 }
 
@@ -2608,6 +2613,75 @@ mod tests {
     }
 
     const NOW: u64 = 1_000_000_000;
+    #[test]
+    fn original_records_and_job_host_preserve_each_endpoint_build() {
+        let config = ClusterConfig {
+            workspaces: vec![ClusterWorkspace {
+                id: "w-0000abcd".into(),
+                name: "fixture".into(),
+                path: "/fixture/project".into(),
+                created_ms: 0,
+            }],
+            ..Default::default()
+        };
+        let mut original_host = host("77");
+        original_host.build = "abcdef1.123".into();
+        let mut original_workspace = manifest("77");
+        original_workspace.build = Some("abcdef1.124".into());
+        let state = BrowseState {
+            config: config.clone(),
+            jobs: vec![JobFiles {
+                record: record("j-0000aaaa", Some("77"), NOW - 500_000),
+                host: Some(original_host),
+                egress: None,
+                hosting: None,
+            }],
+            manifests: [("w-0000abcd".into(), original_workspace)]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let queue = [queue_row("77", "RUNNING", "n042", "1:00:00", "None")];
+        let observed = build(&config, &state, &queue, true, NOW);
+        assert_eq!(observed.hosts["j-0000aaaa"].build, "abcdef1.123");
+        assert_eq!(observed.endpoints["w-0000abcd"].build, "abcdef1.124");
+        let mut live = JobHostStatus {
+            job: "j-0000aaaa".into(),
+            slurm_job_id: "77".into(),
+            node: "n042".into(),
+            workspaces: vec![HostedWorkspace {
+                id: "w-0000abcd".into(),
+                state: HostedState::Open,
+                port: Some(43000),
+                token: Some("successor-token".into()),
+                build: Some("abcdef1.125".into()),
+                ..Default::default()
+            }],
+        };
+        let mut overview = ClusterOverview {
+            jobs: observed.jobs,
+            workspaces: observed.workspaces,
+            endpoints: observed.endpoints,
+            ..Default::default()
+        };
+        apply_hosting(&mut overview, "j-0000aaaa", &live);
+        let endpoint = &overview.endpoints["w-0000abcd"];
+        assert_eq!(
+            (
+                endpoint.port,
+                endpoint.token.as_str(),
+                endpoint.build.as_str()
+            ),
+            (43000, "successor-token", "abcdef1.125")
+        );
+        live.workspaces[0].build = None;
+        assert_eq!(
+            endpoint_from(&live, "j-0000aaaa", "w-0000abcd")
+                .unwrap()
+                .build,
+            ""
+        );
+    }
 
     #[test]
     fn a_job_waits_starts_and_runs_with_the_queue_and_its_host_record() {
@@ -3023,6 +3097,7 @@ mod tests {
                 port,
                 working: 2,
                 token: port.map(|_| "tok".to_string()),
+                build: port.map(|_| "abcdef1.124".to_string()),
                 detail: detail.into(),
             };
         let status = JobHostStatus {

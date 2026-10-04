@@ -378,14 +378,17 @@ async fn status(host: &Host) -> JobHostStatus {
     let counts = futures::future::join_all(snapshot.iter().map(|w| async {
         match (w.state, w.port) {
             (HostedState::Open, Some(port)) => {
-                let token = manifest_token(&host.cluster_dir, &w.id).await;
+                let identity = manifest_identity(&host.cluster_dir, &w.id).await;
+                let (token, build) = identity
+                    .map(|(token, build)| (Some(token), build))
+                    .unwrap_or_default();
                 let working = match &token {
                     Some(token) => working_agents(port, token).await,
                     None => 0,
                 };
-                (working, token)
+                (working, token, build)
             }
-            _ => (0, None),
+            _ => (0, None, None),
         }
     }))
     .await;
@@ -396,25 +399,25 @@ async fn status(host: &Host) -> JobHostStatus {
         workspaces: snapshot
             .into_iter()
             .zip(counts)
-            .map(|(mut w, (working, token))| {
+            .map(|(mut w, (working, token, build))| {
                 w.working = working;
                 w.token = token;
+                w.build = build;
                 w
             })
             .collect(),
     }
 }
 
-/// An open workspace's token, from the manifest its chimaera wrote on this
-/// node.
-async fn manifest_token(cluster_dir: &Path, wid: &str) -> Option<String> {
+/// An open workspace's token and build come from one original manifest read.
+async fn manifest_identity(cluster_dir: &Path, wid: &str) -> Option<(String, Option<String>)> {
     let manifest = cluster_dir
         .join("w")
         .join(wid)
         .join("data")
         .join("manifest.json");
     tokio::task::spawn_blocking(move || {
-        read_json::<chimaera_core::Manifest>(&manifest).map(|m| m.token)
+        read_json::<chimaera_core::Manifest>(&manifest).map(|m| (m.token, m.build))
     })
     .await
     .ok()
@@ -883,6 +886,47 @@ fn signal(pid: Option<u32>, kill: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn workspace_token_and_build_are_captured_from_the_same_manifest() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-job-identity-{}",
+            chimaera_core::generate_token()
+        ));
+        let data = root.join("w/w-0000abcd/data");
+        std::fs::create_dir_all(&data).unwrap();
+        let path = data.join("manifest.json");
+        let mut manifest = chimaera_core::Manifest {
+            hostname: "fixture".into(),
+            port: 1234,
+            token: "original-token".into(),
+            pid: 1,
+            version: "0.0.1".into(),
+            started_at: 0,
+            build: Some("abcdef1.123".into()),
+            slurm_job_id: Some("77".into()),
+            runtime_leases: false,
+        };
+        std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert_eq!(
+            manifest_identity(&root, "w-0000abcd").await,
+            Some(("original-token".into(), Some("abcdef1.123".into())))
+        );
+        manifest.token = "successor-token".into();
+        manifest.build = Some("abcdef1.124".into());
+        std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert_eq!(
+            manifest_identity(&root, "w-0000abcd").await,
+            Some(("successor-token".into(), Some("abcdef1.124".into())))
+        );
+        manifest.build = None;
+        std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert_eq!(
+            manifest_identity(&root, "w-0000abcd").await,
+            Some(("successor-token".into(), None))
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[tokio::test]
     async fn allocation_shutdown_keeps_durable_ownership_without_endpoints() {

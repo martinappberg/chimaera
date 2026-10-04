@@ -247,6 +247,9 @@ pub struct HostedWorkspace {
     /// the new manifest on the login node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// Captured with that token from the same workspace manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub detail: String,
 }
@@ -958,5 +961,15 @@ mod tests {
         .unwrap();
         assert_eq!(s.workspaces[0].state, HostedState::Open);
         assert_eq!(s.workspaces[0].working, 0);
+        assert!(s.workspaces[0].build.is_none());
+        assert!(serde_json::to_value(&s.workspaces[0])
+            .unwrap()
+            .get("build")
+            .is_none());
+        let mut current = s;
+        current.workspaces[0].build = Some("abcdef1.123".into());
+        let restored: JobHostStatus =
+            serde_json::from_value(serde_json::to_value(&current).unwrap()).unwrap();
+        assert_eq!(restored.workspaces[0].build.as_deref(), Some("abcdef1.123"));
     }
 }
