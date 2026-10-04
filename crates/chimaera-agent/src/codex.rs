@@ -2084,18 +2084,15 @@ impl CodexMapper {
             }
             step.events.push(AgentEvent::ToolCallUpdate {
                 id: tool_id,
-                status: if matches!(run["status"].as_str(), Some("failed" | "blocked")) {
+                status: if matches!(
+                    run["status"].as_str(),
+                    Some("failed" | "blocked" | "stopped")
+                ) {
                     ToolStatus::Failed
                 } else {
                     ToolStatus::Completed
                 },
-                content: run["statusMessage"]
-                    .as_str()
-                    .filter(|s| !s.is_empty())
-                    .map(|s| {
-                        let (text, truncated) = cap_output(s);
-                        ToolContent::Output { text, truncated }
-                    }),
+                content: Self::startup_hook_output(run),
             });
         } else {
             if self.startup_hooks.contains_key(id) || self.startup_hooks.len() >= 32 {
@@ -2120,6 +2117,44 @@ impl CodexMapper {
         step.events.push(AgentEvent::ActivityLine {
             detail: self.startup_hooks.values().next().cloned(),
         });
+    }
+
+    fn startup_hook_output(run: &Value) -> Option<ToolContent> {
+        // Entries carry diagnostics; statusMessage is only a progress label.
+        // Never expose injected context, and cap while joining rather than
+        // allocating every hook's output before truncating it.
+        const DIAGNOSTIC_CAP: usize = 16 * 1024;
+        let mut text = String::new();
+        let mut truncated = false;
+        for entry in run["entries"].as_array().into_iter().flatten() {
+            if !matches!(
+                entry["kind"].as_str(),
+                Some("error" | "feedback" | "stop" | "warning")
+            ) {
+                continue;
+            }
+            let Some(message) = entry["text"].as_str().filter(|s| !s.trim().is_empty()) else {
+                continue;
+            };
+            let room = DIAGNOSTIC_CAP.saturating_sub(text.len() + usize::from(!text.is_empty()));
+            if room == 0 {
+                truncated = true;
+                break;
+            }
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            let mut end = room.min(message.len());
+            while !message.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.push_str(&message[..end]);
+            if end < message.len() {
+                truncated = true;
+                break;
+            }
+        }
+        (!text.is_empty()).then_some(ToolContent::Output { text, truncated })
     }
 
     fn warn_unreceived_input(&mut self, step: &mut DriverStep) {
@@ -5405,20 +5440,53 @@ mod tests {
     }
 
     #[test]
-    fn failed_startup_hook_keeps_its_diagnostic() {
-        let mut m = mapper();
-        active_turn(&mut m);
-        m.on_frame(&startup_hook("a", false));
-        let mut frame = startup_hook("a", true);
-        frame["params"]["run"]["status"] = json!("failed");
-        frame["params"]["run"]["statusMessage"] = json!("Hook timed out");
-        let step = m.on_frame(&frame);
-        assert!(step.events.iter().any(|e| matches!(e,
-            AgentEvent::ToolCallUpdate {
-                status: ToolStatus::Failed,
-                content: Some(ToolContent::Output { text, .. }), ..
-            } if text == "Hook timed out"
-        )));
+    fn unsuccessful_startup_hooks_keep_entry_diagnostics() {
+        for (status, kind) in [
+            ("failed", "error"),
+            ("blocked", "feedback"),
+            ("stopped", "stop"),
+        ] {
+            let mut m = mapper();
+            active_turn(&mut m);
+            let mut frame = startup_hook("a", false);
+            frame["params"]["run"]["eventName"] = json!("userPromptSubmit");
+            m.on_frame(&frame);
+            frame["method"] = json!("hook/completed");
+            frame["params"]["run"]["status"] = json!(status);
+            frame["params"]["run"]["statusMessage"] = json!("Checking policy");
+            frame["params"]["run"]["entries"] = json!([
+                {"kind": "context", "text": "private injected context"},
+                {"kind": kind, "text": "Request rejected"},
+                {"kind": "warning", "text": "Check configuration"},
+            ]);
+            let step = m.on_frame(&frame);
+            assert!(step.events.iter().any(|e| matches!(e,
+                AgentEvent::ToolCallUpdate {
+                    status: ToolStatus::Failed,
+                    content: Some(ToolContent::Output { text, truncated: false }), ..
+                } if text == "Request rejected\nCheck configuration"
+            )));
+        }
+    }
+
+    #[test]
+    fn startup_hook_diagnostics_are_bounded_while_accumulating() {
+        let run = json!({"entries": [
+            {"kind": "error", "text": "α".repeat(20_000)},
+            {"kind": "feedback", "text": "later entry"},
+        ]});
+        let Some(ToolContent::Output { text, truncated }) = CodexMapper::startup_hook_output(&run)
+        else {
+            panic!("missing diagnostic");
+        };
+        assert_eq!(text.len(), 16 * 1024);
+        assert!(truncated);
+        assert!(!text.contains("later entry"));
+        assert!(CodexMapper::startup_hook_output(&json!({"entries": [
+            {"kind": "context", "text": "private"},
+            {"kind": "error", "text": "  "},
+        ]}))
+        .is_none());
     }
 
     #[test]

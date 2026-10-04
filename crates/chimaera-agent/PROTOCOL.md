@@ -153,6 +153,10 @@ produced the hook row and phase; Stop produced the resend notice, which survived
 UI reload. Resending the original prompt completed normally. Hook ids can be
 configuration-derived (`session-start:0:<sourcePath>`), so normalized row ids
 include the turn id to keep later hooks from overwriting earlier history.
+Run statuses `failed`, `blocked`, and `stopped` all represent unsuccessful hooks.
+Diagnostics live in `entries[{kind,text}]` (`error`, `feedback`, `stop`, `warning`);
+`statusMessage` is a configured progress label. Join diagnostics with a byte cap
+while accumulating, and do not expose `context` entries containing injected input.
 
 ### Lifecycle (live)
 
