@@ -46,7 +46,7 @@ pub(crate) struct Configure {
 }
 
 #[derive(Clone, Deserialize)]
-pub(super) struct Baton {
+pub struct Baton {
     #[serde(default)]
     pub continuity: Option<super::execution::wire::Continuity>,
     #[serde(default)]

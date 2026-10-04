@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { installedExtension } from "./installed";
+import type { AccountBrandingSubscription } from "./accountPresentation";
 import type { SurfaceMount } from "./application";
 const scope = (signal: AbortSignal) => ({ signal }) as SurfaceMount;
 describe("selected optional entry", () => {
@@ -26,4 +27,62 @@ describe("selected optional entry", () => {
     await facade.mount("kept-review", {} as HTMLElement, scope(new AbortController().signal));
     expect(load).toHaveBeenCalledTimes(2);
   });
+});
+
+it("fences original branding publication and disposes a late subscription without adopting it", async () => {
+  let resolve!: (stop: () => void) => void;
+  let captured!: AccountBrandingSubscription;
+  const stop = vi.fn(), publish = vi.fn();
+  const binder = vi.fn((value: AccountBrandingSubscription) => {
+    captured = value;
+    return new Promise<() => void>((finish) => { resolve = finish; });
+  });
+  const facade = installedExtension(async () => ({ default: { version: 1, id: "chimaera-pro", mount: vi.fn(), bindAccountBranding: binder } }))!;
+  const owner = new AbortController();
+  const pending = facade.bindAccountBranding!({ signal: owner.signal, publish,
+    environment: { native: true, gateway: false, local: true, workbench: "/" },
+  });
+  // Wait for the actual original module/binding admission before retiring it.
+  await vi.waitFor(() => expect(binder).toHaveBeenCalledTimes(1));
+  captured.publish({ plan: "pro", offered: true, signedOut: false });
+  expect(publish).toHaveBeenCalledTimes(1);
+  owner.abort();
+  captured.publish({ plan: "max", offered: true, signedOut: false });
+  resolve(stop);
+  await expect(pending).rejects.toThrow("ended");
+  expect(stop).toHaveBeenCalledTimes(1);
+  expect(publish).toHaveBeenCalledTimes(1);
+});
+
+it("gateway module admission consumes the original ten seconds and never starts a late lookup", async () => {
+  vi.useFakeTimers();
+  let finish!: (value: { default: unknown }) => void;
+  const bind = vi.fn(() => () => {});
+  const facade = installedExtension(() => new Promise<{ default: unknown }>((resolve) => { finish = resolve; }))!;
+  const scope = { signal: new AbortController().signal, publish: vi.fn(), environment: { native: false, gateway: true, local: true, workbench: "/" } };
+  const pending = facade.bindAccountBranding!(scope);
+  const rejected = expect(pending).rejects.toThrow("ended");
+  try {
+    await vi.advanceTimersByTimeAsync(10_000);
+    await rejected;
+    finish({ default: { version: 1, id: "chimaera-pro", mount: vi.fn(), bindAccountBranding: bind } });
+    await Promise.resolve(); await Promise.resolve();
+    expect(bind).not.toHaveBeenCalled(); expect(scope.publish).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  } finally { vi.useRealTimers(); }
+});
+
+
+it("an already expired original gateway deadline starts no package load", async () => {
+  vi.useFakeTimers();
+  const clock = vi.spyOn(performance, "now").mockReturnValue(10_001);
+  const load = vi.fn();
+  const facade = installedExtension(load)!;
+  const parent = new AbortController();
+  try {
+    await expect(facade.bindAccountBranding!({ signal: parent.signal, startupDeadline: 10_000,
+      publish: vi.fn(), environment: { native: false, gateway: true, local: true, workbench: "/" },
+    })).rejects.toThrow("ended");
+    expect(load).not.toHaveBeenCalled(); expect(vi.getTimerCount()).toBe(0);
+  } finally { parent.abort(); clock.mockRestore(); vi.useRealTimers(); }
 });

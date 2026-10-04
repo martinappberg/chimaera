@@ -1,36 +1,39 @@
 //! Optional daemon-owned mirrors and workspace handoff. No credential is durable.
 mod authority;
 mod canonical;
+mod companion;
 mod config;
+#[cfg(any(target_os = "macos", test))]
+mod config_exec;
+mod config_wire;
 mod detached;
 mod drain;
-mod engine;
-mod execution;
+pub(crate) mod engine;
+pub(crate) mod execution;
 pub(crate) mod install;
 mod kept;
-mod mirror;
-mod moves;
-mod policy;
+pub(crate) mod mirror;
+pub(crate) mod moves;
+pub(crate) mod policy;
 mod project_copy;
 mod projects;
 mod protocol;
 mod provider_gate;
 mod repository;
-mod routes;
-mod shadow_cache;
+pub(crate) mod routes;
+pub(crate) mod shadow_cache;
+pub(crate) mod transfer_dispatch;
+pub(crate) mod transfer_host;
+pub(crate) mod transfer_types;
 mod transport;
 mod trash;
 pub(crate) use drain::{cancel as cancel_drain, start as drain};
-#[cfg(all(target_os = "linux", feature = "provider-claude-fixture"))]
-pub(crate) use execution::start_claude_fixture;
-#[cfg(all(target_os = "linux", feature = "provider-github-fixture"))]
-pub(crate) use execution::start_github_fixture;
 pub(crate) use kept::{
     file as kept_file, list as kept_list, resolve as kept_resolve, resolve_all as kept_resolve_all,
 };
-#[cfg(test)]
+#[cfg(feature = "daemon-extension-fixture")]
 pub(crate) use moves::device_fixture;
-pub(crate) use moves::{acted_here, other_computer, Outcome as MoveOutcome};
+pub(crate) use moves::{acted_here, other_computer};
 pub(crate) use policy::CloudProfile;
 pub(crate) use provider_gate::{
     blocking_provider, cloud_provider_blocks, workspace_provider_blocks,
@@ -83,7 +86,9 @@ pub(crate) struct ProState {
     /// a daemon restart keeps them away too.
     parked: Mutex<std::collections::HashSet<String>>,
     /// The last bytes written, so an unchanged tick costs no disk sync.
-    persistence: AsyncMutex<Option<Vec<u8>>>,
+    persistence: Arc<AsyncMutex<Option<Vec<u8>>>>,
+    #[cfg(test)]
+    persistence_pause: Mutex<Option<PersistencePause>>,
     configuration: Arc<AsyncMutex<()>>,
     caches: Mutex<HashMap<String, Weak<AsyncMutex<()>>>>,
     boot_deferred: Mutex<std::collections::HashSet<String>>,
@@ -130,7 +135,7 @@ pub(crate) struct ProState {
 }
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
-enum Ownership {
+pub enum Ownership {
     PrivacyDisabled { epoch: u64 },
     Hydrating { epoch: u64 },
     SettingUp { epoch: u64 },
@@ -478,7 +483,9 @@ impl ProState {
             sleeping: Mutex::new(Default::default()),
             release_pending: Mutex::new(Default::default()),
             parked: Mutex::new(parked),
-            persistence: AsyncMutex::new(None),
+            persistence: Arc::new(AsyncMutex::new(None)),
+            #[cfg(test)]
+            persistence_pause: Mutex::new(None),
             configuration: Arc::new(AsyncMutex::new(())),
             caches: Mutex::new(HashMap::new()),
             boot_deferred: Mutex::new(Default::default()),
@@ -594,7 +601,7 @@ pub(crate) fn may_write(state: &crate::AppState, workspace: &str) -> bool {
 #[cfg(test)]
 pub(crate) use execution::expired_lease_fixture as expire_execution_fixture;
 /// Execution has a stricter lease boundary than local file editing.
-#[cfg(test)]
+#[cfg(any(test, feature = "daemon-extension-fixture"))]
 pub(crate) use execution::install_fixture as install_execution_fixture;
 pub(crate) use execution::installer;
 pub(crate) use execution::mutation;
@@ -889,8 +896,14 @@ fn now() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
+#[cfg(test)]
+struct PersistencePause {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
 async fn persist(state: &crate::AppState) -> anyhow::Result<()> {
-    let mut written = state.pro.persistence.lock().await;
+    let mut written = state.pro.persistence.clone().lock_owned().await;
     ensure_root(&state.pro.root).await?;
     project_copy::persist_latch(state).await?;
     execution::record_groups(state);
@@ -931,9 +944,24 @@ async fn persist(state: &crate::AppState) -> anyhow::Result<()> {
     }
     let path = state.pro.root.join("state.json");
     let copy = bytes.clone();
-    tokio::task::spawn_blocking(move || crate::persist::atomic_write_json_durable(&path, copy))
-        .await??;
-    execution::persist_latch(state).await?;
+    #[cfg(test)]
+    let pause = crate::lock(&state.pro.persistence_pause).take();
+    // Aborting a coordinator/request cannot release this writer while its
+    // blocking rename/fsync still owns state.json.tmp. Return the SAME guard
+    // after settlement and retain it through the original state→latch order.
+    written = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if let Some(pause) = pause {
+            let _ = pause.entered.send(());
+            pause
+                .release
+                .recv_timeout(std::time::Duration::from_secs(5))?;
+        }
+        crate::persist::atomic_write_json_durable(&path, copy)?;
+        Ok::<_, anyhow::Error>(written)
+    })
+    .await??;
+    written = execution::persist_latch(state, written).await?;
     *written = Some(bytes);
     Ok(())
 }
@@ -1331,6 +1359,68 @@ mod tests {
             root.to_path_buf(),
             root.join("config"),
         ))
+    }
+    #[tokio::test]
+    async fn cancelled_persistence_observer_retains_original_writer_until_durable_settlement() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-writer-{}",
+            chimaera_core::generate_token()
+        ));
+        let state = state(&root);
+        let workspace = "p-writer";
+        crate::lock(&state.pro.ownership).insert(workspace.into(), Ownership::Local { epoch: 1 });
+        crate::lock(&state.pro.execution.latched).insert(workspace.into());
+        let (entered, reached) = tokio::sync::oneshot::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        *crate::lock(&state.pro.persistence_pause) = Some(PersistencePause {
+            entered,
+            release: resume,
+        });
+        let original = state.clone();
+        let first = tokio::spawn(async move { persist(&original).await });
+        let mut second = None;
+        let outcome: anyhow::Result<()> = async {
+            tokio::time::timeout(std::time::Duration::from_secs(3), reached).await??;
+            // Publication changed while the ORIGINAL blocking writer remains
+            // held. Losing its coordinator observer must not authorize a new
+            // writer to rename the same temporary file or overtake this write.
+            crate::lock(&state.pro.ownership).insert(workspace.into(), Ownership::Remote {
+                epoch: 2, holder: "d-other".into()
+            });
+            first.abort();
+            while !first.is_finished() { tokio::task::yield_now().await; }
+            anyhow::ensure!(state.pro.persistence.try_lock().is_err(), "original blocking writer was released");
+            let successor = state.clone();
+            second = Some(tokio::spawn(async move { persist(&successor).await }));
+            anyhow::ensure!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), second.as_mut().unwrap()).await.is_err(),
+                "successor overtook the original writer"
+            );
+            release.send(())?;
+            tokio::time::timeout(std::time::Duration::from_secs(3), second.take().unwrap()).await???;
+            let bytes = std::fs::read(root.join("pro/state.json"))?;
+            let disk: DiskState = serde_json::from_slice(&bytes)?;
+            anyhow::ensure!(matches!(disk.ownership.get(workspace), Some(Ownership::Remote { epoch: 2, holder }) if holder == "d-other"), "durable successor state was lost");
+            let latch: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("pro/execution-authority.json"))?)?;
+            anyhow::ensure!(latch["workspaces"] == serde_json::json!([workspace]), "original execution latch was not settled");
+            anyhow::ensure!(state.pro.persistence.lock().await.as_deref() == Some(bytes.as_slice()), "cached write precedes durable settlement");
+            Ok(())
+        }.await;
+        // Always unblock the test-owned worker and settle observers on failure.
+        let _ = release.send(());
+        first.abort();
+        let _ = first.await;
+        if let Some(task) = second {
+            task.abort();
+            let _ = task.await;
+        }
+        if outcome.is_ok() {
+            std::fs::remove_dir_all(&root).unwrap();
+        }
+        assert!(
+            outcome.is_ok(),
+            "retained durable-writer regression failed; owned root retained"
+        );
     }
     #[test]
     fn bounded_saved_state_preserves_fences_beyond_runtime_admission_cap() {

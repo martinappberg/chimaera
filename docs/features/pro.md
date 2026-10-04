@@ -1,19 +1,19 @@
 # Chimaera Pro connections
 
-An optional account connection in the native app. It keeps remote hosts reachable
+An optional account connection supplied by the separate Pro application assembly. It keeps remote hosts reachable
 through an authenticated keeper, relays SSH login prompts, and offers the local
 daemon to other signed-in devices. Ordinary SSH connections and the free daemon
 continue to work without an account.
 
 **Status: partial.** This page covers the native account and connection surface.
-Cloud setup controls are implemented; automatic handoff and browser access are being verified before acceptance. Native phone apps remain separate.
+The public build contains no private client dependency and works without an account or Pro service. The separately built Pro assembly supplies account controls and transfer policy; automatic installation, signed delivery and the remaining end-to-end acceptance are incomplete. Native phone apps remain separate.
 
 For the combined public implementation, review entrypoints, reproducible checks,
 and remaining acceptance gates, see the [integration review guide](../agent-guides/pro-integration.md).
 
 ## How it is used
 
-1. Open **Pro** from Home or the first **Chimaera Pro** group in Settings.
+1. In an assembly with the Pro extension selected and its endpoint configured, open **Pro** from Home or the **Chimaera Pro** group in Settings.
    Paid accounts can also click the compact plan badge beside the workspace name.
    It opens a dedicated account page; ordinary app settings stay separate.
    In an account browser, the cloud machine opens the same agent-connection
@@ -505,7 +505,7 @@ The daemon renews a workspace ownership lease independently of mirror jobs: acco
 
 Agents running in the cloud receive a current-host brief through MCP initialization. On the user's own computer an agent gets no brief at all, unless its project came back from the cloud while this daemon was running; then the brief says work runs on the computer again and replaces the earlier cloud assumptions. Structured conversations with an interrupted turn or background work also receive it in their transfer pickup message. That pickup says in plain words where the conversation now runs (in the cloud, or on the user's computer), whether it is the same conversation or a copy continuing from the last saved point because the other machine stopped responding, that the project files were installed and may differ, and to re-check tools and paths; a recovery adds how to treat work of uncertain state. It is tagged `UserMessage.origin` `moved` (now in the cloud), `home` (back on the user's computer) or `recovered` (either way, continuing from the last saved point after the other machine stopped responding), and the chat view keys its divider on that tag. Finished structured conversations resume idle without starting a model turn merely because they moved or returned. Their fresh MCP context is available when the user next asks them to work. The brief identifies device or cloud execution, the registered project root, OS/architecture needed for builds, headless limitations, and fresh cached provider observations. Guidance about the cloud machine's resource capacity appears only in a cloud brief. Absent or expired observations remain unknown; generating context never probes, logs in, wakes compute or sends a turn. Both MCP initialization and read_cloud_profile use this same projection, and returning to a device replaces stale cloud assumptions. Generated context omits topology, routing IDs, raw diagnostics, hardware allocations and credentials. User-owned profile content remains untrusted project data; missing variable names do not prove a dependency is unavailable. Agents should inspect actual tools and failures, use compatible headless or lower-resource alternatives within existing permissions, preserve completed work, and explain only meaningful progress or the specific user action needed. This prompt is product guidance, not an authorization or confidentiality boundary: agents can inspect their permitted environment and may infer where they run. It does not guarantee compliance or prevent all inference. Ordinary Claude and Codex terminal sessions receive the same MCP context under the same rule; a terminal session whose turn was cut off by the move starts with one short "Continuing here" line, and an idle one resumes without starting a turn.
 
-`read_cloud_profile` and `update_cloud_profile` operate only on the authenticated session's registered project. Updates require the current revision, reject unknown fields and credential-shaped content, and are capped at 32 KiB. They keep ordinary agent permissions, and deferred laptop steps remain guidance. An agent can keep or clear the confirmed `setup_command`, but a new command it saves is only a proposal (`pending_setup_command`, additive on `GET /api/v1/pro/profile`): it never runs until the user confirms it in Projects and privacy, which saves it as `setup_command` through `PUT /api/v1/pro/profile`. That route replaces the whole profile. The page ([`pro/profile.ts`](../../web-ui/src/lib/pro/profile.ts)) re-reads it, applies **Confirm** or **Dismiss** only to the proposal shown, and carries the read's `ETag` in `If-Match` with every field. The daemon compares that revision atomically with replacement, including the account generation; a concurrent update is refused with 412. A 409 during transfer triggers bounded re-reads only while the revision remains unchanged. A 412 or changed revision requires another explicit decision, preserving concurrent guidance and never carrying approval into a replacement account with identical command text. Older unconditional PUT clients remain supported, but the current confirmation UI refuses to save without an ETag. The accepted durable write retains its reservations if the window closes. An update that leaves the command alone keeps an earlier proposal waiting, and the tool's result says `awaiting_confirmation`. Saving a profile never runs a command or wakes a machine. Implementation: [`mcp/cloud_context.rs`](../../crates/chimaera-server/src/mcp/cloud_context.rs).
+`read_cloud_profile` and `update_cloud_profile` operate only on the authenticated session's registered project. Updates require the current revision, reject unknown fields and credential-shaped content, and are capped at 32 KiB. They keep ordinary agent permissions, and deferred laptop steps remain guidance. An agent can keep or clear the confirmed `setup_command`, but a new command it saves is only a proposal (`pending_setup_command`, additive on `GET /api/v1/pro/profile`): it never runs until the user confirms it in Projects and privacy, which saves it as `setup_command` through `PUT /api/v1/pro/profile`. That route replaces the whole profile. The optional Pro account page re-reads it through the public fixed [`profile transport`](../../web-ui/src/lib/pro/profile.ts), applies **Confirm** or **Dismiss** only to the proposal shown, and carries the read's `ETag` in `If-Match` with every field. The daemon compares that revision atomically with replacement, including the account generation; a concurrent update is refused with 412. A 409 during transfer triggers bounded re-reads only while the revision remains unchanged. A 412 or changed revision requires another explicit decision, preserving concurrent guidance and never carrying approval into a replacement account with identical command text. Older unconditional PUT clients remain supported, but the current confirmation UI refuses to save without an ETag. The accepted durable write retains its reservations if the window closes. An update that leaves the command alone keeps an earlier proposal waiting, and the tool's result says `awaiting_confirmation`. Saving a profile never runs a command or wakes a machine. Implementation: [`mcp/cloud_context.rs`](../../crates/chimaera-server/src/mcp/cloud_context.rs).
 
 The app's system sleep hook tells the daemon how long it has before the computer sleeps (`POST /api/v1/pro/sleep {deadline_ms}`): 23 seconds of macOS's 25-second wait, logind's configured delay minus a margin on Linux, and under a second on Windows. The daemon's flush fits the deadline it is given. It preempts the periodic mirror pass, stops agents and publishes every project in parallel (projects with running agents first), and never leaves a half transfer: a flush that outlives the deadline finishes or recovers on its own. The publication fence is not waited out past the deadline; an unreleased lease lapses and the cloud continues from the acknowledged checkpoint. Waking before a flush finishes keeps the project on the computer. A failed flush leaves the lease takeover path available.
 
@@ -583,7 +583,7 @@ reference is relative to the actual Git directory, so linked worktrees work too.
 Source and shadow histories remain within account quotas; initial transfers have
 a bounded 16-minute deadline.
 Implementation: [`pro/`](../../crates/chimaera-server/src/pro/AGENTS.md),
-[`MirrorSettings.svelte`](../../web-ui/src/lib/settings/MirrorSettings.svelte),
+the [optional account presentation interface](../../web-ui/src/lib/extensions/accountPresentation.ts),
 [`power.rs`](../../crates/chimaera-app/src/shell/power.rs), and the
 [session bundle contract](../../crates/chimaera-server/BUNDLE.md).
 
@@ -903,12 +903,10 @@ account replacement, changed configuration or failed proof refuses a grant.
 Cancellation before the append leaves trust unchanged; a failure after an approved
 append can retain that verified entry while still refusing the connection.
 
-The native implementation lives in
-[`ssh_agent/trust`](../../crates/chimaera-app/src/ssh_agent/trust/mod.rs), with
-attempt ownership in
-[`ssh_agent/lifecycle.rs`](../../crates/chimaera-app/src/ssh_agent/lifecycle.rs)
-and scoped prompts in
-[`askpass.rs`](../../crates/chimaera-app/src/askpass.rs).
+The keeper authentication implementation is supplied by the optional native
+account extension through the [host interface](../../crates/chimaera-app/src/account/mod.rs).
+The public host retains scoped prompts in
+[`askpass.rs`](../../crates/chimaera-app/src/askpass.rs) and ordinary Direct SSH.
 First-use UI, configured but unloaded keys and complete keeper-held route/Slurm
 journeys still require integration acceptance. The prototype does not change
 ordinary direct SSH or advertise completed keeper support.

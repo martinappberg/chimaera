@@ -24,7 +24,7 @@ the opt-in "teach agents the document dialect" installs over
 `/api/v1/agent-docs` (an `AGENTS.md` block, a Claude Code skill). The daemon
 owns the text; the confirm dialog shows it verbatim before anything is written.
 
-**Pro is a separate account surface.** `../pro/ProView.svelte` is a singleton
+**Pro is a separate account surface.** the private optional account view is a singleton
 workbench tab and Home view. When Pro is offered (`net/plan.ts` `proOffered`;
 a build without an account endpoint offers none) Settings ends with a small
 Chimaera Pro group that opens it (Pro is an optional add-on, so it follows every
@@ -36,7 +36,7 @@ group after it never splits them off. `../net/plan.ts` shares its existing subsc
 and the badges: loading or failed/unknown entitlement stays neutral, never a
 sales prompt or an active-plan claim. There is no extra poll or cloud wake. A paid workspace plan badge also
 opens it, without adding a full-width sidebar row for any plan.
-It renders `ProSettings.svelte`, which invokes the native `pro_*` commands.
+It now renders the finite optional `../extensions/AccountApplicationView.svelte`; the private package presents the named native account commands. The old public ProSettings/CloudSetup/MirrorSettings files are temporarily unused source candidates until actual adapter acceptance and removal.
 The generic Settings form no longer embeds account/billing/onboarding controls.
 An account browser on a cloud worker opens the same provider flow; other hosts
 link to the account's billing page (`/account/billing`). Ordinary browser daemons
@@ -44,11 +44,11 @@ have no Pro entry. An account browser
 shows a Cloud category only on the cloud machine's own page (a passive
 `isCloudMachine` read); it remains host-pinned and cookie-authenticated.
 On the web's Home (the account's own page, `net/base.ts` `isAccountHome`; see
-[pro](../pro/AGENTS.md) `AccountHome.svelte`) there is no daemon: `SettingsView`
+[optional account host](../extensions/AGENTS.md)) there is no daemon: `SettingsView`
 with `account` shows only Chimaera Pro, rendered in place by
-`pro/BrowserAccount.svelte` (plan, usage, the billing link and Sign out), with no
+the finite account-settings extension slot (plan, usage, the billing link and Sign out), with no
 search, JSON tab or daemon settings.
-`pro/ProjectSecrets.svelte` is a separate capability-gated account control on
+The private optional project-secrets view is a separate capability-gated account control on
 paid native/browser Home. It edits one name without reading existing values,
 carries the shown queued batch, and separates Queue until idle from confirmed
 Apply now or immediate Remove access. Project contexts navigate to account Home;
@@ -74,7 +74,7 @@ window (`returning_until`) reads as no plan: the badge says **Plan ended**, plan
 are offered, and one quiet line says when its cloud work can still be brought
 home. A planned restart of the always-on cloud connection (`keeper_restart_at`)
 is one quiet line under Connected machines, until the account clears it. The page renders from the last
-confirmed status (`pro/account.ts` `accountPanel`) while background reads run, so
+confirmed status (private `packages/pro-client-ui/src/account/account.ts` `accountPanel`) while background reads run, so
 nothing unmounts on `pro-changed` or focus; an account needing attention keeps
 that panel too, and only Check again shows checking (the error bar hides
 meanwhile). `service_unsupported` shows its explanation with no manual check,
@@ -90,7 +90,7 @@ opening/waiting/confirming/result states and refreshes cached status on events o
 Subscriber billing feedback stays inside the account card, preserving cloud and
 provider panels. Account events immediately invalidate older reads; billing
 snapshots cannot roll back to an older attempt or phase. Pro subscribers near
-a limit (`nearLimit`) can choose Upgrade to Max, review the interval locally, then explicitly open the
+a limit (private `account/account.ts` `nearLimit`) can choose Upgrade to Max, review the interval locally, then explicitly open the
 hosted price/proration confirmation. Only server-confirmed Max changes the plan. An unconfirmed review return settles
 after a bounded native check with the actual current plan; it never implies that
 the user canceled or that a delayed billing update cannot arrive.
@@ -132,9 +132,9 @@ wakes row always shows.
 | `agentStatus.ts` | Honest update and installer status rules; unknown/failure never means up to date or installed. |
 | `EnvironmentSettings.svelte` | The Environment prelude panel (bespoke, `/api/v1/environment`-backed — see the exception above). |
 | `environment.ts` | Wire types + `getEnvironment`/`putEnvironment` for the prelude map. |
-| `CloudSetup.svelte` | Automatic cloud status, bounded visible polling (no manual check). Only an account's very first setup reads as setup ("Getting things ready", "Setting up your cloud. This usually takes a couple of minutes."); once the cloud has been ready (`presentation.ts` `cloudReadyOnce` from the app's `cloud_ready_once`, or seen ready this session) a later `preparing` is the same "Available when you need it" as ready and idle. The check mark needs an agent on record (live from the connection panel, else the app's remembered `agents_connected`, or in a browser view its remembered rows); none connected names the step, unknown claims nothing. A ready-but-unreachable read is re-checked with the account and reported only on a second read in a row, and a failed account status read likewise (`presentation.ts` `afterFailedRead`: one miss keeps the last confirmed state and its calm copy and re-checks on the fast cadence; the second in a row shows the existing error); an asleep-or-starting answer (`cloud_asleep`) is idle, never unreachable and never words. **Agent connections** (`ProviderConnections`, compact, mounted once and kept) shows whenever the account has a cloud, fed the remembered rows (`remembered_providers`, or `pro/catalogMemory.ts` in a browser view) and `live` only while the cloud answers. Showing or opening it never wakes the cloud (it only looks, passively); there is no `start` request here. Historical project-copy summaries. Opening a repository exists only on the cloud machine's own page, as navigation; the app has none. See [provider map](../pro/AGENTS.md). |
-| `MirrorSettings.svelte` | Native project-copy status and privacy; visibility-gated 15-second status refresh; the row is re-read after every change; a privacy change the account hasn't confirmed yet is a success that reads as quiet progress and is re-sent quietly (≤1/min, the first a minute after the click); each row names who runs the project (`presentation.ts` `projectPlace`), and setup reads as progress unless it failed or waits on an agent; the switch is **Keep this project on this computer**; copy work still under way and too-large files read as a muted hint, only real problems in the warning colour; `renewal_failed` reads "Reconnecting your account…"; kept-both rows name the user's versions saved beside each file; blocked-provider rows open the shared connection flow. An agent's proposed setup command (`pending_setup_command`) shows once per project, whole, with Confirm/Dismiss (`pro/profile.ts`); `profile.deferred` is a plain "Steps that need your computer" list with no run button. Setup commands are otherwise not edited here, and idle-session policy stays internal. |
-| `ProSettings.svelte` | Dedicated Pro overview content: account identity, plan choices, browser checkout/portal, usage, and progressive connection/privacy/security sections; **Sign in** beside **See plans** for signed-out users; a browser sign-in that ended (`status.ts` `signInNote`) keeps the plans with one quiet line; sign-out asks first (ConfirmDialog) for **Sign out everywhere** and when a project is running elsewhere (its opaque holder never identifies cloud), and `sign_out_pending` reads as a quiet signed-out line. |
+| Private optional `CloudSetup` | Automatic cloud status, bounded visible polling (no manual check). Only an account's very first setup reads as setup ("Getting things ready", "Setting up your cloud. This usually takes a couple of minutes."); once the cloud has been ready (`presentation.ts` `cloudReadyOnce` from the app's `cloud_ready_once`, or seen ready this session) a later `preparing` is the same "Available when you need it" as ready and idle. The check mark needs an agent on record (live from the connection panel, else the app's remembered `agents_connected`, or in a browser view its remembered rows); none connected names the step, unknown claims nothing. A ready-but-unreachable read is re-checked with the account and reported only on a second read in a row, and a failed account status read likewise (`presentation.ts` `afterFailedRead`: one miss keeps the last confirmed state and its calm copy and re-checks on the fast cadence; the second in a row shows the existing error); an asleep-or-starting answer (`cloud_asleep`) is idle, never unreachable and never words. **Agent connections** (`ProviderConnections`, compact, mounted once and kept) shows whenever the account has a cloud, fed the remembered rows (`remembered_providers`, or `pro/catalogMemory.ts` in a browser view) and `live` only while the cloud answers. Showing or opening it never wakes the cloud (it only looks, passively); there is no `start` request here. Historical project-copy summaries. Opening a repository exists only on the cloud machine's own page, as navigation; the app has none. See [provider map](../pro/AGENTS.md). |
+| Private optional `MirrorSettings` | Native project-copy status and privacy; visibility-gated 15-second status refresh; the row is re-read after every change; a privacy change the account hasn't confirmed yet is a success that reads as quiet progress and is re-sent quietly (≤1/min, the first a minute after the click); each row names who runs the project (`presentation.ts` `projectPlace`), and setup reads as progress unless it failed or waits on an agent; the switch is **Keep this project on this computer**; copy work still under way and too-large files read as a muted hint, only real problems in the warning colour; `renewal_failed` reads "Reconnecting your account…"; kept-both rows name the user's versions saved beside each file; blocked-provider rows open the shared connection flow. An agent's proposed setup command (`pending_setup_command`) shows once per project, whole, with Confirm/Dismiss (private `packages/pro-client-ui/src/account/profile.ts`, over the fixed public profile read/save bridge); `profile.deferred` is a plain "Steps that need your computer" list with no run button. Setup commands are otherwise not edited here, and idle-session policy stays internal. |
+| Private optional `ProSettings` | Dedicated Pro overview content: account identity, plan choices, browser checkout/portal, usage, and progressive connection/privacy/security sections; **Sign in** beside **See plans** for signed-out users; a browser sign-in that ended (`status.ts` `signInNote`) keeps the plans with one quiet line; sign-out asks first (ConfirmDialog) for **Sign out everywhere** and when a project is running elsewhere (its opaque holder never identifies cloud), and `sign_out_pending` reads as a quiet signed-out line. |
 | `DocumentsSettings.svelte` | The Documents panel: the opt-in AGENTS.md / Claude skill installs (see the exception above). |
 | `agentDocs.ts` | Wire types + `getAgentDocs`/`installAgentDocs` for `/api/v1/agent-docs`. |
 | `PluginsSettings.svelte` | Settings → Plugins: every installed plugin's declared settings (see the exception above); slotted after Extensions. |

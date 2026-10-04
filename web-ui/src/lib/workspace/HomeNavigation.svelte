@@ -1,6 +1,5 @@
 <script lang="ts">
   import BrandMark from "../shared/BrandMark.svelte";
-  import PlanBadge from "../shared/PlanBadge.svelte";
   import { keyHint } from "../shared/keybindings";
 
   let { active, plan, showPro, onHome, onPro, onSettings }: {
@@ -14,7 +13,7 @@
 </script>
 
 <nav class="home-navigation" aria-label="Chimaera">
-  <div class="brand"><BrandMark size={23} title="Chimaera" /><span>chimaera</span><PlanBadge {plan} /></div>
+  <div class="brand"><BrandMark size={23} title="Chimaera" /><span>chimaera</span>{#if plan !== null}{#await import("../shared/PlanBadge.svelte") then { default: PlanBadge }}<PlanBadge {plan} />{/await}{/if}</div>
   <button class="home-link" class:active={active === "workspaces"} aria-current={active === "workspaces" ? "page" : undefined} onclick={onHome}>
     <svg viewBox="0 0 18 18" width="17" height="17" aria-hidden="true"><rect x="2.5" y="3" width="13" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.3" /><path d="M2.5 7h13M7 7v8" fill="none" stroke="currentColor" stroke-width="1.3" /></svg>
     <span>Workspaces</span>

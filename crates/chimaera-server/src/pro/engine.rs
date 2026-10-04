@@ -4,7 +4,7 @@ use super::{
     transport, Ownership, WorkspaceStatus,
 };
 use crate::{lock, AppState};
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -22,34 +22,34 @@ mod release;
 mod snapshot_diagnostics;
 
 #[derive(Serialize, Deserialize)]
-pub(super) struct Manifest {
-    version: u32,
+pub struct Manifest {
+    pub version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    project: Option<super::projects::catalog::Metadata>,
+    pub project: Option<super::projects::catalog::Metadata>,
     #[serde(default)]
-    pub(super) branch: Option<String>,
+    pub branch: Option<String>,
     #[serde(default)]
-    pub(super) repository_origin: Option<String>,
+    pub repository_origin: Option<String>,
     #[serde(default)]
-    pub(super) repository: Option<super::repository::Snapshot>,
-    pub(super) workspace_id: String,
+    pub repository: Option<super::repository::Snapshot>,
+    pub workspace_id: String,
     pub root: PathBuf,
-    pub(super) name: String,
-    pub(super) epoch: u64,
-    clean: bool,
+    pub name: String,
+    pub epoch: u64,
+    pub clean: bool,
     #[serde(default)]
-    continuation: execution::wire::Continuation,
-    profile: super::policy::CloudProfile,
-    sessions: Vec<SessionArchive>,
+    pub continuation: execution::wire::Continuation,
+    pub profile: super::policy::CloudProfile,
+    pub sessions: Vec<SessionArchive>,
     /// Additive: project paths this snapshot deliberately left out. Only a
     /// snapshot that carries this inventory can show that a file is gone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) left_out: Option<Vec<PathBuf>>,
+    pub left_out: Option<Vec<PathBuf>>,
 }
 #[derive(Serialize, Deserialize)]
-struct SessionArchive {
-    id: String,
-    archive: String,
+pub struct SessionArchive {
+    pub id: String,
+    pub archive: String,
 }
 
 pub(super) async fn account(
@@ -133,182 +133,15 @@ pub(super) async fn credentials(
     );
     Ok(credentials)
 }
-/// Every project is copied this often whatever its agents do: the backstop
-/// for work no agent did (the user's own edits, a plain shell).
-const TIMED_COPY: u64 = 120;
-/// A copy this soon after the last one started would mostly republish it; a
-/// run of short turns is copied at most this often.
-const TURN_COPY_GAP: u64 = 20;
-
-/// Which projects had an agent finish a step since their last copy. A
-/// finished turn is the moment its work is whole, so that project is copied
-/// then instead of at the next timer pass: after a sudden loss of this
-/// computer the cloud continues from the end of the last turn, not from up to
-/// two minutes before it. Fed by the lease loop each tick; holds only ids the
-/// loop iterates.
-#[derive(Default)]
-struct TurnEnds {
-    working: BTreeSet<String>,
-    ended: BTreeSet<String>,
-}
-
-impl TurnEnds {
-    fn observe(&mut self, workspace: &str, working: bool) {
-        if working {
-            self.working.insert(workspace.to_owned());
-        } else if self.working.remove(workspace) {
-            self.ended.insert(workspace.to_owned());
-        }
-    }
-
-    /// Projects the loop no longer iterates are forgotten.
-    fn keep(&mut self, seen: &BTreeSet<String>) {
-        self.working.retain(|id| seen.contains(id));
-        self.ended.retain(|id| seen.contains(id));
-    }
-
-    /// Whether a copy should start, given the seconds since the last one
-    /// started: `Some(None)` is every project (the timer), `Some(Some(ids))`
-    /// the projects whose turn ended, `None` not yet.
-    fn due(&self, since_last: u64) -> Option<Option<BTreeSet<String>>> {
-        if since_last >= TIMED_COPY {
-            Some(None)
-        } else if !self.ended.is_empty() && since_last >= TURN_COPY_GAP {
-            Some(Some(self.ended.clone()))
-        } else {
-            None
-        }
-    }
-
-    /// A copy started for these projects (every project when `None`). A turn
-    /// that ends while it runs is seen by a later tick and copied next.
-    fn copied(&mut self, only: &Option<BTreeSet<String>>) {
-        match only {
-            None => self.ended.clear(),
-            Some(ids) => self.ended.retain(|id| !ids.contains(id)),
-        }
-    }
-}
+pub(crate) mod coordinator_host;
+pub(crate) mod project_host;
 
 pub(super) fn start(state: Arc<AppState>) {
-    let generation = state.pro.generation.load(Ordering::Acquire);
-    let task_state = state.clone();
-    let task = tokio::spawn(async move {
-        let state = task_state;
-        let mut last_mirror = 0;
-        let mut turns = TurnEnds::default();
-        let mut renewed = super::now();
-        let mut next_renewal = 0;
-        let mut unauthorized = false;
-        loop {
-            if state.stopping.load(Ordering::Relaxed)
-                || generation != state.pro.generation.load(Ordering::Acquire)
-            {
-                return;
-            }
-            let Some(config) = lock(&state.pro.runtime).clone() else {
-                return;
-            };
-            // Hourly, and at once after the account refused this credential
-            // (then at most once a minute while it keeps failing).
-            if (super::now().saturating_sub(renewed) >= 3600 || unauthorized)
-                && super::now() >= next_renewal
-            {
-                if renew_delegation(&state, &config, generation).await {
-                    renewed = super::now();
-                } else {
-                    next_renewal = super::now() + 60;
-                }
-            }
-            unauthorized = false;
-            // Previous-life processes that have exited release their fence.
-            execution::reprobe(&state);
-            let workspaces = lock(&state.workspaces).list();
-            let mut seen = BTreeSet::new();
-            for workspace in workspaces
-                .into_iter()
-                .filter(|workspace| eligible(&state, workspace))
-                .take(128)
-            {
-                if lock(&state.pro.preferences)
-                    .get(&workspace.id)
-                    .is_some_and(|p| p.never_mirror)
-                    && !matches!(
-                        lock(&state.pro.ownership).get(&workspace.id),
-                        Some(Ownership::AwaitingVerification { .. })
-                    )
-                {
-                    continue;
-                }
-                if let Err(error) = reconcile(&state, &config, &workspace.id).await {
-                    unauthorized |= error
-                        .chain()
-                        .any(|cause| cause.to_string() == transport::UNAUTHORIZED);
-                    record_error(&state, &workspace.id, &error);
-                }
-                turns.observe(
-                    &workspace.id,
-                    super::owned_epoch(&state, &workspace.id).is_some()
-                        && !working_agents(&state, &workspace.id).is_empty(),
-                );
-                seen.insert(workspace.id);
-            }
-            turns.keep(&seen);
-            let copy = turns.due(super::now().saturating_sub(last_mirror));
-            if let Some(only) = copy.filter(|_| {
-                !super::drain::draining(&state)
-                    && lock(&state.pro.mirror_task)
-                        .as_ref()
-                        .is_none_or(|task| task.is_finished())
-            }) {
-                turns.copied(&only);
-                let owner = state.clone();
-                let config = config.clone();
-                let task = tokio::spawn(async move {
-                    let _guard = owner.pro.jobs.lock().await;
-                    // Locating returning projects stays on the timer: a copy
-                    // after a turn publishes that project and nothing else.
-                    if only.is_none() {
-                        if let Err(error) = lazy_handback(&owner, &config).await {
-                            tracing::warn!(phase="locate_return", error=%error, "Could not locate returning projects");
-                        }
-                    }
-                    let workspaces = lock(&owner.workspaces).list();
-                    for workspace in workspaces
-                        .into_iter()
-                        .filter(|workspace| eligible(&owner, workspace))
-                        .filter(|workspace| {
-                            only.as_ref().is_none_or(|ids| ids.contains(&workspace.id))
-                        })
-                        .take(128)
-                    {
-                        if generation != owner.pro.generation.load(Ordering::Acquire) {
-                            return;
-                        }
-                        // An unrenewed lease stops publication, never local work;
-                        // the lease loop re-establishes it quietly.
-                        if super::owned_epoch(&owner, &workspace.id).is_none()
-                            || !execution::lease_valid(&owner, &workspace.id)
-                            || lock(&owner.pro.preferences)
-                                .get(&workspace.id)
-                                .is_some_and(|p| p.never_mirror)
-                        {
-                            continue;
-                        }
-                        if let Err(error) = snapshot(&owner, &config, &workspace.id, false).await {
-                            record_error(&owner, &workspace.id, &error);
-                        }
-                    }
-                });
-                *lock(&state.pro.mirror_task) = Some(task);
-                last_mirror = super::now();
-            }
-            tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(5)) => {}
-                () = state.pro.renew_now.notified() => {}
-            }
-        }
-    });
+    let Some(runtime) = state.daemon_extension.clone() else {
+        return;
+    };
+    let owner = coordinator_host::CoordinatorOwner::capture(state.clone());
+    let task = tokio::spawn(runtime.coordinate(owner));
     if let Some(old) = lock(&state.pro.task).replace(task) {
         old.abort();
     }
@@ -355,6 +188,7 @@ fn record_error(state: &AppState, workspace: &str, error: &anyhow::Error) {
     status.error = Some(message);
     status.error_code = Some(super::routes::error_code(error));
 }
+#[cfg(test)]
 pub(super) async fn reconcile(
     state: &Arc<AppState>,
     config: &Configure,
@@ -371,462 +205,17 @@ async fn reconcile_generation(
     workspace: &str,
     generation: u64,
 ) -> Result<Option<u64>> {
-    authority::config_matches(state, config, workspace)?;
-    // A local copy never renews/acquires execution or advertises a return
-    // destination. Only the explicit takeover operation may hydrate it.
-    if super::project_copy::copy_only(state, workspace) {
-        ensure!(
-            generation == state.pro.generation.load(Ordering::Acquire)
-                && super::projects::account_matches(state, workspace),
-            "Account changed during copy owner read"
-        );
-        let baton: Baton = account(config, &execution::path(config, workspace, ""), "GET", None)
-            .await?
-            .json()?;
-        ensure!(
-            baton.workspace_id == workspace
-                && generation == state.pro.generation.load(Ordering::Acquire),
-            "Copy owner read changed"
-        );
-        let _configuration = state.pro.configuration.lock().await;
-        ensure!(
-            generation == state.pro.generation.load(Ordering::Acquire)
-                && super::projects::account_matches(state, workspace),
-            "Account changed during copy owner read"
-        );
-        if !super::project_copy::copy_only(state, workspace) {
-            return Ok(None);
-        }
-        // An older passive answer must not regress an admitted takeover. An
-        // active owned move already observes its own epoch through hydration.
-        if super::moves::pulling(state, workspace) {
-            return Ok(None);
-        }
-        let previous = lock(&state.pro.ownership).get(workspace).cloned();
-        let newer = previous.as_ref().is_some_and(|ownership| match ownership {
-            Ownership::Local { epoch }
-            | Ownership::Remote { epoch, .. }
-            | Ownership::Hydrating { epoch }
-            | Ownership::SettingUp { epoch }
-            | Ownership::Transferring { epoch }
-            | Ownership::AwaitingVerification { epoch }
-            | Ownership::PrivacyDisabled { epoch } => *epoch > baton.epoch,
-        });
-        if newer {
-            return Ok(None);
-        }
-        if let Some(copy) = lock(&state.pro.preferences)
-            .get_mut(workspace)
-            .and_then(|p| p.copy.as_mut())
-        {
-            copy.owner_epoch = Some(baton.epoch);
-        }
-        if let Some(holder) = baton
-            .holder_id
-            .as_ref()
-            .filter(|holder| *holder != &config.delegation.device_id)
-        {
-            lock(&state.pro.ownership).insert(
-                workspace.to_owned(),
-                Ownership::Remote {
-                    epoch: baton.epoch,
-                    holder: holder.clone(),
-                },
-            );
-        } else if baton.holder_id.is_none() && matches!(previous, Some(Ownership::Remote { .. })) {
-            lock(&state.pro.ownership).remove(workspace);
-        }
-        let requested = lock(&state.pro.preferences)
-            .get(workspace)
-            .and_then(|p| p.copy.as_ref())
-            .is_some_and(|copy| copy.takeover_requested);
-        super::persist(state).await?;
-        if requested
-            && (baton.move_to.as_deref() == Some(config.delegation.device_id.as_str())
-                || baton.holder_id.as_deref() == Some(config.delegation.device_id.as_str()))
-        {
-            super::moves::answer(state, config, workspace, &baton);
-        }
-        return Ok(None);
-    }
-    ensure!(
-        generation == state.pro.generation.load(Ordering::Acquire),
-        "Account changed during project transfer"
-    );
-    ensure!(
-        super::projects::account_matches(state, workspace),
-        "This project belongs to another account"
-    );
-    // Stopped for sleep and not handed over: renewing now would keep the lease
-    // from lapsing (delaying the cloud) and could resume agents before sleep.
-    if lock(&state.pro.release_pending).contains(workspace) {
-        return Ok(None);
-    }
-    // The passive read also tells the account whether this computer could
-    // take the project now (`moves::watch_query`), so a phone's action on a
-    // sleeping cloud can be sent here instead of waking it.
-    let path = format!(
-        "{}{}",
-        execution::path(config, workspace, ""),
-        super::moves::watch_query(state, config, workspace)
-    );
-    let baton: Baton = account(config, &path, "GET", None).await?.json()?;
-    ensure!(baton.workspace_id == workspace, "baton workspace mismatch");
-    ensure!(
-        generation == state.pro.generation.load(Ordering::Acquire),
-        "Account changed during project transfer"
-    );
-    {
-        // The account answered: from now on the verified path decides what
-        // resumes here, not the unverified boot fallback.
-        let mut answered = lock(&state.pro.answered);
-        if answered.len() < 128 || answered.contains(workspace) {
-            answered.insert(workspace.to_owned());
-        }
-    }
-    execution::observe(state, config, &baton)?;
-    if baton.continuity.is_some() {
-        super::persist(state).await?;
-    }
-    let operation_config = if baton.holder_id.is_none() && config.role == Role::Device {
-        config.clone()
-    } else {
-        execution::effective(state, config, workspace)?
-    };
-    let holder = &config.delegation.device_id;
-    // The account asks this computer to take the project (the user acted on
-    // it here, or a phone acted while the cloud slept): take it now, without
-    // the settle wait a return has (`moves`).
-    if config.role == Role::Device
-        && baton.move_to.as_deref() == Some(holder.as_str())
-        && baton.holder_id.as_deref() != Some(holder.as_str())
-    {
-        super::moves::answer(state, config, workspace, &baton);
-    }
-    let previous = lock(&state.pro.ownership).get(workspace).cloned();
-    if baton.mirror_disabled {
-        if config.role == Role::Worker {
-            lock(&state.pro.ownership).insert(
-                workspace.into(),
-                Ownership::PrivacyDisabled { epoch: baton.epoch },
-            );
-            super::persist(state).await?;
-            suspend_workspace(state, workspace).await?;
-            anyhow::bail!("Mirroring is disabled for this project");
-        }
-        {
-            let mut preferences = lock(&state.pro.preferences);
-            let preference = preferences.entry(workspace.into()).or_default();
-            preference.never_mirror = true;
-            preference.privacy_pending = false;
-        }
-        super::persist(state).await?;
-    }
-
-    if baton.holder_id.as_deref().is_some_and(|id| id != holder) {
-        // A worker never steals an active owner. Devices observe remote work
-        // immediately; hand-back is a separate coordinated stop/release path.
-        // A resumed machine that finds another owner does not renew: fence.
-        if execution::resuming(state, workspace) {
-            execution::fence_workspace(state, workspace);
-        }
-        lock(&state.pro.ownership).insert(
-            workspace.into(),
-            Ownership::Remote {
-                epoch: baton.epoch,
-                holder: baton.holder_id.clone().unwrap_or_default(),
-            },
-        );
-        super::persist(state).await?;
-        stop_after_verified_owner(state, config, workspace).await?;
-        return Ok(None);
-    }
-    // A worker may sleep through an entire device tenure without ever observing
-    // its remote owner. Only hydration may reacquire its saved work. Negotiated
-    // checkpoint execution retains its dedicated hydration protocol below.
-    if config.role == Role::Worker
-        && baton.holder_id.is_none()
-        && !execution::checkpoint_mode(state, workspace)
-    {
-        // Snapshot recovery can call reconciliation while already holding jobs.
-        // Leave that operation alone; the next poll or hydrate owns the retry.
-        let Ok(_job) = state.pro.jobs.try_lock() else {
-            return Ok(None);
-        };
-        let fenced = {
-            let _configuration = state.pro.configuration.lock().await;
-            ensure!(
-                generation == state.pro.generation.load(Ordering::Acquire),
-                "Account changed during project transfer"
-            );
-            let mut ownership = lock(&state.pro.ownership);
-            if ownership.get(workspace) == previous.as_ref()
-                && !matches!(
-                    previous,
-                    Some(
-                        Ownership::Transferring { .. }
-                            | Ownership::Hydrating { .. }
-                            | Ownership::SettingUp { .. }
-                    )
-                )
-            {
-                ownership.insert(
-                    workspace.into(),
-                    Ownership::Hydrating { epoch: baton.epoch },
-                );
-                true
-            } else {
-                false
-            }
-        };
-        if fenced {
-            super::persist(state).await?;
-            ensure!(
-                generation == state.pro.generation.load(Ordering::Acquire),
-                "Account changed during project transfer"
-            );
-            suspend_workspace(state, workspace).await?;
-        }
-        return Ok(None);
-    }
-    // Released for another computer that never took it (its request was
-    // withdrawn or lapsed): the work is still here, so take the released
-    // epoch back below (no install, no fork) and resume what stopped.
-    let previous = if config.role == Role::Device
-        && super::moves::abandoned(state, &baton, previous.as_ref())
-    {
-        let back = Ownership::AwaitingVerification { epoch: baton.epoch };
-        lock(&state.pro.ownership).insert(workspace.into(), back.clone());
-        Some(back)
-    } else {
-        previous
-    };
-    // A remote release means its saved work must be hydrated first. The lease
-    // loop must not race hand-back and resume this machine's older journal.
-    if config.role == Role::Device
-        && baton.holder_id.is_none()
-        && matches!(previous, Some(Ownership::Remote { .. }))
-    {
-        return Ok(None);
-    }
-    let owned = baton.holder_id.as_deref() == Some(holder);
-    let transferring = matches!(
-        previous,
-        Some(
-            Ownership::Transferring { .. }
-                | Ownership::Hydrating { .. }
-                | Ownership::SettingUp { .. }
-        )
-    );
-    if transferring && !owned {
-        return Ok(None);
-    }
-    // Handed to the cloud when the app quit: until the app returns
-    // (`/pro/wake`) this computer neither takes the project back nor renews
-    // it. A handover still in flight (Transferring) keeps renewing its own
-    // lease until it releases.
-    if config.role == Role::Device && !transferring && super::parked(state, workspace) {
-        return Ok(None);
-    }
-
-    // A cloud machine resuming from suspension renews its own recorded epoch
-    // even though the lease reads expired: the account kept it as a paused
-    // owner (same epoch, no fork). Acquiring instead would install the
-    // checkpoint over its own newer work. Only a refused renewal fences. The
-    // loop may run before the watchdog noticed the freeze.
-    if config.role == Role::Worker {
-        execution::thawed(state);
-    }
-    let resuming = config.role == Role::Worker
-        && owned
-        && execution::resuming(state, workspace)
-        && execution::proof_epoch(state, workspace) == Some(baton.epoch);
-    let operation = if resuming
-        || (owned
-            && baton
-                .expires_at
-                .as_ref()
-                .is_some_and(|expiry| expiry > &baton.server_now))
-    {
-        "renew"
-    } else {
-        "acquire"
-    };
-    // Re-acquiring the epoch this installation itself held (its own clean
-    // release, or its own lease that lapsed while it kept working) continues
-    // its own newer files and conversations: no checkpoint install, no fork,
-    // no second transfer pickup. That includes a cloud machine thawed from a
-    // suspension whose renewal window was missed (the lease loop can run
-    // before the watchdog notices the freeze): the account turns a paused
-    // owner's acquire into a renewal of the same epoch. A cloud machine whose
-    // own arrival was interrupted (still installing) installs it again.
-    let own_epoch = execution::held_here(state, config, &baton)
-        && (config.role == Role::Device || !transferring);
-    if operation == "acquire" && execution::checkpoint_mode(state, workspace) && !own_epoch {
-        ensure!(
-            baton.checkpoint.is_some(),
-            "a durable project checkpoint is not available yet"
-        );
-        // An expired/replaced executor must install the selected canonical
-        // checkpoint, even when it is the same physical worker or home device.
-        let Ok(job) = state.pro.jobs.clone().try_lock_owned() else {
-            return Ok(None);
-        };
-        // Fenced from the moment the install is scheduled: canonical files
-        // are about to replace this project's, so nothing new may start (and
-        // no stale boot-deferred turn may resume) before hydrate's own fence.
-        lock(&state.pro.installing).insert(workspace.to_owned());
-        lock(&state.pro.ownership).insert(
-            workspace.into(),
-            Ownership::AwaitingVerification { epoch: baton.epoch },
-        );
-        if let Err(error) = super::persist(state).await {
-            lock(&state.pro.installing).remove(workspace);
-            return Err(error);
-        }
-        // Installing runs as its own owned task: lease renewal for every
-        // other project continues meanwhile. The grant's own requires_fork
-        // decides; hydrate applies it.
-        let owner = state.clone();
-        let config = config.clone();
-        let key = workspace.to_owned();
-        let epoch = baton.epoch;
-        tokio::spawn(async move {
-            super::detached::run(
-                &owner.clone(),
-                ("install", false),
-                &key.clone(),
-                epoch,
-                || None,
-                move || async move {
-                    let _job = job;
-                    let result = install_owned(owner.clone(), config, key.clone(), epoch).await;
-                    lock(&owner.pro.installing).remove(&key);
-                    if let Err(error) = result {
-                        record_error(&owner, &key, &error);
-                        return super::detached::Outcome::refused(
-                            axum::http::StatusCode::CONFLICT,
-                            None,
-                        );
-                    }
-                    super::detached::Outcome::done()
-                },
-            )
-            .await
-        });
-        return Ok(None);
-    }
-    let body = execution::body(&operation_config, baton.epoch, operation == "acquire");
-    // First enrollment happens around work already running here: its agents
-    // keep their processes (a stop and restart would resend a billed pickup
-    // turn) and become this life's managed workload, recorded as crash
-    // evidence with the state write below.
-    if operation_config.execution.is_some() && baton.continuity.is_none() {
-        execution::adopt_running(state, workspace);
-        super::persist(state).await?;
-    }
-    // Never take or extend a lease this worker could not accept: an expired
-    // one lets the laptop (or a clean worker) continue instead.
-    ensure!(
-        !execution::worker(state)
-            || (!execution::uncertain(state, workspace) && !execution::unclean(state, workspace)),
-        "previous managed processes are still stopping"
-    );
-    let was_fenced = execution::fenced(state, workspace);
-    let request_start = execution::RequestStart::now();
-    let response = account(
-        &operation_config,
-        &execution::path(&operation_config, workspace, operation),
-        "POST",
-        Some(&body),
-    )
-    .await
-    .context("Could not renew project ownership")?;
-    // The account's reconnect grace after a lapsed lease is a normal wait,
-    // not a failure; the next tick asks again while local work continues.
-    if response.status == 409
-        && serde_json::from_slice::<serde_json::Value>(&response.body)
-            .is_ok_and(|value| value["error"] == "takeover_grace")
-    {
-        return Ok(None);
-    }
-    // The account refused this resumed machine's own epoch (someone else
-    // took the project while it slept): fence now, not at the window's end.
-    if resuming && (400..500).contains(&response.status) {
-        execution::fence_workspace(state, workspace);
-    }
-    let grant: Baton = response
-        .json()
-        .context("Could not confirm project ownership")?;
-    ensure!(
-        grant.workspace_id == workspace && grant.holder_id.as_deref() == Some(holder),
-        "baton grant names another owner"
-    );
-    ensure!(
-        generation == state.pro.generation.load(Ordering::Acquire),
-        "Account changed while verifying project ownership"
-    );
-    ensure!(
-        grant.workspace_id == workspace,
-        "execution grant workspace mismatch"
-    );
-    execution::accept(state, &operation_config, &grant, generation, request_start)?;
-    super::projects::bind_workspace_account(state, config, workspace)?;
-    if operation_config.execution.is_some() {
-        super::persist(state).await?;
-    }
-    if transferring {
-        if let Some(Ownership::SettingUp { epoch }) = previous {
-            ensure!(
-                grant.epoch == epoch,
-                "Project ownership changed; retry the handoff"
-            );
-        }
-        return Ok(Some(grant.epoch));
-    }
-    // A project running here with sessions still waiting for a provider stays
-    // Local; those sessions resume through `provider_gate::resume_ready`
-    // after sign-in, not by re-probing every lease tick.
-    if config.role == Role::Worker && !matches!(previous, Some(Ownership::Local { .. })) {
-        ensure!(
-            generation == state.pro.generation.load(Ordering::Acquire),
-            "Account changed while verifying project ownership"
-        );
-        lock(&state.pro.ownership).insert(
-            workspace.into(),
-            Ownership::SettingUp { epoch: grant.epoch },
-        );
-        finish_hydration(state, workspace, grant.epoch, generation, async { Ok(()) }).await?;
-        return Ok(Some(grant.epoch));
-    }
-    if baton.mirror_disabled
-        && !matches!(
-            previous,
-            Some(Ownership::Remote { .. } | Ownership::Hydrating { .. })
-        )
-    {
-        lock(&state.pro.ownership).remove(workspace);
-    } else {
-        lock(&state.pro.ownership)
-            .insert(workspace.into(), Ownership::Local { epoch: grant.epoch });
-    }
-    super::persist(state).await?;
-    ensure!(
-        generation == state.pro.generation.load(Ordering::Acquire),
-        "Account changed during project transfer"
-    );
-    // A renewal after a same-epoch fence resumes what the fence preserved.
-    if (!matches!(previous, Some(Ownership::Local { .. })) || was_fenced)
-        && execution::resume_allowed(state, workspace)
-    {
-        crate::ledger::resume_deferred_workspace(state, workspace).await?;
-    }
-    // Another computer asked for this project (its user acted there): yield
-    // at the next pause, unless this computer's user acted after it asked.
-    if config.role == Role::Device && matches!(previous, Some(Ownership::Local { .. })) {
-        super::moves::consider(state, config, workspace, &grant);
-    }
-    Ok(Some(grant.epoch))
+    let owner = project_host::ProjectOwner::capture(
+        state.clone(),
+        config.clone(),
+        workspace.to_owned(),
+        generation,
+    )?;
+    let runtime = state
+        .daemon_extension
+        .as_ref()
+        .context("optional_runtime_unavailable")?;
+    runtime.reconcile(owner).await
 }
 /// A named boxed future breaks the reconcile -> hydrate -> reconcile type cycle
 /// for a spawned install.
@@ -983,7 +372,7 @@ fn transfer_session_ids(state: &AppState, workspace: &str) -> Result<Vec<String>
 /// A clean flush before this computer sleeps: one shared deadline, and no
 /// release once the computer woke again (the project simply stays here).
 #[derive(Clone, Copy)]
-pub(super) struct Sleep {
+pub struct Sleep {
     pub generation: u64,
     pub deadline: tokio::time::Instant,
     /// The app is quitting, not the computer sleeping: a flush that cannot
@@ -992,7 +381,7 @@ pub(super) struct Sleep {
     pub park: bool,
 }
 impl Sleep {
-    pub fn woke(&self, state: &AppState) -> bool {
+    pub(super) fn woke(&self, state: &AppState) -> bool {
         state.pro.sleep_generation.load(Ordering::Acquire) != self.generation
     }
 }
@@ -1068,8 +457,16 @@ async fn snapshot_inner(
     transport::cache_quiescent(workspace)?;
     transport::cache_scope(
         workspace,
-        cache,
-        snapshot_inner_scoped(state, config, workspace, clean, sleep, phase),
+        cache.clone(),
+        snapshot_inner_scoped(
+            state,
+            config,
+            workspace,
+            clean,
+            sleep,
+            phase,
+            (cache, generation),
+        ),
     )
     .await
 }
@@ -1081,7 +478,9 @@ async fn snapshot_inner_scoped(
     clean: bool,
     sleep: Option<Sleep>,
     phase: &mut &'static str,
+    admission: (Arc<tokio::sync::OwnedMutexGuard<()>>, u64),
 ) -> Result<()> {
+    let (cache_guard, original_generation) = admission;
     ensure!(
         !super::project_copy::copy_only(state, workspace),
         "local copy cannot publish execution state"
@@ -1117,248 +516,56 @@ async fn snapshot_inner_scoped(
     authority::destination(state, config, &workspace.id, Some(&workspace.root)).await?;
     *phase = "credentials";
     let grant = credentials(config, &workspace.id, Some(epoch)).await?;
-    let root = state.pro.root.join(&workspace.id);
-    let shadow = root.join("working-tree.git");
-    *phase = "initialize";
-    let interrupted = root.clone();
-    tokio::task::spawn_blocking(move || mirror::clear_interrupted(&interrupted)).await??;
-    mirror::initialize(&shadow).await?;
-    if mirror::set_aside_damaged(&shadow).await? {
-        tracing::warn!("Rebuilding a damaged outgoing project mirror from its published copy");
-        mirror::initialize(&shadow).await?;
-        mirror::fetch_published(&shadow, &grant).await?;
-    }
-    let staging = root.join(format!("stage-{}", chimaera_core::generate_token()));
-    tokio::fs::create_dir_all(&staging).await?;
-    let woke = || sleep.is_some_and(|sleep| sleep.woke(state));
-    // Sessions this flush stopped; a wake returns them to this computer.
-    let stopped_ids = std::sync::Mutex::new(Vec::<String>::new());
-    let mut published = false;
-    let result = async {
-        let agent_ids=sessions(state,&workspace.id);
-        let continuation=continuation(state,&workspace.id);
-        let mut has_agents=false;
-        let mut stopped=std::collections::HashMap::new();
-        if clean {
-            *phase = "stop_sessions";
-            lock(&state.pro.ownership).insert(workspace.id.clone(),Ownership::Transferring{epoch});super::persist(state).await?;
-            ensure!(transfer_session_ids(state,&workspace.id)?.iter().all(|id|session_ids.contains(id)), "Project sessions changed during transfer; try again");
-            for id in &session_ids {
-                // Woken mid-flush: stop no further sessions.
-                if woke() { break; }
-                let path = match crate::bundle::export_for_mirror(state.clone(),id,crate::bundle::ExportMode::Stop).await {
-                    Ok(Some(path)) => path,
-                    Ok(None) => continue,
-                    Err(error) => {
-                        // One conversation that cannot travel (no transcript
-                        // yet, too large) never fails the project: it stays
-                        // here, stopped and paused with its identity, for
-                        // when the project comes back.
-                        tracing::warn!(category = snapshot_diagnostics::category(&error), "A conversation stays paused here instead of moving");
-                        park_here(state, id).await;
-                        lock(&stopped_ids).push(id.clone());
-                        continue;
-                    }
-                };
-                lock(&stopped_ids).push(id.clone());
-                let target=staging.join(format!("stopped-{id}.zip"));tokio::fs::rename(path,&target).await?;stopped.insert(id.clone(),target);
-            }
-        }
-        *phase = "stop_execution";
-        if clean && !woke() {
-            execution::stop(state,std::slice::from_ref(&workspace.id)).await?;
-            ensure!(transfer_session_ids(state,&workspace.id)?.iter().all(|id|session_ids.contains(id)), "Project sessions changed during transfer; try again");
-        }
-        *phase = "inventory";
-        let paths = mirror::inventory(&workspace.root, &shadow).await?;
-        let project = workspace.root.clone(); let destination = staging.join("tree");
-        let budget = grant.storage_limit_bytes; let max_file = grant.max_file_bytes;
-        *phase = "copy_files";
-        let report = tokio::task::spawn_blocking(move || mirror::copy_tree(&project, &destination, paths, budget, max_file)).await??;
-        *phase = "export_config";
-        let home = state.claude_settings_path.parent().and_then(Path::parent).context("agent home unavailable")?.to_path_buf();
-        let sources = config::Sources { home, claude:state.claude_settings_path.parent().unwrap().to_path_buf(), codex:state.codex_config_path.parent().context("codex home unavailable")?.to_path_buf(), workspace:workspace.root.clone() };
-        let destination = staging.join("config");
-        let config_report = tokio::task::spawn_blocking(move || config::export(sources, &destination, budget.saturating_sub(report.bytes))).await??;
-        let mut profile = lock(&state.pro.preferences).entry(workspace.id.clone()).or_default().profile.clone();
-        profile.missing_environment = config_report.missing_environment;
-        let command_sessions:Vec<_>=lock(&state.session_workspaces).iter().filter(|(_,id)|*id==&workspace.id).map(|(id,_)|id.clone()).take(64).collect();
-        for id in command_sessions {if let Some(marks)=state.sessions.marks(&id) {for command in marks.journal(32) {if let Some(command)=command.command.as_deref(){profile.observe_command(command);}}}}
-        *phase = "archive_sessions";
-        let handoff = staging.join("handoff"); tokio::fs::create_dir_all(handoff.join("bundles")).await?;
-        let mut archives = Vec::new(); let mut archive_bytes = 0u64;
-        for id in session_ids {
-            let path = if clean {
-                stopped.remove(&id)
-            } else {
-                // A conversation that cannot be saved right now is left out of
-                // this copy (and kept running); the project's files still go.
-                crate::bundle::export_for_mirror(state.clone(), &id, crate::bundle::ExportMode::Snapshot).await.unwrap_or_else(|error| {
-                    tracing::warn!(category = snapshot_diagnostics::category(&error), "A conversation was left out of this project copy");
-                    None
-                })
-            };
-            let Some(path) = path else {continue;};
-            let length = tokio::fs::metadata(&path).await?.len();
-            // Too large for the copy: leave that conversation out (a moved
-            // one stays paused here), never fail the project.
-            if length > max_file || archive_bytes + length + report.bytes + config_report.bytes > budget {
-                let _ = tokio::fs::remove_file(path).await;
-                tracing::warn!("A conversation was too large for the project copy");
-                continue;
-            }
-            has_agents |= agent_ids.contains(&id);
-            archive_bytes = archive_bytes.saturating_add(length);
-            let archive = format!("bundles/{id}.zip");
-            tokio::fs::rename(path, handoff.join(&archive)).await?;
-            archives.push(SessionArchive {id,archive});
-        }
-        // Automatic continuation requires this per-epoch eligibility on the
-        // account in both protocol versions: its offline wake and the worker's
-        // discovery read only these flags. Publish it while this epoch is
-        // still owned and before any snapshot bytes leave, so a refusal cannot
-        // strand a published checkpoint that nothing will ever continue.
-        if !config.recovery {
-            *phase = "update_policy";
-            publish_policy(config, &workspace.id, epoch, has_agents).await?;
-        }
-        *phase = "capture_repository";
-        let super::repository::Described { branch, origin: repository_origin, snapshot: mut repository } =
-            super::repository::describe(&state.pro, &workspace.id, &workspace.root).await?;
-        let mut staging_bytes = 0u64;
-        if let Some(repository) = repository.as_mut() {
-            let remaining = budget.saturating_sub(report.bytes).saturating_sub(config_report.bytes).saturating_sub(archive_bytes);
-            let (descriptor, bytes) = super::repository::staging::capture(&workspace.root, &handoff, remaining, max_file).await?;
-            staging_bytes = bytes;
-            repository.staging = Some(descriptor);
-        }
-        let manifest = Manifest {version:1,project:super::projects::catalog::metadata(&workspace.name,!workspace.cloud_internal && !workspace.hidden),branch,repository_origin,repository,workspace_id:workspace.id.clone(),root:workspace.root.clone(),name:workspace.name.clone(),epoch,clean,continuation,profile:profile.clone(),sessions:archives,left_out:report.left_out.clone()};
-        let manifest_bytes = serde_json::to_vec(&manifest)?;
-        ensure!(manifest_bytes.len() <= 256*1024, "handoff manifest exceeds limit");
-        let used = report.bytes.checked_add(config_report.bytes).and_then(|bytes|bytes.checked_add(archive_bytes)).and_then(|bytes|bytes.checked_add(staging_bytes)).and_then(|bytes|bytes.checked_add(manifest_bytes.len() as u64)).context("snapshot size overflow")?;
-        ensure!(used <= budget, "snapshot exceeds combined storage limit");
-        tokio::fs::write(handoff.join("manifest.json"), manifest_bytes).await?;
-        *phase = "mirror_repository";
-        mirror::mirror_repository(&workspace.root, &root.join("repository.git"), &grant).await?;
-        *phase = "commit_files";
-        let tree_oid=mirror::commit_tree(&shadow, &staging.join("tree"), "main").await?;
-        *phase = "commit_config";
-        let config_oid=mirror::commit_tree(&shadow, &staging.join("config"), "config").await?;
-        *phase = "commit_sessions";
-        let handoff_oid=mirror::commit_tree(&shadow, &handoff, "handoff").await?;
-        *phase = "publish_snapshot";
-        mirror::push(&shadow, &grant, &["refs/heads/main", "refs/heads/config", "refs/heads/handoff"]).await?;
-        *phase = "confirm_checkpoint";
-        if config.execution.is_some(){execution::receipt::published(config,&workspace.id,epoch,[&tree_oid,&config_oid,&handoff_oid],continuation).await?;}
-        {
-            // The three-way baseline for a later return is what was actually
-            // published and acknowledged, never a local commit whose push failed.
-            let mut preferences = lock(&state.pro.preferences);
-            let preference = preferences.entry(workspace.id.clone()).or_default();
-            preference.profile = profile;
-            preference.published_tree = Some(tree_oid.clone());
-            if config.execution.is_some() { preference.published_handoff = Some(handoff_oid.clone()); }
-        }
-        {
-            // The last return's report stays until the next return replaces it.
-            let mut statuses = lock(&state.pro.status);
-            let previous = statuses.remove(&workspace.id).unwrap_or_default();
-            statuses.insert(workspace.id.clone(), WorkspaceStatus {report,last_mirrored_at:Some(super::now()),storage_limit_bytes:budget,error:None,error_code:None,git_staging:previous.git_staging,kept_both:previous.kept_both,kept_paths:previous.kept_paths,kept_at:previous.kept_at,kept_total:previous.kept_total,blocked_providers:Vec::new()});
-        }
-        *phase = "persist_snapshot";
-        super::persist(state).await?;
-        published = true;
-        if clean && !woke() {
-            *phase = "release";
-            // Before sleep, the account's short publication fence is not
-            // waited out past the deadline: an unreleased lease simply lapses
-            // and the cloud continues from this acknowledged checkpoint.
-            let budget = sleep.map_or(Duration::from_secs(15), |sleep| {
-                sleep.deadline.saturating_duration_since(tokio::time::Instant::now())
-            });
-            release::after_publication(config, &workspace.id, epoch, budget, || {
-                generation == state.pro.generation.load(Ordering::Acquire)
-                    && !woke()
-                    && matches!(lock(&state.pro.ownership).get(&workspace.id), Some(Ownership::Transferring { epoch: current }) if *current == epoch)
-            }).await?;
-        }
-        Ok::<_,anyhow::Error>(())
-    }.await;
-    let _ = tokio::fs::remove_dir_all(staging).await;
-    // Recognised before any recovery below, so every path that follows (a wake,
-    // a sleep window, the reconcile) already sees the project as enrolled.
-    let must_upgrade = result.as_ref().err().is_some_and(upgrade_required);
-    if must_upgrade {
-        execution::require_v2(state, &workspace.id);
-    }
-    let stopped_ids = stopped_ids.into_inner().unwrap_or_default();
-    if clean && woke() {
-        // The computer woke during this flush: whatever publication did, the
-        // project stays here and the sessions it stopped continue locally,
-        // without waiting for the account.
-        if !stopped_ids.is_empty() {
-            if let Err(error) =
-                crate::ledger::resume_deferred_sessions(state, &workspace.id, &stopped_ids).await
-            {
-                tracing::warn!(%error, "Could not resume sessions after waking");
-            }
-        }
-        return result;
-    }
-    if clean && !config.recovery && sleep.is_some_and(|sleep| !sleep.park || published) {
-        // Inside the sleep window a flush never renews or resumes (that would
-        // restart agents seconds before sleep and keep the lease from lapsing):
-        // published but unreleased, the cloud continues once the lease lapses;
-        // failed, the project waits. Either way the next wake returns it here.
-        // A quit handover whose copy is published is the same once the account
-        // cannot confirm the release in time: the user chose the cloud, so the
-        // project stays parked, its lease lapses, and the cloud continues from
-        // this acknowledged copy within a couple of minutes, as after a lost
-        // connection, instead of the work quietly staying on a computer whose
-        // app is gone.
-        if result.is_err()
-            && matches!(lock(&state.pro.ownership).get(&workspace.id), Some(Ownership::Transferring { epoch: current }) if *current == epoch)
-        {
-            lock(&state.pro.release_pending).insert(workspace.id.clone());
-            if published {
-                tracing::info!("Project published before sleep; its release will lapse");
-                return Ok(());
-            }
-        }
-        return result;
-    }
-    if result.is_err() && clean && !config.recovery {
-        // A quit handover whose copy never published is not parked: the
-        // renewal below must be allowed to keep the work here, and the app
-        // says so.
-        if sleep.is_some_and(|sleep| sleep.park) {
-            super::unpark(state, &workspace.id);
-        }
-        // A failed flush must not strand a stopped laptop agent, but a changed
-        // account must never recover using the previous account's credentials.
-        let recover = {
-            let _configuration = state.pro.configuration.lock().await;
-            let mut ownership = lock(&state.pro.ownership);
-            if generation == state.pro.generation.load(Ordering::Acquire)
-                && matches!(ownership.get(&workspace.id), Some(Ownership::Transferring { epoch: current }) if *current == epoch)
-            {
-                ownership.insert(
-                    workspace.id.clone(),
-                    Ownership::AwaitingVerification { epoch },
-                );
-                true
-            } else {
-                false
-            }
-        };
-        if recover {
-            // A legacy configuration would read the project over the path the
-            // account just refused and be denied as a downgrade.
-            let config = if must_upgrade { requested } else { config };
-            let _ = reconcile_generation(state, config, &workspace.id, generation).await;
-        }
-    }
-    result
+    *phase = "companion";
+    let companion = super::companion::preflight().await?;
+    ensure!(
+        generation == state.pro.generation.load(Ordering::Acquire),
+        "Account changed during companion capture"
+    );
+    authority::config_matches(state, requested, &workspace.id)?;
+    ensure!(
+        config.recovery || execution::lease_valid(state, &workspace.id),
+        "execution authority expired during companion capture"
+    );
+    ensure!(
+        super::owned_epoch(state, &workspace.id) == Some(epoch),
+        "Project ownership changed during companion capture"
+    );
+    let captured_sessions = transfer_session_ids(state, &workspace.id)?;
+    ensure!(
+        captured_sessions.len() == session_ids.len()
+            && captured_sessions.iter().all(|id| session_ids.contains(id)),
+        "Project sessions changed during companion capture"
+    );
+    let transfer = super::transfer_dispatch::TransferScope::capture(
+        state,
+        &workspace.id,
+        Some(&workspace.root),
+        cache_guard,
+        original_generation,
+    )
+    .await?;
+    let grant = transfer.host.grant(grant)?;
+    let owner = project_host::SnapshotOwner {
+        project: project_host::ProjectOwner::capture(
+            state.clone(),
+            requested.clone(),
+            workspace.id.clone(),
+            generation,
+        )?,
+        effective: config.clone(),
+        requested: requested.clone(),
+        workspace,
+        epoch,
+        session_ids,
+        companion: std::sync::Mutex::new(Some(companion)),
+        transfer: transfer.clone(),
+        grant,
+        sleep,
+        clean,
+    };
+    let runtime = transfer.runtime.clone();
+    super::transfer_dispatch::scope(transfer, runtime.snapshot(owner, phase)).await
 }
 
 /// The account's policy route is the same `/v1` resource for both protocol
@@ -1390,11 +597,14 @@ async fn publish_policy(
     Ok(())
 }
 
-pub(super) async fn fetch_snapshot(
-    config: &Configure,
-    workspace: &str,
-    cache: &Path,
-) -> Result<Manifest> {
+/// Read-only checkpoint and credential admission. This owns no cache, live
+/// destination or execution grant; materialization consumes the exact result.
+struct SnapshotRead {
+    config: Configure,
+    receipt: Option<execution::wire::Checkpoint>,
+    grant: MirrorCredentials,
+}
+async fn read_snapshot(config: &Configure, workspace: &str) -> Result<SnapshotRead> {
     authority::config_workspace(config, workspace)?;
     let mut effective = config.clone();
     let receipt = if config.execution.is_some() {
@@ -1414,7 +624,30 @@ pub(super) async fn fetch_snapshot(
     } else {
         None
     };
-    fetch_snapshot_at(&effective, workspace, cache, receipt.as_ref()).await
+    read_snapshot_at(&effective, workspace, receipt.as_ref()).await
+}
+async fn read_snapshot_at(
+    config: &Configure,
+    workspace: &str,
+    receipt: Option<&execution::wire::Checkpoint>,
+) -> Result<SnapshotRead> {
+    if let Some(receipt) = receipt {
+        execution::receipt::validate(receipt)?;
+    }
+    let grant = credentials(config, workspace, None).await?;
+    Ok(SnapshotRead {
+        config: config.clone(),
+        receipt: receipt.cloned(),
+        grant,
+    })
+}
+pub(super) async fn fetch_snapshot(
+    config: &Configure,
+    workspace: &str,
+    cache: &Path,
+) -> Result<Manifest> {
+    let admission = read_snapshot(config, workspace).await?;
+    fetch_snapshot_admitted(workspace, cache, admission).await
 }
 pub(super) async fn fetch_snapshot_at(
     config: &Configure,
@@ -1422,10 +655,21 @@ pub(super) async fn fetch_snapshot_at(
     cache: &Path,
     receipt: Option<&execution::wire::Checkpoint>,
 ) -> Result<Manifest> {
-    if let Some(receipt) = receipt {
-        execution::receipt::validate(receipt)?;
-    }
-    let grant = credentials(config, workspace, None).await?;
+    let admission = read_snapshot_at(config, workspace, receipt).await?;
+    fetch_snapshot_admitted(workspace, cache, admission).await
+}
+async fn fetch_snapshot_admitted(
+    workspace: &str,
+    cache: &Path,
+    admission: SnapshotRead,
+) -> Result<Manifest> {
+    let SnapshotRead {
+        config,
+        receipt,
+        grant,
+    } = admission;
+    authority::config_workspace(&config, workspace)?;
+    let receipt = receipt.as_ref();
     mirror::initialize(cache).await?;
     let url = transport::endpoint(&grant.working_tree_url)?;
     transport::git_output(
@@ -1495,6 +739,27 @@ pub(super) async fn hydrate(
     fork: bool,
     destination_root: Option<&Path>,
 ) -> Result<()> {
+    let generation = state.pro.generation.load(Ordering::Acquire);
+    Box::pin(hydrate_generation(
+        state,
+        config,
+        workspace,
+        expected_epoch,
+        fork,
+        destination_root,
+        generation,
+    ))
+    .await
+}
+async fn hydrate_generation(
+    state: &Arc<AppState>,
+    config: &Configure,
+    workspace: &str,
+    expected_epoch: u64,
+    fork: bool,
+    destination_root: Option<&Path>,
+    generation: u64,
+) -> Result<()> {
     ensure!(
         !super::project_copy::copy_only(state, workspace)
             || lock(&state.pro.preferences)
@@ -1503,7 +768,6 @@ pub(super) async fn hydrate(
                 .is_some_and(|copy| copy.takeover_requested),
         "Explicit Take over is required for a local copy"
     );
-    let generation = state.pro.generation.load(Ordering::Acquire);
     let bound_destination =
         authority::destination(state, config, workspace, destination_root).await?;
     let destination_root = bound_destination.as_deref();
@@ -1523,7 +787,7 @@ pub(super) async fn hydrate(
             expected_epoch,
             fork,
             destination_root,
-            cache,
+            (cache, generation),
         ),
     )
     .await;
@@ -1557,9 +821,9 @@ async fn hydrate_scoped(
     expected_epoch: u64,
     fork: bool,
     destination_root: Option<&Path>,
-    mut cache_guard: Arc<tokio::sync::OwnedMutexGuard<()>>,
+    original: (Arc<tokio::sync::OwnedMutexGuard<()>>, u64),
 ) -> Result<()> {
-    let generation = state.pro.generation.load(Ordering::Acquire);
+    let (mut cache_guard, generation) = original;
     let install_epoch = std::sync::atomic::AtomicU64::new(0);
     let current = || -> Result<()> {
         let epoch = install_epoch.load(Ordering::Acquire);
@@ -1577,7 +841,7 @@ async fn hydrate_scoped(
         && lock(&state.workspaces).get(workspace).is_some()
         && matches!(lock(&state.pro.ownership).get(workspace),Some(Ownership::SettingUp{epoch}) if *epoch==expected_epoch)
     {
-        reconcile(state, config, workspace).await?;
+        reconcile_generation(state, config, workspace, generation).await?;
         let path = state.pro.root.join(workspace).join("return-install");
         let endpoint = config.endpoint.clone();
         let account = config.account_id.clone();
@@ -1632,6 +896,23 @@ async fn hydrate_scoped(
             }
         }
     }
+    // Preserve the original read admission before optional artifact discovery.
+    // A missing helper refuses before Git/cache or executor effects, without
+    // suppressing the account's checkpoint/credential refusal and backoff path.
+    let snapshot = read_snapshot(config, workspace).await?;
+    current()?;
+    let companion = super::companion::preflight().await?;
+    current()?;
+    let transfer = super::transfer_dispatch::TransferScope::capture(
+        state,
+        workspace,
+        None,
+        cache_guard.clone(),
+        generation,
+    )
+    .await?;
+    let original_transfer = transfer.host.clone();
+    super::transfer_dispatch::scope(transfer, async {
     if execution::managed(state, workspace) {
         // No canonical files are installed while an old local managed executor
         // can still write them. An unclean same-boot registry remains blocked.
@@ -1641,7 +922,7 @@ async fn hydrate_scoped(
     let interrupted = state.pro.root.join(workspace);
     tokio::task::spawn_blocking(move || mirror::clear_interrupted(&interrupted)).await??;
     let cache = state.pro.root.join(workspace).join("incoming.git");
-    let manifest = fetch_snapshot(config, workspace, &cache).await?;
+    let manifest = fetch_snapshot_admitted(workspace, &cache, snapshot).await?;
     let destination_root = destination_root
         .map(Path::to_path_buf)
         .or_else(|| {
@@ -1660,6 +941,8 @@ async fn hydrate_scoped(
             .is_ok_and(|metadata| metadata.is_dir()),
         "root_setup_required"
     );
+    original_transfer.bind_source(&destination_root).await?;
+    current()?;
     let probe = destination_root.join(format!(
         ".chimaera-write-probe-{}",
         chimaera_core::generate_token()
@@ -1817,48 +1100,30 @@ async fn hydrate_scoped(
                 let preference = preferences.get(workspace);
                 (preference.and_then(|p| p.published_handoff.clone()), preference.and_then(|p| p.copy.as_ref()).and_then(|copy| copy.checkpoint.clone()))
             };
-            let copied_baseline = if let Some(checkpoint) = &copy_checkpoint {
-                let copy_cache = state.pro.root.join(workspace).join("copy-incoming.git");
-                Some(takeover_copy_baseline(&copy_cache, &stage, checkpoint, budget).await?)
-            } else { None };
-            let staging_baseline = if let Some(copied) = copied_baseline {
-                copied
-            } else {
-                staging_baseline(&local_shadow, &stage.join("baseline-handoff"), acknowledged, budget).await?
+            if let Some(checkpoint) = &copy_checkpoint {
+                execution::receipt::validate(checkpoint)?;
+            }
+            let grant = original_transfer.grant(read_grant.clone())?;
+            let repository_cache = state.pro.root.join(workspace).join("incoming-repository.git");
+            let answer = super::transfer_dispatch::call(super::transfer_dispatch::TransferRequest::PrepareReturnRepository(super::transfer_types::ReturnRepository {
+                original: &destination_root,
+                checkout: &checkout,
+                stage: &stage,
+                incoming: super::transfer_types::Incoming {
+                    cache: &repository_cache, credentials: &grant,
+                    branch: manifest.branch.as_deref(), origin: manifest.repository_origin.as_deref(),
+                    snapshot: manifest.repository.as_ref(), staging: None,
+                },
+                published_handoff: acknowledged.as_deref(),
+                copy_checkpoint: copy_checkpoint.as_ref(),
+                check: &current,
+            })).await?;
+            let (super::repository::Prepared { branches: git_branches, writes: git_writes, staging: git_staging }, has_baseline) = match answer {
+                super::transfer_dispatch::TransferReply::ReturnRepository(prepared, has_baseline) => (prepared, has_baseline),
+                _ => bail!("optional transfer runtime returned an invalid result"),
             };
-            let super::repository::Prepared {branches:git_branches,writes:git_writes,staging:git_staging} = super::repository::prepare_receive(
-                &destination_root,&checkout,&stage.join("repository"),
-                super::repository::Incoming {cache:&state.pro.root.join(workspace).join("incoming-repository.git"),credentials:&read_grant,branch:manifest.branch.as_deref(),origin:manifest.repository_origin.as_deref(),snapshot:manifest.repository.as_ref(),staging:Some(super::repository::StagingIncoming {handoff:&stage.join("handoff"),baseline:staging_baseline.as_ref().map(|(path,descriptor)|(path.as_path(),descriptor))})},&current,
-            ).await.context("repository return preparation failed")?;
             planned.extend(git_writes);
-        let baseline = stage.join("baseline");
-        let old_shadow = if copy_checkpoint.is_none() { super::shadow_cache::baseline(&local_shadow).await? } else { None };
-        let has_baseline = copy_checkpoint.is_some() || old_shadow.is_some();
-        if let Some(old_shadow) = &old_shadow {
-            tokio::fs::create_dir_all(&baseline).await?;
-            // The last snapshot this computer published successfully. A local
-            // commit whose push failed is newer than anything the other side
-            // saw; using it would silently overwrite edits made since.
-            let published = lock(&state.pro.preferences)
-                .get(workspace)
-                .and_then(|p| p.published_tree.clone());
-            let revision = baseline_revision(old_shadow, published).await?;
-            let mut command = transport::git(old_shadow, None).await?;
-            command.env("GIT_WORK_TREE", &baseline);
-            transport::git_output(
-                command,
-                &[
-                    "--work-tree",
-                    baseline.to_str().context("invalid baseline path")?,
-                    "checkout",
-                    &revision,
-                    "--",
-                    ".",
-                ],
-                vec![],
-            )
-            .await?;
-        }
+            let baseline = stage.join("baseline");
         current()?;
         authority::destination(state, config, workspace, Some(&destination_root)).await?;
         let tree = stage.join("tree");
@@ -1882,7 +1147,7 @@ async fn hydrate_scoped(
         let home = state.claude_settings_path.parent().and_then(Path::parent).context("agent home unavailable")?.to_path_buf();
         let (overlay,config_workspace,config_stage)=(stage.join("config"),destination_root.clone(),stage.join("configuration"));
         let budget = read_grant.storage_limit_bytes;
-        planned.extend(tokio::task::spawn_blocking(move ||config::prepare_import(&overlay,&home,&config_workspace,&config_stage,budget)).await??);
+        planned.extend(config::prepare_import_with_image(&overlay,&home,&config_workspace,&config_stage,budget,companion).await?);
         let (marker_root,marker_checkout,marker_stage,marker_id)=(destination_root.clone(),checkout.clone(),stage.join("marker"),workspace.to_owned());
         planned.push(tokio::task::spawn_blocking(move ||prepare_marker(&marker_root,&marker_checkout,&marker_stage,&marker_id)).await??);
         let kept = super::project_copy::carry_kept(state,workspace,kept);
@@ -2002,7 +1267,9 @@ async fn hydrate_scoped(
         let commit_workspace=workspace.to_owned();
         // Keep admission through the durable ownership transition, even if the
         // requesting browser disconnects after the blocking commit starts.
+        let retained_transfer = original_transfer.clone();
         install=tokio::spawn(async move {
+            let _retained_transfer = retained_transfer;
             commit_guard.check(&commit_state)?;
             super::report_return(&commit_state,&commit_workspace,kept,&git_branches);
             {
@@ -2031,7 +1298,8 @@ async fn hydrate_scoped(
             drop(commit_guard);
             Ok::<_,anyhow::Error>(install)
         }).await??;
-        tokio::task::spawn_blocking(move ||install.cleanup()).await??;
+        let retained_transfer = original_transfer.clone();
+        tokio::task::spawn_blocking(move || { let _retained_transfer = retained_transfer; install.cleanup() }).await??;
         finish_hydration(
             state,
             workspace,
@@ -2048,6 +1316,8 @@ async fn hydrate_scoped(
         let _ = tokio::fs::remove_dir_all(stage).await;
     }
     result
+
+    }).await
 }
 pub(super) fn prepare_marker(
     root: &Path,
@@ -2105,139 +1375,47 @@ pub(super) fn prepare_marker(
 }
 /// A completed copy has its own immutable receipt baseline. Takeover must
 /// preserve edits against that copy, never a newer cloud tip or local shadow.
-async fn takeover_copy_baseline(
+#[cfg(all(unix, feature = "daemon-extension-fixture"))]
+pub(in crate::pro) async fn takeover_copy_baseline(
     cache: &Path,
     stage: &Path,
     checkpoint: &execution::wire::Checkpoint,
     budget: u64,
 ) -> Result<Option<(PathBuf, super::repository::staging::Descriptor)>> {
     execution::receipt::validate(checkpoint)?;
-    let mut bytes = 0_u64;
-    for revision in [&checkpoint.working_tree_oid, &checkpoint.handoff_oid] {
-        bytes = bytes
-            .checked_add(
-                mirror::validate_tree_bytes(
-                    cache,
-                    revision,
-                    budget.min(1024 * 1024 * 1024),
-                    super::policy::MAX_FILE_BYTES,
-                )
-                .await?,
-            )
-            .context("copy baseline exceeds quota")?;
-    }
-    ensure!(bytes <= budget, "combined copy baseline exceeds quota");
-    let baseline = stage.join("baseline");
-    tokio::fs::create_dir_all(&baseline).await?;
-    let mut command = transport::git(cache, None).await?;
-    command.env("GIT_WORK_TREE", &baseline);
-    transport::git_output(
-        command,
-        &[
-            "--work-tree",
-            baseline.to_str().context("invalid copy baseline path")?,
-            "checkout",
-            &checkpoint.working_tree_oid,
-            "--",
-            ".",
-        ],
-        vec![],
-    )
-    .await?;
-    staging_baseline(
-        cache,
-        &stage.join("baseline-handoff"),
-        Some(checkpoint.handoff_oid.clone()),
+    match super::transfer_dispatch::call(super::transfer_dispatch::TransferRequest::CopyBaseline {
+        shadow: cache,
+        stage,
+        checkpoint,
         budget,
-    )
-    .await
+    })
+    .await?
+    {
+        super::transfer_dispatch::TransferReply::StagingBaseline(value) => Ok(value),
+        _ => bail!("optional transfer runtime returned an invalid result"),
+    }
 }
-
-/// Missing immutable staging baseline stays unknown. Never replace it with the
-/// shadow's newest (possibly unacknowledged) local handoff commit.
+/// Only the exact acknowledged checkpoint selects a baseline.
+#[cfg(all(unix, feature = "daemon-extension-fixture"))]
 pub(super) async fn staging_baseline(
     shadow: &Path,
     stage: &Path,
     published: Option<String>,
     budget: u64,
 ) -> Result<Option<(PathBuf, super::repository::staging::Descriptor)>> {
-    let Some(revision) = published else {
-        return Ok(None);
-    };
-    ensure!(
-        revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit()),
-        "invalid acknowledged staging baseline"
-    );
-    if !tokio::fs::try_exists(shadow.join("HEAD")).await? {
-        return Ok(None);
-    }
-    let mut probe = transport::git(shadow, None).await?;
-    probe.args(["cat-file", "-e", &format!("{revision}^{{commit}}")]);
-    if !transport::run(probe, vec![], Duration::from_secs(10), 256)
-        .await?
-        .success
+    match super::transfer_dispatch::call(
+        super::transfer_dispatch::TransferRequest::StagingBaseline {
+            shadow,
+            stage,
+            published: published.as_deref(),
+            budget,
+        },
+    )
+    .await?
     {
-        return Ok(None);
+        super::transfer_dispatch::TransferReply::StagingBaseline(value) => Ok(value),
+        _ => bail!("optional transfer runtime returned an invalid result"),
     }
-    let bytes = transport::git_output(
-        transport::git(shadow, None).await?,
-        &["show", &format!("{revision}:manifest.json")],
-        vec![],
-    )
-    .await?;
-    ensure!(bytes.len() <= 256 * 1024, "baseline manifest exceeds limit");
-    let manifest: Manifest = serde_json::from_slice(&bytes)?;
-    let Some(descriptor) = manifest
-        .repository
-        .and_then(|repository| repository.staging)
-    else {
-        return Ok(None);
-    };
-    mirror::validate_tree(
-        shadow,
-        &revision,
-        budget.min(1024 * 1024 * 1024),
-        super::policy::MAX_FILE_BYTES,
-    )
-    .await?;
-    tokio::fs::create_dir_all(stage).await?;
-    let mut command = transport::git(shadow, None).await?;
-    command.env("GIT_WORK_TREE", stage);
-    transport::git_output(
-        command,
-        &[
-            "--work-tree",
-            stage.to_str().context("invalid baseline stage")?,
-            "checkout",
-            &revision,
-            "--",
-            "git",
-        ],
-        vec![],
-    )
-    .await?;
-    super::repository::staging::require_service_format(stage, &descriptor).await?;
-    Ok(Some((stage.to_owned(), descriptor)))
-}
-
-/// The published commit when this shadow still has it, else its main tip
-/// (older state files recorded no publication).
-async fn baseline_revision(shadow: &Path, published: Option<String>) -> Result<String> {
-    if let Some(published) = published {
-        ensure!(
-            published.len() >= 40 && published.bytes().all(|b| b.is_ascii_hexdigit()),
-            "invalid published baseline"
-        );
-        let mut probe = transport::git(shadow, None).await?;
-        probe.args(["cat-file", "-e", &format!("{published}^{{tree}}")]);
-        if transport::run(probe, vec![], Duration::from_secs(10), 256)
-            .await?
-            .success
-        {
-            return Ok(published);
-        }
-    }
-    Ok("refs/heads/main".to_owned())
 }
 
 /// Three-way install of an incoming tree over the local project. Returns how
@@ -3154,40 +2332,6 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    fn a_finished_turn_is_copied_soon_and_the_timer_stays_the_backstop() {
-        let mut turns = TurnEnds::default();
-        let ids = |list: &[&str]| {
-            list.iter()
-                .map(|id| id.to_string())
-                .collect::<BTreeSet<_>>()
-        };
-        // Nothing ended: only the timer copies.
-        turns.observe("a", true);
-        turns.observe("b", false);
-        assert_eq!(turns.due(TURN_COPY_GAP), None);
-        assert_eq!(turns.due(TIMED_COPY), Some(None));
-        // The agent in `a` finishes: that project is due once the gap passed,
-        // and only that project.
-        turns.observe("a", false);
-        assert_eq!(turns.due(TURN_COPY_GAP - 1), None);
-        assert_eq!(turns.due(TURN_COPY_GAP), Some(Some(ids(&["a"]))));
-        // A copy that started is not repeated; a turn that ends while it runs
-        // is copied next.
-        turns.observe("b", true);
-        turns.copied(&Some(ids(&["a"])));
-        assert_eq!(turns.due(TURN_COPY_GAP), None);
-        turns.observe("b", false);
-        assert_eq!(turns.due(TURN_COPY_GAP), Some(Some(ids(&["b"]))));
-        // The timer pass covers everything pending.
-        turns.copied(&None);
-        assert_eq!(turns.due(TURN_COPY_GAP), None);
-        // A project the loop no longer iterates is forgotten.
-        turns.observe("c", true);
-        turns.observe("c", false);
-        turns.keep(&ids(&["a", "b"]));
-        assert_eq!(turns.due(TURN_COPY_GAP), None);
-    }
     #[tokio::test]
     async fn setup_failure_fences_agents_until_success_and_laptop_steps_never_autoplay() {
         let root = std::env::temp_dir().join(format!(
@@ -3685,199 +2829,6 @@ mod return_tests {
             install_tree(&cloud, &local, Some(&base), left_out.as_deref()).unwrap();
             assert_eq!(!local.join("secret-looking").exists(), deleted, "{label}");
         }
-        std::fs::remove_dir_all(root).unwrap();
-    }
-    #[tokio::test]
-    async fn the_baseline_is_the_published_commit_not_a_failed_local_one() {
-        let root = std::env::temp_dir().join(format!(
-            "chimaera-return-baseline-{}",
-            chimaera_core::generate_token()
-        ));
-        let shadow = root.join("working-tree.git");
-        mirror::initialize(&shadow).await.unwrap();
-        let published =
-            mirror::commit_tree(&shadow, &tree(&root.join("t0"), &[("f", "t0")]), "main")
-                .await
-                .unwrap();
-        let unpushed =
-            mirror::commit_tree(&shadow, &tree(&root.join("t1"), &[("f", "t1")]), "main")
-                .await
-                .unwrap();
-        assert_ne!(published, unpushed);
-        assert_eq!(
-            baseline_revision(&shadow, Some(published.clone()))
-                .await
-                .unwrap(),
-            published
-        );
-        assert_eq!(
-            baseline_revision(&shadow, None).await.unwrap(),
-            "refs/heads/main"
-        );
-        std::fs::remove_dir_all(root).unwrap();
-    }
-    #[tokio::test]
-    async fn staging_baseline_uses_only_exact_acknowledged_handoff_and_never_the_newest_tip() {
-        let root = std::env::temp_dir().join(format!(
-            "chimaera-staging-baseline-{}",
-            chimaera_core::generate_token()
-        ));
-        tree(&root.join("source"), &[("file", "t0")]);
-        let root = root.canonicalize().unwrap();
-        let source = root.join("source");
-        transport::git_output(
-            transport::git(&source, None).await.unwrap(),
-            &["init", "--quiet"],
-            vec![],
-        )
-        .await
-        .unwrap();
-        transport::git_output(
-            transport::git(&source, None).await.unwrap(),
-            &["add", "file"],
-            vec![],
-        )
-        .await
-        .unwrap();
-        let shadow = root.join("working-tree.git");
-        mirror::initialize(&shadow).await.unwrap();
-        let mut acknowledged = None;
-        let mut copy_checkpoint = None;
-        let mut expected = Vec::new();
-        for version in ["t0", "t1"] {
-            std::fs::write(source.join("file"), version).unwrap();
-            transport::git_output(
-                transport::git(&source, None).await.unwrap(),
-                &["add", "file"],
-                vec![],
-            )
-            .await
-            .unwrap();
-            let handoff = root.join(version);
-            let (descriptor, _) = super::super::repository::staging::capture(
-                &source,
-                &handoff,
-                1024 * 1024,
-                1024 * 1024,
-            )
-            .await
-            .unwrap();
-            let manifest = Manifest {
-                version: 1,
-                project: None,
-                branch: None,
-                repository_origin: None,
-                repository: Some(super::super::repository::Snapshot {
-                    head: None,
-                    config: vec![],
-                    staging: Some(descriptor),
-                }),
-                workspace_id: "w-fixture".into(),
-                root: source.clone(),
-                name: "Fixture".into(),
-                epoch: 1,
-                clean: true,
-                continuation: execution::wire::Continuation::Idle,
-                profile: Default::default(),
-                sessions: vec![],
-                left_out: Some(vec![]),
-            };
-            std::fs::write(
-                handoff.join("manifest.json"),
-                serde_json::to_vec(&manifest).unwrap(),
-            )
-            .unwrap();
-            let oid = mirror::commit_tree(&shadow, &handoff, "handoff")
-                .await
-                .unwrap();
-            let working = mirror::commit_tree(
-                &shadow,
-                &tree(
-                    &root.join(format!("working-{version}")),
-                    &[("file", version), ("unchanged", "base")],
-                ),
-                "main",
-            )
-            .await
-            .unwrap();
-            if version == "t0" {
-                copy_checkpoint = Some(execution::wire::Checkpoint {
-                    id: "cp-fixture".into(),
-                    sequence: 1,
-                    source_holder_id: "d-fixture".into(),
-                    source_epoch: 1,
-                    working_tree_oid: working.clone(),
-                    config_oid: working,
-                    handoff_oid: oid.clone(),
-                    continuation: execution::wire::Continuation::Idle,
-                });
-                acknowledged = Some(oid);
-                expected = std::fs::read(handoff.join("git/index.json")).unwrap();
-            }
-        }
-        let baseline = staging_baseline(&shadow, &root.join("baseline"), acknowledged, 1024 * 1024)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            std::fs::read(baseline.0.join("git/index.json")).unwrap(),
-            expected
-        );
-        assert!(
-            staging_baseline(&shadow, &root.join("unknown"), None, 1024 * 1024)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(staging_baseline(
-            &shadow,
-            &root.join("missing"),
-            Some("a".repeat(40)),
-            1024 * 1024
-        )
-        .await
-        .unwrap()
-        .is_none());
-        let checkpoint = copy_checkpoint.unwrap();
-        let takeover = root.join("takeover");
-        let copied = takeover_copy_baseline(&shadow, &takeover, &checkpoint, 1024 * 1024)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            std::fs::read(copied.0.join("git/index.json")).unwrap(),
-            expected
-        );
-        assert_eq!(
-            std::fs::read(takeover.join("baseline/file")).unwrap(),
-            b"t0"
-        );
-        let local = tree(
-            &root.join("local-copy"),
-            &[("file", "local edit"), ("unchanged", "base")],
-        );
-        let incoming = tree(
-            &root.join("incoming-copy"),
-            &[("file", "t0"), ("unchanged", "cloud edit")],
-        );
-        assert!(
-            install_tree(&incoming, &local, Some(&takeover.join("baseline")), None)
-                .unwrap()
-                .1
-                .is_empty()
-        );
-        assert_eq!(std::fs::read(local.join("file")).unwrap(), b"local edit");
-        assert_eq!(
-            std::fs::read(local.join("unchanged")).unwrap(),
-            b"cloud edit"
-        );
-        let mut missing = checkpoint;
-        missing.working_tree_oid = "b".repeat(40);
-        assert!(
-            takeover_copy_baseline(&shadow, &root.join("missing-copy"), &missing, 1024 * 1024)
-                .await
-                .is_err()
-        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -4,20 +4,28 @@
 // Requires scripts/build-plugins.sh first, or an explicit Mycelium directory
 // holding the release plugins/plugins.lock pins (the expected answer is that
 // release's, below).
-// Usage: node scripts/smoke-macos-plugins.mjs [chimaera.app] [mycelium-directory]
+// Usage: node scripts/smoke-macos-plugins.mjs [chimaera.app] [mycelium-directory] [chimaera|chimaera-pro]
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { cp, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { cp, mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 
+export function smokeBinaryName(value = 'chimaera') {
+  assert.ok(value === 'chimaera' || value === 'chimaera-pro', 'fixed native binary name required');
+  return value;
+}
+
+async function main() {
+assert.ok(process.argv.length <= 5, 'at most app, plugin directory and fixed binary name');
+const binaryName = smokeBinaryName(process.argv[4]);
 assert.equal(process.platform, 'darwin', 'run against the macOS signed bundle');
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const app = resolve(process.argv[2] ?? join(root, 'crates/chimaera-app/target/release/bundle/macos/chimaera.app'));
 const plugin = resolve(process.argv[3] ?? join(root, 'plugins/dist-test/mycelium'));
-const binary = join(app, 'Contents/MacOS/chimaera');
+const binary = join(app, 'Contents/MacOS', binaryName);
 const details = spawnSync('/usr/bin/codesign', ['-dv', binary], { encoding: 'utf8' });
 assert.equal(details.status, 0, 'bundle must be signed');
 assert.match(details.stderr, /flags=.*\bruntime\b/, 'bundle must use the hardened runtime');
@@ -117,4 +125,9 @@ try {
     }
   }
   await rm(scratch, { recursive: true, force: true });
+}
+}
+
+if (process.argv[1] && await realpath(process.argv[1]) === await realpath(fileURLToPath(import.meta.url))) {
+  await main();
 }

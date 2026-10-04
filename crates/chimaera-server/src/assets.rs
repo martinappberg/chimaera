@@ -2,9 +2,7 @@ use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use rust_embed::RustEmbed;
 
-#[derive(RustEmbed)]
-#[folder = "../../web-ui/dist"]
-struct Assets;
+include!(concat!(env!("OUT_DIR"), "/ui_assets.rs"));
 
 const BUILD_PLACEHOLDER: &str = "__CHIMAERA_BUILD_ID__";
 

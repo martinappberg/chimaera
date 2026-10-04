@@ -7,13 +7,15 @@ repository.workspace = true
 
 [features]
 default = []
+# Explicit private integration harness; ordinary daemon builds do not expose it.
+daemon-extension-fixture = ["dep:tower", "dep:http-body-util"]
 # Consumers are explicit trusted-supervisor entrypoints, never normal startup.
 provider-authority-prototype = ["dep:zeroize", "chimaera-core/provider-runtime"]
-# Disposable fixed synthetic GitHub pairing only; never ordinary serve selection.
-provider-github-fixture = ["provider-authority-prototype"]
-provider-claude-fixture = ["provider-authority-prototype"]
 
 [dependencies]
+# Real Configure/Ready tests are available only to explicit composed fixtures.
+tower = { version = "0.5", features = ["util"], optional = true }
+http-body-util = { version = "0.1", optional = true }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

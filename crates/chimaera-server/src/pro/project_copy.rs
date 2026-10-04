@@ -199,7 +199,16 @@ pub(super) async fn sync(
     execution::receipt::validate(&latest)?;
     let cache_guard = Arc::new(state.pro.cache(workspace)?.lock_owned().await);
     transport::cache_quiescent(workspace)?;
-    transport::cache_scope(workspace, cache_guard, async {
+    let transfer = super::transfer_dispatch::TransferScope::capture(
+        state,
+        workspace,
+        Some(&destination),
+        cache_guard.clone(),
+        generation,
+    )
+    .await?;
+    let original_transfer = transfer.host.clone();
+    transport::cache_scope(workspace, cache_guard, super::transfer_dispatch::scope(transfer, async {
         let existing_transaction=tokio::fs::try_exists(state.pro.root.join(workspace).join("copy-install")).await?;
         let selected = {
             let _configuration = state.pro.configuration.lock().await;
@@ -319,7 +328,9 @@ pub(super) async fn sync(
         // Commit and its durable ready receipt have one owner even when the
         // browser disappears. Existing user edits never become a new baseline
         // until the transaction committed its exact before/after images.
+        let retained_transfer = original_transfer.clone();
         let result=tokio::spawn(async move {
+            let _retained_transfer = retained_transfer;
             guard.check(&owner)?;
             let worker=owner.clone();
             let (transaction,guard)=tokio::task::spawn_blocking(move || -> Result<_> {
@@ -356,7 +367,7 @@ pub(super) async fn sync(
             Ok::<_,anyhow::Error>(serde_json::json!({"copy_version":1,"state":"local_copy","workspace_id":id,"root":destination,"name":report.name,"checkpoint":selected,"git_staging":report.staging,"kept_files":report.kept.0,"local_copy":view(&owner,&id)}))
         }).await??;
         Ok(result)
-    }).await
+    })).await
 }
 
 async fn checkout_tree(

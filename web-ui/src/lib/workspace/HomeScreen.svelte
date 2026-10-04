@@ -957,8 +957,8 @@
       <!-- The cloud projects list (and the Pro presentation copy behind it)
            loads only for a paid plan: it stays out of the always-loaded
            entry, whose budget the shell is close to. -->
-      {#await import("../pro/CloudProjects.svelte") then { default: CloudProjects }}
-        <CloudProjects onOpen={onOpen} knownIds={workspaces.map(workspace => workspace.id)} />
+      {#await import("../extensions/AccountApplicationView.svelte") then { default: CloudProjects }}
+        <CloudProjects kind="cloud-projects" onOpen={onOpen} knownIds={workspaces.map(workspace => workspace.id)} />
       {/await}
     {/if}
 

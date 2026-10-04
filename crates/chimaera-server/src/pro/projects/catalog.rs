@@ -2,7 +2,7 @@
 use super::*;
 
 #[derive(Serialize, Deserialize)]
-pub(in crate::pro) struct Metadata {
+pub struct Metadata {
     version: u32,
     name: String,
     visible: bool,

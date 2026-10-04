@@ -1,7 +1,5 @@
 <script module lang="ts">
-  import { loadApplicationEntry } from "virtual:chimaera-application-entry";
-  import { installedExtension } from "./installed";
-  const selected = installedExtension(loadApplicationEntry);
+  import { selectedApplication as selected } from "./selected";
   let sequence = 0;
 </script>
 <script lang="ts">

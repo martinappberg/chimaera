@@ -23,29 +23,16 @@ pub(super) mod maintenance_startup;
 #[allow(dead_code)]
 mod maintenance_store;
 pub(crate) mod mutation;
-// No route or launch caller until all provider adapters and final overlays exist.
-#[cfg(all(unix, feature = "provider-authority-prototype"))]
-#[allow(dead_code)]
-pub(super) mod provider_claude;
-#[cfg(all(unix, feature = "provider-authority-prototype"))]
-#[allow(dead_code)]
-pub(super) mod provider_claude_child;
-#[cfg(all(unix, feature = "provider-authority-prototype"))]
-mod provider_claude_diagnostics;
-#[cfg(all(target_os = "linux", feature = "provider-claude-fixture"))]
-mod provider_claude_fixture;
+// Original protected admission remains host-owned; vendor consumers are private.
 #[cfg(all(unix, feature = "provider-authority-prototype"))]
 #[allow(dead_code)]
 pub(super) mod provider_client;
-#[cfg(all(unix, feature = "provider-authority-prototype"))]
-#[allow(dead_code)]
-pub(super) mod provider_github;
-#[cfg(all(target_os = "linux", feature = "provider-claude-fixture"))]
-pub(crate) use provider_claude_fixture::start as start_claude_fixture;
-#[cfg(all(target_os = "linux", feature = "provider-github-fixture"))]
-mod provider_github_fixture;
-#[cfg(all(target_os = "linux", feature = "provider-github-fixture"))]
-pub(crate) use provider_github_fixture::start as start_github_fixture;
+#[cfg(all(
+    unix,
+    feature = "provider-authority-prototype",
+    feature = "daemon-extension-fixture"
+))]
+pub mod provider_fixture_host;
 #[cfg(all(unix, feature = "provider-authority-prototype"))]
 pub(super) mod provider_ready;
 #[cfg(all(unix, feature = "provider-authority-prototype"))]
@@ -907,7 +894,7 @@ pub(crate) fn expired_lease_fixture(state: &AppState, workspace: &str) -> Vec<St
 }
 /// A suspended machine resumed after its lease deadline passed, as the
 /// watchdog's freeze detection sees it. Returns what the watchdog would fence.
-#[cfg(test)]
+#[cfg(any(test, feature = "daemon-extension-fixture"))]
 pub(crate) fn resumed_fixture(state: &AppState, workspace: &str) -> Vec<String> {
     if let Some(proof) = lock(&state.pro.execution.proofs).get_mut(workspace) {
         proof.deadline = lease::Deadline::expired_fixture();
@@ -918,7 +905,7 @@ pub(crate) fn resumed_fixture(state: &AppState, workspace: &str) -> Vec<String> 
 }
 /// A suspended machine just thawed: its lease deadline passed while it was
 /// frozen and its watchdog has not ticked since.
-#[cfg(test)]
+#[cfg(any(test, feature = "daemon-extension-fixture"))]
 pub(crate) fn thawed_fixture(state: &AppState, workspace: &str) {
     if let Some(proof) = lock(&state.pro.execution.proofs).get_mut(workspace) {
         proof.deadline = lease::Deadline::expired_fixture();
@@ -946,7 +933,7 @@ pub(crate) fn worker_fixture(state: &AppState) {
 }
 /// Shared HTTP/scope fixtures install a normally validated synthetic grant;
 /// production validation has no test-only permissive branch.
-#[cfg(test)]
+#[cfg(any(test, feature = "daemon-extension-fixture"))]
 pub(crate) fn install_fixture(state: &AppState, workspace: &str, epoch: u64) -> Result<()> {
     grant_fixture(state, workspace, epoch, 1)?;
     lock(&state.pro.ownership).insert(workspace.into(), Ownership::Local { epoch });
@@ -968,7 +955,7 @@ pub(crate) fn renewed_fixture(state: &AppState, workspace: &str, epoch: u64) -> 
 pub(crate) fn refused_fixture(state: &AppState, workspace: &str) {
     fence_workspace(state, workspace);
 }
-#[cfg(test)]
+#[cfg(any(test, feature = "daemon-extension-fixture"))]
 fn grant_fixture(state: &AppState, workspace: &str, epoch: u64, sequence: u64) -> Result<()> {
     let config: Configure = serde_json::from_value(json!({
         "account_id":"a-fixture", "role":"device", "endpoint":"http://127.0.0.1:1",

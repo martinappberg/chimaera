@@ -67,8 +67,5 @@ export function waitingReview(review: KeptReview | null | undefined): review is 
   return review !== null && review !== undefined && review.files > 0 && review.returned_at !== null;
 }
 
-/** Ask the workbench to open (or focus) a project's review. App listens and
- *  switches this window to the project first when it shows another one. */
-export function requestKeptReview(workspaceId: string): void {
-  window.dispatchEvent(new CustomEvent("chimaera:kept-review", { detail: workspaceId }));
-}
+/** Compatibility export; the fixed event leaf must not load this owner. */
+export { requestKeptReview } from "./kept";

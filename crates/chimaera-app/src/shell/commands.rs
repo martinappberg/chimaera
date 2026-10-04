@@ -98,7 +98,7 @@ pub(super) async fn list_hosts(state: State<'_, Shell>) -> Result<Vec<HostState>
     let tunnels = state.tunnels.lock().await;
     let connecting: HashSet<String> = lock(&state.connecting).keys().cloned().collect();
     let unhealthy = lock(&state.unhealthy_tunnels).clone();
-    let keeper = lock(&state.pro.hosts).clone();
+    let keeper = state.pro.hosts();
     let local_token = lock(&state.local).token.clone();
     let clusters: HashMap<String, super::cluster::ClusterInfo> = lock(&state.clusters)
         .iter()
@@ -110,12 +110,12 @@ pub(super) async fn list_hosts(state: State<'_, Shell>) -> Result<Vec<HostState>
         // choices. Keep the authoritative host map intact for automatic routing.
         .filter(|h| {
             !keeper
-                .values()
+                .iter()
                 .any(|host| host.alias == h.alias && !visible_machine(host, &local_token))
         })
         .map(|h| {
             if let Some(host) = keeper
-                .values()
+                .iter()
                 .find(|host| host.alias == h.alias && !h.direct_ssh)
             {
                 return super::connect::keeper_state(
@@ -145,7 +145,7 @@ pub(super) async fn list_hosts(state: State<'_, Shell>) -> Result<Vec<HostState>
         })
         .collect();
     for host in keeper
-        .values()
+        .iter()
         .filter(|host| visible_machine(host, &local_token))
     {
         if !hosts.iter().any(|entry| entry.alias == host.alias) {
@@ -332,7 +332,7 @@ pub(super) async fn update_local_daemon(
     state: State<'_, Shell>,
 ) -> Result<(), String> {
     tracing::info!("ipc: update_local_daemon");
-    let fresh = crate::daemon::update_local_daemon()
+    let fresh = crate::daemon::update_local_daemon_for(super::runtime_requirement(&app))
         .await
         .map_err(|e| format!("{e:#}"))?;
     let moved = LocalDaemonMoved {
@@ -343,6 +343,7 @@ pub(super) async fn update_local_daemon(
     authorize_scope_origin(&app, None, fresh.port)
         .map_err(|e| format!("could not authorize the updated daemon origin: {e}"))?;
     *lock(&state.local) = fresh;
+    super::activate_account(&app);
     super::pro::refresh_serve(&state).await;
     // The replacement daemon starts without Pro setup; restore it now so
     // project copying and viewing do not pause until the next reconciliation.

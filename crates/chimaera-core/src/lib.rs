@@ -123,6 +123,17 @@ pub fn managed_agents_dir() -> PathBuf {
     data_dir_in(state_home().as_deref()).join("agents")
 }
 
+/// Optional companion assets use the same user-scoped root as managed agents,
+/// ignoring a cluster workspace's CHIMAERA_DATA_DIR. Resolving this path never
+/// creates a directory, discovers a package or starts an account task.
+pub fn managed_companions_dir() -> PathBuf {
+    managed_companions_dir_in(state_home().as_deref())
+}
+
+fn managed_companions_dir_in(home: Option<&Path>) -> PathBuf {
+    data_dir_in(home).join("companions")
+}
+
 /// Per-user data directory (`~/.chimaera`, or `$CHIMAERA_HOME/data` when
 /// isolated), created on demand.
 pub fn data_dir() -> PathBuf {
@@ -593,6 +604,18 @@ mod tests {
         assert_eq!(data_dir_in(Some(iso)), iso.join("data"));
         // ...while the default still resolves to ~/.chimaera.
         assert!(data_dir_in(None).ends_with(".chimaera"));
+    }
+
+    #[test]
+    fn companion_root_is_user_scoped_without_workspace_override() {
+        let isolated = Path::new("/tmp/example-chimaera-home");
+        assert_eq!(
+            managed_companions_dir_in(Some(isolated)),
+            isolated.join("data/companions")
+        );
+        assert!(managed_companions_dir_in(None).ends_with(".chimaera/companions"));
+        // No environment mutation: the pure resolver accepts only the state
+        // home, so a cluster's per-workspace data root cannot enter this path.
     }
 
     // Relies on $HOME relocation and unix file modes.

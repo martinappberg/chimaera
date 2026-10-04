@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, LazyLock, Mutex,
     },
     time::Duration,
@@ -38,7 +38,7 @@ struct CacheContext {
     _guard: Arc<OwnedMutexGuard<()>>,
 }
 
-fn uncertain(workspace: Option<&str>) {
+pub(super) fn uncertain(workspace: Option<&str>) {
     let Some(workspace) = workspace else {
         return;
     };
@@ -293,14 +293,228 @@ pub(super) async fn run(
     run_reserved(command, input, timeout, cap, permit, None).await
 }
 
+/// Original fixed-Git binding validation carried into the retained child owner.
+pub(super) type GitCheck = Arc<dyn Fn() -> Result<()> + Send + Sync>;
+fn checked_prepare(check: GitCheck) -> CompanionPrepare {
+    Box::new(move |command| {
+        check()?;
+        Ok(PreparedCompanion {
+            file: None,
+            command,
+            cleanup: None,
+        })
+    })
+}
+pub(super) async fn run_checked(
+    command: Command,
+    input: Vec<u8>,
+    timeout: Duration,
+    cap: usize,
+    check: GitCheck,
+) -> Result<Output> {
+    // Preserve run's original queue and work mint points; the same task/permit
+    // retains capture validation through actual blocking/child settlement.
+    let permit = Arc::new(CHILDREN.clone().acquire_owned().await?);
+    let deadline = tokio::time::Instant::now() + timeout;
+    run_reserved_prepared(
+        command,
+        input,
+        deadline,
+        cap,
+        permit,
+        None,
+        Some(checked_prepare(check)),
+    )
+    .await
+}
+
+/// Trusted fixed-companion preparation/cleanup, never supplied over a wire.
+pub(super) type CompanionCleanup = Box<dyn FnOnce() -> Result<()> + Send>;
+pub(super) struct PreparedCompanion {
+    pub command: Command,
+    pub cleanup: Option<CompanionCleanup>,
+    pub file: Option<PreparedFile>,
+}
+/// Exact captured staging output, created only inside admitted blocking work.
+pub(super) struct PreparedFile {
+    pub file: std::fs::File,
+    pub destination: PathBuf,
+    pub cap: u64,
+    pub length: Arc<AtomicU64>,
+    pub cleanup: CompanionCleanup,
+}
+pub(super) type CompanionPrepare = Box<dyn FnOnce(Command) -> Result<PreparedCompanion> + Send>;
+#[derive(Debug)]
+pub(super) struct CompanionCleanupUnknown;
+impl std::fmt::Display for CompanionCleanupUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("transfer companion cleanup could not be verified")
+    }
+}
+impl std::error::Error for CompanionCleanupUnknown {}
+#[derive(Default)]
+struct CleanupState {
+    deadline: Option<tokio::time::Instant>,
+    child_started: bool,
+    child_settled: bool,
+}
+type CleanupClock = Arc<Mutex<CleanupState>>;
+struct OwnedCleanup<'a> {
+    workspace: Option<&'a str>,
+    clock: CleanupClock,
+}
+
+/// Companion admission and work share the original deadline. Existing Git/curl
+/// callers retain their budgets; cleanup still settles under the same owner.
+pub(super) async fn run_companion(
+    command: Command,
+    input: Vec<u8>,
+    timeout: Duration,
+    cap: usize,
+    prepare: CompanionPrepare,
+) -> Result<Output> {
+    run_bounded_on(
+        command,
+        input,
+        timeout,
+        cap,
+        CHILDREN.clone(),
+        Some(prepare),
+    )
+    .await
+}
+/// Compatibility capture occupies the same helper/cache owner as execution.
+/// Dropping its observer retires the result, never the actual blocking work.
+pub(super) async fn prepare_image(
+    prepare: impl FnOnce() -> Result<super::companion::CompatibleImage> + Send + 'static,
+) -> Result<super::companion::CompatibleImage> {
+    prepare_image_on(prepare, CHILDREN.clone(), Duration::from_secs(10)).await
+}
+async fn prepare_image_on(
+    prepare: impl FnOnce() -> Result<super::companion::CompatibleImage> + Send + 'static,
+    slots: Arc<Semaphore>,
+    timeout: Duration,
+) -> Result<super::companion::CompatibleImage> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let permit = Arc::new(
+        tokio::time::timeout_at(deadline, slots.acquire_owned())
+            .await
+            .context("companion capture admission timed out")??,
+    );
+    ensure!(
+        tokio::time::Instant::now() < deadline,
+        "companion capture admission timed out"
+    );
+    let cache = CACHE_GUARD.try_with(Clone::clone).ok();
+    if let Some(cache) = &cache {
+        cache_quiescent(&cache.workspace)?;
+    }
+    let (cancel, mut canceled) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        let workspace = cache.as_ref().map(|c| c.workspace.as_str());
+        let mut completion = HelperCompletion {
+            verified: false,
+            workspace,
+        };
+        let (worker_cache, worker_permit) = (cache.clone(), permit.clone());
+        let mut worker = tokio::task::spawn_blocking(move || {
+            let (_cache, _permit) = (worker_cache, worker_permit);
+            prepare()
+        });
+        let result = tokio::select! {
+            result=&mut worker=>Some(result),
+            _=tokio::time::sleep_until(deadline)=>None,
+            _=&mut canceled=>None,
+        };
+        let retired = result.is_none();
+        let result = match result {
+            Some(result) => result,
+            None => match tokio::time::timeout(CLEANUP_TIMEOUT, &mut worker).await {
+                Ok(result) => result,
+                // The actual blocking worker still retains the original
+                // permit/cache. Its detached handle cannot certify recovery.
+                Err(_) => return Err(CompanionCleanupUnknown.into()),
+            },
+        };
+        let result = result.map_err(|_| CompanionCleanupUnknown)?;
+        completion.verified = true;
+        ensure!(
+            !retired
+                && tokio::time::Instant::now() < deadline
+                && !matches!(
+                    canceled.try_recv(),
+                    Ok(()) | Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+                ),
+            "companion capture retired"
+        );
+        result
+    });
+    let result = task.await.context("companion capture task failed")?;
+    drop(cancel);
+    result
+}
+
+async fn run_bounded_on(
+    command: Command,
+    input: Vec<u8>,
+    timeout: Duration,
+    cap: usize,
+    slots: Arc<Semaphore>,
+    prepare: Option<CompanionPrepare>,
+) -> Result<Output> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let permit = Arc::new(
+        tokio::time::timeout_at(deadline, slots.acquire_owned())
+            .await
+            .context("companion helper admission timed out")??,
+    );
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    ensure!(!remaining.is_zero(), "companion helper admission timed out");
+    run_reserved_prepared(command, input, deadline, cap, permit, None, prepare).await
+}
+
 /// Stream one staged blob into a private, exclusively created file. The owned
 /// helper retains cache exclusion through cancellation/descendant cleanup;
 /// rejected or incomplete bytes never survive as a successful artifact.
+#[cfg(test)]
 pub(super) async fn run_file(
     command: Command,
     destination: PathBuf,
     timeout: Duration,
     cap: u64,
+) -> Result<u64> {
+    run_file_selected(command, destination, timeout, cap, None).await
+}
+pub(super) async fn run_file_checked(
+    command: Command,
+    timeout: Duration,
+    check: GitCheck,
+    output: Box<dyn FnOnce() -> Result<PreparedFile> + Send>,
+    length: Arc<AtomicU64>,
+) -> Result<u64> {
+    let permit = Arc::new(CHILDREN.clone().acquire_owned().await?);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let prepare = Box::new(move |command| {
+        check()?;
+        let file = output()?;
+        Ok(PreparedCompanion {
+            command,
+            cleanup: None,
+            file: Some(file),
+        })
+    });
+    let result =
+        run_reserved_prepared(command, vec![], deadline, 0, permit, None, Some(prepare)).await?;
+    ensure!(result.success, "staged Git blob export failed");
+    Ok(length.load(Ordering::Acquire))
+}
+#[cfg(test)]
+async fn run_file_selected(
+    command: Command,
+    destination: PathBuf,
+    timeout: Duration,
+    cap: u64,
+    check: Option<GitCheck>,
 ) -> Result<u64> {
     let permit = Arc::new(CHILDREN.clone().acquire_owned().await?);
     let mut options = tokio::fs::OpenOptions::new();
@@ -312,8 +526,20 @@ pub(super) async fn run_file(
         file,
         destination: destination.clone(),
         cap,
+        length: None,
     };
-    let output = match run_reserved(command, vec![], timeout, 0, permit, Some(sink)).await {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let output = match run_reserved_prepared(
+        command,
+        vec![],
+        deadline,
+        0,
+        permit,
+        Some(sink),
+        check.map(checked_prepare),
+    )
+    .await
+    {
         Ok(output) => output,
         Err(error) => {
             let _ = tokio::fs::remove_file(&destination).await;
@@ -328,6 +554,7 @@ struct FileSink {
     file: tokio::fs::File,
     destination: PathBuf,
     cap: u64,
+    length: Option<Arc<AtomicU64>>,
 }
 
 async fn run_reserved(
@@ -338,11 +565,23 @@ async fn run_reserved(
     permit: Arc<OwnedSemaphorePermit>,
     file: Option<FileSink>,
 ) -> Result<Output> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    run_reserved_prepared(command, input, deadline, cap, permit, file, None).await
+}
+async fn run_reserved_prepared(
+    command: Command,
+    input: Vec<u8>,
+    deadline: tokio::time::Instant,
+    cap: usize,
+    permit: Arc<OwnedSemaphorePermit>,
+    file: Option<FileSink>,
+    prepare: Option<CompanionPrepare>,
+) -> Result<Output> {
     let cache = CACHE_GUARD.try_with(Clone::clone).ok();
     if let Some(cache) = &cache {
         cache_quiescent(&cache.workspace)?;
     }
-    let (cancel, canceled) = tokio::sync::oneshot::channel::<()>();
+    let (cancel, mut canceled) = tokio::sync::oneshot::channel::<()>();
     let task = tokio::spawn(async move {
         let workspace = cache.as_ref().map(|cache| cache.workspace.as_str());
         let _permit = permit;
@@ -351,9 +590,145 @@ async fn run_reserved(
             workspace,
         };
         let destination = file.as_ref().map(|sink| sink.destination.clone());
-        let result = run_owned(command, input, timeout, cap, canceled, workspace, file).await;
+        let clock: CleanupClock = Arc::new(Mutex::new(CleanupState::default()));
+        let (command, cleanup, mut file, failed_file) = if let Some(prepare) = prepare {
+            let retired = Arc::new(AtomicBool::new(false));
+            let (worker_retired, worker_cache, worker_permit) =
+                (retired.clone(), cache.clone(), _permit.clone());
+            let mut preparation = tokio::task::spawn_blocking(move || {
+                let (_cache, _permit) = (worker_cache, worker_permit);
+                let mut prepared = prepare(command)?;
+                if worker_retired.load(Ordering::Acquire) {
+                    if let Some(file) = prepared.file.take() {
+                        (file.cleanup)().map_err(|_| CompanionCleanupUnknown)?;
+                    }
+                    if let Some(cleanup) = prepared.cleanup {
+                        cleanup().map_err(|_| CompanionCleanupUnknown)?;
+                    }
+                    return Err(anyhow::anyhow!("transfer companion preparation retired"));
+                }
+                Ok(prepared)
+            });
+            let result = tokio::select! {
+                result=&mut preparation=>Some(result),
+                _=tokio::time::sleep_until(deadline)=>None,
+                _=&mut canceled=>None,
+            };
+            let expired = result.is_none();
+            let result = if let Some(result) = result {
+                result
+            } else {
+                retired.store(true, Ordering::Release);
+                let cleanup_deadline = tokio::time::Instant::now() + CLEANUP_TIMEOUT;
+                crate::lock(&clock).deadline = Some(cleanup_deadline);
+                match tokio::time::timeout_at(cleanup_deadline, &mut preparation).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        uncertain(workspace);
+                        return Err(CompanionCleanupUnknown.into());
+                    }
+                }
+            };
+            let prepared = match result {
+                Ok(Ok(prepared)) => prepared,
+                Ok(Err(error)) => {
+                    if error.downcast_ref::<CompanionCleanupUnknown>().is_some() {
+                        uncertain(workspace);
+                    }
+                    completion.verified = true;
+                    return Err(error);
+                }
+                Err(_) => {
+                    uncertain(workspace);
+                    return Err(CompanionCleanupUnknown.into());
+                }
+            };
+            if expired
+                || tokio::time::Instant::now() >= deadline
+                || matches!(
+                    canceled.try_recv(),
+                    Ok(()) | Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+                )
+            {
+                let cleanup_deadline = *crate::lock(&clock)
+                    .deadline
+                    .get_or_insert_with(|| tokio::time::Instant::now() + CLEANUP_TIMEOUT);
+                if let Some(file) = prepared.file {
+                    settle_companion(
+                        Some(file.cleanup),
+                        cleanup_deadline,
+                        cache.clone(),
+                        _permit.clone(),
+                    )
+                    .await?;
+                }
+                settle_companion(
+                    prepared.cleanup,
+                    cleanup_deadline,
+                    cache.clone(),
+                    _permit.clone(),
+                )
+                .await?;
+                completion.verified = true;
+                return Err(anyhow::anyhow!("transfer companion preparation retired"));
+            }
+            let (file, failed_file) = if let Some(prepared_file) = prepared.file {
+                debug_assert!(file.is_none());
+                (
+                    Some(FileSink {
+                        file: tokio::fs::File::from_std(prepared_file.file),
+                        destination: prepared_file.destination,
+                        cap: prepared_file.cap,
+                        length: Some(prepared_file.length),
+                    }),
+                    Some(prepared_file.cleanup),
+                )
+            } else {
+                (file, None)
+            };
+            (prepared.command, prepared.cleanup, file, failed_file)
+        } else {
+            (command, None, file, None)
+        };
+        let result = run_owned(
+            command,
+            input,
+            deadline,
+            cap,
+            canceled,
+            file.take(),
+            OwnedCleanup {
+                workspace,
+                clock: clock.clone(),
+            },
+        )
+        .await;
+        let cleanup_deadline = {
+            let mut state = crate::lock(&clock);
+            // An unverified child may still map its executable or write its
+            // captured output. Retain either stage as evidence.
+            if (cleanup.is_some() || failed_file.is_some())
+                && state.child_started
+                && !state.child_settled
+            {
+                uncertain(workspace);
+                return Err(CompanionCleanupUnknown.into());
+            }
+            *state
+                .deadline
+                .get_or_insert_with(|| tokio::time::Instant::now() + CLEANUP_TIMEOUT)
+        };
+        settle_companion(cleanup, cleanup_deadline, cache.clone(), _permit.clone()).await?;
         if !matches!(&result, Ok(output) if output.success) {
-            if let Some(destination) = destination {
+            if let Some(cleanup) = failed_file {
+                settle_companion(
+                    Some(cleanup),
+                    cleanup_deadline,
+                    cache.clone(),
+                    _permit.clone(),
+                )
+                .await?;
+            } else if let Some(destination) = destination {
                 tokio::fs::remove_file(destination).await?;
             }
         }
@@ -363,6 +738,29 @@ async fn run_reserved(
     let result = task.await.context("mirror helper task failed")?;
     drop(cancel);
     result
+}
+
+async fn settle_companion(
+    cleanup: Option<CompanionCleanup>,
+    deadline: tokio::time::Instant,
+    cache: Option<CacheContext>,
+    permit: Arc<OwnedSemaphorePermit>,
+) -> Result<()> {
+    let Some(cleanup) = cleanup else {
+        return Ok(());
+    };
+    let workspace = cache.as_ref().map(|c| c.workspace.clone());
+    let task = tokio::task::spawn_blocking(move || {
+        let (_cache, _permit) = (cache, permit);
+        cleanup()
+    });
+    match tokio::time::timeout_at(deadline, task).await {
+        Ok(Ok(Ok(()))) => Ok(()),
+        _ => {
+            uncertain(workspace.as_deref());
+            Err(CompanionCleanupUnknown.into())
+        }
+    }
 }
 
 struct HelperCompletion<'a> {
@@ -428,7 +826,7 @@ impl Helper<'_> {
         #[cfg(not(unix))]
         Ok(self.child.wait().await?.success())
     }
-    async fn finish(&mut self, _completed: bool) -> Result<()> {
+    async fn finish(&mut self, _completed: bool, deadline: tokio::time::Instant) -> Result<()> {
         self.stop();
         let cleanup = async {
             self.child.wait().await?;
@@ -455,7 +853,7 @@ impl Helper<'_> {
             }
             Ok::<_, anyhow::Error>(())
         };
-        let result = tokio::time::timeout(CLEANUP_TIMEOUT, cleanup).await;
+        let result = tokio::time::timeout_at(deadline, cleanup).await;
         if !matches!(result, Ok(Ok(()))) {
             uncertain(self.workspace);
             bail!("mirror helper cleanup could not be verified");
@@ -480,18 +878,23 @@ impl Drop for Helper<'_> {
 async fn run_owned(
     mut command: Command,
     input: Vec<u8>,
-    timeout: Duration,
+    deadline: tokio::time::Instant,
     cap: usize,
     mut canceled: tokio::sync::oneshot::Receiver<()>,
-    workspace: Option<&str>,
     mut file: Option<FileSink>,
+    cleanup: OwnedCleanup<'_>,
 ) -> Result<Output> {
+    let workspace = cleanup.workspace;
     if matches!(
         canceled.try_recv(),
         Ok(()) | Err(tokio::sync::oneshot::error::TryRecvError::Closed)
     ) {
         bail!("mirror helper request canceled");
     }
+    ensure!(
+        tokio::time::Instant::now() < deadline,
+        "mirror helper timed out before start"
+    );
     #[cfg(unix)]
     command.process_group(0);
     let child = command
@@ -501,6 +904,7 @@ async fn run_owned(
         .kill_on_drop(true)
         .spawn()
         .context("could not start mirror helper")?;
+    crate::lock(&cleanup.clock).child_started = true;
     #[cfg(unix)]
     let group = child
         .id()
@@ -566,12 +970,15 @@ async fn run_owned(
         })
     };
     let result = tokio::select! {
-        result = tokio::time::timeout(timeout, work) => result.context("mirror helper timed out").and_then(|v| v),
+        result = tokio::time::timeout_at(deadline, work) => result.context("mirror helper timed out").and_then(|v| v),
         _ = &mut canceled => Err(anyhow::anyhow!("mirror helper request canceled")),
     };
-    let cleanup = helper.finish(result.is_ok()).await;
+    let deadline = tokio::time::Instant::now() + CLEANUP_TIMEOUT;
+    crate::lock(&cleanup.clock).deadline = Some(deadline);
+    let settled = helper.finish(result.is_ok(), deadline).await;
     drop(file);
-    cleanup?;
+    settled?;
+    crate::lock(&cleanup.clock).child_settled = true;
     result
 }
 
@@ -608,6 +1015,9 @@ async fn read_output(
         overlap.drain(..keep);
     }
     sink.file.sync_all().await?;
+    if let Some(observed) = &sink.length {
+        observed.store(length, Ordering::Release);
+    }
     Ok(Vec::new())
 }
 
@@ -968,10 +1378,22 @@ pub(super) async fn git(dir: &Path, credentials: Option<(&str, &str)>) -> Result
     Ok(command)
 }
 
-pub(super) async fn git_output(
+pub(super) async fn git_output(command: Command, args: &[&str], input: Vec<u8>) -> Result<Vec<u8>> {
+    git_output_selected(command, args, input, None).await
+}
+pub(super) async fn git_output_checked(
+    command: Command,
+    args: &[&str],
+    input: Vec<u8>,
+    check: GitCheck,
+) -> Result<Vec<u8>> {
+    git_output_selected(command, args, input, Some(check)).await
+}
+async fn git_output_selected(
     mut command: Command,
     args: &[&str],
     input: Vec<u8>,
+    check: Option<GitCheck>,
 ) -> Result<Vec<u8>> {
     command.args(args);
     // The service permits a streamed transfer for fifteen minutes. Keep a
@@ -994,7 +1416,18 @@ pub(super) async fn git_output(
         } else {
             std::mem::replace(&mut command, Command::new("git"))
         };
-        let result = run(attempt_command, input.clone(), timeout, PATH_CAP).await;
+        let result = if let Some(check) = &check {
+            run_checked(
+                attempt_command,
+                input.clone(),
+                timeout,
+                PATH_CAP,
+                check.clone(),
+            )
+            .await
+        } else {
+            run(attempt_command, input.clone(), timeout, PATH_CAP).await
+        };
         let output = if compatibility_hint {
             result.context(HTTP_GIT_HINT)?
         } else {
@@ -1033,6 +1466,257 @@ pub(super) async fn git_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn canceled_or_expired_capture_retains_actual_slot_and_cache_until_settlement() {
+        for cancel in [false, true] {
+            let slots = Arc::new(Semaphore::new(1));
+            let checked = slots.clone();
+            let cache = Arc::new(tokio::sync::Mutex::new(()));
+            let guard = Arc::new(cache.clone().lock_owned().await);
+            let workspace = format!("capture-{}", chimaera_core::generate_token());
+            let (began, ready) = tokio::sync::oneshot::channel();
+            let (release, held) = std::sync::mpsc::channel();
+            let owner = tokio::spawn(async move {
+                cache_scope(
+                    &workspace,
+                    guard,
+                    prepare_image_on(
+                        move || {
+                            let _ = began.send(());
+                            held.recv_timeout(Duration::from_secs(3))
+                                .map_err(|_| anyhow::anyhow!("test capture release expired"))?;
+                            Err(anyhow::anyhow!("test capture settled"))
+                        },
+                        slots,
+                        if cancel {
+                            Duration::from_secs(2)
+                        } else {
+                            Duration::from_millis(30)
+                        },
+                    ),
+                )
+                .await
+            });
+            tokio::time::timeout(Duration::from_secs(1), ready)
+                .await
+                .unwrap()
+                .unwrap();
+            if cancel {
+                owner.abort();
+            } else {
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                assert!(!owner.is_finished());
+            }
+            assert_eq!(checked.available_permits(), 0);
+            assert!(cache.try_lock().is_err());
+            release.send(()).unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(1), owner)
+                .await
+                .unwrap();
+            if cancel {
+                assert!(matches!(result,Err(error) if error.is_cancelled()));
+            } else {
+                assert!(result.unwrap().is_err());
+            }
+            let _settled = tokio::time::timeout(Duration::from_secs(1), cache.lock())
+                .await
+                .unwrap();
+            let permit =
+                tokio::time::timeout(Duration::from_secs(1), checked.clone().acquire_owned())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            drop(permit);
+            assert_eq!(checked.available_permits(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn companion_queue_expiry_refuses_before_start_without_a_fresh_work_budget() {
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_bounded_on(
+                Command::new("/fixed-nonexistent-transfer-helper"),
+                Vec::new(),
+                Duration::from_millis(10),
+                32,
+                Arc::new(Semaphore::new(0)),
+                Some(Box::new(|_| {
+                    panic!("queue expiry must not prepare an image")
+                })),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("admission timed out"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_staged_output_retains_cache_and_unlinks_only_original_parent() {
+        let base = std::env::temp_dir().join(format!(
+            "chimaera-staged-output-{}",
+            chimaera_core::generate_token()
+        ));
+        let root = base.join("stage");
+        std::fs::create_dir_all(&root).unwrap();
+        let parent = Arc::new(std::fs::File::open(&root).unwrap());
+        let marker = base.join("must-not-start");
+        let destination = root.join("blob");
+        let (started, began) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let slots = Arc::new(Semaphore::new(1));
+        let actual_slots = slots.clone();
+        let cache = Arc::new(tokio::sync::Mutex::new(()));
+        let original_cache = Arc::new(cache.clone().lock_owned().await);
+        let workspace = format!("staged-output-{}", chimaera_core::generate_token());
+        let original_workspace = workspace.clone();
+        let original_marker = marker.clone();
+        let prepare = Box::new(move |_| {
+            let file: std::fs::File = rustix::fs::openat(
+                &*parent,
+                "blob",
+                rustix::fs::OFlags::WRONLY
+                    | rustix::fs::OFlags::CREATE
+                    | rustix::fs::OFlags::EXCL
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            )?
+            .into();
+            let _ = started.send(());
+            held.recv_timeout(Duration::from_secs(2))?;
+            let mut command = Command::new("/bin/sh");
+            command
+                .env("MARKER", original_marker)
+                .args(["-c", "printf child; printf late > \"$MARKER\""]);
+            Ok(PreparedCompanion {
+                command,
+                cleanup: None,
+                file: Some(PreparedFile {
+                    file,
+                    destination,
+                    cap: 32,
+                    length: Arc::new(AtomicU64::new(0)),
+                    cleanup: Box::new(move || {
+                        rustix::fs::unlinkat(&*parent, "blob", rustix::fs::AtFlags::empty())?;
+                        Ok(())
+                    }),
+                }),
+            })
+        });
+        let observer = tokio::spawn(async move {
+            cache_scope(
+                &original_workspace,
+                original_cache,
+                run_bounded_on(
+                    Command::new("/unused-git"),
+                    vec![],
+                    Duration::from_secs(1),
+                    0,
+                    slots,
+                    Some(prepare),
+                ),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), began)
+            .await
+            .unwrap()
+            .unwrap();
+        observer.abort();
+        assert!(matches!(observer.await, Err(error) if error.is_cancelled()));
+        assert_eq!(actual_slots.available_permits(), 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), cache.lock())
+                .await
+                .is_err()
+        );
+        std::fs::rename(&root, base.join("original-stage")).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("blob"), b"successor evidence").unwrap();
+        release.send(()).unwrap();
+        let _settled = tokio::time::timeout(Duration::from_secs(2), cache.lock())
+            .await
+            .unwrap();
+        let settled_slot =
+            tokio::time::timeout(Duration::from_secs(2), actual_slots.clone().acquire_owned())
+                .await
+                .unwrap()
+                .unwrap();
+        drop(settled_slot);
+        assert_eq!(actual_slots.available_permits(), 1);
+        cache_quiescent(&workspace).unwrap();
+        assert!(!base.join("original-stage/blob").exists());
+        assert_eq!(
+            std::fs::read(root.join("blob")).unwrap(),
+            b"successor evidence"
+        );
+        assert!(!marker.exists());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retired_preparation_cleans_under_original_owner_without_starting_late_child() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-transfer-late-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let marker = root.join("must-not-start");
+        let checked = marker.clone();
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let cleanup_seen = cleaned.clone();
+        let (started, began) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let slots = Arc::new(Semaphore::new(1));
+        let checked_slots = slots.clone();
+        let prepare = Box::new(move |_| {
+            let _ = started.send(());
+            held.recv_timeout(Duration::from_secs(2))?;
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", &format!("printf late > '{}'", marker.display())]);
+            Ok(PreparedCompanion {
+                file: None,
+                command,
+                cleanup: Some(Box::new(move || {
+                    cleanup_seen.store(true, Ordering::Release);
+                    Ok(())
+                })),
+            })
+        });
+        let task = tokio::spawn(run_bounded_on(
+            Command::new("/unused-companion"),
+            Vec::new(),
+            Duration::from_millis(40),
+            32,
+            slots,
+            Some(prepare),
+        ));
+        tokio::time::timeout(Duration::from_secs(1), began)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(checked_slots.available_permits(), 0);
+        assert!(!task.is_finished());
+        release.send(()).unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
+        assert!(cleaned.load(Ordering::Acquire));
+        assert_eq!(checked_slots.available_permits(), 1);
+        assert!(!checked.exists());
+        std::fs::remove_dir(root).unwrap();
+    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -1404,7 +2088,16 @@ mod tests {
                 "chimaera-busy-mirror-{}",
                 chimaera_core::generate_token()
             ));
-            super::super::mirror::initialize(&directory).await.unwrap();
+            // This tests host HTTP retry/child settlement, independently of the
+            // optional paid repository policy.
+            tokio::fs::create_dir_all(&directory).await.unwrap();
+            git_output(
+                git(&directory, None).await.unwrap(),
+                &["init", "--bare", "--quiet", "."],
+                Vec::new(),
+            )
+            .await
+            .unwrap();
             let result = git_output(
                 git(&directory, None).await.unwrap(),
                 &["fetch", &url, "+refs/heads/*:refs/remotes/mirror/*"],

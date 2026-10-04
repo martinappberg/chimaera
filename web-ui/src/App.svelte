@@ -1,12 +1,10 @@
 <script lang="ts">
   import { RecentSessions } from "./lib/workspace/recentSessions";
   import { cloudOnboarding } from "./lib/pro/onboarding.svelte";
-  import { keptReviews } from "./lib/pro/keptReviews.svelte";
   import { KEPT_NOTICE_PREFIX, keptNoticeWorkspace } from "./lib/pro/kept";
   import { onMount, tick, untrack, type Component } from "svelte";
-  import ProNavigation from "./lib/pro/ProNavigation.svelte";
+  import { loadApplicationEntry } from "virtual:chimaera-application-entry";
   import { paidPlan, proOffered } from "./lib/net/plan";
-  import { listenForProReturn } from "./lib/net/proReturn";
   import { isBrowserGateway, gatewayWorkspace } from "./lib/net/base";
   import AgentSetupLoader from "./lib/workspace/AgentSetupLoader.svelte";
   import { agentSetup, openAgentSetup } from "./lib/workspace/agentSetup";
@@ -345,7 +343,7 @@
     type HostStatusEvent,
   } from "./lib/net/native";
   import { clearBrowserNotices, deliverBrowserNotices } from "./lib/workspace/notices";
-  import UpdateToast from "./lib/workspace/UpdateToast.svelte";
+  import UpdateToastLoader from "./lib/workspace/UpdateToastLoader.svelte";
   import {
     applyAppStatus,
     checkForUpdates,
@@ -1821,7 +1819,7 @@
         // A return that kept both versions: the chat's line and an open
         // review read the project's answer again (native or browser).
         for (const n of list) {
-          if (n.kind === "kept_both" && n.workspace_id !== null) void keptReviews.refresh(n.workspace_id);
+          if (n.kind === "kept_both" && n.workspace_id !== null) void import("./lib/pro/keptReviews.svelte").then(({ keptReviews }) => keptReviews.refresh(n.workspace_id!)).catch(() => { /* A visible review retains its own explicit Refresh recovery. */ });
         }
         if (isNativeShell()) return;
         deliverBrowserNotices(list, {
@@ -1862,7 +1860,9 @@
     // Native menu items the shell forwards to the focused window. Cmd+W
     // closes the focused VIEW (a home window just closes), reclaiming the
     // chords a browser reserves for tabs.
-    const stopProReturn = isNativeShell() ? listenForProReturn(() => { pendingProReturn = true; }) : () => {};
+    let proReturnLive = true;
+    const stopProReturn = loadApplicationEntry !== null && isNativeShell() ? asyncDisposer(import("./lib/net/proReturn").then(({ listenForProReturn }) =>
+      proReturnLive ? listenForProReturn(() => { if (proReturnLive) pendingProReturn = true; }) : () => {})) : () => {};
     let unlistenMenu: (() => void) | null = null;
     let unlistenDaemonMoved: (() => void) | null = null;
     let unlistenHostStatus: (() => void) | null = null;
@@ -1993,7 +1993,7 @@
       window.removeEventListener("pagehide", onPagehide);
       window.removeEventListener("chimaera:open-pro", openProSurface);
       window.removeEventListener("chimaera:kept-review", keptReviewRequested);
-      stopProReturn();
+      proReturnLive = false; stopProReturn();
       unlistenMenu?.();
       unlistenDaemonMoved?.();
       unlistenHostStatus?.();
@@ -3686,7 +3686,7 @@
       return;
     }
     layout = openKeptReview(layout);
-    void keptReviews.refresh(workspaceId);
+    void import("./lib/pro/keptReviews.svelte").then(({ keptReviews }) => keptReviews.refresh(workspaceId)).catch(() => { /* The review has explicit Refresh recovery. */ });
   }
   $effect(() => {
     const id = pendingKeptReview;
@@ -5353,7 +5353,7 @@
           {#await homeSettingsLoad}
             <p>Loading {homeSurface === "pro" ? "Chimaera Pro" : "settings"}…</p>
           {:then SettingsView}
-            {#if SettingsView}<SettingsView />{/if}
+            {#if SettingsView}<SettingsView onClose={() => (homeSettingsOpen = false)} />{/if}
           {:catch}
             <p role="alert">Couldn't open {homeSurface === "pro" ? "Chimaera Pro" : "settings"}.</p>
             <button onclick={homeSurface === "pro" ? openProSurface : openSettingsSurface}>Retry</button>
@@ -5410,8 +5410,10 @@
             />
           </svg>
         </button>
-        {#if isNativeShell() || isBrowserGateway()}
-          <ProNavigation plan={$paidPlan} onOpen={openProSurface} />
+        {#if $paidPlan !== null && (isNativeShell() || isBrowserGateway())}
+          {#await import("./lib/pro/ProNavigation.svelte") then { default: ProNavigation }}
+            <ProNavigation plan={$paidPlan} onOpen={openProSurface} />
+          {/await}
         {/if}
         {#if needsYou > 0}
           <span
@@ -6497,7 +6499,7 @@
 {/if}
 
 {#if updateNotice !== null && $assetTransition === null}
-  <UpdateToast notice={updateNotice} />
+  <UpdateToastLoader notice={updateNotice} />
 {/if}
 
 <!-- Transient outcome chip: an action that would otherwise fail in silence

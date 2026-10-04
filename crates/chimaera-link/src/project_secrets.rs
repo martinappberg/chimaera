@@ -150,13 +150,13 @@ pub enum Command {
         name: String,
     },
 }
-pub(crate) fn id(value: &str) -> bool {
+pub fn id(value: &str) -> bool {
     (1..=128).contains(&value.len())
         && value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
 }
-pub(crate) fn uuid(value: &str) -> bool {
+pub fn uuid(value: &str) -> bool {
     value.len() == 36
         && value.bytes().enumerate().all(|(i, b)| {
             if [8, 13, 18, 23].contains(&i) {

@@ -129,7 +129,7 @@ pub(crate) fn write_state(path: &Path, bytes: &[u8]) -> Result<()> {
 
 /// A staged file change. `before` is the version observed while planning, not a
 /// fresh reading taken just before overwriting a possibly newer user edit.
-pub(crate) struct Write {
+pub struct Write {
     pub root: PathBuf,
     pub relative: PathBuf,
     pub before: Option<PathBuf>,

@@ -47,7 +47,9 @@ fn outcome_with(error: anyhow::Error, route_code: Option<&'static str>) -> detac
 pub(super) fn error_code(error: &anyhow::Error) -> &'static str {
     let text = error.to_string();
     let has = |needle: &str| text.contains(needle);
-    if error
+    if has("optional_runtime_unavailable") {
+        "optional_runtime_unavailable"
+    } else if error
         .downcast_ref::<super::provider_gate::Blocked>()
         .is_some()
     {
@@ -296,7 +298,7 @@ async fn configure_inner(
     }
     response
 }
-async fn stop_tasks(state: &Arc<AppState>) -> anyhow::Result<()> {
+pub(super) async fn stop_tasks(state: &Arc<AppState>) -> anyhow::Result<()> {
     #[cfg(all(unix, feature = "provider-authority-prototype"))]
     execution::provider_ready::replacing(state);
     // Captured before the runtime changes: replacing or removing a device's
@@ -417,7 +419,24 @@ pub(crate) async fn status(State(state): State<Arc<AppState>>) -> Json<serde_jso
     let workspaces = lock(&state.workspaces).list();
     let preferences = lock(&state.pro.preferences).clone();
     let ownership = lock(&state.pro.ownership).clone();
-    let statuses = lock(&state.pro.status).clone();
+    let mut statuses = lock(&state.pro.status).clone();
+    if state.daemon_extension.is_none() && state.pro.configured.load(Ordering::Acquire) {
+        for workspace in &workspaces {
+            if ownership.contains_key(&workspace.id)
+                || preferences
+                    .get(&workspace.id)
+                    .is_some_and(|p| p.account.is_some())
+            {
+                let status = statuses.entry(workspace.id.clone()).or_default();
+                // Preserve enrollment/proof fields; this is missing policy
+                // capability, never an account/ownership downgrade.
+                if status.error.is_none() {
+                    status.error = Some("optional_runtime_unavailable".into());
+                    status.error_code = Some("optional_runtime_unavailable");
+                }
+            }
+        }
+    }
     // A delegation the account refused, or one that expired unrenewed, can do
     // nothing: report the daemon as not configured (and why, additively) so
     // the native app mints a fresh one instead of trusting its cached stamp.
@@ -450,7 +469,8 @@ fn cloud_handoff(state: &AppState, config: Option<&Configure>, workspace: &str) 
         config.role == super::protocol::Role::Device
             && config.delegation.workspace.is_none()
             && !config.hours_exhausted
-    }) && state.pro.configured.load(Ordering::Acquire)
+    }) && state.daemon_extension.is_some()
+        && state.pro.configured.load(Ordering::Acquire)
         && !execution::worker(state)
         && !super::drain::draining(state)
         && flushable(state, workspace)

@@ -1,11 +1,10 @@
 //! Auth subprocesses never forward their output to logs or HTTP errors.
-use serde_json::{json, Value};
 use std::{path::Path, process::Stdio, time::Duration};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncReadExt;
 
-pub(super) const LIMIT: usize = 64 * 1024;
-pub(super) const TIMEOUT: Duration = Duration::from_secs(8);
-pub(crate) struct Child {
+pub const LIMIT: usize = 64 * 1024;
+pub const TIMEOUT: Duration = Duration::from_secs(8);
+pub struct Child {
     pub child: tokio::process::Child,
     #[cfg(unix)]
     group: Option<rustix::process::Pid>,
@@ -122,15 +121,15 @@ pub(super) fn command(bin: &Path, args: &[&str], cwd: &Path) -> tokio::process::
     }
     cmd
 }
-pub(super) struct Output {
+pub struct Output {
     pub success: bool,
     pub code: Option<i32>,
     pub stdout: Vec<u8>,
 }
-pub(super) async fn output(cmd: &mut tokio::process::Command) -> Result<Output, &'static str> {
+pub async fn output(cmd: &mut tokio::process::Command) -> Result<Output, &'static str> {
     output_tracked(cmd, |_| {}).await
 }
-pub(super) async fn output_tracked(
+pub async fn output_tracked(
     cmd: &mut tokio::process::Command,
     started: impl FnOnce(u32),
 ) -> Result<Output, &'static str> {
@@ -168,99 +167,10 @@ pub(super) async fn output_tracked(
         .map_err(|_| "probe_timeout")?
 }
 
-pub(super) struct Rpc {
-    _child: Child,
-    input: tokio::process::ChildStdin,
-    output: BufReader<tokio::process::ChildStdout>,
-    next_id: u64,
-}
-impl Rpc {
-    pub fn process_id(&self) -> Option<u32> {
-        self._child.child.id()
-    }
-    pub async fn open(bin: &Path, cwd: &Path) -> Result<Self, &'static str> {
-        Self::open_command(command(bin, &["app-server"], cwd)).await
-    }
-    pub async fn open_command(mut cmd: tokio::process::Command) -> Result<Self, &'static str> {
-        cmd.stdin(Stdio::piped()).stderr(Stdio::null());
-        let mut rpc = Self::spawn_command(cmd)?;
-        rpc.initialize().await?;
-        Ok(rpc)
-    }
-    pub fn spawn_command(mut cmd: tokio::process::Command) -> Result<Self, &'static str> {
-        cmd.stdin(Stdio::piped()).stderr(Stdio::null());
-        let mut child = Child::spawn(&mut cmd)?;
-        Ok(Self {
-            input: child.child.stdin.take().ok_or("start_failed")?,
-            output: BufReader::new(child.child.stdout.take().ok_or("start_failed")?),
-            _child: child,
-            next_id: 0,
-        })
-    }
-    pub async fn initialize(&mut self) -> Result<(), &'static str> {
-        self.request(
-            "initialize",
-            json!({"clientInfo":{"name":"chimaera-provider","version":chimaera_core::VERSION}}),
-        )
-        .await?;
-        self.send(json!({"method":"initialized"})).await?;
-        Ok(())
-    }
-    async fn send(&mut self, value: Value) -> Result<(), &'static str> {
-        let mut bytes = serde_json::to_vec(&value).map_err(|_| "protocol_error")?;
-        bytes.push(b'\n');
-        self.input
-            .write_all(&bytes)
-            .await
-            .map_err(|_| "connection_closed")
-    }
-    pub async fn next(&mut self) -> Result<Value, &'static str> {
-        // read_until on a limited adapter caps allocation before parsing;
-        // checking String::len after lines().next_line() would be too late.
-        let mut bytes = Vec::new();
-        let n = (&mut self.output)
-            .take((LIMIT + 1) as u64)
-            .read_until(b'\n', &mut bytes)
-            .await
-            .map_err(|_| "connection_closed")?;
-        if n == 0 {
-            return Err("connection_closed");
-        }
-        if n > LIMIT {
-            return Err("output_limit");
-        }
-        serde_json::from_slice(&bytes).map_err(|_| "protocol_error")
-    }
-    pub async fn request(&mut self, method: &str, params: Value) -> Result<Value, &'static str> {
-        self.next_id += 1;
-        let id = self.next_id;
-        let work = async {
-            self.send(json!({"id":id,"method":method,"params":params}))
-                .await?;
-            // Notifications are bounded too: a noisy child cannot monopolize
-            // an auth request indefinitely even before the wall-time fence.
-            for _ in 0..64 {
-                let msg = self.next().await?;
-                if msg["id"].as_u64() != Some(id) {
-                    continue;
-                }
-                if msg.get("error").is_some() {
-                    return Err("provider_rejected");
-                }
-                return msg.get("result").cloned().ok_or("protocol_error");
-            }
-            Err("output_limit")
-        };
-        tokio::time::timeout(TIMEOUT, work)
-            .await
-            .map_err(|_| "probe_timeout")?
-    }
-}
-
 /// Only used for a child process group that this service created and killed.
 /// A reused PID makes cleanup conservatively fail closed rather than releasing
 /// the provider's single-writer reservation while its status is uncertain.
-pub(super) fn group_alive(pid: u32) -> bool {
+pub fn group_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         rustix::process::Pid::from_raw(pid as i32).is_some_and(|pid| {

@@ -21,19 +21,18 @@ use tauri::{AppHandle, Manager};
 use crate::daemon::LocalDaemon;
 use crate::windows::{WindowRecord, WindowRegistry};
 
-mod cloud;
 mod cluster;
 mod commands;
-mod connect;
+pub(crate) mod connect;
 mod drag;
 pub(crate) mod notices;
-mod power;
+pub(crate) mod power;
 #[cfg(target_os = "macos")]
 mod print_frame;
 mod pro;
 mod quit;
 mod restore;
-mod tunnel;
+pub(crate) mod tunnel;
 mod unsaved;
 
 pub use restore::open_ui_window;
@@ -68,16 +67,17 @@ type ConnectFlight = tokio::sync::watch::Receiver<Option<Result<(), String>>>;
 
 /// App-global shell state.
 pub struct Shell {
+    pub(crate) app: AppHandle,
     /// The local daemon (mutable: the update affordance replaces it).
     pub local: Mutex<LocalDaemon>,
-    pro: pro::Pro,
+    pub(crate) pro: crate::account::OptionalAccount,
     /// Live tunnels by host alias.
-    tunnels: tokio::sync::Mutex<HashMap<String, Tunnel>>,
+    pub(crate) tunnels: tokio::sync::Mutex<HashMap<String, Tunnel>>,
     /// Tunnels that still have an owned forward but missed enough
     /// end-to-end probes to be considered down. Keeping this separate from
     /// `tunnels` lets reconnect do one final proof before teardown while
     /// `list_hosts` remains honest in a home-only window.
-    unhealthy_tunnels: Mutex<HashSet<String>>,
+    pub(crate) unhealthy_tunnels: Mutex<HashSet<String>>,
     /// Aliases whose tunnel the monitor confirmed down and no connect has
     /// since proven — the "possibly a wedged ControlMaster" verdict. Unlike
     /// `unhealthy_tunnels` it is NOT pruned when the tunnel goes away: a
@@ -90,7 +90,7 @@ pub struct Shell {
     /// The hosts.json entry each connected alias was last stamped with, so
     /// publishing a connect (joiners, healthy-tunnel reuse) never reloads
     /// the file.
-    host_entries: Mutex<HashMap<String, chimaera_remote::hosts::HostEntry>>,
+    pub(crate) host_entries: Mutex<HashMap<String, chimaera_remote::hosts::HostEntry>>,
     /// Live tunnels to cluster workspace jobs, keyed `"{alias}#job{job_id}"`.
     /// Separate from `tunnels`: a job tunnel is its own type with its own
     /// ladder and a walltime-bounded lifetime.
@@ -119,7 +119,7 @@ pub struct Shell {
     /// focus-existing (open the same workspace → raise its window instead of a
     /// duplicate). The SPA reports its own scope because it swaps `ws`
     /// client-side without a shell round-trip.
-    windows: Mutex<HashMap<String, WindowScope>>,
+    pub(crate) windows: Mutex<HashMap<String, WindowScope>>,
     /// Most recently focused native window. macOS clears every window's
     /// focused flag when the application deactivates, so Dock reopen and a
     /// repeated launch need this label to restore the prior frontmost window.
@@ -139,7 +139,7 @@ pub struct Shell {
     /// before a reconnect unusable if its port is later recycled.
     allowed_daemon_ports: Mutex<HashMap<String, u16>>,
     /// The persisted window set (windows.json) — what the next launch reopens.
-    registry: Mutex<WindowRegistry>,
+    pub(crate) registry: Mutex<WindowRegistry>,
     /// Last confirmed first-paint palette per host. Unlike web storage this
     /// survives volatile daemon/tunnel ports and app restarts.
     appearance: Mutex<crate::appearance::AppearanceCache>,
@@ -153,9 +153,6 @@ pub struct Shell {
     /// Each window's unsaved-file count and the close/quit prompts it is
     /// answering (see `unsaved`).
     unsaved: Mutex<unsaved::Guard>,
-    /// Whether a quit is asking (or handing work to the cloud) because an
-    /// agent is working on this computer (see `quit`).
-    quit_gate: Mutex<quit::Gate>,
     /// Live cross-window drags: source label → the sibling its pointer
     /// currently hovers (None over desktop). Entries live for one drag;
     /// `done_drags` is what fences late per-frame updates, so the entry
@@ -246,6 +243,10 @@ fn askpass_scope_matches(scope: &AskpassScope, prompt_alias: Option<&str>) -> bo
 }
 
 impl WindowScope {
+    pub fn home_hub(&self) -> bool {
+        self.home_hub
+    }
+
     pub(crate) fn new(alias: Option<String>, ws: Option<String>, stable_id: String) -> Self {
         let askpass_scope = match &alias {
             Some(alias) => AskpassScope::Host(alias.clone()),
@@ -320,7 +321,7 @@ impl WindowScope {
         }
     }
 
-    pub(crate) fn navigation_pending(&self) -> bool {
+    pub fn navigation_pending(&self) -> bool {
         self.navigation_pending
     }
 
@@ -580,6 +581,25 @@ fn closing_ends_app(app: &AppHandle, shell: &Shell, label: &str) -> bool {
         && !lock(&shell.windows)
             .get(label)
             .is_some_and(WindowScope::reopens_home)
+}
+
+/// Focus only the existing native handoff/closing/last-focused window. The
+/// account contribution cannot access or mutate the host's registry tables.
+pub(crate) fn raise_quit_question(app: &AppHandle, original_close: Option<&str>) {
+    let target = app
+        .get_webview_window(quit::HANDOFF_WINDOW)
+        .or_else(|| original_close.and_then(|label| app.get_webview_window(label)))
+        .or_else(|| {
+            let label = lock(&app.state::<Shell>().last_focused_window).clone();
+            label.and_then(|label| app.get_webview_window(&label))
+        });
+    #[cfg(target_os = "macos")]
+    let _ = app.show();
+    if let Some(window) = target {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
 }
 
 /// Activate the app the way a macOS app conventionally answers a Dock click
@@ -944,8 +964,9 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
     let fresh = handle.try_state::<Shell>().is_none();
     if fresh {
         handle.manage(Shell {
+            app: handle.clone(),
             local: Mutex::new(local),
-            pro: pro::Pro::load(),
+            pro: crate::account::OptionalAccount::default(),
             tunnels: tokio::sync::Mutex::new(HashMap::new()),
             unhealthy_tunnels: Mutex::new(HashSet::new()),
             wedge_suspects: Mutex::new(HashSet::new()),
@@ -966,7 +987,6 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
             quitting: AtomicBool::new(false),
             last_close_needs_home: AtomicBool::new(false),
             unsaved: Mutex::new(unsaved::Guard::default()),
-            quit_gate: Mutex::new(quit::Gate::default()),
             drags: Mutex::new(HashMap::new()),
             done_drags: Mutex::new(HashMap::new()),
             transfers: Mutex::new(HashMap::new()),
@@ -974,18 +994,20 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
         });
     } else {
         *lock(&handle.state::<Shell>().local) = local;
-        let app = handle.clone();
-        tauri::async_runtime::spawn(async move {
-            pro::refresh_serve(&app.state::<Shell>()).await;
-        });
     }
     if fresh {
         // Before any window opens: the watchers start polling right away,
         // and a window's first scope report may already owe it a focus.
         notices::start(handle);
-        pro::start(handle.clone());
-        // Work handed to the cloud on the last quit may come home again.
-        quit::welcome_back(handle);
+    }
+    let installed = activate_account(handle);
+    if !fresh && !installed {
+        if let Some(owner) = handle.state::<Shell>().pro.owner().cloned() {
+            let app = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                owner.refresh_serve(app.clone()).await;
+            });
+        }
     }
     // Reopen last session's windows. Restore itself registers a home surface
     // before launching any remote ssh that may need askpass, and also covers
@@ -1029,8 +1051,9 @@ fn open_setup_window(handle: &tauri::AppHandle) -> tauri::Result<()> {
 }
 
 /// Build and run the Tauri app.
-pub fn run() {
+pub fn run(factory: Option<crate::account::Factory>, context: tauri::Context<tauri::Wry>) {
     tauri::Builder::default()
+        .manage(AccountFactory(factory, Mutex::new(())))
         // Must be registered first: the plugin intercepts a second launch
         // before any other plugin or process-global shell resource starts.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -1041,38 +1064,38 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_clipboard_manager::init())
-        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
-            cloud::pro_cloud_request,
-            cloud::pro_cloud_status,
-            pro::pro_status,
-            pro::pro_refresh_account,
-            pro::projects::pro_cloud_projects,
-            pro::projects::pro_open_cloud_project,
-            pro::projects::pro_copy_project,
-            pro::projects::pro_take_over_project,
-            pro::project_secrets::pro_project_secrets_catalog,
-            pro::project_secrets::pro_project_secret_command,
-            pro::project_secrets::pro_project_secret_operation,
-            pro::personal_providers::pro_personal_provider_mode,
-            pro::personal_providers::pro_personal_provider_catalog,
-            pro::personal_providers::pro_personal_provider_command,
-            pro::personal_providers::pro_personal_provider_operation,
-            pro::personal_providers::pro_personal_provider_open,
-            pro::billing::pro_billing_checkout,
-            pro::billing::pro_billing_portal,
-            pro::billing::pro_cancel_billing,
-            pro::pro_take_return,
-            pro::pro_mirror_status,
-            pro::pro_set_never_mirror,
-            pro::pro_sign_in,
-            pro::pro_cancel_sign_in,
-            pro::pro_sign_out,
-            pro::pro_sign_out_everywhere,
-            pro::pro_hosts,
-            pro::pro_set_host_kept,
-            pro::pro_devices,
-            pro::pro_revoke_device,
+            crate::account::commands::pro_cloud_request,
+            crate::account::commands::pro_cloud_status,
+            crate::account::commands::pro_status,
+            crate::account::commands::pro_refresh_account,
+            crate::account::commands::pro_cloud_projects,
+            crate::account::commands::pro_open_cloud_project,
+            crate::account::commands::pro_copy_project,
+            crate::account::commands::pro_take_over_project,
+            crate::account::commands::pro_project_secrets_catalog,
+            crate::account::commands::pro_project_secret_command,
+            crate::account::commands::pro_project_secret_operation,
+            crate::account::commands::pro_personal_provider_mode,
+            crate::account::commands::pro_personal_provider_catalog,
+            crate::account::commands::pro_personal_provider_command,
+            crate::account::commands::pro_personal_provider_operation,
+            crate::account::commands::pro_personal_provider_open,
+            crate::account::commands::pro_billing_checkout,
+            crate::account::commands::pro_billing_portal,
+            crate::account::commands::pro_cancel_billing,
+            crate::account::commands::pro_take_return,
+            crate::account::commands::pro_mirror_status,
+            crate::account::commands::pro_set_never_mirror,
+            crate::account::commands::pro_settle_setup_proposal,
+            crate::account::commands::pro_sign_in,
+            crate::account::commands::pro_cancel_sign_in,
+            crate::account::commands::pro_sign_out,
+            crate::account::commands::pro_sign_out_everywhere,
+            crate::account::commands::pro_hosts,
+            crate::account::commands::pro_set_host_kept,
+            crate::account::commands::pro_devices,
+            crate::account::commands::pro_revoke_device,
             commands::list_hosts,
             commands::add_host,
             commands::set_host_direct_ssh,
@@ -1284,29 +1307,31 @@ pub fn run() {
             }
             // The daemon must be up before the first window points at it;
             // block setup on it (fast when a daemon is already running).
-            let mut local =
-                match tauri::async_runtime::block_on(crate::daemon::ensure_local_daemon()) {
-                    Ok(local) => local,
-                    // Windows: anything that needs provisioning — no WSL, no
-                    // distro, no (current) daemon — goes through the wizard,
-                    // which shows the work; startup itself never downloads or
-                    // installs invisibly. Its finishing command
-                    // (wsl_setup_daemon) completes the startup this skips.
-                    Err(e) if e.downcast_ref::<crate::wsl::WslNotReady>().is_some() => {
-                        tracing::info!("WSL daemon not adoptable — opening the setup wizard");
-                        // Any pending update intent is moot on this path: the
-                        // wizard's ensure replaces an old-build daemon anyway,
-                        // and a stale intent must not fire on a LATER launch
-                        // detached from the click that authorized it.
-                        crate::update::clear_intent();
-                        open_setup_window(&handle)?;
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        tracing::error!("{e:#}");
-                        return Err(std::io::Error::other(format!("{e:#}")).into());
-                    }
-                };
+            let requirement = runtime_requirement(&handle);
+            let mut local = match tauri::async_runtime::block_on(
+                crate::daemon::ensure_local_daemon_for(requirement),
+            ) {
+                Ok(local) => local,
+                // Windows: anything that needs provisioning — no WSL, no
+                // distro, no (current) daemon — goes through the wizard,
+                // which shows the work; startup itself never downloads or
+                // installs invisibly. Its finishing command
+                // (wsl_setup_daemon) completes the startup this skips.
+                Err(e) if e.downcast_ref::<crate::wsl::WslNotReady>().is_some() => {
+                    tracing::info!("WSL daemon not adoptable — opening the setup wizard");
+                    // Any pending update intent is moot on this path: the
+                    // wizard's ensure replaces an old-build daemon anyway,
+                    // and a stale intent must not fire on a LATER launch
+                    // detached from the click that authorized it.
+                    crate::update::clear_intent();
+                    open_setup_window(&handle)?;
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::error!("{e:#}");
+                    return Err(std::io::Error::other(format!("{e:#}")).into());
+                }
+            };
             // A fresh update intent = the user clicked "update" in the OLD
             // process and the app half already swapped; finish the chain by
             // replacing the outdated daemon NOW, before any window loads its
@@ -1315,7 +1340,9 @@ pub fn run() {
             // below land on the new daemon with everything where it was.
             if crate::update::consume_intent() && local.outdated {
                 tracing::info!("update intent: replacing the outdated local daemon");
-                match tauri::async_runtime::block_on(crate::daemon::update_local_daemon()) {
+                match tauri::async_runtime::block_on(crate::daemon::update_local_daemon_for(
+                    requirement,
+                )) {
                     Ok(fresh) => local = fresh,
                     // The old daemon keeps serving; the update stays a
                     // visible affordance instead of a silent failure.
@@ -1337,7 +1364,7 @@ pub fn run() {
             finished?;
             Ok(())
         })
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while building chimaera")
         .run(|app, event| match event {
             // A Dock click: AppKit's activation already raises every visible
@@ -1403,7 +1430,9 @@ pub fn run() {
                     cluster::end_all_terminals(app);
                     cluster::end_attached_jobs(app);
                     tauri::async_runtime::block_on(async {
-                        pro::stop(&state).await;
+                        if let Some(owner) = state.pro.owner().cloned() {
+                            owner.stop(app.clone()).await;
+                        }
                         let tunnels: Vec<_> =
                             state.tunnels.lock().await.drain().map(|(_, t)| t).collect();
                         for tunnel in tunnels {
@@ -1427,6 +1456,34 @@ pub fn run() {
             }
             _ => {}
         });
+}
+
+struct AccountFactory(Option<crate::account::Factory>, Mutex<()>);
+
+fn runtime_requirement(app: &tauri::AppHandle) -> crate::daemon::RuntimeRequirement {
+    if app.state::<AccountFactory>().0.is_some() {
+        crate::daemon::RuntimeRequirement::Extension
+    } else {
+        crate::daemon::RuntimeRequirement::FreeCompatible
+    }
+}
+
+/// Publish the original owner once, only after the selected daemon is ready.
+/// This synchronous factory lock guards construction, not account mutation.
+fn activate_account(app: &tauri::AppHandle) -> bool {
+    let factory = app.state::<AccountFactory>();
+    let Some(create) = factory.0.as_ref() else {
+        return false;
+    };
+    let _construction = lock(&factory.1);
+    let state = app.state::<Shell>();
+    if state.pro.owner().is_some() || !runtime_requirement(app).ready(&lock(&state.local)) {
+        return false;
+    }
+    let owner = create(app.clone());
+    state.pro.install(owner.clone());
+    owner.start(app.clone());
+    true
 }
 
 #[cfg(test)]

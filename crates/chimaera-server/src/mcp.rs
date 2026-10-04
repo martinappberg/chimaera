@@ -271,7 +271,7 @@ pub(crate) async fn mcp(
                 tools
                     .as_array_mut()
                     .unwrap()
-                    .extend(cloud_context::definitions());
+                    .extend(cloud_context::definitions(&state));
             }
             Ok(json!({"tools":tools}))
         }
@@ -485,11 +485,10 @@ pub(crate) fn is_core_tool(name: &str) -> bool {
                 .as_array()
                 .expect("tool definitions are an array")
                 .iter()
-                .chain(cloud_context::definitions().iter())
                 .filter_map(|t| t["name"].as_str().map(str::to_owned))
                 .collect()
         });
-    NAMES.contains(name)
+    NAMES.contains(name) || cloud_context::NAMES.contains(&name)
 }
 
 fn base_tool_defs() -> Vec<Value> {

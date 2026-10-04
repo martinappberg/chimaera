@@ -63,18 +63,33 @@ fn service_responses_accept_additive_fields() {
 }
 
 #[tokio::test]
-async fn strict_worker_polling_fences_released_work_until_hydration() {
+async fn strict_worker_polling_refuses_missing_runtime_without_granting_execution() {
     use axum::{http::StatusCode, response::IntoResponse, routing::any, Json, Router};
     use std::sync::atomic::AtomicUsize;
     let (state, mut config, root) = fixture();
     config.role = Role::Worker;
     config.delegation.device_id = "worker-fixture".into();
+    config.execution.as_mut().unwrap().installation_id = None;
+    validate_configuration(&config).unwrap();
+    worker_fixture(&state);
     let released = json!({
         "workspace_id":"w-a", "holder_id":null, "epoch":3, "requires_fork":false,
         "server_now":"2026-09-28T00:00:00Z", "expires_at":null,
         "continuity":{"version":2,"mode":"managed_v1","policy_revision":1,"preferred_installation_id":"i-home"},
         "execution_capability":{"version":1,"boundary":"managed_processes","expired_takeover":false}
     });
+    // A passive, normally validated enrollment is metadata, not a lease.
+    // The absent Runtime cannot install a proof or thaw this strict worker.
+    observe(
+        &state,
+        &config,
+        &serde_json::from_value(released.clone()).unwrap(),
+    )
+    .unwrap();
+    assert!(managed(&state, "w-a"));
+    assert!(!lease_valid(&state, "w-a"));
+    assert!(!crate::pro::may_execute(&state, "w-a"));
+    assert!(crate::pro::may_execute(&state, "w-free"));
     let mutations = Arc::new(AtomicUsize::new(0));
     let counted = mutations.clone();
     let router = Router::new().fallback(any(move |request: axum::extract::Request| {
@@ -95,15 +110,16 @@ async fn strict_worker_polling_fences_released_work_until_hydration() {
     config.endpoint = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     lock(&state.pro.ownership).insert("w-a".into(), Ownership::Local { epoch: 1 });
-    super::super::engine::reconcile(&state, &config, "w-a")
+    let error = super::super::engine::reconcile(&state, &config, "w-a")
         .await
-        .unwrap();
-    assert!(managed(&state, "w-a"));
-    assert!(!checkpoint_mode(&state, "w-a"));
+        .unwrap_err();
+    assert_eq!(error.to_string(), "optional_runtime_unavailable");
+    assert!(!lease_valid(&state, "w-a"));
+    assert!(crate::pro::may_execute(&state, "w-free"));
     assert_eq!(mutations.load(Ordering::SeqCst), 0);
     assert!(matches!(
         lock(&state.pro.ownership).get("w-a"),
-        Some(Ownership::Hydrating { epoch: 3 })
+        Some(Ownership::Local { epoch: 1 })
     ));
     assert!(!crate::pro::may_execute(&state, "w-a"));
     server.abort();

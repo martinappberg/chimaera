@@ -81,6 +81,12 @@ struct LoginDaemonWire {
 }
 
 impl HostState {
+    pub fn mark_kept(mut self) -> Self {
+        self.via_pro = true;
+        self.kept = true;
+        self
+    }
+
     /// Attach what is known about `entry` being a cluster: this process's
     /// live verdict when there is one, else the hint hosts.json keeps.
     pub(super) fn with_cluster(
@@ -130,29 +136,29 @@ struct ConnectProgress {
 /// screen watching a startup-restore connect — don't stay "connecting"
 /// forever on a failure they never hear about.
 #[derive(Clone, Serialize)]
-pub(super) struct HostStatus {
-    pub(super) alias: String,
-    pub(super) status: &'static str,
-    pub(super) local_port: Option<u16>,
+pub(crate) struct HostStatus {
+    pub(crate) alias: String,
+    pub(crate) status: &'static str,
+    pub(crate) local_port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) token: Option<String>,
+    pub(crate) token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) error: Option<String>,
+    pub(crate) error: Option<String>,
     /// Human-facing context for a liveness transition. Unlike `error`, this
     /// does not mean a reconnect attempt failed; it explains why one began.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) reason: Option<String>,
+    pub(crate) reason: Option<String>,
     /// Source build behind the tunnel. Open windows use a changed build as a
     /// navigation boundary even when the forward kept its port and token:
     /// hashed UI chunks never span daemon builds.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) build: Option<String>,
+    pub(crate) build: Option<String>,
     /// On `connected`: the login node the tunnel is pinned to (a pool alias
     /// whose daemon runs on another node than where the alias lands).
     /// Every connected event carries it, so a row re-routed by a reconnect it
     /// didn't start never keeps a stale node.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) node: Option<String>,
+    pub(crate) node: Option<String>,
 }
 
 fn connected_status(
@@ -211,7 +217,11 @@ pub(super) fn state_for(
 /// reply. Every success path uses this, including healthy-tunnel reuse and
 /// joined flights: a caller may still hold an old daemon token even though
 /// another window already rebuilt the shared tunnel.
-async fn publish_connected_state(app: &AppHandle, state: &Shell, alias: &str) -> Option<HostState> {
+pub(crate) async fn publish_connected_state(
+    app: &AppHandle,
+    state: &Shell,
+    alias: &str,
+) -> Option<HostState> {
     // The entry the flight stamped; a miss (none this process) is the only
     // publish that reads hosts.json.
     // The guard must not live across the fallback's await.
@@ -264,6 +274,8 @@ async fn run_connect(
     let opts = ConnectOpts {
         local_port,
         binary: entry.binary.clone(),
+        // Direct SSH stays the free deployment path in either native assembly.
+        deployment_source: chimaera_remote::DeploymentSource::PublicRelease,
         update_daemon,
         login_serve: entry.login_serve,
         not_cluster: entry.not_cluster,
@@ -308,7 +320,7 @@ fn emit_progress_at(app: &AppHandle, alias: &str, phase: &'static str, node: Opt
 /// attempt per alias runs at a time; every concurrent caller awaits that
 /// flight's outcome, so N windows reconnecting share ONE ssh auth flow (one
 /// 2FA prompt) instead of stampeding or bouncing with errors.
-pub(super) async fn do_connect(
+pub(crate) async fn do_connect(
     app: &AppHandle,
     alias: String,
     update_daemon: bool,
@@ -321,7 +333,7 @@ pub(super) async fn restore_connect(app: &AppHandle, alias: String) -> Result<Ho
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ConnectIntent {
+pub enum ConnectIntent {
     Explicit,
     Restore,
 }
@@ -392,10 +404,8 @@ async fn connect_with_intent(
             let via_pro = (!entry.direct_ssh && entry.kept)
                 || keeper_route_selected(
                     entry.direct_ssh,
-                    state.pro.client_now().is_some(),
-                    lock(&state.pro.hosts)
-                        .values()
-                        .any(|host| host.alias == alias),
+                    state.pro.active(),
+                    state.pro.hosts().iter().any(|host| host.alias == alias),
                 );
             // Probe liveness WITHOUT holding the tunnels lock: this is a ~2s
             // HTTP round-trip, and holding the map locked across it would
@@ -466,20 +476,21 @@ async fn run_flight(
     // tunnel's teardown below — to the row's "probing" label (the same one
     // `connect` re-emits when it starts).
     emit_progress(app, alias, "probing");
-    if let Some((client, host, generation)) = super::pro::connection(&state, alias).await? {
-        if !super::tunnel::app_host(&host.kind) {
-            // The account's cloud is never connected as a host, so no window
-            // (a restored one from an older build, say) shows its own page
-            // and no update is ever offered for it. Checked before any
-            // reconnect, so nothing wakes it.
-            forget_cloud_windows(&state, alias);
-            return Err(CLOUD_IS_NOT_A_HOST.into());
+    if let Some(owner) = state.pro.owner().cloned() {
+        if let Some(reply) = owner
+            .connect(app.clone(), alias.into(), update_daemon, intent)
+            .await?
+        {
+            return Ok(reply);
         }
-        return run_link_flight(app, client, host, generation, update_daemon, intent)
-            .await
-            .map_err(|error| match error {
-                LinkFailure::Transport(error) | LinkFailure::Final(error) => error,
-            });
+    } else {
+        let saved_alias = alias.to_owned();
+        let entry = with_hosts(move |hosts| Ok(hosts.get(&saved_alias))).await?;
+        if entry.is_some_and(|entry| entry.kept && !entry.direct_ssh)
+            || lock(&state.registry).is_link_device(alias)
+        {
+            return Err("This kept host needs Chimaera Pro. Choose Direct in advanced host settings to connect from this computer.".into());
+        }
     }
     // Remove under the map lock, then do process/network teardown without it.
     // `Tunnel::close` is bounded but still asynchronous; holding this lock made
@@ -586,17 +597,13 @@ async fn run_flight(
     Ok(host_state)
 }
 
-/// The answer to a connect aimed at the account's cloud.
-const CLOUD_IS_NOT_A_HOST: &str =
-    "Your cloud doesn't open as a window here. Chimaera keeps it up to date for you.";
-
 fn keeper_route_selected(direct_ssh: bool, signed_in: bool, known_keeper: bool) -> bool {
     !direct_ssh && signed_in && known_keeper
 }
 
 /// Drop saved windows on the account's cloud (an older build could open one):
 /// they would only ever show the cloud's own page, which the app never opens.
-fn forget_cloud_windows(state: &Shell, alias: &str) {
+pub(crate) fn forget_cloud_windows(state: &Shell, alias: &str) {
     let mut registry = lock(&state.registry);
     let saved: Vec<String> = registry
         .list()
@@ -615,173 +622,11 @@ fn forget_cloud_windows(state: &Shell, alias: &str) {
     }
 }
 
-/// All failures of an account-owned route remain on that route. Direct SSH
-/// is selected only by the host's explicit per-computer advanced preference.
-#[derive(Debug)]
-enum LinkFailure {
-    Transport(String),
-    Final(String),
-}
-impl From<String> for LinkFailure {
-    fn from(error: String) -> Self {
-        Self::Final(error)
-    }
-}
-impl From<&str> for LinkFailure {
-    fn from(error: &str) -> Self {
-        Self::Final(error.into())
-    }
-}
-
-async fn run_link_flight(
-    app: &AppHandle,
-    client: chimaera_link::Client,
-    mut host: chimaera_link::Host,
-    generation: u64,
-    reconnect: bool,
-    intent: ConnectIntent,
-) -> Result<HostState, LinkFailure> {
-    let state = app.state::<Shell>();
-    let alias = host.alias.clone();
-    let transport = |_| LinkFailure::Transport("Chimaera Pro is unreachable".into());
-    let current = || state.pro.generation() == generation;
-    if !current() {
-        return Err("Account changed while connecting".into());
-    }
-    let accepted = reconnect || !keeper_host_ready(&host);
-    if accepted {
-        if intent != ConnectIntent::Explicit {
-            return Err(KEEPER_CONNECT_REQUIRED.into());
-        }
-        host = explicit_keeper_connect(app, &state, &client, host, generation).await?;
-    }
-    if let Some(cluster) = host
-        .cluster
-        .as_ref()
-        .filter(|cluster| !cluster.not_cluster && !cluster.login_serve)
-    {
-        if cluster.scheduler != chimaera_link::ClusterScheduler::Slurm {
-            return Err("This keeper's cluster type isn't supported by this app".into());
-        }
-        client.cluster_capabilities().await.map_err(|_| {
-            LinkFailure::Final("This keeper needs an update before opening its Jobs page".into())
-        })?;
-        // Account replacement owns the same operation gate. Keep this owner
-        // through local persistence, window retirement and the final event.
-        let authority = keeper_landing_authority(&state.pro.operation, current).await?;
-        let previous = remove_current_keeper_tunnel(&state.tunnels, &alias, current).await?;
-        if let Some(previous) = previous {
-            previous.close().await;
-        }
-        if !current() {
-            return Err("Account changed while connecting".into());
-        }
-        let found = chimaera_remote::ClusterHost {
-            host: alias.clone(),
-            scheduler: chimaera_core::slurm::Scheduler::Slurm,
-            login_daemon: None,
-        };
-        let mut reply = landed_on_cluster(app, &alias, &found, Some(authority)).await;
-        reply.via_pro = true;
-        reply.kept = true;
-        return Ok(reply);
-    }
-    let existing = {
-        let mut tunnels = state.tunnels.lock().await;
-        tunnels
-            .get_mut(&alias)
-            .filter(|tunnel| tunnel.link_id() == Some(host.id.as_str()))
-            .map(|tunnel| {
-                tunnel.update_link(&host);
-                (tunnel.local_port, tunnel.manifest.token.clone())
-            })
-    };
-    let new = if existing.is_none() {
-        let link = chimaera_link::LinkTunnel::bind(client, host.id.clone())
-            .await
-            .map_err(|error| {
-                if accepted {
-                    LinkFailure::Final("Chimaera Pro is unreachable".into())
-                } else {
-                    transport(error)
-                }
-            })?;
-        Some(Tunnel::link(&host, link).map_err(|error| error.to_string())?)
-    } else {
-        None
-    };
-    let (port, token) = existing
-        .or_else(|| {
-            new.as_ref()
-                .map(|tunnel| (tunnel.local_port, tunnel.manifest.token.clone()))
-        })
-        .ok_or("Host is unavailable")?;
-    let probe_deadline = tokio::time::Instant::now() + KEEPER_PROBE_WAIT;
-    let mut pause = KEEPER_POLL_FIRST;
-    while !chimaera_remote::http_alive_authed(port, &token).await {
-        let unanswered = "Pro connected, but the host daemon did not answer";
-        if !accepted {
-            return Err(LinkFailure::Transport(unanswered.into()));
-        }
-        if !current() {
-            return Err("Account changed while connecting".into());
-        }
-        if tokio::time::Instant::now() >= probe_deadline {
-            return Err(unanswered.into());
-        }
-        tokio::time::sleep(pause).await;
-        pause = (pause * 2).min(KEEPER_POLL_MAX);
-    }
-    authorize_scope_origin(app, Some(&alias), port).map_err(|error| error.to_string())?;
-    let old = {
-        let mut tunnels = state.tunnels.lock().await;
-        // Sign-out drains under the same map lock after advancing this epoch.
-        // An in-flight health check must never reinstall its old account.
-        if state.pro.generation() != generation {
-            return Err("Account changed while connecting".into());
-        }
-        new.and_then(|tunnel| tunnels.insert(alias.clone(), tunnel))
-    };
-    if let Some(old) = old {
-        old.close().await;
-    }
-    let mut entry = if host.kind == chimaera_link::HostKind::Ssh {
-        let saved_alias = alias.clone();
-        with_hosts(move |hosts| {
-            hosts.set_kept(&saved_alias, true)?;
-            hosts.record_connected(&saved_alias)
-        })
-        .await?
-    } else {
-        host_entry(&alias).await
-    };
-    entry.kept = true;
-    lock(&state.host_entries).insert(alias.clone(), entry);
-    let reply = publish_connected_state(app, &state, &alias)
-        .await
-        .ok_or("Host disconnected while connecting")?;
-    reopen_windows(app, &alias, port, &token);
-    Ok(reply)
-}
-
-type KeeperLandingAuthority = std::sync::Arc<tokio::sync::OwnedMutexGuard<()>>;
-
-async fn keeper_landing_authority(
-    operation: &std::sync::Arc<tokio::sync::Mutex<()>>,
-    current: impl Fn() -> bool,
-) -> Result<KeeperLandingAuthority, LinkFailure> {
-    let guard = operation.clone().lock_owned().await;
-    if !current() {
-        return Err("Account changed while connecting".into());
-    }
-    Ok(std::sync::Arc::new(guard))
-}
-
-async fn remove_current_keeper_tunnel<T>(
+pub(crate) async fn remove_current_keeper_tunnel<T>(
     tunnels: &tokio::sync::Mutex<std::collections::HashMap<String, T>>,
     alias: &str,
     current: impl Fn() -> bool,
-) -> Result<Option<T>, LinkFailure> {
+) -> Result<Option<T>, String> {
     let mut tunnels = tunnels.lock().await;
     if !current() {
         return Err("Account changed while connecting".into());
@@ -789,172 +634,7 @@ async fn remove_current_keeper_tunnel<T>(
     Ok(tunnels.remove(alias))
 }
 
-fn keeper_host_ready(host: &chimaera_link::Host) -> bool {
-    host.status == chimaera_link::HostStatus::Connected
-        && (host.daemon.is_some()
-            || host
-                .cluster
-                .as_ref()
-                .is_some_and(|cluster| !cluster.login_serve && !cluster.not_cluster))
-}
-
-async fn explicit_keeper_connect(
-    _app: &AppHandle,
-    state: &Shell,
-    client: &chimaera_link::Client,
-    host: chimaera_link::Host,
-    generation: u64,
-) -> Result<chimaera_link::Host, LinkFailure> {
-    let current = || state.pro.generation() == generation;
-    #[cfg(all(feature = "ssh-agent-prototype", unix))]
-    if host.kind == chimaera_link::HostKind::Ssh {
-        use crate::ssh_agent::{connect, selection};
-        let deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_secs(chimaera_link::SSH_AUTH_LIFETIME.into());
-        let attempt = state
-            .pro
-            .ssh_authentication(generation)
-            .map_err(|_| "Account changed while connecting")?;
-        let mut cancellation = attempt.cancellation();
-        let caps = native_keeper_capabilities(client, &attempt, deadline, current).await?;
-        if !caps.route_policy_supported() {
-            return Err("This keeper needs an update before native route authentication".into());
-        }
-        let prompt_app = _app.clone();
-        let prompt_alias = host.alias.clone();
-        let generation_app = _app.clone();
-        let owner = crate::ssh_agent::trust::Owner {
-            alias: host.alias.clone(),
-            guard: attempt.native_prompt(deadline),
-            account: state.pro.operation.clone(),
-            current: std::sync::Arc::new(move || {
-                generation_app.state::<Shell>().pro.generation() == generation
-            }),
-            prompt: std::sync::Arc::new(move |prompt, guard| {
-                let app = prompt_app.clone();
-                let alias = prompt_alias.clone();
-                Box::pin(async move {
-                    crate::askpass::native_owned_prompt(&app, &alias, prompt, guard).await
-                })
-            }),
-        };
-        let selection = tokio::select! {
-            biased;
-            _ = cancellation.wait_for(|value| *value) => return Err("Account changed while connecting".into()),
-            result = crate::ssh_agent::trust::resolve(&host.alias, caps.keeper_boot, owner) => result,
-        }.map_err(|error| match error {
-            selection::SelectionFailure::HostTrustRequired => "This SSH hop needs a writable native known_hosts destination before fingerprint approval",
-            selection::SelectionFailure::RevokedHost => "An SSH hop's key is revoked on this Mac",
-            selection::SelectionFailure::TooManyKeys => "Choose this host's SSH identity in your SSH settings before connecting",
-            _ => "This SSH route couldn't be verified on this Mac. Check its settings or choose Direct in advanced host settings",
-        })?;
-        return connect::authenticate_route(client, &host.id, selection, attempt, || async {
-            await_keeper_login(|| client.hosts(), &host.id, current,
-                tokio::time::Instant::now() + KEEPER_LOGIN_WAIT, KEEPER_POLL_FIRST)
-                .await.map_err(|_| chimaera_link::SshAuthFailure::Unavailable)
-        }).await.map_err(|_| "Couldn't authenticate this SSH route through the keeper. Check the hop's trust, SSH key or prompt and connect again.".into());
-    }
-    if !current() {
-        return Err("Account changed while connecting".into());
-    }
-    client
-        .reconnect_host(&host.id)
-        .await
-        .map_err(|_| LinkFailure::Transport("Chimaera Pro is unreachable".into()))?;
-    await_keeper_login(
-        || client.hosts(),
-        &host.id,
-        current,
-        tokio::time::Instant::now() + KEEPER_LOGIN_WAIT,
-        KEEPER_POLL_FIRST,
-    )
-    .await
-}
-
-/// The first negotiation spends the original Connect lifetime too. No native
-/// key capture or prompt may follow a reply from a retired account/attempt.
-#[cfg(all(feature = "ssh-agent-prototype", unix))]
-async fn native_keeper_capabilities(
-    client: &chimaera_link::Client,
-    attempt: &crate::ssh_agent::lifecycle::Attempt,
-    deadline: tokio::time::Instant,
-    current: impl Fn() -> bool,
-) -> Result<chimaera_link::SshAuthCapabilities, LinkFailure> {
-    let mut cancellation = attempt.cancellation();
-    if !current() || *cancellation.borrow() {
-        return Err("Account changed while connecting".into());
-    }
-    if tokio::time::Instant::now() >= deadline {
-        return Err("SSH authentication expired; connect again".into());
-    }
-    let caps = tokio::select! {
-        biased;
-        _ = cancellation.wait_for(|value| *value) => return Err("Account changed while connecting".into()),
-        result = tokio::time::timeout_at(deadline, client.ssh_auth_capabilities()) => {
-            result.map_err(|_| LinkFailure::Final("SSH authentication expired; connect again".into()))?
-                .map_err(|_| LinkFailure::Final("This keeper needs an update before connecting with this Mac's SSH keys".into()))?
-        },
-    };
-    if !current() || *cancellation.borrow() {
-        return Err("Account changed while connecting".into());
-    }
-    if tokio::time::Instant::now() >= deadline {
-        return Err("SSH authentication expired; connect again".into());
-    }
-    Ok(caps)
-}
-
-/// A keeper login can wait minutes for a password or Duo answer.
-const KEEPER_LOGIN_WAIT: std::time::Duration = std::time::Duration::from_secs(180);
-/// A freshly connected daemon can take a moment to answer through the route.
-const KEEPER_PROBE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
-const KEEPER_POLL_FIRST: std::time::Duration = std::time::Duration::from_millis(500);
-const KEEPER_POLL_MAX: std::time::Duration = std::time::Duration::from_secs(3);
-
-/// Waits for the keeper's row of a host whose reconnect it accepted. Polls
-/// with backoff instead of twice a second for the whole wait. A failed read
-/// says nothing about the login the keeper holds, so it never ends the wait
-/// early and never yields `Transport`: a direct SSH attempt now would raise a
-/// second password/Duo prompt.
-async fn await_keeper_login<F, Fut>(
-    mut read: F,
-    id: &str,
-    current: impl Fn() -> bool,
-    deadline: tokio::time::Instant,
-    first_pause: std::time::Duration,
-) -> Result<chimaera_link::Host, LinkFailure>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = anyhow::Result<Vec<chimaera_link::Host>>>,
-{
-    let mut pause = first_pause;
-    let mut last_error = None;
-    loop {
-        if !current() {
-            return Err("Account changed while connecting".into());
-        }
-        match read().await {
-            Ok(hosts) => {
-                let host = hosts
-                    .into_iter()
-                    .find(|candidate| candidate.id == id)
-                    .ok_or("Host is no longer kept connected")?;
-                if keeper_host_ready(&host) {
-                    return Ok(host);
-                }
-                last_error = host.error;
-            }
-            Err(error) => tracing::debug!("Pro connection status unavailable: {error:#}"),
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(last_error
-                .unwrap_or_else(|| "Pro connection timed out".into())
-                .into());
-        }
-        tokio::time::sleep(pause).await;
-        pause = (pause * 2).min(KEEPER_POLL_MAX);
-    }
-}
+type KeeperLandingAuthority = std::sync::Arc<tokio::sync::OwnedMutexGuard<()>>;
 
 pub(super) fn keeper_state(host: &chimaera_link::Host, tunnel: Option<&Tunnel>) -> HostState {
     let entry = HostEntry {
@@ -986,7 +666,7 @@ pub(super) fn keeper_state(host: &chimaera_link::Host, tunnel: Option<&Tunnel>) 
 /// Open every persisted window record for `alias` without a live window
 /// (matched on the record's stable id — an open window re-homes in place
 /// and must not be duplicated).
-fn reopen_windows(app: &AppHandle, alias: &str, port: u16, token: &str) {
+pub(crate) fn reopen_windows(app: &AppHandle, alias: &str, port: u16, token: &str) {
     let Some(shell) = app.try_state::<Shell>() else {
         return;
     };
@@ -1056,7 +736,7 @@ async fn drop_compute_tunnels_of(app: &AppHandle, state: &Shell, alias: &str) {
 /// The connect landed on a cluster: nothing was started. Remember what it
 /// found, forget windows that pointed at a login-node daemon (there is none
 /// now), and answer with the cluster's state — a success, not an error.
-async fn landed_on_cluster(
+pub(crate) async fn landed_on_cluster(
     app: &AppHandle,
     alias: &str,
     found: &chimaera_remote::ClusterHost,
@@ -1139,7 +819,7 @@ async fn cluster_state(state: &Shell, alias: &str) -> Option<HostState> {
     Some(state_for(&entry, "cluster", None).with_cluster(&entry, Some(&info)))
 }
 
-async fn host_entry(alias: &str) -> HostEntry {
+pub(crate) async fn host_entry(alias: &str) -> HostEntry {
     let owned = alias.to_string();
     with_hosts(move |hosts| Ok(hosts.get(&owned)))
         .await
@@ -1172,7 +852,7 @@ static HOSTS_IO: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// on the tokio reactor, where a slow home directory would stall every other
 /// tunnel op. The closure's error is flattened here so call sites are a
 /// plain `?`.
-pub(super) async fn with_hosts<T: Send + 'static>(
+pub(crate) async fn with_hosts<T: Send + 'static>(
     f: impl FnOnce(&mut HostsStore) -> anyhow::Result<T> + Send + 'static,
 ) -> Result<T, String> {
     let _serialized = HOSTS_IO.lock().await;
@@ -1187,107 +867,9 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    use super::{
-        await_keeper_login, claim_connect_flight, connected_status, reusable_tunnel_port,
-        LinkFailure,
-    };
+    use super::{claim_connect_flight, connected_status, reusable_tunnel_port};
     use crate::shell::lock;
     use chimaera_link::{Daemon, Host, HostKind, HostStatus};
-    use std::time::Duration;
-
-    #[cfg(all(feature = "ssh-agent-prototype", unix))]
-    #[tokio::test]
-    async fn native_capability_wait_obeys_original_deadline_and_account_retirement() {
-        use std::sync::{
-            atomic::{AtomicBool, Ordering},
-            Arc,
-        };
-        use tokio::sync::Semaphore;
-
-        struct Server(tokio::task::JoinHandle<()>);
-        impl Drop for Server {
-            fn drop(&mut self) {
-                self.0.abort();
-            }
-        }
-        // Stall the real capability HTTP response after the Link client has
-        // discovered its keeper. Neither sign-out nor expiry waits for Link's
-        // separate thirty-second HTTP timeout; a positive late reply cannot
-        // admit selection under a replaced account either.
-        for case in 0..3 {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let keeper = chimaera_link::fake::FakeKeeper::new(format!(
-                "http://{}",
-                listener.local_addr().unwrap()
-            ));
-            keeper.set_ssh_auth_supported(true).await;
-            let entered = Arc::new(Semaphore::new(0));
-            let release = Arc::new(Semaphore::new(0));
-            let arrived = entered.clone();
-            let resume = release.clone();
-            let router = keeper.router().layer(axum::middleware::from_fn(
-                move |request: axum::extract::Request, next: axum::middleware::Next| {
-                    let entered = arrived.clone();
-                    let release = resume.clone();
-                    async move {
-                        if request.uri().path() == "/v1/ssh/auth/capabilities" {
-                            entered.add_permits(1);
-                            release.acquire().await.unwrap().forget();
-                        }
-                        next.run(request).await
-                    }
-                },
-            ));
-            let _server = Server(tokio::spawn(async move {
-                axum::serve(listener, router).await.unwrap();
-            }));
-            let client = chimaera_link::Client::new(
-                &keeper.endpoint,
-                Some(chimaera_link::fake::FakeKeeper::tokens()),
-            )
-            .unwrap();
-            client.me().await.unwrap();
-            let registry = crate::ssh_agent::lifecycle::Registry::default();
-            let attempt = registry.admit(0).ok().unwrap();
-            let current = AtomicBool::new(true);
-            let deadline = tokio::time::Instant::now()
-                + if case == 0 {
-                    Duration::from_secs(1)
-                } else {
-                    Duration::from_secs(30)
-                };
-            let guard = attempt.native_prompt(deadline);
-            let result = tokio::time::timeout(Duration::from_secs(3), async {
-                let request =
-                    super::native_keeper_capabilities(&client, &attempt, deadline, || {
-                        current.load(Ordering::Acquire)
-                    });
-                let retire = async {
-                    entered.acquire().await.unwrap().forget();
-                    match case {
-                        0 => {} // Keep the server stalled past the original deadline.
-                        1 => registry.advance(1),
-                        _ => {
-                            current.store(false, Ordering::Release);
-                            release.add_permits(1);
-                        }
-                    }
-                };
-                tokio::join!(request, retire).0
-            })
-            .await
-            .expect("a stalled capability request must settle within its original admission");
-            let Err(LinkFailure::Final(message)) = result else {
-                panic!("retired negotiation must refuse before native selection");
-            };
-            if case == 0 {
-                assert_eq!(message, "SSH authentication expired; connect again");
-                assert!(!guard.active());
-            } else {
-                assert_eq!(message, "Account changed while connecting");
-            }
-        }
-    }
 
     #[test]
     fn saved_direct_choice_overrides_known_keeper_without_changing_kept_state() {
@@ -1361,120 +943,6 @@ mod tests {
         drop(held);
         assert!(old.await.unwrap().is_err());
         assert_eq!(tunnels.lock().await.get("host"), Some(&"replacement"));
-    }
-
-    #[tokio::test]
-    async fn keeper_landing_retains_account_authority_through_canceled_hosts_persistence() {
-        use std::sync::{
-            atomic::{AtomicU64, Ordering},
-            Arc,
-        };
-        let operation = Arc::new(tokio::sync::Mutex::new(()));
-        let generation = Arc::new(AtomicU64::new(1));
-        let authority =
-            super::keeper_landing_authority(&operation, || generation.load(Ordering::SeqCst) == 1)
-                .await
-                .unwrap();
-        // The blocking file writer owns its clone even if native IPC is canceled.
-        let persistence = authority.clone();
-        drop(authority);
-        let waiting = operation.clone();
-        let epoch = generation.clone();
-        let replacement = tokio::spawn(async move {
-            let _guard = waiting.lock().await;
-            epoch.store(2, Ordering::SeqCst);
-        });
-        tokio::task::yield_now().await;
-        assert_eq!(generation.load(Ordering::SeqCst), 1);
-        assert!(!replacement.is_finished());
-        drop(persistence);
-        replacement.await.unwrap();
-        assert!(
-            super::keeper_landing_authority(&operation, || generation.load(Ordering::SeqCst) == 1)
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn kept_slurm_ready_without_login_daemon_finishes_authentication() {
-        let mut cluster = row(HostStatus::Connected, false);
-        cluster.cluster = Some(chimaera_link::HostCluster {
-            scheduler: chimaera_link::ClusterScheduler::Slurm,
-            login_serve: false,
-            not_cluster: false,
-        });
-        let result = await_keeper_login(
-            || std::future::ready(Ok(vec![cluster.clone()])),
-            "h-1",
-            || true,
-            tokio::time::Instant::now() + Duration::from_millis(30),
-            Duration::from_millis(1),
-        )
-        .await
-        .unwrap();
-        assert!(result.daemon.is_none());
-        cluster.cluster.as_mut().unwrap().login_serve = true;
-        assert!(
-            !super::keeper_host_ready(&cluster),
-            "login opt-in needs a daemon"
-        );
-        cluster.cluster.as_mut().unwrap().login_serve = false;
-        cluster.cluster.as_mut().unwrap().not_cluster = true;
-        assert!(
-            !super::keeper_host_ready(&cluster),
-            "ordinary remote needs a daemon"
-        );
-    }
-
-    #[tokio::test]
-    async fn failed_reads_during_an_accepted_login_are_waited_out() {
-        let mut script = vec![
-            Err(anyhow::anyhow!("account unavailable")),
-            Ok(vec![row(HostStatus::Prompting, false)]),
-            Err(anyhow::anyhow!("keeper unavailable")),
-            Ok(vec![row(HostStatus::Connected, true)]),
-        ]
-        .into_iter();
-        let host = await_keeper_login(
-            || std::future::ready(script.next().expect("polled past the script")),
-            "h-1",
-            || true,
-            tokio::time::Instant::now() + Duration::from_secs(10),
-            Duration::from_millis(1),
-        )
-        .await
-        .expect("the login completes");
-        assert_eq!(host.status, HostStatus::Connected);
-    }
-
-    #[tokio::test]
-    async fn an_accepted_login_never_falls_back_to_direct_ssh() {
-        let reads = std::cell::Cell::new(0);
-        let failure = await_keeper_login(
-            || {
-                reads.set(reads.get() + 1);
-                std::future::ready(Err(anyhow::anyhow!("account unavailable")))
-            },
-            "h-1",
-            || true,
-            tokio::time::Instant::now() + Duration::from_millis(40),
-            Duration::from_millis(1),
-        )
-        .await
-        .expect_err("the wait ends at its deadline");
-        assert!(matches!(failure, LinkFailure::Final(_)), "{failure:?}");
-        assert!(reads.get() > 1, "failed reads are retried");
-        let gone = await_keeper_login(
-            || std::future::ready(Ok(Vec::new())),
-            "h-1",
-            || true,
-            tokio::time::Instant::now() + Duration::from_secs(10),
-            Duration::from_millis(1),
-        )
-        .await
-        .expect_err("the row is gone");
-        assert!(matches!(gone, LinkFailure::Final(_)), "{gone:?}");
     }
 
     #[test]

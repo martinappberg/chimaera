@@ -295,7 +295,13 @@ pub(crate) fn stage_startup(state: &AppState, startup: Option<Startup>) -> Resul
     *pending = Some(startup.receipt);
     Ok(())
 }
-#[cfg(test)]
+#[cfg(any(
+    test,
+    all(
+        feature = "daemon-extension-fixture",
+        feature = "provider-authority-prototype"
+    )
+))]
 pub(crate) fn stage(state: &AppState, receipt: Option<CleanupReceipt>) {
     *lock(&state.pro.execution.supervisor_pending) = receipt;
 }

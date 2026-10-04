@@ -8,9 +8,6 @@ import { describe, expect, it } from "vitest";
 // header), which live outside these files.
 const sources = Object.fromEntries(Object.entries(import.meta.glob<string>([
   "/src/lib/pro/**/*.{svelte,ts}",
-  "/src/lib/settings/CloudSetup.svelte",
-  "/src/lib/settings/ProSettings.svelte",
-  "/src/lib/settings/MirrorSettings.svelte",
 ], { query: "?raw", import: "default", eager: true })).filter(([file]) => !file.endsWith(".test.ts")));
 
 // Cluster logins the user added on Home (their own SSH hosts, which Home
@@ -41,9 +38,9 @@ function hits(pattern: RegExp): string[] {
 }
 
 describe("Chimaera Pro vocabulary", () => {
-  it("scans the Pro and cloud settings sources", () => {
+  it("scans the remaining public Pro transport and shared copy sources", () => {
     expect(Object.keys(sources)).toEqual(expect.arrayContaining([
-      "/src/lib/settings/CloudSetup.svelte", "/src/lib/pro/ProviderConnections.svelte", "/src/lib/pro/presentation.ts", "/src/lib/pro/providers.ts",
+      "/src/lib/pro/presentation.ts", "/src/lib/pro/providers.ts",
     ]));
   });
   it("never calls the cloud a machine", () => {

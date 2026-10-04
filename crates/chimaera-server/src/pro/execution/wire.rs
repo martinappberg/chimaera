@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ExecutionCapability {
+pub struct ExecutionCapability {
     pub version: u16,
     pub boundary: String,
     pub expired_takeover: bool,
@@ -51,20 +51,20 @@ pub(crate) struct ExecutionConfiguration {
 // capability above and the local configure/recovery/identity records stay
 // exact: an unknown field there means a different contract, not a newer one.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Continuity {
+pub struct Continuity {
     pub version: u16,
     pub mode: String,
     pub policy_revision: u64,
     pub preferred_installation_id: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ExecutionLease {
+pub struct ExecutionLease {
     pub id: String,
     pub sequence: u64,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum Continuation {
+pub enum Continuation {
     Idle,
     Interrupted,
     /// Unknown evidence is uncertain, never a blind replay.
@@ -73,7 +73,7 @@ pub(crate) enum Continuation {
     Uncertain,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Checkpoint {
+pub struct Checkpoint {
     pub id: String,
     pub sequence: u64,
     pub source_holder_id: String,

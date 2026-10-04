@@ -42,7 +42,7 @@ use crate::daemon::LocalDaemon;
 
 /// Daemon paths are POSIX on every supported desktop host, including Windows
 /// where the local daemon runs inside WSL. Backslashes are legitimate names.
-pub(crate) fn valid_daemon_root(root: &str) -> bool {
+pub fn valid_daemon_root(root: &str) -> bool {
     root.len() <= 4096
         && root.starts_with('/')
         && !root.contains('\0')
@@ -52,14 +52,14 @@ pub(crate) fn valid_daemon_root(root: &str) -> bool {
 /// A copy stays attached to the daemon selected before its native picker opens.
 /// In particular, a later WSL setup must not reinterpret that folder in another
 /// distro or route the request to a replacement daemon.
-pub(crate) struct CopyTarget {
+pub struct CopyTarget {
     local: LocalDaemon,
     #[cfg(windows)]
     adoption: std::sync::Arc<Adoption>,
 }
 
 impl CopyTarget {
-    pub(crate) fn capture(local: &LocalDaemon) -> anyhow::Result<Self> {
+    pub fn capture(local: &LocalDaemon) -> anyhow::Result<Self> {
         Ok(Self {
             local: local.clone(),
             #[cfg(windows)]
@@ -67,7 +67,7 @@ impl CopyTarget {
         })
     }
 
-    pub(crate) fn check(&self, local: &LocalDaemon) -> anyhow::Result<()> {
+    pub fn check(&self, local: &LocalDaemon) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.local.port == local.port && self.local.token == local.token,
             "project_open_failed"
@@ -77,7 +77,7 @@ impl CopyTarget {
         Ok(())
     }
 
-    pub(crate) fn validate_chosen(&self, chosen: &std::path::Path) -> anyhow::Result<()> {
+    pub fn validate_chosen(&self, chosen: &std::path::Path) -> anyhow::Result<()> {
         #[cfg(windows)]
         picked_path(
             chosen
@@ -90,7 +90,7 @@ impl CopyTarget {
         Ok(())
     }
 
-    pub(crate) async fn destination(
+    pub async fn destination(
         &self,
         chosen: std::path::PathBuf,
     ) -> anyhow::Result<std::path::PathBuf> {

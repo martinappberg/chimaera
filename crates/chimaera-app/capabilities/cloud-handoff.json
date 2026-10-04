@@ -1,7 +1,0 @@
-{
-  "identifier": "cloud-handoff",
-  "description": "The shell-local window shown while quitting sends work to the cloud (assets/handoff.html). Its Quit button only closes that window; the shell turns the close into the quit. No shell command is granted.",
-  "windows": ["cloud-handoff"],
-  "local": true,
-  "permissions": ["core:window:allow-close"]
-}

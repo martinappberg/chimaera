@@ -6,13 +6,19 @@ Worker-only readiness and explicitly requested provider authentication. Parent:
 
 | File | Responsibility |
 |---|---|
-| `mod.rs` | Catalog adapters, allowlisted status parsing, bounded single-flight cache, authenticated HTTP handlers the handoff `readiness` helper, and catalog-only passive prompt observations (expired/absent status is unknown). |
-| `process.rs` | Capped CLI output and Codex auth-only JSON-RPC; owned process-group cleanup: direct-child exit is observed with `WNOWAIT` (EINTR retried), descendants are stopped before the leader is reaped, and the group identity is then cleared. Output drains concurrently with that wait within the existing eight-second budget. No raw output enters HTTP errors or logs. Its crate-visible child owner also backs the disabled fixed project GitHub consumer, retaining the same waitable-leader/group receipt. |
-| `claude.rs` | Official Claude CLI headless browser/code adapter; bounded URL extraction and one-time stdin reply, without a workspace or PTY. |
-| `github.rs` | Official GitHub CLI device-code adapter (`gh auth login --web`, piped, non-interactive): bounded parsing of its one-time code and GitHub's device page from stdout+stderr, then `gh auth setup-git`; no workspace, PTY or browser on the machine. |
-| `connect.rs` | Short-lived connection/disconnection jobs, one writer per provider, curated runtime installation (its visible install terminal), Codex and GitHub device codes, cancellation and cleanup acknowledgement. |
-| `disconnect.rs` | Official CLI logout adapters and fresh negative verification; personal-cloud scope, no credential-file reads or claims of vendor-wide revocation. |
-| `tests.rs`, `connect_tests.rs` | Status isolation, cache/freshness, real child/PTY cleanup, cancellation/retry races and device completion verification. GitHub's CLI is found on the login shell's PATH, so tests register a fake per fixture home (`preset_github`). |
+| `mod.rs` | Authenticated fixed legacy worker routes; one private owner handles readiness and passive observations. Unsupported IDs/oversized requests fail closed. Missing extension creates no probe/login task. |
+| `host.rs` | Public catalog/wire rows, inert once-cell admitting the existing worker environment or configured Worker for internal readiness; HTTP routes retain their environment guard. Fixed original executable/install/session effects and global ActivePermit. No AppState accessor, arbitrary command/URL or credential snapshot. |
+| `host/fixture.rs` | Explicit Unix daemon-extension-fixture only: actual AppState, synthetic provider binaries and original session/workspace observations. |
+| `process.rs` | Shared bounded Child/output and waitable-leader/group cleanup, including free codex notification. Provider RPC/parser policy is private. |
+
+Original cache/auth epoch/probe/connection/Attempt and official CLI adapters
+now live in private `crates/pro-daemon-runtime/src/providers` with original
+suites/provenance. Constructor is inert, called once. Passive reads never
+initialize it. Connect900s/disconnect60s/cleanup3s and bounded uncertain
+rechecks remain. Unfinished attempts retain the original ActivePermit after
+recheck exhaustion until positive group/session disappearance; manual shutdown
+recovery is unchanged and no new infinite task is introduced. Source-only,
+uncompiled/unrun until root gates; canonical provider capabilities unchanged.
 
 ## Contract
 
@@ -55,7 +61,7 @@ All routes are behind the daemon bearer middleware, under `/api/v1/pro/cloud`:
 
 ## Invariants
 
-- Worker-only personal-control enrollment, fixed login homes and credential extraction live in the private `chimaera-provider-login` executable. The public daemon has no personal-control CLI entrypoint, credential extractor or private-helper dependency. Its optional provider runtime consumers and public protocol DTOs remain here; legacy unisolated provider routes retain their existing adapters.
+- Worker-only personal-control enrollment, fixed login homes and credential extraction live in the private `chimaera-provider-login` executable. The public daemon has no personal-control CLI entrypoint, credential extractor or private-helper dependency. Its optional provider runtime consumers and public protocol DTOs remain here; legacy unisolated provider routes retain fixed public admission while their original adapters and one controller live in private `pro-daemon-runtime`.
 - Passive status never installs, logs in, starts a model turn, or wakes compute.
   Readiness is auth configuration reported by the official CLI, not a promise
   about its billing, quota or model entitlement. Legacy readiness and ordinary
@@ -135,7 +141,7 @@ support:
 1. Add the stable ID, label, `agent` or `repository` category, and exact verified
    HTTPS authentication origins to the [shared catalog](../../../../chimaera-core/src/cloud-providers.json).
    Every published browser/device page needs its origin here. Add the server adapter to
-   `PROVIDERS` in `mod.rs`; the HTTP catalog lists implemented adapters, not every
+   `PROVIDERS` in `host.rs`; the HTTP catalog lists implemented adapters, not every
    JSON entry. Keep catalog/adapter consistency tests passing.
 2. For an agent, extend [AgentKind](../../agent_state.rs),
    [launcher detection](../../launcher.rs) and the
@@ -144,16 +150,17 @@ support:
    connection request; never interpret a provider ID as an executable or reuse
    another provider's install/login fallback. Repository adapters must define
    their own binary discovery and honest missing-runtime behavior.
-3. Implement and live-verify the official auth-status protocol in `mod.rs` and
-   explicit login adapter in `connect.rs`/`process.rs`. Distinguish missing,
+3. Implement and live-verify official auth-status, login and RPC policy in the
+   private `pro-daemon-runtime/src/providers/{mod,connect,process}.rs` family,
+   retaining fixed public effect/admission handles in `host.rs`. Distinguish missing,
    signed out, signed in, and unverifiable status using allowlisted fields;
    never inspect credential files or expose raw output. Preserve probe deadlines,
    output caps, one writer per provider, expiry, activity accounting, cancellation
    and observed child cleanup. Login completion must trigger a fresh auth probe.
 4. Validate every published browser/device URL against that provider's catalog
    origins in the daemon, and preserve the matching
-   [native opener](../../../../chimaera-app/src/shell/cloud.rs) and
-   [browser policy](../../../../../web-ui/src/lib/pro/providers.ts) checks.
+   optional native client opener and browser validation through the
+   [account host interface](../../../../../web-ui/src/lib/extensions/accountPresentation.ts).
    Keep client-supplied URLs/commands out of opener requests. A new action shape
    needs coordinated daemon, native and UI support; existing terminal/device-code
    actions can reuse their current presentation.
@@ -166,8 +173,8 @@ support:
    `AgentKind::as_str()` must match the adapter ID because
    [provider_gate.rs](../../pro/provider_gate.rs) derives required providers from
    deferred sessions. Authentication alone must never grant unsupported resume.
-6. Keep [ProviderConnections](../../../../../web-ui/src/lib/pro/ProviderConnections.svelte)
-   driven by returned catalog rows, labels, categories and methods rather than a
+6. Keep the optional provider-connections presentation driven by returned
+   catalog rows, labels, categories and methods rather than a
    new hard-coded provider card. General onboarding needs one connected agent;
    each deferred session resumes once its own provider is ready (a provider not
    signed in holds back only its sessions; the project and everything else

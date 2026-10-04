@@ -498,15 +498,7 @@ connection and reconnects, and the reconnect snapshot replaces what was missed.
 
 ## Fixture and conformance
 
-The fixture is excluded from default builds and binds only literal `127.0.0.1`:
-
-```sh
-cargo run -p chimaera-link --features fixtures --bin fake-keeper -- \
-  --host cluster=127.0.0.1:9700
-cargo run -p chimaera-link --features fixtures --bin link-conformance -- \
-  --endpoint http://127.0.0.1:PORT --token fake-keeper-local-token --test-hooks
-cargo test -p chimaera-link --all-features
-```
+The public crate contains the protocol types and validators only. Run its contract tests with `cargo test -p chimaera-link`. The optional client package supplies `fake-keeper`, `link-conformance` and their real-socket lifecycle tests; those tools are not dependencies of the free workbench. A conforming fixture binds only literal `127.0.0.1`.
 
 `fake-keeper` prints its origin and static development token. `--listen` can pin a
 loopback port for restart/reconnect tests. `--daemon-manifest alias=/path/to/manifest.json`
@@ -683,9 +675,11 @@ keeper or a worker, and none accepts a host, a destination or a credential:
 
 | Method and path | Request | Response |
 | --- | --- | --- |
-| `GET /home/account` | — | `{email,plan,limits,usage,hours_exhausted,payment_due,returning_until}`: the `/v1/me` fields of those names; no identifiers, keeper address or prices |
+| `GET /home/account` | — | `{email,plan,limits,usage,hours_exhausted,payment_due,returning_until,account_lifetime}`: the `/v1/me` account fields plus the optional lifetime receipt; no identifiers, keeper address or prices |
 | `GET /home/projects` | — | `{projects:[{workspace_id,name,href,available}],pending}` |
-| `POST /home/sign-out` | — (the account Origin and `X-Chimaera-Browser: 1`) | `204`; revokes this browser's own device and clears its cookie |
+| `POST /home/sign-out` | the account Origin, `X-Chimaera-Browser: 1`, optional `X-Chimaera-Account-Lifetime` | `204`; revokes this browser's own device; legacy requests clear its cookie |
+
+`account_lifetime`, when supplied, is a non-authorizing 64-character lowercase hexadecimal equality receipt for the freshly authenticated account, browser device and account session epoch. It survives ordinary access-token refresh and changes with the original account/device/epoch. A client binding an account presentation requires this field and submits it on its browser account, project, provider and secret reads/mutations, including initial mode/catalog selection and sign-out; it never retries without the header after a missing capability, mismatch or uncertain reply. Normal cookie authentication and same-origin mutation proof remain required. Gateway browser authentication checks a present malformed, duplicate or different receipt before any fixed route may select or act for its user: refusal is `409 account_changed` (typed provider/secret adapters retain `409 context_changed`), with no forwarding, revocation or cookie effects. Guarded success revokes only the original authenticated device and sends no `Set-Cookie`: a delayed reply must not erase a newer browser login. The old cookie no longer authenticates. Legacy header absence retains the existing cookie-clear response. Retired clients must not navigate a successor account after a late reply.
 
 `projects` lists the account's enrolled projects, whose `href` is
 `/workspace/{workspace_id}/`, then any other project registered on a cloud

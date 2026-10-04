@@ -12,8 +12,6 @@ import { workbenchPath } from "./base";
 import { writable } from "svelte/store";
 import { getHostLabel, getJobContext, getToken } from "./api";
 import type { Workspace } from "../workspace/sessions";
-import type { SecretCommand, SecretPage, SecretResult } from "../pro/projectSecrets";
-import type { ProviderMode, ProviderPage, ProviderOriginal, ProviderCommand, ProviderResult } from "../pro/personalProviders";
 
 interface TauriGlobal {
   core: { invoke: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T> };
@@ -1226,6 +1224,12 @@ export interface ProPlanPrice {
 
 /** Account controls are native-shell state, separate from daemon settings. */
 export interface ProStatus {
+  /** Opaque original account-owner lifetime, including signed-out state.
+   * Absent on older shells; a new private account surface requires it. */
+  account_lifetime?: string | null;
+  /** Original signed-out lifetime of a successful explicit native Sign in;
+   * only while that resulting generation remains current. Never mutation authority. */
+  completed_sign_in_lifetime?: string | null;
   initializing?: boolean;
   initialization_phase?: "keychain" | "account" | "connection" | null;
   available: boolean;
@@ -1283,16 +1287,12 @@ export interface CloudProvisioningStatus {
   attended_actions?: boolean;
 }
 
-export async function proCloudStatus(): Promise<CloudProvisioningStatus> {
-  const t = tauri();
-  if (t === null) throw new Error("Open the desktop app to check your cloud status.");
-  return t.core.invoke<CloudProvisioningStatus>("pro_cloud_status");
-}
-
-export async function proRefreshAccount(): Promise<void> {
-  const t = tauri();
-  if (t === null) return;
-  await t.core.invoke<void>("pro_refresh_account");
+/** Omission is compatibility for original callers only. New account surfaces
+ * always supply their captured receipt; a rejection never retries omission. */
+function accountGuard(expectedAccountLifetime?: string): { expectedAccountLifetime?: string } {
+  if (expectedAccountLifetime === undefined) return {};
+  if (!/^[0-9a-f]{64}$/.test(expectedAccountLifetime)) throw new Error("account_changed");
+  return { expectedAccountLifetime };
 }
 
 export interface CloudProject {
@@ -1314,16 +1314,12 @@ export interface CloudProjectOpen {
   local_copy?: LocalProjectCopy;
 }
 
-export async function proCloudProjects(): Promise<CloudProject[]> {
-  return (await tauri()?.core.invoke<CloudProject[]>("pro_cloud_projects")) ?? [];
-}
-
-export async function proOpenCloudProject(workspaceId: string): Promise<CloudProjectOpen | null> {
+export async function proOpenCloudProject(workspaceId: string, expectedAccountLifetime?: string): Promise<CloudProjectOpen | null> {
   const t = tauri();
   if (t === null) throw new Error("Open the desktop app to save a local project copy.");
   // A distinct command refuses old native shells before their legacy Open
   // implementation can acquire execution. Never fall back to that command.
-  return t.core.invoke<CloudProjectOpen | null>("pro_copy_project", { workspaceId }).catch(reason => {
+  return t.core.invoke<CloudProjectOpen | null>("pro_copy_project", { workspaceId, ...accountGuard(expectedAccountLifetime) }).catch(reason => {
     const detail = reason instanceof Error ? reason.message : typeof reason === "string" ? reason : "";
     if (/^Command pro_copy_project not found$/i.test(detail)) throw new Error("project_copy_update_required");
     throw reason;
@@ -1336,16 +1332,6 @@ export async function proTakeOverProject(workspaceId: string, expectedEpoch: num
   await t.core.invoke<void>("pro_take_over_project", { workspaceId, expectedEpoch });
 }
 
-export async function proBillingCheckout(plan: "pro" | "max", interval: "month" | "year"): Promise<void> {
-  const t = tauri();
-  if (t === null) throw new Error("Open the desktop app to choose a plan.");
-  await t.core.invoke<void>("pro_billing_checkout", { plan, interval });
-}
-
-export async function proCancelBilling(attemptId?: number): Promise<void> {
-  await tauri()?.core.invoke<void>("pro_cancel_billing", { attemptId });
-}
-
 export async function proTakeReturn(): Promise<boolean> {
   return (await tauri()?.core.invoke<boolean>("pro_take_return")) ?? false;
 }
@@ -1354,12 +1340,6 @@ export function onProReturn(handler: () => void): Promise<() => void> {
   const t = tauri();
   if (t === null) return Promise.resolve(() => {});
   return t.webviewWindow.getCurrentWebviewWindow().listen<null>("pro-return", () => handler());
-}
-
-export async function proBillingPortal(target?: { plan: "pro" | "max"; interval: "month" | "year" }): Promise<void> {
-  const t = tauri();
-  if (t === null) throw new Error("Open the desktop app to manage billing.");
-  await t.core.invoke<void>("pro_billing_portal", { target });
 }
 
 export interface ProHost {
@@ -1377,95 +1357,10 @@ export interface ProDevice {
   this: boolean;
 }
 
-export async function proStatus(): Promise<ProStatus> {
-  const t = tauri();
-  if (t === null) return { available: false, signed_in: false, email: null, plan: null, error: null };
-  return t.core.invoke<ProStatus>("pro_status");
-}
-
 export type ProAuthScreenHint = "sign-up" | "sign-in";
-
-export async function proSignIn(screenHint: ProAuthScreenHint = "sign-in"): Promise<void> {
-  const t = tauri();
-  if (t === null) throw new Error("not running in the native shell");
-  await t.core.invoke<void>("pro_sign_in", { screenHint });
-}
-
-export async function proCancelSignIn(): Promise<void> {
-  const t = tauri();
-  if (t === null) return;
-  await t.core.invoke<void>("pro_cancel_sign_in");
-}
-
-export async function proSignOut(): Promise<void> {
-  await tauri()?.core.invoke<void>("pro_sign_out");
-}
-
-export async function proSignOutEverywhere(): Promise<void> {
-  await tauri()?.core.invoke<void>("pro_sign_out_everywhere");
-}
-
-export async function proHosts(): Promise<ProHost[]> {
-  return (await tauri()?.core.invoke<ProHost[]>("pro_hosts")) ?? [];
-}
-
-export async function proSetHostKept(alias: string, kept: boolean): Promise<void> {
-  const t = tauri();
-  if (t === null) throw new Error("not running in the native shell");
-  await t.core.invoke<void>("pro_set_host_kept", { alias, kept });
-}
-
-export async function proDevices(): Promise<ProDevice[]> {
-  return (await tauri()?.core.invoke<ProDevice[]>("pro_devices")) ?? [];
-}
-
-export async function proRevokeDevice(deviceId: string): Promise<void> {
-  const t = tauri();
-  if (t === null) throw new Error("not running in the native shell");
-  await t.core.invoke<void>("pro_revoke_device", { deviceId });
-}
 
 export function onProChanged(handler: () => void): Promise<() => void> {
   return tauri()?.event.listen<null>("pro-changed", () => handler()) ?? Promise.resolve(() => {});
-}
-
-/** Additive account-Home IPC. There is no project-daemon/browser fallback. */
-export async function proProjectSecretsCatalog(after: string | null = null): Promise<SecretPage> {
-  const t = tauri();
-  if (t === null) throw new Error("project_secrets_unsupported");
-  return t.core.invoke<SecretPage>("pro_project_secrets_catalog", { after });
-}
-export async function proProjectSecretCommand(context: string, command: SecretCommand): Promise<SecretResult> {
-  const t = tauri();
-  if (t === null) throw new Error("project_secrets_unsupported");
-  return t.core.invoke<SecretResult>("pro_project_secret_command", { contextTag: context, payload: JSON.stringify(command) });
-}
-export async function proProjectSecretOperation(context: string, operationId: string): Promise<SecretResult> {
-  const t = tauri();
-  if (t === null) throw new Error("project_secrets_unsupported");
-  return t.core.invoke<SecretResult>("pro_project_secret_operation", { contextTag: context, operationId });
-}
-
-/** Personal controls retain an exact original login; no daemon fallback. */
-export async function proPersonalProviderMode(): Promise<ProviderMode> {
-  const t = tauri(); if (t === null) throw new Error("providers_unsupported");
-  return t.core.invoke<ProviderMode>("pro_personal_provider_mode");
-}
-export async function proPersonalProviderCatalog(): Promise<ProviderPage> {
-  const t = tauri(); if (t === null) throw new Error("providers_unsupported");
-  return t.core.invoke<ProviderPage>("pro_personal_provider_catalog");
-}
-export async function proPersonalProviderCommand(original: ProviderOriginal, command: ProviderCommand): Promise<ProviderResult> {
-  const t = tauri(); if (t === null) throw new Error("providers_unsupported");
-  return t.core.invoke<ProviderResult>("pro_personal_provider_command", { original, payload: JSON.stringify(command) });
-}
-export async function proPersonalProviderOperation(original: ProviderOriginal): Promise<ProviderResult> {
-  const t = tauri(); if (t === null) throw new Error("providers_unsupported");
-  return t.core.invoke<ProviderResult>("pro_personal_provider_operation", { original });
-}
-export async function proPersonalProviderOpen(original: ProviderOriginal): Promise<void> {
-  const t = tauri(); if (t === null) throw new Error("providers_unsupported");
-  await t.core.invoke<void>("pro_personal_provider_open", { original });
 }
 
 export type CloudProviderState = "missing" | "needs_sign_in" | "signed_in" | "unknown" | "unavailable";
@@ -1525,16 +1420,11 @@ export type CloudSetupRequest = { operation: "info" | "start" | "providers" }
   | { operation: "provider_connection" | "provider_cancel" | "open_provider_browser"; connection_id: string }
   | { operation: "resume_handoff"; workspace_id: string; expected_epoch: number }
   | { operation: "project"; url: string; name?: string };
-export async function proCloudRequest(request: CloudSetupRequest): Promise<CloudSetupInfo> {
-  const t = tauri();
-  if (t === null) throw new Error("Cloud account setup requires the native app");
-  return t.core.invoke<CloudSetupInfo>("pro_cloud_request", { request });
-}
 
 export interface MirrorProfile {
   setup_command: string | null;
   /** Additive: a setup command an agent proposed. It never runs until the
-   * user confirms it (`pro/profile.ts`), which makes it `setup_command`. */
+   * user confirms it in the private account surface, making it `setup_command`. */
   pending_setup_command?: string | null;
   laptop_only: string[];
   deferred: string[];
@@ -1563,11 +1453,7 @@ export interface MirrorStatus {
   renewal_failed?: boolean;
   sessions: { id: string; workspace_id: string; display_name?: string; name: string }[];
 }
-export async function proMirrorStatus(): Promise<MirrorStatus> {
+export async function proMirrorStatus(expectedAccountLifetime?: string): Promise<MirrorStatus> {
   const t = tauri(); if (t === null) throw new Error("Mirror settings require the native app");
-  return t.core.invoke<MirrorStatus>("pro_mirror_status");
-}
-export async function proSetNeverMirror(workspaceId: string, neverMirror: boolean): Promise<void> {
-  const t = tauri(); if (t === null) throw new Error("Mirror settings require the native app");
-  await t.core.invoke("pro_set_never_mirror", { workspaceId, neverMirror });
+  return t.core.invoke<MirrorStatus>("pro_mirror_status", { ...accountGuard(expectedAccountLifetime) });
 }

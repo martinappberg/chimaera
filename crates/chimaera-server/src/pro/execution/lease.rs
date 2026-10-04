@@ -25,7 +25,7 @@ pub(super) struct Deadline {
     lifetime: Duration,
 }
 impl Deadline {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "daemon-extension-fixture"))]
     pub(in crate::pro) fn expired_fixture() -> Self {
         Self {
             start: RequestStart::now(),

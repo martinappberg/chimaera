@@ -37,10 +37,11 @@ pub(super) struct Pending {
     channel_nonce: String,
     _protected: Protection,
 }
-/// Sealed to this trusted startup; synthetic actors cannot mint it at runtime.
+/// Sealed to trusted startup. Only tests and the explicit nondefault host
+/// fixture constructor can mint synthetic evidence; ordinary builds cannot.
 pub(super) struct Protection {
     pid: u32,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "daemon-extension-fixture"))]
     synthetic: bool,
 }
 impl Protection {
@@ -53,12 +54,12 @@ impl Protection {
         self.current()?;
         Ok(Self {
             pid: self.pid,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "daemon-extension-fixture"))]
             synthetic: self.synthetic,
         })
     }
     pub(super) fn current(&self) -> anyhow::Result<()> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "daemon-extension-fixture"))]
         if self.synthetic {
             return Ok(());
         }
@@ -68,7 +69,7 @@ impl Protection {
         );
         verify_process()
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "daemon-extension-fixture"))]
     pub(super) fn synthetic() -> Self {
         Self {
             pid: std::process::id(),
@@ -249,7 +250,7 @@ fn protect_process() -> anyhow::Result<Protection> {
     verify_process()?;
     Ok(Protection {
         pid: std::process::id(),
-        #[cfg(test)]
+        #[cfg(any(test, feature = "daemon-extension-fixture"))]
         synthetic: false,
     })
 }

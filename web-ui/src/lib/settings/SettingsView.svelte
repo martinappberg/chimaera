@@ -13,13 +13,13 @@
   import AgentsSettings from "./AgentsSettings.svelte";
   import EnvironmentSettings from "./EnvironmentSettings.svelte";
   import DocumentsSettings from "./DocumentsSettings.svelte";
-  import CloudSetup from "./CloudSetup.svelte";
-  import BrowserAccount from "../pro/BrowserAccount.svelte";
+  import { loadApplicationEntry } from "virtual:chimaera-application-entry";
+  const accountExtensionSelected = loadApplicationEntry !== null;
   import { isBrowserGateway } from "../net/base";
   import { isNativeShell } from "../net/native";
   import BrandMark from "../shared/BrandMark.svelte";
   import { accountPlan, proOffered } from "../net/plan";
-  import { isCloudMachine } from "../pro/cloudTransport";
+  import { legacyCloudRequest } from "../extensions/accountDaemon";
   import { pageVisible } from "../shared/visibility";
   import PluginsSettings from "./PluginsSettings.svelte";
   import { workspacePlugins } from "../plugins/store";
@@ -36,7 +36,7 @@
   /** The tab is showing (kept-alive tabs stay mounted while hidden).
    *  `account`: the web's Home, the account's own page. It has no daemon, so
    *  Settings is only Chimaera Pro, whose plan, usage and sign-out show in
-   *  place (`pro/BrowserAccount.svelte`). */
+   *  place (the private optional account presentation). */
   let { visible: tabVisible = true, account = false }: { visible?: boolean; account?: boolean } = $props();
 
   /**
@@ -69,9 +69,9 @@
    * behind the gateway (a laptop being viewed) has no cloud status to show. */
   let cloudMachine = $state(false);
   $effect(() => {
-    if (!isBrowserGateway() || cloudMachine || !tabVisible || !$pageVisible) return;
+    if (!accountExtensionSelected || !isBrowserGateway() || cloudMachine || !tabVisible || !$pageVisible) return;
     const controller = new AbortController();
-    void isCloudMachine(controller.signal)
+    void legacyCloudRequest({ operation: "info" }, controller.signal).then(value => value.available === true)
       .then((value) => { if (!controller.signal.aborted) cloudMachine = value; })
       .catch(() => { /* Passive; the next time Settings shows it asks again. */ });
     return () => controller.abort();
@@ -318,7 +318,9 @@
             <section data-section={group.category}>
               <h2 class="cat">Chimaera Pro</h2>
               {#if account}
-                <BrowserAccount visible={tabVisible} />
+                {#await import("../extensions/AccountApplicationView.svelte") then { default: AccountApplicationView }}
+                  <AccountApplicationView kind="account-settings" visible={tabVisible} />
+                {/await}
               {:else}
               <button class="pro-entry" aria-label={proAction === "Get Pro" ? "Get Chimaera Pro" : `View Chimaera ${$accountPlan === "max" ? "Max" : "Pro"} account`}
                 onclick={() => window.dispatchEvent(new Event("chimaera:open-pro"))}>
@@ -376,7 +378,9 @@
             </section>
           {:else if group.category === "Cloud"}
             <section data-section={group.category}>
-              <CloudSetup visible={tabVisible} />
+              {#await import("../extensions/AccountApplicationView.svelte") then { default: AccountApplicationView }}
+                <AccountApplicationView kind="cloud-setup" visible={tabVisible} />
+              {/await}
             </section>
           {:else if group.category === "Plugins"}
             <!-- Bespoke panel: each installed plugin's declared settings,

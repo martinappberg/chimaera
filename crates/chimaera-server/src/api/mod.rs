@@ -59,6 +59,8 @@ pub(crate) async fn health(State(state): State<Arc<AppState>>) -> Json<serde_jso
         // The build id lets clients spot daemon/client skew (semver is the
         // 0.0.1 sentinel on every dev build, so it cannot).
         "build": chimaera_core::BUILD_ID,
+        // Assembly presence is independent of SDK build compatibility.
+        "daemon_extension": state.daemon_extension.is_some(),
         "hostname": state.hostname,
         "pid": state.pid,
         "uptime_secs": state.started.elapsed().as_secs(),

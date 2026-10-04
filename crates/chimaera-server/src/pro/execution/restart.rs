@@ -320,10 +320,13 @@ pub(in crate::pro) async fn shutdown(state: &std::sync::Arc<AppState>) -> Result
     }
     crate::pro::persist(state).await
 }
-pub(in crate::pro) async fn persist_latch(state: &AppState) -> Result<()> {
+pub(in crate::pro) async fn persist_latch(
+    state: &AppState,
+    writer: tokio::sync::OwnedMutexGuard<Option<Vec<u8>>>,
+) -> Result<tokio::sync::OwnedMutexGuard<Option<Vec<u8>>>> {
     let mut workspaces: Vec<_> = lock(&state.pro.execution.latched).iter().cloned().collect();
     if workspaces.is_empty() {
-        return Ok(());
+        return Ok(writer);
     }
     ensure!(workspaces.len() <= 128, "execution workspace limit");
     workspaces.sort();
@@ -332,9 +335,13 @@ pub(in crate::pro) async fn persist_latch(state: &AppState) -> Result<()> {
         workspaces,
     })?;
     let path = state.pro.root.join("execution-authority.json");
-    tokio::task::spawn_blocking(move || crate::persist::atomic_write_json_durable(&path, bytes))
-        .await??;
-    Ok(())
+    // The state writer also excludes this latch's original blocking write.
+    // Keep its custody if the async observer is cancelled before settlement.
+    tokio::task::spawn_blocking(move || {
+        crate::persist::atomic_write_json_durable(&path, bytes)?;
+        Ok::<_, anyhow::Error>(writer)
+    })
+    .await?
 }
 /// The OS boot identifier changes only on a new kernel boot, where old local
 /// processes cannot survive. Suspend/hibernation keeps the same identifier.

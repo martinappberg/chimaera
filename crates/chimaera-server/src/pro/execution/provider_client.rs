@@ -25,7 +25,7 @@ const SOCKET: &str = "/run/chimaera/providers.sock";
 
 /// No Clone/Debug: only exact retained Ready can mint this owner. It has no
 /// caller-supplied binding, registration, capability, transport or generation.
-pub(super) struct Owner {
+pub struct Owner {
     state: Arc<AppState>,
     pending: Arc<Pending>,
     work: Arc<provider_ready::Work>,
@@ -36,6 +36,17 @@ pub(super) struct Owner {
     parent: Option<Arc<ChildLifetime>>,
 }
 impl Owner {
+    #[cfg(feature = "daemon-extension-fixture")]
+    pub fn admit(
+        context: &super::provider_fixture_host::Context,
+        command: wire::Command,
+        deadline: Instant,
+    ) -> Result<Self, wire::Error> {
+        context.current()?;
+        let owner = Self::new(&context.state, command, deadline)?;
+        context.current()?;
+        Ok(owner)
+    }
     pub(super) fn new(
         state: &Arc<AppState>,
         command: wire::Command,
@@ -62,7 +73,7 @@ impl Owner {
         owner.current()?;
         Ok(owner)
     }
-    pub(super) fn for_child(
+    pub fn for_child(
         child: &Arc<ChildLifetime>,
         command: wire::Command,
         deadline: Instant,
@@ -92,22 +103,22 @@ impl Owner {
         owner.current()?;
         Ok(owner)
     }
-    pub(super) fn claim(&self) -> Result<&wire::Request, wire::Error> {
+    pub fn claim(&self) -> Result<&wire::Request, wire::Error> {
         self.current()?;
         if self.request_used.swap(true, Ordering::AcqRel) {
             return Err(wire::Error::InvalidRequest);
         }
         self.request.as_ref().ok_or(wire::Error::StateChanged)
     }
-    pub(super) async fn connect(&self) -> Result<UnixStream, wire::Error> {
+    pub async fn connect(&self) -> Result<UnixStream, wire::Error> {
         let path = std::path::PathBuf::from(SOCKET);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "daemon-extension-fixture"))]
         let path = provider_ready::socket_fixture(&self.pending).unwrap_or(path);
         self.wait(UnixStream::connect(path))
             .await?
             .map_err(|_| wire::Error::Unavailable)
     }
-    pub(super) fn current(&self) -> Result<(), wire::Error> {
+    pub fn current(&self) -> Result<(), wire::Error> {
         if self
             .parent
             .as_ref()
@@ -122,7 +133,7 @@ impl Owner {
             Ok(())
         }
     }
-    pub(super) async fn wait<T>(&self, effect: impl Future<Output = T>) -> Result<T, wire::Error> {
+    pub async fn wait<T>(&self, effect: impl Future<Output = T>) -> Result<T, wire::Error> {
         self.current()?;
         let mut cancelled = self.work.cancel.subscribe();
         let mut parent = self
@@ -142,21 +153,21 @@ impl Owner {
         self.current()?;
         Ok(result)
     }
-    pub(super) fn project_root(&self) -> Result<std::path::PathBuf, wire::Error> {
+    pub fn project_root(&self) -> Result<std::path::PathBuf, wire::Error> {
         self.current()?;
         let root = accepted_root(&self.state, &self.pending)?;
         self.current()?;
         Ok(root)
     }
-    pub(super) fn observer(&self) -> Observer {
+    pub fn observer(&self) -> Observer {
         Observer {
             cancel: self.work.cancel.clone(),
         }
     }
-    pub(super) fn child_pending(&self, pending: bool) {
+    pub fn child_pending(&self, pending: bool) {
         self.child_pending.store(pending, Ordering::Release);
     }
-    pub(super) async fn github(&self) -> Result<wire::GithubAccess, wire::Error> {
+    pub async fn github(&self) -> Result<wire::GithubAccess, wire::Error> {
         self.current()?;
         if self.request_used.swap(true, Ordering::AcqRel) {
             return Err(wire::Error::InvalidRequest);
@@ -164,7 +175,7 @@ impl Owner {
         let request = self.request.as_ref().ok_or(wire::Error::StateChanged)?;
         let bytes = wire::encode_control(request)?;
         let path = std::path::PathBuf::from(SOCKET);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "daemon-extension-fixture"))]
         let path = provider_ready::socket_fixture(&self.pending).unwrap_or(path);
         let response = exchange(self, request, &bytes, &path).await?;
         match response.result {
@@ -185,7 +196,7 @@ impl Owner {
 }
 /// One child/frontend pinned to the original attachment; not a stream request.
 /// The observer retires it immediately, while actual child cleanup stays owned.
-pub(super) struct ChildLifetime {
+pub struct ChildLifetime {
     state: Arc<AppState>,
     pending: Arc<Pending>,
     work: Arc<provider_ready::Work>,
@@ -193,6 +204,16 @@ pub(super) struct ChildLifetime {
     process_pending: AtomicBool,
 }
 impl ChildLifetime {
+    #[cfg(feature = "daemon-extension-fixture")]
+    pub fn admit(
+        context: &super::provider_fixture_host::Context,
+        deadline: Instant,
+    ) -> Result<Arc<Self>, wire::Error> {
+        context.current()?;
+        let child = Self::new(&context.state, deadline)?;
+        context.current()?;
+        Ok(child)
+    }
     pub(super) fn new(state: &Arc<AppState>, deadline: Instant) -> Result<Arc<Self>, wire::Error> {
         let permit = CHILDREN
             .try_acquire()
@@ -208,7 +229,7 @@ impl ChildLifetime {
         child.current()?;
         Ok(child)
     }
-    pub(super) fn current(&self) -> Result<(), wire::Error> {
+    pub fn current(&self) -> Result<(), wire::Error> {
         if Instant::now() >= self.work.deadline
             || *self.work.cancel.borrow()
             || !provider_ready::child_current(&self.pending, &self.work)
@@ -219,30 +240,30 @@ impl ChildLifetime {
             Ok(())
         }
     }
-    pub(super) fn cancel(&self) {
+    pub fn cancel(&self) {
         self.work.cancel.send_replace(true);
     }
-    pub(super) fn observer(&self) -> Observer {
+    pub fn observer(&self) -> Observer {
         Observer {
             cancel: self.work.cancel.clone(),
         }
     }
-    pub(super) fn cancellation(&self) -> tokio::sync::watch::Receiver<bool> {
+    pub fn cancellation(&self) -> tokio::sync::watch::Receiver<bool> {
         self.work.cancel.subscribe()
     }
-    pub(super) fn deadline(&self) -> Instant {
+    pub fn deadline(&self) -> Instant {
         self.work.deadline
     }
-    pub(super) fn process_pending(&self, pending: bool) {
+    pub fn process_pending(&self, pending: bool) {
         self.process_pending.store(pending, Ordering::Release);
     }
-    pub(super) fn project_root(&self) -> Result<std::path::PathBuf, wire::Error> {
+    pub fn project_root(&self) -> Result<std::path::PathBuf, wire::Error> {
         self.current()?;
         let root = accepted_root(&self.state, &self.pending)?;
         self.current()?;
         Ok(root)
     }
-    pub(super) async fn wait<T>(&self, effect: impl Future<Output = T>) -> Result<T, wire::Error> {
+    pub async fn wait<T>(&self, effect: impl Future<Output = T>) -> Result<T, wire::Error> {
         self.current()?;
         let mut cancelled = self.cancellation();
         let value = tokio::select! {
@@ -295,7 +316,7 @@ fn accepted_root(state: &AppState, pending: &Pending) -> Result<std::path::PathB
 }
 /// Dropping the awaiting caller synchronously retires authority; the producer
 /// still owns its actual socket/group cleanup and quota until positive completion.
-pub(super) struct Observer {
+pub struct Observer {
     cancel: tokio::sync::watch::Sender<bool>,
 }
 impl Drop for Observer {

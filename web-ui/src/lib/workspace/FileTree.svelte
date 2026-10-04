@@ -28,8 +28,7 @@
     pasteInto,
   } from "./fileClipboard.svelte";
   import { getActiveWorkspaceId, isOwnerAsleep, isRemoteHost, projectStateNote } from "../net/api";
-  import { hereName, isKeptCopy, keptCopyHint } from "../pro/kept";
-  import { requestKeptReview } from "../pro/keptReviews.svelte";
+  import { hereName, isKeptCopy, keptCopyHint, requestKeptReview } from "../pro/kept";
   import { refetchWhenOwnerAwake } from "../net/reconnect";
   import { stemLength, validateEntryName } from "../shared/fsNames";
   import { contextMenu, type ContextMenuEntry } from "../shared/contextMenu.svelte";

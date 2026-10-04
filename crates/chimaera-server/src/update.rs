@@ -130,6 +130,15 @@ impl UpdateStatus {
 /// This daemon's update status as every surface reads it.
 pub(crate) fn status_json(state: &AppState) -> serde_json::Value {
     let managed = crate::pro::updates_managed(state);
+    if !managed && state.daemon_extension.is_some() {
+        // A composed executable cannot be updated from the public release feed.
+        // Keep the existing failure wire shape until its assembly has a channel.
+        return UpdateStatus {
+            error: Some("Updates for this daemon require its original application".into()),
+            ..UpdateStatus::default()
+        }
+        .to_json(false);
+    }
     crate::lock(&state.update).to_json(managed)
 }
 
@@ -213,7 +222,7 @@ pub(crate) async fn run_checker(state: Arc<AppState>) {
 ///
 /// The account's cloud never asks: the service updates its daemon.
 pub(crate) async fn check_now(state: &Arc<AppState>) {
-    if crate::pro::updates_managed(state) {
+    if crate::pro::updates_managed(state) || state.daemon_extension.is_some() {
         return;
     }
     // Every finished check moves the epoch (below, before the lock drops),

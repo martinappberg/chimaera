@@ -30,7 +30,7 @@ if (!target) {
 // Account Home has no daemon; a cluster's terminal-only window has no workbench.
 const termSession = terminalWindowSession();
 const app = isAccountHome()
-  ? import("./lib/pro/AccountHome.svelte").then(({ default: AccountHome }) => mount(AccountHome, { target }))
+  ? import("./lib/extensions/AccountApplicationView.svelte").then(({ default: AccountHome }) => mount(AccountHome, { target, props: { kind: "account-home" } }))
   : termSession !== null
     ? mount(TerminalWindow, { target, props: { sessionId: termSession } })
     : mount(App, { target });

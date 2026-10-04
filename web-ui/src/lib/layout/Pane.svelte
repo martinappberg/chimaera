@@ -607,7 +607,9 @@
   {:else if tab.surface === "pro"}
     {@const ProView = views.pro}
     {#if ProView !== undefined}
-      <ProView visible={active} />
+      <ProView visible={active} workspaceId={wsId} incarnation={tab}
+        current={() => node.tabs.some(candidate => candidate === tab)}
+        onClose={() => { const index = node.tabs.findIndex(candidate => candidate === tab); if (index >= 0) ctrl.closeTab(node.id, index); }} />
     {:else if viewErrors.pro}
       {@render loadFailure("pro", "Chimaera Pro")}
     {/if}

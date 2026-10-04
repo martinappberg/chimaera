@@ -962,16 +962,33 @@ where
 /// On overflow/timeout the child is killed and reaped; dropping a read future
 /// closes its pipe, so a producer cannot remain wedged behind backpressure.
 async fn collect_child_bounded(
+    child: Child,
+    secs: u64,
+    what: &str,
+) -> anyhow::Result<std::process::Output> {
+    collect_child_bounded_with_caps(
+        child,
+        secs,
+        what,
+        CHILD_STDOUT_MAX_BYTES,
+        CHILD_STDERR_MAX_BYTES,
+    )
+    .await
+}
+
+async fn collect_child_bounded_with_caps(
     mut child: Child,
     secs: u64,
     what: &str,
+    stdout_cap: usize,
+    stderr_cap: usize,
 ) -> anyhow::Result<std::process::Output> {
     let stdout = child.stdout.take().context("child stdout was not piped")?;
     let stderr = child.stderr.take().context("child stderr was not piped")?;
     let collect = async {
         let (stdout, stderr) = tokio::try_join!(
-            read_bounded(stdout, CHILD_STDOUT_MAX_BYTES, "stdout"),
-            read_bounded(stderr, CHILD_STDERR_MAX_BYTES, "stderr"),
+            read_bounded(stdout, stdout_cap, "stdout"),
+            read_bounded(stderr, stderr_cap, "stderr"),
         )?;
         let status = child.wait().await.context("failed to wait for child")?;
         Ok::<_, anyhow::Error>(std::process::Output {
@@ -1325,6 +1342,16 @@ pub enum Phase {
     Tunneling { local_port: u16 },
 }
 
+/// Which trusted source may supply a daemon when deployment is needed.
+/// Healthy reconnects never resolve a binary. Selected assemblies require the
+/// original explicit artifact instead of consulting the public release feed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DeploymentSource {
+    #[default]
+    PublicRelease,
+    ExplicitBinary,
+}
+
 /// Options for [`connect`].
 #[derive(Default)]
 pub struct ConnectOpts {
@@ -1333,6 +1360,8 @@ pub struct ConnectOpts {
     /// Explicit binary to install on the host if chimaera is missing;
     /// otherwise `~/.chimaera/dist/` is searched for a matching build.
     pub binary: Option<PathBuf>,
+    /// Fixed assembly deployment policy; the free default remains unchanged.
+    pub deployment_source: DeploymentSource,
     /// Reinstall the executable, even at the same build. A direct-host daemon
     /// restarts gracefully (SIGTERM); its live sessions end. Cluster job mode
     /// only stages the executable for future jobs, without starting a daemon.
@@ -1345,6 +1374,15 @@ pub struct ConnectOpts {
     /// workstation's PATH): it connects like any host, and a daemon started
     /// here doesn't tell its agents they are on a shared login node.
     pub not_cluster: bool,
+}
+
+impl ConnectOpts {
+    fn deployment_binary(&self) -> anyhow::Result<Option<&Path>> {
+        if self.deployment_source == DeploymentSource::ExplicitBinary && self.binary.is_none() {
+            bail!("The selected daemon requires an explicit compatible --binary artifact; automatic public release deployment is unavailable");
+        }
+        Ok(self.binary.as_deref())
+    }
 }
 
 /// `connect` found a cluster: a host whose login shell reaches a batch
@@ -1969,6 +2007,11 @@ trait RemoteOps {
         host: &str,
         manifest: &Manifest,
     ) -> anyhow::Result<Option<usize>>;
+    async fn remote_daemon_extension(
+        &self,
+        host: &str,
+        manifest: &Manifest,
+    ) -> anyhow::Result<Option<bool>>;
     async fn resolve_local_binary(
         &self,
         host: &str,
@@ -2023,6 +2066,13 @@ impl RemoteOps for SshOps {
         manifest: &Manifest,
     ) -> anyhow::Result<Option<usize>> {
         remote_sessions_count(host, manifest).await
+    }
+    async fn remote_daemon_extension(
+        &self,
+        host: &str,
+        manifest: &Manifest,
+    ) -> anyhow::Result<Option<bool>> {
+        remote_daemon_extension(host, manifest).await
     }
     async fn resolve_local_binary(
         &self,
@@ -2258,7 +2308,7 @@ async fn resolve_daemon(
             // Repair the executable for future jobs without starting anything
             // on the login node or disrupting jobs already using their inode.
             let binary = ops
-                .resolve_local_binary(host, opts.binary.as_deref(), progress)
+                .resolve_local_binary(host, opts.deployment_binary()?, progress)
                 .await?;
             ops.deploy_binary(host, &binary, progress).await?;
         }
@@ -2297,12 +2347,18 @@ async fn resolve_daemon(
                         sessions.map_or("unknown".to_string(), |n| n.to_string()),
                     );
                     progress(Phase::Updating);
+                    if opts.deployment_source == DeploymentSource::PublicRelease
+                        && opts.binary.is_none()
+                        && ops.remote_daemon_extension(host, &m).await? == Some(true)
+                    {
+                        bail!("The remote daemon has a selected runtime; automatic public release replacement is unavailable. Supply an explicit compatible --binary artifact");
+                    }
                     // Secure the replacement binary BEFORE stopping the
                     // running daemon: a failed download/build must never leave
                     // the host with nothing running (the bug that stranded a
                     // stopped daemon when a dev build 404'd on download).
                     let bin = ops
-                        .resolve_local_binary(host, opts.binary.as_deref(), progress)
+                        .resolve_local_binary(host, opts.deployment_binary()?, progress)
                         .await?;
                     ops.stop_remote(host, m.pid).await?;
                     ops.deploy_binary(host, &bin, progress).await?;
@@ -2340,11 +2396,13 @@ async fn resolve_daemon(
             }
         }
         _ => {
-            if opts.update_daemon {
+            if opts.update_daemon || opts.deployment_source == DeploymentSource::ExplicitBinary {
+                // A selected assembly must deploy its explicit artifact rather
+                // than start an unclassified executable already on disk.
                 // A broken/missing daemon is precisely when repair is useful;
                 // do not trust an existing on-disk binary just because it exists.
                 let binary = ops
-                    .resolve_local_binary(host, opts.binary.as_deref(), progress)
+                    .resolve_local_binary(host, opts.deployment_binary()?, progress)
                     .await?;
                 ops.deploy_binary(host, &binary, progress).await?;
             } else {
@@ -2905,6 +2963,83 @@ pub async fn remote_sessions_count(
     Ok(count_alive_sessions(&String::from_utf8_lossy(
         &output.stdout,
     )))
+}
+
+/// Observe composition only immediately before an implicit public replacement.
+/// Reuse the original route/address/token; no tunnel or route fallback is added.
+async fn remote_daemon_extension(host: &str, manifest: &Manifest) -> anyhow::Result<Option<bool>> {
+    anyhow::ensure!(
+        !manifest.token.is_empty()
+            && manifest.token.len() <= 512
+            && manifest
+                .token
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte)),
+        "Remote daemon composition credential shape refused"
+    );
+    let cmd = format!(
+        "curl -fsS -m 5 --config - http://127.0.0.1:{}/api/v1/health",
+        manifest.port
+    );
+    let mut command = ssh_cmd(host);
+    command
+        .arg(cmd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .context("failed to run ssh composition probe")?;
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        let line = format!("header = \"Authorization: Bearer {}\"\n", manifest.token);
+        if stdin.write_all(line.as_bytes()).await.is_err() {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            bail!("Remote daemon composition could not be confirmed");
+        }
+    }
+    let output = collect_child_bounded_with_caps(
+        child,
+        SSH_ONESHOT_SECS,
+        "ssh composition probe",
+        16 * 1024,
+        16 * 1024,
+    )
+    .await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "Remote daemon composition could not be confirmed"
+    );
+    parse_daemon_extension(&output.stdout, manifest)
+}
+
+fn parse_daemon_extension(bytes: &[u8], manifest: &Manifest) -> anyhow::Result<Option<bool>> {
+    anyhow::ensure!(
+        bytes.len() <= 16 * 1024,
+        "Remote daemon composition exceeded bound"
+    );
+    let value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|_| anyhow::anyhow!("Remote daemon composition could not be confirmed"))?;
+    anyhow::ensure!(
+        value["name"] == "chimaera"
+            && value["pid"].as_u64() == Some(u64::from(manifest.pid))
+            && value["hostname"].as_str() == Some(manifest.hostname.as_str())
+            && value["version"].as_str() == Some(manifest.version.as_str())
+            && manifest
+                .build
+                .as_deref()
+                .is_none_or(|build| value["build"].as_str() == Some(build)),
+        "Remote daemon composition identity did not match the original manifest"
+    );
+    match value.get("daemon_extension") {
+        None => Ok(None),
+        Some(value) => value
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| anyhow::anyhow!("Remote daemon composition could not be confirmed")),
+    }
 }
 
 /// Parse a `GET /api/v1/sessions` payload and count `alive: true` entries
@@ -6511,6 +6646,7 @@ mod tests {
     enum Call {
         RemoteProbe,
         RemoteSessionsCount,
+        RemoteDaemonExtension,
         ResolveLocalBinary,
         StopRemote,
         DeployBinary,
@@ -6530,6 +6666,8 @@ mod tests {
         probe_manifest: Option<Manifest>,
         alive: bool,
         sessions: Option<usize>,
+        daemon_extension: Option<bool>,
+        composition_unconfirmed: bool,
         resolved_bin: PathBuf,
         start_manifest: Manifest,
         /// Overrides the default probe (the manifest, written on the node
@@ -6549,6 +6687,8 @@ mod tests {
                 probe_manifest: None,
                 alive: false,
                 sessions: None,
+                daemon_extension: None,
+                composition_unconfirmed: false,
                 resolved_bin: PathBuf::from("/unused"),
                 start_manifest: fake_manifest(Some(chimaera_core::BUILD_ID), 999),
                 probe: None,
@@ -6601,6 +6741,15 @@ mod tests {
         ) -> anyhow::Result<Option<usize>> {
             self.record(Call::RemoteSessionsCount);
             Ok(self.sessions)
+        }
+        async fn remote_daemon_extension(
+            &self,
+            _host: &str,
+            _manifest: &Manifest,
+        ) -> anyhow::Result<Option<bool>> {
+            self.record(Call::RemoteDaemonExtension);
+            anyhow::ensure!(!self.composition_unconfirmed, "composition unconfirmed");
+            Ok(self.daemon_extension)
         }
         async fn resolve_local_binary(
             &self,
@@ -6826,6 +6975,211 @@ mod tests {
         assert_eq!(phases, vec!["probing"]);
     }
 
+    #[test]
+    fn daemon_composition_requires_original_identity_and_strict_boolean() {
+        let manifest = fake_manifest(Some("original.1"), 42);
+        let mut body = serde_json::json!({"name":"chimaera","pid":42,"hostname":"host","version":"0.0.1","build":"original.1"});
+        let parse = |value: &serde_json::Value| {
+            parse_daemon_extension(&serde_json::to_vec(value).unwrap(), &manifest)
+        };
+        assert_eq!(parse(&body).unwrap(), None);
+        body["daemon_extension"] = serde_json::json!(false);
+        assert_eq!(parse(&body).unwrap(), Some(false));
+        body["daemon_extension"] = serde_json::json!(true);
+        assert_eq!(parse(&body).unwrap(), Some(true));
+        for (key, value) in [
+            ("pid", serde_json::json!(43)),
+            ("hostname", serde_json::json!("other")),
+            ("build", serde_json::json!("successor.2")),
+            ("version", serde_json::json!("9.0.0")),
+            ("name", serde_json::json!("other")),
+            ("daemon_extension", serde_json::json!(null)),
+            ("daemon_extension", serde_json::json!("true")),
+        ] {
+            let mut changed = body.clone();
+            changed[key] = value;
+            assert!(parse(&changed).is_err(), "refused {key}");
+        }
+        assert!(parse_daemon_extension(b"{", &manifest).is_err());
+        assert!(parse_daemon_extension(&vec![b' '; 16 * 1024 + 1], &manifest).is_err());
+    }
+
+    #[tokio::test]
+    async fn selected_cli_without_artifact_refuses_all_deployment_branches_without_effects() {
+        for (manifest, alive, update, cluster) in [
+            (Some(fake_manifest(None, 42)), true, false, false),
+            (
+                Some(fake_manifest(Some(chimaera_core::BUILD_ID), 42)),
+                true,
+                true,
+                false,
+            ),
+            (None, false, false, false),
+            (None, false, true, false),
+            (None, false, true, true),
+        ] {
+            let fake = FakeOps {
+                probe_manifest: manifest,
+                alive,
+                sessions: Some(0),
+                scheduler: if cluster {
+                    Scheduler::Slurm
+                } else {
+                    Scheduler::None
+                },
+                ..FakeOps::base()
+            };
+            let opts = ConnectOpts {
+                deployment_source: DeploymentSource::ExplicitBinary,
+                update_daemon: update,
+                ..Default::default()
+            };
+            let error = resolve_daemon(&fake, "host", &opts, &|_| {})
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("explicit compatible --binary"));
+            assert!(
+                fake.calls()
+                    .iter()
+                    .all(|call| matches!(call, Call::RemoteProbe | Call::RemoteSessionsCount)),
+                "{:?}",
+                fake.calls()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_cli_reconnect_and_explicit_artifact_keep_original_effect_order() {
+        let matching = FakeOps {
+            probe_manifest: Some(fake_manifest(Some(chimaera_core::BUILD_ID), 42)),
+            alive: true,
+            sessions: Some(3),
+            ..FakeOps::base()
+        };
+        let opts = ConnectOpts {
+            deployment_source: DeploymentSource::ExplicitBinary,
+            ..Default::default()
+        };
+        let (manifest, outdated, _) = resolve_daemon(&matching, "host", &opts, &|_| {})
+            .await
+            .unwrap();
+        assert_eq!(manifest.pid, 42);
+        assert!(!outdated);
+        assert_eq!(matching.calls(), vec![Call::RemoteProbe]);
+        let replacement = FakeOps {
+            probe_manifest: Some(fake_manifest(None, 42)),
+            alive: true,
+            sessions: Some(0),
+            ..FakeOps::base()
+        };
+        let opts = ConnectOpts {
+            deployment_source: DeploymentSource::ExplicitBinary,
+            binary: Some(PathBuf::from("/explicit-selected-artifact")),
+            ..Default::default()
+        };
+        resolve_daemon(&replacement, "host", &opts, &|_| {})
+            .await
+            .unwrap();
+        assert_eq!(
+            replacement.calls(),
+            vec![
+                Call::RemoteProbe,
+                Call::RemoteSessionsCount,
+                Call::ResolveLocalBinary,
+                Call::StopRemote,
+                Call::DeployBinary,
+                Call::StartRemote
+            ]
+        );
+        let initial = FakeOps::base();
+        resolve_daemon(&initial, "host", &opts, &|_| {})
+            .await
+            .unwrap();
+        assert_eq!(
+            initial.calls(),
+            vec![
+                Call::RemoteProbe,
+                Call::ResolveLocalBinary,
+                Call::DeployBinary,
+                Call::StartRemote
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn public_implicit_replacement_refuses_selected_or_unconfirmed_remote_composition() {
+        for unconfirmed in [false, true] {
+            let fake = FakeOps {
+                probe_manifest: Some(fake_manifest(None, 42)),
+                alive: true,
+                sessions: Some(0),
+                daemon_extension: Some(true),
+                composition_unconfirmed: unconfirmed,
+                ..FakeOps::base()
+            };
+            assert!(
+                resolve_daemon(&fake, "host", &ConnectOpts::default(), &|_| {})
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                fake.calls(),
+                vec![
+                    Call::RemoteProbe,
+                    Call::RemoteSessionsCount,
+                    Call::RemoteDaemonExtension
+                ]
+            );
+        }
+        for composition in [None, Some(false)] {
+            let compatible = FakeOps {
+                probe_manifest: Some(fake_manifest(None, 42)),
+                alive: true,
+                sessions: Some(0),
+                daemon_extension: composition,
+                ..FakeOps::base()
+            };
+            resolve_daemon(&compatible, "host", &ConnectOpts::default(), &|_| {})
+                .await
+                .unwrap();
+            assert_eq!(
+                compatible.calls(),
+                vec![
+                    Call::RemoteProbe,
+                    Call::RemoteSessionsCount,
+                    Call::RemoteDaemonExtension,
+                    Call::ResolveLocalBinary,
+                    Call::StopRemote,
+                    Call::DeployBinary,
+                    Call::StartRemote
+                ]
+            );
+        }
+        let fake = FakeOps {
+            probe_manifest: Some(fake_manifest(None, 42)),
+            alive: true,
+            sessions: Some(0),
+            daemon_extension: Some(true),
+            ..FakeOps::base()
+        };
+        let opts = ConnectOpts {
+            binary: Some(PathBuf::from("/user-explicit-override")),
+            ..Default::default()
+        };
+        resolve_daemon(&fake, "host", &opts, &|_| {}).await.unwrap();
+        assert_eq!(
+            fake.calls(),
+            vec![
+                Call::RemoteProbe,
+                Call::RemoteSessionsCount,
+                Call::ResolveLocalBinary,
+                Call::StopRemote,
+                Call::DeployBinary,
+                Call::StartRemote
+            ]
+        );
+    }
+
     /// Update: a build mismatch with a provably idle daemon (sessions == 0)
     /// replaces it — and CRITICALLY resolves the replacement binary BEFORE
     /// stopping the old daemon, so a failed fetch never strands the host.
@@ -6850,6 +7204,7 @@ mod tests {
             vec![
                 Call::RemoteProbe,
                 Call::RemoteSessionsCount,
+                Call::RemoteDaemonExtension,
                 Call::ResolveLocalBinary,
                 Call::StopRemote,
                 Call::DeployBinary,
@@ -6881,6 +7236,7 @@ mod tests {
             vec![
                 Call::RemoteProbe,
                 Call::RemoteSessionsCount,
+                Call::RemoteDaemonExtension,
                 Call::ResolveLocalBinary,
                 Call::StopRemote,
                 Call::DeployBinary,
@@ -7121,6 +7477,7 @@ mod tests {
                 (Call::RemoteProbe, Route::Alias),
                 (Call::RemoteProbe, ln01.clone()),
                 (Call::RemoteSessionsCount, ln01.clone()),
+                (Call::RemoteDaemonExtension, ln01.clone()),
                 (Call::ResolveLocalBinary, ln01.clone()),
                 (Call::StopRemote, ln01.clone()),
                 (Call::DeployBinary, ln01.clone()),

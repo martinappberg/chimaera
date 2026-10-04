@@ -1,7 +1,7 @@
 # chimaera — the binary + CLI front-end
 
 Orientation for coding agents. This crate is the `chimaera` executable: the clap
-command tree and `main()` dispatch, and **almost nothing else**. Every subcommand
+command tree and reusable library dispatch, and **almost nothing else**. Every subcommand
 is a thin delegation to a sibling library crate. Parent map: repo-root
 [AGENTS.md](../../AGENTS.md).
 
@@ -19,16 +19,17 @@ is a thin delegation to a sibling library crate. Parent map: repo-root
 
 | File | Command / role |
 |---|---|
-| `main.rs` | Separate required-feature hidden `serve --provider-github-fixture` and `serve --provider-claude-fixture` select only one fixed protected synthetic pairing task (GitHub or Claude print Messages), with no origin/path/token/command argument; both default off and cannot be selected together. Clap `Cli`/`Command` defs, all flags, `main()` dispatch, `parse_port` (`$PORT` fallback), `#[global_allocator]` mimalloc, tracing→stderr, and the tokio runtime's explicit sizing (4 workers / 128 blocking — see the invariants below). The crate's only tests (CLI parse assertions). |
-| `connect.rs` | `connect <host>`: calls `chimaera_remote::connect` with a progress closure, records the host, opens the tunnel URL, holds until Ctrl-C. |
+| `main.rs` | The free binary allocator and call to `run()`; no optional runtime is selected. |
+| `lib.rs` | `run()` preserves free dispatch; `run_with_extension(factory)` creates a trusted optional daemon runtime only inside `serve`, after daemonization and the early read-only commands. Nondefault `provider-fixture-host` exposes only a shared parser/startup continuation and pure serve/loopback validation for private fixture composition; no public vendor selectors or Runtime methods. Callback admission requires serve+loopback before daemonization/tracing/runtime effects, then uses the same original startup path. Private assembly owns fixed flags and their tests. Clap `Cli`/`Command` defs, all flags, `run_selected()` dispatch, `parse_port` (`$PORT` fallback), tracing→stderr, and the tokio runtime's explicit sizing (4 workers / 128 blocking — see the invariants below). The crate's only tests (CLI parse assertions). |
+| `connect.rs` | `connect <host>`: selected runtime dispatch requires an explicit compatible `--binary` only when deployment/repair is needed, before resolution or stopping; healthy reconnects and free initial public-release resolution are unchanged. Before implicit public replacement, one bounded authenticated observation on the captured remote route refuses a proven selected runtime or unconfirmed identity; valid legacy health remains compatible. Calls `chimaera_remote::connect` with a progress closure, records the host, opens the tunnel URL, holds until Ctrl-C. |
 | `daemonize.rs` | `serve --daemonize`: fork + `setsid` + re-exec so the daemon outlives its launching shell/ssh channel; re-points non-regular-file stdio at `/dev/null` (a caller's log redirect is kept). |
 | `status.rs` | `status [host]`: local reads `chimaera_core::Manifest`; remote goes through `chimaera_remote`. A manifest another login node wrote is reported as registered there, never as running or stale. |
 | `kill.rs` | `kill`: SIGTERM the manifest pid, poll `is_alive()` ~5s, remove the manifest — only for a manifest written on this node. |
 | `doctor.rs` | `doctor`: probe write access to data/runtime dirs + ssh/claude on PATH. |
-| `compute.rs` | `compute jobs|add|start|open|close|move|continue|stop <host> …`: Slurm jobs with workspaces open inside them, through `chimaera_remote::cluster` (short ssh execs and plain `ssh -L` forwards to job-host; nothing on the login node). `connect.rs` refuses a cluster unless `--login-node`. `main.rs` also carries two hidden commands: `job-host --job-dir` (delegates to `chimaera_server::run_job_host`; a job's main process on its compute node) and `browse --state\|--dir` (read-only JSON on stdout, run before tracing and the runtime so it exits at once on the login node). |
+| `compute.rs` | `compute jobs|add|start|open|close|move|continue|stop <host> …`: Slurm jobs with workspaces open inside them, through `chimaera_remote::cluster` (short ssh execs and plain `ssh -L` forwards to job-host; nothing on the login node). `connect.rs` refuses a cluster unless `--login-node`. `lib.rs` also carries two hidden commands: `job-host --job-dir` (delegates to `chimaera_server::run_job_host`; a job's main process on its compute node) and `browse --state\|--dir` (read-only JSON on stdout, run before tracing and the runtime so it exits at once on the login node). |
 | `plugin.rs` | `plugin list|add <owner/repo> [--version x] [--trust]|update <id> [--trust]|remove <id>|trust <id> [--yes]|untrust <id>|activity <id>|caps <plugin.toml> [--json]`: the daemon's installed-plugin routes (`GET /plugins`, `POST /plugins/install`, `POST /plugins/{id}/update`, `DELETE /plugins/{id}`, `POST`/`DELETE /plugins/{id}/trust`, `GET /plugins/{id}/activity`) against the daemon running on THIS node (the local manifest's port + token), through the system `curl` with the token and body on its stdin config (`--config -`) — never argv. Prints one line per change ("installed mycelium 0.2.1", no hashes) and marks Chimaera's own plugins with a leading `✓` in `list`. A 409 carrying `trust` (an unverified plugin, an update that asks for more) prints the Can list and asks on the terminal, then repeats the request with the digest shown (`--trust` / `--yes` answer yes; no terminal is a no). `caps` needs no daemon: `chimaera_server::plugin_capabilities`. |
 
-(`shell-integration` prints `chimaera_core::shellint::snippet()` — handled inline in `main.rs`.)
+(`shell-integration` prints `chimaera_core::shellint::snippet()` — handled inline in `lib.rs`.)
 
 ## Invariants (breaking these bites elsewhere)
 
@@ -41,7 +42,7 @@ is a thin delegation to a sibling library crate. Parent map: repo-root
   shared across HPC login nodes its pid is meaningful only on the node that wrote it
   (`Manifest::written_here`) — anywhere else neither signal nor remove it.
 - **Port precedence:** explicit `--port` > `$PORT` env > OS-assigned free port.
-- **The reactor is four threads wide, not one per core.** `main()` pins
+- **The reactor is four threads wide, not one per core.** `run_selected()` pins
   `worker_threads(4)` / `max_blocking_threads(128)` (a login node has 64–192 cores; the
   daemon measures <1 core), and the app's `--daemon` builds the same shape. Any blocking
   filesystem call left inline in a `chimaera-server` async handler now stalls a quarter of

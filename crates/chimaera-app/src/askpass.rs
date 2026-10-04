@@ -70,10 +70,8 @@ struct PendingPrompt {
     tx: oneshot::Sender<Option<String>>,
     source: PromptSource,
     kind: Option<PromptKind>,
-    #[cfg(all(feature = "ssh-agent-prototype", unix))]
-    route_guard: Option<crate::ssh_agent::lifecycle::RoutePromptGuard>,
-    #[cfg(all(feature = "ssh-agent-prototype", unix))]
-    native_guard: Option<crate::ssh_agent::lifecycle::NativePromptGuard>,
+    route_guard: Option<std::sync::Arc<dyn PromptFence>>,
+    native_guard: Option<std::sync::Arc<dyn PromptFence>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -91,7 +89,6 @@ pub enum PromptSource {
 #[derive(Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PromptKind {
-    #[cfg(all(feature = "ssh-agent-prototype", unix))]
     HostKey { host: String, fingerprint: String },
 }
 
@@ -149,9 +146,7 @@ impl Askpass {
                 tx,
                 source,
                 kind: None,
-                #[cfg(all(feature = "ssh-agent-prototype", unix))]
                 route_guard: None,
-                #[cfg(all(feature = "ssh-agent-prototype", unix))]
                 native_guard: None,
             },
         );
@@ -165,7 +160,7 @@ impl Askpass {
     /// Resolve a prompt only when the shell-owned caller scope is allowed to
     /// see its alias. Authorization and removal share one lock, so a caller
     /// cannot race a scope check against another answer.
-    pub fn answer_scoped(
+    pub(crate) fn answer_scoped(
         &self,
         id: u64,
         secret: Option<String>,
@@ -178,7 +173,6 @@ impl Askpass {
         if !window_scope.allows_askpass(prompt.alias.as_deref()) {
             return AnswerResult::Forbidden;
         }
-        #[cfg(all(feature = "ssh-agent-prototype", unix))]
         if prompt
             .route_guard
             .as_ref()
@@ -199,12 +193,14 @@ impl Askpass {
 
     /// Prompts this shell-owned caller scope may observe, oldest first (ssh
     /// asks sequentially, so order is answer order).
-    pub fn pending_scoped(&self, window_scope: &crate::shell::WindowScope) -> Vec<PromptEvent> {
+    pub(crate) fn pending_scoped(
+        &self,
+        window_scope: &crate::shell::WindowScope,
+    ) -> Vec<PromptEvent> {
         let mut prompts: Vec<PromptEvent> = lock(&self.pending)
             .iter()
             .filter(|(_, prompt)| window_scope.allows_askpass(prompt.alias.as_deref()))
             .filter(|(_, _prompt)| {
-                #[cfg(all(feature = "ssh-agent-prototype", unix))]
                 {
                     _prompt
                         .route_guard
@@ -214,10 +210,6 @@ impl Askpass {
                             .native_guard
                             .as_ref()
                             .is_none_or(|guard| guard.active())
-                }
-                #[cfg(not(all(feature = "ssh-agent-prototype", unix)))]
-                {
-                    true
                 }
             })
             .map(|(id, p)| PromptEvent {
@@ -235,12 +227,11 @@ impl Askpass {
 
 /// First-use trust and local key unlock never borrow generic or keeper prompt
 /// authority. The original native Connect owner gates display and the answer.
-#[cfg(all(feature = "ssh-agent-prototype", unix))]
-pub(crate) async fn native_owned_prompt(
+pub async fn native_owned_prompt(
     app: &AppHandle,
     alias: &str,
-    prompt: crate::ssh_agent::trust::NativePrompt,
-    guard: crate::ssh_agent::lifecycle::NativePromptGuard,
+    prompt: NativePrompt,
+    guard: std::sync::Arc<dyn PromptFence>,
 ) -> Option<String> {
     let kind = prompt.host_key.map(|key| PromptKind::HostKey {
         host: key.host,
@@ -310,18 +301,15 @@ pub(crate) async fn native_owned_prompt(
 
 /// Keeper prompts share local SSH's scope and timeout, but answers travel only
 /// on their original events connection. Dropping it cancels every pending input.
-pub(crate) fn relay_keeper(
+pub fn relay_keeper(
     app: &AppHandle,
     alias: String,
     host_id: String,
     keeper_prompt_id: String,
     prompt: String,
-    commands: tokio::sync::mpsc::Sender<chimaera_link::EventCommand>,
+    commands: std::sync::Arc<dyn PromptAnswerSink>,
 ) {
-    #[cfg(all(feature = "ssh-agent-prototype", unix))]
     let guard = None;
-    #[cfg(not(all(feature = "ssh-agent-prototype", unix)))]
-    let guard = ();
     relay_keeper_inner(
         app,
         alias,
@@ -332,20 +320,16 @@ pub(crate) fn relay_keeper(
         guard,
     );
 }
-#[cfg(all(feature = "ssh-agent-prototype", unix))]
-type KeeperGuard = Option<crate::ssh_agent::lifecycle::RoutePromptGuard>;
-#[cfg(not(all(feature = "ssh-agent-prototype", unix)))]
-type KeeperGuard = ();
+type KeeperGuard = Option<std::sync::Arc<dyn PromptFence>>;
 
-#[cfg(all(feature = "ssh-agent-prototype", unix))]
-pub(crate) fn relay_keeper_route(
+pub fn relay_keeper_route(
     app: &AppHandle,
     alias: String,
     host_id: String,
     keeper_prompt_id: String,
     prompt: String,
-    commands: tokio::sync::mpsc::Sender<chimaera_link::EventCommand>,
-    guard: crate::ssh_agent::lifecycle::RoutePromptGuard,
+    commands: std::sync::Arc<dyn PromptAnswerSink>,
+    guard: std::sync::Arc<dyn PromptFence>,
 ) {
     let prompt = guard.prompt(&prompt);
     relay_keeper_inner(
@@ -364,10 +348,9 @@ fn relay_keeper_inner(
     host_id: String,
     keeper_prompt_id: String,
     prompt: String,
-    commands: tokio::sync::mpsc::Sender<chimaera_link::EventCommand>,
+    commands: std::sync::Arc<dyn PromptAnswerSink>,
     _guard: KeeperGuard,
 ) {
-    #[cfg(all(feature = "ssh-agent-prototype", unix))]
     if _guard.as_ref().is_some_and(|guard| !guard.active()) {
         return;
     }
@@ -382,7 +365,6 @@ fn relay_keeper_inner(
         keeper_prompt_id: keeper_prompt_id.clone(),
     };
     let id = askpass.register_source(Some(alias.clone()), prompt.clone(), tx, source.clone());
-    #[cfg(all(feature = "ssh-agent-prototype", unix))]
     if let Some(pending) = lock(&askpass.pending).get_mut(&id) {
         pending.route_guard = _guard.clone();
     }
@@ -396,7 +378,6 @@ fn relay_keeper_inner(
     emit_scoped(app, "ssh-askpass", event, Some(&alias));
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        #[cfg(all(feature = "ssh-agent-prototype", unix))]
         let answer = match &_guard {
             Some(guard) => tokio::select! {
                 biased;
@@ -405,8 +386,6 @@ fn relay_keeper_inner(
             },
             None => tokio::time::timeout(PROMPT_TIMEOUT, rx).await,
         };
-        #[cfg(not(all(feature = "ssh-agent-prototype", unix)))]
-        let answer = tokio::time::timeout(PROMPT_TIMEOUT, rx).await;
         app.state::<Askpass>().discard(id);
         emit_done(&app, id, Some(&alias));
         let value = match answer {
@@ -414,7 +393,6 @@ fn relay_keeper_inner(
             Err(_) => None,
             Ok(Err(_)) => return,
         };
-        #[cfg(all(feature = "ssh-agent-prototype", unix))]
         let value = if _guard.as_ref().is_some_and(|guard| !guard.active()) {
             None
         } else {
@@ -422,16 +400,13 @@ fn relay_keeper_inner(
         };
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            commands.send(chimaera_link::EventCommand::Answer {
-                id: keeper_prompt_id,
-                value,
-            }),
+            commands.answer(keeper_prompt_id, value),
         )
         .await;
     });
 }
 
-pub(crate) fn close_keeper(app: &AppHandle, keeper_id: Option<&str>) {
+pub fn close_keeper(app: &AppHandle, keeper_id: Option<&str>) {
     let askpass = app.state::<Askpass>();
     let closed: Vec<_> = {
         let mut pending = lock(&askpass.pending);
@@ -984,100 +959,43 @@ mod tests {
         assert_eq!(rx.blocking_recv().unwrap(), None);
     }
 
-    #[cfg(feature = "ssh-agent-prototype")]
     #[tokio::test]
-    async fn routed_pending_prompt_cannot_be_seen_or_answered_after_connect_owner_loss() {
-        use base64::Engine;
-        use chimaera_link::{
-            SshAuthDestination, SshAuthHostKey, SshRoute, SshRouteAuthLeg, SshRouteGrant,
-            SshRouteGrantRequest, SshRouteMode, SshRoutePromptAuth,
-        };
-        let registry = crate::ssh_agent::lifecycle::Registry::default();
-        let attempt = registry.admit(0).ok().unwrap();
-        let destination = SshAuthDestination {
-            hostname: "fixture.invalid".into(),
-            user: "person".into(),
-            port: 22,
-        };
-        let request = SshRouteGrantRequest {
-            version: 1,
-            keeper_boot: "boot".into(),
-            destination: destination.clone(),
-            route: SshRoute {
-                version: 1,
-                jumps: vec![],
-            },
-            legs: vec![SshRouteAuthLeg {
-                policy: None,
-                destination: destination.clone(),
-                mode: SshRouteMode::Interactive,
-                host_keys: vec![SshAuthHostKey {
-                    key: base64::engine::general_purpose::STANDARD.encode(b"public-trust"),
-                    is_ca: false,
-                }],
-                user_keys: vec![],
-            }],
-        };
-        let receipt = SshRouteGrant {
-            policies: None,
-            version: 1,
-            grant_id: "grant".into(),
-            expires_in: 180,
-            destination: destination.clone(),
-            route: request.route.clone(),
-            modes: vec![SshRouteMode::Interactive],
-        };
-        let owner = attempt
-            .bind_route(
-                "host",
-                &receipt,
-                &request,
-                tokio::time::Instant::now() + std::time::Duration::from_secs(1),
-            )
-            .ok()
-            .unwrap();
-        let auth = SshRoutePromptAuth {
-            grant_id: "grant".into(),
-            keeper_boot: "boot".into(),
-            leg: 0,
-            mode: SshRouteMode::Interactive,
-            destination,
-        };
-        let guard = registry.route_prompt(0, "host", &auth).unwrap();
+    async fn retired_injected_prompt_fence_blocks_pending_answers() {
+        struct Fence(tokio::sync::watch::Receiver<bool>);
+        impl PromptFence for Fence {
+            fn active(&self) -> bool {
+                !*self.0.borrow()
+            }
+            fn stopped(&self) -> crate::account::BorrowedTask<'_, ()> {
+                let mut stop = self.0.clone();
+                Box::pin(async move {
+                    let _ = stop.wait_for(|v| *v).await;
+                })
+            }
+        }
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        let guard: std::sync::Arc<dyn PromptFence> = std::sync::Arc::new(Fence(rx));
         let askpass = Askpass::default();
-        let (tx, rx) = oneshot::channel();
+        let (tx, answer) = oneshot::channel();
         let id = askpass.register_source(
             Some("cluster".into()),
-            guard.prompt("Password:"),
+            "Password:".into(),
             tx,
             PromptSource::Keeper {
                 host_id: "host".into(),
                 keeper_prompt_id: "wire".into(),
             },
         );
-        askpass
-            .pending
-            .lock()
-            .unwrap()
-            .get_mut(&id)
-            .unwrap()
-            .route_guard = Some(guard);
-        let scope = crate::shell::WindowScope::new(
-            Some("cluster".into()),
-            Some("work".into()),
-            "window".into(),
-        );
+        lock(&askpass.pending).get_mut(&id).unwrap().route_guard = Some(guard);
+        let scope = crate::shell::WindowScope::new(Some("cluster".into()), None, "window".into());
         assert_eq!(askpass.pending_scoped(&scope).len(), 1);
-        drop(owner);
+        stop.send_replace(true);
         assert!(askpass.pending_scoped(&scope).is_empty());
-        assert_eq!(
-            askpass.answer_scoped(id, Some("synthetic-answer".into()), &scope),
+        assert!(matches!(
+            askpass.answer_scoped(id, Some("never forwarded".into()), &scope),
             AnswerResult::Missing
-        );
-        assert!(
-            rx.await.is_err(),
-            "owner loss cannot forward the withheld answer"
-        );
+        ));
+        assert!(answer.await.is_err());
     }
 
     #[test]
@@ -1112,4 +1030,28 @@ mod tests {
         );
         assert_eq!(rx.blocking_recv().unwrap(), Some("secret".into()));
     }
+}
+
+/// Original native authority. No account token, path or socket selector crosses it.
+pub trait PromptFence: Send + Sync {
+    fn active(&self) -> bool;
+    fn stopped(&self) -> crate::account::BorrowedTask<'_, ()>;
+    fn prompt(&self, text: &str) -> String {
+        text.to_owned()
+    }
+}
+pub trait PromptAnswerSink: Send + Sync {
+    fn answer(
+        &self,
+        original_id: String,
+        value: Option<String>,
+    ) -> crate::account::BorrowedTask<'_, ()>;
+}
+pub struct NativePrompt {
+    pub text: String,
+    pub host_key: Option<NativeHostKey>,
+}
+pub struct NativeHostKey {
+    pub host: String,
+    pub fingerprint: String,
 }

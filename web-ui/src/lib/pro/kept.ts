@@ -56,35 +56,6 @@ export function backNote(total: number, here = hereName()): string {
   return `Back on ${here}. Both copies changed ${files(total)} while apart.`;
 }
 
-/** "Use incoming" hover hint for one file: where this computer's copy
- *  goes (the Trash, or deleted when the folder's drive has none). */
-export function useCloudHint(deletedIncoming: boolean, trash: boolean, here = hereName()): string {
-  if (deletedIncoming) {
-    return trash
-      ? `The incoming copy deleted this file; ${here}'s copy moves to the Trash`
-      : `The incoming copy deleted this file; ${here}'s copy is deleted too`;
-  }
-  return trash
-    ? `The incoming version stays; ${here}'s copy moves to the Trash`
-    : `The incoming version stays; ${here}'s copy is deleted`;
-}
-
-/** The "Use incoming for all" confirmation's text. */
-export function useCloudForAllBody(count: number, trash: boolean, here = hereName()): string {
-  const Here = here.charAt(0).toUpperCase() + here.slice(1);
-  return trash
-    ? `${Here}'s versions of ${files(count)} will be moved to the Trash. The incoming versions stay.`
-    : `${Here}'s versions of ${files(count)} will be deleted: this folder's drive has no Trash. The incoming versions stay.`;
-}
-
-/** After a choice the review said would use the Trash: copies no Trash
- *  could take, so they were deleted. */
-export function deletedNote(count: number, here = hereName()): string {
-  return count === 1
-    ? `The Trash couldn't take ${here}'s copy, so it was deleted.`
-    : `The Trash couldn't take ${count} of ${here}'s copies, so they were deleted.`;
-}
-
 /** The file tree badge's hover hint beside a kept copy. */
 export function keptCopyHint(name: string, here = hereName()): string {
   const original = keptOriginal(name) ?? "the file";
@@ -105,10 +76,6 @@ export interface KeptPair {
   mine_changed_at: number | null;
   /** False when the saved copy's original name cannot be recovered safely. */
   can_use_mine?: boolean;
-}
-
-export function canUseMine(pair: Pick<KeptPair, "can_use_mine">): boolean {
-  return pair.can_use_mine !== false;
 }
 
 /** `GET /pro/projects/{w}/kept`. */
@@ -238,19 +205,6 @@ export async function resolveAllKept(workspaceId: string, choice: KeptChoice, gu
   );
 }
 
-/** A size people read: "812 bytes", "4.2 KB", "1.3 MB". */
-export function sizeLabel(bytes: number): string {
-  if (bytes < 1000) return bytes === 1 ? "1 byte" : `${bytes} bytes`;
-  const units = ["KB", "MB", "GB"];
-  let value = bytes / 1000;
-  let unit = 0;
-  while (value >= 1000 && unit < units.length - 1) {
-    value /= 1000;
-    unit += 1;
-  }
-  return `${value < 10 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`;
-}
-
 /** The session key the daemon's `kept_both` notice carries for a project
  *  (`notices::push_kept_both`): a click on that notice opens the review. */
 export const KEPT_NOTICE_PREFIX = "kept-both-";
@@ -259,4 +213,10 @@ export function keptNoticeWorkspace(sessionId: string): string | null {
   if (!sessionId.startsWith(KEPT_NOTICE_PREFIX)) return null;
   const id = sessionId.slice(KEPT_NOTICE_PREFIX.length);
   return /^[A-Za-z0-9_-]{1,128}$/.test(id) ? id : null;
+}
+
+/** Ask the workbench to open (or focus) a project's review. App listens and
+ *  switches this window to the project first when it shows another one. */
+export function requestKeptReview(workspaceId: string): void {
+  window.dispatchEvent(new CustomEvent("chimaera:kept-review", { detail: workspaceId }));
 }

@@ -42,7 +42,7 @@ pub(super) struct Work {
 }
 pub(super) struct State {
     inner: Mutex<Inner>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "daemon-extension-fixture"))]
     transport: Mutex<Option<(std::path::PathBuf, Duration)>>,
 }
 impl State {
@@ -55,7 +55,7 @@ impl State {
                 consumers: Vec::new(),
                 children: Vec::new(),
             }),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "daemon-extension-fixture"))]
             transport: Mutex::default(),
         }
     }
@@ -149,7 +149,7 @@ pub(in crate::pro) fn configured(state: &Arc<AppState>) {
         return;
     };
     let (path, budget) = (std::path::PathBuf::from(SOCKET), BUDGET);
-    #[cfg(test)]
+    #[cfg(any(test, feature = "daemon-extension-fixture"))]
     let (path, budget) = lock(&pending.ready.transport)
         .clone()
         .unwrap_or((path, budget));
@@ -358,7 +358,7 @@ pub(super) fn consumer_current(pending: &Pending, work: &Arc<Work>) -> bool {
     let inner = lock(&pending.ready.inner);
     inner.phase == Phase::Verified && inner.consumers.iter().any(|row| Arc::ptr_eq(row, work))
 }
-#[cfg(test)]
+#[cfg(any(test, feature = "daemon-extension-fixture"))]
 pub(super) fn socket_fixture(pending: &Pending) -> Option<std::path::PathBuf> {
     lock(&pending.ready.transport)
         .as_ref()
@@ -481,13 +481,7 @@ async fn exchange(request: &wire::Request, bytes: &[u8], path: &Path) -> Result<
 
 /// Read-only fixture evidence from the actual retained Ready publisher. It does
 /// not mint a synthetic proof, alter phase or authorize ordinary execution.
-#[cfg(all(
-    target_os = "linux",
-    any(
-        feature = "provider-github-fixture",
-        feature = "provider-claude-fixture"
-    )
-))]
+#[cfg(all(unix, feature = "daemon-extension-fixture"))]
 pub(super) fn fixture_verified(state: &AppState) -> Result<bool, wire::Error> {
     let pending = pending(state).ok_or(wire::Error::Inactive)?;
     pending
@@ -516,3 +510,7 @@ pub(super) fn fixture_verified(state: &AppState) -> Result<bool, wire::Error> {
 #[cfg(test)]
 #[path = "provider_ready_tests.rs"]
 pub(super) mod tests;
+
+#[cfg(any(test, feature = "daemon-extension-fixture"))]
+#[path = "provider_test_fixture.rs"]
+pub(super) mod test_fixture;

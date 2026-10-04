@@ -10,42 +10,63 @@ use crate::{app, lock, AppState, ServerConfig};
 
 /// Bind on 127.0.0.1, write the manifest, and serve until SIGINT/SIGTERM.
 pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
-    run_selected(cfg, false, false).await
+    run_selected(
+        cfg,
+        None,
+        #[cfg(all(
+            unix,
+            feature = "provider-authority-prototype",
+            feature = "daemon-extension-fixture"
+        ))]
+        None,
+    )
+    .await
 }
 
-/// Explicit disposable CLI selection; ordinary run never selects this task.
-#[cfg(all(target_os = "linux", feature = "provider-github-fixture"))]
-pub async fn run_provider_github_fixture(cfg: ServerConfig) -> anyhow::Result<()> {
+/// Trusted composed assembly. Optional policy is supplied after CLI daemonization;
+/// public startup restrictions and the actual task owners remain the same.
+pub async fn run_with_extension(
+    cfg: ServerConfig,
+    runtime: Arc<dyn crate::daemon_extension::Runtime>,
+) -> anyhow::Result<()> {
+    run_selected(
+        cfg,
+        Some(runtime),
+        #[cfg(all(
+            unix,
+            feature = "provider-authority-prototype",
+            feature = "daemon-extension-fixture"
+        ))]
+        None,
+    )
+    .await
+}
+
+/// Nondefault closed fixture composition; ordinary daemon entrypoints never
+/// receive this callback. Actual inherited startup is consumed by the same host.
+#[cfg(all(
+    target_os = "linux",
+    feature = "provider-authority-prototype",
+    feature = "daemon-extension-fixture"
+))]
+pub async fn run_with_provider_fixture(
+    cfg: ServerConfig,
+    start: fn(crate::provider_fixture::Context) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     anyhow::ensure!(!cfg.routable_bind, "Fixture requires loopback binding");
-    run_selected(cfg, true, false).await
-}
-
-#[cfg(all(not(target_os = "linux"), feature = "provider-github-fixture"))]
-pub async fn run_provider_github_fixture(_: ServerConfig) -> anyhow::Result<()> {
-    anyhow::bail!("Fixture requires Linux")
-}
-
-/// Separate explicit print fixture; no normal startup selects it.
-#[cfg(all(target_os = "linux", feature = "provider-claude-fixture"))]
-pub async fn run_provider_claude_fixture(cfg: ServerConfig) -> anyhow::Result<()> {
-    anyhow::ensure!(!cfg.routable_bind, "Fixture requires loopback binding");
-    run_selected(cfg, false, true).await
-}
-
-#[cfg(all(not(target_os = "linux"), feature = "provider-claude-fixture"))]
-pub async fn run_provider_claude_fixture(_: ServerConfig) -> anyhow::Result<()> {
-    anyhow::bail!("Fixture requires Linux")
+    run_selected(cfg, None, Some(start)).await
 }
 
 async fn run_selected(
     cfg: ServerConfig,
-    github_fixture: bool,
-    claude_fixture: bool,
+    runtime: Option<Arc<dyn crate::daemon_extension::Runtime>>,
+    #[cfg(all(
+        unix,
+        feature = "provider-authority-prototype",
+        feature = "daemon-extension-fixture"
+    ))]
+    provider_fixture: Option<fn(crate::provider_fixture::Context) -> anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
-    #[cfg(not(all(target_os = "linux", feature = "provider-github-fixture")))]
-    let _ = github_fixture;
-    #[cfg(not(all(target_os = "linux", feature = "provider-claude-fixture")))]
-    let _ = claude_fixture;
     // Consume the trusted launcher's one-shot pipe before restore or helpers
     // can inherit it. An opted-in idle descriptor is protected and its Linux
     // proc/ptrace gate verified here, before any startup child. Ordinary device
@@ -180,6 +201,7 @@ async fn run_selected(
         chimaera_core::data_dir(),
         chimaera_core::config_dir(),
     );
+    state.daemon_extension = runtime;
     let managed_root = chimaera_core::managed_agents_dir();
     if state.managed_root != managed_root {
         state.legacy_managed_root = Some(std::mem::replace(&mut state.managed_root, managed_root));
@@ -197,13 +219,13 @@ async fn run_selected(
     }
 
     crate::pro::stage_supervisor_cleanup(&state, supervisor_cleanup)?;
-    #[cfg(all(target_os = "linux", feature = "provider-github-fixture"))]
-    if github_fixture {
-        crate::pro::start_github_fixture(&state)?;
-    }
-    #[cfg(all(target_os = "linux", feature = "provider-claude-fixture"))]
-    if claude_fixture {
-        crate::pro::start_claude_fixture(&state)?;
+    #[cfg(all(
+        unix,
+        feature = "provider-authority-prototype",
+        feature = "daemon-extension-fixture"
+    ))]
+    if let Some(start) = provider_fixture {
+        start(crate::provider_fixture::Context::from_state(state.clone())?)?;
     }
 
     // Theming shims: regenerated at every daemon start (and after installs /

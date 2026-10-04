@@ -38,10 +38,6 @@ use crate::windows::{ComputeScope, WindowRecord};
 mod kept;
 use chimaera_link::{ClusterOperation as Op, ClusterReply as Reply};
 
-/// Called synchronously on account replacement/sign-out; no SSH or network.
-pub(super) fn close_kept_links(shell: &Shell) {
-    kept::close_all(shell);
-}
 pub(super) fn kept_link_endpoints(shell: &Shell) -> Vec<(String, u16, String)> {
     kept::endpoints(shell)
 }
@@ -52,11 +48,6 @@ pub(super) fn kept_link_current(shell: &Shell, key: &str, port: u16, token: &str
 /// Live, per-cluster state of this process.
 #[derive(Default)]
 pub(crate) struct ClusterLive {
-    kept_links: HashMap<String, kept::Held>,
-    kept_opening: HashSet<String>,
-    kept_identity: Option<(String, u64)>,
-    kept_link_epoch: u64,
-    kept_control: std::sync::Arc<kept::Control>,
     /// What the last connect found (None until a connect ran this process).
     pub(crate) info: Option<ClusterInfo>,
     /// Open workspaces' chimaeras, from the last overview.
@@ -260,9 +251,10 @@ async fn absorb_with_effects(
 ) {
     let shell = app.state::<Shell>();
     kept::reconcile(&shell, alias, ov);
-    let is_kept = lock(&shell.clusters)
-        .get(alias)
-        .is_some_and(|c| c.kept_identity.is_some());
+    let is_kept = shell
+        .pro
+        .owner()
+        .is_some_and(|owner| owner.cluster_selected(alias));
     // (window key, reason) to end; (wid, new endpoint) to follow.
     let mut ended: Vec<(String, String)> = Vec::new();
     let mut moved: Vec<(String, String, cluster::Endpoint)> = Vec::new();

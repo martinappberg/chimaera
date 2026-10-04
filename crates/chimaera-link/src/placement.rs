@@ -32,7 +32,7 @@ pub struct WorkspacePlacement {
     pub expires_at: Option<String>,
 }
 
-pub(crate) fn valid_id(id: &str) -> bool {
+pub fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
         && id
@@ -42,7 +42,7 @@ pub(crate) fn valid_id(id: &str) -> bool {
 impl WorkspacePlacement {
     /// The account's answer for a project it has no ownership record for
     /// (404 `workspace_not_found`): nobody executes it, epoch 0.
-    pub(crate) fn unowned(workspace: &str) -> Self {
+    pub fn unowned(workspace: &str) -> Self {
         Self {
             workspace_id: workspace.into(),
             holder_id: None,

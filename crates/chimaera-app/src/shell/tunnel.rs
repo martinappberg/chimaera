@@ -16,12 +16,12 @@ pub(super) fn offers_daemon_update(kind: &HostKind, build: &str) -> bool {
     app_host(kind) && !chimaera_core::builds_match(chimaera_core::BUILD_ID, Some(build))
 }
 
-pub(super) struct Endpoint {
+pub(crate) struct Endpoint {
     pub token: String,
     pub build: Option<String>,
 }
 
-pub(super) struct Tunnel {
+pub(crate) struct Tunnel {
     pub local_port: u16,
     pub manifest: Endpoint,
     pub outdated: bool,
@@ -34,7 +34,7 @@ enum Transport {
     Ssh(Box<chimaera_remote::Tunnel>),
     Link {
         host_id: String,
-        tunnel: chimaera_link::LinkTunnel,
+        tunnel: Box<dyn crate::account::DelegatedTransport>,
     },
 }
 
@@ -57,14 +57,15 @@ impl From<chimaera_remote::Tunnel> for Tunnel {
 impl Tunnel {
     pub fn link(
         host: &chimaera_link::Host,
-        tunnel: chimaera_link::LinkTunnel,
+        local_port: u16,
+        tunnel: Box<dyn crate::account::DelegatedTransport>,
     ) -> anyhow::Result<Self> {
         let daemon = host
             .daemon
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("host daemon is unavailable"))?;
         Ok(Self {
-            local_port: tunnel.local_port,
+            local_port,
             manifest: Endpoint {
                 token: daemon.token.clone(),
                 build: Some(daemon.build.clone()),

@@ -1,6 +1,7 @@
 //! Stable session identities routed to another authenticated daemon. Credentials
 //! and loopback listeners are memory-only; cached rows never imply local ownership.
 use crate::AppState;
+pub mod viewer_host;
 use anyhow::{bail, Context, Result};
 use axum::{
     body::Body,
@@ -1476,32 +1477,13 @@ type Upstream = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsSt
 use axum::extract::ws::Message as Down;
 use tokio_tungstenite::tungstenite::Message as Up;
 
-/// Typing a viewer did before the owner's terminal answered.
-const HELD_TERMINAL_BYTES: usize = 64 * 1024;
-/// Chat commands a viewer sent before the owner's chat answered. One maximum
-/// structured command is ~10 MiB (images), so the byte bound admits one.
-const HELD_CHAT_COMMANDS: usize = 4;
-const HELD_CHAT_BYTES: usize = 11 * 1024 * 1024;
-/// Settings a viewer changed before the owner's chat answered, outside the
-/// command cap above: they are small, and coalesce (see [`Held::setting`]).
-const HELD_SETTINGS: usize = 16;
-const HELD_SETTING_BYTES: usize = 16 * 1024;
-/// How long a held setting waits for the viewer's next input. A setting only
-/// ever rides in front of what this viewer does next; a window left open must
-/// not apply a mode picked long ago to a turn started much later, so past
-/// this it is refused by name instead.
-const HELD_SETTING_FOR: Duration = if cfg!(test) {
-    Duration::from_secs(5)
-} else {
-    Duration::from_secs(10 * 60)
-};
 /// Input held across every relay at once. Per-socket caps alone let a window
 /// full of chats to a sleeping owner pin gigabytes (128 sockets × 11 MiB);
 /// past this, new input is refused visibly instead of held.
 const HELD_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 static HELD_BUDGET: HeldBudget = HeldBudget::new(HELD_TOTAL_BYTES);
 
-/// Bytes held by every relay's [`Held`], against one daemon-wide limit.
+/// Queued and write-held bytes against one daemon-wide limit.
 struct HeldBudget {
     used: std::sync::atomic::AtomicUsize,
     limit: usize,
@@ -1524,53 +1506,13 @@ impl HeldBudget {
         self.used.fetch_sub(bytes, Ordering::AcqRel);
     }
 }
-/// Owner-socket retry pacing while nobody is typing.
-const RETRY_MIN: Duration = Duration::from_secs(2);
-const RETRY_MAX: Duration = Duration::from_secs(30);
-/// How often a viewer socket looks again at an owner reported asleep.
-const ASLEEP_RETRY: Duration = if cfg!(test) {
-    Duration::from_secs(3)
-} else {
-    RETRY_MAX
-};
 /// Frames larger than this are replay batches, never a `ready` frame.
 const READY_SCAN_BYTES: usize = 64 * 1024;
 /// How long an awake owner gets to accept a socket.
 const AWAKE_CONNECT: Duration = Duration::from_secs(15);
-/// How long an [`Opened::Doubtful`] socket gets to say `ready`, the same
-/// wait: it was accepted for an owner reported asleep, so silence past this
-/// means nothing is behind it.
-const DOUBTFUL_READY: Duration = if cfg!(test) {
-    Duration::from_millis(600)
-} else {
-    AWAKE_CONNECT
-};
-
-/// Caller has consumed and authenticated the local first frame. Remote tokens
-/// replace only that frame's token; application messages remain byte-for-byte.
-///
-/// The viewer's socket stays open while the owner is unreachable or asleep:
-/// attaching is passive, and the first real input (a keystroke, or a chat
-/// command that is the user acting, [`Viewer::Input`]) is held and carries wake
-/// intent. Held input is delivered once after the owner's `ready`, or
-/// answered with a visible refusal that names the refused command (and, for
-/// a send, the id its client sent it under) when it cannot be delivered.
-/// This relay sends nothing twice; a viewer's client may send an unconfirmed
-/// send again under its id, which the owner's daemon accepts once.
-///
-/// A cloud machine's transport may keep its sockets instead (it marks every
-/// upgrade it accepts with [`SOCKETS_HEADER`]): it accepts the socket while
-/// the machine sleeps, keeps it open across suspend and resume, holds what
-/// the viewer sends, wakes the machine for it and delivers it once. This
-/// relay then holds nothing and says nothing: frames pass straight through in
-/// both directions ([`Opened::Held`]), and when such a socket ends with input
-/// the transport still held, the transport discards it and the viewer's
-/// client sends it again by its id at the next `ready`, so closing the
-/// viewer's socket is this relay's whole answer. A transport without the
-/// mark leaves the relay on the path above, whatever the scope probe said.
-///
-/// Ordinary input stays with the current owner. The separate explicit Take
-/// over route changes execution placement; this relay never requests a move.
+/// Caller authenticated the local first frame. Scope, route generation and
+/// the original socket permit are shared guards. Selected policy owns its
+/// inline relay; absence permits only ordinary ready forwarding, never wake.
 pub(crate) async fn socket(
     state: &Arc<AppState>,
     id: &str,
@@ -1582,7 +1524,7 @@ pub(crate) async fn socket(
     let Some((route, workspace)) = state.session_proxy.for_session(id) else {
         return false;
     };
-    let Ok(_permit) = SOCKETS.try_acquire() else {
+    let Ok(permit) = SOCKETS.try_acquire() else {
         let _ = bounded_send(downstream, Down::Text(unavailable().to_string().into())).await;
         return true;
     };
@@ -1598,7 +1540,11 @@ pub(crate) async fn socket(
         chat: kind == "chat",
     };
     let wake = !options.read_only && options.wake.as_deref() == Some("interaction");
-    relay(&link, wake, downstream).await;
+    let admission = viewer_host::ViewerAdmission::new(link, wake, permit);
+    match &state.daemon_extension {
+        Some(runtime) => runtime.viewer(admission, downstream).await,
+        None => viewer_host::ready(admission, downstream).await,
+    }
     true
 }
 
@@ -1621,67 +1567,8 @@ enum Opened {
     /// machine has answered `ready`, waking it for input, and attaches again
     /// by itself after every sleep. `ready` may be a long time coming.
     Held(Box<Upstream>),
-    /// Accepted without wake intent although the probe said the owner is
-    /// asleep, by a transport that did not mark it kept: the machine woke in
-    /// between, or the transport takes sockets it then drops or never
-    /// attaches. Treated as [`Opened::Live`], and remembered as a refusal
-    /// when it ends before `ready`. One that closes ends the viewer's socket
-    /// like any owner's close (input held for it is refused first, and the
-    /// viewer reconnects onto the hold-and-wake path). One that says nothing
-    /// for [`DOUBTFUL_READY`] is dropped here instead: input held for it then
-    /// wakes the owner, and with none held the viewer hears "asleep".
-    Doubtful(Box<Upstream>),
-    /// The owner is asleep and this attempt carried no interaction.
-    Sleeping,
-    /// The owner is asleep and this attempt carries interaction: the relay
-    /// says it is waking, then connects (which wakes it).
-    Waking,
 }
 impl Link<'_> {
-    /// `None` while this socket's route is current. Once it is not: a
-    /// transport-only change (tunnel rebind, new credential) ends the socket
-    /// quietly so the viewer reconnects to the same owner, and a real owner
-    /// change also says where the session continues.
-    fn ended(&self) -> Option<Option<Value>> {
-        match self
-            .state
-            .session_proxy
-            .change(&self.route, &self.workspace)
-        {
-            RouteChange::Current => None,
-            RouteChange::Transport => Some(None),
-            RouteChange::Owner => Some(Some(self.moved())),
-        }
-    }
-    /// `passive`: a sleeping cloud machine's transport may keep its sockets
-    /// (see [`Opened::Held`]); attach without wake intent instead of
-    /// reporting it asleep, unless that transport refused one recently.
-    async fn open(&self, wake: bool, passive: bool) -> Result<Opened> {
-        let store = &self.state.session_proxy;
-        let reach = verify_scope(store, &self.route, &self.workspace).await?;
-        // Viewing never wakes a sleeping owner; only interaction may.
-        match (reach, wake) {
-            (Reach::Sleeping, false) => {
-                if !passive || store.passive_refused(&self.route) {
-                    return Ok(Opened::Sleeping);
-                }
-                // Still passive: no wake marker rides this attach. A
-                // transport that keeps no sockets refuses it at once (503
-                // `worker_asleep`), and any failure reads as "asleep",
-                // exactly as before the attempt existed.
-                match self.connect(false, Reach::Awake).await {
-                    Ok(Opened::Live(socket)) => Ok(Opened::Doubtful(socket)),
-                    Ok(opened) => Ok(opened),
-                    Err(_) => {
-                        store.note_passive_refused(&self.route);
-                        Ok(Opened::Sleeping)
-                    }
-                }
-            }
-            (Reach::Sleeping, true) => Ok(Opened::Waking),
-            (Reach::Awake, _) => self.connect(wake, reach).await,
-        }
-    }
     /// Whether this socket's owner is a cloud machine, whose transport may
     /// keep its sockets while it sleeps. Another computer's never does.
     fn cloud(&self) -> bool {
@@ -1752,60 +1639,6 @@ impl Link<'_> {
         }
         (text.to_owned(), false)
     }
-    /// Input that arrived while the work is coming here and did not fit what
-    /// is already held: not sent, and said so.
-    async fn refuse_bringing(
-        &self,
-        downstream: &mut axum::extract::ws::WebSocket,
-        refused: &Down,
-    ) -> Result<()> {
-        let frame = if self.chat {
-            tagged(
-                json!({"type":"error","code":"command_failed","reason":"bringing",
-                    "message":"Still bringing the work here. That was not sent; send it again in a moment."}),
-                refused,
-            )
-        } else {
-            json!({"type":"error","code":"read_only","reason":"bringing","owner":self.owner(),
-                "message":"Bringing the work here… That input was not sent."})
-        };
-        bounded_send(downstream, Down::Text(frame.to_string().into())).await
-    }
-    /// The other computer kept the work (its user acted, or it did not reach
-    /// a pause in time): the held input comes back (a message returns to the
-    /// composer) with one plain line.
-    async fn refuse_kept<'f>(
-        &self,
-        downstream: &mut axum::extract::ws::WebSocket,
-        refused: impl IntoIterator<Item = &'f Down>,
-    ) -> Result<()> {
-        const KEPT: &str =
-            "Your other computer is still working on this. Try again when it pauses.";
-        let mut refused = refused.into_iter().peekable();
-        if self.chat {
-            for frame in refused {
-                let answer = tagged(
-                    json!({"type":"error","code":"command_failed","reason":"still_working","message":KEPT}),
-                    frame,
-                );
-                bounded_send(downstream, Down::Text(answer.to_string().into())).await?;
-            }
-        } else if refused.peek().is_some() {
-            let frame = json!({"type":"error","code":"read_only","reason":"still_working",
-                "owner":self.owner(),"message":KEPT});
-            bounded_send(downstream, Down::Text(frame.to_string().into())).await?;
-        }
-        Ok(())
-    }
-    /// Where this socket's owner is: a cloud machine (`worker-` route) or a
-    /// computer — the additive `owner` of this relay's `read_only` refusals.
-    fn owner(&self) -> &'static str {
-        if self.cloud() {
-            "cloud"
-        } else {
-            "computer"
-        }
-    }
     /// Where the session continues after its project changed owner.
     fn moved(&self) -> Value {
         let to = match self.state.session_proxy.for_session(&self.session) {
@@ -1816,51 +1649,10 @@ impl Link<'_> {
         };
         json!({"type":"moved","to":to})
     }
-    /// Answer input that arrived while this socket's wake is pending: it is
-    /// not held, and the viewer is told why in plain words (a refused send is
-    /// named by its id, so exactly that one returns to its composer).
-    async fn refuse_waking(
-        &self,
-        downstream: &mut axum::extract::ws::WebSocket,
-        refused: &Down,
-    ) -> Result<()> {
-        let frame = if self.chat {
-            tagged(
-                json!({"type":"error","code":"command_failed","reason":"waking",
-                    "message":"Still waking the cloud machine. That was not sent; send it again in a moment."}),
-                refused,
-            )
-        } else {
-            json!({"type":"error","code":"read_only","reason":"waking","owner":self.owner(),
-                "message":"Waking the cloud machine… That input was not sent."})
-        };
-        bounded_send(downstream, Down::Text(frame.to_string().into())).await
-    }
-    /// Answer input that never reached the owner, so nothing vanishes silently.
-    /// A chat hears one refusal per command, tagged with which command it was
-    /// (`command`, additive), so only a refused send hands its text back.
-    async fn refuse<'f>(
-        &self,
-        downstream: &mut axum::extract::ws::WebSocket,
-        refused: impl IntoIterator<Item = &'f Down>,
-    ) -> Result<()> {
-        let mut refused = refused.into_iter().peekable();
-        if self.chat {
-            for frame in refused {
-                let answer = tagged(not_sent(), frame);
-                bounded_send(downstream, Down::Text(answer.to_string().into())).await?;
-            }
-        } else if refused.peek().is_some() {
-            let frame = json!({"type":"error","code":"read_only","reason":"reconnecting","owner":self.owner(),
-                "message":"Your project is reconnecting. That input was not sent."});
-            bounded_send(downstream, Down::Text(frame.to_string().into())).await?;
-        }
-        Ok(())
-    }
 }
 
 /// What a viewer's frame is to this relay.
-enum Viewer {
+pub enum Viewer {
     /// The user acting: a terminal's typing (its binary frames; text frames
     /// are grid control), or one of a chat's acting commands, which are
     /// exactly the daemon's own list (`activity::is_interaction`). Held,
@@ -1882,7 +1674,7 @@ enum Viewer {
 impl Viewer {
     /// Sorted from the frame's own tag, without building the command (a
     /// send's pictures are megabytes).
-    fn of(chat: bool, frame: &Down) -> Self {
+    pub fn of(chat: bool, frame: &Down) -> Self {
         let text = match frame {
             Down::Binary(bytes) if !chat && !bytes.is_empty() => {
                 return Viewer::Input { client_id: None }
@@ -1915,190 +1707,6 @@ impl Viewer {
     }
 }
 
-struct HeldFrame {
-    frame: Down,
-    size: usize,
-    /// The send id it was made under, when it is a send.
-    client_id: Option<String>,
-    /// `Some` for a setting: what a later pick of the same setting replaces.
-    setting: Option<String>,
-    /// When it was held: a setting waits [`HELD_SETTING_FOR`] at most.
-    since: tokio::time::Instant,
-}
-
-/// What a viewer did before the owner's socket was ready, in order. Bounded
-/// per socket and, through `budget`, across the daemon.
-///
-/// A holder treats send ids as the daemon does: the id of a held send counts
-/// as accepted. The relay never holds a second frame under it and never
-/// refuses one either (the first copy will be delivered, so a refusal would
-/// return a message that runs), and it answers a `cancel_send` for it itself.
-struct Held<'b> {
-    chat: bool,
-    frames: std::collections::VecDeque<HeldFrame>,
-    bytes: usize,
-    budget: &'b HeldBudget,
-}
-impl Drop for Held<'_> {
-    fn drop(&mut self) {
-        self.budget.release(self.bytes);
-    }
-}
-impl Held<'_> {
-    fn size(frame: &Down) -> usize {
-        match frame {
-            Down::Text(text) => text.len(),
-            Down::Binary(bytes) => bytes.len(),
-            _ => 0,
-        }
-    }
-    /// Whether anything held is the user acting (a reason to wake the owner).
-    fn has_input(&self) -> bool {
-        self.frames.iter().any(|held| held.setting.is_none())
-    }
-    /// Whether a send made under `client_id` is held.
-    fn holds(&self, client_id: &str) -> bool {
-        self.frames
-            .iter()
-            .any(|held| held.client_id.as_deref() == Some(client_id))
-    }
-    /// Hold input, or hand it back when it does not fit.
-    fn input(&mut self, frame: Down, client_id: Option<String>) -> std::result::Result<(), Down> {
-        let size = Self::size(&frame);
-        if !self.chat {
-            if !matches!(frame, Down::Binary(_)) {
-                return Err(frame);
-            }
-            if size == 0 {
-                return Ok(());
-            }
-        }
-        let (count, bytes) = self
-            .frames
-            .iter()
-            .filter(|held| held.setting.is_none())
-            .fold((0, 0), |(count, bytes), held| {
-                (count + 1, bytes + held.size)
-            });
-        let fits = if self.chat {
-            count < HELD_CHAT_COMMANDS && bytes + size <= HELD_CHAT_BYTES
-        } else {
-            bytes + size <= HELD_TERMINAL_BYTES
-        };
-        if !fits || !self.budget.reserve(size) {
-            return Err(frame);
-        }
-        self.bytes += size;
-        // A byte ceiling alone does not bound the number of WebSocket frames:
-        // many tiny keystrokes must occupy one buffer, not one queue allocation
-        // each. Recover the uniquely owned BytesMut capacity for amortized appends.
-        if !self.chat {
-            if let (Some(last), Down::Binary(incoming)) = (self.frames.back_mut(), &frame) {
-                if let Down::Binary(bytes) = &mut last.frame {
-                    let mut combined = std::mem::take(bytes)
-                        .try_into_mut()
-                        .unwrap_or_else(|bytes| bytes::BytesMut::from(bytes.as_ref()));
-                    combined.extend_from_slice(incoming);
-                    *bytes = combined.freeze();
-                    last.size += size;
-                    return Ok(());
-                }
-            }
-        }
-        self.frames.push_back(HeldFrame {
-            frame,
-            size,
-            client_id,
-            setting: None,
-            since: tokio::time::Instant::now(),
-        });
-        Ok(())
-    }
-    /// Hold a setting, or hand it back when it does not fit. The latest pick
-    /// of a setting wins unless the user acted in between: it replaces an
-    /// earlier pick of the same `key` held after the last input, so `model X,
-    /// send A, model Y` is delivered in that order and consecutive picks
-    /// collapse to the last.
-    fn setting(&mut self, frame: Down, key: String) -> std::result::Result<(), Down> {
-        let size = Self::size(&frame);
-        if size > HELD_SETTING_BYTES {
-            return Err(frame);
-        }
-        let earlier = self
-            .frames
-            .iter_mut()
-            .rev()
-            .take_while(|held| held.setting.is_some())
-            .find(|held| held.setting.as_deref() == Some(key.as_str()));
-        if let Some(earlier) = earlier {
-            if size > earlier.size && !self.budget.reserve(size - earlier.size) {
-                return Err(frame);
-            }
-            if size < earlier.size {
-                self.budget.release(earlier.size - size);
-            }
-            self.bytes = self.bytes - earlier.size + size;
-            earlier.frame = frame;
-            earlier.size = size;
-            earlier.since = tokio::time::Instant::now();
-            return Ok(());
-        }
-        let settings = self
-            .frames
-            .iter()
-            .filter(|held| held.setting.is_some())
-            .count();
-        if settings >= HELD_SETTINGS || !self.budget.reserve(size) {
-            return Err(frame);
-        }
-        self.bytes += size;
-        self.frames.push_back(HeldFrame {
-            frame,
-            size,
-            client_id: None,
-            setting: Some(key),
-            since: tokio::time::Instant::now(),
-        });
-        Ok(())
-    }
-    /// Take the held frames `gone` picks out, in order.
-    fn remove(&mut self, gone: impl Fn(&HeldFrame) -> bool) -> Vec<Down> {
-        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.frames)
-            .into_iter()
-            .partition(|held| gone(held));
-        self.frames = kept.into();
-        let freed: usize = gone.iter().map(|held| held.size).sum();
-        self.bytes -= freed;
-        self.budget.release(freed);
-        gone.into_iter().map(|held| held.frame).collect()
-    }
-    /// The user picked setting `key` on an owner that is attached: it applies
-    /// now, so an earlier pick of it still held is stale and must not be
-    /// delivered after it.
-    fn supersede(&mut self, key: &str) {
-        self.remove(|held| held.setting.as_deref() == Some(key));
-    }
-    /// The settings that have waited [`HELD_SETTING_FOR`] for input that did
-    /// not come, taken out to be refused.
-    fn expired(&mut self, now: tokio::time::Instant) -> Vec<Down> {
-        self.remove(|held| held.setting.is_some() && now >= held.since + HELD_SETTING_FOR)
-    }
-    /// When the next held setting expires.
-    fn next_expiry(&self) -> Option<tokio::time::Instant> {
-        self.frames
-            .iter()
-            .filter(|held| held.setting.is_some())
-            .map(|held| held.since + HELD_SETTING_FOR)
-            .min()
-    }
-    fn take(&mut self) -> std::collections::VecDeque<Down> {
-        self.budget.release(std::mem::take(&mut self.bytes));
-        std::mem::take(&mut self.frames)
-            .into_iter()
-            .map(|held| held.frame)
-            .collect()
-    }
-}
 /// Whether a transport marked an accepted upgrade [`SOCKETS_HEADER`]`: kept`.
 fn kept(headers: &axum::http::HeaderMap) -> bool {
     headers
@@ -2114,458 +1722,11 @@ fn kept(headers: &axum::http::HeaderMap) -> bool {
 fn unavailable() -> Value {
     json!({"type":"error","code":"remote_unavailable","reason":"reconnecting","message":"Your project is reconnecting."})
 }
-fn asleep() -> Value {
-    json!({"type":"error","code":"worker_asleep","message":"Your project is paused. Sending a message picks it back up."})
-}
-/// Additive status: the viewer's first input is waking the owner and will be
-/// delivered once it answers. Older clients ignore it.
-fn waking_status() -> Value {
-    json!({"type":"waking"})
-}
-/// A terminal says "waking" at most this often while typing is refused.
-const WAKING_NOTE_EVERY: Duration = Duration::from_secs(1);
-/// The existing per-command refusal: the socket stays up, the client keeps
-/// the unsent text.
-fn not_sent() -> Value {
-    json!({"type":"error","code":"command_failed","message":"Not sent. Your project is reconnecting."})
-}
-/// A chat refusal naming the command it answers and, for a send made under
-/// a client's id, that id: the client hands back exactly the refused send.
-fn tagged(answer: Value, refused: &Down) -> Value {
-    match refused {
-        Down::Text(text) => crate::ws::command_refusal(answer, text),
-        _ => answer,
-    }
-}
 fn upward(frame: Down) -> Option<Up> {
     match frame {
         Down::Text(text) => Some(Up::Text(text.as_str().into())),
         Down::Binary(bytes) => Some(Up::Binary(bytes)),
         _ => None,
-    }
-}
-async fn next_up(
-    upstream: &mut Option<Box<Upstream>>,
-) -> Option<Result<Up, tokio_tungstenite::tungstenite::Error>> {
-    match upstream {
-        Some(socket) => socket.next().await,
-        None => std::future::pending().await,
-    }
-}
-
-/// Whether an owner's text frame says its session left that machine
-/// (`moved`/`paused`): while the work is coming here those are about this
-/// very move and the viewer is not told them.
-fn departure(text: &str) -> bool {
-    text.len() <= READY_SCAN_BYTES
-        && serde_json::from_str::<Value>(text)
-            .is_ok_and(|value| matches!(value["type"].as_str(), Some("moved" | "paused")))
-}
-/// The request to bring the work here settled (or its sender went away).
-async fn settled(
-    pull: &mut Option<tokio::sync::watch::Receiver<crate::pro::MoveOutcome>>,
-) -> crate::pro::MoveOutcome {
-    let Some(receiver) = pull.as_mut() else {
-        return std::future::pending().await;
-    };
-    loop {
-        let closed = receiver.changed().await.is_err();
-        let outcome = *receiver.borrow();
-        if outcome != crate::pro::MoveOutcome::Waiting {
-            return outcome;
-        }
-        if closed {
-            return crate::pro::MoveOutcome::Refused;
-        }
-    }
-}
-
-async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::ws::WebSocket) {
-    let mut held = Held {
-        chat: link.chat,
-        frames: Default::default(),
-        bytes: 0,
-        budget: &HELD_BUDGET,
-    };
-    // Ordinary input stays with the owner. This relay does not initiate a pull;
-    // execution moves only through the separate explicit Take over action.
-    let mut pull: Option<tokio::sync::watch::Receiver<crate::pro::MoveOutcome>> = None;
-    let mut upstream: Option<Box<Upstream>> = None;
-    let mut ready = false;
-    // A passive attach to a sleeping cloud machine is tried until its
-    // transport refuses one; from then on this socket stays on the
-    // hold-and-wake path (that transport would only refuse again).
-    let mut passive = link.cloud();
-    // The transport keeps this upstream ([`Opened::Held`]) and holds input
-    // itself, so everything passes through, before `ready` too.
-    let mut through = false;
-    // See [`Opened::Doubtful`]: such a socket has until `doubt` to say
-    // `ready`.
-    let mut doubtful = false;
-    let doubt = tokio::time::sleep(Duration::ZERO);
-    tokio::pin!(doubt);
-    // The last connection status told to the viewer, sent once per change.
-    let mut told: Option<&'static str> = None;
-    let mut attempt: Option<futures::future::BoxFuture<'_, Result<Opened>>> =
-        Some(Box::pin(link.open(wake, passive)));
-    let mut backoff = RETRY_MIN;
-    let retry = tokio::time::sleep(Duration::ZERO);
-    tokio::pin!(retry);
-    let mut retry_armed = false;
-    let mut ownership = tokio::time::interval(Duration::from_secs(2));
-    ownership.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // A wake this socket asked for is pending: the input that asked is held,
-    // anything more is refused until the owner answers.
-    let mut waking = false;
-    let mut noted: Option<tokio::time::Instant> = None;
-    loop {
-        let expiry = held.next_expiry();
-        tokio::select! {
-            Some(result) = futures::future::OptionFuture::from(attempt.as_mut()), if attempt.is_some() => {
-                attempt = None;
-                match result {
-                    Ok(opened @ (Opened::Live(_) | Opened::Doubtful(_))) => {
-                        doubtful = matches!(opened, Opened::Doubtful(_));
-                        if doubtful {
-                            doubt.as_mut().reset(tokio::time::Instant::now() + DOUBTFUL_READY);
-                        }
-                        let (Opened::Live(socket) | Opened::Doubtful(socket)) = opened else { continue };
-                        upstream = Some(socket);
-                        ready = false;
-                        through = false;
-                        backoff = RETRY_MIN;
-                    }
-                    Ok(Opened::Held(mut socket)) => {
-                        // The viewer was told the owner cannot be reached and
-                        // nothing here will take that back: a sleeping
-                        // machine sends no `ready`, and nothing is waiting to
-                        // wake it. End this socket so the viewer reconnects
-                        // into the quiet attach.
-                        // A setting held with no input does not keep it open:
-                        // it is refused by name, since it cannot wait across
-                        // the reconnect.
-                        if told == Some("remote_unavailable") && !held.has_input() {
-                            let refused = held.take();
-                            let _ = link.refuse(downstream, &refused).await;
-                            return;
-                        }
-                        // What was sent while this attach was in flight goes
-                        // to the transport now: it holds it and wakes the
-                        // machine (input held for a move here waits for that;
-                        // a setting held with no input waits for input).
-                        if pull.is_none() && held.has_input() {
-                            for frame in held.take() {
-                                let Some(frame) = upward(frame) else { continue };
-                                if bounded_send(socket.as_mut(), frame).await.is_err() { return; }
-                            }
-                        }
-                        upstream = Some(socket);
-                        ready = false;
-                        through = true;
-                        doubtful = false;
-                        waking = false;
-                        backoff = RETRY_MIN;
-                    }
-                    Ok(Opened::Waking) => {
-                        if !waking {
-                            waking = true;
-                            if bounded_send(downstream, Down::Text(waking_status().to_string().into())).await.is_err() { return; }
-                        }
-                        attempt = Some(Box::pin(link.connect(true, Reach::Sleeping)));
-                    }
-                    // Only what the user did wakes the owner: a held setting
-                    // waits for it without asking.
-                    Ok(Opened::Sleeping) if held.has_input() && pull.is_none() => {
-                        passive = false;
-                        wake = true;
-                        attempt = Some(Box::pin(link.open(true, false)));
-                    }
-                    Ok(Opened::Sleeping) => {
-                        passive = false;
-                        if told != Some("worker_asleep") {
-                            told = Some("worker_asleep");
-                            if bounded_send(downstream, Down::Text(asleep().to_string().into())).await.is_err() { return; }
-                        }
-                        retry.as_mut().reset(tokio::time::Instant::now() + ASLEEP_RETRY);
-                        retry_armed = true;
-                    }
-                    Err(_) => {
-                        // A failed wake attempt answers what it was carrying
-                        // (input held for the move here waits for that; a
-                        // setting held with no input asked for no attempt
-                        // and keeps waiting).
-                        let refused = if pull.is_none() && held.has_input() { held.take() } else { Default::default() };
-                        if link.refuse(downstream, &refused).await.is_err() { return; }
-                        wake = false;
-                        waking = false;
-                        if told != Some("remote_unavailable") {
-                            told = Some("remote_unavailable");
-                            if bounded_send(downstream, Down::Text(unavailable().to_string().into())).await.is_err() { return; }
-                        }
-                        retry.as_mut().reset(tokio::time::Instant::now() + backoff);
-                        retry_armed = true;
-                        backoff = (backoff * 2).min(RETRY_MAX);
-                    }
-                }
-            }
-            _ = &mut retry, if retry_armed => {
-                retry_armed = false;
-                attempt = Some(Box::pin(link.open(wake, passive)));
-            }
-            // A held setting waited too long for input that did not come: it
-            // is refused by name rather than applied to whatever runs next.
-            _ = async {
-                match expiry {
-                    Some(at) => tokio::time::sleep_until(at).await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                let expired = held.expired(tokio::time::Instant::now());
-                if link.refuse(downstream, &expired).await.is_err() { return; }
-            }
-            // Accepted for an owner reported asleep and silent since: nothing
-            // is behind this socket. That is a refusal: input held for it
-            // wakes the owner (a held setting alone does not), and otherwise
-            // the viewer hears the owner is asleep.
-            _ = &mut doubt, if doubtful && !ready && upstream.is_some() => {
-                link.state.session_proxy.note_passive_refused(&link.route);
-                upstream = None;
-                doubtful = false;
-                passive = false;
-                if held.has_input() && pull.is_none() {
-                    wake = true;
-                    attempt = Some(Box::pin(link.open(true, false)));
-                } else {
-                    if told != Some("worker_asleep") {
-                        told = Some("worker_asleep");
-                        if bounded_send(downstream, Down::Text(asleep().to_string().into())).await.is_err() { return; }
-                    }
-                    retry.as_mut().reset(tokio::time::Instant::now() + ASLEEP_RETRY);
-                    retry_armed = true;
-                }
-            }
-            outcome = settled(&mut pull) => {
-                pull = None;
-                if outcome == crate::pro::MoveOutcome::Here {
-                    // The project runs here now: deliver what the user sent,
-                    // once, to the session on this computer, then close so
-                    // the viewer reconnects to it (it replays the message).
-                    // One wait for the session to come up covers the whole
-                    // batch (a session that never starts must not stall this
-                    // socket once per frame). And once a setting could not be
-                    // applied, nothing after it is run: a message must not go
-                    // out under a mode the user had just changed.
-                    let deadline = tokio::time::Instant::now() + crate::ws::HELD_DELIVERY;
-                    let mut stopped = false;
-                    for frame in held.take() {
-                        let setting = matches!(Viewer::of(link.chat, &frame), Viewer::Setting { .. });
-                        let answer = if link.chat { frame.clone() } else { Down::Binary(Default::default()) };
-                        if stopped
-                            || crate::ws::deliver_held(link.state, &link.session, link.chat, frame, deadline).await.is_err()
-                        {
-                            stopped |= setting;
-                            let _ = link.refuse(downstream, [&answer]).await;
-                        }
-                    }
-                    return;
-                }
-                let refused = held.take();
-                if link.refuse_kept(downstream, &refused).await.is_err() { return; }
-                if upstream.is_none() && attempt.is_none() {
-                    retry_armed = false;
-                    attempt = Some(Box::pin(link.open(false, passive)));
-                }
-            }
-            _ = ownership.tick() => {
-                // The owner handing the project over (or this computer taking
-                // it) is the move this socket asked for: wait for its outcome.
-                if pull.is_some() {
-                    continue;
-                }
-                // Input a keeping transport still holds for this socket is
-                // discarded when the socket ends here; the viewer's client
-                // sends it again by its id at its next `ready`.
-                if let Some(moved) = link.ended() {
-                    let refused = held.take();
-                    let _ = link.refuse(downstream, &refused).await;
-                    if let Some(moved) = moved {
-                        let _ = bounded_send(downstream, Down::Text(moved.to_string().into())).await;
-                    }
-                    return;
-                }
-            }
-            next = next_up(&mut upstream) => match next {
-                Some(Ok(Up::Text(text))) => {
-                    if pull.is_some() && departure(&text) {
-                        continue;
-                    }
-                    let (frame, is_ready) = link.downstream_text(&text);
-                    if bounded_send(downstream, Down::Text(frame.into())).await.is_err() { return; }
-                    if is_ready && !ready {
-                        ready = true;
-                        told = None;
-                        waking = false;
-                        // Deliver what the viewer typed while connecting, once,
-                        // in order (input held for a move here waits for it).
-                        // A setting held with no input is not delivered now:
-                        // it rides in front of this viewer's next input or
-                        // expires, so an owner that answers hours later is
-                        // never handed a mode nobody is asking for any more.
-                        if let (Some(socket), None, true) = (upstream.as_mut(), pull.as_ref(), held.has_input()) {
-                            for frame in held.take() {
-                                let Some(frame) = upward(frame) else { continue };
-                                if bounded_send(socket.as_mut(), frame).await.is_err() { return; }
-                            }
-                        }
-                    }
-                }
-                Some(Ok(Up::Binary(bytes))) => {
-                    if bounded_send(downstream, Down::Binary(bytes)).await.is_err() { return; }
-                }
-                Some(Ok(Up::Ping(bytes))) => {
-                    if let Some(socket) = upstream.as_mut() {
-                        let _ = bounded_send(socket.as_mut(), Up::Pong(bytes)).await;
-                    }
-                }
-                Some(Ok(Up::Close(_))) | None | Some(Err(_)) => {
-                    // Handing the project here ends the owner's session there:
-                    // keep waiting for the move this socket asked for.
-                    if pull.is_some() {
-                        upstream = None;
-                        ready = false;
-                        continue;
-                    }
-                    // Accepted for an owner reported asleep and dropped
-                    // before any answer: that transport keeps no sockets.
-                    if doubtful && !ready {
-                        link.state.session_proxy.note_passive_refused(&link.route);
-                    }
-                    // The owner ended this connection (exit, restart, owner
-                    // change). The viewer reconnects and is routed afresh;
-                    // what a keeping transport held for it is discarded there
-                    // and sent again by the viewer's client (see above).
-                    let refused = held.take();
-                    let _ = link.refuse(downstream, &refused).await;
-                    return;
-                }
-                _ => {}
-            },
-            next = downstream.recv() => match next {
-                Some(Ok(frame @ (Down::Text(_) | Down::Binary(_)))) => {
-                    let what = Viewer::of(link.chat, &frame);
-                    // The id of a held send counts as accepted, as it does in
-                    // the daemon. A second copy (the viewer's client sends an
-                    // unconfirmed send again at a `ready`) is dropped, never
-                    // held twice and never refused: the first copy will be
-                    // delivered, and a refusal would return a message that
-                    // runs. A `cancel_send` for it is answered here and never
-                    // forwarded: an owner that has not seen the send would
-                    // call it withdrawn.
-                    match &what {
-                        Viewer::Input { client_id: Some(id) } if held.holds(id) => continue,
-                        Viewer::Cancel { client_id } if held.holds(client_id) => {
-                            let answer = json!({"type":"send_cancelled","client_id":client_id,"cancelled":false});
-                            if bounded_send(downstream, Down::Text(answer.to_string().into())).await.is_err() { return; }
-                            continue;
-                        }
-                        _ => {}
-                    }
-                    let input = matches!(what, Viewer::Input { .. });
-                    // Ordinary input stays with this socket's current owner.
-                    // Only the explicit takeover route starts a move.
-                    if pull.is_some() && (link.chat || input) {
-                        // While the work is coming, nothing a chat sends goes
-                        // to the owner it is leaving: input and settings wait
-                        // in order for the session here, the rest is dropped.
-                        let kept = match what {
-                            Viewer::Input { client_id } => held.input(frame, client_id),
-                            Viewer::Setting { key } => held.setting(frame, key),
-                            Viewer::Cancel { .. } | Viewer::Other => Ok(()),
-                        };
-                        if let Err(refused) = kept {
-                            if link.refuse_bringing(downstream, &refused).await.is_err() { return; }
-                        }
-                        continue;
-                    }
-                    match (upstream.as_mut(), what) {
-                        // A keeping transport takes everything at once: it
-                        // holds input until `ready` and folds grid control
-                        // into the authentication it attaches with.
-                        (Some(socket), what) if ready || through => {
-                            if let Some(moved) = link.ended() {
-                                // Input and settings are answered, never
-                                // dropped: this one, and settings still held.
-                                let mut refused = if pull.is_none() { held.take() } else { Default::default() };
-                                if input || matches!(what, Viewer::Setting { .. }) {
-                                    refused.push_back(frame);
-                                }
-                                let _ = link.refuse(downstream, &refused).await;
-                                if let Some(moved) = moved {
-                                    let _ = bounded_send(downstream, Down::Text(moved.to_string().into())).await;
-                                }
-                                return;
-                            }
-                            match what {
-                                // Settings held for this owner ride in front
-                                // of what the user does now, in order. (What
-                                // is held for a move here is not for this
-                                // owner.)
-                                Viewer::Input { .. } if pull.is_none() => {
-                                    for earlier in held.take() {
-                                        let Some(earlier) = upward(earlier) else { continue };
-                                        if bounded_send(socket.as_mut(), earlier).await.is_err() { return; }
-                                    }
-                                }
-                                // Applied now: an earlier pick of the same
-                                // setting still held is stale.
-                                Viewer::Setting { key } => held.supersede(&key),
-                                _ => {}
-                            }
-                            let Some(frame) = upward(frame) else { continue };
-                            if bounded_send(socket.as_mut(), frame).await.is_err() { return; }
-                        }
-                        (_, Viewer::Input { .. }) if waking => {
-                            let now = tokio::time::Instant::now();
-                            let say = link.chat || noted.is_none_or(|at| now >= at + WAKING_NOTE_EVERY);
-                            if say {
-                                noted = Some(now);
-                                if link.refuse_waking(downstream, &frame).await.is_err() { return; }
-                            }
-                        }
-                        (_, Viewer::Input { client_id }) => {
-                            if let Err(refused) = held.input(frame, client_id) {
-                                if link.refuse(downstream, [&refused]).await.is_err() { return; }
-                            }
-                            // The first real input carries wake intent; an
-                            // in-flight passive attempt upgrades when it
-                            // reports the owner asleep.
-                            if upstream.is_none() && attempt.is_none() {
-                                wake = true;
-                                retry_armed = false;
-                                attempt = Some(Box::pin(link.open(true, passive)));
-                            }
-                        }
-                        // A setting picked while the owner is away must still
-                        // apply to what the user sends next (a stricter
-                        // permission mode above all), so it is held in order
-                        // with the input. It asks for no wake by itself.
-                        (_, Viewer::Setting { key }) => {
-                            if let Err(refused) = held.setting(frame, key) {
-                                if link.refuse(downstream, [&refused]).await.is_err() { return; }
-                            }
-                        }
-                        // Grid control before the owner answers: the auth frame
-                        // already carries the grid; the ready reconcile fixes drift.
-                        // A chat command that is neither the user acting nor a
-                        // setting is dropped too: nothing waits on it in the
-                        // viewer, and holding it would only replay it late.
-                        (_, Viewer::Cancel { .. } | Viewer::Other) => {}
-                    }
-                }
-                Some(Ok(Down::Close(_))) | None | Some(Err(_)) => return,
-                _ => {}
-            },
-        }
     }
 }
 /// One project's live frames from its current owner, merged into a window's
@@ -3155,168 +2316,6 @@ mod tests {
             Viewer::of(true, &odd),
             Viewer::Input { client_id: None }
         ));
-    }
-
-    fn held(budget: &HeldBudget) -> Held<'_> {
-        Held {
-            chat: true,
-            frames: Default::default(),
-            bytes: 0,
-            budget,
-        }
-    }
-    fn texts(frames: std::collections::VecDeque<Down>) -> Vec<String> {
-        frames
-            .into_iter()
-            .map(|frame| match frame {
-                Down::Text(text) => text.to_string(),
-                _ => String::new(),
-            })
-            .collect()
-    }
-
-    /// Held settings: the latest pick of a setting wins unless the user acted
-    /// in between, MCP settings are kept per server, and they are bounded
-    /// apart from the four commands.
-    #[test]
-    fn held_settings_coalesce_until_the_user_acts() {
-        let budget = HeldBudget::new(HELD_TOTAL_BYTES);
-        let mut queue = held(&budget);
-        let model = |id: &str| chat_frame(json!({"type":"set_model","model_id":id}));
-        let key = |frame: &Down| match Viewer::of(true, frame) {
-            Viewer::Setting { key } => key,
-            _ => panic!("not a setting"),
-        };
-        let pick = |queue: &mut Held<'_>, frame: Down| {
-            let key = key(&frame);
-            queue.setting(frame, key)
-        };
-        assert!(!queue.has_input());
-        pick(&mut queue, model("x")).unwrap();
-        pick(
-            &mut queue,
-            chat_frame(json!({"type":"set_mode","mode_id":"plan"})),
-        )
-        .unwrap();
-        pick(&mut queue, model("x2")).unwrap();
-        assert!(!queue.has_input(), "a setting is no reason to wake");
-        queue
-            .input(
-                chat_frame(json!({"type":"send","blocks":[],"client_id":"client-0001"})),
-                Some("client-0001".into()),
-            )
-            .unwrap();
-        assert!(queue.has_input());
-        assert!(queue.holds("client-0001") && !queue.holds("client-0002"));
-        pick(&mut queue, model("y")).unwrap();
-        pick(&mut queue, model("y2")).unwrap();
-        let enabled = |server: &str, enabled: bool| {
-            chat_frame(json!({"type":"set_mcp_enabled","server":server,"enabled":enabled}))
-        };
-        pick(&mut queue, enabled("a", true)).unwrap();
-        pick(&mut queue, enabled("b", true)).unwrap();
-        pick(&mut queue, enabled("a", false)).unwrap();
-        pick(
-            &mut queue,
-            chat_frame(json!({"type":"reconnect_mcp","server":"a"})),
-        )
-        .unwrap();
-        let bytes = queue.bytes;
-        assert_eq!(budget.used.load(Ordering::Acquire), bytes);
-        let order: Vec<Value> = texts(queue.take())
-            .iter()
-            .map(|text| serde_json::from_str(text).unwrap())
-            .collect();
-        assert_eq!(
-            order,
-            [
-                json!({"type":"set_model","model_id":"x2"}),
-                json!({"type":"set_mode","mode_id":"plan"}),
-                json!({"type":"send","blocks":[],"client_id":"client-0001"}),
-                json!({"type":"set_model","model_id":"y2"}),
-                json!({"type":"set_mcp_enabled","server":"a","enabled":false}),
-                json!({"type":"set_mcp_enabled","server":"b","enabled":true}),
-                json!({"type":"reconnect_mcp","server":"a"}),
-            ]
-        );
-        assert_eq!(budget.used.load(Ordering::Acquire), 0);
-
-        // Sixteen settings and four commands, each within its own bound.
-        for n in 0..HELD_SETTINGS {
-            pick(&mut queue, enabled(&format!("server-{n}"), true)).unwrap();
-        }
-        assert!(pick(&mut queue, enabled("one-too-many", true)).is_err());
-        pick(&mut queue, enabled("server-3", false)).expect("a held setting can still change");
-        for n in 0..HELD_CHAT_COMMANDS {
-            queue
-                .input(chat_frame(json!({"type":"send","blocks":[],"n":n})), None)
-                .expect("settings do not use up the command cap");
-        }
-        assert!(queue
-            .input(chat_frame(json!({"type":"interrupt"})), None)
-            .is_err());
-        let long =
-            chat_frame(json!({"type":"set_model","model_id":"m".repeat(HELD_SETTING_BYTES)}));
-        assert!(pick(&mut queue, long).is_err());
-    }
-
-    #[test]
-    fn held_input_shares_one_daemon_wide_budget() {
-        let budget = HeldBudget::new(10 * 1024);
-        let frame = |size: usize| Down::Binary(vec![b'x'; size].into());
-        let mut first = Held {
-            chat: false,
-            frames: Default::default(),
-            bytes: 0,
-            budget: &budget,
-        };
-        let mut second = Held {
-            chat: false,
-            frames: Default::default(),
-            bytes: 0,
-            budget: &budget,
-        };
-        assert!(first.input(frame(6 * 1024), None).is_ok());
-        // Within its own cap, but not within what is left daemon-wide.
-        assert!(second.input(frame(6 * 1024), None).is_err());
-        assert!(second.input(frame(4 * 1024), None).is_ok());
-        // Delivering (or dropping) held input gives its bytes back.
-        assert_eq!(first.take().len(), 1);
-        assert!(second.input(frame(6 * 1024), None).is_ok());
-        drop(second);
-        assert_eq!(budget.used.load(Ordering::Acquire), 0);
-    }
-
-    #[test]
-    fn terminal_input_holds_one_bounded_buffer_and_empty_frames_never_wake() {
-        let budget = HeldBudget::new(HELD_TERMINAL_BYTES);
-        let mut queue = held(&budget);
-        queue.chat = false;
-        let empty = Down::Binary(Default::default());
-        assert!(matches!(Viewer::of(false, &empty), Viewer::Other));
-        for _ in 0..1024 {
-            queue.input(empty.clone(), None).unwrap();
-        }
-        assert!(queue.frames.is_empty());
-        assert!(!queue.has_input());
-        for index in 0..HELD_TERMINAL_BYTES {
-            queue
-                .input(Down::Binary(vec![(index % 251) as u8].into()), None)
-                .unwrap();
-        }
-        assert_eq!(queue.frames.len(), 1);
-        assert_eq!(queue.bytes, HELD_TERMINAL_BYTES);
-        assert_eq!(budget.used.load(Ordering::Acquire), HELD_TERMINAL_BYTES);
-        assert!(queue.input(Down::Binary(vec![b'x'].into()), None).is_err());
-        let frames = queue.take();
-        let Down::Binary(bytes) = &frames[0] else {
-            panic!("terminal bytes")
-        };
-        assert!(bytes
-            .iter()
-            .enumerate()
-            .all(|(index, byte)| *byte == (index % 251) as u8));
-        assert_eq!(budget.used.load(Ordering::Acquire), 0);
     }
 
     #[test]

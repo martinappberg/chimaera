@@ -1,9 +1,24 @@
-import { derived, readable, toStore } from "svelte/store";
+import { derived, toStore } from "svelte/store";
 import { accountPlan, accountSignedOut, proOffered } from "../net/plan";
 import { pageVisible } from "../shared/visibility";
+import { cloudOnboarding, type CloudOnboardingContext } from "../pro/onboarding.svelte";
+import type { OnboardingIntent } from "./application";
 import { keptReviews } from "../pro/keptReviews.svelte";
 import { relativeFilePath, type ApplicationRuntime, type HostSurfaceActions } from "./application";
 
+const intents = new WeakMap<CloudOnboardingContext, OnboardingIntent>();
+let intentSequence = 0;
+export function originalOnboardingIntent(context: CloudOnboardingContext | null): OnboardingIntent | null {
+  if (context === null) return null;
+  let intent = intents.get(context);
+  if (intent === undefined) {
+    intent = Object.freeze({ version: 1 as const, intentId: `intent-${++intentSequence}`,
+      providerIds: Object.freeze([...context.providerIds]), workspaceId: context.workspaceId ?? null,
+      projectLabel: context.workspaceName ?? null });
+    intents.set(context, intent);
+  }
+  return intent;
+}
 /** One dormant projection of the existing window services, never a new client. */
 export const keptApplicationRuntime: ApplicationRuntime = Object.freeze({
   version: 1 as const,
@@ -18,8 +33,8 @@ export const keptApplicationRuntime: ApplicationRuntime = Object.freeze({
       workspaceId, pendingFiles: review.files,
       returnedAt: review.returned_at === null ? null : new Date(review.returned_at).toISOString() });
   }) },
-  // A kept-only presentation has no onboarding completion authority.
-  onboarding: readable(null),
+  // A projection never grants completion: each surface checks its original intent.
+  onboarding: toStore(() => originalOnboardingIntent(cloudOnboarding.context)),
 });
 
 export interface KeptHostSnapshot {

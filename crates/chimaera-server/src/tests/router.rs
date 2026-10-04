@@ -80,6 +80,7 @@ async fn health_with_token_is_200() {
     let body = res.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["name"], "chimaera");
+    assert_eq!(json["daemon_extension"], false);
     assert_eq!(json["version"], chimaera_core::VERSION);
     assert_eq!(json["hostname"], "testhost");
     assert_eq!(json["pid"], 4242);

@@ -108,7 +108,7 @@ pub(super) fn adoption_pending(state: &AppState, workspace: &str) -> bool {
             .get(workspace)
             .is_some_and(|entry| !entry.complete)
 }
-fn local_root(state: &AppState, workspace: &str) -> Option<PathBuf> {
+pub(in crate::pro) fn local_root(state: &AppState, workspace: &str) -> Option<PathBuf> {
     if (lock(&state.pro.legacy_pending).contains(workspace)
         && !lock(&state.pro.preferences)
             .get(workspace)
@@ -288,7 +288,7 @@ async fn configuration(state: &AppState) -> (Option<Configure>, u64) {
         state.pro.generation.load(Ordering::Acquire),
     )
 }
-async fn list(state: &Arc<AppState>) -> Cache {
+pub(in crate::pro) async fn list(state: &Arc<AppState>) -> Cache {
     let (config, generation) = configuration(state).await;
     let Some(config) = config.filter(|config| config.role == Role::Device) else {
         return Cache::default();
@@ -503,7 +503,10 @@ pub(super) async fn begin_install(state: &AppState, workspace: &str, root: &Path
     Ok(())
 }
 
-async fn copy(state: &Arc<AppState>, request: Open) -> Result<serde_json::Value> {
+pub(in crate::pro) async fn copy(
+    state: &Arc<AppState>,
+    request: Open,
+) -> Result<serde_json::Value> {
     anyhow::ensure!(
         !crate::lock(&state.pro.authority).restricted(),
         refuse("unavailable", "workspace destination is fixed")

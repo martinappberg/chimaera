@@ -358,7 +358,7 @@ scope every generic session/file/MCP endpoint or protect against a compromised
 daemon with an account-wide network credential. Project namespaces, trusted
 project routing, provider delivery and cryptographically enforced service-side
 workspace authority must all be integrated and verified before selected-project
-secret sharing is enabled. The public fake account still implements legacy
+secret sharing is enabled. The optional test account still implements legacy
 account-wide delegation only; service-side scoped conformance remains a separate
 implementation gate.
 

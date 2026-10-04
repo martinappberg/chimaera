@@ -167,3 +167,45 @@ describe("application surface original owner", () => {
     expect(() => mount.actions.completeOnboarding("successor-intent")).toThrow("retired"); expect(actions.openFile).not.toHaveBeenCalled(); owner.close();
   });
 });
+
+// Real session admission, including a late host factory, rather than testing
+// a duplicated async guard. Renderer/HTTP acceptance remains a separate gate.
+describe("selected account host domain", () => {
+  it("does not construct account services when the entry is absent", async () => {
+    const actions = host(); actions.accountPresentation = vi.fn();
+    const owner = new ApplicationSurfaceSession(dom(new Target()), "account", { version: 1, viewId: "account", attemptId: 1, workspaceId: null },
+      { revision: 1, visible: true, projectLabel: null, onboarding: null }, runtime(), null, actions);
+    owner.start(); await flush(); owner.close();
+    expect(actions.accountPresentation).not.toHaveBeenCalled();
+  });
+  it("retires a late account factory before mounting a successor", async () => {
+    const factory = deferred<import("./accountPresentation").AccountPresentationServices>();
+    const dispose = vi.fn(), mount = vi.fn(); const actions = host();
+    let signal!: AbortSignal;
+    actions.accountPresentation = (_, originalSignal) => { signal = originalSignal; return factory.promise; };
+    const owner = new ApplicationSurfaceSession(dom(new Target()), "account", { version: 1, viewId: "account", attemptId: 1, workspaceId: null },
+      { revision: 1, visible: true, projectLabel: null, onboarding: null }, runtime(), { version: 1, id: "chimaera-pro", mount }, actions);
+    owner.start(); await flush(); expect(signal.aborted).toBe(false); owner.close();
+    expect(signal.aborted).toBe(true);
+    factory.resolve({ version: 1, dispose } as unknown as import("./accountPresentation").AccountPresentationServices);
+    await flush(); expect(dispose).toHaveBeenCalledTimes(1); expect(mount).not.toHaveBeenCalled();
+  });
+  it("keeps the factory reservation until actual settlement after the original deadline", async () => {
+    vi.useFakeTimers(); const services = runtime(); const factories = Array.from({ length: 8 }, () => deferred<import("./accountPresentation").AccountPresentationServices>());
+    const original: ApplicationSurfaceSession[] = [];
+    for (const factory of factories) {
+      const actions = host(); actions.accountPresentation = () => factory.promise;
+      const owner = new ApplicationSurfaceSession(dom(new Target()), "account", { version: 1, viewId: "account", attemptId: 1, workspaceId: null },
+        { revision: 1, visible: true, projectLabel: null, onboarding: null }, services,
+        { version: 1, id: "chimaera-pro", mount: vi.fn() }, actions);
+      original.push(owner); owner.start();
+    }
+    await flush(); vi.advanceTimersByTime(10_001);
+    const ninth = host(); ninth.accountPresentation = vi.fn();
+    const successor = new ApplicationSurfaceSession(dom(new Target()), "account", { version: 1, viewId: "account", attemptId: 2, workspaceId: null },
+      { revision: 1, visible: true, projectLabel: null, onboarding: null }, services, { version: 1, id: "chimaera-pro", mount: vi.fn() }, ninth);
+    successor.start(); await flush(); expect(successor.status).toBe("failed"); expect(ninth.accountPresentation).not.toHaveBeenCalled();
+    for (const factory of factories) factory.resolve({ version: 1, dispose: vi.fn() } as unknown as import("./accountPresentation").AccountPresentationServices);
+    await flush(); for (const owner of original) owner.close(); successor.close();
+  });
+});

@@ -1,5 +1,5 @@
 //! Actual Configure + Unix peer; synthetic protection/access, no vendor or Broker.
-use super::super::provider_ready::tests::Fixture;
+use super::super::provider_ready::test_fixture::Fixture;
 use super::*;
 use std::time::Duration;
 

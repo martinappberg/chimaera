@@ -1,8 +1,9 @@
 /** Trusted first-party presentation only. The caller supplies the window's
  * existing runtime services; this module creates no account or route owner. */
 import type { KeptReviewDomain } from "./keptReview";
+import type { AccountPresentationServices, AccountHostScope, AccountBrandingSubscription } from "./accountPresentation";
 
-export type SurfaceKind = "account" | "account-settings" | "kept-review";
+export type SurfaceKind = "account" | "account-settings" | "account-home" | "cloud-projects" | "cloud-setup" | "kept-review";
 export interface Observable<T> { subscribe(listener: (snapshot: Readonly<T>) => void): () => void }
 export interface AccountSnapshot {
   version: 1;
@@ -26,7 +27,7 @@ export interface ApplicationRuntime {
   onboarding: Observable<OnboardingIntent | null>;
 }
 export interface SurfaceIdentity { version: 1; viewId: string; attemptId: number; workspaceId: string | null }
-export interface SurfacePresentation { revision: number; visible: boolean; projectLabel: string | null; onboarding: OnboardingIntent | null }
+export interface SurfacePresentation { knownWorkspaceIds?: readonly string[]; revision: number; visible: boolean; projectLabel: string | null; onboarding: OnboardingIntent | null }
 export interface SurfaceActions {
   openFile(relativePath: string): Promise<void>;
   completeOnboarding(intentId: string): void;
@@ -41,12 +42,15 @@ export interface SurfaceMount {
   signal: AbortSignal;
   /** Original host-bound review only; absent on ordinary/account surfaces. */
   keptReview: KeptReviewDomain | null;
+  accountPresentation?: AccountPresentationServices | null;
 }
 export interface SurfaceOwner { update(presentation: Readonly<SurfacePresentation>): void; dispose(): void }
 export interface ApplicationExtension {
   version: 1;
   id: "chimaera-pro";
   mount(kind: SurfaceKind, target: HTMLElement, mount: SurfaceMount): Promise<SurfaceOwner>;
+  bindAccountPresentation?(scope: AccountHostScope): Promise<AccountPresentationServices>;
+  bindAccountBranding?(scope: AccountBrandingSubscription): Promise<() => void>;
 }
 export type SurfaceStatus = "absent" | "loading" | "ready" | "failed" | "closed";
 export interface HostSurfaceActions {
@@ -60,6 +64,8 @@ export interface HostSurfaceActions {
   current(): boolean;
   /** Host-only factory captures original workspace/epoch/pane before mount. */
   keptReview?(): KeptReviewDomain;
+  /** Selected entry only; the original host owns every named service. */
+  accountPresentation?(actions: SurfaceActions, signal: AbortSignal): Promise<AccountPresentationServices>;
 }
 const validId = (v: unknown): v is string => typeof v === "string" && /^[a-zA-Z0-9_-]{1,128}$/.test(v);
 const counter = (v: number): boolean => Number.isSafeInteger(v) && v > 0;
@@ -70,7 +76,8 @@ export function relativeFilePath(path: string): boolean {
 }
 function snapshot(value: SurfacePresentation): Readonly<SurfacePresentation> {
   const intent = value.onboarding;
-  if (!counter(value.revision) || typeof value.visible !== "boolean" ||
+  if ((value.knownWorkspaceIds !== undefined && (!Array.isArray(value.knownWorkspaceIds) || value.knownWorkspaceIds.length > 256 ||
+      value.knownWorkspaceIds.some(id => !validId(id)) || new Set(value.knownWorkspaceIds).size !== value.knownWorkspaceIds.length)) || !counter(value.revision) || typeof value.visible !== "boolean" ||
       (value.projectLabel !== null && (typeof value.projectLabel !== "string" || value.projectLabel.length > 160)) ||
       (intent !== null && (intent.version !== 1 || !validId(intent.intentId) ||
         !Array.isArray(intent.providerIds) || intent.providerIds.length > 16 ||
@@ -82,6 +89,7 @@ function snapshot(value: SurfacePresentation): Readonly<SurfacePresentation> {
   // Structural TypeScript inputs can contain additional data. Project only
   // declared presentation fields into the separately bundled entry.
   return Object.freeze({
+    ...(value.knownWorkspaceIds === undefined ? {} : { knownWorkspaceIds: Object.freeze([...value.knownWorkspaceIds]) }),
     revision: value.revision, visible: value.visible, projectLabel: value.projectLabel,
     onboarding: intent === null ? null : Object.freeze({
       version: 1 as const, intentId: intent.intentId,
@@ -108,6 +116,7 @@ export class ApplicationSurfaceSession {
   #mounting = false;
   #closed = false;
   #keptReview: KeptReviewDomain | null = null;
+  #accountPresentation: AccountPresentationServices | null = null;
   #modals = new Set<{ destroy(): void }>();
   status: SurfaceStatus;
   constructor(
@@ -122,7 +131,7 @@ export class ApplicationSurfaceSession {
   ) {
     if (identity.version !== 1 || !validId(identity.viewId) || !counter(identity.attemptId) ||
       (identity.workspaceId !== null && !validId(identity.workspaceId)) || runtime.version !== 1 ||
-      !["account", "account-settings", "kept-review"].includes(kind) ||
+      !["account", "account-settings", "account-home", "cloud-projects", "cloud-setup", "kept-review"].includes(kind) ||
       (extension !== null && (extension.version !== 1 || extension.id !== "chimaera-pro"))) {
       throw new Error("Invalid application surface");
     }
@@ -153,6 +162,8 @@ export class ApplicationSurfaceSession {
     const owner = this.#owner;
     this.#owner = null;
     try { owner?.dispose(); } catch { /* Detached UI cannot block host cleanup. */ }
+    const account = this.#accountPresentation; this.#accountPresentation = null;
+    try { account?.dispose(); } catch { /* Retire exact presentation only. */ }
     const kept = this.#keptReview; this.#keptReview = null;
     try { kept?.dispose(); } catch { /* Retire only this presentation domain. */ }
   }
@@ -202,7 +213,7 @@ export class ApplicationSurfaceSession {
     };
     this.#timer = setTimeout(() => { this.#clear(); if (!this.#closed) this.#set("failed"); }, MOUNT_MS);
     // Calling mount in a promise also accounts for synchronous module throws.
-    void Promise.resolve().then(() => {
+    void Promise.resolve().then(async () => {
       check();
       if (this.kind === "kept-review" && this.host.keptReview !== undefined) {
         const kept = this.host.keptReview();
@@ -210,9 +221,15 @@ export class ApplicationSurfaceSession {
         if (kept.workspaceId !== this.#identity.workspaceId) throw new Error("Application review scope mismatch");
         check();
       }
+      if (this.kind !== "kept-review" && this.host.accountPresentation !== undefined) {
+        const account = await this.host.accountPresentation(actions, controller.signal);
+        if (!this.#current(target)) { account.dispose(); throw new Error("Application surface retired"); }
+        this.#accountPresentation = account;
+      }
+      check();
       return this.extension!.mount(this.kind, target, {
         identity: this.#identity, presentation: this.#presentation, runtime: this.runtime,
-        actions, signal: controller.signal, keptReview: this.#keptReview,
+        actions, signal: controller.signal, keptReview: this.#keptReview, accountPresentation: this.#accountPresentation,
       });
     }).then((owner) => {
       if (!this.#current(target)) {
