@@ -155,6 +155,11 @@ configuration-derived (`session-start:0:<sourcePath>`), so normalized row ids us
 a local monotonic counter with a random mapper namespace to keep later hooks and
 resumed drivers from overwriting earlier history without copying unbounded native
 turn ids into each row.
+Native hook keys are SHA-256 digests, so deeply nested configuration paths remain
+visible without retaining large IDs. For runtimes without a user `clientId`, model
+work items (including all tool types, plan and sleep), output deltas, patch updates,
+and parent-turn tool requests confirm receipt. Setup items such as hookPrompt and
+contextCompaction, and child-thread activity, do not establish parent delivery.
 Run statuses `failed`, `blocked`, and `stopped` all represent unsuccessful hooks.
 Diagnostics live in `entries[{kind,text}]` (`error`, `feedback`, `stop`, `warning`);
 `statusMessage` is a configured progress label. Join diagnostics with a byte cap

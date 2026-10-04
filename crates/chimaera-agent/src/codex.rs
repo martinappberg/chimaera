@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::ndjson::JsonlChild;
 
@@ -1159,7 +1160,7 @@ struct CodexMapper {
     unread_opening_message: Option<String>,
     /// Only synchronous pre-prompt hooks block delivery. Keep their progress
     /// separate from model activity, bounded even if a runtime misses closes.
-    startup_hooks: BTreeMap<String, (String, String)>,
+    startup_hooks: BTreeMap<[u8; 32], (String, String)>,
     /// A resumed mapper restarts its counter; retain uniqueness in the journal.
     startup_hook_namespace: u128,
     /// Follow-ups for a later turn, FIFO: `SendAfterTurn` messages (each
@@ -1516,6 +1517,8 @@ impl CodexMapper {
             "item/agentMessage/delta"
                 | "item/reasoning/textDelta"
                 | "item/reasoning/summaryTextDelta"
+                | "item/plan/delta"
+                | "item/commandExecution/outputDelta"
         ) && frame["params"]["delta"]
             .as_str()
             .is_some_and(|s| !s.is_empty())
@@ -1658,6 +1661,7 @@ impl CodexMapper {
             "item/fileChange/patchUpdated" => {
                 let params = &frame["params"];
                 if let Some(item_id) = params["itemId"].as_str() {
+                    self.unread_opening_message = None;
                     let changes = params["changes"].as_array().cloned().unwrap_or_default();
                     self.file_change_upsert(item_id, &changes, &mut step);
                 }
@@ -2072,14 +2076,14 @@ impl CodexMapper {
         if !self.turn_active || run["executionMode"] != "sync" {
             return;
         }
-        let Some(id) = run["id"]
-            .as_str()
-            .filter(|id| !id.is_empty() && id.len() <= 256)
-        else {
+        let Some(id) = run["id"].as_str().filter(|id| !id.is_empty()) else {
             return;
         };
+        // Configuration-derived IDs include source paths. Hash rather than
+        // dropping long paths, which would hide legitimate blocking hooks.
+        let id: [u8; 32] = Sha256::digest(id.as_bytes()).into();
         if completed {
-            let Some((tool_id, _)) = self.startup_hooks.remove(id) else {
+            let Some((tool_id, _)) = self.startup_hooks.remove(&id) else {
                 return;
             };
             step.events.push(AgentEvent::ToolCallUpdate {
@@ -2095,7 +2099,7 @@ impl CodexMapper {
                 content: Self::startup_hook_output(run),
             });
         } else {
-            if self.startup_hooks.contains_key(id) || self.startup_hooks.len() >= 32 {
+            if self.startup_hooks.contains_key(&id) || self.startup_hooks.len() >= 32 {
                 return;
             }
             // Native hook IDs repeat across turns, and native turn IDs can be
@@ -2103,8 +2107,7 @@ impl CodexMapper {
             let row_id = self.rpc_id();
             let tool_id = format!("codex-hook-{:032x}-{row_id}", self.startup_hook_namespace);
             let label = format!("Running {event} hook");
-            self.startup_hooks
-                .insert(id.to_string(), (tool_id.clone(), label));
+            self.startup_hooks.insert(id, (tool_id.clone(), label));
             step.events.push(AgentEvent::ToolCall {
                 id: tool_id,
                 kind: ToolKind::Other,
@@ -2555,7 +2558,21 @@ impl CodexMapper {
         // activity also proves we passed the pre-prompt hook barrier.
         if matches!(
             item["type"].as_str(),
-            Some("reasoning" | "agentMessage" | "commandExecution" | "mcpToolCall")
+            Some(
+                "reasoning"
+                    | "agentMessage"
+                    | "commandExecution"
+                    | "mcpToolCall"
+                    | "webSearch"
+                    | "fileChange"
+                    | "imageGeneration"
+                    | "imageView"
+                    | "dynamicToolCall"
+                    | "collabAgentToolCall"
+                    | "functionCallOutput"
+                    | "plan"
+                    | "sleep"
+            )
         ) {
             self.unread_opening_message = None;
         }
@@ -3808,6 +3825,19 @@ impl CodexMapper {
         let params = &frame["params"];
         let method = frame["method"].as_str().unwrap_or_default();
         let request_id = format!("codex-{}", rpc_id);
+        if params["threadId"].as_str() == Some(self.thread_id.as_str())
+            && params["turnId"].as_str() == Some(self.turn_id.as_str())
+            && matches!(
+                method,
+                "item/fileChange/requestApproval"
+                    | "item/commandExecution/requestApproval"
+                    | "item/permissions/requestApproval"
+                    | "item/tool/requestUserInput"
+                    | "item/tool/call"
+            )
+        {
+            self.unread_opening_message = None;
+        }
 
         // Codex asking the user structured questions (mined: answers keyed
         // by question id, each {answers:[string,…]}).
@@ -5446,6 +5476,102 @@ mod tests {
         assert_eq!(m.startup_hooks.len(), 32);
         m.reset_turn_state();
         assert!(m.startup_hooks.is_empty());
+    }
+
+    #[test]
+    fn long_configuration_ids_remain_visible_and_settle_independently() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let prefix = format!("session-start:0:{}", "/nested/α".repeat(1000));
+        for suffix in ["first", "second"] {
+            let id = format!("{prefix}/{suffix}");
+            assert!(m
+                .on_frame(&startup_hook(&id, false))
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolCall { .. })));
+        }
+        assert_eq!(m.startup_hooks.len(), 2);
+        for suffix in ["first", "second"] {
+            let id = format!("{prefix}/{suffix}");
+            assert!(m
+                .on_frame(&startup_hook(&id, true))
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolCallUpdate { .. })));
+        }
+        assert!(m.startup_hooks.is_empty());
+    }
+
+    #[test]
+    fn model_work_confirms_opening_input_but_pre_prompt_items_do_not() {
+        for kind in [
+            "reasoning",
+            "agentMessage",
+            "commandExecution",
+            "mcpToolCall",
+            "webSearch",
+            "fileChange",
+            "imageGeneration",
+            "imageView",
+            "dynamicToolCall",
+            "collabAgentToolCall",
+            "functionCallOutput",
+            "plan",
+            "sleep",
+        ] {
+            for completed in [false, true] {
+                let mut m = mapper();
+                active_turn(&mut m);
+                m.unread_opening_message = Some("opening".into());
+                m.on_frame(&json!({
+                    "method": if completed {"item/completed"} else {"item/started"},
+                    "params": {"threadId": "thr-1", "item": {"type": kind, "id": "work"}},
+                }));
+                assert!(m.unread_opening_message.is_none(), "{kind}");
+            }
+        }
+        for kind in [
+            "userMessage",
+            "hookPrompt",
+            "contextCompaction",
+            "subAgentActivity",
+            "enteredReviewMode",
+            "exitedReviewMode",
+        ] {
+            let mut m = mapper();
+            active_turn(&mut m);
+            m.unread_opening_message = Some("opening".into());
+            m.on_frame(&json!({
+                "method": "item/started",
+                "params": {"threadId": "thr-1", "item": {"type": kind, "id": "setup"}},
+            }));
+            assert!(m.unread_opening_message.is_some(), "{kind}");
+        }
+    }
+
+    #[test]
+    fn model_deltas_and_parent_tool_requests_confirm_input() {
+        for method in ["item/plan/delta", "item/commandExecution/outputDelta"] {
+            let mut m = mapper();
+            active_turn(&mut m);
+            m.unread_opening_message = Some("opening".into());
+            m.on_frame(&json!({"method": method,
+                "params": {"threadId": "thr-1", "itemId": "work", "delta": "working"},
+            }));
+            assert!(m.unread_opening_message.is_none());
+        }
+        for thread in ["thr-1", "child"] {
+            let mut m = mapper();
+            active_turn(&mut m);
+            m.unread_opening_message = Some("opening".into());
+            m.on_frame(
+                &json!({"id": 42, "method": "item/fileChange/requestApproval",
+                    "params": {"threadId": thread, "turnId": "turn-A", "itemId": "work"},
+                }),
+            );
+            assert_eq!(m.unread_opening_message.is_none(), thread == "thr-1");
+        }
     }
 
     #[test]
