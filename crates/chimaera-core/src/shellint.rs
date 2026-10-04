@@ -243,19 +243,17 @@ mod tests {
 
         let zsh = shell_launch_for("/bin/zsh", &base).unwrap();
         assert_eq!(zsh.argv, vec!["/bin/zsh"]);
-        assert!(
-            zsh.env
-                .iter()
-                .any(|(k, v)| k == "ZDOTDIR" && v.ends_with("shell-integration/zsh"))
-        );
+        assert!(zsh
+            .env
+            .iter()
+            .any(|(k, v)| k == "ZDOTDIR" && v.ends_with("shell-integration/zsh")));
 
         let fish = shell_launch_for("/opt/homebrew/bin/fish", &base).unwrap();
         assert_eq!(fish.argv, vec!["/opt/homebrew/bin/fish"]);
-        assert!(
-            fish.env
-                .iter()
-                .any(|(k, v)| k == "XDG_DATA_DIRS" && v.contains("fish-xdg"))
-        );
+        assert!(fish
+            .env
+            .iter()
+            .any(|(k, v)| k == "XDG_DATA_DIRS" && v.contains("fish-xdg")));
 
         // Unknown shells spawn plain.
         let other = shell_launch_for("/bin/tcsh", &base).unwrap();
