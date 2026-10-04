@@ -1,14 +1,14 @@
 import { constants } from "node:fs";
 import { open, realpath, readdir } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 const virtual = "virtual:chimaera-application-entry";
 const internal = `\0${virtual}`;
 const sha = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const jsName = (value) => typeof value === "string" && /^[A-Za-z0-9_.-]+\.js$/.test(value);
 const digest = (value) => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
-const relative = (value) => typeof value === "string" && value.length <= 4096 && !value.startsWith("/") &&
+const relative = (value) => typeof value === "string" && value.length <= 4096 && !value.startsWith("/") && !value.includes("\\") &&
   value.split("/").every((piece) => piece.length > 0 && piece !== "." && piece !== "..");
 async function bounded(path, max = 16 * 1024 * 1024) {
   const fd = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
@@ -31,7 +31,7 @@ async function bounded(path, max = 16 * 1024 * 1024) {
  * provenance checks are not signing, entitlement or installation authority. */
 export async function captureApplicationEntry(selected, publicRoot) {
   if (selected === undefined || selected === "") return null;
-  if (!isAbsolute(selected) || await realpath(selected) !== resolve(selected) || !selected.endsWith("/dist/pro-client-ui.js")) {
+  if (!isAbsolute(selected) || await realpath(selected) !== resolve(selected) || basename(selected) !== "pro-client-ui.js" || basename(dirname(selected)) !== "dist") {
     throw new Error("Expected captured application entry");
   }
   const directory = dirname(selected), packageRoot = dirname(directory);
@@ -71,6 +71,7 @@ export async function captureApplicationEntry(selected, publicRoot) {
   if (lexerPackage.version !== lock.packages?.["node_modules/es-module-lexer"]?.version) throw new Error("Application parser drift");
   const lexer = await import(pathToFileURL(join(publicRoot, "node_modules/es-module-lexer/dist/lexer.js")).href); await lexer.init;
   const graph = new Map();
+  const publicSources = join(publicRoot, "src").replaceAll("\\", "/") + "/";
   for (const chunk of receipt.chunks) {
     if (!jsName(chunk.file) || !digest(chunk.sha256) || graph.has(chunk.file)) throw new Error("Invalid application chunk");
     const bytes = await take(join(directory, chunk.file));
@@ -85,7 +86,7 @@ export async function captureApplicationEntry(selected, publicRoot) {
     if (JSON.stringify([...new Set(actual)].sort()) !== JSON.stringify([...new Set(declared)].sort())) throw new Error("Application graph drift");
     const provenance = compiler.chunks.find((item) => item.file === chunk.file);
     if (!provenance || provenance.sha256 !== chunk.sha256 || !Array.isArray(provenance.modules) || provenance.modules.length > 4096 ||
-      provenance.modules.some((id) => typeof id !== "string" || id.split("?")[0].startsWith(join(publicRoot, "src") + "/"))) throw new Error("Application host module copy refused");
+      provenance.modules.some((id) => typeof id !== "string" || id.split("?")[0].replaceAll("\\", "/").startsWith(publicSources))) throw new Error("Application host module copy refused");
     graph.set(chunk.file, actual);
   }
   const names = (await readdir(directory)).filter((name) => name.endsWith(".js")).sort();

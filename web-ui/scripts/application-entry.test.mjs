@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, writeFile, readFile, rm, realpath, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { captureApplicationEntry, applicationEntryPlugin } from "./application-entry.mjs";
@@ -37,6 +37,9 @@ test("absent entry never inspects private inputs and produces a closed null faca
 });
 test("actual selected capture checks graph/source/bytes and detects mid-assembly drift", async () => {
   const f = await fixture(); try {
+    // join() emits backslashes on Windows. This actual capture must reach all
+    // byte/graph checks with the same closed dist/entry shape on every runner.
+    assert.equal(basename(dirname(f.entry)), "dist"); assert.equal(basename(f.entry), "pro-client-ui.js");
     const capture = await captureApplicationEntry(f.entry, publicRoot); assert.ok(capture); await capture.verify();
     await writeFile(join(f.root, "src/index.ts"), "changed"); await assert.rejects(capture.verify(), /changed/);
   } finally { await rm(f.root, { recursive: true }); }
@@ -55,5 +58,28 @@ test("linked entry, remote CSS and unrecorded chunks refuse", async () => {
     await writeFile(join(f.dist, "pro-client-ui.css"), ""); await writeFile(join(f.dist, "extra.js"), "export default 0;");
     await assert.rejects(captureApplicationEntry(f.entry, publicRoot), /Unrecorded/);
     await symlink(f.entry, join(f.dist, "linked.js")); await assert.rejects(captureApplicationEntry(join(f.dist, "linked.js"), publicRoot));
+  } finally { await rm(f.root, { recursive: true }); }
+});
+
+test("host implementation provenance refuses either emitted path separator", async () => {
+  const f = await fixture(); try {
+    for (const separator of ["/", "\\"]) {
+      const compiler = JSON.parse(await readFile(join(f.dist, "build-closure.json"), "utf8"));
+      compiler.chunks[0].modules = [join(publicRoot, "src", "lib", "net", "api.ts").replaceAll("\\", "/").replaceAll("/", separator) + "?fixture"];
+      await writeFile(join(f.dist, "build-closure.json"), JSON.stringify(compiler));
+      await assert.rejects(captureApplicationEntry(f.entry, publicRoot), /host module copy refused/);
+    }
+  } finally { await rm(f.root, { recursive: true }); }
+});
+test("receipt source paths retain their closed forward-slash grammar on every platform", async () => {
+  const f = await fixture(); try {
+    const input = JSON.parse(await readFile(join(f.dist, "build-input.json"), "utf8"));
+    // A backslash can become a traversal separator on Windows. Never interpret
+    // a different source namespace from the verifier's forward-slash receipt.
+    for (const file of ["src\\index.ts", "..\\index.ts"]) {
+      input.privateSources[0].file = file;
+      await writeFile(join(f.dist, "build-input.json"), JSON.stringify(input));
+      await assert.rejects(captureApplicationEntry(f.entry, publicRoot), /Invalid application source/);
+    }
   } finally { await rm(f.root, { recursive: true }); }
 });
