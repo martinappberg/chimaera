@@ -112,7 +112,7 @@ async fn owned(
     dispatch: crate::pro::mutation::Dispatch,
     deadline: tokio::time::Instant,
 ) -> Result<Value, ()> {
-    let _configuration = tokio::time::timeout_at(
+    let configuration = tokio::time::timeout_at(
         deadline,
         crate::pro::manual_resume_configuration(&state).lock_owned(),
     )
@@ -124,152 +124,166 @@ async fn owned(
         .map_err(|_| ())?;
     let _lifecycle =
         crate::chat::ChatSwitchGuard::acquire(&state, &entry.id, "manual-resume").ok_or(())?;
-    let _mutation = dispatch.begin(&state).map_err(|_| ())?;
-    let current = || -> Result<(), ()> {
-        if tokio::time::Instant::now() >= deadline
-            || state.stopping.load(std::sync::atomic::Ordering::Acquire)
-            || crate::lock(&state.workspaces)
-                .get(&workspace.id)
-                .is_none_or(|now| now.root != workspace.root)
-        {
-            return Err(());
-        }
-        dispatch.check(&state).map_err(|_| ())
-    };
-    current()?;
-    crate::pro::ensure_root(crate::pro::manual_resume_storage(&state))
-        .await
-        .map_err(|_| failed("storage_root"))?;
-    let storage = state.clone();
-    let mut receipts = tokio::task::spawn_blocking(move || ledger::manual::load(&storage))
-        .await
-        .map_err(|_| failed("receipt_worker"))?
-        .map_err(|_| failed("receipt_read"))?;
-    current()?;
-    let deferred = crate::lock(&state.deferred_sessions)
-        .get(&entry.id)
-        .cloned();
-    if deferred.is_none() {
-        if !receipts.contains(&entry)
-            || !tokio::time::timeout_at(
-                deadline,
-                state.chat.resumed_native_ready(
-                    &entry.id,
-                    entry.agent.as_ref().unwrap().resume.as_deref().unwrap(),
-                ),
-            )
-            .await
-            .map_err(|_| ())?
-            .map_err(|_| ())?
-        {
-            return Err(());
-        }
-        return row(&state, &entry.id);
-    }
-    if deferred.as_ref() != Some(&entry)
-        || entry.manual_resume_reason.as_deref() != Some("project_secrets_idle")
-        || state.chat.get(&entry.id).is_some_and(|info| info.alive)
-        || state.sessions.get(&entry.id).is_some_and(|info| info.alive)
-        || state.chat.process_group(&entry.id).is_some()
-    {
-        return Err(());
-    }
-    receipts.retain(&state, &entry).map_err(|_| ())?;
-    let storage = state.clone();
-    let original = entry.clone();
-    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let native = crate::bundle::native_path(&storage, &original)?
-            .ok_or_else(|| anyhow::anyhow!("manual native unavailable"))?;
-        let (file, metadata) = crate::fs::open_regular(&native)?;
-        anyhow::ensure!(
-            metadata.len() > 0 && metadata.len() <= 100 * 1024 * 1024,
-            "manual native unavailable"
-        );
-        file.sync_all()?;
-        Ok(())
-    })
-    .await
-    .map_err(|_| failed("native_worker"))?
-    .map_err(|_| failed("native_sync"))?;
-    current()?;
-    // A positively reaped old registry row owns no process. Reusing its exact
-    // ID opens the existing journal; remove() never removes journal bytes.
-    state.chat.remove(&entry.id);
-    // After spawn starts, every error is handled by this owned continuation.
-    // It retains lifecycle/configuration/authority/quota until actual reaping.
-    let spawned = dispatch
-        .run(ledger::manual_resumption(
-            entry.id.clone(),
-            ledger::respawn(&state, &entry, workspace.clone()),
-        ))
-        .await;
-    let mut pause = None;
-    let result = async {
-        spawned.map_err(|_| failed("spawn"))?;
+    let mutation = dispatch.begin(&state).map_err(|_| ())?;
+    let continuation = Box::pin(async {
+        let current = || -> Result<(), ()> {
+            if tokio::time::Instant::now() >= deadline
+                || state.stopping.load(std::sync::atomic::Ordering::Acquire)
+                || crate::lock(&state.workspaces)
+                    .get(&workspace.id)
+                    .is_none_or(|now| now.root != workspace.root)
+            {
+                return Err(());
+            }
+            dispatch.check(&state).map_err(|_| ())
+        };
         current()?;
-        pause = Some(
-            tokio::time::timeout_at(deadline, state.chat.pause_commands(&entry.id))
-                .await
-                .map_err(|_| ())?
-                .map_err(|_| ())?,
-        );
-        let native = entry.agent.as_ref().unwrap().resume.as_deref().unwrap();
-        loop {
-            current()?;
-            if tokio::time::timeout_at(deadline, state.chat.resumed_native_ready(&entry.id, native))
+        crate::pro::ensure_root(crate::pro::manual_resume_storage(&state))
+            .await
+            .map_err(|_| failed("storage_root"))?;
+        let storage = state.clone();
+        let mut receipts = tokio::task::spawn_blocking(move || ledger::manual::load(&storage))
+            .await
+            .map_err(|_| failed("receipt_worker"))?
+            .map_err(|_| failed("receipt_read"))?;
+        current()?;
+        let deferred = crate::lock(&state.deferred_sessions)
+            .get(&entry.id)
+            .cloned();
+        if deferred.is_none() {
+            if !receipts.contains(&entry)
+                || !tokio::time::timeout_at(
+                    deadline,
+                    state.chat.resumed_native_ready(
+                        &entry.id,
+                        entry.agent.as_ref().unwrap().resume.as_deref().unwrap(),
+                    ),
+                )
                 .await
                 .map_err(|_| ())?
                 .map_err(|_| ())?
             {
-                break;
+                return Err(());
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            return row(&state, &entry.id);
         }
-        tokio::time::timeout_at(deadline, state.chat.sync_resumed_journal(&entry.id))
-            .await
-            .map_err(|_| ())?
-            .map_err(|_| ())?;
-        current()?;
-        let storage = state.clone();
-        tokio::task::spawn_blocking(move || ledger::manual::save(&storage, &receipts))
-            .await
-            .map_err(|_| ())?
-            .map_err(|_| ())?;
-        current()?;
-        if crate::lock(&state.deferred_sessions).get(&entry.id) != Some(&entry) {
+        if deferred.as_ref() != Some(&entry)
+            || entry.manual_resume_reason.as_deref() != Some("project_secrets_idle")
+            || state.chat.get(&entry.id).is_some_and(|info| info.alive)
+            || state.sessions.get(&entry.id).is_some_and(|info| info.alive)
+            || state.chat.process_group(&entry.id).is_some()
+        {
             return Err(());
         }
-        crate::lock(&state.deferred_sessions).remove(&entry.id);
-        durable(&state).await?;
+        receipts.retain(&state, &entry).map_err(|_| ())?;
+        let storage = state.clone();
+        let original = entry.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let native = crate::bundle::native_path(&storage, &original)?
+                .ok_or_else(|| anyhow::anyhow!("manual native unavailable"))?;
+            let (file, metadata) = crate::fs::open_regular(&native)?;
+            anyhow::ensure!(
+                metadata.len() > 0 && metadata.len() <= 100 * 1024 * 1024,
+                "manual native unavailable"
+            );
+            file.sync_all()?;
+            Ok(())
+        })
+        .await
+        .map_err(|_| failed("native_worker"))?
+        .map_err(|_| failed("native_sync"))?;
         current()?;
-        row(&state, &entry.id)
-    }
-    .await;
-    if result.is_err() {
-        crate::lock(&state.deferred_sessions).insert(entry.id.clone(), entry.clone());
-        if let Some(pause) = &mut pause {
-            pause.fence();
+        // A positively reaped old registry row owns no process. Reusing its exact
+        // ID opens the existing journal; remove() never removes journal bytes.
+        state.chat.remove(&entry.id);
+        // Launch preparation takes configuration itself. Release only this lock;
+        // the original counted reservation still orders Configure/stop against us.
+        // Its reserved-request scope makes contested preparation refuse rather than
+        // wait for a writer that is draining this same reservation.
+        drop(configuration);
+        // After spawn starts, every error is handled by this owned continuation.
+        // It retains lifecycle/authority/quota through reaping and durable recovery.
+        let spawned = dispatch
+            .run(ledger::manual_resumption(
+                entry.id.clone(),
+                ledger::respawn(&state, &entry, workspace.clone()),
+            ))
+            .await;
+        let mut pause = None;
+        let result = async {
+            spawned.map_err(|_| failed("spawn"))?;
+            current()?;
+            pause = Some(
+                tokio::time::timeout_at(deadline, state.chat.pause_commands(&entry.id))
+                    .await
+                    .map_err(|_| ())?
+                    .map_err(|_| ())?,
+            );
+            let native = entry.agent.as_ref().unwrap().resume.as_deref().unwrap();
+            loop {
+                current()?;
+                if tokio::time::timeout_at(
+                    deadline,
+                    state.chat.resumed_native_ready(&entry.id, native),
+                )
+                .await
+                .map_err(|_| ())?
+                .map_err(|_| ())?
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            tokio::time::timeout_at(deadline, state.chat.sync_resumed_journal(&entry.id))
+                .await
+                .map_err(|_| ())?
+                .map_err(|_| ())?;
+            current()?;
+            let storage = state.clone();
+            tokio::task::spawn_blocking(move || ledger::manual::save(&storage, &receipts))
+                .await
+                .map_err(|_| ())?
+                .map_err(|_| ())?;
+            current()?;
+            if crate::lock(&state.deferred_sessions).get(&entry.id) != Some(&entry) {
+                return Err(());
+            }
+            crate::lock(&state.deferred_sessions).remove(&entry.id);
+            durable(&state).await?;
+            current()?;
+            row(&state, &entry.id)
         }
-        state.chat.fence(&entry.id);
-        // A bound on the HTTP observer cannot become an untracked process.
-        // Repeated exact fencing owns cleanup even if driver teardown stalls.
-        while pause.as_ref().is_some_and(|pause| pause.cleanup_pending())
-            || state.chat.process_group(&entry.id).is_some()
-            || state.chat.get(&entry.id).is_some_and(|info| info.alive)
-        {
+        .await;
+        if result.is_err() {
+            crate::lock(&state.deferred_sessions).insert(entry.id.clone(), entry.clone());
             if let Some(pause) = &mut pause {
                 pause.fence();
             }
             state.chat.fence(&entry.id);
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            // A bound on the HTTP observer cannot become an untracked process.
+            // Repeated exact fencing owns cleanup even if driver teardown stalls.
+            while pause.as_ref().is_some_and(|pause| pause.cleanup_pending())
+                || state.chat.process_group(&entry.id).is_some()
+                || state.chat.get(&entry.id).is_some_and(|info| info.alive)
+            {
+                if let Some(pause) = &mut pause {
+                    pause.fence();
+                }
+                state.chat.fence(&entry.id);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            // Keep the input fence and actual owner until the retained manual row
+            // is durable; a transient storage failure does not authorize a child.
+            while durable(&state).await.is_err() {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
         }
-        // Keep the input fence and actual owner until the retained manual row
-        // is durable; a transient storage failure does not authorize a child.
-        while durable(&state).await.is_err() {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
+        result
+    });
+    match mutation {
+        Some(guard) => crate::pro::mutation::reserved_request(guard, continuation).await,
+        None => continuation.await,
     }
-    result
 }
 
 #[cfg(unix)]

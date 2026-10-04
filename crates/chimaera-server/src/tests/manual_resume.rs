@@ -66,12 +66,15 @@ fn fixture() -> (Arc<AppState>, ledger::LedgerEntry, PathBuf) {
     lock(&state.session_workspaces).insert(entry.id.clone(), entry.workspace_id.clone());
     (state, entry, gate)
 }
-async fn wait(mut condition: impl FnMut() -> bool) {
+async fn wait(condition: impl FnMut() -> bool) {
+    wait_at("condition", condition).await;
+}
+async fn wait_at(stage: &'static str, mut condition: impl FnMut() -> bool) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while !condition() {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "synthetic resume condition timed out"
+            "synthetic resume condition timed out at {stage}"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -79,7 +82,19 @@ async fn wait(mut condition: impl FnMut() -> bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manual_resume_same_id_survives_observer_loss_and_duplicate_never_respawns() {
+    same_id_survives_observer_loss(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn managed_manual_resume_releases_configuration_but_retains_original_reservation() {
+    same_id_survives_observer_loss(true).await;
+}
+
+async fn same_id_survives_observer_loss(managed: bool) {
     let (state, entry, gate) = fixture();
+    if managed {
+        pro::install_execution_fixture(&state, &entry.workspace_id, 1).unwrap();
+    }
     let owner = state.clone();
     let id = entry.id.clone();
     let mut observer = tokio::spawn(async move {
@@ -93,7 +108,24 @@ async fn manual_resume_same_id_survives_observer_loss_and_duplicate_never_respaw
     });
     tokio::select! {
         outcome = &mut observer => panic!("manual synthetic spawn refused: {outcome:?}"),
-        _ = wait(|| state.chat.get(&entry.id).is_some_and(|info| info.alive)) => (),
+        _ = wait_at("child_registered", || state.chat.get(&entry.id).is_some_and(|info| info.alive)) => (),
+    }
+    if managed {
+        // This actual managed respawn could not reach its child before the fix:
+        // prepare_launch awaited the lock retained by its own Resume owner.
+        let configuration = pro::manual_resume_configuration(&state);
+        wait_at("configuration_available", || {
+            configuration.clone().try_lock_owned().is_ok()
+        })
+        .await;
+        // Native Init is still held, so the original reservation must prevent
+        // replacement even after releasing configuration and losing HTTP.
+        assert_eq!(
+            pro::install_execution_fixture(&state, &entry.workspace_id, 2)
+                .unwrap_err()
+                .to_string(),
+            "previous project mutation is still committing"
+        );
     }
     assert!(!ws::session_writable(&state, &entry.id));
     assert!(!state
@@ -104,9 +136,23 @@ async fn manual_resume_same_id_survives_observer_loss_and_duplicate_never_respaw
     assert!(lock(&state.deferred_sessions).contains_key(&entry.id));
     observer.abort();
     let _ = observer.await;
+    if managed {
+        assert_eq!(
+            pro::install_execution_fixture(&state, &entry.workspace_id, 2)
+                .unwrap_err()
+                .to_string(),
+            "previous project mutation is still committing"
+        );
+    }
     std::fs::write(gate, b"release").unwrap();
-    wait(|| !lock(&state.deferred_sessions).contains_key(&entry.id)).await;
-    wait(|| !lock(&state.chat_switching).contains_key(&entry.id)).await;
+    wait_at("manual_row_committed", || {
+        !lock(&state.deferred_sessions).contains_key(&entry.id)
+    })
+    .await;
+    wait_at("lifecycle_settled", || {
+        !lock(&state.chat_switching).contains_key(&entry.id)
+    })
+    .await;
     assert!(state
         .chat
         .resumed_native_ready(&entry.id, NATIVE)
@@ -136,8 +182,24 @@ async fn manual_resume_same_id_survives_observer_loss_and_duplicate_never_respaw
         .any(|row| row.id == entry.id
             && row.manual_resume_reason.is_none()
             && row.agent.as_ref().unwrap().resume.as_deref() == Some(NATIVE)));
+    if managed {
+        // The generic execution fixture deliberately reuses one lease ID and
+        // cannot mint a new epoch. Prove reservation release directly through
+        // the original admission ceiling, without replacing authority.
+        let dispatch = pro::mutation::Dispatch::capture(&state, &entry.workspace_id).unwrap();
+        wait_at("reservations_settled", || {
+            (0..64)
+                .map(|_| dispatch.begin(&state))
+                .collect::<anyhow::Result<Vec<_>>>()
+                .is_ok_and(|guards| guards.iter().all(Option::is_some))
+        })
+        .await;
+    }
     state.chat.fence(&entry.id);
-    wait(|| state.chat.process_group(&entry.id).is_none()).await;
+    wait_at("child_reaped", || {
+        state.chat.process_group(&entry.id).is_none()
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
