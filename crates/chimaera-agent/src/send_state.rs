@@ -575,6 +575,113 @@ pub(crate) fn uncertain_error() -> anyhow::Error {
 mod tests {
     use super::*;
 
+    /// A receipt writer can yield after the agent has consumed the input.
+    /// Retries in that interval still belong to the original reservation.
+    #[tokio::test]
+    async fn retry_during_receipt_write_keeps_original_send_admission() {
+        use crate::driver::SpawnSpec;
+        use crate::model::{AgentCommand, AgentEvent, ContentBlock, UserMessageState};
+        use crate::{ChatManager, SendOutcome};
+        for queued in [false, true] {
+            for cancelled in [false, true] {
+                if cancelled && !queued {
+                    continue;
+                }
+                let dir = tempfile::tempdir().unwrap();
+                let manager = Arc::new(ChatManager::new(
+                    dir.path().join("chat"),
+                    Box::new(|_, _| {}),
+                    Box::new(|_, _| {}),
+                ));
+                let commands = Arc::new(Mutex::new(None));
+                manager
+                    .spawn(
+                        &crate::tests::HeldCommands {
+                            commands: commands.clone(),
+                        },
+                        SpawnSpec::new("receipt", vec!["fixture".into()], dir.path().to_path_buf()),
+                    )
+                    .unwrap();
+                let mut commands = commands.lock().unwrap().take().unwrap();
+                let session = manager.get_session("receipt").unwrap();
+                let send = || AgentCommand::Send {
+                    blocks: vec![ContentBlock::Text {
+                        text: "once".into(),
+                    }],
+                };
+                assert_eq!(
+                    manager
+                        .send_from_client("receipt", send(), Some("client-receipt-race"))
+                        .await
+                        .unwrap(),
+                    SendOutcome::Accepted
+                );
+                assert!(commands.try_recv().is_ok());
+                let echo = AgentEvent::UserMessage {
+                    text: "once".into(),
+                    attachments: 0,
+                    attachment_paths: Vec::new(),
+                    id: Some("delivery".into()),
+                    queued,
+                    after_turn: false,
+                    origin: None,
+                    client_id: None,
+                };
+                let event = if queued {
+                    manager.absorb("receipt", &session, echo).await;
+                    AgentEvent::UserMessageUpdate {
+                        id: "delivery".into(),
+                        state: if cancelled {
+                            UserMessageState::Cancelled
+                        } else {
+                            UserMessageState::Sent
+                        },
+                    }
+                } else {
+                    echo
+                };
+                let (entered, entrance) = std::sync::mpsc::channel();
+                let (resume, paused) = std::sync::mpsc::channel();
+                *session.send_state.before_write.lock().unwrap() = Some((entered, paused));
+                let owner = manager.clone();
+                let captured = session.clone();
+                let settlement =
+                    tokio::spawn(async move { owner.absorb("receipt", &captured, event).await });
+                tokio::task::spawn_blocking(move || {
+                    entrance.recv_timeout(Duration::from_secs(1)).unwrap()
+                })
+                .await
+                .unwrap();
+                // Release before asserting, so a failed assertion cannot leave
+                // the original blocking writer parked at its test barrier.
+                let observed = manager.client_id_state("receipt", "client-receipt-race");
+                let retry = manager
+                    .send_from_client("receipt", send(), Some("client-receipt-race"))
+                    .await;
+                let cancel = manager.cancel_send("receipt", "client-receipt-race").await;
+                resume.send(()).unwrap();
+                settlement.await.unwrap();
+                assert_eq!(observed, Some(ClientIdState::Accepted));
+                assert_eq!(retry.unwrap(), SendOutcome::Duplicate);
+                assert!(!cancel.unwrap());
+                assert!(
+                    commands.try_recv().is_err(),
+                    "retry must not reach the driver"
+                );
+                assert_eq!(
+                    manager.client_id_state("receipt", "client-receipt-race"),
+                    Some(if cancelled {
+                        ClientIdState::Cancelled
+                    } else {
+                        ClientIdState::Confirmed
+                    })
+                );
+                assert_eq!(session.command_budget.lock().unwrap().sends, 0);
+                manager.kill("receipt");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn withdrawals_and_unreceipted_dispatch_survive_store_replacement() {
         let dir = tempfile::tempdir().unwrap();

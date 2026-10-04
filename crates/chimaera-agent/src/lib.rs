@@ -257,13 +257,53 @@ impl CommandBudget {
 
     /// The reservation an echo with delivery key `id` pairs with: the keyed
     /// one when the caller minted that key, else the oldest unkeyed one.
-    fn take_for_echo(&mut self, id: &str) -> Option<SendReservation> {
-        let pos = self
-            .unassigned
+    fn echo_position(&self, id: &str) -> Option<usize> {
+        self.unassigned
             .iter()
             .position(|r| r.send_id.as_deref() == Some(id))
-            .or_else(|| self.unassigned.iter().position(|r| r.send_id.is_none()))?;
-        self.unassigned.remove(pos)
+            .or_else(|| self.unassigned.iter().position(|r| r.send_id.is_none()))
+    }
+
+    fn take_for_echo(&mut self, id: &str) -> Option<SendReservation> {
+        self.unassigned.remove(self.echo_position(id)?)
+    }
+
+    /// Keep the original reservation until durable settlement finishes. A
+    /// duplicate must not see a gap between live admission and its receipt.
+    fn settlement(&self, event: &AgentEvent) -> Option<(String, bool)> {
+        match event {
+            AgentEvent::UserMessage {
+                id,
+                client_id,
+                queued: false,
+                ..
+            } => id
+                .as_deref()
+                .and_then(|id| self.echo_position(id))
+                .and_then(|pos| self.unassigned[pos].client_id.clone())
+                .or_else(|| client_id.clone())
+                .map(|id| (id, false)),
+            AgentEvent::UserMessageUpdate {
+                id,
+                state: model::UserMessageState::Sent | model::UserMessageState::Cancelled,
+            } => self
+                .queued
+                .get(id)
+                .and_then(|reservation| reservation.client_id.clone())
+                .map(|id| {
+                    (
+                        id,
+                        matches!(
+                            event,
+                            AgentEvent::UserMessageUpdate {
+                                state: model::UserMessageState::Cancelled,
+                                ..
+                            }
+                        ),
+                    )
+                }),
+            _ => None,
+        }
     }
 
     fn release(&mut self, reservation: SendReservation) {
@@ -984,47 +1024,12 @@ impl ChatManager {
         if matches!(ev, AgentEvent::Init { .. } | AgentEvent::UserMessage { .. }) {
             session.unused_startup.store(false, Ordering::Relaxed);
         }
-        let (settled_client_id, withdrawn) = {
-            // A delivered input may precede TurnStarted. Fold both sides of
-            // that boundary under the same locks used by input_activity.
-            let mut budget = session.command_budget.lock().expect("command budget lock");
-            // A queued echo acknowledges only a process-owned FIFO. Retain
-            // its client correlation until the driver says it was delivered.
-            let queued_receipt = match &ev {
-                AgentEvent::UserMessageUpdate {
-                    id,
-                    state: model::UserMessageState::Sent | model::UserMessageState::Cancelled,
-                } => budget
-                    .queued
-                    .get(id)
-                    .and_then(|reservation| reservation.client_id.clone()),
-                _ => None,
-            };
-            budget.observe(&mut ev);
-            session
-                .carryover
-                .lock()
-                .expect("carryover lock")
-                .observe(&ev);
-            match &ev {
-                AgentEvent::UserMessage {
-                    client_id,
-                    queued: false,
-                    ..
-                } => (client_id.clone(), false),
-                _ => (
-                    queued_receipt,
-                    matches!(
-                        &ev,
-                        AgentEvent::UserMessageUpdate {
-                            state: model::UserMessageState::Cancelled,
-                            ..
-                        }
-                    ),
-                ),
-            }
-        };
-        if let Some(client_id) = settled_client_id {
+        let settlement = session
+            .command_budget
+            .lock()
+            .expect("command budget lock")
+            .settlement(&ev);
+        if let Some((client_id, withdrawn)) = settlement {
             // Receipt storage is independently bounded. A slow/refused disk
             // leaves dispatch uncertain without stalling provider events forever.
             let result = if withdrawn {
@@ -1035,6 +1040,17 @@ impl ChatManager {
             if result.is_err() {
                 tracing::warn!("send receipt storage unavailable; retaining dispatch evidence");
             }
+        }
+        {
+            // Retire admission only after the receipt attempt settles. Keep
+            // delivered-input and turn state atomic for idle observers.
+            let mut budget = session.command_budget.lock().expect("command budget lock");
+            budget.observe(&mut ev);
+            session
+                .carryover
+                .lock()
+                .expect("carryover lock")
+                .observe(&ev);
         }
         let background_running = session
             .background_work
@@ -1341,8 +1357,10 @@ impl ChatManager {
         // A reservation is active only in this driver life. Once it disappears,
         // independent durable evidence, never a stale in-memory echo record,
         // determines whether a replacement may accept input.
-        let durable = session.send_state.state(client_id)?;
+        // A completed receipt may release its reservation concurrently. Read
+        // its in-memory durable snapshot while that release is excluded.
         let budget = session.command_budget.lock().expect("command budget lock");
+        let durable = session.send_state.state(client_id)?;
         if durable != Some(ClientIdState::Cancelled)
             && (budget
                 .unassigned
