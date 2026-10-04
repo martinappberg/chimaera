@@ -1159,7 +1159,9 @@ struct CodexMapper {
     unread_opening_message: Option<String>,
     /// Only synchronous pre-prompt hooks block delivery. Keep their progress
     /// separate from model activity, bounded even if a runtime misses closes.
-    startup_hooks: BTreeMap<String, String>,
+    startup_hooks: BTreeMap<String, (String, String)>,
+    /// A resumed mapper restarts its counter; retain uniqueness in the journal.
+    startup_hook_namespace: u128,
     /// Follow-ups for a later turn, FIFO: `SendAfterTurn` messages (each
     /// opens the next turn, one per turn — Codex's own queue semantics), plus
     /// plain sends made in the `turn/start` → `turn/started` window, marked
@@ -1340,6 +1342,7 @@ impl CodexMapper {
             turn_pending: false,
             unread_opening_message: None,
             startup_hooks: BTreeMap::new(),
+            startup_hook_namespace: rand::random(),
             queued_sends: VecDeque::new(),
             deferred_steer_redrives: BTreeMap::new(),
             unread_steers: BTreeMap::new(),
@@ -2075,13 +2078,10 @@ impl CodexMapper {
         else {
             return;
         };
-        // Codex's hook id can be configuration-derived (session-start:0:path),
-        // unlike a model tool id. Reuse in another turn must not upsert history.
-        let tool_id = format!("codex-hook-{}-{id}", self.turn_id);
         if completed {
-            if self.startup_hooks.remove(id).is_none() {
+            let Some((tool_id, _)) = self.startup_hooks.remove(id) else {
                 return;
-            }
+            };
             step.events.push(AgentEvent::ToolCallUpdate {
                 id: tool_id,
                 status: if matches!(
@@ -2098,8 +2098,13 @@ impl CodexMapper {
             if self.startup_hooks.contains_key(id) || self.startup_hooks.len() >= 32 {
                 return;
             }
+            // Native hook IDs repeat across turns, and native turn IDs can be
+            // huge. A local monotonic ID bounds rows and keeps history unique.
+            let row_id = self.rpc_id();
+            let tool_id = format!("codex-hook-{:032x}-{row_id}", self.startup_hook_namespace);
             let label = format!("Running {event} hook");
-            self.startup_hooks.insert(id.to_string(), label);
+            self.startup_hooks
+                .insert(id.to_string(), (tool_id.clone(), label));
             step.events.push(AgentEvent::ToolCall {
                 id: tool_id,
                 kind: ToolKind::Other,
@@ -2115,7 +2120,11 @@ impl CodexMapper {
             });
         }
         step.events.push(AgentEvent::ActivityLine {
-            detail: self.startup_hooks.values().next().cloned(),
+            detail: self
+                .startup_hooks
+                .values()
+                .next()
+                .map(|(_, label)| label.clone()),
         });
     }
 
@@ -5509,6 +5518,40 @@ mod tests {
                 .unwrap()
         };
         assert_ne!(id(first), id(second));
+    }
+
+    #[test]
+    fn oversized_native_turn_ids_cannot_expand_hook_rows() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        m.turn_id = "α".repeat(100_000);
+        let mut started = startup_hook("same-hook", false);
+        started["params"]["turnId"] = Value::Null;
+        let first = m.on_frame(&started);
+        let id = first
+            .events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::ToolCall { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(id.len() < 64);
+        let mut completed = started.clone();
+        completed["method"] = json!("hook/completed");
+        assert!(m.on_frame(&completed).events.iter().any(|e| matches!(e,
+            AgentEvent::ToolCallUpdate { id: update_id, .. } if update_id == &id
+        )));
+        m.reset_turn_state();
+        m.turn_id.push('β');
+        assert!(m.on_frame(&started).events.iter().any(|e| matches!(e,
+            AgentEvent::ToolCall { id: next_id, .. } if next_id != &id && next_id.len() < 64
+        )));
+        let mut resumed = mapper();
+        active_turn(&mut resumed);
+        assert!(resumed.on_frame(&started).events.iter().any(|e| matches!(e,
+            AgentEvent::ToolCall { id: resumed_id, .. } if resumed_id != &id && resumed_id.len() < 64
+        )));
     }
 
     #[test]

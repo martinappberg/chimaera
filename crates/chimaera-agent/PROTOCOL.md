@@ -151,8 +151,10 @@ the interrupt watchdog supplies the missing turn end.
 Isolated live reproduction: a trusted project SessionStart hook (`sleep 300`)
 produced the hook row and phase; Stop produced the resend notice, which survived
 UI reload. Resending the original prompt completed normally. Hook ids can be
-configuration-derived (`session-start:0:<sourcePath>`), so normalized row ids
-include the turn id to keep later hooks from overwriting earlier history.
+configuration-derived (`session-start:0:<sourcePath>`), so normalized row ids use
+a local monotonic counter with a random mapper namespace to keep later hooks and
+resumed drivers from overwriting earlier history without copying unbounded native
+turn ids into each row.
 Run statuses `failed`, `blocked`, and `stopped` all represent unsuccessful hooks.
 Diagnostics live in `entries[{kind,text}]` (`error`, `feedback`, `stop`, `warning`);
 `statusMessage` is a configured progress label. Join diagnostics with a byte cap
