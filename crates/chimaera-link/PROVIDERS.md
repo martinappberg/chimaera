@@ -1,5 +1,20 @@
 # Named provider authority v1
 
+## Product boundary and legacy protocol status
+
+The 2026-10-04 product decision uses one customer daemon and one trusted OS user,
+with custom values delivered to selected workspace children. It does not promise
+separate project HOME/configuration/history, hostile same-user isolation or a
+namespace for every project. Named personal provider connections remain separate
+from custom secret selection and retain their provider-granted permissions.
+
+The namespace-specific and protected-startup mechanics below record an unshipped
+v1 design and its prior acceptance gates. Statements requiring separate project
+HOME or namespaces are historical, not the approved shipping topology. Bounded
+named-provider controls and credential ownership remain independent. This
+qualification changes no request, capability version or serialized type; actual
+provider migration still requires independent acceptance.
+
 This optional contract separates personal-cloud Claude, Codex and GitHub login
 from project runtime access. It does not enable a service, image or namespace at
 startup. Ordinary laptop/free launches and older unisolated cloud deployments

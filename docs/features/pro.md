@@ -526,9 +526,10 @@ configured and the project is owned elsewhere, and never in the accent colour.
 
 ### Manually parked conversations
 
-Active-idle application of custom cloud secrets remains disabled pending its
-supervisor process-census and real-runtime acceptance gates. Its daemon and UI
-support a separate manual parking reason, `project_secrets_idle`, which preserves
+Custom cloud-secret application remains gated on the approved shared-daemon
+workspace session/launch integration and real-runtime acceptance. The earlier
+namespace process-census evidence does not certify that delivery path.
+The daemon and UI support a separate manual parking reason, `project_secrets_idle`, which preserves
 the original conversation, session ID, journal and delivery receipts. Opening
 that conversation shows a neutral paused explanation; it does not claim that
 secret values were applied. **Resume** explicitly restores that same session
@@ -951,6 +952,20 @@ _Captured 2026-10-02 from the maintainer's direct answers in this conversation._
 - **Custom secrets:** “Include selected-project custom secrets in this completion”.
   For changes while work is active: “Queue until idle; offer Apply now”.
   Named provider connections and custom project permissions remain distinct.
+
+### Project-specific secret delivery; one trusted user
+_Captured 2026-10-04 from the maintainer's direct decision in this conversation._
+
+- **Model:** “Yes—project-specific delivery, one trusted user”. One ordinary
+  Chimaera daemon handles many workspaces on the customer's VM. Custom values
+  belong in newly started agents and terminals of the selected workspace.
+- **Boundary:** This supersedes the stronger hostile cross-project isolation
+  interpretation in earlier implementation notes. It does not promise separate
+  per-project daemons, users or process/file/network sandboxes. Per-account VM
+  separation and honest selected-workspace delivery remain required.
+- **Controls:** The existing “Queue until idle; offer Apply now” decision stays.
+  Apply/removal settles the selected workspace's work; siblings continue. This
+  intent does not certify the new shared-daemon integration or enable capability.
 
 ### Cloud connections — scope and experience
 _Captured 2026-09-28 from the maintainer's instructions in this conversation._

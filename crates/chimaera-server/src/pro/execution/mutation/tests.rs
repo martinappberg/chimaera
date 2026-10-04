@@ -133,6 +133,78 @@ fn final_worker_launch_still_requires_its_live_proof() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn plain_shell_renewal_window_keeps_original_execution_and_counted_maintenance() {
+    let (state, root) = fixture();
+    let workspace = lock(&state.workspaces).add(root.clone()).unwrap();
+    install_fixture(&state, &workspace.id, 4).unwrap();
+    super::super::worker_fixture(&state);
+    lock(&state.pro.execution.proofs)
+        .get_mut(&workspace.id)
+        .unwrap()
+        .deadline = super::super::lease::Deadline::expired_fixture();
+    assert!(!crate::pro::may_execute(&state, &workspace.id));
+    assert!(super::super::resumed(&state, generation(&state)));
+    assert!(super::super::resuming(&state, &workspace.id));
+    assert!(crate::pro::may_execute(&state, &workspace.id));
+    assert!(begin_launch(&state, &workspace.id).is_err());
+    assert!(begin_shell_launch(&state, "w-free").unwrap().is_none());
+
+    let shell = begin_shell_launch(&state, &workspace.id).unwrap().unwrap();
+    assert!(!idle(&state, &workspace.id));
+    assert!(begin_workspace_maintenance(&state, &workspace.id).is_err());
+    drop(shell);
+    assert!(idle(&state, &workspace.id));
+    let maintenance = begin_workspace_maintenance(&state, &workspace.id).unwrap();
+    assert!(begin_shell_launch(&state, &workspace.id).is_err());
+    drop(maintenance);
+
+    // Exercise the actual shared spawn path, not just the new entry point.
+    let id = "s-renewing-shell";
+    let result = crate::spawn::spawn_session(
+        &state,
+        crate::spawn::SpawnSpec {
+            workspace: workspace.clone(),
+            id: Some(id.into()),
+            name: None,
+            cwd: None,
+            cols: None,
+            rows: None,
+            theme: "dark".into(),
+            title_hint: None,
+            prelude: None,
+            kind: crate::spawn::SpawnKind::Shell,
+            fork_head: false,
+            native_cwd: None,
+            started_by: crate::history::StartedBy::You,
+        },
+    )
+    .await;
+    assert!(result.is_ok());
+    assert!(state.sessions.get(id).is_some_and(|session| session.alive));
+    assert!(idle(&state, &workspace.id));
+    assert!(begin_launch(&state, &workspace.id).is_err());
+    state.sessions.kill(id).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while state.sessions.get(id).is_some() {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    lock(&state.pro.ownership).insert(
+        workspace.id.clone(),
+        Ownership::Remote {
+            epoch: 5,
+            holder: "other-worker".into(),
+        },
+    );
+    assert!(!crate::pro::may_execute(&state, &workspace.id));
+    assert!(begin_shell_launch(&state, &workspace.id).is_err());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[tokio::test]
 async fn import_reservation_accepts_hydration_and_rejects_stale_generation_epoch_and_expiry() {
     let (state, root) = fixture();

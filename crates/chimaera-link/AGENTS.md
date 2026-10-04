@@ -10,7 +10,7 @@ This crate defines serializable protocol types and their bounded validators. It 
 | [CLUSTER.md](CLUSTER.md), `src/cluster.rs` | Capability-gated cluster control and exact operation/history identities |
 | [SSH_AUTH.md](SSH_AUTH.md), `src/ssh_auth.rs`, `src/ssh_auth/route.rs` | Bounded destination/route-bound grants and frame validation; no cryptographic authority |
 | [PROVIDERS.md](PROVIDERS.md), `src/providers.rs` | Closed provider contract reexports from core |
-| [PROJECT_SECRETS.md](PROJECT_SECRETS.md), `src/project_secrets.rs` | Write-only bounded secret commands and fixed outcomes |
+| [PROJECT_SECRETS.md](PROJECT_SECRETS.md), `src/project_secrets.rs` | Write-only bounded secret commands and fixed outcomes; approved trusted-user delivery intent and explicitly unshipped namespace-v1 reference |
 | `src/continuity.rs` | Managed execution/checkpoint receipts and exact recovery acknowledgments |
 | `src/error.rs` | Typed revoked, unsupported and already-subscribed outcomes |
 

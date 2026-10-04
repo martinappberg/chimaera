@@ -14,6 +14,7 @@ pub(super) struct Commits(pub(super) Arc<Mutex<Admission>>);
 pub(super) struct Admission {
     pub(super) counts: HashMap<String, usize>,
     pub(super) maintenance: HashMap<String, super::maintenance::Entry>,
+    workspace_maintenance: std::collections::HashSet<String>,
 }
 
 pub(crate) struct Guard {
@@ -77,6 +78,7 @@ pub(in crate::pro) async fn begin_copy(
     let commit = {
         let mut commits = lock(&state.pro.execution.commits.0);
         if commits.maintenance.contains_key(workspace)
+            || commits.workspace_maintenance.contains(workspace)
             || commits.counts.get(workspace).copied().unwrap_or(0) > 0
             || commits.counts.values().sum::<usize>() >= 64
         {
@@ -221,7 +223,10 @@ pub(crate) async fn begin_import(
         return Err(Changed.into());
     }
     let mut commits = lock(&state.pro.execution.commits.0);
-    if commits.maintenance.contains_key(workspace) || commits.counts.values().sum::<usize>() >= 64 {
+    if commits.maintenance.contains_key(workspace)
+        || commits.workspace_maintenance.contains(workspace)
+        || commits.counts.values().sum::<usize>() >= 64
+    {
         return Err(Changed.into());
     }
     *commits.counts.entry(workspace.to_owned()).or_default() += 1;
@@ -411,7 +416,24 @@ fn account_bound(state: &AppState, workspace: &str, ownership: &Option<Ownership
 /// cannot mistake a not-yet-registered child for an empty workload. Ordinary
 /// unconfigured local sessions remain inert; device work needs ownership alone.
 pub(crate) fn begin_launch(state: &AppState, workspace: &str) -> anyhow::Result<Option<Guard>> {
-    if !crate::pro::may_execute(state, workspace) {
+    begin_launch_admission(state, workspace, true)
+}
+
+/// Plain shells retain their existing execution allowance during a worker's
+/// bounded renewal window, while sharing the same counted maintenance gate.
+pub(crate) fn begin_shell_launch(
+    state: &AppState,
+    workspace: &str,
+) -> anyhow::Result<Option<Guard>> {
+    begin_launch_admission(state, workspace, false)
+}
+
+fn begin_launch_admission(
+    state: &AppState,
+    workspace: &str,
+    require_agent_proof: bool,
+) -> anyhow::Result<Option<Guard>> {
+    if workspace_closed(state, workspace) || !crate::pro::may_execute(state, workspace) {
         return Err(Changed.into());
     }
     let generation = generation(state);
@@ -440,7 +462,7 @@ pub(crate) fn begin_launch(state: &AppState, workspace: &str) -> anyhow::Result<
         Some(Ownership::AwaitingVerification { .. }) if !worker && !installing => {}
         _ => return Err(Changed.into()),
     }
-    if managed && worker {
+    if require_agent_proof && managed && worker {
         let allowed = proofs.get(workspace).is_some_and(|proof| {
             !proof.stopped
                 && proof.generation == generation
@@ -452,7 +474,10 @@ pub(crate) fn begin_launch(state: &AppState, workspace: &str) -> anyhow::Result<
         }
     }
     let mut commits = lock(&state.pro.execution.commits.0);
-    if commits.maintenance.contains_key(workspace) || commits.counts.values().sum::<usize>() >= 64 {
+    if commits.maintenance.contains_key(workspace)
+        || commits.workspace_maintenance.contains(workspace)
+        || commits.counts.values().sum::<usize>() >= 64
+    {
         return Err(Changed.into());
     }
     *commits.counts.entry(workspace.to_owned()).or_default() += 1;
@@ -522,7 +547,10 @@ pub(crate) fn begin(
     let mut commits = lock(&state.pro.execution.commits.0);
     // At most 64 irreversible operations can be outstanding, even if a shared
     // filesystem stalls. No mutex or reactor thread waits for their I/O.
-    if commits.maintenance.contains_key(workspace) || commits.counts.values().sum::<usize>() >= 64 {
+    if commits.maintenance.contains_key(workspace)
+        || commits.workspace_maintenance.contains(workspace)
+        || commits.counts.values().sum::<usize>() >= 64
+    {
         return Err(Changed.into());
     }
     *commits.counts.entry(workspace.to_owned()).or_default() += 1;
@@ -532,5 +560,62 @@ pub(crate) fn begin(
     })
 }
 
+/// One exclusive workspace operation shares the original mutation count store.
+/// Configuration is retained by the caller; no account or execution proof is minted.
+pub(crate) struct WorkspaceMutation {
+    guard: Guard,
+}
+impl WorkspaceMutation {
+    pub(crate) fn current(&self) -> bool {
+        let commits = lock(&self.guard.commits);
+        commits
+            .workspace_maintenance
+            .contains(&self.guard.workspace)
+            && commits.counts.get(&self.guard.workspace) == Some(&1)
+    }
+}
+impl Drop for WorkspaceMutation {
+    fn drop(&mut self) {
+        lock(&self.guard.commits)
+            .workspace_maintenance
+            .remove(&self.guard.workspace);
+        // The original counted Guard releases only after the exclusive marker.
+    }
+}
+pub(crate) fn workspace_closed(state: &AppState, workspace: &str) -> bool {
+    lock(&state.pro.execution.commits.0)
+        .workspace_maintenance
+        .contains(workspace)
+}
+pub(crate) fn begin_workspace_maintenance(
+    state: &AppState,
+    workspace: &str,
+) -> anyhow::Result<WorkspaceMutation> {
+    // Same original ownership -> count order as ordinary mutation admission.
+    // A worker with no admitted project cannot manufacture a maintenance owner.
+    let ownership = lock(&state.pro.ownership);
+    if !matches!(ownership.get(workspace), Some(Ownership::Local { .. })) {
+        return Err(Changed.into());
+    }
+    let mut commits = lock(&state.pro.execution.commits.0);
+    if commits.maintenance.contains_key(workspace)
+        || commits.workspace_maintenance.contains(workspace)
+        || commits.counts.get(workspace).copied().unwrap_or(0) != 0
+        || commits.counts.values().sum::<usize>() >= 64
+    {
+        return Err(Changed.into());
+    }
+    commits.workspace_maintenance.insert(workspace.to_owned());
+    commits.counts.insert(workspace.to_owned(), 1);
+    Ok(WorkspaceMutation {
+        guard: Guard {
+            commits: state.pro.execution.commits.0.clone(),
+            workspace: workspace.to_owned(),
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, unix))]
+mod workspace_tests;

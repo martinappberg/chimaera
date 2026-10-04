@@ -63,6 +63,25 @@ pub struct MaintenanceIdle {
     pump_release: Option<oneshot::Sender<()>>,
 }
 impl MaintenanceIdle {
+    /// Keep the already-captured command fence through owned child settlement.
+    pub fn fence(&mut self) {
+        self._commands.fence();
+        // The command fence stays closed; release only the output barrier so
+        // the original exit and journal pump can positively finish cleanup.
+        self.pump.take();
+        self.pump_release.take();
+    }
+    /// Drain the existing event pump and pin its current native conversation.
+    /// This does not pause the driver or assert whole-process idle/census proof.
+    pub async fn drain_native(&mut self, expected: &str, deadline: Instant) -> Result<()> {
+        self.check()?;
+        self.drain_pump(deadline).await?;
+        self.check_native(expected)
+    }
+    /// Registry removal alone cannot prove this captured process settled.
+    pub fn cleanup_pending(&self) -> bool {
+        self._commands.cleanup_pending()
+    }
     pub fn check(&self) -> Result<()> {
         let budget = self
             .session

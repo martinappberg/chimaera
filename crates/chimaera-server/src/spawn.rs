@@ -368,14 +368,25 @@ pub(crate) async fn spawn_session(
     } else {
         None
     };
+    // Shells share the short launch/registration gate; they still do not carry
+    // an execution lease or start any account work in an unconfigured daemon.
     let _launch = if spawned_agent.is_some() {
-        crate::pro::mutation::begin_launch(state, &workspace.id).map_err(SpawnFailure::Internal)?
+        crate::pro::mutation::begin_launch(state, &workspace.id)
     } else {
-        None
-    };
+        crate::pro::mutation::begin_shell_launch(state, &workspace.id)
+    }
+    .map_err(SpawnFailure::Internal)?;
     if let Some(intent) = &intent {
         intent.check().map_err(SpawnFailure::Internal)?;
     }
+    crate::daemon_extension::apply_session_environment(
+        state,
+        &workspace.id,
+        &mut opts.env,
+        &mut opts.env_remove,
+    )
+    .await
+    .map_err(SpawnFailure::Internal)?;
     let native = match &spec.kind {
         SpawnKind::Agent { resume, .. } => resume.as_deref(),
         SpawnKind::Shell => None,

@@ -847,7 +847,7 @@ async fn switch_to_pty(
     );
     let env = crate::api::session_env(state, id, &recipe.theme, prelude.as_deref());
     let env_remove = crate::api::spawn_env_remove(&env);
-    let opts = chimaera_pty::SpawnOpts {
+    let mut opts = chimaera_pty::SpawnOpts {
         cwd: recipe.workspace_root,
         // Carry the user's pinned name across the toggle so the PTY row keeps
         // it (and reports `renamed` truthfully); None leaves it deriving.
@@ -879,6 +879,17 @@ async fn switch_to_pty(
     if intent
         .as_ref()
         .is_some_and(|intent| intent.check().is_err())
+    {
+        return false;
+    }
+    if crate::daemon_extension::apply_session_environment(
+        state,
+        &successor_recipe.workspace_id,
+        &mut opts.env,
+        &mut opts.env_remove,
+    )
+    .await
+    .is_err()
     {
         return false;
     }
@@ -3533,6 +3544,13 @@ pub(crate) async fn spawn_chat_session(
     if let Some(intent) = &intent {
         intent.check()?;
     }
+    crate::daemon_extension::apply_session_environment(
+        state,
+        &recipe.workspace_id,
+        &mut spec.env,
+        &mut spec.env_remove,
+    )
+    .await?;
     spec.managed_execution = crate::pro::managed_execution(state, &recipe.workspace_id)
         || crate::lock(&state.deferred_sessions)
             .get(&id)

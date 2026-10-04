@@ -1,15 +1,33 @@
 # Selected-project custom secrets v1
 
-This optional contract is disabled until the complete project execution,
-storage, network, provider and control boundaries have passed integration tests.
-Publishing this contract advertises no capability and enables no service.
-An older deployment must return unsupported before accepting a secret value.
+## Current product decision and protocol status
+
+The maintainer approved project-specific delivery under one trusted OS user on
+2026-10-04. One ordinary daemon handles the customer's cloud workspaces. Custom
+values are passed only to newly started agents and terminals in each selected
+workspace; this is not a hostile cross-project process, file or network sandbox.
+A process receiving a value can use or print it, and same-user code may inspect
+other same-user processes or files. Per-account VM separation remains distinct.
+
+Queue until idle, Apply now, Cancel and Remove remain the intended controls.
+Changing delivery must fence and settle the selected workspace's actual owned
+work before admitting new launches; sibling workspaces continue. Ordinary use
+does not require a separate daemon, UID, cgroup or network namespace per project.
+The shared-daemon implementation still requires integrated launch, idle, apply,
+removal, restart and retirement acceptance before capability enablement.
+
+The bounded v1 messages below remain a compatibility reference, not evidence of
+an enabled service. The namespace-specific supervisor bridge and inherited idle
+protocol describe an unshipped legacy design. They do not define the approved
+shipping boundary, and this correction changes no serialized body or version.
+Older or unsupported deployments must refuse before accepting a secret value.
 
 A custom secret is an environment value shared with explicitly selected cloud
 projects. It is separate from the personal-cloud Claude, Codex and GitHub
 connections in [PROVIDERS.md](PROVIDERS.md). A project receiving a value can use
-or print it; this feature isolates other projects, rather than promising to
-erase values from an authorized project's outputs or external services.
+or print it. Selection controls where Chimaera delivers values; it cannot erase
+them from an authorized project's outputs or external services or prevent access
+by other code running as the same trusted user.
 
 ## Product behavior
 
@@ -42,10 +60,11 @@ The control displays names, selected projects and outcomes only.
 
 The exact positive capability is `project_secrets:1`. It is independent of
 `providers_control` and `provider_runtime`; none implies another. It is offered
-only by the personal control plane after the actual worker proves the complete
-isolated-project path. A cached capability can show status but cannot authorize
-a value submission. Missing, partial or unknown versions refuse before values
-are forwarded. There is no legacy shared-daemon fallback.
+only by the personal control plane after the actual worker passes the approved
+workspace-specific delivery gates. A cached capability can show status but
+cannot authorize a value submission. Missing, partial or unknown versions refuse
+before values are forwarded. No fallback may deliver values to the daemon-wide
+environment or to unselected workspace children.
 
 Only a freshly authenticated personal device session can submit, cancel,
 replace, immediately apply or remove a secret. Daemon delegations, project
@@ -259,6 +278,20 @@ start. After the reply, the keeper and worker recheck their current registration
 pending intent and expected applied revision before any effect. Account outages
 leave the batch queued and do not permit applying from a cached successful read.
 
+For the approved shared-daemon model, automatic application must use the real
+selected workspace's session and launch owner, not a namespace-wide UID census.
+Idle parking preserves conversation and delivery identity; explicit Apply now
+stops that workspace's owned agents and terminals after confirmation. No new
+launch may race the environment revision change. Unknown work remains queued,
+and an incomplete applying transition remains recovery-required rather than
+producing a success receipt or replaying submitted values.
+
+### Legacy v1 namespace application sequence (unshipped)
+
+The following sequence records the earlier stronger namespace design. Its full
+runtime/descendant cleanup and remote-floor requirements are historical protocol
+requirements, not a claim about the approved trusted-user delivery boundary.
+
 Automatic application first proves the exact project has no active agent turn,
 pending input, setup command, mutation, user terminal or other user workload.
 An idle managed agent may be durably parked through the existing conversation
@@ -395,6 +428,10 @@ are 16–256 ASCII letters, digits, `_` or `-`; no credential is logged.
 
 ## Private keeper and supervisor bridge
 
+This is the unshipped v1 namespace-controller bridge. Its wire remains readable
+for existing source and evidence; it does not enable or prescribe a separate
+project daemon in the approved shared-daemon product.
+
 This bridge is separate from provider login control. It uses the existing
 authenticated current personal-worker registration, with a separately negotiated
 `project_secrets:1` acknowledgment. A provider registration, a cached project
@@ -493,6 +530,10 @@ transition but cannot manufacture a new queued intent or execution grant.
 
 ## Durable preparation before account admission
 
+The Registry preparation below belongs to that unshipped v1 bridge. Its exact
+authorization and no-replay bindings remain documented without implying that
+namespace registration is required for ordinary workspaces.
+
 Before the keeper's first account admission RPC for a `set`, the exact tuple and
 random authority must already have a durable encrypted cleanup owner in the
 worker Registry. The preparation contains no custom value or value fingerprint,
@@ -560,6 +601,11 @@ never removed because its deadline or a correlation window expired. These
 limits supplement the Registry's existing whole-file byte ceiling.
 
 ## Active-runtime automatic idle fence
+
+This section and inherited idle control v1 are legacy namespace-specific
+mechanics and acceptance evidence. They are not the shipping requirement for
+workspace-specific delivery under one trusted user. The selected workspace must
+still have a real serialized session/launch fence and honest recovery outcome.
 
 This is a separately negotiated, initially disabled extension. Automatic apply
 may first support only a positively stopped registry entry: no active or
@@ -792,6 +838,23 @@ Applying, failed kill, timeout or a lost acknowledgment must never thaw the old
 cgroup or reopen its execution authority.
 
 ## Acceptance gate
+
+The approved shared-daemon delivery gate requires the real account, keeper,
+worker, daemon and native/browser flow: captured workspace/revision checks,
+correct environments in newly launched PTYs and structured agents, queue through
+restart and refresh, idle parking, explicit Apply now, removal of the last value,
+revocation during waits, ambiguous replies and credential replacement. Prove
+that Chimaera does not deliver selected values to sibling children or its shared
+coordinator, that sibling work continues, and that old launches cannot cross a
+revision change. These checks do not certify isolation from hostile same-user
+code. Preserve bounded per-account resource use and truthful OOM/restart recovery.
+Light/dark and narrow controls, partial results, cleared unsaved values and
+passive unavailable-compute polls remain required. Unit checks alone do not
+enable this contract.
+
+### Legacy v1 namespace acceptance (unshipped)
+
+The earlier stronger gate is retained for historical evidence only:
 
 Capability enablement requires the real account, keeper, supervisor, daemon and
 native/browser control flow: queue through restart and refresh, cancel, explicit

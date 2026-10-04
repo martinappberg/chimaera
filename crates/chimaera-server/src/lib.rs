@@ -55,6 +55,7 @@ mod update;
 mod upload;
 mod view_state;
 mod voice;
+mod workspace_maintenance;
 mod workspace_scope;
 mod workspaces;
 mod ws;

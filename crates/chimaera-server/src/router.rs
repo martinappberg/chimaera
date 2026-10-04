@@ -459,6 +459,19 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/proxy", get(proxy::list_proxies).post(proxy::create_proxy))
         .route("/proxy/{id}", delete(proxy::delete_proxy))
         .route("/proxy/{id}/health", get(proxy::proxy_health))
+        .merge(
+            state
+                .daemon_extension
+                .as_ref()
+                .map_or_else(Router::new, |extension| {
+                    Router::new().nest_service(
+                        "/extensions",
+                        extension.workspace_routes(
+                            crate::workspace_maintenance::WorkspaceHost::new(state.clone()),
+                        ),
+                    )
+                }),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             crate::session_proxy::api_proxy,
