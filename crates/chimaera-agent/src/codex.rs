@@ -1512,16 +1512,21 @@ impl CodexMapper {
             }
         }
 
-        if matches!(
-            method,
-            "item/agentMessage/delta"
-                | "item/reasoning/textDelta"
-                | "item/reasoning/summaryTextDelta"
-                | "item/plan/delta"
-                | "item/commandExecution/outputDelta"
-        ) && frame["params"]["delta"]
-            .as_str()
-            .is_some_and(|s| !s.is_empty())
+        let current_turn = self.turn_active
+            && !self.turn_pending
+            && frame["params"]["turnId"].as_str() == Some(self.turn_id.as_str());
+        if current_turn
+            && matches!(
+                method,
+                "item/agentMessage/delta"
+                    | "item/reasoning/textDelta"
+                    | "item/reasoning/summaryTextDelta"
+                    | "item/plan/delta"
+                    | "item/commandExecution/outputDelta"
+            )
+            && frame["params"]["delta"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty())
         {
             self.unread_opening_message = None;
         }
@@ -1577,6 +1582,9 @@ impl CodexMapper {
             // break_paragraph is deferred + guarded, so a turn's FIRST part
             // no longer buffers a stray leading break.
             "item/reasoning/summaryPartAdded" => {
+                if current_turn {
+                    self.unread_opening_message = None;
+                }
                 let turn = self.turn_id.clone();
                 self.coalescer.break_paragraph(&turn, ChunkKind::Thought);
             }
@@ -1653,15 +1661,21 @@ impl CodexMapper {
                     text,
                 });
             }
-            "item/started" => self.on_item(&frame["params"]["item"], false, &mut step),
-            "item/completed" => self.on_item(&frame["params"]["item"], true, &mut step),
+            "item/started" => {
+                self.on_item(&frame["params"]["item"], false, current_turn, &mut step)
+            }
+            "item/completed" => {
+                self.on_item(&frame["params"]["item"], true, current_turn, &mut step)
+            }
             // Live wholesale-replace of a fileChange item's patch (PROTOCOL.md:
             // item/fileChange/patchUpdated). Re-upsert the row's locations and
             // title so an approval arriving after it names the right files.
             "item/fileChange/patchUpdated" => {
                 let params = &frame["params"];
                 if let Some(item_id) = params["itemId"].as_str() {
-                    self.unread_opening_message = None;
+                    if current_turn {
+                        self.unread_opening_message = None;
+                    }
                     let changes = params["changes"].as_array().cloned().unwrap_or_default();
                     self.file_change_upsert(item_id, &changes, &mut step);
                 }
@@ -1669,6 +1683,9 @@ impl CodexMapper {
             // The turn's todo list (entries {step, status}).
             "turn/plan/updated" => {
                 if let Some(plan) = frame["params"]["plan"].as_array() {
+                    if current_turn {
+                        self.unread_opening_message = None;
+                    }
                     let entries = plan
                         .iter()
                         .filter_map(|p| {
@@ -2552,28 +2569,36 @@ impl CodexMapper {
         });
     }
 
-    fn on_item(&mut self, item: &Value, completed: bool, step: &mut DriverStep) {
+    fn on_item(
+        &mut self,
+        item: &Value,
+        completed: bool,
+        current_turn: bool,
+        step: &mut DriverStep,
+    ) {
         let id = item["id"].as_str().unwrap_or_default().to_string();
         // Older servers may omit clientId on the user echo; actual model
         // activity also proves we passed the pre-prompt hook barrier.
-        if matches!(
-            item["type"].as_str(),
-            Some(
-                "reasoning"
-                    | "agentMessage"
-                    | "commandExecution"
-                    | "mcpToolCall"
-                    | "webSearch"
-                    | "fileChange"
-                    | "imageGeneration"
-                    | "imageView"
-                    | "dynamicToolCall"
-                    | "collabAgentToolCall"
-                    | "functionCallOutput"
-                    | "plan"
-                    | "sleep"
+        if current_turn
+            && matches!(
+                item["type"].as_str(),
+                Some(
+                    "reasoning"
+                        | "agentMessage"
+                        | "commandExecution"
+                        | "mcpToolCall"
+                        | "webSearch"
+                        | "fileChange"
+                        | "imageGeneration"
+                        | "imageView"
+                        | "dynamicToolCall"
+                        | "collabAgentToolCall"
+                        | "functionCallOutput"
+                        | "plan"
+                        | "sleep"
+                )
             )
-        ) {
+        {
             self.unread_opening_message = None;
         }
         match item["type"].as_str() {
@@ -3825,7 +3850,9 @@ impl CodexMapper {
         let params = &frame["params"];
         let method = frame["method"].as_str().unwrap_or_default();
         let request_id = format!("codex-{}", rpc_id);
-        if params["threadId"].as_str() == Some(self.thread_id.as_str())
+        if self.turn_active
+            && !self.turn_pending
+            && params["threadId"].as_str() == Some(self.thread_id.as_str())
             && params["turnId"].as_str() == Some(self.turn_id.as_str())
             && matches!(
                 method,
@@ -5526,7 +5553,7 @@ mod tests {
                 m.unread_opening_message = Some("opening".into());
                 m.on_frame(&json!({
                     "method": if completed {"item/completed"} else {"item/started"},
-                    "params": {"threadId": "thr-1", "item": {"type": kind, "id": "work"}},
+                    "params": {"threadId": "thr-1", "turnId": "turn-A", "item": {"type": kind, "id": "work"}},
                 }));
                 assert!(m.unread_opening_message.is_none(), "{kind}");
             }
@@ -5544,7 +5571,7 @@ mod tests {
             m.unread_opening_message = Some("opening".into());
             m.on_frame(&json!({
                 "method": "item/started",
-                "params": {"threadId": "thr-1", "item": {"type": kind, "id": "setup"}},
+                "params": {"threadId": "thr-1", "turnId": "turn-A", "item": {"type": kind, "id": "setup"}},
             }));
             assert!(m.unread_opening_message.is_some(), "{kind}");
         }
@@ -5557,7 +5584,7 @@ mod tests {
             active_turn(&mut m);
             m.unread_opening_message = Some("opening".into());
             m.on_frame(&json!({"method": method,
-                "params": {"threadId": "thr-1", "itemId": "work", "delta": "working"},
+                "params": {"threadId": "thr-1", "turnId": "turn-A", "itemId": "work", "delta": "working"},
             }));
             assert!(m.unread_opening_message.is_none());
         }
@@ -5571,6 +5598,42 @@ mod tests {
                 }),
             );
             assert_eq!(m.unread_opening_message.is_none(), thread == "thr-1");
+        }
+    }
+
+    #[test]
+    fn confirmation_notifications_require_the_current_turn() {
+        for method in [
+            "item/started",
+            "item/completed",
+            "item/plan/delta",
+            "item/reasoning/textDelta",
+            "item/reasoning/summaryPartAdded",
+            "item/commandExecution/outputDelta",
+            "item/fileChange/patchUpdated",
+            "turn/plan/updated",
+        ] {
+            for (turn, pending) in [
+                (json!("turn-A"), false),
+                (json!("old-turn"), false),
+                (Value::Null, false),
+                (json!("turn-A"), true),
+            ] {
+                let mut m = mapper();
+                active_turn(&mut m);
+                m.turn_pending = pending;
+                m.unread_opening_message = Some("opening".into());
+                m.on_frame(&json!({"method": method, "params": {
+                    "threadId": "thr-1", "turnId": turn, "itemId": "work", "delta": "working",
+                    "item": {"id": "work", "type": "commandExecution"},
+                    "changes": [], "plan": [],
+                }}));
+                assert_eq!(
+                    m.unread_opening_message.is_none(),
+                    turn == "turn-A" && !pending,
+                    "{method}: {turn}"
+                );
+            }
         }
     }
 
@@ -5725,7 +5788,7 @@ mod tests {
             if model_activity {
                 m.on_frame(&json!({
                     "method": "item/started",
-                    "params": { "item": { "type": "reasoning", "id": "r" } },
+                    "params": { "turnId": "turn-A", "item": { "type": "reasoning", "id": "r" } },
                 }));
             }
             m.interrupt_grace = Some(1);

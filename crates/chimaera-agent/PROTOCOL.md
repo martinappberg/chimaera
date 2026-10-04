@@ -158,7 +158,9 @@ turn ids into each row.
 Native hook keys are SHA-256 digests, so deeply nested configuration paths remain
 visible without retaining large IDs. For runtimes without a user `clientId`, model
 work items (including all tool types, plan and sleep), output deltas, patch updates,
-and parent-turn tool requests confirm receipt. Setup items such as hookPrompt and
+turn/plan/updated, and parent-turn tool requests confirm receipt. Work notifications
+must carry the current turnId; late frames from a prior turn cannot confirm a new
+opening message. Setup items such as hookPrompt and
 contextCompaction, and child-thread activity, do not establish parent delivery.
 Run statuses `failed`, `blocked`, and `stopped` all represent unsuccessful hooks.
 Diagnostics live in `entries[{kind,text}]` (`error`, `feedback`, `stop`, `warning`);
