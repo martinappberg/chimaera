@@ -2593,6 +2593,7 @@ impl CodexMapper {
                         | "imageView"
                         | "dynamicToolCall"
                         | "collabAgentToolCall"
+                        | "subAgentActivity"
                         | "functionCallOutput"
                         | "plan"
                         | "sleep"
@@ -5543,6 +5544,7 @@ mod tests {
             "imageView",
             "dynamicToolCall",
             "collabAgentToolCall",
+            "subAgentActivity",
             "functionCallOutput",
             "plan",
             "sleep",
@@ -5562,7 +5564,6 @@ mod tests {
             "userMessage",
             "hookPrompt",
             "contextCompaction",
-            "subAgentActivity",
             "enteredReviewMode",
             "exitedReviewMode",
         ] {
