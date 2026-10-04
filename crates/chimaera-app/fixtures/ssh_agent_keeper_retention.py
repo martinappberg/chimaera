@@ -77,28 +77,63 @@ def held_refusal(value):
     return {"stage": value["stage"], "timeout": value["timeout"]}
 
 
-def stop_refusal(output):
-    # Only the exact fixed native failure marker plus fixed dispatch failure can
-    # yield a diagnostic. Arbitrary child output remains unrendered refusal.
-    stages = ("arguments", "client-build", "me", "capabilities", "stop-reply",
-              "snapshot", "pending-projection", "batch-state", "batch-health", "route-denial")
-    if type(output) is not bytes or len(output) > 128:
+def observer_stages():
+    return ("arguments", "client-build", "me", "capabilities", "stop-reply",
+            "snapshot", "snapshot-request", "snapshot-timeout", "snapshot-client-error",
+            "snapshot-request-error", "snapshot-reply-variant", "snapshot-job-count",
+            "snapshot-job-identity", "snapshot-workspaces", "snapshot-state-unreadable",
+            "pending-projection", "batch-state", "batch-health", "route-denial",
+            "start-batch-reply", "start-attached-reply", "startup-projection", "startup-delay",
+            "attached-state", "attached-health", "attached-terminal", "batch-terminal", "route-absence")
+
+
+def observer_request_classes():
+    return (("bad-request", "unauthorized", "forbidden", "not-found", "conflict",
+             "limited", "unavailable", "other"),
+            ("unsupported-policy", "operation-changed", "requires-job", "jobs-held",
+             "job-unavailable", "jobs-changed", "rollout-pending", "unknown"))
+
+
+def observer_fact(fact, include_capture=False):
+    phases = ("start", "running", "stop-attached", "attached-ended", "jobs-ended", "finished")
+    stages = observer_stages() + (("capture-unsettled", "unclassified-output") if include_capture else ())
+    if (type(fact) is not dict or type(fact.get("phase")) is not str or fact["phase"] not in phases
+            or type(fact.get("stage")) is not str or fact["stage"] not in stages):
+        return False
+    if fact["stage"] != "snapshot-request-error":
+        return set(fact) == {"phase", "stage"}
+    statuses, codes = observer_request_classes()
+    return (set(fact) == {"phase", "stage", "request_status", "request_code"}
+            and type(fact["request_status"]) is str and fact["request_status"] in statuses
+            and type(fact["request_code"]) is str and fact["request_code"] in codes)
+
+
+def observer_refusal(output, phase):
+    # Exact closed projection only; neither child bytes nor raw HTTP errors are
+    # rendered. Typed request classes are diagnostic, never positive proof.
+    if type(phase) is not str or type(output) is not bytes or len(output) > 160:
         return None
-    for stage in stages:
-        if output == b"C1_STOP_REFUSED " + stage.encode("ascii") + b"\nC1_LINK_FAILED\n":
-            return {"stage": stage}
-    return None
+    prefix, suffix = b"C1_LINK_REFUSED ", b"\nC1_LINK_FAILED\n"
+    if not output.startswith(prefix) or not output.endswith(suffix):
+        return None
+    atoms = output[len(prefix):-len(suffix)].split(b" ")
+    if len(atoms) not in (2, 4):
+        return None
+    try:
+        atoms = [atom.decode("ascii") for atom in atoms]
+    except UnicodeDecodeError:
+        return None
+    fact = {"phase": atoms[0], "stage": atoms[1]}
+    if len(atoms) == 4:
+        fact.update(request_status=atoms[2], request_code=atoms[3])
+    return fact if atoms[0] == phase and observer_fact(fact) else None
 
 
-def stop_diagnostic(fact):
-    stages = ("arguments", "client-build", "me", "capabilities", "stop-reply",
-              "snapshot", "pending-projection", "batch-state", "batch-health", "route-denial",
-              "capture-unsettled", "unclassified-output")
-    if (type(fact) is not dict or set(fact) != {"stage"}
-            or type(fact["stage"]) is not str or fact["stage"] not in stages):
+def observer_diagnostic(fact):
+    if not observer_fact(fact, include_capture=True):
         return
     try:
-        print("DIAGNOSTIC C1 stop refusal", json.dumps(fact, separators=(",", ":")), flush=True)
+        print("DIAGNOSTIC C1 Link refusal", json.dumps(fact, separators=(",", ":")), flush=True)
     except (OSError, ValueError):
         pass  # Diagnostic failure cannot replace the original refusal/cleanup.
 
@@ -155,14 +190,13 @@ class RetentionKeeper(Keeper):
             try:
                 output = capture(process, self.end(21 if phase == "start" else 11), 8192)
             except BaseException:
-                if phase == "stop-attached":
-                    stop_diagnostic({"stage": "capture-unsettled"})
+                observer_diagnostic({"phase": phase, "stage": "capture-unsettled"})
                 raise
             if phase == "jobs-ended" and process.returncode == 0 and output == b"C1_LINK_BATCH_PENDING\n":
                 return False
             if process.returncode or output != markers[phase]:
-                if phase == "stop-attached":
-                    stop_diagnostic(stop_refusal(output) or {"stage": "unclassified-output"})
+                observer_diagnostic(observer_refusal(output, phase)
+                                    or {"phase": phase, "stage": "unclassified-output"})
                 raise Refused("c1 authenticated Link observation")
             return True
         finally:

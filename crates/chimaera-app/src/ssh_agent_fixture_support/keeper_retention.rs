@@ -54,30 +54,89 @@ async fn snapshot(
     client: &Client,
     deadline: Instant,
     refresh: bool,
+    stage: &mut ObserverStage,
 ) -> Result<Box<ClusterSnapshot>, ()> {
-    match bounded(
+    *stage = ObserverStage::SnapshotRequest;
+    let result = bounded(
         deadline,
         client.cluster_operation(HOST, &ClusterOperation::Overview { refresh }),
     )
-    .await?
-    .map_err(|_| ())?
-    {
-        ClusterReply::Overview { overview }
-            if overview.jobs.len() == 2
-                && overview.jobs.iter().filter(|job| job.id == BATCH).count() == 1
-                && overview
-                    .jobs
-                    .iter()
-                    .filter(|job| job.id == ATTACHED)
-                    .count()
-                    == 1
-                && overview.workspaces.is_empty()
-                && !overview.state_unreadable =>
-        {
-            Ok(overview)
+    .await;
+    let reply = match result {
+        Err(()) => {
+            *stage = ObserverStage::SnapshotTimeout;
+            return Err(());
         }
-        _ => Err(()),
+        Ok(Err(error)) => {
+            *stage = snapshot_error(&error);
+            return Err(());
+        }
+        Ok(Ok(reply)) => reply,
+    };
+    snapshot_projection(reply, stage)
+}
+
+fn snapshot_error(error: &anyhow::Error) -> ObserverStage {
+    use chimaera_link::ClusterErrorCode;
+    let Some(error) = error.downcast_ref::<chimaera_link::ClusterRequestError>() else {
+        return ObserverStage::SnapshotClientError;
+    };
+    // Only fixed typed classes; never render an anyhow/HTTP error or body.
+    let status = match error.status {
+        400 => "bad-request",
+        401 => "unauthorized",
+        403 => "forbidden",
+        404 => "not-found",
+        409 => "conflict",
+        429 => "limited",
+        503 => "unavailable",
+        _ => "other",
+    };
+    let code = match error.code {
+        ClusterErrorCode::UnsupportedClusterPolicy => "unsupported-policy",
+        ClusterErrorCode::OperationChanged => "operation-changed",
+        ClusterErrorCode::ClusterRequiresJob => "requires-job",
+        ClusterErrorCode::JobsHeld => "jobs-held",
+        ClusterErrorCode::JobUnavailable => "job-unavailable",
+        ClusterErrorCode::JobsChanged => "jobs-changed",
+        ClusterErrorCode::RolloutPending => "rollout-pending",
+        ClusterErrorCode::Unknown => "unknown",
+    };
+    ObserverStage::SnapshotRequestError { status, code }
+}
+
+fn snapshot_projection(
+    reply: ClusterReply,
+    stage: &mut ObserverStage,
+) -> Result<Box<ClusterSnapshot>, ()> {
+    *stage = ObserverStage::SnapshotReplyVariant;
+    let ClusterReply::Overview { overview } = reply else {
+        return Err(());
+    };
+    *stage = ObserverStage::SnapshotJobCount;
+    if overview.jobs.len() != 2 {
+        return Err(());
     }
+    *stage = ObserverStage::SnapshotJobIdentity;
+    if overview.jobs.iter().filter(|job| job.id == BATCH).count() != 1
+        || overview
+            .jobs
+            .iter()
+            .filter(|job| job.id == ATTACHED)
+            .count()
+            != 1
+    {
+        return Err(());
+    }
+    *stage = ObserverStage::SnapshotWorkspaces;
+    if !overview.workspaces.is_empty() {
+        return Err(());
+    }
+    *stage = ObserverStage::SnapshotStateUnreadable;
+    if overview.state_unreadable {
+        return Err(());
+    }
+    Ok(overview)
 }
 
 fn job(snapshot: &ClusterSnapshot, id: &str, attached: bool) -> Result<ClusterJobState, ()> {
@@ -229,32 +288,87 @@ async fn health(
     result
 }
 
-async fn running(client: &Client, deadline: Instant) -> Result<(), ()> {
-    let state = snapshot(client, deadline, true).await?;
-    if state.degraded
-        || job(&state, BATCH, false)? != ClusterJobState::Running
-        || job(&state, ATTACHED, true)? != ClusterJobState::Running
-    {
+async fn running(client: &Client, deadline: Instant, stage: &mut ObserverStage) -> Result<(), ()> {
+    *stage = ObserverStage::Snapshot;
+    let state = snapshot(client, deadline, true, stage).await?;
+    *stage = ObserverStage::BatchState;
+    if state.degraded || job(&state, BATCH, false)? != ClusterJobState::Running {
         return Err(());
     }
+    *stage = ObserverStage::AttachedState;
+    if job(&state, ATTACHED, true)? != ClusterJobState::Running {
+        return Err(());
+    }
+    *stage = ObserverStage::BatchHealth;
     health(client, &state, BATCH, deadline).await?;
+    *stage = ObserverStage::AttachedHealth;
     health(client, &state, ATTACHED, deadline).await
 }
 
+// Terminal presentation may lose its queue-only ID. This is not scheduler or
+// resource proof: the runner still requires the paired private exact TIMEOUT,
+// journal Terminal and original-resource absence before continuing.
+fn jobs_ended(state: &ClusterSnapshot, stage: &mut ObserverStage) -> Result<bool, ()> {
+    *stage = ObserverStage::AttachedTerminal;
+    if !ended(state, ATTACHED) {
+        return Err(());
+    }
+    *stage = ObserverStage::BatchTerminal;
+    let batch = state.jobs.iter().find(|row| row.id == BATCH).ok_or(())?;
+    if batch.state == ClusterJobState::Ended {
+        if batch.attached {
+            return Err(());
+        }
+        *stage = ObserverStage::RouteAbsence;
+        return if ended(state, BATCH) && state.routes.is_empty() {
+            Ok(true)
+        } else {
+            Err(())
+        };
+    }
+    *stage = ObserverStage::BatchState;
+    if job(state, BATCH, false)? == ClusterJobState::Running {
+        Ok(false)
+    } else {
+        Err(())
+    }
+}
+
 #[derive(Clone, Copy)]
-enum StopStage {
+enum ObserverStage {
     Arguments,
     ClientBuild,
     Me,
     Capabilities,
     StopReply,
     Snapshot,
+    SnapshotRequest,
+    SnapshotTimeout,
+    SnapshotClientError,
+    SnapshotRequestError {
+        status: &'static str,
+        code: &'static str,
+    },
+    SnapshotReplyVariant,
+    SnapshotJobCount,
+    SnapshotJobIdentity,
+    SnapshotWorkspaces,
+    SnapshotStateUnreadable,
     PendingProjection,
     BatchState,
     BatchHealth,
     RouteDenial,
+    StartBatchReply,
+    StartAttachedReply,
+    StartupProjection,
+    StartupDelay,
+    AttachedState,
+    AttachedHealth,
+    AttachedTerminal,
+    BatchTerminal,
+    RouteAbsence,
 }
-impl StopStage {
+impl ObserverStage {
     fn label(self) -> &'static str {
         match self {
             Self::Arguments => "arguments",
@@ -263,10 +377,28 @@ impl StopStage {
             Self::Capabilities => "capabilities",
             Self::StopReply => "stop-reply",
             Self::Snapshot => "snapshot",
+            Self::SnapshotRequest => "snapshot-request",
+            Self::SnapshotTimeout => "snapshot-timeout",
+            Self::SnapshotClientError => "snapshot-client-error",
+            Self::SnapshotRequestError { .. } => "snapshot-request-error",
+            Self::SnapshotReplyVariant => "snapshot-reply-variant",
+            Self::SnapshotJobCount => "snapshot-job-count",
+            Self::SnapshotJobIdentity => "snapshot-job-identity",
+            Self::SnapshotWorkspaces => "snapshot-workspaces",
+            Self::SnapshotStateUnreadable => "snapshot-state-unreadable",
             Self::PendingProjection => "pending-projection",
             Self::BatchState => "batch-state",
             Self::BatchHealth => "batch-health",
             Self::RouteDenial => "route-denial",
+            Self::StartBatchReply => "start-batch-reply",
+            Self::StartAttachedReply => "start-attached-reply",
+            Self::StartupProjection => "startup-projection",
+            Self::StartupDelay => "startup-delay",
+            Self::AttachedState => "attached-state",
+            Self::AttachedHealth => "attached-health",
+            Self::AttachedTerminal => "attached-terminal",
+            Self::BatchTerminal => "batch-terminal",
+            Self::RouteAbsence => "route-absence",
         }
     }
 }
@@ -277,8 +409,16 @@ pub(super) async fn run(
     original_remaining_ms: u64,
 ) -> Result<(), ()> {
     let original_start = Instant::now();
-    let report = phase == "stop-attached";
-    let mut stage = StopStage::Arguments;
+    let report = match phase.as_str() {
+        "start" => Some("start"),
+        "running" => Some("running"),
+        "stop-attached" => Some("stop-attached"),
+        "attached-ended" => Some("attached-ended"),
+        "jobs-ended" => Some("jobs-ended"),
+        "finished" => Some("finished"),
+        _ => None,
+    };
+    let mut stage = ObserverStage::Arguments;
     let result = observe(
         endpoint,
         phase,
@@ -287,15 +427,27 @@ pub(super) async fn run(
         original_start,
     )
     .await;
-    if report && result.is_err() {
+    if let Some(phase) = report.filter(|_| result.is_err()) {
         use std::io::Write;
         // Fixed fixture labels only. A closed diagnostic sink cannot replace the
-        // original error, and no HTTP body/status/identity is rendered.
-        let _ = writeln!(
-            std::io::stdout().lock(),
-            "C1_STOP_REFUSED {}",
-            stage.label()
-        );
+        // original error; status classes/codes are typed, never raw HTTP values.
+        if let ObserverStage::SnapshotRequestError { status, code } = stage {
+            let _ = writeln!(
+                std::io::stdout().lock(),
+                "C1_LINK_REFUSED {} {} {} {}",
+                phase,
+                stage.label(),
+                status,
+                code
+            );
+        } else {
+            let _ = writeln!(
+                std::io::stdout().lock(),
+                "C1_LINK_REFUSED {} {}",
+                phase,
+                stage.label()
+            );
+        }
     }
     result
 }
@@ -304,7 +456,7 @@ async fn observe(
     endpoint: String,
     phase: String,
     original_remaining_ms: u64,
-    stage: &mut StopStage,
+    stage: &mut ObserverStage,
     original_start: Instant,
 ) -> Result<(), ()> {
     // The runner retains the one original300s envelope. Every child phase is
@@ -331,7 +483,7 @@ async fn observe(
         return Err(());
     }
     let deadline = original.min(Instant::now() + Duration::from_secs(seconds));
-    *stage = StopStage::ClientBuild;
+    *stage = ObserverStage::ClientBuild;
     let client = Client::new(
         &endpoint,
         Some(Tokens {
@@ -342,9 +494,9 @@ async fn observe(
         }),
     )
     .map_err(|_| ())?;
-    *stage = StopStage::Me;
+    *stage = ObserverStage::Me;
     bounded(deadline, client.me()).await?.map_err(|_| ())?;
-    *stage = StopStage::Capabilities;
+    *stage = ObserverStage::Capabilities;
     if !bounded(deadline, client.cluster_capabilities())
         .await?
         .map_err(|_| ())?
@@ -373,6 +525,11 @@ async fn observe(
                     replaces: None,
                     save_as: None,
                 };
+                *stage = if attached {
+                    ObserverStage::StartAttachedReply
+                } else {
+                    ObserverStage::StartBatchReply
+                };
                 match mutate(&client, operation, deadline).await? {
                     ClusterReply::Job {
                         job_id,
@@ -380,35 +537,38 @@ async fn observe(
                         attached: actual,
                     } if job_id == id
                         && actual == attached
-                        && (attached || slurm_job_id.is_some()) =>
-                    {
-                        ()
-                    }
+                        && (attached || slurm_job_id.is_some()) => {}
                     _ => return Err(()),
                 }
             }
             let mut ready = None;
             for read in 0..4 {
-                let state = snapshot(&client, deadline, true).await?;
+                *stage = ObserverStage::Snapshot;
+                let state = snapshot(&client, deadline, true, stage).await?;
+                *stage = ObserverStage::StartupProjection;
                 if startup_ready(&state)? {
                     ready = Some(state);
                     break;
                 }
                 if read < 3 {
+                    *stage = ObserverStage::StartupDelay;
                     bounded(deadline, tokio::time::sleep(Duration::from_secs(1))).await?;
                 }
             }
+            *stage = ObserverStage::StartupProjection;
             let state = ready.ok_or(())?;
+            *stage = ObserverStage::BatchHealth;
             health(&client, &state, BATCH, deadline).await?;
+            *stage = ObserverStage::AttachedHealth;
             health(&client, &state, ATTACHED, deadline).await?;
             println!("C1_LINK_STARTED");
         }
         "running" => {
-            running(&client, deadline).await?;
+            running(&client, deadline, stage).await?;
             println!("C1_LINK_RUNNING");
         }
         "stop-attached" => {
-            *stage = StopStage::StopReply;
+            *stage = ObserverStage::StopReply;
             match mutate(
                 &client,
                 ClusterOperation::StopJob {
@@ -422,9 +582,9 @@ async fn observe(
                 ClusterReply::StopPending { job_id } if job_id == ATTACHED => (),
                 _ => return Err(()),
             }
-            *stage = StopStage::Snapshot;
-            let state = snapshot(&client, deadline, true).await?;
-            *stage = StopStage::PendingProjection;
+            *stage = ObserverStage::Snapshot;
+            let state = snapshot(&client, deadline, true, stage).await?;
+            *stage = ObserverStage::PendingProjection;
             if !state
                 .jobs
                 .iter()
@@ -433,13 +593,13 @@ async fn observe(
             {
                 return Err(());
             }
-            *stage = StopStage::BatchState;
+            *stage = ObserverStage::BatchState;
             if job(&state, BATCH, false)? != ClusterJobState::Running {
                 return Err(());
             }
-            *stage = StopStage::BatchHealth;
+            *stage = ObserverStage::BatchHealth;
             health(&client, &state, BATCH, deadline).await?;
-            *stage = StopStage::RouteDenial;
+            *stage = ObserverStage::RouteDenial;
             match bounded(deadline, client.cluster_tcp(HOST, ATTACHED, None)).await? {
                 Err(error) if error.to_string() == "websocket upgrade rejected (503)" => (),
                 Ok(mut socket) => {
@@ -451,31 +611,44 @@ async fn observe(
             println!("C1_LINK_UNCERTAIN");
         }
         "attached-ended" => {
-            let state = snapshot(&client, deadline, true).await?;
-            if !ended(&state, ATTACHED) || job(&state, BATCH, false)? != ClusterJobState::Running {
+            *stage = ObserverStage::Snapshot;
+            let state = snapshot(&client, deadline, true, stage).await?;
+            *stage = ObserverStage::AttachedTerminal;
+            if !ended(&state, ATTACHED) {
                 return Err(());
             }
+            *stage = ObserverStage::BatchState;
+            if job(&state, BATCH, false)? != ClusterJobState::Running {
+                return Err(());
+            }
+            *stage = ObserverStage::BatchHealth;
             health(&client, &state, BATCH, deadline).await?;
             println!("C1_LINK_ATTACHED_ENDED");
         }
         "jobs-ended" => {
-            let state = snapshot(&client, deadline, true).await?;
-            if !ended(&state, ATTACHED) {
-                return Err(());
-            }
-            if job(&state, BATCH, false)? == ClusterJobState::Running {
-                println!("C1_LINK_BATCH_PENDING");
-            } else if ended(&state, BATCH) && state.routes.is_empty() {
+            *stage = ObserverStage::Snapshot;
+            let state = snapshot(&client, deadline, true, stage).await?;
+            if jobs_ended(&state, stage)? {
                 println!("C1_LINK_JOBS_ENDED");
             } else {
-                return Err(());
+                println!("C1_LINK_BATCH_PENDING");
             }
         }
         "finished" => {
             // Ordinary UI polling is passive. No refresh or target-health call
             // may reseed the normal login grace after the quiet observation.
-            let state = snapshot(&client, deadline, false).await?;
-            if !ended(&state, ATTACHED) || !ended(&state, BATCH) || !state.routes.is_empty() {
+            *stage = ObserverStage::Snapshot;
+            let state = snapshot(&client, deadline, false, stage).await?;
+            *stage = ObserverStage::AttachedTerminal;
+            if !ended(&state, ATTACHED) {
+                return Err(());
+            }
+            *stage = ObserverStage::BatchTerminal;
+            if !ended(&state, BATCH) {
+                return Err(());
+            }
+            *stage = ObserverStage::RouteAbsence;
+            if !state.routes.is_empty() {
                 return Err(());
             }
             println!("C1_LINK_FINISHED");
@@ -570,6 +743,55 @@ mod tests {
     }
 
     #[test]
+    fn jobs_ended_without_queue_id_is_only_terminal_presentation() {
+        let attached = parsed_job("ended", None);
+        let mut batch = parsed_job("ended", None);
+        batch.id = BATCH.into();
+        batch.attached = false;
+        let mut state: ClusterSnapshot = serde_json::from_value(serde_json::json!({
+            "scheduler": "slurm", "login_node": "", "home": "", "now_ms": 1,
+            "jobs": [attached, batch], "workspaces": [], "other_jobs": {"running": 0, "waiting": 0},
+            "degraded": false, "queue_at_ms": 1,
+            "config": chimaera_core::cluster::ClusterConfig::default(),
+            "startup": {"cluster": "", "workspaces": {}},
+            "config_sum": "", "state_unreadable": false, "records": {}, "routes": []
+        }))
+        .unwrap_or_else(|_| panic!("fixed jobs-ended parser fixture"));
+        let mut stage = ObserverStage::Arguments;
+        assert_eq!(jobs_ended(&state, &mut stage), Ok(true));
+        state.jobs[1].attached = true;
+        assert_eq!(jobs_ended(&state, &mut stage), Err(()));
+        assert_eq!(stage.label(), "batch-terminal");
+        state.jobs[1].attached = false;
+        state.jobs[1].state = ClusterJobState::Running;
+        // Missing identity remains invalid for positive running/pending work.
+        assert_eq!(jobs_ended(&state, &mut stage), Err(()));
+        assert_eq!(stage.label(), "batch-state");
+        state.jobs[1].slurm_job_id = Some("7001".into());
+        assert_eq!(jobs_ended(&state, &mut stage), Ok(false));
+        state.jobs[1].state = ClusterJobState::Ended;
+        state.jobs[1].slurm_job_id = None;
+        state.routes.push(chimaera_link::ClusterRoute {
+            job_id: "j-99999999".into(),
+            workspace_id: None,
+            daemon: chimaera_link::Daemon {
+                token: "synthetic".into(),
+                build: "fixture".into(),
+                sessions: 0,
+            },
+        });
+        assert_eq!(jobs_ended(&state, &mut stage), Err(()));
+        assert_eq!(stage.label(), "route-absence");
+        state.routes[0].job_id = BATCH.into();
+        assert_eq!(jobs_ended(&state, &mut stage), Err(()));
+        assert_eq!(stage.label(), "route-absence");
+        state.routes.clear();
+        state.jobs[0].state = ClusterJobState::Running;
+        assert_eq!(jobs_ended(&state, &mut stage), Err(()));
+        assert_eq!(stage.label(), "attached-terminal");
+    }
+
+    #[test]
     fn asynchronous_allocation_identity_is_not_positive_running_evidence() {
         for state in ["waiting", "starting"] {
             let row = parsed_job(state, None);
@@ -592,5 +814,95 @@ mod tests {
             startup_job(&parsed_job("ended", Some("7002")), true),
             Err(())
         );
+    }
+    #[test]
+    fn snapshot_diagnostics_keep_exact_projection_and_optional_terminal_id() {
+        let mut attached = parsed_job("ended", None);
+        attached.id = ATTACHED.into();
+        let mut batch = parsed_job("ended", None);
+        batch.id = BATCH.into();
+        batch.attached = false;
+        let state: ClusterSnapshot = serde_json::from_value(serde_json::json!({
+            "scheduler": "slurm", "login_node": "", "home": "", "now_ms": 1,
+            "jobs": [attached, batch], "workspaces": [], "other_jobs": {"running": 0, "waiting": 0},
+            "degraded": false, "queue_at_ms": 1,
+            "config": chimaera_core::cluster::ClusterConfig::default(),
+            "startup": {"cluster": "", "workspaces": {}},
+            "config_sum": "", "state_unreadable": false, "records": {}, "routes": []
+        }))
+        .unwrap_or_else(|_| panic!("fixed snapshot projection fixture"));
+        let project = |state: ClusterSnapshot| {
+            let reply = ClusterReply::Overview {
+                overview: Box::new(state),
+            };
+            // Exercise the same actual Link DTO validation before projection.
+            assert!(reply.validate().is_ok());
+            let mut stage = ObserverStage::Arguments;
+            let accepted = snapshot_projection(reply, &mut stage).is_ok();
+            (accepted, stage.label())
+        };
+        assert!(project(state.clone()).0);
+        let mut changed = state.clone();
+        changed.jobs.pop();
+        assert_eq!(project(changed), (false, "snapshot-job-count"));
+        let mut changed = state.clone();
+        changed.jobs[1].id = ATTACHED.into();
+        assert_eq!(project(changed), (false, "snapshot-job-identity"));
+        let mut changed = state.clone();
+        changed.state_unreadable = true;
+        assert_eq!(project(changed), (false, "snapshot-state-unreadable"));
+        let mut changed = state.clone();
+        changed.workspaces.push(
+            serde_json::from_value(serde_json::json!({
+                "id": "w-00000001", "state": "closed", "name": "fixture", "path": ""
+            }))
+            .unwrap_or_else(|_| panic!("fixed workspace projection fixture")),
+        );
+        assert_eq!(project(changed), (false, "snapshot-workspaces"));
+        let mut stage = ObserverStage::Arguments;
+        assert!(snapshot_projection(ClusterReply::Saved, &mut stage).is_err());
+        assert_eq!(stage.label(), "snapshot-reply-variant");
+    }
+
+    #[test]
+    fn snapshot_error_diagnostics_use_only_closed_typed_classes() {
+        use chimaera_link::{ClusterErrorCode, ClusterRequestError};
+        let statuses = [
+            (400, "bad-request"),
+            (401, "unauthorized"),
+            (403, "forbidden"),
+            (404, "not-found"),
+            (409, "conflict"),
+            (429, "limited"),
+            (503, "unavailable"),
+            (599, "other"),
+        ];
+        let codes = [
+            (
+                ClusterErrorCode::UnsupportedClusterPolicy,
+                "unsupported-policy",
+            ),
+            (ClusterErrorCode::OperationChanged, "operation-changed"),
+            (ClusterErrorCode::ClusterRequiresJob, "requires-job"),
+            (ClusterErrorCode::JobsHeld, "jobs-held"),
+            (ClusterErrorCode::JobUnavailable, "job-unavailable"),
+            (ClusterErrorCode::JobsChanged, "jobs-changed"),
+            (ClusterErrorCode::RolloutPending, "rollout-pending"),
+            (ClusterErrorCode::Unknown, "unknown"),
+        ];
+        for (status, expected_status) in statuses {
+            for (code, expected_code) in codes {
+                let error = anyhow::Error::new(ClusterRequestError { status, code });
+                match snapshot_error(&error) {
+                    ObserverStage::SnapshotRequestError { status, code } => {
+                        assert_eq!(status, expected_status);
+                        assert_eq!(code, expected_code);
+                    }
+                    _ => panic!("typed snapshot error classification"),
+                }
+            }
+        }
+        let error = anyhow::anyhow!("synthetic unpublished payload");
+        assert_eq!(snapshot_error(&error).label(), "snapshot-client-error");
     }
 }
