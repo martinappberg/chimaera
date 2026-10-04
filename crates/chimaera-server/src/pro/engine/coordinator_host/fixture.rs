@@ -51,7 +51,7 @@ impl Harness {
         layout: Layout,
         factory: Option<fn() -> Arc<dyn Runtime>>,
     ) -> anyhow::Result<Self> {
-        Self::new_captured(root, layout, None, factory).await
+        Self::new_captured(root, layout, None, factory, None).await
     }
     /// Original project fixture data directory within one caller-owned anchor.
     pub async fn new_projects(
@@ -59,13 +59,21 @@ impl Harness {
         data: PathBuf,
         factory: Option<fn() -> Arc<dyn Runtime>>,
     ) -> anyhow::Result<Self> {
-        Self::new_captured(root, Layout::Projects, Some(data), factory).await
+        Self::new_captured(root, Layout::Projects, Some(data), factory, None).await
+    }
+    /// Captured trusted composition before AppState publication; no setter.
+    pub async fn new_with_runtime(
+        root: PathBuf,
+        runtime: Arc<dyn Runtime>,
+    ) -> anyhow::Result<Self> {
+        Self::new_captured(root, Layout::Standard, None, None, Some(runtime)).await
     }
     async fn new_captured(
         root: PathBuf,
         layout: Layout,
         data: Option<PathBuf>,
         factory: Option<fn() -> Arc<dyn Runtime>>,
+        runtime: Option<Arc<dyn Runtime>>,
     ) -> anyhow::Result<Self> {
         let (root, mut state) = tokio::task::spawn_blocking(move || {
             use std::os::unix::fs::{DirBuilderExt, MetadataExt};
@@ -165,7 +173,7 @@ impl Harness {
             Ok::<_, anyhow::Error>((root, state))
         })
         .await??;
-        state.daemon_extension = factory.map(|factory| factory());
+        state.daemon_extension = runtime.or_else(|| factory.map(|factory| factory()));
         Ok(Self {
             state: Arc::new(state),
             root,

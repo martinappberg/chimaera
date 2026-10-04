@@ -412,6 +412,27 @@ impl Harness {
             task: Some(task),
         })
     }
+    /// Original serving identity, only for this owned loopback listener. No
+    /// process HOME or production Manifest is read or rewritten.
+    pub fn serving_manifest(&self, server: &LoopbackServer) -> Result<chimaera_core::Manifest> {
+        ensure!(
+            server.address.ip().is_loopback() && server.address.port() != 0,
+            "fixture listener unavailable"
+        );
+        Ok(chimaera_core::Manifest {
+            hostname: self.state.hostname.clone(),
+            port: server.address.port(),
+            token: self.state.token.clone(),
+            pid: self.state.pid,
+            version: chimaera_core::VERSION.into(),
+            started_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs(),
+            build: Some(chimaera_core::BUILD_ID.into()),
+            slurm_job_id: None,
+            runtime_leases: false,
+        })
+    }
     pub async fn jobs_reservation(&self) -> Reservation {
         Reservation(self.state.pro.jobs.clone().lock_owned().await)
     }
