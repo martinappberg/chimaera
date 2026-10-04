@@ -1,5 +1,7 @@
 /** Trusted first-party presentation only. The caller supplies the window's
  * existing runtime services; this module creates no account or route owner. */
+import type { KeptReviewDomain } from "./keptReview";
+
 export type SurfaceKind = "account" | "account-settings" | "kept-review";
 export interface Observable<T> { subscribe(listener: (snapshot: Readonly<T>) => void): () => void }
 export interface AccountSnapshot {
@@ -37,6 +39,8 @@ export interface SurfaceMount {
   runtime: ApplicationRuntime;
   actions: SurfaceActions;
   signal: AbortSignal;
+  /** Original host-bound review only; absent on ordinary/account surfaces. */
+  keptReview: KeptReviewDomain | null;
 }
 export interface SurfaceOwner { update(presentation: Readonly<SurfacePresentation>): void; dispose(): void }
 export interface ApplicationExtension {
@@ -54,6 +58,8 @@ export interface HostSurfaceActions {
   /** The original shared host modalFocus action, at ordinary priority. */
   modal(node: HTMLElement): { destroy(): void };
   current(): boolean;
+  /** Host-only factory captures original workspace/epoch/pane before mount. */
+  keptReview?(): KeptReviewDomain;
 }
 const validId = (v: unknown): v is string => typeof v === "string" && /^[a-zA-Z0-9_-]{1,128}$/.test(v);
 const counter = (v: number): boolean => Number.isSafeInteger(v) && v > 0;
@@ -101,6 +107,7 @@ export class ApplicationSurfaceSession {
   #timer: ReturnType<typeof setTimeout> | null = null;
   #mounting = false;
   #closed = false;
+  #keptReview: KeptReviewDomain | null = null;
   #modals = new Set<{ destroy(): void }>();
   status: SurfaceStatus;
   constructor(
@@ -146,6 +153,8 @@ export class ApplicationSurfaceSession {
     const owner = this.#owner;
     this.#owner = null;
     try { owner?.dispose(); } catch { /* Detached UI cannot block host cleanup. */ }
+    const kept = this.#keptReview; this.#keptReview = null;
+    try { kept?.dispose(); } catch { /* Retire only this presentation domain. */ }
   }
   start(): void {
     if (this.#closed || this.extension === null || this.#mounting || this.#owner !== null) return;
@@ -195,9 +204,16 @@ export class ApplicationSurfaceSession {
     // Calling mount in a promise also accounts for synchronous module throws.
     void Promise.resolve().then(() => {
       check();
+      if (this.kind === "kept-review" && this.host.keptReview !== undefined) {
+        const kept = this.host.keptReview();
+        this.#keptReview = kept;
+        if (kept.workspaceId !== this.#identity.workspaceId) throw new Error("Application review scope mismatch");
+        check();
+      }
       return this.extension!.mount(this.kind, target, {
-      identity: this.#identity, presentation: this.#presentation, runtime: this.runtime, actions, signal: controller.signal,
-    });
+        identity: this.#identity, presentation: this.#presentation, runtime: this.runtime,
+        actions, signal: controller.signal, keptReview: this.#keptReview,
+      });
     }).then((owner) => {
       if (!this.#current(target)) {
         try { owner.dispose(); } finally { target.remove(); }

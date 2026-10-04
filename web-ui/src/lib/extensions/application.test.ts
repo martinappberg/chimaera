@@ -1,3 +1,4 @@
+import type { KeptReviewDomain } from "./keptReview";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ApplicationSurfaceSession, relativeFilePath,
@@ -42,6 +43,26 @@ function session(root: Target, services: ApplicationRuntime, module: Application
 afterEach(() => { vi.useRealTimers(); vi.clearAllMocks(); });
 
 describe("application surface original owner", () => {
+  it("captures kept domain only for the original kept surface and disposes it on retirement", async () => {
+    const actions = host(); const dispose = vi.fn();
+    const kept = { workspaceId: "workspace-one", dispose } as unknown as KeptReviewDomain;
+    actions.keptReview = vi.fn(() => kept); let mount!: SurfaceMount;
+    const owner = session(new Target(), runtime(), { version: 1, id: "chimaera-pro", mount: async (_, __, value) => {
+      mount = value; return { update: vi.fn(), dispose: vi.fn() };
+    } }, actions);
+    owner.start(); await flush(); expect(mount.keptReview).toBe(kept); owner.close();
+    expect(dispose).toHaveBeenCalledTimes(1);
+    const account = new ApplicationSurfaceSession(dom(new Target()), "account", { version: 1, viewId: "account", attemptId: 1, workspaceId: "workspace-one" }, presentation(), runtime(),
+      { version: 1, id: "chimaera-pro", mount: async (_, __, value) => { expect(value.keptReview).toBeNull(); return { update: vi.fn(), dispose: vi.fn() }; } }, actions);
+    account.start(); await flush(); account.close(); expect(actions.keptReview).toHaveBeenCalledTimes(1);
+  });
+  it("rejects a mismatched kept domain and still closes its subscription owner", async () => {
+    const dispose = vi.fn(); const actions = host(); const mount = vi.fn();
+    actions.keptReview = () => ({ workspaceId: "successor", dispose }) as unknown as KeptReviewDomain;
+    const owner = session(new Target(), runtime(), { version: 1, id: "chimaera-pro", mount }, actions);
+    owner.start(); await flush(); expect(owner.status).toBe("failed"); expect(mount).not.toHaveBeenCalled();
+    expect(dispose).toHaveBeenCalledTimes(1); owner.close();
+  });
   it("absent module creates no DOM, subscriptions or account work", () => {
     const root = new Target(); const owner = session(root, runtime(), null);
     owner.start(); owner.close();
