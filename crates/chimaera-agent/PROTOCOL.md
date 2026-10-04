@@ -131,6 +131,29 @@ extension either), `channel_enable`, `apply_flag_settings`, `reload_skills`,
 
 ## Codex — `codex app-server` JSON-RPC 2.0 (JSONL, header omitted)
 
+### Startup hooks and interrupted input (0.159.3, 2026-10-03)
+
+The generated schema defines `hook/started|completed {threadId, turnId: string|null,
+run:{id,eventName,executionMode,sourcePath,status,...}}`. Synchronous `sessionStart`
+and `userPromptSubmit` hooks can block after `turn/started`, before the native
+`userMessage` item. Surface those hooks through bounded tool rows and ActivityLine;
+async hooks and other threads must not replace the parent's startup phase.
+
+Observed in the affected live session: `turn/started` → `hook/started`, then no
+completion for over four minutes until interruption. The native rollout contained
+repository instructions but **not the submitted user request**; the next turn's
+"Keep going" was its first recorded user prompt. A successful turn/start RPC or
+TurnStarted event therefore cannot establish delivery. The opening `clientId` is
+tracked until its userMessage echo (or actual model activity for older runtimes);
+an interrupt before confirmation emits an explicit resend notice, including when
+the interrupt watchdog supplies the missing turn end.
+
+Isolated live reproduction: a trusted project SessionStart hook (`sleep 300`)
+produced the hook row and phase; Stop produced the resend notice, which survived
+UI reload. Resending the original prompt completed normally. Hook ids can be
+configuration-derived (`session-start:0:<sourcePath>`), so normalized row ids
+include the turn id to keep later hooks from overwriting earlier history.
+
 ### Lifecycle (live)
 
 `initialize{clientInfo}` → result → client MUST send `initialized`
