@@ -1463,7 +1463,7 @@ async fn spawn_agent(
         .and_then(|m| m.as_str())
         .map(str::to_string);
     if let Some(model) = &model {
-        if !crate::launcher::safe_arg(model) {
+        if !crate::launcher::safe_model_arg(model) {
             return tool_error(format!("invalid model {model:?}"));
         }
     }

@@ -634,17 +634,27 @@ pub(crate) async fn list_agents(
     Json(serde_json::Value::Array(rows))
 }
 
-/// Charset guard for model/resume ids that land in argv. Argv cannot
+/// Charset guard for resume and other native ids that land in argv. Argv cannot
 /// shell-inject, but a flag-shaped value ("--dangerously-…") or control
-/// bytes have no business in either field. Square brackets are claude's
-/// own context-window suffix (`opus[1m]`, `claude-fable-5-1[1m]` — the
-/// picker values its initialize catalog advertises; live-verified accepted
-/// by both `--model` and `set_model` on 2.1.259).
+/// bytes have no business in a native handle. Model selectors use
+/// `safe_model_arg`, which additionally accepts namespaces and tags.
 pub(crate) fn safe_arg(s: &str) -> bool {
     !s.is_empty()
         && !s.starts_with('-')
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '[' | ']'))
+}
+
+/// Model names can include provider namespaces and local model tags. Keep
+/// them as one bounded argv value; flag-shaped IDs and shell syntax are not
+/// model selectors. Resume handles retain the stricter `safe_arg` contract.
+pub(crate) fn safe_model_arg(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= chimaera_agent::model::COMMAND_SELECTOR_MAX
+        && !s.starts_with('-')
+        && s.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '[' | ']' | '/' | ':' | '@')
+        })
 }
 
 /// Argv for an agent session. Claude gets the hook-injecting `--settings`
@@ -1400,6 +1410,54 @@ mod tests {
         assert!(!safe_arg("a b"));
         assert!(!safe_arg("a;b"));
         assert!(!safe_arg("a/b"));
+    }
+
+    #[test]
+    fn custom_model_ids_preserve_namespaces_without_relaxing_resume_handles() {
+        for model in [
+            "provider/model",
+            "local/model:latest",
+            "org/model@v2",
+            "opus[1m]",
+        ] {
+            assert!(safe_model_arg(model), "{model}");
+        }
+        for model in [
+            "",
+            "--model=other",
+            "model name",
+            "model;cmd",
+            "$(cmd)",
+            "`cmd`",
+            "a\nb",
+            "a\0b",
+            "a\\b",
+        ] {
+            assert!(!safe_model_arg(model), "{model:?}");
+        }
+        assert!(!safe_arg("provider/model:latest"));
+        assert!(safe_model_arg(
+            &"m".repeat(chimaera_agent::model::COMMAND_SELECTOR_MAX)
+        ));
+        assert!(!safe_model_arg(
+            &"m".repeat(chimaera_agent::model::COMMAND_SELECTOR_MAX + 1)
+        ));
+
+        let model = "provider/model:latest";
+        for kind in [
+            AgentKind::Claude,
+            AgentKind::Codex,
+            AgentKind::Antigravity,
+            AgentKind::Grok,
+        ] {
+            let argv =
+                build_agent_command(kind, Path::new("/bin/agent"), None, Some(model), None, None);
+            let argument = argv.windows(2).find(|pair| pair[0] == "--model").unwrap();
+            assert_eq!(argument[1], model);
+            let native_defaults =
+                build_agent_command(kind, Path::new("/bin/agent"), None, None, None, None);
+            assert!(!native_defaults.iter().any(|arg| arg == "--model"));
+        }
     }
 
     #[test]

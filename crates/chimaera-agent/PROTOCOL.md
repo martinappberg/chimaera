@@ -18,6 +18,35 @@ Sources:
   (Anthropic.claude-code 2.1.204, openai.chatgpt 26.5623.141536 — the
   extensions are GUIs over these same protocols).
 
+## Custom model settings preflight (2026-10-04; live verification pending)
+
+Installed Codex 0.158.0's `app-server generate-json-schema --experimental`
+reports `ThreadSettingsUpdateParams.model` as an optional string, its response
+as an empty object, and `CollaborationMode.settings.reasoning_effort` as
+nullable. These are schema facts, not model-availability or ordering probes.
+The adapter now waits for that settings acknowledgement before journaling a
+model pick. A rejected request leaves the previous model intact; an older
+runtime without this method can select only advertised catalog entries.
+New turns wait for the pending model response, and stale effort replies cannot
+restore the previous model's effort. An unlisted model carries no Chimaera
+effort override, including in Plan settings or after reopening the chat.
+Genuine native effort read-backs are still retained even for unlisted models;
+omitting an override does not prove that Codex cleared an existing native
+setting. A no-turn native settings probe could not initialize in the sandbox,
+and automatic approval review rejected its authenticated native retry during
+the user's testing hold. Native model/effort reset semantics remain unverified.
+
+Claude's custom IDs use the existing acknowledged `set_model` control.
+Both native adapters gate remembered startup effort on the explicit model's
+advertised effort values. ACP custom model input remains unsupported; its
+shared Antigravity/Grok adapter selects only native catalog values. The
+`chat.newSessionModel=agent` policy omits remembered model/effort for new chats
+through the shared server path, preserving native defaults on every adapter.
+
+No billed probes were run for this change: `just chat-smoke` and affected
+`just chat-smoke-acp` verification remain pending until the user's test hold
+ends. Existing tested-version pins remain unchanged.
+
 ## Upstream app-server integration guidance (audited 2026-07-18)
 
 The official Codex app-server documentation now exposes two integration aids

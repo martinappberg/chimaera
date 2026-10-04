@@ -243,18 +243,29 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   providers' wires (Claude `set_model` / `apply_flag_settings` / `set_permission_mode`,
   Codex `thread/settings/update`, ACP session configuration), so the daemon remembers the last model, effort and permission/approval
   mode **you picked**, per agent kind (`prefs.json` beside the chat journals), and starts the next
-  chat of that kind with them. Only picks count: a safety reroute, a credits fallback, the spawn's
+  chat of that kind with them. **Settings → Chat → New Chat Model → Agent default**
+  skips remembered model and effort choices, letting the runtime use its own configuration;
+  explicit launch choices and a conversation's saved settings still win. Permission-mode
+  memory is unchanged. Only picks count: a safety reroute, a credits fallback, the spawn's
   bootstrap read-back, codex resetting effort on a model switch, or claude leaving plan mode on its
   own are not remembered. Claude gets `--model` at spawn and the effort + mode right after the
   handshake (effort skipped when the catalog says the model has no effort knob, e.g. haiku); codex
-  gets the model and effort on `thread/start` (a resumed codex thread keeps its own indexed effort)
-  and the mode — Auto review, Read only, Auto, Full access, Plan — as a settings update before the
-  first turn. ACP launch picks are applied through advertised session configuration
+  gets the model on `thread/start`; with an explicit model, its saved effort is applied only
+  after the catalog confirms support. The mode — Auto review, Read only, Auto, Full access,
+  Plan — is applied as a settings update before the first turn. ACP launch picks are applied through advertised session configuration
   after initialization. An explicit launch-time model still wins, and a workspace Mastermind keeps its own
   ask/auto mode. **A reopened chat is not a new chat:** resuming, rewinding, forking, or a
   resurrection after a daemon restart brings the conversation back with *its own* last model,
   effort and mode (the journal index carries them per native conversation); the prefs only fill in what that chat never carried. This
   mirrors the official TUIs, which persist the same choices in their config.
+- **Custom models.** The existing model menu offers **Custom model…** only when the
+  adapter explicitly advertises `custom_model` (Claude/Codex; ACP remains catalog-only).
+  Enter a model ID supported by that agent's configured provider; `/model <id>` accepts
+  the same input and preserves case. This selects a model, not a provider or account.
+  Unlisted active IDs remain visible in full in the picker; unsupported IDs fail through
+  the agent's normal error path. An empty live catalog stays empty, and effort controls
+  appear only when the active model's reported metadata supplies them. Credentials and
+  provider configuration remain with the CLI on the workspace host.
 - **Remote Control (claude).** **Chat options → Remote Control** turns on Claude Code's own Remote
   Control bridge for this session — the same `remote_control` control the official VS Code and
   Desktop hosts use — so you can pick the conversation up in the Claude mobile app or at
@@ -1093,3 +1104,11 @@ _Captured 2026-10-03 from the maintainer in this session._
 
 - **Problem it solves (verbatim):** “We need to do all of these” in response to the runtime compatibility assessment, including MCP forms, browser requests, and reauthentication.
 - **How settled it is / deliberate limits:** pending specific MCP intent. The maintainer's “Use your judgment; the UI can evolve” answer concerned Claude Mods; it is not a separate promise about MCP forms.
+
+### Provider-independent model controls — why they exist
+_Captured 2026-10-04 (from the maintainer, in-session, PR #249)._
+
+- **Problem it solves (verbatim):** “Not specifically for open router, but just in general.”
+- **Design constraint (verbatim):** “we are not too verbose and that we stay in line with our UI / UX that we have now which is pretty good for all of this.”
+- **Direction (verbatim):** “make sure Chimaera is generalizable in terms of this (and also in terms of how providers change, or if we add other CLIs / harnesses)”.
+- **Grade:** an addition to the existing capability-based architecture. Exact controls remain implementation choices; no new provider-specific UI contract was requested.

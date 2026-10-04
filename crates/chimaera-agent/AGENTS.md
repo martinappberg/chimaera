@@ -66,6 +66,14 @@ handles must be discarded on disconnect. See the [Mods feature](../../docs/featu
 
 ## Invariants (breaking these is a review failure)
 
+Model selection and custom model input are separate capabilities:
+`custom_model` defaults false on older snapshots and unknown adapters; only
+the Claude/Codex adapters grant it. ACP remains catalog-only. Codex model
+picks wait for `thread/settings/update` acknowledgement before becoming
+`ModelSwitched` picks; older runtimes fall back only for advertised models.
+Effort carried to an explicit model must be supported by its current catalog,
+including at startup. An unlisted model keeps its native controls.
+
 1. **Bounded allocations, always.** The daemon must stay light on shared
    HPC hosts (target ~150 MB RSS), including compute allocations and an
    explicitly allowed login-node deployment. Every channel is bounded; the journal ring and file are

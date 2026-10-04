@@ -286,6 +286,12 @@ impl Driver for CodexDriver {
             spec.mcp_auto_approve.clone(),
             hs.next_id,
         );
+        if spec.initial_model.is_some() {
+            mapper.effort_requires_catalog = true;
+            mapper.pending_effort = mapper.pending_effort.take().filter(|effort| {
+                catalog_supports_effort(&mapper.catalog.models, mapper.model.as_deref(), effort)
+            });
+        }
         if hs.summary_configured {
             mapper.reasoning_summary = None;
         }
@@ -312,7 +318,14 @@ impl Driver for CodexDriver {
         // (live-probed: a thread that ran `low` came back `xhigh`), so the
         // conversation's remembered effort is re-applied like a header pick.
         if let Some(effort) = spec.initial_effort.as_deref() {
-            if mapper.pending_effort.as_deref() != Some(effort) {
+            if mapper.pending_effort.as_deref() != Some(effort)
+                && (spec.initial_model.is_none()
+                    || catalog_supports_effort(
+                        &mapper.catalog.models,
+                        mapper.model.as_deref(),
+                        effort,
+                    ))
+            {
                 initial.push(mapper.on_command(AgentCommand::SetEffort {
                     effort_id: effort.to_string(),
                 }));
@@ -348,6 +361,17 @@ struct CodexHandshake {
 struct CodexCatalog {
     models: Vec<crate::model::ModelInfo>,
     slash_commands: Vec<SlashCommand>,
+}
+
+fn catalog_supports_effort(
+    models: &[crate::model::ModelInfo],
+    model: Option<&str>,
+    effort: &str,
+) -> bool {
+    models.iter().any(|entry| {
+        model.is_some_and(|model| entry.id == model || entry.resolved.as_deref() == Some(model))
+            && entry.efforts.iter().any(|candidate| candidate == effort)
+    })
 }
 
 async fn codex_handshake(
@@ -401,7 +425,14 @@ async fn codex_handshake(
         .filter(|_| spec.initial_effort.is_none())
         .and_then(configured_effort);
     let summary_configured = config.as_ref().is_some_and(summary_configured);
-    let opening_effort = spec.initial_effort.clone().or(configured_effort);
+    // The model catalog arrives after thread open. An explicit model may
+    // belong to another provider, so reconcile its remembered effort only
+    // after the catalog can establish support for that exact value.
+    let opening_effort = if spec.initial_model.is_none() {
+        spec.initial_effort.clone().or(configured_effort)
+    } else {
+        None
+    };
 
     crate::driver::startup_progress(progress, "Opening conversation…").await;
     let open_id = 2u64;
@@ -878,6 +909,12 @@ async fn await_rpc_result(
 /// What an outstanding client→server JSON-RPC id is waiting for.
 enum PendingRpc {
     TurnStart,
+    /// A model pick becomes durable only after the native settings RPC
+    /// accepts it. Unknown IDs have no optimistic compatibility fallback.
+    ModelUpdate {
+        model_id: String,
+        effort: Option<String>,
+    },
     /// Steer retries once with the live turn id parsed from the error.
     Steer {
         input: Value,
@@ -903,6 +940,7 @@ enum PendingRpc {
     EffortUpdate {
         effort_id: String,
         previous: Option<String>,
+        model: Option<String>,
         /// The user's own pick (not the handshake reconciling a reopened
         /// thread's effort).
         chosen: bool,
@@ -1123,10 +1161,14 @@ struct CodexMapper {
     model: Option<String>,
     /// Model override for subsequent turns (set_model).
     pending_model: Option<String>,
+    pending_model_update: Option<u64>,
+    pending_model_effort_readback: Option<Option<String>>,
+    model_change_failed: bool,
     /// Effective/selected reasoning effort for subsequent turns. Current
     /// app-servers persist it through thread/settings/update; older ones use
     /// the guaranteed turn/start override.
     pending_effort: Option<String>,
+    effort_requires_catalog: bool,
     /// The user's own last effort pick. A read-back equal to it is that pick
     /// (`EffortState.chosen`); the spawn's read or the app-server resetting
     /// effort on a model switch is not, so the prefs keep the pick.
@@ -1322,7 +1364,11 @@ impl CodexMapper {
             agent_version,
             model,
             pending_model: None,
+            pending_model_update: None,
+            pending_model_effort_readback: None,
+            model_change_failed: false,
             pending_effort: effort.clone(),
+            effort_requires_catalog: false,
             chosen_effort: None,
             // The handshake queues this exact state immediately after Init.
             reported_effort: Some(effort),
@@ -1454,6 +1500,57 @@ impl CodexMapper {
         }
     }
 
+    fn model_effort(&self, model: &str) -> Option<String> {
+        let entry = self
+            .catalog
+            .models
+            .iter()
+            .find(|entry| entry.id == model || entry.resolved.as_deref() == Some(model))?;
+        self.pending_effort
+            .as_ref()
+            .filter(|effort| entry.efforts.contains(effort))
+            .or_else(|| {
+                entry
+                    .default_effort
+                    .as_ref()
+                    .filter(|effort| entry.efforts.contains(effort))
+            })
+            .cloned()
+    }
+
+    fn apply_model(&mut self, model_id: String, effort: Option<String>, step: &mut DriverStep) {
+        self.model_change_failed = false;
+        self.effort_requires_catalog = true;
+        let readback = self.pending_model_effort_readback.take();
+        let applied_effort = readback
+            .as_ref()
+            .unwrap_or(&effort)
+            .clone()
+            .filter(|effort| {
+                catalog_supports_effort(&self.catalog.models, Some(&model_id), effort)
+            });
+        // Omitting effort from a model patch does not establish a native
+        // reset. Retain the last observed state unless the runtime reports
+        // one; unsupported values never become our next-turn override.
+        let reported = readback.unwrap_or_else(|| {
+            effort
+                .clone()
+                .or_else(|| self.reported_effort.clone().flatten())
+        });
+        self.pending_model = Some(model_id.clone());
+        let from = self.model.replace(model_id.clone());
+        self.pending_effort = applied_effort;
+        self.chosen_effort = None;
+        self.refresh_per_turn_mode_effort();
+        step.events.push(AgentEvent::ModelSwitched {
+            from,
+            to: model_id,
+            reason: None,
+            retract_current_turn: false,
+        });
+        self.emit_effort_state_marked(reported, false, step);
+    }
+
     fn flush(&mut self) -> Option<AgentEvent> {
         self.coalescer.flush()
     }
@@ -1509,17 +1606,46 @@ impl CodexMapper {
         match method {
             "thread/settings/updated" => {
                 let settings = &frame["params"]["threadSettings"];
+                // Settings can precede their acknowledgement or arrive from
+                // an older model. Neither may restore that model's effort.
+                if let Some(id) = self.pending_model_update {
+                    if let Some(PendingRpc::ModelUpdate { model_id, .. }) =
+                        self.pending_rpcs.get(&id)
+                    {
+                        if settings["model"].as_str() == Some(model_id) {
+                            if let Some(value) = settings.get("effort") {
+                                self.pending_model_effort_readback =
+                                    Some(value.as_str().map(String::from));
+                            }
+                        }
+                    }
+                    return step;
+                }
+                if self
+                    .pending_model
+                    .as_deref()
+                    .is_some_and(|model| settings["model"].as_str() != Some(model))
+                {
+                    return step;
+                }
                 if let Some(value) = settings.get("effort") {
                     let effort = value.as_str().map(String::from);
                     let effort_update_pending = self
                         .pending_rpcs
                         .values()
-                        .any(|pending| matches!(pending, PendingRpc::EffortUpdate { .. }));
+                        .any(|pending| matches!(pending, PendingRpc::EffortUpdate { model, .. } if model == &self.model));
                     // A rapid second click may already be in flight when the
                     // first update's notification arrives. Ignore that stale
                     // read-back; the latest selection will reconcile itself.
                     if !effort_update_pending || effort == self.pending_effort {
-                        self.pending_effort = effort.clone();
+                        self.pending_effort = effort.clone().filter(|effort| {
+                            !self.effort_requires_catalog
+                                || catalog_supports_effort(
+                                    &self.catalog.models,
+                                    self.model.as_deref(),
+                                    effort,
+                                )
+                        });
                         self.refresh_per_turn_mode_effort();
                         self.emit_effort_state(effort, &mut step);
                     }
@@ -2223,14 +2349,51 @@ impl CodexMapper {
                     });
                 }
             }
+            (PendingRpc::ModelUpdate { model_id, effort }, error) => {
+                if self.pending_model_update != Some(id) {
+                    return;
+                }
+                self.pending_model_update = None;
+                if let Some(error) = error {
+                    self.pending_model_effort_readback = None;
+                    let unsupported = is_method_not_found(error, "thread/settings/update");
+                    if unsupported {
+                        self.settings_update_unsupported = true;
+                    }
+                    if unsupported
+                        && self.catalog.models.iter().any(|entry| {
+                            entry.id == model_id || entry.resolved.as_deref() == Some(&model_id)
+                        })
+                    {
+                        self.apply_model(model_id, effort, step);
+                    } else {
+                        self.model_change_failed = true;
+                        step.events.push(AgentEvent::Error {
+                            message: if unsupported {
+                                "This Codex version cannot confirm custom model changes; update Codex or choose a listed model".into()
+                            } else {
+                                format!("model change failed: {}", error["message"])
+                            },
+                            fatal: false,
+                        });
+                    }
+                } else {
+                    self.apply_model(model_id, effort, step);
+                }
+                self.start_next_queued(step);
+            }
             (
                 PendingRpc::EffortUpdate {
                     effort_id,
                     previous,
+                    model,
                     ..
                 },
                 Some(err),
             ) => {
+                if model != self.model {
+                    return;
+                }
                 if is_method_not_found(err, "thread/settings/update") {
                     // The selected value still has a guaranteed path: every
                     // subsequent turn/start carries it explicitly.
@@ -2283,11 +2446,14 @@ impl CodexMapper {
             }
             (
                 PendingRpc::EffortUpdate {
-                    effort_id, chosen, ..
+                    effort_id,
+                    chosen,
+                    model,
+                    ..
                 },
                 None,
             ) => {
-                if self.pending_effort.as_deref() == Some(&effort_id) {
+                if model == self.model && self.pending_effort.as_deref() == Some(&effort_id) {
                     self.emit_effort_state_marked(Some(effort_id), chosen, step);
                 }
             }
@@ -2968,6 +3134,7 @@ impl CodexMapper {
         let entered_full = mode_id == "full-access" && self.current_mode != "full-access";
         let entered_review = mode_id == "auto-review" && self.current_mode != "auto-review";
         self.current_mode = mode_id.clone();
+        self.refresh_per_turn_mode_effort();
         // The app-server never changes the mode unasked, so every change is
         // ours: the user's pick (fed to the prefs) or the handshake's replay.
         step.events
@@ -3514,7 +3681,12 @@ impl CodexMapper {
     /// one request without ever issuing concurrent `turn/start`s. Turn-end
     /// callers run this AFTER `reset_turn_state`, which clears `turn_pending`.
     fn start_next_queued(&mut self, step: &mut DriverStep) {
-        if self.turn_active || self.turn_pending || self.steer_in_flight() {
+        if self.turn_active
+            || self.turn_pending
+            || self.pending_model_update.is_some()
+            || self.model_change_failed
+            || self.steer_in_flight()
+        {
             return;
         }
         if !self.deferred_steer_redrives.is_empty() {
@@ -4309,7 +4481,7 @@ impl CodexMapper {
         if self.turn_active && !self.turn_id.is_empty() {
             // Type-through: inject into the RUNNING turn (steer).
             self.emit_steer(input, client_msg_id, step);
-        } else if self.turn_pending {
+        } else if self.turn_pending || self.pending_model_update.is_some() {
             // Decline feedback is explicit type-through (not a queued user
             // bubble). Remember that intent until turn/started supplies the id.
             self.queued_sends.push_back(QueuedSend {
@@ -4378,7 +4550,10 @@ impl CodexMapper {
         // next step (the Codex TUI's and desktop app's default), and it stays
         // pending until then. `SendAfterTurn` holds it for the NEXT turn
         // instead (Codex's queue action).
-        let queued = (self.turn_active && !self.turn_id.is_empty()) || self.turn_pending;
+        let queued = (self.turn_active && !self.turn_id.is_empty())
+            || self.turn_pending
+            || self.pending_model_update.is_some()
+            || self.model_change_failed;
         step.events.push(AgentEvent::UserMessage {
             text,
             attachments,
@@ -4388,7 +4563,12 @@ impl CodexMapper {
             after_turn: queued && after_turn,
             origin: None,
         });
-        if queued && !after_turn && !self.turn_pending {
+        if queued
+            && !after_turn
+            && !self.turn_pending
+            && self.turn_active
+            && !self.turn_id.is_empty()
+        {
             self.emit_steer(input, client_msg_id, step);
         } else if queued {
             // The start window has no turn id to steer into yet: steer once
@@ -4414,6 +4594,19 @@ impl CodexMapper {
 
     fn on_command(&mut self, cmd: AgentCommand) -> DriverStep {
         let mut step = DriverStep::default();
+        // After a rejected model choice, a new user send is an explicit
+        // retry on the displayed model. Release existing input first so a
+        // later message cannot jump ahead of the held FIFO.
+        if self.model_change_failed
+            && self.pending_model_update.is_none()
+            && matches!(
+                &cmd,
+                AgentCommand::Send { .. } | AgentCommand::SendAfterTurn { .. }
+            )
+        {
+            self.model_change_failed = false;
+            self.start_next_queued(&mut step);
+        }
         match cmd {
             AgentCommand::Send { blocks } => self.send_blocks(blocks, false, &mut step),
             AgentCommand::SendAfterTurn { blocks } => self.send_blocks(blocks, true, &mut step),
@@ -4526,16 +4719,62 @@ impl CodexMapper {
             }
             AgentCommand::Interrupt => self.interrupt(&mut step),
             AgentCommand::SetModel { model_id } => {
-                self.pending_model = Some(model_id.clone());
-                let from = self.model.replace(model_id.clone());
-                step.events.push(AgentEvent::ModelSwitched {
-                    from,
-                    to: model_id,
-                    reason: None,
-                    retract_current_turn: false,
-                });
+                let effort = self.model_effort(&model_id);
+                if self.pending_model_update.is_some() {
+                    step.events.push(AgentEvent::Error {
+                        message: "Wait for the current model change before selecting another model"
+                            .into(),
+                        fatal: false,
+                    });
+                    return step;
+                }
+                if self.settings_update_unsupported {
+                    if self.catalog.models.iter().any(|entry| {
+                        entry.id == model_id || entry.resolved.as_deref() == Some(&model_id)
+                    }) {
+                        self.apply_model(model_id, effort, &mut step);
+                        self.start_next_queued(&mut step);
+                    } else {
+                        self.model_change_failed = true;
+                        step.events.push(AgentEvent::Error {
+                            message: "This Codex version cannot confirm custom model changes; update Codex or choose a listed model".into(),
+                            fatal: false,
+                        });
+                    }
+                } else {
+                    let id = self.rpc_id();
+                    let mut params = json!({ "threadId": self.thread_id, "model": model_id });
+                    if let Some(effort) = &effort {
+                        params["effort"] = json!(effort);
+                    }
+                    let mode = self
+                        .pending_mode
+                        .as_ref()
+                        .map(|(_, mode)| mode.as_str())
+                        .unwrap_or(&self.current_mode);
+                    if mode == "plan" {
+                        params["collaborationMode"] =
+                            mode_wire_fields(mode, Some(&model_id), effort.as_deref())
+                                ["collaborationMode"]
+                                .clone();
+                    }
+                    self.pending_model_update = Some(id);
+                    self.pending_model_effort_readback = None;
+                    self.pending_rpcs
+                        .insert(id, PendingRpc::ModelUpdate { model_id, effort });
+                    step.outbound.push(
+                        json!({ "id": id, "method": "thread/settings/update", "params": params }),
+                    );
+                }
             }
             AgentCommand::SetEffort { effort_id } => {
+                if self.pending_model_update.is_some() {
+                    step.events.push(AgentEvent::Error {
+                        message: "Wait for the model change before changing effort".into(),
+                        fatal: false,
+                    });
+                    return step;
+                }
                 // The pick itself is what the prefs remember — even when it
                 // matches the effort already in effect (a bootstrap read-back
                 // is not a pick; re-choosing that value is), so the no-op
@@ -4568,6 +4807,7 @@ impl CodexMapper {
                             PendingRpc::EffortUpdate {
                                 effort_id,
                                 previous,
+                                model: self.model.clone(),
                                 chosen: !self.bootstrapping,
                             },
                         );
@@ -4580,6 +4820,13 @@ impl CodexMapper {
                 }
             }
             AgentCommand::SetMode { mode_id } => {
+                if self.pending_model_update.is_some() {
+                    step.events.push(AgentEvent::Error {
+                        message: "Wait for the model change before changing mode".into(),
+                        fatal: false,
+                    });
+                    return step;
+                }
                 let fields = mode_wire_fields(
                     &mode_id,
                     self.pending_model.as_deref().or(self.model.as_deref()),
@@ -4711,12 +4958,16 @@ impl CodexMapper {
                     .iter()
                     .position(|send| send.client_msg_id == id)
                 {
+                    if self.pending_model_update.is_none() {
+                        self.model_change_failed = false;
+                    }
                     if self.turn_active && !self.turn_id.is_empty() {
                         let send = self.queued_sends.remove(pos).expect("position exists");
                         self.emit_steer(send.input, send.client_msg_id, &mut step);
-                    } else if self.turn_pending {
+                    } else if self.turn_pending || self.pending_model_update.is_some() {
                         self.queued_sends[pos].steer_when_active = true;
                     } else {
+                        self.model_change_failed = false;
                         let send = self.queued_sends.remove(pos).expect("position exists");
                         self.redrive_as_fresh_turn(send.input, send.client_msg_id, &mut step);
                     }
@@ -4742,14 +4993,18 @@ impl CodexMapper {
                     .iter()
                     .position(|send| send.client_msg_id == id)
                 {
+                    if self.pending_model_update.is_none() {
+                        self.model_change_failed = false;
+                    }
                     if running {
                         let send = self.queued_sends.remove(pos).expect("position exists");
                         let order = self.rpc_id();
                         self.deferred_steer_redrives.insert(order, send);
                         self.interrupt(&mut step);
-                    } else if self.turn_pending {
+                    } else if self.turn_pending || self.pending_model_update.is_some() {
                         self.queued_sends[pos].steer_when_active = true;
                     } else {
+                        self.model_change_failed = false;
                         let send = self.queued_sends.remove(pos).expect("position exists");
                         self.redrive_as_fresh_turn(send.input, send.client_msg_id, &mut step);
                     }
@@ -5098,7 +5353,7 @@ fn mode_wire_fields(mode_id: &str, model: Option<&str>, effort: Option<&str>) ->
                 "mode": "plan",
                 "settings": {
                     "model": model.unwrap_or("gpt-5.5"),
-                    "reasoning_effort": effort.unwrap_or("medium"),
+                    "reasoning_effort": effort,
                     "developer_instructions": null,
                 },
             },
@@ -6770,6 +7025,293 @@ mod tests {
             blocks: vec![ContentBlock::Text { text: "hi".into() }],
         });
         assert_eq!(step.outbound[0]["params"]["effort"], "high");
+    }
+
+    fn model_with_efforts(
+        id: &str,
+        efforts: &[&str],
+        default_effort: Option<&str>,
+    ) -> crate::model::ModelInfo {
+        crate::model::ModelInfo {
+            id: id.into(),
+            label: id.into(),
+            description: None,
+            resolved: None,
+            efforts: efforts.iter().map(|effort| (*effort).into()).collect(),
+            default_effort: default_effort.map(String::from),
+        }
+    }
+
+    #[test]
+    fn custom_model_waits_for_ack_and_drops_the_previous_models_effort() {
+        let mut m = mapper();
+        m.model = Some("old-model".into());
+        m.current_mode = "plan".into();
+        m.mode_per_turn = Some(mode_wire_fields("plan", Some("old-model"), Some("xhigh")));
+        let effort_update = m.on_command(AgentCommand::SetEffort {
+            effort_id: "xhigh".into(),
+        });
+        m.reported_effort = Some(Some("xhigh".into()));
+        let old_effort_id = effort_update.outbound[0]["id"].as_u64().unwrap();
+        let pick = m.on_command(AgentCommand::SetModel {
+            model_id: "provider/custom:latest".into(),
+        });
+        let model_id = pick.outbound[0]["id"].as_u64().unwrap();
+        assert!(pick.events.is_empty());
+        assert_eq!(m.model.as_deref(), Some("old-model"));
+        assert_eq!(
+            pick.outbound[0]["params"]["model"],
+            "provider/custom:latest"
+        );
+        assert!(pick.outbound[0]["params"].get("effort").is_none());
+        assert!(
+            pick.outbound[0]["params"]["collaborationMode"]["settings"]["reasoning_effort"]
+                .is_null()
+        );
+        let send = m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "hello".into(),
+            }],
+        });
+        assert!(
+            send.outbound.is_empty(),
+            "a new turn must wait for the model response"
+        );
+        let accepted = m.on_frame(&json!({"id":model_id, "result":{}}));
+        assert!(accepted.events.iter().any(|event| matches!(event, AgentEvent::ModelSwitched { to, reason: None, .. } if to == "provider/custom:latest")));
+        assert_eq!(accepted.outbound[0]["method"], "turn/start");
+        assert_eq!(
+            accepted.outbound[0]["params"]["model"],
+            "provider/custom:latest"
+        );
+        assert!(accepted.outbound[0]["params"].get("effort").is_none());
+        assert!(
+            accepted.outbound[0]["params"]["collaborationMode"]["settings"]["reasoning_effort"]
+                .is_null()
+        );
+        assert_eq!(
+            accepted.outbound[0]["params"]["collaborationMode"]["settings"]["model"],
+            "provider/custom:latest"
+        );
+        let stale = m.on_frame(
+            &json!({"id":old_effort_id, "error":{"code":-32602,"message":"unsupported effort"}}),
+        );
+        assert!(stale.events.is_empty());
+        for model in ["old-model", "provider/custom:latest"] {
+            let stale = m.on_frame(&json!({"method":"thread/settings/updated", "params":{"threadId":"thr-1", "threadSettings":{"model":model,"effort":"xhigh"}}}));
+            assert!(stale.events.is_empty());
+        }
+        assert_eq!(m.pending_effort, None);
+    }
+
+    #[test]
+    fn model_choices_are_serialized_and_refusals_preserve_native_state_and_queued_input() {
+        let mut m = mapper();
+        m.model = Some("original".into());
+        let first = m.on_command(AgentCommand::SetModel {
+            model_id: "provider/first".into(),
+        });
+        let second = m.on_command(AgentCommand::SetModel {
+            model_id: "provider/second".into(),
+        });
+        assert!(second.outbound.is_empty());
+        assert!(matches!(
+            second.events.as_slice(),
+            [AgentEvent::Error { fatal: false, .. }]
+        ));
+        let accepted = m.on_frame(&json!({"id":first.outbound[0]["id"], "result":{}}));
+        assert!(accepted.events.iter().any(
+            |event| matches!(event, AgentEvent::ModelSwitched { to, .. } if to == "provider/first")
+        ));
+        let second = m.on_command(AgentCommand::SetModel {
+            model_id: "provider/second".into(),
+        });
+        let queued = m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "use my chosen model".into(),
+            }],
+        });
+        assert!(queued.outbound.is_empty());
+        let refused = m.on_frame(&json!({"id":second.outbound[0]["id"], "error":{"code":-32602,"message":"unknown model"}}));
+        assert!(matches!(
+            refused.events.as_slice(),
+            [AgentEvent::Error { fatal: false, .. }]
+        ));
+        assert!(
+            refused.outbound.is_empty(),
+            "a rejected pick must not run the queued prompt on a different model"
+        );
+        assert_eq!(m.model.as_deref(), Some("provider/first"));
+        assert_eq!(m.pending_model.as_deref(), Some("provider/first"));
+        assert_eq!(m.queued_sends.len(), 1);
+        let id = m.queued_sends[0].client_msg_id.clone();
+        let retry = m.on_command(AgentCommand::SendNow { id });
+        assert_eq!(retry.outbound[0]["method"], "turn/start");
+        assert_eq!(retry.outbound[0]["params"]["model"], "provider/first");
+    }
+
+    #[test]
+    fn old_codex_only_falls_back_for_catalog_models() {
+        let mut m = mapper();
+        m.catalog.models.push(model_with_efforts(
+            "listed",
+            &["low", "medium"],
+            Some("medium"),
+        ));
+        m.pending_effort = Some("xhigh".into());
+        let pick = m.on_command(AgentCommand::SetModel {
+            model_id: "provider/custom".into(),
+        });
+        let queued = m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "after selection".into(),
+            }],
+        });
+        assert!(queued.outbound.is_empty());
+        let failed = m.on_frame(&json!({"id":pick.outbound[0]["id"],"error":{"code":-32601,"message":"method not found"}}));
+        assert!(matches!(
+            failed.events.as_slice(),
+            [AgentEvent::Error { fatal: false, .. }]
+        ));
+        assert_eq!(m.model, None);
+        let listed = m.on_command(AgentCommand::SetModel {
+            model_id: "listed".into(),
+        });
+        assert_eq!(listed.outbound[0]["method"], "turn/start");
+        assert_eq!(listed.outbound[0]["params"]["model"], "listed");
+        assert_eq!(m.model.as_deref(), Some("listed"));
+        assert_eq!(m.pending_effort.as_deref(), Some("medium"));
+        assert!(listed
+            .events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::EffortState { chosen: false, .. })));
+        let custom = m.on_command(AgentCommand::SetModel {
+            model_id: "provider/custom".into(),
+        });
+        assert!(matches!(
+            custom.events.as_slice(),
+            [AgentEvent::Error { fatal: false, .. }]
+        ));
+        assert_eq!(m.model.as_deref(), Some("listed"));
+    }
+
+    #[test]
+    fn remembered_effort_requires_current_catalog_support() {
+        let models = vec![model_with_efforts(
+            "listed",
+            &["low", "medium"],
+            Some("medium"),
+        )];
+        assert!(catalog_supports_effort(&models, Some("listed"), "medium"));
+        assert!(!catalog_supports_effort(&models, Some("listed"), "xhigh"));
+        assert!(!catalog_supports_effort(
+            &models,
+            Some("provider/custom"),
+            "medium"
+        ));
+        assert!(!catalog_supports_effort(
+            &[],
+            Some("provider/custom"),
+            "medium"
+        ));
+    }
+
+    #[test]
+    fn fresh_send_retries_after_model_rejection_without_overtaking_held_input() {
+        let mut m = mapper();
+        let pick = m.on_command(AgentCommand::SetModel {
+            model_id: "provider/typo".into(),
+        });
+        for text in ["first", "second"] {
+            let queued = m.on_command(AgentCommand::SendAfterTurn {
+                blocks: vec![ContentBlock::Text { text: text.into() }],
+            });
+            assert!(queued.outbound.is_empty());
+        }
+        let refused = m.on_frame(&json!({"id":pick.outbound[0]["id"], "error":{"code":-32602,"message":"unknown model"}}));
+        assert!(refused.outbound.is_empty());
+        let retry = m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "third".into(),
+            }],
+        });
+        assert_eq!(retry.outbound[0]["method"], "turn/start");
+        assert_eq!(retry.outbound[0]["params"]["input"][0]["text"], "first");
+        assert_eq!(m.queued_sends.len(), 2);
+        assert_eq!(m.queued_sends[0].input[0]["text"], "second");
+        assert_eq!(m.queued_sends[1].input[0]["text"], "third");
+        assert!(!m.model_change_failed);
+    }
+
+    #[test]
+    fn reopened_custom_model_keeps_readbacks_out_of_turn_overrides() {
+        let mut m = mapper();
+        m.model = Some("provider/custom".into());
+        m.effort_requires_catalog = true;
+        assert_eq!(
+            m.pending_model, None,
+            "the opening thread already has its model"
+        );
+        let updated = m.on_frame(&json!({"method":"thread/settings/updated", "params":{"threadId":"thr-1", "threadSettings":{"model":"provider/custom", "effort":"xhigh"}}}));
+        assert!(
+            matches!(updated.events.as_slice(), [AgentEvent::EffortState { effort: Some(effort), chosen: false, .. }] if effort == "xhigh")
+        );
+        assert_eq!(m.pending_effort, None);
+        let send = m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "hello".into(),
+            }],
+        });
+        assert!(send.outbound[0]["params"].get("effort").is_none());
+    }
+
+    #[test]
+    fn native_model_ack_readback_owns_both_displayed_effort_and_turn_override() {
+        let mut m = mapper();
+        m.catalog.models.push(model_with_efforts(
+            "listed",
+            &["low", "medium"],
+            Some("medium"),
+        ));
+        m.pending_effort = Some("medium".into());
+        let pick = m.on_command(AgentCommand::SetModel {
+            model_id: "listed".into(),
+        });
+        m.on_frame(&json!({"method":"thread/settings/updated", "params":{"threadId":"thr-1", "threadSettings":{"model":"listed", "effort":"low"}}}));
+        let accepted = m.on_frame(&json!({"id":pick.outbound[0]["id"],"result":{}}));
+        assert!(accepted.events.iter().any(|event| matches!(event, AgentEvent::EffortState { effort: Some(effort), chosen: false, .. } if effort == "low")));
+        assert_eq!(m.pending_effort.as_deref(), Some("low"));
+        let send = m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "hello".into(),
+            }],
+        });
+        assert_eq!(send.outbound[0]["params"]["effort"], "low");
+    }
+
+    #[test]
+    fn custom_model_keeps_native_effort_readbacks_without_inventing_override_support() {
+        let mut m = mapper();
+        m.model = Some("original".into());
+        // An old-model effort response may still be in flight; it must not
+        // suppress genuine settings from the newly selected model.
+        m.on_command(AgentCommand::SetEffort {
+            effort_id: "xhigh".into(),
+        });
+        m.reported_effort = Some(Some("xhigh".into()));
+        let pick = m.on_command(AgentCommand::SetModel {
+            model_id: "provider/custom".into(),
+        });
+        let readback = |effort: &str| json!({"method":"thread/settings/updated", "params":{"threadId":"thr-1", "threadSettings":{"model":"provider/custom", "effort":effort}}});
+        assert!(m.on_frame(&readback("medium")).events.is_empty());
+        let accepted = m.on_frame(&json!({"id":pick.outbound[0]["id"],"result":{}}));
+        assert!(accepted.events.iter().any(|event| matches!(event, AgentEvent::EffortState { effort: Some(effort), chosen: false, .. } if effort == "medium")));
+        assert_eq!(m.pending_effort, None);
+        let updated = m.on_frame(&readback("high"));
+        assert!(
+            matches!(updated.events.as_slice(), [AgentEvent::EffortState { effort: Some(effort), chosen: false, .. }] if effort == "high")
+        );
+        assert_eq!(m.pending_effort, None);
     }
 
     /// `EffortState.chosen` marks the user's own picks — what the per-agent

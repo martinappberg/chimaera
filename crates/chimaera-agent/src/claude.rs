@@ -497,7 +497,7 @@ impl Driver for ClaudeDriver {
         // model has no effort knob (haiku) — the apply would just error.
         mapper.bootstrapping = true;
         if let Some(effort) = spec.initial_effort.as_deref() {
-            if effort_applies(&mapper.models, spec.initial_model.as_deref()) {
+            if effort_applies(&mapper.models, spec.initial_model.as_deref(), effort) {
                 initial.push(mapper.on_command(AgentCommand::SetEffort {
                     effort_id: effort.to_string(),
                 }));
@@ -564,10 +564,10 @@ impl Driver for ClaudeDriver {
     }
 }
 
-/// Whether a spawn-time effort should be applied: true when the catalog is
-/// silent (unknown model / older CLI) or the chosen model advertises effort
-/// levels; false only for a catalog entry with none (haiku).
-fn effort_applies(models: &[crate::model::ModelInfo], model: Option<&str>) -> bool {
+/// An explicit model may be a custom provider ID. Apply remembered effort
+/// only when its catalog entry advertises a control; an unlisted model must
+/// keep its native settings instead of inheriting another model's effort.
+fn effort_applies(models: &[crate::model::ModelInfo], model: Option<&str>, effort: &str) -> bool {
     let Some(model) = model else {
         return true;
     };
@@ -575,8 +575,8 @@ fn effort_applies(models: &[crate::model::ModelInfo], model: Option<&str>) -> bo
         .iter()
         .find(|m| m.id == model || m.resolved.as_deref() == Some(model))
     {
-        Some(entry) => !entry.efforts.is_empty(),
-        None => true,
+        Some(entry) => entry.efforts.iter().any(|candidate| candidate == effort),
+        None => false,
     }
 }
 
@@ -3012,7 +3012,14 @@ impl ClaudeMapper {
                 return;
             }
             step.events.push(AgentEvent::Error {
-                message: format!("control request failed: {}", frame["response"]),
+                message: if matches!(pending, PendingControl::SetModel(_)) {
+                    let detail = frame["response"]["error"]
+                        .as_str()
+                        .unwrap_or("The agent rejected this model");
+                    format!("model change failed: {}", truncate_label(detail, 300))
+                } else {
+                    format!("control request failed: {}", frame["response"])
+                },
                 fatal: false,
             });
             return;
@@ -8764,6 +8771,23 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn rejected_custom_model_keeps_the_model_and_reports_only_the_native_message() {
+        let mut m = mapper();
+        m.model = Some("opus[1m]".into());
+        let request = m.on_command(AgentCommand::SetModel {
+            model_id: "provider/typo".into(),
+        });
+        let id = &request.outbound[0]["request_id"];
+        let rejected = m.on_frame(&json!({"type":"control_response", "response": {
+            "subtype":"error", "request_id":id, "error":"Unknown model"
+        }}));
+        assert_eq!(m.model.as_deref(), Some("opus[1m]"));
+        assert!(
+            matches!(rejected.events.as_slice(), [AgentEvent::Error { message, fatal: false }] if message == "model change failed: Unknown model")
+        );
+    }
+
+    #[test]
     fn refusal_fallback_switches_model_and_retracts() {
         let mut m = mapper();
         let step = m.on_frame(&json!({
@@ -9750,7 +9774,7 @@ mod effort_applies_tests {
     use super::*;
 
     #[test]
-    fn spawn_effort_skips_only_effortless_catalog_entries() {
+    fn spawn_effort_requires_advertised_support_for_an_explicit_model() {
         let models = vec![
             crate::model::ModelInfo {
                 id: "opus[1m]".into(),
@@ -9769,11 +9793,16 @@ mod effort_applies_tests {
                 default_effort: None,
             },
         ];
-        assert!(effort_applies(&models, None));
-        assert!(effort_applies(&models, Some("opus[1m]")));
-        assert!(effort_applies(&models, Some("claude-opus-5[1m]")));
-        assert!(!effort_applies(&models, Some("haiku")));
-        assert!(effort_applies(&models, Some("something-new")));
-        assert!(effort_applies(&[], Some("haiku")));
+        assert!(effort_applies(&models, None, "xhigh"));
+        assert!(effort_applies(&models, Some("opus[1m]"), "xhigh"));
+        assert!(effort_applies(&models, Some("claude-opus-5[1m]"), "low"));
+        assert!(!effort_applies(&models, Some("opus[1m]"), "unsupported"));
+        assert!(!effort_applies(&models, Some("haiku"), "xhigh"));
+        assert!(!effort_applies(
+            &models,
+            Some("provider/something-new:latest"),
+            "xhigh"
+        ));
+        assert!(!effort_applies(&[], Some("haiku"), "xhigh"));
     }
 }

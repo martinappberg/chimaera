@@ -605,6 +605,7 @@ export class ChatStore {
   /** Agent's own model catalog (claude initialize.models / codex
    *  model/list), with per-model efforts. `resolved` is the runtime id a
    *  picker value maps to (claude's `model` reports resolvedModel). */
+  modelCatalogReceived = $state(false);
   models = $state<
     {
       id: string;
@@ -862,6 +863,7 @@ export class ChatStore {
     this.pendingModel = null;
     this.currentMode = null;
     this.models = [];
+    this.modelCatalogReceived = false;
     this.modes = [];
     this.slashCommands = [];
     this.hydrating = false;
@@ -889,6 +891,7 @@ export class ChatStore {
   }
 
   private applyCatalog(ev: AgentEvent): void {
+    this.modelCatalogReceived = true;
     const label = (value: unknown, fallback = "") => typeof value === "string" ? value.slice(0, 512) : fallback;
     this.modes = catalogRows(ev.modes, "id").map((m) => ({ id: m.id as string, label: label(m.label, m.id as string) }));
     this.slashCommands = catalogRows(ev.slash_commands, "name").map((c) => ({
@@ -1735,6 +1738,7 @@ export class ChatStore {
           this.currentMode = null;
           this.slashCommands = [];
           this.models = [];
+          this.modelCatalogReceived = false;
           this.effort = null;
           this.ultracode = false;
           this.contextPct = null;

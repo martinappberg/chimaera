@@ -136,6 +136,7 @@ export type SettingsMap = {
   "chat.remoteControlAtStart": boolean;
   "chat.toolSummaries": boolean;
   "chat.codexSteering": "agent" | "next_step" | "immediate";
+  "chat.newSessionModel": "remember" | "agent";
   "chat.resumeAfterRestart": boolean;
   "chat.voice": boolean;
   "chat.voiceMicrophone": string;
@@ -771,6 +772,18 @@ const DEFS = {
     step: 1000,
     scope: "daemon",
     note: "Applies to sessions started after the change.",
+  },
+  "chat.newSessionModel": {
+    title: "New Chat Model",
+    category: "Chat",
+    description: "Use your last model and effort choices, or follow each agent’s configuration. Existing chats keep their settings.",
+    type: "enum",
+    default: "remember",
+    options: [
+      { value: "remember", label: "Last used" },
+      { value: "agent", label: "Agent default" },
+    ],
+    scope: "daemon",
   },
   "chat.codexSteering": {
     title: "Codex Steering Timing",

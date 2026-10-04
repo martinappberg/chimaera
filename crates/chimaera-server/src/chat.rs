@@ -2701,7 +2701,7 @@ pub(crate) async fn fork_session(
         );
     }
     if let Some(model) = &body.model {
-        if !crate::launcher::safe_arg(model) {
+        if !crate::launcher::safe_model_arg(model) {
             return err(StatusCode::BAD_REQUEST, format!("invalid model {model:?}"));
         }
     }
@@ -3164,19 +3164,26 @@ async fn codex_initial_effort(state: &Arc<AppState>, recipe: &ChatRecipe) -> Opt
 /// Precedence for what a chat starts with: the recipe's explicit model, then
 /// the conversation's own last settings (a reopened chat; `recovered_effort`
 /// is codex's journal-recovered effort for pre-index rows), then the agent
-/// kind's prefs — what the user last picked anywhere.
+/// kind's prefs — what the user last picked anywhere, unless new chats use
+/// native model defaults. Permission-mode preferences remain independent.
 fn resolve_start_settings(
     explicit_model: Option<String>,
     own: chimaera_agent::journal::ConversationSettings,
     recovered_effort: Option<String>,
     prefs: &chimaera_agent::journal::AgentPrefs,
+    remember_model: bool,
 ) -> chimaera_agent::journal::ConversationSettings {
+    let (remembered_model, remembered_effort) = if remember_model {
+        (prefs.model.clone(), prefs.effort.clone())
+    } else {
+        (None, None)
+    };
     chimaera_agent::journal::ConversationSettings {
-        model: [explicit_model, own.model, prefs.model.clone()]
+        model: [explicit_model, own.model, remembered_model]
             .into_iter()
             .flatten()
             .find(|m| chimaera_agent::model::is_real_model(m)),
-        effort: recovered_effort.or(own.effort).or(prefs.effort.clone()),
+        effort: recovered_effort.or(own.effort).or(remembered_effort),
         mode: own.mode.or(prefs.mode.clone()),
     }
 }
@@ -3224,7 +3231,14 @@ pub(crate) async fn spawn_chat_session(
         .map(|native| state.chat.index().settings(native))
         .unwrap_or_default();
     let prefs = state.chat.prefs(recipe.kind.as_str());
-    let start = resolve_start_settings(recipe.model.clone(), own, recovered_effort, &prefs);
+    let remember_model = crate::lock(&state.settings).remember_chat_model();
+    let start = resolve_start_settings(
+        recipe.model.clone(),
+        own,
+        recovered_effort,
+        &prefs,
+        remember_model,
+    );
     let model = start.model;
     let initial_effort = start.effort;
     let initial_mode = start.mode;
@@ -4796,7 +4810,7 @@ mod tests {
         };
         // A new chat (nothing of its own) takes the prefs wholesale.
         assert_eq!(
-            resolve_start_settings(None, ConversationSettings::default(), None, &prefs),
+            resolve_start_settings(None, ConversationSettings::default(), None, &prefs, true),
             ConversationSettings {
                 model: Some("opus".into()),
                 effort: Some("xhigh".into()),
@@ -4809,10 +4823,13 @@ mod tests {
             effort: Some("high".into()),
             mode: Some("plan".into()),
         };
-        assert_eq!(resolve_start_settings(None, own.clone(), None, &prefs), own);
+        assert_eq!(
+            resolve_start_settings(None, own.clone(), None, &prefs, true),
+            own
+        );
         // Old restart recipes could contain a provider's error placeholder.
         assert_eq!(
-            resolve_start_settings(Some("<synthetic>".into()), own.clone(), None, &prefs),
+            resolve_start_settings(Some("<synthetic>".into()), own.clone(), None, &prefs, true),
             own
         );
         assert_eq!(
@@ -4823,7 +4840,8 @@ mod tests {
                     ..Default::default()
                 },
                 None,
-                &prefs
+                &prefs,
+                true
             )
             .model
             .as_deref(),
@@ -4836,7 +4854,7 @@ mod tests {
             mode: None,
         };
         assert_eq!(
-            resolve_start_settings(None, partial, None, &prefs),
+            resolve_start_settings(None, partial, None, &prefs, true),
             ConversationSettings {
                 model: Some("opus".into()),
                 effort: Some("medium".into()),
@@ -4849,7 +4867,8 @@ mod tests {
                 Some("haiku".into()),
                 ConversationSettings::default(),
                 Some("low".into()),
-                &prefs
+                &prefs,
+                true
             ),
             ConversationSettings {
                 model: Some("haiku".into()),
@@ -4857,6 +4876,65 @@ mod tests {
                 mode: Some("acceptEdits".into()),
             }
         );
+    }
+
+    #[test]
+    fn native_model_defaults_keep_explicit_and_conversation_settings_and_permission_prefs() {
+        use chimaera_agent::journal::{AgentPrefs, ConversationSettings};
+        let prefs = AgentPrefs {
+            model: Some("old-provider/model".into()),
+            effort: Some("xhigh".into()),
+            mode: Some("plan".into()),
+            ts: 0,
+        };
+        assert_eq!(
+            resolve_start_settings(None, ConversationSettings::default(), None, &prefs, false),
+            ConversationSettings {
+                model: None,
+                effort: None,
+                mode: prefs.mode.clone()
+            },
+        );
+        let own = ConversationSettings {
+            model: Some("conversation/model".into()),
+            effort: Some("low".into()),
+            mode: Some("auto".into()),
+        };
+        assert_eq!(
+            resolve_start_settings(None, own.clone(), None, &prefs, false),
+            own
+        );
+        assert_eq!(
+            resolve_start_settings(
+                Some("explicit/model:latest".into()),
+                own,
+                Some("medium".into()),
+                &prefs,
+                false
+            ),
+            ConversationSettings {
+                model: Some("explicit/model:latest".into()),
+                effort: Some("medium".into()),
+                mode: Some("auto".into()),
+            },
+        );
+        assert_eq!(
+            resolve_start_settings(
+                Some("explicit/model".into()),
+                ConversationSettings::default(),
+                None,
+                &prefs,
+                false
+            ),
+            ConversationSettings {
+                model: Some("explicit/model".into()),
+                effort: None,
+                mode: prefs.mode.clone()
+            },
+        );
+        // The preference remains available if the user later chooses Remember.
+        assert_eq!(prefs.model.as_deref(), Some("old-provider/model"));
+        assert_eq!(prefs.effort.as_deref(), Some("xhigh"));
     }
 
     #[tokio::test]

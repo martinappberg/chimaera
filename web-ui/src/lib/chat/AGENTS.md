@@ -18,6 +18,12 @@ the sibling of the xterm.js terminal surface. Parent map: repo-root
 Svelte 5 (runes: `$state`/`$derived`/`$effect`/`$props`). Build/check needs
 Node 22 (`.nvmrc`; `nvm use 22`).
 
+Model controls consume adapter capabilities and live catalog metadata. `custom_model`
+is an explicit opt-in independent of `set_model`; unknown adapters and older capability
+snapshots default to false. `modelCatalogReceived` distinguishes a not-yet-reported
+catalog from a deliberately empty one. Never infer a provider or effort ladder from
+the agent's brand, or shorten an unlisted model ID by guessing its naming scheme.
+
 ## The one flow to hold in your head
 
 ```
@@ -42,6 +48,7 @@ hard-resets and rebuilds.
 
 | File | What it owns |
 |---|---|
+| `ModelPicker.svelte` / `modelPicker.ts` | Shared model menu and optional custom-ID form; catalog identity matching, exact-ID validation, and full unlisted current IDs. Custom entry requires the adapter's explicit capability. |
 | `store.svelte.ts` | `ChatStore` — the reducer + all reactive view state (`blocks`, `pending`, `pendingSends`, `questions`, model/mode, `pendingModel` (a sent selection until provider read-back or failure), activity, exited/degraded/connected/fatalError — the last cleared by a fresh `init`, a `forked` marker, or a journal reset; a SOCKET-origin fatal (a handshake failure via `onFatalError`) also clears on the next successful `ready`, while a journal `error{fatal}` outlives reconnects until the driver is genuinely relaunched), including initial replay hydration through the ready-frame `head`. **The single source of truth for the view.** Every block carries a monotonic per-store `uid` (the transcript's keyed-render key — never an array index). `blocks` is capped at ~2000 with hysteresis: it runs one 64-block slack past the cap, then one batch splice trims back to the cap behind a single "earlier history trimmed" notice (so the O(n) index rebuild runs once per batch, not per event at cap); `trimmedCount` counts the NET front shift (dropped − the replacing notice), making a block's virtual index (`trimmedCount + i`) invariant and `virtualTotal` (`blocks.length + trimmedCount`) monotonic at cap. `structuralVersion` counts insertions/removals (net lengths are a false proxy — a retracted-then-reappended tail cancels out) and `epoch` stamps the transcript generation (a journal reset restarts the trim numbering). `activeAgents` is the reducer-maintained live-subagents set (same proxies as `blocks`, so tray rows update in place — no per-event full-blocks filter), and `tool_output_delta` accumulation is capped client-side (12 KiB head + rolling 4 KiB tail behind the server's own "[N bytes omitted]" marker; the authoritative result replaces it). Its reducer has a vitest test (`store.svelte.test.ts`) — one of the UI’s targeted Vitest suites. |
 | `chatWs.ts` / `cooperativeQueue.ts` | `ChatSocket` — connect/auth/reconnect(backoff)/gap-replay, then dispatch replay/live/control frames through one order-preserving cooperative queue so a cold history cannot starve browser input. Per-command refusals (`command_failed` / `invalid_command`) are visible but nonfatal. Shares reconnect accounting with `../terminal/ws.ts`. |
 | `nativeUi.ts` / `mods.svelte.ts` / `Mod*.svelte` / `modClient.ts` | Claude Mods' transient UI bridge. Native requests are bounded and fail on disconnect; trees and closure handles never enter the journal. One controller attaches per visible socket, renders at most four sites concurrently, refreshes mounted sites on invalidation, and routes panes, controls, focus, status, and composer callbacks. `ModNode` validates native elements and uses sanitized Markdown/SVG; `ModClient` loads supplied module graphs in a terminable worker inside an opaque CSP iframe (no workbench origin or network), caches four bundles, and caps active workers at sixteen. Hidden views unmount Clients. Circular module imports currently report an explicit fault. `nativeComposer.ts` holds bounded, grapheme-aware decoration ranges; `Composer` keeps native edits revision-fenced so a delayed hook cannot overwrite a newer draft. |

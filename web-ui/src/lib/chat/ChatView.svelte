@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { modelChoice } from "./modelPicker";
+  import { customModelSelection, modelChoice } from "./modelPicker";
   import { onDestroy, tick, untrack } from "svelte";
   import { displayName, forkSession, rewindSession, renameSession, type Session } from "../workspace/sessions";
   import { fsValidate } from "../previews/files";
@@ -908,7 +908,8 @@
 
   /** Model picker: the agent's own catalog (claude initialize.models /
    *  codex model/list) beats the daemon's curated list. */
-  const modelChoices = $derived(store.models.length > 0 ? store.models : models);
+  const modelChoices = $derived(store.modelCatalogReceived ? store.models : models);
+  const allowCustomModel = $derived(supports("set_model") && capabilities.custom_model);
   /** The catalog row for the live model. Ids come in three spellings:
    *  picker values ("opus[1m]"), catalog resolvedModel
    *  ("claude-opus-4-8[1m]"), and the BARE api id assistant messages report
@@ -918,14 +919,8 @@
    *  this is undefined so the header shows a neutral loading chip — NOT a
    *  concrete "default" that would flash the wrong name (slow on remote). */
   const currentModel = $derived(modelChoice(store.models, store.model));
-  /** Reasoning-effort choices: per-model when the agent reports them;
-   *  codex falls back to its known ladder, claude to none (no effort knob
-   *  on that model — e.g. haiku). */
-  const FALLBACK_EFFORTS = ["minimal", "low", "medium", "high", "xhigh"];
-  const effortChoices = $derived.by(() => {
-    if (currentModel !== undefined) return currentModel.efforts;
-    return agentKind === "codex" ? FALLBACK_EFFORTS : [];
-  });
+  /** Only the active model's reported metadata establishes effort support. */
+  const effortChoices = $derived(currentModel?.efforts ?? []);
   /** Agent read-back is the only displayed truth. Both drivers emit an
    *  effort_state after applying a selection. */
   const effortShown = $derived(store.effort);
@@ -1510,6 +1505,10 @@
    *  "isn't available in this environment" dead end. Arguments resolve
    *  directly ("/effort high", "/model opus"); bare commands open pickers. */
   function onSlash(name: string, args = ""): boolean {
+    if (["model", "mode", "effort"].includes(name) && store.pendingModel !== null) {
+      store.notice("Wait for the model change to finish.", "info");
+      return true;
+    }
     const arg = args.trim().toLowerCase();
     switch (name) {
       case "voice": {
@@ -1564,6 +1563,12 @@
         if (arg.length > 0 && modeHit !== undefined) {
           store.notice(`“${args.trim()}” is a mode — switching it (use /mode next time)`, "info");
           return pickMode(modeHit.id);
+        }
+        if (args.trim().length > 0 && allowCustomModel) {
+          const selection = customModelSelection(args);
+          if (selection.id !== null) return pickModel(selection.id);
+          store.notice(selection.error, "error");
+          return true;
         }
         menu = "model";
         return true;
@@ -1956,6 +1961,7 @@
   });
 
   function pickModel(id: string): boolean {
+    if (store.pendingModel !== null) return false;
     if (!sendCommand({ type: "set_model", model_id: id }, "model change not sent")) return false;
     store.markModelPending(id);
     menu = null;
@@ -1977,6 +1983,7 @@
   }
 
   function pickMode(id: string): boolean {
+    if (store.pendingModel !== null) return false;
     if (!sendCommand({ type: "set_mode", mode_id: id }, "mode change not sent")) return false;
     menu = null;
     return true;
@@ -1993,6 +2000,7 @@
   }
 
   function pickEffort(id: string): boolean {
+    if (store.pendingModel !== null) return false;
     if (!sendCommand({ type: "set_effort", effort_id: id }, "effort change not sent")) return false;
     menu = null;
     return true;
@@ -2038,8 +2046,7 @@
   const modeLabel = $derived(
     store.modes.find((m) => m.id === store.currentMode)?.label ?? store.currentMode,
   );
-  /** Model chip: the catalog's own display name when known ("Opus",
-   *  "Fable"), else a readable fallback from the raw id. */
+  /** Unlisted IDs stay intact: namespaces and punctuation can identify a provider. */
   const modelLabel = $derived.by(() => {
     if (store.pendingModel !== null) {
       const pending = modelChoices.find((m) => m.id === store.pendingModel);
@@ -2054,8 +2061,7 @@
     }
     const choice = modelChoices.find((c) => c.id === m);
     if (choice !== undefined) return choice.label;
-    const match = /claude-(\w+)-(\d+)-(\d+)/.exec(m);
-    return match !== null ? `${match[1]} ${match[2]}.${match[3]}` : m;
+    return m;
   });
 
   /** Live status line under the transcript: what the agent is doing NOW —
@@ -2517,7 +2523,8 @@
     mods={agentKind === "claude" ? mods : undefined}
     {visible}
     bind:menu
-    canPickModel={supports("set_model") && modelChoices.length > 0 && store.connected && store.exited === null && store.fatalError === null && store.pendingModel === null}
+    {allowCustomModel}
+    canPickModel={supports("set_model") && (modelChoices.length > 0 || allowCustomModel) && store.connected && store.exited === null && store.fatalError === null && store.pendingModel === null}
     canPickMode={supports("set_mode")}
     {modelChoices}
     {modelLabel}

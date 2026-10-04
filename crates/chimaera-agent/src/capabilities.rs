@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 pub struct ChatCapabilities {
     pub commands: Vec<String>,
     pub image_input: bool,
+    /// The adapter accepts model IDs beyond its advertised catalog. A model
+    /// selector alone does not establish this for a new harness.
+    #[serde(default)]
+    pub custom_model: bool,
 }
 
 impl ChatCapabilities {
@@ -50,6 +54,7 @@ impl ChatCapabilities {
             .map(str::to_owned)
             .collect(),
             image_input: true,
+            custom_model: true,
         }
     }
 }
@@ -66,5 +71,31 @@ mod tests {
         assert!(claude.commands.iter().any(|c| c == "set_thinking"));
         assert!(!codex.commands.iter().any(|c| c == "set_thinking"));
         assert!(codex.commands.iter().any(|c| c == "compact"));
+        assert!(claude.custom_model && codex.custom_model);
+    }
+
+    #[test]
+    fn old_capability_snapshots_do_not_grant_custom_model_input() {
+        let capabilities: ChatCapabilities = serde_json::from_value(serde_json::json!({
+            "commands": ["set_model"], "image_input": true
+        }))
+        .unwrap();
+        assert!(!capabilities.custom_model);
+    }
+
+    #[test]
+    fn only_the_native_custom_model_adapters_get_the_compatibility_grant() {
+        for (kind, supported) in [
+            ("claude", true),
+            ("codex", true),
+            ("agy", false),
+            ("grok", false),
+        ] {
+            assert_eq!(
+                ChatCapabilities::legacy(kind).custom_model,
+                supported,
+                "{kind}"
+            );
+        }
     }
 }
