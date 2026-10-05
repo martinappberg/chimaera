@@ -1159,8 +1159,11 @@ pub(crate) async fn run_here(
         target: "chimaera_server::pro::leave",
         "a project was asked back to this computer"
     );
-    // The latest computer the user ran it on is the one it returns to.
+    // The latest computer the user ran it on is the one it returns to, and
+    // the story of where it went when the app left is over (the account's
+    // ends with this computer's acquisition).
     lock(&state.pro.opened_here).insert(workspace.clone());
+    lock(&state.pro.left).remove(&workspace);
     let resume_now = bring_back(&state, &workspace);
     // A Transferring project re-acquires through the lease loop, which only
     // `reclaim` holds to account; mark it returning either way.
@@ -1181,6 +1184,11 @@ pub(crate) async fn run_here(
 /// A project taken back from the cloud is here again: the account hears its
 /// outcome once more (it may have refused it while the cloud held it).
 pub(super) async fn back_here(state: &AppState, config: &Configure, workspace: &str) {
+    // Only a reason to stay says anything once the work is here again: a
+    // `moved` story ended with this computer's acquisition at the account.
+    if !outcome(state, workspace).is_some_and(|outcome| outcome.state == Where::StayingHere) {
+        return;
+    }
     let generation = state.pro.generation.load(Ordering::Acquire);
     report(state, config, generation, workspace).await;
 }
