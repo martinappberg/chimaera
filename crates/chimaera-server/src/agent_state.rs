@@ -265,6 +265,12 @@ pub(crate) struct AgentRecord {
     /// view switch, which respawns the process but keeps the record and the
     /// conversation — must not repeat it. Never true off-cluster.
     pub(crate) compute_ctx_delivered: bool,
+    /// A digest of the where-you-run note (`mcp::cloud_context`) this
+    /// session's agent last received through a hook. A synced project's agent
+    /// gets it at the start of every process (a move always starts one, with
+    /// a fresh record); a view switch keeps the record, so an unchanged note
+    /// is not repeated. Never set outside a synced project.
+    pub(crate) placement_delivered: Option<u64>,
     /// Live subagents (SubagentStart/Stop hooks), capped at
     /// [`SUBAGENTS_CAP`]; cleared when the turn ends (Stop) or the session
     /// exits (the record dies with it).
@@ -357,6 +363,7 @@ impl AgentRecord {
             resumed_from: None,
             files_touched: Vec::new(),
             compute_ctx_delivered: false,
+            placement_delivered: None,
             subagents: Vec::new(),
             now_line: None,
             usage: None,

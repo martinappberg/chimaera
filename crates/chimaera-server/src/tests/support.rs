@@ -38,6 +38,16 @@ pub(super) fn test_state_with_data_dir(port: u16, data_dir: PathBuf) -> Arc<AppS
     Arc::new(fixture_state(port, data_dir))
 }
 
+/// A test daemon composed with an optional Runtime stand-in.
+pub(super) fn test_state_with_runtime(
+    data_dir: PathBuf,
+    runtime: Arc<dyn crate::daemon_extension::Runtime>,
+) -> Arc<AppState> {
+    let mut state = fixture_state(0, data_dir);
+    state.daemon_extension = Some(runtime);
+    Arc::new(state)
+}
+
 fn fixture_state(port: u16, data_dir: PathBuf) -> AppState {
     let config_dir = data_dir.join("config");
     let provider_home = data_dir.join("provider-home");

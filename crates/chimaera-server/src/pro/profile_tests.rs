@@ -79,7 +79,8 @@ impl Drop for Fixture {
 #[tokio::test]
 async fn stale_confirmation_preserves_new_proposal_and_guidance() {
     let fixture = Fixture::new();
-    let original = json!({"pending_setup_command":"npm ci","deferred":["xcodebuild test"]});
+    let original =
+        json!({"pending_setup_command":"npm ci","missing_environment":["PROJECT_TOKEN"]});
     assert_eq!(
         fixture.request(Some(original), &[]).await.status(),
         StatusCode::NO_CONTENT
@@ -87,7 +88,7 @@ async fn stale_confirmation_preserves_new_proposal_and_guidance() {
     let (old_revision, mut confirmation) = fixture.read().await;
     let mut updated = confirmation.clone();
     updated["pending_setup_command"] = json!("npm install");
-    updated["deferred"] = json!(["xcodebuild test", "xcrun simctl list"]);
+    updated["missing_environment"] = json!(["PROJECT_TOKEN", "OTHER_TOKEN"]);
     assert_eq!(
         fixture
             .request(Some(updated.clone()), &[&old_revision])
@@ -254,12 +255,15 @@ async fn failed_agent_profile_save_preserves_new_execution_evidence_and_guidance
         let mut preferences = lock(&fixture.state.pro.preferences);
         let entry = preferences.get_mut(&fixture.workspace).unwrap();
         entry.execution_uncertain = true;
-        entry.profile.deferred.push("xcodebuild test".into());
+        entry
+            .profile
+            .missing_environment
+            .push("PROJECT_TOKEN".into());
     }
     drop(disk);
     assert!(caller.await.unwrap().is_err());
     let preferences = lock(&fixture.state.pro.preferences);
     let entry = &preferences[&fixture.workspace];
     assert!(entry.execution_uncertain);
-    assert_eq!(entry.profile.deferred, ["xcodebuild test"]);
+    assert_eq!(entry.profile.missing_environment, ["PROJECT_TOKEN"]);
 }

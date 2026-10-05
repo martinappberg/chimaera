@@ -104,9 +104,6 @@ pub(crate) struct ProState {
     /// Projects the account answered for since this daemon started; the
     /// unverified-resume fallback leaves those to the verified path.
     answered: Mutex<std::collections::HashSet<String>>,
-    /// Projects that came back to this computer from the cloud during this
-    /// daemon's life (their agents get a fresh where-it-runs brief).
-    pub(crate) returned: Mutex<std::collections::HashSet<String>>,
     operations: detached::Operations,
     drain: Mutex<Option<drain::Drain>>,
     /// Serializes drain requests; see `drain::start`.
@@ -492,7 +489,6 @@ impl ProState {
             installing: Mutex::new(Default::default()),
             opened_here: Mutex::new(Default::default()),
             answered: Mutex::new(Default::default()),
-            returned: Mutex::new(Default::default()),
             operations: Default::default(),
             drain: Mutex::new(None),
             drain_gate: AsyncMutex::new(()),
@@ -1017,40 +1013,6 @@ pub(crate) fn may_import(state: &crate::AppState, workspace: &str, epoch: u64) -
     }
 }
 
-/// Commands known to require the laptop are retained in the mirrored profile.
-/// This hook handles API/MCP execution; journal learning covers typed commands.
-pub(crate) async fn defer_command(
-    state: &std::sync::Arc<crate::AppState>,
-    session: &str,
-    command: &str,
-) -> anyhow::Result<bool> {
-    let worker = crate::lock(&state.pro.runtime)
-        .as_ref()
-        .is_some_and(|config| config.role == protocol::Role::Worker);
-    if !worker {
-        return Ok(false);
-    }
-    let Some(workspace) = crate::lock(&state.session_workspaces).get(session).cloned() else {
-        return Ok(false);
-    };
-    authority::workspace(state, &workspace)?;
-    let should_defer = {
-        let mut preferences = crate::lock(&state.pro.preferences);
-        let profile = &mut preferences.entry(workspace).or_default().profile;
-        profile.observe_command(command);
-        let known = profile.laptop_only.iter().any(|entry| entry == command);
-        if known && !profile.deferred.iter().any(|entry| entry == command) {
-            anyhow::ensure!(profile.deferred.len() < 64, "deferred step limit");
-            profile.deferred.push(command.into());
-        }
-        known
-    };
-    if should_defer {
-        persist(state).await?;
-    }
-    Ok(should_defer)
-}
-
 /// Leftovers of transfers a previous daemon life never finished: staging
 /// copies and Git locks per project (each under its cache guard, so a transfer
 /// that starts meanwhile is never touched) and old temporary bundle archives.
@@ -1138,7 +1100,7 @@ pub(crate) async fn shutdown(state: &std::sync::Arc<crate::AppState>) {
 /// anything, one `kept_both` notice goes to the notice feed: the native app's
 /// OS notification and browser tabs' in-app alert — a `.mine-…` copy
 /// appearing in the file tree should never be the first the user hears of it.
-fn report_return(
+pub(super) fn report_return(
     state: &crate::AppState,
     workspace: &str,
     kept: (usize, Vec<PathBuf>),
@@ -1210,6 +1172,10 @@ pub(crate) fn manual_resume_configuration(state: &crate::AppState) -> Arc<AsyncM
 pub(crate) fn manual_resume_storage(state: &crate::AppState) -> &std::path::Path {
     &state.pro.root
 }
+/// Where per-project transfer state lives (`<data>/pro`), outside every project.
+pub(crate) fn storage(state: &crate::AppState) -> &std::path::Path {
+    &state.pro.root
+}
 
 pub(crate) use execution::restore_manual_parking;
 
@@ -1231,16 +1197,6 @@ pub(crate) fn profile_generation(state: &crate::AppState) -> u64 {
         .pro
         .generation
         .load(std::sync::atomic::Ordering::Acquire)
-}
-pub(crate) fn cloud_hours_exhausted(state: &crate::AppState) -> Option<bool> {
-    crate::lock(&state.pro.runtime)
-        .as_ref()
-        .map(|config| config.hours_exhausted)
-}
-/// Whether this project came back to this computer from the cloud during this
-/// daemon's life.
-pub(crate) fn returned_here(state: &crate::AppState, workspace: &str) -> bool {
-    crate::lock(&state.pro.returned).contains(workspace)
 }
 /// Whether the native app configured this daemon for Pro at all.
 pub(crate) fn configured(state: &crate::AppState) -> bool {
@@ -1277,6 +1233,38 @@ pub(crate) fn workspace_profile(state: &crate::AppState, workspace: &str) -> Opt
             .map(|entry| entry.profile.clone())
             .unwrap_or_default(),
     )
+}
+/// A project that actually moves between this computer and the cloud: an
+/// account is configured for it here, it is not kept on this computer, and
+/// it is not the cloud's own setup scratch project. Answers its saved profile
+/// and the kept-both copies still waiting for a choice, each with the file it
+/// sits beside (project-relative).
+pub(crate) fn synced(
+    state: &crate::AppState,
+    workspace: &str,
+) -> Option<(CloudProfile, Vec<(PathBuf, PathBuf)>)> {
+    let profile = workspace_profile(state, workspace)?;
+    if crate::lock(&state.pro.preferences)
+        .get(workspace)
+        .is_some_and(|p| p.never_mirror)
+        || crate::lock(&state.workspaces)
+            .get(workspace)
+            .is_none_or(|w| w.cloud_internal)
+    {
+        return None;
+    }
+    let kept = crate::lock(&state.pro.status)
+        .get(workspace)
+        .map(|status| status.kept_paths.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|copy| {
+            let name = copy.file_name()?.to_str()?;
+            let original = copy.with_file_name(canonical::original_name(name)?);
+            Some((copy, original))
+        })
+        .collect();
+    Some((profile, kept))
 }
 pub(crate) async fn save_workspace_profile(
     state: &std::sync::Arc<crate::AppState>,

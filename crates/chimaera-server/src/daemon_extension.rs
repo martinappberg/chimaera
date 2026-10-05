@@ -84,7 +84,7 @@ pub mod providers {
     };
 }
 pub mod guidance {
-    pub use crate::mcp::cloud_context::{GuidanceContext, GuidanceSetup};
+    pub use crate::mcp::cloud_context::{Arrival, Facts, GuidanceSetup, KeptPair};
     pub use chimaera_agent::model::truncate_label;
 }
 pub use crate::workspace_maintenance::{PreparedWorkspace, WorkspaceHost};
@@ -116,11 +116,16 @@ pub trait Runtime: Send + Sync + 'static {
         axum::Router::new()
     }
 
+    /// Tool descriptions for a synced project's agents (`where_am_i`,
+    /// `update_cloud_profile`); offered only where the host has a note.
     fn guidance_definitions(&self) -> Vec<serde_json::Value> {
         Vec::new()
     }
-    fn guidance_arrival(&self, _context: guidance::GuidanceContext<'_>) -> String {
-        String::new()
+    /// The words for where an agent in a synced project runs and what is
+    /// here. Pure: the host delivers it at each agent start (Claude hook
+    /// context, Codex developer note) and from `where_am_i`.
+    fn placement_note(&self, _facts: &guidance::Facts) -> Option<String> {
+        None
     }
     fn guidance_setup(
         &self,

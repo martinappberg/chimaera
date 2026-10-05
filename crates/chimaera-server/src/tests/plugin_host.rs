@@ -19,7 +19,7 @@ fn plugins_cannot_claim_project_cloud_tools_even_without_an_active_account() {
         )
     };
     assert!(crate::plugins::parse_manifest(&manifest("plugin_profile")).is_ok());
-    for tool in ["read_cloud_profile", "update_cloud_profile"] {
+    for tool in ["where_am_i", "update_cloud_profile"] {
         let error = crate::plugins::parse_manifest(&manifest(tool)).unwrap_err();
         assert!(error.contains("reserved by chimaera"), "{error}");
     }
