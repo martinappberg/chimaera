@@ -275,6 +275,7 @@ impl AcpMapper {
                 .map(str::to_owned)
                 .collect(),
                 image_input: init["agentCapabilities"]["promptCapabilities"]["image"] == true,
+                custom_model: false,
             },
             next_id: 10,
             pending: HashMap::new(),
@@ -1027,6 +1028,10 @@ mod tests {
         let mut m = mapper();
         m.set_config(&json!([{"id":"model","category":"model","type":"select","currentValue":"a","options":[{"value":"a","name":"A"},{"value":"a","name":"duplicate"},{"value":"","name":"invalid"}]}]));
         assert_eq!(m.models.len(), 1);
+        assert!(
+            !m.caps.custom_model,
+            "catalog selection does not grant arbitrary model IDs"
+        );
         let step = m.on_frame(&json!({"method":"session/update","params":{"sessionId":"session","update":{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"help"},{"name":"help"},{"name":""}]}}}));
         assert_eq!(m.commands.len(), 1);
         assert!(serde_json::to_vec(&step.events[0]).unwrap().len() < 256 * 1024);

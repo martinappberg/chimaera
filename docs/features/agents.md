@@ -22,7 +22,16 @@ account, environment, project instructions, skills, and configured connections.
 A local workspace uses your local setup; an SSH workspace uses your user's setup
 on the remote host. Chimaera adds workspace integration through session-scoped
 settings, hooks, and MCP tools. Chat controls select the model and permissions
-for the current session; see [chat mode](chat-mode.md) for provider behavior.
+for the current session; see [chat mode](chat-mode.md) for provider behavior and
+custom model selection. Settings → Chat → New Chat Model can follow the runtime's
+configured model instead of Chimaera's last-used choice. A CLI's identity does not
+establish its upstream provider; launcher subtitles describe installation provenance.
+
+Claude Code 2.1.277+ reads `AGENTS.md` as a fallback when `CLAUDE.md` is absent.
+Existing explicit `CLAUDE.md` → `AGENTS.md` bridges remain useful for older
+runtimes and Claude-specific additions; Chimaera does not rewrite them at launch.
+Before the first live model catalog arrives, Codex's curated fallback starts with
+GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
 
 ## Launching an agent
 
@@ -52,7 +61,7 @@ for the current session; see [chat mode](chat-mode.md) for provider behavior.
   the popover answers "*which* agent" with provenance and install state.
 - **How it's used.** The split button starts the saved default. Its chevron opens a ready-first
   agent menu with one **chat** action per ready agent and a secondary terminal button. Agents
-  needing installation or Antigravity chat setup appear below. Provider labels are visible;
+  needing installation or Antigravity chat setup appear below. Installation provenance is visible;
   binary/version provenance lives in the tooltip and Agents settings. Arrow keys navigate,
   Enter follows the visible chat action, and Command/Ctrl+Enter opens terminal.
 - **Where it lives.** `App.svelte` (`.new-split`, `spawnDefaultAgent`), `Launcher.svelte`,

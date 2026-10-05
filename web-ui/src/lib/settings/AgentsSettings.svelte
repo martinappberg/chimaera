@@ -117,7 +117,7 @@
     <h2>Agents</h2>
     <button class="link" disabled={loading} onclick={() => void load(true)}>{loading ? "Checking…" : "Check for updates"}</button>
   </div>
-  <p class="intro">Existing installations are detected automatically.</p>
+  <p class="intro">Uses each agent’s account, provider, and configuration on this host.</p>
   {#if loadError}<p class="err" role="alert">{loadError}</p>{/if}
   <div class="cards">
     {#each $agentCatalog as a (a.id)}

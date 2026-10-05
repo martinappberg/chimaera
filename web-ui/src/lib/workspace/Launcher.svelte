@@ -262,7 +262,7 @@
             <span class="asub">
               {#if a.installed && !a.outdated}
                 <span class="aver" class:managed={a.managed} title={whereTitle(a)}>
-                  <span>{a.chatSetupRequired ? "finish chat setup" : a.id === "agy" ? "Google · Gemini models" : a.id === "grok" ? "xAI" : a.id === "claude" ? "Anthropic" : a.id === "codex" ? "OpenAI" : "ready"}</span>
+                  <span>{a.chatSetupRequired ? "finish chat setup" : a.managed ? "managed installation" : "your installation"}</span>
                 </span>
                 {#if a.updateAvailable && a.latestVersion !== null}
                   {#if a.managed}

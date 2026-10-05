@@ -31,6 +31,11 @@ fmt:
 chat-smoke:
     cargo test -p chimaera-agent --test live -- --ignored --test-threads=1 --nocapture
 
+# Real installed Claude Mod engine and local fixture; no model turns or billing.
+# Complements, but does not replace, the complete chat-smoke compatibility gate.
+chat-mods-smoke:
+    cargo test -p chimaera-agent --test native_ui_live -- --ignored --nocapture
+
 # CHIMAERA_TEST_AGY_ACP / CHIMAERA_TEST_GROK name official executables.
 # Uses existing logins and disposable workspaces; includes billed turns.
 chat-smoke-acp:

@@ -10,10 +10,11 @@
   interface Props {
     servers: McpServer[] | null;
     onReconnect: (name: string) => void;
+    onAuthenticate?: (name: string) => void;
     onToggleEnabled: (name: string, enabled: boolean) => void;
   }
 
-  let { servers, onReconnect, onToggleEnabled }: Props = $props();
+  let { servers, onReconnect, onToggleEnabled, onAuthenticate }: Props = $props();
 </script>
 
 <div class="menu-host mcp-host">
@@ -45,6 +46,9 @@
           <span class="mcp-name" title={s.error ?? s.status}>{s.name}</span>
           {#if s.tools > 0}
             <span class="mcp-tools">{s.tools} tools</span>
+          {/if}
+          {#if s.status === "needs-auth" && onAuthenticate}
+            <button class="mcp-act" onclick={() => onAuthenticate?.(s.name)}>sign in again</button>
           {/if}
           {#if s.status === "failed" || s.status === "needs-auth"}
             <button class="mcp-act" onclick={() => onReconnect(s.name)}>reconnect</button>

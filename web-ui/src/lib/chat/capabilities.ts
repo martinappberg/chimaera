@@ -3,6 +3,8 @@
 export interface ChatCapabilities {
   commands: string[];
   image_input: boolean;
+  /** Accepts a model ID outside the reported catalog. Never inferred from set_model. */
+  custom_model: boolean;
 }
 
 const shared = [
@@ -17,7 +19,7 @@ export function legacyCapabilities(agent: string): ChatCapabilities {
     ? ["permission_destination", "set_thinking", "set_ultracode", "rewind", "background_tool", "stop_task",
        "get_mcp", "set_mcp_enabled", "reconnect_mcp", "set_remote_control"]
     : agent === "codex" ? ["compact", "steer_queued"] : null;
-  return { commands: extra === null ? [] : [...shared, ...extra], image_input: extra !== null };
+  return { commands: extra === null ? [] : [...shared, ...extra], image_input: extra !== null, custom_model: false };
 }
 
 export function parseCapabilities(value: unknown): ChatCapabilities {
@@ -27,5 +29,6 @@ export function parseCapabilities(value: unknown): ChatCapabilities {
       ? [...new Set(raw.commands.filter((c): c is string => typeof c === "string" && c.length <= 64))].slice(0, 64)
       : [],
     image_input: raw.image_input === true,
+    custom_model: raw.custom_model === true,
   };
 }

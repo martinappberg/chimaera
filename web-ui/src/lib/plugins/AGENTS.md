@@ -31,6 +31,10 @@ Svelte or JavaScript bundle. Keep the renderer and routing generic. Domain
 behavior belongs in the plugin repository, with the client reusing the core
 viewers and theme tokens.
 
+`ui/1` code nodes and Claude Mods share `shared/ExtensionCode.svelte` for bounded,
+syntax-highlighted excerpts. Their input formats, action dispatch and runtime
+capabilities remain separate; do not reinterpret native Mod handles as plugin actions.
+
 For a new node or host/client contract, update the SDK/guide and host validator
 alongside `ui/screen.ts` and `UiNode.svelte`. Follow existing unknown-node
 fallbacks, untrusted-markdown sanitization, built-in action handling and

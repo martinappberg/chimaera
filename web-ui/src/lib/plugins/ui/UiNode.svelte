@@ -22,6 +22,7 @@
   import Switch from "../../shared/Switch.svelte";
   import FileIcon from "../../shared/FileIcon.svelte";
   import Markdown from "../../chat/Markdown.svelte";
+  import ExtensionCode from "../../shared/ExtensionCode.svelte";
   import { openInSystemBrowser } from "../../shared/urlOpen";
   import { fetchDiagnostics, onPlatformFrame, type Diagnostic, type UiNodeData } from "../platform";
   import { fsFile } from "../../previews/files";
@@ -411,7 +412,9 @@
 {:else if kind === "markdown"}
   <div class="markdown"><Markdown text={str(node.text)} /></div>
 {:else if kind === "code"}
-  <pre class="code"><code>{str(node.text)}</code></pre>
+  <!-- This capped vertical scroller must remain keyboard reachable in WebKit. -->
+  <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+  <div class="code-region" role="region" aria-label="Code" tabindex="0"><ExtensionCode source={str(node.text)} language={str(node.language)} /></div>
 {:else if kind === "keyvalue"}
   <dl class="kv">
     {#each Array.isArray(node.items) ? (node.items as Record<string, unknown>[]) : [] as item, i (i)}
@@ -839,16 +842,8 @@
   .tone-bad {
     color: var(--err);
   }
-  .code {
-    margin: 0;
-    font-family: var(--mono);
-    font-size: var(--text-sm);
-    background: var(--row-hover);
-    border-radius: 6px;
-    padding: 8px 10px;
-    overflow: auto;
-    max-height: 360px;
-  }
+  .code-region { max-height: 360px; overflow: auto; border-radius: 5px; }
+  .code-region:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
   .kv {
     display: grid;
     grid-template-columns: max-content 1fr;

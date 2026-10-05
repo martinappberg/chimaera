@@ -2,7 +2,7 @@ import { tick } from "svelte";
 import type { Action } from "svelte/action";
 
 /** Keep toolbar pickers above pane clipping, with keyboard focus owned by the popup. */
-export const toolbarPopover: Action<HTMLElement, { onClose: () => void }> = (node, params) => {
+export const toolbarPopover: Action<HTMLElement, { onClose: () => void; initialFocus?: string }> = (node, params) => {
   let current = params;
   const active = document.activeElement;
   const opener = node.parentElement?.querySelector<HTMLElement>("button[aria-haspopup]") ??
@@ -25,13 +25,16 @@ export const toolbarPopover: Action<HTMLElement, { onClose: () => void }> = (nod
     if (disposed) return;
     place();
     const choices = items();
-    const selected = choices.find((item) => item.matches('.current, [aria-checked="true"], [aria-pressed="true"]')) ?? choices[0];
+    const selected = (current.initialFocus ? node.querySelector<HTMLElement>(current.initialFocus) : null) ?? choices.find((item) => item.matches('.current, [aria-checked="true"], [aria-pressed="true"]')) ?? choices[0];
     // A status-only popup still needs to own focus so Tab and focusout close it.
     if (selected === undefined) node.tabIndex = -1;
     (selected ?? node).focus({ preventScroll: true });
   });
   const onKey = (event: KeyboardEvent) => {
     if (event.isComposing || event.metaKey || event.ctrlKey || event.altKey) return;
+    // A popup can reveal a short form. Its caret and text-selection keys stay
+    // native; menu navigation must never move focus away from an editable field.
+    if (event.target instanceof Element && event.target.closest("input,textarea,select,[contenteditable='true']")) return;
     if (event.key === "Tab" && node.getAttribute("role") === "menu") {
       opener?.focus({ preventScroll: true });
       current.onClose();

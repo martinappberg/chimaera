@@ -2734,3 +2734,78 @@ async fn conversation_settings_are_indexed_per_native_id() {
     assert_eq!(fx.manager.index().settings(&native).model, *model);
     assert!(fx.manager.kill("s-own"));
 }
+
+#[tokio::test]
+async fn elicitation_replays_without_persisting_the_submitted_values() {
+    use chimaera_agent::elicitation::ElicitationAction;
+    let f = fixture();
+    f.manager
+        .spawn(&ClaudeAdapter, spec("elicit", &f.cwd, "elicitation"))
+        .expect("spawn");
+    let mut rx = f.manager.attach("elicit", 0).unwrap().live;
+    let mut seen = Vec::new();
+    f.manager
+        .command(
+            "elicit",
+            AgentCommand::Send {
+                blocks: vec![ContentBlock::Text {
+                    text: "form".into(),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+    wait_for(&mut rx, &mut seen, "MCP form", |event| {
+        matches!(event, AgentEvent::ElicitationRequest { .. })
+    })
+    .await;
+    let replay = f.manager.attach("elicit", 0).unwrap();
+    assert!(replay
+        .replay
+        .iter()
+        .any(|event| matches!(event.ev, AgentEvent::ElicitationRequest { .. })));
+    f.manager
+        .annotate(
+            "elicit",
+            AgentEvent::ElicitationRequest {
+                request_id: "second".into(),
+                server: "fixture".into(),
+                message: "second ask".into(),
+                elicitation: chimaera_agent::elicitation::Elicitation::parse(
+                    "url",
+                    &serde_json::Value::Null,
+                    Some("https://example.com"),
+                ),
+            },
+        )
+        .unwrap();
+    wait_for(&mut rx, &mut seen, "second MCP ask", |event| matches!(event, AgentEvent::ElicitationRequest { request_id, .. } if request_id == "second")).await;
+    f.manager.command("elicit", AgentCommand::Elicitation { request_id: "req-elicit".into(), action: ElicitationAction::Accept, content: serde_json::json!({"name":"private-input-marker","count":0,"enabled":false,"profile":{"owner":"private-owner"}}) }).await.unwrap();
+    wait_for(&mut rx, &mut seen, "MCP decision", |event| matches!(event, AgentEvent::ElicitationResolved { action, .. } if action == "accept")).await;
+    assert!(
+        f.manager.get("elicit").unwrap().pending_permission,
+        "one unresolved request still needs attention"
+    );
+    f.manager
+        .annotate(
+            "elicit",
+            AgentEvent::ElicitationResolved {
+                request_id: "second".into(),
+                action: "cancel".into(),
+            },
+        )
+        .unwrap();
+    wait_for(&mut rx, &mut seen, "second MCP decision", |event| matches!(event, AgentEvent::ElicitationResolved { request_id, .. } if request_id == "second")).await;
+    assert!(!f.manager.get("elicit").unwrap().pending_permission);
+    let replay = f.manager.attach("elicit", 0).unwrap();
+    assert!(!serde_json::to_string(
+        &replay
+            .replay
+            .iter()
+            .map(|event| &**event)
+            .collect::<Vec<_>>()
+    )
+    .unwrap()
+    .contains("private-input-marker"));
+    assert!(f.manager.kill("elicit"));
+}
