@@ -280,3 +280,207 @@ async fn structured_idle_rejects_mismatched_ledger_native_before_owned_stop() {
     std::fs::remove_dir_all(root).unwrap();
     result.unwrap();
 }
+
+struct SelectedRuntime;
+impl crate::daemon_extension::Runtime for SelectedRuntime {
+    fn coordinate(
+        &self,
+        _owner: crate::daemon_extension::CoordinatorOwner,
+    ) -> crate::daemon_extension::RuntimeFuture {
+        Box::pin(async {})
+    }
+}
+fn ordinary_fixture(
+    extension: Option<Arc<dyn crate::daemon_extension::Runtime>>,
+) -> (Arc<AppState>, PathBuf, String, String) {
+    let root = std::env::temp_dir().join(format!(
+        "chimaera-ordinary-maintenance-{}",
+        chimaera_core::generate_token()
+    ));
+    std::fs::create_dir_all(root.join("a")).unwrap();
+    std::fs::create_dir_all(root.join("b")).unwrap();
+    let mut state = AppState::new(
+        "fixture".into(),
+        "fixture".into(),
+        4242,
+        0,
+        root.clone(),
+        root.join("config"),
+    );
+    state.daemon_extension = extension;
+    let state = Arc::new(state);
+    let a = lock(&state.workspaces).add(root.join("a")).unwrap().id;
+    let b = lock(&state.workspaces).add(root.join("b")).unwrap().id;
+    (state, root, a, b)
+}
+
+#[tokio::test]
+async fn ordinary_selected_worker_maintenance_preserves_sibling_and_original_generation() {
+    let (state, root, a, b) = ordinary_fixture(Some(Arc::new(SelectedRuntime)));
+    state.pro.worker.store(true, Ordering::Release);
+    let sibling = terminal(&state, &b, root.join("b"));
+    let worker = state.clone();
+    let result = tokio::spawn(async move {
+        assert!(lock(&worker.pro.runtime).is_none());
+        assert!(lock(&worker.pro.ownership).is_empty());
+        let mut prepared = WorkspaceHost::new(worker.clone())
+            .prepare(&a, false, Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(prepared.current().is_ok());
+        assert!(begin_launch(&worker, &a).is_err());
+        assert!(begin_shell_launch(&worker, &a).is_err());
+        assert!(begin_launch(&worker, &b).unwrap().is_some());
+        prepared.stop().await.unwrap();
+        assert!(worker.sessions.get(&sibling).unwrap().alive);
+        assert!(lock(&worker.pro.runtime).is_none());
+        assert!(lock(&worker.pro.ownership).is_empty());
+        worker.pro.generation.fetch_add(1, Ordering::AcqRel);
+        assert!(prepared.current().is_err());
+        drop(prepared);
+        assert!(begin_launch(&worker, &a).unwrap().is_some());
+    })
+    .await;
+    cleanup(&state).await;
+    std::fs::remove_dir_all(root).unwrap();
+    result.unwrap();
+}
+
+struct HeldEnvironment {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    worker: Arc<std::sync::atomic::AtomicBool>,
+}
+impl crate::daemon_extension::Runtime for HeldEnvironment {
+    fn coordinate(
+        &self,
+        _owner: crate::daemon_extension::CoordinatorOwner,
+    ) -> crate::daemon_extension::RuntimeFuture {
+        Box::pin(async {})
+    }
+    fn session_environment<'a>(
+        &'a self,
+        _workspace: &'a str,
+        worker: bool,
+    ) -> crate::daemon_extension::EnvironmentFuture<'a> {
+        Box::pin(async move {
+            self.worker.store(worker, Ordering::Release);
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(Vec::new())
+        })
+    }
+}
+
+#[tokio::test]
+async fn ordinary_worker_launch_blocks_maintenance_through_actual_environment_wait() {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let observed_worker = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (state, root, a, b) = ordinary_fixture(Some(Arc::new(HeldEnvironment {
+        entered: entered.clone(),
+        release: release.clone(),
+        worker: observed_worker.clone(),
+    })));
+    state.pro.worker.store(true, Ordering::Release);
+    let sibling = terminal(&state, &b, root.join("b"));
+    let worker = state.clone();
+    let result = tokio::spawn(async move {
+        let workspace = lock(&worker.workspaces).get(&a).unwrap();
+        let id = "s-ordinary-counted-launch";
+        let mut launch = Box::pin(crate::spawn::spawn_session(
+            &worker,
+            crate::spawn::SpawnSpec {
+                workspace,
+                id: Some(id.into()),
+                name: None,
+                cwd: None,
+                cols: None,
+                rows: None,
+                theme: "dark".into(),
+                title_hint: None,
+                prelude: None,
+                kind: crate::spawn::SpawnKind::Shell,
+                fork_head: false,
+                native_cwd: None,
+                started_by: crate::history::StartedBy::You,
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                _ = entered.notified() => {},
+                _ = &mut launch => panic!("launch did not retain its environment wait"),
+            }
+        })
+        .await
+        .unwrap();
+        assert!(observed_worker.load(Ordering::Acquire));
+        assert!(!idle(&worker, &a));
+        assert!(worker.sessions.get(id).is_none());
+        assert!(WorkspaceHost::new(worker.clone())
+            .prepare(&a, false, Instant::now() + Duration::from_secs(5))
+            .await
+            .is_err());
+        assert!(!workspace_closed(&worker, &a));
+        assert!(begin_shell_launch(&worker, &b).unwrap().is_some());
+        assert!(worker.sessions.get(&sibling).unwrap().alive);
+        release.notify_one();
+        assert!(tokio::time::timeout(Duration::from_secs(5), &mut launch)
+            .await
+            .unwrap()
+            .is_ok());
+        assert!(worker.sessions.get(id).is_some_and(|row| row.alive));
+        assert!(idle(&worker, &a));
+        assert!(WorkspaceHost::new(worker.clone())
+            .prepare(&a, false, Instant::now() + Duration::from_secs(5))
+            .await
+            .is_err());
+        let mut prepared = WorkspaceHost::new(worker.clone())
+            .prepare(&a, true, Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+        prepared.stop().await.unwrap();
+        assert!(worker.sessions.get(id).is_none());
+        assert!(worker.sessions.get(&sibling).unwrap().alive);
+        assert!(begin_shell_launch(&worker, &a).is_err());
+        drop(prepared);
+        assert!(begin_shell_launch(&worker, &a).unwrap().is_some());
+    })
+    .await;
+    cleanup(&state).await;
+    std::fs::remove_dir_all(root).unwrap();
+    result.unwrap();
+}
+
+#[tokio::test]
+async fn ordinary_maintenance_does_not_admit_absent_extension_or_account_bound_projects() {
+    let (state, root, a, _) = ordinary_fixture(None);
+    assert!(begin_launch(&state, &a).unwrap().is_none());
+    state.pro.worker.store(true, Ordering::Release);
+    assert!(begin_launch(&state, &a).unwrap().is_none());
+    assert!(WorkspaceHost::new(state.clone())
+        .prepare(&a, false, Instant::now() + Duration::from_secs(5))
+        .await
+        .is_err());
+    assert!(!workspace_closed(&state, &a));
+    std::fs::remove_dir_all(root).unwrap();
+
+    let (state, root, a, _) = ordinary_fixture(Some(Arc::new(SelectedRuntime)));
+    assert!(begin_launch(&state, &a).unwrap().is_none());
+    assert!(WorkspaceHost::new(state.clone())
+        .prepare(&a, false, Instant::now() + Duration::from_secs(5))
+        .await
+        .is_err());
+    state.pro.worker.store(true, Ordering::Release);
+    lock(&state.pro.preferences)
+        .entry(a.clone())
+        .or_default()
+        .account = Some("a-foreign".into());
+    assert!(begin_workspace_maintenance(&state, &a).is_err());
+    assert!(WorkspaceHost::new(state.clone())
+        .prepare(&a, false, Instant::now() + Duration::from_secs(5))
+        .await
+        .is_err());
+    assert!(!workspace_closed(&state, &a));
+    std::fs::remove_dir_all(root).unwrap();
+}

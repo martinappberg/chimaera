@@ -409,6 +409,29 @@ fn account_bound(state: &AppState, workspace: &str, ownership: &Option<Ownership
         }
 }
 
+fn tracked(state: &AppState, workspace: &str) -> bool {
+    super::managed(state, workspace)
+        || (lock(&state.pro.runtime).is_some()
+            && (lock(&state.pro.preferences)
+                .get(workspace)
+                .is_some_and(|p| p.account.is_some())
+                || lock(&state.pro.adoptions).contains_key(workspace)
+                || lock(&state.pro.opened_here).contains(workspace)))
+}
+
+pub(crate) fn maintenance_worker(state: &AppState) -> bool {
+    super::worker(state)
+}
+
+fn ordinary_worker(state: &AppState, workspace: &str, tracked: bool) -> bool {
+    maintenance_worker(state)
+        && state.daemon_extension.is_some()
+        && !tracked
+        && lock(&state.workspaces).get(workspace).is_some()
+        && !account_bound(state, workspace, &None)
+        && !lock(&state.pro.authority).restricted()
+}
+
 /// Count the final synchronous spawn/registration window so a clean transfer
 /// cannot mistake a not-yet-registered child for an empty workload. Ordinary
 /// unconfigured local sessions remain inert; device work needs ownership alone.
@@ -435,14 +458,9 @@ fn begin_launch_admission(
     }
     let generation = generation(state);
     let managed = super::managed(state, workspace);
-    let tracked = managed
-        || (lock(&state.pro.runtime).is_some()
-            && (lock(&state.pro.preferences)
-                .get(workspace)
-                .is_some_and(|p| p.account.is_some())
-                || lock(&state.pro.adoptions).contains_key(workspace)
-                || lock(&state.pro.opened_here).contains(workspace)));
+    let tracked = tracked(state, workspace);
     let worker = super::worker(state);
+    let ordinary_worker = ordinary_worker(state, workspace, tracked);
     let installing = lock(&state.pro.installing).contains(workspace);
     let proofs = lock(&state.pro.execution.proofs);
     let ownership = lock(&state.pro.ownership);
@@ -453,6 +471,7 @@ fn begin_launch_admission(
         return Err(Changed.into());
     }
     match ownership.get(workspace) {
+        None if ordinary_worker => {}
         None if !tracked => return Ok(None),
         None if !worker => {}
         Some(Ownership::Local { .. } | Ownership::SettingUp { .. }) => {}
@@ -586,11 +605,14 @@ pub(crate) fn begin_workspace_maintenance(
     state: &AppState,
     workspace: &str,
 ) -> anyhow::Result<WorkspaceMutation> {
-    // Same original ownership -> count order as ordinary mutation admission.
-    // A worker with no admitted project cannot manufacture a maintenance owner.
+    // Ordinary shared workers have no managed lease. Only their selected
+    // extension may reserve an unbound project; managed ownership stays strict.
+    let ordinary_worker = ordinary_worker(state, workspace, tracked(state, workspace));
     let ownership = lock(&state.pro.ownership);
-    if !matches!(ownership.get(workspace), Some(Ownership::Local { .. })) {
-        return Err(Changed.into());
+    match ownership.get(workspace) {
+        None if ordinary_worker => {}
+        Some(Ownership::Local { .. }) => {}
+        _ => return Err(Changed.into()),
     }
     let mut commits = lock(&state.pro.execution.commits.0);
     if commits.workspace_maintenance.contains(workspace)

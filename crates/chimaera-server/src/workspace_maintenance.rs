@@ -36,8 +36,8 @@ impl WorkspaceHost {
         .await
         .context("workspace maintenance admission timed out")?;
         ensure!(
-            crate::pro::is_worker(&self.state),
-            "workspace maintenance requires configured worker"
+            mutation::maintenance_worker(&self.state),
+            "workspace maintenance requires worker"
         );
         let root = lock(&self.state.workspaces)
             .get(workspace)
@@ -175,7 +175,7 @@ impl PreparedWorkspace {
         ensure!(
             Instant::now() < self.deadline
                 && !self.state.stopping.load(Ordering::Acquire)
-                && crate::pro::is_worker(&self.state)
+                && mutation::maintenance_worker(&self.state)
                 && mutation::generation(&self.state) == self.generation
                 && self.reservation.current()
                 && lock(&self.state.workspaces)

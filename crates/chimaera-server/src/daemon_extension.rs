@@ -219,7 +219,7 @@ pub(crate) async fn apply_session_environment(
     };
     let generation = crate::pro::mutation::generation(state);
     let values = extension
-        .session_environment(workspace, crate::pro::is_worker(state))
+        .session_environment(workspace, crate::pro::mutation::maintenance_worker(state))
         .await
         .map_err(|_| anyhow::anyhow!("workspace environment unavailable"))?;
     anyhow::ensure!(
