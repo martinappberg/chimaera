@@ -9,12 +9,6 @@ repository.workspace = true
 name = "chimaera"
 path = "src/main.rs"
 
-[features]
-# Explicit inherited-descriptor runtime consumers; ordinary startup stays unchanged.
-provider-authority-prototype = ["chimaera-server/provider-authority-prototype"]
-# Explicit reusable host continuation; private assembly owns fixed vendor flags.
-provider-fixture-host = ["provider-authority-prototype", "chimaera-server/daemon-extension-fixture"]
-
 [dependencies]
 anyhow.workspace = true
 serde_json.workspace = true
