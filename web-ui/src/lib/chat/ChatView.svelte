@@ -110,7 +110,7 @@
     type PagePlan,
   } from "./transcriptWindow";
   import { measureShift, rowsInReach, selectAnchor, type ReadingAnchor } from "./readingAnchor";
-  import { blockWeight, HistoryWeights, tailWeights } from "./heightModel";
+  import { HistoryWeights, tailWeights, weightAt } from "./heightModel";
   import { activeTheme, getSetting, setSetting } from "../settings/store.svelte";
   import { hostCanDictate, voiceProblem } from "./voice.svelte";
   import { keyHint } from "../shared/keybindings";
@@ -494,16 +494,19 @@
     // Bounded by the live array: a reset or tail splice can shrink it before
     // the windowing effect repairs renderEnd.
     const end = Math.min(renderEnd, store.blocks.length);
-    // Activity after the window's last reply is the unfolded trailing run.
+    // The window's trailing run is unfolded: the finished lines that end it,
+    // else the activity after its last reply.
     let settledEnd = end;
-    while (settledEnd > renderStart) {
-      const kind = store.blocks[settledEnd - 1].kind;
-      if (kind === "message" || kind === "finished") break;
-      settledEnd--;
+    while (settledEnd > renderStart && store.blocks[settledEnd - 1].kind === "finished") settledEnd--;
+    if (settledEnd === end) {
+      while (settledEnd > renderStart) {
+        const kind = store.blocks[settledEnd - 1].kind;
+        if (kind === "message" || kind === "finished") break;
+        settledEnd--;
+      }
     }
     for (let i = renderStart; i < end; i++) {
-      const previous = i > 0 ? store.blocks[i - 1] : null;
-      weight += blockWeight(store.blocks[i], previous, cpl, i < settledEnd);
+      weight += weightAt(store.blocks, i, cpl, i < settledEnd);
     }
     if (first === null || last === null || weight <= 0) return nominal;
     const measured = (last.offsetTop + last.offsetHeight - first.offsetTop) / weight;
@@ -2255,8 +2258,9 @@
   );
 
   /** Render list for the bounded page: consecutive tool blocks coalesce into
-   *  one ToolGroup, and a settled run of activity rows folds under the reply
-   *  that followed it (activityFold.ts). Visible tail rows are live proxies;
+   *  one ToolGroup, a settled run of activity rows folds under the reply
+   *  that followed it, and a settled run of finished-work lines folds on its
+   *  own (activityFold.ts). Visible tail rows are live proxies;
    *  hidden/history rows are inert snapshots. Every item carries its absolute
    *  source index for scroll anchoring and boundary-sensitive actions. */
   type RowItem =
@@ -2270,9 +2274,10 @@
         tail: TurnTail;
       }
     | { t: "single"; key: string; index: number; block: ChatBlock };
-  /** The rows a fold absorbs. Finished-work lines never fold: they are
-   *  results (and a woken turn's only stated cause), so they stay in view and
-   *  settle the run above them the way a reply does. */
+  /** The rows an activity fold absorbs. Finished-work lines never join it:
+   *  they are results (and a woken turn's only stated cause), so they settle
+   *  the run above them the way a reply does, and fold only among themselves
+   *  (`finished-fold`). */
   type ActivityRow =
     | Extract<RowItem, { t: "group" }>
     | { t: "single"; key: string; index: number; block: Extract<ChatBlock, { kind: "thought" }> };

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { finishedTitle, foldSpans, foldTitle } from "./activityFold";
+import { FINISHED_FOLD_MIN, finishedTitle, foldSpans, foldTitle } from "./activityFold";
 import type { LabelledTool } from "./toolLabels";
 
 // a = activity, m = a reply (closes a run), u / n = other rows (user, notice).
@@ -53,7 +53,7 @@ describe("finished-work folds", () => {
       kinds.split(""),
       (k) => k === "f",
       () => true,
-      3,
+      FINISHED_FOLD_MIN,
     );
 
   it("folds three or more settled finished lines, never fewer or the trailing run", () => {
