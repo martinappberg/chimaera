@@ -45,7 +45,9 @@ pub(crate) async fn readiness(
         return vec![ProviderStatus::new("unsupported-provider").failed("provider_limit")];
     }
     if let Some(owner) = controller(state) {
-        owner.readiness(ids, fresh).await
+        let statuses = owner.readiness(ids, fresh).await;
+        crate::pro::report_cloud_agents(state, &statuses);
+        statuses
     } else {
         ids.iter()
             .map(|id| ProviderStatus::new(id).failed("unavailable"))

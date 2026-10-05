@@ -344,6 +344,7 @@ pub(crate) async fn disconnect(State(state): State<Arc<AppState>>) -> Response {
     super::moves::forget(&state);
     // No account is left to keep a quit handover in the cloud.
     lock(&state.pro.parked).clear();
+    lock(&state.pro.left).clear();
     let mut dropped = Vec::new();
     let mut returned: Vec<String> = {
         let mut ownership = lock(&state.pro.ownership);
@@ -443,16 +444,16 @@ pub(crate) async fn status(State(state): State<Arc<AppState>>) -> Json<serde_jso
     let config = lock(&state.pro.runtime).clone();
     let parked = lock(&state.pro.parked).clone();
     // Additive per row: `parked` (handed to the cloud when the app quit),
-    // `working_agents` (agents running work there right now) and
-    // `cloud_handoff` (the cloud could take it now); the native app asks
-    // before quitting only when a working project could move.
+    // `leave` (the last leave outcome: `moved`, `staying_here` with a closed
+    // `reason`, or `pending`), `working_agents` (agents running work there
+    // right now) and `cloud_handoff` (the cloud could take it now).
     Json(
-        json!({"configured":state.pro.configured.load(Ordering::Acquire) && !renewal_failed,"renewal_failed":renewal_failed,"workspace_configuration":authority.acknowledgment(),"projects_root":super::projects_root(&state),"projects_root_confirmed":lock(&state.pro.projects_root).is_some(),"sessions":sessions,"workspaces":workspaces.into_iter().filter(|workspace| authority.allows(&workspace.id)).take(128).map(|workspace|json!({"workspace_id":workspace.id,"name":workspace.name,"root":workspace.root,"never_mirror":preferences.get(&workspace.id).is_some_and(|p|p.never_mirror),"privacy_pending":preferences.get(&workspace.id).is_some_and(|p|p.privacy_pending),"ownership":ownership.get(&workspace.id),"continuity":preferences.get(&workspace.id).and_then(|p|p.continuity.as_ref()),"local_copy":super::local_copy_view(&state,&workspace.id),"git_staging":preferences.get(&workspace.id).and_then(|p|p.git_staging.as_ref()),"execution_allowed":super::may_execute(&state,&workspace.id),"bundle_import":state.bundle_imports.view(&workspace.id),"execution_uncertain":preferences.get(&workspace.id).is_some_and(|p|p.execution_uncertain),"mirror":statuses.get(&workspace.id),"blocked_providers":statuses.get(&workspace.id).map(|status|status.blocked_providers.clone()).unwrap_or_default(),"git_branches":preferences.get(&workspace.id).map(|p|&p.git_branches),"profile":preferences.get(&workspace.id).map(|p|&p.profile),"parked":parked.contains(&workspace.id),"working_agents":engine::working_agents(&state,&workspace.id),"cloud_handoff":!renewal_failed && cloud_handoff(&state,config.as_ref(),&workspace.id)})).collect::<Vec<_>>()}),
+        json!({"configured":state.pro.configured.load(Ordering::Acquire) && !renewal_failed,"renewal_failed":renewal_failed,"workspace_configuration":authority.acknowledgment(),"projects_root":super::projects_root(&state),"projects_root_confirmed":lock(&state.pro.projects_root).is_some(),"sessions":sessions,"workspaces":workspaces.into_iter().filter(|workspace| authority.allows(&workspace.id)).take(128).map(|workspace|json!({"workspace_id":workspace.id,"name":workspace.name,"root":workspace.root,"never_mirror":preferences.get(&workspace.id).is_some_and(|p|p.never_mirror),"privacy_pending":preferences.get(&workspace.id).is_some_and(|p|p.privacy_pending),"ownership":ownership.get(&workspace.id),"continuity":preferences.get(&workspace.id).and_then(|p|p.continuity.as_ref()),"local_copy":super::local_copy_view(&state,&workspace.id),"git_staging":preferences.get(&workspace.id).and_then(|p|p.git_staging.as_ref()),"execution_allowed":super::may_execute(&state,&workspace.id),"bundle_import":state.bundle_imports.view(&workspace.id),"execution_uncertain":preferences.get(&workspace.id).is_some_and(|p|p.execution_uncertain),"mirror":statuses.get(&workspace.id),"blocked_providers":statuses.get(&workspace.id).map(|status|status.blocked_providers.clone()).unwrap_or_default(),"git_branches":preferences.get(&workspace.id).map(|p|&p.git_branches),"profile":preferences.get(&workspace.id).map(|p|&p.profile),"parked":parked.contains(&workspace.id),"leave":super::leave::outcome(&state,&workspace.id),"working_agents":engine::working_agents(&state,&workspace.id),"cloud_handoff":!renewal_failed && cloud_handoff(&state,config.as_ref(),&workspace.id)})).collect::<Vec<_>>()}),
     )
 }
 /// A project a sleep or quit flush may hand over: this computer owns it, the
 /// workspace is in scope and copying it is allowed.
-fn flushable(state: &AppState, workspace: &str) -> bool {
+pub(super) fn flushable(state: &AppState, workspace: &str) -> bool {
     lock(&state.pro.authority).allows(workspace)
         && !lock(&state.pro.preferences)
             .get(workspace)
@@ -715,11 +716,69 @@ pub(crate) async fn sleep(State(state): State<Arc<AppState>>, body: axum::body::
     )
     .saturating_sub(SLEEP_REPLY_MARGIN);
     let deadline = tokio::time::Instant::now() + budget;
+    let (coordinator, unavailable) = match hand_over(
+        &state,
+        config,
+        deadline,
+        request.park,
+        request.workspace_ids,
+    )
+    .await
+    {
+        Ok(started) => started,
+        Err(reason) => {
+            return Json(json!({"handoff":false,"reason":reason,"failed":[]})).into_response()
+        }
+    };
+    let failed = |results: Vec<(String, anyhow::Result<()>)>| -> Vec<serde_json::Value> {
+        unavailable
+            .iter()
+            .map(|id| json!({"workspace_id":id,"error":"unavailable"}))
+            .chain(results.into_iter().filter_map(|(workspace, result)| {
+                result.err().map(
+                    |error| json!({"workspace_id":workspace,"error":engine::failure_code(&error)}),
+                )
+            }))
+            .collect()
+    };
+    match tokio::time::timeout_at(deadline + SLEEP_REPLY_MARGIN / 2, coordinator).await {
+        Ok(Ok(results)) => {
+            let failed = failed(results);
+            Json(json!({"handoff":failed.is_empty(),"failed":failed})).into_response()
+        }
+        Ok(Err(_)) => Json(
+            json!({"handoff":false,"reason":"transfer_interrupted","failed":failed(Vec::new())}),
+        )
+        .into_response(),
+        Err(_) => {
+            // Still publishing: the flushes finish or recover on their own.
+            let pending: Vec<_> = lock(&state.pro.sleeping).iter().cloned().collect();
+            Json(
+                json!({"handoff":false,"reason":"deadline","pending":pending,"failed":failed(Vec::new())}),
+            )
+            .into_response()
+        }
+    }
+}
+/// Each flush's result, by project.
+pub(super) type Flushes = tokio::task::JoinHandle<Vec<(String, anyhow::Result<()>)>>;
+
+/// Starts handing projects to the cloud within `deadline`: the sleep flush,
+/// and with `park` the quit handover (exactly `workspace_ids` then). Returns
+/// the running flushes and the listed projects this computer cannot hand
+/// over, or why nothing started (`transfer_busy`).
+pub(super) async fn hand_over(
+    state: &Arc<AppState>,
+    config: Configure,
+    deadline: tokio::time::Instant,
+    park: bool,
+    workspace_ids: Option<Vec<String>>,
+) -> Result<(Flushes, Vec<String>), &'static str> {
     let generation = state.pro.sleep_generation.fetch_add(1, Ordering::AcqRel) + 1;
     let sleep = engine::Sleep {
         generation,
         deadline,
-        park: request.park,
+        park,
     };
     // The periodic pass holds the job reservation across every project; a
     // sleep preempts it rather than queueing behind a long push. Anything it
@@ -740,25 +799,21 @@ pub(crate) async fn sleep(State(state): State<Arc<AppState>>, body: axum::body::
             }
             match tokio::time::timeout_at(deadline, jobs.lock_owned()).await {
                 Ok(guard) => guard,
-                Err(_) => {
-                    return Json(json!({"handoff":false,"reason":"transfer_busy","failed":[]}))
-                        .into_response()
-                }
+                Err(_) => return Err("transfer_busy"),
             }
         }
     };
     let mut active = Vec::new();
     let mut quiet = Vec::new();
     for workspace in lock(&state.workspaces).list().into_iter().take(128) {
-        if request
-            .workspace_ids
+        if workspace_ids
             .as_ref()
             .is_some_and(|ids| !ids.contains(&workspace.id))
-            || !flushable(&state, &workspace.id)
+            || !flushable(state, &workspace.id)
         {
             continue;
         }
-        if engine::live_agents(&state, &workspace.id) {
+        if engine::live_agents(state, &workspace.id) {
             active.push(workspace.id);
         } else {
             quiet.push(workspace.id);
@@ -766,12 +821,10 @@ pub(crate) async fn sleep(State(state): State<Arc<AppState>>, body: axum::body::
     }
     // A listed project this computer cannot hand over (not owned here, kept
     // on this computer, unknown) keeps working here; the caller hears so.
-    let unavailable: Vec<serde_json::Value> = request
-        .workspace_ids
-        .iter()
+    let unavailable: Vec<String> = workspace_ids
+        .into_iter()
         .flatten()
         .filter(|id| !active.contains(id) && !quiet.contains(id))
-        .map(|id| json!({"workspace_id":id,"error":"unavailable"}))
         .collect();
     let owner = state.clone();
     let coordinator = tokio::spawn(async move {
@@ -829,35 +882,7 @@ pub(crate) async fn sleep(State(state): State<Arc<AppState>>, body: axum::body::
         }
         results
     });
-    let failed = |results: Vec<(String, anyhow::Result<()>)>| -> Vec<serde_json::Value> {
-        unavailable
-            .iter()
-            .cloned()
-            .chain(results.into_iter().filter_map(|(workspace, result)| {
-                result.err().map(
-                    |error| json!({"workspace_id":workspace,"error":engine::failure_code(&error)}),
-                )
-            }))
-            .collect()
-    };
-    match tokio::time::timeout_at(deadline + SLEEP_REPLY_MARGIN / 2, coordinator).await {
-        Ok(Ok(results)) => {
-            let failed = failed(results);
-            Json(json!({"handoff":failed.is_empty(),"failed":failed})).into_response()
-        }
-        Ok(Err(_)) => {
-            Json(json!({"handoff":false,"reason":"transfer_interrupted","failed":unavailable}))
-                .into_response()
-        }
-        Err(_) => {
-            // Still publishing: the flushes finish or recover on their own.
-            let pending: Vec<_> = lock(&state.pro.sleeping).iter().cloned().collect();
-            Json(
-                json!({"handoff":false,"reason":"deadline","pending":pending,"failed":unavailable}),
-            )
-            .into_response()
-        }
-    }
+    Ok((coordinator, unavailable))
 }
 /// This computer woke, or the app came back after a quit that handed work to
 /// the cloud (it posts this at launch while anything is parked).

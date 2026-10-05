@@ -1643,6 +1643,15 @@ fn chat_working(
 /// inverse of `at_pause` per session, except that a session nothing is known
 /// about is not counted as working.
 pub(super) fn working_agents(state: &AppState, workspace: &str) -> Vec<String> {
+    agents_at_work(state, workspace, false)
+}
+/// The agents working or waiting on the user (a permission or a question)
+/// in this project: what leaving moves, since the user will want to answer
+/// from a browser.
+pub(super) fn leaving_agents(state: &AppState, workspace: &str) -> Vec<String> {
+    agents_at_work(state, workspace, true)
+}
+fn agents_at_work(state: &AppState, workspace: &str, waiting_counts: bool) -> Vec<String> {
     let mut kinds: Vec<String> = Vec::new();
     for id in sessions(state, workspace) {
         let (working, kind) = if let Some(chat) = state.chat.get(&id) {
@@ -1651,7 +1660,7 @@ pub(super) fn working_agents(state: &AppState, workspace: &str) -> Vec<String> {
                 &chat,
                 activity.as_ref().map(|(carry, _)| carry),
                 activity.as_ref().is_some_and(|(_, pending)| *pending),
-            );
+            ) || (waiting_counts && chat.alive && chat.pending_permission);
             let kind = lock(&state.agents)
                 .get(&id)
                 .map_or(chat.agent, |record| record.kind.as_str().to_owned());
@@ -1663,14 +1672,16 @@ pub(super) fn working_agents(state: &AppState, workspace: &str) -> Vec<String> {
                 continue;
             };
             let working = info.alive
-                && !crate::agent_state::tui_at_pause(
-                    &record,
-                    info.alive,
-                    info.last_output_at,
-                    info.pid,
-                    state.sessions.foreground_pid(&id),
-                    crate::session_view::now_ms(),
-                );
+                && ((waiting_counts
+                    && record.state == crate::agent_state::AgentState::NeedsPermission)
+                    || !crate::agent_state::tui_at_pause(
+                        &record,
+                        info.alive,
+                        info.last_output_at,
+                        info.pid,
+                        state.sessions.foreground_pid(&id),
+                        crate::session_view::now_ms(),
+                    ));
             (working, record.kind.as_str().to_owned())
         };
         if working && !kind.is_empty() && kind.len() <= 32 && !kinds.contains(&kind) {

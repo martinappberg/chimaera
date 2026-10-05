@@ -8,7 +8,7 @@ revocable delegation over the authenticated local API.
 | --- | --- |
 | `mod.rs` | Bounded, credential-free persistent state, ownership/import fences and deferred-command policy. |
 | `authority.rs` / `authority_tests.rs` | Fixed-identity workspace-bound worker acceptance, startup-only validated revision advancement, credential-free persisted latch, renewal/route/root guards and synthetic side-effect regressions. |
-| `routes.rs` | Authenticated configure/status/privacy/profile/power/hydration HTTP handlers. Profile GET returns an account-generation-bound ETag; PUT optionally checks one exact If-Match under the same preference lock as replacement (412 on change). Older unconditional PUT remains supported. Accepted writes retain configuration/job reservations through durable persistence even if the caller disconnects. `profile_tests.rs` covers stale confirmation, generation changes and disk failure. `/pro/status` rows carry additive `parked`, `working_agents` and `cloud_handoff` (see the quit handover below). |
+| `routes.rs` | Authenticated configure/status/privacy/profile/power/hydration HTTP handlers. Profile GET returns an account-generation-bound ETag; PUT optionally checks one exact If-Match under the same preference lock as replacement (412 on change). Older unconditional PUT remains supported. Accepted writes retain configuration/job reservations through durable persistence even if the caller disconnects. `profile_tests.rs` covers stale confirmation, generation changes and disk failure. `/pro/status` rows carry additive `parked`, `leave`, `working_agents` and `cloud_handoff` (see Leaving below). `hand_over` is the one flush coordinator behind `/pro/sleep` and leaving. |
 | `projects.rs` / `projects/catalog.rs` | Passive published-account discovery (negotiated `/v2/projects`, at most 128 rows/pages; legacy capability absence or 404 falls back to passive worker discovery), explicit copy/takeover routes, native-picked folder validation and inode/account-bound retry. Catalog rows infer no host or execution authority; errors retain cached rows and destination bindings. Legacy `/open` refuses rather than transferring execution. Nine original shared guard cases remain public; five actual runtime project compositions live privately, including four original ignored companion integrations run by the required private companion job. |
 | `project_copy.rs` / `project_copy/tests.rs` | Immutable read-only checkpoint copies with the existing file/Git transaction, independent durable copy enrollment, exact pending baselines, counted admission and explicit post-commit role promotion. Copy selects its receipt through passive `/v2/baton` GET; the legacy v1 response has no checkpoint and is never a fallback. Missing negotiated receipt refuses enrollment/install. No agent/session/configuration restore or copied-edit publication. |
 | `projects/tests.rs` | Nine shared destination/account/cache, refusal and legacy recovery tests. Paid real Git copy/return and worker roundtrip compositions live with the optional private runtime. |
@@ -499,15 +499,37 @@ a restart-deferred one instead of answering "moved" forever. A device's own
 unfinished return retries after 15 s, doubling to two minutes. Failures and
 refusals carry stable codes (`routes::error_code`; mirror row `error_code`).
 
-**Quit handover (`park`).** The native app asks before quitting when a
-`/pro/status` row has both `working_agents` (agent kinds running work now,
-`engine::working_agents`: a chat with a turn in flight, queued input or
-background work, never one waiting on a permission; a terminal agent not
-`tui_at_pause`) and `cloud_handoff` (a configured personal computer with a live
-delegation, cloud hours left and no drain; the project flushable, i.e. owned
-here, in scope and not kept on this computer; a valid lease; not parked). On
-**Continue in the cloud** it posts `/pro/sleep {deadline_ms, park: true,
-workspace_ids}`: the same flush, with three differences. Only the listed
+**Leaving (`leave.rs`, `POST /pro/leave`).** The native app posts it, with no
+body and no question, whenever Pro is active and the app quits (or its last
+window closes); the reply comes at once and the handover runs on as an owned
+task within 90 s. All eligibility is decided here. For each enrolled project
+in scope and not parked: `engine::leaving_agents` (`working_agents` plus a
+chat waiting on a permission or question, or a terminal agent in
+`NeedsPermission`) names the active agent kinds; `leave::plan` moves the
+project when a Claude or Codex one is active and the account does not say
+every such provider is signed out on the cloud machine (`GET
+/v2/cloud/agents`, written by that machine's own readiness checks through
+`provider_gate::report_cloud_agents`; unknown is tried). Everything else stays
+here with a non-clean copy (`nothing_running`, `agent_kind_stays_here`,
+`agent_not_connected_in_cloud`); a refusal before any flush (`cloud_time_used_up`,
+`cloud_unavailable` while draining or with a lapsed delegation, `not_synced_yet`
+for a working project not owned here) records without a copy. Moving projects
+go through `routes::hand_over` with `park` (the quit handover below) and end
+`moved` only when the flush returned Ok with the project still parked: the
+private snapshot refuses a parked flush that carries no conversation archive
+(`has_agents` would be false and the account would never wake for it), so it
+recovers here as `conversation_not_saved`/`conversation_too_large`; other
+failures map through `leave::reason_for`. Each outcome (`ProState.left`,
+persisted as `left` in `state.json`, ≤128, cleared on sign-out) is one
+`chimaera_server::pro::leave` info line, the additive `leave {state, reason?,
+at}` on the status row, and a best-effort `PUT /v2/workspaces/{id}/leave` so
+the account's placement and Home list can say it. A daemon without the
+optional Runtime answers `{"leaving":[],"reason":"optional_runtime_unavailable"}`
+and logs it; a free daemon answers 204.
+
+**Quit handover (`park`).** `/pro/sleep {deadline_ms, park: true,
+workspace_ids}` (older apps) and leaving's moves share one flush with three
+differences from sleep. Only the listed
 projects move (≤128 valid ids, all of them regardless of the time left; a
 listed one that is not flushable is reported in `failed` as `unavailable`).
 The computer stays awake, but the user chose the cloud: a flush whose copy is

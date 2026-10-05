@@ -109,6 +109,50 @@ pub(super) async fn check(
     }
 }
 
+/// On the cloud machine, tells the account what this readiness check found
+/// for the agents it can run, so a computer whose app quits can keep work the
+/// cloud could not continue (`GET /v2/cloud/agents`). Only definite answers
+/// are reported; an unknown or unavailable check says nothing. Best effort and
+/// off the caller's path.
+pub(crate) fn report_cloud_agents(state: &AppState, statuses: &[ProviderStatus]) {
+    if !super::is_worker(state) {
+        return;
+    }
+    // The account answers this only with negotiated execution (continuity v2).
+    let Some(config) = lock(&state.pro.runtime)
+        .clone()
+        .filter(|config| config.execution.is_some())
+    else {
+        return;
+    };
+    let agents: Vec<serde_json::Value> = statuses
+        .iter()
+        .filter(|status| matches!(status.id.as_str(), "claude" | "codex"))
+        .filter_map(|status| {
+            let signed_in = match status.state {
+                ProviderState::SignedIn => status.installed == Some(true),
+                ProviderState::NeedsSignIn | ProviderState::Missing => false,
+                ProviderState::Unknown | ProviderState::Unavailable => return None,
+            };
+            Some(serde_json::json!({"id": status.id, "signed_in": signed_in}))
+        })
+        .take(2)
+        .collect();
+    if agents.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        let body = serde_json::json!({ "agents": agents });
+        let sent = super::engine::account(&config, "/v2/cloud/agents", "PUT", Some(&body));
+        if !matches!(
+            tokio::time::timeout(Duration::from_secs(10), sent).await,
+            Ok(Ok(response)) if (200..300).contains(&response.status)
+        ) {
+            tracing::info!("cloud agent sign-ins not reported to the account");
+        }
+    });
+}
+
 /// Records which providers still hold sessions back. A blocked provider never
 /// holds the project or other sessions: those resume, and these wait as
 /// paused rows naming their provider.

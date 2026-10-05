@@ -71,6 +71,7 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             get(crate::pro::profile).put(crate::pro::put_profile),
         )
         .route("/pro/sleep", post(crate::pro::sleep))
+        .route("/pro/leave", post(crate::pro::leave))
         .route("/pro/wake", post(crate::pro::wake))
         .route("/pro/power", put(crate::pro::power))
         .route("/pro/handoff", post(crate::pro::handoff))

@@ -12,6 +12,7 @@ pub(crate) mod engine;
 pub(crate) mod execution;
 pub(crate) mod install;
 mod kept;
+mod leave;
 pub(crate) mod mirror;
 pub(crate) mod moves;
 pub(crate) mod policy;
@@ -31,10 +32,12 @@ pub(crate) use drain::{cancel as cancel_drain, start as drain};
 pub(crate) use kept::{
     file as kept_file, list as kept_list, resolve as kept_resolve, resolve_all as kept_resolve_all,
 };
+pub(crate) use leave::leave;
 #[cfg(feature = "daemon-extension-fixture")]
 pub(crate) use moves::device_fixture;
 pub(crate) use moves::{acted_here, other_computer};
 pub(crate) use policy::CloudProfile;
+pub(crate) use provider_gate::report_cloud_agents;
 pub(crate) use provider_gate::{
     blocking_provider, cloud_provider_blocks, workspace_provider_blocks,
 };
@@ -85,6 +88,8 @@ pub(crate) struct ProState {
     /// the app returns (`/pro/wake`) or the account signs out. Persisted, so
     /// a daemon restart keeps them away too.
     parked: Mutex<std::collections::HashSet<String>>,
+    /// Each project's last leave outcome (`leave.rs`). Persisted.
+    left: Mutex<HashMap<String, leave::Outcome>>,
     /// The last bytes written, so an unchanged tick costs no disk sync.
     persistence: Arc<AsyncMutex<Option<Vec<u8>>>>,
     #[cfg(test)]
@@ -252,6 +257,9 @@ struct DiskState {
     /// so an unchanged set writes the same bytes.
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     parked: std::collections::BTreeSet<String>,
+    /// Each project's last leave outcome; sorted for stable bytes.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    left: std::collections::BTreeMap<String, leave::Outcome>,
 }
 /// A return's kept-both report as persisted: the count, and the kept copies'
 /// project-relative paths (fewer than `files` when bounded, see
@@ -483,6 +491,13 @@ impl ProState {
             sleeping: Mutex::new(Default::default()),
             release_pending: Mutex::new(Default::default()),
             parked: Mutex::new(parked),
+            left: Mutex::new(
+                disk.left
+                    .into_iter()
+                    .filter(|(id, _)| valid_id(id))
+                    .take(128)
+                    .collect(),
+            ),
             persistence: Arc::new(AsyncMutex::new(None)),
             #[cfg(test)]
             persistence_pause: Mutex::new(None),
@@ -912,6 +927,10 @@ async fn persist(state: &crate::AppState) -> anyhow::Result<()> {
     let adoptions = crate::lock(&state.pro.adoptions).clone();
     let legacy_pending = crate::lock(&state.pro.legacy_pending).clone();
     let parked = crate::lock(&state.pro.parked).iter().cloned().collect();
+    let left = crate::lock(&state.pro.left)
+        .iter()
+        .map(|(id, outcome)| (id.clone(), *outcome))
+        .collect();
     let (provider_blocks, kept_both) = {
         let statuses = crate::lock(&state.pro.status);
         let blocks = statuses
@@ -933,6 +952,7 @@ async fn persist(state: &crate::AppState) -> anyhow::Result<()> {
         ownership,
         preferences,
         parked,
+        left,
     })?;
     anyhow::ensure!(bytes.len() <= 1024 * 1024, "mirror settings exceed limit");
     // State first, then the enrollment latch: a crash between them leaves a
