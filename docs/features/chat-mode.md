@@ -1127,3 +1127,9 @@ _Captured 2026-10-04 (from the maintainer, in-session, PR #249)._
 - **Design constraint (verbatim):** “we are not too verbose and that we stay in line with our UI / UX that we have now which is pretty good for all of this.”
 - **Direction (verbatim):** “make sure Chimaera is generalizable in terms of this (and also in terms of how providers change, or if we add other CLIs / harnesses)”.
 - **Grade:** an addition to the existing capability-based architecture. Exact controls remain implementation choices; no new provider-specific UI contract was requested.
+
+### Grok's mode selector — why it exists
+_Captured 2026-10-05 (from the maintainer, in-session, PR #259)._
+
+- **Problem it solves (verbatim):** “Ok but all of those modes don’t show up in the top bar as they do for the other agents ?”
+- **Grade:** parity with the other agents' header, limited to what Grok confirms over ACP (Normal and Plan). Which further modes to offer, and how, was not specified.

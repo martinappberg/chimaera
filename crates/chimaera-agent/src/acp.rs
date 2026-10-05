@@ -141,7 +141,10 @@ impl Driver for AcpAdapter {
         // until a real user send: opening a fork must stay idle and unbilled.
         mapper.portable_context = spec.portable_context.clone();
         let mut initial = vec![mapper.config_state(false)];
-        // Settings use the same acknowledged protocol path as user changes.
+        // Settings use the same acknowledged protocol path as user changes,
+        // but restoring one is not a pick: its ack must not overwrite the
+        // remembered preference with this conversation's own value.
+        mapper.restoring = true;
         for command in [
             spec.initial_model.as_ref().map(|v| AgentCommand::SetModel {
                 model_id: v.clone(),
@@ -160,6 +163,7 @@ impl Driver for AcpAdapter {
         {
             initial.push(mapper.on_command(command));
         }
+        mapper.restoring = false;
         Ok(Handshake { mapper, initial })
     }
 }
@@ -170,8 +174,9 @@ struct Ask {
 }
 enum Pending {
     Prompt(String),
-    Config(String, String),
-    Mode(String),
+    /// The trailing flag is `chosen`: false for a handshake restore.
+    Config(String, String, bool),
+    Mode(String, bool),
     Model(String),
 }
 struct Queued {
@@ -195,6 +200,12 @@ pub struct AcpMapper {
     interrupted: bool,
     coalescer: Coalescer,
     portable_context: Option<String>,
+    restoring: bool,
+    /// Grok answers `session/set_mode` with `{}` for any id, so only its
+    /// `current_mode_update` confirms a switch. Holds the acked request
+    /// (mode id, chosen) until that update names it.
+    mode_confirmed_by_update: bool,
+    acked_mode: Option<(String, bool)>,
 }
 fn text(v: &Value) -> String {
     cap_output(v.as_str().unwrap_or_default()).0
@@ -286,6 +297,9 @@ impl AcpMapper {
             interrupted: false,
             coalescer: Coalescer::new(),
             portable_context: None,
+            restoring: false,
+            mode_confirmed_by_update: false,
+            acked_mode: None,
         };
         if !mapper.models.is_empty() {
             mapper.caps.commands.push("set_model".into());
@@ -314,6 +328,7 @@ impl AcpMapper {
             .collect();
         self.mode.get_or_insert_with(|| "default".into());
         self.caps.commands.push("set_mode".into());
+        self.mode_confirmed_by_update = true;
     }
     fn set_config(&mut self, config: &Value) {
         // Keep only bounded controls; descriptions and provider metadata are
@@ -507,7 +522,7 @@ impl AcpMapper {
             self.request(
                 "session/set_config_option",
                 json!({"sessionId":self.native,"configId":c["id"],"value":value}),
-                Pending::Config(category.into(), value.into()),
+                Pending::Config(category.into(), value.into(), !self.restoring),
                 step,
             );
         } else {
@@ -520,7 +535,7 @@ impl AcpMapper {
                 "mode" if self.modes.iter().any(|m| m.id == value) => (
                     "session/set_mode",
                     json!({"sessionId":self.native,"modeId":value}),
-                    Pending::Mode(value.into()),
+                    Pending::Mode(value.into(), !self.restoring),
                 ),
                 _ => {
                     step.events.push(AgentEvent::Notice {
@@ -722,7 +737,7 @@ impl Mapper for AcpMapper {
                     message: error.unwrap(),
                     fatal: false,
                 }),
-                Pending::Config(category, value) => {
+                Pending::Config(category, value, chosen) => {
                     let before_model = self.model.clone();
                     if frame["result"]["configOptions"].is_array() {
                         self.set_config(&frame["result"]["configOptions"]);
@@ -734,11 +749,14 @@ impl Mapper for AcpMapper {
                     if category == "model" {
                         self.model = before_model;
                     }
-                    self.changed(&category, value, true, &mut step);
+                    self.changed(&category, value, chosen, &mut step);
                     step.events.extend(self.config_state(false).events);
                 }
                 Pending::Model(value) => self.changed("model", value, true, &mut step),
-                Pending::Mode(value) => self.changed("mode", value, true, &mut step),
+                Pending::Mode(value, chosen) if self.mode_confirmed_by_update => {
+                    self.acked_mode = Some((value, chosen));
+                }
+                Pending::Mode(value, chosen) => self.changed("mode", value, chosen, &mut step),
             }
             return step;
         }
@@ -945,11 +963,16 @@ impl Mapper for AcpMapper {
                 step.events.push(AgentEvent::Plan { entries });
             }
             "current_mode_update" => {
-                self.mode = Some(small(&update["currentModeId"]));
-                step.events.push(AgentEvent::ModeChanged {
-                    mode_id: self.mode.clone().unwrap(),
-                    chosen: false,
-                });
+                let mode_id = small(&update["currentModeId"]);
+                // The update that confirms an acked request carries that
+                // request's `chosen`; any other is the agent's own change.
+                let chosen = self
+                    .acked_mode
+                    .take()
+                    .is_some_and(|(acked, chosen)| acked == mode_id && chosen);
+                self.mode = Some(mode_id.clone());
+                step.events
+                    .push(AgentEvent::ModeChanged { mode_id, chosen });
             }
             _ => {}
         }
@@ -993,6 +1016,25 @@ mod tests {
         });
         assert_eq!(step.outbound[0]["method"], "session/set_mode");
         assert_eq!(step.outbound[0]["params"]["modeId"], "plan");
+        // The `{}` ack confirms nothing; the update that follows does.
+        let acked = m.on_frame(&json!({"id":step.outbound[0]["id"],"result":{}}));
+        assert!(acked.events.is_empty());
+        assert_eq!(m.mode.as_deref(), Some("default"));
+        let confirmed = m.on_frame(&json!({"method":"session/update","params":{"sessionId":"session","update":{"sessionUpdate":"current_mode_update","currentModeId":"plan"}}}));
+        assert!(confirmed.events.iter().any(
+            |e| matches!(e, AgentEvent::ModeChanged { mode_id, chosen: true } if mode_id == "plan")
+        ));
+        // A handshake restore travels the same path but is not a pick.
+        m.restoring = true;
+        let step = m.on_command(AgentCommand::SetMode {
+            mode_id: "default".into(),
+        });
+        m.restoring = false;
+        m.on_frame(&json!({"id":step.outbound[0]["id"],"result":{}}));
+        let confirmed = m.on_frame(&json!({"method":"session/update","params":{"sessionId":"session","update":{"sessionUpdate":"current_mode_update","currentModeId":"default"}}}));
+        assert!(confirmed.events.iter().any(
+            |e| matches!(e, AgentEvent::ModeChanged { mode_id, chosen: false } if mode_id == "default")
+        ));
         // An id Grok would accept silently is never sent.
         let step = m.on_command(AgentCommand::SetMode {
             mode_id: "bypassPermissions".into(),

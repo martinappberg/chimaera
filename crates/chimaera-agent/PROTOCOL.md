@@ -2839,7 +2839,9 @@ Grok 1.0.46 advertises no modes: `session/new` has no `modes` and no `mode` conf
 `modeId`, but only `plan` and `default` do anything: each is confirmed by a `current_mode_update`
 (`currentModeId` `plan` / `default`). `auto`, `bypassPermissions`, `acceptEdits`, `dontAsk` and an
 invented id are accepted with no update. The adapter therefore offers Grok exactly Normal
-(`default`) and Plan (`plan`), Grok's own names for them. Its other permission modes have no
+(`default`) and Plan (`plan`), Grok's own names for them. Because the `{}` answer confirms
+nothing, the adapter reports a Grok mode change only on the `current_mode_update` (which follows
+the answer). Its other permission modes have no
 verified mid-session switch: `x.ai/toggle_plan_mode` and every `x.ai/*yolo*` method guess return
 method-not-found; a `/always-approve on` prompt ends with zero tokens and `_x.ai/sessions/changed`
 still reports `yolo: false`; `_meta.yoloMode` on `session/new` does report `yolo: true`.
