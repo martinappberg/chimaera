@@ -976,6 +976,14 @@
   function onScroll() {
     const el = transcriptEl;
     if (el === null) return;
+    // A parked view has no reader. Its scroller still moves — a turn ending
+    // while hidden drops the status row, and WebKit clamps the offset — and
+    // against a frozen range with rows waiting that read as leaving the live
+    // edge: the chat reopened short of its newest row, no longer following.
+    if (!visible) {
+      lastScrollTop = el.scrollTop;
+      return;
+    }
     const top = el.scrollTop;
     const moved = top !== lastScrollTop;
     const up = top < lastScrollTop;

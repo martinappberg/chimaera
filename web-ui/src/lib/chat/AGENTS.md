@@ -275,7 +275,10 @@ per-chunk work proportional to the TRAILING OPEN SEGMENT, not the message:
   ahead of the scroll they cause; the wheel listener must stay passive). The
   live-tail chrome gates on `atLiveEdge`, which counts a tail window whose
   appended row is one flush from rendering as live: tearing the status row out
-  and back in per append was one of those shrinks. Repro: the real-WebKit
+  and back in per append was one of those shrinks. A parked view's scroll
+  events are ignored outright: a turn ending while hidden drops the status
+  row, the clamp's event met a frozen range with rows waiting, and the chat
+  reopened short of its newest row with following off. Repro: the real-WebKit
   harness in `scripts/perf/transcript-scroll/` with a page script that sends
   and samples the gap.
 - **Never write `scrollTop` while a gesture may be in flight.** WebKit (the
