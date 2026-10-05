@@ -1,9 +1,10 @@
 /**
- * A hook's words as claude reports them. A hook that prints several lines
- * arrives as one notice with every line prefixed alike (`Stop says: …`,
- * `PreToolUse:Bash says: …`); read as one run of text that repeats the
- * prefix mid-sentence. This splits such a notice into the prefix, said
- * once, and the hook's own lines.
+ * A hook's words as claude reports them. What a hook prints arrives as one
+ * notice with every line prefixed alike (`Stop says: …`,
+ * `PreToolUse:Bash says: …`); read as one run of text, a several-line report
+ * repeats the prefix mid-sentence. This splits such a notice into the
+ * hook's name and the hook's own lines (`HookRow` shows them as one quiet,
+ * expandable line).
  */
 
 /** claude's per-line prefix: the hook's name (its event, with what it
@@ -15,6 +16,9 @@
  *  trimmed. */
 const SAYS = /^(\S.{0,119}?) says:(?: (.*))?$/;
 
+/** A one-line notice that can only be a hook's. */
+const ONE_LINE = /^\S+ says: /;
+
 export interface HookNotice {
   /** The hook as claude names it, e.g. `Stop` or `PreToolUse:Bash`. */
   hook: string;
@@ -22,11 +26,12 @@ export interface HookNotice {
   lines: string[];
 }
 
-/** The notice as a hook's multi-line output, or `null` for anything else —
- *  a one-line hook notice included: it already reads right as it is. */
+/** The notice as a hook's output, or `null` for anything else. A one-line
+ *  notice counts only when its name has no space in it — a hook's name
+ *  rarely does, and one line of ordinary words can hold " says:". */
 export function hookNotice(text: string): HookNotice | null {
   const rows = text.split(/\r?\n/);
-  if (rows.length < 2) return null;
+  if (rows.length < 2 && !ONE_LINE.test(text)) return null;
   let hook: string | null = null;
   const lines: string[] = [];
   for (const row of rows) {

@@ -3080,7 +3080,9 @@ subagent's own `PreToolUse`/`PostToolUse` and `SubagentStop` payloads all carry
 (`<repo>/.claude/worktrees/agent-<agent_id>`, branch `worktree-agent-<agent_id>`).
 The parent's own hooks carry neither field and keep the parent's `cwd`. ADOPTED:
 the daemon's session tracker takes `cwd` only from payloads without a subagent
-identity, so a chat is never shown in its subagent's worktree. A hook's
+identity, so a chat is never shown in its subagent's worktree, and answers a
+subagent's hook with no `additionalContext` of the session's (agent messages,
+same-file lines) — those wait for the session's own next hook. A hook's
 multi-line `systemMessage` reaches the chat as one `system/informational` notice
 with `<hook name> says: ` before every line; the chat UI folds the prefix
 (`web-ui/src/lib/chat/hookNotice.ts`).

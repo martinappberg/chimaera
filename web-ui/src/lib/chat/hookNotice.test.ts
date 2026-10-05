@@ -39,8 +39,13 @@ describe("hookNotice", () => {
     });
   });
 
+  it("reads a one-line hook notice whose name is one word", () => {
+    expect(hookNotice("SessionStart:startup says: hello")).toEqual({ hook: "SessionStart:startup", lines: ["hello"] });
+  });
+
   it("leaves everything else alone", () => {
-    expect(hookNotice("SessionStart:startup says: hello")).toBeNull();
+    expect(hookNotice("The agent says: hello")).toBeNull();
+    expect(hookNotice("Stop says:")).toBeNull();
     expect(hookNotice("Stop says: one\nand a line of something else")).toBeNull();
     expect(hookNotice("Stop says: one\nSubagentStop says: two")).toBeNull();
     expect(hookNotice("Stop says:one\nStop says:two")).toBeNull();

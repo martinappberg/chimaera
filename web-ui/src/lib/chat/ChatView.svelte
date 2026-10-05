@@ -69,6 +69,7 @@
   import AgentMessageMeta from "./AgentMessageMeta.svelte";
   import Composer from "./Composer.svelte";
   import { hookNotice } from "./hookNotice";
+  import HookRow from "./HookRow.svelte";
   import SameFileNotice from "../workspace/SameFileNotice.svelte";
   import ModsWorkbench from "./ModsWorkbench.svelte";
   import ModSite from "./ModSite.svelte";
@@ -2817,13 +2818,7 @@
       {:else if item.block.kind === "notice"}
         {@const hook = item.block.tone === "info" ? hookNotice(item.block.text) : null}
         {#if hook}
-          <!-- A hook's several lines: its name once, its lines as written. -->
-          <div class="notice" data-block-index={item.index} data-block-uid={item.block.uid}>
-            <div class="hook-said"
-              ><span class="hook-name">{hook.hook} says:</span>
-              <span class="hook-lines">{hook.lines.join("\n")}</span></div
-            >
-          </div>
+          <HookRow said={hook} sourceIndex={item.index} sourceUid={item.block.uid} />
         {:else if !(incompatibleRuntime && item.block.text === store.fatalError)}
         <div
           class="notice"
@@ -3533,24 +3528,6 @@
   }
   .notice.error {
     color: var(--err);
-  }
-  /* Centered as a block, read left to right: the hook's own line breaks
-     and list indents are kept. The name wraps like the lines do: a tool's
-     full name (`PreToolUse:mcp__…`) has no break of its own and would run
-     out of a narrow pane. */
-  .hook-said {
-    display: inline-flex;
-    flex-direction: column;
-    gap: 2px;
-    max-width: 100%;
-    text-align: left;
-    overflow-wrap: anywhere;
-  }
-  .hook-name {
-    opacity: 0.75;
-  }
-  .hook-lines {
-    white-space: pre-wrap;
   }
   .runtime-error {
     max-width: 64ch;

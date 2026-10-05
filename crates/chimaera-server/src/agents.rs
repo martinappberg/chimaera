@@ -616,13 +616,17 @@ pub(crate) async fn ingest(
         matches!(event, "SessionStart" | "UserPromptSubmit") && !record.compute_ctx_delivered
     };
 
+    // A hook fired inside a subagent (`agent_id` set — verified claude
+    // 2.1.289) speaks for the subagent, not the session: its `cwd` is the
+    // subagent's folder, and what this answers lands in the subagent's
+    // context.
+    let own_hook = subagent_identity(&payload).is_none();
+
     // Every hook payload carries claude's current `cwd`: an agent that
     // enters a worktree mid-session is shown there (git session tracker).
-    // A hook fired inside a subagent (`agent_id` set) carries the SUBAGENT's
-    // folder — its own worktree under `isolation: "worktree"` — while the
-    // session itself has not moved, so those never move it (verified claude
-    // 2.1.289).
-    if subagent_identity(&payload).is_none() {
+    // A subagent's is its own worktree under `isolation: "worktree"` while
+    // the session itself has not moved, so those never move it.
+    if own_hook {
         if let Some(cwd) = payload.get("cwd").and_then(|c| c.as_str()) {
             changed |= state.git.sessions.note_hook_cwd(&id, cwd);
         }
@@ -740,14 +744,18 @@ pub(crate) async fn ingest(
     // Messages from other agents ride the same carriers: at the agent's
     // next step (PostToolUse — live-verified to reach claude in chat mode
     // too, PROTOCOL.md Pass 39), with the user's prompt, or at start. Never
-    // a new turn; nothing waiting adds nothing.
-    context.extend(crate::comms::hook_context(&state, &id, event).await);
+    // a new turn; nothing waiting adds nothing. A subagent's hook is never
+    // the carrier: the message would be marked read inside a context the
+    // session's own agent never sees — it waits for the session's next step.
+    if own_hook {
+        context.extend(crate::comms::hook_context(&state, &id, event).await);
+    }
 
     // Two live sessions here wrote the same file: this one hears about the
     // other, once per file per pair (claude reads PostToolUse and
     // UserPromptSubmit context alike). Nothing locks; with no overlap this
     // adds nothing and the answer stays byte-identical.
-    if matches!(event, "PostToolUse" | "UserPromptSubmit") {
+    if own_hook && matches!(event, "PostToolUse" | "UserPromptSubmit") {
         context.extend(crate::history::same_file_lines(&state, &id));
     }
 
