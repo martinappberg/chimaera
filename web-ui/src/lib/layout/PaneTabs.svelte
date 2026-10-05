@@ -476,7 +476,10 @@
       const sid = activeTerminal.sessionId;
       entries.push("separator", { label: `Review ${touched.length} changed files`, onSelect: () => ctrl.openChangesFrom(node.id, sid, false) });
     }
-    entries.push("separator", { label: `Close view (${keyHint("closeView")})`, onSelect: () => ctrl.closeView(node.id) });
+    const active = node.tabs[node.active];
+    entries.push("separator");
+    if (active !== undefined) entries.push(newWindowEntry(active, node.active));
+    entries.push({ label: `Close view (${keyHint("closeView")})`, onSelect: () => ctrl.closeView(node.id) });
     return entries;
   }
 
@@ -595,13 +598,9 @@
     }
   }
 
-  /** The cross-window section every surface gets: tear out into a new
-   *  window, or move into a live sibling window (same host + workspace).
-   *  Dirty files are blocked — their unsaved buffer lives in THIS window.
-   *  The roster is the last refresh's snapshot; refreshing here (fire-and-
-   *  forget) keeps it current for the next open. */
-  function moveEntries(tab: Tab, i: number): ContextMenuEntry[] {
-    ctrl.refreshMoveTargets();
+  /** Unsaved buffers and volatile drafts live in this window, so both
+   *  menu entry points must block moving their owning tab elsewhere. */
+  function windowMoveGuard(tab: Tab): { disabled: boolean; hint?: string } {
     const dirty =
       (tab.surface === "file" && $dirtyFiles.has(tab.path)) ||
       (tab.surface === "terminal" && $volatileChatDrafts.has(tab.sessionId));
@@ -610,23 +609,33 @@
         ? "save the file first — moving would drop unsaved edits"
         : "send or clear the chat draft first — it cannot follow to another window"
       : undefined;
+    return { disabled: dirty, hint };
+  }
+
+  function newWindowEntry(tab: Tab, i: number): ContextMenuEntry {
+    return {
+      label: "Move to New Window",
+      ...windowMoveGuard(tab),
+      onSelect: () => ctrl.detachTabToWindow(node.id, i),
+    };
+  }
+
+  /** Same-host/workspace siblings use the last refresh's snapshot;
+   *  refreshing here keeps it current for the next menu open. */
+  function moveEntries(tab: Tab, i: number): ContextMenuEntry[] {
+    ctrl.refreshMoveTargets();
+    const guard = windowMoveGuard(tab);
     const rows: ContextMenuEntry[] = [
       ...ctrl.paneTargets().filter((p) => p.id !== node.id).map((p) => ({
         label: `Move to pane ${p.number}${paneMoveHint(p.number) ? ` (${paneMoveHint(p.number)})` : ""}`,
         onSelect: () => ctrl.moveTabToPane(node.id, i, p.id),
       })),
-      {
-        label: "Move to New Window",
-        disabled: dirty,
-        hint,
-        onSelect: () => ctrl.detachTabToWindow(node.id, i),
-      },
+      newWindowEntry(tab, i),
     ];
     for (const w of ctrl.moveTargets()) {
       rows.push({
         label: `Move to “${w.label || "window"}”`,
-        disabled: dirty,
-        hint,
+        ...guard,
         onSelect: () => ctrl.moveTabToWindow(node.id, i, w.winId),
       });
     }

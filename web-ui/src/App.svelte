@@ -6049,7 +6049,9 @@
   {#if layout.focusMode}
     <!-- Focus-mode session strip: the rail is gone, but the window always
          says where you are. Hidden whenever the rail is visible. -->
-    <footer class="strip">
+    <!-- Deep native drag regions include the strip's padding and flex gaps;
+         Tauri excludes interactive descendants, so its buttons still work. -->
+    <footer class="strip" data-tauri-drag-region={nativeTitlebarOverlay ? "deep" : undefined}>
       {#if !detachedWindow}
         <!-- Sidebar reveal is the MAIN window's affordance. A detached solo
              window offers no rail at all — it is just its pane; the way back
@@ -8000,6 +8002,7 @@
   /* The solo strip's flex grower (the chips row plays this role in normal
      windows; .strip-drag exists only under the macOS titlebar overlay). */
   .strip-spacer {
+    align-self: stretch;
     flex: 1;
     min-width: 0;
   }

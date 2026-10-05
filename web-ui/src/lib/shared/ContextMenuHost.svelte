@@ -12,7 +12,7 @@
     type ContextMenuItem,
   } from "./contextMenu.svelte";
   import { dismiss } from "./dismiss";
-  import { writeClipboard } from "../net/native";
+  import { copyText } from "./clipboard";
 
   function onUnhandledContextMenu(e: MouseEvent): void {
     if (e.defaultPrevented) return;
@@ -21,7 +21,7 @@
     if (e.target instanceof Element && e.target.closest("input, textarea, [contenteditable='true'], .term-host") !== null) return;
     const selection = window.getSelection()?.toString() ?? "";
     if (selection !== "") {
-      contextMenu.openAt(e, [{ label: "Copy selection", onSelect: () => { void writeClipboard(selection); } }]);
+      contextMenu.openAt(e, [{ label: "Copy selection", onSelect: () => { void copyText(selection); } }]);
     } else {
       e.preventDefault();
       contextMenu.close();

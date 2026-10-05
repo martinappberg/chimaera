@@ -135,7 +135,9 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   active tab carries a thin accent underline; a tab drag hovering near either edge of an
   overflowed strip auto-scrolls it. The tab row is 28px high and starts flush with the
   pane edge, with no reserved drag-handle gutter. Find and zoom stay directly
-  reachable, while split, text size/reset, and close-view actions share **Pane actions**.
+  reachable, while split, text size/reset, **Move to New Window** (the active tab),
+  and close-view actions share **Pane actions**. Window moves use the same unsaved-edit
+  and chat-draft guards as the tab context menu, and are absent on empty panes.
   In narrow panes, changed-file summaries are also available in that menu.
 - **Preview (italic) tabs.** File opens are **preview** tabs, VS Code-style: the name renders
   italic, opening another file **replaces** the one preview slot per pane (so single-clicking
@@ -191,7 +193,8 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   shell, dragging **over another chimaera window** on the same host+workspace flips the hint
   to "move into window" — the target lights up its normal drop-spot previews and the drop
   lands there (Escape cancels and clears the highlight). Without a drag: every tab's context
-  menu carries **Move to New Window** and **Move to ⟨window⟩** rows, and a detached window's
+  menu carries **Move to New Window** and **Move to ⟨window⟩** rows; **Pane actions** also
+  offers **Move to New Window** for its active tab. A detached window's
   strip has a one-click **re-attach** that sends everything back to its origin window (on
   success the emptied solo window closes itself). Browser windows have the menu paths but no
   cross-window drag (nothing there can know sibling geometry).
@@ -210,7 +213,9 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   the focus-mode chord is gated, and boot heals a blob persisted rail-open; re-attach is the
   way back to the full workbench). Its slim strip shows only its own things: workspace label
   (inert), re-attach, host, and an attention badge scoped to the sessions THIS window shows —
-  never the workspace-wide roster. It titles itself after its tab, never writes the `ws_`
+  never the workspace-wide roster. In the macOS titlebar overlay, the entire strip's
+  non-interactive area drags the window, including padding and gaps; buttons stay clickable.
+  It titles itself after its tab, never writes the `ws_`
   layout mirror (a partial layout must not poison the workspace window's restore fallback),
   self-closes when its last tab goes, is excluded from "open this workspace" raises
   (`WindowScope.detached`, set-only), and restores on app relaunch like any window. Moves
