@@ -222,7 +222,8 @@ per-chunk work proportional to the TRAILING OPEN SEGMENT, not the message:
   same keys — ⇧⌘↩ is Zoom Pane) holds a message until the turn ends: its echo carries `after_turn`, kept as `afterTurn` (caption "after
   this turn" vs "next step"). Every waiting bubble offers **Send now**
   (`{type:"send_now", id}`: the daemon interrupts the turn and every waiting
-  message is read at once) and ✕ (`{type:"cancel_queued", id}`: pulls back a
+  message is read at once; for Claude this is the CLI's send-now, which leaves
+  background agents running, unlike Stop) and ✕ (`{type:"cancel_queued", id}`: pulls back a
   waiting send, dismisses a dropped one — the driver's tombstone `Cancelled`
   survives replay — and no-ops, or answers a Notice, once read). A **Stop
   never drops the queue** — the driver aborts only the turn and the waiting

@@ -129,6 +129,13 @@ fn queued_message_frame(uuid: &str, content: Value, priority: &str) -> Value {
 /// `command_lifecycle` frames (`queued` → `started` → a terminal state).
 const MSG_LIFECYCLE_CAPABILITY: &str = "msg_lifecycle_v1";
 
+/// The `system/init` capability of a CLI whose `interrupt` takes
+/// `send_now: true` (2.1.289): the waiting messages are read now, and nothing
+/// outside the running turn is ended. A plain `interrupt` is the CLI's Stop,
+/// which also kills every background agent and marks it "stopped by the
+/// user" — the CLI then refuses to resume it.
+const SEND_NOW_CAPABILITY: &str = "interrupt_send_now_v1";
+
 fn control_request_frame(id: &str, request: Value) -> Value {
     json!({
         "type": "control_request",
@@ -683,6 +690,9 @@ enum PendingControl {
     Background,
     /// stop_task ack (subagent stop).
     StopTask,
+    /// `interrupt {send_now}` receipt: its `send_now` word says whether the
+    /// running turn was stopped for the waiting messages.
+    SendNow,
     /// cancel_async_message ack: `{cancelled}` for this queued message.
     CancelQueued(String),
     /// remote_control round-trip: enable answers `{session_url, connect_url,
@@ -821,6 +831,9 @@ struct ClaudeMapper {
     /// agent's next step and reports when (`awaiting_read`) — the official
     /// clients' behavior. Without it, messages are held (`queued_sends`).
     native_queue: Option<bool>,
+    /// Whether the CLI advertised [`SEND_NOW_CAPABILITY`] on its latest
+    /// `system/init`.
+    send_now_capable: bool,
     /// Mid-turn messages already written to the CLI's own queue that the
     /// agent has not read yet, in send order. Each resolves on its
     /// `command_lifecycle` frame: `started` → `sent` (folded into the running
@@ -1023,6 +1036,7 @@ impl ClaudeMapper {
             background_tasks: Vec::new(),
             departed_background: VecDeque::new(),
             native_queue: None,
+            send_now_capable: false,
             awaiting_read: VecDeque::new(),
             turn_starting: false,
             queued_sends: VecDeque::new(),
@@ -1363,6 +1377,9 @@ impl ClaudeMapper {
                     .as_array()
                     .is_some_and(|caps| caps.iter().any(|c| c == MSG_LIFECYCLE_CAPABILITY));
                 self.native_queue = Some(native);
+                self.send_now_capable = frame["capabilities"]
+                    .as_array()
+                    .is_some_and(|caps| caps.iter().any(|c| c == SEND_NOW_CAPABILITY));
                 if native {
                     // Sent before this first init could say which kind of CLI
                     // this is: the CLI's own queue takes them from here.
@@ -3073,6 +3090,20 @@ impl ClaudeMapper {
                 self.request_settings(step);
             }
             PendingControl::Interrupt | PendingControl::SetThinking => {}
+            // Live 2.1.289: the receipt lands before the stopped turn's
+            // result. `stopped` promises that result, so the watchdog covers
+            // a CLI that never sends it. `delivering` keeps the turn (what it
+            // waited on moved to the background, or the message was already
+            // on its way in) and may still end it for the message later —
+            // the user's doing either way, so the flag stays. Only
+            // `nothing_waiting` did nothing at all.
+            PendingControl::SendNow => match payload["send_now"].as_str() {
+                Some("stopped") if self.turn_active || self.turn_starting => {
+                    self.interrupt_grace = Some(INTERRUPT_GRACE_TICKS);
+                }
+                Some("nothing_waiting") => self.interrupt_requested = false,
+                _ => {}
+            },
             PendingControl::ContextUsage => {
                 let usage = if payload.get("usage").is_some() {
                     &payload["usage"]
@@ -3240,7 +3271,13 @@ impl ClaudeMapper {
     /// Clears the map it drains.
     fn settle_dangling_tasks(&mut self, interrupted: bool, step: &mut DriverStep) {
         self.task_labels.clear();
-        for row in std::mem::take(&mut self.task_rows).into_values() {
+        for (task_id, row) in std::mem::take(&mut self.task_rows) {
+            // A backgrounded agent the CLI still lists outlives the turn: a
+            // send-now abort ends only the turn (a Stop empties the set and
+            // closes each agent before its result).
+            if self.background_tasks.iter().any(|t| t.id == task_id) {
+                continue;
+            }
             step.events.push(AgentEvent::ToolCallUpdate {
                 id: row,
                 status: if interrupted {
@@ -4019,13 +4056,21 @@ impl ClaudeMapper {
             // as a duplicate, and a fresh one would orphan the bubble's
             // rewind key. Already read (or nothing running): nothing to do.
             AgentCommand::SendNow { id } => {
-                let waiting = self.awaiting_read.contains(&id)
-                    || self.queued_sends.iter().any(|(q, _, _)| *q == id);
+                let at_cli = self.awaiting_read.contains(&id);
+                let waiting = at_cli || self.queued_sends.iter().any(|(q, _, _)| *q == id);
                 // A turn that is starting (a waiting batch was just read) is
                 // interrupted the same way: the CLI aborts it and runs what
                 // is still queued.
                 if waiting && (self.turn_active || self.turn_starting) {
-                    self.interrupt(&mut step);
+                    // A plain interrupt is a Stop: it also kills the
+                    // background agents, for good. The CLI's own send-now
+                    // ends only the turn — but it finds only a message that
+                    // is already in its queue, so a held one stays a Stop.
+                    if at_cli && self.send_now_capable {
+                        self.send_now(&id, &mut step);
+                    } else {
+                        self.interrupt(&mut step);
+                    }
                 }
             }
             // Codex alone exposes queue-vs-steer as two user actions. Claude's
@@ -4092,6 +4137,20 @@ impl ClaudeMapper {
         step.outbound.push(control_request_frame(
             &id,
             json!({ "subtype": "interrupt" }),
+        ));
+    }
+
+    /// The CLI's send-now: `interrupt {send_now, message_uuid}`. The abort it
+    /// may answer with is the user's, so the flag is set here; the watchdog
+    /// waits for the receipt, because the CLI may keep the turn running.
+    fn send_now(&mut self, message_id: &str, step: &mut DriverStep) {
+        self.interrupt_requested = true;
+        let id = self.ctl_id();
+        self.pending_controls
+            .insert(id.clone(), PendingControl::SendNow);
+        step.outbound.push(control_request_frame(
+            &id,
+            json!({ "subtype": "interrupt", "send_now": true, "message_uuid": message_id }),
         ));
     }
 
@@ -5888,6 +5947,94 @@ pub(crate) mod tests {
                 ..
             }]
         ));
+    }
+
+    /// Live 2.1.289: a plain interrupt killed a running background agent for
+    /// good (SendMessage: "was stopped by the user and won't be resumed");
+    /// `interrupt {send_now, message_uuid}` stopped the turn and left it
+    /// running. The watchdog waits for the `stopped` receipt.
+    #[test]
+    fn send_now_spares_background_agents_on_a_capable_cli() {
+        let mut m = native_mapper_mid_turn();
+        m.on_frame(&json!({
+            "type": "system", "subtype": "init", "session_id": "native-1",
+            "capabilities": ["msg_lifecycle_v1", "interrupt_send_now_v1"],
+        }));
+        let (b, _) = send_text(&mut m, "B", false);
+        let step = m.on_command(AgentCommand::SendNow { id: b.clone() });
+        assert_eq!(
+            step.outbound[0]["request"],
+            json!({ "subtype": "interrupt", "send_now": true, "message_uuid": b })
+        );
+        assert!(m.interrupt_requested);
+        assert!(m.interrupt_grace.is_none(), "the turn may keep running");
+        let ctl = step.outbound[0]["request_id"].clone();
+        m.on_frame(&json!({
+            "type": "control_response",
+            "response": { "subtype": "success", "request_id": ctl,
+                "response": { "still_queued": [b], "send_now": "stopped" } },
+        }));
+        assert!(m.interrupt_grace.is_some(), "a promised result is watched");
+        // The Stop button stays the CLI's Stop.
+        let step = m.on_command(AgentCommand::Interrupt);
+        assert_eq!(
+            step.outbound[0]["request"],
+            json!({ "subtype": "interrupt" })
+        );
+    }
+
+    /// The turn a send-now aborts takes its foreground agents with it, not a
+    /// backgrounded one the CLI still lists: that row must not read "stopped".
+    #[test]
+    fn an_aborted_turn_leaves_a_listed_background_agent_row_alone() {
+        let mut m = native_mapper_mid_turn();
+        for (id, backgrounded) in [("tk-bg", true), ("tk-fg", false)] {
+            m.on_frame(&json!({
+                "type": "system", "subtype": "task_started", "task_type": "local_agent",
+                "task_id": id, "description": id, "is_backgrounded": backgrounded,
+            }));
+        }
+        m.on_frame(&json!({
+            "type": "system", "subtype": "background_tasks_changed",
+            "tasks": [{ "task_id": "tk-bg", "task_type": "local_agent", "description": "tk-bg" }],
+        }));
+        m.on_frame(&json!({
+            "type": "stream_event",
+            "event": { "type": "content_block_delta", "index": 0,
+                "delta": { "type": "text_delta", "text": "working" } },
+        }));
+        m.interrupt_requested = true;
+        let step = m.on_frame(&json!({ "type": "result", "is_error": true }));
+        let closed: Vec<&str> = step
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ToolCallUpdate { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(closed, ["task:tk-fg"]);
+    }
+
+    /// A send-now that found nothing waiting did nothing: a later genuine
+    /// error must not read as the user's stop.
+    #[test]
+    fn send_now_that_finds_nothing_waiting_leaves_no_interrupt_behind() {
+        let mut m = native_mapper_mid_turn();
+        m.on_frame(&json!({
+            "type": "system", "subtype": "init", "session_id": "native-1",
+            "capabilities": ["msg_lifecycle_v1", "interrupt_send_now_v1"],
+        }));
+        let (b, _) = send_text(&mut m, "B", false);
+        let step = m.on_command(AgentCommand::SendNow { id: b });
+        let ctl = step.outbound[0]["request_id"].clone();
+        m.on_frame(&json!({
+            "type": "control_response",
+            "response": { "subtype": "success", "request_id": ctl,
+                "response": { "still_queued": [], "send_now": "nothing_waiting" } },
+        }));
+        assert!(!m.interrupt_requested);
+        assert!(m.interrupt_grace.is_none());
     }
 
     /// Send now ends the running turn; the CLI then runs what is still in its
