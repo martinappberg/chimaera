@@ -55,7 +55,8 @@ on the per-session MCP endpoint ([linked-terminals.md](linked-terminals.md#the-m
 - **How it's used.**
   - **Claude, chat or terminal:** the next hook that fires answers with it as
     `additionalContext` — at its next step (PostToolUse), with the user's next prompt
-    (UserPromptSubmit), or at start. A chat session also journals an `agent_message` event so
+    (UserPromptSubmit), or at start. A hook fired inside one of its subagents never carries it
+    (it would be read there and never by the agent it was sent to). A chat session also journals an `agent_message` event so
     its transcript shows the message where the agent read it.
   - **Codex chat, mid-turn:** `send_if_running` — steered into the running turn (a queued
     user message with `origin: "agent"`), read (`sent`) at its next step. One that misses its

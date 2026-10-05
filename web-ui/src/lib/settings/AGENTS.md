@@ -12,6 +12,14 @@ default, label, and grouping — is declared there once; the form (`SettingRow`,
 `AgentsSettings`) and the raw editor (`SettingsJson`) both derive from it. Add a
 setting by adding it to the schema, not by hand-wiring a control.
 
+`chat.codexSteering` is launch-scoped: its Agent default preserves the native
+Codex configuration; the Next step / Immediate choices override only newly
+started or resumed structured chat processes. It does not change queued sends.
+
+`chat.newSessionModel` defaults to the existing remembered model/effort behavior.
+Agent default omits those per-agent preferences at launch; explicit choices and
+the resumed conversation's own settings still win. Permission-mode memory is independent.
+
 **Exception — Environment.** The Environment category is store-backed, not
 schema-backed: `EnvironmentSettings.svelte` edits the daemon's prelude map over
 `/api/v1/environment` (persisted as `env-profiles.json`, not `settings.json`).

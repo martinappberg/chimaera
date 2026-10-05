@@ -35,6 +35,8 @@ export interface FileTab {
    * no-duplicates invariant is unaffected.
    */
   preview?: boolean;
+  /** Link navigation owned by this document view; never persisted. */
+  fileTrail?: { paths: string[]; index: number };
 }
 /** The settings surface — a singleton view (no-duplicates gives "focus the
  *  existing settings tab" for free, VS Code semantics). */
@@ -237,8 +239,14 @@ export interface PaneNode {
   type: "pane";
   id: string;
   tabs: Tab[];
+  /** Stable shortcut destination: inserting or moving another pane must not
+   *  silently redirect an existing numbered focus/move chord. */
+  number?: number;
   /** Index into `tabs`; meaningless (0) when `tabs` is empty. */
   active: number;
+  /** Runtime-only MRU identities: closing a view returns to its source, not
+   *  whichever tab happens to sit beside it. Never stores closed views. */
+  recent?: string[];
   /**
    * Per-pane terminal font size override (px); undefined = the default.
    * Applies to whichever terminal tab the pane shows; persisted with the
@@ -278,8 +286,9 @@ const MAX_DEPTH = 32;
  * Ceiling on the auto-split that shift+cmd+arrow performs when there is no pane
  * to move into yet: never grow a window past `MAX_PANES` panes, and never split
  * a pane so tight that the two halves fall below `MIN_PANE_FRAC` of the window
- * on the split axis. Both guard the auto-split only — an explicit split chord or
- * a drag-tear is still unbounded (deliberate manual placement). ("max 4, or some
+ * on the split axis. The size guard applies to auto-splits only. Empty-pane
+ * and split chords share the count cap in App; a drag-tear remains unbounded
+ * (deliberate manual placement). ("max 4, or some
  * percentage of the window", per the request.)
  */
 export const MAX_PANES = 4;
@@ -302,6 +311,7 @@ export function emptyPane(): PaneNode {
 
 export function defaultLayout(): Layout {
   const pane = emptyPane();
+  pane.number = 1;
   return { root: pane, focusedPaneId: pane.id, zoomedPaneId: null, focusMode: false };
 }
 
@@ -309,6 +319,12 @@ export function defaultLayout(): Layout {
 export function panes(node: LayoutNode): PaneNode[] {
   if (node.type === "pane") return [node];
   return [...panes(node.a), ...panes(node.b)];
+}
+
+/** The first empty pane sits beside the original; subsequent ones stack in
+ *  the chosen pane without narrowing the neighboring column. */
+export function newPaneSplitDirection(l: Layout): SplitDir {
+  return l.root.type === "pane" ? "row" : "col";
 }
 
 /** The pane whose tab bar touches the window's top-right corner: the right
@@ -426,9 +442,30 @@ function normalize(l: Layout): Layout {
     const p = emptyPane();
     return { root: p, focusedPaneId: p.id, zoomedPaneId: null, focusMode: l.focusMode };
   }
+  const numbers = new Map<string, number>();
+  const usedNumbers = new Set<number>();
   for (const p of list) {
+    if (p.number !== undefined && Number.isSafeInteger(p.number) && p.number > 0 && !usedNumbers.has(p.number)) {
+      numbers.set(p.id, p.number);
+      usedNumbers.add(p.number);
+    }
+  }
+  let freeNumber = 1;
+  for (const p of list) {
+    if (!numbers.has(p.id)) {
+      while (usedNumbers.has(freeNumber)) freeNumber++;
+      numbers.set(p.id, freeNumber);
+      usedNumbers.add(freeNumber);
+    }
+    const number = numbers.get(p.id)!;
     const active = p.tabs.length === 0 ? 0 : Math.min(Math.max(p.active, 0), p.tabs.length - 1);
-    if (active !== p.active) root = withPane(root, p.id, (x) => ({ ...x, active }));
+    const key = p.tabs[active] !== undefined ? tabKey(p.tabs[active]) : null;
+    const live = new Set(p.tabs.map(tabKey));
+    const recent = key === null ? [] : [key, ...(p.recent ?? []).filter((k) => k !== key && live.has(k))];
+    const recentChanged = recent.length !== (p.recent?.length ?? 0) || recent.some((k, i) => k !== p.recent?.[i]);
+    if (number !== p.number || active !== p.active || recentChanged) {
+      root = withPane(root, p.id, (x) => ({ ...x, number, active, recent }));
+    }
   }
   list = panes(root);
   const focusedPaneId = list.some((p) => p.id === l.focusedPaneId) ? l.focusedPaneId : list[0].id;
@@ -511,7 +548,10 @@ export function detachTab(l: Layout, paneId: string, index: number): Layout {
     const root = replaceNode(l.root, paneId, null);
     return normalize({ ...l, root: root ?? emptyPane() });
   }
-  const active = index < p.active ? p.active - 1 : Math.min(p.active, tabs.length - 1);
+  const previous = p.recent?.find((k) => tabs.some((t) => tabKey(t) === k));
+  const active = index === p.active && previous !== undefined
+    ? tabs.findIndex((t) => tabKey(t) === previous)
+    : index < p.active ? p.active - 1 : Math.min(p.active, tabs.length - 1);
   const root = withPane(l.root, paneId, (x) => ({ ...x, tabs, active }));
   return normalize({ ...l, root });
 }
@@ -592,6 +632,56 @@ export function openFile(l: Layout, path: string, preview = false): Layout {
   return openTab(l, tab);
 }
 
+/** Follow a link within a document view. Unrelated opens never inherit this
+ *  trail; dedupe focuses an existing view with its own navigation intact. */
+export function openFileLink(l: Layout, paneId: string, path: string): Layout {
+  const pane = findPane(l.root, paneId);
+  const source = pane?.tabs[pane.active];
+  if (source?.surface !== "file") return openFile(focusPane(l, paneId), path, true);
+  if (paneForTab(l.root, { surface: "file", path }) !== null) {
+    return openFile(focusPane(l, paneId), path, true);
+  }
+  const previous = source.fileTrail ?? { paths: [source.path], index: 0 };
+  const paths = [...previous.paths.slice(0, previous.index + 1), path].slice(-50);
+  // A kept/dirty source survives the link. Its own Forward can return to the
+  // destination without commandeering another document's independent trail.
+  const root = withPane(l.root, paneId, (p) => ({ ...p, tabs: p.tabs.map((t, i) =>
+    i === p.active ? { ...source, fileTrail: { paths, index: Math.max(0, paths.length - 2) } } : t,
+  ) }));
+  return openFileWithTrail({ ...l, root }, paneId, path, { paths, index: paths.length - 1 });
+}
+
+function openFileWithTrail(l: Layout, paneId: string, path: string, fileTrail: NonNullable<FileTab["fileTrail"]>): Layout {
+  const next = openFile(focusPane(l, paneId), path, true);
+  const root = withPane(next.root, next.focusedPaneId, (p) => ({ ...p, tabs: p.tabs.map((t, i) =>
+    i === p.active && t.surface === "file" ? { ...t, fileTrail } : t,
+  ) }));
+  return { ...next, root };
+}
+
+/** Back/forward within the active document's link journey. Kept documents
+ *  stay open; an existing destination retains its own independent history. */
+export function navigateFileHistory(l: Layout, paneId: string, delta: -1 | 1): Layout {
+  const pane = findPane(l.root, paneId);
+  const tab = pane?.tabs[pane.active];
+  const trail = tab?.surface === "file" ? tab.fileTrail : undefined;
+  if (trail === undefined) return l;
+  const index = trail.index + delta;
+  const path = trail.paths[index];
+  if (path === undefined) return l;
+  if (paneForTab(l.root, { surface: "file", path }) !== null) {
+    return openFile(focusPane(l, paneId), path, true);
+  }
+  return openFileWithTrail(l, paneId, path, { paths: trail.paths, index });
+}
+
+/** Numbered pane destinations stay attached to the same pane as it moves.
+ *  Moving a view never changes its underlying agent/session/file. */
+export function moveTabToPane(l: Layout, paneId: string, index: number, targetPaneId: string): Layout {
+  const tab = findPane(l.root, paneId)?.tabs[index];
+  return tab === undefined ? l : dropTab(l, tab, targetPaneId, "center");
+}
+
 /** Whether a tab is a preview tab (a file, a diff or a git view opened by a
  *  single click): one per pane, replaced by the next preview open. */
 export function isPreviewTab(t: Tab): boolean {
@@ -661,7 +751,7 @@ export function pinPaths(l: Layout, paths: ReadonlySet<string>): Layout {
         if (t.surface === "file" && t.preview === true && paths.has(t.path)) {
           touched = true;
           changed = true;
-          return { surface: "file", path: t.path } satisfies FileTab;
+          return withoutPreview(t);
         }
         return t;
       });
@@ -1135,6 +1225,7 @@ export function soloLayout(tabs: Tab[], active = 0, fontSize?: number): Layout {
   const pane: PaneNode = {
     type: "pane",
     id: uid(),
+    number: 1,
     tabs: list,
     active: Math.min(Math.max(active, 0), Math.max(list.length - 1, 0)),
   };
@@ -1277,6 +1368,12 @@ export function rewriteTabPaths(l: Layout, from: string, to: string): Layout {
   const mapTab = (t: Tab): Tab => {
     if (t.surface !== "file" && t.surface !== "diff" && t.surface !== "finder") return t;
     const p = move(t.path);
+    if (t.surface === "file" && t.fileTrail !== undefined) {
+      const paths = t.fileTrail.paths.map(move);
+      if (p !== t.path || paths.some((path, i) => path !== t.fileTrail!.paths[i])) {
+        return { ...t, path: p, fileTrail: { paths, index: t.fileTrail.index } };
+      }
+    }
     return p === t.path ? t : { ...t, path: p };
   };
   const seen = new Set<string>();
@@ -1303,7 +1400,9 @@ export function rewriteTabPaths(l: Layout, from: string, to: string): Layout {
           ? tabs.findIndex((t) => tabKey(t) === tabKey(mapTab(activeTab)))
           : -1;
       const active = keptActive >= 0 ? keptActive : Math.min(node.active, tabs.length - 1);
-      return { ...node, tabs, active };
+      const keys = new Map(node.tabs.map((t) => [tabKey(t), tabKey(mapTab(t))]));
+      const recent = [...new Set(node.recent?.map((k) => keys.get(k) ?? k))];
+      return { ...node, tabs, active, recent };
     }
     const a = walk(node.a);
     const b = walk(node.b);
@@ -1332,9 +1431,15 @@ export function pruneDeletedPath(
   const parent = parentPath(path);
   const retarget = (node: LayoutNode): LayoutNode => {
     if (node.type === "pane") {
-      const tabs = node.tabs.map((t) =>
-        t.surface === "finder" && underPath(t.path, path) ? { ...t, path: parent } : t,
-      );
+      const tabs = node.tabs.map((t) => {
+        if (t.surface === "finder" && underPath(t.path, path)) return { ...t, path: parent };
+        if (t.surface !== "file" || t.fileTrail === undefined) return t;
+        const keep = (p: string) => !underPath(p, path) || preserveDirtyFiles?.has(p) === true;
+        const paths = t.fileTrail.paths.filter(keep);
+        if (paths.length === t.fileTrail.paths.length) return t;
+        const index = Math.max(0, Math.min(paths.length - 1, t.fileTrail.paths.slice(0, t.fileTrail.index + 1).filter(keep).length - 1));
+        return { ...t, fileTrail: paths.length === 0 ? undefined : { paths, index } };
+      });
       return tabs.some((t, i) => t !== node.tabs[i]) ? { ...node, tabs } : node;
     }
     const a = retarget(node.a);
@@ -1457,6 +1562,7 @@ interface SPane {
   id: string;
   tabs: STab[];
   active: number;
+  number?: number;
   /** Per-pane terminal font size (px), when overridden. */
   fs?: number;
 }
@@ -1514,6 +1620,7 @@ function serNode(node: LayoutNode): SNode {
       active: node.active,
     };
     if (node.fontSize !== undefined) pane.fs = node.fontSize;
+    if (node.number !== undefined) pane.number = node.number;
     return pane;
   }
   return { t: "s", id: node.id, dir: node.dir, ratio: node.ratio, a: serNode(node.a), b: serNode(node.b) };
@@ -1638,6 +1745,7 @@ function deserNode(
     }
     const active = Number.isInteger(raw.active) ? raw.active : 0;
     const pane: PaneNode = { type: "pane", id: raw.id, tabs, active };
+    if (typeof raw.number === "number" && Number.isSafeInteger(raw.number) && raw.number > 0) pane.number = raw.number;
     if (typeof raw.fs === "number" && raw.fs >= FONT_MIN && raw.fs <= FONT_MAX) {
       pane.fontSize = raw.fs;
     }

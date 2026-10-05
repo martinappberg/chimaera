@@ -15,6 +15,7 @@
   import { closeThisWindow, isNativeShell } from "../net/native";
   import { isMac } from "../shared/keys";
   import { focusOnMount } from "../shared/focusOnMount";
+  import ContextMenuHost from "../shared/ContextMenuHost.svelte";
 
   let { sessionId }: { sessionId: string } = $props();
 
@@ -82,6 +83,8 @@
     </div>
   {/if}
 </div>
+
+<ContextMenuHost />
 
 <style>
   .term-window {

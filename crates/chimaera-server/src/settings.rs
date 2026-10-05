@@ -156,6 +156,30 @@ impl SettingsStore {
             .unwrap_or(false)
     }
 
+    /// Native defaults opt out only of cross-conversation model and effort
+    /// preferences. Explicit picks, resumed settings and permission modes
+    /// keep their separate precedence in `chat::resolve_start_settings`.
+    pub(crate) fn remember_chat_model(&mut self) -> bool {
+        self.current()
+            .get("chat.newSessionModel")
+            .and_then(|v| v.as_str())
+            != Some("agent")
+    }
+
+    /// A launch-only override; absent/unknown preserves the native Codex
+    /// configuration, including a user who already opted into instant input.
+    pub(crate) fn codex_instant_interrupt(&mut self) -> Option<bool> {
+        match self
+            .current()
+            .get("chat.codexSteering")
+            .and_then(|v| v.as_str())
+        {
+            Some("immediate") => Some(true),
+            Some("next_step") => Some(false),
+            _ => None,
+        }
+    }
+
     /// Daemon-consumed key: when a restart cut a chat's work off (a running
     /// turn, background commands / monitors / workflows), send the resumed
     /// agent one message saying what stopped (see `chat::resurrect_chat`).

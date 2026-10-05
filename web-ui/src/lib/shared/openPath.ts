@@ -12,10 +12,17 @@ export type PathKind = "file" | "dir";
 export interface OpenPathOptions {
   /** Cmd/Ctrl-click: open beside the source in a fresh split. */
   split?: boolean;
+  /** A link inside this document, rather than an unrelated file open. */
+  documentFrom?: string;
   /** Scroll to and flash this line range once the file shows. Files only. */
   reveal?: Reveal;
   /** The pane the gesture came from, when known (else the focused pane). */
   fromPane?: string;
+}
+
+/** Capture the gesture's pane before asynchronous path/embed resolution. */
+export function pathPaneFrom(element: Element | null): string | undefined {
+  return element?.closest(".pane")?.getAttribute("data-pane-id") ?? undefined;
 }
 
 type PathOpener = (path: string, kind: PathKind, opts: OpenPathOptions) => void;

@@ -2121,6 +2121,82 @@ async fn driver_codex_send_if_running_joins_the_turn_or_drops() {
     manager.kill("s-codex-sir");
 }
 
+/// Instant input is a launch feature, not a new turn/steer shape. The driver
+/// still waits for the native user-message echo before marking a steer read.
+#[tokio::test]
+#[ignore = "live: spawns real codex, needs auth, bills one steered turn"]
+async fn driver_codex_instant_steering_reads_during_a_response() {
+    use chimaera_agent::codex::CodexAdapter;
+    use std::sync::Arc;
+    let dir = tmpdir();
+    let manager = Arc::new(ChatManager::new(
+        dir.path().join("chat"),
+        Box::new(|_, _| {}),
+        Box::new(|_, _| {}),
+    ));
+    let mut spec = SpawnSpec::new(
+        "s-codex-instant",
+        vec![
+            "codex".into(),
+            "app-server".into(),
+            "-c".into(),
+            "features.instant_interrupt=true".into(),
+        ],
+        dir.path().to_path_buf(),
+    );
+    spec.initial_model = Some("gpt-6.1-sol".into());
+    manager.spawn(&CodexAdapter, spec).expect("spawn driver");
+    let mut rx = manager.attach("s-codex-instant", 0).expect("attach").live;
+    manager.command("s-codex-instant", AgentCommand::Send {
+        blocks: vec![ContentBlock::Text { text: "Write a numbered list of 150 different fruits, vegetables, herbs and spices with one descriptive sentence per item. Begin the list directly, without tools or an introduction.".into() }],
+    }).await.expect("send");
+    let deadline = tokio::time::Instant::now() + TURN;
+    let mut steered = false;
+    let mut read = false;
+    let mut after_steer = String::new();
+    loop {
+        let entry = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .expect("instant steering timed out")
+            .expect("broadcast closed");
+        match &entry.ev {
+            AgentEvent::MessageChunk { text, .. } => {
+                if !steered {
+                    steered = true;
+                    manager
+                        .command(
+                            "s-codex-instant",
+                            AgentCommand::SendIfRunning {
+                                id: "instant-probe".into(),
+                                blocks: vec![ContentBlock::Text {
+                                    text: "Stop the list now. Reply with exactly INSTANT_PLUM."
+                                        .into(),
+                                }],
+                            },
+                        )
+                        .await
+                        .expect("steer while model responds");
+                } else {
+                    after_steer.push_str(text);
+                }
+            }
+            AgentEvent::UserMessageUpdate { id, state } if id == "instant-probe" => {
+                assert_eq!(*state, UserMessageState::Sent, "native input was consumed");
+                read = true;
+            }
+            AgentEvent::TurnCompleted { .. } => break,
+            AgentEvent::TurnAborted { reason, .. } => panic!("turn aborted: {reason}"),
+            _ => {}
+        }
+    }
+    manager.kill("s-codex-instant");
+    assert!(steered && read, "steered={steered}, read={read}");
+    assert!(
+        after_steer.contains("INSTANT_PLUM"),
+        "steering response: {after_steer}"
+    );
+}
+
 /// Ultracode at spawn (a resurrected session had it on): the handshake
 /// applies it and the read-back says so, WITHOUT counting as the user's pick
 /// (it must not become a remembered preference). Bills nothing — no turn.

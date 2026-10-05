@@ -1417,6 +1417,27 @@ async fn ws_chat_sends_are_accepted_once_under_their_client_id() {
         "a watching socket changes nothing"
     );
 
+    // Native Mod controls use a separate bounded channel, but cannot bypass
+    // the watching socket's original command admission.
+    watching
+        .send(WsMessage::Text(
+            serde_json::json!({
+                "type":"native_ui", "request_id":"watching-mod",
+                "request":{"subtype":"ui_press", "id":"synthetic-control"}
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let refused = next_answer(&mut watching).await;
+    assert_eq!(refused["type"], "native_ui", "{refused}");
+    assert_eq!(refused["event"]["request_id"], "watching-mod", "{refused}");
+    assert_eq!(
+        refused["event"]["error"], "This session is read-only",
+        "{refused}"
+    );
+
     // What the agent received (its turn never ends in this fixture, so the
     // second message waits in the driver), and what the next attach replays.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);

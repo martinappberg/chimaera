@@ -223,9 +223,16 @@ pub(crate) async fn create_session(
             }
             // Argv cannot shell-inject, but flag-shaped or control-byte values
             // have no business in --model/--resume.
-            for (field, value) in [("model", &body.model), ("resume", &body.resume)] {
+            for (field, value, valid) in [
+                (
+                    "model",
+                    &body.model,
+                    crate::launcher::safe_model_arg as fn(&str) -> bool,
+                ),
+                ("resume", &body.resume, crate::launcher::safe_arg),
+            ] {
                 if let Some(value) = value {
-                    if !crate::launcher::safe_arg(value) {
+                    if !valid(value) {
                         return bad_request(format!("invalid {field} {value:?}"));
                     }
                 }
@@ -321,9 +328,16 @@ async fn spawn_chat_ui(
             agent_kind.as_str()
         ));
     }
-    for (field, value) in [("model", &body.model), ("resume", &body.resume)] {
+    for (field, value, valid) in [
+        (
+            "model",
+            &body.model,
+            crate::launcher::safe_model_arg as fn(&str) -> bool,
+        ),
+        ("resume", &body.resume, crate::launcher::safe_arg),
+    ] {
         if let Some(value) = value {
-            if !crate::launcher::safe_arg(value) {
+            if !valid(value) {
                 return bad_request(format!("invalid {field} {value:?}"));
             }
         }

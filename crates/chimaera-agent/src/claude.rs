@@ -31,6 +31,7 @@ use crate::driver::{
     run_driver, AgentAdapter, Driver, DriverExit, DriverIo, DriverStep, Handshake, Mapper,
     SpawnSpec, INTERRUPT_GRACE_TICKS,
 };
+use crate::elicitation::{Elicitation, ElicitationAction, ELICITATION_PENDING};
 use crate::model::{
     cap_head_tail, cap_output, clip_command, fmt_elapsed_secs, truncate_label, AgentCommand,
     AgentEvent, BackgroundTask, BackgroundTaskClose, ChunkKind, Coalescer, CompactionPhase,
@@ -47,7 +48,7 @@ use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
 
 /// CLI version these frame shapes were verified against (2026-09-25,
 /// full chat-smoke 23/23; PROTOCOL.md Pass 33).
-pub const TESTED_CLAUDE_VERSION: &str = "2.1.287";
+pub const TESTED_CLAUDE_VERSION: &str = "2.1.289";
 
 /// Arguments for a structured chat session, before server-side extras
 /// (`--settings`, `--mcp-config`, `--session-id`) and login-shell wrapping.
@@ -496,7 +497,7 @@ impl Driver for ClaudeDriver {
         // model has no effort knob (haiku) — the apply would just error.
         mapper.bootstrapping = true;
         if let Some(effort) = spec.initial_effort.as_deref() {
-            if effort_applies(&mapper.models, spec.initial_model.as_deref()) {
+            if effort_applies(&mapper.models, spec.initial_model.as_deref(), effort) {
                 initial.push(mapper.on_command(AgentCommand::SetEffort {
                     effort_id: effort.to_string(),
                 }));
@@ -563,10 +564,10 @@ impl Driver for ClaudeDriver {
     }
 }
 
-/// Whether a spawn-time effort should be applied: true when the catalog is
-/// silent (unknown model / older CLI) or the chosen model advertises effort
-/// levels; false only for a catalog entry with none (haiku).
-fn effort_applies(models: &[crate::model::ModelInfo], model: Option<&str>) -> bool {
+/// An explicit model may be a custom provider ID. Apply remembered effort
+/// only when its catalog entry advertises a control; an unlisted model must
+/// keep its native settings instead of inheriting another model's effort.
+fn effort_applies(models: &[crate::model::ModelInfo], model: Option<&str>, effort: &str) -> bool {
     let Some(model) = model else {
         return true;
     };
@@ -574,8 +575,8 @@ fn effort_applies(models: &[crate::model::ModelInfo], model: Option<&str>) -> bo
         .iter()
         .find(|m| m.id == model || m.resolved.as_deref() == Some(model))
     {
-        Some(entry) => !entry.efforts.is_empty(),
-        None => true,
+        Some(entry) => entry.efforts.iter().any(|candidate| candidate == effort),
+        None => false,
     }
 }
 
@@ -754,6 +755,7 @@ struct ClaudeMapper {
     /// `assistant` frames must not be emitted again.
     streamed: HashSet<String>,
     current_stream_msg: Option<String>,
+    render_message_id: Option<String>,
     /// The streaming `thinking` block whose kind is still unknown — reasoning
     /// or narration (the prose between tool calls, which Opus 5.5+ ships as a
     /// thinking block; [`signature_is_narration`]). Its text waits HERE,
@@ -769,6 +771,7 @@ struct ClaudeMapper {
     tool_kinds: HashMap<String, ToolKind>,
     /// Outstanding can_use_tool requests, keyed by request_id.
     pending_permissions: HashMap<String, PendingPermission>,
+    pending_elicitations: HashMap<String, Elicitation>,
     /// Outstanding AskUserQuestion prompts: request_id → original input
     /// (echoed back inside updatedInput.questions with the answers).
     pending_questions: HashMap<String, Value>,
@@ -776,6 +779,7 @@ struct ClaudeMapper {
     /// completed result string; "dismiss" cancels).
     pending_dialogs: HashMap<String, ()>,
     pending_controls: HashMap<String, PendingControl>,
+    native_ui: crate::native_ui::ClaudeUi,
     /// CLI→client control subtypes we don't handle and have already said so
     /// about — the notice fires once per subtype, not per frame.
     noticed_controls: HashSet<String>,
@@ -1000,13 +1004,16 @@ impl ClaudeMapper {
             turn_active: false,
             streamed: HashSet::new(),
             current_stream_msg: None,
+            render_message_id: None,
             held_thinking: None,
             thinking_route: None,
             tool_kinds: HashMap::new(),
             pending_permissions: HashMap::new(),
+            pending_elicitations: HashMap::new(),
             pending_questions: HashMap::new(),
             pending_dialogs: HashMap::new(),
             pending_controls: HashMap::new(),
+            native_ui: crate::native_ui::ClaudeUi::default(),
             noticed_controls: HashSet::new(),
             task_rows: HashMap::new(),
             agent_tools: HashMap::new(),
@@ -1272,7 +1279,12 @@ impl ClaudeMapper {
             Some("control_request") => self.on_control_request(frame, &mut step),
             Some("control_cancel_request") => {
                 let id = frame["request_id"].as_str().unwrap_or_default().to_string();
-                if self.pending_questions.remove(&id).is_some() {
+                if self.pending_elicitations.remove(&id).is_some() {
+                    step.events.push(AgentEvent::ElicitationResolved {
+                        request_id: id,
+                        action: "cancel".into(),
+                    });
+                } else if self.pending_questions.remove(&id).is_some() {
                     step.events.push(AgentEvent::QuestionResolved {
                         request_id: id,
                         answers: Default::default(),
@@ -1328,6 +1340,20 @@ impl ClaudeMapper {
     }
 
     fn on_system(&mut self, frame: &Value, step: &mut DriverStep) {
+        if self.native_ui.notification(frame, step) {
+            return;
+        }
+        if frame["subtype"] == "ui_log" {
+            self.flush_prose(step);
+            step.events.push(AgentEvent::Notice {
+                text: format!(
+                    "{}: {}",
+                    truncate_label(frame["plugin"].as_str().unwrap_or("Mod"), 120),
+                    truncate_label(frame["text"].as_str().unwrap_or_default(), 4096)
+                ),
+            });
+            return;
+        }
         match frame["subtype"].as_str() {
             Some("init") => {
                 if let Some(id) = frame["session_id"].as_str() {
@@ -2150,7 +2176,7 @@ impl ClaudeMapper {
         if let Some(uuid) = frame["uuid"].as_str() {
             self.last_msg_uuid = Some(uuid.to_string());
         }
-        self.on_tool_results(&frame["message"], step);
+        self.on_tool_results(&frame["message"], frame.get("tool_use_result"), step);
         self.on_remote_user_text(frame, step);
     }
 
@@ -2270,11 +2296,15 @@ impl ClaudeMapper {
                 let turn = self.turn_id();
                 let delta = &event["delta"];
                 let (kind, text) = match delta["type"].as_str() {
-                    Some("text_delta") => (ChunkKind::Message, delta["text"].as_str()),
+                    Some("text_delta") => {
+                        self.identify_message(self.current_stream_msg.clone().as_deref(), step);
+                        (ChunkKind::Message, delta["text"].as_str())
+                    }
                     Some("thinking_delta") => {
                         let Some(text) = delta["thinking"].as_str() else {
                             return;
                         };
+                        self.identify_message(self.current_stream_msg.clone().as_deref(), step);
                         if let Some(id) = &self.current_stream_msg {
                             self.streamed.insert(id.clone());
                         }
@@ -2436,6 +2466,7 @@ impl ClaudeMapper {
             match block["type"].as_str() {
                 Some("text") if !streamed => {
                     if let Some(text) = block["text"].as_str().filter(|t| !t.is_empty()) {
+                        self.identify_message(Some(msg_id), step);
                         // Same boundary rule as the streamed path; the
                         // coalescer no-ops the break before the first block.
                         let turn = self.turn_id();
@@ -2448,6 +2479,7 @@ impl ClaudeMapper {
                 }
                 Some("thinking") if !streamed => {
                     if let Some(text) = block["thinking"].as_str().filter(|t| !t.is_empty()) {
+                        self.identify_message(Some(msg_id), step);
                         let kind = if is_narration(i, block) {
                             ChunkKind::Message
                         } else {
@@ -2539,14 +2571,27 @@ impl ClaudeMapper {
         });
         if let Some(diff) = edit_diff_content(name, input) {
             step.events.push(AgentEvent::ToolCallUpdate {
-                id,
+                id: id.clone(),
                 status: ToolStatus::InProgress,
                 content: Some(diff),
             });
         }
+        if input.is_object() && serde_json::to_vec(input).is_ok_and(|v| v.len() <= 32 * 1024) {
+            step.events.push(AgentEvent::ToolRenderData {
+                id,
+                name: Some(truncate_label(name, 256)),
+                input: Some(input.clone()),
+                output: None,
+            });
+        }
     }
 
-    fn on_tool_results(&mut self, message: &Value, step: &mut DriverStep) {
+    fn on_tool_results(
+        &mut self,
+        message: &Value,
+        native_output: Option<&Value>,
+        step: &mut DriverStep,
+    ) {
         let Some(blocks) = message["content"].as_array() else {
             return;
         };
@@ -2588,7 +2633,7 @@ impl ClaudeMapper {
                 Some(ToolContent::Output { text, truncated })
             };
             step.events.push(AgentEvent::ToolCallUpdate {
-                id,
+                id: id.clone(),
                 status: if failed {
                     ToolStatus::Failed
                 } else {
@@ -2596,12 +2641,57 @@ impl ClaudeMapper {
                 },
                 content,
             });
+            let native = if failed {
+                Some(json!(cap_output(&tool_result_text(block)).0))
+            } else if blocks.iter().filter(|v| v["type"] == "tool_result").count() == 1 {
+                native_output
+                    .filter(|value| serde_json::to_vec(value).is_ok_and(|v| v.len() <= 64 * 1024))
+                    .cloned()
+            } else {
+                None
+            };
+            if let Some(output) = native {
+                step.events.push(AgentEvent::ToolRenderData {
+                    id,
+                    name: None,
+                    input: None,
+                    output: Some(output),
+                });
+            }
         }
     }
 
     fn on_control_request(&mut self, frame: &Value, step: &mut DriverStep) {
+        if self.native_ui.host_request(frame, step) {
+            return;
+        }
         let request = &frame["request"];
         let request_id = frame["request_id"].as_str().unwrap_or_default().to_string();
+        if request["subtype"] == "elicitation" {
+            if request_id.len() > COMMAND_ID_MAX
+                || self.pending_elicitations.len() >= ELICITATION_PENDING
+            {
+                step.outbound.push(json!({"type":"control_response","response":{"subtype":"success","request_id":request_id,"response":{"action":"cancel"}}}));
+                step.events.push(AgentEvent::Notice {
+                    text: "MCP input request cancelled: too many unanswered requests.".into(),
+                });
+                return;
+            }
+            let elicitation = Elicitation::parse(
+                request["mode"].as_str().unwrap_or("form"),
+                &request["requested_schema"],
+                request["url"].as_str(),
+            );
+            self.pending_elicitations
+                .insert(request_id.clone(), elicitation.clone());
+            step.events.push(AgentEvent::ElicitationRequest {
+                request_id,
+                server: truncate_label(request["mcp_server_name"].as_str().unwrap_or("mcp"), 256),
+                message: truncate_label(request["message"].as_str().unwrap_or_default(), 8192),
+                elicitation,
+            });
+            return;
+        }
         if request["subtype"] == "request_user_dialog" {
             self.on_user_dialog(&request_id, request, step);
             return;
@@ -2611,7 +2701,7 @@ impl ClaudeMapper {
             // request until its own deadline (or another attached client)
             // settles it, and an error reply here could break flows that work
             // via that fallback (mined subtypes: hook_callback, mcp_message,
-            // elicitation, oauth refreshes). But never park SILENTLY — the
+            // oauth refreshes). But never park SILENTLY — the
             // agent's later "I was blocked" prose must not be the only trace
             // the ask existed. One notice per subtype, not per frame.
             // `subtype` is agent-influenced; bound the once-per-subtype dedupe
@@ -2852,7 +2942,25 @@ impl ClaudeMapper {
         });
     }
 
+    fn identify_message(&mut self, id: Option<&str>, step: &mut DriverStep) {
+        let Some(id) = id.filter(|id| !id.is_empty() && id.len() <= 256) else {
+            return;
+        };
+        if self.render_message_id.as_deref() == Some(id) {
+            return;
+        }
+        self.flush_prose(step);
+        self.render_message_id = Some(id.into());
+        step.events.push(AgentEvent::MessageIdentity {
+            turn_id: self.turn_id(),
+            message_id: id.into(),
+        });
+    }
+
     fn on_control_response(&mut self, frame: &Value, step: &mut DriverStep) {
+        if self.native_ui.response(frame, step) {
+            return;
+        }
         let id = frame["response"]["request_id"]
             .as_str()
             .unwrap_or_default()
@@ -2905,7 +3013,14 @@ impl ClaudeMapper {
                 return;
             }
             step.events.push(AgentEvent::Error {
-                message: format!("control request failed: {}", frame["response"]),
+                message: if matches!(pending, PendingControl::SetModel(_)) {
+                    let detail = frame["response"]["error"]
+                        .as_str()
+                        .unwrap_or("The agent rejected this model");
+                    format!("model change failed: {}", truncate_label(detail, 300))
+                } else {
+                    format!("control request failed: {}", frame["response"])
+                },
                 fatal: false,
             });
             return;
@@ -2954,6 +3069,9 @@ impl ClaudeMapper {
                     reason: None,
                     retract_current_turn: false,
                 });
+                // Model changes can reset effective effort (e.g. Haiku).
+                // Read the native result instead of retaining the old chip.
+                self.request_settings(step);
             }
             PendingControl::Interrupt | PendingControl::SetThinking => {}
             PendingControl::ContextUsage => {
@@ -3466,6 +3584,35 @@ impl ClaudeMapper {
                     state: UserMessageState::Dropped,
                 });
             }
+            AgentCommand::Elicitation {
+                request_id,
+                action,
+                content,
+            } => {
+                let Some(request) = self.pending_elicitations.get(&request_id) else {
+                    step.events.push(AgentEvent::ElicitationResolved {
+                        request_id,
+                        action: "expired".into(),
+                    });
+                    return step;
+                };
+                if let Err(error) = request.validate(action, &content) {
+                    step.events.push(AgentEvent::Notice {
+                        text: format!("MCP form not sent: {error}"),
+                    });
+                    return step;
+                }
+                let mut result = json!({"action":action});
+                if action == ElicitationAction::Accept && request.mode != "url" {
+                    result["content"] = content;
+                }
+                self.pending_elicitations.remove(&request_id);
+                step.outbound.push(json!({"type":"control_response","response":{"subtype":"success","request_id":request_id,"response":result}}));
+                step.events.push(AgentEvent::ElicitationResolved {
+                    request_id,
+                    action: action.as_str().into(),
+                });
+            }
             AgentCommand::Permission {
                 request_id,
                 option_id,
@@ -3974,6 +4121,12 @@ impl ClaudeMapper {
                 answers: Default::default(),
             });
         }
+        for request_id in std::mem::take(&mut self.pending_elicitations).into_keys() {
+            events.push(AgentEvent::ElicitationResolved {
+                request_id,
+                action: "expired".into(),
+            });
+        }
         let permissions = std::mem::take(&mut self.pending_permissions).into_keys();
         let dialogs = std::mem::take(&mut self.pending_dialogs).into_keys();
         for request_id in permissions.chain(dialogs) {
@@ -4049,6 +4202,7 @@ impl ClaudeMapper {
     /// result, so there is no coalesced surplus for a timer to reconcile.
     fn tick(&mut self) -> DriverStep {
         let mut step = self.interrupt_watchdog();
+        self.native_ui.tick(&mut step);
         // A thinking block still streaming past the hold is reasoning —
         // narration arrives whole, signature included, in one burst.
         if let Some(held) = self.held_thinking.as_mut().filter(|h| !h.text.is_empty()) {
@@ -4121,6 +4275,9 @@ impl ClaudeMapper {
 /// forward the harness's generic calls to them (inherent methods win in
 /// `self.x()` resolution, so there is no recursion).
 impl Mapper for ClaudeMapper {
+    fn on_native_ui(&mut self, command: crate::native_ui::NativeUiCommand) -> DriverStep {
+        self.native_ui.command(command)
+    }
     fn init_event(&self) -> AgentEvent {
         self.init_event()
     }
@@ -5115,6 +5272,64 @@ pub(crate) mod tests {
             None,
             &json!({ "commands": [{ "name": "compact", "description": "Compact history" }] }),
         )
+    }
+
+    #[test]
+    fn mcp_form_validates_preserves_types_and_settles_once() {
+        let mut m = mapper();
+        let frame = json!({"type":"control_request","request_id":"form-1","request":{"subtype":"elicitation","mcp_server_name":"fixture","mode":"form","message":"Configure","requested_schema":{"type":"object","required":["n"],"properties":{"n":{"type":"integer","minimum":0}}}}});
+        let step = m.on_frame(&frame);
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::ElicitationRequest { .. }
+        ));
+        let invalid = m.on_command(AgentCommand::Elicitation {
+            request_id: "form-1".into(),
+            action: ElicitationAction::Accept,
+            content: json!({"n":"0"}),
+        });
+        assert!(invalid.outbound.is_empty());
+        assert!(!m.pending_elicitations.is_empty());
+        let valid = m.on_command(AgentCommand::Elicitation {
+            request_id: "form-1".into(),
+            action: ElicitationAction::Accept,
+            content: json!({"n":0}),
+        });
+        assert_eq!(
+            valid.outbound[0]["response"]["response"]["content"],
+            json!({"n":0})
+        );
+        assert!(m.pending_elicitations.is_empty());
+        assert!(!serde_json::to_string(&valid.events)
+            .unwrap()
+            .contains("content"));
+        let stale = m.on_command(AgentCommand::Elicitation {
+            request_id: "form-1".into(),
+            action: ElicitationAction::Accept,
+            content: json!({"n":1}),
+        });
+        assert!(stale.outbound.is_empty());
+        m.on_frame(&frame);
+        let cancelled = m.on_frame(&json!({"type":"control_cancel_request","request_id":"form-1"}));
+        assert!(
+            matches!(&cancelled.events[0], AgentEvent::ElicitationResolved { action, .. } if action == "cancel")
+        );
+        for action in [ElicitationAction::Cancel, ElicitationAction::Decline] {
+            m.on_frame(&frame);
+            let reply = m.on_command(AgentCommand::Elicitation {
+                request_id: "form-1".into(),
+                action,
+                content: Value::Null,
+            });
+            assert_eq!(
+                reply.outbound[0]["response"]["response"]["action"],
+                action.as_str()
+            );
+        }
+        m.on_frame(&frame);
+        assert!(m.drain_pending().iter().any(
+            |e| matches!(e, AgentEvent::ElicitationResolved { action, .. } if action == "expired")
+        ));
     }
 
     #[test]
@@ -6834,7 +7049,14 @@ pub(crate) mod tests {
             "event": { "type": "content_block_delta",
                        "delta": { "type": "text_delta", "text": "hi" } },
         }));
-        assert!(step.events.is_empty(), "small delta stays buffered");
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::MessageIdentity {
+                turn_id: "t1".into(),
+                message_id: "m1".into()
+            }],
+            "identity precedes buffered prose"
+        );
 
         // The complete assistant frame for the same message must be skipped…
         let step = m.on_frame(&json!({
@@ -8557,6 +8779,49 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn accepted_model_change_refreshes_native_effort_without_remembering_a_new_pick() {
+        let mut m = mapper();
+        m.model = Some("opus".into());
+        let request = m.on_command(AgentCommand::SetModel {
+            model_id: "haiku".into(),
+        });
+        let ack = m.on_frame(&json!({"type":"control_response", "response": {
+            "subtype":"success", "request_id":request.outbound[0]["request_id"], "response":{}
+        }}));
+        assert_eq!(ack.outbound[0]["request"]["subtype"], "get_settings");
+        assert!(ack.events.iter().any(|event| matches!(event, AgentEvent::ModelSwitched { to, reason: None, .. } if to == "haiku")));
+        let settings = m.on_frame(&json!({"type":"control_response", "response": {
+            "subtype":"success", "request_id":ack.outbound[0]["request_id"], "response":{"applied":{"model":"claude-haiku-4-5-20251001","effort":null,"ultracode":false}}
+        }}));
+        assert!(matches!(
+            settings.events.as_slice(),
+            [AgentEvent::EffortState {
+                effort: None,
+                ultracode: false,
+                chosen: false
+            }]
+        ));
+        assert_eq!(m.model.as_deref(), Some("haiku"));
+    }
+
+    #[test]
+    fn rejected_custom_model_keeps_the_model_and_reports_only_the_native_message() {
+        let mut m = mapper();
+        m.model = Some("opus[1m]".into());
+        let request = m.on_command(AgentCommand::SetModel {
+            model_id: "provider/typo".into(),
+        });
+        let id = &request.outbound[0]["request_id"];
+        let rejected = m.on_frame(&json!({"type":"control_response", "response": {
+            "subtype":"error", "request_id":id, "error":"Unknown model"
+        }}));
+        assert_eq!(m.model.as_deref(), Some("opus[1m]"));
+        assert!(
+            matches!(rejected.events.as_slice(), [AgentEvent::Error { message, fatal: false }] if message == "model change failed: Unknown model")
+        );
+    }
+
+    #[test]
     fn refusal_fallback_switches_model_and_retracts() {
         let mut m = mapper();
         let step = m.on_frame(&json!({
@@ -9360,6 +9625,7 @@ pub(crate) mod tests {
         steps.push(DriverStep {
             events: m.flush().into_iter().collect(),
             outbound: Vec::new(),
+            native_ui: Vec::new(),
         });
         assert_eq!(
             message_text(&steps, ""),
@@ -9382,6 +9648,7 @@ pub(crate) mod tests {
         steps.push(DriverStep {
             events: m.flush().into_iter().collect(),
             outbound: Vec::new(),
+            native_ui: Vec::new(),
         });
         assert_eq!(thought_text(&steps), "Considering the options carefully.");
         assert!(message_text(&steps, "").is_empty());
@@ -9407,6 +9674,7 @@ pub(crate) mod tests {
         steps.push(DriverStep {
             events: m.flush().into_iter().collect(),
             outbound: Vec::new(),
+            native_ui: Vec::new(),
         });
         assert_eq!(message_text(&steps, ""), "Checking the config next.");
         assert!(thought_text(&steps).is_empty());
@@ -9430,6 +9698,7 @@ pub(crate) mod tests {
             DriverStep {
                 events: m.flush().into_iter().collect(),
                 outbound: Vec::new(),
+                native_ui: Vec::new(),
             },
         ];
         assert_eq!(message_text(&steps, ""), "Reading the log now.");
@@ -9540,7 +9809,7 @@ mod effort_applies_tests {
     use super::*;
 
     #[test]
-    fn spawn_effort_skips_only_effortless_catalog_entries() {
+    fn spawn_effort_requires_advertised_support_for_an_explicit_model() {
         let models = vec![
             crate::model::ModelInfo {
                 id: "opus[1m]".into(),
@@ -9559,11 +9828,16 @@ mod effort_applies_tests {
                 default_effort: None,
             },
         ];
-        assert!(effort_applies(&models, None));
-        assert!(effort_applies(&models, Some("opus[1m]")));
-        assert!(effort_applies(&models, Some("claude-opus-5[1m]")));
-        assert!(!effort_applies(&models, Some("haiku")));
-        assert!(effort_applies(&models, Some("something-new")));
-        assert!(effort_applies(&[], Some("haiku")));
+        assert!(effort_applies(&models, None, "xhigh"));
+        assert!(effort_applies(&models, Some("opus[1m]"), "xhigh"));
+        assert!(effort_applies(&models, Some("claude-opus-5[1m]"), "low"));
+        assert!(!effort_applies(&models, Some("opus[1m]"), "unsupported"));
+        assert!(!effort_applies(&models, Some("haiku"), "xhigh"));
+        assert!(!effort_applies(
+            &models,
+            Some("provider/something-new:latest"),
+            "xhigh"
+        ));
+        assert!(!effort_applies(&[], Some("haiku"), "xhigh"));
     }
 }

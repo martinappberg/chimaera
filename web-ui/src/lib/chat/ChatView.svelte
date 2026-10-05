@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { modelChoice } from "./modelPicker";
+  import { customModelSelection, modelChoice } from "./modelPicker";
   import { onDestroy, tick, untrack } from "svelte";
   import { displayName, forkSession, rewindSession, renameSession, type Session } from "../workspace/sessions";
   import { fsValidate } from "../previews/files";
@@ -60,10 +60,14 @@
   import { resolveTargets } from "../shared/embed/embed";
   import { HoverPreviews } from "../previews/doc/hoverController.svelte";
   import PermissionCard from "./PermissionCard.svelte";
+  import ElicitationCard from "./ElicitationCard.svelte";
+  import type { PendingElicitation } from "./elicitation";
   import PlanApprovalCard from "./PlanApprovalCard.svelte";
   import QuestionCard from "./QuestionCard.svelte";
   import UsagePanel from "./UsagePanel.svelte";
   import McpPanel from "./McpPanel.svelte";
+  import ConnectionDialog from "../plugins/ConnectionDialog.svelte";
+  let authServer = $state<string | null>(null);
   import RewindDialog from "./RewindDialog.svelte";
   import AttachmentStrip from "./AttachmentStrip.svelte";
   import ForkDialog from "./ForkDialog.svelte";
@@ -75,7 +79,14 @@
   import Composer from "./Composer.svelte";
   import ManualResume from "./ManualResume.svelte";
   import { manualResumeNote } from "../workspace/manualResume";
+  import { hookNotice } from "./hookNotice";
+  import HookRow from "./HookRow.svelte";
   import SameFileNotice from "../workspace/SameFileNotice.svelte";
+  import ModsWorkbench from "./ModsWorkbench.svelte";
+  import ModSite from "./ModSite.svelte";
+  import { modsFor } from "./mods.svelte";
+  import type { NativeComposer } from "./nativeComposer";
+  import { pageVisible } from "../shared/visibility";
   import { sameFile } from "../workspace/sameFile.svelte";
   import ReferenceChip from "../shared/ReferenceChip.svelte";
   import { activeSelection, clearSelection, setSelection } from "../shared/reference";
@@ -156,6 +167,9 @@
   // the pool disposes them when the session ends or toggles to a PTY.
   // svelte-ignore state_referenced_locally
   const { store, socket } = acquireChat(session.id);
+  const mods = modsFor(socket.nativeUi);
+  let composerApi = $state<NativeComposer>();
+  let modDockWidth = $state(0);
   // svelte-ignore state_referenced_locally
   onDestroy(() => releaseChat(session.id));
   onDestroy(() => {
@@ -908,7 +922,8 @@
 
   /** Model picker: the agent's own catalog (claude initialize.models /
    *  codex model/list) beats the daemon's curated list. */
-  const modelChoices = $derived(store.models.length > 0 ? store.models : models);
+  const modelChoices = $derived(store.modelCatalogReceived ? store.models : models);
+  const allowCustomModel = $derived(supports("set_model") && capabilities.custom_model);
   /** The catalog row for the live model. Ids come in three spellings:
    *  picker values ("opus[1m]"), catalog resolvedModel
    *  ("claude-opus-4-8[1m]"), and the BARE api id assistant messages report
@@ -918,14 +933,8 @@
    *  this is undefined so the header shows a neutral loading chip — NOT a
    *  concrete "default" that would flash the wrong name (slow on remote). */
   const currentModel = $derived(modelChoice(store.models, store.model));
-  /** Reasoning-effort choices: per-model when the agent reports them;
-   *  codex falls back to its known ladder, claude to none (no effort knob
-   *  on that model — e.g. haiku). */
-  const FALLBACK_EFFORTS = ["minimal", "low", "medium", "high", "xhigh"];
-  const effortChoices = $derived.by(() => {
-    if (currentModel !== undefined) return currentModel.efforts;
-    return agentKind === "codex" ? FALLBACK_EFFORTS : [];
-  });
+  /** Only the active model's reported metadata establishes effort support. */
+  const effortChoices = $derived(currentModel?.efforts ?? []);
   /** Agent read-back is the only displayed truth. Both drivers emit an
    *  effort_state after applying a selection. */
   const effortShown = $derived(store.effort);
@@ -979,6 +988,14 @@
   function onScroll() {
     const el = transcriptEl;
     if (el === null) return;
+    // A parked view has no reader. Its scroller still moves — a turn ending
+    // while hidden drops the status row, and WebKit clamps the offset — and
+    // against a frozen range with rows waiting that read as leaving the live
+    // edge: the chat reopened short of its newest row, no longer following.
+    if (!visible) {
+      lastScrollTop = el.scrollTop;
+      return;
+    }
     const top = el.scrollTop;
     const moved = top !== lastScrollTop;
     const up = top < lastScrollTop;
@@ -1356,6 +1373,7 @@
   $effect(() => {
     void store.blocks.length;
     void store.pending.length;
+    void store.elicitations.length;
     void store.lastSeq;
     if (!visible || store.hydrating || !renderReady || !atBottom || composerEngaged) return;
     queueBottomScroll();
@@ -1556,6 +1574,10 @@
    *  "isn't available in this environment" dead end. Arguments resolve
    *  directly ("/effort high", "/model opus"); bare commands open pickers. */
   function onSlash(name: string, args = ""): boolean {
+    if (["model", "mode", "effort"].includes(name) && store.pendingModel !== null) {
+      store.notice("Wait for the model change to finish.", "info");
+      return true;
+    }
     const arg = args.trim().toLowerCase();
     switch (name) {
       case "voice": {
@@ -1610,6 +1632,12 @@
         if (arg.length > 0 && modeHit !== undefined) {
           store.notice(`“${args.trim()}” is a mode — switching it (use /mode next time)`, "info");
           return pickMode(modeHit.id);
+        }
+        if (args.trim().length > 0 && allowCustomModel) {
+          const selection = customModelSelection(args);
+          if (selection.id !== null) return pickModel(selection.id);
+          store.notice(selection.error, "error");
+          return true;
         }
         menu = "model";
         return true;
@@ -2027,6 +2055,7 @@
   });
 
   function pickModel(id: string): boolean {
+    if (store.pendingModel !== null) return false;
     if (!sendCommand({ type: "set_model", model_id: id }, "model change not sent")) return false;
     store.markModelPending(id);
     menu = null;
@@ -2048,6 +2077,7 @@
   }
 
   function pickMode(id: string): boolean {
+    if (store.pendingModel !== null) return false;
     if (!sendCommand({ type: "set_mode", mode_id: id }, "mode change not sent")) return false;
     menu = null;
     return true;
@@ -2064,6 +2094,7 @@
   }
 
   function pickEffort(id: string): boolean {
+    if (store.pendingModel !== null) return false;
     if (!sendCommand({ type: "set_effort", effort_id: id }, "effort change not sent")) return false;
     menu = null;
     return true;
@@ -2111,8 +2142,7 @@
   const modeLabel = $derived(
     store.modes.find((m) => m.id === store.currentMode)?.label ?? store.currentMode,
   );
-  /** Model chip: the catalog's own display name when known ("Opus",
-   *  "Fable"), else a readable fallback from the raw id. */
+  /** Unlisted IDs stay intact: namespaces and punctuation can identify a provider. */
   const modelLabel = $derived.by(() => {
     if (store.pendingModel !== null) {
       const pending = modelChoices.find((m) => m.id === store.pendingModel);
@@ -2127,8 +2157,7 @@
     }
     const choice = modelChoices.find((c) => c.id === m);
     if (choice !== undefined) return choice.label;
-    const match = /claude-(\w+)-(\d+)-(\d+)/.exec(m);
-    return match !== null ? `${match[1]} ${match[2]}.${match[3]}` : m;
+    return m;
   });
 
   /** Live status line under the transcript: what the agent is doing NOW —
@@ -2317,6 +2346,7 @@
   let pinnedPlan = $state.raw<PlanEntry[]>([]);
   let pinnedPermissions = $state.raw<PendingPermission[]>([]);
   let pinnedQuestions = $state.raw<PendingQuestion[]>([]);
+  let pinnedElicitations = $state.raw<PendingElicitation[]>([]);
   let pinnedSends = $state.raw<PendingSend[]>([]);
   $effect(() => {
     if (!visible) {
@@ -2326,6 +2356,7 @@
         pinnedPlan = $state.snapshot(store.plan);
         pinnedPermissions = $state.snapshot(store.pending);
         pinnedQuestions = $state.snapshot(store.questions);
+        pinnedElicitations = $state.snapshot(store.elicitations);
         pinnedSends = $state.snapshot(store.pendingSends);
       });
       return;
@@ -2335,6 +2366,7 @@
     pinnedPlan = store.plan;
     pinnedPermissions = store.pending;
     pinnedQuestions = store.questions;
+    pinnedElicitations = store.elicitations;
     pinnedSends = store.pendingSends;
   });
 
@@ -2699,6 +2731,7 @@
   style:--chat-line-height={chatLineHeight}
   style:--chat-measure={`${chatContentWidth}px`}
   style:--chat-font-family={chatFontFamily}
+  style:padding-right={agentKind === "claude" && store.exited === null ? `${modDockWidth}px` : undefined}
   use:dismiss={{
     enabled: menu !== null,
     onDismiss: () => (menu = null),
@@ -2712,8 +2745,11 @@
     {store}
     {agentKind}
     {agentName}
+    mods={agentKind === "claude" ? mods : undefined}
+    {visible}
     bind:menu
-    canPickModel={supports("set_model") && modelChoices.length > 0 && store.connected && store.exited === null && store.fatalError === null && store.pendingModel === null}
+    {allowCustomModel}
+    canPickModel={supports("set_model") && (modelChoices.length > 0 || allowCustomModel) && store.connected && store.exited === null && store.fatalError === null && store.pendingModel === null}
     canPickMode={supports("set_mode")}
     {modelChoices}
     {modelLabel}
@@ -2840,6 +2876,7 @@
           resolvePaths={prosePaths}
           onBackground={supports("background_tool") ? backgroundTool : undefined}
           onStopTask={supports("stop_task") ? stopTask : undefined}
+          mods={agentKind === "claude" ? mods : undefined}
         />
       {:else}
         <ThoughtRow
@@ -2924,11 +2961,11 @@
               {@render sentImages(block.attachmentPaths)}
             {:else}
               <div class="bubble">
-                <UserText
-                  text={block.text}
-                  onOpenPath={openProsePath}
-                  resolvePaths={prosePaths}
-                />
+                {#if agentKind === "claude" && block.checkpoint?.id}
+                  <ModSite {mods} component="UserMessage" instanceId={block.checkpoint.id} active={visible && $pageVisible} props={{ text: block.text, origin: { kind: block.origin ? "unclassified" : "composer" }, isExpanded: true }}>
+                    {#snippet children(draw)}<UserText text={typeof draw.text === "string" ? draw.text : block.text} onOpenPath={openProsePath} resolvePaths={prosePaths} />{/snippet}
+                  </ModSite>
+                {:else}<UserText text={block.text} onOpenPath={openProsePath} resolvePaths={prosePaths} />{/if}
               </div>
             {/if}
           </div>
@@ -2964,6 +3001,7 @@
           sourceUid={item.block.uid}
         />
       {:else if item.block.kind === "message"}
+        {@const message = item.block}
         <div
           class="msg agent"
           class:streaming={store.running && item.block.uid === lastInlineUid}
@@ -2975,8 +3013,9 @@
                the live segment DOM in place instead of paying a synchronous
                whole-message canonical parse at tab-switch-away, and thaw
                resumes the reveal cursor instead of re-animating the row. -->
+          {#snippet assistantProse(text: string)}
           <Markdown
-            text={item.block.text}
+            {text}
             streaming={store.running && item.block.uid === lastInlineUid}
             {visible}
             onOpenPath={openProsePath}
@@ -2987,6 +3026,12 @@
               if (visible && atBottom && !composerEngaged) queueBottomScroll();
             }}
           />
+          {/snippet}
+          {#if agentKind === "claude" && item.block.nativeMessageId}
+            <ModSite {mods} component="AssistantMessage" instanceId={item.block.nativeMessageId} active={visible && $pageVisible} props={{ text: item.block.text, isFirstOfReply: item.block.nativeFirstOfReply === true }}>
+              {#snippet children(draw)}{@render assistantProse(typeof draw.text === "string" ? draw.text : message.text)}{/snippet}
+            </ModSite>
+          {:else}{@render assistantProse(item.block.text)}{/if}
           <AgentMessageMeta
             text={item.block.text}
             sentAtMs={item.block.sentAtMs}
@@ -3041,7 +3086,10 @@
           >
         </div>
       {:else if item.block.kind === "notice"}
-        {#if !(incompatibleRuntime && item.block.text === store.fatalError)}
+        {@const hook = item.block.tone === "info" ? hookNotice(item.block.text) : null}
+        {#if hook}
+          <HookRow said={hook} sourceIndex={item.index} sourceUid={item.block.uid} />
+        {:else if !(incompatibleRuntime && item.block.text === store.fatalError)}
         <div
           class="notice"
           class:error={item.block.tone === "error"}
@@ -3119,7 +3167,11 @@
       <QuestionCard {request} {visible} onAnswer={(answers) => answer(request.requestId, answers)} />
     {/each}
 
-    {#if agentBusy && pinnedPermissions.length === 0 && pinnedQuestions.length === 0}
+    {#each pinnedElicitations as request (request.requestId)}
+      <ElicitationCard {request} {visible} onRespond={(action, content) => sendCommand({type: "elicitation", request_id: request.requestId, action, content}, "MCP response not sent")} />
+    {/each}
+
+    {#if agentBusy && pinnedPermissions.length === 0 && pinnedQuestions.length === 0 && pinnedElicitations.length === 0}
       <div class="status-row" aria-live={visible ? "polite" : "off"}>
         <span class="status-spark">
           <SessionGlyph kind="agent" {agentKind} size={12} state="alive" />
@@ -3133,7 +3185,11 @@
         {#if runningTasks > 0}
           <span class="status-part">{runningTasks} running task{runningTasks === 1 ? "" : "s"}</span>
         {/if}
-        <span class="status-label" title={activityDetail}>{activityLabel}</span>
+        {#if agentKind === "claude"}
+          <ModSite {mods} component="Spinner" instanceId="spinner" active={visible && $pageVisible} props={{ word: activityLabel, message: null, suffix: "…", mode: store.activity?.kind === "thinking" ? "thinking" : store.activity?.kind === "writing" ? "responding" : store.activity?.kind === "tool" ? "tool-use" : "requesting" }}>
+            {#snippet children(draw)}<span class="status-label" title={activityDetail}>{typeof draw.message === "string" ? draw.message : typeof draw.word === "string" ? draw.word : activityLabel}</span>{/snippet}
+          </ModSite>
+        {:else}<span class="status-label" title={activityDetail}>{activityLabel}</span>{/if}
         {#if store.compacting}
           <span class="compaction-progress" role="progressbar" aria-label="Compacting conversation">
             <span></span>
@@ -3358,12 +3414,19 @@
     />
   {/if}
 
+  {#if authServer !== null && session.workspace_id && agentKind === "claude"}
+    <ConnectionDialog wsId={session.workspace_id} agent="claude" name={authServer} {visible}
+      onClose={() => { authServer = null; sendCommand({type: "get_mcp"}, "MCP refresh not sent"); }}
+      onConnected={() => { if (authServer) sendCommand({type: "reconnect_mcp", server: authServer}, "reconnect not sent"); }} />
+  {/if}
+
   {#if menu === "mcp"}
     <McpPanel
       servers={store.mcpServers}
-      onReconnect={(server) => socket.send({ type: "reconnect_mcp", server })}
+      onReconnect={(server) => sendCommand({ type: "reconnect_mcp", server }, "reconnect not sent")}
+      onAuthenticate={session.workspace_id && agentKind === "claude" ? (server) => { authServer = server; menu = null; } : undefined}
       onToggleEnabled={(server, enabled) =>
-        socket.send({ type: "set_mcp_enabled", server, enabled })}
+        sendCommand({ type: "set_mcp_enabled", server, enabled }, "MCP change not sent")}
     />
   {/if}
 
@@ -3420,7 +3483,13 @@
     </div>
   {/if}
 
+  {#if agentKind === "claude" && store.exited === null}
+    <ModsWorkbench transport={socket.nativeUi} host={chatEl} onDockWidth={(width) => (modDockWidth = width)} {visible} {focused} running={agentBusy} hasSurvey={store.questions.length > 0 || store.elicitations.length > 0} composer={composerApi} canEdit={!composerDisabled && store.pending.length === 0 && store.questions.length === 0 && store.elicitations.length === 0 && rewindIntent === null && forkIntent === null} canFocus={focused && !composerEngaged && !agentBusy && store.pending.length === 0 && store.questions.length === 0 && store.elicitations.length === 0 && rewindIntent === null && forkIntent === null} />
+  {/if}
+
   <Composer
+    bind:this={composerApi}
+    onNativeEdit={agentKind === "claude" && mods.attached ? (request) => socket.nativeUi.request(request) : undefined}
     sessionId={session.id}
     imageInput={capabilities.image_input}
     view={quoteOwner}
@@ -3450,6 +3519,7 @@
   .connection-status .connect:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
   @media (pointer: coarse) { .connection-status .connect { min-height: 40px; padding: 6px 12px; } }
   .chat {
+    box-sizing: border-box;
     position: relative; /* anchors the rewind dialog + /mcp panel overlays */
     height: 100%;
     display: flex;

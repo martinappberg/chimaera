@@ -110,6 +110,6 @@
     }
     window.__snaps.push({ label, st: Math.round(tr.scrollTop), start: Number(tr.querySelector(".column > [data-block-index]").dataset.blockIndex), pos });
   };
-  window.__tab = (name) => Array.from(document.querySelectorAll(".tab .tab-name")).find((e) => e.textContent.trim() === name).click();
+  window.__tab = (name) => Array.from(document.querySelectorAll(".tab .tab-name")).find((e) => e.textContent.trim() === name).closest(".tab").click();
   window.__ready = true;
 })();

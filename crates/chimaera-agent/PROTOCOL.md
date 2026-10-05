@@ -18,6 +18,52 @@ Sources:
   (Anthropic.claude-code 2.1.204, openai.chatgpt 26.5623.141536 — the
   extensions are GUIs over these same protocols).
 
+## Model settings and Mods verification (2026-10-04)
+
+**Live: Codex 0.160.0.** `thread/settings/update` accepts a model string and
+returns an empty object. Acceptance does not establish model availability: an
+unlisted synthetic ID was accepted without a model turn. A model-only patch
+retained the previous `xhigh` effort; top-level `effort: null` did not clear it.
+The combined model patch with `collaborationMode: {mode: "default", settings:
+{model, reasoning_effort: null, developer_instructions: null}}` cleared effort
+to null and preserved `approvalPolicy: "never"` and read-only sandbox settings.
+The Plan equivalent also cleared effort. Thus a target without advertised
+effort support receives that explicit reset, rather than merely omitting a
+turn override. Genuine native read-backs remain the displayed truth.
+
+Model choices become durable only after acknowledgement. Rejection preserves
+the previous model and holds queued input; pending choices also gate recovery
+from a failed `turn/start`. Older runtimes without settings updates can select
+only advertised catalog entries. Explicit startup models get remembered effort
+only after their current catalog establishes support for that exact value.
+
+**Live: Claude Code 2.1.289.** A default-model pick was accepted and resolved to
+the account's current Opus; `xhigh` was accepted, switching to Haiku returned
+`effort: null`, and restoring default recovered the native effort. An invalid
+namespaced model was refused, with the previous model and effort unchanged.
+Model acknowledgements need a fresh `get_settings` read, like flag changes.
+
+**Live: Antigravity ACP 1.2.1 and Grok Build 1.0.46.** Both accepted their existing
+login, reported native catalogs/defaults, and passed stream/replay/resume plus
+model selection, approval allow/deny/stop, and queued-message controls. ACP
+remains catalog-only. `chat.newSessionModel=agent` omits remembered model and
+effort through the shared server path; explicit and saved conversation settings
+still take precedence. The four-adapter daemon fixture verifies both startup
+policies without replacing existing chats' settings.
+
+**Live: Claude Mods and background expiry, 2.1.289.** A real Haiku Bash turn
+provided user/assistant identities and native tool input/output. All three
+`UserMessage`, `AssistantMessage`, and `ToolUse` render hooks returned the Mod
+wrapper and delegated engine node, both directly and through the daemon's
+normalized events and native UI WebSocket. The browser displayed all three
+wrappers and the original Bash output; reload reattached and rendered them again
+with clean browser diagnostics. The no-model control/module/reattach suite also
+passed. An explicit `sleep 15`, `run_in_background: true`,
+`timeout: 1000` produced a stopped task notification after 1.009 seconds with
+the native time-limit explanation, followed by an empty background-task set.
+The runtime's default 30-minute and maximum 2-hour limits were source-inspected,
+not waited through.
+
 ## Upstream app-server integration guidance (audited 2026-07-18)
 
 The official Codex app-server documentation now exposes two integration aids
@@ -307,7 +353,7 @@ happened BELOW chimaera's event layer and no permission card can exist:
   strings for unmined kinds are unknown — cancel is the safe floor) but
   now with a visible Notice naming the kind.
 - **claude unknown control_request subtypes** (hook_callback,
-  mcp_message, elicitation, oauth refreshes…) are deliberately left
+  mcp_message, oauth refreshes…) are deliberately left
   unanswered — the CLI parks them until its own deadline or another
   client settles them, and an error reply could break flows that rely on
   that fallback — but a once-per-subtype Notice names what is waiting.
@@ -3154,3 +3200,135 @@ into the model picker. Such placeholders must not produce `ModelSwitched` or ent
 resume/pref state. Real assistant-message model observations use `reason: "reported"`;
 only the successful `set_model` acknowledgement uses `reason: null` to persist a user
 preference. The catalog's `value` remains the exact argument sent to `set_model`.
+
+### Claude Mods native UI (2.1.288, 2026-10-03)
+
+Verified without model turns using `tests/native_ui_live.rs` and its local
+`tests/fixtures/claude-mod` plugin: initialize, desktop `ui_attach`, pane roster,
+`ui_render` for Pane and AbovePrompt, `ui_press`, `ui_input`, `ui_select`,
+`ui_client_module`, close, detach, and reattach with plugin state retained.
+The complete billed smoke gate hit the account's weekly quota; the overall
+Claude driver pin remains unchanged until that gate passes.
+
+`ui_attach {surface:"desktop",client_id,answers}` acknowledges before asynchronous
+`session.attach` hooks finish. A pane can appear in a later `system/ui_panes`.
+`ui_render {component,instance_id,props}` returns `{tree,props,hooked,rewritten,
+client_modules?}`. The native cache may return its old tree before a coalesced
+`system/ui_invalidate` (100ms); render again on invalidation. A no-hook site
+returns an engine reference and `hooked:false`. `engine.ref=0` means original
+props. Returned rewritten props belong to the first engine node only; later
+references whose process-local props are unavailable use the original core view.
+
+Buttons carry a plugin and process-local numeric handle. Input/select requests
+also carry their key, component and instance, allowing Claude to re-resolve a
+field after redraw. `handled:false` means refresh the control, never replay the
+side effect. `ui_client_module` returns the hash, entry/export names, keyed JS
+files, and `claude:surface-runtime`; the runtime exports h/Fragment/install.
+Client closures stay in the isolated surface runtime. `ui_client_press` runs the
+native hook chain before its `reached` event reaches the local closure.
+
+The authenticated WebSocket owns the client ID. UI responses and addressed
+notifications go only to that window, over a separate bounded transient lane.
+Host `ui_copy` and `ui_prompt_read/fill/suggest` requests have five-second native
+timeouts and typed success answers; another window's answer cannot resolve them.
+A Mod's render tree, JS module, and callback handle are never conversation data.
+Only stable `message_identity` and bounded complete `tool_render_data` facts are
+journaled to preserve render-site identities across normal history replay.
+
+Browser verification covered Client state/press/post, pointer capture and native
+key names (`space`, `right`), clipboard forwarding, draft fill/append decorations,
+Tab acceptance of suggestions, reload, and light/dark rendering. `ui_focus`'s
+native element table contains Button/Input/Select, not Client controls; report
+only `is_held` for Client focus. Supplying its key resolves to null and would
+incorrectly move the browser focus back to the site container. Client module
+workers use a classic bootstrap with dynamic imports, which works inside the
+opaque sandbox; a module Worker failed before startup in the tested web view.
+
+## 2026-10-03: October runtime refresh
+
+**Codex 0.160.0.** A temporary official npm installation (the user's global CLI
+was unchanged) emitted an experimental TypeScript schema byte-identical to
+0.159.3. All ten existing Codex cases in `just chat-smoke` passed, including
+streaming, subagent lifecycle, permissions/settings, fork/rollback/compact,
+summary configuration, resume instructions and mid-turn message delivery.
+The tested Codex pin advances to 0.160.0.
+
+`model/list` returned `gpt-6.1-sol` with `isDefault: true`, followed by Astra,
+Sol, Luna and the older models; the daemon's pre-handshake fallback now leads
+with that id. Runtime catalogs remain authoritative for account availability.
+
+`instant_interrupt` is a runtime feature flag, not a `turn/steer` field.
+An app-server launched with `-c features.instant_interrupt=true` reported
+`experimentalFeature/list` entry `{name:"instant_interrupt", enabled:true,
+defaultEnabled:false, stage:"underDevelopment"}`; `config/read` also returned
+the true flag. Chimaera's launch setting either omits the override or passes
+true/false. It does not alter the ordinary queue, expected-turn precondition,
+or native read acknowledgement. The new billed regression
+`driver_codex_instant_steering_reads_during_a_response` remains **pending**:
+the maintainer paused model-backed tests until usage resets, and automatic
+approval review also held that additional billed probe. PR review can proceed.
+The daemon-backed settings UI was verified separately without model calls:
+all three choices, persistence after reload, reset to native configuration,
+light/dark rendering, and an empty browser error log.
+
+**Claude 2.1.288 is not yet fully verified.** The full suite ran 27 tests:
+17 passed and 10 failed. A separate diagnostic confirmed the Claude failures
+were an account weekly-limit response (`api_error_status:429`, `is_error:true`,
+zero model usage), with reset reported as October 6 at 8pm America/Los_Angeles.
+No background task was actually started, so absence of its frames does not
+establish wire drift. The Claude tested pin stays 2.1.287; re-run the full billed
+gate after reset before shipping or advancing it. No-model handshake controls
+worked on 2.1.288.
+
+The [official Claude changelog](https://code.claude.com/docs/en/changelog#21288)
+states that background command time limits apply to `-p` / SDK, CI and cloud
+sessions; Chimaera structured chats use that protocol. We do not impersonate
+the desktop entry point or disable that policy. Durable services belong in a
+linked daemon-owned terminal (or a scheduler job), and agent-owned work follows
+the runtime's actual lifecycle. The precise limit and expiry frame remain
+unverified until a billed background-task probe can run.
+
+## MCP elicitation follow-up (2026-10-03 — Claude 2.1.288; Codex 0.159.3 schema)
+
+- Claude's native `control_request.request` for elicitation carries
+  `subtype:"elicitation", mcp_server_name, message, mode:"form"|"url"`, plus
+  `requested_schema` for forms or `url, elicitation_id` for browser requests.
+  Reply inside `control_response.response.response` with
+  `{action:"accept",content:{…}}`, `{action:"decline"}`, or `{action:"cancel"}`.
+- **No-model live probe:** `python3 scripts/probe-claude-elicitation.py`; a disposable stdio MCP server called through the
+  real CLI's `mcp_call {tool:"mcp__elicit__request_input",arguments:{mode}}`
+  control produced the native asks and received exact replies: form accept
+  preserved integer zero, boolean false, text and a string array; a second form
+  received decline; a URL request received cancel. MCP array enum `items` must
+  include `type:"string"`; Claude rejects the malformed fixture before asking.
+- Generated Codex 0.159.3 app-server TypeScript confirms
+  `mcpServer/elicitation/request` modes `form`, `openai/form`, `openaiForm`, `url`.
+  Replies are `{action,content:null|JSON,_meta:null|JSON}`. Only
+  `_meta.codex_approval_kind:"mcp_tool_call"` uses the existing permission path;
+  forms/URLs cannot inherit that path's standing consent.
+- The shared normalized schema accepts standard scalar/enum/multiple-choice
+  forms plus nested objects. Unknown constraints refuse acceptance visibly.
+  Driver pending maps retain the normalized constraints, validate replies, and
+  withdraw asks on native cancellation or driver teardown. Resolution events
+  contain the action, not private form values.
+- Live isolated daemon UI: submitted a typed form including a nested object,
+  reloaded a pending browser request, then cancelled it; replay preserved the
+  card and decision, and browser diagnostics reported no errors/warnings.
+- Required billed `just chat-smoke` remains pending for this change: the account
+  hit its Claude weekly quota during the parallel runtime-update check. Do not
+  bump Claude's tested-version pin or merge this change until the gate passes.
+
+### Hooks fired inside a subagent carry the subagent's folder (2026-10-04, live probe, claude 2.1.289)
+
+With an `Agent` call under `isolation: "worktree"`, `SubagentStart`, the
+subagent's own `PreToolUse`/`PostToolUse` and `SubagentStop` payloads all carry
+`agent_id` + `agent_type` and, as `cwd`, the subagent's worktree
+(`<repo>/.claude/worktrees/agent-<agent_id>`, branch `worktree-agent-<agent_id>`).
+The parent's own hooks carry neither field and keep the parent's `cwd`. ADOPTED:
+the daemon's session tracker takes `cwd` only from payloads without a subagent
+identity, so a chat is never shown in its subagent's worktree, and answers a
+subagent's hook with no `additionalContext` of the session's (agent messages,
+same-file lines) — those wait for the session's own next hook. A hook's
+multi-line `systemMessage` reaches the chat as one `system/informational` notice
+with `<hook name> says: ` before every line; the chat UI folds the prefix
+(`web-ui/src/lib/chat/hookNotice.ts`).

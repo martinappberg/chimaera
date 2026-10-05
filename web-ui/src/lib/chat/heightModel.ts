@@ -1,3 +1,4 @@
+import { hookNotice } from "./hookNotice";
 import type { ChatBlock } from "./store.svelte";
 import { isTransferOrigin } from "./transfer";
 
@@ -112,6 +113,8 @@ export function blockWeight(
     case "usage":
       return 4;
     case "notice":
+      // A hook's notice is one collapsed line (`HookRow`), whatever it says.
+      if (block.tone === "info" && hookNotice(block.text)) return 1;
       return textLines(block.text, charsPerLine) + 0.5;
     case "wake":
     case "finished":

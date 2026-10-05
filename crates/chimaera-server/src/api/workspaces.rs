@@ -259,7 +259,7 @@ pub(crate) async fn put_mastermind(
         );
     }
     if let Some(model) = &body.model {
-        if !crate::launcher::safe_arg(model) {
+        if !crate::launcher::safe_model_arg(model) {
             return err(StatusCode::BAD_REQUEST, format!("invalid model {model:?}"));
         }
     }

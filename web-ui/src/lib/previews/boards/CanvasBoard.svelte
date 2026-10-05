@@ -14,7 +14,7 @@
   import DOMPurify from "dompurify";
   import { Marked } from "marked";
   import { basename, dirname, fsValidate, isImagePath, rawTicketUrl, resolveDocPath, safeDecodeUri } from "../files";
-  import { openPath } from "../../shared/openPath";
+  import { openPath, pathPaneFrom } from "../../shared/openPath";
   import { activateUrl } from "../../shared/urlOpen";
   import { followDocHref, showLinkHint } from "../docLinks";
   import FileIcon from "../../shared/FileIcon.svelte";
@@ -132,7 +132,7 @@
     if (n.type !== "file") return;
     const hit = resolved[n.file];
     if (hit === null || hit === undefined) return;
-    openPath(hit.path, hit.kind, { split: e.metaKey || e.ctrlKey });
+    openPath(hit.path, hit.kind, { split: e.metaKey || e.ctrlKey, documentFrom: path, fromPane: pathPaneFrom(rootEl) });
   }
 
   function openLink(url: string, e: MouseEvent): void {
@@ -202,6 +202,7 @@
     const host = rootEl;
     void followDocHref(href, e.metaKey || e.ctrlKey, {
       docPath: path,
+      fromPane: pathPaneFrom(a),
       wsRoot,
       workspaceId: null,
       toAnchor: () => false,

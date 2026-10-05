@@ -648,10 +648,10 @@ async fn established_scoped_terminal_refuses_input_after_authority_is_invalidate
 
 #[tokio::test]
 async fn established_scoped_sockets_cannot_rejoin_a_replacement_account_at_the_same_epoch() {
-    for surface in ["sessions", "resize", "chat", "events"] {
+    for surface in ["sessions", "resize", "chat", "native_ui", "events"] {
         let (state, project, _) = fixture();
         let captured = project.root.join("synthetic-input.txt");
-        let id = if surface == "chat" {
+        let id = if matches!(surface, "chat" | "native_ui") {
             let fake = write_fake_claude("viewer-generation-agent");
             let script = std::fs::read_to_string(&fake).unwrap();
             std::fs::write(
@@ -702,6 +702,8 @@ async fn established_scoped_sockets_cannot_rejoin_a_replacement_account_at_the_s
         };
         let endpoint = if surface == "resize" {
             "sessions"
+        } else if surface == "native_ui" {
+            "chat"
         } else {
             surface
         };
@@ -738,6 +740,14 @@ async fn established_scoped_sockets_cannot_rejoin_a_replacement_account_at_the_s
                     .into(),
             ),
             "sessions" => Message::Binary(bytes::Bytes::from_static(b"touch STALE_WS_INPUT\n")),
+            "native_ui" => Message::Text(
+                json!({
+                    "type":"native_ui", "request_id":"stale-mod",
+                    "request":{"subtype":"ui_press", "id":"STALE_WS_MESSAGE"}
+                })
+                .to_string()
+                .into(),
+            ),
             "chat" => Message::Text(
                 json!({"type":"send","blocks":[{"type":"text","text":"STALE_WS_MESSAGE"}]})
                     .to_string()
@@ -776,7 +786,7 @@ async fn established_scoped_sockets_cannot_rejoin_a_replacement_account_at_the_s
         state
             .stopping
             .store(true, std::sync::atomic::Ordering::Release);
-        if surface == "chat" {
+        if matches!(surface, "chat" | "native_ui") {
             state.chat.kill(&id);
         } else {
             let _ = state.sessions.kill(&id);

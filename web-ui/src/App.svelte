@@ -153,6 +153,11 @@
     focusedSession as focusedSessionOf,
     moveFocus,
     moveTabToIndex,
+    moveTabToPane,
+    navigateFileHistory,
+    openFileLink,
+    newPaneSplitDirection,
+    MAX_PANES,
     movePane,
     movePaneToIndex,
     movePaneToRootEdge,
@@ -379,9 +384,8 @@
     saveRailChrome,
   } from "./lib/layout/railState";
   import { hintsActive, initChordHints } from "./lib/shared/chordHints.svelte";
-  import HomeScreen from "./lib/workspace/HomeScreen.svelte";
   import HomeNavigation from "./lib/workspace/HomeNavigation.svelte";
-  import { loadDialog, loadPaneView } from "./lib/layout/lazyViews";
+  import { loadDialog, loadPaneView, retryPaneView } from "./lib/layout/lazyViews";
   import AskpassModal from "./lib/workspace/AskpassModal.svelte";
   import ContextMenuHost from "./lib/shared/ContextMenuHost.svelte";
   import { contextMenu } from "./lib/shared/contextMenu.svelte";
@@ -1202,17 +1206,10 @@
       refreshWorkspaces();
     }
   });
-  // The rail groups terminals (few) above agents (many); this order is also
-  // the mod+1–9 chord order and the focus-mode strip order, so what you see
-  // is what the numbers mean.
+  // The rail and focus-mode strip share the terminal-then-agent order.
   const shellSessions = $derived(wsSessions.filter((s) => s.kind !== "agent"));
   const agentSessions = $derived(wsSessions.filter((s) => s.kind === "agent"));
   const railSessions = $derived([...shellSessions, ...agentSessions]);
-  // The first nine rail rows carry the ⌘1–9 chord; this map is what the
-  // which-key hints (rail badges + strip chips) read to label them.
-  const chordDigits = $derived(
-    new Map(railSessions.slice(0, 9).map((s, i) => [s.id, i + 1] as const)),
-  );
   const sessionsById = $derived(new Map(sessions.map((s) => [s.id, s])));
   /** terminal session id -> agent session id (one agent per terminal). */
   const linksByTerminal = $derived(new Map(links.map((l) => [l.terminal_id, l.agent_id])));
@@ -1965,7 +1962,7 @@
       void flushSettings();
     };
     const onCopy = () => rememberCopy();
-    // Which-key discovery: holding the app modifier fades in the ⌘1–9 badges.
+    // Holding the app modifier reveals numbered pane destinations.
     const stopChordHints = initChordHints();
     const keptReviewRequested = (event: Event) => {
       const id = (event as CustomEvent).detail;
@@ -2416,7 +2413,11 @@
    * the line reveal, which the file view takes once it shows the path.
    */
   function openPathInLayout(path: string, kind: PathKind, opts: OpenPathOptions): void {
-    const from = opts.fromPane;
+    const source = opts.documentFrom !== undefined
+      ? paneForTab(layout.root, { surface: "file", path: opts.documentFrom }) : null;
+    // A document gesture captures its pane before validation. Older callers
+    // supplying only its path still anchor on that view, never on later focus.
+    const from = opts.fromPane ?? source?.paneId;
     const fromPane =
       from !== undefined && findPane(layout.root, from) !== null ? from : layout.focusedPaneId;
     const split = opts.split === true;
@@ -2425,7 +2426,12 @@
       revealInTree(path);
       return;
     }
-    openFileFromPane(fromPane, path, split);
+    if (!split && source?.paneId === fromPane && findPane(layout.root, fromPane)?.active === source.index) {
+      layout = openFileLink(pinPaths(layout, get(dirtyFiles)), source.paneId, path);
+      if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+    } else {
+      openFileFromPane(fromPane, path, split);
+    }
   }
 
   /**
@@ -2437,6 +2443,7 @@
    * the right instead, the escape hatch when you want it beside the source.
    */
   function openFileFromPane(paneId: string, path: string, newSplit: boolean, pinned = false): void {
+    layout = pinPaths(layout, get(dirtyFiles));
     const existing = paneForTab(layout.root, { surface: "file", path });
     if (existing !== null) {
       layout = activateTab(layout, existing.paneId, existing.index);
@@ -2894,6 +2901,15 @@
     }
 
     if (hit === null) {
+      const destination = chordDigit(e, modifierSetting(), true);
+      if (destination !== null && destination >= 1 && destination <= 9) {
+        intercept();
+        const target = panesOf(layout.root).find((p) => p.number === destination);
+        const source = findPane(layout.root, layout.focusedPaneId);
+        if (target !== undefined && source !== null) ctrl.moveTabToPane(source.id, source.active, target.id);
+        else showFlash(`Open pane ${destination} first${keyHint("newPane") ? ` (${keyHint("newPane")})` : ""}.`);
+        return;
+      }
       // Context bridge: reference the current selection in the target agent.
       // Spec-pinned chord — ⇧⌘R / Ctrl+Shift+R. Intercepts only while a
       // selection exists, so the browser's reload chord survives when there
@@ -2905,22 +2921,27 @@
         }
         return;
       }
-      // Pinned Mod+1–9: open the Nth rail session; Mod+0 is the dashboard.
+      // Pinned Mod+1–9 focuses the numbered pane; Mod+0 is the dashboard.
       const n = chordDigit(e, modifierSetting());
-      if (n !== null && detachedWindow) {
-        // The digit map targets the workspace roster, whose every visual
-        // (chips with badges, the rail) is absent in a solo window — a blind
-        // chord pulling arbitrary sessions in contradicts "just its pane".
-        // Mod+0's dashboard is equally kept out of solo windows.
+      if (n === 0 && detachedWindow) {
+        // A solo window does not pull in the workspace dashboard.
         intercept();
         return;
       }
       if (n === 0) {
         intercept();
         openDashboardSurface();
-      } else if (n !== null && n <= railSessions.length) {
+      } else if (n !== null && n >= 1) {
         intercept();
-        openSess(railSessions[n - 1].id);
+        const pane = panesOf(layout.root).find((p) => p.number === n);
+        if (pane !== undefined) {
+          layout = focusPane(layout, pane.id);
+          const sid = focusedSessionOf(layout);
+          void tick().then(() => {
+            if (sid !== null) pool.focusTerminal(sid);
+            else paneRootEl(pane.id)?.focus();
+          });
+        }
       }
       return;
     }
@@ -2931,6 +2952,20 @@
     if (hit.dir !== null && isEditableTarget(e.target)) return;
 
     switch (hit.id) {
+      case "newPane":
+        intercept();
+        newPaneAt(layout.focusedPaneId);
+        return;
+      case "fileBack":
+      case "fileForward": {
+        if (isEditableTarget(e.target)) return;
+        const pane = findPane(layout.root, layout.focusedPaneId);
+        if (pane?.tabs[pane.active]?.surface === "file") {
+          intercept();
+          ctrl.navigateFileHistory(layout.focusedPaneId, hit.id === "fileBack" ? -1 : 1);
+        }
+        return;
+      }
       case "settings":
         intercept();
         openSettingsSurface();
@@ -3309,8 +3344,7 @@
   /**
    * First-known non-zero created_at per session id. The daemon's mid-switch
    * placeholder row carries created_at:0 (a sentinel); sorting by it verbatim
-   * would teleport a switching session to the rail top and renumber every
-   * ⌘1–9 chord for the switch's duration. Keeping its original
+   * would teleport a switching session to the rail top. Keeping its original
    * created_at through placeholders AND respawns keeps the row in place. Pruned to live ids each snapshot.
    */
   const lastCreatedAt = new Map<string, number>();
@@ -3622,6 +3656,15 @@
     }
   });
   let homeSettingsOpen = $state(false);
+  // Workspace windows defer Home until it is visible. The shared view cache
+  // retains successes; the same asset recovery used by panes owns retries.
+  let homeLoad = $state<ReturnType<typeof loadPaneView> | null>(null);
+  $effect(() => {
+    if (activeWsId === null && !homeSettingsOpen && homeLoad === null) {
+      homeLoad = untrack(() => loadPaneView("home"));
+    }
+  });
+
   let homeSurface = $state<"settings" | "pro">("settings");
   let homeSettingsLoad = $state<ReturnType<typeof loadPaneView> | null>(null);
 
@@ -3752,6 +3795,7 @@
   // Knowledge is offered only while a knowledge plugin is on here (it is
   // that plugin's view; without one there is nothing to open).
   const quickOpenCommands = $derived([
+    { id: "new-pane", label: "New empty pane", aliases: ["split"], hint: keyHint("newPane"), run: () => newPaneAt(layout.focusedPaneId) },
     { id: "find", label: "Find in current pane", aliases: ["search"], hint: keyHint("find"), run: () => {
       const pane = quickOpenRestoreEl?.closest(".pane");
       const find = targetIn(pane?.querySelector<HTMLElement>(".layer.active") ?? findLayer());
@@ -3831,16 +3875,28 @@
   function cycle(delta: number): void {
     layout = cycleTab(layout, delta);
     const sid = focusedSessionOf(layout);
-    if (sid !== null) pool.focusTerminal(sid);
+    const paneId = layout.focusedPaneId;
+    void tick().then(() => {
+      if (sid !== null) pool.focusTerminal(sid);
+      else paneRootEl(paneId)?.focus();
+    });
   }
 
   function split(dir: SplitDir): void {
     splitAt(layout.focusedPaneId, dir);
   }
 
+  function newPaneAt(paneId: string): void {
+    splitAt(paneId, newPaneSplitDirection(layout));
+  }
+
   /** Split `paneId`; focus lands INSIDE the new pane on a real focusable
    *  target (the pane root), so chords and Escape keep working. */
   function splitAt(paneId: string, dir: SplitDir): void {
+    if (panesOf(layout.root).length >= MAX_PANES) {
+      showFlash(`All ${MAX_PANES} panes are open — move a tab into one of them.`);
+      return;
+    }
     layout = splitPane(layout, paneId, dir);
     const newPaneId = layout.focusedPaneId;
     // Pull DOM focus off the old terminal so typing doesn't land in a pane
@@ -4342,6 +4398,32 @@
   // --- layout controller (invoked by the pane tree) -------------------------
 
   const ctrl: LayoutCtrl = {
+    paneTargets() {
+      return panesOf(layout.root).map((p) => ({ id: p.id, number: p.number! })).sort((a, b) => a.number - b.number);
+    },
+    newPaneAt(paneId) {
+      newPaneAt(paneId);
+    },
+    moveTabToPane(paneId, index, targetPaneId) {
+      layout = moveTabToPane(layout, paneId, index, targetPaneId);
+      const id = layout.focusedPaneId;
+      const sid = focusedSessionOf(layout);
+      void tick().then(() => {
+        if (sid !== null) pool.focusTerminal(sid);
+        else paneRootEl(id)?.focus();
+      });
+    },
+    navigateFileHistory(paneId, delta) {
+      // Dirty previews are pinned synchronously before any replacement, even
+      // when the reactive pin effect has not flushed yet.
+      layout = navigateFileHistory(pinPaths(layout, get(dirtyFiles)), paneId, delta);
+      const id = layout.focusedPaneId;
+      void tick().then(() => paneRootEl(id)?.focus());
+    },
+    quickOpen(paneId) {
+      layout = focusPane(layout, paneId);
+      openQuickOpen();
+    },
     focusPane(paneId) {
       layout = focusPane(layout, paneId);
     },
@@ -5362,6 +5444,10 @@
       </div>
       </div>
     {:else}
+    {#if homeLoad !== null}
+      {#await homeLoad}
+        <p role="status">Loading Home…</p>
+      {:then HomeScreen}
     <HomeScreen
       {workspaces}
       sessions={sessions.filter((s) => !isMastermind(s))}
@@ -5375,6 +5461,18 @@
       onSettings={openSettingsSurface}
       onPro={openProSurface}
     />
+      {:catch error}
+        <div class="home-settings-shell">
+          <HomeNavigation active="workspaces" plan={$paidPlan} showPro={isBrowserGateway() || (isNativeShell() && $proOffered === true)}
+            onHome={() => (homeLoad = retryPaneView("home", error))} onPro={openProSurface} onSettings={openSettingsSurface} />
+          <div class="home-settings-content">
+            <p role="alert">Couldn't open Home.</p>
+            <button onclick={() => (homeLoad = retryPaneView("home", error))}>Retry</button>
+            <button onclick={openPicker}>Open a folder</button>
+          </div>
+        </div>
+      {/await}
+    {/if}
     {/if}
   {:else}
   <div class="body" bind:clientWidth={bodyWidth}>
@@ -5569,11 +5667,7 @@
                   {/if}
                 </span>
               {/if}
-              {#if hintsActive() && renamingId !== s.id && chordDigits.has(s.id)}
-                <!-- Which-key discovery: the ⌘1–9 digit for this row, faded in
-                     while the modifier is held. Pure teaching chrome. -->
-                <span class="kbd-badge" aria-hidden="true">{chordDigits.get(s.id)}</span>
-              {:else if renamingId !== s.id && isUnread(s.id)}
+              {#if renamingId !== s.id && isUnread(s.id)}
                 <!-- Unread: the scannable half of the cue (the bold name is
                      the readable half). Yields to the close button on hover. -->
                 <span class="unread-dot" aria-hidden="true"></span>
@@ -5651,7 +5745,7 @@
         </button>
 
         <!-- Terminals first (there are few), agents below (there are many);
-             this order is also the mod+1–9 order and the strip order. -->
+             the focus-mode strip follows the same order. -->
         <div class="rail-sec">terminals</div>
         {#each shellSessions as s (s.id)}
           {@render sessionRow(s)}
@@ -6225,7 +6319,9 @@
   {#if layout.focusMode}
     <!-- Focus-mode session strip: the rail is gone, but the window always
          says where you are. Hidden whenever the rail is visible. -->
-    <footer class="strip">
+    <!-- Deep native drag regions include the strip's padding and flex gaps;
+         Tauri excludes interactive descendants, so its buttons still work. -->
+    <footer class="strip" data-tauri-drag-region={nativeTitlebarOverlay ? "deep" : undefined}>
       {#if projectView && !isNativeShell()}
         <a class="account-home-link" href="/" aria-label="Back to account Home" title="Back to Home">Home</a>
       {/if}
@@ -6306,9 +6402,6 @@
               <span class="chip-name">{displayNames.get(s.id) ?? displayName(s)}</span>
               {#if isUnread(s.id)}
                 <span class="chip-unread" aria-hidden="true"></span>
-              {/if}
-              {#if hintsActive() && chordDigits.has(s.id)}
-                <span class="chip-badge" aria-hidden="true">{chordDigits.get(s.id)}</span>
               {/if}
             </button>
           {/each}
@@ -8012,29 +8105,6 @@
       color 0.12s ease;
   }
 
-  /* Which-key digit on the strip chip — the ⌘1–9 target in focus mode. Corner
-     badge so it overlays rather than widening the chip. */
-  .chip-badge {
-    position: absolute;
-    top: -3px;
-    right: -3px;
-    min-width: 13px;
-    height: 13px;
-    padding: 0 2px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    border-radius: 4px;
-    background: color-mix(in srgb, var(--accent) 24%, var(--rail-bg));
-    border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
-    font-family: var(--mono);
-    font-size: var(--text-xs);
-    line-height: 1;
-    color: var(--fg);
-    pointer-events: none;
-    animation: hintfade 0.14s ease-out;
-  }
-
   .chip:hover {
     background: var(--row-hover);
     color: var(--fg);
@@ -8280,6 +8350,7 @@
   /* The solo strip's flex grower (the chips row plays this role in normal
      windows; .strip-drag exists only under the macOS titlebar overlay). */
   .strip-spacer {
+    align-self: stretch;
     flex: 1;
     min-width: 0;
   }

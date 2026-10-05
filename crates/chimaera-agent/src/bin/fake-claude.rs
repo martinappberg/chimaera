@@ -140,6 +140,25 @@ fn main() {
             } else {
                 turn_active = true;
                 match mode.as_str() {
+                    "elicitation" => {
+                        emit(
+                            json!({"type":"system","subtype":"init","session_id":"fake-native-1","model":"fixture","tools":[],"mcp_servers":[]}),
+                        );
+                        let is_url = frame.to_string().contains("browser");
+                        emit(
+                            json!({"type":"control_request","request_id":"req-elicit","request":{
+                                "subtype":"elicitation","mcp_server_name":"Fixture","message":"Configure the workspace report","mode":if is_url {"url"} else {"form"},
+                                "url":if is_url {Some("http://localhost:8080/authorize")} else {None},
+                                "requested_schema":{"type":"object","required":["name","count","enabled","profile"],"properties":{
+                                    "name":{"type":"string","title":"Report name","minLength":1},
+                                    "count":{"type":"integer","title":"Count","minimum":0,"maximum":10,"default":0},
+                                    "enabled":{"type":"boolean","title":"Enabled","default":false},
+                                    "tags":{"type":"array","title":"Topics","items":{"type":"string","enum":["alpha","beta"]}},
+                                    "profile":{"type":"object","title":"Profile","required":["owner"],"properties":{"owner":{"type":"string","title":"Owner","minLength":1}}}
+                                }}
+                            }}),
+                        );
+                    }
                     "question" => run_question_turn(),
                     "plan" => run_plan_turn(),
                     "subagent" => run_subagent_turn(),
@@ -172,7 +191,12 @@ fn main() {
             // question) drive the turn; ignore any other control_response so
             // a future non-permission answer (get_settings, title, …) can't
             // corrupt this state machine.
-            if frame["response"]["request_id"] == "req-1" {
+            if frame["response"]["request_id"] == "req-elicit" {
+                turn_active = false;
+                emit(
+                    json!({"type":"result","subtype":"success","is_error":false,"session_id":"fake-native-1","duration_ms":1,"result":"MCP fixture received the response","usage":{}}),
+                );
+            } else if frame["response"]["request_id"] == "req-1" {
                 let response = &frame["response"]["response"];
                 let allowed = response["behavior"] == "allow";
                 let feedback_denial = !allowed && response["interrupt"] == json!(false);

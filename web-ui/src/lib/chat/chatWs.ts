@@ -3,6 +3,7 @@ import { movedTo, ownerSuspended, parsePause, sendSocketAuth, type MovedTo, type
 import { getToken } from "../net/api";
 import { ownerAwake, parkUntilAwake, QUIET_OPEN_MS, Reconnector, UNKNOWN_SESSION_RETRIES } from "../net/reconnect";
 import { CooperativeQueue } from "./cooperativeQueue";
+import { NativeUiTransport } from "./nativeUi";
 
 /**
  * Normalized agent events from the daemon (chimaera-agent's AgentEvent,
@@ -134,6 +135,7 @@ type ChatDelivery =
  * backoff — the journal gap-replay makes reconnects lossless.
  */
 export class ChatSocket {
+  readonly nativeUi = new NativeUiTransport((frame) => this.send(frame));
   private ws: WebSocket | null = null;
   private authenticatedSocket: WebSocket | null = null;
   private closed = false;
@@ -173,6 +175,7 @@ export class ChatSocket {
       switch (delivery.kind) {
         case "ready":
           this.handlers.onReady(delivery.session, delivery.replayFrom, delivery.head, delivery.attach);
+          if (this.ws?.readyState === WebSocket.OPEN && this.healthy) this.nativeUi.connected();
           break;
         case "event":
           this.handlers.onEvent(delivery.entry);
@@ -261,6 +264,12 @@ export class ChatSocket {
       // Any frame ends the quiet wait: the owner's side spoke.
       this.stopQuiet();
       switch (msg.type) {
+        case "native_ui":
+          this.nativeUi.receive(msg.event);
+          break;
+        case "native_ui_reset":
+          this.nativeUi.reset();
+          break;
         case "ready":
           // Also a kept socket's later `ready`: the account attached it to
           // the woken machine again with `last_seq` raised, so only the gap
@@ -314,10 +323,12 @@ export class ChatSocket {
           break;
         case "degraded":
           this.ended = true;
+          this.nativeUi.reset(true);
           this.deliveries.push({ kind: "degraded" });
           break;
         case "exited":
           this.ended = true;
+          this.nativeUi.reset(true);
           this.deliveries.push({
             kind: "exited",
             status: (msg.status as number | null) ?? null,
@@ -400,6 +411,7 @@ export class ChatSocket {
             break;
           }
           this.fatal = true;
+          this.nativeUi.reset(true);
           this.deliveries.push({
             kind: "error",
             message: (msg.message as string) ?? "unknown error",
@@ -411,6 +423,7 @@ export class ChatSocket {
     };
 
     ws.onclose = () => {
+      this.nativeUi.reset(true);
       if (this.ws === ws) this.ws = null;
       this.waking = false;
       const kept = this.kept;
@@ -555,6 +568,7 @@ export class ChatSocket {
     this.closed = true;
     this.stopSleepWait();
     this.stopQuiet();
+    this.nativeUi.reset(true);
     this.recon.cancel();
     this.recon.clear();
     this.deliveries.clear();

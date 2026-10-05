@@ -16,7 +16,7 @@ refetched off the Timeline epoch nudge and on visibility return — never polled
 | `Overview.svelte` | Where we left off (the handoff's slots drawn as markdown, older handoffs) · Waiting on you (`asks`) · What changed (7 days, bad news first) · Open work. |
 | `EntryList.svelte` | A section's filter chips and rows (the shared `Row`): findings grouped by topic, to-dos by status (done folded), the rest newest first. |
 | `EntryReader.svelte` | One entry: nav + crumb + open in file, standing / amends / reused-id callouts, the status as written, facts (to-do, session), What backs it (`FileCard`s: resolving paths open), the body (`EntryBody`), follow-ups, Referenced by. |
-| `EntryBody.svelte` | Fetches the entry's file (`render.ts`, cached per snapshot), draws its `span` through the reading renderer, links ids (`linkReferences`); a fallback markdown without a span. |
+| `EntryBody.svelte` | Fetches the entry's file (`render.ts`, cached per snapshot), draws its `span` through the reading renderer, links ids (`linkReferences`); a fallback markdown without a span. Link gestures capture their pane before path validation. |
 | `StatusMark.svelte` | A status exactly as written, with the plugin's ladder glyph only for the plugin's own status words. |
 | `TidyList.svelte` | The plugin's `tidy` rows; "Ask an agent" drafts the row's `ask` via `shared/askAgent.ts`. |
 | `entries.ts` | `buildIndex`: every entry of every kind as one `Entry` envelope (`ekey` unique), `byId`, backlinks from `refs`; `resolveRef` (same topic first), `searchEntries`, `qualifiedId`. Vitest. |
