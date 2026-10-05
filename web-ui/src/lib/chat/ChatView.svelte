@@ -68,6 +68,8 @@
   import ForkDialog from "./ForkDialog.svelte";
   import AgentMessageMeta from "./AgentMessageMeta.svelte";
   import Composer from "./Composer.svelte";
+  import { hookNotice } from "./hookNotice";
+  import HookRow from "./HookRow.svelte";
   import SameFileNotice from "../workspace/SameFileNotice.svelte";
   import ModsWorkbench from "./ModsWorkbench.svelte";
   import ModSite from "./ModSite.svelte";
@@ -2822,7 +2824,10 @@
           >
         </div>
       {:else if item.block.kind === "notice"}
-        {#if !(incompatibleRuntime && item.block.text === store.fatalError)}
+        {@const hook = item.block.tone === "info" ? hookNotice(item.block.text) : null}
+        {#if hook}
+          <HookRow said={hook} sourceIndex={item.index} sourceUid={item.block.uid} />
+        {:else if !(incompatibleRuntime && item.block.text === store.fatalError)}
         <div
           class="notice"
           class:error={item.block.tone === "error"}

@@ -144,6 +144,24 @@ async fn a_message_reaches_a_claude_terminal_on_its_next_hook_exactly_once() {
     assert_eq!(note["from_agent"], "claude");
     assert!(note["delivery"].is_string(), "{note}");
 
+    // A hook fired inside one of b's subagents is never the carrier: the
+    // message waits for b's own next step.
+    let (status, answer) = request(
+        &state,
+        Method::POST,
+        &format!("/api/v1/agent-events/{b}?key=kb"),
+        Some(serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "agent_id": "a55d52603606673c2",
+            "agent_type": "general-purpose",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert!(answer.get("hookSpecificOutput").is_none(), "{answer}");
+    assert_eq!(comms(&state, &ws).await["unread"][&b], 1);
+
     let (one, two) = tokio::join!(
         hook(&state, &b, "kb", "PostToolUse"),
         hook(&state, &b, "kb", "PostToolUse"),

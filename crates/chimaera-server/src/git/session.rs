@@ -2,7 +2,9 @@
 //!
 //! Every live session has a current folder: a shell's polled cwd, the `cwd`
 //! every claude hook payload carries (an agent that `cd`s or enters a
-//! worktree mid-session moves with it), else the folder it was spawned in.
+//! worktree mid-session moves with it; a hook fired inside a subagent
+//! carries the subagent's folder and is not taken), else the folder it was
+//! spawned in.
 //! The tracker resolves the checkout containing that folder (one
 //! `rev-parse`, cached per folder) and reads its branch from the `HEAD`
 //! file (no process). It recomputes only when a session's folder changes or

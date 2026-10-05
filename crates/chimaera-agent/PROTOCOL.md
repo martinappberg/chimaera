@@ -3071,3 +3071,19 @@ unverified until a billed background-task probe can run.
 - Required billed `just chat-smoke` remains pending for this change: the account
   hit its Claude weekly quota during the parallel runtime-update check. Do not
   bump Claude's tested-version pin or merge this change until the gate passes.
+
+### Hooks fired inside a subagent carry the subagent's folder (2026-10-04, live probe, claude 2.1.289)
+
+With an `Agent` call under `isolation: "worktree"`, `SubagentStart`, the
+subagent's own `PreToolUse`/`PostToolUse` and `SubagentStop` payloads all carry
+`agent_id` + `agent_type` and, as `cwd`, the subagent's worktree
+(`<repo>/.claude/worktrees/agent-<agent_id>`, branch `worktree-agent-<agent_id>`).
+The parent's own hooks carry neither field and keep the parent's `cwd`. ADOPTED:
+the daemon's session tracker takes `cwd` only from payloads without a subagent
+identity, so a chat is never shown in its subagent's worktree, and answers a
+subagent's hook with no `additionalContext` of the session's (agent messages,
+same-file lines) — those wait for the session's own next hook. A hook's
+multi-line `systemMessage` reaches the chat as one `system/informational` notice
+with `<hook name> says: ` before every line; the chat UI folds the prefix
+(`web-ui/src/lib/chat/hookNotice.ts`).
+||||||| c923c873
