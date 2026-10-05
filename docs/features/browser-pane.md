@@ -131,7 +131,7 @@ plane `ANY /proxy/{id}[/{*path}]`; agent-opened panes add the MCP `open_browser`
   acts, and so does any *visible* window showing the same workspace without that tab (a
   window cannot see another's layout, so two windows on one workspace may both open it).
   An existing tab on the same `host:port` is re-pointed and shown; otherwise the pane joins a
-  pane already showing a browser, else splits beside the session's pane (under the pane
+  pane already showing a browser, else fills an empty pane, else splits beside the session's pane (under the pane
   cap), else becomes a tab in a pane that is neither the session's nor the focused one. It
   never covers the session or the focused pane, keeps a zoomed pane zoomed, and never takes
   focus — the user keeps typing where they were

@@ -96,7 +96,8 @@ export function shouldActOnAgentBrowserOpen(open: AgentBrowserOpen, view: Window
  *    shown — moved beside the anchor if showing it would cover the anchor's
  *    or the focused pane's current view.
  * 2. Otherwise it joins a pane that is already showing a browser (agent
- *    panes collect in one place instead of splitting every time),
+ *    panes collect in one place instead of splitting every time), else
+ *    fills an empty pane,
  * 3. else splits beside the anchor (as a Cmd/Ctrl-clicked terminal URL
  *    does) while under the pane cap,
  * 4. else becomes a tab in the anchor's neighbour, or any other pane when
@@ -129,12 +130,16 @@ export function placeAgentBrowser(l: Layout, open: AgentBrowserOpen): Layout {
   }
   tab ??= freshBrowserTab(open.host, open.port, open.path);
 
-  const browserPane = panes(next.root).find((p) => {
-    const active = p.tabs[p.active];
-    return !covers(p.id) && active !== undefined && active.surface === "browser";
-  });
-  if (browserPane !== undefined) {
-    next = openTab(focusPane(next, browserPane.id), tab);
+  const all = panes(next.root);
+  // An empty pane shows nothing to cover — the anchor or the user's own
+  // included — so it is taken before a split leaves it sitting empty.
+  const home =
+    all.find((p) => {
+      const active = p.tabs[p.active];
+      return !covers(p.id) && active !== undefined && active.surface === "browser";
+    }) ?? all.find((p) => p.tabs.length === 0);
+  if (home !== undefined) {
+    next = openTab(focusPane(next, home.id), tab);
   } else if (panes(next.root).length < MAX_PANES) {
     next = openTab(splitPane(next, anchor, "row"), tab);
   } else {

@@ -215,6 +215,24 @@ describe("placeAgentBrowser", () => {
     expect(browserTabs(next)).toHaveLength(1);
   });
 
+  it("fills an empty pane instead of splitting beside it", () => {
+    // A window on the workspace with nothing open: the one empty pane.
+    const blank = defaultLayout();
+    const solo = placeAgentBrowser(blank, frame());
+    expect(panes(solo.root)).toHaveLength(1);
+    expect(browserTabs(solo)).toHaveLength(1);
+    expect(solo.focusedPaneId).toBe(blank.focusedPaneId);
+
+    // An empty pane beside the agent is used; no third pane appears.
+    const base = withAgent();
+    const agentPane = sessionPaneId(base, "s-agent")!;
+    const l = focusPane(splitPane(base, agentPane, "row"), agentPane);
+    const next = placeAgentBrowser(l, frame());
+    expect(panes(next.root)).toHaveLength(2);
+    expect(browserTabs(next)[0].pane).not.toBe(agentPane);
+    expect(next.focusedPaneId).toBe(agentPane);
+  });
+
   it("without the session's tab, opens beside the focused pane", () => {
     const l = openSession(defaultLayout(), "s-other");
     const next = placeAgentBrowser(l, frame());
