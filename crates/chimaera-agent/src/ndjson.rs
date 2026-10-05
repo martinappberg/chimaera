@@ -132,10 +132,11 @@ impl JsonlChild {
             "managed process was fenced before spawn"
         );
         let mut cmd = Command::new(bin);
+        // The executable can be a launcher (for example npm's Codex entry),
+        // so direct-child kill alone may strand its native subprocess.
+        // Group ownership is independent of managed lease admission.
         #[cfg(unix)]
-        if control.is_some() {
-            cmd.process_group(0);
-        }
+        cmd.process_group(0);
 
         cmd.args(args)
             .current_dir(cwd)
@@ -190,7 +191,7 @@ impl JsonlChild {
                 lines: CappedLines::new(stdout, MAX_STDOUT_LINE_BYTES),
             },
             guard: ChildGuard {
-                managed_group: control.is_some(),
+                managed_execution: control.is_some(),
                 child,
                 stderr_tail,
                 stderr_task,
@@ -310,7 +311,7 @@ const STDERR_SETTLE: Duration = Duration::from_secs(1);
 
 /// Owns the child for lifecycle: bounded shutdown, kill, stderr diagnostics.
 pub struct ChildGuard {
-    managed_group: bool,
+    managed_execution: bool,
     child: Arc<Mutex<Child>>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
     stderr_task: tokio::task::JoinHandle<()>,
@@ -347,16 +348,21 @@ impl ChildGuard {
     /// after the child died. A fast-crashing child otherwise loses the race
     /// and its failure diagnostics read as an empty tail.
     pub async fn shutdown_with_stderr(mut self, grace: Duration) -> (Option<i32>, String) {
-        if self.managed_group {
+        let deadline = Instant::now() + grace;
+        if cfg!(unix) || self.managed_execution {
             // Wait for the child to exit or the deadline, whichever comes
             // first (a clean stop takes ~0.3 s; every stop, view switch and
             // rewind used to wait the full two seconds), then end whatever
             // else is left in its process group.
             // The exit is observed without reaping (WNOWAIT), so the group id
             // cannot be recycled before the group kill below.
-            let deadline = Instant::now() + grace.min(Duration::from_secs(2));
+            let group_deadline = if self.managed_execution {
+                Instant::now() + grace.min(Duration::from_secs(2))
+            } else {
+                deadline
+            };
             let pid = self.child.lock().expect("child lifecycle lock").id();
-            while Instant::now() < deadline && !pid.is_some_and(exited_unreaped) {
+            while Instant::now() < group_deadline && !pid.is_some_and(exited_unreaped) {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
             let child = self.child.lock().expect("child lifecycle lock");
@@ -368,7 +374,13 @@ impl ChildGuard {
                 );
             }
         }
-        let deadline = Instant::now() + grace;
+        // Keep the managed path's existing reap window; ordinary shutdown
+        // still kills at the original grace, without adding another grace.
+        let deadline = if self.managed_execution {
+            Instant::now() + grace
+        } else {
+            deadline
+        };
         let status = loop {
             let observed = self.child.lock().expect("child lifecycle lock").try_wait();
             match observed {
@@ -527,9 +539,6 @@ impl Drop for ChildGuard {
         // A detached descendant may retain stderr after the bounded drain.
         // The reader belongs to this guard, including canceled shutdowns.
         self.stderr_task.abort();
-        if !self.managed_group {
-            return;
-        }
         #[cfg(unix)]
         if let Some(pid) = self.child.lock().expect("child lifecycle lock").id() {
             let _ = nix::sys::signal::killpg(
@@ -619,6 +628,86 @@ mod tests {
         .await
         .unwrap();
     }
+    // Model the npm entrypoint: one owned launcher forwards TERM, but its
+    // native child ignores it. Both retain stdout until their finite exit.
+    // No recorded PID/group is ever used to signal test cleanup.
+    async fn ordinary_launcher_cleanup(cancel_shutdown: bool) {
+        let child = JsonlChild::spawn(
+            "/bin/sh",
+            &[
+                "-c".into(),
+                r#"
+native=
+trap 'if [ -n "$native" ]; then kill -TERM "$native"; fi' TERM
+/bin/sh -c 'trap "" TERM INT HUP; printf "{\"ready\":true}\n"; sleep 6' &
+native=$!
+wait "$native"
+wait "$native"
+"#
+                .into(),
+            ],
+            Path::new("/"),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let (sink, mut stream, guard) = child.split();
+        let owns_group = {
+            let child = guard.child.lock().expect("child lifecycle lock");
+            let pid = child.id().unwrap() as i32;
+            // The unreaped direct Child pins this identity while inspected.
+            unsafe { nix::libc::getpgid(pid) == pid && pid != nix::libc::getpgrp() }
+        };
+        let ordinary = !guard.managed_execution;
+        let ready = tokio::time::timeout(Duration::from_secs(1), stream.next()).await;
+        guard.terminate();
+        drop(sink);
+        let stopped = if cancel_shutdown {
+            // Drop the original shutdown future while its grace is waiting.
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                guard.shutdown(Duration::from_secs(3)),
+            )
+            .await
+            .is_err()
+        } else {
+            guard.shutdown(Duration::from_secs(3)).await;
+            true
+        };
+        let eof = tokio::time::timeout(Duration::from_millis(500), stream.next()).await;
+        let closed_promptly = matches!(eof, Ok(Ok(None)));
+        // The pre-fix child may survive the launcher. Let the SAME finite
+        // child end naturally before any assertion, including negative runs.
+        let settled = closed_promptly
+            || matches!(
+                tokio::time::timeout(Duration::from_secs(8), stream.next()).await,
+                Ok(Ok(None))
+            );
+        drop(stream);
+        assert!(settled, "finite launcher/native pipe did not settle");
+        assert!(matches!(ready, Ok(Ok(Some(ref frame))) if frame["ready"] == true));
+        assert!(
+            ordinary,
+            "ordinary launch must not acquire managed admission"
+        );
+        assert!(stopped, "shutdown did not reach its intended cutpoint");
+        assert!(
+            closed_promptly,
+            "native child survived launcher teardown (own group: {owns_group})"
+        );
+        assert!(owns_group, "ordinary launcher inherited the caller's group");
+    }
+
+    #[tokio::test]
+    async fn ordinary_launcher_shutdown_ends_its_native_child() {
+        ordinary_launcher_cleanup(false).await;
+    }
+
+    #[tokio::test]
+    async fn ordinary_launcher_canceled_shutdown_ends_its_native_child() {
+        ordinary_launcher_cleanup(true).await;
+    }
+
     /// A managed child that exits on its own is reaped at once (a stop, view
     /// switch or rewind no longer waits out a fixed two seconds), and what it
     /// left running in its process group is still ended.
