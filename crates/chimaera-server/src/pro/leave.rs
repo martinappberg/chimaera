@@ -1058,8 +1058,24 @@ async fn take_back(
         Some(reason),
         Vec::new(),
     );
-    let resume_now = {
-        super::unpark(state, workspace);
+    let resume_now = bring_back(state, workspace);
+    save(state).await;
+    state.pro.renew_now.notify_waiters();
+    report(state, config, generation, workspace).await;
+    if resume_now {
+        resume_here(state, workspace);
+    }
+}
+
+/// Starts bringing one project back to this computer, as a wake would for it
+/// alone: unparked; a release nobody took is re-acquired at its own epoch
+/// (`Transferring` → `AwaitingVerification`, no install, no fork), one the
+/// cloud holds comes home at its next pause (`reclaim`, `lazy_handback`,
+/// conflicts kept in both versions). Returns whether its stopped sessions
+/// resume here at once (a release that never went out). The caller persists.
+fn bring_back(state: &AppState, workspace: &str) -> bool {
+    super::unpark(state, workspace);
+    {
         let mut ownership = lock(&state.pro.ownership);
         match ownership.get(workspace).cloned() {
             Some(Ownership::Transferring { epoch }) => {
@@ -1076,20 +1092,90 @@ async fn take_back(
             }
             _ => {}
         }
-        lock(&state.pro.release_pending).remove(workspace)
-    };
-    save(state).await;
-    state.pro.renew_now.notify_waiters();
-    report(state, config, generation, workspace).await;
-    if resume_now {
-        let owner = state.clone();
-        let workspace = workspace.to_owned();
-        tokio::spawn(async move {
-            if let Err(error) = crate::ledger::resume_deferred_workspace(&owner, &workspace).await {
-                tracing::warn!(%error, "Could not resume a project's sessions after taking it back");
-            }
-        });
     }
+    // The next lease tick runs a return pass for it at once.
+    state.pro.return_pass.store(0, Ordering::Release);
+    lock(&state.pro.release_pending).remove(workspace)
+}
+fn resume_here(state: &Arc<AppState>, workspace: &str) {
+    let owner = state.clone();
+    let workspace = workspace.to_owned();
+    tokio::spawn(async move {
+        if let Err(error) = crate::ledger::resume_deferred_workspace(&owner, &workspace).await {
+            tracing::warn!(%error, "Could not resume a project's sessions after bringing it back");
+        }
+    });
+}
+
+/// Whether "run here" applies to `workspace` on this computer (the additive
+/// `run_here` of its `/pro/status` row): a personal computer with the
+/// Runtime, the project registered and synced here, and its work in the
+/// cloud or on its way there (parked, released, or held there).
+pub(super) fn may_run_here(state: &AppState, config: Option<&Configure>, workspace: &str) -> bool {
+    config.is_some_and(|config| {
+        config.role == super::protocol::Role::Device && config.delegation.workspace.is_none()
+    }) && state.daemon_extension.is_some()
+        && lock(&state.workspaces).get(workspace).is_some()
+        && lock(&state.pro.authority).allows(workspace)
+        && !super::project_copy::copy_only(state, workspace)
+        && !lock(&state.pro.preferences)
+            .get(workspace)
+            .is_some_and(|p| p.never_mirror)
+        && !lock(&state.pro.reclaim).contains(workspace)
+        && matches!(
+            lock(&state.pro.ownership).get(workspace),
+            Some(Ownership::Remote { .. } | Ownership::Transferring { .. })
+        )
+        && !lock(&state.pro.sleeping).contains(workspace)
+}
+
+/// `POST /pro/projects/{id}/here`: the user asked for one project to run on
+/// this computer again ("Run here"), whatever the app's presence: it comes
+/// back at its conversation's next pause through the usual return (exactly
+/// once, no new turn, both versions kept where both changed). 202 when it is
+/// on its way (`returning` on its row until it is here), 409 `not_elsewhere`
+/// when there is nothing to bring back, 404 for an unknown project.
+pub(crate) async fn run_here(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(workspace): axum::extract::Path<String>,
+) -> Response {
+    if !super::valid_id(&workspace) || lock(&state.workspaces).get(&workspace).is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let config = lock(&state.pro.runtime).clone();
+    if !may_run_here(&state, config.as_ref(), &workspace) {
+        let returning = lock(&state.pro.reclaim).contains(&workspace);
+        return if returning {
+            (StatusCode::ACCEPTED, Json(json!({"returning": true}))).into_response()
+        } else {
+            (
+                StatusCode::CONFLICT,
+                Json(json!({"error": "not_elsewhere"})),
+            )
+                .into_response()
+        };
+    }
+    tracing::info!(
+        target: "chimaera_server::pro::leave",
+        "a project was asked back to this computer"
+    );
+    // The latest computer the user ran it on is the one it returns to.
+    lock(&state.pro.opened_here).insert(workspace.clone());
+    let resume_now = bring_back(&state, &workspace);
+    // A Transferring project re-acquires through the lease loop, which only
+    // `reclaim` holds to account; mark it returning either way.
+    {
+        let mut reclaim = lock(&state.pro.reclaim);
+        if reclaim.len() < 128 || reclaim.contains(&workspace) {
+            reclaim.insert(workspace.clone());
+        }
+    }
+    save(&state).await;
+    state.pro.renew_now.notify_waiters();
+    if resume_now {
+        resume_here(&state, &workspace);
+    }
+    (StatusCode::ACCEPTED, Json(json!({"returning": true}))).into_response()
 }
 
 /// A project taken back from the cloud is here again: the account hears its
@@ -1397,6 +1483,46 @@ mod tests {
         );
         // A refusal is said for work that would have moved; nothing here works.
         assert_eq!(sleeping(&state, Some(Reason::CloudTimeUsedUp)), generation);
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn one_project_comes_back_without_touching_the_others() {
+        let (state, root) = fixture("here");
+        let id = |name: &str| name.to_owned();
+        lock(&state.pro.ownership).insert(id("w-released"), Ownership::Transferring { epoch: 4 });
+        lock(&state.pro.ownership).insert(
+            id("w-cloud"),
+            Ownership::Remote {
+                epoch: 5,
+                holder: "m-1".into(),
+            },
+        );
+        lock(&state.pro.ownership).insert(id("w-other"), Ownership::Transferring { epoch: 2 });
+        for parked in ["w-released", "w-cloud", "w-other"] {
+            lock(&state.pro.parked).insert(id(parked));
+        }
+        lock(&state.pro.release_pending).insert(id("w-released"));
+        // A release that never went out resumes here at once, at its epoch.
+        assert!(bring_back(&state, "w-released"));
+        assert!(matches!(
+            lock(&state.pro.ownership).get("w-released"),
+            Some(Ownership::AwaitingVerification { epoch: 4 })
+        ));
+        // Work the cloud holds comes home at its next pause.
+        assert!(!bring_back(&state, "w-cloud"));
+        assert!(lock(&state.pro.reclaim).contains("w-cloud"));
+        // Nothing else moved.
+        assert!(lock(&state.pro.parked).contains("w-other"));
+        assert!(matches!(
+            lock(&state.pro.ownership).get("w-other"),
+            Some(Ownership::Transferring { epoch: 2 })
+        ));
+        // Without the Runtime (a free daemon) the call never applies.
+        assert!(!may_run_here(&state, None, "w-other"));
+        let response = run_here(State(state.clone()), axum::extract::Path("w-none".into())).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
         drop(state);
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -548,7 +548,12 @@ outcomes without account calls (`leave::sleeping`, `leave::slept`). Each outcome
 parked, and its watch restarts on the next tick; pruned to registered projects,
 cleared on sign-out) is one `chimaera_server::pro::leave` info line, the
 additive `leave {state, reason?, at, stopped?}` on the status row, and a
-best-effort `PUT /v2/workspaces/{id}/leave`. `/pro/status` has an additive
+best-effort `PUT /v2/workspaces/{id}/leave`. `POST /pro/projects/{id}/here` ("Run here") brings one
+project back the same way whatever the app's presence (`leave::bring_back`, plus
+`opened_here` so the return applies; 202 `{returning: true}`, 409
+`not_elsewhere`, 404); rows carry additive `run_here` (it applies: the project's
+work is in the cloud or on its way, `may_run_here`) and `returning` (in
+`reclaim` until held here again; `start_return` prunes it). `/pro/status` has an additive
 top-level `leaving {ready, reason?}` for a personal computer
 (`optional_runtime_unavailable` without the Runtime). A daemon without the
 optional Runtime answers leave with `{"leaving":[],"reason":"optional_runtime_unavailable"}`;

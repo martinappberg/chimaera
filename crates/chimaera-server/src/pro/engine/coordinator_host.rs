@@ -201,6 +201,16 @@ impl CoordinatorTick {
         if !self.can_mirror() || self.config.role != Role::Device {
             return false;
         }
+        // A project brought back through its own epoch (the lease loop) is
+        // no longer returning once it is held here again.
+        let reclaim: Vec<String> = lock(&self.state.pro.reclaim).iter().cloned().collect();
+        let home: Vec<String> = reclaim
+            .into_iter()
+            .filter(|id| super::super::owned_epoch(&self.state, id).is_some())
+            .collect();
+        if !home.is_empty() {
+            lock(&self.state.pro.reclaim).retain(|id| !home.contains(id));
+        }
         let wanted = !lock(&self.state.pro.reclaim).is_empty()
             || (super::super::leave::app_settled(&self.state)
                 && lock(&self.state.pro.ownership).values().any(|owner| {

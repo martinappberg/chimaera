@@ -56,6 +56,8 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/pro/projects/copy", post(crate::pro::copy_project))
         .route("/pro/projects/takeover", post(crate::pro::takeover_project))
         // Both versions a return kept (`pro/kept.rs`): list, compare, choose.
+        // One project back to this computer ("Run here", `pro/leave.rs`).
+        .route("/pro/projects/{id}/here", post(crate::pro::run_here))
         .route("/pro/projects/{id}/kept", get(crate::pro::kept_list))
         .route("/pro/projects/{id}/kept/file", get(crate::pro::kept_file))
         .route(

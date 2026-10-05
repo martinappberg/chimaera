@@ -32,7 +32,7 @@ pub(crate) use drain::{cancel as cancel_drain, start as drain};
 pub(crate) use kept::{
     file as kept_file, list as kept_list, resolve as kept_resolve, resolve_all as kept_resolve_all,
 };
-pub(crate) use leave::leave;
+pub(crate) use leave::{leave, run_here};
 #[cfg(feature = "daemon-extension-fixture")]
 pub(crate) use moves::device_fixture;
 pub(crate) use moves::{acted_here, other_computer};
