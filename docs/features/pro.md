@@ -180,9 +180,20 @@ Tokens never belong in this file. Use the
 [loopback fixture](../../crates/chimaera-link/PROTOCOL.md#fixture-and-conformance)
 for a local integration run.
 
+## Where work runs: the host indicator
+
+The workspace window's host label (the connection dot and "local" at the foot of the rail, or in the focus-mode strip) is the one place that says where a synced project's work runs. It applies only to the official app with an active plan, on a local project in a native window; everyone else, including a signed-out or no-plan user of the official app, sees exactly the label of the free app (the public host renders its own label and mounts nothing; `web-ui/src/lib/extensions/PlaceSlot.svelte`). For a synced project the label reads **This Mac** (or "This computer"), **In the cloud**, or **On <computer name>** (the account's own device names), and **Moving…** / **Moving here…** while an action the user took is under way. A project kept on this computer only keeps the plain host label.
+
+It normally only informs. Clicking it opens a small menu: one sentence ("Running on this Mac", "Running in your cloud", "Running on Studio"), at most one plain note, and only the entries that apply. The note says why work stays or cannot move, from the daemon's own facts: the last leave outcome ("When you last quit, this stayed on this Mac: Claude Code isn't signed in in your cloud yet.", with **Connect Claude Code**, the only fixable reason), a daemon that cannot hand work over ("Work stays on this Mac when you quit: this copy of Chimaera can't move it to your cloud."), a used-up allowance, an agent sign-in the cloud waits for (with **Connect**), or a refused action. Unknown reason values read as a generic true sentence.
+
+- **Run here**: shown on a computer that holds a ready copy of a project another computer or the cloud runs. It is the same explicit move the former Take over button made (native `pro_take_over_project` with the copy's ownership epoch).
+- **Run in the cloud**: shown when this computer runs the project, the daemon says the cloud can take it now (`/pro/status` `cloud_handoff`), and the project has a Claude Code or Codex conversation here. It sends the quit hand-off for exactly this project (`POST /api/v1/pro/sleep {park:true, workspace_ids:[id]}`, `web-ui/src/lib/extensions/placeHost.ts`), so the project stays in the cloud until this computer leaves and comes back (`/pro/wake`). A short note says it uses cloud time; nothing else anywhere points at it.
+
+There is no "Run here" for a project this same computer handed to the cloud: no daemon call brings back one parked project (only `/pro/wake`, which unparks every project). The presentation, its polling (15 s while visible, 3 s while a move runs) and its words live in the private package (`account/ProjectPlace.svelte`, `account/place.ts`); the public host passes only the workspace id, its session list, visibility and three fixed actions (`PlaceMount` in `extensions/application.ts`).
+
 ## On the web
 
-Signing in at the account's address in a browser lands in the same workbench the desktop app shows, not on an account page. The account serves this UI at `/` with a `chimaera-surface` marker (`net/base.ts` `isAccountHome`), and `main.ts` mounts `pro/AccountHome.svelte` there instead of the workbench, because no daemon stands behind that page. Home has the desktop's navigation and heading and lists **Cloud projects** (`pro/CloudProjects.svelte` in its browser mode): every project the account keeps in the cloud, by name. **Open project** goes to its project view (`/workspace/{id}/`, which follows the project to whichever machine runs it) or, for a project only a cloud machine has, to that machine's page. There is no This Mac section, no remote machines and no **Open folder**: those need a computer of your own. Nothing about plans or billing shows on Home.
+Signing in at the account's address in a browser lands in the same workbench the desktop app shows, not on an account page. The account serves this UI at `/` with a `chimaera-surface` marker (`net/base.ts` `isAccountHome`), and `main.ts` mounts `pro/AccountHome.svelte` there instead of the workbench, because no daemon stands behind that page. Home has the desktop's navigation and heading and lists **Cloud projects** (`pro/CloudProjects.svelte` in its browser mode): every project the account keeps in the cloud, by name, each with one line saying where it is right now and only when that says something: "Running in the cloud", "In the cloud" (idle there), "On your computer" (with the reason when its work stayed there when the app quit, from the row's `leave`), "Moving to the cloud…", or "Can't be reached right now. Your work is saved." for a project whose name could not be read. An idle project with nothing running anywhere gets no line. The place comes from each project's own passive placement read (`GET /workspace/{id}/placement`, account state only, never a wake; at most 32 per refresh, four at a time; private `account/control/accountHome.ts` `fetchHomePlaces`, words in `account/place.ts` `homeLine`), so a stale leave outcome never claims the cloud. **Open project** goes to its project view (`/workspace/{id}/`, which follows the project to whichever machine runs it) or, for a project only a cloud machine has, to that machine's page. There is no This Mac section, no remote machines and no **Open folder**: those need a computer of your own. Nothing about plans or billing shows on Home.
 
 Settings there holds only **Chimaera Pro** (`SettingsView` with `account`, which renders `pro/BrowserAccount.svelte` in place): the plan and its badge, usage as percentages of the account's own allowances, **Manage plan and billing** (**See plans** without a plan), which opens the account's billing page in the same tab, and **Sign out**, which signs out this browser only. Devices, other sign-ins and **Sign out everywhere** are on that billing page. Both reads are passive, same-origin and cookie-authenticated (`pro/accountHome.ts`; routes in the [protocol](../../crates/chimaera-link/PROTOCOL.md#account-home-in-a-browser)), and neither wakes a cloud machine. Home rereads its list every 30 seconds while visible (every 10 while part of it is still connecting); a session that ended returns to the sign-in page. Project views and host views are unchanged; their Pro page links to the same billing page.
 
@@ -216,11 +227,14 @@ account's cloud has been ready (the app remembers it per account as
 computer knows), a later `preparing`, such as a service update, reads exactly
 like ready and idle: **Available when you need it** with the agents line. The
 user never has to think about a machine: no sentence in Settings → Chimaera Pro
-calls the cloud a machine or says it sleeps or wakes. Words about waking belong
-only to the user's own action: a pressed button (“Connecting Claude Code…”) and
-the chat and terminal lines for a sleeping project (“Asleep in the cloud. Send a
-message to wake it.”). `pro/vocabulary.test.ts` scans the Pro and cloud settings
-copy for it.
+calls the cloud a machine or says it sleeps or wakes, and no Pro surface uses a
+mechanism word (asleep, waking, owner, lease, checkpoint, epoch, baton, worker,
+keeper, mirror, take over): the cloud is "the cloud" or "your cloud", a computer
+is "this Mac", "your computer" or its name, and while the cloud starts for
+something the user did, the line shows that action's own progress ("Sending…",
+"Connecting…"), never a state. `pro/vocabulary.test.ts` (public copy and the
+shared chat, terminal and project states) and the private package's
+`account/vocabulary.test.ts` scan for it.
 
 A disabled service says cloud work isn't available yet and that work on this
 computer continues; an uninvited preview account says access is by invitation.
@@ -360,7 +374,7 @@ connection operations keep the worker active only until they finish or expire.
 Repository-provider connections remain optional. On the cloud machine's own page
 (an account browser), an HTTPS Git URL clones into its persistent projects folder
 and navigates to the new project (`/workspace/{id}/` in a project tab). The desktop
-app opens synced local copies and offers **Take over** separately; it has no
+app opens synced local copies and offers **Run here** separately; it has no
 cloud-page clone control. Duplicate names
 and embedded URL credentials are rejected. Only one clone runs at a time;
 incomplete clones are not registered. The cloud machine's SSH public key is under
@@ -452,7 +466,9 @@ computer's projects while the app is closed: offering the daemon to them belongs
 to the running app. Work an agent is doing or waiting on when the app quits
 continues in the cloud by itself (see [Quitting](#quitting)).
 
-Pro → **Projects and privacy** shows privacy, the last recorded copy, and actual
+Pro → **Projects** lists each synced project with one place line and the one
+per-project choice, **Keep on this computer only**. **Advanced** (collapsed)
+holds each project's details: the last sync, and actual
 problems such as an incomplete copy or a required provider connection. Healthy
 file counts, storage quotas and generic environment diagnostics are not account
 controls, and setup commands are not edited there; Chimaera and its agents manage
@@ -559,8 +575,8 @@ Implementation: the native app posts `POST /api/v1/pro/leave` (no body) and quit
 A project folder records its workspace identity inside its Git directory (or a
 small `.chimaera-workspace` marker for a non-Git folder). Opening an already
 synced project on another computer refreshes a local copy; execution remains
-with its current owner. **Take over** separately moves execution through the
-existing safe handoff. A duplicate folder on the same computer becomes a
+where it runs. **Run here**, in the host indicator's menu, separately moves the
+work to this computer through the existing safe handoff. A duplicate folder on the same computer becomes a
 separate project; a plain Git clone is separate until selected from synced
 projects. Read-only folders carry no persistent marker. Identity lives in
 [`workspaces/identity.rs`](../../crates/chimaera-server/src/workspaces/identity.rs).
@@ -574,10 +590,10 @@ agents or runs setup. A missing/moved folder or unrelated nonempty destination
 fails safely. An older daemon without the exact copy acknowledgment requires an
 update; there is no fallback to its old transfer-on-open route.
 
-A copied workspace's placement strip offers **Take over** only after a ready
-copy and current ownership epoch are verified. Sessions continue on the current
-owner until that explicit action completes. Copied-local edits are retained but
-are not automatically published. **Project copies** in Settings also reports Git
+A copied workspace's host indicator offers **Run here** only after a ready
+copy and current ownership epoch are verified. Sessions continue where they run
+until that explicit action completes. Copied-local edits are retained but
+are not automatically published. **Project details** under Advanced also reports Git
 staging: synchronized, an older snapshot without staging, or conflicts. Conflicts
 keep the local staged version for conflicting paths and preserve both index
 snapshots for recovery, including staged-only content. Its advanced recovery
@@ -596,7 +612,9 @@ workspace tabs. The local workbench merges remote session rows under those IDs
 and forwards their chat and terminal connections through the signed-in app. A
 routed session is labelled "In the cloud" or "On another computer" ("·
 reconnecting" while its owner cannot be reached and this view's own connection
-to it is down); opening it never silently starts another local agent.
+to it is down), but only while the project's sessions run in more than one
+place (`net/placement.ts` `placesSplit`): when they all run in one, the host
+indicator names it once. Opening one never silently starts another local agent.
 
 **Explicit opens and input may wake; background views never do.** An explicit
 project open may wake cloud without moving execution. Passive chat or terminal
@@ -615,17 +633,17 @@ old value keeps showing. It is never applied by itself: if you send nothing
 within ten minutes it is dropped with a short note, so a window left open
 cannot change the mode of work someone starts later from another device.
 The message shows at once as a "sending…" bubble and
-the chat says "Waking the cloud machine…"; a terminal says the same over the
+the chat says "Sending…"; a terminal says "Connecting…" over the
 pane and echoes nothing until the owner answers. While it wakes, a second
 message or more typing is not held: it is refused with a short note (the
 message comes back into the composer). A browser
 view reconnects once with wake intent when the user types or sends into a
 dropped connection; the action itself is not queued (the composer keeps its
-text; a terminal says it is waking). There is no reconnect or wake button: the
-chat says "Reconnecting…" (only for a viewed project, after a short grace) or
-"Asleep in the cloud. Send a message to wake it." while the cloud machine is
-asleep, and its header reads "In the cloud · asleep"; a terminal says "Asleep in
-the cloud. Press a key to wake it." Asleep holds across dropped connections
+text; a terminal says it is connecting). There is no reconnect or wake button: the
+chat says "Reconnecting…" (only for a viewed project, after a short grace) and
+nothing at all while the project is idle in the cloud (the composer stays ready;
+its header reads only "In the cloud"); a terminal says "Idle in your cloud.
+Press a key to continue." Idle holds across dropped connections
 until something wakes it, and nothing retries against a sleeping cloud
 machine: a chat or terminal whose connection drops while it sleeps waits with
 no timer until you send or type (which wakes it) or the project answers again
@@ -649,7 +667,7 @@ and more messages or typing during the wake join the same queue; a model,
 mode or effort you pick meanwhile is kept too and applied in the order you
 made it. Each message
 shows as its own "sending…" bubble until the agent has it; while the machine
-wakes, a terminal says "Waking the cloud machine…" over the pane (as does a
+wakes, a terminal says "Connecting…" over the pane (as does a
 chat that had not connected before) and echoes nothing until the machine
 answers. A connection that is open and quiet is not "Reconnecting…". A
 conversation opened for the first time while its machine sleeps says "The
@@ -692,7 +710,8 @@ was still on its way when a connection ended is not replayed.
 
 **Opening and ordinary input leave execution with its owner.** Opening a synced project creates or
 updates its local copy. Chat messages and terminal input still route to the
-current owner; they do not implicitly acquire execution. **Take over** asks that
+current owner; they do not implicitly acquire execution. **Run here** (the host
+indicator's menu; formerly Take over) asks that
 owner to finish its current step, save and release, then establishes execution
 here. A failed or stale action leaves the current owner authoritative and asks
 for a fresh explicit decision. Explicit opens may wake the cloud; background
@@ -864,7 +883,7 @@ cloud copies once the account confirms them again.
 
 Opening the same project on a phone, browser or another computer does not move
 execution away from its current computer; a native local copy requires explicit
-**Take over** to move execution. Logical browser routes and
+**Run here** in the host indicator to move execution. Logical browser routes and
 native project views resolve the
 current owner passively, carry its exact workspace/epoch and preserve the same
 session identity. Files, previews and watches follow that owner while native file

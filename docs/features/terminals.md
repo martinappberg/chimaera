@@ -265,15 +265,15 @@ daemon’s existing grid and scrolls horizontally without resizing it or
 accepting input. Taking control reconnects and fits the terminal to the current
 pane; it is not itself interaction. Explicitly opening the project may wake
 cloud; background reconnects and watching do not. On a sleeping connection, a keystroke wakes it. In a native window that
-first burst of typing waits for it (the pane says "Waking the cloud machine…",
+first burst of typing waits for it (the pane says "Connecting…",
 nothing echoes until it answers, and more typing meanwhile is refused with a
 note rather than run twice). When the service keeps the connection, it queues
 typing within its byte budget and delivers it in order after wake. With an older
 service whose connection has closed, a browser view drops that keystroke,
 reconnects with wake intent and says so over the pane (see [Pro: continuing and viewing](pro.md#continuing-and-viewing-a-remote-session)).
 Typing the daemon refuses (watching, busy, running in the cloud or on your
-computer) is said in a short note over the pane, never in the scrollback; an
-asleep cloud machine is said there too ("Asleep in the cloud. Press a key to
-wake it.") until a keystroke wakes it. A terminal whose session
+computer) is said in a short note over the pane, never in the scrollback; a
+project idle in the cloud is said there too ("Idle in your cloud. Press a key to
+continue.") until a keystroke continues it. A terminal whose session
 moves to another machine keeps its screen and reconnects; it does not show as
 exited.

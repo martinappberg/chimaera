@@ -81,7 +81,7 @@ workspace/session wire, helpers in `web-ui/src/lib/workspace/sessions.ts`).
   empty is one line ("Nothing new since 14:02"). A turn the daemon started itself after a
   transfer or a restart shows the short line the chat's divider uses ("Continued in the cloud",
   "Back on your computer") instead of quoting the agent-facing pick-up text, and a project whose
-  cloud machine sleeps says "Asleep in the cloud. Send a message to wake it." in the muted voice
+  cloud is idle says "Idle in your cloud. Send a message to continue." in the muted voice
   (a state, not an error); it reads again when the project answers.
 - **Key behaviors.** Per viewer, not daemon state: the baseline is the seq this browser had
   looked up to (localStorage via `lastSeen`/`markSeen`), captured each time the dashboard
