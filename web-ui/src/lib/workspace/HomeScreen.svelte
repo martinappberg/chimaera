@@ -118,7 +118,7 @@
   });
 
   /** Where a project's work runs when that is not (only) here — "In the
-   *  cloud", "Coming home…" — from this daemon's own Pro ownership answer. A
+   *  cloud", "Coming back here…" — from this daemon's own Pro ownership answer. A
    *  project the cloud holds otherwise looks idle here. Empty without Pro.
    *  Read while the page shows (and re-read while Pro answers), never on a
    *  remote host's Home or in a project view, which have no ownership here. */
@@ -680,7 +680,7 @@
         if (copied === null) return;
         target = { ...w, id: copied.workspace_id, root: copied.root, name: copied.name, local_copy: copied.local_copy };
       } catch (reason) {
-        copyError = await import("../pro/projectCopy").then(({ projectCopyError }) => projectCopyError(reason), () => "The local copy couldn’t refresh. Try Open again.");
+        copyError = await import("../pro/projectCopy").then(({ projectCopyError }) => projectCopyError(reason), () => "This project couldn’t update here. Try Open again.");
         return;
       }
       finally { copyingProject = null; }
@@ -860,7 +860,7 @@
         </div>
       </div>
       {#if copyError}<p class="err-line" role="alert">{copyError}</p>{/if}
-      {#if copyingProject !== null}<p class="hint" role="status">Updating the local project copy…</p>{/if}
+      {#if copyingProject !== null}<p class="hint" role="status">Getting the project’s latest files…</p>{/if}
       {#if !daemonReachable}<p class="offline-note" role="status">Connection interrupted. Your workspaces will reconnect when this machine is available.</p>{/if}
       {#if sorted.length === 0}
         <div class="blank">

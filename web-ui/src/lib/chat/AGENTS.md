@@ -451,8 +451,8 @@ shows until the owner confirms.
 
 The rest of this paragraph applies when the connected keeper refuses or
 closes those sockets, and for another computer as owner. In a native window the daemon holds the first command while a paused
-owner wakes (the additive `{"type":"waking"}` → `store.waking`, "Waking the
-cloud machine…"), refuses further acting commands until it answers, and answers
+owner wakes (the additive `{"type":"waking"}` → `store.waking`, shown as the send's own
+progress, "Sending…"), refuses further acting commands until it answers, and answers
 anything it cannot deliver with `command_failed`. Only acting commands (the
 daemon's `activity::is_interaction`) wake its current owner; the
 seven settings commands are held with them (above), everything else is
@@ -475,8 +475,8 @@ kept it; the send it names comes back to the composer). A move to another comput
 other computer…"). In a browser view, `send()` into a
 dropped socket reconnects once with `?wake=interaction` and returns false (the
 composer keeps the draft). Socket states that are not errors: `worker_asleep` →
-`store.asleep` ("Asleep in the cloud. Send a message to wake it.", and the
-header's "In the cloud · asleep" instead of "· reconnecting"; it survives a
+`store.asleep` (no status line: the composer stays ready, and the header says
+only "In the cloud", never "· reconnecting"; it survives a
 dropped socket and ends with an accepted send, `waking`, a move or `ready`; a
 socket that drops meanwhile waits with no retry timer until a send dials it with
 wake intent or `retrySoon` / `ownerAwake` dials it passively — `reachKey`

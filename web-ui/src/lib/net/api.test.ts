@@ -44,7 +44,7 @@ describe("a project running elsewhere", () => {
       expect(ownerElsewhere()).toBeNull();
       expect(new ApiError(409, "workspace_owned_elsewhere").message).toBe("This project is running somewhere else right now.");
       expect(plainError("read_only")).toBe("This project is running somewhere else right now.");
-      expect(plainError("on_other_machine")).toBe("This file is on the other machine and can’t be opened here.");
+      expect(plainError("on_other_machine")).toBe("This file is on another computer and can’t be opened here.");
     }
     // Verified placement still names the actual owner.
     expect(plainError("workspace_owned_elsewhere", "cloud")).toBe("This project is running in the cloud right now.");
@@ -55,18 +55,18 @@ describe("a project running elsewhere", () => {
     }
   });
 
-  it("calls a sleeping cloud machine asleep", () => {
-    expect(plainError("worker_asleep")).toBe("The cloud machine is asleep.");
+  it("says an idle cloud is where the project is, not a machine state", () => {
+    expect(plainError("worker_asleep")).toBe("This project is idle in your cloud.");
   });
 });
 
 describe("a project's state, told apart from a failure", () => {
   it("reads a sleeping or unreachable owner as a quiet note, never an error", () => {
     expect(projectStateNote(new ApiError(409, "worker_asleep"))).toBe(ASLEEP_NOTE);
-    expect(ASLEEP_NOTE).toBe("Asleep in the cloud. Send a message to wake it.");
+    expect(ASLEEP_NOTE).toBe("Idle in your cloud. Send a message to continue.");
     expect(projectStateNote(new ApiError(503, "project_unavailable"))).toBe("This project isn’t reachable right now.");
     for (const code of ["remote_unavailable", "workspace_scope_changed", "workspace_unavailable"]) {
-      expect(projectStateNote(new ApiError(503, code))).toBe("Your project is reconnecting.");
+      expect(projectStateNote(new ApiError(503, code))).toBe("This project can’t be reached right now.");
     }
   });
 

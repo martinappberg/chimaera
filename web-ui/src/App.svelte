@@ -33,7 +33,7 @@
     type Health,
   } from "./lib/net/api";
   import { linkRtt, linkRttNow, resetLinkRtt, LINK_RTT_BADGE_MS } from "./lib/net/rtt";
-  import { projectWhere, projectWhereLabel } from "./lib/net/placement";
+  import { notePlaces, projectWhere, projectWhereLabel } from "./lib/net/placement";
   import { titleHost, windowTitle } from "./lib/shared/windowTitle";
   import { LOCAL_ECHO_MIN_RTT_MS } from "./lib/terminal/localEcho";
   import { healthPollDelayMs, type PollHandle } from "./lib/net/poll";
@@ -497,11 +497,11 @@
   const isRemoteWindow = hostAlias !== "local";
   /** A browser view of a project (`/workspace/{id}/`) follows the project
    *  between the cloud and your computer: its strip names where it runs now
-   *  ("In the cloud · asleep" while its owner sleeps), not a host, and a link
+   *  ("In the cloud", "On your computer"), not a host, and a link
    *  round trip to whichever machine that is means nothing to the person
    *  reading it. */
   const projectView = gatewayWorkspace() !== null;
-  const stripHost = $derived(projectView ? projectWhereLabel($projectWhere, { state: true }) : hostAlias);
+  const stripHost = $derived(projectView ? projectWhereLabel($projectWhere) : hostAlias);
   /** Set when this window sits on a compute-node daemon (Mode 2 job). */
   const jobCtx = getJobContext();
   /** The key this window's tunnel reports `host-status` under. A job window
@@ -1131,6 +1131,8 @@
   const placeWorkspaceId = $derived(
     workspace !== null && isNativeShell() && !isRemoteWindow && !projectView && !$computeStatus?.self ? workspace.id : null,
   );
+  // Per-session place labels speak only when the project is split.
+  $effect(() => notePlaces(wsSessions));
 
   /** How this window is named in the shell's tray window-list: the workspace
    *  name (with the host on a remote window), or "Home" for the home screen —
@@ -3115,7 +3117,7 @@
       workspace: workspace?.name ?? null,
       host: titleHost({
         projectView,
-        projectLabel: $projectWhere !== null ? projectWhereLabel($projectWhere, { state: true }) : null,
+        projectLabel: $projectWhere !== null ? projectWhereLabel($projectWhere) : null,
         hostAlias,
         remote: isRemoteWindow,
       }),
