@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-copy-file-to-clipboard"
+description = "Enables the copy_file_to_clipboard command without any pre-configured scope."
+commands.allow = ["copy_file_to_clipboard"]
+
+[[permission]]
+identifier = "deny-copy-file-to-clipboard"
+description = "Denies the copy_file_to_clipboard command without any pre-configured scope."
+commands.deny = ["copy_file_to_clipboard"]

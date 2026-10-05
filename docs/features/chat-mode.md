@@ -316,7 +316,10 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
     tool lines in a row fold into one line — "Thought, ran 6 commands, read 2 files ›" — that
     expands to the original rows. The trailing run stays open while the agent works, so live
     progress is always in view; a hard failure inside shows on the folded line. Finished-work lines
-    never fold: they are the results, and for a woken turn the only stated cause.
+    never join that fold: they are the results, and for a woken turn the only stated cause. Three or
+    more of them in a row, once something follows, fold on their own into one line that says what
+    ended and how — "1 agent finished, 2 background tasks finished, 5 stopped ›" (a failure shows
+    on it) — and expands to each line with its report and output link.
 - **Interim prose is prose.** Opus 5.5+ ships the sentences it writes between tool calls as
   server-summarized `thinking` blocks tagged `narration` in their signature; the driver classifies
   each block (the `narration_block_indexes` wrapper, else the decoded signature) and renders

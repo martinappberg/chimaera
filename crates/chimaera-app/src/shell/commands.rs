@@ -1309,6 +1309,131 @@ pub(super) fn write_clipboard(app: AppHandle, text: String) -> Result<(), String
     app.clipboard().write_text(text).map_err(|e| e.to_string())
 }
 
+/// The path of a file on THIS machine that a window may hand to the OS.
+///
+/// A daemon-served page names the path, and remote hosts' pages hold the same
+/// command grants — so only a window the shell registered on the local daemon
+/// may ask (its paths are this machine's; a remote page's would name whatever
+/// happens to sit at that path here). On Windows the local daemon lives inside
+/// WSL2, so its paths are not host paths either.
+fn local_file_path(
+    webview: &tauri::WebviewWindow,
+    state: &Shell,
+    path: &str,
+) -> Result<std::path::PathBuf, String> {
+    if cfg!(windows) {
+        return Err("not available on Windows".to_string());
+    }
+    let local = state
+        .window_scope(webview.label())
+        .is_some_and(|scope| scope.alias.is_none() && !scope.navigation_pending());
+    if !local {
+        return Err("only a window on this machine can do that".to_string());
+    }
+    existing_absolute_path(path)
+}
+
+/// `path` as an absolute path to something that exists (a dangling symlink
+/// counts: it is still an entry the file manager can show).
+fn existing_absolute_path(path: &str) -> Result<std::path::PathBuf, String> {
+    let path = std::path::PathBuf::from(path);
+    if !path.is_absolute() {
+        return Err("not an absolute path".to_string());
+    }
+    if std::fs::symlink_metadata(&path).is_err() {
+        return Err("no such file".to_string());
+    }
+    Ok(path)
+}
+
+/// Put a file or folder itself on the OS clipboard, the way the platform's
+/// file manager does: pasting into Finder, a mail or a chat app attaches it.
+/// The in-app Copy only filled Chimaera's own clipboard, so nothing outside
+/// the workbench could paste what the user had just copied.
+#[tauri::command]
+pub(super) async fn copy_file_to_clipboard(
+    webview: tauri::WebviewWindow,
+    state: State<'_, Shell>,
+    path: String,
+) -> Result<(), String> {
+    let path = local_file_path(&webview, &state, &path)?;
+    // X11 and Wayland serve a selection from the process that owns it, so the
+    // clipboard that set it must outlive this call.
+    static CLIPBOARD: Mutex<Option<arboard::Clipboard>> = Mutex::new(None);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut slot = lock(&CLIPBOARD);
+        if slot.is_none() {
+            *slot = Some(arboard::Clipboard::new().map_err(|e| e.to_string())?);
+        }
+        let clipboard = slot.as_mut().expect("just filled");
+        clipboard
+            .set()
+            .file_list(&[path])
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Show a file or folder in the platform's file manager, selected in its
+/// parent folder (macOS Finder; a Linux file manager that speaks the
+/// freedesktop `FileManager1` interface, else the parent folder just opens).
+#[tauri::command]
+pub(super) async fn reveal_in_file_manager(
+    webview: tauri::WebviewWindow,
+    state: State<'_, Shell>,
+    path: String,
+) -> Result<(), String> {
+    let path = local_file_path(&webview, &state, &path)?;
+    tauri::async_runtime::spawn_blocking(move || reveal(&path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[cfg(target_os = "macos")]
+fn reveal(path: &std::path::Path) -> Result<(), String> {
+    let status = std::process::Command::new("/usr/bin/open")
+        .arg("-R")
+        .arg("--")
+        .arg(path)
+        .status()
+        .map_err(|e| e.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("Finder could not show that file".to_string())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn reveal(path: &std::path::Path) -> Result<(), String> {
+    let shown = tauri::Url::from_file_path(path).is_ok_and(|url| {
+        std::process::Command::new("dbus-send")
+            .args([
+                "--session",
+                "--print-reply",
+                "--dest=org.freedesktop.FileManager1",
+                "--type=method_call",
+                "/org/freedesktop/FileManager1",
+                "org.freedesktop.FileManager1.ShowItems",
+            ])
+            // dbus-send splits an array on commas, and a file URL keeps a
+            // name's comma literal: escaped, the name stays one item.
+            .arg(format!("array:string:{}", url.as_str().replace(',', "%2C")))
+            .arg("string:")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    });
+    if shown {
+        return Ok(());
+    }
+    // No file manager answered: opening the folder still gets the user there.
+    let parent = path.parent().unwrap_or(path);
+    open::that_detached(parent).map_err(|e| e.to_string())
+}
+
 /// Hand a web URL to the user's real browser.
 ///
 /// The shell's navigation guard admits only the exact daemon origin, and a
@@ -1475,7 +1600,20 @@ pub(super) async fn wsl_setup_daemon(app: AppHandle, distro: Option<String>) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::report_can_reclaim_local_home;
+    use super::{existing_absolute_path, report_can_reclaim_local_home};
+
+    #[test]
+    fn a_file_handed_to_the_os_must_be_an_existing_absolute_path() {
+        let dir = std::env::temp_dir();
+        assert_eq!(
+            existing_absolute_path(dir.to_str().unwrap()),
+            Ok(dir.clone())
+        );
+        assert!(existing_absolute_path("relative/file.png").is_err());
+        assert!(
+            existing_absolute_path(dir.join("chimaera-no-such-file").to_str().unwrap()).is_err()
+        );
+    }
 
     #[test]
     fn only_local_empty_reports_enter_the_home_reclamation_gate() {

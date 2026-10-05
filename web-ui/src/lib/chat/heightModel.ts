@@ -1,3 +1,4 @@
+import { FINISHED_FOLD_MIN } from "./activityFold";
 import { hookNotice } from "./hookNotice";
 import type { ChatBlock } from "./store.svelte";
 import { isTransferOrigin } from "./transfer";
@@ -65,7 +66,9 @@ function isActivity(block: ChatBlock | null): boolean {
  *  a settled run of activity rows (thoughts and tool calls) shares one line.
  *  `settled` is false for the trailing run no reply has followed yet — it
  *  renders unfolded, a line per thought and per group of tool calls — which
- *  only the live tail has (its window calibrates the model). */
+ *  only the live tail has (its window calibrates the model). Weigh a block
+ *  in a transcript through {@link weightAt}, which also knows a folded run
+ *  of finished lines. */
 export function blockWeight(
   block: ChatBlock,
   previous: ChatBlock | null,
@@ -122,6 +125,31 @@ export function blockWeight(
   }
 }
 
+/** A finished line its fold hides: any but the first of a run of at least
+ *  FINISHED_FOLD_MIN (activityFold.ts) — the first stands for the fold's one
+ *  line. Looks no further than that minimum either way, so a long run costs
+ *  what a short one does. */
+function foldedFinished(blocks: readonly ChatBlock[], i: number): boolean {
+  if (i === 0 || blocks[i].kind !== "finished" || blocks[i - 1].kind !== "finished") return false;
+  let run = 2;
+  for (let j = i - 2; run < FINISHED_FOLD_MIN && j >= 0 && blocks[j].kind === "finished"; j--) run++;
+  for (let j = i + 1; run < FINISHED_FOLD_MIN && j < blocks.length && blocks[j].kind === "finished"; j++) run++;
+  return run >= FINISHED_FOLD_MIN;
+}
+
+/** {@link blockWeight} of `blocks[i]` where it stands. A settled run of
+ *  finished lines long enough to fold shares one line as well, and whether
+ *  it is that long takes more of the run than the one block before. */
+export function weightAt(
+  blocks: readonly ChatBlock[],
+  i: number,
+  charsPerLine: number,
+  settled = true,
+): number {
+  if (settled && foldedFinished(blocks, i)) return 0;
+  return blockWeight(blocks[i], i > 0 ? blocks[i - 1] : null, charsPerLine, settled);
+}
+
 /** Weights of the blocks from `from` to the end, NOT cached: that stretch
  *  includes the live tail (a reply still streaming, a run not yet folded),
  *  which the prefix sums below must never freeze. `at` maps a weight into
@@ -132,10 +160,13 @@ export function tailWeights(
   charsPerLine: number,
 ): { total: number; at(weight: number): number } {
   const start = Math.max(0, Math.min(from, blocks.length));
+  // Finished lines that end the transcript are a line each until something
+  // follows them; weighing them folded would undershoot the later spacer.
+  let open = blocks.length;
+  while (open > start && blocks[open - 1].kind === "finished") open--;
   const prefix = [0];
   for (let i = start; i < blocks.length; i++) {
-    const weight = blockWeight(blocks[i], i > 0 ? blocks[i - 1] : null, charsPerLine);
-    prefix.push(prefix[prefix.length - 1] + weight);
+    prefix.push(prefix[prefix.length - 1] + weightAt(blocks, i, charsPerLine, i < open));
   }
   return {
     total: prefix[prefix.length - 1],
@@ -152,7 +183,7 @@ export function tailWeights(
   };
 }
 
-/** Prefix sums of {@link blockWeight} over the reducer's blocks, extended
+/** Prefix sums of {@link weightAt} over the reducer's blocks, extended
  *  incrementally. Rebuilt when the array's front moved (a cap trim or a
  *  journal reset) or the measure changed. Rows that already have a prefix
  *  are not re-weighed when they change in place — history above the window
@@ -170,9 +201,7 @@ export class HistoryWeights {
     }
     const target = Math.max(0, Math.min(n, blocks.length));
     for (let i = this.prefix.length - 1; i < target; i++) {
-      this.prefix.push(
-        this.prefix[i] + blockWeight(blocks[i], i > 0 ? blocks[i - 1] : null, charsPerLine),
-      );
+      this.prefix.push(this.prefix[i] + weightAt(blocks, i, charsPerLine));
     }
     return this.prefix[target];
   }

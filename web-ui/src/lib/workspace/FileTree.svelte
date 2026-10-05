@@ -32,7 +32,7 @@
   import { refetchWhenOwnerAwake } from "../net/reconnect";
   import { stemLength, validateEntryName } from "../shared/fsNames";
   import { contextMenu, type ContextMenuEntry } from "../shared/contextMenu.svelte";
-  import { writeClipboard } from "../net/native";
+  import { hasLocalFiles, revealEntries, writeClipboard } from "../net/native";
   import FileIcon from "../shared/FileIcon.svelte";
   import FolderIcon from "../shared/FolderIcon.svelte";
   import Spinner from "../previews/Spinner.svelte";
@@ -950,6 +950,7 @@
             } as ContextMenuEntry,
           ]
         : []),
+      ...revealEntries(entry.path),
       // Only inside a repository: git is ambient, never an offer.
       ...(entry.kind === "file" && repoForPath($gitRepos, entry.path) !== null
         ? [{ label: "File history", onSelect: () => openFileHistory(entry.path) } as ContextMenuEntry]
@@ -1133,6 +1134,7 @@
           hint: fileClip() === null ? "nothing copied" : undefined,
           onSelect: () => void pasteInto(root),
         },
+        ...(hasLocalFiles() ? ["separator" as const, ...revealEntries(root)] : []),
       ])}
   >
   {#if rootError !== null}
