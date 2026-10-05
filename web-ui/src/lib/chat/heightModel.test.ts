@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { blockWeight, HistoryWeights, tailWeights } from "./heightModel";
+import { blockWeight, HistoryWeights, tailWeights, weightAt } from "./heightModel";
 import type { ChatBlock } from "./store.svelte";
 
 const message = (text: string, uid = 1): ChatBlock =>
@@ -50,6 +50,24 @@ describe("block height model", () => {
     expect(blockWeight(thought(), tool(), 100, false)).toBe(1);
     expect(blockWeight(tool(), thought(), 100, false)).toBe(1);
     expect(blockWeight(tool(2), tool(1), 100, false)).toBe(0);
+  });
+
+  it("puts a settled run of three or more finished lines on the one line its fold renders", () => {
+    const finished = (uid: number): ChatBlock =>
+      ({ uid, kind: "finished", source: "task", title: "", status: "completed", stats: null, result: null, outputFile: null }) as ChatBlock;
+    const weights = (blocks: ChatBlock[], settled = true) =>
+      blocks.map((_, i) => weightAt(blocks, i, 100, settled));
+    const run = [message("hi", 1), finished(2), finished(3), finished(4), finished(5), message("ok", 6)];
+    expect(weights(run)).toEqual([2, 1, 0, 0, 0, 2]);
+    // Two are read at a glance and never fold.
+    expect(weights([message("hi", 1), finished(2), finished(3), message("ok", 4)])).toEqual([2, 1, 1, 2]);
+    // The trailing run is not folded yet.
+    expect(weights(run.slice(0, 5), false)).toEqual([2, 1, 1, 1, 1]);
+    // Every other block weighs what blockWeight says.
+    expect(weightAt([tool(1), tool(2)], 1, 100)).toBe(0);
+    expect(tailWeights(run, 1, 100).total).toBe(1 + 2);
+    // Nothing follows the transcript's last finished lines: a line each.
+    expect(tailWeights(run.slice(0, 5), 1, 100).total).toBe(4);
   });
 
   it("adds a picture row to a user message with saved images", () => {
