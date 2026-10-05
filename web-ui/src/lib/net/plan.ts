@@ -21,12 +21,23 @@ interface AccountState {
   signedOut: boolean;
 }
 
+/** Whether this window can ever offer Pro: the official app's extension is
+ *  composed, and the window is this computer's own native window or the
+ *  account gateway. A build without the extension, a native window on
+ *  another host's daemon and an ordinary browser never can. Synchronous and
+ *  static for the process: deciding it asks nothing of anyone. */
+function proPossible(): boolean {
+  if (selectedApplication === null) return false;
+  if (isBrowserGateway() || isAccountHome()) return true;
+  return isNativeShell() && getHostLabel() === "local";
+}
+
 /** Account branding only; transport availability never implies entitlement.
  * Each window owns one subscription lifecycle and keeps no account data on disk.
  */
 const account = readable<AccountState>({ plan: "loading", offered: null, signedOut: false }, (setState) => {
   const selected = selectedApplication;
-  if (selected === null) { setState({ plan: "unavailable", offered: false, signedOut: false }); return; }
+  if (selected === null || !proPossible()) { setState({ plan: "unavailable", offered: false, signedOut: false }); return; }
   if (typeof document === "undefined") return;
   setState({ plan: "loading", offered: null, signedOut: false });
   const controller = new AbortController();
@@ -57,4 +68,17 @@ export const proOffered = derived(account, (state): boolean | null => state.offe
 /** Existing badge consumers share the account read; unknown is never a paid badge. */
 export const paidPlan = derived(accountPlan, (plan): PaidPlan =>
   plan === "pro" || plan === "max" ? plan : null,
+);
+
+/** The one Pro tier rule for this window; every Pro gate in the UI reads it.
+ *  - `free`: no extension in this build, or a window that can never offer Pro
+ *    (see `proPossible`). Nothing Pro renders and nothing Pro is requested.
+ *  - `offered`: the official app without a known active plan (signed out, no
+ *    plan, or not answered yet). Only the two quiet entries show, Home's
+ *    "Chimaera Pro" item and the Settings card; neither asks the daemon or
+ *    the account anything until the person opens the Pro page.
+ *  - `active`: an active plan (`paidPlan`). Everything else Pro renders. */
+export type ProTier = "free" | "offered" | "active";
+export const proTier = derived(paidPlan, (plan): ProTier =>
+  !proPossible() ? "free" : plan !== null ? "active" : "offered",
 );

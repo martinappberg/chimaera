@@ -4,7 +4,7 @@
   import { KEPT_NOTICE_PREFIX, keptNoticeWorkspace } from "./lib/pro/kept";
   import { onMount, tick, untrack, type Component } from "svelte";
   import { loadApplicationEntry } from "virtual:chimaera-application-entry";
-  import { paidPlan, proOffered } from "./lib/net/plan";
+  import { paidPlan, proTier } from "./lib/net/plan";
   import { isBrowserGateway, gatewayWorkspace } from "./lib/net/base";
   import AgentSetupLoader from "./lib/workspace/AgentSetupLoader.svelte";
   import { agentSetup, openAgentSetup } from "./lib/workspace/agentSetup";
@@ -5451,7 +5451,7 @@
          worker: keep it out of the per-workspace live/attention rollups. -->
     {#if homeSettingsOpen}
       <div class="home-settings-shell">
-        <HomeNavigation active={homeSurface} plan={$paidPlan} showPro={isBrowserGateway() || (isNativeShell() && $proOffered === true)}
+        <HomeNavigation active={homeSurface} plan={$paidPlan} showPro={$proTier !== "free"}
           onHome={() => (homeSettingsOpen = false)} onPro={openProSurface} onSettings={openSettingsSurface} />
       <div class="home-settings-surface">
         <nav class="home-surface-nav" aria-label="Home navigation">
@@ -5495,7 +5495,7 @@
     />
       {:catch error}
         <div class="home-settings-shell">
-          <HomeNavigation active="workspaces" plan={$paidPlan} showPro={isBrowserGateway() || (isNativeShell() && $proOffered === true)}
+          <HomeNavigation active="workspaces" plan={$paidPlan} showPro={$proTier !== "free"}
             onHome={() => (homeLoad = retryPaneView("home", error))} onPro={openProSurface} onSettings={openSettingsSurface} />
           <div class="home-settings-content">
             <p role="alert">Couldn't open Home.</p>
@@ -5540,7 +5540,7 @@
             />
           </svg>
         </button>
-        {#if $paidPlan !== null && (isNativeShell() || isBrowserGateway())}
+        {#if $paidPlan !== null && $proTier === "active"}
           {#await import("./lib/pro/ProNavigation.svelte") then { default: ProNavigation }}
             <ProNavigation plan={$paidPlan} onOpen={openProSurface} />
           {/await}

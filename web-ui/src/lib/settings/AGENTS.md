@@ -33,13 +33,14 @@ the opt-in "teach agents the document dialect" installs over
 owns the text; the confirm dialog shows it verbatim before anything is written.
 
 **Pro is a separate account surface.** the private optional account view is a singleton
-workbench tab and Home view. When Pro is offered (`net/plan.ts` `proOffered`;
-a build without an account endpoint offers none) Settings ends with a small
+workbench tab and Home view. When Pro is offered (`net/plan.ts` `proTier` is
+not `free`: the extension is composed and the window is this computer's own or
+the account gateway; decided without asking anything) Settings ends with a small
 Chimaera Pro group that opens it (Pro is an optional add-on, so it follows every
 working section, and its entry is neutral for every plan, never accent-tinted);
-Home retains its Pro navigation. Confirmed free/signed-out users see a short
-optional-benefit Get Pro entry; paid users see Your Chimaera Pro/Max and View
-account. The Keyboard section carries its reference chords inside it, so a
+Home retains its Pro navigation. Until a plan is active (`proTier` `active`)
+the entry is the short optional-benefit Get Pro card, never "checking your
+plan"; paid users see Your Chimaera Pro/Max and View account. The Keyboard section carries its reference chords inside it, so a
 group after it never splits them off. `../net/plan.ts` shares its existing subscription between this entry
 and the badges: loading or failed/unknown entitlement stays neutral, never a
 sales prompt or an active-plan claim. There is no extra poll or cloud wake. A paid workspace plan badge also

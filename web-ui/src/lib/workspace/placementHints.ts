@@ -7,6 +7,15 @@
  * daemon; without Pro the answer carries nothing to say.
  */
 import { api } from "../net/api";
+import type { ProTier } from "../net/plan";
+
+/** Whether Home may ask this daemon for ownership at all: only with an
+ *  active plan (`proTier`), on this computer's own Home (not a remote host's,
+ *  not a browser view) and while the page shows. A free or merely offered
+ *  window never requests `/pro/status`. */
+export function readsOwnership(o: { tier: ProTier; remoteHome: boolean; gateway: boolean; visible: boolean }): boolean {
+  return o.tier === "active" && !o.remoteHome && !o.gateway && o.visible;
+}
 
 /** The ownership states that name somewhere else, in a row's words. The rest
  *  (`local`, `awaiting_verification`, `setting_up`, `privacy_disabled`) say

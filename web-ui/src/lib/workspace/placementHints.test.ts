@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { parseOwnershipHints } from "./placementHints";
+import { parseOwnershipHints, readsOwnership } from "./placementHints";
 
 const row = (workspace_id: string, ownership: unknown) => ({ workspace_id, name: workspace_id, ownership });
 
@@ -44,5 +44,19 @@ describe("a Home row's place hint", () => {
     for (const body of [null, "x", 3, [], { configured: true }, { configured: true, workspaces: [null, 1, {}, { workspace_id: 7, ownership: { state: "remote" } }] }]) {
       expect(parseOwnershipHints(body).hints.size).toBe(0);
     }
+  });
+});
+
+describe("when Home asks the daemon about Pro", () => {
+  const own = { remoteHome: false, gateway: false, visible: true };
+  it("never without an active plan: a free or offered window requests no /pro/status", () => {
+    expect(readsOwnership({ ...own, tier: "free" })).toBe(false);
+    expect(readsOwnership({ ...own, tier: "offered" })).toBe(false);
+    expect(readsOwnership({ ...own, tier: "active" })).toBe(true);
+  });
+  it("never on a remote host's Home, in a browser view or while hidden", () => {
+    expect(readsOwnership({ ...own, tier: "active", remoteHome: true })).toBe(false);
+    expect(readsOwnership({ ...own, tier: "active", gateway: true })).toBe(false);
+    expect(readsOwnership({ ...own, tier: "active", visible: false })).toBe(false);
   });
 });

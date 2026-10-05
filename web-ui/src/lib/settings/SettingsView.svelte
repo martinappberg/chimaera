@@ -18,7 +18,7 @@
   import { isBrowserGateway } from "../net/base";
   import { isNativeShell } from "../net/native";
   import BrandMark from "../shared/BrandMark.svelte";
-  import { accountPlan, proOffered } from "../net/plan";
+  import { accountPlan, proTier } from "../net/plan";
   import { legacyCloudRequest } from "../extensions/accountDaemon";
   import { pageVisible } from "../shared/visibility";
   import PluginsSettings from "./PluginsSettings.svelte";
@@ -85,8 +85,10 @@
   let navEl = $state<HTMLElement | null>(null);
 
   const q = $derived(query.trim().toLowerCase());
-  const paid = $derived($accountPlan === "pro" || $accountPlan === "max");
-  const proAction = $derived($accountPlan === "free" ? "Get Pro" : "View account");
+  // The card is the tier-two entry: until a plan is active it is a quiet
+  // offer that asks the account nothing (`proTier`).
+  const paid = $derived($proTier === "active");
+  const proAction = $derived(paid ? "View account" : "Get Pro");
 
   // Focus the search box when the UI tab shows (VS Code behavior).
   $effect(() => {
@@ -147,7 +149,7 @@
       }
       if (cat === "Chimaera Pro") {
         // A build without an account endpoint never shows an account group.
-        if (account || (proVisible && (isBrowserGateway() || $proOffered === true))) out.push({ category: cat, defs: [] });
+        if (account || (proVisible && $proTier !== "free")) out.push({ category: cat, defs: [] });
         continue;
       }
       if (cat === "Cloud") {
@@ -323,19 +325,16 @@
                   <AccountApplicationView kind="account-settings" visible={tabVisible} />
                 {/await}
               {:else}
-              <button class="pro-entry" aria-label={proAction === "Get Pro" ? "Get Chimaera Pro" : `View Chimaera ${$accountPlan === "max" ? "Max" : "Pro"} account`}
+              <button class="pro-entry" aria-label={paid ? `View Chimaera ${$accountPlan === "max" ? "Max" : "Pro"} account` : "Get Chimaera Pro"}
                 onclick={() => window.dispatchEvent(new Event("chimaera:open-pro"))}>
                 <BrandMark size={30} />
                 <span class="pro-copy">
-                  {#if $accountPlan === "free"}
-                    <strong>Chimaera Pro</strong>
-                    <span>Optional: agents keep working in the cloud while you're away, and your work opens on another device.</span>
-                  {:else if paid}
+                  {#if paid}
                     <strong>Your Chimaera {$accountPlan === "max" ? "Max" : "Pro"}</strong>
                     <span>Your plan, cloud agents and project sync.</span>
                   {:else}
-                    <strong>Your Chimaera account</strong>
-                    <span>{$accountPlan === "loading" ? "Checking your plan…" : "View your account to check your plan and cloud access."}</span>
+                    <strong>Chimaera Pro</strong>
+                    <span>Optional: agents keep working in the cloud while you're away, and your work opens on another device.</span>
                   {/if}
                 </span>
                 <span class="pro-open" aria-hidden="true">{proAction} <span>→</span></span>

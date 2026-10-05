@@ -7,7 +7,7 @@ vi.mock("../extensions/selected", () => ({ selectedApplication: {
 vi.mock("./native", () => ({ isNativeShell: () => true }));
 vi.mock("./api", () => ({ getHostLabel: () => "local" }));
 vi.mock("./base", () => ({ isAccountHome: () => false, isBrowserGateway: () => false, workbenchPath: () => "/" }));
-import { accountPlan, accountSignedOut, paidPlan, proOffered } from "./plan";
+import { accountPlan, accountSignedOut, paidPlan, proOffered, proTier } from "./plan";
 afterEach(() => vi.unstubAllGlobals());
 it("shares one selected publication lifecycle and rejects delivery after its last subscriber", async () => {
   vi.stubGlobal("document", new EventTarget());
@@ -27,4 +27,16 @@ it("shares one selected publication lifecycle and rejects delivery after its las
   expect(binding.stop).toHaveBeenCalledTimes(1);
   scope.publish({ plan: "max", offered: true, signedOut: false });
   expect(JSON.stringify(states)).toBe(before);
+});
+it("offers Pro at once in the official app's own window and activates only with a plan", () => {
+  vi.stubGlobal("document", new EventTarget());
+  const tiers: unknown[] = [];
+  const stop = proTier.subscribe(value => tiers.push(value));
+  // The entries show before (and without) any account answer.
+  expect(tiers).toEqual(["offered"]);
+  binding.scope!.publish({ plan: "free", offered: true, signedOut: false });
+  binding.scope!.publish({ plan: "max", offered: true, signedOut: false });
+  binding.scope!.publish({ plan: "unknown", offered: true, signedOut: false });
+  stop();
+  expect(tiers).toEqual(["offered", "active", "offered"]);
 });
