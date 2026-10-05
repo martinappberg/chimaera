@@ -43,7 +43,8 @@
   import AgentMessageCards from "./AgentMessageCards.svelte";
   import { isAgentOrigin, parseAgentText } from "./agentMessages";
   import ActivityFold from "./ActivityFold.svelte";
-  import { foldSpans } from "./activityFold";
+  import { FINISHED_FOLD_MIN, foldSpans } from "./activityFold";
+  import FinishedFold from "./FinishedFold.svelte";
   import { backgroundKind } from "./backgroundKinds";
   import AgentsTray from "./AgentsTray.svelte";
   import BackgroundTray from "./BackgroundTray.svelte";
@@ -2287,7 +2288,19 @@
         tools: Extract<ChatBlock, { kind: "tool" }>[];
         tail: TurnTail | undefined;
         thoughts: number;
+      }
+    | {
+        /** A settled run of finished-work lines (activityFold.ts). */
+        t: "finished-fold";
+        key: string;
+        index: number;
+        endIndex: number;
+        uid: number;
+        items: FinishedItem[];
       };
+  type FinishedItem = { t: "single"; key: string; index: number; block: Extract<ChatBlock, { kind: "finished" }> };
+  const isFinishedItem = (item: RowItem): item is FinishedItem =>
+    item.t === "single" && item.block.kind === "finished";
   const isActivityRow = (item: RowItem): item is ActivityRow =>
     item.t === "group" || item.block.kind === "thought";
   const renderItems = $derived.by((): RenderItem[] => {
@@ -2338,11 +2351,29 @@
       (item) =>
         item.t === "single" && (item.block.kind === "message" || item.block.kind === "finished"),
     );
-    if (spans.length === 0) return items;
+    // Finished-work lines never join an activity fold, but a long settled
+    // run of them folds on its own. The two kinds of run never overlap.
+    const finishedSpans = foldSpans(items, isFinishedItem, () => true, FINISHED_FOLD_MIN);
+    if (spans.length === 0 && finishedSpans.length === 0) return items;
+    const finishedAt = new Set(finishedSpans.map(([start]) => start));
+    const allSpans = [...spans, ...finishedSpans].sort((a, b) => a[0] - b[0]);
     const folded: RenderItem[] = [];
     let at = 0;
-    for (const [start, end] of spans) {
+    for (const [start, end] of allSpans) {
       folded.push(...items.slice(at, start));
+      if (finishedAt.has(start)) {
+        const run = items.slice(start, end).filter(isFinishedItem);
+        folded.push({
+          t: "finished-fold",
+          key: `ff-${items[end].key}`,
+          index: run[0].index,
+          endIndex: run[run.length - 1].index,
+          uid: run[0].block.uid,
+          items: run,
+        });
+        at = end;
+        continue;
+      }
       // Every row in a span is an activity row; the filter only narrows.
       const run = items.slice(start, end).filter(isActivityRow);
       const first = run[0];
@@ -2645,6 +2676,19 @@
         />
       {/if}
     {/snippet}
+    {#snippet finishedRow(block: Extract<ChatBlock, { kind: "finished" }>, index: number)}
+      <FinishedRow
+        {block}
+        {visible}
+        onOpenFile={openLocation}
+        onOpenPath={openProsePath}
+        resolvePaths={prosePaths}
+        embeds={proseEmbeds}
+        {hoverTargets}
+        sourceIndex={index}
+        sourceUid={block.uid}
+      />
+    {/snippet}
     {#each renderItems as item (item.key)}
       {#if item.t === "fold"}
         <ActivityFold
@@ -2661,6 +2705,18 @@
             {@render activityRow(row)}
           {/each}
         </ActivityFold>
+      {:else if item.t === "finished-fold"}
+        <FinishedFold
+          rows={item.items.map((row) => row.block)}
+          {visible}
+          sourceIndex={item.index}
+          sourceEnd={item.endIndex}
+          sourceUid={item.uid}
+        >
+          {#each item.items as row (row.key)}
+            {@render finishedRow(row.block, row.index)}
+          {/each}
+        </FinishedFold>
       {:else if isActivityRow(item)}
         {@render activityRow(item)}
       {:else if item.block.kind === "user"}
@@ -2792,17 +2848,7 @@
           </div>
         {/if}
       {:else if item.block.kind === "finished"}
-        <FinishedRow
-          block={item.block}
-          {visible}
-          onOpenFile={openLocation}
-          onOpenPath={openProsePath}
-          resolvePaths={prosePaths}
-          embeds={proseEmbeds}
-          {hoverTargets}
-          sourceIndex={item.index}
-          sourceUid={item.block.uid}
-        />
+        {@render finishedRow(item.block, item.index)}
       {:else if item.block.kind === "wake"}
         <div class="wake activity" data-block-index={item.index} data-block-uid={item.block.uid}>
           <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true"
