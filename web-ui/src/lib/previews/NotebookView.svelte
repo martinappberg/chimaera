@@ -35,6 +35,7 @@
   import { parserFor, renderCode } from "./highlight";
   import { ansiVars, appendRuns, collapseCarriageReturns, parseAnsi, plainStyle } from "./ansi";
   import { loadMath } from "./mathLoad";
+  import { pathPaneFrom } from "../shared/openPath";
   import { followDocHref, showLinkHint } from "./docLinks";
   import { revealRequest, takeReveal } from "../shared/reveal";
   import { copyText } from "../shared/clipboard";
@@ -362,6 +363,7 @@
     const y = e.clientY;
     void followDocHref(href, e.metaKey || e.ctrlKey, {
       docPath: path,
+      fromPane: pathPaneFrom(anchor),
       wsRoot,
       workspaceId: null,
       toAnchor: (anchorId) => scrollToHeading(anchorId),

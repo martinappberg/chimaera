@@ -21,7 +21,7 @@
   import { settingsJump } from "./jump";
   import { tick, untrack } from "svelte";
   import { APP_MENU, PINNED } from "../shared/keys";
-  import { activeModLabel } from "../shared/keybindings";
+  import { activeModLabel, paneMoveHint } from "../shared/keybindings";
   import { paneTabHasKeyboardFocus } from "../shared/tabNavigation";
 
   /** The tab is showing (kept-alive tabs stay mounted while hidden). */
@@ -180,12 +180,13 @@
   });
 
   /**
-   * The spec-pinned chords — not rebindable, listed for reference. openN
+   * The spec-pinned chords — not rebindable, listed for reference. Pane focus
    * follows the base modifier; the rest shadow browser conventions too
    * carefully to be worth opening up (see keys.ts).
    */
   const pinnedRows = $derived([
-    { label: "Open session 1–9", chord: `${activeModLabel()}1–9` },
+    { label: "Focus pane 1–9", chord: `${activeModLabel()}1–9` },
+    { label: "Move active tab to pane 1–9", chord: `${paneMoveHint(1)}–9` },
     { label: "Reference selection in agent", chord: PINNED.reference },
     { label: "Terminal text larger", chord: PINNED.fontPlus },
     { label: "Terminal text smaller", chord: PINNED.fontMinus },

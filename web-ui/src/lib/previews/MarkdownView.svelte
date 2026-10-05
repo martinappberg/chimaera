@@ -93,6 +93,7 @@
   import PublishButton from "./PublishButton.svelte";
   import { HoverPreviews } from "./doc/hoverController.svelte";
   import { hasUrlScheme, isWebUrl, urlMenuEntries } from "../shared/urlOpen";
+  import { pathPaneFrom } from "../shared/openPath";
   import { contextMenu } from "../shared/contextMenu.svelte";
   import { revealRequest, takeReveal, type Reveal } from "../shared/reveal";
   import { readingWindow } from "./readingWindow";
@@ -1129,6 +1130,7 @@
       split,
       {
         docPath: path,
+        fromPane: pathPaneFrom(anchor),
         ...linkContext(),
         toAnchor: toAnchorInReading,
         toLines: revealInReading,

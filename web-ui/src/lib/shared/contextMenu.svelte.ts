@@ -3,8 +3,8 @@
  * at App level. A surface's oncontextmenu handler calls openAt(e, items); the
  * component positions itself at the pointer, clamps to the viewport, and
  * closes on outside pointerdown / Escape / selection. Suppressing the native
- * menu is openAt's preventDefault — only elements that attach a handler lose
- * it, so inputs and terminals keep the browser menu.
+ * menu is openAt's preventDefault. ContextMenuHost suppresses unhandled
+ * clicks on view chrome while retaining native text-editor menus.
  */
 
 export interface ContextMenuItem {
@@ -60,6 +60,10 @@ export const contextMenu = {
    *  that opened it (keyboard-opened too), without fabricating a pointer
    *  event. */
   openAtPoint(px: number, py: number, entries: ContextMenuEntry[], opts: { alignRight?: boolean } = {}): void {
+    if (!entries.some((entry) => entry !== "separator")) {
+      this.close();
+      return;
+    }
     x = px;
     y = py;
     alignRight = opts.alignRight === true;
