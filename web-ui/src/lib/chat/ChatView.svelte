@@ -64,6 +64,7 @@
   import ForkDialog from "./ForkDialog.svelte";
   import AgentMessageMeta from "./AgentMessageMeta.svelte";
   import Composer from "./Composer.svelte";
+  import { hookNotice } from "./hookNotice";
   import SameFileNotice from "../workspace/SameFileNotice.svelte";
   import { sameFile } from "../workspace/sameFile.svelte";
   import ReferenceChip from "../shared/ReferenceChip.svelte";
@@ -2779,7 +2780,16 @@
           >
         </div>
       {:else if item.block.kind === "notice"}
-        {#if !(incompatibleRuntime && item.block.text === store.fatalError)}
+        {@const hook = item.block.tone === "info" ? hookNotice(item.block.text) : null}
+        {#if hook}
+          <!-- A hook's several lines: its name once, its lines as written. -->
+          <div class="notice hook" data-block-index={item.index} data-block-uid={item.block.uid}>
+            <div class="hook-said"
+              ><span class="hook-name">{hook.hook} says:</span>
+              <span class="hook-lines">{hook.lines.join("\n")}</span></div
+            >
+          </div>
+        {:else if !(incompatibleRuntime && item.block.text === store.fatalError)}
         <div
           class="notice"
           class:error={item.block.tone === "error"}
@@ -3466,6 +3476,22 @@
   }
   .notice.error {
     color: var(--err);
+  }
+  /* Centered as a block, read left to right: the hook's own line breaks
+     and list indents are kept. */
+  .hook-said {
+    display: inline-flex;
+    flex-direction: column;
+    gap: 2px;
+    max-width: 100%;
+    text-align: left;
+  }
+  .hook-name {
+    opacity: 0.75;
+  }
+  .hook-lines {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
   }
   .runtime-error {
     max-width: 64ch;

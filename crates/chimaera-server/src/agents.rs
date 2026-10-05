@@ -618,8 +618,14 @@ pub(crate) async fn ingest(
 
     // Every hook payload carries claude's current `cwd`: an agent that
     // enters a worktree mid-session is shown there (git session tracker).
-    if let Some(cwd) = payload.get("cwd").and_then(|c| c.as_str()) {
-        changed |= state.git.sessions.note_hook_cwd(&id, cwd);
+    // A hook fired inside a subagent (`agent_id` set) carries the SUBAGENT's
+    // folder — its own worktree under `isolation: "worktree"` — while the
+    // session itself has not moved, so those never move it (verified claude
+    // 2.1.289).
+    if subagent_identity(&payload).is_none() {
+        if let Some(cwd) = payload.get("cwd").and_then(|c| c.as_str()) {
+            changed |= state.git.sessions.note_hook_cwd(&id, cwd);
+        }
     }
     if event == "Stop" {
         crate::git::session_turn_end(&state, &id);

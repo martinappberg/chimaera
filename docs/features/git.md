@@ -111,7 +111,9 @@ repos,branches,log,show,compare}`, `GET/POST/DELETE /api/v1/git/worktrees`,
   the agent's `cwd_current`). UI `shared/BranchChip.svelte`, `chat/ChatView.svelte`,
   `dashboard/AgentCard.svelte`.
 - **Key behaviors.** A session's folder is its shell's polled cwd, the `cwd` every claude hook carries,
-  else its spawn folder (hook-less agent TUIs keep their start folder). The tracker
+  else its spawn folder (hook-less agent TUIs keep their start folder). A hook fired inside a subagent
+  (`agent_id` set) carries the subagent's folder — its own worktree when isolated — and never moves
+  the session. The tracker
   resolves it once per folder (`rev-parse`), reads the branch from `HEAD` (no process), and recomputes
   only when a folder changes or a git epoch moves — never on a timer. It keeps anchors
   `{repo, worktree, branch, head}` at start, at claude turn ends and at end (in memory; ended sessions

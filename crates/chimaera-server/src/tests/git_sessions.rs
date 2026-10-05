@@ -128,6 +128,26 @@ async fn session_git_follows_the_agent_hook_cwd() {
     // Still the same repository: every worktree names the main checkout.
     assert_eq!(row["git"]["repo"], serde_json::json!(root));
 
+    // A hook fired inside a subagent carries the subagent's folder (its own
+    // worktree when isolated): the session has not moved.
+    for event in ["SubagentStart", "PreToolUse", "SubagentStop"] {
+        post_hook(
+            &state,
+            &id,
+            "k1",
+            serde_json::json!({
+                "hook_event_name": event,
+                "cwd": root,
+                "agent_id": "a55d52603606673c2",
+                "agent_type": "general-purpose",
+            }),
+        )
+        .await;
+    }
+    let row = session_entry(&state, &id).await;
+    assert_eq!(row["git"]["branch"], "feat/y");
+    assert_eq!(row["cwd_current"], serde_json::json!(linked.join("")));
+
     // A relative or empty cwd is ignored, never run in.
     post_hook(
         &state,
