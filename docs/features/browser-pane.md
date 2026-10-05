@@ -14,7 +14,8 @@ the pane, `proxy.ts` the mint/health client + title store) +
 `web-ui/src/lib/terminal/urlLinks.ts` (URL detection) + the `BrowserTab` kind in
 `layout/layout.ts`. Wire: `POST/GET /api/v1/proxy`, `DELETE /api/v1/proxy/{id}`,
 `GET /api/v1/proxy/{id}/health` (bearer-authed) and the unauthenticated ticketed data
-plane `ANY /proxy/{id}[/{*path}]`.
+plane `ANY /proxy/{id}[/{*path}]`; agent-opened panes add the MCP `open_browser` tool
+(`browser_open.rs`) and a `browser_open` frame on `/ws/events`.
 
 ## Proxy sessions (the ticket model)
 
@@ -108,6 +109,63 @@ plane `ANY /proxy/{id}[/{*path}]`.
   or any host with an explicit port. Ordinary web URLs (`https://github.com/…`) stay
   deliberately unlinkified — the standing terminals decision.
 
+## Agent-opened panes (`open_browser`)
+
+- **What & when.** An agent that has just started a web app (a dev server, a notebook, a
+  dashboard) calls the MCP tool `open_browser {url}` so the person watching the workspace
+  sees what it is building, beside the agent, instead of a printed URL. Every MCP-equipped
+  session has it (workers and Masterminds). It is **showing, not inspecting**: strictly
+  one-way — nothing about the page (content, screenshots, load state) ever reaches the agent,
+  and a successful call says nothing about whether the page works, so agents verify their
+  app with their own tooling first and use the pane to present the result.
+- **How it works.** The daemon parses the URL with the terminal link rules (`http` only, no
+  userinfo, an explicit port unless the host is loopback — then 80; path, query and fragment
+  kept), then applies the proxy's own mint allowlist (`proxy::check_target`, the function
+  `POST /proxy` uses). A target that would need the in-pane confirmation is refused with a
+  tool error telling the agent to give the user the URL; the daemon's own port stays refused.
+  An accepted call pushes one additive frame on `/ws/events` —
+  `{"type":"browser_open","session_id","workspace_id","host","port","path"}` — and mints
+  nothing: the pane mints its ticket on mount, as every pane does. Older UIs ignore the
+  unknown frame type.
+- **Which window, where, and focus.** The window whose layout holds the calling session's tab
+  acts, and so does any *visible* window showing the same workspace without that tab (a
+  window cannot see another's layout, so two windows on one workspace may both open it).
+  An existing tab on the same `host:port` is re-pointed and shown; otherwise the pane joins a
+  pane already showing a browser, else fills an empty pane, else splits beside the session's pane (under the pane
+  cap), else becomes a tab in a pane that is neither the session's nor the focused one. It
+  never covers the session or the focused pane, keeps a zoomed pane zoomed, and never takes
+  focus — the user keeps typing where they were
+  (`web-ui/src/lib/browser/agentOpen.ts`, pure and unit-tested).
+- **Who opened it.** An agent-opened tab remembers its opener (`BrowserTab.openedBy`, the
+  session id; the latest opener wins when an agent re-points a pane). The pane's top bar
+  ends with a quiet pill — the agent's mark (`SessionGlyph`) in its link hue, "opened by"
+  and the session's name as the rail shows it, read live from the roster so a rename shows
+  through; a click reveals that session (the linked-terminal chips' reveal path). Once the
+  session has ended the pill turns into a muted note ("opened by fix CI · ended", or
+  "opened by an agent that has ended" once the roster has forgotten it), no longer a
+  control. In a narrow pane only the mark shows, the words in its tooltip. The user
+  pointing the pane at another `host:port` (the address bar) drops the attribution — it
+  would no longer be true; in-app navigation and the compute-node hunt (the same app,
+  found on its node) keep it. Saved layouts carry it as an optional `wb` on the browser tab:
+  older layouts restore unchanged, and a value that is not an id-shaped string is dropped
+  without touching the rest of the tab.
+- **In the transcript.** The call reads as what happened — "Showed localhost:8000 in a
+  browser pane", "Didn't open example.org:8080 in a browser pane" for a refusal or when no
+  window was connected (`chat/toolLabels.ts`; the address from Claude's input, else from the
+  result text, which is all a Codex row carries; the query is left off, a Jupyter `?token=`
+  being a credential). The expanded row shows the full result.
+- **Key behaviors.** No queueing: a frame reaches only the windows connected when it is sent
+  (a stale one older than 10 s is dropped), and with no window connected the tool says so and
+  tells the agent to hand over the URL. Rate-limited per session (3 in any 10 s — an agent
+  presenting a frontend and its dashboard in one step gets both — and 12 per hour; the
+  refusal says how long to wait; bounded history). Always allowed: the harness does not prompt for it, since targets are
+  held to the mint allowlist with no confirm path. **Where it lives:** `crates/chimaera-server/src/browser_open.rs` (parse, feed,
+  limits, consumer count), the tool def in `mcp.rs`, the frame in `ws.rs::handle_events`,
+  the UI half in `browser/agentOpen.ts` + `net/events.ts` + `App.svelte::onAgentBrowserOpen`,
+  the attribution in `browser/BrowserView.svelte` (fed by `layout/Pane.svelte`).
+- **Known limit.** A page that focuses itself on load (an `autofocus` field) can still pull
+  focus into the pane: the pane treats focus moving into its iframe as the user clicking in.
+
 ## Links everywhere else (and the real browser)
 
 - **What & when.** One policy for every link chimaera renders — terminal output, chat
@@ -135,6 +193,15 @@ plane `ANY /proxy/{id}[/{*path}]`.
   appears only when the URL is actually proxyable, so the menu never offers a pane that
   would just show "can't reach".
 
+## Routed project limitation
+
+Automatic `open_browser` works on a direct connection to the daemon that owns
+its calling session, including a direct SSH/Slurm daemon connection. A project
+view routed through another computer or an account workspace gateway does not
+yet have an owner-bound scoped proxy ticket route. These automatic notices are
+dropped, never replayed or interpreted as the laptop's `localhost`; passive
+events do not wake an owner. Direct local browser panes remain available.
+
 ## Key constraints
 
 - **Same-origin is deliberate, and for the real cases it costs nothing.** The proxied app
@@ -144,7 +211,11 @@ plane `ANY /proxy/{id}[/{*path}]`.
   `sessionStorage`, the parent DOM). Weigh that against **what the app could already
   do**, because the token grants code execution *as the user, on the daemon's host*:
   - **loopback / self-host** — the app runs as the user on that same host and can read
-    the manifest token off disk. Grants nothing new.
+    the manifest token off disk. Grants nothing new. This assumes the loopback port is
+    the user's own: on a host other people can log in to, anyone can listen on a loopback
+    port, and a page served from one runs with the workbench's origin like any other.
+    A person clicking a URL chooses the port; an agent calling `open_browser` (pre-allowed
+    by the maintainer's decision, so no prompt shows the URL) chooses it for them.
   - **remote workspace** (daemon and app on the same dev server or compute node;
     an explicit login-node override works the same way) — same identity, same host. Grants nothing new, and reaches nothing on the
     user's laptop.
@@ -198,3 +269,18 @@ _Captured 2026-07-21 (from the maintainer, on the shipping PR)._
 - **Follow-up he flagged immediately:** compute-node apps printing `localhost` URLs
   must not dead-end ("this we need to fix") — the compute-node hunt above is that
   fix, shipped in the same PR.
+
+### Why agents can open a pane (`open_browser`)
+_Captured 2026-10-04 (from the maintainer, in the session that built it)._
+
+- **Problem it solves (maintainer's words):** "the in app browser is nice if we want
+  someone to be able to preview what is building". The pane is the person's view of the
+  agent's work, opened for them instead of a URL they have to click.
+- **One tool, one direction, on purpose:** offered a way for agents to read the pane
+  back, he declined: "it is enough then with open browser".
+- **Never a way to validate:** "I dont want agents to think that is how they can validate
+  the app ... they should use their own browsers inspect as much as possible". The tool
+  description, the session instructions and the result text all say so; keep them saying it.
+- **Silent, by decision:** he chose no permission prompt ("I'd rather it be silent") and
+  confirmed "Silent everywhere" after being shown the shared-host risk recorded under
+  Key constraints. Do not add a prompt, or a per-host exception, without asking.

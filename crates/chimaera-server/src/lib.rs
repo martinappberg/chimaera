@@ -7,6 +7,7 @@ mod agent_updates;
 mod agents;
 mod api;
 mod assets;
+mod browser_open;
 mod bundle;
 mod chat;
 mod cloud;

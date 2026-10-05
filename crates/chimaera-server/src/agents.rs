@@ -1131,14 +1131,15 @@ mod tests {
         // explicit theme choice is never overridden).
         assert!(value.get("theme").is_none());
         // Not a mastermind: only the prompt-free tools (`notify`, the
-        // read-only document tools) are pre-allowed — every other tool (the
-        // terminal tools included) still prompts.
+        // read-only document tools, `open_browser`) are pre-allowed — every
+        // other tool (the terminal tools included) still prompts.
         assert_eq!(
             value["permissions"]["allow"],
             json!([
                 "mcp__chimaera__notify",
                 "mcp__chimaera__document_guide",
                 "mcp__chimaera__check_document",
+                "mcp__chimaera__open_browser",
             ])
         );
         use std::os::unix::fs::PermissionsExt;
@@ -1198,6 +1199,7 @@ mod tests {
                 "mcp__chimaera__notify",
                 "mcp__chimaera__document_guide",
                 "mcp__chimaera__check_document",
+                "mcp__chimaera__open_browser",
                 "mcp__chimaera__workspace_status",
                 "mcp__chimaera__list_changed_files",
                 "mcp__chimaera__read_timeline",

@@ -1,6 +1,7 @@
 mod agent_probe;
 mod agent_view;
 mod agents;
+mod browser_open;
 mod bundle;
 mod chat;
 mod cloud_context;

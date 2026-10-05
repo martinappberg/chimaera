@@ -174,7 +174,7 @@ pub(crate) async fn sweeper(state: Arc<AppState>) {
 
 /// Where a requested target host sits relative to this daemon.
 #[derive(Debug, PartialEq, Clone, Copy)]
-enum HostClass {
+pub(crate) enum HostClass {
     Loopback,
     SelfHost,
     ComputeNode,
@@ -202,7 +202,7 @@ fn cached_route_usable(route: Route, class: HostClass) -> bool {
     }
 }
 
-fn is_loopback_host(host: &str) -> bool {
+pub(crate) fn is_loopback_host(host: &str) -> bool {
     if host.eq_ignore_ascii_case("localhost") {
         return true;
     }
@@ -330,6 +330,44 @@ async fn classify_host(state: &AppState, host: &str) -> HostClass {
     HostClass::Other
 }
 
+/// Why a target is not openable without more from the caller.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Refusal {
+    /// Not a host name or IP literal (or port 0).
+    Invalid,
+    /// Outside the auto allowlist: only an explicit user confirmation opens it.
+    ConfirmRequired,
+    /// The daemon's own port on this host (a same-origin loop).
+    Daemon,
+}
+
+/// Brackets and surrounding whitespace off a requested host (`[::1]`).
+pub(crate) fn normalize_host(raw: &str) -> String {
+    raw.trim().trim_matches(['[', ']']).to_string()
+}
+
+/// THE mint allowlist, shared by every way a target gets opened (the UI's
+/// mint and the agent `open_browser` tool), so the two can never disagree
+/// about what is reachable without a person confirming it. `host` must
+/// already be normalized ([`normalize_host`]).
+pub(crate) async fn check_target(
+    state: &AppState,
+    host: &str,
+    port: u16,
+) -> Result<HostClass, Refusal> {
+    if !valid_host(host) || port == 0 {
+        return Err(Refusal::Invalid);
+    }
+    let class = classify_host(state, host).await;
+    if class == HostClass::Other {
+        return Err(Refusal::ConfirmRequired);
+    }
+    if port == state.port && matches!(class, HostClass::Loopback | HostClass::SelfHost) {
+        return Err(Refusal::Daemon);
+    }
+    Ok(class)
+}
+
 // --- REST: mint / list / revoke / health ----------------------------------------
 
 #[derive(Deserialize)]
@@ -347,33 +385,38 @@ pub(crate) async fn create_proxy(
     State(state): State<Arc<AppState>>,
     Json(req): Json<MintReq>,
 ) -> Response {
-    let host = req.host.trim().trim_matches(['[', ']']).to_string();
-    if !valid_host(&host) || req.port == 0 {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "invalid target host/port"})),
-        )
-            .into_response();
-    }
-    let class = classify_host(&state, &host).await;
-    if class == HostClass::Other && !req.confirm {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": "confirm_required",
-                "detail": format!("{host} is not this host, loopback, or one of your compute nodes"),
-            })),
-        )
-            .into_response();
-    }
-    // The daemon itself is not a proxy target (a same-origin loop).
-    if req.port == state.port && matches!(class, HostClass::Loopback | HostClass::SelfHost) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "that port is chimaera itself"})),
-        )
-            .into_response();
-    }
+    let host = normalize_host(&req.host);
+    let class = match check_target(&state, &host, req.port).await {
+        Ok(class) => class,
+        // A confirmed foreign host is dialed directly; the daemon-port rule
+        // only ever concerns loopback and this host, never an `Other`.
+        Err(Refusal::ConfirmRequired) if req.confirm => HostClass::Other,
+        Err(Refusal::Invalid) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "invalid target host/port"})),
+            )
+                .into_response();
+        }
+        Err(Refusal::ConfirmRequired) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": "confirm_required",
+                    "detail": format!("{host} is not this host, loopback, or one of your compute nodes"),
+                })),
+            )
+                .into_response();
+        }
+        // The daemon itself is not a proxy target (a same-origin loop).
+        Err(Refusal::Daemon) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "that port is chimaera itself"})),
+            )
+                .into_response();
+        }
+    };
 
     let (id, evicted) = {
         let mut store = crate::lock(&state.proxies);

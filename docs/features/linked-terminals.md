@@ -48,7 +48,8 @@ leash-drawing in `web-ui/src/App.svelte`; the drag band that arms a link is in
   `list_terminals` (the agent's granted terminals), `run_in_terminal` (type a command, await the
   outcome — the same [exec engine](terminals.md#the-exec-engine-and-command-journal)), `read_terminal`
   (the command journal). The same server also carries `notify` (every MCP-equipped session; native Claude/Codex pre-allow it) — see
-  [notifications.md](notifications.md).
+  [notifications.md](notifications.md) — and `open_browser` (show the user a web app in a browser pane beside the
+  session; one-way, pre-allowed like `notify`) — see [browser-pane.md](browser-pane.md#agent-opened-panes-open_browser).
 - **Where it lives.** `mcp.rs` (`mcp`, `tool_defs`, `list_terminals`/`run_in_terminal`/`read_terminal`,
   `autolink_mentions`, `resolve_terminal`). The same server gives every session the document
   tools `document_guide` and `check_document`; see

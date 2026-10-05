@@ -158,6 +158,9 @@ pub(crate) struct AppState {
     pub(crate) stopping: std::sync::atomic::AtomicBool,
     /// The notice feed (agent finished / needs you / agent `notify`).
     pub(crate) notices: crate::notices::Notices,
+    /// Agent `open_browser` requests on their way to the windows, plus how
+    /// many `/ws/events` consumers are connected (see `browser_open`).
+    pub(crate) browser_opens: crate::browser_open::BrowserOpens,
     /// Agent binaries resolved via the login shell (with `--version`),
     /// cached per agent for the daemon's lifetime;
     /// `GET /api/v1/agents?refresh=true` bypasses and refills it.
@@ -348,6 +351,7 @@ impl AppState {
             shutdown: tokio::sync::Notify::new(),
             stopping: std::sync::atomic::AtomicBool::new(false),
             notices: crate::notices::Notices::new(),
+            browser_opens: crate::browser_open::BrowserOpens::default(),
             agent_bins: Mutex::new(HashMap::new()),
             claude_projects_dir: home.join(".claude").join("projects"),
             managed_root: data_dir.join("agents"),

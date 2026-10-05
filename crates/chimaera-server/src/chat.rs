@@ -4166,6 +4166,7 @@ mod tests {
                 "notify".to_string(),
                 "document_guide".to_string(),
                 "check_document".to_string(),
+                "open_browser".to_string(),
             ])
         );
         let ask = codex_mcp_auto_approve(Some(MastermindMode::Ask), Vec::new())

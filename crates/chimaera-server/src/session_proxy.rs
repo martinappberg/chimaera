@@ -1993,6 +1993,10 @@ async fn feed(
                                 crate::notices::relay(state, workspace, row);
                             }
                         }
+                        // No owner-bound proxy route exists on this viewer.
+                        // Never interpret the remote owner's localhost here,
+                        // or retain the notice to open after a later reconnect.
+                        Some("browser_open") => {}
                         // The owner's connection for this project changed:
                         // end, and let the window's loop start afresh.
                         Some("error") => return Ok(()),

@@ -17,6 +17,9 @@
   import { pageVisible } from "../shared/visibility";
   import { computeStatus } from "../workspace/compute";
   import { isWebUrl, openInSystemBrowser } from "../shared/urlOpen";
+  import SessionGlyph from "../shared/SessionGlyph.svelte";
+  import { agentHue } from "../workspace/agentLinks";
+  import type { BrowserOpener } from "./agentOpen";
   import {
     ConfirmRequired,
     browserPreviewLease,
@@ -41,14 +44,31 @@
     visible: boolean;
     /** Persist the current in-app path onto the tab. */
     onNavigate: (path: string) => void;
-    /** The address bar named a different target: re-point this tab. */
-    onRetarget: (host: string, port: number, path: string) => void;
+    /** Re-point this tab: the address bar named a different target
+     *  (`found` false), or the compute-node hunt found this app on the node
+     *  it runs on (`found` true). */
+    onRetarget: (host: string, port: number, path: string, found: boolean) => void;
     /** A click landed inside the iframe: focus this pane. */
     onFocusRequest: () => void;
+    /** The agent session that opened this pane (`open_browser`), as the
+     *  roster knows it now; null for a pane the user opened. */
+    opener?: BrowserOpener | null;
+    /** Show the opening agent's session (its tab, revealed beside). */
+    onRevealOpener?: () => void;
   }
 
-  let { tabId, host, port, path, visible, onNavigate, onRetarget, onFocusRequest }: Props =
-    $props();
+  let {
+    tabId,
+    host,
+    port,
+    path,
+    visible,
+    onNavigate,
+    onRetarget,
+    onFocusRequest,
+    opener = null,
+    onRevealOpener,
+  }: Props = $props();
 
   type Phase =
     | { kind: "blank" }
@@ -129,14 +149,14 @@
       nodeHits = hits;
       if (hits.length === 1) {
         moved = targetLabel(host, port);
-        onRetarget(hits[0], port, path);
+        onRetarget(hits[0], port, path, true);
       }
     });
   });
 
   function chooseNode(node: string): void {
     moved = targetLabel(host, port);
-    onRetarget(node, port, path);
+    onRetarget(node, port, path, true);
   }
 
   const address = $derived(
@@ -325,6 +345,9 @@
     try {
       const win = el.contentWindow;
       if (win === null) return null; // cross-origin: leave the address as-is
+      // The iframe's initial about:blank document (before the first load
+      // commits) has pathname "blank": recording it would re-point the tab.
+      if (win.location.protocol === "about:") return null;
       // Include the hash so livePath matches a target path that carried one
       // (a hash-router route) — otherwise the external-navigation effect above
       // would see a spurious mismatch and re-load on every settle.
@@ -478,7 +501,7 @@
       }
       return;
     }
-    onRetarget(parsed.host, parsed.port, parsed.path);
+    onRetarget(parsed.host, parsed.port, parsed.path, false);
   }
 
   function onAddressKeydown(e: KeyboardEvent): void {
@@ -547,6 +570,34 @@
         <path d="M6.5 3H3.8A1.3 1.3 0 0 0 2.5 4.3v7.9a1.3 1.3 0 0 0 1.3 1.3h7.9a1.3 1.3 0 0 0 1.3-1.3V9.5M9.5 2.5H13.5V6.5M13.2 2.8 7.5 8.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" />
       </svg>
     </button>
+    <!-- Who put this page here: the agent's mark + its live name, trailing
+         the bar so nothing the user aims at moves when it appears. A
+         mousedown never takes focus; the click reveals that agent. -->
+    {#if opener !== null}
+      {#if opener.live}
+        <button
+          class="opener"
+          style:--hue={agentHue(opener.id)}
+          title="opened by {opener.label} — click to show it"
+          aria-label="opened by {opener.label} — show this agent"
+          onmousedown={(e) => e.preventDefault()}
+          onclick={() => onRevealOpener?.()}
+        >
+          <SessionGlyph kind="agent" agentKind={opener.agentKind} size={10} />
+          <span class="opener-text"><span class="opener-by">opened by</span> <span class="opener-name">{opener.label}</span></span>
+        </button>
+      {:else}
+        <span
+          class="opener ended"
+          title={opener.label !== null
+            ? `opened by ${opener.label}, an agent session that has ended`
+            : "opened by an agent session that has ended"}
+        >
+          <SessionGlyph kind="agent" agentKind={opener.agentKind} size={10} />
+          <span class="opener-text">{opener.label !== null ? `opened by ${opener.label} · ended` : "opened by an agent that has ended"}</span>
+        </span>
+      {/if}
+    {/if}
   </div>
 
   <div class="stage">
@@ -625,6 +676,76 @@
     border-bottom: 1px solid var(--edge);
     background: var(--bg);
     flex: none;
+    /* The attribution collapses to its mark in a narrow pane (below). */
+    container: browser-chrome / inline-size;
+  }
+
+  /* The opening agent: the linked-terminal chip's shape (mono pill) with
+     only its mark in the agent's link hue — quieter than the address it
+     sits beside; the page title stays the tab's label. */
+  .opener {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    height: 18px;
+    max-width: 260px;
+    min-width: 0;
+    margin-left: 4px;
+    padding: 0 8px 0 6px;
+    border: 1px solid var(--edge);
+    border-radius: 9px;
+    background: none;
+    color: var(--fg);
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    line-height: 1;
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .opener :global(.sglyph) {
+    color: hsl(var(--hue) 55% 55%);
+  }
+
+  /* The ended note is not a control (and has no hue): it never lights up. */
+  .opener:not(.ended):hover {
+    border-color: hsl(var(--hue) 45% 55% / 0.5);
+    background: color-mix(in srgb, var(--fg) 5%, transparent);
+  }
+
+  .opener-text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .opener-by {
+    color: var(--muted);
+  }
+
+  /* Its agent has ended: nothing to show, so no control — a muted note. */
+  .opener.ended {
+    border-style: dashed;
+    color: var(--muted);
+    cursor: default;
+  }
+
+  .opener.ended :global(.sglyph) {
+    color: var(--muted);
+  }
+
+  /* Below this the address needs the room: the mark alone, words in its
+     title (the hover tooltip every chrome control uses). */
+  @container browser-chrome (max-width: 520px) {
+    .opener {
+      padding: 0 5px;
+    }
+
+    .opener-text {
+      display: none;
+    }
   }
 
   .nav {
