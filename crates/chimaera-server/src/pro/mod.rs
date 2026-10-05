@@ -491,10 +491,12 @@ impl ProState {
             sleeping: Mutex::new(Default::default()),
             release_pending: Mutex::new(Default::default()),
             parked: Mutex::new(parked),
+            // A move the daemon died during is no outcome: it either
+            // finished (parked) or its project is ordinary local work again.
             left: Mutex::new(
                 disk.left
                     .into_iter()
-                    .filter(|(id, _)| valid_id(id))
+                    .filter(|(id, outcome)| valid_id(id) && outcome.state != leave::Where::Pending)
                     .take(128)
                     .collect(),
             ),

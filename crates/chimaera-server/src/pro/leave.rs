@@ -249,7 +249,13 @@ pub(crate) async fn leave(State(state): State<Arc<AppState>>) -> Response {
     for workspace in lock(&state.workspaces).list().into_iter().take(128) {
         let id = workspace.id;
         let enrolled = lock(&state.pro.ownership).contains_key(&id);
-        if !enrolled || !lock(&state.pro.authority).allows(&id) || super::parked(&state, &id) {
+        // A move still running from an earlier leave keeps its own outcome.
+        let moving = outcome(&state, &id).is_some_and(|o| o.state == Where::Pending);
+        if !enrolled
+            || moving
+            || !lock(&state.pro.authority).allows(&id)
+            || super::parked(&state, &id)
+        {
             continue;
         }
         let active = engine::leaving_agents(&state, &id);
