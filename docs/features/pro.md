@@ -695,15 +695,10 @@ current owner; they do not implicitly acquire execution. **Take over** asks that
 owner to finish its current step, save and release, then establishes execution
 here. A failed or stale action leaves the current owner authoritative and asks
 for a fresh explicit decision. Explicit opens may wake the cloud; background
-views, polls and refreshes never wake or move work.
-From a phone the same holds, with one addition:
-when the cloud is asleep with the project and one of your computers is
-online with the app open (preferably the one the project last ran on, and
-one on power), a message or typing from the phone brings the work to that
-computer instead of waking the cloud, and the phone says "Bringing the work
-to your computer…". Only if no computer takes it within about twenty seconds
-is the cloud woken as before. For this, the cloud saves each project it holds
-as it goes to sleep. Implementation: [`pro/moves.rs`](../../crates/chimaera-server/src/pro/moves.rs)
+views, polls and refreshes never wake or move work. A phone or browser acting
+on a project the cloud holds is relayed to the cloud like any other view; it
+never moves the work to a computer (that earlier "phone move" was removed on
+2026-10-05). Implementation: [`pro/moves.rs`](../../crates/chimaera-server/src/pro/moves.rs)
 and the viewer relay in [`session_proxy.rs`](../../crates/chimaera-server/src/session_proxy.rs)
 (the contract is in [HANDOFF](../../crates/chimaera-link/HANDOFF.md#explicit-take-over-moves-execution)).
 
@@ -939,6 +934,8 @@ _Captured 2026-09-30 from the maintainer's decision, relayed with the task that 
   opening, reading and watching never do.
 - **Phone:** "if you are on your phone, and the laptop is connected, it should
   still run on the computer and not the cloud (to minimize cloud usage)".
+  Superseded on 2026-10-05 by the Pro contract: a phone's action no longer
+  moves the work to a computer.
 
 ### Sync a local copy; take over separately
 _Captured 2026-10-02 from the maintainer's direct answers in this conversation._
@@ -948,7 +945,7 @@ _Captured 2026-10-02 from the maintainer's direct answers in this conversation._
   earlier “Acting brings the work to you” decision. Opening copies files; the
   separate takeover action moves execution.
 - **Wake:** “Explicit opens may wake the cloud; polls and refreshes never do
-  (latest recorded decision)”. The phone-to-available-computer policy remains.
+  (latest recorded decision)”. The phone-to-available-computer policy was removed on 2026-10-05.
 - **Custom secrets:** “Include selected-project custom secrets in this completion”.
   For changes while work is active: “Queue until idle; offer Apply now”.
   Named provider connections and custom project permissions remain distinct.

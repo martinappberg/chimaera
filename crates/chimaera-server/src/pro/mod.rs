@@ -126,9 +126,6 @@ pub(crate) struct ProState {
     /// of a project this computer runs comes home at its next pause
     /// (`engine::lazy_handback`, `leave::app_settled`).
     app_since: AtomicU64,
-    /// Only reported to the account (`moves::watch_query`); no longer gates
-    /// coming home.
-    power_suitable: AtomicBool,
     /// Projects the cloud did not take, or cannot run, after the app left
     /// (`leave::take_back`): they come back here at once, app or not. Hot
     /// state, bounded by enrolled projects.
@@ -537,7 +534,6 @@ impl ProState {
             remote_since: Mutex::new(HashMap::new()),
             return_backoff: Mutex::new(HashMap::new()),
             app_since: AtomicU64::new(0),
-            power_suitable: AtomicBool::new(false),
             reclaim: Mutex::new(Default::default()),
             return_pass: AtomicU64::new(0),
             renew_now: tokio::sync::Notify::new(),

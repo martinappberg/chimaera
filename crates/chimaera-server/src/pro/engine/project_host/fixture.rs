@@ -22,6 +22,7 @@ pub enum Seed {
         parked: bool,
         release_pending: bool,
         awake_since: u64,
+        /// Ignored: nothing reads power any more.
         power_suitable: bool,
         backoff: Option<(u64, u64)>,
     },
@@ -674,7 +675,7 @@ impl Scenario {
                 parked,
                 release_pending,
                 awake_since,
-                power_suitable,
+                power_suitable: _,
                 backoff,
             } => {
                 state
@@ -686,10 +687,6 @@ impl Scenario {
                     .pro
                     .app_since
                     .store(awake_since.max(1), Ordering::Release);
-                state
-                    .pro
-                    .power_suitable
-                    .store(power_suitable, Ordering::Release);
                 for (record, value) in [
                     (&state.pro.sleeping, sleeping),
                     (&state.pro.parked, parked),

@@ -86,10 +86,9 @@ export interface ChatSocketHandlers {
    *  until it gets through) or kept as before by whoever just handed back a
    *  wake that did not arrive (`onHeld` follows). */
   onUnreachable?(): void;
-  /** Acting here brings the work to this computer (`here`), or a phone's send
-   *  brings it to the user's computer (`computer`): the send that asked waits
+  /** Acting here brings the work to this computer: the send that asked waits
    *  for it rather than for the current owner. */
-  onBringing?(to: "here" | "computer"): void;
+  onBringing?(): void;
   /** The conversation is continuing on another machine: stay mounted and
    *  keep reconnecting; it did not exit. */
   onMoved?(to: MovedTo): void;
@@ -124,7 +123,7 @@ type ChatDelivery =
   | { kind: "waking" }
   | { kind: "held" }
   | { kind: "unreachable" }
-  | { kind: "bringing"; to: "here" | "computer" }
+  | { kind: "bringing" }
   | { kind: "moved"; to: MovedTo }
   | { kind: "paused"; pause: SessionPause }
   | { kind: "disconnected" };
@@ -223,7 +222,7 @@ export class ChatSocket {
           this.handlers.onUnreachable?.();
           break;
         case "bringing":
-          this.handlers.onBringing?.(delivery.to);
+          this.handlers.onBringing?.();
           break;
         case "moved":
           this.handlers.onMoved?.(delivery.to);
@@ -361,7 +360,7 @@ export class ChatSocket {
         case "bringing":
           this.resetNativeUi();
           this.asleep = false;
-          this.deliveries.push({ kind: "bringing", to: msg.to === "computer" ? "computer" : "here" });
+          this.deliveries.push({ kind: "bringing" });
           break;
         case "paused": {
           this.resetNativeUi();

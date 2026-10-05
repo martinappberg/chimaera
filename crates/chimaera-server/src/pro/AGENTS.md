@@ -24,8 +24,8 @@ revocable delegation over the authenticated local API.
 | `engine.rs` / `engine/coordinator_host.rs` | Public authority/effect host for snapshot, reconciliation, staged hydration and live return. Private runtime owns coordinator timing, snapshot/reconcile policy and move/release loops over the same captured generation and ProjectOwner. Public `engine::start` retains the spawned task. Without a runtime no coordinator/account loop starts; durable enrollment, ownership and recovery still load. |
 | `install.rs` / `install/tests.rs` | Durable, account/epoch/checkpoint-bound return file intents: private before/after blobs, descriptor-relative no-follow replacement, exact restart roll-forward, checkout invariants and refusal to overwrite newer user edits. Planning opens enumerated images nonblocking beneath pinned roots; a missing or nonregular image refuses rather than silently changing the write intent. |
 | `detached.rs` | Owned transfer tasks keyed by (kind, project, epoch): a caller that disconnects never cancels a flush or hydration; repeats join; a completed release is remembered ten minutes. |
-| `drain.rs` | `POST/DELETE /pro/drain`: refuse new transfer work and wait for jobs, transfer tasks, project caches and Git helpers before a cloud machine suspends; on a cloud machine it first publishes each project it holds (the copy a computer takes when a phone acts while it sleeps). |
-| `moves.rs` / `engine/project_host/move_host.rs` | Single bounded pull/answered/acted/yielding/leaving stores, original task admission/outcome cleanup, explicit Take over and exact captured fixed move effects. Private optional policy owns the original pull/read-retry/hydrate and pause/last-actor handover loops over the same ProjectOwner; original generation flows through request and hydration, and the same yield tuple retires only after completion. No-runtime pull refuses and releases its original request. Phone90s/computer300s selection, renewal target/dedup selection and passive readiness query remain public paid behavior alongside shared custody; this is a bounded reduction, not a claim that the whole family is free. Original older-wire test stays public; private move tests cover original policy, observed epoch and replacement before mutation. |
+| `drain.rs` | `POST/DELETE /pro/drain`: refuse new transfer work and wait for jobs, transfer tasks, project caches and Git helpers before a cloud machine suspends. |
+| `moves.rs` / `engine/project_host/move_host.rs` | Single bounded pull/answered/acted/yielding/leaving stores, original task admission/outcome cleanup, explicit Take over and exact captured fixed move effects. Private optional policy owns the original pull/read-retry/hydrate and pause/last-actor handover loops over the same ProjectOwner; original generation flows through request and hydration, and the same yield tuple retires only after completion. No-runtime pull refuses and releases its original request. The 300 s request bound and renewal target/dedup selection remain public paid behavior alongside shared custody; this is a bounded reduction, not a claim that the whole family is free. Original older-wire test stays public; private move tests cover original policy, observed epoch and replacement before mutation. |
 | `continuity_tests.rs` | Eight retained original free/admission cases: hidden workspace eligibility, boot shells, sign-out recovery, drain custody/refusal, stable failure codes, ended-return presentation, thaw admission and release settle bounds. Shared loopback fixtures remain for original public custody tests. The 24 original paid continuity journeys now live in private `pro-daemon-runtime` under `orchestration::continuity_tests`, using the actual optional Runtime and original host effects; five original companion-prerequisite annotations remain and require exact execution with a normally installed compatible helper. The required companion job runs the complete private runtime suite and every historical companion selector; migration adds no ignores. |
 | `snapshot_diagnostics.rs` | Fixed snapshot failure categories; no response bodies, paths, identifiers or error text enter diagnostic logs. |
 | `handback.rs` | Forwards the original captured project owner to optional private return policy; original live authority and cleanup stay host-owned. |
@@ -275,8 +275,8 @@ waits for drain/release, then uses the normal leased hydration. Failed old inten
 cannot clear a newer one. Copy enrollment and the old-daemon `legacy_pending`
 fence retire only after the file transaction committed, under `ImportGuard`
 through durable `SettingUp`; failed role persistence restores both restrictions.
-Copied projects never resume, renew/acquire in background, publish, advertise
-phone readiness or enter lazy return. A persisted explicit pending takeover may
+Copied projects never resume, renew/acquire in background, publish or enter
+lazy return. A persisted explicit pending takeover may
 resume its own interrupted move; ordinary passive owner reads do not admit one.
 
 Workspace list/status rows expose additive `local_copy` when enrolled:
@@ -315,7 +315,6 @@ A signed-out computer's live lease is retried only with the account's bounded
 `retry_after_ms` hint for that exact holder and epoch. The captured account and
 project remain current through the five-minute deadline; lease expiry and the
 account's thirty-second reconnect grace both precede hydration.
-Phone requests target only eligible executors, never ordinary local copies.
 Ordinary viewer input is forwarded to the current owner, including sleeping-owner
 wake behavior; `session_proxy` does not submit account moves. The native
 conversation identity still remains in the ledger until its first resumed turn.

@@ -465,10 +465,7 @@ answer, which could resurrect a delivered message. A send made while not
 live shows at once in `store.sending` ("sending…") until its echo. Ordinary chat input stays with its current owner, including from a copied-local
 project. Only explicit **Take over** moves execution to this computer. The
 additive `{"type":"bringing","to":"here"}` frame remains understood for older
-relays; a browser gateway says `to:"computer"` when a phone's send on a sleeping
-cloud goes to an eligible computer →
-`store.bringing` ("Bringing the work here…" / "Bringing the work to your
-computer…", the send shown pending); it ends with the next `ready`, a wake, a
+relays → `store.bringing` ("Bringing the work here…", the send shown pending); it ends with the next `ready`, a wake, a
 move, or a `command_failed` with `reason:"still_working"` (the other computer
 kept it; the send it names comes back to the composer). A move to another computer is
 `moved` with `other:true` → `store.moving = "other"` ("Continuing on your

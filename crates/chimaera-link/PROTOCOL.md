@@ -526,9 +526,8 @@ credentials. It leaves the Link transport protocol number unchanged.
 ### Acting brings the work to you
 
 Additive (2026-09-30): `POST|DELETE /v2/baton/{workspace}/move`, the
-`move_to`/`move_requested_at`/`move_reason` fields of ownership answers, the
-passive read's `ready`/`power` query, the `{"type":"bringing","to":"here"|"computer"}`
-socket frame, the `bringing`/`still_working` refusal reasons and the `other`
+`move_to`/`move_requested_at` fields of ownership answers, the
+`{"type":"bringing","to":"here"}` socket frame, the `bringing`/`still_working` refusal reasons and the `other`
 flag of `moved`. Clients that ignore them keep today's behavior (the work
 stays where it runs and a send wakes a sleeping cloud machine). In current
 native clients, opening synchronizes a local copy and ordinary input stays

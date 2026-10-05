@@ -80,7 +80,7 @@ function makeSocket(sessionId: string, store: ChatStore): ChatSocket {
     onWaking: () => store.onWaking(),
     onHeld: () => store.onHeld(),
     onUnreachable: () => store.onUnreachable(),
-    onBringing: (to: "here" | "computer") => store.onBringing(to),
+    onBringing: () => store.onBringing(),
     onMoved: (to: MovedTo) => store.onMoved(to),
     onPaused: (pause) => store.onPaused(pause),
     onDisconnected: () => store.onDisconnected(),

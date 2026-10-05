@@ -45,7 +45,7 @@ const WAKING = " · waking";
 export interface OwnerNote {
   /** What the view's socket heard; only `asleep` and `waking` change the
    *  label (work being brought here says so in the view itself). */
-  owner?: "asleep" | "waking" | "bringing" | "bringing-computer" | null;
+  owner?: "asleep" | "waking" | "bringing" | null;
   /** The view's own status line already says it is reconnecting: the label
    *  must not say it a second time. */
   reconnectingShown?: boolean;

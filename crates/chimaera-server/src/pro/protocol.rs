@@ -64,18 +64,13 @@ pub struct Baton {
     pub server_now: String,
     pub requires_fork: bool,
     /// Additive: the account asks the work to move to this holder, because
-    /// the user acted on that computer (or a phone acted while the cloud
-    /// slept and this computer can take it). The holder yields at its next
-    /// pause; the named computer takes it. Absent from older accounts.
+    /// the user acted on that computer. The holder yields at its next pause;
+    /// the named computer takes it. Absent from older accounts.
     #[serde(default)]
     pub move_to: Option<String>,
     /// Additive: when the account recorded that request, by its own clock.
     #[serde(default)]
     pub move_requested_at: Option<String>,
-    /// Additive: `computer` (the user acted on another computer) or `phone`
-    /// (a phone acted while the cloud slept).
-    #[serde(default)]
-    pub move_reason: Option<String>,
     /// Additive: a browser opened this project while the computer holding it
     /// has no app open; that computer hands it to the cloud (`leave::observed`).
     #[serde(default)]

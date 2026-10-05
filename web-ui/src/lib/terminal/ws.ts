@@ -65,10 +65,8 @@ export interface SessionSocketHandlers {
 }
 
 /** `bringing`: typing here is bringing the work to this computer from the
- *  other one; `bringing-computer`: a phone's typing is bringing it to the
- *  user's computer instead of waking the cloud machine. The typing that asked
- *  is held until it arrives. */
-export type TerminalStatus = "asleep" | "waking" | "bringing" | "bringing-computer";
+ *  other one. The typing that asked is held until it arrives. */
+export type TerminalStatus = "asleep" | "waking" | "bringing";
 
 interface ServerTextFrame {
   type: string;
@@ -391,7 +389,7 @@ export class SessionSocket {
         // The typing that asked is held until the work arrives; the socket
         // then closes and the reconnect finds the terminal where it runs.
         this.asleep = false;
-        this.handlers.onStatus?.(msg.to === "computer" ? "bringing-computer" : "bringing");
+        this.handlers.onStatus?.("bringing");
         break;
       case "moved":
       case "paused":

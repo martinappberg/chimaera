@@ -753,13 +753,11 @@ export class ChatStore {
   /** A send picked a paused project back up and it is waking; cleared by the
    *  next `ready`, a disconnect or a move. */
   waking = $state(false);
-  /** Acting on this conversation is bringing its work here (`here`: this
-   *  computer takes it from the other one) or to the user's computer
-   *  (`computer`: a phone's send while the cloud sleeps). The send waits for
-   *  it. It outlives the socket that closes once the work arrived (the
+  /** Acting on this conversation is bringing its work here: this computer
+   *  takes it from the other one. The send waits for it. It outlives the socket that closes once the work arrived (the
    *  reconnect's `ready` ends it), a refusal from the other computer ends it,
    *  and so do a wake or a move. */
-  bringing = $state<"here" | "computer" | null>(null);
+  bringing = $state(false);
   /** Sends not confirmed yet that show as a pending bubble, oldest first:
    *  one made while the conversation is not live (paused, waking,
    *  reconnecting) shows at once, so it is never typed twice, and the others
@@ -967,7 +965,7 @@ export class ChatStore {
     this.held = false;
     this.asleep = false;
     this.waking = false;
-    this.bringing = null;
+    this.bringing = false;
     this.moving = null;
     this.pausedFor = null;
     // This handshake succeeded, which is the one fact a socket-level fatal
@@ -1143,7 +1141,7 @@ export class ChatStore {
   onWaking(): void {
     this.asleep = false;
     this.waking = true;
-    this.bringing = null;
+    this.bringing = false;
     this.showUnconfirmed();
   }
 
@@ -1175,12 +1173,11 @@ export class ChatStore {
     }
   }
 
-  /** Acting here is bringing the work to this computer (or, from a phone, to
-   *  the user's computer). The send that asked is held until it arrives: show
-   *  it pending rather than as delivered. */
-  onBringing(to: "here" | "computer"): void {
+  /** Acting here is bringing the work to this computer. The send that asked
+   *  is held until it arrives: show it pending rather than as delivered. */
+  onBringing(): void {
     this.asleep = false;
-    this.bringing = to;
+    this.bringing = true;
     this.showUnconfirmed();
   }
 
@@ -1191,7 +1188,7 @@ export class ChatStore {
     this.pausedFor = null;
     this.asleep = false;
     this.waking = false;
-    this.bringing = null;
+    this.bringing = false;
     // Sends still unconfirmed stay: this socket closes next, and they go out
     // again at the `ready` from wherever the conversation runs now (its
     // journal travelled with it, so a delivered one echoes in that replay).
@@ -1214,7 +1211,7 @@ export class ChatStore {
    *  so it can go out again or come back. */
   noteSent(id: string, frame: Record<string, unknown>, text: string, images: ImageAttachment[] = []): void {
     // Sending is what picks a paused project back up: stop inviting it.
-    const live = this.connected && !this.waking && this.bringing === null;
+    const live = this.connected && !this.waking && !this.bringing;
     this.asleep = false;
     this.unconfirmed = [
       ...this.unconfirmed,
@@ -1284,7 +1281,7 @@ export class ChatStore {
     }
     this.notice(message, "error");
     // The other computer kept the work: nothing is on its way here any more.
-    if (reason === "still_working") this.bringing = null;
+    if (reason === "still_working") this.bringing = false;
     if (!send || this.unconfirmed.length === 0) return;
     if (at >= 0) {
       this.handBackAt(at);

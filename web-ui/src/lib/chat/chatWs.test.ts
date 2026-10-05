@@ -152,7 +152,6 @@ it("acting brings the work here: the socket says so and a kept refusal names why
   const socket = new ChatSocket("s-chat", h);
   Socket.all[0].onopen?.();
   Socket.all[0].frame({ type: "bringing", to: "here" });
-  Socket.all[0].frame({ type: "bringing", to: "computer" });
   Socket.all[0].frame({
     type: "error",
     code: "command_failed",
@@ -161,8 +160,7 @@ it("acting brings the work here: the socket says so and a kept refusal names why
     command: "send",
   });
   await drain();
-  expect(h.onBringing).toHaveBeenNthCalledWith(1, "here");
-  expect(h.onBringing).toHaveBeenNthCalledWith(2, "computer");
+  expect(h.onBringing).toHaveBeenCalledTimes(1);
   expect(h.onCommandFailed).toHaveBeenCalledWith(
     "Your other computer is still working on this. Try again when it pauses.",
     "send",

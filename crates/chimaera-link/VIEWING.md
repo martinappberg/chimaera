@@ -487,14 +487,7 @@ to the current owner. Opening a local copy or typing never requests a move.
 Explicit Take over uses the checked ownership endpoint; only after successful
 acquisition and resume does new input route to the local executor. An owner
 that is still working may refuse the explicit move with `still_working`.
-A browser view gets the same
-`bringing` frame with `to:"computer"` from the account's gateway when its
-action on a sleeping cloud machine is sent to one of the user's computers
-instead; the gateway holds the socket authentication and first input and
-delivers them once to that computer's session, or to the woken cloud machine
-(`waking`) when no computer took the work. Like a keeper it holds only acting
-commands and the seven settings commands while the work is being brought,
-never a view's other frames. Every `read_only` refusal (`reason`:
+Every `read_only` refusal (`reason`:
 `watching`, `elsewhere`, `busy`, `waking`, `bringing`, `still_working`, `reconnecting`)
 and HTTP `409 {"error":"workspace_owned_elsewhere"}` may carry the additive
 `owner: "cloud" | "computer" | null`. Only a known typed route or explicit

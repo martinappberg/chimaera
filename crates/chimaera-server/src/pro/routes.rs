@@ -1042,18 +1042,7 @@ async fn hydrate_owned(state: Arc<AppState>, mut request: Hydrate) -> detached::
     )
 }
 
-#[derive(Deserialize)]
-pub(crate) struct Power {
-    suitable: bool,
-}
-pub(crate) async fn power(
-    State(state): State<Arc<AppState>>,
-    Json(power): Json<Power>,
-) -> Response {
-    state
-        .pro
-        .power_suitable
-        .store(power.suitable, Ordering::Release);
+pub(crate) async fn power(State(state): State<Arc<AppState>>) -> Response {
     // Only the app reports power: its first report while away is it arriving.
     super::leave::app_arrived(&state, false);
     StatusCode::NO_CONTENT.into_response()

@@ -203,16 +203,8 @@ impl ProjectOwner {
     pub async fn persist(&self) -> Result<()> {
         super::super::persist(&self.state).await
     }
-    pub async fn read_owner(&self, advertise_return: bool) -> Result<ProjectBaton> {
-        let path = format!(
-            "{}{}",
-            execution::path(&self.config, &self.workspace, ""),
-            if advertise_return {
-                super::super::moves::watch_query(&self.state, &self.config, &self.workspace)
-            } else {
-                ""
-            }
-        );
+    pub async fn read_owner(&self) -> Result<ProjectBaton> {
+        let path = execution::path(&self.config, &self.workspace, "");
         Ok(ProjectBaton::capture(
             super::account(&self.config, &path, "GET", None)
                 .await?
