@@ -1639,8 +1639,8 @@ fn chat_working(
 }
 
 /// The agents (`claude`, `codex`, ...) running work in this project right
-/// now, each named once: what the native app's quit question names. The
-/// inverse of `at_pause` per session, except that a session nothing is known
+/// now, each named once (the coordinator's turn-end copies; leaving uses
+/// [`leaving_agents`]). The inverse of `at_pause` per session, except that a session nothing is known
 /// about is not counted as working.
 pub(super) fn working_agents(state: &AppState, workspace: &str) -> Vec<String> {
     agents_at_work(state, workspace, false)

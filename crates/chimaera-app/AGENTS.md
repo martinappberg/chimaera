@@ -115,9 +115,10 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
   `finish_quit` once the gate is `Settled`). macOS terminate (Dock › Quit,
   logout) runs the same two in `unsaved::os_quit_may_proceed`, deciding
   synchronously. The two dialogs are never merged. The updater's
-  `app.restart()` asks neither. The daemon outlives every quit (daemon.rs);
-  only **Continue in the cloud** moves work, and nothing moves without that
-  click.
+  `app.restart()` asks neither. The daemon outlives every quit (daemon.rs).
+  With Pro composed in, the private owner's `hold_quit` never holds: it tells
+  the daemon the app is leaving (`POST /pro/leave`) and the daemon decides
+  which work continues in the cloud; nothing is asked.
 - **The single-instance plugin must stay first** in `shell.rs`'s builder. The
   shell owns process-global window persistence, tunnels, and askpass state; two
   app processes would race and corrupt that ownership. A repeated launch raises

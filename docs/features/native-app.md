@@ -290,9 +290,9 @@ app-build` (never the root `cargo`).
 - **The unsaved-edits guard on close and quit** has unit-tested decisions (the shell's `Guard`,
   the page's dialog controller) and CI's bundle builds, but has not yet been hand-driven in the
   app; the macOS `applicationShouldTerminate:` hook (Dock › Quit, logout) is compile-checked only.
-- **The quit question (Pro)** has unit-tested decisions (`shell/quit.rs`) and daemon tests for
-  the parked handover, but its dialog, handover window and quit paths have not yet been
-  hand-driven in the app.
+- **Leaving on quit (Pro)** asks nothing: the private shell posts `/pro/leave` and quits. The
+  daemon's decision is unit-tested and driven end to end by the private loopback harness, but
+  the quit paths have not yet been hand-driven in the app.
 - **Reload Window** was hand-driven on macOS (⌘R, the held and cancelled notice, a page that never
   booted); its F5 path on Linux (GTK accelerator) and Windows (WebView2) is compile-checked only.
 
