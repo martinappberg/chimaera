@@ -28,7 +28,8 @@
     pasteInto,
   } from "./fileClipboard.svelte";
   import { getActiveWorkspaceId, isOwnerAsleep, isRemoteHost, projectStateNote } from "../net/api";
-  import { hereName, isKeptCopy, keptCopyHint, requestKeptReview } from "../pro/kept";
+  import { hereName, keptCopyHint, keptMark, requestKeptReview } from "../pro/kept";
+  import { proTier } from "../net/plan";
   import { refetchWhenOwnerAwake } from "../net/reconnect";
   import { stemLength, validateEntryName } from "../shared/fsNames";
   import { contextMenu, type ContextMenuEntry } from "../shared/contextMenu.svelte";
@@ -939,7 +940,7 @@
         : []),
       { label: "Copy Path", onSelect: () => void copyPath(entry.path) },
       // This computer's version kept beside the cloud's (a Pro return).
-      ...(entry.kind === "file" && isKeptCopy(entry.name) && getActiveWorkspaceId() !== null
+      ...(entry.kind === "file" && keptMark(entry.name, $proTier) && getActiveWorkspaceId() !== null
         ? [
             {
               label: "Review both versions",
@@ -1291,7 +1292,7 @@
           class:symlink={entry.symlink}
           class:broken={entry.broken}
           style:color={entry.broken ? undefined : gDeco ? gDeco.color : undefined}>{entry.name}</span>
-        {#if entry.kind === "file" && !entry.symlink && isKeptCopy(entry.name)}
+        {#if entry.kind === "file" && !entry.symlink && keptMark(entry.name, $proTier)}
           <!-- A Pro return's kept copy: the odd name explained where it
                appears (right-click offers the review). -->
           <span class="kept-mark" title={keptCopyHint(entry.name, keptHere)}>from {keptHere}</span>

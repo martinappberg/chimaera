@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { backNote, isKeptCopy, keptCopyHint, keptErrorLine, keptNoticeWorkspace, keptOriginal } from "./kept";
+import { backNote, isKeptCopy, keptCopyHint, keptErrorLine, keptMark, keptNoticeWorkspace, keptOriginal } from "./kept";
 
 describe("shared kept copy naming and recovery", () => {
 it("recognises the daemon's names and nothing else", () => {
@@ -49,5 +49,15 @@ it("never shows a raw code", () => {
       expect(line).not.toContain("_");
       expect(line.length).toBeGreaterThan(10);
     }
+  });
+});
+
+describe("the file tree's kept-copy mark", () => {
+  it("is never shown in a build without Pro: the name is an ordinary file there", () => {
+    const name = "notes.md.mine-20260929-1412";
+    expect(keptMark(name, "free")).toBe(false);
+    expect(keptMark(name, "offered")).toBe(true);
+    expect(keptMark(name, "active")).toBe(true);
+    expect(keptMark("notes.md", "active")).toBe(false);
   });
 });
