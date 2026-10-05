@@ -94,6 +94,7 @@ pub(crate) fn is_interaction(command: &chimaera_agent::model::AgentCommand) -> b
             | AgentCommand::SendAfterTurn { .. }
             | AgentCommand::Permission { .. }
             | AgentCommand::Answer { .. }
+            | AgentCommand::Elicitation { .. }
             | AgentCommand::Interrupt
             | AgentCommand::Compact
             | AgentCommand::Rewind { dry_run: false, .. }
@@ -122,8 +123,8 @@ pub(crate) enum ChatFrame {
 /// command.
 pub(crate) fn chat_frame(kind: &str, dry_run: bool) -> ChatFrame {
     match kind {
-        "send" | "send_after_turn" | "permission" | "answer" | "interrupt" | "compact"
-        | "background_tool" | "stop_task" => ChatFrame::Acting,
+        "send" | "send_after_turn" | "permission" | "answer" | "elicitation" | "interrupt"
+        | "compact" | "background_tool" | "stop_task" => ChatFrame::Acting,
         "rewind" if !dry_run => ChatFrame::Acting,
         "set_model" | "set_mode" | "set_effort" | "set_ultracode" | "set_remote_control"
         | "set_mcp_enabled" | "reconnect_mcp" => ChatFrame::Setting,
@@ -160,6 +161,11 @@ mod tests {
             C::Answer {
                 request_id: "r".into(),
                 answers: Default::default(),
+            },
+            C::Elicitation {
+                request_id: "r".into(),
+                action: chimaera_agent::elicitation::ElicitationAction::Decline,
+                content: serde_json::Value::Null,
             },
             C::GetUsage,
             C::Compact,
@@ -207,6 +213,7 @@ mod tests {
                 | C::SetThinking { .. }
                 | C::SetUltracode { .. }
                 | C::Answer { .. }
+                | C::Elicitation { .. }
                 | C::GetUsage
                 | C::Compact
                 | C::Rewind { .. }

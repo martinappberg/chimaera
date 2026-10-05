@@ -1947,13 +1947,13 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let (exited, mut exits) = mpsc::unbounded_channel();
-        let manager = ChatManager::new(
+        let manager = Arc::new(ChatManager::new(
             dir.path().join("chat"),
             Box::new(|_, _| {}),
             Box::new(move |_, _| {
                 let _ = exited.send(());
             }),
-        );
+        ));
         let incoming = Arc::new(Mutex::new(None));
         manager
             .spawn(

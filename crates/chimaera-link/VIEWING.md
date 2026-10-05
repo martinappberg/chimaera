@@ -181,7 +181,7 @@ which:
 
 - **Acting commands** are exactly the ones the daemon counts as interaction
   (`chimaera-server` `activity::is_interaction`; the two lists change
-  together): `send`, `send_after_turn`, `permission`, `answer`, `interrupt`,
+  together): `send`, `send_after_turn`, `permission`, `answer`, `elicitation`, `interrupt`,
   `compact`, `rewind` when it is not a dry run, `background_tool` and
   `stop_task`. Held, in order, and the machine is woken for them.
 - **The seven settings commands** the user gives: `set_model`, `set_mode`,
