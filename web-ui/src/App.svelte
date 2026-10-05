@@ -279,6 +279,7 @@
   import ExtensionsGlyph from "./lib/plugins/ExtensionsGlyph.svelte";
   import { transferBlock, transferInto, type FileSource } from "./lib/workspace/fileTransfer";
   import ComputeStrip from "./lib/workspace/ComputeStrip.svelte";
+  import PlaceSlot from "./lib/extensions/PlaceSlot.svelte";
   import type JobWindowNotices from "./lib/workspace/JobWindowNotices.svelte";
   import type JobClusterHome from "./lib/workspace/JobClusterHome.svelte";
   import {
@@ -1123,6 +1124,12 @@
   // (sessionsById, the pools' keep-alive sync) stay on the unfiltered list.
   const wsSessions = $derived(
     sessions.filter((s) => s.workspace_id === activeWsId && !isMastermind(s)),
+  );
+  /** The project the host indicator may speak for: a local project in a
+   *  native window on this computer (not a remote host, an allocation or a
+   *  browser view, whose labels already name their machine). */
+  const placeWorkspaceId = $derived(
+    workspace !== null && isNativeShell() && !isRemoteWindow && !projectView && !$computeStatus?.self ? workspace.id : null,
   );
 
   /** How this window is named in the shell's tray window-list: the workspace
@@ -6060,16 +6067,13 @@
         <!-- Inside an allocation the label carries the node ("cluster ›
              n042") so a compute-node window never poses as its login
              node — derived from the daemon's self block, hash-independent. -->
-        <span class="daemon-host" class:remote={isRemoteWindow} title={health?.hostname}
-          >{$computeStatus?.self
-            ? `${getHostLabel()} › ${$computeStatus.self.node}`
-            : stripHost}</span
-        >
-        {#if workspace?.local_copy !== undefined && isNativeShell() && !isRemoteWindow}
-          {#await import("./lib/pro/ProjectCopyStatus.svelte") then { default: ProjectCopyStatus }}
-            <ProjectCopyStatus workspaceId={workspace.id} onTaken={() => void refreshWorkspaces()} />
-          {:catch}<span>Project controls couldn’t load. Reopen this workspace to try again.</span>{/await}
-        {/if}
+        <PlaceSlot workspaceId={placeWorkspaceId} sessions={wsSessions} onChanged={() => void refreshWorkspaces()}>
+          {#snippet label()}<span class="daemon-host" class:remote={isRemoteWindow} title={health?.hostname}
+            >{$computeStatus?.self
+              ? `${getHostLabel()} › ${$computeStatus.self.node}`
+              : stripHost}</span
+          >{/snippet}
+        </PlaceSlot>
         {#if isRemoteWindow && !projectView && $linkRtt !== null && $linkRtt >= LINK_RTT_BADGE_MS}
           <!-- Honest latency signal: on a distant host every keystroke echo
                and UI fetch pays at least this — better named than mysterious
@@ -6460,14 +6464,11 @@
           re-attach
         </button>
       {/if}
-      <span class="strip-host" class:remote={isRemoteWindow} title={health?.hostname}
-        >{stripHost}</span
-      >
-      {#if workspace?.local_copy !== undefined && isNativeShell() && !isRemoteWindow}
-        {#await import("./lib/pro/ProjectCopyStatus.svelte") then { default: ProjectCopyStatus }}
-          <ProjectCopyStatus workspaceId={workspace.id} onTaken={() => void refreshWorkspaces()} />
-        {:catch}<span>Project controls couldn’t load. Reopen this workspace to try again.</span>{/await}
-      {/if}
+      <PlaceSlot workspaceId={placeWorkspaceId} sessions={wsSessions} onChanged={() => void refreshWorkspaces()}>
+        {#snippet label()}<span class="strip-host" class:remote={isRemoteWindow} title={health?.hostname}
+          >{stripHost}</span
+        >{/snippet}
+      </PlaceSlot>
       {#if isRemoteWindow && !projectView && $linkRtt !== null && $linkRtt >= LINK_RTT_BADGE_MS}
         <!-- Detached windows ghost keystrokes like any remote window — they
              get the same honest latency signal. -->

@@ -1377,12 +1377,6 @@ export async function proOpenCloudProject(workspaceId: string, expectedAccountLi
   });
 }
 
-export async function proTakeOverProject(workspaceId: string, expectedEpoch: number): Promise<void> {
-  const t = tauri();
-  if (t === null) throw new Error("Open the desktop app to take over execution.");
-  await t.core.invoke<void>("pro_take_over_project", { workspaceId, expectedEpoch });
-}
-
 export async function proTakeReturn(): Promise<boolean> {
   return (await tauri()?.core.invoke<boolean>("pro_take_return")) ?? false;
 }
@@ -1495,6 +1489,18 @@ export interface MirrorWorkspace {
   profile: MirrorProfile | null;
   git_branches?: string[] | null;
   blocked_providers?: CloudBlockedProvider[];
+  /** Additive (newer daemons): where this project's work went the last time
+   *  the app left (`moved`, `staying_here` with a closed `reason`, or
+   *  `pending` while that runs; `at` in Unix ms). Reasons the UI does not
+   *  know read as a generic true sentence. */
+  leave?: { state: "moved" | "staying_here" | "pending" | (string & {}); reason?: string | null; at: number } | null;
+  /** Additive: the cloud could take this project's work right now. */
+  cloud_handoff?: boolean;
+  /** Additive: the agent kinds working or waiting on the user there now. */
+  working_agents?: string[];
+  /** Additive: handed to the cloud and kept there until this computer
+   *  leaves and comes back. */
+  parked?: boolean;
 }
 export interface MirrorStatus {
   configured: boolean; projects_root: string; projects_root_confirmed: boolean; workspaces: MirrorWorkspace[];
@@ -1504,6 +1510,6 @@ export interface MirrorStatus {
   sessions: { id: string; workspace_id: string; display_name?: string; name: string }[];
 }
 export async function proMirrorStatus(expectedAccountLifetime?: string): Promise<MirrorStatus> {
-  const t = tauri(); if (t === null) throw new Error("Mirror settings require the native app");
+  const t = tauri(); if (t === null) throw new Error("Open the desktop app to see your synced projects.");
   return t.core.invoke<MirrorStatus>("pro_mirror_status", { ...accountGuard(expectedAccountLifetime) });
 }

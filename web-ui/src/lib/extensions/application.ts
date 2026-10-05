@@ -45,12 +45,44 @@ export interface SurfaceMount {
   accountPresentation?: AccountPresentationServices | null;
 }
 export interface SurfaceOwner { update(presentation: Readonly<SurfacePresentation>): void; dispose(): void }
+/** One conversation or terminal of the project, as the window lists it:
+ *  `remote` is the host a routed session runs on (`worker-…` / `device-…`),
+ *  null for one on this computer. */
+export interface PlaceSession { readonly id: string; readonly agentKind: string | null; readonly remote: string | null }
+/** Why moving the project's work to the cloud did not happen: the daemon's
+ *  own fixed reason (`cloud_hours_exhausted`, `draining`, a failure code), or
+ *  `unavailable` when it could not be asked. */
+export type PlaceMoveResult = { moved: true } | { moved: false; reason: string };
+/** The window's host indicator for one local project. The host owns the
+ *  label it shows today; the extension may take its place (`claim`) and say
+ *  where the project's work runs. Only these finite facts and actions cross:
+ *  the extension reads its own account status. */
+export interface PlaceMount {
+  version: 1;
+  workspaceId: string;
+  signal: AbortSignal;
+  /** true: the extension renders in the target and the host hides its label;
+   *  false: the host's own label shows again, exactly as without it. */
+  claim(claimed: boolean): void;
+  visibility: Observable<boolean>;
+  sessions: Observable<readonly PlaceSession[]>;
+  /** Opens Chimaera Pro's agent connection flow for this project. */
+  connectAgents(providerIds: readonly string[]): void;
+  /** The clean hand-off of this one project to the cloud (the same daemon
+   *  operation quitting uses), resolved when the daemon has answered. */
+  runInCloud(): Promise<PlaceMoveResult>;
+  /** Reads the window's project list again (after this computer took it). */
+  refreshProjects(): void;
+}
+export interface PlaceOwner { dispose(): void }
 export interface ApplicationExtension {
   version: 1;
   id: "chimaera-pro";
   mount(kind: SurfaceKind, target: HTMLElement, mount: SurfaceMount): Promise<SurfaceOwner>;
   bindAccountPresentation?(scope: AccountHostScope): Promise<AccountPresentationServices>;
   bindAccountBranding?(scope: AccountBrandingSubscription): Promise<() => void>;
+  /** Optional: an extension without it leaves the host indicator alone. */
+  mountPlace?(target: HTMLElement, mount: PlaceMount): Promise<PlaceOwner>;
 }
 export type SurfaceStatus = "absent" | "loading" | "ready" | "failed" | "closed";
 export interface HostSurfaceActions {
