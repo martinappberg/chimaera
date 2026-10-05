@@ -83,8 +83,12 @@ pub fn run_with_context_and_assembly(
         .with_writer(std::io::stderr)
         .init();
 
+    // Only the Pro extension's connections need more descriptors; the open
+    // build keeps the limit it was started with (and so do its terminals).
     #[cfg(unix)]
-    raise_open_file_limit();
+    if factory.is_some() {
+        raise_open_file_limit();
+    }
     let assembly_identity = factory.as_ref().and(assembly_identity);
     assert!(
         assembly_identity.is_none_or(daemon::valid_assembly_identity),
