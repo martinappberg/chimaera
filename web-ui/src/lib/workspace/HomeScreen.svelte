@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import HomeNavigation from "./HomeNavigation.svelte";
   import HomeActions from "./HomeActions.svelte";
+  import HostSlot from "../extensions/HostSlot.svelte";
   import { isMac } from "../shared/keys";
   import { paidPlan, proOffered } from "../net/plan";
   import { gatewayWorkspace, isBrowserGateway } from "../net/base";
@@ -1114,6 +1115,7 @@
                   {#if err !== undefined}
                     <div class="err-line">{err}</div>
                   {/if}
+                  <HostSlot alias={h.alias} />
                   {#if h.cluster !== null && h.cluster.login_daemon !== null && phase === undefined}
                     <div class="note-line warn">
                       a chimaera server from before is still running on {shortNode(h.cluster.login_daemon.node)} —
@@ -1195,6 +1197,7 @@
                   {#if err !== undefined}
                     <div class="err-line">{err}</div>
                   {/if}
+                  <HostSlot alias={h.alias} />
                   {#if h.status === "connected" && h.outdated && phase === undefined}
                     <div class="note-line" title={buildNote(h.remote_build)}>
                       daemon is an older build —

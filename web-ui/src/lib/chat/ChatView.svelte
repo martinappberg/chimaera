@@ -62,6 +62,7 @@
   import { HoverPreviews } from "../previews/doc/hoverController.svelte";
   import PermissionCard from "./PermissionCard.svelte";
   import ElicitationCard from "./ElicitationCard.svelte";
+  import ConversationSlot from "../extensions/ConversationSlot.svelte";
   import type { PendingElicitation } from "./elicitation";
   import PlanApprovalCard from "./PlanApprovalCard.svelte";
   import QuestionCard from "./QuestionCard.svelte";
@@ -3222,6 +3223,10 @@
     {#each pinnedElicitations as request (request.requestId)}
       <ElicitationCard {request} {visible} onRespond={(action, content) => sendCommand({type: "elicitation", request_id: request.requestId, action, content}, "MCP response not sent")} />
     {/each}
+
+    <!-- A decision only the optional extension can take (a setup command
+         this agent proposed): nothing at all without it or without a plan. -->
+    <ConversationSlot workspaceId={session.workspace_id ?? null} sessionId={session.id} blocks={store.blocks} {visible} />
 
     {#if agentBusy && pinnedPermissions.length === 0 && pinnedQuestions.length === 0 && pinnedElicitations.length === 0}
       <div class="status-row" aria-live={visible ? "polite" : "off"}>

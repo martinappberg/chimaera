@@ -75,6 +75,26 @@ export interface PlaceMount {
   refreshProjects(): void;
 }
 export interface PlaceOwner { dispose(): void }
+/** One conversation that asked for something only the extension can answer:
+ *  the setup commands it proposed with the chimaera `update_cloud_profile`
+ *  tool, read from its own transcript (oldest first). The host mounts the
+ *  extension only while that list is non-empty, so other conversations cost
+ *  nothing; the extension decides whether one of them still waits. */
+export interface ConversationMount {
+  version: 1;
+  workspaceId: string;
+  sessionId: string;
+  signal: AbortSignal;
+  visibility: Observable<boolean>;
+  proposals: Observable<readonly string[]>;
+}
+/** One remote machine row on Home, by its SSH alias. */
+export interface HostMount {
+  version: 1;
+  alias: string;
+  signal: AbortSignal;
+  visibility: Observable<boolean>;
+}
 export interface ApplicationExtension {
   version: 1;
   id: "chimaera-pro";
@@ -83,6 +103,10 @@ export interface ApplicationExtension {
   bindAccountBranding?(scope: AccountBrandingSubscription): Promise<() => void>;
   /** Optional: an extension without it leaves the host indicator alone. */
   mountPlace?(target: HTMLElement, mount: PlaceMount): Promise<PlaceOwner>;
+  /** Optional: rendered in a conversation's own approval area. */
+  mountConversation?(target: HTMLElement, mount: ConversationMount): Promise<PlaceOwner>;
+  /** Optional: one quiet line under a remote machine's Home row. */
+  mountHost?(target: HTMLElement, mount: HostMount): Promise<PlaceOwner>;
 }
 export type SurfaceStatus = "absent" | "loading" | "ready" | "failed" | "closed";
 export interface HostSurfaceActions {
