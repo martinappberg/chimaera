@@ -509,6 +509,14 @@ export interface RemoteControlInfo {
 
 /** Fold a wire `remote_control` event or an Init's `remote_control` snapshot
  *  (same field names) into the store's shape; off/absent = null. */
+/** A permission decision's history row. An agent's title can be a whole
+ *  multi-line command, so the row names the request by its first line. */
+function decisionLine(title: string, label: string): string {
+  const trimmed = title.trim();
+  const first = trimmed.split("\n", 1)[0].trimEnd();
+  return `${first}${first.length < trimmed.length ? " …" : ""} — ${label}`;
+}
+
 function foldRemoteControl(raw: unknown): RemoteControlInfo | null {
   if (raw === null || typeof raw !== "object") return null;
   const ev = raw as Record<string, unknown>;
@@ -1513,7 +1521,7 @@ export class ChatStore {
           const label =
             req.options.find((o) => o.id === option)?.label ??
             (option === "cancelled" || option === "expired" ? "no longer active" : option);
-          this.notice(`${req.title} — ${label}`, "info");
+          this.notice(decisionLine(req.title, label), "info");
         }
         if (req?.toolCallId != null) {
           const idx = this.toolIndex.get(req.toolCallId);
@@ -2044,7 +2052,7 @@ export class ChatStore {
     this.questions = [];
     this.elicitations = [];
     for (const p of this.pending) {
-      this.notice(`${p.title} — no longer active`, "info");
+      this.notice(decisionLine(p.title, "no longer active"), "info");
     }
     this.pending = [];
   }

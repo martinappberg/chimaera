@@ -2353,8 +2353,10 @@
     const spans = foldSpans(
       items,
       isActivityRow,
-      (item) =>
-        item.t === "single" && (item.block.kind === "message" || item.block.kind === "finished"),
+      // Whatever follows a run settles it — a reply, a finished line, a
+      // permission decision, a message sent mid-turn. Only the trailing run
+      // is live work.
+      () => true,
     );
     // Finished-work lines never join an activity fold, but a long settled
     // run of them folds on its own. The two kinds of run never overlap.

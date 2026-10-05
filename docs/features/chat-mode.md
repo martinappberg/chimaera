@@ -312,7 +312,7 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
     a monitor's end; each links its output file.
   - **Wake markers** — a turn nobody typed (a monitor event, a scheduled wake-up) is marked "Woke
     on a monitor event · “…”" / "Resumed on its own", unless a finished row already shows why.
-  - **Folded runs** — once a reply (or a finished-work line) follows them, two or more thought and
+  - **Folded runs** — once anything follows them (a reply, a finished-work line, a permission decision, a message sent mid-turn), two or more thought and
     tool lines in a row fold into one line — "Thought, ran 6 commands, read 2 files ›" — that
     expands to the original rows. The trailing run stays open while the agent works, so live
     progress is always in view; a hard failure inside shows on the folded line. Finished-work lines

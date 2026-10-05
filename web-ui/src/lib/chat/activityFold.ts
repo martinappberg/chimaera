@@ -1,6 +1,7 @@
 /**
- * Settled activity folds away. A run of thought and tool lines that a reply
- * (or a finished-work line) has since followed is history: it collapses into
+ * Settled activity folds away. A run of thought and tool lines that any other
+ * row has since followed (a reply, a finished-work line, a permission
+ * decision, a message sent mid-turn) is history: it collapses into
  * one quiet line — "Thought, ran 6 commands, read 2 files" — one click from
  * its rows. The trailing run (nothing after it yet) stays open, so live work
  * is always visible. Finished-work lines never join that fold: they are

@@ -23,6 +23,20 @@ describe("foldSpans", () => {
     ]);
   });
 
+  it("folds a run that any row follows, when every row closes one", () => {
+    const any = (row: string) =>
+      foldSpans(
+        row.split(""),
+        (c) => c === "a",
+        () => true,
+      );
+    expect(any("aanaaam")).toEqual([
+      [0, 2],
+      [3, 6],
+    ]);
+    expect(any("aauaa")).toEqual([[0, 2]]);
+  });
+
   it("leaves a lone line, a trailing run, and a run closed by anything else", () => {
     expect(spans("uam")).toEqual([]);
     expect(spans("amaaa")).toEqual([]);
