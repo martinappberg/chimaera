@@ -906,7 +906,7 @@ mod tests {
     fn row(status: HostStatus, daemon: bool) -> Host {
         Host {
             id: "h-1".into(),
-            alias: "Sherlock".into(),
+            alias: "hpc".into(),
             kind: HostKind::Ssh,
             status,
             daemon: daemon.then(|| Daemon {

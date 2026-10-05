@@ -2,10 +2,10 @@
  * The window / tab title, composed from what the window shows. Pure so the
  * wording is pinned by tests; App.svelte feeds it and sets `document.title`.
  *
- *   "crc_finish •Sherlock | chimaera"        a remote window, in a workspace
- *   "crc_finish | chimaera"                  local — the host is implicit
- *   "crc_finish •In the cloud | chimaera"    a browser view of a project
- *   "claude (2) — crc_finish | chimaera"     a detached solo window: tab leads
+ *   "my-analysis •hpc | chimaera"        a remote window, in a workspace
+ *   "my-analysis | chimaera"                  local — the host is implicit
+ *   "my-analysis •In the cloud | chimaera"    a browser view of a project
+ *   "claude (2) — my-analysis | chimaera"     a detached solo window: tab leads
  */
 
 /** What a window wears after the workspace name, or null when it wears none.
@@ -28,7 +28,7 @@ export function titleHost(o: {
 export function windowTitle(o: {
   workspace: string | null;
   host: string | null;
-  /** A compute-node daemon's node: "Sherlock › sh02-02n44", so a job window
+  /** A compute-node daemon's node: "hpc › node-044", so a job window
    *  never poses as its login node. */
   node?: string | null;
   /** A detached solo window is named for what it shows: the tab leads. */

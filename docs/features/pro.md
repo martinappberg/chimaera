@@ -143,7 +143,7 @@ and remaining acceptance gates, see the [integration review guide](../agent-guid
    time in the person's own format: today, tonight, tomorrow, a weekday within
    the week, else a date) **to update. You’ll be asked to sign in to your cluster
    again when you next use it.**, naming the cluster instead ("sign in to
-   Sherlock again") when exactly one login is kept. A time that has passed reads
+   hpc again") when exactly one login is kept. A time that has passed reads
    **restarts shortly**: the account restarts it as soon as no Git transfer runs.
    The restart drops the kept cluster logins, hence the sign-in. The line goes
    away when the account stops announcing the restart. No dialog, no warning
