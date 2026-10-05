@@ -6,6 +6,7 @@ mod agent_updates;
 mod agents;
 mod api;
 mod assets;
+mod browser_open;
 mod chat;
 mod comms;
 mod compute;

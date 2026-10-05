@@ -4,6 +4,7 @@ import type { Link } from "../workspace/agentLinks";
 import type { Session } from "../workspace/sessions";
 import type { Notice } from "../workspace/notices";
 import type { PlatformFrame } from "../plugins/platform";
+import { parseAgentBrowserOpen, type AgentBrowserOpen } from "../browser/agentOpen";
 import { parseUpdateStatus, type UpdateStatus } from "../workspace/update.svelte";
 
 const INITIAL_BACKOFF_MS = 500;
@@ -77,6 +78,12 @@ export interface EventsSocketHandlers {
    * `emit` (`plugin`).
    */
   onPlatform?(frame: PlatformFrame): void;
+  /**
+   * An agent asked for a browser pane (the MCP `open_browser` tool): sent to
+   * every window connected at that moment, never replayed; the window
+   * decides whether it is the one to act (`browser/agentOpen.ts`).
+   */
+  onBrowserOpen?(open: AgentBrowserOpen): void;
   /**
    * Connection state. While false the caller should fall back to polling;
    * fired only on transitions.
@@ -303,6 +310,9 @@ export class EventsSocket {
       } else if (msg.type === "notices" && Array.isArray(msg.notices)) {
         this.backoffMs = INITIAL_BACKOFF_MS;
         this.handlers.onNotices?.(msg.notices);
+      } else if (msg.type === "browser_open") {
+        const open = parseAgentBrowserOpen(msg);
+        if (open !== null) this.handlers.onBrowserOpen?.(open);
       } else if (msg.type === "error") {
         // Bad auth or a server-side failure; give up and surface it (the
         // app shows the blocking re-auth overlay on "unauthorized").

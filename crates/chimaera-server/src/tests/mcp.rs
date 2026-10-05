@@ -35,8 +35,8 @@ async fn mcp_handshake_auth_and_tool_listing() {
     .await;
     assert_eq!(status, StatusCode::ACCEPTED);
 
-    // tools/list names the three linked-terminal tools and the two
-    // document tools.
+    // tools/list names the three linked-terminal tools, the two document
+    // tools, notify, open_browser, and agent communication's four.
     let (status, out) = mcp_post(
         &state,
         &id,
@@ -60,6 +60,7 @@ async fn mcp_handshake_auth_and_tool_listing() {
             "document_guide",
             "check_document",
             "notify",
+            "open_browser",
             "workspace_agents",
             "read_agent",
             "message_agent",

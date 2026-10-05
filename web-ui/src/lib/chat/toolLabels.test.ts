@@ -208,3 +208,80 @@ describe("agent-communication tools", () => {
     ).toBe("Sent 2 messages, checking messages");
   });
 });
+
+describe("open_browser", () => {
+  const ok = (url: string) => ({
+    kind: "output",
+    text: `Requested a browser pane for ${url}: a window showing this session, and any other visible window on this workspace, opens it beside your session.`,
+  });
+
+  it("names the address from claude's input, under every driver title", () => {
+    for (const title of ["open_browser (chimaera)", "mcp__chimaera__open_browser", "chimaera.open_browser"]) {
+      expect(
+        readableToolTitle({ tool: "other", title, status: "completed", nativeInput: { url: "http://localhost:8000/" } }),
+      ).toBe("Showed localhost:8000 in a browser pane");
+    }
+  });
+
+  it("reads codex's address from the result, and leaves a token-bearing query off", () => {
+    expect(
+      readableToolTitle({
+        tool: "other",
+        title: "chimaera.open_browser",
+        status: "completed",
+        content: ok("http://127.0.0.1:8888/lab?token=secret"),
+      }),
+    ).toBe("Showed 127.0.0.1:8888/lab in a browser pane");
+  });
+
+  it("says a running call in the present and a refusal as not opened", () => {
+    expect(readableToolTitle({ tool: "other", title: "open_browser (chimaera)", status: "in_progress" })).toBe(
+      "Showing a page in a browser pane",
+    );
+    expect(
+      readableToolTitle({
+        tool: "other",
+        title: "open_browser (chimaera)",
+        status: "failed",
+        nativeInput: { url: "http://example.org:8080/" },
+        content: { kind: "output", text: "Not opened: example.org is not this host…" },
+      }),
+    ).toBe("Didn't open example.org:8080 in a browser pane");
+    // No window connected: the call succeeded, but nothing opened.
+    expect(
+      readableToolTitle({
+        tool: "other",
+        title: "chimaera.open_browser",
+        status: "completed",
+        content: {
+          kind: "output",
+          text: "Not opened: no Chimaera window is connected right now. Tell the user the URL (http://localhost:5173/) so they can open it themselves.",
+        },
+      }),
+    ).toBe("Didn't open localhost:5173 in a browser pane");
+  });
+
+  it("counts in words, never as 'used a tool'", () => {
+    const open = (url: string, over: Partial<LabelledTool> = {}) =>
+      tool("other", { title: "open_browser (chimaera)", nativeInput: { url }, ...over });
+    expect(toolGroupTitle([tool("execute"), open("http://localhost:8000/")])).toBe(
+      "Ran a command, showed localhost:8000 in a browser pane",
+    );
+    expect(toolGroupTitle([open("http://localhost:1/"), open("http://localhost:2/")])).toBe(
+      "Showed 2 pages in browser panes",
+    );
+    expect(toolGroupTitle([open("http://localhost:1/", { status: "failed" })])).toBe(
+      "Didn't open localhost:1 in a browser pane",
+    );
+    expect(toolGroupTitle([open("http://localhost:1/", { status: "in_progress" })])).toBe(
+      "Showing localhost:1 in a browser pane",
+    );
+  });
+
+  it("leaves other tools alone", () => {
+    expect(readableToolTitle({ tool: "other", title: "open_browser_v2 (chimaera)" })).toBe(
+      "open_browser_v2 (chimaera)",
+    );
+    expect(readableToolTitle({ tool: "fetch", title: "open_browser (chimaera)" })).toBe("open_browser (chimaera)");
+  });
+});

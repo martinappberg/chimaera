@@ -1035,6 +1035,8 @@ pub fn run() {
             commands::begin_update,
             commands::shell_build,
             commands::write_clipboard,
+            commands::copy_file_to_clipboard,
+            commands::reveal_in_file_manager,
             commands::open_external,
             commands::answer_askpass,
             commands::list_askpass,

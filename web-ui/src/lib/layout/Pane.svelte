@@ -18,6 +18,7 @@
     requestAssetReload,
   } from "./assetTransition";
   import Spinner from "../previews/Spinner.svelte";
+  import { browserOpener } from "../browser/agentOpen";
   import { findTargetsChanged, targetIn } from "../shared/find";
   import type { DashCtx } from "../dashboard/dash";
 
@@ -549,9 +550,13 @@
         path={tab.path}
         visible={active}
         onNavigate={(p: string) => ctrl.navigateBrowser(tab.id, p)}
-        onRetarget={(h: string, p: number, pth: string) =>
-          ctrl.retargetBrowser(tab.id, h, p, pth)}
+        onRetarget={(h: string, p: number, pth: string, found: boolean) =>
+          ctrl.retargetBrowser(tab.id, h, p, pth, found)}
         onFocusRequest={() => ctrl.focusPane(node.id)}
+        opener={tab.openedBy !== undefined ? browserOpener(tab.openedBy, sessions, names) : null}
+        onRevealOpener={() => {
+          if (tab.openedBy !== undefined) linkCtrl.reveal(tab.openedBy, node.id);
+        }}
       />
     {:else if viewErrors.browser}
       {@render loadFailure("browser", "browser pane")}
