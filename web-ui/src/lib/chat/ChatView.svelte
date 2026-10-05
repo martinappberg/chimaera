@@ -2348,16 +2348,18 @@
     // permission decision, a message sent mid-turn. Only the trailing run
     // is live work.
     const spans = foldSpans(items, isActivityRow).filter(([, end]) => {
-      // A decision lands as its command starts: the run stays open until
-      // that command ends, so approving never hides what was just approved.
+      // A row can land while the run's last calls still run: a permission
+      // decision (as its command starts), a message read mid-turn, a peer's
+      // note. The run stays open until those calls end, so nothing hides
+      // work in progress. Any call of the group counts — in a parallel
+      // batch the approved one is often not the last. A reply or a finished
+      // line settles the run regardless: what outlives those is background
+      // work, which the fold's live dot shows.
       const closer = items[end];
       const last = items[end - 1];
-      return !(
-        closer.t === "single" &&
-        closer.block.kind === "notice" &&
-        last.t === "group" &&
-        isLive(last.tools[last.tools.length - 1])
-      );
+      const settles =
+        closer.t !== "single" || closer.block.kind === "message" || closer.block.kind === "finished";
+      return settles || !(last.t === "group" && last.tools.some(isLive));
     });
     // Finished-work lines never join an activity fold, but a long settled
     // run of them folds on its own. The two kinds of run never overlap.
