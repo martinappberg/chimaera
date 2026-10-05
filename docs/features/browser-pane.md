@@ -14,7 +14,8 @@ the pane, `proxy.ts` the mint/health client + title store) +
 `web-ui/src/lib/terminal/urlLinks.ts` (URL detection) + the `BrowserTab` kind in
 `layout/layout.ts`. Wire: `POST/GET /api/v1/proxy`, `DELETE /api/v1/proxy/{id}`,
 `GET /api/v1/proxy/{id}/health` (bearer-authed) and the unauthenticated ticketed data
-plane `ANY /proxy/{id}[/{*path}]`.
+plane `ANY /proxy/{id}[/{*path}]`; agent-opened panes add the MCP `open_browser` tool
+(`browser_open.rs`) and a `browser_open` frame on `/ws/events`.
 
 ## Proxy sessions (the ticket model)
 
@@ -108,6 +109,39 @@ plane `ANY /proxy/{id}[/{*path}]`.
   or any host with an explicit port. Ordinary web URLs (`https://github.com/…`) stay
   deliberately unlinkified — the standing terminals decision.
 
+## Agent-opened panes (`open_browser`)
+
+- **What & when.** An agent that has just started a web app (a dev server, a notebook, a
+  dashboard) calls the MCP tool `open_browser {url}` so the person watching the workspace
+  sees what it is building, beside the agent, instead of a printed URL. Every MCP-equipped
+  session has it (workers and Masterminds). It is **showing, not inspecting**: strictly
+  one-way — nothing about the page (content, screenshots, load state) ever reaches the agent,
+  and a successful call says nothing about whether the page works, so agents verify their
+  app with their own tooling first and use the pane to present the result.
+- **How it works.** The daemon parses the URL with the terminal link rules (`http` only, no
+  userinfo, an explicit port unless the host is loopback — then 80; path, query and fragment
+  kept), then applies the proxy's own mint allowlist (`proxy::check_target`, the function
+  `POST /proxy` uses). A target that would need the in-pane confirmation is refused with a
+  tool error telling the agent to give the user the URL; the daemon's own port stays refused.
+  An accepted call pushes one additive frame on `/ws/events` —
+  `{"type":"browser_open","session_id","workspace_id","host","port","path"}` — and mints
+  nothing: the pane mints its ticket on mount, as every pane does. Older UIs ignore the
+  unknown frame type.
+- **Which window, where, and focus.** The window whose layout holds the calling session's tab
+  acts; failing that, any *visible* window showing the same workspace does (several may).
+  An existing tab on the same `host:port` is re-pointed and shown; otherwise the pane joins a
+  pane already showing a browser, else splits beside the session's pane (under the pane
+  cap), else becomes a tab in its neighbour. It never covers the session or the focused pane,
+  and never takes focus — the user keeps typing where they were
+  (`web-ui/src/lib/browser/agentOpen.ts`, pure and unit-tested).
+- **Key behaviors.** No queueing: a frame reaches only the windows connected when it is sent
+  (a stale one older than 10 s is dropped), and with no window connected the tool says so and
+  tells the agent to hand over the URL. Rate-limited per session (one per 3 s, 12 per hour,
+  bounded history). Always allowed: the harness does not prompt for it, since targets are
+  held to the mint allowlist with no confirm path. **Where it lives:** `crates/chimaera-server/src/browser_open.rs` (parse, feed,
+  limits, consumer count), the tool def in `mcp.rs`, the frame in `ws.rs::handle_events`,
+  the UI half in `browser/agentOpen.ts` + `net/events.ts` + `App.svelte::onAgentBrowserOpen`.
+
 ## Links everywhere else (and the real browser)
 
 - **What & when.** One policy for every link chimaera renders — terminal output, chat
@@ -198,3 +232,6 @@ _Captured 2026-07-21 (from the maintainer, on the shipping PR)._
 - **Follow-up he flagged immediately:** compute-node apps printing `localhost` URLs
   must not dead-end ("this we need to fix") — the compute-node hunt above is that
   fix, shipped in the same PR.
+
+### Why agents can open a pane (`open_browser`)
+_Intent pending — to be captured from the maintainer via **capture-feature-intent**._

@@ -281,6 +281,9 @@
     try {
       const win = el.contentWindow;
       if (win === null) return null; // cross-origin: leave the address as-is
+      // The iframe's initial about:blank document (before the first load
+      // commits) has pathname "blank": recording it would re-point the tab.
+      if (win.location.protocol === "about:") return null;
       // Include the hash so livePath matches a target path that carried one
       // (a hash-router route) — otherwise the external-navigation effect above
       // would see a spurious mismatch and re-load on every settle.

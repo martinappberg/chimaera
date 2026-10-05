@@ -25,6 +25,10 @@
 //! and every act call leaves a tracing audit line. `interrupt_agent` reaches
 //! chat sessions only: nothing ever types into a TUI (the exec-409 wall).
 //!
+//! Every tier gets `notify` (a desktop notification, `notices`) and
+//! `open_browser` (a browser pane beside the session, `browser_open`; one-way
+//! — nothing about the page comes back).
+//!
 //! Every tier also gets the document tools: `document_guide` (the portable
 //! markdown dialect, `doc_guide.md`) and `check_document` (`doc_check`, the
 //! same checker as the reading view's issues chip), announced by a short
@@ -101,7 +105,14 @@ pub(crate) const MASTERMIND_READ_TOOLS: [&str; 8] = [
 /// `check_document` stats and reads, bounded, only regular files — see
 /// `doc_check`), and the instructions ask every session to call them, so a
 /// prompt per call would train users to click through prompts.
-pub(crate) const ALWAYS_ALLOWED_TOOLS: [&str; 3] = ["notify", "document_guide", "check_document"];
+///
+/// `open_browser` is here at the maintainer's call: it changes nothing in the
+/// workspace, only what the user's window shows, and its targets are held to
+/// the proxy's mint allowlist with no `confirm` path (`browser_open::open`),
+/// so a prompt per pane would be noise. The limits that stand in for the
+/// prompt are that allowlist and the per-session rate limit.
+pub(crate) const ALWAYS_ALLOWED_TOOLS: [&str; 4] =
+    ["notify", "document_guide", "check_document", "open_browser"];
 
 /// Every Mastermind-tier tool name — the dispatch gate's single source, so
 /// adding a tool means extending THIS list + `mastermind_tool_defs` (a
@@ -135,7 +146,10 @@ that is usually why the user linked it.\n\
 notify shows the user a desktop notification. They are already notified \
 automatically when your turn ends or you need their input, so use it only \
 for news they asked for (\"ping me when the job finishes\") or would clearly \
-want while away — never for routine progress.";
+want while away — never for routine progress.\n\
+open_browser shows the user a web app you started in a browser pane beside \
+you; it only shows the page and tells you nothing about it, so check your \
+work with your own tools first and use it to present the result.";
 
 /// The documents paragraph every session gets (all tiers): the portable
 /// dialect in brief, the two document tools, and how to cite files so the
@@ -448,6 +462,7 @@ fn mastermind_tool_defs() -> Vec<Value> {
 fn tool_defs(comms_on: bool, mastermind: bool, plugin_tools: Vec<Value>) -> Value {
     let mut tools = base_tool_defs();
     tools.push(notify_tool_def());
+    tools.push(open_browser_tool_def());
     if comms_on {
         tools.extend(crate::comms::tool_defs());
     }
@@ -633,6 +648,47 @@ fn notify(state: &AppState, agent_id: &str, args: &Value) -> Value {
     }
 }
 
+/// The `open_browser` tool def (base tier — every session has it).
+fn open_browser_tool_def() -> Value {
+    json!({
+        "name": "open_browser",
+        "description": "Show the user a web app you started (a dev server, a notebook, a \
+                        dashboard) in a Chimaera browser pane beside this session. Only \
+                        addresses on this host, loopback, or a node of the user's running \
+                        Slurm jobs open; for anything else, give the user the URL. This only \
+                        shows the page to the user: nothing about the page comes back, and a \
+                        successful call says nothing about whether it loaded, rendered or \
+                        works. Check your work with your own tools first (request the page, \
+                        your own browser or headless-browser tooling, tests, server logs), \
+                        then use this to show the user the result — never instead of \
+                        checking. Call once per app, not on every reload. Rate-limited per \
+                        session.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["url"],
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The app's http:// address, e.g. http://localhost:5173/ \
+                                    (path and query are kept; a port is required unless \
+                                    the host is loopback).",
+                },
+            },
+            "additionalProperties": false,
+        },
+    })
+}
+
+/// `open_browser`: everything (parse, the proxy's mint allowlist, rate
+/// limits, the window frame) lives in `browser_open`.
+async fn open_browser(state: &AppState, agent_id: &str, args: &Value) -> Value {
+    let url = args.get("url").and_then(|u| u.as_str()).unwrap_or("");
+    match crate::browser_open::open(state, agent_id, url).await {
+        Ok(text) => tool_text(text),
+        Err(text) => tool_error(text),
+    }
+}
+
 /// Result content for a successful tool call.
 fn tool_text(text: String) -> Value {
     json!({ "content": [{ "type": "text", "text": text }] })
@@ -695,6 +751,7 @@ async fn tools_call(
         "document_guide" => Ok(tool_text(crate::agent_docs::GUIDE.to_string())),
         "check_document" => Ok(check_document(state, agent_id, &args).await),
         "notify" => Ok(notify(state, agent_id, &args)),
+        "open_browser" => Ok(open_browser(state, agent_id, &args).await),
         "workspace_agents" | "read_agent" | "message_agent" | "read_messages" if !comms_on => {
             Ok(tool_error(crate::comms::OFF.to_string()))
         }

@@ -338,6 +338,11 @@
     type HostStatusEvent,
   } from "./lib/net/native";
   import { clearBrowserNotices, deliverBrowserNotices } from "./lib/workspace/notices";
+  import {
+    placeAgentBrowser,
+    shouldActOnAgentBrowserOpen,
+    type AgentBrowserOpen,
+  } from "./lib/browser/agentOpen";
   import UpdateToast from "./lib/workspace/UpdateToast.svelte";
   import {
     applyAppStatus,
@@ -1787,6 +1792,7 @@
           onClick: focusFromNotification,
         });
       },
+      onBrowserOpen: onAgentBrowserOpen,
       onStatus: (up) => {
         // A recovered events socket often means a re-established tunnel — a
         // different link. Drop the RTT window so the rolling minimum can't
@@ -2323,6 +2329,24 @@
   function onOpenUrl(id: string, target: UrlTarget, newSplit: boolean): void {
     const loc = paneForTab(layout.root, { surface: "terminal", sessionId: id });
     openBrowserFromPane(loc?.paneId ?? layout.focusedPaneId, target, newSplit);
+  }
+
+  /**
+   * An agent asked to show the user a web app (`open_browser`). Unlike a
+   * click, nobody here asked for it: the pane opens beside the agent and
+   * focus — layout and DOM — stays exactly where the user is typing, so no
+   * blur here (`placeAgentBrowser` hands the focused pane back). A layout not
+   * restored yet has nothing to anchor on; the frame is not queued.
+   */
+  function onAgentBrowserOpen(open: AgentBrowserOpen): void {
+    if (!layoutReady) return;
+    const view = {
+      layout,
+      workspaceId: activeWsId,
+      visible: document.visibilityState === "visible",
+    };
+    if (!shouldActOnAgentBrowserOpen(open, view)) return;
+    layout = placeAgentBrowser(layout, open);
   }
 
   /** The Mod2+B chord / a manual open: a blank browser pane (address entry). */
