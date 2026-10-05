@@ -99,7 +99,10 @@ export function shouldActOnAgentBrowserOpen(open: AgentBrowserOpen, view: Window
  *    panes collect in one place instead of splitting every time),
  * 3. else splits beside the anchor (as a Cmd/Ctrl-clicked terminal URL
  *    does) while under the pane cap,
- * 4. else becomes a tab in the anchor's neighbour.
+ * 4. else becomes a tab in the anchor's neighbour, or any other pane when
+ *    the neighbour is the one the user is in.
+ *
+ * A zoomed pane stays zoomed: the pane opens behind it.
  */
 export function placeAgentBrowser(l: Layout, open: AgentBrowserOpen): Layout {
   const focused = l.focusedPaneId;
@@ -117,7 +120,7 @@ export function placeAgentBrowser(l: Layout, open: AgentBrowserOpen): Layout {
     if (existing.surface !== "browser") break;
     next = setBrowserPath(next, existing.id, open.path);
     if (p.active === index || !covers(p.id)) {
-      return restoreFocus(activateTab(next, p.id, index), focused);
+      return restoreFocus(activateTab(next, p.id, index), l);
     }
     // Showing it in place would hide what the user is looking at: move it.
     next = detachTab(next, p.id, index);
@@ -135,13 +138,24 @@ export function placeAgentBrowser(l: Layout, open: AgentBrowserOpen): Layout {
   } else if (panes(next.root).length < MAX_PANES) {
     next = openTab(splitPane(next, anchor, "row"), tab);
   } else {
-    const beside = adjacentPane(next, anchor) ?? anchor;
+    const neighbour = adjacentPane(next, anchor);
+    const beside =
+      neighbour !== null && !covers(neighbour)
+        ? neighbour
+        : (panes(next.root).find((p) => !covers(p.id))?.id ?? anchor);
     next = openTab(focusPane(next, beside), tab);
   }
-  return restoreFocus(next, focused);
+  return restoreFocus(next, l);
 }
 
-/** Hand focus back to the pane that had it (if it still exists). */
-function restoreFocus(l: Layout, paneId: string): Layout {
-  return findPane(l.root, paneId) !== null ? focusPane(l, paneId) : l;
+/**
+ * Hand focus back to the pane that had it, and its zoom with it (the layout
+ * helpers used above clear zoom whenever focus moves).
+ */
+function restoreFocus(l: Layout, before: Layout): Layout {
+  if (findPane(l.root, before.focusedPaneId) === null) return l;
+  const focused = focusPane(l, before.focusedPaneId);
+  return before.zoomedPaneId === before.focusedPaneId
+    ? { ...focused, zoomedPaneId: before.zoomedPaneId }
+    : focused;
 }

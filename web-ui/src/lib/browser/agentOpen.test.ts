@@ -5,12 +5,14 @@ import {
   activateTab,
   defaultLayout,
   findPane,
+  focusPane,
   freshBrowserTab,
   openSession,
   openTab,
   panes,
   sessionPaneId,
   splitPane,
+  toggleZoom,
 } from "../layout/layout";
 import {
   type AgentBrowserOpen,
@@ -181,6 +183,36 @@ describe("placeAgentBrowser", () => {
     expect(browserTabs(next)).toHaveLength(1);
     expect(browserTabs(next)[0].pane).not.toBe(sessionPaneId(next, "s-agent"));
     expect(next.focusedPaneId).toBe(focused);
+  });
+
+  it("at the pane cap, never covers the pane the user is in", () => {
+    let l = withAgent();
+    const agentPane = l.focusedPaneId;
+    while (panes(l.root).length < MAX_PANES) {
+      l = splitPane(l, agentPane, "row");
+      l = openSession(l, `s-${panes(l.root).length}`);
+    }
+    // The user is in each other pane in turn, the agent's neighbour included.
+    for (const p of panes(l.root)) {
+      if (p.id === agentPane) continue;
+      const before = focusPane(l, p.id);
+      const next = placeAgentBrowser(before, frame());
+      expect(next.focusedPaneId).toBe(p.id);
+      expect(activeTab(next, p.id)).toEqual(activeTab(before, p.id));
+      expect(activeTab(next, agentPane)).toEqual(activeTab(before, agentPane));
+      expect(browserTabs(next)).toHaveLength(1);
+    }
+  });
+
+  it("keeps a zoomed pane zoomed", () => {
+    const base = withAgent();
+    const l = toggleZoom(splitPane(base, base.focusedPaneId, "row"));
+    expect(panes(l.root)).toHaveLength(2);
+    expect(l.zoomedPaneId).toBe(l.focusedPaneId);
+    const next = placeAgentBrowser(l, frame());
+    expect(next.zoomedPaneId).toBe(l.zoomedPaneId);
+    expect(next.focusedPaneId).toBe(l.focusedPaneId);
+    expect(browserTabs(next)).toHaveLength(1);
   });
 
   it("without the session's tab, opens beside the focused pane", () => {

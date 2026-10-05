@@ -311,9 +311,8 @@ pub(crate) async fn open(state: &AppState, session_id: &str, url: &str) -> Resul
     );
     state.changes.notify_waiters();
     Ok(format!(
-        "Requested a browser pane for {shown}: a window showing this session (or, \
-         failing that, a visible window on this workspace) opens it beside your \
-         session. This says nothing about whether the page loads or works, nor that \
+        "Requested a browser pane for {shown}: a window showing this session, and any \
+         other visible window on this workspace, opens it beside your session. This says nothing about whether the page loads or works, nor that \
          the user is looking; nothing from the page comes back to you. Call again only \
          for a different address, not after the app reloads."
     ))

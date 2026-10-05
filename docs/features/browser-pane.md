@@ -128,11 +128,13 @@ plane `ANY /proxy/{id}[/{*path}]`; agent-opened panes add the MCP `open_browser`
   nothing: the pane mints its ticket on mount, as every pane does. Older UIs ignore the
   unknown frame type.
 - **Which window, where, and focus.** The window whose layout holds the calling session's tab
-  acts; failing that, any *visible* window showing the same workspace does (several may).
+  acts, and so does any *visible* window showing the same workspace without that tab (a
+  window cannot see another's layout, so two windows on one workspace may both open it).
   An existing tab on the same `host:port` is re-pointed and shown; otherwise the pane joins a
   pane already showing a browser, else splits beside the session's pane (under the pane
-  cap), else becomes a tab in its neighbour. It never covers the session or the focused pane,
-  and never takes focus — the user keeps typing where they were
+  cap), else becomes a tab in a pane that is neither the session's nor the focused one. It
+  never covers the session or the focused pane, keeps a zoomed pane zoomed, and never takes
+  focus — the user keeps typing where they were
   (`web-ui/src/lib/browser/agentOpen.ts`, pure and unit-tested).
 - **Key behaviors.** No queueing: a frame reaches only the windows connected when it is sent
   (a stale one older than 10 s is dropped), and with no window connected the tool says so and
@@ -178,7 +180,11 @@ plane `ANY /proxy/{id}[/{*path}]`; agent-opened panes add the MCP `open_browser`
   `sessionStorage`, the parent DOM). Weigh that against **what the app could already
   do**, because the token grants code execution *as the user, on the daemon's host*:
   - **loopback / self-host** — the app runs as the user on that same host and can read
-    the manifest token off disk. Grants nothing new.
+    the manifest token off disk. Grants nothing new. This assumes the loopback port is
+    the user's own: on a host other people can log in to, anyone can listen on a loopback
+    port, and a page served from one runs with the workbench's origin like any other.
+    A person clicking a URL chooses the port; an agent calling `open_browser` (pre-allowed
+    by the maintainer's decision, so no prompt shows the URL) chooses it for them.
   - **remote workspace** (daemon and app on the same dev server or compute node;
     an explicit login-node override works the same way) — same identity, same host. Grants nothing new, and reaches nothing on the
     user's laptop.
