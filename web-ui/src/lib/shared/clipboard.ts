@@ -22,27 +22,44 @@ export async function copyText(text: string): Promise<boolean> {
   }
 }
 
+/** A picture copy pulls the whole file into the page (and, unless it is a
+ *  PNG, a full-size canvas); past this the copy is refused instead. */
+const MAX_IMAGE_COPY_BYTES = 64 * 1024 * 1024;
+
 /** The bytes at `url` as a PNG — the one image type every clipboard takes. */
-async function pngBlob(url: string): Promise<Blob> {
-  let source = url;
+async function pngBlob(url: string, shown?: HTMLImageElement): Promise<Blob> {
+  let source: string | null = url;
   let fetched: string | null = null;
+  let tooLarge = false;
   try {
     const res = await fetch(url);
     if (!res.ok) throw new Error(`image request failed with status ${res.status}`);
+    if (Number(res.headers.get("content-length") ?? 0) > MAX_IMAGE_COPY_BYTES) {
+      tooLarge = true;
+      void res.body?.cancel();
+      throw new Error("image is too large to copy");
+    }
     const blob = await res.blob();
     // Already PNG: hand over the file's own bytes, not a re-encode.
     if (blob.type === "image/png") return blob;
     fetched = URL.createObjectURL(blob);
     source = fetched;
   } catch {
-    // Not fetchable from here (a data: URL under the page's policy): the
-    // decoder below can still load what an <img> could.
+    // Not fetchable from here (a data: URL under the page's policy, a /raw
+    // ticket that expired since the picture loaded): the element on screen
+    // still holds the pixels, else the decoder below can load what an <img>
+    // could.
+    if (tooLarge) throw new Error("image is too large to copy");
+    if (shown !== undefined && shown.complete && shown.naturalWidth > 0) source = null;
   }
   try {
-    const img = new Image();
-    img.decoding = "async";
-    img.src = source;
-    await img.decode();
+    let img = shown as HTMLImageElement;
+    if (source !== null) {
+      img = new Image();
+      img.decoding = "async";
+      img.src = source;
+      await img.decode();
+    }
     const canvas = document.createElement("canvas");
     // An SVG without intrinsic dimensions reports 0: give it a usable box.
     canvas.width = img.naturalWidth || 1024;
@@ -58,17 +75,29 @@ async function pngBlob(url: string): Promise<Blob> {
   }
 }
 
+/** Counts picture copies, so an earlier one can tell it was overtaken. */
+let imageCopies = 0;
+
 /**
  * Copy the picture at `src` (a URL, or one still being minted) to the OS
  * clipboard as an image, so it pastes into a chat, a mail or an editor.
  *
  * The write starts before the bytes exist — the item carries a promise —
  * because WebKit only honours a clipboard write made inside the user's
- * gesture, and fetching first would outlive it.
+ * gesture, and fetching first would outlive it. `shown` is the element
+ * already drawing it, when there is one: its pixels stand in if the URL no
+ * longer answers.
  */
-export async function copyImage(src: string | Promise<string>): Promise<boolean> {
+export async function copyImage(src: string | Promise<string>, shown?: HTMLImageElement): Promise<boolean> {
   if (typeof ClipboardItem === "undefined" || navigator.clipboard?.write === undefined) return false;
-  const png = Promise.resolve(src).then(pngBlob);
+  // A slow picture must not land over a copy made after it.
+  const turn = ++imageCopies;
+  const png = Promise.resolve(src)
+    .then((url) => pngBlob(url, shown))
+    .then((blob) => {
+      if (turn !== imageCopies) throw new Error("superseded by a later copy");
+      return blob;
+    });
   // A write refused up front never awaits the item; its failure is the write's.
   png.catch(() => {});
   try {

@@ -305,6 +305,14 @@ export function revealLabel(): string {
 }
 
 /**
+ * The "Reveal in Finder" row for a files menu — empty where this window's
+ * files are not this machine's, so a menu spreads it unconditionally.
+ */
+export function revealEntries(path: string): { label: string; onSelect: () => void }[] {
+  return hasLocalFiles() ? [{ label: revealLabel(), onSelect: () => void revealInFileManager(path) }] : [];
+}
+
+/**
  * Put a file or folder itself on the OS clipboard (what copying it in the
  * file manager does), through the native shell. True when it is there; false
  * in a browser, on a remote window, or on shell error.

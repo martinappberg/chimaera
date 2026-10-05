@@ -40,7 +40,7 @@
   } from "../workspace/fileClipboard.svelte";
   import { stemLength, validateEntryName } from "../shared/fsNames";
   import { contextMenu, type ContextMenuEntry } from "../shared/contextMenu.svelte";
-  import { hasLocalFiles, revealInFileManager, revealLabel, writeClipboard } from "../net/native";
+  import { revealEntries, writeClipboard } from "../net/native";
   import FileIcon from "../shared/FileIcon.svelte";
   import FolderIcon from "../shared/FolderIcon.svelte";
   import Spinner from "./Spinner.svelte";
@@ -502,11 +502,6 @@
     } catch {
       // clipboard unavailable — quiet
     }
-  }
-
-  /** "Reveal in Finder", where this window's files are this machine's. */
-  function revealEntries(p: string): ContextMenuEntry[] {
-    return hasLocalFiles() ? [{ label: revealLabel(), onSelect: () => void revealInFileManager(p) }] : [];
   }
 
   /** Paste target for a row: into the dir itself, else its parent column. */

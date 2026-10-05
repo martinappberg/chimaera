@@ -29,7 +29,7 @@
   import ReferenceChip from "../shared/ReferenceChip.svelte";
   import { contextMenu } from "../shared/contextMenu.svelte";
   import { copyImage } from "../shared/clipboard";
-  import { hasLocalFiles, revealInFileManager, revealLabel } from "../net/native";
+  import { revealEntries } from "../net/native";
   import Spinner from "./Spinner.svelte";
 
   interface Props {
@@ -408,10 +408,8 @@
   function onContextMenu(e: MouseEvent): void {
     const src = url;
     if (src === null || error !== null) return;
-    contextMenu.openAt(e, [
-      { label: "Copy Image", onSelect: () => void copyImage(src) },
-      ...(hasLocalFiles() ? [{ label: revealLabel(), onSelect: () => void revealInFileManager(path) }] : []),
-    ]);
+    const shown = viewport?.querySelector("img") ?? undefined;
+    contextMenu.openAt(e, [{ label: "Copy Image", onSelect: () => void copyImage(src, shown) }, ...revealEntries(path)]);
   }
 
   /** Outline `r` and frame it: centered, zoomed to fill most of the view. */

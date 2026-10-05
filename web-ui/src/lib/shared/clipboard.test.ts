@@ -57,7 +57,7 @@ describe("copying a file to the OS clipboard", () => {
         constructor(public data: Record<string, Promise<Blob>>) {}
       },
     );
-    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, blob: async () => png })));
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, headers: new Headers(), blob: async () => png })));
   });
 
   afterEach(() => vi.unstubAllGlobals());
@@ -84,6 +84,12 @@ describe("copying a file to the OS clipboard", () => {
     expect(await copyFileToOs("/work/notes.txt", "file")).toBe(false);
     expect(await copyFileToOs("/work/figures.png", "dir")).toBe(false);
     expect(browserWrite).not.toHaveBeenCalled();
+  });
+
+  it("refuses a picture too large to pull into the page", async () => {
+    const headers = new Headers({ "content-length": String(65 * 1024 * 1024) });
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, headers, blob: async () => png })));
+    expect(await copyFileToOs("/work/figure.png", "file")).toBe(false);
   });
 
   it("reports a refused picture write", async () => {

@@ -1340,7 +1340,9 @@ fn reveal(path: &std::path::Path) -> Result<(), String> {
                 "/org/freedesktop/FileManager1",
                 "org.freedesktop.FileManager1.ShowItems",
             ])
-            .arg(format!("array:string:{url}"))
+            // dbus-send splits an array on commas, and a file URL keeps a
+            // name's comma literal: escaped, the name stays one item.
+            .arg(format!("array:string:{}", url.as_str().replace(',', "%2C")))
             .arg("string:")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

@@ -30,7 +30,7 @@
   import { isRemoteHost } from "../net/api";
   import { stemLength, validateEntryName } from "../shared/fsNames";
   import { contextMenu, type ContextMenuEntry } from "../shared/contextMenu.svelte";
-  import { hasLocalFiles, revealInFileManager, revealLabel, writeClipboard } from "../net/native";
+  import { hasLocalFiles, revealEntries, writeClipboard } from "../net/native";
   import FileIcon from "../shared/FileIcon.svelte";
   import FolderIcon from "../shared/FolderIcon.svelte";
   import Spinner from "../previews/Spinner.svelte";
@@ -869,11 +869,6 @@
     } catch {
       // clipboard unavailable — quiet, like the terminal's copy path
     }
-  }
-
-  /** "Reveal in Finder", where this window's files are this machine's. */
-  function revealEntries(path: string): ContextMenuEntry[] {
-    return hasLocalFiles() ? [{ label: revealLabel(), onSelect: () => void revealInFileManager(path) }] : [];
   }
 
   function menuFor(entry: FsEntry): ContextMenuEntry[] {

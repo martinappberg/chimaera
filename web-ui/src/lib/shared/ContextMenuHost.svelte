@@ -23,9 +23,11 @@
     const selection = window.getSelection()?.toString() ?? "";
     // A picture anywhere (chat, a rendered document, a preview) copies as a
     // picture: the app menu replaces the webview's own "Copy Image".
-    const image = e.target instanceof HTMLImageElement ? e.target.currentSrc || e.target.src : "";
+    // Decorative marks (aria-hidden) are chrome, not content.
+    const shown = e.target instanceof HTMLImageElement && e.target.getAttribute("aria-hidden") !== "true" ? e.target : null;
+    const image = shown !== null ? shown.currentSrc || shown.src : "";
     const entries: ContextMenuEntry[] = [
-      ...(image !== "" ? [{ label: "Copy Image", onSelect: () => { void copyImage(image); } }] : []),
+      ...(shown !== null && image !== "" ? [{ label: "Copy Image", onSelect: () => { void copyImage(image, shown); } }] : []),
       ...(selection !== "" ? [{ label: "Copy selection", onSelect: () => { void copyText(selection); } }] : []),
     ];
     if (entries.length > 0) {

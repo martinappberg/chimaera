@@ -95,7 +95,7 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   a cut into the same folder is a no-op. **A copy also reaches the system clipboard** wherever it
   has a form there: in the native app on a local workspace the file or folder itself (it pastes
   into Finder, a mail, a chat app — what copying it in the file manager does); on a remote
-  workspace or in a browser an image file copies as a picture, and other files stay in-app only
+  workspace or in a browser an image file (up to 64 MB) copies as a picture, and other files stay in-app only
   (their bytes are on another machine). Right-clicking any picture — the image preview, a chat
   message, a rendered document — offers **Copy Image**. **Reveal in Finder** ("Show in File
   Manager" on Linux) selects the file in the OS file manager; a remote window never offers it,
