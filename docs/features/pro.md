@@ -409,7 +409,6 @@ Native IPC commands (the `LOCAL_ACCOUNT_COMMANDS` list in
 `pro_sign_out_everywhere`, `pro_take_return`, `pro_billing_checkout`,
 `pro_billing_portal`, `pro_cancel_billing`, `pro_cloud_status`,
 `pro_cloud_request`, `pro_cloud_projects`, `pro_copy_project`,
-`pro_open_cloud_project` (the compatibility alias),
 `pro_take_over_project`,
 `pro_mirror_status`, `pro_set_never_mirror`, `pro_hosts`, `pro_set_host_kept`,
 `pro_devices` and `pro_revoke_device`. They are granted only to windows showing

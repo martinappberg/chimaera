@@ -327,71 +327,6 @@ pub async fn pro_personal_provider_open(
     }
 }
 #[tauri::command]
-pub async fn pro_project_secrets_catalog(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
-    after: Option<String>,
-    expected_account_lifetime: Option<String>,
-) -> Result<chimaera_link::project_secrets::CatalogPage, String> {
-    let owner = app.state::<crate::shell::Shell>().pro.owner().cloned();
-    match owner {
-        Some(owner) => {
-            owner
-                .pro_project_secrets_catalog(app, window, after, expected_account_lifetime)
-                .await
-        }
-        None => Err(super::ABSENT.into()),
-    }
-}
-#[tauri::command]
-pub async fn pro_project_secret_command(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
-    context_tag: String,
-    payload: String,
-    expected_account_lifetime: Option<String>,
-) -> Result<chimaera_link::project_secrets::CommandResult, String> {
-    let owner = app.state::<crate::shell::Shell>().pro.owner().cloned();
-    match owner {
-        Some(owner) => {
-            owner
-                .pro_project_secret_command(
-                    app,
-                    window,
-                    context_tag,
-                    payload,
-                    expected_account_lifetime,
-                )
-                .await
-        }
-        None => Err(super::ABSENT.into()),
-    }
-}
-#[tauri::command]
-pub async fn pro_project_secret_operation(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
-    context_tag: String,
-    operation_id: String,
-    expected_account_lifetime: Option<String>,
-) -> Result<chimaera_link::project_secrets::CommandResult, String> {
-    let owner = app.state::<crate::shell::Shell>().pro.owner().cloned();
-    match owner {
-        Some(owner) => {
-            owner
-                .pro_project_secret_operation(
-                    app,
-                    window,
-                    context_tag,
-                    operation_id,
-                    expected_account_lifetime,
-                )
-                .await
-        }
-        None => Err(super::ABSENT.into()),
-    }
-}
-#[tauri::command]
 pub async fn pro_cloud_projects(
     app: tauri::AppHandle,
     expected_account_lifetime: Option<String>,
@@ -418,23 +353,6 @@ pub async fn pro_copy_project(
         Some(owner) => {
             owner
                 .pro_copy_project(app, window, workspace_id, expected_account_lifetime)
-                .await
-        }
-        None => Err(super::ABSENT.into()),
-    }
-}
-#[tauri::command]
-pub async fn pro_open_cloud_project(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
-    workspace_id: String,
-    expected_account_lifetime: Option<String>,
-) -> Result<Option<types::projects::CloudProjectOpen>, String> {
-    let owner = app.state::<crate::shell::Shell>().pro.owner().cloned();
-    match owner {
-        Some(owner) => {
-            owner
-                .pro_open_cloud_project(app, window, workspace_id, expected_account_lifetime)
                 .await
         }
         None => Err(super::ABSENT.into()),

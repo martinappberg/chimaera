@@ -5,7 +5,6 @@ pub mod cluster;
 #[cfg(feature = "personal-providers")]
 pub mod personal_providers;
 pub mod project_secret_idle;
-pub mod project_secret_status;
 #[cfg(feature = "provider-runtime")]
 pub mod provider_runtime;
 #[cfg(unix)]
