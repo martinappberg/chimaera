@@ -93,46 +93,24 @@ pub struct CloudProfile {
     /// on the credentialed cloud machine by itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_setup_command: Option<String>,
-    #[serde(default)]
-    pub laptop_only: Vec<String>,
-    #[serde(default)]
-    pub deferred: Vec<String>,
+    /// Environment variable NAMES the last move's agent-configuration export
+    /// left out (values never travel). Written by the sender, never by an agent.
     #[serde(default)]
     pub missing_environment: Vec<String>,
 }
 impl CloudProfile {
-    pub fn observe_command(&mut self, command: &str) {
-        let command = command.trim();
-        if command.is_empty() || command.len() > 2048 || contains_credential(command.as_bytes()) {
-            return;
-        }
-        let first = command.split_whitespace().next().unwrap_or_default();
-        let first = first.rsplit('/').next().unwrap_or(first);
-        if matches!(
-            first,
-            "xcodebuild" | "xcrun" | "simctl" | "osascript" | "open" | "nvidia-smi" | "nvcc"
-        ) && self.laptop_only.len() < 64
-            && !self.laptop_only.iter().any(|old| old == command)
-        {
-            self.laptop_only.push(command.into());
-        }
-    }
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.setup_command
                 .iter()
                 .chain(&self.pending_setup_command)
                 .all(|s| s.len() <= 16 * 1024 && !contains_credential(s.as_bytes()))
-                && self.laptop_only.len() <= 64
-                && self.deferred.len() <= 64
                 && self.missing_environment.len() <= 128,
             "cloud profile exceeds limits or contains a credential"
         );
         anyhow::ensure!(
-            self.laptop_only
+            self.missing_environment
                 .iter()
-                .chain(&self.deferred)
-                .chain(&self.missing_environment)
                 .all(|v| v.len() <= 2048 && !contains_credential(v.as_bytes())),
             "cloud profile entry exceeds limits or contains a credential"
         );
@@ -173,14 +151,5 @@ mod tests {
         assert!(contains_credential(b"-----BEGIN OPENSSH PRIVATE KEY-----"));
         assert!(contains_credential(b"sk-abcdefghijklmnopqrstuv"));
         assert!(!contains_credential(b"task-list markdown"));
-    }
-    #[test]
-    fn profile_learns_platform_steps_without_running_them() {
-        let mut profile = CloudProfile::default();
-        profile.observe_command("xcodebuild test");
-        profile.observe_command("xcodebuild test");
-        profile.observe_command("npm test");
-        assert_eq!(profile.laptop_only, ["xcodebuild test"]);
-        profile.validate().unwrap();
     }
 }

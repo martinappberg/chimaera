@@ -45,6 +45,12 @@ pub struct Manifest {
     /// snapshot that carries this inventory can show that a file is gone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub left_out: Option<Vec<PathBuf>>,
+    /// Additive: the sending machine's OS and CPU (`std::env::consts`), so
+    /// the receiver can tell its agents what the other side is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_os: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_arch: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 pub struct SessionArchive {
@@ -1010,12 +1016,6 @@ async fn hydrate_scoped(
     // immediately instead of after the next renewal.
     super::projects::bind_workspace_account(state, config, workspace)?;
     install_epoch.store(grant.epoch, Ordering::Release);
-    if config.role == Role::Device {
-        let mut returned = lock(&state.pro.returned);
-        if returned.len() < 128 || returned.contains(workspace) {
-            returned.insert(workspace.to_owned());
-        }
-    }
     let receipt = if config.execution.is_some() {
         let receipt = grant
             .checkpoint
@@ -1317,6 +1317,15 @@ async fn hydrate_scoped(
         }).await??;
         let retained_transfer = original_transfer.clone();
         tokio::task::spawn_blocking(move || { let _retained_transfer = retained_transfer; install.cleanup() }).await??;
+        // What this machine's agents are told about the move, recorded before
+        // any of them resumes (`mcp::cloud_context`).
+        crate::mcp::cloud_context::record_arrival(
+            state,
+            workspace,
+            manifest.left_out.as_deref(),
+            [manifest.source_os.as_deref(), manifest.source_arch.as_deref()],
+        )
+        .await;
         finish_hydration(
             state,
             workspace,
@@ -2441,7 +2450,7 @@ mod tests {
             .entry("w-project".into())
             .or_default()
             .profile
-            .deferred = vec!["must-not-be-executed".into()];
+            .missing_environment = vec!["MUST_NOT_BE_EXECUTED".into()];
         run_profile_steps(&state, &config, "w-project")
             .await
             .unwrap();
@@ -2450,8 +2459,8 @@ mod tests {
                 .get("w-project")
                 .unwrap()
                 .profile
-                .deferred,
-            ["must-not-be-executed"]
+                .missing_environment,
+            ["MUST_NOT_BE_EXECUTED"]
         );
         drop(restarted);
         drop(state);

@@ -803,6 +803,7 @@ pub(crate) async fn ingest(
     // (see the transcript_path note above). Off-cluster `agent_context` is
     // None after one Option check and one atomic load — response unchanged.
     let mut context: Vec<String> = Vec::new();
+    let starting = matches!(event, "SessionStart" | "UserPromptSubmit");
     if compute_ctx_pending {
         if let Some(ctx) = state.compute.agent_context().await {
             let mut agents = crate::lock(&state.agents);
@@ -812,6 +813,30 @@ pub(crate) async fn ingest(
                 if !record.compute_ctx_delivered {
                     record.compute_ctx_delivered = true;
                     context.push(ctx);
+                }
+            }
+        }
+    }
+
+    // Where a synced project's agent runs (the user's computer or their
+    // cloud machine) and what did not travel: the same carriers, once per
+    // agent start, and again only if the words changed. A move always starts
+    // a new process with a fresh record, so a conversation that comes home
+    // hears it after the cloud's note and the newer one wins. Without the
+    // optional Runtime this is one Option check.
+    if starting && own_hook {
+        if let Some(note) = crate::mcp::cloud_context::note_for_session(&state, &id).await {
+            let digest = {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                note.hash(&mut hasher);
+                hasher.finish()
+            };
+            let mut agents = crate::lock(&state.agents);
+            if let Some(record) = agents.get_mut(&id) {
+                if record.placement_delivered != Some(digest) {
+                    record.placement_delivered = Some(digest);
+                    context.push(note);
                 }
             }
         }
@@ -829,7 +854,7 @@ pub(crate) async fn ingest(
 
     // Active plugins: each may add one line on a carrier that already
     // fires — never a new turn. Nothing switched on returns before any work.
-    if matches!(event, "SessionStart" | "UserPromptSubmit") {
+    if starting {
         context.extend(crate::plugins::runtime::hook(&state, &id, event).await);
     }
 

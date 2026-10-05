@@ -69,33 +69,6 @@ pub(crate) async fn run_exec_scoped(
             .map_err(changed)?
             .flatten(),
     };
-    // Profile learning/defer is itself a mutation. Its brief persistence work
-    // completes before the shell queue, where no reservation is retained.
-    let deferred = if let Some(admission) = admission.clone() {
-        let owner = state.clone();
-        let session = id.to_owned();
-        let command = command.clone();
-        // MCP callers can disappear too. The owner of a persisted profile
-        // update keeps its reservation until underlying blocking writes drain.
-        tokio::spawn(async move {
-            let _commit = admission.begin(&owner)?;
-            crate::pro::defer_command(&owner, &session, &command).await
-        })
-        .await
-        .map_err(|_| chimaera_pty::ExecError::Busy("command preparation failed".into()))?
-    } else {
-        crate::pro::defer_command(state, id, &command).await
-    }
-    .map_err(|error| chimaera_pty::ExecError::Busy(error.to_string()))?;
-    // Nothing runs it later on its own: the step is recorded in the project's
-    // cloud profile (`deferred`, shown with the project in Chimaera Pro) and
-    // the user runs it on their computer.
-    if deferred {
-        return Err(chimaera_pty::ExecError::Busy(
-            "This step needs the user's computer, so it was not run here. It is listed as a pending step for this project in Chimaera Pro; ask the user to run it on their computer."
-                .into(),
-        ));
-    }
     let allow_sentinel_over_running = state
         .sessions
         .foreground_pid(id)

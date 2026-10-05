@@ -56,16 +56,6 @@ impl Scenario {
         membership.remove(id);
         Ok(())
     }
-    pub fn mark_returned(&self) -> Result<()> {
-        ensure!(
-            lock(&self.harness.state.workspaces)
-                .get(&self.key)
-                .is_some(),
-            "fixture project missing"
-        );
-        lock(&self.harness.state.pro.returned).insert(self.key.clone());
-        Ok(())
-    }
     pub fn cloud_profile(&self) -> Option<crate::pro::policy::CloudProfile> {
         crate::pro::workspace_profile(&self.harness.state, &self.key)
     }
@@ -129,5 +119,175 @@ impl Scenario {
             .as_str()
             .context("fixture TUI identity missing")?
             .to_owned())
+    }
+}
+
+/// Where-you-run proofs: real agent processes (a recording stand-in for the
+/// vendor CLI) started through the ordinary spawn, resume and hook paths.
+impl Scenario {
+    async fn fixture_agent(&self, kind: AgentKind) -> Result<()> {
+        let workspace = lock(&self.harness.state.workspaces)
+            .get(&self.key)
+            .context("fixture project missing")?;
+        let script = workspace.root.join(format!("fixture-{}", kind.as_str()));
+        let script = tokio::task::spawn_blocking(move || {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = std::fs::symlink_metadata(&script)?;
+            ensure!(
+                metadata.is_file()
+                    && metadata.uid() == rustix::process::geteuid().as_raw()
+                    && metadata.nlink() == 1
+                    && metadata.len() <= 64 * 1024
+                    && metadata.mode() & 0o777 == 0o700,
+                "fixture CLI untrusted"
+            );
+            Ok::<_, anyhow::Error>(script)
+        })
+        .await??;
+        lock(&self.harness.state.agent_bins).insert(
+            kind,
+            crate::launcher::AgentDetection {
+                path: Ok(script),
+                version: Some(match kind {
+                    AgentKind::Codex => chimaera_agent::codex::TESTED_CODEX_VERSION.into(),
+                    _ => "2.1.283".into(),
+                }),
+                managed: false,
+                explicit: true,
+                mtime: None,
+            },
+        );
+        Ok(())
+    }
+    fn agent_kind(kind: &str) -> Result<AgentKind> {
+        match kind {
+            "claude" => Ok(AgentKind::Claude),
+            "codex" => Ok(AgentKind::Codex),
+            _ => anyhow::bail!("unknown fixture agent"),
+        }
+    }
+    /// A new conversation here, as the user starts one (`POST /sessions`).
+    pub async fn start_fixture_chat(&self, kind: &str) -> Result<String> {
+        self.fixture_agent(Self::agent_kind(kind)?).await?;
+        let response = self
+            .harness
+            .fixed_request(
+                "/api/v1/sessions",
+                json!({"workspace_id":self.key,"kind":"agent","agent":kind,"ui":"chat"}),
+            )
+            .await?;
+        ensure!(
+            response.status == axum::http::StatusCode::OK,
+            "fixture chat creation refused: {}",
+            response.body
+        );
+        Ok(response.body["id"]
+            .as_str()
+            .context("fixture chat identity missing")?
+            .to_owned())
+    }
+    /// A terminal agent here (the PTY/TUI spawn).
+    pub async fn start_fixture_terminal(&self, kind: &str) -> Result<String> {
+        let kind = Self::agent_kind(kind)?;
+        self.fixture_agent(kind).await?;
+        let workspace = lock(&self.harness.state.workspaces)
+            .get(&self.key)
+            .context("fixture project missing")?;
+        let row = crate::spawn::spawn_session(
+            &self.harness.state,
+            crate::spawn::SpawnSpec {
+                workspace,
+                started_by: crate::history::StartedBy::You,
+                id: None,
+                name: None,
+                cwd: None,
+                native_cwd: None,
+                cols: None,
+                rows: None,
+                theme: "dark".into(),
+                title_hint: None,
+                prelude: None,
+                fork_head: false,
+                kind: crate::spawn::SpawnKind::Agent {
+                    kind,
+                    model: None,
+                    resume: None,
+                },
+            },
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("fixture terminal agent failed to spawn"))?;
+        Ok(row["id"]
+            .as_str()
+            .context("fixture terminal identity missing")?
+            .to_owned())
+    }
+    /// A Claude conversation arriving here as a move installs it: its native
+    /// transcript and a deferred entry carrying the move's origin
+    /// (`moved` | `home`) and, mid-turn, the cut-off turn; then the ordinary
+    /// deferred resume starts it.
+    pub async fn arrive_fixture_chat(
+        &self,
+        session: &str,
+        native: &str,
+        transcript: String,
+        origin: &str,
+        mid_turn: bool,
+    ) -> Result<()> {
+        ensure!(
+            crate::pro::valid_id(session)
+                && native.len() == 36
+                && native.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+                && matches!(origin, "moved" | "home")
+                && transcript.len() <= 64 * 1024,
+            "invalid fixture arrival"
+        );
+        self.fixture_agent(AgentKind::Claude).await?;
+        let state = &self.harness.state;
+        let workspace = lock(&state.workspaces)
+            .get(&self.key)
+            .context("fixture project missing")?;
+        let path = state
+            .claude_projects_dir
+            .join(crate::launcher::encode_cwd(&workspace.root))
+            .join(format!("{native}.jsonl"));
+        tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(path.parent().context("fixture native parent")?)?;
+            std::fs::write(path, transcript)?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        let carryover = mid_turn.then(|| json!({"turn_in_flight": true}));
+        let entry = crate::ledger::LedgerEntry::from_json(&json!({
+            "id": session, "suspended": true, "handoff": {"fork": false, "origin": origin, "epoch": 1},
+            "workspace_id": self.key, "cwd": workspace.root, "cols": 80, "rows": 24, "theme": "dark",
+            "agent": {"kind": "claude", "resume": native, "title": "fixture conversation", "ui": "chat", "carryover": carryover},
+        }))
+        .context("invalid fixture ledger entry")?;
+        lock(&state.deferred_sessions).insert(session.to_owned(), entry);
+        crate::ledger::resume_deferred_workspace(state, &self.key).await
+    }
+    /// What a move into this machine records before its agents resume.
+    pub async fn record_fixture_arrival(&self, left_out: &[&str], os: &str, arch: &str) {
+        let left_out: Vec<PathBuf> = left_out.iter().take(64).map(PathBuf::from).collect();
+        crate::mcp::cloud_context::record_arrival(
+            &self.harness.state,
+            &self.key,
+            Some(&left_out),
+            [Some(os), Some(arch)],
+        )
+        .await;
+    }
+    /// What a return that kept both versions of some files reports.
+    pub fn report_fixture_kept(&self, copies: &[&str]) {
+        let copies: Vec<PathBuf> = copies.iter().take(32).map(PathBuf::from).collect();
+        crate::pro::report_return(&self.harness.state, &self.key, (copies.len(), copies), &[]);
+    }
+    /// Seeds what the last move's configuration export left out.
+    pub fn seed_fixture_environment(&self, names: &[&str]) -> Result<()> {
+        let mut preferences = lock(&self.harness.state.pro.preferences);
+        let profile = &mut preferences.entry(self.key.clone()).or_default().profile;
+        profile.missing_environment = names.iter().take(32).map(|n| n.to_string()).collect();
+        profile.validate()
     }
 }

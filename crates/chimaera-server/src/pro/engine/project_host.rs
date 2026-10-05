@@ -585,24 +585,6 @@ impl SnapshotOwner {
             .profile
             .clone()
     }
-    pub fn observe_commands(&self, profile: &mut super::super::policy::CloudProfile) {
-        let state = &self.project.state;
-        let ids: Vec<_> = lock(&state.session_workspaces)
-            .iter()
-            .filter(|(_, id)| *id == &self.project.workspace)
-            .map(|(id, _)| id.clone())
-            .take(64)
-            .collect();
-        for id in ids {
-            if let Some(marks) = state.sessions.marks(&id) {
-                for command in marks.journal(32) {
-                    if let Some(command) = command.command.as_deref() {
-                        profile.observe_command(command);
-                    }
-                }
-            }
-        }
-    }
     pub fn metadata(&self) -> Option<super::super::projects::catalog::Metadata> {
         super::super::projects::catalog::metadata(self.name(), self.visible())
     }

@@ -74,7 +74,6 @@ pub struct ProjectObservation {
     pub installing: bool,
     pub parked: bool,
     pub release_pending: bool,
-    pub returned: bool,
     pub opened: bool,
     pub return_backoff: Option<(u64, u64)>,
     pub sleeping: bool,
@@ -736,7 +735,6 @@ impl Scenario {
         let installing = lock(&state.pro.installing).contains(key);
         let parked = lock(&state.pro.parked).contains(key);
         let release_pending = lock(&state.pro.release_pending).contains(key);
-        let returned = lock(&state.pro.returned).contains(key);
         let opened = lock(&state.pro.opened_here).contains(key);
         let return_backoff = lock(&state.pro.return_backoff).get(key).copied();
         let sleeping = lock(&state.pro.sleeping).contains(key);
@@ -748,7 +746,6 @@ impl Scenario {
             installing,
             parked,
             release_pending,
-            returned,
             opened,
             return_backoff,
             sleeping,

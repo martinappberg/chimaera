@@ -1477,8 +1477,7 @@ export interface MirrorProfile {
   /** Additive: a setup command an agent proposed. It never runs until the
    * user confirms it in the private account surface, making it `setup_command`. */
   pending_setup_command?: string | null;
-  laptop_only: string[];
-  deferred: string[];
+  /** Environment variable names the last move's configuration export left out. */
   missing_environment: string[];
 }
 export interface LocalProjectCopy { state: "ready" | "pending" | "taking_over" | "recovery_needed"; ready: boolean; checkpoint?: unknown | null; owner_epoch?: number | null }

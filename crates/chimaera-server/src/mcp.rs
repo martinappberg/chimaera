@@ -262,21 +262,17 @@ pub(crate) async fn mcp(
         };
     let result = match method {
         "initialize" => {
-            let mut result = initialize_result(
+            // Where the agent runs is not appended here: Claude Code cuts
+            // long server instructions short. It rides the hook/developer-note
+            // carriers instead (`cloud_context`).
+            Ok(initialize_result(
                 &params,
                 &agent_id,
                 comms_on,
                 mastermind,
                 mastermind_here,
                 &plugin_paragraphs,
-            );
-            if let Some(workspace) = workspace_of(&state, &agent_id) {
-                let context = cloud_context::arrival(&state, &workspace.id).await;
-                if let Some(text) = result["instructions"].as_str() {
-                    result["instructions"] = Value::String(format!("{text}{context}"));
-                }
-            }
-            Ok(result)
+            ))
         }
         "ping" => Ok(json!({})),
         "tools/list" => {
@@ -764,7 +760,7 @@ async fn tools_call(
         return Ok(crate::plugins::tools::call(state, &owner, agent_id, name, &args).await);
     }
     match name {
-        "read_cloud_profile" | "update_cloud_profile" => {
+        "where_am_i" | "update_cloud_profile" => {
             Ok(cloud_context::call(state, agent_id, name, &args).await)
         }
         "list_terminals" => Ok(list_terminals(state, agent_id).await),

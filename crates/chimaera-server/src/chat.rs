@@ -3311,8 +3311,17 @@ pub(crate) async fn spawn_chat_session(
     // context it gets as a developer note once its thread opens (claude's
     // rides the hook carrier). Both are None off-cluster without any I/O.
     let startup = crate::environment::job_startup().await;
-    let codex_cluster_context = if recipe.kind == AgentKind::Codex {
-        state.compute.agent_context().await
+    // Codex has no hook carrier: a synced project's where-you-run note rides
+    // the same developer note, after the cluster's (`cloud_context`).
+    let codex_note = if recipe.kind == AgentKind::Codex {
+        let notes: Vec<String> = [
+            state.compute.agent_context().await,
+            crate::mcp::cloud_context::note(state, &recipe.workspace_id).await,
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        (!notes.is_empty()).then(|| notes.join("\n\n"))
     } else {
         None
     };
@@ -3577,7 +3586,7 @@ pub(crate) async fn spawn_chat_session(
     spec.fork_at = recipe.fork_at.clone();
     spec.fork_head = recipe.fork_head;
     spec.portable_context = recipe.portable_context.clone();
-    spec.developer_note = codex_cluster_context;
+    spec.developer_note = codex_note;
     // Resurrection carries the original creation time so age survives the
     // restart; every other path leaves it None → the spawn stamps now.
     spec.created_at_ms = recipe.created_at_ms;
@@ -3852,15 +3861,10 @@ pub(crate) async fn resurrect_chat_transfer(
                 None
             } else if let Some(origin) = origin {
                 let recovery = crate::pro::checkpoint_recovery_context(state, &entry.workspace_id);
-                if let Some(mut text) = handoff_message(origin, carry.as_ref(), recovery, fork_head)
-                {
-                    text.push_str(
-                        &crate::mcp::cloud_context::arrival(state, &entry.workspace_id).await,
-                    );
-                    Some((text, transfer_origin(origin, recovery)))
-                } else {
-                    None
-                }
+                // Where it runs now arrives separately, at the process start
+                // (`cloud_context`); the pick-up only says what to continue.
+                handoff_message(origin, carry.as_ref(), recovery, fork_head)
+                    .map(|text| (text, transfer_origin(origin, recovery)))
             } else {
                 pickup_message(
                     &entry.id,
@@ -4059,8 +4063,8 @@ fn restart_message(carry: &chimaera_agent::Carryover) -> Option<String> {
 }
 
 /// Only interrupted work needs a transfer pick-up turn. Idle conversations keep
-/// their history without asking the model to do more work; fresh MCP initialization
-/// supplies the current host context before a later user-requested turn.
+/// their history without asking the model to do more work; in a synced project
+/// the new process's start note (`mcp::cloud_context`) says where it runs now.
 fn handoff_message(
     origin: &str,
     carry: Option<&chimaera_agent::Carryover>,
