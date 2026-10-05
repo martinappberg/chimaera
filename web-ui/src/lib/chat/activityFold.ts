@@ -12,13 +12,12 @@
  */
 import { capitalize, countPhrase, type LabelledTool } from "./toolLabels";
 
-/** Runs of at least `min` (two) activity items that a closing item directly
+/** Runs of at least `min` (two) activity items that any other item directly
  *  follows, as half-open `[start, end)` spans. A lone line gains nothing
- *  from folding; an unclosed (trailing) run is still being written. */
+ *  from folding; a trailing run (nothing after it) is still being written. */
 export function foldSpans<T>(
   items: readonly T[],
   isActivity: (item: T) => boolean,
-  closesRun: (item: T) => boolean,
   min = 2,
 ): [number, number][] {
   const spans: [number, number][] = [];
@@ -28,7 +27,7 @@ export function foldSpans<T>(
       if (start === -1) start = i;
       return;
     }
-    if (start !== -1 && i - start >= min && closesRun(item)) spans.push([start, i]);
+    if (start !== -1 && i - start >= min) spans.push([start, i]);
     start = -1;
   });
   return spans;

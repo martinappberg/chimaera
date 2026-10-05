@@ -2,13 +2,8 @@ import { describe, expect, it } from "vitest";
 import { FINISHED_FOLD_MIN, finishedTitle, foldSpans, foldTitle } from "./activityFold";
 import type { LabelledTool } from "./toolLabels";
 
-// a = activity, m = a reply (closes a run), u / n = other rows (user, notice).
-const spans = (row: string) =>
-  foldSpans(
-    row.split(""),
-    (c) => c === "a",
-    (c) => c === "m",
-  );
+// a = activity; m / u / n = any other row (a reply, a user message, a notice).
+const spans = (row: string) => foldSpans(row.split(""), (c) => c === "a");
 
 function tool(kind: string, over: Partial<LabelledTool> = {}): LabelledTool {
   return { tool: kind, status: "completed", locations: [], summary: null, ...over };
@@ -23,25 +18,18 @@ describe("foldSpans", () => {
     ]);
   });
 
-  it("folds a run that any row follows, when every row closes one", () => {
-    const any = (row: string) =>
-      foldSpans(
-        row.split(""),
-        (c) => c === "a",
-        () => true,
-      );
-    expect(any("aanaaam")).toEqual([
+  it("folds a run whatever row follows it", () => {
+    expect(spans("aanaaam")).toEqual([
       [0, 2],
       [3, 6],
     ]);
-    expect(any("aauaa")).toEqual([[0, 2]]);
+    expect(spans("aauaa")).toEqual([[0, 2]]);
   });
 
-  it("leaves a lone line, a trailing run, and a run closed by anything else", () => {
+  it("leaves a lone line and the trailing run", () => {
     expect(spans("uam")).toEqual([]);
     expect(spans("amaaa")).toEqual([]);
-    expect(spans("aanm")).toEqual([]);
-    expect(spans("aau")).toEqual([]);
+    expect(spans("aa")).toEqual([]);
   });
 });
 
@@ -62,13 +50,7 @@ describe("foldTitle", () => {
 });
 
 describe("finished-work folds", () => {
-  const spans = (kinds: string) =>
-    foldSpans(
-      kinds.split(""),
-      (k) => k === "f",
-      () => true,
-      FINISHED_FOLD_MIN,
-    );
+  const spans = (kinds: string) => foldSpans(kinds.split(""), (k) => k === "f", FINISHED_FOLD_MIN);
 
   it("folds three or more settled finished lines, never fewer or the trailing run", () => {
     expect(spans("mfffm")).toEqual([[1, 4]]);

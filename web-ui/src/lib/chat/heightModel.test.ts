@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { blockWeight, HistoryWeights, tailWeights, weightAt } from "./heightModel";
+import { blockWeight, HistoryWeights, tailWeights, unfoldedFrom, weightAt } from "./heightModel";
 import type { ChatBlock } from "./store.svelte";
 
 const message = (text: string, uid = 1): ChatBlock =>
@@ -74,6 +74,28 @@ describe("block height model", () => {
     const user = (attachmentPaths: string[]): ChatBlock =>
       ({ uid: 5, kind: "user", text: "look", attachments: attachmentPaths.length, attachmentPaths, checkpoint: null, id: null, origin: null, forkSeq: 0 }) as ChatBlock;
     expect(blockWeight(user(["/u/image-1.png"]), null, 100) - blockWeight(user([]), null, 100)).toBe(5.5);
+  });
+});
+
+describe("the unfolded trailing run", () => {
+  const thought = (uid: number): ChatBlock => ({ uid, kind: "thought", text: "t" }) as ChatBlock;
+  const notice = (uid: number): ChatBlock => ({ uid, kind: "notice", text: "ok", tone: "info" }) as ChatBlock;
+  const finished = (uid: number): ChatBlock =>
+    ({ uid, kind: "finished", source: "task", title: "", status: "completed", stats: null, result: null, outputFile: null }) as ChatBlock;
+
+  it("starts after the last row that is neither a thought nor a tool call", () => {
+    // A permission decision settles the run before it, like a reply does.
+    const blocks = [message("hi", 1), thought(2), tool(3), notice(4), thought(5), tool(6)];
+    expect(unfoldedFrom(blocks, 0, blocks.length)).toBe(4);
+    expect(unfoldedFrom(blocks, 0, 4)).toBe(4);
+    expect(unfoldedFrom(blocks, 0, 3)).toBe(1);
+    // Never before the stretch's own start.
+    expect(unfoldedFrom(blocks, 5, blocks.length)).toBe(5);
+  });
+
+  it("is the finished lines that end the stretch, when some do", () => {
+    const blocks = [thought(1), tool(2), finished(3), finished(4)];
+    expect(unfoldedFrom(blocks, 0, blocks.length)).toBe(2);
   });
 });
 

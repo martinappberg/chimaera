@@ -54,16 +54,28 @@ function renderedMarkdown(text: string): string {
     .replace(/[*`#~[\]]/g, "");
 }
 
-/** Thought and tool rows: a settled run of them folds into one line under
- *  the reply that followed (activityFold.ts), and a run of tool calls is one
- *  group line even unfolded. */
+/** Thought and tool rows: a settled run of them folds into one line once
+ *  any other row follows it (activityFold.ts), and a run of tool calls is
+ *  one group line even unfolded. */
 function isActivity(block: ChatBlock | null): boolean {
   return block?.kind === "tool" || block?.kind === "thought";
 }
 
+/** Where the unfolded trailing run of `blocks[start, end)` begins (`end`
+ *  when there is none): the finished lines that end the stretch, else the
+ *  thought and tool rows that do. Any other row settles the run before it,
+ *  so nothing earlier is unfolded — the rule `foldSpans` renders. */
+export function unfoldedFrom(blocks: readonly ChatBlock[], start: number, end: number): number {
+  let at = end;
+  while (at > start && blocks[at - 1].kind === "finished") at--;
+  if (at < end) return at;
+  while (at > start && isActivity(blocks[at - 1])) at--;
+  return at;
+}
+
 /** Rough rendered height of one block, in lines. `previous` matters because
  *  a settled run of activity rows (thoughts and tool calls) shares one line.
- *  `settled` is false for the trailing run no reply has followed yet — it
+ *  `settled` is false for the trailing run nothing has followed yet — it
  *  renders unfolded, a line per thought and per group of tool calls — which
  *  only the live tail has (its window calibrates the model). Weigh a block
  *  in a transcript through {@link weightAt}, which also knows a folded run

@@ -44,7 +44,9 @@
 
   let open = $state(false);
   const title = $derived(foldTitle(thoughts, tools));
-  /** Backgrounded or cross-turn work can outlive the reply that followed it. */
+  /** Work can outlive the row that settled its run: a backgrounded or
+   *  cross-turn call, a command still running when its permission decision
+   *  landed. */
   const running = $derived(tools.some(isLive));
   /** Only a hard failure surfaces on the fold; a recovered one is the
    *  inner group's detail. */
