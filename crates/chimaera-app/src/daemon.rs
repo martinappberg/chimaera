@@ -96,20 +96,70 @@ fn run_headless_with_runtime(factory: Option<RuntimeFactory>) {
 pub enum RuntimeRequirement {
     FreeCompatible,
     Extension,
+    ExtensionWithIdentity(&'static str),
+}
+
+pub(crate) fn valid_assembly_identity(identity: &str) -> bool {
+    !identity.is_empty()
+        && identity.len() <= 128
+        && identity.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
 impl RuntimeRequirement {
+    #[cfg(unix)]
+    fn identity_selected(self) -> bool {
+        matches!(self, Self::ExtensionWithIdentity(_))
+    }
+
+    #[cfg(unix)]
+    fn matches(self, extension: Option<bool>, identity: Option<&str>) -> bool {
+        match self {
+            Self::FreeCompatible => true,
+            Self::Extension => extension == Some(true),
+            Self::ExtensionWithIdentity(expected) => {
+                extension == Some(true) && identity == Some(expected)
+            }
+        }
+    }
+
     pub(crate) fn ready(self, daemon: &LocalDaemon) -> bool {
-        self == Self::FreeCompatible || daemon.daemon_extension == Some(true)
+        match self {
+            Self::FreeCompatible => true,
+            Self::Extension => daemon.daemon_extension == Some(true),
+            Self::ExtensionWithIdentity(_) => {
+                daemon.daemon_extension == Some(true) && !daemon.outdated
+            }
+        }
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn runtime_decision(
     requirement: RuntimeRequirement,
     local_build: &str,
     remote_build: Option<&str>,
     extension: Option<bool>,
+    sessions: Option<usize>,
+    force: bool,
+) -> anyhow::Result<Decision> {
+    runtime_decision_with_identity(
+        requirement,
+        local_build,
+        remote_build,
+        extension,
+        None,
+        sessions,
+        force,
+    )
+}
+
+#[cfg(unix)]
+fn runtime_decision_with_identity(
+    requirement: RuntimeRequirement,
+    local_build: &str,
+    remote_build: Option<&str>,
+    extension: Option<bool>,
+    identity: Option<&str>,
     sessions: Option<usize>,
     force: bool,
 ) -> anyhow::Result<Decision> {
@@ -122,12 +172,11 @@ fn runtime_decision(
         }
         return Ok(Decision::ConnectOutdated);
     }
-    let compatible_build =
-        if requirement == RuntimeRequirement::Extension && extension != Some(true) {
-            None
-        } else {
-            remote_build
-        };
+    let compatible_build = if !requirement.matches(extension, identity) {
+        None
+    } else {
+        remote_build
+    };
     Ok(chimaera_remote::update_decision(
         local_build,
         compatible_build,
@@ -146,21 +195,21 @@ pub async fn ensure_local_daemon() -> anyhow::Result<LocalDaemon> {
 pub(crate) async fn ensure_local_daemon_for(
     requirement: RuntimeRequirement,
 ) -> anyhow::Result<LocalDaemon> {
-    if let Some(probed) = probe().await? {
+    if let Some(probed) = probe(requirement).await? {
         let m = &probed.manifest;
         let compatible = chimaera_core::builds_match(chimaera_core::BUILD_ID, m.build.as_deref())
-            && (requirement == RuntimeRequirement::FreeCompatible
-                || probed.extension == Some(true));
+            && requirement.matches(probed.extension, probed.identity.as_deref());
         let sessions = if compatible {
             None
         } else {
             live_session_count(m.port, &m.token).await
         };
-        match runtime_decision(
+        match runtime_decision_with_identity(
             requirement,
             chimaera_core::BUILD_ID,
             m.build.as_deref(),
             probed.extension,
+            probed.identity.as_deref(),
             sessions,
             false,
         )? {
@@ -176,14 +225,15 @@ pub(crate) async fn ensure_local_daemon_for(
     // Original readiness rounds and per-probe deadline; no timer is reseeded.
     for _ in 0..50 {
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let Ok(Some(probed)) = probe().await else {
+        let Ok(Some(probed)) = probe(requirement).await else {
             continue;
         };
-        if runtime_decision(
+        if runtime_decision_with_identity(
             requirement,
             chimaera_core::BUILD_ID,
             probed.manifest.build.as_deref(),
             probed.extension,
+            probed.identity.as_deref(),
             None,
             false,
         )? == Decision::Reuse
@@ -207,13 +257,14 @@ pub async fn update_local_daemon() -> anyhow::Result<LocalDaemon> {
 pub(crate) async fn update_local_daemon_for(
     requirement: RuntimeRequirement,
 ) -> anyhow::Result<LocalDaemon> {
-    if let Some(probed) = probe().await? {
+    if let Some(probed) = probe(requirement).await? {
         let m = &probed.manifest;
-        let decision = runtime_decision(
+        let decision = runtime_decision_with_identity(
             requirement,
             chimaera_core::BUILD_ID,
             m.build.as_deref(),
             probed.extension,
+            probed.identity.as_deref(),
             None,
             false,
         )?;
@@ -221,11 +272,12 @@ pub(crate) async fn update_local_daemon_for(
             return Ok(probed.attached(false, None));
         }
         // Force only after the free/selected-assembly downgrade check.
-        runtime_decision(
+        runtime_decision_with_identity(
             requirement,
             chimaera_core::BUILD_ID,
             m.build.as_deref(),
             probed.extension,
+            probed.identity.as_deref(),
             None,
             true,
         )?;
@@ -275,6 +327,7 @@ pub(crate) fn attached(m: Manifest, outdated: bool, live_sessions: Option<usize>
 struct Probed {
     manifest: Manifest,
     extension: Option<bool>,
+    identity: Option<String>,
 }
 
 #[cfg(unix)]
@@ -288,12 +341,15 @@ impl Probed {
 
 /// The same original manifest PID/token and one bounded authenticated request.
 #[cfg(unix)]
-async fn probe() -> anyhow::Result<Option<Probed>> {
-    probe_loaded(Manifest::load()).await
+async fn probe(requirement: RuntimeRequirement) -> anyhow::Result<Option<Probed>> {
+    probe_loaded_for(Manifest::load(), requirement).await
 }
 
 #[cfg(unix)]
-async fn probe_loaded(loaded: anyhow::Result<Option<Manifest>>) -> anyhow::Result<Option<Probed>> {
+async fn probe_loaded_for(
+    loaded: anyhow::Result<Option<Manifest>>,
+    requirement: RuntimeRequirement,
+) -> anyhow::Result<Option<Probed>> {
     // Corrupt/unreadable records never supplied a usable original daemon.
     // The server independently checks its own live-record/startup lock.
     let Some(m) = loaded.ok().flatten() else {
@@ -303,17 +359,25 @@ async fn probe_loaded(loaded: anyhow::Result<Option<Manifest>>) -> anyhow::Resul
         return Ok(None);
     }
     let (port, token, pid, build) = (m.port, m.token.clone(), m.pid, m.build.clone());
-    let extension =
-        tokio::task::spawn_blocking(move || health_extension(port, &token, pid, build.as_deref()))
-            .await
-            .context("local daemon health worker failed")??;
-    let extension = match extension {
-        Health::Reachable(extension) => extension,
+    let health = tokio::task::spawn_blocking(move || {
+        health_observation(
+            port,
+            &token,
+            pid,
+            build.as_deref(),
+            requirement.identity_selected(),
+        )
+    })
+    .await
+    .context("local daemon health worker failed")??;
+    let (extension, identity) = match health {
+        Health::Reachable(extension, identity) => (extension, identity),
         Health::Closed => return Ok(None),
     };
     Ok(Some(Probed {
         manifest: m,
         extension,
+        identity,
     }))
 }
 
@@ -324,7 +388,12 @@ fn refused_hint(error: &anyhow::Error) -> bool {
 }
 
 #[cfg(unix)]
-fn decode_health(body: &[u8], pid: u32, build: Option<&str>) -> anyhow::Result<Option<bool>> {
+fn decode_health(
+    body: &[u8],
+    pid: u32,
+    build: Option<&str>,
+    identity_selected: bool,
+) -> anyhow::Result<(Option<bool>, Option<String>)> {
     if body.len() > 16 * 1024 {
         bail!("local daemon health response exceeds its bound")
     }
@@ -336,17 +405,35 @@ fn decode_health(body: &[u8], pid: u32, build: Option<&str>) -> anyhow::Result<O
     {
         bail!("local daemon health does not match its original manifest");
     }
-    match value.get("daemon_extension") {
-        None => Ok(None),
-        Some(serde_json::Value::Bool(enabled)) => Ok(Some(*enabled)),
+    let extension = match value.get("daemon_extension") {
+        None => None,
+        Some(serde_json::Value::Bool(enabled)) => Some(*enabled),
         Some(_) => bail!("invalid local daemon assembly observation"),
-    }
+    };
+    // Free/legacy assemblies retain their original tolerance of unknown fields.
+    let identity = if identity_selected {
+        match value.get("daemon_assembly") {
+            None => None,
+            Some(value) => {
+                let Some(identity) = value
+                    .as_str()
+                    .filter(|identity| valid_assembly_identity(identity))
+                else {
+                    bail!("invalid local daemon assembly identity");
+                };
+                Some(identity.to_owned())
+            }
+        }
+    } else {
+        None
+    };
+    Ok((extension, identity))
 }
 
 #[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
 enum Health {
-    Reachable(Option<bool>),
+    Reachable(Option<bool>, Option<String>),
     Closed,
 }
 
@@ -364,11 +451,12 @@ fn confirmed_closed(port: u16, deadline: std::time::Instant) -> bool {
 }
 
 #[cfg(unix)]
-fn health_extension(
+fn health_observation(
     port: u16,
     token: &str,
     pid: u32,
     build: Option<&str>,
+    identity_selected: bool,
 ) -> anyhow::Result<Health> {
     use std::io::Read;
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -403,7 +491,8 @@ fn health_extension(
         .take(16 * 1024 + 1)
         .read_to_end(&mut body)
         .context("could not read local daemon health")?;
-    decode_health(&body, pid, build).map(Health::Reachable)
+    decode_health(&body, pid, build, identity_selected)
+        .map(|(extension, identity)| Health::Reachable(extension, identity))
 }
 
 /// GET /api/v1/health with the manifest token; any 200 counts. Shared with
@@ -601,6 +690,170 @@ mod tests {
         assert!(Extension.ready(&daemon));
     }
 
+    async fn probe_loaded(
+        loaded: anyhow::Result<Option<Manifest>>,
+    ) -> anyhow::Result<Option<Probed>> {
+        probe_loaded_for(loaded, RuntimeRequirement::FreeCompatible).await
+    }
+
+    fn health_extension(
+        port: u16,
+        token: &str,
+        pid: u32,
+        build: Option<&str>,
+    ) -> anyhow::Result<Health> {
+        health_observation(port, token, pid, build, false)
+    }
+
+    #[test]
+    fn selected_identity_preserves_original_replacement_and_readiness_rules() {
+        let selected = RuntimeRequirement::ExtensionWithIdentity("2.0.0@fixture-new");
+        for sessions in [None, Some(0), Some(3)] {
+            for identity in [None, Some("1.0.0@fixture-old")] {
+                let expected = if sessions == Some(0) {
+                    Decision::Update
+                } else {
+                    Decision::ConnectOutdated
+                };
+                assert_eq!(
+                    runtime_decision_with_identity(
+                        selected,
+                        "sdk.2",
+                        Some("sdk.1"),
+                        Some(true),
+                        identity,
+                        sessions,
+                        false
+                    )
+                    .unwrap(),
+                    expected
+                );
+                assert_eq!(
+                    runtime_decision_with_identity(
+                        selected,
+                        "sdk.2",
+                        Some("sdk.1"),
+                        Some(true),
+                        identity,
+                        sessions,
+                        true
+                    )
+                    .unwrap(),
+                    Decision::Update
+                );
+            }
+            assert_eq!(
+                runtime_decision_with_identity(
+                    selected,
+                    "sdk.2",
+                    Some("sdk.1"),
+                    Some(true),
+                    Some("2.0.0@fixture-new"),
+                    sessions,
+                    false
+                )
+                .unwrap(),
+                Decision::Reuse
+            );
+            // Unknown extra metadata must not change the free or legacy path.
+            for requirement in [
+                RuntimeRequirement::FreeCompatible,
+                RuntimeRequirement::Extension,
+            ] {
+                assert_eq!(
+                    runtime_decision_with_identity(
+                        requirement,
+                        "sdk.2",
+                        Some("sdk.1"),
+                        Some(true),
+                        Some("foreign"),
+                        sessions,
+                        false
+                    )
+                    .unwrap(),
+                    Decision::Reuse
+                );
+            }
+        }
+        assert!(runtime_decision_with_identity(
+            RuntimeRequirement::FreeCompatible,
+            "sdk.2",
+            Some("other.1"),
+            Some(true),
+            Some("foreign"),
+            Some(0),
+            true
+        )
+        .is_err());
+        let mut local = LocalDaemon {
+            port: 1,
+            token: String::new(),
+            build: Some("sdk.1".into()),
+            outdated: true,
+            live_sessions: Some(3),
+            daemon_extension: Some(true),
+        };
+        assert!(
+            !selected.ready(&local),
+            "an old busy assembly must not initialize its successor owner"
+        );
+        local.outdated = false;
+        assert!(selected.ready(&local));
+        local.daemon_extension = None;
+        assert!(!selected.ready(&local));
+    }
+
+    #[test]
+    fn authenticated_health_identity_is_bounded_and_selected_only() {
+        let baseline = serde_json::json!({"name":"chimaera", "pid":42, "build":"fixture-build", "daemon_extension":true});
+        for identity in [
+            None,
+            Some(serde_json::json!("2.0.0@fixture-new")),
+            Some(serde_json::json!("1.0.0@fixture-old")),
+        ] {
+            let mut value = baseline.clone();
+            if let Some(identity) = identity {
+                value["daemon_assembly"] = identity;
+            }
+            let (port, task) = serve_health(serde_json::to_vec(&value).unwrap());
+            let result = health_observation(port, "fixture-token", 42, Some("fixture-build"), true);
+            task.join().unwrap();
+            assert_eq!(
+                result.unwrap(),
+                Health::Reachable(
+                    Some(true),
+                    value
+                        .get("daemon_assembly")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned)
+                )
+            );
+        }
+        for identity in [
+            serde_json::json!(null),
+            serde_json::json!(42),
+            serde_json::json!(""),
+            serde_json::json!("bad identity"),
+            serde_json::json!("x".repeat(129)),
+        ] {
+            let mut value = baseline.clone();
+            value["daemon_assembly"] = identity;
+            let raw = serde_json::to_vec(&value).unwrap();
+            let (port, task) = serve_health(raw.clone());
+            let selected =
+                health_observation(port, "fixture-token", 42, Some("fixture-build"), true);
+            task.join().unwrap();
+            assert!(
+                selected.is_err(),
+                "malformed selected identity must refuse before any replacement"
+            );
+            let (port, task) = serve_health(raw);
+            let free = health_observation(port, "fixture-token", 42, Some("fixture-build"), false);
+            task.join().unwrap();
+            assert_eq!(free.unwrap(), Health::Reachable(Some(true), None));
+        }
+    }
+
     // Exercise the actual bounded authenticated request, not only the JSON helper.
     fn serve_health(body: Vec<u8>) -> (u16, std::thread::JoinHandle<()>) {
         serve_response(200, body)
@@ -663,7 +916,7 @@ mod tests {
             let (port, task) = serve_health(serde_json::to_vec(&value).unwrap());
             let result = health_extension(port, "fixture-token", 42, Some("fixture-build"));
             task.join().unwrap();
-            assert_eq!(result.unwrap(), Health::Reachable(marker));
+            assert_eq!(result.unwrap(), Health::Reachable(marker, None));
         }
         for body in [
             br#"{"name":"chimaera","pid":43,"build":"fixture-build","daemon_extension":true}"#

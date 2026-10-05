@@ -81,6 +81,7 @@ async fn health_with_token_is_200() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["name"], "chimaera");
     assert_eq!(json["daemon_extension"], false);
+    assert!(json.get("daemon_assembly").is_none());
     assert_eq!(json["version"], chimaera_core::VERSION);
     assert_eq!(json["hostname"], "testhost");
     assert_eq!(json["pid"], 4242);
@@ -178,4 +179,80 @@ async fn unknown_api_path_is_404() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn health_assembly_metadata_is_authenticated_optional_and_stateless() {
+    struct DefaultRuntime;
+    impl crate::daemon_extension::Runtime for DefaultRuntime {
+        fn coordinate(
+            &self,
+            _owner: crate::daemon_extension::CoordinatorOwner,
+        ) -> crate::daemon_extension::RuntimeFuture {
+            Box::pin(async {})
+        }
+    }
+    struct SelectedRuntime;
+    impl crate::daemon_extension::Runtime for SelectedRuntime {
+        fn coordinate(
+            &self,
+            _owner: crate::daemon_extension::CoordinatorOwner,
+        ) -> crate::daemon_extension::RuntimeFuture {
+            Box::pin(async {})
+        }
+        fn assembly_identity(&self) -> Option<&'static str> {
+            Some("2.0.0@fixture")
+        }
+    }
+    for (runtime, expected) in [
+        (
+            std::sync::Arc::new(DefaultRuntime)
+                as std::sync::Arc<dyn crate::daemon_extension::Runtime>,
+            None,
+        ),
+        (
+            std::sync::Arc::new(SelectedRuntime)
+                as std::sync::Arc<dyn crate::daemon_extension::Runtime>,
+            Some("2.0.0@fixture"),
+        ),
+    ] {
+        let mut state = test_state();
+        std::sync::Arc::get_mut(&mut state)
+            .unwrap()
+            .daemon_extension = Some(runtime);
+        let router = app(state);
+        let unauthorized = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["daemon_extension"], true);
+        assert_eq!(
+            value.get("daemon_assembly").and_then(|v| v.as_str()),
+            expected
+        );
+        if expected.is_none() {
+            assert!(value.get("daemon_assembly").is_none());
+        }
+        assert_eq!(value["build"], chimaera_core::BUILD_ID);
+    }
 }

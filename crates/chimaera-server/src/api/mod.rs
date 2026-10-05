@@ -65,6 +65,13 @@ pub(crate) async fn health(State(state): State<Arc<AppState>>) -> Json<serde_jso
         "pid": state.pid,
         "uptime_secs": state.started.elapsed().as_secs(),
     });
+    if let Some(identity) = state
+        .daemon_extension
+        .as_ref()
+        .and_then(|runtime| runtime.assembly_identity())
+    {
+        value["daemon_assembly"] = json!(identity);
+    }
     if let Some(ack) = crate::pro::supervisor_cleanup_ack(&state) {
         value["supervisor_cleanup"] = json!(ack);
     }

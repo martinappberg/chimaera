@@ -95,6 +95,12 @@ pub type RuntimeFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 /// A first-party in-process policy. It never receives AppState, a token or a
 /// generic process/HTTP callback. The public host owns its spawned continuation.
 pub trait Runtime: Send + Sync + 'static {
+    /// Stateless local composition identity (1..=128 visible ASCII bytes),
+    /// independent of public SDK parity.
+    fn assembly_identity(&self) -> Option<&'static str> {
+        None
+    }
+
     /// A transient child-process overlay, never settings, argv or a saved recipe.
     /// The host retains launch admission until the actual session is registered.
     fn session_environment<'a>(

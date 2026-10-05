@@ -36,6 +36,16 @@ pub fn run_with_context(
     factory: Option<account::Factory>,
     context: impl FnOnce() -> tauri::Context<tauri::Wry>,
 ) {
+    run_with_context_and_assembly(factory, context, None);
+}
+
+/// A selected executable supplies immutable daemon metadata without constructing
+/// its account owner. Free/legacy callers retain the original None path.
+pub fn run_with_context_and_assembly(
+    factory: Option<account::Factory>,
+    context: impl FnOnce() -> tauri::Context<tauri::Wry>,
+    assembly_identity: Option<&'static str>,
+) {
     // `--askpass <prompt>` is the tiny SSH_ASKPASS helper ssh
     // runs to prompt for a password / 2FA: it relays to the running app over
     // a socket and prints the answer, no Tauri init. Checked first — it must
@@ -75,7 +85,12 @@ pub fn run_with_context(
 
     #[cfg(unix)]
     raise_open_file_limit();
-    shell::run(factory, context());
+    let assembly_identity = factory.as_ref().and(assembly_identity);
+    assert!(
+        assembly_identity.is_none_or(daemon::valid_assembly_identity),
+        "invalid selected daemon assembly identity"
+    );
+    shell::run(factory, context(), assembly_identity);
 }
 
 /// macOS starts GUI apps with a 256-descriptor soft limit. Every forwarded

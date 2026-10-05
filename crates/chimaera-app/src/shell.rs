@@ -1051,9 +1051,13 @@ fn open_setup_window(handle: &tauri::AppHandle) -> tauri::Result<()> {
 }
 
 /// Build and run the Tauri app.
-pub fn run(factory: Option<crate::account::Factory>, context: tauri::Context<tauri::Wry>) {
+pub fn run(
+    factory: Option<crate::account::Factory>,
+    context: tauri::Context<tauri::Wry>,
+    assembly_identity: Option<&'static str>,
+) {
     tauri::Builder::default()
-        .manage(AccountFactory(factory, Mutex::new(())))
+        .manage(AccountFactory(factory, Mutex::new(()), assembly_identity))
         // Must be registered first: the plugin intercepts a second launch
         // before any other plugin or process-global shell resource starts.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -1458,11 +1462,18 @@ pub fn run(factory: Option<crate::account::Factory>, context: tauri::Context<tau
         });
 }
 
-struct AccountFactory(Option<crate::account::Factory>, Mutex<()>);
+struct AccountFactory(
+    Option<crate::account::Factory>,
+    Mutex<()>,
+    Option<&'static str>,
+);
 
 fn runtime_requirement(app: &tauri::AppHandle) -> crate::daemon::RuntimeRequirement {
     if app.state::<AccountFactory>().0.is_some() {
-        crate::daemon::RuntimeRequirement::Extension
+        match app.state::<AccountFactory>().2 {
+            Some(identity) => crate::daemon::RuntimeRequirement::ExtensionWithIdentity(identity),
+            None => crate::daemon::RuntimeRequirement::Extension,
+        }
     } else {
         crate::daemon::RuntimeRequirement::FreeCompatible
     }
