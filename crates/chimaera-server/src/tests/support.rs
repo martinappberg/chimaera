@@ -38,6 +38,23 @@ pub(super) fn test_state_with_data_dir(port: u16, data_dir: PathBuf) -> Arc<AppS
     Arc::new(fixture_state(port, data_dir))
 }
 
+/// A daemon with the Pro extension composed (an inert Runtime) and no
+/// account: the official app before sign-in (`pro::Tier::Offered`).
+pub(super) fn test_state_with_extension() -> Arc<AppState> {
+    struct Inert;
+    impl crate::daemon_extension::Runtime for Inert {
+        fn coordinate(
+            &self,
+            _owner: crate::daemon_extension::CoordinatorOwner,
+        ) -> crate::daemon_extension::RuntimeFuture {
+            Box::pin(async {})
+        }
+    }
+    let mut state = fixture_state(0, test_dir("data"));
+    state.daemon_extension = Some(Arc::new(Inert));
+    Arc::new(state)
+}
+
 fn fixture_state(port: u16, data_dir: PathBuf) -> AppState {
     let config_dir = data_dir.join("config");
     let provider_home = data_dir.join("provider-home");

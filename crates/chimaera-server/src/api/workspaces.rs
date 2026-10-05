@@ -128,7 +128,9 @@ pub(crate) async fn create_workspace(
                 // this computer (`pro::note_opened`).
                 crate::pro::note_opened(&state, &workspace.id);
             }
-            if registered.write_marker {
+            // The marker exists for Pro's cloud copy: only a project Pro
+            // enrolled carries one, so a free user's folders never change.
+            if registered.write_marker && crate::pro::marks_folder(&state, &workspace.id) {
                 let (root, id) = (workspace.root.clone(), workspace.id.clone());
                 // Best effort, off the reactor and off the store's lock.
                 tokio::task::spawn_blocking(move || identity::write(&root, &id))
@@ -149,9 +151,9 @@ pub(crate) async fn create_workspace(
 }
 
 /// POST /api/v1/workspaces/{id}/open — stamp a workspace as freshly opened
-/// (home-screen recency), returning it. Also gives a folder that has no
-/// identity marker yet its own (one stat, best effort, never awaited): folders
-/// registered before markers existed gain one over time.
+/// (home-screen recency), returning it. Also gives an enrolled Pro project's
+/// folder that has no identity marker yet its own (one stat, best effort,
+/// never awaited); a project Pro never enrolled is left untouched.
 pub(crate) async fn open_workspace(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -160,10 +162,12 @@ pub(crate) async fn open_workspace(
         Some(workspace) => {
             if !workspace.cloud_internal && !workspace.hidden {
                 crate::pro::note_opened(&state, &workspace.id);
-                let (root, id) = (workspace.root.clone(), workspace.id.clone());
-                tokio::task::spawn_blocking(move || {
-                    crate::workspaces::identity::backfill(&root, &id)
-                });
+                if crate::pro::marks_folder(&state, &workspace.id) {
+                    let (root, id) = (workspace.root.clone(), workspace.id.clone());
+                    tokio::task::spawn_blocking(move || {
+                        crate::workspaces::identity::backfill(&root, &id)
+                    });
+                }
             }
             Json(workspace).into_response()
         }

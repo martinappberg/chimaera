@@ -555,8 +555,10 @@ Quitting the app (⌘Q, the menu, the tray, Dock › Quit, logging out), or clos
 Implementation: [`shell/quit.rs`](../../crates/chimaera-app/src/shell/quit.rs) asks and posts `POST /api/v1/pro/sleep {deadline_ms, park: true, workspace_ids}`; each `/pro/status` project row carries additive `working_agents`, `cloud_handoff` and `parked`; the app posts `/pro/wake` at launch while anything is parked ([`pro/AGENTS.md`](../../crates/chimaera-server/src/pro/AGENTS.md), "Quit handover").
 ### After a reinstall or reset
 
-A project folder records its workspace identity inside its Git directory (or a
-small `.chimaera-workspace` marker for a non-Git folder). Opening an already
+A project folder Pro enrolled records its workspace identity inside its Git
+directory (or a small `.chimaera-workspace` marker for a non-Git folder); the
+marker is written when an account first binds the project, never for a folder
+Pro never took on. Opening an already
 synced project on another computer refreshes a local copy; execution remains
 with its current owner. **Take over** separately moves execution through the
 existing safe handoff. A duplicate folder on the same computer becomes a

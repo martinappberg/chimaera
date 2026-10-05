@@ -177,9 +177,6 @@ async fn a_panicking_plugin_is_an_error_and_the_next_call_works() {
 async fn reads_stay_in_the_workspace_refuse_symlinks_and_stop_at_the_cap() {
     let (state, ws, sid) = fixture_workspace("host-read", "k5").await;
     let root = root_of(&state, &ws);
-    // Registration recorded the workspace id in the folder; this test lists
-    // the folder's own contents.
-    std::fs::remove_file(root.join(".chimaera-workspace")).unwrap();
     std::fs::create_dir_all(root.join("sub")).unwrap();
     std::fs::write(root.join("sub/a.txt"), "x".repeat(100)).unwrap();
     let outside = test_dir("host-read-outside");

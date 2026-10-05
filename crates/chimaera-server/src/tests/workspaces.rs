@@ -196,10 +196,10 @@ async fn internal_setup_is_persisted_and_hidden_without_hiding_similarly_named_u
     assert_eq!(rows[0]["id"], normal.id);
 }
 
-/// A folder registered through the route records its workspace id, and the
+/// A project Pro enrolled records its workspace id in its folder, and the
 /// id follows the folder: a new daemon (a reinstall, a state reset, a second
 /// computer) reopens the same project; a local duplicate is its own; a moved
-/// folder keeps its workspace.
+/// folder keeps its workspace. A project Pro never enrolled gets nothing.
 mod folder_identity {
     use super::*;
     use crate::workspaces::identity;
@@ -221,18 +221,96 @@ mod folder_identity {
         ws
     }
 
-    #[tokio::test]
-    async fn registering_writes_the_marker_in_git_or_a_dotfile() {
-        let state = test_state();
-        let plain = folder("ident-plain");
-        let ws = register(&state, &plain).await;
+    /// The marker is written off the request: wait for it briefly.
+    async fn marker_naming(root: &Path, id: &str) {
+        for _ in 0..100 {
+            if identity::read(root).is_some_and(|m| m.id == id) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("{} never named {id}", root.display());
+    }
+
+    /// Registered, then enrolled by Pro (an account bound it).
+    async fn enrolled(state: &Arc<AppState>, root: &Path) -> serde_json::Value {
+        let ws = register(state, root).await;
         let id = ws["id"].as_str().unwrap();
-        assert_eq!(identity::read(&plain).unwrap().id, id);
+        crate::pro::enroll_fixture(state, id);
+        marker_naming(root, id).await;
+        ws
+    }
+
+    /// Every file under `root` with its bytes, sorted.
+    fn contents(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path.clone());
+                    out.push((path, Vec::new()));
+                } else {
+                    out.push((path.clone(), std::fs::read(&path).unwrap()));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// The free contract: registering and opening a project on a daemon
+    /// without Pro, or with the extension but no account, leaves its folder
+    /// byte-identical, and nothing Pro is noted.
+    #[tokio::test]
+    async fn a_project_pro_never_enrolled_is_left_byte_identical() {
+        for state in [test_state(), test_state_with_extension()] {
+            for repo in [false, true] {
+                let root = folder("ident-free");
+                std::fs::write(root.join("notes.md"), b"mine").unwrap();
+                if repo {
+                    std::fs::create_dir(root.join(".git")).unwrap();
+                    std::fs::write(root.join(".git/HEAD"), b"ref: refs/heads/main\n").unwrap();
+                }
+                let before = contents(&root);
+                let ws = register(&state, &root).await;
+                let id = ws["id"].as_str().unwrap();
+                for _ in 0..2 {
+                    let (status, _) = request(
+                        &state,
+                        Method::POST,
+                        &format!("/api/v1/workspaces/{id}/open"),
+                        None,
+                    )
+                    .await;
+                    assert_eq!(status, StatusCode::OK);
+                }
+                register(&state, &root).await;
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                assert_eq!(contents(&root), before, "the folder gained nothing");
+                assert!(identity::read(&root).is_none());
+                if state.daemon_extension.is_none() {
+                    assert!(!crate::pro::opened_here(&state, id));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn enrolling_writes_the_marker_in_git_or_a_dotfile() {
+        let state = test_state_with_extension();
+        let plain = folder("ident-plain");
+        let ws = enrolled(&state, &plain).await;
+        assert_eq!(
+            identity::read(&plain).unwrap().id,
+            ws["id"].as_str().unwrap()
+        );
         assert!(plain.join(".chimaera-workspace").is_file());
 
         let repo = folder("ident-repo");
         std::fs::create_dir(repo.join(".git")).unwrap();
-        let ws = register(&state, &repo).await;
+        let ws = enrolled(&state, &repo).await;
         assert_eq!(
             identity::read(&repo).unwrap().id,
             ws["id"].as_str().unwrap()
@@ -244,16 +322,16 @@ mod folder_identity {
     #[tokio::test]
     async fn a_new_daemon_reopens_the_same_folder_as_the_same_project() {
         let root = folder("ident-reinstall");
-        let first = register(&test_state(), &root).await;
+        let first = enrolled(&test_state_with_extension(), &root).await;
         // A different daemon with an empty registry: a reinstall, a state
         // reset, or the same folder on another computer.
-        let second_state = test_state();
+        let second_state = test_state_with_extension();
         let second = register(&second_state, &root).await;
         assert_eq!(second["id"], first["id"]);
         assert_eq!(second["root"], first["root"]);
         // The user opened an existing project here: it may come home to this
         // computer (a fresh registration is not that).
-        let first_state = test_state();
+        let first_state = test_state_with_extension();
         let fresh = folder("ident-fresh");
         let fresh_ws = register(&first_state, &fresh).await;
         assert!(!crate::pro::opened_here(
@@ -272,11 +350,11 @@ mod folder_identity {
 
     #[tokio::test]
     async fn a_local_duplicate_is_its_own_project_and_a_move_keeps_the_project() {
-        let state = test_state();
+        let state = test_state_with_extension();
         let parent = folder("ident-dup");
         let original = parent.join("thesis");
         std::fs::create_dir(&original).unwrap();
-        let first = register(&state, &original).await;
+        let first = enrolled(&state, &original).await;
         let first_id = first["id"].as_str().unwrap().to_owned();
 
         // A copy of the folder (the marker comes along), the original still there.
@@ -288,16 +366,14 @@ mod folder_identity {
         )
         .unwrap();
         let copy = register(&state, &duplicate).await;
-        assert_ne!(copy["id"], first["id"]);
-        assert!(!crate::pro::opened_here(
-            &state,
-            copy["id"].as_str().unwrap()
-        ));
-        assert_eq!(
-            identity::read(&duplicate).unwrap().id,
-            copy["id"].as_str().unwrap(),
-            "the duplicate is told its own id"
-        );
+        let copy_id = copy["id"].as_str().unwrap().to_owned();
+        assert_ne!(copy_id, first_id);
+        assert!(!crate::pro::opened_here(&state, &copy_id));
+        // Not enrolled: its folder is left as the user copied it until Pro
+        // takes it on, which tells it its own id.
+        assert_eq!(identity::read(&duplicate).unwrap().id, first_id);
+        crate::pro::enroll_fixture(&state, &copy_id);
+        marker_naming(&duplicate, &copy_id).await;
         assert_eq!(
             identity::read(&original).unwrap().id,
             first_id,
@@ -323,16 +399,13 @@ mod folder_identity {
 
     #[tokio::test]
     async fn an_unreadable_marker_is_no_marker_and_a_wrong_one_is_repaired() {
-        let state = test_state();
+        let state = test_state_with_extension();
         let root = folder("ident-broken");
         std::fs::write(root.join(".chimaera-workspace"), "x".repeat(10_000)).unwrap();
-        let ws = register(&state, &root).await;
-        assert_eq!(
-            identity::read(&root).unwrap().id,
-            ws["id"].as_str().unwrap()
-        );
+        let ws = enrolled(&state, &root).await;
+        let id = ws["id"].as_str().unwrap();
 
-        // A registered root whose marker names another id is repaired.
+        // An enrolled root whose marker names another id is repaired.
         std::fs::write(
             root.join(".chimaera-workspace"),
             r#"{"id":"w-someoneelse","written_at":1}"#,
@@ -340,10 +413,7 @@ mod folder_identity {
         .unwrap();
         let again = register(&state, &root).await;
         assert_eq!(again["id"], ws["id"]);
-        assert_eq!(
-            identity::read(&root).unwrap().id,
-            ws["id"].as_str().unwrap()
-        );
+        marker_naming(&root, id).await;
     }
 
     #[cfg(unix)]
@@ -363,10 +433,10 @@ mod folder_identity {
     }
 
     #[tokio::test]
-    async fn opening_a_workspace_backfills_a_missing_marker_only() {
-        let state = test_state();
+    async fn opening_an_enrolled_workspace_backfills_a_missing_marker_only() {
+        let state = test_state_with_extension();
         let root = folder("ident-backfill");
-        let ws = register(&state, &root).await;
+        let ws = enrolled(&state, &root).await;
         let id = ws["id"].as_str().unwrap();
         std::fs::remove_file(root.join(".chimaera-workspace")).unwrap();
         let (status, _) = request(

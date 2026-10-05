@@ -55,6 +55,10 @@ use tokio::sync::Mutex as AsyncMutex;
 pub(crate) struct ProState {
     root: PathBuf,
     configured: AtomicBool,
+    /// `state.json` existed but could not be read at boot, so which projects
+    /// Pro took on is unknown: every project is treated as enrolled
+    /// ([`enrolled`]) and the other Pro state files fail closed for all.
+    records_unknown: bool,
     worker: AtomicBool,
     generation: AtomicU64,
     runtime: Mutex<Option<protocol::Configure>>,
@@ -451,7 +455,21 @@ impl ProState {
                 status.entry(id.clone()).or_default().git_staging = Some(staging.clone());
             }
         }
-        let authority = authority::Authority::load(&root);
+        // A workspace authority record is only ever written on a cloud
+        // worker (`authority::validate_scoped`). Anywhere else an unreadable
+        // one cannot be a fence this installation relied on, so it never
+        // blocks a free user's projects (`enrolled`).
+        let authority = match authority::Authority::load(&root) {
+            authority::Authority::Invalid
+                if !(disk.worker || crate::cloud::enabled() || unknown) =>
+            {
+                tracing::warn!(
+                    "ignoring an unreadable workspace authority record on a personal computer"
+                );
+                authority::Authority::Unbound
+            }
+            loaded => loaded,
+        };
         let execution = execution::State::restore(
             &root,
             &disk.preferences,
@@ -462,6 +480,7 @@ impl ProState {
         Self {
             root,
             configured: AtomicBool::new(false),
+            records_unknown: unknown,
             worker: AtomicBool::new(disk.worker),
             generation: AtomicU64::new(0),
             runtime: Mutex::new(None),
@@ -510,13 +529,82 @@ impl ProState {
     }
 }
 
+/// Which product this daemon serves. The one rule shared code asks before it
+/// does anything for Pro; durable per-project fences ([`enrolled`]) are
+/// separate and hold in every tier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Tier {
+    /// No Pro extension composed (the open-source daemon) and no account:
+    /// behaves exactly like a daemon without Pro code.
+    Free,
+    /// The official app's extension is composed, but no account configured
+    /// this daemon (signed out, or no plan): Pro does no work yet.
+    Offered,
+    /// An account configured this daemon (`/pro/configure`), or it is a
+    /// cloud machine (`cloud::enabled`), which exists only for Pro.
+    Active,
+}
+pub(crate) fn tier(state: &crate::AppState) -> Tier {
+    if state
+        .pro
+        .configured
+        .load(std::sync::atomic::Ordering::Acquire)
+        || crate::cloud::enabled()
+    {
+        Tier::Active
+    } else if state.daemon_extension.is_some() {
+        Tier::Offered
+    } else {
+        Tier::Free
+    }
+}
+
+/// Whether Pro ever took this project on: an account bound it, or this
+/// daemon holds an ownership, transfer or adoption record for it. A project
+/// that was never enrolled is never fenced by Pro state, whatever happens to
+/// Pro's own files; while `state.json` itself is unreadable every project
+/// counts, so a damaged record never lifts a real fence.
+pub(crate) fn enrolled(state: &crate::AppState, workspace: &str) -> bool {
+    let pro = &state.pro;
+    pro.records_unknown
+        || crate::lock(&pro.ownership).contains_key(workspace)
+        || crate::lock(&pro.preferences)
+            .get(workspace)
+            .is_some_and(|p| p.account.is_some() || p.copy.is_some())
+        || crate::lock(&pro.adoptions).contains_key(workspace)
+        || crate::lock(&pro.legacy_pending).contains(workspace)
+        || crate::lock(&pro.parked).contains(workspace)
+}
+/// Whether this project's folder should carry its identity marker
+/// (`workspaces::identity`): only a project Pro enrolled, on a daemon with
+/// the extension. The marker keys the project's cloud copy and nothing else.
+pub(crate) fn marks_folder(state: &crate::AppState, workspace: &str) -> bool {
+    tier(state) != Tier::Free && enrolled(state, workspace)
+}
+/// Whether this daemon holds any Pro project record at all (see
+/// [`enrolled`]). A never-enrolled installation has none.
+pub(crate) fn any_enrolled(state: &crate::AppState) -> bool {
+    let pro = &state.pro;
+    pro.records_unknown
+        || !crate::lock(&pro.ownership).is_empty()
+        || crate::lock(&pro.preferences)
+            .values()
+            .any(|p| p.account.is_some() || p.copy.is_some())
+        || !crate::lock(&pro.adoptions).is_empty()
+        || !crate::lock(&pro.legacy_pending).is_empty()
+        || !crate::lock(&pro.parked).is_empty()
+}
+
 /// The user opened this project on this computer (registering its folder from
 /// its identity marker, or opening a registered workspace) and this computer
 /// does not hold it: from now on the project may come home here (`lazy_handback`)
 /// even when the account's preferred installation is another one — the
 /// latest computer that had the project is the one it returns to. Bounded;
-/// inert without Pro.
+/// nothing at all without the Pro extension ([`Tier::Free`]).
 pub(crate) fn note_opened(state: &crate::AppState, workspace: &str) {
+    if tier(state) == Tier::Free {
+        return;
+    }
     if project_copy::copy_only(state, workspace) {
         return;
     }
@@ -534,6 +622,16 @@ pub(crate) fn note_opened(state: &crate::AppState, workspace: &str) {
 #[cfg(test)]
 pub(crate) fn opened_here(state: &crate::AppState, workspace: &str) -> bool {
     crate::lock(&state.pro.opened_here).contains(workspace)
+}
+/// What an account binding does to a project (`projects::bind_workspace_account`)
+/// without an account: it counts as enrolled and its folder gets its marker.
+#[cfg(test)]
+pub(crate) fn enroll_fixture(state: &crate::AppState, workspace: &str) {
+    crate::lock(&state.pro.preferences)
+        .entry(workspace.into())
+        .or_default()
+        .account = Some("acct-fixture".into());
+    projects::mark_folder(state, workspace);
 }
 
 /// Only a verified ownership transition or an explicit clean handoff fences a

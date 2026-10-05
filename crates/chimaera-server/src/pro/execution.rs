@@ -980,7 +980,13 @@ pub(crate) async fn restore_manual_parking(
         let result = tokio::task::spawn_blocking(move || {
             let mut boot = boot;
             if maintenance_store::overlay_boot(&owner, &mut boot).is_err() {
+                // The receipt only ever names an enrolled project's
+                // sessions: a project Pro never took on keeps its
+                // automatic restore (`super::enrolled`).
                 for entry in &mut boot.sessions {
+                    if !super::enrolled(&owner, &entry.workspace_id) {
+                        continue;
+                    }
                     entry.suspended = true;
                     entry.manual_resume_reason = Some("unknown".into());
                 }
