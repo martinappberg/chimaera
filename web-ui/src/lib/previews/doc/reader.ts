@@ -28,7 +28,7 @@ import { renderMermaid } from "../../shared/mermaid";
 import { mountEmbed, type EmbedHandle } from "../../shared/embed/mount.svelte";
 import { embedKind, isMissing, parseSizeHint, rawUrl, splitTarget, type TargetResult } from "../../shared/embed/embed";
 import { fragmentReveal, parseEmbedFragment } from "../../shared/embed/fragment";
-import { openPath } from "../../shared/openPath";
+import { openPath, pathPaneFrom } from "../../shared/openPath";
 import type { LinkContext } from "../docLinks";
 import {
   bodyText,
@@ -487,9 +487,10 @@ export class Hydrator {
   openEmbed(slot: HTMLElement): boolean {
     const d = this.drawn.get(slot);
     if (d === undefined) return false;
+    const fromPane = pathPaneFrom(slot);
     return this.embeds.use(d.ref, (a) => {
       const reveal = fragmentReveal(parseEmbedFragment(splitTarget(d.ref.target).fragment, a.path));
-      openPath(a.path, a.kind, { documentFrom: this.opts.docPath, ...(reveal !== undefined ? { reveal } : {}) });
+      openPath(a.path, a.kind, { fromPane, documentFrom: this.opts.docPath, ...(reveal !== undefined ? { reveal } : {}) });
     });
   }
 

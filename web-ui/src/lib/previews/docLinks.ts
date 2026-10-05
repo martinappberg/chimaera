@@ -120,6 +120,8 @@ export interface LinkContext {
 export interface DocLinkHost extends LinkContext {
   /** The document the link is in (absolute daemon path). */
   docPath: string;
+  /** Captured at the gesture, before validation can yield to another pane. */
+  fromPane?: string;
   /** Scroll this document to an anchor; false when it has none such. */
   toAnchor(anchor: string): boolean | Promise<boolean>;
   /** Scroll this document to a line range. */
@@ -226,7 +228,7 @@ async function followPath(
   const anchor = fragment !== null && reveal === null ? decodeAnchor(fragment) : "";
   const anchored = isFile && anchor !== "" && viewKindFor(hit.path) === "markdown";
   if (anchored) requestAnchor(hit.path, anchor);
-  const opened = openPath(hit.path, hit.kind, { split, documentFrom: docPath, ...(reveal !== null ? { reveal } : {}) });
+  const opened = openPath(hit.path, hit.kind, { split, fromPane: host.fromPane, documentFrom: docPath, ...(reveal !== null ? { reveal } : {}) });
   if (!opened) {
     if (anchored) takeAnchor(hit.path);
     host.hint("files can't be opened from here");

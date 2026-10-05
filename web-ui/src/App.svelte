@@ -2351,7 +2351,11 @@
    * the line reveal, which the file view takes once it shows the path.
    */
   function openPathInLayout(path: string, kind: PathKind, opts: OpenPathOptions): void {
-    const from = opts.fromPane;
+    const source = opts.documentFrom !== undefined
+      ? paneForTab(layout.root, { surface: "file", path: opts.documentFrom }) : null;
+    // A document gesture captures its pane before validation. Older callers
+    // supplying only its path still anchor on that view, never on later focus.
+    const from = opts.fromPane ?? source?.paneId;
     const fromPane =
       from !== undefined && findPane(layout.root, from) !== null ? from : layout.focusedPaneId;
     const split = opts.split === true;
@@ -2360,8 +2364,6 @@
       revealInTree(path);
       return;
     }
-    const source = opts.documentFrom !== undefined
-      ? paneForTab(layout.root, { surface: "file", path: opts.documentFrom }) : null;
     if (!split && source?.paneId === fromPane && findPane(layout.root, fromPane)?.active === source.index) {
       layout = openFileLink(pinPaths(layout, get(dirtyFiles)), source.paneId, path);
       if (document.activeElement instanceof HTMLElement) document.activeElement.blur();

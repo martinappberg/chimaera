@@ -7,7 +7,7 @@
    */
   import { untrack } from "svelte";
   import { followDocHref, requestAnchor, showLinkHint } from "../previews/docLinks";
-  import { openPath } from "../shared/openPath";
+  import { openPath, pathPaneFrom } from "../shared/openPath";
   import { activeTheme } from "../settings/store.svelte";
   import type { Span } from "../workspace/knowledge";
   import { linkReferences, type RefMatcher, type ReferenceChips } from "../shared/references";
@@ -49,18 +49,20 @@
     if (/^(mailto|tel):/i.test(href)) return;
     e.preventDefault();
     const docPath = abs(span?.path ?? "");
+    const fromPane = pathPaneFrom(a);
     const x = e.clientX;
     const y = e.clientY;
     void followDocHref(href, split, {
       docPath,
+      fromPane,
       wsRoot,
       workspaceId: wsId,
       toAnchor: (anchor) => {
         requestAnchor(docPath, anchor);
-        return openPath(docPath, "file");
+        return openPath(docPath, "file", { fromPane });
       },
       toLines: (r) => {
-        openPath(docPath, "file", { reveal: r });
+        openPath(docPath, "file", { reveal: r, fromPane });
       },
       hint: (text) => {
         if (box !== null) showLinkHint(box, x, y, text);

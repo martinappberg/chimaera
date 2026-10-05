@@ -16,9 +16,9 @@
 
   function onUnhandledContextMenu(e: MouseEvent): void {
     if (e.defaultPrevented) return;
-    // Editors retain their useful native edit/spelling menu. All other
+    // Editors and xterm retain their native edit/copy/paste menu. Other
     // surfaces opt into app actions; unused space must not offer Reload.
-    if (e.target instanceof Element && e.target.closest("input, textarea, [contenteditable='true']") !== null) return;
+    if (e.target instanceof Element && e.target.closest("input, textarea, [contenteditable='true'], .term-host") !== null) return;
     const selection = window.getSelection()?.toString() ?? "";
     if (selection !== "") {
       contextMenu.openAt(e, [{ label: "Copy selection", onSelect: () => { void writeClipboard(selection); } }]);

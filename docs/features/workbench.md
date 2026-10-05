@@ -155,7 +155,8 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   most 50 paths followed through its links; opening unrelated files and switching tabs do
   not add to that history. Closing and reopening the document, or reopening/reloading the
   window, starts fresh. Moving the tab carries its history. Renames carry the paths and
-  deletions remove them. This trail and the tab return order stay outside the saved layout.
+  deletions remove them. Link and embed resolution retains the gesture's source pane even
+  if focus changes while it resolves. This trail and tab return order stay outside the saved layout.
 - **Where it lives.** `web-ui/src/lib/layout/layout.ts` (`splitPane`, `openFile`/`pinTab`/
   `pinPaths`, `detachTab`, `tabKey`, `moveTabToIndex`/`dropTab`/`dropTabAtRootEdge`,
   `movePane`/`movePaneToRootEdge`/`movePaneToIndex`), `dnd.ts` (custom pointer DnD),

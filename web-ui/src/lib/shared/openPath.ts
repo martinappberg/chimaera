@@ -20,6 +20,11 @@ export interface OpenPathOptions {
   fromPane?: string;
 }
 
+/** Capture the gesture's pane before asynchronous path/embed resolution. */
+export function pathPaneFrom(element: Element | null): string | undefined {
+  return element?.closest(".pane")?.getAttribute("data-pane-id") ?? undefined;
+}
+
 type PathOpener = (path: string, kind: PathKind, opts: OpenPathOptions) => void;
 let opener: PathOpener | null = null;
 

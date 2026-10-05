@@ -577,6 +577,7 @@
 <div class="pane-shell">
 <section
   class="pane"
+  data-pane-id={node.id}
   class:focused
   class:linked={linkHue !== null}
   class:agent-exec={agentExec}
