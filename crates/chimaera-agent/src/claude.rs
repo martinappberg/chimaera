@@ -1373,13 +1373,14 @@ impl ClaudeMapper {
                 if let Some(id) = frame["session_id"].as_str() {
                     self.native_session_id = Some(id.to_string());
                 }
-                let native = frame["capabilities"]
-                    .as_array()
-                    .is_some_and(|caps| caps.iter().any(|c| c == MSG_LIFECYCLE_CAPABILITY));
+                let advertises = |capability: &str| {
+                    frame["capabilities"]
+                        .as_array()
+                        .is_some_and(|caps| caps.iter().any(|c| c == capability))
+                };
+                let native = advertises(MSG_LIFECYCLE_CAPABILITY);
                 self.native_queue = Some(native);
-                self.send_now_capable = frame["capabilities"]
-                    .as_array()
-                    .is_some_and(|caps| caps.iter().any(|c| c == SEND_NOW_CAPABILITY));
+                self.send_now_capable = advertises(SEND_NOW_CAPABILITY);
                 if native {
                     // Sent before this first init could say which kind of CLI
                     // this is: the CLI's own queue takes them from here.
@@ -3028,6 +3029,11 @@ impl ClaudeMapper {
                 }
                 return;
             }
+            // A refused send-now stopped nothing: a later genuine error must
+            // not read as the user's stop (unless a Stop is also in flight).
+            if matches!(pending, PendingControl::SendNow) && self.interrupt_grace.is_none() {
+                self.interrupt_requested = false;
+            }
             step.events.push(AgentEvent::Error {
                 message: if matches!(pending, PendingControl::SetModel(_)) {
                     let detail = frame["response"]["error"]
@@ -3098,10 +3104,18 @@ impl ClaudeMapper {
             // the user's doing either way, so the flag stays. Only
             // `nothing_waiting` did nothing at all.
             PendingControl::SendNow => match payload["send_now"].as_str() {
-                Some("stopped") if self.turn_active || self.turn_starting => {
+                // The flag is consumed at every result: once it is gone the
+                // stopped turn has ended, and the open one is the next.
+                Some("stopped")
+                    if self.interrupt_requested && (self.turn_active || self.turn_starting) =>
+                {
                     self.interrupt_grace = Some(INTERRUPT_GRACE_TICKS);
                 }
-                Some("nothing_waiting") => self.interrupt_requested = false,
+                // A Stop pressed while this request was in flight armed the
+                // watchdog and owns the flag: its abort is still the user's.
+                Some("nothing_waiting") if self.interrupt_grace.is_none() => {
+                    self.interrupt_requested = false;
+                }
                 _ => {}
             },
             PendingControl::ContextUsage => {
@@ -6035,6 +6049,51 @@ pub(crate) mod tests {
         }));
         assert!(!m.interrupt_requested);
         assert!(m.interrupt_grace.is_none());
+    }
+
+    /// A Stop pressed while a send-now is in flight stays the user's stop,
+    /// whatever the send-now's receipt says; a refused send-now on its own
+    /// leaves no flag behind.
+    #[test]
+    fn a_send_now_receipt_never_clears_a_stop_in_flight() {
+        let capable = || {
+            let mut m = native_mapper_mid_turn();
+            m.on_frame(&json!({
+                "type": "system", "subtype": "init", "session_id": "native-1",
+                "capabilities": ["msg_lifecycle_v1", "interrupt_send_now_v1"],
+            }));
+            let (b, _) = send_text(&mut m, "B", false);
+            let step = m.on_command(AgentCommand::SendNow { id: b });
+            let ctl = step.outbound[0]["request_id"].clone();
+            (m, ctl)
+        };
+        let nothing_waiting = |ctl: &Value| {
+            json!({
+                "type": "control_response",
+                "response": { "subtype": "success", "request_id": ctl,
+                    "response": { "still_queued": [], "send_now": "nothing_waiting" } },
+            })
+        };
+        let refused = |ctl: &Value| {
+            json!({
+                "type": "control_response",
+                "response": { "subtype": "error", "request_id": ctl, "error": "no" },
+            })
+        };
+
+        let (mut m, ctl) = capable();
+        m.on_command(AgentCommand::Interrupt);
+        m.on_frame(&nothing_waiting(&ctl));
+        assert!(m.interrupt_requested, "the Stop's abort is the user's");
+
+        let (mut m, ctl) = capable();
+        m.on_command(AgentCommand::Interrupt);
+        m.on_frame(&refused(&ctl));
+        assert!(m.interrupt_requested);
+
+        let (mut m, ctl) = capable();
+        m.on_frame(&refused(&ctl));
+        assert!(!m.interrupt_requested, "a refused send-now stopped nothing");
     }
 
     /// Send now ends the running turn; the CLI then runs what is still in its

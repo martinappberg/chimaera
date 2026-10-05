@@ -92,7 +92,7 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   turn", until the agent actually reads it (claude: the CLI's `command_lifecycle started`; codex:
   the steered message's `userMessage` item — not the RPC ack). Then it leaves the stack and enters
   the transcript right there, solid — mid-turn if that is where it was read. Each waiting bubble
-  has **Send now** (stops the current turn; every waiting message is then read at once — claude
+  has **Send now** (stops the current turn, unless Claude can take the message into it by moving what the turn waits on to the background; every waiting message is then read at once — claude
   keeps its queue through the interrupt, and Chimaera re-sends the steers Codex drops; Claude's
   background agents keep running, because Chimaera sends the CLI's own send-now rather than its
   Stop, which ends them for good) and **✕**
