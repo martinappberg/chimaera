@@ -224,6 +224,9 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   settings tuple so a prior reviewer, sandbox, approval policy, or collaboration mode cannot stay
   invisibly active. Claude's launch-gated Bypass permissions mode is not offered: structured chat
   sessions do not start with `--dangerously-skip-permissions`, so Claude would reject the switch.
+  Grok Build advertises no modes over ACP; Chimaera offers the two its mode switch confirms,
+  Normal and Plan. Always-approve and Auto-review are not offered: Grok confirms no mid-chat
+  switch for them (`/always-approve` still types).
   New and resumed Codex chats default to **Auto review** at thread open — workspace writes remain
   sandboxed and escalation remains on-request, while `auto_review` assesses approval requests.
   The header reflects that state from the first `Init`; `/mode auto-review` switches it explicitly,

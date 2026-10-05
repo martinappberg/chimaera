@@ -2834,6 +2834,19 @@ and `session/set_config_option` returns the authoritative current values. `confi
 can replace controls; absence removes an effort control. Grok advertised image input false;
 Google true. Buttons and attachment admission follow that negotiated capability.
 
+Grok 1.0.46 advertises no modes: `session/new` has no `modes` and no `mode` config option (its
+`configOptions` are `model` and `reasoning_effort`). `session/set_mode` still answers `{}` for any
+`modeId`, but only `plan` and `default` do anything: each is confirmed by a `current_mode_update`
+(`currentModeId` `plan` / `default`). `auto`, `bypassPermissions`, `acceptEdits`, `dontAsk` and an
+invented id are accepted with no update. The adapter therefore offers Grok exactly Normal
+(`default`) and Plan (`plan`), Grok's own names for them. Its other permission modes have no
+verified mid-session switch: `x.ai/toggle_plan_mode` and every `x.ai/*yolo*` method guess return
+method-not-found; a `/always-approve on` prompt ends with zero tokens and `_x.ai/sessions/changed`
+still reports `yolo: false`; `_meta.yoloMode` on `session/new` does report `yolo: true`.
+Auto-review is gated per account (`_x.ai/settings/update` `auto_permission_mode_enabled`, null on
+the probed account; `/auto` is then absent from the command list). Recorded with protocol probes
+only (2026-10-04); what Plan and always-approve change in a model turn is not yet observed.
+
 A `session/prompt` response ends the turn (`end_turn` or `cancelled`). Permission requests are
 agent-initiated JSON-RPC requests; replies preserve the original numeric/string id and choose
 only an offered `optionId`. Cancellation resolves open permission requests as cancelled before

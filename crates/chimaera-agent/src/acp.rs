@@ -136,6 +136,7 @@ impl Driver for AcpAdapter {
             return Err("Invalid ACP sessionId".into());
         }
         let mut mapper = AcpMapper::new(native.to_owned(), &init, &session);
+        mapper.offer_unadvertised_modes(self.kind);
         // ACP has no portable system-context field. Hold the bounded handoff
         // until a real user send: opening a fork must stay idle and unbilled.
         mapper.portable_context = spec.portable_context.clone();
@@ -294,6 +295,25 @@ impl AcpMapper {
         }
         mapper.set_config(&session["configOptions"]);
         mapper
+    }
+    /// Grok 1.0.46 advertises no modes, yet `session/set_mode` switches its
+    /// plan mode and confirms with `current_mode_update` (PROTOCOL.md, ACP).
+    /// Offer exactly the two ids that read back; every other id is accepted
+    /// silently and changes nothing. A session that advertises modes keeps
+    /// its own list.
+    fn offer_unadvertised_modes(&mut self, kind: &str) {
+        if kind != GROK.kind || !self.modes.is_empty() {
+            return;
+        }
+        self.modes = [("default", "Normal"), ("plan", "Plan")]
+            .into_iter()
+            .map(|(id, label)| ModeInfo {
+                id: id.into(),
+                label: label.into(),
+            })
+            .collect();
+        self.mode.get_or_insert_with(|| "default".into());
+        self.caps.commands.push("set_mode".into());
     }
     fn set_config(&mut self, config: &Value) {
         // Keep only bounded controls; descriptions and provider metadata are
@@ -957,6 +977,42 @@ mod tests {
     use super::*;
     fn mapper() -> AcpMapper {
         AcpMapper::new("session".into(), &json!({}), &json!({}))
+    }
+    #[test]
+    fn grok_offers_the_plan_switch_it_does_not_advertise() {
+        let mut m = mapper();
+        m.offer_unadvertised_modes(GROK.kind);
+        assert_eq!(
+            m.modes.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["default", "plan"]
+        );
+        assert_eq!(m.mode.as_deref(), Some("default"));
+        assert!(m.caps.commands.contains(&"set_mode".into()));
+        let step = m.on_command(AgentCommand::SetMode {
+            mode_id: "plan".into(),
+        });
+        assert_eq!(step.outbound[0]["method"], "session/set_mode");
+        assert_eq!(step.outbound[0]["params"]["modeId"], "plan");
+        // An id Grok would accept silently is never sent.
+        let step = m.on_command(AgentCommand::SetMode {
+            mode_id: "bypassPermissions".into(),
+        });
+        assert!(step.outbound.is_empty());
+
+        // Other adapters, and a session that advertises its own modes, are
+        // left as reported.
+        let mut agy = mapper();
+        agy.offer_unadvertised_modes(ANTIGRAVITY.kind);
+        assert!(agy.modes.is_empty());
+        assert!(!agy.caps.commands.contains(&"set_mode".into()));
+        let mut own = AcpMapper::new(
+            "session".into(),
+            &json!({}),
+            &json!({"modes":{"currentModeId":"ask","availableModes":[{"id":"ask","name":"Ask"}]}}),
+        );
+        own.offer_unadvertised_modes(GROK.kind);
+        assert_eq!(own.modes.len(), 1);
+        assert_eq!(own.mode.as_deref(), Some("ask"));
     }
     fn send(mapper: &mut AcpMapper, text: &str) -> DriverStep {
         mapper.on_command(AgentCommand::Send {
