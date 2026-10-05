@@ -277,21 +277,21 @@ the product thesis in one screen). Interactions:
   the session-hue idea from the interaction model applies here first).
 
 **Tabs within panes** (added same day). A pane holds a *stack* of surfaces with a quiet tab
-bar (always present, with pane controls and a quiet numbered badge): one active
+bar (always present, with pane controls): one active
 tab per pane. Clicking a rail session opens it as a tab in the focused pane — or focuses the
 existing tab if it's already open somewhere (VS Code semantics, no duplicates by default).
 Drag tabs to reorder, drag between panes, drag to a pane edge to tear off into a new split;
 middle-click closes a tab (closing a tab detaches the view, never kills the session — the
 rail is the source of truth for lifecycle). Keyboard: Ctrl+Tab / Ctrl+Shift+Tab cycles tabs in
-the focused pane. Cmd+T/Cmd+W stay unbound in the browser (tab-collision; the Tauri shell
+the focused pane in the native app; browsers use Mod+Alt+] / Mod+Alt+[. Cmd+T/Cmd+W stay unbound in the browser (tab-collision; the Tauri shell
 owns them properly). At M3, files open the same way: a preview tab in the focused pane.
 
 **Modifier policy (post-audit, 2026-07-06): the terminal owns bare Ctrl, everywhere.** App
 chords are Cmd-based on macOS and Ctrl+Shift-based on Linux/Windows (the terminal-emulator
 convention). A workbench that steals Ctrl+D from a shell is broken by definition — the first
 UX audit caught exactly this.
-Ctrl+Tab / Ctrl+Shift+Tab are the explicit editor-style exception: they navigate the focused
-pane's tabs. Other control chords still belong to the terminal. The pane shortcuts and
+Native Ctrl+Tab / Ctrl+Shift+Tab are the explicit editor-style exception: they navigate the focused
+pane's tabs. Browser defaults avoid those browser-owned chords. Other control chords still belong to the terminal. The pane shortcuts and
 document navigation are described in [the workbench feature page](../features/workbench.md).
 
 **The parity principle (author, 2026-07-06): every action has BOTH a keyboard chord and a

@@ -108,7 +108,8 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   Open a surface → it appends a tab to the focused pane (VS Code "no duplicates": if already
   open anywhere, that tab is focused). Middle-click or `×` closes a tab (**detaches the view —
   never kills the session**). `Ctrl+Tab` / `Ctrl+Shift+Tab` cycle forward/backward in the
-  focused pane, wrapping at either end. Closing its active tab returns to the most recently
+  focused pane in the native app; browsers use `Mod+Alt+]` / `Mod+Alt+[` because they own
+  Ctrl+Tab for browser tabs. Both wrap at either end. Closing its active tab returns to the most recently
   used surviving tab, including the agent or workspace view underneath a document. Tab focuses the selected tab;
   Left/Right and Home/End activate and reveal tabs without moving focus into the document. Drag a tab to reorder within a bar,
   move to another pane, tear off into a split, or slam a **window edge** to split the whole window.

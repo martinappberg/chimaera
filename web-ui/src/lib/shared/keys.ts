@@ -16,8 +16,8 @@
  * is a wildcard for all four arrows; the matcher reports which one fired.
  *
  * Policy invariant: the terminal owns bare Ctrl on every platform, so no
- * modifier option resolves to Ctrl alone. Ctrl+Tab / Ctrl+Shift+Tab are
- * explicit pane-tab navigation shortcuts, like a native editor's tab strip.
+ * modifier option resolves to Ctrl alone. Native pane-tab cycling uses
+ * Ctrl+Tab / Ctrl+Shift+Tab; browsers own those, so use Mod+Alt+[ / ].
  */
 
 interface NavigatorUAData {
@@ -32,6 +32,10 @@ export const isMac: boolean = (() => {
   }
   return /mac|iphone|ipad/i.test(navigator.platform);
 })();
+
+// Keep this registry independent of native.ts's API/settings imports. The
+// shell installs its global bridge before loading the daemon-served bundle.
+const nativeTabs = typeof window !== "undefined" && Boolean((window as { __TAURI__?: unknown }).__TAURI__);
 
 // --- the action registry -----------------------------------------------------
 
@@ -158,13 +162,13 @@ export const ACTIONS = [
     id: "cyclePrev",
     label: "Previous Tab",
     description: "Activate the previous tab in the focused pane.",
-    def: "Ctrl+Shift+Tab",
+    def: nativeTabs ? "Ctrl+Shift+Tab" : "Mod+Alt+[",
   },
   {
     id: "cycleNext",
     label: "Next Tab",
     description: "Activate the next tab in the focused pane.",
-    def: "Ctrl+Tab",
+    def: nativeTabs ? "Ctrl+Tab" : "Mod+Alt+]",
   },
   {
     id: "focusArrows",

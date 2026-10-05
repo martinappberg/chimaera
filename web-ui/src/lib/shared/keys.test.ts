@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { chordDigit, matchChord, paneMoveChord, parseChord } from "./keys";
 
 function digit(modifiers: Partial<KeyboardEvent>): KeyboardEvent {
@@ -34,5 +34,30 @@ describe("numbered pane shortcuts", () => {
   it("rejects unrelated modifiers and non-digit keys", () => {
     expect(chordDigit(digit({ metaKey: true, altKey: true, shiftKey: true }), "cmd", true)).toBeNull();
     expect(chordDigit(digit({ metaKey: true, ctrlKey: true, code: "KeyQ" }), "cmd", true)).toBeNull();
+  });
+});
+
+describe("host-specific pane-tab defaults", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.resetModules();
+  });
+
+  it.each(["MacIntel", "Win32", "Linux x86_64"])("uses browser-deliverable chords on %s", async (platform) => {
+    vi.stubGlobal("window", {});
+    vi.stubGlobal("navigator", { platform });
+    vi.resetModules();
+    const { ACTION_BY_ID } = await import("./keys");
+    expect(ACTION_BY_ID.get("cyclePrev")?.def).toBe("Mod+Alt+[");
+    expect(ACTION_BY_ID.get("cycleNext")?.def).toBe("Mod+Alt+]");
+  });
+
+  it.each(["MacIntel", "Win32", "Linux x86_64"])("keeps native editor tab cycling on %s", async (platform) => {
+    vi.stubGlobal("window", { __TAURI__: {} });
+    vi.stubGlobal("navigator", { platform });
+    vi.resetModules();
+    const { ACTION_BY_ID } = await import("./keys");
+    expect(ACTION_BY_ID.get("cyclePrev")?.def).toBe("Ctrl+Shift+Tab");
+    expect(ACTION_BY_ID.get("cycleNext")?.def).toBe("Ctrl+Tab");
   });
 });
