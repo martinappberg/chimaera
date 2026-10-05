@@ -484,30 +484,3 @@ pub async fn pro_cloud_request(
         None => Err(super::ABSENT.into()),
     }
 }
-
-#[tauri::command]
-pub async fn pro_settle_setup_proposal(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
-    workspace_id: String,
-    shown: String,
-    decision: types::profile::Decision,
-    expected_account_lifetime: Option<String>,
-) -> Result<types::profile::Outcome, String> {
-    let owner = app.state::<crate::shell::Shell>().pro.owner().cloned();
-    match owner {
-        Some(owner) => {
-            owner
-                .pro_settle_setup_proposal(
-                    app,
-                    window,
-                    workspace_id,
-                    shown,
-                    decision,
-                    expected_account_lifetime,
-                )
-                .await
-        }
-        None => Err(super::ABSENT.into()),
-    }
-}

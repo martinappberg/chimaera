@@ -56,9 +56,6 @@ impl Scenario {
         membership.remove(id);
         Ok(())
     }
-    pub fn cloud_profile(&self) -> Option<crate::pro::policy::CloudProfile> {
-        crate::pro::workspace_profile(&self.harness.state, &self.key)
-    }
     pub async fn spawn_fixture_codex(&self, script: PathBuf) -> Result<String> {
         let workspace = lock(&self.harness.state.workspaces)
             .get(&self.key)
@@ -293,8 +290,12 @@ impl Scenario {
     /// Seeds what the last move's configuration export left out.
     pub fn seed_fixture_environment(&self, names: &[&str]) -> Result<()> {
         let mut preferences = lock(&self.harness.state.pro.preferences);
-        let profile = &mut preferences.entry(self.key.clone()).or_default().profile;
-        profile.missing_environment = names.iter().take(32).map(|n| n.to_string()).collect();
-        profile.validate()
+        let names: Vec<String> = names.iter().take(32).map(|n| n.to_string()).collect();
+        crate::pro::policy::validate_missing_environment(&names)?;
+        preferences
+            .entry(self.key.clone())
+            .or_default()
+            .missing_environment = names;
+        Ok(())
     }
 }

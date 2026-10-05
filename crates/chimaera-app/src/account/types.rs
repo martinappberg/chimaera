@@ -240,18 +240,3 @@ impl account::Status {
     }
 }
 
-pub mod profile {
-    use serde::{Deserialize, Serialize};
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
-    #[serde(rename_all = "snake_case")]
-    pub enum Decision {
-        Confirm,
-        Dismiss,
-    }
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-    #[serde(rename_all = "snake_case")]
-    pub enum Outcome {
-        Saved,
-        Changed,
-    }
-}

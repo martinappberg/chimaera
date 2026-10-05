@@ -1472,14 +1472,6 @@ export type CloudSetupRequest = { operation: "info" | "start" | "providers" }
   | { operation: "resume_handoff"; workspace_id: string; expected_epoch: number }
   | { operation: "project"; url: string; name?: string };
 
-export interface MirrorProfile {
-  setup_command: string | null;
-  /** Additive: a setup command an agent proposed. It never runs until the
-   * user confirms it in the private account surface, making it `setup_command`. */
-  pending_setup_command?: string | null;
-  /** Environment variable names the last move's configuration export left out. */
-  missing_environment: string[];
-}
 export interface LocalProjectCopy { state: "ready" | "pending" | "taking_over" | "recovery_needed"; ready: boolean; checkpoint?: unknown | null; owner_epoch?: number | null }
 export type GitStagingStatus = { state: "uncaptured" } | { state: "synced" } | { state: "conflicts"; paths: string[]; total: number; recovery: string };
 export interface MirrorWorkspace {
@@ -1492,7 +1484,6 @@ export interface MirrorWorkspace {
   mirror: { files: number; bytes: number; excluded: number; too_large: number; last_mirrored_at: number | null; storage_limit_bytes: number; error: string | null;
     /** Additive (newer daemons): a stable code for `error`, and the files the last return kept in both versions. */
     error_code?: string | null; kept_both?: number; kept_paths?: string[]; git_staging?: GitStagingStatus } | null;
-  profile: MirrorProfile | null;
   git_branches?: string[] | null;
   blocked_providers?: CloudBlockedProvider[];
 }

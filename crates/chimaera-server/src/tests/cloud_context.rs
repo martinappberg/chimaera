@@ -232,22 +232,20 @@ async fn absent_runtime_hands_agents_exactly_what_a_free_daemon_does() {
                 crate::chat::codex_developer_note(&state, &codex, "s-cloud").await;
             assert_eq!(note, None, "{label}: codex developer note");
             assert!(placement.is_none());
-            for name in ["where_am_i", "update_cloud_profile"] {
-                let (status, answer) = rpc(
-                    port,
-                    "s-cloud",
-                    "cloud-fixture",
-                    "tools/call",
-                    json!({"name":name,"arguments":{"expected_revision":"0".repeat(64),"setup_command":"touch forbidden-auto-execution"}}),
-                )
-                .await;
-                assert_eq!(status, StatusCode::OK);
-                assert_eq!(
-                    answer["error"],
-                    json!({"code":-32602,"message":format!("unknown tool: {name}")}),
-                    "{label}: {answer}"
-                );
-            }
+            let (status, answer) = rpc(
+                port,
+                "s-cloud",
+                "cloud-fixture",
+                "tools/call",
+                json!({"name":"where_am_i","arguments":{}}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                answer["error"],
+                json!({"code":-32602,"message":"unknown tool: where_am_i"}),
+                "{label}: {answer}"
+            );
         }
     };
     check("never configured").await;
@@ -271,7 +269,6 @@ async fn absent_runtime_hands_agents_exactly_what_a_free_daemon_does() {
         ));
     }
     assert!(!crate::pro::storage(&state).join(&workspace.id).exists());
-    assert!(!root.join("forbidden-auto-execution").exists());
     assert!(state.sessions.list().is_empty() && state.chat.list().is_empty());
     request(&state, Method::DELETE, "/api/v1/pro/configure", None).await;
     server.abort();
@@ -290,10 +287,7 @@ impl crate::daemon_extension::Runtime for Wording {
         Box::pin(async {})
     }
     fn guidance_definitions(&self) -> Vec<Value> {
-        vec![
-            json!({"name":"where_am_i","description":"fixture","inputSchema":{"type":"object"}}),
-            json!({"name":"update_cloud_profile","description":"fixture","inputSchema":{"type":"object"}}),
-        ]
+        vec![json!({"name":"where_am_i","description":"fixture","inputSchema":{"type":"object"}})]
     }
     fn placement_note(&self, facts: &crate::daemon_extension::guidance::Facts) -> Option<String> {
         Some(format!(
@@ -302,17 +296,6 @@ impl crate::daemon_extension::Runtime for Wording {
             facts.arrival.as_ref().and_then(|a| a.from_os.clone()),
             facts.kept_both.len()
         ))
-    }
-    fn guidance_setup(
-        &self,
-        _profile: &crate::daemon_extension::project::CloudProfile,
-        proposed: Option<&str>,
-    ) -> Option<crate::daemon_extension::guidance::GuidanceSetup> {
-        Some(crate::daemon_extension::guidance::GuidanceSetup {
-            setup_command: proposed.map(str::to_owned),
-            pending_setup_command: None,
-            note: "saved",
-        })
     }
 }
 
@@ -464,79 +447,6 @@ async fn a_synced_projects_agents_hear_where_they_run_once_per_change() {
     request(&state, Method::DELETE, "/api/v1/pro/configure", None).await;
     let kept = crate::pro::storage(&state).join(&workspace.id);
     assert!(!kept.join("arrival.json").exists() && !kept.join("told.json").exists());
-    server.abort();
-    let _ = server.await;
-    drop(state);
-    std::fs::remove_dir_all(data).unwrap();
-}
-
-/// An agent that leaves `setup_command` out of `update_cloud_profile` keeps
-/// the command the user confirmed.
-#[tokio::test]
-async fn an_update_without_a_setup_command_keeps_the_confirmed_one() {
-    let data = test_dir("cloud-context-setup").canonicalize().unwrap();
-    let state = test_state_with_runtime(data.clone(), Arc::new(Wording));
-    state
-        .stopping
-        .store(true, std::sync::atomic::Ordering::Release);
-    let root = data.join("project");
-    std::fs::create_dir(&root).unwrap();
-    let workspace = lock(&state.workspaces).add(root.clone()).unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let app = crate::app(state.clone());
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    configure(&state, port, "device").await;
-    crate::pro::enroll_for_tests(&state, &workspace.id);
-    lock(&state.agents).insert(
-        "s-cloud".into(),
-        AgentRecord::new("cloud-fixture".into(), AgentKind::Claude),
-    );
-    lock(&state.session_workspaces).insert("s-cloud".into(), workspace.id.clone());
-    let before = crate::pro::workspace_profile(&state, &workspace.id).unwrap();
-    let confirmed = crate::pro::CloudProfile {
-        setup_command: Some("npm ci".into()),
-        ..before.clone()
-    };
-    crate::pro::save_workspace_profile(
-        &state,
-        &workspace.id,
-        crate::pro::profile_generation(&state),
-        &before,
-        confirmed,
-    )
-    .await
-    .unwrap();
-    let lookup = |name: &'static str, arguments: Value| async move {
-        let (_, answer) = rpc(
-            port,
-            "s-cloud",
-            "cloud-fixture",
-            "tools/call",
-            json!({"name":name,"arguments":arguments}),
-        )
-        .await;
-        let text = answer["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        serde_json::from_str::<Value>(&text).unwrap_or(json!({"text": text}))
-    };
-    let revision = lookup("where_am_i", json!({})).await["profile_revision"].clone();
-    let saved = lookup(
-        "update_cloud_profile",
-        json!({"expected_revision": revision}),
-    )
-    .await;
-    assert_eq!(saved["saved"], true, "{saved}");
-    assert_eq!(
-        crate::pro::workspace_profile(&state, &workspace.id)
-            .unwrap()
-            .setup_command
-            .as_deref(),
-        Some("npm ci")
-    );
-    request(&state, Method::DELETE, "/api/v1/pro/configure", None).await;
     server.abort();
     let _ = server.await;
     drop(state);

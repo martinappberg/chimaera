@@ -354,14 +354,7 @@ impl ProjectOwner {
         .await
     }
     pub async fn finish_existing_hydration(&self, epoch: u64) -> Result<()> {
-        super::finish_hydration(
-            &self.state,
-            &self.workspace,
-            epoch,
-            self.generation,
-            async { Ok(()) },
-        )
-        .await
+        super::finish_hydration(&self.state, &self.workspace, epoch, self.generation).await
     }
     pub async fn resume_deferred(&self) -> Result<()> {
         crate::ledger::resume_deferred_workspace(&self.state, &self.workspace).await
@@ -607,12 +600,9 @@ impl SnapshotOwner {
         };
         config::export_with_image(sources, destination, budget, image).await
     }
-    pub fn profile(&self) -> super::super::policy::CloudProfile {
-        lock(&self.project.state.pro.preferences)
-            .entry(self.project.workspace.clone())
-            .or_default()
-            .profile
-            .clone()
+    /// Environment variable names the last move into this project left out.
+    pub fn missing_environment(&self) -> Vec<String> {
+        crate::pro::missing_environment(&self.project.state, &self.project.workspace)
     }
     pub fn metadata(&self) -> Option<super::super::projects::catalog::Metadata> {
         super::super::projects::catalog::metadata(self.name(), self.visible())
@@ -641,7 +631,7 @@ impl SnapshotOwner {
     }
     pub fn record_publication(
         &self,
-        profile: super::super::policy::CloudProfile,
+        missing_environment: Vec<String>,
         tree: String,
         handoff: String,
         report: super::super::mirror::Report,
@@ -651,7 +641,7 @@ impl SnapshotOwner {
         {
             let mut entries = lock(&state.pro.preferences);
             let preference = entries.entry(workspace.into()).or_default();
-            preference.profile = profile;
+            preference.missing_environment = missing_environment;
             preference.published_tree = Some(tree);
             if self.negotiated() {
                 preference.published_handoff = Some(handoff);

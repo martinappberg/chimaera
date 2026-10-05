@@ -646,7 +646,7 @@ impl Scenario {
             Seed::CopyAndPreference(value) => {
                 bounded(&value)?;
                 let preference: crate::pro::Preference = serde_json::from_value(value)?;
-                preference.profile.validate()?;
+                crate::pro::policy::validate_missing_environment(&preference.missing_environment)?;
                 lock(&state.pro.preferences).insert(key.clone(), preference);
             }
             Seed::ExecutionObservation { baton, accept } => {

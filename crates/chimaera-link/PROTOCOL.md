@@ -607,10 +607,9 @@ Content-Type and the explicit wake marker, and never accepts a destination URL.
 
 Allowed method/path pairs after `/http/` are `GET api/v1/sessions`,
 `GET|POST api/v1/workspaces`, `GET api/v1/pro/bundles/{session_id}`,
-`POST api/v1/pro/bundles/{session_id}/export`, `POST api/v1/pro/bundles`, and
-`GET|PUT api/v1/pro/profile`. Profile GET adds `ETag` and `Cache-Control: no-store`; PUT accepts one exact quoted SHA-256 `If-Match` and returns 412 if the profile or account generation changed. Missing `If-Match` retains legacy unconditional behavior; malformed or multiple conditions return 400. This changes no JSON fields. Bundle import accepts only `fork=true|false`,
-`origin=moved|home`, and unsigned `epoch` query parameters; profile accepts only
-`workspace_id`. Session and workspace identifiers use letters, digits, `_` and
+`POST api/v1/pro/bundles/{session_id}/export` and `POST api/v1/pro/bundles`.
+Bundle import accepts only `fork=true|false`, `origin=moved|home`, and
+unsigned `epoch` query parameters. Session and workspace identifiers use letters, digits, `_` and
 `-`, up to 128 bytes. Other routes, methods and query keys are rejected.
 
 Bodies stream with a 128 MiB ceiling; response preparation is bounded to two

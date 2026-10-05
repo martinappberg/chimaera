@@ -6,7 +6,6 @@ import { pageVisible } from "../shared/visibility";
 import { matchAction, keyHint } from "../shared/keybindings";
 import { cloudOnboarding } from "../pro/onboarding.svelte";
 import { requestKeptReview } from "../pro/kept";
-import { readSetupProfile, saveSetupProfile } from "../pro/profile";
 import { legacyCloudRequest, readBrowserMirrorStatus } from "./accountDaemon";
 import type { AccountHostScope } from "./accountPresentation";
 export function accountHostScope(original: Pick<AccountHostScope, "current" | "signal" | "retire" | "modal" | "openWorkspace" | "originalIntent">): AccountHostScope {
@@ -19,7 +18,6 @@ export function accountHostScope(original: Pick<AccountHostScope, "current" | "s
     pageVisible, paidPlan, writeClipboard, navigateHome,
     settingsShortcut: event => matchAction(event)?.id === "settings", settingsKeyHint: () => keyHint("settings"),
     requestKeptReview, legacyCloudRequest, readBrowserMirrorStatus,
-    readSetupProfile, saveSetupProfile,
     cloudOnboarding: {
       get context() {
         check(); const value = cloudOnboarding.context;

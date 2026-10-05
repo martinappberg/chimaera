@@ -750,7 +750,7 @@ async fn tools_call(
     // A synced project's own tools, where they are offered, before any
     // plugin's of the same name (`cloud_context::NAMES` are not reserved).
     if cloud_context::NAMES.contains(&name) && cloud_context::available(state, agent_id) {
-        return Ok(cloud_context::call(state, agent_id, name, &args).await);
+        return Ok(cloud_context::call(state, agent_id, &args).await);
     }
     // Plugin tools: offered only where their plugin is active; the same
     // gate on call (a caller can name a tool it was never offered).

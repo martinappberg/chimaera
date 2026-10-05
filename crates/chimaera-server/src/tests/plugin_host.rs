@@ -10,10 +10,9 @@ use std::time::{Duration, Instant};
 use super::support::*;
 use crate::{lock, AppState};
 
-/// As before Pro: a plugin may name a tool `where_am_i` or
-/// `update_cloud_profile`. Only an enrolled project's agents on a daemon with
-/// the optional Runtime get Chimaera's own tools of those names instead
-/// (`mcp::cloud_context::NAMES`).
+/// As before Pro: a plugin may name a tool `where_am_i`. Only an enrolled
+/// project's agents on a daemon with the optional Runtime get Chimaera's own
+/// tool of that name instead (`mcp::cloud_context::NAMES`).
 #[test]
 fn plugins_may_use_the_cloud_tool_names_a_free_daemon_never_offers() {
     let manifest = |tool: &str| {
@@ -22,7 +21,7 @@ fn plugins_may_use_the_cloud_tool_names_a_free_daemon_never_offers() {
              summary = \"Fixture\"\napi = \"0.1\"\n[provides]\nmcp_tools = [\"{tool}\"]\n"
         )
     };
-    for tool in ["plugin_profile", "where_am_i", "update_cloud_profile"] {
+    for tool in ["plugin_profile", "where_am_i"] {
         assert!(
             crate::plugins::parse_manifest(&manifest(tool)).is_ok(),
             "{tool}"
