@@ -27,10 +27,23 @@ describe("hookNotice", () => {
     });
   });
 
+  it("takes the name as claude wrote it, up to the first says", () => {
+    // What a hook matched is not always a tool: a server's or a file's name
+    // can hold spaces and punctuation.
+    expect(
+      hookNotice("Elicitation:my docs (beta) says: one\nElicitation:my docs (beta) says: two"),
+    ).toEqual({ hook: "Elicitation:my docs (beta)", lines: ["one", "two"] });
+    expect(hookNotice("Stop says: Simon says: sit\nStop says: stand")).toEqual({
+      hook: "Stop",
+      lines: ["Simon says: sit", "stand"],
+    });
+  });
+
   it("leaves everything else alone", () => {
     expect(hookNotice("SessionStart:startup says: hello")).toBeNull();
     expect(hookNotice("Stop says: one\nand a line of something else")).toBeNull();
     expect(hookNotice("Stop says: one\nSubagentStop says: two")).toBeNull();
+    expect(hookNotice("Stop says:one\nStop says:two")).toBeNull();
     expect(hookNotice("MCP server config skipped: a, b")).toBeNull();
   });
 });

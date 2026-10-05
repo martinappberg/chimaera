@@ -2908,3 +2908,16 @@ into the model picker. Such placeholders must not produce `ModelSwitched` or ent
 resume/pref state. Real assistant-message model observations use `reason: "reported"`;
 only the successful `set_model` acknowledgement uses `reason: null` to persist a user
 preference. The catalog's `value` remains the exact argument sent to `set_model`.
+
+### Hooks fired inside a subagent carry the subagent's folder (2026-10-04, live probe, claude 2.1.289)
+
+With an `Agent` call under `isolation: "worktree"`, `SubagentStart`, the
+subagent's own `PreToolUse`/`PostToolUse` and `SubagentStop` payloads all carry
+`agent_id` + `agent_type` and, as `cwd`, the subagent's worktree
+(`<repo>/.claude/worktrees/agent-<agent_id>`, branch `worktree-agent-<agent_id>`).
+The parent's own hooks carry neither field and keep the parent's `cwd`. ADOPTED:
+the daemon's session tracker takes `cwd` only from payloads without a subagent
+identity, so a chat is never shown in its subagent's worktree. A hook's
+multi-line `systemMessage` reaches the chat as one `system/informational` notice
+with `<hook name> says: ` before every line; the chat UI folds the prefix
+(`web-ui/src/lib/chat/hookNotice.ts`).
