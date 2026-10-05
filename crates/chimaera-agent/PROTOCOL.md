@@ -3086,4 +3086,19 @@ same-file lines) — those wait for the session's own next hook. A hook's
 multi-line `systemMessage` reaches the chat as one `system/informational` notice
 with `<hook name> says: ` before every line; the chat UI folds the prefix
 (`web-ui/src/lib/chat/hookNotice.ts`).
-||||||| c923c873
+
+### Send now is `interrupt {send_now}`, not a Stop (2026-10-05, live probes, claude 2.1.289). ADOPTED.
+
+A maintainer pressed Send now on a waiting message while three background agents were twelve minutes into their work. All three ended at once, and the agent could not bring them back.
+
+- **A plain `interrupt` is the CLI's Stop, and a Stop ends background agents.** With one background `Agent` running: `background_tasks_changed {tasks: []}`, `task_updated {patch: {status: "killed"}}` and `task_notification {status: "stopped"}` for the agent land before the receipt `{still_queued: [...]}`. Every interrupted tool gets the "The user doesn't want to proceed with this tool use" result, in the subagent too.
+- **A stopped agent cannot be resumed.** `ListAgents` shows it `killed`, and `SendMessage` to it answers `{"success": false, "message": "Agent <id> was stopped by the user and won't be resumed. Treat its work as cancelled; only launch a new agent if the user explicitly asks."}`.
+- **`system/init` advertises `interrupt_send_now_v1`.** The full list in this build: `interrupt_receipt_v1`, `interrupt_cancel_queued_v1`, `interrupt_send_now_v1`, `msg_lifecycle_v1`, `sdk_mcp_tools_list_changed`, `sdk_mcp_manifests`, `mcp_read_resource_v1`, `mcp_tool_ui_meta_v1`, `ui_surface_v1`.
+- **`interrupt {send_now: true, message_uuid}`** is the terminal's send-now key for a client. The schema text: "It is not a Stop: it makes no later turn start aborted, cancels nothing that is queued, and ends no background task, subscription or other thing outside the running turn that a Stop ends." `message_uuid` names the waiting message and is compared as an exact string; the message must already be in the CLI's queue. With `cancel_queued: true` the request is a Stop again. A CLI without the capability treats it as a plain interrupt.
+- **The receipt gains `send_now`:** `stopped` (the turn was aborted, its result follows), `delivering` (no turn was stopped: the CLI is moving what the turn waits on to the background, or the message is already on its way in; it may still stop the turn later, without a marker), or `nothing_waiting` (nothing was done).
+- **Live, the same scene with `send_now`:** receipt `{still_queued: [B], send_now: "stopped"}` first, then the foreground Bash's `task_notification {status: "stopped"}`, the interruption marker, the `error_during_execution` result, A `cancelled`, B `started`. No frame for the background agent; afterwards `SendMessage` to it answered `success: true`. Sent in the same instant as the message itself, it still found the message (`stopped`).
+- **A subagent's own Bash task says so:** its `task_started` carries `owned_by_subagent: true` (`task_type: "local_bash"`, `is_backgrounded: false`); the parent's foreground command has no such field. The live test keys on it.
+
+ADOPTED: `AgentCommand::SendNow` on a CLI that advertises `interrupt_send_now_v1`, for a message in the CLI's queue, sends `interrupt {send_now: true, message_uuid}`. The interrupt watchdog is armed by a `stopped` receipt instead of the request, because a `delivering` turn keeps running; `nothing_waiting` clears the user-stop flag. A message the driver still holds (the pre-init fallback, or an older CLI) keeps the plain interrupt. An aborted turn no longer closes the row of a backgrounded agent the CLI still lists in `background_tasks_changed`: after a send-now it is running. `AgentCommand::Interrupt` is unchanged: Stop is the CLI's Stop and ends background agents, with no request field that spares them.
+
+Tests: claude `send_now_spares_background_agents_on_a_capable_cli`, `send_now_that_finds_nothing_waiting_leaves_no_interrupt_behind`, `an_aborted_turn_leaves_a_listed_background_agent_row_alone`, `a_send_now_receipt_never_clears_a_stop_in_flight`; live `claude_send_now_spares_background_agents`.
