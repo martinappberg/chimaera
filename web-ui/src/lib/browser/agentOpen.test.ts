@@ -10,12 +10,18 @@ import {
   openSession,
   openTab,
   panes,
+  deserializeLayout,
+  serializeLayout,
   sessionPaneId,
+  setBrowserPath,
+  setBrowserTarget,
   splitPane,
   toggleZoom,
 } from "../layout/layout";
+import type { Session } from "../workspace/sessions";
 import {
   type AgentBrowserOpen,
+  browserOpener,
   parseAgentBrowserOpen,
   placeAgentBrowser,
   shouldActOnAgentBrowserOpen,
@@ -239,5 +245,94 @@ describe("placeAgentBrowser", () => {
     expect(next.focusedPaneId).toBe(l.focusedPaneId);
     expect(activeTab(next, l.focusedPaneId)).toEqual({ surface: "terminal", sessionId: "s-other" });
     expect(browserTabs(next)).toHaveLength(1);
+  });
+});
+
+describe("who opened a browser pane", () => {
+  const opener = (l: Layout) =>
+    browserTabs(l).map(({ tab }) => (tab.surface === "browser" ? tab.openedBy : null));
+
+  it("credits a new pane to the calling session, and a re-point to the latest opener", () => {
+    const first = placeAgentBrowser(withAgent(), frame({ path: "/a" }));
+    expect(opener(first)).toEqual(["s-agent"]);
+    const again = placeAgentBrowser(first, frame({ sessionId: "s-other", path: "/b" }));
+    expect(opener(again)).toEqual(["s-other"]);
+  });
+
+  it("credits a tab moved out from behind the session", () => {
+    let l = withAgent();
+    l = openTab(l, freshBrowserTab("localhost", 5173, "/old"));
+    l = activateTab(l, sessionPaneId(l, "s-agent")!, 0);
+    expect(opener(l)).toEqual([undefined]);
+    expect(opener(placeAgentBrowser(l, frame()))).toEqual(["s-agent"]);
+  });
+
+  it("a pane the user opened has no opener", () => {
+    expect(Object.keys(freshBrowserTab("localhost", 1, "/"))).not.toContain("openedBy");
+  });
+
+  it("the user pointing it elsewhere drops the attribution; the node hunt and in-app paths keep it", () => {
+    const l = placeAgentBrowser(withAgent(), frame());
+    const id = browserTabs(l)[0].tab.id;
+    expect(opener(setBrowserPath(l, id, "/elsewhere"))).toEqual(["s-agent"]);
+    expect(opener(setBrowserTarget(l, id, "localhost", 5173, "/x"))).toEqual(["s-agent"]);
+    expect(opener(setBrowserTarget(l, id, "node-7", 5173, "/", true))).toEqual(["s-agent"]);
+    expect(opener(setBrowserTarget(l, id, "localhost", 9999, "/"))).toEqual([undefined]);
+  });
+
+  it("round-trips through the saved layout", () => {
+    const l = placeAgentBrowser(withAgent(), frame({ path: "/app" }));
+    const back = deserializeLayout(JSON.parse(JSON.stringify(serializeLayout(l))));
+    expect(back).not.toBeNull();
+    expect(browserTabs(back!).map(({ tab }) => tab)).toEqual(browserTabs(l).map(({ tab }) => tab));
+  });
+
+  it("restores an older layout without the field unchanged, and drops a garbage value", () => {
+    const saved = (wb?: unknown) => ({
+      v: 1,
+      focusMode: false,
+      zoom: null,
+      focused: "p1",
+      root: {
+        t: "p",
+        id: "p1",
+        tabs: [
+          { s: "s-agent" },
+          { w: "localhost", wo: 5173, wi: "b1", wp: "/", ...(wb === undefined ? {} : { wb }) },
+        ],
+        active: 0,
+      },
+    });
+    expect(browserTabs(deserializeLayout(saved())!).map(({ tab }) => tab)).toEqual([
+      { surface: "browser", id: "b1", host: "localhost", port: 5173, path: "/" },
+    ]);
+    for (const wb of [42, "", "s-<script>", "x".repeat(65), { id: "s-1" }]) {
+      const l = deserializeLayout(saved(wb));
+      expect(l).not.toBeNull();
+      expect(panes(l!.root)[0].tabs).toHaveLength(2);
+      expect(opener(l!)).toEqual([undefined]);
+    }
+    expect(opener(deserializeLayout(saved("s-1a2b3c4d"))!)).toEqual(["s-1a2b3c4d"]);
+  });
+
+  it("names the opener from the live roster, and says when it has ended", () => {
+    const s = (over: Record<string, unknown>) =>
+      ({ id: "s-1", name: "fix CI", kind: "agent", agent_kind: "codex", alive: true, ...over }) as unknown as Session;
+    const roster = new Map([["s-1", s({})]]);
+    expect(browserOpener("s-1", roster, new Map())).toEqual({
+      id: "s-1",
+      live: true,
+      label: "fix CI",
+      agentKind: "codex",
+    });
+    // A pinned rename shows through.
+    expect(browserOpener("s-1", roster, new Map([["s-1", "frontend"]])).label).toBe("frontend");
+    expect(browserOpener("s-1", new Map([["s-1", s({ alive: false })]]), new Map()).live).toBe(false);
+    expect(browserOpener("s-gone", roster, new Map())).toEqual({
+      id: "s-gone",
+      live: false,
+      label: null,
+      agentKind: null,
+    });
   });
 });

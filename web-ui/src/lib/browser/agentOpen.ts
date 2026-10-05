@@ -22,9 +22,35 @@ import {
   openTab,
   panes,
   sessionPaneId,
+  setBrowserOpener,
   setBrowserPath,
   splitPane,
 } from "../layout/layout";
+import { sessionLabel, type Session } from "../workspace/sessions";
+
+/** Who opened a browser pane, as the chrome shows it — read from the live
+ *  roster each render, so a rename shows through and an ended session says
+ *  so. `label` is null once the roster no longer has the session at all. */
+export interface BrowserOpener {
+  id: string;
+  live: boolean;
+  label: string | null;
+  agentKind: string | null;
+}
+
+export function browserOpener(
+  id: string,
+  sessions: ReadonlyMap<string, Session>,
+  names: ReadonlyMap<string, string>,
+): BrowserOpener {
+  const s = sessions.get(id);
+  return {
+    id,
+    live: s?.alive === true,
+    label: s === undefined ? null : sessionLabel(names, sessions, id),
+    agentKind: s?.agent_kind ?? null,
+  };
+}
 
 /** One `{"type":"browser_open", ...}` frame, validated. */
 export interface AgentBrowserOpen {
@@ -103,7 +129,8 @@ export function shouldActOnAgentBrowserOpen(open: AgentBrowserOpen, view: Window
  * 4. else becomes a tab in the anchor's neighbour, or any other pane when
  *    the neighbour is the one the user is in.
  *
- * A zoomed pane stays zoomed: the pane opens behind it.
+ * A zoomed pane stays zoomed: the pane opens behind it. The tab is credited
+ * to the calling session (`openedBy`), so its chrome can say who opened it.
  */
 export function placeAgentBrowser(l: Layout, open: AgentBrowserOpen): Layout {
   const focused = l.focusedPaneId;
@@ -119,16 +146,17 @@ export function placeAgentBrowser(l: Layout, open: AgentBrowserOpen): Layout {
     if (index < 0) continue;
     const existing = p.tabs[index];
     if (existing.surface !== "browser") break;
-    next = setBrowserPath(next, existing.id, open.path);
+    // The latest opener wins: the pane now shows what THIS agent asked for.
+    next = setBrowserOpener(setBrowserPath(next, existing.id, open.path), existing.id, open.sessionId);
     if (p.active === index || !covers(p.id)) {
       return restoreFocus(activateTab(next, p.id, index), l);
     }
     // Showing it in place would hide what the user is looking at: move it.
     next = detachTab(next, p.id, index);
-    tab = { ...existing, path: open.path };
+    tab = { ...existing, path: open.path, openedBy: open.sessionId };
     break;
   }
-  tab ??= freshBrowserTab(open.host, open.port, open.path);
+  tab ??= freshBrowserTab(open.host, open.port, open.path, open.sessionId);
 
   const all = panes(next.root);
   // An empty pane shows nothing to cover — the anchor or the user's own

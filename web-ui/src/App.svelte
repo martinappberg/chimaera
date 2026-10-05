@@ -4303,8 +4303,8 @@
     navigateBrowser(id, path) {
       layout = setBrowserPath(layout, id, path);
     },
-    retargetBrowser(id, host, port, path) {
-      layout = setBrowserTarget(layout, id, host, port, path);
+    retargetBrowser(id, host, port, path, found) {
+      layout = setBrowserTarget(layout, id, host, port, path, found);
     },
     openDiffFrom(paneId, path, mode, newSplit, keep) {
       openDiffFromPane(paneId, path, mode, newSplit, keep === true);
@@ -5008,6 +5008,13 @@
   /** Link mutations + reveal for the pane top bars (chips and the menu). */
   const linkCtrl: LinkCtrl = {
     reveal(sessionId, besidePaneId) {
+      // The Mastermind lives in its panel, never in a pane tab (a browser
+      // pane it opened names it as the opener).
+      const s = sessionsById.get(sessionId);
+      if (s !== undefined && isMastermind(s)) {
+        setMastermindPanelOpen(true);
+        return;
+      }
       revealSession(sessionId, besidePaneId);
       pool.focusTerminal(sessionId);
     },

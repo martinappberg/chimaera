@@ -115,10 +115,19 @@ async fn open_browser_frame_reaches_connected_windows() {
         })
     );
 
-    // Right again: inside the per-session gap.
-    let (is_error, text) = open(&state, &agent, "http://localhost:5174/").await;
+    // Two more right away still pass (a burst of three: several apps shown
+    // in one step); a fourth inside the 10 s window is refused with a wait.
+    for port in [5174, 5175] {
+        let (is_error, text) = open(&state, &agent, &format!("http://localhost:{port}/")).await;
+        assert!(!is_error, "{text}");
+    }
+    let (is_error, text) = open(&state, &agent, "http://localhost:5176/").await;
     assert!(is_error, "{text}");
-    assert!(text.contains("moments ago"), "{text}");
+    assert!(
+        text.contains("already opened 3 browser panes in the last 10s"),
+        "{text}"
+    );
+    assert!(text.contains("Wait "), "{text}");
 
     socket.close(None).await.unwrap();
     // The consumer count follows the socket down (the handler notices the

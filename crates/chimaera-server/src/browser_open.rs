@@ -35,9 +35,13 @@ const RING_CAP: usize = 16;
 /// A frame older than this is dropped instead of delivered: a window whose
 /// socket stalled must not open a pane long after the agent moved on.
 const FRAME_MAX_AGE: Duration = Duration::from_secs(10);
-/// Per-session limits: one open per [`MIN_GAP`], [`HOURLY_CAP`] per hour.
-/// An app is opened once, not on every reload.
-const MIN_GAP: Duration = Duration::from_secs(3);
+/// Per-session limits: [`BURST_CAP`] opens in any [`BURST_WINDOW`], and
+/// [`HOURLY_CAP`] per hour. A burst, not a minimum gap: an agent presenting a
+/// frontend and its dashboard in one step makes two calls back to back, and
+/// agents tend to treat a tool error as final. An app is still opened once,
+/// not on every reload.
+const BURST_CAP: usize = 3;
+const BURST_WINDOW: Duration = Duration::from_secs(10);
 const HOURLY_CAP: usize = 12;
 const HOUR: Duration = Duration::from_secs(60 * 60);
 /// Sessions whose send history is kept; the least recent is forgotten first.
@@ -236,15 +240,27 @@ impl BrowserOpens {
         while sends.front().is_some_and(|at| at.elapsed() > HOUR) {
             sends.pop_front();
         }
-        if let Some(last) = sends.back() {
-            let gap = last.elapsed();
-            if gap < MIN_GAP {
-                let wait = (MIN_GAP - gap).as_secs().max(1);
-                return Err(format!(
-                    "Not opened: this session opened a browser pane moments ago. Wait \
-                     {wait}s; one call per app is enough."
-                ));
-            }
+        // The oldest open inside the window decides when a slot frees up.
+        let recent = sends
+            .iter()
+            .rev()
+            .take_while(|at| at.elapsed() < BURST_WINDOW)
+            .count();
+        if recent >= BURST_CAP {
+            let oldest = sends[sends.len() - recent].elapsed();
+            // Saturating: `oldest` is read again after the count above, and
+            // may have crossed the window since (a plain `-` would panic).
+            let wait = BURST_WINDOW
+                .saturating_sub(oldest)
+                .as_secs_f64()
+                .ceil()
+                .max(1.0) as u64;
+            return Err(format!(
+                "Not opened: this session already opened {BURST_CAP} browser panes in \
+                 the last {}s. Wait {wait}s before opening another; one call per app \
+                 is enough.",
+                BURST_WINDOW.as_secs()
+            ));
         }
         if sends.len() >= HOURLY_CAP {
             return Err(format!(
@@ -392,15 +408,28 @@ mod tests {
     #[test]
     fn opens_are_rate_limited_per_session() {
         let opens = BrowserOpens::default();
-        assert!(opens.admit("s-1").is_ok());
+        // A small burst passes (two apps shown in one step), the next waits.
+        for _ in 0..BURST_CAP {
+            assert!(opens.admit("s-1").is_ok());
+        }
         let err = opens.admit("s-1").unwrap_err();
-        assert!(err.contains("moments ago"), "{err}");
+        assert!(err.contains("in the last 10s"), "{err}");
+        assert!(err.contains("Wait 10s"), "{err}");
         assert!(
             opens.admit("s-2").is_ok(),
             "another session has its own budget"
         );
 
-        let old = Instant::now() - MIN_GAP * 2;
+        // Once the burst's oldest open ages out of the window, a slot frees.
+        {
+            let mut inner = crate::lock(&opens.inner);
+            let sends = inner.sends.get_mut("s-1").unwrap();
+            sends[0] = Instant::now() - BURST_WINDOW - Duration::from_millis(1);
+        }
+        assert!(opens.admit("s-1").is_ok());
+        assert!(opens.admit("s-1").is_err());
+
+        let old = Instant::now() - BURST_WINDOW * 2;
         crate::lock(&opens.inner)
             .sends
             .insert("s-3".into(), std::iter::repeat_n(old, HOURLY_CAP).collect());

@@ -15,6 +15,11 @@ export interface LabelledTool {
   summary: string | null;
   /** The row's title ("Agent: Measure file sizes") — names a lone agent. */
   title?: string;
+  /** The call's arguments where the driver reports them (claude) — where a
+   *  call that says what it did finds its object. */
+  nativeInput?: unknown;
+  /** The result, for calls whose arguments only show there (codex). */
+  content?: { kind: string; text?: string | null } | null;
 }
 
 interface Phrase {
@@ -152,10 +157,84 @@ export function commsTitle(call: CommsCall): string {
   }
 }
 
-/** A tool row's title as the card shows it: agent-communication calls in
- *  words, every other tool as the driver titled it. */
-export function readableToolTitle(t: { tool: string; title: string }): string {
+// --- showing a web app (the chimaera MCP `open_browser` tool) ----------------
+
+/** An `open_browser` call: the address it showed (`localhost:8000`,
+ *  `localhost:8888/lab` — the query and fragment left off the title, since a
+ *  Jupyter `?token=` is a credential), and whether a pane was opened. */
+export interface BrowserCall {
+  address: string | null;
+  opened: boolean;
+}
+
+/** Where a path stops reading as a label. */
+const ADDRESS_PATH_MAX = 32;
+
+function shortAddress(url: string): string | null {
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    return null;
+  }
+  if (u.protocol !== "http:") return null;
+  const path = u.pathname === "/" ? "" : u.pathname;
+  const shown = path.length > ADDRESS_PATH_MAX ? `${path.slice(0, ADDRESS_PATH_MAX - 1)}…` : path;
+  return `${u.host}${shown}`;
+}
+
+/** The address in the daemon's own result sentence ("…a browser pane for
+ *  http://…: a window…", "…Tell the user the URL (http://…) so…"). */
+const RESULT_URL = /\bhttp:\/\/[^\s()]+?(?=:\s|\)|\s|$)/;
+
+/** The `open_browser` call a tool row is; null for every other tool. The
+ *  address comes from the call's input (claude), else from the daemon's own
+ *  result sentence, which is all codex rows carry. A refusal fails the call;
+ *  "no window is connected" succeeds but opened nothing — both read as not
+ *  opened. */
+export function browserCall(t: {
+  tool: string;
+  title?: string;
+  status?: string;
+  nativeInput?: unknown;
+  content?: { kind: string; text?: string | null } | null;
+}): BrowserCall | null {
+  const title = t.title?.trim();
+  if (t.tool !== "other" || title === undefined) return null;
+  if (!COMMS_TITLE.some((re) => re.exec(title)?.[1] === "open_browser")) return null;
+  const input = t.nativeInput;
+  const fromInput =
+    typeof input === "object" && input !== null && typeof (input as { url?: unknown }).url === "string"
+      ? (input as { url: string }).url
+      : null;
+  const result = t.content?.kind === "output" ? (t.content.text ?? "") : "";
+  const url = fromInput ?? RESULT_URL.exec(result)?.[0] ?? null;
+  return {
+    address: url !== null ? shortAddress(url.trim()) : null,
+    opened: t.status !== "failed" && !result.startsWith("Not opened"),
+  };
+}
+
+/** An `open_browser` card title: "Showed localhost:8000 in a browser pane",
+ *  "Showing …" while it runs, "Didn't open …" when nothing opened. */
+export function browserTitle(call: BrowserCall, live: boolean): string {
+  const what = call.address ?? "a page";
+  if (live) return `Showing ${what} in a browser pane`;
+  return call.opened ? `Showed ${what} in a browser pane` : `Didn't open ${what} in a browser pane`;
+}
+
+/** A tool row's title as the card shows it: agent-communication and browser
+ *  calls in words, every other tool as the driver titled it. */
+export function readableToolTitle(t: {
+  tool: string;
+  title: string;
+  status?: string;
+  nativeInput?: unknown;
+  content?: { kind: string; text?: string | null } | null;
+}): string {
   if (t.tool !== "other") return t.title;
+  const browser = browserCall(t);
+  if (browser !== null) return browserTitle(browser, isLive({ status: t.status ?? "" }));
   const call = commsCall(t.title);
   return call === null ? t.title : commsTitle(call);
 }
@@ -205,8 +284,32 @@ function commsPhrases(tools: LabelledTool[], live: boolean): string[] {
   return out;
 }
 
+/** The `open_browser` calls among `tools`, as phrases (all of one tense): a
+ *  lone call names its address. */
+function browserPhrases(tools: LabelledTool[], live: boolean): string[] {
+  const calls = tools.flatMap((t) => {
+    const c = browserCall(t);
+    return c === null ? [] : [c];
+  });
+  const phrase = (of: BrowserCall[], verb: string, plural: string): string[] => {
+    if (of.length === 0) return [];
+    if (of.length === 1) return [`${verb} ${of[0].address ?? "a page"} in a browser pane`];
+    return [`${verb} ${of.length} ${plural}`];
+  };
+  if (live) return phrase(calls, "showing", "pages in browser panes");
+  return [
+    ...phrase(calls.filter((c) => c.opened), "showed", "pages in browser panes"),
+    ...phrase(calls.filter((c) => !c.opened), "didn't open", "browser panes"),
+  ];
+}
+
+/** Calls the count says in words rather than as "used a tool". */
 function isCommsTool(t: LabelledTool): boolean {
-  return t.tool === "other" && t.title !== undefined && commsCall(t.title) !== null;
+  return (
+    t.tool === "other" &&
+    t.title !== undefined &&
+    (commsCall(t.title) !== null || browserCall(t) !== null)
+  );
 }
 
 /** Still running — said in the present tense, and a live dot on its line. */
@@ -233,7 +336,10 @@ export function countPhrase(tools: LabelledTool[]): string {
     for (const k of KINDS) {
       // Agent-communication calls say what they did, ahead of the
       // catch-all "used a tool".
-      if (k.kind === "other") parts.push(...commsPhrases(tools.filter((t) => isLive(t) === live), live));
+      if (k.kind === "other") {
+        const now = tools.filter((t) => isLive(t) === live);
+        parts.push(...commsPhrases(now, live), ...browserPhrases(now, live));
+      }
       const of = tools.filter(
         (t) =>
           isLive(t) === live &&

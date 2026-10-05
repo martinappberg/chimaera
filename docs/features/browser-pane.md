@@ -136,13 +136,35 @@ plane `ANY /proxy/{id}[/{*path}]`; agent-opened panes add the MCP `open_browser`
   never covers the session or the focused pane, keeps a zoomed pane zoomed, and never takes
   focus — the user keeps typing where they were
   (`web-ui/src/lib/browser/agentOpen.ts`, pure and unit-tested).
+- **Who opened it.** An agent-opened tab remembers its opener (`BrowserTab.openedBy`, the
+  session id; the latest opener wins when an agent re-points a pane). The pane's top bar
+  ends with a quiet pill — the agent's mark (`SessionGlyph`) in its link hue, "opened by"
+  and the session's name as the rail shows it, read live from the roster so a rename shows
+  through; a click reveals that session (the linked-terminal chips' reveal path). Once the
+  session has ended the pill turns into a muted note ("opened by fix CI · ended", or
+  "opened by an agent that has ended" once the roster has forgotten it), no longer a
+  control. In a narrow pane only the mark shows, the words in its tooltip. The user
+  pointing the pane at another `host:port` (the address bar) drops the attribution — it
+  would no longer be true; in-app navigation and the compute-node hunt (the same app,
+  found on its node) keep it. Saved layouts carry it as an optional `wb` on the browser tab:
+  older layouts restore unchanged, and a value that is not an id-shaped string is dropped
+  without touching the rest of the tab.
+- **In the transcript.** The call reads as what happened — "Showed localhost:8000 in a
+  browser pane", "Didn't open example.org:8080 in a browser pane" for a refusal or when no
+  window was connected (`chat/toolLabels.ts`; the address from Claude's input, else from the
+  result text, which is all a Codex row carries; the query is left off, a Jupyter `?token=`
+  being a credential). The expanded row shows the full result.
 - **Key behaviors.** No queueing: a frame reaches only the windows connected when it is sent
   (a stale one older than 10 s is dropped), and with no window connected the tool says so and
-  tells the agent to hand over the URL. Rate-limited per session (one per 3 s, 12 per hour,
-  bounded history). Always allowed: the harness does not prompt for it, since targets are
+  tells the agent to hand over the URL. Rate-limited per session (3 in any 10 s — an agent
+  presenting a frontend and its dashboard in one step gets both — and 12 per hour; the
+  refusal says how long to wait; bounded history). Always allowed: the harness does not prompt for it, since targets are
   held to the mint allowlist with no confirm path. **Where it lives:** `crates/chimaera-server/src/browser_open.rs` (parse, feed,
   limits, consumer count), the tool def in `mcp.rs`, the frame in `ws.rs::handle_events`,
-  the UI half in `browser/agentOpen.ts` + `net/events.ts` + `App.svelte::onAgentBrowserOpen`.
+  the UI half in `browser/agentOpen.ts` + `net/events.ts` + `App.svelte::onAgentBrowserOpen`,
+  the attribution in `browser/BrowserView.svelte` (fed by `layout/Pane.svelte`).
+- **Known limit.** A page that focuses itself on load (an `autofocus` field) can still pull
+  focus into the pane: the pane treats focus moving into its iframe as the user clicking in.
 
 ## Links everywhere else (and the real browser)
 
