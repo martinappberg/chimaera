@@ -42,6 +42,8 @@ fn fixture_state(port: u16, data_dir: PathBuf) -> AppState {
     let config_dir = data_dir.join("config");
     let provider_home = data_dir.join("provider-home");
     let managed_root = data_dir.join("managed-agents");
+    let scheduler_tools = data_dir.join("scheduler-tools");
+    std::fs::create_dir_all(&scheduler_tools).unwrap();
     let mut state = AppState::new(
         "test-token".to_string(),
         "testhost".to_string(),
@@ -56,6 +58,18 @@ fn fixture_state(port: u16, data_dir: PathBuf) -> AppState {
     // Spawns acquire runtime leases even for synthetic executables.
     state.managed_root = managed_root;
     state.legacy_managed_root = None;
+    // These API fixtures need real Git, not ambient login rc or cluster tools.
+    // Keep settings empty and leave dedicated resolver/compute tests unchanged.
+    let git_name = format!("git{}", std::env::consts::EXE_SUFFIX);
+    let git = std::env::split_paths(&std::env::var_os("PATH").expect("fixture PATH"))
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(&git_name))
+        .find(|path| crate::launcher::is_executable(path))
+        .expect("fixture Git must be installed")
+        .canonicalize()
+        .unwrap();
+    state.git = crate::git::GitService::with_fixture_git(git);
+    state.compute = crate::compute::ComputeService::with_bindir(scheduler_tools);
     state
 }
 

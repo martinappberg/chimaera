@@ -787,7 +787,7 @@ async fn established_scoped_sockets_cannot_rejoin_a_replacement_account_at_the_s
             .stopping
             .store(true, std::sync::atomic::Ordering::Release);
         if matches!(surface, "chat" | "native_ui") {
-            state.chat.kill(&id);
+            stop_chat(&state, &id).await;
         } else {
             let _ = state.sessions.kill(&id);
         }
@@ -973,7 +973,7 @@ async fn laptop_first_sign_out_and_unreachable_account_keep_local_work_running()
     );
     assert!(!project.root.join("REFUSED_ELSEWHERE").exists());
 
-    state.chat.kill("s-laptop-chat");
+    stop_chat(&state, "s-laptop-chat").await;
     let _ = state.sessions.kill(&shell);
     let _ = state.sessions.kill(&typed);
     server.abort();
@@ -1192,8 +1192,22 @@ async fn closed_cleanly(socket: &mut ViewerSocket) {
     );
 }
 
-fn stop(state: &Arc<AppState>, id: &str, server: tokio::task::JoinHandle<()>) {
-    state.chat.kill(id);
+async fn stop_chat(state: &Arc<AppState>, id: &str) {
+    // A watch send is not child/pump settlement. Keep the captured session
+    // alive until its original cleanup finishes, before this test's runtime ends.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let captured = state.chat.pause_commands(id).await.unwrap();
+        assert!(state.chat.kill(id));
+        while captured.cleanup_pending() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("workspace viewer chat cleanup did not settle");
+}
+
+async fn stop(state: &Arc<AppState>, id: &str, server: tokio::task::JoinHandle<()>) {
+    stop_chat(state, id).await;
     server.abort();
     state
         .stopping
@@ -1223,7 +1237,7 @@ async fn a_thawed_owner_admits_the_socket_that_woke_it_once_its_renewal_lands() 
     pro::renew_execution_fixture(&state, &project.id, 4).unwrap();
     let ready = json_frame(&mut socket).await;
     assert_eq!(ready["type"], "ready", "{ready}");
-    stop(&state, "s-thaw-renewed", server);
+    stop(&state, "s-thaw-renewed", server).await;
 }
 
 /// A refused renewal (someone else took the project while the machine slept)
@@ -1246,7 +1260,7 @@ async fn a_thawed_owner_whose_renewal_is_refused_refuses_the_waiting_socket_at_o
         "refused as soon as the renewal was, not at the window's end"
     );
     closed_cleanly(&mut socket).await;
-    stop(&state, "s-thaw-refused", server);
+    stop(&state, "s-thaw-refused", server).await;
 }
 
 /// Only the epoch the machine is renewing is worth waiting for: a socket for
@@ -1266,7 +1280,7 @@ async fn a_thawed_owner_refuses_another_epoch_without_waiting() {
         "the machine's own renewal is still out"
     );
     closed_cleanly(&mut socket).await;
-    stop(&state, "s-thaw-other-epoch", server);
+    stop(&state, "s-thaw-other-epoch", server).await;
 }
 
 /// A scoped request that reaches a machine still renewing its own epoch (the

@@ -520,3 +520,57 @@ it("passes bounded active queued IDs at ready and ignores invalid capability dat
   }
   socket.close();
 });
+
+
+it("automatic native UI RPCs never wake and an explicit detached control is refused without replay", async () => {
+  vi.stubGlobal("location", new URL("https://fixture.invalid/app/worker-one/"));
+  const socket = new ChatSocket("s-chat", handlers());
+  const ws = Socket.all[0];
+  ws.onopen?.();
+  ws.frame({ type: "ready", session: {}, replay_from: 0, head: 0 });
+  await drain();
+  expect(socket.nativeUi.ready).toBe(true);
+  ws.readyState = 0;
+  try {
+    await expect(socket.nativeUi.request({ subtype: "ui_render" })).rejects.toThrow("disconnected");
+    expect(Socket.all).toHaveLength(1);
+    await expect(socket.nativeUi.request({ subtype: "ui_press", handle: 4 })).rejects.toThrow("disconnected");
+    expect(Socket.all).toHaveLength(2);
+    expect(Socket.all[1].url).toContain("wake=interaction");
+    expect(socket.nativeUi.ready).toBe(false);
+    expect(Socket.all.flatMap((s) => s.sent).filter((frame) => String(frame).includes("native_ui"))).toEqual([]);
+    Socket.all[1].onopen?.();
+    Socket.all[1].frame({ type: "ready", session: {}, replay_from: 0, head: 0 });
+    await drain();
+    expect(socket.nativeUi.ready).toBe(true);
+    expect(Socket.all.flatMap((s) => s.sent).filter((frame) => String(frame).includes("native_ui"))).toEqual([]);
+  } finally {
+    socket.close();
+  }
+});
+
+it.each([
+  { type: "moved", to: "cloud" },
+  { type: "waking" },
+  { type: "bringing", to: "here" },
+  { type: "paused", reason: "needs_provider", provider: "claude" },
+  { type: "error", code: "worker_asleep" },
+  { type: "error", code: "remote_unavailable" },
+  { type: "error", code: "workspace_scope_changed" },
+])("retires native UI handles immediately on %j, including a queued ready", async (state) => {
+  const socket = new ChatSocket("s-chat", handlers());
+  const ws = Socket.all[0];
+  ws.onopen?.();
+  ws.frame({ type: "ready", session: {}, replay_from: 0, head: 0 });
+  await drain();
+  const pending = socket.nativeUi.request({ subtype: "ui_render" });
+  const rejected = expect(pending).rejects.toThrow("disconnected");
+  // A fresh ready is waiting in the cooperative FIFO when the owner pauses.
+  ws.frame({ type: "ready", session: {}, replay_from: 0, head: 0 });
+  ws.frame(state);
+  expect(socket.nativeUi.ready).toBe(false);
+  await rejected;
+  await drain();
+  expect(socket.nativeUi.ready).toBe(false);
+  socket.close();
+});

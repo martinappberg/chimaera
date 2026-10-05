@@ -1325,10 +1325,21 @@ impl ChatManager {
             "session is paused for transfer; retry after the project returns"
         );
         // Serialize this separate channel with the same lifecycle fence.
-        session
+        let permit = session
             .native_ui_tx
-            .try_send(command)
-            .map_err(|_| anyhow::anyhow!("Native UI is busy or disconnected"))
+            .try_reserve()
+            .map_err(|_| anyhow::anyhow!("Native UI is busy or disconnected"))?;
+        if command.is_user_action() {
+            // A control may change native work. Reuse no earlier completed-turn
+            // proof, and invalidate before the driver can consume this request.
+            session
+                .maintenance_evidence
+                .lock()
+                .expect("maintenance evidence lock")
+                .command();
+        }
+        permit.send(command);
+        Ok(())
     }
 
     pub async fn detach_native_ui(&self, id: &str, client_id: &str) {
@@ -1955,16 +1966,54 @@ mod tests {
             }),
         ));
         let incoming = Arc::new(Mutex::new(None));
+        let mut spec = SpawnSpec::new(
+            "native-fence",
+            vec!["synthetic".into()],
+            dir.path().to_path_buf(),
+        );
+        spec.agent_version = Some(crate::claude::TESTED_CLAUDE_VERSION.into());
+        manager.spawn(&HeldUi(incoming.clone()), spec).unwrap();
+        let session = manager.get_session("native-fence").unwrap();
         manager
-            .spawn(
-                &HeldUi(incoming.clone()),
-                SpawnSpec::new(
-                    "native-fence",
-                    vec!["synthetic".into()],
-                    dir.path().to_path_buf(),
-                ),
+            .absorb(
+                "native-fence",
+                &session,
+                serde_json::from_value(
+                    serde_json::json!({"type":"init","native_session_id":"native-ui-fixture"}),
+                )
+                .unwrap(),
+            )
+            .await;
+        let completed = || AgentEvent::TurnAborted {
+            turn_id: "synthetic-completion".into(),
+            reason: "fixture completion".into(),
+            interrupted: false,
+        };
+        manager.absorb("native-fence", &session, completed()).await;
+        assert!(manager.maintenance_idle("native-fence").await.is_ok());
+        manager
+            .native_ui(
+                "native-fence",
+                native_ui::NativeUiCommand::new(
+                    "view",
+                    "render",
+                    serde_json::json!({"subtype":"ui_render"}),
+                )
+                .unwrap(),
             )
             .unwrap();
+        assert_eq!(
+            incoming
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .try_recv()
+                .unwrap()
+                .request_id,
+            "render"
+        );
+        assert!(manager.maintenance_idle("native-fence").await.is_ok());
         let mut incoming = incoming.lock().unwrap().take().unwrap();
         let command = |id| {
             native_ui::NativeUiCommand::new(
@@ -1978,6 +2027,8 @@ mod tests {
             .native_ui("native-fence", command("before"))
             .unwrap();
         assert_eq!(incoming.try_recv().unwrap().request_id, "before");
+        assert!(manager.maintenance_idle("native-fence").await.is_err());
+        manager.absorb("native-fence", &session, completed()).await;
         let paused = manager.pause_commands("native-fence").await.unwrap();
         assert!(manager
             .native_ui("native-fence", command("paused"))
@@ -1987,8 +2038,10 @@ mod tests {
             Err(mpsc::error::TryRecvError::Empty)
         ));
         drop(paused);
+        assert!(manager.maintenance_idle("native-fence").await.is_ok());
         manager.native_ui("native-fence", command("after")).unwrap();
         assert_eq!(incoming.try_recv().unwrap().request_id, "after");
+        assert!(manager.maintenance_idle("native-fence").await.is_err());
         assert!(manager.kill("native-fence"));
         tokio::time::timeout(Duration::from_secs(2), exits.recv())
             .await

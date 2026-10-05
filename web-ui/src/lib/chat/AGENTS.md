@@ -6,7 +6,10 @@ Claude Mods use `nativeUi.ts` (bounded socket RPC and tree validation),
 `ModClient.svelte`/`modClient.ts` (isolated surface modules), and
 `ModsWorkbench.svelte` (responsive dock/inline panes, tabs and status). Code
 elements share `../shared/ExtensionCode.svelte` with workbench plugins. Never journal a render tree or
-replay a press; reconnect creates fresh render handles. See
+replay a press; reconnect creates fresh render handles. Only `ui_press`,
+`ui_input`, `ui_select` and `ui_client_press` carry user intent. Automatic RPCs
+send quietly. Ownership/wake/pause notices immediately reject pending RPCs and
+invalidate handles; a queued old `ready` cannot restore them. See
 [Claude Mods](../../../../docs/features/claude-mods.md).
 
 Orientation for coding agents. This directory is the **front half of chat mode**:

@@ -3,7 +3,11 @@
 The authenticated chat WebSocket also carries transient `native_ui` frames for
 Claude Mods. `ws.rs` mints each window's client ID, filters addressed replies and
 host callbacks, sends `native_ui_reset` on UI ring lag, and detaches the native
-window when the socket closes. This lane never participates in journal replay.
+window when the socket closes. This lane never participates in journal replay. Only `ui_press`, `ui_input`,
+`ui_select` and `ui_client_press` count as interaction after actual enqueue.
+`session_proxy::Viewer::Ephemeral` separates those controls from retained input:
+an attached owner may receive them, a detached owner may wake but never replay
+old handles. Automatic native UI traffic remains passive.
 
 Orientation for coding agents. This crate is the daemon: every HTTP route, every
 WebSocket, and the logic behind them. It embeds `web-ui/dist` and serves it.
@@ -86,6 +90,11 @@ the module you need and read its header doc.
 | `workspaces.rs` | The workspace registry (`workspaces.json`, atomic, save-on-change): `add` / `add_identified` (the folder-identity table below), the Mastermind binding, per-workspace plugin switches. Store operations that need the filesystem take what the caller found (`FolderIdentity`), so no stat runs under the store's lock. |
 | `workspaces/identity.rs` | A folder carries its workspace id: the one-line JSON marker `{id, written_at}` at `<root>/.git/chimaera-workspace` (a `.git` DIRECTORY), `<git dir>/chimaera-workspace` (a linked worktree's or submodule's `.git` FILE names its private git directory: nothing untracked appears in the folder and `git worktree remove` is never blocked; the directory must have a `HEAD`), else `<root>/.chimaera-workspace`. `read` (≤4 KiB, regular file via `fs::open_regular`, well-formed `[A-Za-z0-9_-]` 1..=128 id, else none), `write` (temp `.chimaera-staging-…` + rename, best effort, never fails the caller, skips an identical marker), `backfill` (only when missing). Never mirrored (`pro::policy::allowed_path`). |
 | `workspaces` / `links`+`mcp` / `settings` / `quickopen` / `recents` / `naming` / `view_state` | The rest of the workbench: roots, linked terminals, settings, palette, history, per-window view-state. A cluster workspace job registers its workspace at boot under the cluster's id (`seed_cluster_workspace`: the `CHIMAERA_CLUSTER_WORKSPACE` seed `{id,name,path}`, inserted first if missing, left alone if present). `quickopen` is stale-while-revalidate + single-flight per workspace with a walk-cost-scaled freshness window (its header doc has the rules — a cold NFS crawl must never run twice at once nor on a reactor worker); `view_state` caps keys at 128 by write recency and persists off the reactor. |
+
+Route test support captures an executable Git from absolute PATH entries and uses
+an owned empty scheduler-tool directory. It preserves empty default settings and
+explicit Git overrides, without running the developer's login rc for Git or
+scheduler discovery. Dedicated Git resolver and compute tests retain their original constructors and coverage.
 
 ## The status feed (v0.2)
 
@@ -442,3 +451,5 @@ and require the actual helper installed in an isolated ordinary managed home.
 The extracted optional viewer fixture registers placements through the original authenticated router/oneshot path, so its passive roster poll starts before the unchanged ten-second row wait. This corrects fixture startup only; default daemon authentication, poll timing and socket policy are unchanged. Fresh composed viewer gates remain root-owned.
 
 Authenticated `/api/v1/health` reports additive `daemon_extension` from actual optional Runtime presence, independently of Core build identity. It starts no extension owner. Older daemons omit it; omission is not proof of a selected assembly. The default daemon keeps its public release checks; selected assemblies refuse that feed and report the existing failed-update shape until their original application supplies delivery. Managed cloud workers retain their existing managed status.
+
+Workspace-viewer test teardown retains the existing captured chat cleanup guard until child and pump settlement before ending its Tokio runtime.

@@ -1659,6 +1659,9 @@ pub enum Viewer {
     /// and the only thing that wakes a sleeping owner. Ordinary input stays
     /// with that owner. `client_id`: the id a send was made under.
     Input { client_id: Option<String> },
+    /// An explicit control on a live native UI tree. Forwarded while attached;
+    /// detached, it may wake this owner but is refused without retaining handles.
+    Ephemeral,
     /// One of a chat's seven settings commands. Held, and delivered only in
     /// front of this viewer's next input: it wakes nothing, moves nothing,
     /// and is never delivered by itself when the owner answers. `key`: what
@@ -1686,6 +1689,23 @@ impl Viewer {
         let Some(kind) = tag.kind.as_deref() else {
             return Viewer::Other;
         };
+        if kind == "native_ui" && text.len() <= chimaera_agent::native_ui::UI_REQUEST_BYTES + 1024 {
+            #[derive(serde::Deserialize)]
+            struct Request<'a> {
+                #[serde(borrow)]
+                subtype: &'a str,
+            }
+            #[derive(serde::Deserialize)]
+            struct Frame<'a> {
+                #[serde(borrow)]
+                request: Request<'a>,
+            }
+            if serde_json::from_str::<Frame<'_>>(text)
+                .is_ok_and(|frame| chimaera_agent::native_ui::is_user_action(frame.request.subtype))
+            {
+                return Viewer::Ephemeral;
+            }
+        }
         match crate::activity::chat_frame(kind, tag.dry_run) {
             crate::activity::ChatFrame::Acting => Viewer::Input {
                 // Only a send is made under an id that is accepted once.
@@ -2293,6 +2313,63 @@ mod tests {
             ),
             Viewer::Other
         ));
+    }
+
+    #[test]
+    fn native_ui_actions_are_ephemeral_and_automatic_requests_stay_passive() {
+        for subtype in ["ui_press", "ui_input", "ui_select", "ui_client_press"] {
+            assert!(
+                matches!(
+                    Viewer::of(
+                        true,
+                        &chat_frame(
+                            json!({"type":"native_ui","request":{"subtype":subtype,"handle":4}})
+                        )
+                    ),
+                    Viewer::Ephemeral
+                ),
+                "{subtype}"
+            );
+        }
+        for subtype in [
+            "ui_attach",
+            "ui_detach",
+            "ui_render",
+            "ui_panes",
+            "ui_pane_show",
+            "ui_pane_focus",
+            "ui_close",
+            "ui_scroll",
+            "ui_focus",
+            "ui_client_module",
+            "ui_message",
+            "ui_prompt_edit",
+            "ui_host_response",
+            "unknown",
+        ] {
+            assert!(
+                matches!(
+                    Viewer::of(
+                        true,
+                        &chat_frame(
+                            json!({"type":"native_ui","request":{"subtype":subtype,"interaction":true}})
+                        )
+                    ),
+                    Viewer::Other
+                ),
+                "{subtype}"
+            );
+        }
+        for frame in [
+            json!({"type":"native_ui","request":null}),
+            json!({"type":"native_ui","request":{"subtype":1}}),
+            json!({"type":"native_ui","request":{"subtype":"ui_press","text":"x".repeat(chimaera_agent::native_ui::UI_REQUEST_BYTES + 1024)}}),
+        ] {
+            assert!(matches!(
+                Viewer::of(true, &chat_frame(frame)),
+                Viewer::Other
+            ));
+        }
     }
 
     /// Sorting a send reads its tag, not its pictures: a frame of megabytes

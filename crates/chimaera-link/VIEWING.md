@@ -162,6 +162,14 @@ replays exactly the gap. A terminal's later `resize`, `park` and `unpark`
 text frames are folded into the remembered frame (its `cols`/`rows` and
 `parked`), so every attach uses the grid and park state the viewer has now.
 
+Native UI controls are a separate ephemeral lane. Only `native_ui` requests
+with subtype `ui_press`, `ui_input`, `ui_select` or `ui_client_press` are deliberate
+interaction. An attached owner receives them and invalidates its idle sample.
+A detached socket may ask its captured owner to wake, then refuses the control;
+closure handles are never held, replayed, or sent to a different owner. Automatic
+attach, render, focus and host replies remain passive. Wake, pause or ownership
+notices retire the client's pending native UI requests immediately.
+
 What the user does is held whenever the daemon has not answered `ready` on
 the current attach: while nothing is attached, and also after an attach until
 its `ready`. Held are a chat's acting commands (up to 4 frames and 12 MiB per

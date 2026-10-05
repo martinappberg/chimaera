@@ -1598,7 +1598,15 @@ async fn handle_chat(
                                     None => None,
                                 };
                                 chimaera_agent::native_ui::NativeUiCommand::new(&client_id, request_id, frame["request"].clone())
-                                    .and_then(|command| state.chat.native_ui(&id, command))
+                                    .and_then(|command| {
+                                        let interaction = command.is_user_action();
+                                        state.chat.native_ui(&id, command)?;
+                                        if interaction {
+                                            crate::activity::record(&state, &id);
+                                            if scope.is_none() { acted_here(&state, &id); }
+                                        }
+                                        Ok(())
+                                    })
                             };
                             if let Err(error) = result {
                                 let frame = json!({"type":"native_ui","event":{"kind":"response","client_id":client_id,

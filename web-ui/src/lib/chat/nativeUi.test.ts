@@ -1,11 +1,18 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { NativeUiTransport, parseUiTree, safeUiHref, uiStyle, type UiRecord } from "./nativeUi";
+import { NativeUiTransport, isNativeUiAction, parseUiTree, safeUiHref, uiStyle, type UiRecord } from "./nativeUi";
 import { prepareClientBundle, reserveClientWorker, clientKeyEvent, clientPointerEvent, clientViewport, CLIENT_CLOCK, CLIENT_WORKER } from "./modClient";
 import { decorationRuns } from "./nativeComposer";
 
 afterEach(() => vi.useRealTimers());
 
 describe("ephemeral native UI requests", () => {
+  it("separates explicit controls from automatic RPCs without accepting an intent flag", () => {
+    for (const subtype of ["ui_press", "ui_input", "ui_select", "ui_client_press"]) expect(isNativeUiAction({ subtype })).toBe(true);
+    for (const subtype of ["ui_attach", "ui_detach", "ui_render", "ui_panes", "ui_pane_show", "ui_pane_focus", "ui_close", "ui_scroll", "ui_focus", "ui_client_module", "ui_message", "ui_prompt_edit", "ui_host_response", "unknown"]) {
+      expect(isNativeUiAction({ subtype, interaction: true })).toBe(false);
+    }
+    for (const request of [null, [], {}, { subtype: 1 }]) expect(isNativeUiAction(request)).toBe(false);
+  });
   it("refuses disconnected sends and rejects outstanding actions without replaying them", async () => {
     const frames: UiRecord[] = [];
     const transport = new NativeUiTransport((frame) => { frames.push(frame); return true; });

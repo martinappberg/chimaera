@@ -249,7 +249,7 @@ pub(super) async fn ready(admission: ViewerAdmission<'_>, downstream: &mut Viewe
                         admission.current().map_err(|_| anyhow::anyhow!("viewer retired"))?;
                         if ready {
                             if let Some(frame) = upward(frame) { bounded_send(&mut upstream, frame).await?; }
-                        } else if matches!(ViewerFrameKind::of(admission.chat(), &frame), ViewerFrameKind::Input { .. } | ViewerFrameKind::Setting { .. }) {
+                        } else if matches!(ViewerFrameKind::of(admission.chat(), &frame), ViewerFrameKind::Input { .. } | ViewerFrameKind::Setting { .. } | ViewerFrameKind::Ephemeral) {
                             // Missing policy never creates a deferred mutation.
                             // Still consume close/input before ready so a silent
                             // peer cannot keep a disconnected viewer's permit.

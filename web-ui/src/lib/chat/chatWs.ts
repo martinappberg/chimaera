@@ -3,7 +3,7 @@ import { movedTo, ownerSuspended, parsePause, sendSocketAuth, type MovedTo, type
 import { getToken } from "../net/api";
 import { ownerAwake, parkUntilAwake, QUIET_OPEN_MS, Reconnector, UNKNOWN_SESSION_RETRIES } from "../net/reconnect";
 import { CooperativeQueue } from "./cooperativeQueue";
-import { NativeUiTransport } from "./nativeUi";
+import { NativeUiTransport, isNativeUiAction } from "./nativeUi";
 
 /**
  * Normalized agent events from the daemon (chimaera-agent's AgentEvent,
@@ -110,6 +110,7 @@ type ChatDelivery =
       replayFrom: number;
       head: number | undefined;
       attach: ReadyAttach;
+      nativeUiGeneration: number;
     }
   | { kind: "event"; entry: SeqEvent }
   | { kind: "degraded" }
@@ -135,7 +136,13 @@ type ChatDelivery =
  * backoff — the journal gap-replay makes reconnects lossless.
  */
 export class ChatSocket {
-  readonly nativeUi = new NativeUiTransport((frame) => this.send(frame));
+  readonly nativeUi = new NativeUiTransport((frame) =>
+    isNativeUiAction(frame.request) ? this.send(frame) : this.sendQuietly(frame));
+  private nativeUiGeneration = 0;
+  private resetNativeUi(): void {
+    this.nativeUiGeneration++;
+    this.nativeUi.reset(true);
+  }
   private ws: WebSocket | null = null;
   private authenticatedSocket: WebSocket | null = null;
   private closed = false;
@@ -175,7 +182,9 @@ export class ChatSocket {
       switch (delivery.kind) {
         case "ready":
           this.handlers.onReady(delivery.session, delivery.replayFrom, delivery.head, delivery.attach);
-          if (this.ws?.readyState === WebSocket.OPEN && this.healthy) this.nativeUi.connected();
+          if (delivery.nativeUiGeneration === this.nativeUiGeneration
+            && this.ws?.readyState === WebSocket.OPEN && this.authenticatedSocket === this.ws
+            && this.healthy) this.nativeUi.connected();
           break;
         case "event":
           this.handlers.onEvent(delivery.entry);
@@ -284,6 +293,7 @@ export class ChatSocket {
           ownerAwake();
           this.deliveries.push({
             kind: "ready",
+            nativeUiGeneration: ++this.nativeUiGeneration,
             session: msg.session as ChatSessionInfo,
             replayFrom: (msg.replay_from as number) ?? 0,
             head: msg.head as number | undefined,
@@ -323,18 +333,19 @@ export class ChatSocket {
           break;
         case "degraded":
           this.ended = true;
-          this.nativeUi.reset(true);
+          this.resetNativeUi();
           this.deliveries.push({ kind: "degraded" });
           break;
         case "exited":
           this.ended = true;
-          this.nativeUi.reset(true);
+          this.resetNativeUi();
           this.deliveries.push({
             kind: "exited",
             status: (msg.status as number | null) ?? null,
           });
           break;
         case "moved":
+          this.resetNativeUi();
           // Continuing elsewhere: never `ended`. The daemon closes this
           // socket next and the ordinary reconnect follows the new owner.
           // Sends stop here, before that close lands.
@@ -343,14 +354,17 @@ export class ChatSocket {
           this.deliveries.push({ kind: "moved", to: movedTo(msg) });
           break;
         case "waking":
+          this.resetNativeUi();
           this.asleep = false;
           this.deliveries.push({ kind: "waking" });
           break;
         case "bringing":
+          this.resetNativeUi();
           this.asleep = false;
           this.deliveries.push({ kind: "bringing", to: msg.to === "computer" ? "computer" : "here" });
           break;
         case "paused": {
+          this.resetNativeUi();
           // Not an exit either: the daemon closes this socket next and the
           // ordinary reconnect finds the conversation once it runs again.
           const pause = parsePause(msg);
@@ -363,6 +377,7 @@ export class ChatSocket {
           // Connection states, never fatal: the socket stays (or reconnects)
           // and the next send carries wake intent.
           if (msg.code === "worker_asleep") {
+            this.resetNativeUi();
             // Said by a relay or gateway that keeps no socket for the owner,
             // possibly after this one had counted as kept (a slow answer).
             this.kept = false;
@@ -371,6 +386,7 @@ export class ChatSocket {
             break;
           }
           if (msg.code === "remote_unavailable") {
+            this.resetNativeUi();
             this.kept = false;
             this.deliveries.push({ kind: "unreachable" });
             // A relay that cannot reach the owner says it is retrying
@@ -381,7 +397,7 @@ export class ChatSocket {
             if (msg.reason !== "reconnecting") this.awaitQuiet(ws);
             break;
           }
-          if (msg.code === "workspace_scope_changed") break;
+          if (msg.code === "workspace_scope_changed") { this.resetNativeUi(); break; }
           // Mid view-switch the driver may not be registered yet — the
           // normal onclose reconnect path retries before this goes fatal.
           if (
@@ -411,7 +427,7 @@ export class ChatSocket {
             break;
           }
           this.fatal = true;
-          this.nativeUi.reset(true);
+          this.resetNativeUi();
           this.deliveries.push({
             kind: "error",
             message: (msg.message as string) ?? "unknown error",
@@ -423,7 +439,7 @@ export class ChatSocket {
     };
 
     ws.onclose = () => {
-      this.nativeUi.reset(true);
+      this.resetNativeUi();
       if (this.ws === ws) this.ws = null;
       this.waking = false;
       const kept = this.kept;
@@ -542,6 +558,7 @@ export class ChatSocket {
   private wakeOnInput(): void {
     if (!(isBrowserGateway() || this.leaveSleepWait !== null) || this.closed || this.fatal || this.ended || this.waking) return;
     this.waking = true;
+    this.resetNativeUi();
     this.recon.cancel();
     if (this.ws !== null) {
       this.ws.onclose = null;
@@ -568,7 +585,7 @@ export class ChatSocket {
     this.closed = true;
     this.stopSleepWait();
     this.stopQuiet();
-    this.nativeUi.reset(true);
+    this.resetNativeUi();
     this.recon.cancel();
     this.recon.clear();
     this.deliveries.clear();

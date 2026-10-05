@@ -92,6 +92,8 @@ pub(crate) struct GitService {
     /// module-loaded git in the user's dotfiles), so it must not happen per
     /// invocation — every git call reads the cached path.
     resolved_git: Mutex<Option<(Option<String>, Arc<GitBinary>)>>,
+    #[cfg(test)]
+    fixture_git: Option<String>,
     /// Bounds concurrent `git` processes across the whole daemon.
     pub(super) procs: Arc<Semaphore>,
     /// Per-repository single-flight + short reuse for status runs, keyed by
@@ -304,11 +306,23 @@ impl GitService {
             watchers: Mutex::new(HashMap::new()),
             hashes: Mutex::new(HashMap::new()),
             resolved_git: Mutex::new(None),
+            #[cfg(test)]
+            fixture_git: None,
             procs: Arc::new(Semaphore::new(MAX_CONCURRENT_GIT)),
             status_share: StatusShare::new(),
             sessions: Default::default(),
             vs_main: Mutex::new(HashMap::new()),
             fresh_branches: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Route fixtures use a captured PATH binary without reading the host's rc.
+    /// An explicit setting still overrides it; production resolution is unchanged.
+    #[cfg(test)]
+    pub(crate) fn with_fixture_git(path: PathBuf) -> Self {
+        Self {
+            fixture_git: Some(path.to_string_lossy().into_owned()),
+            ..Self::new()
         }
     }
 
@@ -325,7 +339,10 @@ impl GitService {
                 }
             }
         }
-        let bin = Arc::new(resolve_git_binary(configured.clone()).await);
+        let resolver_input = configured.clone();
+        #[cfg(test)]
+        let resolver_input = resolver_input.or_else(|| self.fixture_git.clone());
+        let bin = Arc::new(resolve_git_binary(resolver_input).await);
         *crate::lock(&self.resolved_git) = Some((configured, bin.clone()));
         bin
     }
@@ -1208,6 +1225,26 @@ pub(crate) async fn git_facts(state: &AppState, ws_id: &str, root: &Path) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn fixture_git_keeps_explicit_overrides_and_restores_its_default() {
+        let service = GitService::with_fixture_git(PathBuf::from("git"));
+        let git = service.resolve_git(None).await;
+        assert!(git.adequate);
+        assert_eq!(git.path, PathBuf::from("git"));
+        let missing = std::env::temp_dir().join(format!(
+            "chimaera-missing-fixture-git-{}-{}",
+            std::process::id(),
+            chimaera_core::generate_token()
+        ));
+        let explicit = service
+            .resolve_git(Some(missing.to_string_lossy().into_owned()))
+            .await;
+        assert_eq!(explicit.path, missing);
+        assert!(!explicit.adequate);
+        assert!(service.resolve_git(None).await.adequate);
+        assert_eq!(service.resolve_git(None).await.path, PathBuf::from("git"));
+    }
 
     /// A real repo must never silently read as "not a git repository": only
     /// git's own "not a git repository" (and an empty stderr) is the ordinary
