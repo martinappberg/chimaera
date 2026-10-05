@@ -2,7 +2,7 @@
  * The window / tab title, composed from what the window shows. Pure so the
  * wording is pinned by tests; App.svelte feeds it and sets `document.title`.
  *
- *   "my-analysis •hpc | chimaera"        a remote window, in a workspace
+ *   "my-analysis •hpc | chimaera"             a remote window, in a workspace
  *   "my-analysis | chimaera"                  local — the host is implicit
  *   "my-analysis •In the cloud | chimaera"    a browser view of a project
  *   "claude (2) — my-analysis | chimaera"     a detached solo window: tab leads
