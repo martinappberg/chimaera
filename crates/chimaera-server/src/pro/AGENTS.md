@@ -381,7 +381,12 @@ machine cannot do, and they leave such a step for when the user is back.
 Before any agent resumes, hydration records what the move left behind for the
 note (`mcp::cloud_context::record_arrival`: the manifest's `left_out` and the
 sender's OS/CPU, `source_os`/`source_arch`, additive on the manifest) in
-`<data>/pro/<workspace>/arrival.json`.
+`<data>/pro/<workspace>/arrival.json`, bounded at write time to the 64 KiB its
+reader accepts. Which conversations heard which note is `told.json` beside it;
+`disconnect` removes both for every project, `privacy` (keep on this computer)
+for that project. Only an enrolled project (an ownership record here) counts as
+synced (`pro::synced`); `workspace_profile` alone also answers for projects that
+never enrolled.
 
 Cloud resume additionally checks the providers named by actual deferred ledger
 agents after setup, using fresh bounded worker-local readiness probes, per

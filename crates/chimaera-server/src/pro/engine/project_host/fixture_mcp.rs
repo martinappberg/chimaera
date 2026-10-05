@@ -267,6 +267,13 @@ impl Scenario {
         lock(&state.deferred_sessions).insert(session.to_owned(), entry);
         crate::ledger::resume_deferred_workspace(state, &self.key).await
     }
+    /// Enrolls the project as its first copy or a hydrate would: only an
+    /// enrolled project's agents hear where they run (`pro::synced`).
+    pub fn enroll_fixture(&self) {
+        lock(&self.harness.state.pro.ownership)
+            .entry(self.key.clone())
+            .or_insert(crate::pro::Ownership::Local { epoch: 1 });
+    }
     /// What a move into this machine records before its agents resume.
     pub async fn record_fixture_arrival(&self, left_out: &[&str], os: &str, arch: &str) {
         let left_out: Vec<PathBuf> = left_out.iter().take(64).map(PathBuf::from).collect();

@@ -1283,18 +1283,22 @@ pub(crate) fn workspace_profile(state: &crate::AppState, workspace: &str) -> Opt
     )
 }
 /// A project that actually moves between this computer and the cloud: an
-/// account is configured for it here, it is not kept on this computer, and
-/// it is not the cloud's own setup scratch project. Answers its saved profile
-/// and the kept-both copies still waiting for a choice, each with the file it
-/// sits beside (project-relative).
+/// account is configured for it here, it is enrolled (this daemon holds an
+/// ownership record for it, as only a first copy, a move or a hydrate
+/// writes), it is not kept on this computer, and it is not the cloud's own
+/// setup scratch project. `workspace_profile` alone also answers for a
+/// project that never enrolled. Answers its saved profile and the kept-both
+/// copies still waiting for a choice, each with the file it sits beside
+/// (project-relative).
 pub(crate) fn synced(
     state: &crate::AppState,
     workspace: &str,
 ) -> Option<(CloudProfile, Vec<(PathBuf, PathBuf)>)> {
     let profile = workspace_profile(state, workspace)?;
-    if crate::lock(&state.pro.preferences)
-        .get(workspace)
-        .is_some_and(|p| p.never_mirror)
+    if !crate::lock(&state.pro.ownership).contains_key(workspace)
+        || crate::lock(&state.pro.preferences)
+            .get(workspace)
+            .is_some_and(|p| p.never_mirror)
         || crate::lock(&state.workspaces)
             .get(workspace)
             .is_none_or(|w| w.cloud_internal)
@@ -1313,6 +1317,12 @@ pub(crate) fn synced(
         })
         .collect();
     Some((profile, kept))
+}
+/// Enrolls a project as its first copy would, for tests of what enrolled
+/// projects get.
+#[cfg(test)]
+pub(crate) fn enroll_for_tests(state: &crate::AppState, workspace: &str) {
+    crate::lock(&state.pro.ownership).insert(workspace.into(), Ownership::Local { epoch: 1 });
 }
 pub(crate) async fn save_workspace_profile(
     state: &std::sync::Arc<crate::AppState>,

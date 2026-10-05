@@ -85,7 +85,9 @@ pub mod providers {
     };
 }
 pub mod guidance {
-    pub use crate::mcp::cloud_context::{Arrival, Facts, GuidanceSetup, KeptPair};
+    pub use crate::mcp::cloud_context::{
+        clean_name, Arrival, Facts, GuidanceSetup, KeptPair, NAME_CAP, NOTE_CAP,
+    };
     pub use chimaera_agent::model::truncate_label;
 }
 pub use crate::workspace_maintenance::{PreparedWorkspace, WorkspaceHost};
@@ -123,8 +125,10 @@ pub trait Runtime: Send + Sync + 'static {
         Vec::new()
     }
     /// The words for where an agent in a synced project runs and what is
-    /// here. Pure: the host delivers it at each agent start (Claude hook
-    /// context, Codex developer note) and from `where_am_i`.
+    /// here. Pure: the host delivers it once per change of machine per
+    /// conversation (Claude hook context, Codex developer note) and from
+    /// `where_am_i`. Keep it within `guidance::NOTE_CAP` with the essential
+    /// first line first: the host cuts a longer note at a line boundary.
     fn placement_note(&self, _facts: &guidance::Facts) -> Option<String> {
         None
     }

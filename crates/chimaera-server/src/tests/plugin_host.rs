@@ -10,19 +10,27 @@ use std::time::{Duration, Instant};
 use super::support::*;
 use crate::{lock, AppState};
 
+/// As before Pro: a plugin may name a tool `where_am_i` or
+/// `update_cloud_profile`. Only an enrolled project's agents on a daemon with
+/// the optional Runtime get Chimaera's own tools of those names instead
+/// (`mcp::cloud_context::NAMES`).
 #[test]
-fn plugins_cannot_claim_project_cloud_tools_even_without_an_active_account() {
+fn plugins_may_use_the_cloud_tool_names_a_free_daemon_never_offers() {
     let manifest = |tool: &str| {
         format!(
             "id = \"profile-plugin\"\nname = \"Profile plugin\"\nversion = \"1.0.0\"\n\
              summary = \"Fixture\"\napi = \"0.1\"\n[provides]\nmcp_tools = [\"{tool}\"]\n"
         )
     };
-    assert!(crate::plugins::parse_manifest(&manifest("plugin_profile")).is_ok());
-    for tool in ["where_am_i", "update_cloud_profile"] {
-        let error = crate::plugins::parse_manifest(&manifest(tool)).unwrap_err();
-        assert!(error.contains("reserved by chimaera"), "{error}");
+    for tool in ["plugin_profile", "where_am_i", "update_cloud_profile"] {
+        assert!(
+            crate::plugins::parse_manifest(&manifest(tool)).is_ok(),
+            "{tool}"
+        );
     }
+    assert!(crate::plugins::parse_manifest(&manifest("notify"))
+        .unwrap_err()
+        .contains("reserved by chimaera"));
 }
 
 /// A workspace with the fixture switched on and one agent session in it.

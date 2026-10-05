@@ -3311,20 +3311,7 @@ pub(crate) async fn spawn_chat_session(
     // context it gets as a developer note once its thread opens (claude's
     // rides the hook carrier). Both are None off-cluster without any I/O.
     let startup = crate::environment::job_startup().await;
-    // Codex has no hook carrier: a synced project's where-you-run note rides
-    // the same developer note, after the cluster's (`cloud_context`).
-    let codex_note = if recipe.kind == AgentKind::Codex {
-        let notes: Vec<String> = [
-            state.compute.agent_context().await,
-            crate::mcp::cloud_context::note(state, &recipe.workspace_id).await,
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        (!notes.is_empty()).then(|| notes.join("\n\n"))
-    } else {
-        None
-    };
+    let (codex_note, placement) = codex_developer_note(state, &recipe, &id).await;
     // Re-enforce the journal-dir budget as sessions are created: pruning only
     // at boot lets a weeks-long daemon accumulate one capped journal per
     // session past the documented ceiling.
@@ -3661,11 +3648,39 @@ pub(crate) async fn spawn_chat_session(
             state.chat.fence(&id);
             anyhow::bail!("project execution authority changed during launch");
         }
+        if let Some(placement) = &placement {
+            crate::mcp::cloud_context::told(state, placement).await;
+        }
         if let Some(intent) = intent {
             intent.registered(id);
         }
     }
     info
+}
+
+/// What a Codex chat is handed as its developer note when its thread opens
+/// (`SpawnSpec::developer_note`, PROTOCOL.md Pass 47): the cluster context in
+/// a cluster job, then, in a synced project with the optional Runtime, the
+/// where-you-run note when this conversation has not heard it for this
+/// machine (`cloud_context::pending`, remembered once the spawn succeeds).
+/// Codex chats have no hook carrier. Other agents get nothing here.
+pub(crate) async fn codex_developer_note(
+    state: &AppState,
+    recipe: &ChatRecipe,
+    id: &str,
+) -> (Option<String>, Option<crate::mcp::cloud_context::Pending>) {
+    if recipe.kind != AgentKind::Codex {
+        return (None, None);
+    }
+    let placement = crate::mcp::cloud_context::pending(state, &recipe.workspace_id, id).await;
+    let notes: Vec<String> = [
+        state.compute.agent_context().await,
+        placement.as_ref().map(|pending| pending.text.clone()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    ((!notes.is_empty()).then(|| notes.join("\n\n")), placement)
 }
 
 /// Resurrect a chat session from the ledger under its ORIGINAL id (the boot

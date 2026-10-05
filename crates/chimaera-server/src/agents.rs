@@ -819,25 +819,25 @@ pub(crate) async fn ingest(
     }
 
     // Where a synced project's agent runs (the user's computer or their
-    // cloud machine) and what did not travel: the same carriers, once per
-    // agent start, and again only if the words changed. A move always starts
-    // a new process with a fresh record, so a conversation that comes home
-    // hears it after the cloud's note and the newer one wins. Without the
-    // optional Runtime this is one Option check.
+    // cloud machine) and what did not travel: the same carriers. It lands in
+    // the conversation's history, so a conversation hears it once per change
+    // of machine (`cloud_context::pending`, remembered across restarts and
+    // view switches) and the record's digest keeps two hooks racing at one
+    // start from both carrying it. Without the optional Runtime this is one
+    // Option check.
     if starting && own_hook {
-        if let Some(note) = crate::mcp::cloud_context::note_for_session(&state, &id).await {
-            let digest = {
-                use std::hash::{Hash, Hasher};
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                note.hash(&mut hasher);
-                hasher.finish()
+        if let Some(pending) = crate::mcp::cloud_context::pending_for_session(&state, &id).await {
+            let fresh = {
+                let mut agents = crate::lock(&state.agents);
+                agents.get_mut(&id).is_some_and(|record| {
+                    let fresh = record.placement_delivered != Some(pending.digest);
+                    record.placement_delivered = Some(pending.digest);
+                    fresh
+                })
             };
-            let mut agents = crate::lock(&state.agents);
-            if let Some(record) = agents.get_mut(&id) {
-                if record.placement_delivered != Some(digest) {
-                    record.placement_delivered = Some(digest);
-                    context.push(note);
-                }
+            if fresh {
+                crate::mcp::cloud_context::told(&state, &pending).await;
+                context.push(pending.text);
             }
         }
     }

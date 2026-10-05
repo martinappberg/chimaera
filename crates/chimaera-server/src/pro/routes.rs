@@ -375,6 +375,8 @@ pub(crate) async fn disconnect(State(state): State<Arc<AppState>>) -> Response {
     if let Err(error) = super::persist(&state).await {
         return failure(error);
     }
+    // No project file names stay behind for agents of a later sign-in.
+    crate::mcp::cloud_context::forget_all(&state).await;
     if device {
         // A project this computer owned can still hold sessions that were
         // due to resume: a return's resume still in flight (one resumer per
@@ -514,6 +516,10 @@ pub(crate) async fn privacy(
         ) {
             ownership.remove(&request.workspace_id);
         }
+    }
+    if request.never_mirror {
+        // Kept on this computer from now on: nothing of its moves is told.
+        crate::mcp::cloud_context::forget(&state, &request.workspace_id).await;
     }
     match super::persist(&state).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),

@@ -278,10 +278,13 @@ pub(crate) async fn mcp(
         "tools/list" => {
             let mut tools = tool_defs(comms_on, mastermind, plugin_tools);
             if cloud_context::available(&state, &agent_id) {
-                tools
-                    .as_array_mut()
-                    .unwrap()
-                    .extend(cloud_context::definitions(&state));
+                // Where they are offered, these win over a plugin tool of
+                // the same name (plugins may use the names elsewhere).
+                let tools = tools.as_array_mut().unwrap();
+                tools.retain(|tool| {
+                    !cloud_context::NAMES.contains(&tool["name"].as_str().unwrap_or_default())
+                });
+                tools.extend(cloud_context::definitions(&state));
             }
             Ok(json!({"tools":tools}))
         }
@@ -499,7 +502,7 @@ pub(crate) fn is_core_tool(name: &str) -> bool {
                 .filter_map(|t| t["name"].as_str().map(str::to_owned))
                 .collect()
         });
-    NAMES.contains(name) || cloud_context::NAMES.contains(&name)
+    NAMES.contains(name)
 }
 
 fn base_tool_defs() -> Vec<Value> {
@@ -744,6 +747,11 @@ async fn tools_call(
             ),
         ));
     }
+    // A synced project's own tools, where they are offered, before any
+    // plugin's of the same name (`cloud_context::NAMES` are not reserved).
+    if cloud_context::NAMES.contains(&name) && cloud_context::available(state, agent_id) {
+        return Ok(cloud_context::call(state, agent_id, name, &args).await);
+    }
     // Plugin tools: offered only where their plugin is active; the same
     // gate on call (a caller can name a tool it was never offered).
     if let Some(owner) = crate::plugins::tools::owner(state, plugins, name) {
@@ -760,9 +768,6 @@ async fn tools_call(
         return Ok(crate::plugins::tools::call(state, &owner, agent_id, name, &args).await);
     }
     match name {
-        "where_am_i" | "update_cloud_profile" => {
-            Ok(cloud_context::call(state, agent_id, name, &args).await)
-        }
         "list_terminals" => Ok(list_terminals(state, agent_id).await),
         "run_in_terminal" => Ok(run_in_terminal(state, agent_id, &args).await),
         "read_terminal" => Ok(read_terminal(state, agent_id, &args).await),
