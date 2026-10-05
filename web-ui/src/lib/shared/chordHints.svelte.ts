@@ -1,8 +1,8 @@
 /**
  * The "which-key" discovery state: true while the user is HOLDING the app's
  * base modifier (⌘ on macOS, Ctrl+Shift elsewhere) without yet committing to a
- * chord, so surfaces can fade in what the next key would do (the ⌘1–9 digit
- * badges on rail rows). Deliberately quiet — it arms only after a short hold,
+ * chord, so panes can reveal their numbered focus/move shortcuts.
+ * Deliberately quiet — it arms only after a short hold,
  * so a fast chord (⌘1 struck and released) never flashes anything, and it
  * clears the instant a real key lands or the modifier lifts.
  *
@@ -10,25 +10,34 @@
  * so it can never get in the way of the very chords it advertises.
  */
 
-import { isMac } from "./keys";
+import { resolveMod, resolvePaneMoveMod } from "./keys";
+import { modifierSetting } from "./keybindings";
 
 /** Hold this long before the hints arm — long enough that executing a chord
  *  outruns it, short enough that a pause to think reveals them. */
 const ARM_DELAY_MS = 380;
 
 let active = $state(false);
+let layer = $state<"base" | "move" | null>(null);
 let timer: ReturnType<typeof setTimeout> | null = null;
 
 /** True while the discovery hints should be shown. */
 export function hintsActive(): boolean {
-  return active;
+  return active && layer === "base";
 }
 
-/** Just the app base modifier is down (no second layer, no stray modifier) —
- *  the state that, held, means "I'm about to chord but haven't picked a key". */
-function baseModifierOnly(e: KeyboardEvent): boolean {
-  if (isMac) return e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey;
-  return e.ctrlKey && e.shiftKey && !e.metaKey && !e.altKey;
+export function paneHintsActive(): boolean {
+  return active && layer === "move";
+}
+
+/** Match the configured modifier and its move layer, without stray modifiers. */
+function modifierLayer(e: KeyboardEvent): "base" | "move" | null {
+  const setting = modifierSetting();
+  const matches = (m: ReturnType<typeof resolveMod>) =>
+    e.metaKey === m.meta && e.ctrlKey === m.ctrl && e.altKey === m.alt && e.shiftKey === m.shift;
+  if (matches(resolveMod(setting))) return "base";
+  if (matches(resolvePaneMoveMod(setting))) return "move";
+  return null;
 }
 
 /** Modifier keys never count as "committing" to a chord. */
@@ -42,6 +51,7 @@ function disarm(): void {
     timer = null;
   }
   active = false;
+  layer = null;
 }
 
 /**
@@ -57,13 +67,20 @@ export function initChordHints(): () => void {
       if (active || timer !== null) disarm();
       return;
     }
-    if (!baseModifierOnly(e)) {
-      // A second layer (Shift/Alt) joined the modifier — a different chord
-      // family, not the digit layer these hints teach.
+    const next = modifierLayer(e);
+    if (next === null) {
       if (active || timer !== null) disarm();
       return;
     }
-    if (active || timer !== null) return; // already armed/pending (auto-repeat)
+    if (layer === next && (active || timer !== null)) return;
+    // Adding the move modifier after discovery should not flash the backdrop
+    // away and make the user wait through a second hold delay.
+    if (active) {
+      layer = next;
+      return;
+    }
+    disarm();
+    layer = next;
     timer = setTimeout(() => {
       timer = null;
       active = true;

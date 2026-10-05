@@ -160,6 +160,44 @@ extension either), `channel_enable`, `apply_flag_settings`, `reload_skills`,
 
 ## Codex — `codex app-server` JSON-RPC 2.0 (JSONL, header omitted)
 
+### Startup hooks and interrupted input (0.159.3, 2026-10-03)
+
+The generated schema defines `hook/started|completed {threadId, turnId: string|null,
+run:{id,eventName,executionMode,sourcePath,status,...}}`. Synchronous `sessionStart`
+and `userPromptSubmit` hooks can block after `turn/started`, before the native
+`userMessage` item. Surface those hooks through bounded tool rows and ActivityLine;
+async hooks and other threads must not replace the parent's startup phase.
+
+Observed in the affected live session: `turn/started` → `hook/started`, then no
+completion for over four minutes until interruption. The native rollout contained
+repository instructions but **not the submitted user request**; the next turn's
+"Keep going" was its first recorded user prompt. A successful turn/start RPC or
+TurnStarted event therefore cannot establish delivery. The opening `clientId` is
+tracked until its userMessage echo (or actual model activity for older runtimes);
+an interrupt before confirmation emits an explicit resend notice, including when
+the interrupt watchdog supplies the missing turn end.
+
+Isolated live reproduction: a trusted project SessionStart hook (`sleep 300`)
+produced the hook row and phase; Stop produced the resend notice, which survived
+UI reload. Resending the original prompt completed normally. Hook ids can be
+configuration-derived (`session-start:0:<sourcePath>`), so normalized row ids use
+a local monotonic counter with a random mapper namespace to keep later hooks and
+resumed drivers from overwriting earlier history without copying unbounded native
+turn ids into each row.
+Native hook keys are SHA-256 digests, so deeply nested configuration paths remain
+visible without retaining large IDs. For runtimes without a user `clientId`, model
+work items (including all tool types, plan and sleep), output deltas, patch updates,
+turn/plan/updated, and parent-turn tool requests confirm receipt. Work notifications
+must carry the current turnId; late frames from a prior turn cannot confirm a new
+opening message. Setup items such as hookPrompt and contextCompaction, and
+child-thread activity, do not establish parent delivery.
+Activity in a turn adopted after a rejected start (or a stale-target steer) cannot
+confirm an opening message from a different turn; only its exact user echo can.
+Run statuses `failed`, `blocked`, and `stopped` all represent unsuccessful hooks.
+Diagnostics live in `entries[{kind,text}]` (`error`, `feedback`, `stop`, `warning`);
+`statusMessage` is a configured progress label. Join diagnostics with a byte cap
+while accumulating, and do not expose `context` entries containing injected input.
+
 ### Lifecycle (live)
 
 `initialize{clientInfo}` → result → client MUST send `initialized`

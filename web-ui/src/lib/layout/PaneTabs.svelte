@@ -13,7 +13,7 @@
    */
   import { tabNavigation } from "../shared/tabNavigation";
   import { untrack } from "svelte";
-  import { isPreviewTab, tabKey, type PaneNode, type Tab } from "./layout";
+  import { isPreviewTab, tabKey, MAX_PANES, type PaneNode, type Tab } from "./layout";
   import { TAB_FADE_PX, revealTabScrollLeft, tabFadeWidths, tabInView, type TabBounds } from "./tabScroll";
   import type { Session } from "../workspace/sessions";
   import {
@@ -38,7 +38,7 @@
   import { isUnread } from "../workspace/unread.svelte";
   import { decoFor } from "../workspace/gitDeco";
   import { PINNED } from "../shared/keys";
-  import { keyHint, keyHintSuffix } from "../shared/keybindings";
+  import { keyHint, keyHintSuffix, paneMoveHint } from "../shared/keybindings";
   import BrandMark from "../shared/BrandMark.svelte";
   import { mastermindPanel, setMastermindPanelOpen } from "../dashboard/mastermindPanelState.svelte";
   import { activeSelection, referenceTarget, requestReference } from "../shared/reference";
@@ -462,10 +462,11 @@
     ctrl.openChangesFrom(node.id, activeTerminal.sessionId, e.metaKey || e.ctrlKey);
   }
 
-  function openPaneMenu(button: HTMLElement): void {
+  function paneMenu(): ContextMenuEntry[] {
     const entries: ContextMenuEntry[] = [
-      { label: `Split right (${keyHint("splitRight")})`, onSelect: () => ctrl.splitPaneAt(node.id, "row") },
-      { label: `Split down (${keyHint("splitDown")})`, onSelect: () => ctrl.splitPaneAt(node.id, "col") },
+      { label: `New empty pane${keyHintSuffix("newPane")}`, disabled: ctrl.paneTargets().length >= MAX_PANES, onSelect: () => ctrl.newPaneAt(node.id) },
+      { label: `Split right${keyHintSuffix("splitRight")}`, disabled: ctrl.paneTargets().length >= MAX_PANES, onSelect: () => ctrl.splitPaneAt(node.id, "row") },
+      { label: `Split down${keyHintSuffix("splitDown")}`, disabled: ctrl.paneTargets().length >= MAX_PANES, onSelect: () => ctrl.splitPaneAt(node.id, "col") },
     ];
     if (fontTarget) entries.push("separator",
       { label: `Smaller text (${PINNED.fontMinus})`, onSelect: () => ctrl.adjustFont(node.id, -1) },
@@ -475,10 +476,17 @@
       const sid = activeTerminal.sessionId;
       entries.push("separator", { label: `Review ${touched.length} changed files`, onSelect: () => ctrl.openChangesFrom(node.id, sid, false) });
     }
-    entries.push("separator", { label: `Close view (${keyHint("closeView")})`, onSelect: () => ctrl.closeView(node.id) });
+    const active = node.tabs[node.active];
+    entries.push("separator");
+    if (active !== undefined) entries.push(newWindowEntry(active, node.active));
+    entries.push({ label: `Close view (${keyHint("closeView")})`, onSelect: () => ctrl.closeView(node.id) });
+    return entries;
+  }
+
+  function openPaneMenu(button: HTMLElement): void {
     button.focus({ preventScroll: true });
     const r = button.getBoundingClientRect();
-    contextMenu.openAtPoint(r.right, r.bottom + 4, entries, { alignRight: true });
+    contextMenu.openAtPoint(r.right, r.bottom + 4, paneMenu(), { alignRight: true });
   }
 
   /** Empty bar area drags the pane's ACTIVE tab (capture runs before the
@@ -590,13 +598,9 @@
     }
   }
 
-  /** The cross-window section every surface gets: tear out into a new
-   *  window, or move into a live sibling window (same host + workspace).
-   *  Dirty files are blocked — their unsaved buffer lives in THIS window.
-   *  The roster is the last refresh's snapshot; refreshing here (fire-and-
-   *  forget) keeps it current for the next open. */
-  function moveEntries(tab: Tab, i: number): ContextMenuEntry[] {
-    ctrl.refreshMoveTargets();
+  /** Unsaved buffers and volatile drafts live in this window, so both
+   *  menu entry points must block moving their owning tab elsewhere. */
+  function windowMoveGuard(tab: Tab): { disabled: boolean; hint?: string } {
     const dirty =
       (tab.surface === "file" && $dirtyFiles.has(tab.path)) ||
       (tab.surface === "terminal" && $volatileChatDrafts.has(tab.sessionId));
@@ -605,19 +609,33 @@
         ? "save the file first — moving would drop unsaved edits"
         : "send or clear the chat draft first — it cannot follow to another window"
       : undefined;
+    return { disabled: dirty, hint };
+  }
+
+  function newWindowEntry(tab: Tab, i: number): ContextMenuEntry {
+    return {
+      label: "Move to New Window",
+      ...windowMoveGuard(tab),
+      onSelect: () => ctrl.detachTabToWindow(node.id, i),
+    };
+  }
+
+  /** Same-host/workspace siblings use the last refresh's snapshot;
+   *  refreshing here keeps it current for the next menu open. */
+  function moveEntries(tab: Tab, i: number): ContextMenuEntry[] {
+    ctrl.refreshMoveTargets();
+    const guard = windowMoveGuard(tab);
     const rows: ContextMenuEntry[] = [
-      {
-        label: "Move to New Window",
-        disabled: dirty,
-        hint,
-        onSelect: () => ctrl.detachTabToWindow(node.id, i),
-      },
+      ...ctrl.paneTargets().filter((p) => p.id !== node.id).map((p) => ({
+        label: `Move to pane ${p.number}${paneMoveHint(p.number) ? ` (${paneMoveHint(p.number)})` : ""}`,
+        onSelect: () => ctrl.moveTabToPane(node.id, i, p.id),
+      })),
+      newWindowEntry(tab, i),
     ];
     for (const w of ctrl.moveTargets()) {
       rows.push({
         label: `Move to “${w.label || "window"}”`,
-        disabled: dirty,
-        hint,
+        ...guard,
         onSelect: () => ctrl.moveTabToWindow(node.id, i, w.winId),
       });
     }
@@ -698,12 +716,13 @@
   }
 </script>
 
-<div class="bar" bind:this={el} onpointerdowncapture={onBarPointerDown}>
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<div class="bar" bind:this={el} onpointerdowncapture={onBarPointerDown} oncontextmenu={(e) => contextMenu.openAt(e, paneMenu())}>
   <!-- .strip owns the edge fades + the "more" control; .tabs is the
        scroller (hidden scrollbar, wheel → sideways). -->
   <div class="strip" class:clip-left={clip.left} class:clip-right={clip.right} class:over={clip.over}
     style:--left-fade="{clip.leftFade}px" style:--right-fade="{clip.rightFade}px">
-    <div class="tabs" role="tablist" aria-label="Pane tabs" use:tabNavigation bind:this={tabsEl} onscroll={onStripScroll} onwheel={onStripWheel}>
+    <div class="tabs" role="tablist" aria-label="Pane tabs" title={`Next tab${keyHintSuffix("cycleNext")} · previous tab${keyHintSuffix("cyclePrev")}`} use:tabNavigation bind:this={tabsEl} onscroll={onStripScroll} onwheel={onStripWheel}>
       {#each node.tabs as tab, i (tabKey(tab))}
         {@const sid = tab.surface === "terminal" ? tab.sessionId : null}
         {@const ts = sid !== null ? (sessions.get(sid) ?? null) : null}

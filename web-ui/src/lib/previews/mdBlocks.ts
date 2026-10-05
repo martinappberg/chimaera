@@ -101,6 +101,7 @@ import { copyPayload, decorateCopyTargets } from "../shared/copyDecor";
 import { copyText } from "../shared/clipboard";
 import { requestReveal } from "../shared/reveal";
 import { isWebUrl, urlMenuEntries, webUrl } from "../shared/urlOpen";
+import { pathPaneFrom } from "../shared/openPath";
 import { contextMenu } from "../shared/contextMenu.svelte";
 import {
   followDocHref,
@@ -187,6 +188,7 @@ export function followLiveLink(
   const box = view.dom.closest<HTMLElement>(".md-content") ?? view.dom;
   const host: DocLinkHost = {
     docPath: doc,
+    fromPane: pathPaneFrom(view.dom),
     wsRoot: ctx.wsRoot,
     workspaceId: ctx.workspaceId,
     toAnchor: (anchor) => revealAnchorInSource(doc, anchor, view.state.doc.toString()),

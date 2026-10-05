@@ -87,6 +87,12 @@ export interface DragPayload {
 
 /** Layout mutations the pane tree invokes; implemented by App. */
 export interface LayoutCtrl {
+  /** Stable pane numbers, shared by discovery and keyboard destinations. */
+  paneTargets(): { id: string; number: number }[];
+  newPaneAt(paneId: string): void;
+  moveTabToPane(paneId: string, index: number, targetPaneId: string): void;
+  navigateFileHistory(paneId: string, delta: -1 | 1): void;
+  quickOpen(paneId: string): void;
   focusPane(paneId: string): void;
   activateTab(paneId: string, index: number): void;
   closeTab(paneId: string, index: number): void;

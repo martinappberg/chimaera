@@ -346,6 +346,9 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
 - **Live status line.** While a turn runs: elapsed · output tokens this turn · running tasks
   (subagents + background work) · what it is doing — the agent's own phrase when it offers one
   (Claude `task_summary`, "Measuring file sizes…"), else Thinking / Writing / Running tools.
+  Codex's synchronous SessionStart and UserPromptSubmit hooks show their actual phase
+  and a hook row linking to the hook configuration. These can block a turn after the
+  runtime has initialized but before it receives the opening message.
   Finished turns keep their duration off the page (it is on the closing message's timestamp
   tooltip).
 - **Stopping.** Esc (or the header stop chip) interrupts the running turn. A deliberate stop is
@@ -354,6 +357,8 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   shows a muted "stopped" notice, dangling subagents settle neutrally instead of turning their
   tool group red, and the session rail reads finished — error-red `turn failed`, failed tool rows,
   and the Errored rail state are reserved for genuine failures.
+  If Codex has not confirmed receipt of the opening message when stopped, a brief
+  notice asks you to resend it. Saying only “Keep going” cannot recover missing input.
 - **Rendering.** Streamed prose reveals word-by-word on a ~75ms ticker (respects
   `prefers-reduced-motion`). Markdown and Codex's common LaTeX delimiters (`$…$`, `$$…$$`,
   `\(…\)`, `\[…\]`) render through **marked + KaTeX MathML → DOMPurify**; math is excluded from
