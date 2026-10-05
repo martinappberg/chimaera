@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { foldSpans, foldTitle } from "./activityFold";
+import { FINISHED_FOLD_MIN, finishedTitle, foldSpans, foldTitle } from "./activityFold";
 import type { LabelledTool } from "./toolLabels";
 
 // a = activity, m = a reply (closes a run), u / n = other rows (user, notice).
@@ -44,5 +44,42 @@ describe("foldTitle", () => {
   it("counts thoughts only when they are all there is", () => {
     expect(foldTitle(2, [])).toBe("Thought 2 times");
     expect(foldTitle(1, [])).toBe("Thought");
+  });
+});
+
+describe("finished-work folds", () => {
+  const spans = (kinds: string) =>
+    foldSpans(
+      kinds.split(""),
+      (k) => k === "f",
+      () => true,
+      FINISHED_FOLD_MIN,
+    );
+
+  it("folds three or more settled finished lines, never fewer or the trailing run", () => {
+    expect(spans("mfffm")).toEqual([[1, 4]]);
+    expect(spans("mffm")).toEqual([]);
+    expect(spans("mfff")).toEqual([]);
+    expect(spans("ffffufff")).toEqual([[0, 4]]);
+  });
+
+  it("says what ended and how, naming each kind once", () => {
+    const row = (source: string, status: string) => ({ source, status });
+    expect(
+      finishedTitle([
+        row("task", "completed"),
+        row("task", "completed"),
+        row("task", "stopped"),
+        row("task", "stopped"),
+        row("task", "stopped"),
+        row("agent", "completed"),
+      ]),
+    ).toBe("1 agent finished, 2 background tasks finished, 3 stopped");
+    expect(finishedTitle([row("task", "failed"), row("monitor", "completed"), row("monitor", "completed")])).toBe(
+      "1 background task failed, 2 monitors finished",
+    );
+    expect(finishedTitle([row("task", "killed"), row("task", "completed"), row("task", "killed")])).toBe(
+      "1 background task finished, 2 killed",
+    );
   });
 });
