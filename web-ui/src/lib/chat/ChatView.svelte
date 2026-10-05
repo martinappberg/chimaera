@@ -38,7 +38,7 @@
   import UserText from "./UserText.svelte";
   import ThoughtRow from "./ThoughtRow.svelte";
   import ToolGroup from "./ToolGroup.svelte";
-  import type { TurnTail } from "./toolLabels";
+  import { isLive, type TurnTail } from "./toolLabels";
   import FinishedRow from "./FinishedRow.svelte";
   import AgentMessageCards from "./AgentMessageCards.svelte";
   import { isAgentOrigin, parseAgentText } from "./agentMessages";
@@ -110,7 +110,7 @@
     type PagePlan,
   } from "./transcriptWindow";
   import { measureShift, rowsInReach, selectAnchor, type ReadingAnchor } from "./readingAnchor";
-  import { HistoryWeights, tailWeights, weightAt } from "./heightModel";
+  import { HistoryWeights, tailWeights, unfoldedFrom, weightAt } from "./heightModel";
   import { activeTheme, getSetting, setSetting } from "../settings/store.svelte";
   import { hostCanDictate, voiceProblem } from "./voice.svelte";
   import { keyHint } from "../shared/keybindings";
@@ -494,17 +494,9 @@
     // Bounded by the live array: a reset or tail splice can shrink it before
     // the windowing effect repairs renderEnd.
     const end = Math.min(renderEnd, store.blocks.length);
-    // The window's trailing run is unfolded: the finished lines that end it,
-    // else the activity after its last reply.
-    let settledEnd = end;
-    while (settledEnd > renderStart && store.blocks[settledEnd - 1].kind === "finished") settledEnd--;
-    if (settledEnd === end) {
-      while (settledEnd > renderStart) {
-        const kind = store.blocks[settledEnd - 1].kind;
-        if (kind === "message" || kind === "finished") break;
-        settledEnd--;
-      }
-    }
+    // The window's trailing run is unfolded; every run before it has a row
+    // after it and renders as its fold's one line.
+    const settledEnd = unfoldedFrom(store.blocks, renderStart, end);
     for (let i = renderStart; i < end; i++) {
       weight += weightAt(store.blocks, i, cpl, i < settledEnd);
     }
@@ -2258,8 +2250,8 @@
   );
 
   /** Render list for the bounded page: consecutive tool blocks coalesce into
-   *  one ToolGroup, a settled run of activity rows folds under the reply
-   *  that followed it, and a settled run of finished-work lines folds on its
+   *  one ToolGroup, a settled run of activity rows folds above whatever row
+   *  followed it, and a settled run of finished-work lines folds on its
    *  own (activityFold.ts). Visible tail rows are live proxies;
    *  hidden/history rows are inert snapshots. Every item carries its absolute
    *  source index for scroll anchoring and boundary-sensitive actions. */
@@ -2315,11 +2307,13 @@
     let turnTools: Extract<ChatBlock, { kind: "tool" }>[] = [];
     renderBlocks.forEach((block, i) => {
       const originalIndex = renderStart + i;
+      // A message the agent read mid-turn joined that turn: a retry after it
+      // still clears a failure before it.
       if (
-        block.kind === "user" ||
+        ((block.kind === "user" || (block.kind === "agent_message" && block.via === "send")) &&
+          block.midTurn !== true) ||
         block.kind === "wake" ||
-        block.kind === "turn_end" ||
-        (block.kind === "agent_message" && block.via === "send")
+        block.kind === "turn_end"
       )
         turnTools = [];
       // Every user block in `blocks` is delivered — queued/undelivered sends
@@ -2350,15 +2344,26 @@
         items.push({ t: "single", key: `b-${block.uid}`, index: originalIndex, block });
       }
     });
-    const spans = foldSpans(
-      items,
-      isActivityRow,
-      (item) =>
-        item.t === "single" && (item.block.kind === "message" || item.block.kind === "finished"),
-    );
+    // Whatever follows a run settles it — a reply, a finished line, a
+    // permission decision, a message sent mid-turn. Only the trailing run
+    // is live work.
+    const spans = foldSpans(items, isActivityRow).filter(([, end]) => {
+      // A row can land while the run's last calls still run: a permission
+      // decision (as its command starts), a message read mid-turn, a peer's
+      // note. The run stays open until those calls end, so nothing hides
+      // work in progress. Any call of the group counts — in a parallel
+      // batch the approved one is often not the last. A reply or a finished
+      // line settles the run regardless: what outlives those is background
+      // work, which the fold's live dot shows.
+      const closer = items[end];
+      const last = items[end - 1];
+      const settles =
+        closer.t !== "single" || closer.block.kind === "message" || closer.block.kind === "finished";
+      return settles || !(last.t === "group" && last.tools.some(isLive));
+    });
     // Finished-work lines never join an activity fold, but a long settled
     // run of them folds on its own. The two kinds of run never overlap.
-    const finishedSpans = foldSpans(items, isFinishedItem, () => true, FINISHED_FOLD_MIN);
+    const finishedSpans = foldSpans(items, isFinishedItem, FINISHED_FOLD_MIN);
     if (spans.length === 0 && finishedSpans.length === 0) return items;
     const finishedAt = new Set(finishedSpans.map(([start]) => start));
     const allSpans = [...spans, ...finishedSpans].sort((a, b) => a[0] - b[0]);
