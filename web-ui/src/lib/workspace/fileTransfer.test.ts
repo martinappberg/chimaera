@@ -3,7 +3,9 @@ import { transferBlock, transferInto } from "./fileTransfer";
 import { clearClip, copyFile, cutFile, fileClip, pasteInto } from "./fileClipboard.svelte";
 import { fsCopyOp, fsMoveOp } from "./fsEvents";
 import { reportUploadError } from "../net/uploads";
+import { copyFileToOs } from "../shared/clipboard";
 
+vi.mock("../shared/clipboard", () => ({ copyFileToOs: vi.fn(async () => true) }));
 vi.mock("./fsEvents", () => ({ fsCopyOp: vi.fn(), fsMoveOp: vi.fn() }));
 vi.mock("../net/uploads", () => ({
   reportUploadError: vi.fn(),
@@ -61,6 +63,13 @@ describe("file transfer destinations", () => {
 });
 
 describe("clipboard transfer lifecycle", () => {
+  it("offers a copy to the OS clipboard too, but never a pending cut", () => {
+    cutFile("/work/figure.png", "file");
+    expect(copyFileToOs).not.toHaveBeenCalled();
+    copyFile("/work/figure.png", "file");
+    expect(copyFileToOs).toHaveBeenCalledWith("/work/figure.png", "file");
+  });
+
   it("keeps a newer clipboard selection when a previous move finishes", async () => {
     let finish!: (path: string) => void;
     vi.mocked(fsMoveOp).mockReturnValue(new Promise((resolve) => { finish = resolve; }));

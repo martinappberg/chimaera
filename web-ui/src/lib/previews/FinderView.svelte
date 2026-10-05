@@ -40,7 +40,7 @@
   } from "../workspace/fileClipboard.svelte";
   import { stemLength, validateEntryName } from "../shared/fsNames";
   import { contextMenu, type ContextMenuEntry } from "../shared/contextMenu.svelte";
-  import { writeClipboard } from "../net/native";
+  import { revealEntries, writeClipboard } from "../net/native";
   import FileIcon from "../shared/FileIcon.svelte";
   import FolderIcon from "../shared/FolderIcon.svelte";
   import Spinner from "./Spinner.svelte";
@@ -559,6 +559,7 @@
         ? [{ label: "Download", onSelect: () => void fsDownload(entry.path) } as ContextMenuEntry]
         : []),
       { label: "Copy Path", onSelect: () => void copyPath(entry.path) },
+      ...revealEntries(entry.path),
       "separator",
       {
         label: "Delete…",
@@ -584,6 +585,7 @@
       },
       "separator",
       { label: "Copy Path", onSelect: () => void copyPath(dir) },
+      ...revealEntries(dir),
     ];
   }
 

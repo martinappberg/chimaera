@@ -56,6 +56,8 @@ pub const DAEMON_UI_COMMANDS: &[&str] = &[
     "begin_update",
     "shell_build",
     "write_clipboard",
+    "copy_file_to_clipboard",
+    "reveal_in_file_manager",
     "open_external",
     "answer_askpass",
     "list_askpass",
