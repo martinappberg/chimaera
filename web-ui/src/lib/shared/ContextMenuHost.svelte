@@ -12,6 +12,21 @@
     type ContextMenuItem,
   } from "./contextMenu.svelte";
   import { dismiss } from "./dismiss";
+  import { writeClipboard } from "../net/native";
+
+  function onUnhandledContextMenu(e: MouseEvent): void {
+    if (e.defaultPrevented) return;
+    // Editors retain their useful native edit/spelling menu. All other
+    // surfaces opt into app actions; unused space must not offer Reload.
+    if (e.target instanceof Element && e.target.closest("input, textarea, [contenteditable='true']") !== null) return;
+    const selection = window.getSelection()?.toString() ?? "";
+    if (selection !== "") {
+      contextMenu.openAt(e, [{ label: "Copy selection", onSelect: () => { void writeClipboard(selection); } }]);
+    } else {
+      e.preventDefault();
+      contextMenu.close();
+    }
+  }
 
   let menuEl = $state<HTMLElement | null>(null);
   /** The menu button that opened this menu (`aria-haspopup="menu"`), which
@@ -147,6 +162,8 @@
     // Escape is handled by the dismiss action (which also refocuses).
   }
 </script>
+
+<svelte:window oncontextmenu={onUnhandledContextMenu} />
 
 {#if contextMenu.open}
   <div

@@ -489,7 +489,7 @@ export class Hydrator {
     if (d === undefined) return false;
     return this.embeds.use(d.ref, (a) => {
       const reveal = fragmentReveal(parseEmbedFragment(splitTarget(d.ref.target).fragment, a.path));
-      openPath(a.path, a.kind, reveal !== undefined ? { reveal } : {});
+      openPath(a.path, a.kind, { documentFrom: this.opts.docPath, ...(reveal !== undefined ? { reveal } : {}) });
     });
   }
 

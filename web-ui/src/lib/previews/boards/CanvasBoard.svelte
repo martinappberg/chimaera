@@ -132,7 +132,7 @@
     if (n.type !== "file") return;
     const hit = resolved[n.file];
     if (hit === null || hit === undefined) return;
-    openPath(hit.path, hit.kind, { split: e.metaKey || e.ctrlKey });
+    openPath(hit.path, hit.kind, { split: e.metaKey || e.ctrlKey, documentFrom: path });
   }
 
   function openLink(url: string, e: MouseEvent): void {

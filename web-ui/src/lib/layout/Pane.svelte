@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { keepsPaneViewAlive, tabKey, type PaneNode, type Tab } from "./layout";
+  import { keepsPaneViewAlive, tabKey, MAX_PANES, type PaneNode, type Tab } from "./layout";
   import { untrack, type Component } from "svelte";
   import { get } from "svelte/store";
   import { dirtyFiles } from "../shared/editing";
@@ -8,8 +8,9 @@
   import { registerPane, unregisterPane, zoneWord } from "./dnd";
   import { dirLabel } from "../previews/files";
   import { agentHue, type LinkCtrl } from "../workspace/agentLinks";
-  import { activeModLabel, keyHint } from "../shared/keybindings";
+  import { activeModLabel, keyHint, keyHintSuffix, paneFocusHint, paneMoveHint } from "../shared/keybindings";
   import PaneTabs from "./PaneTabs.svelte";
+  import { hintsActive, paneHintsActive } from "../shared/chordHints.svelte";
   import { loadPaneView, retryPaneView, type PaneViewKind } from "./lazyViews";
   import {
     clearChunkFailure,
@@ -25,7 +26,6 @@
     focusedPaneId: string;
     /** True when this pane is rendered zoomed (fullscreen in the window). */
     zoomed?: boolean;
-    /** True when this is the only pane (hides the move-pane grip). */
     dropSpot: DropSpot | null;
     sessions: Map<string, Session>;
     names: Map<string, string>;
@@ -63,6 +63,11 @@
 
   const focused = $derived(node.id === focusedPaneId);
   const activeTab = $derived(node.tabs[node.active] ?? null);
+  const fileTrail = $derived(activeTab?.surface === "file" ? activeTab.fileTrail : undefined);
+  const historyVisible = $derived(fileTrail !== undefined && (
+    fileTrail.paths[fileTrail.index - 1] !== undefined || fileTrail.paths[fileTrail.index + 1] !== undefined
+  ));
+  const paneNumber = $derived(ctrl.paneTargets().find((p) => p.id === node.id)?.number ?? 1);
   let canFind = $state(false);
   $effect(() => {
     void $findTargetsChanged;
@@ -575,11 +580,31 @@
   class:focused
   class:linked={linkHue !== null}
   class:agent-exec={agentExec}
+  aria-label={`Pane ${paneNumber}`}
   style:--hue={linkHue}
   tabindex="-1"
   bind:this={rootEl}
   onpointerdowncapture={() => ctrl.focusPane(node.id)}
 >
+  <div class="pane-guide" class:shown={hintsActive() || paneHintsActive()} aria-hidden="true" inert>
+    <div class="pane-guide-center">
+      <span class="pane-guide-label">{focused ? "Current pane" : "Pane"}</span>
+      <span class="pane-guide-number">{paneNumber}</span>
+      {#if paneMoveHint(paneNumber)}
+        <span class="pane-guide-move">{paneHintsActive() ? "Move tab here" : "Focus pane"} <kbd>{paneHintsActive() ? paneMoveHint(paneNumber) : paneFocusHint(paneNumber)}</kbd></span>
+      {/if}
+    </div>
+    {#if focused}
+      <div class="pane-guide-actions">
+        {#if keyHint("newPane") && ctrl.paneTargets().length < MAX_PANES}
+          <span>New empty pane <kbd>{keyHint("newPane")}</kbd></span>
+        {/if}
+        {#if node.tabs.length > 1 && keyHint("cycleNext")}
+          <span>Next tab <kbd>{keyHint("cycleNext")}</kbd></span>
+        {/if}
+      </div>
+    {/if}
+  </div>
   <!-- Every pane always has its top bar — orientation, drag handle, and the
        mouse home for zoom/split/close, even single-pane single-tab. -->
   <PaneTabs
@@ -622,21 +647,27 @@
       </div>
     {/each}
     {#if activeTab === null}
-      {#if names.size === 0}
-        <!-- No sessions to open or drag yet: point at creating one. -->
-        <div class="hint">
-          <span><kbd>{keyHint("newAgent")}</kbd> new agent</span>
-          <span class="hint-sep">·</span>
-          <span><kbd>{keyHint("newTerminal")}</kbd> new terminal</span>
+      <div class="empty-pane">
+        <span class="empty-title">Space for your next view</span>
+        <span class="empty-detail">Drag any tab here, or hold <kbd>{activeModLabel()}</kbd> for shortcuts.</span>
+        <button class="empty-open" onclick={() => ctrl.quickOpen(node.id)}>Open a file or session {#if keyHint("quickOpen")}<kbd>{keyHint("quickOpen")}</kbd>{/if}</button>
+        <div class="empty-foot">
+          <span>{#if keyHint("newAgent")}<kbd>{keyHint("newAgent")}</kbd>{/if} new agent</span>
+          <span aria-hidden="true">·</span>
+          <span>{#if keyHint("newTerminal")}<kbd>{keyHint("newTerminal")}</kbd>{/if} terminal</span>
         </div>
-      {:else}
-        <div class="hint">
-          <span><kbd>{activeModLabel()}1–9</kbd> opens a session</span>
-          <span class="hint-sep">·</span>
-          <span>drag one here</span>
-        </div>
-      {/if}
+      </div>
     {/if}
+  </div>
+
+  <div class="document-nav" class:shown={historyVisible} role="group" aria-label="Document history" aria-hidden={!historyVisible} inert={!historyVisible}>
+    <button aria-label="Previous document" title={`Previous document${keyHintSuffix("fileBack")}`} disabled={fileTrail === undefined || fileTrail.index === 0} onclick={() => ctrl.navigateFileHistory(node.id, -1)}>
+      <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="m9.5 4-4 4 4 4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" /></svg>
+    </button>
+    <span class="document-nav-divider" aria-hidden="true"></span>
+    <button aria-label="Next document" title={`Next document${keyHintSuffix("fileForward")}`} disabled={fileTrail === undefined || fileTrail.index === fileTrail.paths.length - 1} onclick={() => ctrl.navigateFileHistory(node.id, 1)}>
+      <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="m6.5 4 4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" /></svg>
+    </button>
   </div>
 
   {#if zone !== null}
@@ -701,6 +732,80 @@
 </div>
 
 <style>
+  /* Keep the floating control inside the document area, clear of editor
+     status and sheet bars. The same inset works across preview types. */
+  .document-nav { position: absolute; bottom: calc(var(--pane-toolbar-height) + 12px); left: 12px; z-index: 3; display: flex; align-items: center; padding: 2px; border: 1px solid var(--edge); border-radius: 7px; background: color-mix(in srgb, var(--bg) 94%, transparent); box-shadow: 0 2px 6px color-mix(in srgb, var(--fg) 4%, transparent); opacity: 0; transition: opacity 140ms ease; }
+  .content:hover ~ .document-nav.shown { opacity: 0.7; }
+  .document-nav.shown:hover, .document-nav.shown:focus-within { opacity: 1; }
+  .document-nav button { width: 22px; height: 22px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 4px; background: transparent; color: var(--muted); cursor: pointer; }
+  .document-nav button:hover:not(:disabled) { background: var(--row-hover); color: var(--fg); }
+  .document-nav button:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+  .document-nav button:disabled { opacity: 0.3; cursor: default; }
+  .document-nav-divider { width: 1px; height: 12px; margin: 0 2px; background: var(--edge); }
+  .pane-guide {
+    position: absolute;
+    inset: 0;
+    z-index: 8;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    border-radius: inherit;
+    color: var(--muted);
+    background: color-mix(in srgb, var(--accent) 3%, transparent);
+    font-size: 11px;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 160ms ease;
+  }
+  .pane-guide.shown { opacity: 1; }
+  .pane-guide-center { display: flex; flex-direction: column; align-items: center; gap: 18px; text-align: center; }
+  .pane-guide-label { font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: color-mix(in srgb, var(--muted) 75%, transparent); }
+  .pane-guide-number { font-size: clamp(80px, 12vw, 160px); font-weight: 200; line-height: 1; letter-spacing: -0.06em; color: color-mix(in srgb, var(--fg) 12%, transparent); }
+  .pane-guide-move { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; justify-content: center; }
+  .pane-guide kbd { font: 11px var(--mono); color: var(--text); border: 1px solid var(--edge); border-radius: 5px; padding: 3px 6px; white-space: nowrap; }
+  .pane-guide-actions { position: absolute; bottom: 28px; left: 24px; right: 24px; display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 16px 24px; }
+  .pane-guide-actions span { display: flex; align-items: center; gap: 10px; }
+  @media (prefers-reduced-motion: reduce) { .pane-guide, .document-nav { transition: none; } }
+  .empty-pane {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    padding: 24px;
+    text-align: center;
+    color: var(--muted);
+    font-size: var(--text-sm);
+  }
+  .empty-title { color: var(--text); font-weight: 500; }
+  .empty-detail { font-size: var(--text-xs); line-height: 1.7; max-width: 270px; }
+  .empty-pane kbd {
+    font: 10px var(--mono);
+    white-space: nowrap;
+    border: 1px solid var(--edge);
+    border-radius: 4px;
+    padding: 2px 4px;
+  }
+  .empty-open {
+    margin: 3px 0;
+    padding: 7px 10px;
+    display: flex;
+    max-width: 100%;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 12px;
+    align-items: center;
+    border: 1px solid var(--edge);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text);
+    font: inherit;
+    cursor: pointer;
+  }
+  .empty-open:hover { background: color-mix(in srgb, var(--accent) 7%, transparent); border-color: var(--accent); }
+  .empty-foot { display: flex; gap: 9px; flex-wrap: wrap; justify-content: center; font-size: 10px; line-height: 1.9; margin-top: 8px; }
   .pane-shell {
     flex: 1;
     min-width: 0;
@@ -830,15 +935,6 @@
     color: var(--muted);
     font-size: var(--text-sm);
     user-select: none;
-  }
-
-  .hint kbd {
-    font-family: var(--mono);
-    font-size: var(--text-xs);
-    padding: 0 0.25rem;
-    border: 1px solid var(--edge);
-    border-radius: 4px;
-    background: none;
   }
 
   .hint-sep {

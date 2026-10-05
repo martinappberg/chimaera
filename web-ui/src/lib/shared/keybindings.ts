@@ -44,6 +44,17 @@ export function activeModLabel(): string {
   return modLabelFor(modifierSetting());
 }
 
+/** Numbered pane focus uses the base modifier; carrying a tab adds its move layer. */
+export function paneFocusHint(n: number): string {
+  if (n < 1 || n > 9) return "";
+  return displayChord(`Mod+${n}`, modifierSetting());
+}
+
+export function paneMoveHint(n: number): string {
+  if (n < 1 || n > 9) return "";
+  return displayChord(`Mod2+${n}`, modifierSetting());
+}
+
 export interface ActionHit {
   id: ActionId;
   /** Which arrow fired, for arrow-set actions. */

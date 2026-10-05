@@ -51,7 +51,215 @@ import {
   allTabs,
   openTabAs,
   isPreviewTab,
+  detachTab,
+  navigateFileHistory,
+  openFileLink,
+  moveTabToPane,
+  newPaneSplitDirection,
+  focusPane,
+  rewriteTabPaths,
+  cycleTab,
 } from "./layout";
+
+describe("adaptive empty panes and stable numbered destinations", () => {
+  it("builds 1 | 2, then 1/3 | 2 without redirecting pane 2's shortcut", () => {
+    let l = openSession(defaultLayout(), "left");
+    const left = l.focusedPaneId;
+    l = splitPane(l, left, newPaneSplitDirection(l));
+    const right = l.focusedPaneId;
+    l = openSession(l, "right");
+    expect(l.root).toMatchObject({ type: "split", dir: "row" });
+    expect(panes(l.root).map((p) => p.number)).toEqual([1, 2]);
+    l = focusPane(l, left);
+    l = splitPane(l, left, newPaneSplitDirection(l));
+    expect(l.root).toMatchObject({
+      type: "split", dir: "row",
+      a: { type: "split", dir: "col", a: { id: left, number: 1 }, b: { number: 3, tabs: [] } },
+      b: { id: right, number: 2 },
+    });
+    expect(sessionPaneId(l, "left")).toBe(left);
+    expect(sessionPaneId(l, "right")).toBe(right);
+    expect(panes(deserializeLayout(serializeLayout(l))!.root).map((p) => p.number)).toEqual([1, 3, 2]);
+  });
+
+  it("keeps a pane's number when rearranged and reuses a closed destination", () => {
+    let l = defaultLayout();
+    const left = l.focusedPaneId;
+    l = splitPane(l, left, "row");
+    const right = l.focusedPaneId;
+    l = movePaneToRootEdge(l, right, "left");
+    expect(panes(l.root).map((p) => p.number)).toEqual([2, 1]);
+    l = closePane(l, right);
+    l = splitPane(l, left, newPaneSplitDirection(l));
+    expect(panes(l.root).map((p) => p.number)).toEqual([1, 2]);
+  });
+
+  it("assigns legacy panes numbers and repairs duplicate persisted destinations", () => {
+    const blob = {
+      v: 1, focusMode: false, focused: "left", zoom: null,
+      root: { t: "s", id: "split", dir: "row", ratio: 0.5,
+        a: { t: "p", id: "left", tabs: [], active: 0 },
+        b: { t: "p", id: "right", tabs: [], active: 0 } },
+    };
+    expect(panes(deserializeLayout(blob)!.root).map((p) => p.number)).toEqual([1, 2]);
+    const repeated = { ...blob, root: { ...blob.root,
+      a: { ...blob.root.a, number: 2 }, b: { ...blob.root.b, number: 2 } } };
+    expect(panes(deserializeLayout(repeated)!.root).map((p) => p.number)).toEqual([2, 1]);
+  });
+});
+
+function activeTrail(l: Layout, paneId = l.focusedPaneId) {
+  const p = findPane(l.root, paneId);
+  const t = p?.tabs[p.active];
+  return t?.surface === "file" ? t.fileTrail : undefined;
+}
+
+describe("pane navigation", () => {
+  it("cycles only the focused pane's tabs, wraps, and closes back to the last visited tab", () => {
+    let l = openKnowledge(openSession(defaultLayout(), "agent"));
+    const source = l.focusedPaneId;
+    l = splitPane(l, source, "row");
+    l = openFile(openDashboard(l), "/a.md");
+    const target = l.focusedPaneId;
+    l = cycleTab(l, 1);
+    expect(findPane(l.root, target)?.tabs[findPane(l.root, target)!.active].surface).toBe("dashboard");
+    expect(findPane(l.root, source)?.active).toBe(1);
+    l = cycleTab(l, -1);
+    expect(focusedFile(l)).toBe("/a.md");
+    l = detachTab(l, target, 1);
+    expect(findPane(l.root, target)?.tabs[0].surface).toBe("dashboard");
+  });
+
+  it("history follows renamed folders and forgets deleted documents", () => {
+    let l = openFile(defaultLayout(), "/old/a.md", true);
+    l = openFileLink(l, l.focusedPaneId, "/old/b.md");
+    const id = l.focusedPaneId;
+    l = rewriteTabPaths(l, "/old", "/new");
+    l = navigateFileHistory(l, id, -1);
+    expect(focusedFile(l)).toBe("/new/a.md");
+    l = pruneDeletedPath(l, "/new/b.md");
+    expect(activeTrail(l, id)).toEqual({ paths: ["/new/a.md"], index: 0 });
+    expect(navigateFileHistory(l, id, 1)).toBe(l);
+  });
+
+  it("closing a document returns to the source tab, even when it is not its neighbor", () => {
+    let l = openKnowledge(openSession(openSession(defaultLayout(), "agent"), "shell"));
+    const id = l.focusedPaneId;
+    l = activateTab(l, id, 0);
+    l = openFile(l, "/guide.md", true);
+    l = openFile(l, "/nested.md", true);
+    l = detachTab(l, id, 3);
+    expect(focusedSession(l)).toBe("agent");
+    expect(findPane(l.root, id)?.recent).toEqual(["s:agent", "v:knowledge", "s:shell"]);
+  });
+
+  it("closing an inactive tab leaves the current view active", () => {
+    let l = openFile(openSession(openSession(defaultLayout(), "a"), "b"), "/guide.md", true);
+    l = detachTab(l, l.focusedPaneId, 0);
+    expect(focusedFile(l)).toBe("/guide.md");
+  });
+
+  it("back and forward reuse the preview slot and a new link truncates forward history", () => {
+    let l = openFile(defaultLayout(), "/a.md", true);
+    l = openFileLink(l, l.focusedPaneId, "/b.md");
+    l = openFileLink(l, l.focusedPaneId, "/c.md");
+    const id = l.focusedPaneId;
+    l = navigateFileHistory(l, id, -1);
+    expect(focusedFile(l)).toBe("/b.md");
+    expect(tabCount(l)).toBe(1);
+    l = navigateFileHistory(l, id, 1);
+    expect(focusedFile(l)).toBe("/c.md");
+    l = navigateFileHistory(l, id, -1);
+    l = openFileLink(l, id, "/d.md");
+    expect(activeTrail(l, id)).toEqual({ paths: ["/a.md", "/b.md", "/d.md"], index: 2 });
+    expect(navigateFileHistory(l, id, 1)).toBe(l);
+  });
+
+  it("history keeps edited documents and deduplicates documents open in other panes", () => {
+    let l = openFile(defaultLayout(), "/a.md", true);
+    l = openFileLink(l, l.focusedPaneId, "/b.md");
+    const id = l.focusedPaneId;
+    l = pinPaths(l, new Set(["/b.md"]));
+    l = navigateFileHistory(l, id, -1);
+    expect(allFilePaths(l).sort()).toEqual(["/a.md", "/b.md"]);
+    expect(isPreviewTab(findPane(l.root, id)!.tabs[0])).toBe(false);
+    l = splitPane(l, id, "row");
+    l = moveTabToPane(l, id, 0, l.focusedPaneId);
+    l = navigateFileHistory(l, id, 1);
+    expect(allFilePaths(l).filter((p) => p === "/b.md")).toHaveLength(1);
+    expect(focusedFile(l)).toBe("/b.md");
+  });
+
+  it("numbered pane moves work for all surfaces and only detach the view", () => {
+    for (const tab of [{ surface: "terminal", sessionId: "agent" }, { surface: "file", path: "/a.md" }, { surface: "knowledge" }] as Tab[]) {
+      let l = openTab(openDashboard(defaultLayout()), tab);
+      const source = l.focusedPaneId;
+      l = splitPane(l, source, "row");
+      const target = l.focusedPaneId;
+      l = moveTabToPane(l, source, 1, target);
+      expect(findPane(l.root, target)?.tabs.map(tabKey)).toEqual([tabKey(tab)]);
+      expect(findPane(l.root, source)?.tabs).toEqual([{ surface: "dashboard" }]);
+      expect(l.focusedPaneId).toBe(target);
+    }
+  });
+
+  it("unrelated file opens do not become document navigation", () => {
+    let l = openFile(defaultLayout(), "/a.md", true);
+    l = openFile(l, "/b.md", true);
+    expect(activeTrail(l)).toBeUndefined();
+    expect(navigateFileHistory(l, l.focusedPaneId, -1)).toBe(l);
+    l = openFileLink(l, l.focusedPaneId, "/nested.md");
+    l = openFile(l, "/unrelated.txt", true);
+    expect(activeTrail(l)).toBeUndefined();
+  });
+
+  it("tab switches and moves keep independent document histories", () => {
+    let l = openFile(defaultLayout(), "/a.md", true);
+    const id = l.focusedPaneId;
+    l = pinTab(openFileLink(l, id, "/a-child.md"), id, 0);
+    l = openFileLink(openFile(l, "/b.md", true), id, "/b-child.md");
+    l = activateTab(l, id, 0);
+    expect(activeTrail(l)?.paths).toEqual(["/a.md", "/a-child.md"]);
+    l = splitPane(l, id, "row");
+    const target = l.focusedPaneId;
+    l = moveTabToPane(l, id, 0, target);
+    l = navigateFileHistory(l, target, -1);
+    expect(focusedFile(l)).toBe("/a.md");
+    expect(activeTrail(l, id)?.paths).toEqual(["/b.md", "/b-child.md"]);
+  });
+
+  it("closing and reopening a document starts a fresh view", () => {
+    let l = openFile(defaultLayout(), "/a.md", true);
+    const id = l.focusedPaneId;
+    l = openFileLink(l, id, "/child.md");
+    l = detachTab(l, id, 0);
+    l = openFile(l, "/child.md", true);
+    expect(activeTrail(l)).toBeUndefined();
+  });
+
+  it("following a link to an existing view preserves that view's history", () => {
+    let l = openFile(defaultLayout(), "/a.md", true);
+    const id = l.focusedPaneId;
+    l = pinTab(openFileLink(l, id, "/a-child.md"), id, 0);
+    l = openFile(l, "/b.md", true);
+    l = openFileLink(l, id, "/a-child.md");
+    expect(tabCount(l)).toBe(2);
+    expect(activeTrail(l)?.paths).toEqual(["/a.md", "/a-child.md"]);
+  });
+
+  it("document history is bounded and stays out of the saved wire layout", () => {
+    let l = defaultLayout();
+    l = openFile(l, "/root.md", true);
+    for (let i = 0; i < 80; i++) l = openFileLink(l, l.focusedPaneId, `/doc-${i}.md`);
+    expect(activeTrail(l)?.paths).toHaveLength(50);
+    const saved = JSON.stringify(serializeLayout(l));
+    expect(saved).not.toContain("fileTrail");
+    expect(saved).not.toContain("recent");
+    const restored = deserializeLayout(JSON.parse(saved))!;
+    expect(activeTrail(restored)).toBeUndefined();
+    expect(navigateFileHistory(restored, restored.focusedPaneId, -1)).toBe(restored);
+  });
+});
 
 // Pure layout-tree logic — the single most refactor-fragile pure module in the
 // UI, and the client has no other tests. These pin the observable behavior so a

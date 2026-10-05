@@ -107,7 +107,9 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   a tab to a pane edge. Drag the divider to reratio (double-click snaps 50/50; Escape restores).
   Open a surface → it appends a tab to the focused pane (VS Code "no duplicates": if already
   open anywhere, that tab is focused). Middle-click or `×` closes a tab (**detaches the view —
-  never kills the session**). `Mod+Alt+[`/`]` cycle tabs. Tab focuses the selected tab;
+  never kills the session**). `Ctrl+Tab` / `Ctrl+Shift+Tab` cycle forward/backward in the
+  focused pane, wrapping at either end. Closing its active tab returns to the most recently
+  used surviving tab, including the agent or workspace view underneath a document. Tab focuses the selected tab;
   Left/Right and Home/End activate and reveal tabs without moving focus into the document. Drag a tab to reorder within a bar,
   move to another pane, tear off into a split, or slam a **window edge** to split the whole window.
   A **pane grip** (six dots) sits with the actions at the right of the tab strip; drag
@@ -123,7 +125,7 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   strip scrolls it sideways, trackpad horizontal scroll is native), the clipped side(s) fade
   into the pane ground, and a **"N more" control** (chevron + count of tabs out of view) at
   the strip's end opens a menu of **every** tab in order, the active one marked — pick one to
-  activate it. The active tab is scrolled into view whenever it changes (click, `Mod+Alt+[`/`]`,
+  activate it. The active tab is scrolled into view whenever it changes (click, `Ctrl+Tab`,
   an open, a layout restore) and stays in view across a resize when it was in view before it — a
   strip the user scrolled away from is not snapped back by an unrelated layout change.
   The reveal accounts for the dropdown taking space; in narrow panes the edge fades yield
@@ -142,6 +144,18 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   edit can't be replaced away), or on a tab move/reorder. Tree single-click = preview, tree
   double-click / a created file = pinned; chat/quick-open/terminal-link/Finder opens = preview.
   The preview flag persists in the layout blob (`pv:1`, additive).
+- **Document navigation.** Files open above the existing view in the current pane.
+  Following nested Markdown links reuses the preview slot; small Back/Forward buttons in a
+  compact bottom-left floating control appear only while hovering the document (or focusing
+  the controls by keyboard), and only when Back or Forward has a destination. This shared
+  pane control works for every file type, clears bottom status bars by one toolbar height,
+  and never changes tab-bar spacing. `Mod+[` / `Mod+]` navigate
+  that journey (text editors retain their bracket shortcuts). Kept or edited documents stay
+  open, and an already-open document is focused rather than duplicated. Each document view keeps at
+  most 50 paths followed through its links; opening unrelated files and switching tabs do
+  not add to that history. Closing and reopening the document, or reopening/reloading the
+  window, starts fresh. Moving the tab carries its history. Renames carry the paths and
+  deletions remove them. This trail and the tab return order stay outside the saved layout.
 - **Where it lives.** `web-ui/src/lib/layout/layout.ts` (`splitPane`, `openFile`/`pinTab`/
   `pinPaths`, `detachTab`, `tabKey`, `moveTabToIndex`/`dropTab`/`dropTabAtRootEdge`,
   `movePane`/`movePaneToRootEdge`/`movePaneToIndex`), `dnd.ts` (custom pointer DnD),
@@ -214,9 +228,13 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
 - **How it's used.** Terminal/chat tabs: **Rename…** (inline input in the tab) pins the
   session's display name — the same pin as the rail's double-click/F2 rename and chat's
   `/rename`, so the tab, rail row, and quick-open all agree. File tabs: **Rename…** renames
-  the file *on disk* (disabled while the file has unsaved edits), plus Reveal in File Tree,
+  the file *on disk* (its unsaved buffer follows the rename), plus Reveal in File Tree,
   Download, Copy Path. Every other surface gets Close. Rail session rows also carry a
-  right-click Rename….
+  right-click Rename…. Every tab type also offers **Move to pane N**, with its shortcut,
+  alongside the existing cross-window moves. Right-click empty tab-bar space for pane actions.
+  Elsewhere, surfaces offer their own actions, selected text offers Copy, and blank view
+  space stays quiet instead of showing the web view's Reload menu. Native text-editor menus
+  retain their edit/spelling actions; embedded web apps own the menus inside their frames.
 - **Where it lives.** `PaneTabs.svelte` (`tabMenu`, the inline rename input);
   `shared/contextMenu.svelte.ts` + `ContextMenuHost.svelte` (the app-wide menu singleton);
   session rename via `PATCH /api/v1/sessions/{id}` (unchanged), file rename via
@@ -231,13 +249,33 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
 - **What & when.** Focus one pane or hide the rail for a distraction-free / max-width view;
   move focus and tabs by keyboard.
 - **How it's used.** Zoom a pane: bar button, double-click a tab, or `Mod2+Enter` (a "restore"
-  badge appears). Focus mode (hide the left rail): `Mod+B` (a slim session strip keeps `Mod+1–9`
-  reachable). `Mod+Arrow` moves pane focus spatially; `Mod2+Arrow` carries the active tab into
+  badge appears). Focus mode (hide the left rail): `Mod+B` keeps sessions reachable through
+  a slim strip. `Mod+Arrow` moves pane focus spatially; `Mod2+Arrow` carries the active tab into
   the neighbor — or, when there is no pane in that direction, **auto-splits a new one** on that
-  side (capped at `MAX_PANES` and a minimum pane size); `Mod+1–9` opens the Nth rail session;
+  side (capped at `MAX_PANES` and a minimum pane size); `Mod+1–9` focuses that numbered pane;
   `⌘±`/`⌘0` bump one pane's terminal/markdown font.
+- **Empty panes & numbered moves.** `Mod+N` creates an empty pane to the right, up to
+  `MAX_PANES` (4); the same action is available from Pane actions or Quick Open.
+  The first split puts panes side by side (`1 | 2`). Subsequent new panes split the
+  focused pane top/bottom (`1/3 | 2` when pane 1 was focused). Explicit `Mod+D`
+  always splits right; `Mod2+D` always splits down.
+  Its blank state offers file/session lookup and teaches dragging or holding the modifier
+  to discover `Mod+1–9` (focus) and `Mod2+1–9` (move).
+  Pane numbers appear only while holding
+  the modifier. Existing panes keep their shortcut numbers through splits, moves, and
+  reloads; new panes take the lowest free number. Agents, terminals, documents, and workspace views use the same tab move operation;
+  moving or closing a session view leaves the underlying session running. Empty source panes
+  collapse after their last tab moves away. Sessions are reachable from the sidebar or Quick Open.
+  Holding the configured modifier for 380 ms fades in a faint pane number and a 3% accent
+  tint, with no blur or opaque backdrop. The base layer shows focus shortcuts and its second
+  layer shows move shortcuts, plus new-pane / next-tab hints in the focused
+  pane. Holding its second layer keeps the destinations visible. Committing a key,
+  releasing the modifier, hiding, or blurring the window clears the hints. No layout shifts.
+  Browsers may reserve `Cmd+N`; the native app receives it, and the mouse/Quick Open paths
+  are available in either host. `Cmd+Tab` remains macOS application switching.
 - **Where it lives.** `layout.ts` (`toggleZoom`, `focusMode`, `moveFocus`, `moveTabDirection`,
-  `setPaneFont` with `FONT_MIN 9`/`FONT_MAX 28`), `App.svelte` chords, `keys.ts`.
+  `moveTabToPane`, `navigateFileHistory`, `newPaneSplitDirection`, `setPaneFont` with `FONT_MIN 9`/`FONT_MAX 28`),
+  `App.svelte` chords, `keys.ts`, `shared/chordHints.svelte.ts`.
 - **Key behaviors.** Zoom always tracks the focused pane (focusing elsewhere clears it, so you
   can't get "stuck" zoomed). Focus mode is part of the persisted layout. Arrow chords defer to a
   text caret in editable surfaces but **not** in xterm's helper textarea (app chords must work
@@ -348,3 +386,23 @@ _Captured 2026-10-01 (from the maintainer)._
   shortcut. The remaining behavior and presentation are improvable additions.
 - **Open for improvement.** The maintainer requested a separate UI/UX pass on the
   crowded pane headers, Markdown toolbar, and Find controls at narrow split widths.
+
+
+### Pane shortcuts and document journeys — why they exist
+_Captured 2026-10-04 from the maintainer's requests and live-preview feedback in this session._
+
+- **Problem it solves.** The maintainer likes the i3-like hotkeys, but found it
+  confusing that “agents and terminals are treated as differently than views and
+  panes.” They requested standard tab behavior: keep the previous view underneath
+  an opened document, return to it on close, and cycle tabs within the pane.
+- **Deliberate navigation choices.** A new pane first creates `1 | 2`; later panes
+  split below the focused pane (`1/3 | 2` when pane 1 is focused). Pane numbers
+  should appear “only when you hold the cmd key” with a “very subtle” backdrop.
+  Shortcut hints “should not distract the UX at all.”
+- **Document history scope.** History is “only in the specific view you are in”
+  while following links, and should not survive reopening the window. Back/Forward
+  should float just above the status line, be smaller, appear on document hover,
+  and disappear entirely when there is nowhere to navigate.
+- **Grade — addition.** These refine the existing split-pane and keyboard additions
+  above. The maintainer approved the resulting native preview: “Great !Looks good.”
+  No additional frozen contract or future exclusions were stated in this session.

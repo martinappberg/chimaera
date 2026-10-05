@@ -226,7 +226,7 @@ async function followPath(
   const anchor = fragment !== null && reveal === null ? decodeAnchor(fragment) : "";
   const anchored = isFile && anchor !== "" && viewKindFor(hit.path) === "markdown";
   if (anchored) requestAnchor(hit.path, anchor);
-  const opened = openPath(hit.path, hit.kind, reveal === null ? { split } : { split, reveal });
+  const opened = openPath(hit.path, hit.kind, { split, documentFrom: docPath, ...(reveal !== null ? { reveal } : {}) });
   if (!opened) {
     if (anchored) takeAnchor(hit.path);
     host.hint("files can't be opened from here");

@@ -16,7 +16,8 @@
  * is a wildcard for all four arrows; the matcher reports which one fired.
  *
  * Policy invariant: the terminal owns bare Ctrl on every platform, so no
- * modifier option resolves to Ctrl alone.
+ * modifier option resolves to Ctrl alone. Ctrl+Tab / Ctrl+Shift+Tab are
+ * explicit pane-tab navigation shortcuts, like a native editor's tab strip.
  */
 
 interface NavigatorUAData {
@@ -51,7 +52,7 @@ export interface ActionDef {
 
 /**
  * Rebindable actions, in match priority order (when two bindings collide on
- * the same chord, the earlier action wins). openN (Mod+1–9), the reference
+ * the same chord, the earlier action wins). Pane focus (Mod+1–9), the reference
  * chord, and the terminal font chords (Mod +/−/0) are spec-pinned and are
  * not listed here.
  */
@@ -79,6 +80,24 @@ export const ACTIONS = [
     label: "Open Settings",
     description: "Open this settings surface.",
     def: "Mod+,",
+  },
+  {
+    id: "newPane",
+    label: "New Empty Pane",
+    description: "Create an empty pane: first beside the original, then below the focused pane. Browsers may reserve Cmd+N for a new window.",
+    def: "Mod+n",
+  },
+  {
+    id: "fileBack",
+    label: "Previous Document",
+    description: "Go back through links followed in the active document view.",
+    def: "Mod+[",
+  },
+  {
+    id: "fileForward",
+    label: "Next Document",
+    description: "Go forward through the active document view's link history.",
+    def: "Mod+]",
   },
   {
     id: "newTerminal",
@@ -139,13 +158,13 @@ export const ACTIONS = [
     id: "cyclePrev",
     label: "Previous Tab",
     description: "Activate the previous tab in the focused pane.",
-    def: "Mod+Alt+[",
+    def: "Ctrl+Shift+Tab",
   },
   {
     id: "cycleNext",
     label: "Next Tab",
     description: "Activate the next tab in the focused pane.",
-    def: "Mod+Alt+]",
+    def: "Ctrl+Tab",
   },
   {
     id: "focusArrows",
@@ -517,13 +536,17 @@ export function fontChord(e: KeyboardEvent): 1 | -1 | 0 | null {
 }
 
 /**
- * Digit 0..9 when the event carries exactly the base modifier (openN is
+ * Digit 0..9 when the event carries exactly the base modifier (pane focus is
  * pinned to Mod+1–9 and Mod+0 is the workspace dashboard; the digit comes
  * from the physical key so Shift-digit symbol layouts don't break it).
- * Null otherwise.
+ * `secondLayer` matches Mod2+1–9 for numbered pane moves instead. Null otherwise.
  */
-export function chordDigit(e: KeyboardEvent, setting: ModifierSetting): number | null {
+export function chordDigit(e: KeyboardEvent, setting: ModifierSetting, secondLayer = false): number | null {
   const m = resolveMod(setting);
+  if (secondLayer) {
+    if (m.shift) m.alt = true;
+    else m.shift = true;
+  }
   if (e.metaKey !== m.meta || e.ctrlKey !== m.ctrl || e.altKey !== m.alt || e.shiftKey !== m.shift) {
     return null;
   }
