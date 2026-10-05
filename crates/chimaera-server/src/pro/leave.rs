@@ -1496,6 +1496,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_leave_from_a_previous_sign_in_writes_nothing() {
+        let (state, root) = fixture("generation");
+        let folder = root.join("project");
+        std::fs::create_dir_all(&folder).unwrap();
+        let workspace = lock(&state.workspaces).add(folder).unwrap();
+        let started = state.pro.generation.load(Ordering::Acquire);
+        // Signed out (or into another account) while the leave ran.
+        state.pro.generation.fetch_add(1, Ordering::AcqRel);
+        record(
+            &state,
+            started,
+            &workspace.id,
+            Where::Moved,
+            None,
+            Vec::new(),
+        );
+        assert!(outcome(&state, &workspace.id).is_none());
+        // The current sign-in still records.
+        let current = state.pro.generation.load(Ordering::Acquire);
+        record(
+            &state,
+            current,
+            &workspace.id,
+            Where::Pending,
+            None,
+            Vec::new(),
+        );
+        assert!(pending(&state, &workspace.id));
+        // A project no longer registered here is pruned on the next record.
+        lock(&state.pro.left).insert(
+            "w-gone".into(),
+            Outcome {
+                state: Where::Moved,
+                reason: None,
+                at: 1,
+                stopped: Vec::new(),
+            },
+        );
+        record(
+            &state,
+            current,
+            &workspace.id,
+            Where::Moved,
+            None,
+            Vec::new(),
+        );
+        assert!(outcome(&state, "w-gone").is_none());
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn one_project_comes_back_without_touching_the_others() {
         let (state, root) = fixture("here");
         let id = |name: &str| name.to_owned();
