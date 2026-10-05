@@ -81,7 +81,8 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
 
 - **What & when.** Right-click anywhere files show — tree rows, the tree background, Finder
   entries, Finder column backgrounds, file-backed pane tabs — for New File…/New Folder…,
-  Copy/Cut/Paste, Rename…, Download (remote only), Copy Path, and Delete…. The FILES section
+  Copy/Cut/Paste, Rename…, Download (remote only), Copy Path, Reveal in Finder (the native app on
+  a local workspace only), and Delete…. The FILES section
   header also carries new-file/new-folder buttons targeting the workspace root.
 - **How it's used.** Creates are **inline**, VS Code-style: an editable row appears in place;
   the typed name may nest (`a/b/c.txt` creates the intermediate folders). A created file opens
@@ -91,7 +92,14 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   ⌘/Ctrl+C/X/V while a tree row or Finder is focused (scoped so terminals keep their own
   copy): paste runs a server-side copy/move (bytes never round-trip the browser), copies get a
   macOS "name copy" sibling on collision, a cut row dims until it lands (Escape clears it), and
-  a cut into the same folder is a no-op. **Drag to move** between tree folders and Finder
+  a cut into the same folder is a no-op. **A copy also reaches the system clipboard** wherever it
+  has a form there: in the native app on a local workspace the file or folder itself (it pastes
+  into Finder, a mail, a chat app — what copying it in the file manager does); on a remote
+  workspace or in a browser an image file copies as a picture, and other files stay in-app only
+  (their bytes are on another machine). Right-clicking any picture — the image preview, a chat
+  message, a rendered document — offers **Copy Image**. **Reveal in Finder** ("Show in File
+  Manager" on Linux) selects the file in the OS file manager; a remote window never offers it,
+  and the shell refuses it from one. **Drag to move** between tree folders and Finder
   columns/rows/breadcrumbs; hold Option/Alt to copy. A file-preview tab can move its file into
   a folder too. The target and operation are named before release; hover opens folders,
   edges scroll, and invalid drops explain why. Files can also be **dragged from the OS desktop** onto
@@ -109,7 +117,9 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
 - **Where it lives.** UI: `shared/contextMenu.svelte.ts` + `ContextMenuHost.svelte` (the one
   right-click menu), `shared/ConfirmDialog.svelte`, `shared/fsNames.ts` (name validation +
   stem preselect), `workspace/fsEvents.ts` (the mutation bus), `workspace/fileClipboard.svelte.ts`
-  (the in-app file clipboard + paste) + `workspace/fileTransfer.ts` (shared move/copy policy). Daemon: `fs.rs` handlers
+  (the in-app file clipboard + paste) + `workspace/fileTransfer.ts` (shared move/copy policy),
+  `shared/clipboard.ts` (`copyFileToOs`, `copyImage`) over the shell's `copy_file_to_clipboard` /
+  `reveal_in_file_manager` commands (`net/native.ts`; `hasLocalFiles()` gates the offer). Daemon: `fs.rs` handlers
   `create`/`rename`/`copy`/`move`/`delete` + `crates/chimaera-server/src/download.rs`.
 - **Routes.** `POST /api/v1/fs/create {path, kind}` (makes parents; 409 if the target exists),
   `POST /api/v1/fs/rename {from, to}` (409 on existing target; symlink-safe; case-only renames

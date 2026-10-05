@@ -30,7 +30,7 @@
   import { isRemoteHost } from "../net/api";
   import { stemLength, validateEntryName } from "../shared/fsNames";
   import { contextMenu, type ContextMenuEntry } from "../shared/contextMenu.svelte";
-  import { writeClipboard } from "../net/native";
+  import { hasLocalFiles, revealInFileManager, revealLabel, writeClipboard } from "../net/native";
   import FileIcon from "../shared/FileIcon.svelte";
   import FolderIcon from "../shared/FolderIcon.svelte";
   import Spinner from "../previews/Spinner.svelte";
@@ -871,6 +871,11 @@
     }
   }
 
+  /** "Reveal in Finder", where this window's files are this machine's. */
+  function revealEntries(path: string): ContextMenuEntry[] {
+    return hasLocalFiles() ? [{ label: revealLabel(), onSelect: () => void revealInFileManager(path) }] : [];
+  }
+
   function menuFor(entry: FsEntry): ContextMenuEntry[] {
     const clip = fileClip();
     // A broken symlink can only be renamed/copied/deleted (all on the link).
@@ -905,6 +910,7 @@
         ? [{ label: "Download", onSelect: () => void fsDownload(entry.path) } as ContextMenuEntry]
         : []),
       { label: "Copy Path", onSelect: () => void copyPath(entry.path) },
+      ...revealEntries(entry.path),
       // Only inside a repository: git is ambient, never an offer.
       ...(entry.kind === "file" && repoForPath($gitRepos, entry.path) !== null
         ? [{ label: "File history", onSelect: () => openFileHistory(entry.path) } as ContextMenuEntry]
@@ -1088,6 +1094,7 @@
           hint: fileClip() === null ? "nothing copied" : undefined,
           onSelect: () => void pasteInto(root),
         },
+        ...(hasLocalFiles() ? ["separator" as const, ...revealEntries(root)] : []),
       ])}
   >
   {#if rootError !== null}

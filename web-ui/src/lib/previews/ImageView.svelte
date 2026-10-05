@@ -27,6 +27,9 @@
   import { activeSelection, clearSelection, setSelection, type FileSelection } from "../shared/reference";
   import { xywhFragment } from "../shared/locator";
   import ReferenceChip from "../shared/ReferenceChip.svelte";
+  import { contextMenu } from "../shared/contextMenu.svelte";
+  import { copyImage } from "../shared/clipboard";
+  import { hasLocalFiles, revealInFileManager, revealLabel } from "../net/native";
   import Spinner from "./Spinner.svelte";
 
   interface Props {
@@ -400,6 +403,17 @@
     untrack(() => showRegion(r));
   });
 
+  /** The picture's own menu — the overlays (grid, region, area) sit over the
+   *  <img>, so the app-wide image menu never sees it here. */
+  function onContextMenu(e: MouseEvent): void {
+    const src = url;
+    if (src === null || error !== null) return;
+    contextMenu.openAt(e, [
+      { label: "Copy Image", onSelect: () => void copyImage(src) },
+      ...(hasLocalFiles() ? [{ label: revealLabel(), onSelect: () => void revealInFileManager(path) }] : []),
+    ]);
+  }
+
   /** Outline `r` and frame it: centered, zoomed to fill most of the view. */
   function showRegion(r: Region): void {
     if (natural === null) return;
@@ -510,6 +524,7 @@
     onpointerup={onPointerUp}
     onpointercancel={onPointerUp}
     onkeydown={onViewKey}
+    oncontextmenu={onContextMenu}
   >
     {#if error !== null}
       <div class="file-error">{error}</div>

@@ -9,10 +9,11 @@
   import { tick } from "svelte";
   import {
     contextMenu,
+    type ContextMenuEntry,
     type ContextMenuItem,
   } from "./contextMenu.svelte";
   import { dismiss } from "./dismiss";
-  import { copyText } from "./clipboard";
+  import { copyImage, copyText } from "./clipboard";
 
   function onUnhandledContextMenu(e: MouseEvent): void {
     if (e.defaultPrevented) return;
@@ -20,8 +21,15 @@
     // surfaces opt into app actions; unused space must not offer Reload.
     if (e.target instanceof Element && e.target.closest("input, textarea, [contenteditable='true'], .term-host") !== null) return;
     const selection = window.getSelection()?.toString() ?? "";
-    if (selection !== "") {
-      contextMenu.openAt(e, [{ label: "Copy selection", onSelect: () => { void copyText(selection); } }]);
+    // A picture anywhere (chat, a rendered document, a preview) copies as a
+    // picture: the app menu replaces the webview's own "Copy Image".
+    const image = e.target instanceof HTMLImageElement ? e.target.currentSrc || e.target.src : "";
+    const entries: ContextMenuEntry[] = [
+      ...(image !== "" ? [{ label: "Copy Image", onSelect: () => { void copyImage(image); } }] : []),
+      ...(selection !== "" ? [{ label: "Copy selection", onSelect: () => { void copyText(selection); } }] : []),
+    ];
+    if (entries.length > 0) {
+      contextMenu.openAt(e, entries);
     } else {
       e.preventDefault();
       contextMenu.close();

@@ -31,7 +31,7 @@
   import { fsRenameOp } from "../workspace/fsEvents";
   import { stemLength, validateEntryName } from "../shared/fsNames";
   import { contextMenu, type ContextMenuEntry } from "../shared/contextMenu.svelte";
-  import { writeClipboard } from "../net/native";
+  import { hasLocalFiles, revealInFileManager, revealLabel, writeClipboard } from "../net/native";
   import { dirtyFiles } from "../shared/editing";
   import { volatileChatDrafts } from "../chat/drafts";
   import { gitIndex } from "../workspace/git";
@@ -698,6 +698,9 @@
           ? [{ label: "Download", onSelect: () => void fsDownload(tab.path) } as ContextMenuEntry]
           : []),
         { label: "Copy Path", onSelect: () => void copyPath(tab.path) },
+        ...(hasLocalFiles()
+          ? [{ label: revealLabel(), onSelect: () => void revealInFileManager(tab.path) } as ContextMenuEntry]
+          : []),
         ...(repoForPath($gitRepos, tab.path) !== null
           ? [{ label: "File history", onSelect: () => openFileHistory(tab.path) } as ContextMenuEntry]
           : []),
