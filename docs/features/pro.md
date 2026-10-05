@@ -134,16 +134,22 @@ and remaining acceptance gates, see the [integration review guide](../agent-guid
    withdraw it. A checkout refused because the account already has a plan re-reads
    the account and shows it. Older shells without native attempt status refresh
    the account when the window regains focus.
-   With an active plan, toggle **Keep connected** for a saved SSH host. A password
-   or Duo challenge uses the usual
+   With an active plan, each remote machine's row on Home carries one quiet line
+   about its sign-in staying connected while you're away: "Stays connected while
+   you’re away · **Turn off**" for a kept login (with "· waiting for you to sign
+   in" while it asks), or **Keep connected while you’re away** for one that is
+   not. The line comes from the optional extension (`extensions/HostSlot.svelte`,
+   private `account/HostKeep.svelte`); a free, signed-out or no-plan window shows
+   the row exactly as before. Logins are not kept by default yet: that default
+   is the native shell's to set. A password or Duo challenge uses the usual
    host-scoped prompt, with “Asked by your Pro connection” underneath its title.
    When the account plans a restart of the always-on cloud connection to update
-   it (optional `ProStatus.keeper_restart_at`), one quiet line under **Connected
-   machines** says so: **Your cloud connection restarts** tonight at 02:00 (the
+   it (optional `ProStatus.keeper_restart_at`), one quiet line under each kept
+   machine's row says so: **Your cloud connection restarts** tonight at 02:00 (the
    time in the person's own format: today, tonight, tomorrow, a weekday within
    the week, else a date) **to update. You’ll be asked to sign in to your cluster
-   again when you next use it.**, naming the cluster instead ("sign in to
-   Sherlock again") when exactly one login is kept. A time that has passed reads
+   again when you next use it.**, naming the cluster ("sign in to
+   your-cluster again"), since the line sits under that machine's own row. A time that has passed reads
    **restarts shortly**: the account restarts it as soon as no Git transfer runs.
    The restart drops the kept cluster logins, hence the sign-in. The line goes
    away when the account stops announcing the restart. No dialog, no warning
@@ -466,17 +472,29 @@ computer's projects while the app is closed: offering the daemon to them belongs
 to the running app. Work an agent is doing or waiting on when the app quits
 continues in the cloud by itself (see [Quitting](#quitting)).
 
-Pro → **Projects** lists each synced project with one place line and the one
-per-project choice, **Keep on this computer only**. **Advanced** (collapsed)
-holds each project's details: the last sync, and actual
-problems such as an incomplete copy or a required provider connection. Healthy
-file counts, storage quotas and generic environment diagnostics are not account
-controls, and setup commands are not edited there; Chimaera and its agents manage
-those details. The two exceptions are decisions only the user makes. A setup
-command an agent proposed (`profile.pending_setup_command`) shows once per
-project, whole, in monospace, as "Your agent proposed a setup command for the
-cloud" with **Confirm** (it becomes the project's `setup_command`) and
-**Dismiss** (the proposal is cleared). There
+Pro → **Projects** lists each synced project with one place line, in the
+host indicator's words ("Synced · running on this Mac", "… running in the
+cloud", "… running on Studio" by the account's device name, "… not running on
+this Mac" while the account's computers are unknown), and the one per-project
+choice, **Keep on this computer only**. Under a project's place, one sentence
+appears only when there is something to do there: a sync problem, staged Git
+changes kept apart (with where both versions are saved), or changes from
+elsewhere waiting in a Git branch to merge. The page has no Advanced area.
+Healthy file counts, storage quotas and generic environment diagnostics are not
+account controls, and setup commands are not edited there.
+
+A setup command an agent proposed with `update_cloud_profile`
+(`profile.pending_setup_command`) is asked in the conversation that proposed
+it, beside its other approvals: "Run this setup command in the cloud?", the
+command whole in monospace, **Confirm** (it becomes the project's
+`setup_command`) and **Dismiss** (the proposal is cleared). The daemon keeps one
+waiting proposal per project and does not record which conversation made it,
+so the conversation's own transcript is the evidence: the card shows only in a
+Claude Code chat whose `update_cloud_profile` input is exactly the waiting
+command (`extensions/ConversationSlot.svelte`, private
+`account/ConversationSetup.svelte`). Codex chats and terminal agents do not
+carry the tool's input, so their proposals show nowhere yet; the agent's own
+reply still says one is waiting. There
 is no per-session placement pin: neither the native shell nor the daemon (the old `PUT /pro/keep-running` route is gone) offers one.
 **Keep this project on this computer** stops local publication and disables account-side
 mirror access. Existing stored data is not silently deleted. A step that needs
@@ -542,7 +560,10 @@ configured and the project is owned elsewhere, and never in the accent colour.
 
 Custom cloud-secret application remains gated on the approved shared-daemon
 workspace session/launch integration and real-runtime acceptance. The earlier
-namespace process-census evidence does not certify that delivery path.
+namespace process-census evidence does not certify that delivery path. Until the
+account reports the positive `project_secrets: 1` capability on its account
+status (no account or shell does yet), the secrets control does not mount, load
+or request anything: neither on the Pro page nor on the web account Home.
 The daemon and UI support a separate manual parking reason, `project_secrets_idle`, which preserves
 the original conversation, session ID, journal and delivery receipts. Opening
 that conversation shows a neutral paused explanation; it does not claim that
@@ -558,7 +579,7 @@ and [`ledger_manual.rs`](../../crates/chimaera-server/src/ledger_manual.rs).
 
 ### When both sides changed a file
 
-When the work comes home and the cloud and this Mac both changed the same file while apart, both versions are kept: the file holds the cloud's version and this Mac's version sits right beside it as `<name>.mine-<yyyymmdd-hhmm>`. Nobody has to go looking for those names. The chat marks where the work came back with one quiet line, "Back on this Mac. The cloud and this Mac both changed 3 files while apart.", and a **Review** button; the same review opens from the "Kept both versions" line in Settings → Chimaera Pro (its **Review** link), from the "Kept both versions" notification, and from a kept copy's right-click menu in the file tree, where every such copy carries a small "from this Mac" badge that explains the name on hover. (Off a Mac the words say "this computer", and a browser view of the project says "your computer".)
+When the work comes home and the cloud and this Mac both changed the same file while apart, both versions are kept: the file holds the cloud's version and this Mac's version sits right beside it as `<name>.mine-<yyyymmdd-hhmm>`. Nobody has to go looking for those names. The chat marks where the work came back with one quiet line, "Back on this Mac. The cloud and this Mac both changed 3 files while apart.", and a **Review** button; the same review opens from the "Kept both versions" notification, and from a kept copy's right-click menu in the file tree, where every such copy carries a small "from this Mac" badge that explains the name on hover. (Off a Mac the words say "this computer", and a browser view of the project says "your computer".)
 
 The review is a workbench tab, "Both versions": the files on the left, and for the selected one this Mac's version and the cloud's side by side with the differences highlighted. Each file offers **Use this Mac's** (it replaces the file and the copy beside it goes away), **Use the cloud's** (the copy beside it moves to the Trash, so it can still be taken back), and **Keep both** (nothing moves; the file just stops asking); the header offers **Use the cloud's for all** and **Use this Mac's for all**, each confirmed first ("This Mac's versions of 3 files will be moved to the Trash. The cloud's versions stay."). The copy goes to the Trash on its own drive: the Mac's Trash (`~/.Trash`) for a folder on the Mac itself, the drive's own Trash for a folder on an external drive that has one, and on Linux the desktop's trash (`~/.local/share/Trash`, restorable from the file manager). A folder on a drive with no Trash (a network share, say) says so before you choose, and there the copy is deleted instead; if a Trash refuses a copy the review promised it would take, the review says it was deleted. Moving to the Trash never replaces anything already there: a second copy of the same name becomes "<name> 2". A picture or other non-text file, or one larger than 512 KB, shows both sizes and the same choices. A file the cloud deleted says so: this Mac's version brings it back, the cloud's leaves it deleted. Branches the cloud kept beside yours (`<branch>@cloud-<commit>`) are listed under "Branches from the cloud" for merging, with no actions. A return names at most 32 kept copies; when it kept more, the review says that some aren't listed and that they keep their `.mine-` names in the folder. Choices apply only while the project is on this Mac. Once nothing is left to choose, the chat line and the Settings line go away. Implementation: [`pro/kept.rs`](../../crates/chimaera-server/src/pro/kept.rs) (routes in [`pro/AGENTS.md`](../../crates/chimaera-server/src/pro/AGENTS.md), "Reviewing both versions") and the public [`kept host adapter`](../../web-ui/src/lib/extensions/KeptApplicationView.svelte) / [`finite review domain`](../../web-ui/src/lib/extensions/keptReview.ts). The list/diff presentation is supplied by the optional private Pro client assembly. If that presentation is absent, the tab offers Close and Open project folder; both ordinary files remain available to the existing file and Git tools. Automatic installation and entitlement are separate gates.
 
@@ -593,11 +614,12 @@ update; there is no fallback to its old transfer-on-open route.
 A copied workspace's host indicator offers **Run here** only after a ready
 copy and current ownership epoch are verified. Sessions continue where they run
 until that explicit action completes. Copied-local edits are retained but
-are not automatically published. **Project details** under Advanced also reports Git
-staging: synchronized, an older snapshot without staging, or conflicts. Conflicts
-keep the local staged version for conflicting paths and preserve both index
-snapshots for recovery, including staged-only content. Its advanced recovery
-reference is relative to the actual Git directory, so linked worktrees work too.
+are not automatically published. Git staging conflicts keep the local staged
+version for conflicting paths and preserve both index snapshots for recovery,
+including staged-only content, under `chimaera-staging/<id>` in the actual Git
+directory (so linked worktrees work too). Only a conflict is shown: one
+sentence on the project's Pro row and in its host indicator's menu names that
+folder; a synchronized or older snapshot says nothing.
 Source and shadow histories remain within account quotas; initial transfers have
 a bounded 16-minute deadline.
 Implementation: [`pro/`](../../crates/chimaera-server/src/pro/AGENTS.md),
