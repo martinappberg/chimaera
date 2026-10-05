@@ -397,6 +397,29 @@ mod tests {
         kinds.iter().map(|kind| kind.to_string()).collect()
     }
 
+    #[tokio::test]
+    async fn a_daemon_without_pro_answers_nothing_and_writes_nothing() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-leave-free-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let state = Arc::new(AppState::new(
+            "fixture".into(),
+            "fixture".into(),
+            4242,
+            0,
+            root.clone(),
+            root.join("config"),
+        ));
+        let response = leave(State(state.clone())).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(lock(&state.pro.left).is_empty());
+        assert!(!state.pro.root.join("state.json").exists());
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn working_or_waiting_claude_and_codex_move() {
         assert_eq!(plan(&kinds(&["claude"]), &[]), Plan::Move);
