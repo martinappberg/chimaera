@@ -48,7 +48,7 @@ use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
 
 /// CLI version these frame shapes were verified against (2026-09-25,
 /// full chat-smoke 23/23; PROTOCOL.md Pass 33).
-pub const TESTED_CLAUDE_VERSION: &str = "2.1.287";
+pub const TESTED_CLAUDE_VERSION: &str = "2.1.289";
 
 /// Arguments for a structured chat session, before server-side extras
 /// (`--settings`, `--mcp-config`, `--session-id`) and login-shell wrapping.
@@ -3068,6 +3068,9 @@ impl ClaudeMapper {
                     reason: None,
                     retract_current_turn: false,
                 });
+                // Model changes can reset effective effort (e.g. Haiku).
+                // Read the native result instead of retaining the old chip.
+                self.request_settings(step);
             }
             PendingControl::Interrupt | PendingControl::SetThinking => {}
             PendingControl::ContextUsage => {
@@ -8768,6 +8771,32 @@ pub(crate) mod tests {
         assert!(ack.events.iter().any(|e| matches!(e,
             AgentEvent::ModelSwitched { to, reason: None, .. } if to == "opus[1m]"
         )));
+    }
+
+    #[test]
+    fn accepted_model_change_refreshes_native_effort_without_remembering_a_new_pick() {
+        let mut m = mapper();
+        m.model = Some("opus".into());
+        let request = m.on_command(AgentCommand::SetModel {
+            model_id: "haiku".into(),
+        });
+        let ack = m.on_frame(&json!({"type":"control_response", "response": {
+            "subtype":"success", "request_id":request.outbound[0]["request_id"], "response":{}
+        }}));
+        assert_eq!(ack.outbound[0]["request"]["subtype"], "get_settings");
+        assert!(ack.events.iter().any(|event| matches!(event, AgentEvent::ModelSwitched { to, reason: None, .. } if to == "haiku")));
+        let settings = m.on_frame(&json!({"type":"control_response", "response": {
+            "subtype":"success", "request_id":ack.outbound[0]["request_id"], "response":{"applied":{"model":"claude-haiku-4-5-20251001","effort":null,"ultracode":false}}
+        }}));
+        assert!(matches!(
+            settings.events.as_slice(),
+            [AgentEvent::EffortState {
+                effort: None,
+                ultracode: false,
+                chosen: false
+            }]
+        ));
+        assert_eq!(m.model.as_deref(), Some("haiku"));
     }
 
     #[test]

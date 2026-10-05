@@ -18,34 +18,51 @@ Sources:
   (Anthropic.claude-code 2.1.204, openai.chatgpt 26.5623.141536 — the
   extensions are GUIs over these same protocols).
 
-## Custom model settings preflight (2026-10-04; live verification pending)
+## Model settings and Mods verification (2026-10-04)
 
-Installed Codex 0.158.0's `app-server generate-json-schema --experimental`
-reports `ThreadSettingsUpdateParams.model` as an optional string, its response
-as an empty object, and `CollaborationMode.settings.reasoning_effort` as
-nullable. These are schema facts, not model-availability or ordering probes.
-The adapter now waits for that settings acknowledgement before journaling a
-model pick. A rejected request leaves the previous model intact; an older
-runtime without this method can select only advertised catalog entries.
-New turns wait for the pending model response, and stale effort replies cannot
-restore the previous model's effort. An unlisted model carries no Chimaera
-effort override, including in Plan settings or after reopening the chat.
-Genuine native effort read-backs are still retained even for unlisted models;
-omitting an override does not prove that Codex cleared an existing native
-setting. A no-turn native settings probe could not initialize in the sandbox,
-and automatic approval review rejected its authenticated native retry during
-the user's testing hold. Native model/effort reset semantics remain unverified.
+**Live: Codex 0.160.0.** `thread/settings/update` accepts a model string and
+returns an empty object. Acceptance does not establish model availability: an
+unlisted synthetic ID was accepted without a model turn. A model-only patch
+retained the previous `xhigh` effort; top-level `effort: null` did not clear it.
+The combined model patch with `collaborationMode: {mode: "default", settings:
+{model, reasoning_effort: null, developer_instructions: null}}` cleared effort
+to null and preserved `approvalPolicy: "never"` and read-only sandbox settings.
+The Plan equivalent also cleared effort. Thus a target without advertised
+effort support receives that explicit reset, rather than merely omitting a
+turn override. Genuine native read-backs remain the displayed truth.
 
-Claude's custom IDs use the existing acknowledged `set_model` control.
-Both native adapters gate remembered startup effort on the explicit model's
-advertised effort values. ACP custom model input remains unsupported; its
-shared Antigravity/Grok adapter selects only native catalog values. The
-`chat.newSessionModel=agent` policy omits remembered model/effort for new chats
-through the shared server path, preserving native defaults on every adapter.
+Model choices become durable only after acknowledgement. Rejection preserves
+the previous model and holds queued input; pending choices also gate recovery
+from a failed `turn/start`. Older runtimes without settings updates can select
+only advertised catalog entries. Explicit startup models get remembered effort
+only after their current catalog establishes support for that exact value.
 
-No billed probes were run for this change: `just chat-smoke` and affected
-`just chat-smoke-acp` verification remain pending until the user's test hold
-ends. Existing tested-version pins remain unchanged.
+**Live: Claude Code 2.1.289.** A default-model pick was accepted and resolved to
+the account's current Opus; `xhigh` was accepted, switching to Haiku returned
+`effort: null`, and restoring default recovered the native effort. An invalid
+namespaced model was refused, with the previous model and effort unchanged.
+Model acknowledgements need a fresh `get_settings` read, like flag changes.
+
+**Live: Antigravity ACP 1.2.1 and Grok Build 1.0.46.** Both accepted their existing
+login, reported native catalogs/defaults, and passed stream/replay/resume plus
+model selection, approval allow/deny/stop, and queued-message controls. ACP
+remains catalog-only. `chat.newSessionModel=agent` omits remembered model and
+effort through the shared server path; explicit and saved conversation settings
+still take precedence. The four-adapter daemon fixture verifies both startup
+policies without replacing existing chats' settings.
+
+**Live: Claude Mods and background expiry, 2.1.289.** A real Haiku Bash turn
+provided user/assistant identities and native tool input/output. All three
+`UserMessage`, `AssistantMessage`, and `ToolUse` render hooks returned the Mod
+wrapper and delegated engine node, both directly and through the daemon's
+normalized events and native UI WebSocket. The browser displayed all three
+wrappers and the original Bash output; reload reattached and rendered them again
+with clean browser diagnostics. The no-model control/module/reattach suite also
+passed. An explicit `sleep 15`, `run_in_background: true`,
+`timeout: 1000` produced a stopped task notification after 1.009 seconds with
+the native time-limit explanation, followed by an empty background-task set.
+The runtime's default 30-minute and maximum 2-hour limits were source-inspected,
+not waited through.
 
 ## Upstream app-server integration guidance (audited 2026-07-18)
 

@@ -1,8 +1,8 @@
 # Claude Mods in structured chat
 
-**Status: in preparation.** The native UI protocol has been verified against
-Claude Code 2.1.288 without model requests. The complete billed chat smoke gate
-is pending account quota reset; this does not advance the driver's tested pin.
+**Status: implemented and live-verified.** Claude Code 2.1.289 passes the native
+control/module/reattach suite and model-driven transcript/tool rendering checks.
+The complete Claude/Codex compatibility smoke suite also passes.
 
 ## What and how
 
@@ -32,8 +32,9 @@ and manual checkmarks make no claim that a review or tests have run.
 
 Mods can also wrap user and assistant messages, expanded tool cards, the working
 indicator, and the session mode. Composer integration supports reading a draft,
-filling it, offering a suggestion, and decorating text. Model-driven rendering
-on these transcript sites still needs the complete live smoke run.
+filling it, offering a suggestion, and decorating text. Real model turns verify
+user/assistant message identities and complete native tool input/output through
+the daemon's render transport; missing facts still use the core transcript.
 
 ## Where it lives
 

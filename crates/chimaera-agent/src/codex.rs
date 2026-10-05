@@ -2407,10 +2407,9 @@ impl CodexMapper {
                         message: format!("turn/start failed: {}", err["message"]),
                         fatal: false,
                     });
-                    // Promote one queued send so it isn't stranded.
-                    if let Some(queued) = self.queued_sends.pop_front() {
-                        self.redrive_as_fresh_turn(queued.input, queued.client_msg_id, step);
-                    }
+                    // A pending or refused model choice still owns its
+                    // queued input; every promotion uses the same gates.
+                    self.start_next_queued(step);
                 }
             }
             (
@@ -5002,6 +5001,19 @@ impl CodexMapper {
                             mode_wire_fields(mode, Some(&model_id), effort.as_deref())
                                 ["collaborationMode"]
                                 .clone();
+                    } else if effort.is_none() {
+                        // Codex preserves the old effort on a model-only
+                        // patch; top-level effort:null also preserves it.
+                        // A default collaboration setting explicitly clears
+                        // it without changing the permission profile.
+                        params["collaborationMode"] = json!({
+                            "mode": "default",
+                            "settings": {
+                                "model": model_id,
+                                "reasoning_effort": null,
+                                "developer_instructions": null,
+                            },
+                        });
                     }
                     self.pending_model_update = Some(id);
                     self.pending_model_effort_readback = None;
@@ -7852,6 +7864,29 @@ mod tests {
     }
 
     #[test]
+    fn model_without_advertised_effort_clears_native_effort_without_changing_permissions() {
+        for model in ["provider/custom", "effortless"] {
+            let mut m = mapper();
+            m.catalog
+                .models
+                .push(model_with_efforts("effortless", &[], None));
+            m.pending_effort = Some("xhigh".into());
+            let pick = m.on_command(AgentCommand::SetModel {
+                model_id: model.into(),
+            });
+            let params = &pick.outbound[0]["params"];
+            assert_eq!(params["model"], model);
+            assert!(params.get("effort").is_none());
+            assert_eq!(params["collaborationMode"]["mode"], "default");
+            assert_eq!(params["collaborationMode"]["settings"]["model"], model);
+            assert!(params["collaborationMode"]["settings"]["reasoning_effort"].is_null());
+            assert!(params.get("permissions").is_none());
+            assert!(params.get("approvalPolicy").is_none());
+            assert!(params.get("approvalsReviewer").is_none());
+        }
+    }
+
+    #[test]
     fn remembered_effort_requires_current_catalog_support() {
         let models = vec![model_with_efforts(
             "listed",
@@ -7870,6 +7905,48 @@ mod tests {
             Some("provider/custom"),
             "medium"
         ));
+    }
+
+    #[test]
+    fn failed_turn_start_does_not_bypass_a_pending_or_rejected_model_choice() {
+        for reject_model_first in [false, true] {
+            let mut m = mapper();
+            m.model = Some("original".into());
+            let first = m.on_command(AgentCommand::Send {
+                blocks: vec![ContentBlock::Text {
+                    text: "first".into(),
+                }],
+            });
+            let mut pick = m.on_command(AgentCommand::SetModel {
+                model_id: "provider/next".into(),
+            });
+            let second = m.on_command(AgentCommand::Send {
+                blocks: vec![ContentBlock::Text {
+                    text: "second".into(),
+                }],
+            });
+            assert!(second.outbound.is_empty());
+            if reject_model_first {
+                let rejected = m.on_frame(&json!({"id":pick.outbound[0]["id"], "error":{"code":-32602,"message":"model unavailable"}}));
+                assert!(rejected.outbound.is_empty());
+            }
+            let failed = m.on_frame(&json!({"id":first.outbound[0]["id"], "error":{"code":-32602,"message":"turn startup failed"}}));
+            assert!(
+                failed.outbound.is_empty(),
+                "a failed turn must not dispatch queued input with the old model"
+            );
+            assert_eq!(m.queued_sends.len(), 1);
+            assert_eq!(m.model.as_deref(), Some("original"));
+            if reject_model_first {
+                pick = m.on_command(AgentCommand::SetModel {
+                    model_id: "provider/next".into(),
+                });
+            }
+            let accepted = m.on_frame(&json!({"id":pick.outbound[0]["id"], "result":{}}));
+            assert_eq!(accepted.outbound[0]["method"], "turn/start");
+            assert_eq!(accepted.outbound[0]["params"]["model"], "provider/next");
+            assert_eq!(accepted.outbound[0]["params"]["input"][0]["text"], "second");
+        }
     }
 
     #[test]
