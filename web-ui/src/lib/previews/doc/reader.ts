@@ -573,6 +573,7 @@ export class Hydrator {
       alt: hint.alt,
       width: hint.width,
       resolve: () => this.embeds.ask(ref),
+      onOpen: () => { this.openEmbed(slot); },
     });
     if (a === undefined) void this.embeds.ask(ref);
     this.track(slot, ref, card);

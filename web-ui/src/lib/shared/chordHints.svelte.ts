@@ -10,7 +10,7 @@
  * so it can never get in the way of the very chords it advertises.
  */
 
-import { resolveMod } from "./keys";
+import { resolveMod, resolvePaneMoveMod } from "./keys";
 import { modifierSetting } from "./keybindings";
 
 /** Hold this long before the hints arm — long enough that executing a chord
@@ -32,12 +32,11 @@ export function paneHintsActive(): boolean {
 
 /** Match the configured modifier and its move layer, without stray modifiers. */
 function modifierLayer(e: KeyboardEvent): "base" | "move" | null {
-  const m = resolveMod(modifierSetting());
-  if (e.metaKey !== m.meta || e.ctrlKey !== m.ctrl) return null;
-  if (e.altKey === m.alt && e.shiftKey === m.shift) return "base";
-  if (m.shift) m.alt = true;
-  else m.shift = true;
-  if (e.altKey === m.alt && e.shiftKey === m.shift) return "move";
+  const setting = modifierSetting();
+  const matches = (m: ReturnType<typeof resolveMod>) =>
+    e.metaKey === m.meta && e.ctrlKey === m.ctrl && e.altKey === m.alt && e.shiftKey === m.shift;
+  if (matches(resolveMod(setting))) return "base";
+  if (matches(resolvePaneMoveMod(setting))) return "move";
   return null;
 }
 

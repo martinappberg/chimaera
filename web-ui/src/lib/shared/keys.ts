@@ -226,6 +226,21 @@ export function resolveMod(setting: ModifierSetting): Pick<ParsedChord, "meta" |
   }
 }
 
+/** Numbered tab moves add Control to Cmd, avoiding macOS's screenshot chords.
+ * Other modifier settings retain their existing second layer. */
+export function paneMoveChord(key: string | number, setting: ModifierSetting): string {
+  const m = resolveMod(setting);
+  return `Mod+${m.meta ? "Ctrl" : m.shift ? "Alt" : "Shift"}+${key}`;
+}
+
+export function resolvePaneMoveMod(setting: ModifierSetting): ReturnType<typeof resolveMod> {
+  const m = resolveMod(setting);
+  if (m.meta) m.ctrl = true;
+  else if (m.shift) m.alt = true;
+  else m.shift = true;
+  return m;
+}
+
 const NAMED_KEYS = new Set([
   "Enter",
   "Backspace",
@@ -539,14 +554,10 @@ export function fontChord(e: KeyboardEvent): 1 | -1 | 0 | null {
  * Digit 0..9 when the event carries exactly the base modifier (pane focus is
  * pinned to Mod+1–9 and Mod+0 is the workspace dashboard; the digit comes
  * from the physical key so Shift-digit symbol layouts don't break it).
- * `secondLayer` matches Mod2+1–9 for numbered pane moves instead. Null otherwise.
+ * `move` matches the numbered tab-move modifier instead. Null otherwise.
  */
-export function chordDigit(e: KeyboardEvent, setting: ModifierSetting, secondLayer = false): number | null {
-  const m = resolveMod(setting);
-  if (secondLayer) {
-    if (m.shift) m.alt = true;
-    else m.shift = true;
-  }
+export function chordDigit(e: KeyboardEvent, setting: ModifierSetting, move = false): number | null {
+  const m = move ? resolvePaneMoveMod(setting) : resolveMod(setting);
   if (e.metaKey !== m.meta || e.ctrlKey !== m.ctrl || e.altKey !== m.alt || e.shiftKey !== m.shift) {
     return null;
   }

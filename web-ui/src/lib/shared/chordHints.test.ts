@@ -55,6 +55,18 @@ describe("held modifier discovery", () => {
     expect(paneHintsActive()).toBe(false);
   });
 
+  it("shows Cmd+Control move hints without claiming Cmd+Shift screenshot chords", () => {
+    press("Meta", { metaKey: true });
+    vi.advanceTimersByTime(380);
+    press("Control", { metaKey: true, ctrlKey: true });
+    expect(hintsActive()).toBe(false);
+    expect(paneHintsActive()).toBe(true);
+    press("Shift", { metaKey: true, shiftKey: true });
+    vi.advanceTimersByTime(380);
+    expect(hintsActive()).toBe(false);
+    expect(paneHintsActive()).toBe(false);
+  });
+
   it("cancels pending and visible hints on blur, hiding and teardown", () => {
     press("Meta", { metaKey: true });
     keys.dispatchEvent(new Event("blur"));

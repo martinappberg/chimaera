@@ -261,16 +261,17 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   focused pane top/bottom (`1/3 | 2` when pane 1 was focused). Explicit `Mod+D`
   always splits right; `Mod2+D` always splits down.
   Its blank state offers file/session lookup and teaches dragging or holding the modifier
-  to discover `Mod+1–9` (focus) and `Mod2+1–9` (move).
+  to discover `Mod+1–9` (focus) and numbered tab moves (`⌃⌘1–9` on macOS;
+  the second modifier layer elsewhere). The extra Control avoids macOS screenshot shortcuts.
   Pane numbers appear only while holding
   the modifier. Existing panes keep their shortcut numbers through splits, moves, and
   reloads; new panes take the lowest free number. Agents, terminals, documents, and workspace views use the same tab move operation;
   moving or closing a session view leaves the underlying session running. Empty source panes
   collapse after their last tab moves away. Sessions are reachable from the sidebar or Quick Open.
   Holding the configured modifier for 380 ms fades in a faint pane number and a 3% accent
-  tint, with no blur or opaque backdrop. The base layer shows focus shortcuts and its second
+  tint, with no blur or opaque backdrop. The base layer shows focus shortcuts and its move
   layer shows move shortcuts, plus new-pane / next-tab hints in the focused
-  pane. Holding its second layer keeps the destinations visible. Committing a key,
+  pane. Holding the move modifier keeps the destinations visible. Committing a key,
   releasing the modifier, hiding, or blurring the window clears the hints. No layout shifts.
   Browsers may reserve `Cmd+N`; the native app receives it, and the mouse/Quick Open paths
   are available in either host. `Cmd+Tab` remains macOS application switching.

@@ -11,6 +11,7 @@ import {
   matchChord,
   modLabel as modLabelFor,
   parseChord,
+  paneMoveChord,
   type ActionId,
   type ArrowDir,
   type ModifierSetting,
@@ -52,7 +53,8 @@ export function paneFocusHint(n: number): string {
 
 export function paneMoveHint(n: number): string {
   if (n < 1 || n > 9) return "";
-  return displayChord(`Mod2+${n}`, modifierSetting());
+  const setting = modifierSetting();
+  return displayChord(paneMoveChord(n, setting), setting);
 }
 
 export interface ActionHit {
