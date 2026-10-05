@@ -290,6 +290,57 @@ export async function writeClipboard(text: string): Promise<boolean> {
 }
 
 /**
+ * Whether this window can hand the daemon's files to the OS by path: the
+ * native shell, on the machine the files live on. A remote window's paths
+ * name another machine's files, and on Windows the local daemon runs inside
+ * WSL2. The shell enforces the same rule; this only decides what to offer.
+ */
+export function hasLocalFiles(): boolean {
+  return tauri() !== null && getHostLabel() === "local" && !/\bWindows\b/.test(navigator.userAgent);
+}
+
+/** What the platform calls showing a file in its file manager. */
+export function revealLabel(): string {
+  return /\bMac/.test(navigator.userAgent) ? "Reveal in Finder" : "Show in File Manager";
+}
+
+/**
+ * The "Reveal in Finder" row for a files menu — empty where this window's
+ * files are not this machine's, so a menu spreads it unconditionally.
+ */
+export function revealEntries(path: string): { label: string; onSelect: () => void }[] {
+  return hasLocalFiles() ? [{ label: revealLabel(), onSelect: () => void revealInFileManager(path) }] : [];
+}
+
+/**
+ * Put a file or folder itself on the OS clipboard (what copying it in the
+ * file manager does), through the native shell. True when it is there; false
+ * in a browser, on a remote window, or on shell error.
+ */
+export async function copyFileToClipboard(path: string): Promise<boolean> {
+  const t = tauri();
+  if (t === null || !hasLocalFiles()) return false;
+  try {
+    await t.core.invoke<void>("copy_file_to_clipboard", { path });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Show a file or folder in the OS file manager. Only where `hasLocalFiles()`. */
+export async function revealInFileManager(path: string): Promise<boolean> {
+  const t = tauri();
+  if (t === null || !hasLocalFiles()) return false;
+  try {
+    await t.core.invoke<void>("reveal_in_file_manager", { path });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Hand a web URL to the user's real browser through the native shell.
  *
  * In the app there is no other route: the window's navigation guard admits

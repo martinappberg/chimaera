@@ -6,9 +6,14 @@
  * server-side /fs/copy or /fs/move (bytes never round-trip through the browser
  * for a same-daemon op). Cut clears itself once the move lands.
  *
+ * A copy also goes to the OS clipboard where it has a form there (the file
+ * itself on a local native window, else an image's picture), so it pastes
+ * outside the workbench too. A cut stays in-app: nothing has moved yet.
+ *
  * Runes discipline: mutate the field only through this module's functions.
  */
 
+import { copyFileToOs } from "../shared/clipboard";
 import { transferInto } from "./fileTransfer";
 
 export interface FileClip {
@@ -31,6 +36,7 @@ export function isCutPending(path: string): boolean {
 
 export function copyFile(path: string, kind: "dir" | "file"): void {
   clip = { path, kind, mode: "copy" };
+  void copyFileToOs(path, kind);
 }
 
 export function cutFile(path: string, kind: "dir" | "file"): void {

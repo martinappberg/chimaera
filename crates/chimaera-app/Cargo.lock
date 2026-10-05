@@ -770,6 +770,7 @@ name = "chimaera-app"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "arboard",
  "block2",
  "chimaera-core",
  "chimaera-remote",
