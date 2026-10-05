@@ -240,4 +240,16 @@ _Captured 2026-07-21 (from the maintainer, on the shipping PR)._
   fix, shipped in the same PR.
 
 ### Why agents can open a pane (`open_browser`)
-_Intent pending — to be captured from the maintainer via **capture-feature-intent**._
+_Captured 2026-10-04 (from the maintainer, in the session that built it)._
+
+- **Problem it solves (maintainer's words):** "the in app browser is nice if we want
+  someone to be able to preview what is building". The pane is the person's view of the
+  agent's work, opened for them instead of a URL they have to click.
+- **One tool, one direction, on purpose:** offered a way for agents to read the pane
+  back, he declined: "it is enough then with open browser".
+- **Never a way to validate:** "I dont want agents to think that is how they can validate
+  the app ... they should use their own browsers inspect as much as possible". The tool
+  description, the session instructions and the result text all say so; keep them saying it.
+- **Silent, by decision:** he chose no permission prompt ("I'd rather it be silent") and
+  confirmed "Silent everywhere" after being shown the shared-host risk recorded under
+  Key constraints. Do not add a prompt, or a per-host exception, without asking.
