@@ -21,8 +21,10 @@ pub mod capabilities;
 pub mod claude;
 pub mod codex;
 pub mod driver;
+pub mod elicitation;
 pub mod journal;
 pub mod model;
+pub mod native_ui;
 pub mod ndjson;
 pub mod transcript;
 
@@ -39,6 +41,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 use driver::{AgentAdapter, DriverExit, DriverIo, SpawnSpec};
 use journal::{Journal, JournalIndex, SeqEvent};
 use model::{AgentCommand, AgentEvent, ModelInfo};
+use native_ui::{NativeUiCommand, NativeUiEvent, UI_EVENT_QUEUE, UI_QUEUE};
 
 /// Called after every journaled event (server: derive AgentState, poke the
 /// event bus). Runs on the pump task — keep it cheap.
@@ -486,10 +489,13 @@ struct ChatSession {
     annotate_tx: mpsc::WeakSender<AgentEvent>,
     info: Mutex<ChatInfo>,
     background_work: Mutex<BackgroundWork>,
+    pending_asks: Mutex<HashSet<(u8, String)>>,
     carryover: Mutex<Carryover>,
     journal: Arc<Journal>,
     cmd_tx: mpsc::Sender<AgentCommand>,
     events_tx: broadcast::Sender<Arc<SeqEvent>>,
+    native_ui_tx: mpsc::Sender<NativeUiCommand>,
+    native_ui_events: broadcast::Sender<Arc<NativeUiEvent>>,
     kill_tx: watch::Sender<bool>,
     /// Serializes reservations with channel enqueue so driver echoes consume
     /// the manager's FIFO in exactly the command order.
@@ -506,6 +512,7 @@ pub struct ChatAttachment {
     pub info: ChatInfo,
     pub replay: Vec<Arc<SeqEvent>>,
     pub live: broadcast::Receiver<Arc<SeqEvent>>,
+    pub native_ui: broadcast::Receiver<Arc<NativeUiEvent>>,
     /// Effective replay cursor. Usually the caller's `last_seq`; reset to 0
     /// when that cursor is ahead of a recreated journal's head. The WS bridge
     /// must dedupe live events against THIS value, not the stale client value
@@ -602,6 +609,8 @@ impl ChatManager {
         let (cmd_tx, cmd_rx) = mpsc::channel(CMD_QUEUE);
         let (ev_tx, mut ev_rx) = mpsc::channel::<AgentEvent>(EVENT_QUEUE);
         let (events_tx, _) = broadcast::channel(BROADCAST_QUEUE);
+        let (native_ui_tx, native_ui_rx) = mpsc::channel(UI_QUEUE);
+        let (native_ui_events, _) = broadcast::channel(UI_EVENT_QUEUE);
         let (kill_tx, kill_rx) = watch::channel(false);
 
         // Background work survives TURNS, not driver processes. A hard daemon
@@ -643,10 +652,13 @@ impl ChatManager {
             annotate_tx: ev_tx.downgrade(),
             info: Mutex::new(info.clone()),
             background_work: Mutex::new(BackgroundWork::default()),
+            pending_asks: Mutex::new(HashSet::new()),
             carryover: Mutex::new(Carryover::default()),
             journal: Arc::clone(&journal),
             cmd_tx,
             events_tx: events_tx.clone(),
+            native_ui_tx,
+            native_ui_events: native_ui_events.clone(),
             kill_tx,
             command_order: tokio::sync::Mutex::new(()),
             command_budget: Mutex::new(CommandBudget::default()),
@@ -659,6 +671,8 @@ impl ChatManager {
                     commands: cmd_rx,
                     events: ev_tx,
                     kill: kill_rx,
+                    native_ui_commands: native_ui_rx,
+                    native_ui_events,
                 },
             )
             .context("spawn agent driver")?;
@@ -736,6 +750,43 @@ impl ChatManager {
             .lock()
             .expect("background work lock")
             .observe(&ev);
+        // MCP requests may be standalone and outlive a model turn. Keep
+        // attention until the final native ask settles, including across tabs.
+        let pending_permission = {
+            let mut asks = session.pending_asks.lock().expect("pending asks lock");
+            match &ev {
+                AgentEvent::PermissionRequest { request_id, .. } => {
+                    if asks.len() < 256 {
+                        asks.insert((0, request_id.clone()));
+                    }
+                }
+                AgentEvent::QuestionRequest { request_id, .. } => {
+                    if asks.len() < 256 {
+                        asks.insert((1, request_id.clone()));
+                    }
+                }
+                AgentEvent::ElicitationRequest { request_id, .. } => {
+                    if asks.len() < 256 {
+                        asks.insert((2, request_id.clone()));
+                    }
+                }
+                AgentEvent::PermissionResolved { request_id, .. } => {
+                    asks.remove(&(0, request_id.clone()));
+                }
+                AgentEvent::QuestionResolved { request_id, .. } => {
+                    asks.remove(&(1, request_id.clone()));
+                }
+                AgentEvent::ElicitationResolved { request_id, .. } => {
+                    asks.remove(&(2, request_id.clone()));
+                }
+                AgentEvent::TurnCompleted { .. } | AgentEvent::TurnAborted { .. } => {
+                    asks.retain(|(kind, _)| *kind == 2)
+                }
+                AgentEvent::Init { .. } | AgentEvent::Exited { .. } => asks.clear(),
+                _ => {}
+            }
+            !asks.is_empty()
+        };
         // Native id to record in the resume index, captured under the info
         // lock but recorded AFTER it drops: index.record does a blocking
         // atomic write on possibly-NFS `~/.chimaera`, and holding the info
@@ -748,6 +799,7 @@ impl ChatManager {
         {
             let mut info = session.info.lock().expect("info lock");
             fold_session_metadata(&mut info, &ev);
+            info.pending_permission = pending_permission;
             info.background_running = background_running;
             match &ev {
                 AgentEvent::Init {
@@ -837,21 +889,10 @@ impl ChatManager {
                         });
                     }
                 }
-                // "Pending permission" really means "waiting on a human
-                // decision" — structured questions block the turn exactly
-                // like permission prompts, so they set the same flag.
-                AgentEvent::PermissionRequest { .. } | AgentEvent::QuestionRequest { .. } => {
-                    info.pending_permission = true
-                }
-                AgentEvent::PermissionResolved { .. }
-                | AgentEvent::QuestionResolved { .. }
-                | AgentEvent::TurnCompleted { .. }
-                | AgentEvent::TurnAborted { .. } => info.pending_permission = false,
                 // A new turn also clears the "needs action" flag — the user
                 // acted — while the status LINE stays as context until the
                 // next summary supersedes it (latest-wins).
                 AgentEvent::TurnStarted { .. } => {
-                    info.pending_permission = false;
                     info.status_needs_action = false;
                 }
                 AgentEvent::SessionStatus {
@@ -944,6 +985,7 @@ impl ChatManager {
             info,
             replay,
             live,
+            native_ui: session.native_ui_events.subscribe(),
             replay_from: from,
             head_seq,
         })
@@ -951,6 +993,34 @@ impl ChatManager {
 
     pub async fn command(&self, id: &str, cmd: AgentCommand) -> Result<()> {
         self.command_as(id, cmd, None).await
+    }
+
+    /// Ephemeral UI requests never reserve a turn or enter the journal.
+    pub fn native_ui(&self, id: &str, command: NativeUiCommand) -> Result<()> {
+        self.get_session(id)?
+            .native_ui_tx
+            .try_send(command)
+            .map_err(|_| anyhow::anyhow!("Native UI is busy or disconnected"))
+    }
+
+    pub async fn detach_native_ui(&self, id: &str, client_id: &str) {
+        let Ok(session) = self.get_session(id) else {
+            return;
+        };
+        let Ok(command) = NativeUiCommand::new(
+            client_id,
+            "detach",
+            serde_json::json!({"subtype":"ui_detach"}),
+        ) else {
+            return;
+        };
+        // Socket teardown must release Claude's attached window even when a
+        // burst of renders has temporarily filled the command queue.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            session.native_ui_tx.send(command),
+        )
+        .await;
     }
 
     /// [`Self::command`] for a send the DAEMON makes on its own (not a

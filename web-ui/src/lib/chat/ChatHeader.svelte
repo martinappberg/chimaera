@@ -11,17 +11,24 @@
   import { copyText } from "../shared/clipboard";
   import { openInSystemBrowser } from "../shared/urlOpen";
   import type { ChatStore } from "./store.svelte";
+  import ModSite from "./ModSite.svelte";
+  import type { ModsController } from "./mods.svelte";
+  import { pageVisible } from "../shared/visibility";
 
-  import { modelChoice, type ModelChoice } from "./modelPicker";
+  import type { ModelChoice } from "./modelPicker";
+  import ModelPicker from "./ModelPicker.svelte";
 
   interface Props {
     store: ChatStore;
     agentKind: string;
     agentName: string;
+    mods?: ModsController;
+    visible?: boolean;
     /** The one-of-N open overlay; two-way so the host can open /mcp and the
      *  outside-dismiss action can close everything. */
     menu: "model" | "mode" | "effort" | "mcp" | "remote" | "options" | null;
     canPickModel: boolean;
+    allowCustomModel?: boolean;
     canPickMode: boolean;
     modelChoices: ModelChoice[];
     modelLabel: string | null;
@@ -33,7 +40,7 @@
     hasUltracode: boolean;
     hasThinking: boolean;
     thinking: boolean;
-    onPickModel: (id: string) => void;
+    onPickModel: (id: string) => boolean;
     onPickMode: (id: string) => void;
     onPickEffort: (id: string) => void;
     onToggleUltracode: () => void;
@@ -48,8 +55,11 @@
     store,
     agentKind,
     agentName,
+    mods,
+    visible = true,
     menu = $bindable(),
     canPickModel,
+    allowCustomModel = false,
     canPickMode,
     modelChoices,
     modelLabel,
@@ -154,44 +164,30 @@
       {#if canPickModel}{@render caret()}{/if}
     </button>
     {#if canPickModel && menu === "model"}
-      <div class="overlay-surface menu" use:toolbarPopover={{ onClose: () => (menu = null) }} role="menu" aria-label="model">
-        {#if modelChoices.length === 0}
-          <span class="menu-empty">no known models</span>
-        {/if}
-        {#each modelChoices as m (m.id)}
-          <button
-            class="overlay-row menu-row"
-            class:current={m.id === modelChoice(modelChoices, store.pendingModel ?? store.model)?.id}
-            role="menuitemradio"
-            aria-checked={m.id === modelChoice(modelChoices, store.pendingModel ?? store.model)?.id}
-            title={typeof m.description === "string" ? m.description : undefined}
-            onclick={() => onPickModel(m.id)}
-          >
-            <span class="model-option-copy">
-              <span>{m.label}</span>
-              {#if m.description}<span class="model-description">{m.description}</span>{/if}
-            </span>
-            {#if m.id === modelChoice(modelChoices, store.pendingModel ?? store.model)?.id}
-              <span class="model-check" aria-hidden="true">✓</span>
-            {/if}
-          </button>
-        {/each}
-      </div>
+      <ModelPicker choices={modelChoices} currentId={store.pendingModel ?? store.model} {allowCustomModel} onPick={onPickModel} onClose={() => (menu = null)} />
     {/if}
   </div>
   {#if canPickMode && store.modes.length > 0}
     <div class="menu-host primary-picker mode-picker">
+      {#snippet modeButton(label: string)}
       <button
         class="chip pick"
         title={`Permission mode: ${modeLabel ?? "mode"}`}
         aria-label={`Permission mode: ${modeLabel ?? "mode"}`}
+        disabled={store.pendingModel !== null}
         aria-haspopup="menu"
         aria-expanded={menu === "mode"}
         onclick={() => (menu = menu === "mode" ? null : "mode")}
       >
-        <span class="pick-label">{modeLabel ?? "mode"}</span>
+        <span class="pick-label">{label}</span>
         {@render caret()}
       </button>
+      {/snippet}
+      {#if mods}
+        <ModSite {mods} component="SessionMode" instanceId="session-mode" active={visible && $pageVisible} props={{ modes: modeLabel ? [modeLabel] : [] }}>
+          {#snippet children(draw)}{@render modeButton(Array.isArray(draw.modes) ? draw.modes.filter((mode) => typeof mode === "string").join(" · ") : modeLabel ?? "mode")}{/snippet}
+        </ModSite>
+      {:else}{@render modeButton(modeLabel ?? "mode")}{/if}
       {#if menu === "mode"}
         <div class="overlay-surface menu" use:toolbarPopover={{ onClose: () => (menu = null) }} role="menu" aria-label="permission mode">
           {#each store.modes as m (m.id)}
@@ -215,6 +211,7 @@
         class="chip pick"
         title={effortHint}
         aria-label={`Reasoning effort: ${effortShown ?? "default"}`}
+        disabled={store.pendingModel !== null}
         aria-haspopup="menu"
         aria-expanded={menu === "effort"}
         onclick={() => (menu = menu === "effort" ? null : "effort")}
@@ -344,12 +341,6 @@
 </div>
 
 <style>
-  .model-picker .menu { width: min(360px, calc(100vw - 32px)); --toolbar-menu-height: 480px; overscroll-behavior: contain; }
-  .model-picker .menu-row { display: flex; align-items: flex-start; gap: 12px; white-space: normal; }
-  .model-option-copy { display: flex; flex: 1; flex-direction: column; gap: 3px; text-align: left; }
-  .model-description { color: var(--muted); font-size: var(--text-xs); line-height: 1.4; }
-  .model-check { color: var(--accent); }
-
   .chat-header { container: pane-chrome / inline-size; flex: none; min-width: 0; }
   .strip {
     display: flex;
@@ -547,12 +538,6 @@
   }
   .menu-row.current {
     color: var(--accent);
-  }
-  .menu-empty {
-    display: block;
-    padding: 6px 12px;
-    color: var(--muted);
-    font-size: var(--text-sm);
   }
   .spacer { flex: 1; }
   .session-status { display: flex; align-items: center; gap: 6px; min-width: 0; }

@@ -5,6 +5,9 @@
   import type { ChatBlock } from "./store.svelte";
   import ToolCallCard from "./ToolCallCard.svelte";
   import { isLive, toolGroupTitle, toolRunHealth, type TurnTail } from "./toolLabels";
+  import ModSite from "./ModSite.svelte";
+  import type { ModsController } from "./mods.svelte";
+  import { pageVisible } from "../shared/visibility";
 
   /**
    * A run of consecutive tool calls, condensed. Collapsed it is one quiet
@@ -35,6 +38,7 @@
     /** First tool row's stable block uid — the anchor policy's trim-proof
      *  identity (index labels go stale when the reducer cap trims). */
     sourceUid?: number;
+    mods?: ModsController;
   }
 
   let {
@@ -48,6 +52,7 @@
     sourceIndex,
     sourceEnd,
     sourceUid,
+    mods,
   }: Props = $props();
 
   const running = $derived(tools.some(isLive));
@@ -83,6 +88,7 @@
   {#if open}
     <ActivityRows>
       {#each tools as tool (tool.id)}
+        {#snippet coreTool()}
         <ToolCallCard
           block={tool}
           {visible}
@@ -91,6 +97,12 @@
           onBackground={onBackground !== undefined ? () => onBackground?.(tool.id) : undefined}
           onStop={onStopTask !== undefined ? () => onStopTask?.(tool.id) : undefined}
         />
+        {/snippet}
+        {#if mods && tool.nativeName && tool.nativeInput !== undefined}
+          <ModSite {mods} component="ToolUse" instanceId={tool.id} active={visible && $pageVisible} props={{ tool_use_id: tool.id, tool: tool.nativeName, input: tool.nativeInput, isRunning: isLive(tool), isErrored: tool.status === "failed", isInterrupted: false, ...(tool.nativeOutput !== undefined ? { output: tool.nativeOutput } : {}) }}>
+            {#snippet children(_draw)}{@render coreTool()}{/snippet}
+          </ModSite>
+        {:else}{@render coreTool()}{/if}
       {/each}
     </ActivityRows>
   {/if}

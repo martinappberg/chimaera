@@ -656,6 +656,10 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   - A screen is data: semantic props only (tone, size, icon names), so light, dark and the
     brand hold; markdown goes through chat's sanitizer; links open outside; images and files
     come from the workspace or the plugin's output folder only.
+  - Code excerpts share the bounded, syntax-highlighted `ExtensionCode` renderer with
+    Claude Mods. The existing `ui/1` format, named actions and WASM capabilities stay
+    unchanged; [portable Mod authoring](../design/mods-extension-compatibility.md) is a
+    separate design proposal.
   - A tree the daemon's check refuses (size, node count, a missing label or alt) is not drawn:
     the view says so and lists each problem with its JSON path.
   - A plugin never writes into the workspace itself: **Save to workspace** is the user's click.

@@ -1,5 +1,10 @@
 # chimaera-server — the daemon's HTTP/WS surface + business logic
 
+The authenticated chat WebSocket also carries transient `native_ui` frames for
+Claude Mods. `ws.rs` mints each window's client ID, filters addressed replies and
+host callbacks, sends `native_ui_reset` on UI ring lag, and detaches the native
+window when the socket closes. This lane never participates in journal replay.
+
 Orientation for coding agents. This crate is the daemon: every HTTP route, every
 WebSocket, and the logic behind them. It embeds `web-ui/dist` and serves it.
 Parent map: repo-root [AGENTS.md](../../AGENTS.md). Architecture + rationale:
@@ -25,7 +30,7 @@ the module you need and read its header doc.
 | `ws.rs` | WebSockets: `/ws/sessions/{id}` (PTY byte pipe; 1 MiB frames chunked to the input queue; output coalesced — leading-edge first chunk, then one frame per ~8 ms tick or 32 KiB, and always flushed ahead of event frames and resizes so the byte stream is never overtaken; attach/resync snapshot renders AND resizes run under `spawn_blocking`, off the reactor; a reset-bearing frame and its snapshot are sent adjacently — a client contract; `park`/`unpark` client frames stop and resume output forwarding for hidden pooled terminals, with the session's broadcast ring as the catch-up buffer and a repaint when it can't cover the gap — `auth.parked` attaches without a snapshot at all), **`/ws/chat/{id}`** (structured events; 10 MiB command frames and ~512 KiB replay batches), `/ws/events` (the session-list bus; the sessions frame is built ONCE per change generation and shared across every connected window — per-client state like fs_watch, git epochs, and the last-sent compare stays per-client — and the settings frame reads only the cached generation, never a reactor stat: external edits arrive via `settings::watch_external_edits`). |
 | `chat.rs` | **The chat-mode glue** (see below). |
 | `agent_setup.rs` | Noninteractive managed installs via `/agents/{id}/setup`: no session/PTY entries, one 64 KiB result per provider until restart, idempotent POST/join, generation-scoped cancel, 15-minute deadline, whole-process-group teardown. Shares `runtimes` install locks and retention cleanup with legacy PTY installers. Success never asserts account or chat readiness. |
-| `launcher.rs` | argv assembly (`build_agent_command`, `build_chat_command`, `build_agent_resume_command` — the switch-to-TUI argv), binary `detect`, login-shell wrapping, per-agent binary resolution. Unit-tested — argv logic lives HERE, not in drivers or `chat.rs`. |
+| `launcher.rs` | argv assembly (`build_agent_command`, `build_chat_command`, `build_agent_resume_command` — the switch-to-TUI argv), binary `detect`, login-shell wrapping, per-agent binary resolution. `safe_model_arg` permits bounded provider/model:tag selectors; resume handles retain `safe_arg`'s stricter grammar. Unit-tested — argv logic lives HERE, not in drivers or `chat.rs`. |
 | `agent_state.rs` | The pure state core: `AgentKind`/`AgentState`/`AgentRecord` + the hook→state / title helpers. A leaf (no transport/fs/`AppState`) — this is what lets `chat.rs` depend on it without the old agents↔chat cycle. |
 | `agents.rs` | The agent glue over `agent_state`: hook ingest, settings/mcp writers, the transcript watcher. |
 | `spawn.rs` | PTY session spawn (the Tier-A TUI path), theme injection. |
@@ -162,6 +167,10 @@ One privileged chat session per workspace (the dashboard plan §6/§7 —
 Codex chat sessions get the per-session chimaera MCP injected at spawn via
 `-c mcp_servers.chimaera.url=…` + `bearer_token_env_var` — the key rides the
 spawn env, never world-readable argv (`launcher::build_codex_chat_command`).
+The launch-only `chat.codexSteering` preference adds an explicit true/false
+`features.instant_interrupt` override only for its Next step / Immediate choices;
+Agent default preserves the runtime's configuration. Ordinary queued sends keep
+their existing delivery policy.
 Codex TUIs get the same injection while agent communication is on or a
 workbench plugin with tools is active in the workspace (`plugins::spawn_allow`
 → `launcher::codex_tui_mcp_args`, `spawn.rs`), with a per-tool
