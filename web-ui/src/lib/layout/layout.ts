@@ -158,6 +158,13 @@ export interface BrowserTab {
   host: string;
   port: number;
   path: string;
+  /**
+   * The agent session that put this pane in front of the user (the MCP
+   * `open_browser` tool; the latest opener wins). Absent on a pane the user
+   * opened, and dropped once the user points it at another target — the
+   * attribution must stay true. Optional and additive in the saved layout.
+   */
+  openedBy?: string;
 }
 export type Tab =
   | TerminalTab
@@ -850,8 +857,28 @@ export function openBrowser(l: Layout, host: string, port: number, path: string)
 }
 
 /** A browser tab NOT yet in any layout (fresh instance id per call). */
-export function freshBrowserTab(host: string, port: number, path: string): BrowserTab {
-  return { surface: "browser", id: uid(), host, port, path };
+export function freshBrowserTab(
+  host: string,
+  port: number,
+  path: string,
+  openedBy?: string,
+): BrowserTab {
+  const tab: BrowserTab = { surface: "browser", id: uid(), host, port, path };
+  if (openedBy !== undefined) tab.openedBy = openedBy;
+  return tab;
+}
+
+/** Credit a browser instance to the agent session that (re)opened it. */
+export function setBrowserOpener(l: Layout, id: string, sessionId: string): Layout {
+  const loc = findBrowser(l, id);
+  if (loc === null || loc.tab.openedBy === sessionId) return l;
+  const root = withPane(l.root, loc.paneId, (p) => ({
+    ...p,
+    tabs: p.tabs.map((t, i) =>
+      i === loc.index && t.surface === "browser" ? { ...t, openedBy: sessionId } : t,
+    ),
+  }));
+  return root === l.root ? l : { ...l, root };
 }
 
 /** The browser instance with `id`, and where it lives, if open. */
@@ -878,21 +905,29 @@ export function setBrowserPath(l: Layout, id: string, path: string): Layout {
 }
 
 /** Re-point a browser instance at a different target (the address bar's
- *  full-URL entry, and the blank tab's first address). */
+ *  full-URL entry, and the blank tab's first address). The user choosing a
+ *  different target drops an agent's attribution — it would no longer be
+ *  true; `keepOpener` is for the pane's own compute-node hunt, which finds
+ *  the SAME app on the node it really runs on. */
 export function setBrowserTarget(
   l: Layout,
   id: string,
   host: string,
   port: number,
   path: string,
+  keepOpener = false,
 ): Layout {
   const loc = findBrowser(l, id);
   if (loc === null) return l;
+  const moved = loc.tab.host !== host || loc.tab.port !== port;
   const root = withPane(l.root, loc.paneId, (p) => ({
     ...p,
-    tabs: p.tabs.map((t, i) =>
-      i === loc.index && t.surface === "browser" ? { ...t, host, port, path } : t,
-    ),
+    tabs: p.tabs.map((t, i) => {
+      if (i !== loc.index || t.surface !== "browser") return t;
+      const next: BrowserTab = { ...t, host, port, path };
+      if (moved && !keepOpener) delete next.openedBy;
+      return next;
+    }),
   }));
   return root === l.root ? l : { ...l, root };
 }
@@ -1513,7 +1548,11 @@ type STab =
   | { gx: string; xr?: string; xs?: string; xp?: string; xv?: string; xb?: string; xt?: string; pv?: 1 }
   | { cs: string }
   | { pg: string; pgv: string }
-  | { w: string; wo: number; wi: string; wp: string };
+  | { w: string; wo: number; wi: string; wp: string; wb?: string };
+
+/** What a persisted session id may look like (the daemon's `s-…` ids, with
+ *  room to spare); a value outside it is dropped on restore. */
+const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
 /** Coerce a persisted diff mode, defaulting to unstaged. */
 function diffModeOf(x: unknown): DiffMode {
@@ -1579,7 +1618,16 @@ function serNode(node: LayoutNode): SNode {
         if (t.surface === "plugin") return { pg: t.plugin, pgv: t.view };
         if (t.surface === "sessions") return { v: "sessions" };
         if (t.surface === "changes") return { cs: t.sessionId };
-        if (t.surface === "browser") return { w: t.host, wo: t.port, wi: t.id, wp: t.path };
+        if (t.surface === "browser") {
+          const w: { w: string; wo: number; wi: string; wp: string; wb?: string } = {
+            w: t.host,
+            wo: t.port,
+            wi: t.id,
+            wp: t.path,
+          };
+          if (t.openedBy !== undefined) w.wb = t.openedBy;
+          return w;
+        }
         return { v: "settings" };
       }),
       active: node.active,
@@ -1688,7 +1736,11 @@ function deserNode(
         // Browser: `wi` is the instance id, `wp` the app-internal path+query.
         const id = typeof t.wi === "string" && t.wi.length > 0 ? t.wi : uid();
         const path = typeof t.wp === "string" && t.wp.length <= 4096 ? t.wp : "/";
-        tab = { surface: "browser", id, host: t.w, port: t.wo, path };
+        const browser: BrowserTab = { surface: "browser", id, host: t.w, port: t.wo, path };
+        // `wb`: the opening agent's session id. Optional (older blobs have
+        // none); anything not shaped like an id is dropped, never fatal.
+        if (typeof t.wb === "string" && SESSION_ID_RE.test(t.wb)) browser.openedBy = t.wb;
+        tab = browser;
       } else if (t.v === "settings") {
         tab = { surface: "settings" };
       } else {

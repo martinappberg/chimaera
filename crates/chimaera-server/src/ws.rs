@@ -1040,6 +1040,12 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
     let mut last_notice = state.notices.head();
     // Plugin `emit` frames, same rule: from now on, never a replay.
     let mut last_plugin_event = state.plugin_runtime.events_head();
+    // Agent `open_browser` frames, same rule: a window that was not here when
+    // the agent asked never opens the pane later.
+    let mut last_browser_open = state.browser_opens.head();
+    // Counted for `open_browser`'s honest "no window is connected" answer;
+    // dropped on every exit path below.
+    let _consumer = state.browser_opens.consumer();
     // A new window's FIRST settings frame gets one fresh disk read (off the
     // reactor): a hand-edit inside the watcher's poll window must not greet
     // a fresh window with stale settings. Steady-state sends stay cached.
@@ -1211,6 +1217,17 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
         }
         if let Some(frame) = crate::notices::frame_since(&state, &mut last_notice) {
             if socket.send(Message::Text(frame.into())).await.is_err() {
+                return;
+            }
+        }
+        // `{"type":"browser_open", ...}` — additive, like the plugin frames
+        // below: a client ignores types it doesn't know.
+        for frame in state.browser_opens.since(&mut last_browser_open) {
+            if socket
+                .send(Message::Text(frame.as_ref().into()))
+                .await
+                .is_err()
+            {
                 return;
             }
         }
