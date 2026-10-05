@@ -184,6 +184,11 @@ fn endpoint(raw: &str) -> Result<std::net::SocketAddr> {
     Ok(address)
 }
 impl Store {
+    /// Whether the roster poll runs (only after a placement registered).
+    #[cfg(test)]
+    pub(crate) fn polling(&self) -> bool {
+        self.started.load(Ordering::Acquire)
+    }
     fn register(&self, request: Registration, local_root: std::path::PathBuf) -> Result<()> {
         if !valid_id(&request.host_id)
             || !valid_id(&request.workspace_id)
@@ -519,6 +524,9 @@ pub(crate) async fn register(
     };
     match state.session_proxy.register(body, workspace.root) {
         Ok(()) => {
+            // The roster poll exists only once a project runs elsewhere: a
+            // daemon nobody registered a placement with runs no timer.
+            start(state.clone());
             state.changes.notify_waiters();
             StatusCode::NO_CONTENT.into_response()
         }
@@ -560,7 +568,8 @@ pub(crate) async fn remove(
     state.changes.notify_waiters();
     StatusCode::NO_CONTENT
 }
-pub(crate) fn start(state: Arc<AppState>) {
+/// Starts the roster poll on the first registered placement (idempotent).
+fn start(state: Arc<AppState>) {
     if state.session_proxy.started.swap(true, Ordering::AcqRel) {
         return;
     }

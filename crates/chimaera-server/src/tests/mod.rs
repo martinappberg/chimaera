@@ -12,6 +12,7 @@ mod drafts;
 mod embed;
 mod environment;
 mod exec;
+mod free_contract;
 mod fs;
 mod git;
 mod git_history;

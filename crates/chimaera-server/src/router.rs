@@ -16,7 +16,6 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
     // Consumes the chat manager's hook signals for the daemon's lifetime
     // (no-op when already running — tests may build several routers).
     chat::spawn_signal_task(state.clone());
-    crate::session_proxy::start(state.clone());
     // Finished Slurm jobs → the Timeline (idempotent; idle without a queue).
     crate::episodes::spawn_jobs_task(state.clone());
     // Plugins' file events and watch sweep (idle without listeners).
