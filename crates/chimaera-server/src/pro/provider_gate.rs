@@ -141,6 +141,15 @@ pub(crate) fn report_cloud_agents(state: &AppState, statuses: &[ProviderStatus])
     if agents.is_empty() {
         return;
     }
+    // One write per change, not per readiness call (the provider list polls).
+    static SENT: std::sync::Mutex<Option<Vec<serde_json::Value>>> = std::sync::Mutex::new(None);
+    {
+        let mut sent = lock(&SENT);
+        if sent.as_ref() == Some(&agents) {
+            return;
+        }
+        *sent = Some(agents.clone());
+    }
     tokio::spawn(async move {
         let body = serde_json::json!({ "agents": agents });
         let sent = super::engine::account(&config, "/v2/cloud/agents", "PUT", Some(&body));
@@ -149,6 +158,8 @@ pub(crate) fn report_cloud_agents(state: &AppState, statuses: &[ProviderStatus])
             Ok(Ok(response)) if (200..300).contains(&response.status)
         ) {
             tracing::info!("cloud agent sign-ins not reported to the account");
+            // Sent again on the next check instead of never.
+            *lock(&SENT) = None;
         }
     });
 }

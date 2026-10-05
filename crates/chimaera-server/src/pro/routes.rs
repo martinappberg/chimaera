@@ -345,6 +345,7 @@ pub(crate) async fn disconnect(State(state): State<Arc<AppState>>) -> Response {
     // No account is left to keep a quit handover in the cloud.
     lock(&state.pro.parked).clear();
     lock(&state.pro.left).clear();
+    lock(&state.pro.reclaim).clear();
     let mut dropped = Vec::new();
     let mut returned: Vec<String> = {
         let mut ownership = lock(&state.pro.ownership);
@@ -448,7 +449,7 @@ pub(crate) async fn status(State(state): State<Arc<AppState>>) -> Json<serde_jso
     // `reason`, or `pending`), `working_agents` (agents running work there
     // right now) and `cloud_handoff` (the cloud could take it now).
     Json(
-        json!({"configured":state.pro.configured.load(Ordering::Acquire) && !renewal_failed,"renewal_failed":renewal_failed,"workspace_configuration":authority.acknowledgment(),"projects_root":super::projects_root(&state),"projects_root_confirmed":lock(&state.pro.projects_root).is_some(),"sessions":sessions,"workspaces":workspaces.into_iter().filter(|workspace| authority.allows(&workspace.id)).take(128).map(|workspace|json!({"workspace_id":workspace.id,"name":workspace.name,"root":workspace.root,"never_mirror":preferences.get(&workspace.id).is_some_and(|p|p.never_mirror),"privacy_pending":preferences.get(&workspace.id).is_some_and(|p|p.privacy_pending),"ownership":ownership.get(&workspace.id),"continuity":preferences.get(&workspace.id).and_then(|p|p.continuity.as_ref()),"local_copy":super::local_copy_view(&state,&workspace.id),"git_staging":preferences.get(&workspace.id).and_then(|p|p.git_staging.as_ref()),"execution_allowed":super::may_execute(&state,&workspace.id),"bundle_import":state.bundle_imports.view(&workspace.id),"execution_uncertain":preferences.get(&workspace.id).is_some_and(|p|p.execution_uncertain),"mirror":statuses.get(&workspace.id),"blocked_providers":statuses.get(&workspace.id).map(|status|status.blocked_providers.clone()).unwrap_or_default(),"git_branches":preferences.get(&workspace.id).map(|p|&p.git_branches),"profile":preferences.get(&workspace.id).map(|p|&p.profile),"parked":parked.contains(&workspace.id),"leave":super::leave::outcome(&state,&workspace.id),"working_agents":engine::working_agents(&state,&workspace.id),"cloud_handoff":!renewal_failed && cloud_handoff(&state,config.as_ref(),&workspace.id)})).collect::<Vec<_>>()}),
+        json!({"configured":state.pro.configured.load(Ordering::Acquire) && !renewal_failed,"renewal_failed":renewal_failed,"leaving":super::leave::readiness(&state,config.as_ref()),"workspace_configuration":authority.acknowledgment(),"projects_root":super::projects_root(&state),"projects_root_confirmed":lock(&state.pro.projects_root).is_some(),"sessions":sessions,"workspaces":workspaces.into_iter().filter(|workspace| authority.allows(&workspace.id)).take(128).map(|workspace|json!({"workspace_id":workspace.id,"name":workspace.name,"root":workspace.root,"never_mirror":preferences.get(&workspace.id).is_some_and(|p|p.never_mirror),"privacy_pending":preferences.get(&workspace.id).is_some_and(|p|p.privacy_pending),"ownership":ownership.get(&workspace.id),"continuity":preferences.get(&workspace.id).and_then(|p|p.continuity.as_ref()),"local_copy":super::local_copy_view(&state,&workspace.id),"git_staging":preferences.get(&workspace.id).and_then(|p|p.git_staging.as_ref()),"execution_allowed":super::may_execute(&state,&workspace.id),"bundle_import":state.bundle_imports.view(&workspace.id),"execution_uncertain":preferences.get(&workspace.id).is_some_and(|p|p.execution_uncertain),"mirror":statuses.get(&workspace.id),"blocked_providers":statuses.get(&workspace.id).map(|status|status.blocked_providers.clone()).unwrap_or_default(),"git_branches":preferences.get(&workspace.id).map(|p|&p.git_branches),"profile":preferences.get(&workspace.id).map(|p|&p.profile),"parked":parked.contains(&workspace.id),"leave":super::leave::outcome(&state,&workspace.id),"working_agents":engine::working_agents(&state,&workspace.id),"cloud_handoff":!renewal_failed && cloud_handoff(&state,config.as_ref(),&workspace.id)})).collect::<Vec<_>>()}),
     )
 }
 /// A project a sleep or quit flush may hand over: this computer owns it, the
@@ -702,6 +703,24 @@ pub(crate) async fn sleep(State(state): State<Arc<AppState>>, body: axum::body::
     let Some(config) = lock(&state.pro.runtime).clone() else {
         return StatusCode::NO_CONTENT.into_response();
     };
+    // The app is away while the computer sleeps; every project gets the
+    // outcome a quit would give it, saved before the reply.
+    let device = config.role == super::protocol::Role::Device
+        && config.delegation.workspace.is_none()
+        && state.daemon_extension.is_some();
+    let refusal = if config.hours_exhausted {
+        Some(super::leave::Reason::CloudTimeUsedUp)
+    } else if super::drain::draining(&state) {
+        Some(super::leave::Reason::CloudUnavailable)
+    } else {
+        None
+    };
+    let outcomes = device.then(|| super::leave::sleeping(&state, refusal));
+    if refusal.is_some() {
+        if let Some(generation) = outcomes {
+            super::leave::slept(&state, generation, &[]).await;
+        }
+    }
     if config.hours_exhausted {
         return Json(json!({"handoff":false,"reason":"cloud_hours_exhausted"})).into_response();
     }
@@ -716,20 +735,22 @@ pub(crate) async fn sleep(State(state): State<Arc<AppState>>, body: axum::body::
     )
     .saturating_sub(SLEEP_REPLY_MARGIN);
     let deadline = tokio::time::Instant::now() + budget;
-    let (coordinator, unavailable) = match hand_over(
-        &state,
-        config,
+    let handover = Handover {
         deadline,
-        request.park,
-        request.workspace_ids,
-    )
-    .await
-    {
-        Ok(started) => started,
-        Err(reason) => {
-            return Json(json!({"handoff":false,"reason":reason,"failed":[]})).into_response()
-        }
+        park: request.park,
+        opened: false,
+        since: None,
     };
+    let (coordinator, unavailable) =
+        match hand_over(&state, config, handover, request.workspace_ids).await {
+            Ok(started) => started,
+            Err(reason) => {
+                if let Some(generation) = outcomes {
+                    super::leave::slept(&state, generation, &[]).await;
+                }
+                return Json(json!({"handoff":false,"reason":reason,"failed":[]})).into_response();
+            }
+        };
     let failed = |results: Vec<(String, anyhow::Result<()>)>| -> Vec<serde_json::Value> {
         unavailable
             .iter()
@@ -743,14 +764,27 @@ pub(crate) async fn sleep(State(state): State<Arc<AppState>>, body: axum::body::
     };
     match tokio::time::timeout_at(deadline + SLEEP_REPLY_MARGIN / 2, coordinator).await {
         Ok(Ok(results)) => {
+            if let Some(generation) = outcomes {
+                super::leave::slept(&state, generation, &results).await;
+            }
             let failed = failed(results);
             Json(json!({"handoff":failed.is_empty(),"failed":failed})).into_response()
         }
-        Ok(Err(_)) => Json(
-            json!({"handoff":false,"reason":"transfer_interrupted","failed":failed(Vec::new())}),
-        )
-        .into_response(),
+        Ok(Err(_)) => {
+            if let Some(generation) = outcomes {
+                super::leave::slept(&state, generation, &[]).await;
+            }
+            Json(
+                json!({"handoff":false,"reason":"transfer_interrupted","failed":failed(Vec::new())}),
+            )
+            .into_response()
+        }
         Err(_) => {
+            // Still publishing: the outcomes say `pending` until the watch
+            // reads the cloud's answer after the computer wakes.
+            if let Some(generation) = outcomes {
+                super::leave::slept(&state, generation, &[]).await;
+            }
             // Still publishing: the flushes finish or recover on their own.
             let pending: Vec<_> = lock(&state.pro.sleeping).iter().cloned().collect();
             Json(
@@ -763,22 +797,55 @@ pub(crate) async fn sleep(State(state): State<Arc<AppState>>, body: axum::body::
 /// Each flush's result, by project.
 pub(super) type Flushes = tokio::task::JoinHandle<Vec<(String, anyhow::Result<()>)>>;
 
+/// How a handover started: what `hand_over` needs besides its projects.
+#[derive(Clone, Copy)]
+pub(super) struct Handover {
+    pub deadline: tokio::time::Instant,
+    /// The quit handover (exactly the listed projects, parked).
+    pub park: bool,
+    /// A browser asked the cloud to run the project (`engine::Sleep::opened`).
+    pub opened: bool,
+    /// The sleep generation when the app left: any wake since (the app came
+    /// back) means nothing starts (`woke`). `None` for the OS sleep itself.
+    pub since: Option<u64>,
+}
+
 /// Starts handing projects to the cloud within `deadline`: the sleep flush,
 /// and with `park` the quit handover (exactly `workspace_ids` then). Returns
 /// the running flushes and the listed projects this computer cannot hand
-/// over, or why nothing started (`transfer_busy`).
+/// over, or why nothing started (`transfer_busy`, or `woke` when the app came
+/// back since it left).
 pub(super) async fn hand_over(
     state: &Arc<AppState>,
     config: Configure,
-    deadline: tokio::time::Instant,
-    park: bool,
+    handover: Handover,
     workspace_ids: Option<Vec<String>>,
 ) -> Result<(Flushes, Vec<String>), &'static str> {
-    let generation = state.pro.sleep_generation.fetch_add(1, Ordering::AcqRel) + 1;
+    let Handover {
+        deadline,
+        park,
+        opened,
+        since,
+    } = handover;
+    let generation = match since {
+        // Taken only if no wake happened since the app left, so a wake at any
+        // point before the flush parks anything keeps the work here.
+        Some(since) => match state.pro.sleep_generation.compare_exchange(
+            since,
+            since + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => since + 1,
+            Err(_) => return Err("woke"),
+        },
+        None => state.pro.sleep_generation.fetch_add(1, Ordering::AcqRel) + 1,
+    };
     let sleep = engine::Sleep {
         generation,
         deadline,
         park,
+        opened,
     };
     // The periodic pass holds the job reservation across every project; a
     // sleep preempts it rather than queueing behind a long push. Anything it
@@ -885,9 +952,9 @@ pub(super) async fn hand_over(
     Ok((coordinator, unavailable))
 }
 /// This computer woke, or the app came back after a quit that handed work to
-/// the cloud (it posts this at launch while anything is parked).
+/// the cloud (it posts this at every launch): the app is here again.
 pub(crate) async fn wake(State(state): State<Arc<AppState>>) -> Response {
-    state.pro.awake_since.store(super::now(), Ordering::Release);
+    super::leave::app_arrived(&state, true);
     // A flush still running for the sleep (or quit) that just ended keeps its
     // publication but will not release; it returns the project itself.
     // Parked projects may come home again, by the usual return rules.
@@ -1121,14 +1188,12 @@ pub(crate) async fn power(
     State(state): State<Arc<AppState>>,
     Json(power): Json<Power>,
 ) -> Response {
-    if state
+    state
         .pro
         .power_suitable
-        .swap(power.suitable, Ordering::AcqRel)
-        != power.suitable
-    {
-        state.pro.awake_since.store(super::now(), Ordering::Release);
-    }
+        .store(power.suitable, Ordering::Release);
+    // Only the app reports power: its first report while away is it arriving.
+    super::leave::app_arrived(&state, false);
     StatusCode::NO_CONTENT.into_response()
 }
 #[derive(Deserialize)]

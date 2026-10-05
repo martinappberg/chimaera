@@ -190,6 +190,42 @@ impl CoordinatorTick {
         *lock(&self.state.pro.mirror_task) = Some(task);
         true
     }
+    /// A pass that only brings work home (`lazy_handback`), between the copy
+    /// passes (which run it every two minutes): while the app is here and
+    /// settled and the cloud holds a project, so its work comes home at the
+    /// conversation's next pause, or while a project the cloud did not keep
+    /// is being taken back. At most every ten seconds; never beside another
+    /// pass.
+    pub fn start_return(&self) -> bool {
+        const EVERY: u64 = 10;
+        if !self.can_mirror() || self.config.role != Role::Device {
+            return false;
+        }
+        let wanted = !lock(&self.state.pro.reclaim).is_empty()
+            || (super::super::leave::app_settled(&self.state)
+                && lock(&self.state.pro.ownership).values().any(|owner| {
+                    matches!(
+                        owner,
+                        Ownership::Remote { .. } | Ownership::Hydrating { .. }
+                    )
+                }));
+        let now = super::super::now();
+        if !wanted || now.saturating_sub(self.state.pro.return_pass.load(Ordering::Acquire)) < EVERY
+        {
+            return false;
+        }
+        self.state.pro.return_pass.store(now, Ordering::Release);
+        let owner = self.state.clone();
+        let config = self.config.clone();
+        let task = tokio::spawn(async move {
+            let _guard = owner.pro.jobs.lock().await;
+            if let Err(error) = lazy_handback(&owner, &config).await {
+                tracing::warn!(phase="locate_return", error=%error, "Could not locate returning projects");
+            }
+        });
+        *lock(&self.state.pro.mirror_task) = Some(task);
+        true
+    }
 }
 
 #[cfg(test)]

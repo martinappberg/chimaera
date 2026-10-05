@@ -76,6 +76,10 @@ pub struct Baton {
     /// (a phone acted while the cloud slept).
     #[serde(default)]
     pub move_reason: Option<String>,
+    /// Additive: a browser opened this project while the computer holding it
+    /// has no app open; that computer hands it to the cloud (`leave::observed`).
+    #[serde(default)]
+    pub open_in_cloud: bool,
 }
 
 #[derive(Clone, Deserialize)]

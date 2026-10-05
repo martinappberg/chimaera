@@ -6,6 +6,7 @@ pub mod fixture;
 pub(crate) mod move_host;
 pub(crate) mod policy_host;
 pub use crate::pro::config_wire::Report as ConfigurationReport;
+pub use crate::pro::leave::ConversationStays;
 pub use crate::pro::projects::catalog::Metadata as ProjectMetadata;
 
 /// One public route/coordinator admission. Cloning retains the same original
@@ -223,7 +224,9 @@ impl ProjectOwner {
             baton.original.workspace_id == self.workspace,
             "project observation changed"
         );
-        execution::observe(&self.state, &self.config, &baton.original)
+        execution::observe(&self.state, &self.config, &baton.original)?;
+        super::super::leave::observed(&self.state, &self.config, &baton.original);
+        Ok(())
     }
     pub fn effective(&self, unowned_device: bool) -> Result<ProjectConfiguration> {
         Ok(ProjectConfiguration {
@@ -446,6 +449,8 @@ pub struct SnapshotOwner {
     pub(super) workspace: crate::workspaces::Workspace,
     pub(super) epoch: u64,
     pub(super) session_ids: Vec<String>,
+    /// The conversations a quit handover must carry (`engine::leaving_sessions`).
+    pub(super) must_carry: Vec<String>,
     pub(super) companion: std::sync::Mutex<Option<super::super::companion::CompatibleImage>>,
     pub(super) transfer: super::super::transfer_dispatch::TransferScope,
     pub(super) grant: super::super::transfer_host::MirrorGrant,
@@ -538,6 +543,30 @@ impl SnapshotOwner {
             },
         )
         .await
+    }
+    /// The working or waiting conversations a quit handover exists for: it
+    /// carries every one of them or none ([`ConversationStays`]), decided
+    /// before anything stops. Empty for every other flush.
+    pub fn must_carry(&self) -> &[String] {
+        &self.must_carry
+    }
+    /// Whether a conversation can travel, without stopping it: the size of
+    /// a fresh copy of it (the copy itself is removed at once).
+    pub async fn probe_session(&self, id: &str) -> Result<u64> {
+        ensure!(
+            self.session_ids.iter().any(|original| original == id),
+            "Session is not in the original transfer roster"
+        );
+        let path = crate::bundle::export_for_mirror(
+            self.project.state.clone(),
+            id,
+            crate::bundle::ExportMode::Snapshot,
+        )
+        .await?
+        .ok_or(ConversationStays::NotSaved)?;
+        let length = tokio::fs::metadata(&path).await.map(|meta| meta.len());
+        let _ = tokio::fs::remove_file(&path).await;
+        Ok(length?)
     }
     pub async fn park_session(&self, id: &str) {
         if self.session_ids.iter().any(|original| original == id) {

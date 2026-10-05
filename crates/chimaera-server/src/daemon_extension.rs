@@ -52,6 +52,7 @@ pub mod project {
         UpgradeRequired,
     };
     pub use crate::pro::engine::project_host::ConfigurationReport;
+    pub use crate::pro::engine::project_host::ConversationStays;
     pub use crate::pro::engine::project_host::ProjectMetadata;
     pub use crate::pro::engine::project_host::{
         snapshot_failure, SnapshotDescription, SnapshotOwner,

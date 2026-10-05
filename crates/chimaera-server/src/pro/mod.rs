@@ -90,6 +90,11 @@ pub(crate) struct ProState {
     parked: Mutex<std::collections::HashSet<String>>,
     /// Each project's last leave outcome (`leave.rs`). Persisted.
     left: Mutex<HashMap<String, leave::Outcome>>,
+    /// Projects a leave is deciding or moving right now, and those whose
+    /// cloud answer is being watched (`leave.rs`). Hot state: each entry is
+    /// held by its owned task and removed when that task ends, however it ends.
+    leaving: Mutex<std::collections::HashSet<String>>,
+    watching: Mutex<std::collections::HashSet<String>>,
     /// The last bytes written, so an unchanged tick costs no disk sync.
     persistence: Arc<AsyncMutex<Option<Vec<u8>>>>,
     #[cfg(test)]
@@ -117,8 +122,21 @@ pub(crate) struct ProState {
     drain_started: tokio::sync::Notify,
     remote_since: Mutex<HashMap<String, u64>>,
     return_backoff: Mutex<HashMap<String, (u64, u64)>>,
-    awake_since: AtomicU64,
+    /// When the native app last arrived (its first `/pro/power` while it was
+    /// away, or `/pro/wake`); 0 while it is away (`/pro/leave` when it quit,
+    /// `/pro/sleep` before the computer sleeps). While it is here, cloud work
+    /// of a project this computer runs comes home at its next pause
+    /// (`engine::lazy_handback`, `leave::app_settled`).
+    app_since: AtomicU64,
+    /// Only reported to the account (`moves::watch_query`); no longer gates
+    /// coming home.
     power_suitable: AtomicBool,
+    /// Projects the cloud did not take, or cannot run, after the app left
+    /// (`leave::take_back`): they come back here at once, app or not. Hot
+    /// state, bounded by enrolled projects.
+    reclaim: Mutex<std::collections::HashSet<String>>,
+    /// When the last return-only pass started (`CoordinatorTick::start_return`).
+    return_pass: AtomicU64,
     /// Wakes the lease loop at once: a resumed machine renews before fencing.
     renew_now: tokio::sync::Notify,
     /// The account refused this daemon's delegation (401/403 on renewal):
@@ -487,16 +505,22 @@ impl ProState {
             sleep_generation: AtomicU64::new(0),
             sleeping: Mutex::new(Default::default()),
             release_pending: Mutex::new(Default::default()),
-            parked: Mutex::new(parked),
-            // A move the daemon died during is no outcome: it either
-            // finished (parked) or its project is ordinary local work again.
+            // A move the daemon died during is no outcome unless it finished
+            // (still parked): then the cloud's answer is still awaited and
+            // the next lease tick watches for it again (`leave::observed`).
             left: Mutex::new(
                 disk.left
                     .into_iter()
-                    .filter(|(id, outcome)| valid_id(id) && outcome.state != leave::Where::Pending)
+                    .filter(|(id, outcome)| {
+                        valid_id(id)
+                            && (outcome.state != leave::Where::Pending || parked.contains(id))
+                    })
                     .take(128)
                     .collect(),
             ),
+            parked: Mutex::new(parked),
+            leaving: Mutex::new(Default::default()),
+            watching: Mutex::new(Default::default()),
             persistence: Arc::new(AsyncMutex::new(None)),
             #[cfg(test)]
             persistence_pause: Mutex::new(None),
@@ -512,8 +536,10 @@ impl ProState {
             drain_started: tokio::sync::Notify::new(),
             remote_since: Mutex::new(HashMap::new()),
             return_backoff: Mutex::new(HashMap::new()),
-            awake_since: AtomicU64::new(now()),
+            app_since: AtomicU64::new(0),
             power_suitable: AtomicBool::new(false),
+            reclaim: Mutex::new(Default::default()),
+            return_pass: AtomicU64::new(0),
             renew_now: tokio::sync::Notify::new(),
             delegation_refused: AtomicBool::new(false),
             moves: Default::default(),
@@ -927,7 +953,7 @@ async fn persist(state: &crate::AppState) -> anyhow::Result<()> {
     let parked = crate::lock(&state.pro.parked).iter().cloned().collect();
     let left = crate::lock(&state.pro.left)
         .iter()
-        .map(|(id, outcome)| (id.clone(), *outcome))
+        .map(|(id, outcome)| (id.clone(), outcome.clone()))
         .collect();
     let (provider_blocks, kept_both) = {
         let statuses = crate::lock(&state.pro.status);

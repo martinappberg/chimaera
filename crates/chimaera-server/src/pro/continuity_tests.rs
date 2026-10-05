@@ -594,13 +594,14 @@ async fn the_request_that_wakes_a_cloud_machine_is_admitted_before_its_watchdog_
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// The five-minute settle gate before live cloud work moves home is fixed in
-/// release builds; only a development build may shorten it (never lengthen).
+/// The short guard before live cloud work moves home to an open app is fixed
+/// in release builds; a development build may change it within five minutes.
 #[test]
-fn the_settle_gate_is_fixed_in_release_builds() {
-    assert_eq!(super::settle_override(false, Some("5")), 300);
-    assert_eq!(super::settle_override(true, None), 300);
+fn the_settle_guard_is_short_and_fixed_in_release_builds() {
+    assert_eq!(super::settle_override(false, Some("5")), 20);
+    assert_eq!(super::settle_override(true, None), 20);
     assert_eq!(super::settle_override(true, Some("5")), 5);
+    assert_eq!(super::settle_override(true, Some("120")), 120);
     assert_eq!(super::settle_override(true, Some("9000")), 300);
-    assert_eq!(super::settle_override(true, Some("soon")), 300);
+    assert_eq!(super::settle_override(true, Some("soon")), 20);
 }

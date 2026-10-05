@@ -8,7 +8,7 @@ revocable delegation over the authenticated local API.
 | --- | --- |
 | `mod.rs` | Bounded, credential-free persistent state and ownership/import fences; `synced` says whether a project's agents get the where-you-run note (`mcp/cloud_context.rs`). |
 | `authority.rs` / `authority_tests.rs` | Fixed-identity workspace-bound worker acceptance, startup-only validated revision advancement, credential-free persisted latch, renewal/route/root guards and synthetic side-effect regressions. |
-| `routes.rs` | Authenticated configure/status/privacy/profile/power/hydration HTTP handlers. Profile GET returns an account-generation-bound ETag; PUT optionally checks one exact If-Match under the same preference lock as replacement (412 on change). Older unconditional PUT remains supported. Accepted writes retain configuration/job reservations through durable persistence even if the caller disconnects. `profile_tests.rs` covers stale confirmation, generation changes and disk failure. `/pro/status` rows carry additive `parked`, `leave`, `working_agents` and `cloud_handoff` (see Leaving below). `hand_over` is the one flush coordinator behind `/pro/sleep` and leaving. |
+| `routes.rs` | Authenticated configure/status/privacy/profile/power/hydration HTTP handlers. Profile GET returns an account-generation-bound ETag; PUT optionally checks one exact If-Match under the same preference lock as replacement (412 on change). Older unconditional PUT remains supported. Accepted writes retain configuration/job reservations through durable persistence even if the caller disconnects. `profile_tests.rs` covers stale confirmation, generation changes and disk failure. `/pro/status` rows carry additive `parked`, `leave`, `working_agents` and `cloud_handoff`, and the top level `leaving` (see Leaving below). `hand_over` is the one flush coordinator behind `/pro/sleep` and leaving. |
 | `projects.rs` / `projects/catalog.rs` | Passive published-account discovery (negotiated `/v2/projects`, at most 128 rows/pages; legacy capability absence or 404 falls back to passive worker discovery), explicit copy/takeover routes, native-picked folder validation and inode/account-bound retry. Catalog rows infer no host or execution authority; errors retain cached rows and destination bindings. Legacy `/open` refuses rather than transferring execution. Nine original shared guard cases remain public; five actual runtime project compositions live privately, including four original ignored companion integrations run by the required private companion job. |
 | `project_copy.rs` / `project_copy/tests.rs` | Immutable read-only checkpoint copies with the existing file/Git transaction, independent durable copy enrollment, exact pending baselines, counted admission and explicit post-commit role promotion. Copy selects its receipt through passive `/v2/baton` GET; the legacy v1 response has no checkpoint and is never a fallback. Missing negotiated receipt refuses enrollment/install. No agent/session/configuration restore or copied-edit publication. |
 | `projects/tests.rs` | Nine shared destination/account/cache, refusal and legacy recovery tests. Paid real Git copy/return and worker roundtrip compositions live with the optional private runtime. |
@@ -322,8 +322,9 @@ wake behavior; `session_proxy` does not submit account moves. The native
 conversation identity still remains in the ledger until its first resumed turn.
 
 Normal lazy return only handles registered projects without a pending adoption.
-Moving live cloud work waits for the settle gate (awake on power for five
-minutes) in both protocol versions. Work the cloud is not running returns at
+Moving live cloud work waits for the settle gate (the app here for 20 s,
+`leave::app_settled`; power plays no part) in both protocol versions, and a
+project being taken back (`reclaim`) skips it. Work the cloud is not running returns at
 once: a cloud release (holder none), a lapsed cloud lease (the device takes it
 from the last acknowledged checkpoint; the account's reconnect grace answers
 409 `takeover_grace`, treated as a quiet wait), or this device's own unfinished
@@ -399,9 +400,9 @@ cached readiness never grants permission to resume. After sign-in the page's
 `POST /pro/hydrate {workspace_id, expected_epoch}` re-checks (fresh) and
 resumes the now-ready sessions (`provider_gate::resume_ready`); nothing is
 fetched or reinstalled. One session failing to resume never stops the others.
-Live cloud work moves home only after this computer has been awake on power
-for five minutes (`lazy_handback`); a development build may shorten that with
-`CHIMAERA_PRO_SETTLE_SECS` for the loopback harness, release builds ignore it.
+Live cloud work moves home at its next pause once the app has been here for
+the 20 s guard (`lazy_handback`); a development build may set the guard with
+`CHIMAERA_PRO_SETTLE_SECS` (up to 300), release builds ignore it.
 A worker asked to hydrate the epoch it already verifiably holds (same holder,
 same epoch, managed or not) only re-verifies it with the account: its running
 agents are not stopped and nothing is reinstalled; a managed project with
@@ -481,7 +482,9 @@ copies.
 The lease loop starts a copy of every eligible project every 120 s (`TIMED_COPY`), and of one project as soon as one of
 its agents finishes a turn (`TurnEnds`: fed each 5 s tick from `working_agents`, a working → not working transition marks
 the project; copied once 20 s have passed since the last copy started, `TURN_COPY_GAP`; a turn that ends while a copy runs
-is copied next; that pass skips `lazy_handback`). One copy task at a time, never while draining.
+is copied next; that pass skips `lazy_handback`). One copy task at a time, never while draining. Between copies,
+`CoordinatorTick::start_return` runs `lazy_handback` alone, at most every ten seconds, while the app is settled and the
+cloud holds a project, or while a project is being taken back.
 
 The sleep flush (`/pro/sleep {deadline_ms?}`) preempts the periodic pass, flushes
 projects in parallel as owned tasks (live agents first), releases within the
@@ -503,33 +506,53 @@ a restart-deferred one instead of answering "moved" forever. A device's own
 unfinished return retries after 15 s, doubling to two minutes. Failures and
 refusals carry stable codes (`routes::error_code`; mirror row `error_code`).
 
-**Leaving (`leave.rs`, `POST /pro/leave`).** The native app posts it, with no
-body and no question, whenever Pro is active and the app quits (or its last
-window closes); the reply comes at once and the handover runs on as an owned
-task within 90 s. All eligibility is decided here. For each enrolled project
-in scope and not parked: `engine::leaving_agents` (`working_agents` plus a
-chat waiting on a permission or question, or a terminal agent in
-`NeedsPermission`) names the active agent kinds; `leave::plan` moves the
-project when a Claude or Codex one is active and the account does not say
-every such provider is signed out on the cloud machine (`GET
-/v2/cloud/agents`, written by that machine's own readiness checks through
-`provider_gate::report_cloud_agents`; unknown is tried). Everything else stays
-here with a non-clean copy (`nothing_running`, `agent_kind_stays_here`,
-`agent_not_connected_in_cloud`); a refusal before any flush (`cloud_time_used_up`,
-`cloud_unavailable` while draining or with a lapsed delegation, `not_synced_yet`
-for a working project not owned here) records without a copy. Moving projects
-go through `routes::hand_over` with `park` (the quit handover below) and end
-`moved` only when the flush returned Ok with the project still parked: the
-private snapshot refuses a parked flush that carries no conversation archive
-(`has_agents` would be false and the account would never wake for it), so it
-recovers here as `conversation_not_saved`/`conversation_too_large`; other
-failures map through `leave::reason_for`. Each outcome (`ProState.left`,
-persisted as `left` in `state.json`, ≤128, cleared on sign-out) is one
-`chimaera_server::pro::leave` info line, the additive `leave {state, reason?,
-at}` on the status row, and a best-effort `PUT /v2/workspaces/{id}/leave` so
-the account's placement and Home list can say it. A daemon without the
-optional Runtime answers `{"leaving":[],"reason":"optional_runtime_unavailable"}`
-and logs it; a free daemon answers 204.
+**Leaving (`leave.rs`).** App presence: `ProState.app_since` is set when the
+app arrives (`/pro/wake`, or its first `/pro/power` while away) and cleared by
+`/pro/leave` and `/pro/sleep`; an arrival also advances `sleep_generation` (an
+in-flight leave or sleep flush then parks or releases nothing) and clears the
+last absence's outcomes here and at the account (`DELETE
+/v2/workspaces/{id}/leave`). `POST /pro/leave` (no body, from the native app on
+quit) answers 202 at once and runs everything in one owned task, so a client
+that disconnects cancels nothing; the projects a leave or a watch is handling
+sit in `ProState.leaving`/`watching`, each held by its task through a drop
+guard (no stuck entry). The task records `sleep_generation` at arrival and
+`routes::hand_over` takes the next generation only if no wake happened since
+(`Handover::since`, else `woke`). For each enrolled project in scope and not
+parked: `engine::leaving_agents` names the active kinds; `leave::plan` moves the
+project when a Claude or Codex one is active and the account does not say every
+such provider is signed out on the cloud machine (`GET /v2/cloud/agents`, written
+by that machine's readiness checks, once per change; unknown is tried). Others
+stay with a non-clean copy (`nothing_running`, `agent_kind_stays_here`,
+`agent_not_connected_in_cloud`); refusals before any flush (`cloud_time_used_up`,
+`cloud_unavailable`, `not_synced_yet`) record without a copy. A move carries
+`engine::leaving_sessions` (working or waiting Claude/Codex conversations) as
+`SnapshotOwner::must_carry`: the private snapshot probes each one in snapshot
+mode before stopping anything and refuses with the typed
+`ConversationStays::{TooLarge,NotSaved}`. A parked move stays `pending` with the
+kinds it stopped that the cloud does not continue (`stopped`); `leave::watch`
+then reads the account placement every 5 s (`verdict`): `leave.state` `moved`
+(the cloud machine's own report after its resume, `leave::arrived`) records
+`moved`; `staying_here` (the cloud machine found every moved conversation
+waiting for a provider, the account refused for budget or allowlist, the worker
+supervisor gave up) or no taker within `TAKE_BOUND` (4 min), or a cloud holder
+silent past 15 min, takes the work back while the app is away
+(`leave::take_back`: unpark, `Transferring` → `AwaitingVerification` so the
+lease loop re-acquires its own epoch, or `reclaim` so `lazy_handback` brings it
+home from the cloud at its pause; `release_pending` resumes locally at once).
+A browser that opens a project held here while the app is away
+(`Baton::open_in_cloud` in the ownership read, checked by `leave::observed` on
+every tick) hands it over the same way when nothing in it works, waits or is
+busy (`Sleep::opened`: no conversation needed). `/pro/sleep` records the same
+outcomes without account calls (`leave::sleeping`, `leave::slept`). Each outcome
+(`ProState.left`, persisted as `left`; `pending` survives a restart only while
+parked, and its watch restarts on the next tick; pruned to registered projects,
+cleared on sign-out) is one `chimaera_server::pro::leave` info line, the
+additive `leave {state, reason?, at, stopped?}` on the status row, and a
+best-effort `PUT /v2/workspaces/{id}/leave`. `/pro/status` has an additive
+top-level `leaving {ready, reason?}` for a personal computer
+(`optional_runtime_unavailable` without the Runtime). A daemon without the
+optional Runtime answers leave with `{"leaving":[],"reason":"optional_runtime_unavailable"}`;
+a free daemon answers 204.
 
 **Quit handover (`park`).** `/pro/sleep {deadline_ms, park: true,
 workspace_ids}` (older apps) and leaving's moves share one flush with three
@@ -545,8 +568,8 @@ connection); only a flush whose copy never published recovers at once
 so. And each flushed project is **parked**
 (`ProState.parked`, persisted as a sorted `parked` list in `state.json`) from
 the moment its flush starts until such a flush fails (`unpark`), the app returns
-(`/pro/wake` clears every park; the app posts it at launch when a row says
-`parked`) or the account signs out. While parked, on a device the lease loop
+(`/pro/wake` clears every park; the app posts it at every launch), the work
+is taken back (`leave::take_back`) or the account signs out. While parked, on a device the lease loop
 neither renews nor acquires the project (`reconcile_generation`; a flush still
 `Transferring` keeps renewing its own lease until it releases) and
 `lazy_handback` skips it, however long this computer has been awake on power

@@ -681,7 +681,11 @@ impl Scenario {
                     .pro
                     .sleep_generation
                     .store(sleep_generation, Ordering::Release);
-                state.pro.awake_since.store(awake_since, Ordering::Release);
+                // The fixture's computer has had its app open since then (0: long ago).
+                state
+                    .pro
+                    .app_since
+                    .store(awake_since.max(1), Ordering::Release);
                 state
                     .pro
                     .power_suitable
