@@ -21,12 +21,14 @@ contracts are [PROTOCOL](../../crates/chimaera-link/PROTOCOL.md),
 These are the maintainer's decisions through 2026-10-02. A change that
 violates one is a defect regardless of tests.
 
-- **Laptop first.** The laptop never stops its own agents or shells because the
-  account is unreachable, because the user signed out, because the plan lapsed,
-  because the privacy switch was used, or because the daemon restarted. Local
-  execution is fenced only after a *verified* newer owner exists, and then at a
-  safe pause. Publication (mirror writes) is what an unreachable account fences.
-  Plain shells are never managed processes. Sign-out and boot never leave a
+- **One handoff mechanism (2026-10-05, supersedes "laptop first" fencing).**
+  Whoever holds a project's lease runs it; the laptop holds it while its daemon
+  can reach the account. A laptop whose lease lapsed stops its own agents (so the
+  cloud continues exactly once), except while the account answers with server
+  errors; its plain shells keep working. Signing out, a lapsed plan, the privacy
+  switch and a daemon restart never stop its agents or shells. A *verified*
+  newer owner stops them at a safe pause. Plain shells are never managed
+  processes. Sign-out and boot never leave a
   returned session deferred: a sign-out that cuts a return's resume short
   resumes it at once (the resume runs as its own task, one resumer per
   session), and a daemon restarted over one resumes it like any session the
@@ -159,7 +161,7 @@ in one run with production lease, reconnect and idle timings:
 6. The cloud machine drains, flushes and suspends while keeping ownership; a
    passive read does not wake it; a send with wake intent does, into the same
    conversation, same process, no fork.
-7. The laptop wakes on power; after the settle window the work comes home:
+7. The laptop is reachable again; after the one-minute guard the work comes home:
    same conversation, no fork, zero new turns, both machines' files present,
    the branch fast-forwarded.
 8. Battery loss mid-turn: the cloud takes over from the last checkpoint with a
@@ -205,7 +207,7 @@ Known intermittent tests under a loaded full run (they pass alone):
 
 | Area | Start here | What to trace |
 | --- | --- | --- |
-| Account lifecycle, billing, power | [native map](../../crates/chimaera-app/AGENTS.md), `shell/pro.rs`, `shell/pro/` | sign-in → keychain → daemon setup in the background; billing return; the sleep deadline; placements retire only on definitive answers |
+| Account lifecycle, billing, power | [native map](../../crates/chimaera-app/AGENTS.md), `shell/pro.rs`, `shell/pro/` | sign-in → keychain → daemon setup in the background; billing return; the daemon (not the app) holds the reverse link and hears sleep; placements retire only on definitive answers |
 | Link crate | [link map](../../crates/chimaera-link/AGENTS.md) | refresh semantics, lenient service decoding, exact daemon acks, tunnel and reverse-serve limits |
 | Ownership and transfer | [pro map](../../crates/chimaera-server/src/pro/AGENTS.md), `engine.rs`, `execution/`, `detached.rs`, `drain.rs`, `handback.rs` | laptop-first fence, owned flush/hydrate, sleep deadline, return at a pause, drain for the supervisor |
 | Files and durability | `pro/mirror.rs`, `repository.rs`, `canonical.rs`, `persist.rs`, [BUNDLE](../../crates/chimaera-server/BUNDLE.md) | baseline, `left_out`, kept-both siblings, durable Pro state |
