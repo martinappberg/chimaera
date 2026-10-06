@@ -1029,7 +1029,16 @@ impl ChatManager {
                 live,
                 reply,
             })
-            .map_err(|_| anyhow::anyhow!("the agent is busy with other reads"))?;
+            .map_err(|err| match err {
+                mpsc::error::TrySendError::Full(_) => {
+                    anyhow::anyhow!("the agent is busy with other reads")
+                }
+                // The driver task dropped its receiver: a dead session kept
+                // in the registry so the UI can show why.
+                mpsc::error::TrySendError::Closed(_) => {
+                    anyhow::anyhow!("the agent is no longer running")
+                }
+            })?;
         match tokio::time::timeout(SUBAGENT_READ_TIMEOUT, answer).await {
             Ok(Ok(Ok(transcript))) => Ok(transcript),
             Ok(Ok(Err(reason))) => Err(anyhow::anyhow!(reason)),

@@ -2523,7 +2523,11 @@
   // break. A chat that can't take a message offers no quote.
   const quoteOwner = {};
   let quoteChip = $state<{ x: number; y: number } | null>(null);
-  const composerDisabled = $derived(store.exited !== null || store.degraded || store.fatalError !== null);
+  /** Nothing to type into (and so nothing to quote into): a read-only
+   *  subagent view, or a session that ended, degraded or failed. */
+  const composerDisabled = $derived(
+    readOnly || store.exited !== null || store.degraded || store.fatalError !== null,
+  );
   const incompatibleRuntime = $derived(/GLIBC_[\d.]+[^\n]*not found/.test(store.fatalError ?? ""));
 
   function dropQuote(): void {

@@ -157,6 +157,11 @@ export class SubagentSocket {
       if (!response.ok) {
         const body = (await response.json().catch(() => null)) as { error?: string } | null;
         this.problem = body?.error ?? `could not read this subagent (${response.status})`;
+        // The daemon's own refusal of a FINISHED subagent (no transcript, an
+        // agent whose children cannot be read) will not change by asking
+        // again: count it as the closing read, so the chain idles until the
+        // parent says the subagent is working. A gateway's 5xx is transient.
+        if (!working && response.status < 500) this.closedRead = true;
         return;
       }
       answer = (await response.json()) as SubagentRead;

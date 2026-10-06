@@ -189,6 +189,11 @@ pub(crate) async fn subagent_transcript(
             }
             Json(body).into_response()
         }
+        // A read that could not happen NOW (the driver is busy or slow) is
+        // not a missing subagent: the status tells a reader to try again.
+        Err(reason) if reason.contains("busy") || reason.contains("in time") => {
+            refuse(StatusCode::SERVICE_UNAVAILABLE, reason)
+        }
         Err(reason) => refuse(StatusCode::NOT_FOUND, reason),
     }
 }

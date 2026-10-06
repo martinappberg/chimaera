@@ -2184,22 +2184,14 @@ impl ClaudeMapper {
         let Some(facts) = self.subagents.get_mut(row) else {
             return;
         };
-        let mut changed = false;
-        let mut learn = |slot: &mut Option<String>, value: Option<&str>, cap: usize| {
-            // `<synthetic>` is the CLI's own placeholder on error frames.
-            let Some(value) = value.filter(|v| !v.is_empty() && *v != "<synthetic>") else {
-                return;
-            };
-            let value = truncate_label(value, cap);
-            if slot.as_deref() != Some(value.as_str()) {
-                *slot = Some(value);
-                changed = true;
-            }
-        };
-        use crate::subagent::{SUBAGENT_ID_MAX, SUBAGENT_MODEL_MAX};
-        learn(&mut facts.agent_id, agent_id, SUBAGENT_ID_MAX);
-        learn(&mut facts.model, model, SUBAGENT_MODEL_MAX);
-        learn(&mut facts.agent_type, agent_type, SUBAGENT_ID_MAX);
+        use crate::subagent::{learn_label, SUBAGENT_ID_MAX, SUBAGENT_MODEL_MAX};
+        // `<synthetic>` is the CLI's own placeholder on error frames.
+        fn real(value: Option<&str>) -> Option<&str> {
+            value.filter(|v| *v != "<synthetic>")
+        }
+        let mut changed = learn_label(&mut facts.agent_id, real(agent_id), SUBAGENT_ID_MAX);
+        changed |= learn_label(&mut facts.model, real(model), SUBAGENT_MODEL_MAX);
+        changed |= learn_label(&mut facts.agent_type, real(agent_type), SUBAGENT_ID_MAX);
         if !changed {
             return;
         }

@@ -220,7 +220,7 @@ use crate::model::{
 };
 use crate::ndjson::{JsonlSink, JsonlStream};
 use crate::subagent::{
-    valid_agent_id, DriverQuery, SubagentTranscript, QUERY_QUEUE, SUBAGENT_ID_MAX,
+    learn_label, valid_agent_id, DriverQuery, SubagentTranscript, QUERY_QUEUE, SUBAGENT_ID_MAX,
     SUBAGENT_MODEL_MAX,
 };
 
@@ -1194,25 +1194,14 @@ fn subagent_info(agent: &CollabAgent) -> Option<AgentEvent> {
 /// Fold a child `Thread` object's `model` and `agentRole` into `agent`,
 /// capped; true when either changed.
 fn learn_subagent_facts(agent: &mut CollabAgent, thread: &Value) -> bool {
-    let mut changed = false;
-    let mut learn = |slot: &mut Option<String>, value: Option<&str>, cap: usize| {
-        let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
-            return;
-        };
-        let value = truncate_label(value, cap);
-        if slot.as_deref() != Some(value.as_str()) {
-            *slot = Some(value);
-            changed = true;
-        }
-    };
-    learn(
+    let mut changed = learn_label(
         &mut agent.model,
-        thread["model"].as_str(),
+        thread["model"].as_str().map(str::trim),
         SUBAGENT_MODEL_MAX,
     );
-    learn(
+    changed |= learn_label(
         &mut agent.agent_type,
-        thread["agentRole"].as_str(),
+        thread["agentRole"].as_str().map(str::trim),
         SUBAGENT_ID_MAX,
     );
     changed
@@ -5508,12 +5497,15 @@ impl CodexMapper {
 
     /// A subagent's conversation is a child THREAD only this app-server
     /// connection can read: answer from `thread/read {includeTurns}` once it
-    /// returns (see [`thread_to_events`]). Only threads this driver tracks
-    /// are read — the handle came from its own `SubagentInfo`.
+    /// returns (see [`thread_to_events`]). A thread this driver does not
+    /// track is read too: the handle came from a `SubagentInfo` in the
+    /// journal, and after a resume the child threads live on only as saved
+    /// history (`thread/read` serves them `notLoaded`, PROTOCOL.md Pass 42)
+    /// — codex itself refuses an id that names nothing.
     fn on_query(&mut self, query: DriverQuery) -> DriverStep {
         let mut step = DriverStep::default();
         let DriverQuery::SubagentTranscript { agent_id, .. } = &query;
-        if !valid_agent_id(agent_id) || self.collab_agent_mut(agent_id).is_none() {
+        if !valid_agent_id(agent_id) {
             query.refuse("no such subagent in this conversation");
             return step;
         }
@@ -10445,22 +10437,25 @@ mod tests {
             step.events
         );
         assert!(step.outbound.is_empty());
-        // Nor can it be read.
+        // It can still be read: the handle may come from the journal of a
+        // resumed chat, whose child threads codex serves as saved history.
         let (query, mut rx) = transcript_query("sub-over", false);
         let step = m.on_query(query);
-        assert!(step.outbound.is_empty());
-        assert!(rx.try_recv().unwrap().is_err());
+        assert_eq!(thread_reads(&step).len(), 1);
+        assert!(rx.try_recv().is_err(), "the answer waits for codex");
     }
 
     #[test]
     fn transcript_queries_refuse_unknown_threads_and_a_full_queue() {
         let mut m = mapper();
-        let (query, mut rx) = transcript_query(CHILD, false);
+        // Only an id that could not name a thread is refused outright; an
+        // untracked but well-formed one is codex's to accept or refuse.
+        let (query, mut rx) = transcript_query("../etc", false);
         let step = m.on_query(query);
         assert!(step.outbound.is_empty());
         assert!(
             rx.try_recv().unwrap().is_err(),
-            "an unknown thread is refused"
+            "a malformed thread id is refused"
         );
 
         active_turn(&mut m);

@@ -183,6 +183,7 @@
     pruneDeletedPath,
     pruneFiles,
     pruneSessions,
+    pruneTabs,
     rewriteTabPaths,
     adoptTabs,
     allSessionIds,
@@ -3307,7 +3308,12 @@
     // degrade frame and stopped reconnecting; it's dead weight).
     for (const s of list) {
       if (s.ui === "chat") pool.disposeSession(s.id);
-      else if (s.ui === "term") chatPool.disposeChat(s.id);
+      else if (s.ui === "term") {
+        chatPool.disposeChat(s.id);
+        // Its subagent views read through that chat: without it they could
+        // neither follow nor tell working from finished. They go with it.
+        layout = pruneTabs(layout, (t) => t.surface !== "subagent" || t.sessionId !== s.id);
+      }
     }
     const agentIds = new Set(list.filter((s) => s.kind === "agent").map((s) => s.id));
     const changed =

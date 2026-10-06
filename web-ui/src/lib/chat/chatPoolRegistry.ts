@@ -65,7 +65,6 @@ export const tick = {
   },
 };
 
-
 /** Close the socket and drop the entry (a session that ended, toggled to a
  *  terminal, or the app unmounting). Idempotent. */
 export function disposeChat(sessionId: string): void {

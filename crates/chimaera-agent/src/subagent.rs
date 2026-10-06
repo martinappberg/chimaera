@@ -13,7 +13,7 @@
 
 use tokio::sync::oneshot;
 
-use crate::model::AgentEvent;
+use crate::model::{truncate_label, AgentEvent};
 
 /// Outstanding [`DriverQuery`]s a driver accepts at once (queued + in
 /// flight). A view polls one transcript at a time; past this the request is
@@ -62,6 +62,23 @@ impl DriverQuery {
             }
         }
     }
+}
+
+/// Fold one fact the wire names about a subagent into `slot` — latest wins,
+/// capped at construction — and say whether it is news. An empty value
+/// teaches nothing (a field the wire has not named yet); callers strip
+/// their own placeholders first. Shared by both drivers so the two cannot
+/// drift on what counts as a change.
+pub fn learn_label(slot: &mut Option<String>, value: Option<&str>, cap: usize) -> bool {
+    let Some(value) = value.filter(|v| !v.is_empty()) else {
+        return false;
+    };
+    let value = truncate_label(value, cap);
+    if slot.as_deref() == Some(value.as_str()) {
+        return false;
+    }
+    *slot = Some(value);
+    true
 }
 
 /// Whether `id` is safe to name a subagent with: it is put in a file name

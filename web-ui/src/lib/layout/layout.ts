@@ -1329,7 +1329,7 @@ export function adoptTabs(
  * Drop tabs failing `keep`; panes emptied by pruning close (the last pane
  * survives, empty). The active tab follows its surface when it survives.
  */
-function pruneTabs(l: Layout, keep: (t: Tab) => boolean): Layout {
+export function pruneTabs(l: Layout, keep: (t: Tab) => boolean): Layout {
   const walk = (node: LayoutNode): LayoutNode | null => {
     if (node.type === "pane") {
       const tabs = node.tabs.filter(keep);
