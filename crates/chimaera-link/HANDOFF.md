@@ -182,7 +182,7 @@ billing, start OAuth or mint another delegation. The keeper introspector accepts
 it as the same account and original device holder, restricted to the keeper
 scope. Parent device revocation and sign-out-everywhere invalidate it and close
 its keeper transport (the keeper revalidates every open socket's bearer every
-five seconds). Servers store only a token hash. The app passes this
+five seconds, so a revoked socket closes within about twelve). Servers store only a token hash. The app passes this
 credential only to its authenticated local daemon; it never persists the value
 in configuration, logs, bundles or mirrors.
 
@@ -192,9 +192,11 @@ computer from the user's other devices. It does so only for a personal computer
 (`role: device`, no workspace binding, `keeper` in `scope`, a keeper URL) with
 the optional Runtime composed in; it registers under Configure's additive
 `alias` (the app's machine name) with its own local bearer, reconnects with
-jittered backoff (half a second doubling to ten; a minute after a 401/403), and
-ends the socket on `DELETE /api/v1/pro/configure` (sign-out) or a new
-configuration.
+jittered backoff (half a second doubling to ten), and ends the socket on
+`DELETE /api/v1/pro/configure` (sign-out) or a new configuration. A refused
+(401/403) or expired delegation ends the link for good: nothing is dialed again
+until a new configuration starts a new one. At most 8 MiB read from the daemon
+wait to be written to the keeper, across all streams.
 
 ## Workspace-bound worker delegation
 
@@ -416,12 +418,21 @@ deadline ends 15 seconds before the account's expiry, and at that deadline the
 computer stops its own managed agents (plain shells are never managed), so a
 turn never runs in two places. While the account answers with server errors
 nobody can acquire through it, and the computer keeps its own work running.
+The account marks every answer it gives, errors included, with
+`X-Chimaera-Account: 1`; a 5xx without it (a proxy, captive portal or edge in
+between) proves nothing about the account and counts as not reaching it, as
+does a refused credential. A success or a 409 counts as reaching it. A project
+whose "keep on this computer only" switch the account acknowledged holds no
+lease and is never fenced for one. The daemon renews up to 16 projects at once
+and waits for a pass at most 20 seconds; a slower project's renewal continues
+on its own and later passes skip it until it ends.
 
 The account acts at the earliest lease end plus grace rather than polling, so
 the cloud continues about 75 seconds after the last renewal (plus the cloud
 machine's start) from the latest synced state. The daemon copies a project
-when a turn starts (so the user's prompt is in the copy), when a turn ends, every
-minute while an agent works, and every two minutes otherwise. A computer frozen
+when a turn starts (no sooner than 20 seconds after its previous copy, so a
+prompt sent just before a sudden loss may not be in it), when a turn ends,
+every minute while an agent works, and every two minutes otherwise. A computer frozen
 past its deadline renews first only while nobody could have taken the project
 yet (by wall clock, lease end plus grace less a margin); otherwise it is fenced
 at once and re-acquires its own epoch without a fork or install if nobody took
@@ -461,11 +472,13 @@ reply is `{handoff, failed:[{workspace_id, error:<code>}]}`, plus
 their own. A flush that could not hand its project over (its release ran out
 of time, or publication failed) never renews the lease or resumes agents inside
 the sleep window: an unreleased lease lapses and the cloud continues from the
-acknowledged checkpoint. On waking (the daemon's own power notification) a
-flush still running keeps its publication, stops no further sessions, never
-releases and resumes the sessions it stopped; a project whose flush ended
-without handing over waits for the lease loop to verify who holds it now, since
-the cloud may have taken it during sleep. Signing out returns any transfer or
+acknowledged checkpoint. On waking (the daemon's own power notification, or a
+sleep announced and then cancelled) a flush still running keeps its
+publication, stops no further sessions and never releases; nothing resumes on
+sight. A project whose flush did not hand it over starts or resumes no agent
+until the lease loop has verified who holds it now, since the cloud may have
+taken it during sleep; its preserved sessions resume after that verification.
+A sleep notice does nothing on a signed-out daemon or one without the Runtime. Signing out returns any transfer or
 return this computer itself started to it.
 
 `POST /api/v1/pro/projects/{id}/cloud` ("Run in the cloud") hands one project
@@ -602,15 +615,16 @@ mechanism](#one-handoff-mechanism)), and a resumed worker renews before fencing:
 daemon first renews the recorded epoch, which the account grants to a suspended
 owner at the same epoch with no fork; only a refused renewal (or no answer within
 20 seconds) fences. That renewal starts the moment the thaw is noticed (by the
-daemon's 100 ms watchdog, or by the first request or socket frame to arrive
+daemon's watchdog, 100 ms on a cloud machine and 1 s on a computer, or by the first request or socket frame to arrive
 after it), never at the next 5-second renewal tick, because a viewer's socket
 is admitted only once it answers. A personal computer is also fenced by its
 lapsed lease (above), a verified other owner (an authenticated read naming
 another holder) or its own in-progress transfer; sign-out, a lapsed plan, the
 privacy switch and a daemon restart stop publication, never its agents or
-shells, and after a restart its interrupted sessions resume only once the
-account confirms it still holds them (or the account answers with server
-errors). A verified other owner refuses local input at once; the computer's
+shells. After a restart no agent starts or resumes in a synced project until
+the account confirms the computer still holds it; only a sign-out, which the
+daemon records on disk, lets interrupted sessions resume without the account.
+Sessions a lapse stopped are dropped once another machine held the project. A verified other owner refuses local input at once; the computer's
 agents stop at their next safe pause, at most five minutes later.
 Re-acquiring the epoch this installation itself held (its own clean release, or
 its own lapsed lease) continues local work: no checkpoint install and no fork,
@@ -621,7 +635,7 @@ managed processes.
 A cloud machine that suspends keeps ownership (placement `suspended`, lease
 expired by design); the account answers anyone else's acquire with 409 `held`
 for as long as it stays paused. A computer that wants the project back reads
-placement (passive, never wakes) and, once it has reached the account without a gap for a minute, POSTs the worker's
+placement (passive, never wakes) and, once it has reached the account without a gap for fifteen seconds, POSTs the worker's
 `/api/v1/pro/handoff` through the keeper's HTTP adapter with `X-Chimaera-Wake:
 interaction`: the keeper wakes the machine, which renews its own epoch, flushes
 at a safe pause and releases, and the computer then hydrates. A `held` refusal

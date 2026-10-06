@@ -10,8 +10,8 @@ revocable delegation over the authenticated local API.
 | `authority.rs` / `authority_tests.rs` | Fixed-identity workspace-bound worker acceptance, startup-only validated revision advancement, credential-free persisted latch, renewal/route/root guards and synthetic side-effect regressions. |
 | `routes.rs` | Authenticated configure/status/privacy/sleep/hydration HTTP handlers. Accepted writes retain configuration/job reservations through durable persistence even if the caller disconnects. `/pro/status` rows carry additive `place`, `reason`, `run_here` and `run_in_cloud` (see Where work runs below). `hand_over` is the one flush coordinator behind `/pro/sleep`, the macOS sleep watcher and "Run in the cloud"; `woke` is the wake. |
 | `place.rs` | Where a synced project's work runs and the user's two choices: `run_here` (`POST /pro/projects/{id}/here`), `run_in_cloud` (`POST /pro/projects/{id}/cloud`), `observed` (the ownership read's `reason`/`holder_kind`/`holder_name`), the cloud machine's `arrived` report (`PUT /v2/workspaces/{id}/reason`). |
-| `reach.rs` | Whether this computer can reach the account (the lease loop's own calls: `answered`, `unreachable`, `settled` after a 15 s guard, `erroring`) and the daemon-owned reverse-serve link to the keeper. |
-| `sleep_watch.rs` | macOS only: the daemon's own IOKit sleep/wake watcher; a will-sleep runs `routes::sleeping` (23 s) and always acknowledges, a power-on runs `routes::woke`. |
+| `reach.rs` | Whether this computer can reach the account (the lease loop's own calls: `answered` (a 2xx or 409 is reachable; a 5xx is `erroring` only with the account's marker), `unreachable`, `settled` after a 15 s guard, `erroring`) and the daemon-owned reverse-serve link to the keeper (ends for good on a refused or expired delegation; at most 8 MiB read from the daemon queued across all streams). |
+| `sleep_watch.rs` | macOS only: the daemon's own IOKit sleep/wake watcher; a will-sleep runs `routes::sleeping` (23 s) and always acknowledges, a power-on or will-not-sleep runs `routes::woke`; signed out or without the Runtime a notice is only acknowledged. |
 | `projects.rs` / `projects/catalog.rs` | Passive published-account discovery (negotiated `/v2/projects`, at most 128 rows/pages; legacy capability absence or 404 falls back to passive worker discovery), explicit copy/takeover routes, native-picked folder validation and inode/account-bound retry. Catalog rows infer no host or execution authority; errors retain cached rows and destination bindings. Legacy `/open` refuses rather than transferring execution. Nine original shared guard cases remain public; five actual runtime project compositions live privately, including four original ignored companion integrations run by the required private companion job. |
 | `project_copy.rs` / `project_copy/tests.rs` | Immutable read-only checkpoint copies with the existing file/Git transaction, independent durable copy enrollment, exact pending baselines, counted admission and explicit post-commit role promotion. Copy selects its receipt through passive `/v2/baton` GET; the legacy v1 response has no checkpoint and is never a fallback. Missing negotiated receipt refuses enrollment/install. No agent/session/configuration restore or copied-edit publication. |
 | `projects/tests.rs` | Nine shared destination/account/cache, refusal and legacy recovery tests. Paid real Git copy/return and worker roundtrip compositions live with the optional private runtime. |
@@ -55,8 +55,15 @@ its daemon can reach the account. A computer is fenced by its own lapsed lease
 the cloud never runs a turn the computer is still running), by a verified other
 owner (`Ownership::Remote`, from an authenticated read) or by its own
 in-progress transfer (`Transferring`, `Hydrating`, `SettingUp`);
-`AwaitingVerification` stays writable there. While the account answers with
-server errors (`reach::erroring`) a computer keeps its own work. Sign-out
+`AwaitingVerification` (after a restart, a wake or a failed flush) keeps
+writes and terminals but starts and resumes no agent until the lease loop
+verified the project (`execution::allows`; not when signed out). While the
+account answers with server errors carrying its own `X-Chimaera-Account`
+marker (`reach::erroring`; `transport::Response::from_account`) a computer
+keeps its own work; an unmarked 5xx (a proxy or captive portal) counts as
+unreachable. A project kept on this computer whose switch the account
+acknowledged (`execution::kept_here`) holds no lease proof (`expire` drops it)
+and restores without one. Sign-out
 (`disconnect` never stops sessions), plan changes, the privacy switch and daemon
 restarts stop publication only. A verified other owner refuses input at once
 (`may_write`); the device's agents then stop at their next safe pause, bounded
@@ -70,8 +77,8 @@ marker, or a Worker runtime) stays strict: its execution needs an unexpired
 acquire/renew proof, never a passive GET; a request-start deadline reserves stop
 time; clock divergence closes admission; and the watchdog (started only on
 workers) fences chat/PTY input and owned agent process groups. Renew before
-fencing: when the watchdog sees the process was frozen (a 100 ms tick taking
-over 3 s, or wall and monotonic time disagreeing by over 1 s) and a deadline
+fencing: when the watchdog sees the process was frozen (a tick, 100 ms on a
+worker and 1 s on a computer, taking over 3 s, or wall and monotonic time disagreeing by over 1 s) and a deadline
 lapsed across it, it wakes the lease loop, which renews the recorded epoch
 (the account keeps a suspended owner's lease: same epoch, no fork, never an
 acquire/checkpoint install); input stays admitted meanwhile. A personal
@@ -91,10 +98,18 @@ or another verified owner fences at once; no answer within 20 s fences too.
 `lease_valid` gates publication and forwarded viewers on every host. Plain shells are never
 managed: not signalled by fences, not awaited by stops, never evidence. Sessions
 a previous daemon left running wait for this life's lease (`may_restore`); on a
-device `resume_unverified` resumes the restart-deferred ones after one minute
-only when the account answered with server errors (an unreachable account
-proves nothing: the cloud may run the work), unless another owner was verified
-meanwhile.
+device `resume_unverified` resumes the restart-deferred ones of a synced
+project after one minute only when the user signed out (`ProState.signed_out`,
+written by `/pro/disconnect`, persisted in `state.json`, cleared by the next
+configure; nothing else proves the cloud is not running the work), unless
+another owner was verified meanwhile. Sessions a lease fence preserved
+(`watchdog::preserve`, also marking a running agent `Unknown`) are tracked in
+`fenced_sessions` and dropped (`drop_fenced`) once the project is seen held
+elsewhere or a return installs its own copy, so a finished turn never resumes.
+The lease loop's per-project pass (`CoordinatorTick::reconcile`) runs as an
+owned task tracked in `ProState.reconciling` (aborted by `stop_tasks`); the
+policy waits for a pass at most a budget and a later pass skips a project still
+running.
 Plain shells never wait at boot. The fallback leaves alone projects the account
 answered for this life and projects with a checkpoint install scheduled (fenced
 from scheduling, before hydrate's own fence), and re-runs once recorded old
@@ -335,7 +350,7 @@ conversation identity still remains in the ledger until its first resumed turn.
 
 Normal lazy return only handles registered projects without a pending adoption.
 Moving live cloud work waits for the one guard (`reach::settled`: the lease
-loop's account calls answered without a gap for 60 s; the app, power and how
+loop's account calls answered without a gap for 15 s; the app, power and how
 the computer left play no part) in both protocol versions, and a project asked
 back with "Run here" (`reclaim`) skips it. Work the cloud is not running returns at
 once: a cloud release (holder none), a lapsed cloud lease (the device takes it
@@ -506,11 +521,14 @@ tasks (live agents first), releases within the remaining deadline only, and
 reports `pending` flushes that continue after it answers. A sleep flush that did
 not hand over (release out of time, or a failed publication) marks the project
 `release_pending`: the lease loop leaves it alone (no renewal, no resume) so the
-lease lapses. On wake (`routes::woke`) the sleep generation advances (a running
-flush stops no further sessions, keeps its publication, skips release and
-resumes what it stopped), `release_pending` is cleared and every `Transferring`
-project becomes `AwaitingVerification`: the lease loop verifies who holds it, and
-nothing resumes on sight. Sign-out returns `Transferring` projects, and on a
+lease lapses. On wake (`routes::woke`, also for a cancelled sleep) the sleep
+generation advances (only a wake does: a running flush stops no further
+sessions, keeps its publication and skips release; what it stopped stays
+preserved), `release_pending` is cleared and every `Transferring` project
+becomes `AwaitingVerification`: the lease loop verifies who holds it and resumes
+the preserved sessions only then. "Run in the cloud" claims its project in
+`sleeping` before answering 202, so a second request (409) or a sleep flush
+never hands it over twice. Sign-out returns `Transferring` projects, and on a
 device its own `Hydrating`/`SettingUp` return and every project whose `Local`
 ownership it drops that still holds deferred sessions (a return's resume runs as
 its own task; `ledger::resume_one` gives each session one resumer at a time). At
