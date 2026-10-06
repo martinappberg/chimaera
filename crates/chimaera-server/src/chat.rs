@@ -878,11 +878,15 @@ async fn switch_to_pty(
             .get(id)
             .map(|record| record.key.clone());
         if let Some(key) = key {
-            argv.extend(crate::codex_notify::args(state, id, &key).await);
+            let notify = crate::codex_notify::args(state, id, &key).await;
+            // The rollout identity only serves the notify shim; without it a
+            // Codex TUI carries no transcript, as before the shim existed.
+            let identity = !notify.is_empty();
+            argv.extend(notify);
             // A chat->terminal switch can be closed or restarted before its
             // first TUI turn. Carry its already-existing rollout now rather
             // than relying on a notify that may never arrive.
-            if let Some(thread) = recipe.resume.clone() {
+            if let Some(thread) = recipe.resume.clone().filter(|_| identity) {
                 if let Some(home) = state
                     .codex_config_path
                     .parent()
@@ -4188,6 +4192,84 @@ fn transfer_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Without the Pro notify shim (a free daemon), a Codex chat->terminal
+    /// switch never scans the rollout store: the TUI record carries no
+    /// transcript or thread identity, as before the shim existed.
+    #[tokio::test]
+    async fn free_codex_terminal_switch_carries_no_rollout_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-free-codex-switch-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut state = AppState::new(
+            "test-token".into(),
+            "test-host".into(),
+            std::process::id(),
+            0,
+            root.join("data"),
+            root.join("config"),
+        );
+        state.codex_config_path = root.join("codex-home/config.toml");
+        state.managed_root = root.join("managed");
+        state.legacy_managed_root = None;
+        let state = Arc::new(state);
+        let thread = "0199a1b2-c3d4-4e5f-8a6b-7c8d9e0f1a2b";
+        let home = root.join("codex-home");
+        let day = home.join("sessions/2026/10/06");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(
+            day.join(format!("rollout-2026-10-06T00-00-00-{thread}.jsonl")),
+            format!(
+                "{}\n",
+                serde_json::json!({"type":"session_meta","payload":{"id":thread,"cwd":project}})
+            ),
+        )
+        .unwrap();
+        // The scan would find it: only the missing shim keeps it off the record.
+        assert!(crate::codex_notify::find_rollout(&home, thread, &project).is_some());
+        let id = "s-free-codex-switch";
+        crate::lock(&state.agents).insert(
+            id.into(),
+            crate::agents::AgentRecord::new("k".into(), AgentKind::Codex),
+        );
+        crate::lock(&state.session_workspaces).insert(id.into(), "w-free".into());
+        let recipe = ChatRecipe {
+            workspace_root: project.clone(),
+            workspace_id: "w-free".into(),
+            kind: AgentKind::Codex,
+            bin: PathBuf::from("/bin/true"),
+            version: None,
+            settings: None,
+            mcp_config: None,
+            model: None,
+            resume: Some(thread.into()),
+            fork_at: None,
+            fork_head: false,
+            rollback_turns: None,
+            revert_before_turn: None,
+            remote_control: RemoteControlAtStart::No,
+            carry_ultracode: false,
+            theme: "dark".into(),
+            prelude: None,
+            mastermind: None,
+            portable_context: None,
+            created_at_ms: None,
+        };
+        assert!(switch_to_pty(&state, id, recipe, None).await);
+        {
+            let agents = crate::lock(&state.agents);
+            let record = agents.get(id).expect("the switched TUI keeps its record");
+            assert_eq!(record.transcript_path, None);
+            assert_eq!(record.codex_thread_id, None);
+        }
+        let _ = state.sessions.kill(id);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     /// A chat driver that never speaks: alive until killed, then one Exited.
     struct IdleAdapter;

@@ -269,8 +269,13 @@ pub(crate) async fn spawn_session(
                 argv.push("--mcp-config".to_string());
                 argv.push(mcp.to_string_lossy().into_owned());
             }
+            let mut codex_identity = false;
             if agent_kind == AgentKind::Codex {
-                argv.extend(crate::codex_notify::args_in(state, &workspace.id, &id, &key).await);
+                let notify = crate::codex_notify::args_in(state, &workspace.id, &id, &key).await;
+                // The rollout identity only serves the notify shim; without
+                // it a Codex TUI carries no transcript.
+                codex_identity = !notify.is_empty();
+                argv.extend(notify);
             }
             if !codex_plugin_tools.is_empty()
                 || (agent_kind == AgentKind::Codex
@@ -328,7 +333,7 @@ pub(crate) async fn spawn_session(
             // supersede) the old conversation either way.
             record.resumed_from = resume.clone();
             record.native_cwd = spec.native_cwd.clone();
-            if agent_kind == AgentKind::Codex {
+            if codex_identity {
                 if let Some(thread) = resume.clone() {
                     if let Some(home) = state
                         .codex_config_path
