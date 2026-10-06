@@ -297,6 +297,23 @@ mod folder_identity {
         }
     }
 
+    /// Without the extension a marker another installation left in the
+    /// folder is not read: the folder registers under a fresh id, as it
+    /// would on a daemon without Pro code.
+    #[tokio::test]
+    async fn a_daemon_without_pro_ignores_a_folder_marker() {
+        let root = folder("ident-free-read");
+        std::fs::write(
+            root.join(".chimaera-workspace"),
+            r#"{"id":"w-fromanotherinstall","written_at":1}"#,
+        )
+        .unwrap();
+        let ws = register(&test_state(), &root).await;
+        assert_ne!(ws["id"], "w-fromanotherinstall");
+        let ws = register(&test_state_with_extension(), &root).await;
+        assert_eq!(ws["id"], "w-fromanotherinstall");
+    }
+
     #[tokio::test]
     async fn enrolling_writes_the_marker_in_git_or_a_dotfile() {
         let state = test_state_with_extension();

@@ -56,15 +56,17 @@ pub(crate) async fn create_workspace(
     // `canonicalize` and `is_dir` are blocking fs syscalls on a user-supplied
     // path — a slow or dead NFS mount would otherwise stall the async reactor.
     // Validate off the reactor; the error strings are unchanged. The folder's
-    // marker is read in the same blocking step.
+    // marker is read in the same blocking step, and only where Pro can be:
+    // without the extension a folder registers exactly as it always did.
     let input = body.root.clone();
+    let read_marker = crate::pro::tier(&state) != crate::pro::Tier::Free;
     let validated = tokio::task::spawn_blocking(move || {
         let root = std::fs::canonicalize(PathBuf::from(&input))
             .map_err(|err| format!("{input}: {err}"))?;
         if !root.is_dir() {
             return Err(format!("{} is not a directory", root.display()));
         }
-        let marker = identity::read(&root);
+        let marker = read_marker.then(|| identity::read(&root)).flatten();
         Ok::<_, String>((root, marker))
     })
     .await;
