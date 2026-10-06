@@ -784,30 +784,25 @@
       <div class="sec-head">
         <h2 class="sec-title">{ownAlias === null ? (native && isMac ? "This Mac" : "This computer") : "On this machine"}</h2>
         {#if sorted.length > FILTER_THRESHOLD}
-          <label class="filter">
-            <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.4" /><path d="m10.5 10.5 3 3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" /></svg>
-            <input
-              bind:value={filter}
-              placeholder="Filter"
-              aria-label="Filter workspaces"
-              spellcheck="false"
-              autocomplete="off"
-              onkeydown={(e) => {
-                if (e.key === "Escape" && filter !== "") {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  filter = "";
-                } else if (e.key === "Enter" && shownWorkspaces.length > 0) {
-                  e.preventDefault();
-                  if ((e.metaKey || e.ctrlKey) && !jobScoped) void openWindow(ownAlias, shownWorkspaces[0].id, true);
-                  else onOpen(shownWorkspaces[0]);
-                }
-              }}
-            />
-            {#if filter !== ""}
-              <button type="button" class="filter-clear" aria-label="Clear filter" onclick={() => (filter = "")}>×</button>
-            {/if}
-          </label>
+          <input
+            class="add-input filter"
+            bind:value={filter}
+            placeholder="Filter workspaces"
+            aria-label="Filter workspaces"
+            spellcheck="false"
+            autocomplete="off"
+            onkeydown={(e) => {
+              if (e.key === "Escape" && filter !== "") {
+                e.preventDefault();
+                e.stopPropagation();
+                filter = "";
+              } else if (e.key === "Enter" && shownWorkspaces.length > 0) {
+                e.preventDefault();
+                if ((e.metaKey || e.ctrlKey) && !jobScoped) void openWindow(ownAlias, shownWorkspaces[0].id, true);
+                else onOpen(shownWorkspaces[0]);
+              }
+            }}
+          />
         {/if}
         <div class="where" title={health?.hostname}>
           {#if health !== null}<span class="hostname">{health.hostname}</span>{/if}
@@ -1882,11 +1877,8 @@
      scroll is visible; the remote machines stay below it. */
   .workspaces .rows.scroll { max-height: 268px; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
   .no-match { margin: 0; padding: 14px 12px; color: var(--muted); font-size: var(--text-sm); }
-  .filter { flex: 0 1 190px; margin-left: 14px; display: flex; align-items: center; gap: 6px; padding: 0 8px; height: 26px; border: 1px solid var(--edge); border-radius: 7px; color: var(--muted); transition: border-color 0.12s ease; }
-  .filter:focus-within { border-color: color-mix(in srgb, var(--accent) 60%, transparent); color: var(--fg); }
-  .filter input { flex: 1; min-width: 0; appearance: none; border: none; outline: none; background: none; font: inherit; font-size: var(--text-xs); color: var(--fg); }
-  .filter-clear { appearance: none; border: none; background: none; color: var(--muted); font-size: var(--text-md); line-height: 1; padding: 0 2px; cursor: pointer; }
-  .filter-clear:hover { color: var(--fg); }
+  /* Same field as the Add-machine input, just narrower and quieter. */
+  .add-input.filter { flex: 0 1 180px; margin-left: auto; padding: 3px 9px; font-size: var(--text-xs); }
   /* No hover on touch: the End sessions control replaces the count outright. */
   @media (hover: none) {
     .live-slot .session-state { opacity: 0; }
