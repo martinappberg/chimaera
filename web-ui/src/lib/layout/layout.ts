@@ -1724,6 +1724,7 @@ function deserNode(
   depth: number,
   ids: Set<string>,
   seenTabs: Set<string>,
+  proTabs: boolean,
 ): LayoutNode | null {
   if (!isRecord(raw) || depth > MAX_DEPTH) return null;
   if (typeof raw.id !== "string" || raw.id.length === 0 || raw.id.length > 64 || ids.has(raw.id)) {
@@ -1788,7 +1789,7 @@ function deserNode(
         tab = { surface: "plugin", plugin: t.pg, view: t.pgv };
       } else if (t.v === "sessions") {
         tab = { surface: "sessions" };
-      } else if (t.v === "kept") {
+      } else if (t.v === "kept" && proTabs) {
         tab = { surface: "kept" };
       } else if (typeof t.cs === "string" && t.cs.length > 0) {
         tab = { surface: "changes", sessionId: t.cs };
@@ -1815,7 +1816,7 @@ function deserNode(
         // none); anything not shaped like an id is dropped, never fatal.
         if (typeof t.wb === "string" && SESSION_ID_RE.test(t.wb)) browser.openedBy = t.wb;
         tab = browser;
-      } else if (t.v === "pro") {
+      } else if (t.v === "pro" && proTabs) {
         tab = { surface: "pro" };
       } else if (t.v === "settings") {
         tab = { surface: "settings" };
@@ -1843,18 +1844,20 @@ function deserNode(
   if (raw.t === "s") {
     if (raw.dir !== "row" && raw.dir !== "col") return null;
     if (typeof raw.ratio !== "number") return null;
-    const a = deserNode(raw.a, depth + 1, ids, seenTabs);
-    const b = deserNode(raw.b, depth + 1, ids, seenTabs);
+    const a = deserNode(raw.a, depth + 1, ids, seenTabs, proTabs);
+    const b = deserNode(raw.b, depth + 1, ids, seenTabs, proTabs);
     if (a === null || b === null) return null;
     return { type: "split", id: raw.id, dir: raw.dir, ratio: clampRatio(raw.ratio), a, b };
   }
   return null;
 }
 
-/** Validate a persisted blob; anything malformed yields null (caller falls back to defaultLayout). */
-export function deserializeLayout(raw: unknown): Layout | null {
+/** Validate a persisted blob; anything malformed yields null (caller falls back to defaultLayout).
+ *  `proTabs`: this build has the optional extension. Without it a saved Pro
+ *  tab is skipped like any tab kind this build does not know. */
+export function deserializeLayout(raw: unknown, proTabs = false): Layout | null {
   if (!isRecord(raw) || raw.v !== 1) return null;
-  const root = deserNode(raw.root, 0, new Set(), new Set());
+  const root = deserNode(raw.root, 0, new Set(), new Set(), proTabs);
   if (root === null) return null;
   const focused = typeof raw.focused === "string" ? raw.focused : "";
   const zoom = typeof raw.zoom === "string" ? raw.zoom : null;
