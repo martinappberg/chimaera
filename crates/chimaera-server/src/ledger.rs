@@ -463,14 +463,14 @@ pub(crate) async fn restore(state: &Arc<AppState>, boot: BootLedger) {
                     Ok(()) => respawned += 1,
                     Err(err) => {
                         tracing::warn!(session = %entry.id, %err, "resurrection failed");
-                        if retire_to_recents(state, entry, boot.written_at) {
+                        if retire_to_recents(state, entry, boot.written_at).await {
                             retired += 1;
                         }
                     }
                 }
             }
             RestorePlan::Retire => {
-                if retire_to_recents(state, entry, boot.written_at) {
+                if retire_to_recents(state, entry, boot.written_at).await {
                     retired += 1;
                 }
             }
@@ -549,7 +549,9 @@ fn plan_restore(entry: &LedgerEntry, restore_enabled: bool, workspace_exists: bo
 /// conversation whose transcript does not exist gets `None` — resuming it
 /// would only produce an instantly-dead "No conversation found" pane.
 /// (Claude 2.1.204 interactive sessions persist no transcript, so this is
-/// a normal case, not a corruption case.)
+/// a normal case, not a corruption case.) A miss scans every project dir, and
+/// only claude's store is searched — blocking fs: call off the reactor
+/// (`resolve_resume_blocking`).
 fn resolve_resume(claude_projects_dir: &std::path::Path, entry: &LedgerEntry) -> Option<String> {
     let agent = entry.agent.as_ref()?;
     let id = agent.resume.as_deref()?;
@@ -557,9 +559,19 @@ fn resolve_resume(claude_projects_dir: &std::path::Path, entry: &LedgerEntry) ->
         .transcript
         .as_deref()
         .is_some_and(|path| path.is_file());
-    let derived =
-        crate::launcher::find_claude_transcript(claude_projects_dir, &entry.cwd, id).is_some();
+    let derived = agent.kind == AgentKind::Claude
+        && crate::launcher::find_claude_transcript(claude_projects_dir, &entry.cwd, id).is_some();
     (recorded || derived).then(|| id.to_string())
+}
+
+/// `resolve_resume` on the blocking pool: the restore loop runs it per ledger
+/// entry on the reactor, and an agent with no transcript (the common miss)
+/// walks the whole store.
+async fn resolve_resume_blocking(state: &Arc<AppState>, entry: &LedgerEntry) -> Option<String> {
+    let (store, entry) = (state.claude_projects_dir.clone(), entry.clone());
+    tokio::task::spawn_blocking(move || resolve_resume(&store, &entry))
+        .await
+        .unwrap_or(None)
 }
 
 async fn respawn(
@@ -589,7 +601,7 @@ async fn respawn(
     let kind = match &entry.agent {
         None => crate::spawn::SpawnKind::Shell,
         Some(agent) => {
-            let resume = resolve_resume(&state.claude_projects_dir, entry);
+            let resume = resolve_resume_blocking(state, entry).await;
             if resume.is_none() && agent.resume.is_some() {
                 tracing::info!(session = %entry.id,
                     "conversation transcript is gone; respawning fresh instead of --resume");
@@ -630,7 +642,7 @@ async fn respawn(
 /// Remember a non-resurrectable agent conversation in its workspace's
 /// Recents, honoring `retire()`'s rules (untitled claude boots carry
 /// nothing recognizable and are skipped). Returns whether a row landed.
-fn retire_to_recents(state: &Arc<AppState>, entry: &LedgerEntry, last_active: u64) -> bool {
+async fn retire_to_recents(state: &Arc<AppState>, entry: &LedgerEntry, last_active: u64) -> bool {
     let Some(agent) = &entry.agent else {
         return false; // shells have no conversation to remember
     };
@@ -642,19 +654,20 @@ fn retire_to_recents(state: &Arc<AppState>, entry: &LedgerEntry, last_active: u6
         return false;
     }
     let is_chat = agent.ui == SessionUi::Chat;
+    // Only promise resumption the handle can actually deliver. Codex chat
+    // resumes its thread in-protocol (no transcript file to check), so its
+    // native id passes straight through; claude (chat or TUI) needs the
+    // transcript on disk (`resolve_resume`), else the row honestly starts
+    // fresh (existing UI rule).
+    let resume = if is_chat && agent.kind != AgentKind::Claude {
+        agent.resume.clone()
+    } else {
+        resolve_resume_blocking(state, entry).await
+    };
     let recent = crate::recents::RecentEntry {
         kind: agent.kind,
         title,
-        // Only promise resumption the handle can actually deliver. Codex chat
-        // resumes its thread in-protocol (no transcript file to check), so its
-        // native id passes straight through; claude (chat or TUI) needs the
-        // transcript on disk (`resolve_resume`), else the row honestly starts
-        // fresh (existing UI rule).
-        resume: if is_chat && agent.kind != AgentKind::Claude {
-            agent.resume.clone()
-        } else {
-            resolve_resume(&state.claude_projects_dir, entry)
-        },
+        resume,
         supersedes: Vec::new(),
         last_active: if last_active > 0 {
             last_active
@@ -736,6 +749,19 @@ mod tests {
         std::fs::write(derived_dir.join("conv-1.jsonl"), "{}\n").unwrap();
         assert_eq!(resolve_resume(&store, &entry), Some("conv-1".to_string()));
         std::fs::remove_file(derived_dir.join("conv-1.jsonl")).unwrap();
+
+        // So does another project dir: an agent that entered a worktree filed
+        // its conversation there, and `--resume` finds it from the root.
+        let worktree_dir = store.join(crate::launcher::encode_cwd(&cwd.join("wt")));
+        std::fs::create_dir_all(&worktree_dir).unwrap();
+        std::fs::write(worktree_dir.join("conv-1.jsonl"), "{}\n").unwrap();
+        assert_eq!(resolve_resume(&store, &entry), Some("conv-1".to_string()));
+        // Only claude's store is searched: another agent's id never resolves
+        // through it (and never walks it).
+        let mut codex = agent_entry(AgentKind::Codex, Some("conv-1"));
+        codex.cwd = cwd.clone();
+        assert_eq!(resolve_resume(&store, &codex), None);
+        std::fs::remove_file(worktree_dir.join("conv-1.jsonl")).unwrap();
 
         // The hook-recorded path counts wherever it points.
         let recorded = dir.join("elsewhere-conv-1.jsonl");

@@ -1079,18 +1079,21 @@ pub(crate) fn encode_cwd(cwd: &Path) -> String {
         .collect()
 }
 
+/// Project folders examined when a transcript is not in the folder its cwd
+/// names (the session moved since it started). A bound, not a tuning knob: one
+/// `stat` each, and a miss — the normal case for a conversation claude never
+/// persisted — pays all of them.
+pub(crate) const PROJECT_SCAN_MAX: usize = 4096;
+
 /// Where claude keeps conversation `id`: the project dir for `cwd` first, then
 /// any other project dir. Claude files a transcript under the cwd it is in
 /// when it writes — an agent that enters a git worktree moves its conversation
 /// into that worktree's dir, which stays behind when the worktree is removed —
 /// and `--resume <id>` finds it from anywhere, so a check that only looked
 /// under the workspace root called a live conversation "gone" and restarted it
-/// empty. Blocking fs: call off the reactor.
-pub(crate) fn find_claude_transcript(
-    projects_dir: &Path,
-    cwd: &Path,
-    id: &str,
-) -> Option<std::path::PathBuf> {
+/// empty. Blocking fs (a miss scans up to `PROJECT_SCAN_MAX` folders): call off
+/// the reactor.
+pub(crate) fn find_claude_transcript(projects_dir: &Path, cwd: &Path, id: &str) -> Option<PathBuf> {
     // An id from a hook or a journal is a uuid; refuse anything that could
     // walk out of the store.
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
@@ -1104,6 +1107,7 @@ pub(crate) fn find_claude_transcript(
     std::fs::read_dir(projects_dir)
         .ok()?
         .filter_map(Result::ok)
+        .take(PROJECT_SCAN_MAX)
         .map(|dir| dir.path().join(&file))
         .find(|candidate| candidate.is_file())
 }
@@ -1456,9 +1460,12 @@ mod tests {
             Some(home.join("conv-1.jsonl"))
         );
 
-        // Ids that could leave the store never resolve.
-        std::fs::write(dir.join("evil.jsonl"), "{}\n").unwrap();
+        // Ids that could leave the store never resolve. The planted file sits
+        // where `<project dir>/../evil.jsonl` lands, so only the id check
+        // keeps it out.
+        std::fs::write(store.join("evil.jsonl"), "{}\n").unwrap();
         assert_eq!(find_claude_transcript(&store, root, "../evil"), None);
+        assert_eq!(find_claude_transcript(&store, root, "a/../evil"), None);
         assert_eq!(find_claude_transcript(&store, root, ""), None);
 
         std::fs::remove_dir_all(&dir).ok();

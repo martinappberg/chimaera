@@ -351,12 +351,15 @@ fn retire_inner(
                     record.transcript_path.as_deref().is_some_and(|p| {
                         p.file_stem().is_some_and(|s| s == id.as_str()) && p.is_file()
                     }) || workspace_root.as_deref().is_some_and(|root| {
-                        state
-                            .claude_projects_dir
-                            .join(crate::launcher::encode_cwd(root))
-                            .join(id)
-                            .with_extension("jsonl")
-                            .is_file()
+                        // Any project dir, not just the root's: an agent that
+                        // entered a worktree filed its conversation there. One
+                        // bounded scan per ended session.
+                        crate::launcher::find_claude_transcript(
+                            &state.claude_projects_dir,
+                            root,
+                            id,
+                        )
+                        .is_some()
                     })
                 })
         };

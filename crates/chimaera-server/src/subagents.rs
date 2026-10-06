@@ -30,10 +30,7 @@ use serde_json::json;
 use crate::agents::AgentKind;
 use crate::AppState;
 
-/// Project folders examined when the transcript is not where the session's
-/// folder says (the session moved since it started). A bound, not a tuning
-/// knob: one `stat` each.
-const PROJECT_SCAN_MAX: usize = 4096;
+use crate::launcher::PROJECT_SCAN_MAX;
 
 #[derive(Deserialize)]
 pub(crate) struct TranscriptQuery {
