@@ -24,6 +24,7 @@ mod reach;
 mod repository;
 pub(crate) mod routes;
 pub(crate) mod shadow_cache;
+mod sign_out;
 mod sleep_watch;
 pub(crate) mod transfer_dispatch;
 pub(crate) mod transfer_host;
@@ -63,6 +64,13 @@ pub(crate) struct ProState {
     /// a configuration that has not arrived yet) lets interrupted sessions
     /// resume without the account (`resume_unverified`).
     signed_out: AtomicBool,
+    /// Projects sign-out could not stand down at the account (`sign_out`):
+    /// the signed-out exemptions skip them, so their agents stay fenced at
+    /// their lease deadline and nothing resumes them without the account.
+    /// Persisted, at most 128; cleared by the next configure.
+    unreleased: Mutex<std::collections::BTreeSet<String>>,
+    /// The background retry of those stand-downs (`sign_out::retry`).
+    stand_down: Mutex<Option<tokio::task::JoinHandle<()>>>,
     generation: AtomicU64,
     runtime: Mutex<Option<protocol::Configure>>,
     authority: Mutex<authority::Authority>,
@@ -286,6 +294,8 @@ struct DiskState {
     parked: std::collections::BTreeSet<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     signed_out: bool,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    unreleased: std::collections::BTreeSet<String>,
 }
 /// A return's kept-both report as persisted: the count, and the kept copies'
 /// project-relative paths (fewer than `files` when bounded, see
@@ -498,6 +508,14 @@ impl ProState {
             configured: AtomicBool::new(false),
             worker: AtomicBool::new(disk.worker),
             signed_out: AtomicBool::new(disk.signed_out),
+            unreleased: Mutex::new(
+                disk.unreleased
+                    .into_iter()
+                    .filter(|id| valid_id(id))
+                    .take(128)
+                    .collect(),
+            ),
+            stand_down: Mutex::new(None),
             generation: AtomicU64::new(0),
             runtime: Mutex::new(None),
             authority: Mutex::new(authority),
@@ -781,10 +799,9 @@ pub(crate) fn defer_boot_session(state: &crate::AppState, session: &str) {
     }
 }
 /// Restart-deferred sessions of a synced project on a device resume without
-/// the account only when the user signed out (`signed_out`, written by
-/// `/pro/disconnect` and persisted, so a restart before the configuration
-/// arrives is never mistaken for it): sign-out never stops a computer's
-/// work. Anything else proves nothing (the cloud may run the work by now), so
+/// the account only when the user signed out and the account acknowledged
+/// that sign-out stood the project down (`sign_out::released`, persisted, so
+/// a restart before the configuration arrives is never mistaken for it). Anything else proves nothing (the cloud may run the work by now), so
 /// those sessions wait for the verified path (exactly once). Unsynced
 /// projects resume unless old processes may still be running. Sessions a
 /// clean handoff suspended stay suspended; they belong to whoever now owns
@@ -854,7 +871,7 @@ async fn resume_unverified_once(state: &std::sync::Arc<crate::AppState>) -> Vec<
         // A synced project waits for the account unless the user signed out
         // (or it is kept on this computer: nobody else may take it).
         if execution::managed(state, &workspace)
-            && !signed_out(state)
+            && !sign_out::released(state, &workspace)
             && !execution::kept_here(state, &workspace)
         {
             // Still waiting for the verified path (or a later fallback).
@@ -1018,6 +1035,7 @@ async fn persist(state: &crate::AppState) -> anyhow::Result<()> {
         preferences,
         parked,
         signed_out: signed_out(state),
+        unreleased: crate::lock(&state.pro.unreleased).clone(),
     })?;
     anyhow::ensure!(bytes.len() <= 1024 * 1024, "mirror settings exceed limit");
     // State first, then the enrollment latch: a crash between them leaves a

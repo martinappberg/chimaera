@@ -621,11 +621,21 @@ daemon's watchdog, 100 ms on a cloud machine and 1 s on a computer, or by the fi
 after it), never at the next 5-second renewal tick, because a viewer's socket
 is admitted only once it answers. A personal computer is also fenced by its
 lapsed lease (above), a verified other owner (an authenticated read naming
-another holder) or its own in-progress transfer; sign-out, a lapsed plan, the
+another holder) or its own in-progress transfer; a lapsed plan, the
 privacy switch and a daemon restart stop publication, never its agents or
-shells. After a restart no agent starts or resumes in a synced project until
-the account confirms the computer still holds it; only a sign-out, which the
-daemon records on disk, lets interrupted sessions resume without the account.
+shells. Sign-out (`DELETE /api/v1/pro/configure`) first publishes
+`{handoff_enabled,offline_takeover,has_agents}` all false through
+`PUT /v1/baton/{workspace}/policy` for every project the computer holds, at
+most 8 s in all; an acknowledged project keeps running and is never taken over
+on the computer's behalf. A project without an acknowledgment keeps its lease
+deadline and is fenced there (fail closed); a failure or no answer is retried
+in the background with the credential held in memory, and any other refusal
+leaves it fenced until the next sign-in (persisted as `unreleased`). The
+account never offers, takes over or wakes for a lapsed lease whose holder is a
+revoked computer. After a restart no agent starts or resumes in a synced
+project until the account confirms the computer still holds it; only a
+sign-out the account acknowledged, which the daemon records on disk, lets
+interrupted sessions resume without the account.
 Sessions a lapse stopped are dropped once another machine held the project. A verified other owner refuses local input at once; the computer's
 agents stop at their next safe pause, at most five minutes later.
 Re-acquiring the epoch this installation itself held (its own clean release, or

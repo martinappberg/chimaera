@@ -289,6 +289,7 @@ async fn configure_inner(
     }
     *lock(&state.pro.runtime) = Some(config);
     state.pro.delegation_refused.store(false, Ordering::Release);
+    super::sign_out::forget(&state);
     if state.pro.signed_out.swap(false, Ordering::AcqRel) {
         if let Err(error) = super::persist(&state).await {
             return failure(error);
@@ -349,9 +350,42 @@ pub(crate) async fn disconnect(State(state): State<Arc<AppState>>) -> Response {
     let _configuration = state.pro.configuration.lock().await;
     #[cfg(all(unix, feature = "provider-authority-prototype"))]
     execution::provider_ready::retire(&state);
+    let device = !execution::worker(&state);
+    // Captured before the lease loop stops: the leases this computer holds,
+    // and the credential that stands them down (`sign_out`).
+    let config = lock(&state.pro.runtime).clone();
+    let held = if device {
+        execution::held(&state)
+    } else {
+        Vec::new()
+    };
     if let Err(error) = stop_tasks(&state).await {
         return failure(error);
     }
+    // After the lease and mirror loops stopped, so no later policy write
+    // undoes the stand-down. Nothing is fenced or resumed yet.
+    let answers = match &config {
+        Some(config) if !held.is_empty() => {
+            let projects: Vec<_> = held
+                .iter()
+                .map(|(workspace, epoch, _)| (workspace.clone(), *epoch))
+                .collect();
+            super::sign_out::stand_down_all(config, &projects).await
+        }
+        _ => Vec::new(),
+    };
+    let unreleased: std::collections::BTreeSet<String> = answers
+        .iter()
+        .filter(|(_, _, answer)| *answer != super::sign_out::Answer::Released)
+        .map(|(workspace, _, _)| workspace.clone())
+        .take(128)
+        .collect();
+    let owed: Vec<(String, u64)> = answers
+        .iter()
+        .filter(|(_, _, answer)| *answer == super::sign_out::Answer::Owed)
+        .map(|(workspace, epoch, _)| (workspace.clone(), *epoch))
+        .collect();
+    *lock(&state.pro.unreleased) = unreleased.clone();
     *lock(&state.pro.project_cache) = Default::default();
     *lock(&state.pro.runtime) = None;
     state.pro.configured.store(false, Ordering::Release);
@@ -360,8 +394,9 @@ pub(crate) async fn disconnect(State(state): State<Arc<AppState>>) -> Response {
     // out publishes nothing more, but never stops this computer's agents. On a
     // personal computer that includes a return this computer itself started
     // (Hydrating/SettingUp): no account is left to finish it, so it must not
-    // stay fenced. Sessions a transfer stopped continue here.
-    let device = !execution::worker(&state);
+    // stay fenced. Sessions a transfer stopped continue here. A project the
+    // account did not acknowledge standing down is the exception: it stays
+    // fenced at its lease's deadline and nothing resumes it (`sign_out`).
     lock(&state.pro.release_pending).clear();
     lock(&state.pro.opened_here).clear();
     super::moves::forget(&state);
@@ -401,8 +436,19 @@ pub(crate) async fn disconnect(State(state): State<Arc<AppState>>) -> Response {
         }
         returned
     };
+    returned.retain(|id| !unreleased.contains(id));
     if let Err(error) = super::persist(&state).await {
         return failure(error);
+    }
+    execution::keep_held(
+        &state,
+        held.into_iter()
+            .filter(|(workspace, _, _)| unreleased.contains(workspace))
+            .map(|(workspace, _, proof)| (workspace, proof))
+            .collect(),
+    );
+    if let Some(config) = config {
+        super::sign_out::retry(&state, config, owed);
     }
     // No project file names stay behind for agents of a later sign-in.
     crate::mcp::cloud_context::forget_all(&state).await;
@@ -417,11 +463,11 @@ pub(crate) async fn disconnect(State(state): State<Arc<AppState>>) -> Response {
             .values()
             .map(|entry| entry.workspace_id.clone())
             .collect();
-        returned.extend(
-            dropped
-                .into_iter()
-                .filter(|id| waiting.contains(id) && execution::resume_allowed(&state, id)),
-        );
+        returned.extend(dropped.into_iter().filter(|id| {
+            waiting.contains(id)
+                && !unreleased.contains(id)
+                && execution::resume_allowed(&state, id)
+        }));
     }
     if device && !returned.is_empty() {
         let owner = state.clone();
