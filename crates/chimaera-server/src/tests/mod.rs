@@ -38,6 +38,7 @@ mod save;
 mod sessions;
 mod settings;
 mod shell;
+mod subagents;
 mod support;
 mod upload;
 mod validate;

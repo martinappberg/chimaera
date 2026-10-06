@@ -44,6 +44,7 @@ mod session_view;
 mod settings;
 mod spawn;
 mod state;
+mod subagents;
 mod timeline;
 mod update;
 mod upload;

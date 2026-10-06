@@ -728,6 +728,7 @@ fn transcript_surface_wire_shapes_are_additive() {
         agents_done: 0,
         monitor,
         ambient,
+        model: None,
         tool_use_id: None,
     };
     let plain = serde_json::to_value(task(false, false)).unwrap();
