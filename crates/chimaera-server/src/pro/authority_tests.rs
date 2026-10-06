@@ -30,15 +30,17 @@ impl Fixture {
         ));
         std::fs::create_dir_all(root.join("project")).unwrap();
         let root = root.canonicalize().unwrap();
-        let mut state = AppState::new(
+        let mut state = crate::daemon_extension::with_inert_for_tests(AppState::new(
             "fixture-token".into(),
             "fixture".into(),
             4242,
             0,
             root.clone(),
             root.join("config"),
-        );
-        state.daemon_extension = runtime;
+        ));
+        if runtime.is_some() {
+            state.daemon_extension = runtime;
+        }
         let state = Arc::new(state);
         state.stopping.store(true, Ordering::Release);
         Self {
@@ -530,13 +532,15 @@ async fn rejected_or_stale_renewal_does_not_count_as_a_refresh() {
 async fn supervised_revision_comparison_preserves_every_other_latched_identity() {
     let fixture = Fixture::new();
     fixture.bind().await;
-    let state = Arc::new(AppState::new(
-        "fixture-token".into(),
-        "fixture".into(),
-        4242,
-        0,
-        fixture.root.clone(),
-        fixture.root.join("config"),
+    let state = Arc::new(crate::daemon_extension::with_inert_for_tests(
+        AppState::new(
+            "fixture-token".into(),
+            "fixture".into(),
+            4242,
+            0,
+            fixture.root.clone(),
+            fixture.root.join("config"),
+        ),
     ));
     state.stopping.store(true, Ordering::Release);
     let Authority::Bound(previous) = Authority::load(&state.pro.root) else {

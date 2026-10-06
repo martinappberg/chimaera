@@ -11,7 +11,7 @@ async fn prepared_bundle_recovers_metadata_after_restart_without_starting_an_age
     use std::io::Write;
     let _serial = crate::bundle::TEST_SERIAL.lock().await;
     let data = test_dir("prepared-bundle-data");
-    let target = test_state_with_data_dir(0, data.clone());
+    let target = test_state_with_extension_in(data.clone());
     let destination = std::fs::canonicalize(test_dir("prepared-bundle-project")).unwrap();
     let stage = test_dir("prepared-bundle-stage");
     let archive = stage.join("source.zip");
@@ -117,7 +117,7 @@ async fn prepared_bundle_recovers_metadata_after_restart_without_starting_an_age
     assert!(lock(&target.deferred_sessions).is_empty());
     drop(target);
     std::fs::remove_dir(&index).unwrap();
-    let restarted = test_state_with_data_dir(0, data);
+    let restarted = test_state_with_extension_in(data);
     let mut prepared = bundle::prepare_import(
         restarted.clone(),
         &archive,
@@ -194,7 +194,7 @@ async fn prepared_bundle_recovers_metadata_after_restart_without_starting_an_age
 #[tokio::test]
 async fn a_wandering_terminal_never_fails_a_project_move() {
     let _serial = crate::bundle::TEST_SERIAL.lock().await;
-    let source = test_state();
+    let source = test_state_with_extension();
     let root = std::fs::canonicalize(test_dir("wandering-project")).unwrap();
     std::fs::create_dir_all(root.join("target/debug")).unwrap();
     let (_, workspace) = request(
@@ -225,7 +225,7 @@ async fn a_wandering_terminal_never_fails_a_project_move() {
         // The destination has the project but not its ignored build folder.
         let destination =
             std::fs::canonicalize(test_dir(&format!("wandering-destination-{label}"))).unwrap();
-        let target = test_state();
+        let target = test_state_with_extension();
         let imported = bundle::import(
             target.clone(),
             &path,
@@ -248,8 +248,8 @@ async fn a_wandering_terminal_never_fails_a_project_move() {
 #[tokio::test]
 async fn bundle_preserves_shell_identity_and_defers_moved_terminal() {
     let _serial = crate::bundle::TEST_SERIAL.lock().await;
-    let source = test_state();
-    let target = test_state();
+    let source = test_state_with_extension();
+    let target = test_state_with_extension();
     let root = std::fs::canonicalize(test_dir("bundle-project")).unwrap();
     let (_, workspace) = request(
         &source,
@@ -364,7 +364,7 @@ async fn bundle_preserves_shell_identity_and_defers_moved_terminal() {
 
 #[tokio::test]
 async fn suspended_ledger_never_respawns_until_verified_resume() {
-    let state = test_state();
+    let state = test_state_with_extension();
     let root = std::fs::canonicalize(test_dir("deferred-root")).unwrap();
     let workspace = lock(&state.workspaces).add(root.clone()).unwrap();
     let entry = ledger::LedgerEntry {
@@ -403,8 +403,8 @@ async fn suspended_ledger_never_respawns_until_verified_resume() {
 #[tokio::test]
 async fn destination_remap_preserves_relative_cwd_and_stages_before_resume() {
     let _serial = crate::bundle::TEST_SERIAL.lock().await;
-    let source = test_state();
-    let target = test_state();
+    let source = test_state_with_extension();
+    let target = test_state_with_extension();
     let root = std::fs::canonicalize(test_dir("remap-source")).unwrap();
     let destination = std::fs::canonicalize(test_dir("remap-target")).unwrap();
     let (_, workspace) = request(
@@ -517,7 +517,7 @@ async fn public_bundle_validates_all_metadata_before_canonical_writes() {
         (b"broken".as_slice(), None),
         (b"{}".as_slice(), Some(b"broken".as_slice())),
     ] {
-        let state = test_state();
+        let state = test_state_with_extension();
         let project = std::fs::canonicalize(test_dir("public-bad-metadata")).unwrap();
         let archive = public_fixture(&project, index, view);
         let journal = state.chat.journal_dir().join("s-public.jsonl");
@@ -539,7 +539,7 @@ async fn public_bundle_validates_all_metadata_before_canonical_writes() {
 async fn public_bundle_failed_metadata_is_fenced_across_restart_and_exact_retry() {
     let _serial = bundle::TEST_SERIAL.lock().await;
     let data = test_dir("public-recover-data");
-    let state = test_state_with_data_dir(0, data.clone());
+    let state = test_state_with_extension_in(data.clone());
     let project = std::fs::canonicalize(test_dir("public-recover-project")).unwrap();
     let archive = public_fixture(&project, b"{\"model\":\"fixture\"}", None);
     let journal = state.chat.journal_dir().join("s-public.jsonl");
@@ -588,7 +588,7 @@ async fn public_bundle_failed_metadata_is_fenced_across_restart_and_exact_retry(
     assert_eq!(std::fs::read(before).unwrap(), b"original local history");
     drop(state);
     std::fs::remove_dir(&index).unwrap();
-    let restarted = test_state_with_data_dir(0, data);
+    let restarted = test_state_with_extension_in(data);
     assert!(!crate::pro::may_execute(&restarted, "w-public"));
     let mut different = public_options(&project);
     different.epoch += 1;
@@ -628,7 +628,7 @@ async fn malformed_pending_import_record_blocks_restoration_and_new_workspace_la
         br#"{"ownership":{"w-enrolled":{"state":"local","epoch":1}},"preferences":{}}"#,
     )
     .unwrap();
-    let state = test_state_with_data_dir(0, data);
+    let state = test_state_with_extension_in(data);
     assert!(!crate::pro::may_execute(&state, "unrelated-free-project"));
     assert!(state.bundle_imports.admit("w-new", "s-new", None).is_err());
     assert_eq!(state.bundle_imports.view("w-new").unwrap()["damaged"], true);
@@ -637,7 +637,7 @@ async fn malformed_pending_import_record_blocks_restoration_and_new_workspace_la
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public_bundle_caller_cancellation_retains_config_and_pending_until_owned_commit() {
     let _serial = bundle::TEST_SERIAL.lock().await;
-    let state = test_state();
+    let state = test_state_with_extension();
     let project = std::fs::canonicalize(test_dir("public-cancel-project")).unwrap();
     let archive = public_fixture(&project, b"{}", None);
     let (entered, release) = bundle::hold_public(&state, "s-public", false);
@@ -667,8 +667,8 @@ async fn public_bundle_caller_cancellation_retains_config_and_pending_until_owne
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public_bundle_resume_refuses_account_replacement_after_async_preparation() {
     let _serial = bundle::TEST_SERIAL.lock().await;
-    let source = test_state();
-    let target = test_state();
+    let source = test_state_with_extension();
+    let target = test_state_with_extension();
     let project = std::fs::canonicalize(test_dir("public-resume-account")).unwrap();
     let (_, workspace) = request(
         &source,
@@ -724,7 +724,7 @@ async fn public_bundle_resume_refuses_account_replacement_after_async_preparatio
 async fn public_bundle_view_failure_retry_flushes_the_existing_cached_layout() {
     let _serial = bundle::TEST_SERIAL.lock().await;
     let data = test_dir("public-view-failure");
-    let state = test_state_with_data_dir(0, data.clone());
+    let state = test_state_with_extension_in(data.clone());
     let project = std::fs::canonicalize(test_dir("public-view-project")).unwrap();
     let archive = public_fixture(&project, b"{}", Some(b"{\"layout\":\"incoming\"}"));
     let view = data.join("view-state.json");
@@ -769,7 +769,7 @@ async fn public_bundle_cannot_replace_a_live_resumed_chat_before_its_native_init
         }
     }
     let _serial = bundle::TEST_SERIAL.lock().await;
-    let state = test_state();
+    let state = test_state_with_extension();
     let project = std::fs::canonicalize(test_dir("public-live-resume")).unwrap();
     let archive = public_fixture(&project, b"{}", None);
     let id = "s-already-resuming";

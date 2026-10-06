@@ -407,7 +407,7 @@ mod tests {
         assert_eq!(json["available"], !dev);
         assert_eq!(json["dev"], dev);
         assert_eq!(json["state"], if dev { "current" } else { "available" });
-        assert_eq!(json["managed"], false);
+        assert!(json.get("managed").is_none(), "{json}");
         // The account's cloud: managed for it, whatever an earlier check knew.
         let managed = status.to_json(true);
         assert_eq!(managed["state"], "managed");

@@ -250,7 +250,15 @@ async fn absent_runtime_hands_agents_exactly_what_a_free_daemon_does() {
     };
     check("never configured").await;
     for role in ["worker", "device"] {
-        configure(&state, port, role).await;
+        // A free daemon has no `/pro/*`: no account can configure it.
+        let (status, _) = request(
+            &state,
+            Method::POST,
+            "/api/v1/pro/configure",
+            Some(json!({"role": role})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{role}");
         crate::pro::enroll_for_tests(&state, &workspace.id);
         crate::mcp::cloud_context::record_arrival(
             &state,

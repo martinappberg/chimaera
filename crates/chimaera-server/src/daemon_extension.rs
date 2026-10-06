@@ -263,6 +263,20 @@ fn validate_environment(
     Ok(())
 }
 
+/// Tests only: `state` composed with an inert Runtime, the official app's
+/// daemon before sign-in. Without one a daemon is free and has no `/pro/*`.
+#[cfg(test)]
+pub(crate) fn with_inert_for_tests(mut state: crate::AppState) -> crate::AppState {
+    struct Inert;
+    impl Runtime for Inert {
+        fn coordinate(&self, _owner: CoordinatorOwner) -> RuntimeFuture {
+            Box::pin(async {})
+        }
+    }
+    state.daemon_extension = Some(std::sync::Arc::new(Inert));
+    state
+}
+
 #[cfg(test)]
 mod environment_tests {
     use super::*;

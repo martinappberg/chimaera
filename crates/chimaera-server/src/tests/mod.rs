@@ -13,6 +13,7 @@ mod embed;
 mod environment;
 mod exec;
 mod free_contract;
+mod free_server;
 mod fs;
 mod git;
 mod git_history;

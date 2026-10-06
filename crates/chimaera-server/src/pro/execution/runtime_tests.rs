@@ -45,6 +45,10 @@ async fn cold_boot_proof_clears_only_orphan_process_uncertainty_not_execution_au
 #[tokio::test]
 async fn real_http_negotiation_status_and_restart_cannot_downgrade_enrolled_work() {
     let (state, config, root) = fixture();
+    // Its `/pro/*` routes exist only with the extension composed.
+    let state = std::sync::Arc::new(crate::daemon_extension::with_inert_for_tests(
+        std::sync::Arc::into_inner(state).unwrap(),
+    ));
     state.stopping.store(true, Ordering::Release);
     std::fs::create_dir_all(root.join("project")).unwrap();
     lock(&state.workspaces)
@@ -110,13 +114,15 @@ async fn real_http_negotiation_status_and_restart_cannot_downgrade_enrolled_work
     assert_eq!(status["workspaces"][0]["execution_allowed"], true);
     assert_eq!(status["workspaces"][0]["continuity"]["version"], 2);
     server.abort();
-    let restored = Arc::new(AppState::new(
-        "fixture".into(),
-        "fixture".into(),
-        4242,
-        0,
-        root.clone(),
-        root.join("config"),
+    let restored = Arc::new(crate::daemon_extension::with_inert_for_tests(
+        AppState::new(
+            "fixture".into(),
+            "fixture".into(),
+            4242,
+            0,
+            root.clone(),
+            root.join("config"),
+        ),
     ));
     restored.stopping.store(true, Ordering::Release);
     // A restarted device keeps its terminals, but its agents (new or
