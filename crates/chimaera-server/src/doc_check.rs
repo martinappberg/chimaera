@@ -280,21 +280,43 @@ fn check_path_pinned(
 ) -> anyhow::Result<Report> {
     // The main document is confined before its first read, just like targets.
     // A previous async scope proof cannot authorize a replacement symlink.
-    let doc = match &confined {
-        Some(confined) => confined.resolve(path)?,
-        None => std::fs::canonicalize(path).with_context(|| path.display().to_string())?,
-    };
-    if confined.is_none() {
-        let metadata = std::fs::metadata(&doc)?;
-        if !metadata.is_file() {
-            anyhow::bail!("{} is not a file", doc.display());
+    // Only a confined (viewer) check hides paths; the owner's own check
+    // names the file it failed on.
+    let (doc, bytes) = match &confined {
+        Some(confined) => {
+            let doc = confined.resolve(path)?;
+            let bytes = confined
+                .read(&doc, MAX_DOC_BYTES)?
+                .context("document is too large to check")?;
+            (doc, bytes)
         }
-    }
-    let bytes = match &confined {
-        Some(confined) => confined.read(&doc, MAX_DOC_BYTES)?,
-        None => read_regular(&doc, MAX_DOC_BYTES)?,
-    }
-    .context("document is too large to check")?;
+        None => {
+            let doc = std::fs::canonicalize(path).with_context(|| path.display().to_string())?;
+            let meta = std::fs::metadata(&doc)
+                .with_context(|| format!("{}: failed to stat", doc.display()))?;
+            if !meta.is_file() {
+                anyhow::bail!("{} is not a file", doc.display());
+            }
+            if meta.len() > MAX_DOC_BYTES {
+                anyhow::bail!(
+                    "{} is too large to check ({} bytes, limit {MAX_DOC_BYTES})",
+                    doc.display(),
+                    meta.len()
+                );
+            }
+            // Bounded again at the read: the file may have grown (or been
+            // swapped) since the stat.
+            let bytes = read_regular(&doc, MAX_DOC_BYTES)
+                .with_context(|| format!("{}: failed to read", doc.display()))?
+                .with_context(|| {
+                    format!(
+                        "{} is too large to check (over the {MAX_DOC_BYTES}-byte limit)",
+                        doc.display()
+                    )
+                })?;
+            (doc, bytes)
+        }
+    };
     let text = String::from_utf8_lossy(&bytes);
     let root = root.map(|r| std::fs::canonicalize(r).unwrap_or_else(|_| r.to_path_buf()));
     let report = check_text(&text, &doc, root.as_deref(), confined);
@@ -2051,4 +2073,44 @@ fn file_stem(file: &str) -> String {
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod unconfined_error_tests {
+    use super::*;
+
+    /// The owner's own check names the file it failed on (path, size and
+    /// limit); only a confined viewer check keeps paths out of its errors.
+    #[test]
+    fn unconfined_errors_name_the_document_and_confined_ones_do_not() {
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-doc-check-errors-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let big = dir.join("big.md");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_DOC_BYTES + 1)
+            .unwrap();
+        let error = format!("{:#}", check_path(&big, None).unwrap_err());
+        assert!(
+            error.contains(&format!(
+                "{} is too large to check ({} bytes, limit {MAX_DOC_BYTES})",
+                big.display(),
+                MAX_DOC_BYTES + 1
+            )),
+            "{error}"
+        );
+        let confined = format!(
+            "{:#}",
+            check_path_within(&big, Some(&dir), Some(&dir)).unwrap_err()
+        );
+        assert!(!confined.contains(&*dir.to_string_lossy()), "{confined}");
+        let missing = dir.join("missing.md");
+        let error = format!("{:#}", check_path(&missing, None).unwrap_err());
+        assert!(error.contains(&*missing.to_string_lossy()), "{error}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
