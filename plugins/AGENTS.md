@@ -111,8 +111,9 @@ does not activate it. Rebuild, copy and reinstall the same version to iterate.
    so `tier` and `caps` carry over. Otherwise the PR waits for a maintainer:
    review the release, set `tier` and `caps` to what `chimaera plugin caps`
    prints for its `plugin.toml` (CI stays red until they match), merge. CI
-   installs the release against the new lock; the merge cuts a patch release,
-   and from it **Install** fetches that version. Run it by hand with **Actions →
+   installs the release against the new lock; the merge requests a patch
+   release, and from that release (the next daily batch) **Install** fetches
+   that version. Run it by hand with **Actions →
    plugin-lock → Run workflow**, or locally without writing:
    `node .github/scripts/plugin-lock.mjs`. One bump PR at a time: a newer
    release waits for the open one, which the workflow keeps up to date with
@@ -127,7 +128,8 @@ does not activate it. Rebuild, copy and reinstall the same version to iterate.
    **One-time setup — the `PLUGIN_LOCK_TOKEN` secret.** A PR opened with the
    workflow's own `GITHUB_TOKEN` triggers no workflows (no CI, no `cla`
    status, so auto-merge never fires) and a merge made with it doesn't start
-   `release.yml`, so the workflow writes with a token of the maintainer's: a
+   `ci.yml`'s run on `main`, which a release waits on, so the workflow writes
+   with a token of the maintainer's: a
    fine-grained personal access token on the maintainer's account (so the PR
    author passes the CLA allowlist), repository access `martinappberg/chimaera`
    and every plugin repository in the lock, permissions **Contents: Read and

@@ -1,15 +1,16 @@
 ---
 name: ship-pr
-description: Open a pull request for Chimaera correctly — the CI gates that must pass, the Conventional-Commit prefix that drives the auto version bump on merge, and the [skip release] marker for docs/chore PRs that shouldn't ship a version. Use when creating a PR, choosing a commit/PR title, or deciding whether a change should cut a release.
+description: Open a pull request for Chimaera correctly — the CI gates that must pass, the Conventional-Commit prefix that drives the automatic version bump, and the [skip release] marker for docs/chore PRs that shouldn't ship a version. Use when creating a PR, choosing a commit/PR title, or deciding whether a change should cut a release.
 ---
 
 # Shipping a PR on Chimaera
 
-Merges to `main` use an automated release decision over every unreleased merge:
-shipping prefixes request a release, while docs/chore/refactor-only prefixes do
-not request one. A docs merge can still trigger an earlier pending release. The PR *title* and
-commit prefix are therefore load-bearing. See [AGENTS.md](../../../AGENTS.md) →
-"Releases" for the full rules.
+A merge to `main` publishes nothing by itself. Releases ship in daily batches:
+`release.yml` reads every merge since the last release, and shipping prefixes
+request a release while docs/chore/refactor-only prefixes do not. The PR *title*
+and commit prefix are therefore load-bearing. See
+[docs/agent-guides/releases.md](../../../docs/agent-guides/releases.md) for the
+full rules.
 
 ## Before opening
 
@@ -38,7 +39,7 @@ On squash-merge the commit subject defaults to the **PR title**, and
 `scripts/version-bump.sh` reads that **subject** (never the body) to decide the
 bump. Full rules + rationale: [docs/agent-guides/releases.md](../../../docs/agent-guides/releases.md).
 
-| PR title starts with | Result on merge |
+| PR title starts with | What the merge requests of the next release |
 |---|---|
 | `feat:` | **minor** — a genuinely new user-facing capability |
 | `fix:` / `perf:` / `revert:` | **patch** |
@@ -99,11 +100,11 @@ completing the merge: stop owned previews gracefully, release build output,
 and remove the idle checkout from another checkout (or archive a managed Codex
 worktree). If another session still uses it, leave it intact and report why.
 
-Watch that the intended workflow ran: for a normal PR, `release.yml` should
-publish a release with the bumped version; for a no-release type or
-`[skip release]` PR, the
-`version` job should report `release=false`, all build/publish jobs should be
-skipped, and no release should be cut — unless an earlier merge since the last
-tag still wants one: the decision reads every merge since that tag, so a
-`[skip release]` or `docs:` merge then ships the pending release. If it cut one
-nothing asked for, the marker didn't make it into the squash message.
+Nothing publishes on merge. The next scheduled `release.yml` run ships the
+merge with everything else merged since the last release, once `main`'s CI has
+passed on it. A fix that shouldn't wait: after its `ci.yml` run on `main` passes,
+`gh workflow run release.yml --ref main`. The run's `version` job lists the merges it
+read and the version it chose; a no-release type or `[skip release]` merge
+contributes no bump, so a batch of only those reports `release=false` and cuts
+nothing. If a release came out that nothing asked for, a marker didn't make it
+into a squash message.

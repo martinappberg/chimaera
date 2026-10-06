@@ -232,7 +232,7 @@ export function newer(a, b) {
 }
 
 /** The pull request for a set of bumps: its title (a `fix:` — merging it
- *  cuts a patch release, which is how the app gets the new lock), branch
+ *  requests a patch release, which is how the app gets the new lock), branch
  *  and body. */
 export function pullRequest(bumps) {
   const review = bumps.filter((b) => !b.automerge);
@@ -261,14 +261,14 @@ export function pullRequest(bumps) {
       ? [
           "Each release is sandboxed and asks for nothing its pinned release didn't (the same capability lines), so `tier` and `caps` carry over.",
           "",
-          "CI installs these releases from GitHub against the new lock (`scripts/build-plugins.sh` and the server's plugin tests). Auto-merge (squash) is on: it lands when the required checks pass, and the `fix:` title cuts a patch release so the app picks the new versions up.",
+          "CI installs these releases from GitHub against the new lock (`scripts/build-plugins.sh` and the server's plugin tests). Auto-merge (squash) is on: it lands when the required checks pass, and the `fix:` title requests a patch release, so the next daily release brings the app the new versions.",
         ]
       : [
           "**Needs a maintainer's review — no auto-merge.** What these plugins can do changed, or they run programs (privileged):",
           "",
           ...review.map((b) => `- \`${b.id}\` ${b.to}: ${b.why}`),
           "",
-          "Review the release's code and manifest, then set its `tier` and `caps` in `plugins/plugins.lock` to what `chimaera plugin caps plugin.toml` prints for the release's `plugin.toml`. CI checks both against the release and stays red until they match. Merging cuts a patch release.",
+          "Review the release's code and manifest, then set its `tier` and `caps` in `plugins/plugins.lock` to what `chimaera plugin caps plugin.toml` prints for the release's `plugin.toml`. CI checks both against the release and stays red until they match. Merging requests a patch release, which the next daily release ships.",
         ]),
   ].join("\n");
   return { title, branch, body, automerge: review.length === 0 };

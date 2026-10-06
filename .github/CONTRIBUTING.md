@@ -83,14 +83,14 @@ Extension authors can start with the verified scaffold and author checklist in t
 
 ## Releases and update signing
 
-**A releasing merge to `main` cuts a published release.** `.github/workflows/release.yml`
-derives the next version from the last git tag, bumped by the largest bump the squash-merge
-**subjects** since that tag ask for
+**Releases ship in daily batches, not per merge.** Once a day, or when a maintainer
+runs it by hand, `.github/workflows/release.yml` takes the newest `main` commit that
+passed CI and derives the next version from the last git tag, bumped by the largest
+bump the squash-merge **subjects** since that tag ask for
 (`feat:` → minor, `fix:`/`perf:`/`revert:` → patch, `!` → major; `refactor:`/`chore:`/`docs:`/… and
-`[skip release]` request **no** release), builds Linux musl and macOS daemon
-binaries plus the macOS, Linux and Windows native apps, and **publishes** the
-GitHub Release. A docs-only merge can still trigger a pending release requested
-by an earlier merge since the last tag. Published releases carry a `latest.json`
+`[skip release]` request **no** release). When a release is due it builds Linux musl
+and macOS daemon binaries plus the macOS, Linux and Windows native apps, and
+**publishes** the GitHub Release. Published releases carry a `latest.json`
 for the app's update checks; the download is verified against
 a minisign public key embedded in the app, so only a release signed with the matching private
 key can ever install.

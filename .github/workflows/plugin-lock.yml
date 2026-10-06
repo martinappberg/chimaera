@@ -3,7 +3,8 @@ name: plugin-lock
 # Keeps plugins/plugins.lock on each first-party plugin's latest release, so
 # a plugin release reaches the app with no hand-made pull request: a newer,
 # checked release (.github/scripts/plugin-lock.mjs) becomes a `fix:` PR, CI
-# installs it against the new lock, and the merge cuts a patch release. The
+# installs it against the new lock, and the merge requests a patch release
+# (the next daily batch ships it, docs/agent-guides/releases.md). The
 # PR auto-merges (squash) only when every bumped plugin is sandboxed and asks
 # for nothing new (the same capability lines as its pinned release); a
 # privileged plugin, or one whose capabilities changed, waits for a person
@@ -14,8 +15,9 @@ name: plugin-lock
 # Writes use the PLUGIN_LOCK_TOKEN secret, not GITHUB_TOKEN: a branch pushed
 # and a PR opened with GITHUB_TOKEN trigger no workflows, so ci.yml and the
 # cla status would never report and auto-merge would never fire, and a merge
-# it made would not start release.yml. Without the secret a bump is only
-# reported (a warning), never opened. Setup: plugins/AGENTS.md.
+# it made would not start ci.yml's main run, which a release waits on.
+# Without the secret a bump is only reported (a warning), never opened.
+# Setup: plugins/AGENTS.md.
 on:
   schedule:
     - cron: "23 * * * *"
