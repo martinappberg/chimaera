@@ -1919,6 +1919,10 @@
   .offline-note { margin: 0 0 8px; font-size: var(--text-sm); line-height: 1.5; color: var(--muted); }
   .confirm { flex-wrap: wrap; min-height: 58px; }
   .confirm-label { min-width: 120px; line-height: 1.5; }
+  /* In the workspace list the confirm takes the row's own height, so asking
+     doesn't make the list jump. */
+  .workspaces .confirm { min-height: 0; padding: 9px 12px; }
+  .workspaces .confirm-yes, .workspaces .confirm-no { padding-block: 1px; }
   .add { padding: 10px 0; flex-wrap: wrap; }
   .add-input { min-width: 160px; min-height: 34px; }
   .side { min-height: 30px; }
