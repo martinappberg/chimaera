@@ -58,6 +58,7 @@ wakes row always shows.
 
 | File | What it owns |
 |---|---|
+| `SettingsView.svelte` | The surface itself, loaded lazily (`layout/lazyViews.ts`). Mounted in two places: a singleton layout tab in a workspace, and a full page over Home (`App.svelte` `homeSettingsOpen`) where no workspace is open, so it must not assume one. |
 | `schema.ts` | The settings schema: keys, types, defaults, labels, groups. Ground truth. |
 | `store.svelte.ts` | The reactive settings store: load/patch/persist against `/api/v1/settings`, sparse-map semantics, the `dirtySince` echo-guard, and document-wide theme/interface/editor CSS variables. |
 | `themes.ts` | The curated light/dark theme definitions + `applyAppearance`. |

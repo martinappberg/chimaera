@@ -1114,7 +1114,7 @@ pub(super) fn report_window_scope(
     // The reported label names this window in the tray's list; rebuild so it
     // shows the fresh name (the store above happened before this call).
     crate::tray::rebuild(webview.app_handle());
-    // Its workspace also decides whether Settings applies (home screen = no).
+    // A newly scoped window may now enable Settings (any daemon page does).
     crate::menu::sync_settings_enabled(webview.app_handle());
     Ok(())
 }

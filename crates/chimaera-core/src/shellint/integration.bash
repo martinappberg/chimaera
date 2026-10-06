@@ -4,8 +4,8 @@
 # per-session command journal and know when this shell is at its prompt.
 #
 # Safe to source more than once; chains any existing DEBUG trap and
-# PROMPT_COMMAND instead of clobbering them. (If your rc turns
-# PROMPT_COMMAND into an array, source this afterwards.)
+# PROMPT_COMMAND instead of clobbering them; indexed prompt-command arrays
+# retain every original entry in order, with our arm always last.
 
 if [ -n "${CHIMAERA_INTEGRATION:-}" ]; then
     return 0
@@ -87,5 +87,22 @@ trap "$__chimaera_debug_chain" DEBUG
 # silently undone by the first prompt. A bare `trap` run from the
 # PROMPT_COMMAND string itself executes at top level and sticks. It also
 # wins back the hook if another tool re-traps DEBUG at prompt time.
-PROMPT_COMMAND="__chimaera_precmd${PROMPT_COMMAND:+; ${PROMPT_COMMAND}}; "'trap "$__chimaera_debug_chain" DEBUG; __chimaera_arm'
+# A scalar assignment to an indexed array replaces only element zero and
+# leaves later prompt commands running AFTER the arm. Their DEBUG trap would
+# then report a prompt command as user output, before PS1 emits its B mark.
+# Normalize all entries in execution order before unsetting the array. Every
+# piece is joined with a literal newline, scalar included: a `; ` separator
+# after an entry that ends in `;` is a syntax error at every prompt, and one
+# after a trailing `# comment` is swallowed with the arm. Works on Bash 3.2.
+__chimaera_prompt_chain='__chimaera_precmd'
+if [[ $(declare -p PROMPT_COMMAND 2>/dev/null) == 'declare -a'* ]]; then
+    for __chimaera_prompt_entry in "${PROMPT_COMMAND[@]}"; do
+        __chimaera_prompt_chain+=$'\n'"$__chimaera_prompt_entry"
+    done
+    unset PROMPT_COMMAND __chimaera_prompt_entry
+elif [ -n "${PROMPT_COMMAND:-}" ]; then
+    __chimaera_prompt_chain+=$'\n'"$PROMPT_COMMAND"
+fi
+PROMPT_COMMAND="$__chimaera_prompt_chain"$'\n''trap "$__chimaera_debug_chain" DEBUG; __chimaera_arm'
+unset __chimaera_prompt_chain
 PS1="$PS1"'\[\e]133;B\a\]'

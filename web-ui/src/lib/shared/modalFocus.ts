@@ -8,6 +8,7 @@ interface ModalFocusOptions {
 interface Trap {
   node: HTMLElement;
   previous: HTMLElement | null;
+  lastFocused: HTMLElement | null;
   priority: number;
   order: number;
 }
@@ -29,6 +30,7 @@ function focusableWithin(node: HTMLElement): HTMLElement[] {
 
 let traps: Trap[] = [];
 let nextOrder = 0;
+let visibilityObserver: MutationObserver | null = null;
 
 /** A modal parked in a hidden keep-alive layer (`inert`, e.g. a Settings tab
  *  switched away from with its dialog open) waits there and doesn't own the
@@ -62,6 +64,24 @@ function focusFirst(trap: Trap): void {
   (focusableWithin(trap.node)[0] ?? trap.node).focus();
 }
 
+/** Showing a keep-alive layer does not emit focusin: focus may still be on
+ * the outside control that showed it. Restore its safe/user-selected control
+ * after inert changes, without remounting or creating another modal owner. */
+function restoreShownFocus(records: MutationRecord[]): void {
+  // Other keep-alive surfaces can change inert without changing this stack.
+  if (!records.some((record) => traps.some((trap) => record.target.contains(trap.node)))) return;
+  const trap = topTrap();
+  if (trap === null || trap.node.contains(document.activeElement)) return;
+  const previous = trap.lastFocused;
+  if (previous?.isConnected && trap.node.contains(previous) &&
+      previous.closest("[inert]") === null && previous.matches(FOCUSABLE) &&
+      previous.getClientRects().length > 0 && previous.getAttribute("aria-hidden") !== "true") {
+    previous.focus();
+  } else {
+    focusFirst(trap);
+  }
+}
+
 function onKeydown(event: KeyboardEvent): void {
   if (event.key !== "Tab") return;
   const trap = topTrap();
@@ -86,7 +106,11 @@ function onKeydown(event: KeyboardEvent): void {
 
 function onFocusin(event: FocusEvent): void {
   const trap = topTrap();
-  if (trap === null || (event.target instanceof Node && trap.node.contains(event.target))) return;
+  if (trap === null) return;
+  if (event.target instanceof Node && trap.node.contains(event.target)) {
+    if (event.target instanceof HTMLElement) trap.lastFocused = event.target;
+    return;
+  }
   focusFirst(trap);
 }
 
@@ -94,9 +118,15 @@ function syncDocumentListeners(): void {
   if (traps.length === 1) {
     document.addEventListener("keydown", onKeydown, true);
     document.addEventListener("focusin", onFocusin, true);
+    if (visibilityObserver === null) {
+      visibilityObserver = new MutationObserver(restoreShownFocus);
+      visibilityObserver.observe(document.documentElement, { subtree: true, attributes: true, attributeFilter: ["inert"] });
+    }
   } else if (traps.length === 0) {
     document.removeEventListener("keydown", onKeydown, true);
     document.removeEventListener("focusin", onFocusin, true);
+    visibilityObserver?.disconnect();
+    visibilityObserver = null;
   }
 }
 
@@ -113,6 +143,7 @@ export const modalFocus: Action<HTMLElement, ModalFocusOptions | undefined> = (
   const trap: Trap = {
     node,
     previous: document.activeElement instanceof HTMLElement ? document.activeElement : null,
+    lastFocused: null,
     priority: options?.priority ?? 0,
     order: nextOrder++,
   };

@@ -27,7 +27,21 @@ fn open_lock(root: &Path, name: &str) -> std::io::Result<File> {
 /// into a shell must not lose companions during an update in another window.
 /// Holding every kind for a plain shell is conservative and uses a fixed small
 /// set of locks. Failed preparation/spawn drops the guards without a registry row.
-pub(crate) struct Usage(Vec<(PathBuf, AgentKind, File)>);
+pub(crate) struct Usage(Vec<(PathBuf, AgentKind, LeaseLock)>);
+
+/// A held flock (usage lease, removal guard, or the install lock —
+/// `runtimes::InstallLock` is this type). A fork inherits the same open file
+/// description until exec, so closing our descriptor alone would leave the
+/// lock held by that unrelated child; an explicit unlock ends it at once.
+#[derive(Debug)]
+pub(crate) struct LeaseLock(pub(crate) File);
+impl Drop for LeaseLock {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.unlock() {
+            tracing::warn!(%error, "agent lock release deferred until descriptor close");
+        }
+    }
+}
 
 pub(crate) async fn acquire(
     state: &AppState,
@@ -50,6 +64,7 @@ pub(crate) async fn acquire(
                 file.try_lock_shared()
                     .map_err(std::io::Error::from)
                     .context("Agent storage is being cleaned up. Try again in a moment")?;
+                let file = LeaseLock(file);
                 if agent.is_none() {
                     locks.push((root.clone(), kind, file));
                     continue;
@@ -75,7 +90,7 @@ pub(crate) async fn acquire(
                     };
                     let lease = open_lock(&root, &format!(".{}-{version}.use", kind.as_str()))?;
                     lease.try_lock_shared().map_err(std::io::Error::from)?;
-                    locks.push((root.clone(), kind, lease));
+                    locks.push((root.clone(), kind, LeaseLock(lease)));
                     *executable = resolved;
                 }
             }
@@ -144,6 +159,7 @@ fn cleanup(root: &Path, kind: AgentKind) {
         if install.try_lock().is_err() {
             return Ok(());
         }
+        let _install = LeaseLock(install);
         prune_locked(root, kind)
     })();
     if let Err(error) = result {
@@ -154,7 +170,7 @@ fn cleanup(root: &Path, kind: AgentKind) {
 /// Caller holds the install lock. Take the broad lock first to exclude new
 /// sessions while checking every package lease, and retain all guards through
 /// removal. None means a terminal, agent, or older daemon still needs the files.
-pub(crate) fn lock_removal(root: &Path, kind: AgentKind) -> anyhow::Result<Option<Vec<File>>> {
+pub(crate) fn lock_removal(root: &Path, kind: AgentKind) -> anyhow::Result<Option<Vec<LeaseLock>>> {
     let tree = root.join(kind.as_str());
     if !tree.exists() {
         return Ok(Some(Vec::new()));
@@ -165,6 +181,7 @@ pub(crate) fn lock_removal(root: &Path, kind: AgentKind) -> anyhow::Result<Optio
         Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(None),
         Err(error) => return Err(error.into()),
     }
+    let usage = LeaseLock(usage);
     if untracked_daemon(root)? {
         return Ok(None);
     }
@@ -176,7 +193,7 @@ pub(crate) fn lock_removal(root: &Path, kind: AgentKind) -> anyhow::Result<Optio
         };
         let lease = open_lock(root, &format!(".{}-{version}.use", kind.as_str()))?;
         match lease.try_lock().map_err(std::io::Error::from) {
-            Ok(()) => locks.push(lease),
+            Ok(()) => locks.push(LeaseLock(lease)),
             Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(None),
             Err(error) => return Err(error.into()),
         }
@@ -197,6 +214,7 @@ pub(crate) fn prune_locked(root: &Path, kind: AgentKind) -> anyhow::Result<()> {
         Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(()),
         Err(error) => return Err(error.into()),
     }
+    let _usage = LeaseLock(usage);
     if untracked_daemon(root)? {
         return Ok(());
     }
@@ -223,6 +241,7 @@ pub(crate) fn prune_locked(root: &Path, kind: AgentKind) -> anyhow::Result<()> {
             Err(error) if error.kind() == ErrorKind::WouldBlock => continue,
             Err(error) => return Err(error.into()),
         }
+        let _lease = LeaseLock(lease);
         std::fs::remove_dir_all(entry.path()).with_context(|| {
             format!("Could not remove unused {} {version}", kind.product_name())
         })?;
@@ -252,6 +271,7 @@ fn prune_agy_chat(root: &Path, versions: &[String]) -> anyhow::Result<()> {
             Err(error) if error.kind() == ErrorKind::WouldBlock => continue,
             Err(error) => return Err(error.into()),
         }
+        let _lease = LeaseLock(lease);
         let chat = root.join("agy").join(version).join("chat");
         if !chat.is_dir() || std::fs::symlink_metadata(&chat)?.file_type().is_symlink() {
             continue;
@@ -481,6 +501,7 @@ mod tests {
         f.activate("codex", "0.159.2");
         let install = open_lock(&f.root(), ".codex.lock").unwrap();
         install.try_lock().unwrap();
+        let install = LeaseLock(install);
         cleanup(&f.root(), AgentKind::Codex);
         assert!(old.exists());
         drop(install);
@@ -512,6 +533,52 @@ mod tests {
         cleanup(&f.root(), AgentKind::Codex);
         assert!(!old.exists());
         assert!(lock_removal(&f.root(), AgentKind::Codex).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn original_usage_and_removal_unlock_before_inherited_descriptors_close() {
+        let f = Fixture::new();
+        let package = f.package("codex", "0.159.2");
+        f.activate("codex", "0.159.2");
+        let mut state = AppState::new(
+            "token".into(),
+            "host".into(),
+            1,
+            0,
+            f.0.join("workspace"),
+            f.0.join("config"),
+        );
+        state.managed_root = f.root();
+        for agent in [None, Some(AgentKind::Codex)] {
+            let executables = agent
+                .map(|_| package.join("bin/codex"))
+                .into_iter()
+                .collect();
+            let (usage, _) = acquire(&state, agent, executables).await.unwrap();
+            // try_clone models a pre-exec fork's identical open description.
+            let inherited: Vec<_> = usage
+                .0
+                .iter()
+                .map(|(_, _, lease)| lease.0.try_clone().unwrap())
+                .collect();
+            assert!(!inherited.is_empty());
+            assert!(lock_removal(&f.root(), AgentKind::Codex).unwrap().is_none());
+            drop(usage);
+            let removal = lock_removal(&f.root(), AgentKind::Codex).unwrap().unwrap();
+            drop(inherited);
+            // Closing old inherited files cannot unlock the successor owner.
+            assert!(acquire(&state, None, vec![]).await.is_err());
+            let inherited_removal: Vec<_> = removal
+                .iter()
+                .map(|lease| lease.0.try_clone().unwrap())
+                .collect();
+            drop(removal);
+            let (successor, _) = acquire(&state, None, vec![]).await.unwrap();
+            drop(inherited_removal);
+            assert!(lock_removal(&f.root(), AgentKind::Codex).unwrap().is_none());
+            drop(successor);
+            assert!(lock_removal(&f.root(), AgentKind::Codex).unwrap().is_some());
+        }
     }
 
     #[tokio::test]
@@ -584,7 +651,11 @@ mod tests {
         drop(removal);
         let response =
             crate::runtimes::uninstall_agent(State(remover), UrlPath("codex".into())).await;
-        assert_eq!(response.status(), StatusCode::OK);
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "uninstall response: {body:?}");
         for package in packages {
             assert!(!package.exists());
         }

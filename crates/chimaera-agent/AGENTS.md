@@ -59,7 +59,7 @@ handles must be discarded on disconnect. See the [Mods feature](../../docs/featu
 | `journal.rs` | Per-session append-only JSONL + bounded replay ring + the native-id→session index (+ each conversation's own model/effort/mode, so a reopen comes back as it was) + the per-agent-kind `AgentPrefsStore` (last model/effort/mode the user picked, `prefs.json`) + dir pruning (`prune_dir`: history oldest-first, never a `keep` id — `ChatManager::prune_journal_dir` adds its live registry; the server adds every agent session — incl. one between processes — and holds the prune until boot restore settles). The gap-replay crown jewel. | anything touching durability, replay, seq numbering, or what a new chat starts with. |
 | `transcript.rs` | Bounded offline import of Claude's native transcript into normalized events, reusing the live driver's block helpers so a reopened TUI conversation can seed a chat journal; `import_subagent_transcript` reads one subagent's own file (`<session>/subagents/agent-<id>.jsonl`) from a stable 1 MiB-stepped window so a live view can append instead of reloading. Blocking reads must run off the reactor. | importing native conversation history. |
 | `subagent.rs` | Reading one subagent's conversation: `SubagentTranscript` (events + `epoch` window stamp + model), `DriverQuery` (an ephemeral read the daemon asks a LIVE driver — `Mapper::on_query`, `ChatManager::subagent_transcript`; never journaled), `valid_agent_id`. | the subagent view's data path. |
-| `ndjson.rs` | Line-oriented JSON transport over child stdio (`JsonlChild` and its split halves), with per-line length caps. Shared by the structured drivers. | transport/framing, process spawn. |
+| `ndjson.rs` | Line-oriented JSON transport over child stdio (`JsonlChild` and its split halves), with per-line length caps and cancel-safe line reads; each child leads its own process group, which shutdown (and a dropped guard) SIGKILLs so a launcher's native child cannot outlive it. Shared by the structured drivers. | transport/framing, process spawn. |
 | `bin/fake-claude.rs` | A scripted fake that speaks enough of the claude wire to exercise ordinary permission turns plus deterministic `background`, `question`, `plan`, `subagent`, `showcase` (every 2.1.281 transcript surface in one turn — narration, labels, a finished subagent, a background command + Monitor and their closes, a monitor-woken turn; `FAKE_SHOWCASE_PAUSE_MS`/`_SETTLE_MS` slow it for a live UI check), hang, and failure modes. | writing a hermetic driver/registry or live-UI test. |
 | `tests/manager.rs` | Hermetic end-to-end tests via `fake-claude` (no network, no billing). | regression-proofing a change. |
 | `tests/live.rs` | The `just chat-smoke` suite against the real Claude/Codex CLIs. Ignored by ordinary `cargo test`; live runs need auth/network and bill turns. | verifying native protocol facts. |
@@ -79,7 +79,8 @@ including at startup. An unlisted model keeps its native controls.
    HPC hosts (target ~150 MB RSS), including compute allocations and an
    explicitly allowed login-node deployment. Every channel is bounded; the journal ring and file are
    capped; per-line reads are capped in `ndjson.rs`; oversized events are
-   *replaced*, not stored. Event caps live **at event construction** (`model.rs`)
+   *replaced*, not stored (an oversized user message is cut to fit, head and
+   tail kept, so it stays in the transcript with its delivery id). Event caps live **at event construction** (`model.rs`)
    so a giant tool input never reaches the journal, the ring, or a client;
    every `AgentCommand` is validated before enqueue so WS and programmatic
    callers share the same allocation budgets. `ChatManager` then reserves every

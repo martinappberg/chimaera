@@ -80,6 +80,27 @@ app-build` (never the root `cargo`).
   during startup) it opens Home. A repeated launch focuses the most recent on-screen window the same way. Minimized
   windows are never mass-restored.
 
+## Home launcher
+
+- **What & when.** Home is workspace-first: **Open folder** registers an existing folder;
+  recent workspaces on this machine show their path, live-session or approval state, and last-opened
+  time. Remote machines are grouped separately, with their own connection status and workspaces.
+- **How it's used.** A workspace row opens in the launcher. A workspace with live sessions shows
+  **End sessions** beside the row on hover, and the same entry in its "…" menu (the keyboard
+  route), which also offers a new window or removing the registration (the folder stays untouched). Cmd/Ctrl-click
+  still opens a new window. Connected remote rows show their loopback port, and a pool alias pinned
+  to one login node says so on hover. Remote menus keep **Disconnect** separate from confirmed
+  **End sessions**, **Shut down**, and **Forget machine**. Cluster compute sessions remain on that
+  host's detail page, their actions revealed on hover. The daemon version stamp sits in the corner.
+- **Navigation.** A quiet column keeps Workspaces and Settings in the same place across Home's
+  surfaces, collapsing to a compact top bar at narrow widths. Settings opens from Home as a full
+  page (the column, ⌘, or the native menu); Escape or **Home** returns, and the page drops its
+  breadcrumb and frame on a phone.
+- **Where it lives.** `web-ui/src/lib/workspace/{HomeScreen,HomeNavigation,HomeActions}.svelte` and
+  `App.svelte` (`homeSettingsOpen`). Home preserves the native titlebar drag lane. Action
+  disclosures support Tab, Escape, and outside-click dismissal; existing destructive confirmations
+  remain in place.
+
 ## Unsaved edits on close and quit
 
 - **What & when.** A webview gets no `beforeunload` when its native window closes or the app
@@ -202,7 +223,9 @@ app-build` (never the root `cargo`).
   focused window (`onMenu` in `App.svelte`, via `native.ts`); New Window is handled shell-side, and
   Reload Window evaluates a fixed script in the focused window instead (see below).
   **Settings** is daemon-scoped: it opens the settings surface for the focused window's daemon (a
-  remote window → the remote daemon's settings), same as the in-UI gear.
+  remote window → the remote daemon's settings), same as the in-UI gear. It is enabled on Home too
+  (Home's Settings page) and disabled for the WSL setup wizard and a login-node terminal window
+  (`shell::focused_daemon_open`).
 - **System tray / menu-bar status item** (`tray.rs`, `tray-icon` feature): a persistent icon whose
   menu lists the **open workspace windows** (click one to raise it) — each with its count of agents
   awaiting approval ("crc_finish — 2 awaiting approval"; the tooltip totals them) — then New Window

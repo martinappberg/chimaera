@@ -19,12 +19,17 @@ export type PaneViewKind =
   | "browser"
   | "settings";
 
+/** A view that is not a pane but still stays out of the always-loaded entry:
+ *  Home loads only while it is visible. It shares the pane cache and asset
+ *  recovery below. */
+export type LazyViewKind = PaneViewKind | "home";
+
 type PaneViewModule = { default: Component<any> };
 
 // Keep imports explicit so Vite produces one feature chunk per workbench
 // surface. The promise cache is shared by every pane: simultaneous split panes
 // request a chunk once, while each Pane keeps its own mounted component state.
-const loaders: Record<PaneViewKind, () => Promise<PaneViewModule>> = {
+const loaders: Record<LazyViewKind, () => Promise<PaneViewModule>> = {
   terminal: async () => {
     const [view] = await Promise.all([
       import("../terminal/Terminal.svelte"),
@@ -47,11 +52,12 @@ const loaders: Record<PaneViewKind, () => Promise<PaneViewModule>> = {
   sessions: () => import("../workspace/SessionsView.svelte"),
   browser: () => import("../browser/BrowserView.svelte"),
   settings: () => import("../settings/SettingsView.svelte"),
+  home: () => import("../workspace/HomeScreen.svelte"),
 };
 
-const pending = new Map<PaneViewKind, Promise<Component<any>>>();
+const pending = new Map<LazyViewKind, Promise<Component<any>>>();
 
-const viewChunkPrefixes: Record<PaneViewKind, string> = {
+const viewChunkPrefixes: Record<LazyViewKind, string> = {
   terminal: "Terminal-",
   chat: "ChatView-",
   file: "FileView-",
@@ -68,6 +74,7 @@ const viewChunkPrefixes: Record<PaneViewKind, string> = {
   sessions: "SessionsView-",
   browser: "BrowserView-",
   settings: "SettingsView-",
+  home: "HomeScreen-",
 };
 
 let retrySequence = 0;
@@ -136,7 +143,7 @@ async function recoverFailedStyles(error: unknown): Promise<void> {
   );
 }
 
-export function loadPaneView(kind: PaneViewKind): Promise<Component<any>> {
+export function loadPaneView(kind: LazyViewKind): Promise<Component<any>> {
   let request = pending.get(kind);
   if (request === undefined) {
     request = loaders[kind]().then((module) => module.default);
@@ -157,7 +164,7 @@ export function loadPaneView(kind: PaneViewKind): Promise<Component<any>> {
  *  failed CSS preload: recover it, then let Vite run the original import. If
  *  the component module itself was memoized as failed by the browser, import
  *  that exact same-origin hashed chunk under a fresh query instead. */
-export async function retryPaneView(kind: PaneViewKind, error: unknown): Promise<Component<any>> {
+export async function retryPaneView(kind: LazyViewKind, error: unknown): Promise<Component<any>> {
   await recoverFailedStyles(error);
   try {
     return await loadPaneView(kind);
