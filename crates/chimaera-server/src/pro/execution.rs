@@ -1134,6 +1134,11 @@ fn grant_fixture(state: &AppState, workspace: &str, epoch: u64, sequence: u64) -
 /// took on keeps its automatic restore (`super::enrolled`).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn fence_unknown(state: &AppState, sessions: &mut [crate::ledger::LedgerEntry]) {
+    // Unknown Pro records count every project as enrolled. A free daemon never
+    // parks on that alone, or a damaged state file would strand every row.
+    if crate::pro::tier(state) == crate::pro::Tier::Free && state.pro.records_unknown {
+        return;
+    }
     for entry in sessions {
         if !super::enrolled(state, &entry.workspace_id) {
             continue;
@@ -1225,5 +1230,12 @@ mod fence_unknown_tests {
         assert_eq!(sessions[0].manual_resume_reason, None);
         assert!(sessions[1].suspended);
         assert_eq!(sessions[1].manual_resume_reason.as_deref(), Some("unknown"));
+        // Unreadable Pro records on a free daemon park nothing.
+        let mut state = state;
+        state.pro.records_unknown = true;
+        let mut sessions = vec![entry("s-free", "w-free")];
+        fence_unknown(&state, &mut sessions);
+        assert!(!sessions[0].suspended);
+        assert_eq!(sessions[0].manual_resume_reason, None);
     }
 }

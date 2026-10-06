@@ -3680,7 +3680,7 @@ pub(crate) async fn spawn_chat_session(
 }
 
 /// What a Codex chat is handed as its developer note when its thread opens
-/// (`SpawnSpec::developer_note`, PROTOCOL.md Pass 47): the cluster context in
+/// (`SpawnSpec::developer_note`, PROTOCOL.md Pass 41): the cluster context in
 /// a cluster job, then, in a synced project with the optional Runtime, the
 /// where-you-run note when this conversation has not heard it for this
 /// machine (`cloud_context::pending`, remembered once the spawn succeeds).
