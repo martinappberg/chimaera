@@ -32,7 +32,8 @@ than build a tree with steps written for another; a run whose copy agrees ships
 the batch.
 
 **Ship now** (a hotfix, or anything that shouldn't wait for the schedule): once the
-merge's `ci.yml` run on `main` has passed, run
+merge's `ci.yml` run on `main` has passed (or, if a merge right behind it replaced
+that run while it waited to start, the later merge's run), run
 
 ```sh
 gh workflow run release.yml --ref main

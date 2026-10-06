@@ -13,7 +13,10 @@ on:
   pull_request:
 
 # A superseded PR run is worthless: cancel it the moment a new commit lands.
-# Pushes to main are never cancelled — they prime the caches described above.
+# A running main push is never cancelled — it primes the caches described
+# above. A main push still waiting for one is replaced by the next merge's
+# (a group holds one pending run), so a commit merged right behind another
+# may get no run of its own; the later commit's run covers its tree.
 # The group is per-workflow, so this can never interfere with release.yml
 # (which runs on a schedule and owns the `release-<ref>` groups).
 concurrency:
