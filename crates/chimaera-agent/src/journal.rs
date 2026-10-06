@@ -879,9 +879,10 @@ pub async fn append_marker(dir: &Path, session_id: &str, ev: AgentEvent) -> Resu
 ///
 /// `create_new` refuses to clobber an existing journal — the caller owns the
 /// fresh-target guarantee, and never seeding over a live session's file is the
-/// same invariant the copy-seed path enforces. Oversized events are replaced
-/// with an `Error` marker, matching [`Journal::append`]'s cap so the ring and
-/// replay budgets downstream still hold.
+/// same invariant the copy-seed path enforces. Oversized events are cut or
+/// replaced exactly as [`Journal::append`] does (a user message is cut to
+/// fit, anything else becomes an `Error` marker) so the ring and replay
+/// budgets downstream still hold.
 pub fn seed_journal(dir: &Path, session_id: &str, events: &[AgentEvent]) -> Result<()> {
     fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     let path = dir.join(format!("{session_id}.jsonl"));
@@ -919,11 +920,15 @@ pub fn seed_journal(dir: &Path, session_id: &str, events: &[AgentEvent]) -> Resu
         };
         let mut line = serde_json::to_vec(&entry)?;
         if line.len() > MAX_ENTRY_BYTES {
-            entry.ev = AgentEvent::Error {
-                message: format!("event exceeded the {MAX_ENTRY_BYTES}-byte journal cap"),
-                fatal: false,
-            };
-            line = serde_json::to_vec(&entry)?;
+            if let Some((_, shortened)) = shortened_user_message(&entry.ev, seq, ts) {
+                line = shortened;
+            } else {
+                entry.ev = AgentEvent::Error {
+                    message: format!("event exceeded the {MAX_ENTRY_BYTES}-byte journal cap"),
+                    fatal: false,
+                };
+                line = serde_json::to_vec(&entry)?;
+            }
         }
         line.push(b'\n');
         debug_assert_eq!(

@@ -90,17 +90,19 @@ trap "$__chimaera_debug_chain" DEBUG
 # A scalar assignment to an indexed array replaces only element zero and
 # leaves later prompt commands running AFTER the arm. Their DEBUG trap would
 # then report a prompt command as user output, before PS1 emits its B mark.
-# Normalize all entries in execution order before unsetting the array. Literal
-# newlines preserve trailing comments/semicolons and work on Bash 3.2 too.
+# Normalize all entries in execution order before unsetting the array. Every
+# piece is joined with a literal newline, scalar included: a `; ` separator
+# after an entry that ends in `;` is a syntax error at every prompt, and one
+# after a trailing `# comment` is swallowed with the arm. Works on Bash 3.2.
+__chimaera_prompt_chain='__chimaera_precmd'
 if [[ $(declare -p PROMPT_COMMAND 2>/dev/null) == 'declare -a'* ]]; then
-    __chimaera_prompt_chain='__chimaera_precmd'
     for __chimaera_prompt_entry in "${PROMPT_COMMAND[@]}"; do
         __chimaera_prompt_chain+=$'\n'"$__chimaera_prompt_entry"
     done
-    unset PROMPT_COMMAND
-    PROMPT_COMMAND="$__chimaera_prompt_chain"$'\n''trap "$__chimaera_debug_chain" DEBUG; __chimaera_arm'
-    unset __chimaera_prompt_chain __chimaera_prompt_entry
-else
-    PROMPT_COMMAND="__chimaera_precmd${PROMPT_COMMAND:+; ${PROMPT_COMMAND}}; "'trap "$__chimaera_debug_chain" DEBUG; __chimaera_arm'
+    unset PROMPT_COMMAND __chimaera_prompt_entry
+elif [ -n "${PROMPT_COMMAND:-}" ]; then
+    __chimaera_prompt_chain+=$'\n'"$PROMPT_COMMAND"
 fi
+PROMPT_COMMAND="$__chimaera_prompt_chain"$'\n''trap "$__chimaera_debug_chain" DEBUG; __chimaera_arm'
+unset __chimaera_prompt_chain
 PS1="$PS1"'\[\e]133;B\a\]'

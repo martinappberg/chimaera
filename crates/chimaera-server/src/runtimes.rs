@@ -636,19 +636,10 @@ pub(crate) async fn prune_install_versions(root: PathBuf, kind: AgentKind) {
 }
 
 /// All workspace daemons share this advisory lock; process death releases it
-/// without a stale lockdir. Explicit unlock on drop: a child forked in the
-/// meantime shares the open file description until it execs, and closing
-/// only our descriptor would leave the lock held by that unrelated child.
-#[derive(Debug)]
-pub(crate) struct InstallLock(std::fs::File);
-
-impl Drop for InstallLock {
-    fn drop(&mut self) {
-        if let Err(error) = self.0.unlock() {
-            tracing::warn!(%error, "agent installation lock release deferred until descriptor close");
-        }
-    }
-}
+/// without a stale lockdir. It unlocks explicitly on drop (see `LeaseLock`):
+/// a child forked in the meantime shares the open file description until it
+/// execs, and closing only our descriptor would leave the lock held by it.
+pub(crate) use crate::runtime_retention::LeaseLock as InstallLock;
 
 pub(crate) async fn lock_install(
     root: &Path,

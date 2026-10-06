@@ -414,6 +414,30 @@ PROMPT_COMMAND='RET=$?; : logger-standin'
         );
     }
 
+    /// A scalar PROMPT_COMMAND ending in `;` (common in rc files: `history
+    /// -a;`) or in a `# comment` must not break the chain: a `; ` separator
+    /// made `;;` a syntax error at every prompt, or let the comment swallow
+    /// the re-arm, so no command ever got its C/D marks.
+    #[test]
+    #[cfg(unix)]
+    fn bash_scalar_prompt_command_with_trailing_semicolon_or_comment_keeps_marks() {
+        for prelude in [
+            r#"PROMPT_COMMAND='printf "PC-RAN\n";'"#,
+            r#"PROMPT_COMMAND='printf "PC-RAN\n" # trailing comment'"#,
+        ] {
+            let out = bash_probe(
+                "prompt-scalar-tail",
+                prelude,
+                "",
+                "(exit 5)\nprintf '\\nCOMMAND_OUTPUT\\n'\n",
+            );
+            assert!(!out.contains("syntax error"), "{prelude}: {out:?}");
+            assert!(out.contains("PC-RAN"), "{prelude}: {out:?}");
+            assert!(out.contains("\x1b]133;D;5\x07"), "{prelude}: {out:?}");
+            assert!(out.lines().any(|line| line == "COMMAND_OUTPUT"), "{out:?}");
+        }
+    }
+
     /// Modern distro rc files use indexed PROMPT_COMMAND arrays. A scalar
     /// replacement only changes index zero, so a later entry would consume the
     /// preexec arm while the prompt is still rendering. Preserve sparse entries

@@ -160,7 +160,12 @@ impl JsonlChild {
                 let mut tail = tail.lock().expect("stderr tail lock");
                 tail.push_back(line);
                 let mut total: usize = tail.iter().map(|l| l.len()).sum();
-                while total > STDERR_TAIL_BUDGET || tail.len() > STDERR_TAIL_LINES {
+                // The newest line stays even when it alone exceeds the byte
+                // budget (a line can be up to MAX_STDERR_LINE_BYTES): popping
+                // it would turn a long stack trace into an empty tail.
+                while (total > STDERR_TAIL_BUDGET && tail.len() > 1)
+                    || tail.len() > STDERR_TAIL_LINES
+                {
                     match tail.pop_front() {
                         Some(dropped) => total -= dropped.len(),
                         None => break,
@@ -375,8 +380,11 @@ fn exited_unreaped(pid: u32) -> bool {
         )
     };
     if result != 0 {
-        // Already reaped or not our child: nothing left to wait for.
-        return true;
+        // ECHILD: already reaped, nothing left to wait for. Any other error
+        // (EINTR, a rejected flag) says nothing about the child; reporting
+        // it as an exit would cut the grace short and SIGKILL the group
+        // before the leader's own SIGTERM cleanup has run.
+        return std::io::Error::last_os_error().raw_os_error() == Some(nix::libc::ECHILD);
     }
     // SAFETY: zero-initialised and possibly written by waitid above.
     let info = unsafe { info.assume_init() };
@@ -448,6 +456,27 @@ mod tests {
         assert_eq!(status, Some(0));
         assert!(tail.ends_with("tail-marker"));
         assert!(tail.lines().count() <= STDERR_TAIL_LINES);
+    }
+
+    #[tokio::test]
+    async fn an_oversize_stderr_line_is_kept_not_dropped() {
+        let over_budget = STDERR_TAIL_BUDGET + 1024;
+        let child = JsonlChild::spawn(
+            "/bin/sh",
+            &[
+                "-c".into(),
+                format!("head -c {over_budget} /dev/zero | tr '\\0' x >&2; printf '\\n' >&2"),
+            ],
+            Path::new("/"),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let (sink, _stream, guard) = child.split();
+        drop(sink);
+        let (status, tail) = guard.shutdown_with_stderr(Duration::from_secs(5)).await;
+        assert_eq!(status, Some(0));
+        assert_eq!(tail.trim_end().len(), over_budget, "{}", tail.len());
     }
 
     #[tokio::test]

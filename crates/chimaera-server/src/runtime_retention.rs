@@ -29,14 +29,16 @@ fn open_lock(root: &Path, name: &str) -> std::io::Result<File> {
 /// set of locks. Failed preparation/spawn drops the guards without a registry row.
 pub(crate) struct Usage(Vec<(PathBuf, AgentKind, LeaseLock)>);
 
-/// A fork inherits the same open file description until exec. Closing our
-/// descriptor alone would leave its flock held by that unrelated child.
-/// Explicit unlock ends only this original lease, like InstallLock does.
-pub(crate) struct LeaseLock(File);
+/// A held flock (usage lease, removal guard, or the install lock —
+/// `runtimes::InstallLock` is this type). A fork inherits the same open file
+/// description until exec, so closing our descriptor alone would leave the
+/// lock held by that unrelated child; an explicit unlock ends it at once.
+#[derive(Debug)]
+pub(crate) struct LeaseLock(pub(crate) File);
 impl Drop for LeaseLock {
     fn drop(&mut self) {
         if let Err(error) = self.0.unlock() {
-            tracing::warn!(%error, "agent usage lock release deferred until descriptor close");
+            tracing::warn!(%error, "agent lock release deferred until descriptor close");
         }
     }
 }
