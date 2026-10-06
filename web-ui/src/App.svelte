@@ -3289,7 +3289,10 @@
   /** Home screen: unregister a workspace (the folder itself is untouched). */
   function removeWorkspace(w: Workspace): void {
     workspaces = workspaces.filter((x) => x.id !== w.id);
-    void deleteWorkspace(w.id)
+    // Its running sessions end with it: the daemon's unregister leaves them
+    // alive but orphaned (no workspace row to find them from).
+    void stopWorkspace(w)
+      .then(() => deleteWorkspace(w.id))
       .catch(() => {
         // already gone or unreachable; the refresh below reconciles
       })

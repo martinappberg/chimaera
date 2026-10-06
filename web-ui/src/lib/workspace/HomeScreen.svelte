@@ -832,11 +832,12 @@
             {@const live = liveByWs.get(w.id)}
             {@const wsState = !daemonReachable ? "" : live && live.attn > 0 ? "attn" : live && live.live > 0 ? "alive" : ""}
             {#if confirmStopId === w.id}
-              <div class="row confirm" role="alertdialog" aria-label="end sessions?">
+              <div class="row confirm" role="alertdialog" aria-label="End sessions?">
                 <span class="name">{w.name}</span>
                 <span class="confirm-label"
-                  >end {live?.live} running session{live?.live === 1 ? "" : "s"}?</span
+                  >End {live?.live} running session{live?.live === 1 ? "" : "s"}? The workspace stays in your list.</span
                 >
+                <button class="confirm-no" onclick={() => (confirmStopId = null)}>Cancel</button>
                 <button
                   class="confirm-yes"
                   onclick={() => {
@@ -844,20 +845,24 @@
                     onStop(w);
                   }}>End sessions</button
                 >
-                <button class="confirm-no" onclick={() => (confirmStopId = null)}>cancel</button>
               </div>
             {:else if confirmRemoveId === w.id}
-              <div class="row confirm" role="alertdialog" aria-label="remove workspace?">
+              {@const running = live?.live ?? 0}
+              <div class="row confirm" class:strong={running > 0} role="alertdialog" aria-label="Remove workspace?">
                 <span class="name">{w.name}</span>
-                <span class="confirm-label">remove from this list?</span>
+                <span class="confirm-label"
+                  >{running > 0
+                    ? `Remove from your list and end its ${running === 1 ? "running session" : `${running} running sessions`}? Your folder is untouched.`
+                    : "Remove from your list? Your folder is untouched."}</span
+                >
+                <button class="confirm-no" onclick={() => (confirmRemoveId = null)}>Cancel</button>
                 <button
                   class="confirm-yes"
                   onclick={() => {
                     confirmRemoveId = null;
                     onRemove(w);
-                  }}>remove</button
+                  }}>{running > 0 ? "End & remove" : "Remove"}</button
                 >
-                <button class="confirm-no" onclick={() => (confirmRemoveId = null)}>cancel</button>
               </div>
             {:else}
               <div class="rowwrap workspace-row" role="presentation" class:live={wsState === "alive"} class:attn={wsState === "attn"}>
