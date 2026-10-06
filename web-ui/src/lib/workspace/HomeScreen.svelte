@@ -669,7 +669,11 @@
   {/if}
   <HomeNavigation active="workspaces"
     onHome={() => {
-      if (showBackToHome) void backToHome();
+      // The cluster page's own back route: a cluster workspace's window has
+      // local Home behind its page; any other Home returns to its own list —
+      // this item is the current page there. The masthead's "Home" button
+      // is a remote window's route to local Home.
+      if (clusterWs !== null) void backToHome();
       else clusterView = null;
     }} {onSettings} />
   {#if clusterView !== null}

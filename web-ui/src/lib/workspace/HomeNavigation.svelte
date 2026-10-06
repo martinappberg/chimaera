@@ -1,6 +1,6 @@
 <script lang="ts">
   import BrandMark from "../shared/BrandMark.svelte";
-  import { keyHint } from "../shared/keybindings";
+  import { keyHintSuffix } from "../shared/keybindings";
 
   let { active, onHome, onSettings }: {
     active: "workspaces" | "settings";
@@ -16,7 +16,7 @@
     <span>Workspaces</span>
   </button>
   <div class="utilities">
-    <button class:active={active === "settings"} aria-current={active === "settings" ? "page" : undefined} onclick={onSettings} title={`Settings (${keyHint("settings")})`}>
+    <button class:active={active === "settings"} aria-current={active === "settings" ? "page" : undefined} onclick={onSettings} title={`Settings${keyHintSuffix("settings")}`}>
       <svg viewBox="0 0 18 18" width="17" height="17" aria-hidden="true"><path d="M3 5h12M3 13h12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" /><circle cx="6" cy="5" r="2" fill="var(--rail-bg)" stroke="currentColor" stroke-width="1.3" /><circle cx="12" cy="13" r="2" fill="var(--rail-bg)" stroke="currentColor" stroke-width="1.3" /></svg>
       <span>Settings</span>
     </button>

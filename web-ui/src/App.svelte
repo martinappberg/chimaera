@@ -3607,16 +3607,22 @@
   }
 
   /** Settings opened from Home: a full page over Home (no workspace, so no
-   *  layout tab to hold it). Its view loads on demand like a pane's. */
+   *  layout tab to hold it). Its view loads on demand like a pane's. Home
+   *  stays mounted underneath, parked (hidden + inert): the cluster page, an
+   *  open Add-machine form and a connect's progress line are still there on
+   *  return, and Home's mount-time fetches don't run again. */
   let homeSettingsOpen = $state(false);
   let homeSettingsLoad = $state<ReturnType<typeof loadPaneView> | null>(null);
   // Workspace windows defer Home until it is visible. The shared view cache
   // retains successes; the same asset recovery used by panes owns retries.
   let homeLoad = $state<ReturnType<typeof loadPaneView> | null>(null);
   $effect(() => {
-    if (activeWsId === null && !homeSettingsOpen && homeLoad === null) {
-      homeLoad = untrack(() => loadPaneView("home"));
-    }
+    if (activeWsId !== null) return;
+    // One-shot: homeLoad is read and written untracked so the effect depends
+    // on activeWsId alone and can never re-run on its own write.
+    untrack(() => {
+      if (homeLoad === null) homeLoad = loadPaneView("home");
+    });
   });
 
   /** Open/focus the settings surface (gear button, ⌘,). In a workspace it is
@@ -5353,6 +5359,54 @@
     <!-- Home: a real launcher, not an empty IDE. The rail and stage only
          exist once a workspace scopes this window. A Mastermind is never a
          worker: keep it out of the per-workspace live/attention rollups. -->
+    <!-- Home stays mounted under its Settings page (parked: hidden + inert)
+         so the page is a sheet over Home, not a replacement. Both surfaces
+         sit in a boundary, like every pane view: a render error in one
+         settings panel must not freeze the whole Home window. -->
+    {#if homeLoad !== null}
+      {#await homeLoad}
+        {#if !homeSettingsOpen}<p role="status">Loading Home…</p>{/if}
+      {:then HomeScreen}
+        <div class="home-host" class:parked={homeSettingsOpen} inert={homeSettingsOpen}>
+          <svelte:boundary onerror={(e) => console.error("home failed", e)}>
+            <HomeScreen
+              {workspaces}
+              sessions={sessions.filter((s) => !isMastermind(s))}
+              hostLabel={getHostLabel()}
+              {health}
+              daemonReachable={eventsUp || healthUp}
+              onOpen={activateWorkspace}
+              onRemove={removeWorkspace}
+              onStop={stopWorkspace}
+              onOpenFolder={openPicker}
+              onSettings={openSettingsSurface}
+            />
+            {#snippet failed(_error, reset)}
+              <div class="home-settings-shell">
+                <HomeNavigation active="workspaces" onHome={reset} onSettings={openSettingsSurface} />
+                <div class="home-settings-content home-surface-failed">
+                  <p role="alert">Home hit an error and stopped.</p>
+                  <button onclick={reset}>Try again</button>
+                  <button onclick={openPicker}>Open a folder</button>
+                </div>
+              </div>
+            {/snippet}
+          </svelte:boundary>
+        </div>
+      {:catch error}
+        {#if !homeSettingsOpen}
+          <div class="home-settings-shell">
+            <HomeNavigation active="workspaces"
+              onHome={() => (homeLoad = retryPaneView("home", error))} onSettings={openSettingsSurface} />
+            <div class="home-settings-content home-surface-failed">
+              <p role="alert">Couldn't open Home.</p>
+              <button onclick={() => (homeLoad = retryPaneView("home", error))}>Retry</button>
+              <button onclick={openPicker}>Open a folder</button>
+            </div>
+          </div>
+        {/if}
+      {/await}
+    {/if}
     {#if homeSettingsOpen}
       <div class="home-settings-shell">
         <HomeNavigation active="settings"
@@ -5371,43 +5425,29 @@
           {#await homeSettingsLoad}
             <p>Loading settings…</p>
           {:then SettingsView}
-            {#if SettingsView}<SettingsView />{/if}
-          {:catch}
-            <p role="alert">Couldn't open settings.</p>
-            <button onclick={openSettingsSurface}>Retry</button>
+            {#if SettingsView}
+              <svelte:boundary onerror={(e) => console.error("settings failed", e)}>
+                <SettingsView />
+                {#snippet failed(_error, reset)}
+                  <div class="home-surface-failed">
+                    <p role="alert">Settings hit an error and stopped.</p>
+                    <button onclick={reset}>Try again</button>
+                  </div>
+                {/snippet}
+              </svelte:boundary>
+            {/if}
+          {:catch error}
+            <div class="home-surface-failed">
+              <p role="alert">Couldn't open settings.</p>
+              <!-- The same asset recovery as a pane's retry: a failed CSS
+                   preload is memoized by Vite, so a plain re-import would
+                   fail the same way every time. -->
+              <button onclick={() => (homeSettingsLoad = retryPaneView("settings", error))}>Retry</button>
+            </div>
           {/await}
         </div>
       </div>
       </div>
-    {:else}
-    {#if homeLoad !== null}
-      {#await homeLoad}
-        <p role="status">Loading Home…</p>
-      {:then HomeScreen}
-    <HomeScreen
-      {workspaces}
-      sessions={sessions.filter((s) => !isMastermind(s))}
-      hostLabel={getHostLabel()}
-      {health}
-      daemonReachable={eventsUp || healthUp}
-      onOpen={activateWorkspace}
-      onRemove={removeWorkspace}
-      onStop={stopWorkspace}
-      onOpenFolder={openPicker}
-      onSettings={openSettingsSurface}
-    />
-      {:catch error}
-        <div class="home-settings-shell">
-          <HomeNavigation active="workspaces"
-            onHome={() => (homeLoad = retryPaneView("home", error))} onSettings={openSettingsSurface} />
-          <div class="home-settings-content">
-            <p role="alert">Couldn't open Home.</p>
-            <button onclick={() => (homeLoad = retryPaneView("home", error))}>Retry</button>
-            <button onclick={openPicker}>Open a folder</button>
-          </div>
-        </div>
-      {/await}
-    {/if}
     {/if}
   {:else}
   <div class="body" bind:clientWidth={bodyWidth}>
@@ -6643,11 +6683,28 @@
 {/if}
 
 <style>
+  /* Parked Home under its Settings page: opacity + inert (never visibility,
+     which inherits and makes WebKit re-resolve the subtree). The opacity
+     stacking context also contains Home's fixed-position version stamp. */
+  .home-host.parked {
+    opacity: 0;
+  }
   .home-settings-shell {
     position: absolute;
     inset: 0;
     display: flex;
     background: var(--bg);
+  }
+  .home-surface-failed {
+    padding: 24px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px;
+  }
+  .home-surface-failed p {
+    margin: 0;
+    flex-basis: 100%;
   }
   .home-settings-surface {
     flex: 1;

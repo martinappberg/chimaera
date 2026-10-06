@@ -224,7 +224,8 @@ app-build` (never the root `cargo`).
   Reload Window evaluates a fixed script in the focused window instead (see below).
   **Settings** is daemon-scoped: it opens the settings surface for the focused window's daemon (a
   remote window → the remote daemon's settings), same as the in-UI gear. It is enabled on Home too
-  (Home's Settings page) and disabled only for the WSL setup wizard (`shell::focused_daemon_open`).
+  (Home's Settings page) and disabled for the WSL setup wizard and a login-node terminal window
+  (`shell::focused_daemon_open`).
 - **System tray / menu-bar status item** (`tray.rs`, `tray-icon` feature): a persistent icon whose
   menu lists the **open workspace windows** (click one to raise it) — each with its count of agents
   awaiting approval ("crc_finish — 2 awaiting approval"; the tooltip totals them) — then New Window

@@ -21,9 +21,11 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   folder picker. A row with live sessions shows **End sessions**; the "…" menu also offers
   **Remove from list** (the folder on disk is untouched). Layout and navigation:
   [native-app.md › Home launcher](native-app.md#home-launcher).
-- **Lazy Home.** `HomeScreen.svelte` loads only while Home is visible, through the cached view
-  loader and asset retry path (`layout/lazyViews.ts`). Home navigation stays eager; a failed load
-  keeps Retry, Settings and Open a folder.
+- **Lazy Home.** `HomeScreen.svelte` loads only in a Home window, through the cached view
+  loader and asset retry path (`layout/lazyViews.ts`); it stays mounted, parked (hidden + inert),
+  under Home's Settings page so its state survives the round trip. Home navigation stays eager; a
+  failed load keeps Retry, Settings and Open a folder, and a render error inside either surface is
+  contained by a boundary (Try again) like a pane view's.
 - **Where it lives.** `web-ui/src/lib/workspace/HomeScreen.svelte` + `sessions.ts`
   (`listWorkspaces`/`deleteWorkspace`/`touchWorkspace`). Routes: `GET/POST /api/v1/workspaces`,
   `DELETE /api/v1/workspaces/{id}`, `POST /api/v1/workspaces/{id}/open` (stamps recency).

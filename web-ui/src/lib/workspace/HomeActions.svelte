@@ -3,17 +3,30 @@
   let { label, children }: { label: string; children: Snippet } = $props();
   let details: HTMLDetailsElement;
   let trigger: HTMLElement;
+  let open = $state(false);
   function dismiss(event: MouseEvent): void {
-    if (details?.open && event.target instanceof Node && !details.contains(event.target)) details.open = false;
+    if (event.target instanceof Node && !details.contains(event.target)) details.open = false;
   }
   function escape(event: KeyboardEvent): void {
-    if (event.key !== "Escape" || !details?.open) return;
+    if (event.key !== "Escape") return;
     event.preventDefault(); event.stopPropagation(); details.open = false; trigger.focus();
   }
+  // Outside-click and Escape listeners exist only while this menu is open: a
+  // Home full of rows would otherwise run every row's handlers on every click
+  // and key anywhere in the window. `toggle` fires after the opening click has
+  // finished dispatching, so that click never dismisses its own menu.
+  $effect(() => {
+    if (!open) return;
+    window.addEventListener("click", dismiss);
+    window.addEventListener("keydown", escape);
+    return () => {
+      window.removeEventListener("click", dismiss);
+      window.removeEventListener("keydown", escape);
+    };
+  });
 </script>
 
-<svelte:window onclick={dismiss} onkeydown={escape} />
-<details class="actions" bind:this={details} onfocusout={(event) => {
+<details class="actions" bind:this={details} ontoggle={() => (open = details.open)} onfocusout={(event) => {
   if (event.relatedTarget instanceof Node && !details.contains(event.relatedTarget)) details.open = false;
 }}>
   <summary bind:this={trigger} aria-label={label} title={label}>

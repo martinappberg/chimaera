@@ -226,9 +226,10 @@ fn focused_window(app: &AppHandle) -> Option<WebviewWindow> {
 }
 
 /// Enable Settings for a focused daemon page, including Home, which shows it
-/// as a full page. The WSL wizard (no scope-map entry) stays excluded. Called
-/// whenever focus or the focused window's scope changes. Cheap; a no-op before
-/// the menu is managed.
+/// as a full page. The WSL wizard (no scope-map entry) and a login-node
+/// terminal window (no settings surface) stay excluded. Called whenever focus
+/// or the focused window's scope changes. Cheap; a no-op before the menu is
+/// managed.
 pub(crate) fn sync_settings_enabled(app: &AppHandle) {
     if let Some(state) = app.try_state::<MenuState>() {
         let _ = state
