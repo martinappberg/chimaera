@@ -1811,6 +1811,9 @@ pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> 
         {
             continue;
         }
+        // The cloud refused a hand-back because its conversation is mid-turn:
+        // asked again after a growing wait, not every pass.
+        let mut busy = false;
         let result = async {
             let operation_config = execution::effective(state, config, &workspace)?;
             let baton: Baton = account(
@@ -1879,7 +1882,7 @@ pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> 
                     });
                     match host {
                         Some(host) => {
-                            handback::prepare(
+                            let prepared = handback::prepare(
                                 state,
                                 config,
                                 &workspace,
@@ -1887,7 +1890,9 @@ pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> 
                                 current,
                                 baton.epoch,
                             )
-                            .await?
+                            .await?;
+                            busy = prepared.is_none();
+                            prepared
                         }
                         None => None,
                     }
@@ -1908,6 +1913,18 @@ pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> 
         }
         .await;
         match result {
+            Ok(()) if busy => {
+                // Ten seconds doubling to thirty while the cloud works: at most half a
+                // minute late after its pause, three requests a minute at most.
+                let mut backoff = lock(&state.pro.return_backoff);
+                if backoff.len() >= 128 && !backoff.contains_key(&workspace) {
+                    backoff.clear();
+                }
+                let delay = backoff
+                    .get(&workspace)
+                    .map_or(10, |(_, delay)| (delay * 2).clamp(10, 30));
+                backoff.insert(workspace.clone(), (super::now() + delay, delay));
+            }
             Ok(()) => {
                 lock(&state.pro.return_backoff).remove(&workspace);
                 if super::owned_epoch(state, &workspace).is_some() {
