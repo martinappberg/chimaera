@@ -33,6 +33,11 @@ pub(crate) async fn resume(
     Path(id): Path<String>,
     request: Request,
 ) -> Response {
+    // Only Pro parks a conversation for manual resume. A free daemon has
+    // nothing to resume and must take no lock or create no Pro state.
+    if crate::pro::tier(&state) == crate::pro::Tier::Free {
+        return refusal(StatusCode::NOT_FOUND, "manual_resume_missing");
+    }
     #[cfg(not(unix))]
     {
         let _ = (state, id, request);
