@@ -644,7 +644,7 @@
     {/if}
     {#if iframeSrc !== null && (phase.kind === "ready" || phase.kind === "connecting")}
       <iframe
-        name={frameName}
+        name={browserGateway ? frameName : undefined}
         class="frame"
         class:hidden={phase.kind !== "ready"}
         src={iframeSrc}
