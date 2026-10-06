@@ -155,6 +155,7 @@
     movePaneToIndex,
     movePaneToRootEdge,
     openChanges,
+    openSubagent,
     openFile,
     pinTab,
     openTabAs,
@@ -351,7 +352,7 @@
     updateState,
   } from "./lib/workspace/update.svelte";
   import * as pool from "./lib/terminal/termPool";
-  import * as chatPool from "./lib/chat/chatPool";
+  import * as chatPool from "./lib/chat/chatPoolRegistry";
   import {
     appearanceBootstrapForNavigation,
     applyRemoteSettings,
@@ -2545,6 +2546,26 @@
     return displayNames.get(target.id) ?? displayName(target);
   }
 
+  /** Open (or focus) one of a chat's subagents as a read-only view of its
+   *  own — a tab next to the chat it belongs to (it is that chat's work, not
+   *  a neighbour's), or a split beside it on a modified click. */
+  function openSubagentFromPane(
+    paneId: string,
+    sessionId: string,
+    agentId: string,
+    title: string,
+    newSplit: boolean,
+  ): void {
+    const existing = paneForTab(layout.root, { surface: "subagent", sessionId, agentId, title });
+    if (existing !== null) {
+      layout = activateTab(layout, existing.paneId, existing.index);
+      return;
+    }
+    if (newSplit) layout = splitPane(layout, paneId, "row");
+    else layout = focusPane(layout, paneId);
+    layout = openSubagent(layout, sessionId, agentId, title);
+  }
+
   /** The "N files changed" chip: open (or focus) this session's changes review,
    *  beside the source pane — adjacent pane, or a split when it stands alone. */
   function openChangesFromPane(paneId: string, sessionId: string, newSplit: boolean): void {
@@ -4294,6 +4315,9 @@
     openChangesFrom(paneId, sessionId, newSplit) {
       openChangesFromPane(paneId, sessionId, newSplit);
     },
+    openSubagentFrom(paneId, sessionId, agentId, title, newSplit) {
+      openSubagentFromPane(paneId, sessionId, agentId, title, newSplit);
+    },
     revealPathInTree(path) {
       revealInTree(path);
     },
@@ -4925,6 +4949,8 @@
               ? "Source Control"
               : tab.surface === "changes"
                 ? "Changes"
+                : tab.surface === "subagent"
+                  ? tab.title
                 : tab.surface === "dashboard"
                   ? "Dashboard"
                   : tab.surface === "timeline"

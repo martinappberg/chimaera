@@ -219,6 +219,10 @@ use crate::model::{
     UNHANDLED_REQUEST_NAME_MAX,
 };
 use crate::ndjson::{JsonlSink, JsonlStream};
+use crate::subagent::{
+    valid_agent_id, DriverQuery, SubagentTranscript, QUERY_QUEUE, SUBAGENT_ID_MAX,
+    SUBAGENT_MODEL_MAX,
+};
 
 pub struct CodexAdapter;
 
@@ -953,6 +957,19 @@ enum PendingRpc {
     /// thread/compact/start ack; the compaction itself runs as its own turn
     /// whose contextCompaction item lands the "context compacted" notice.
     Compact,
+    /// `thread/read` of a collab child thread's metadata — the only place
+    /// its model and role are named (no child `thread/started` reaches this
+    /// connection). An error leaves them unknown, silently.
+    SubagentMeta {
+        thread: String,
+    },
+    /// `thread/read {includeTurns: true}` of a collab child thread, answering
+    /// a [`DriverQuery::SubagentTranscript`] on `reply`.
+    SubagentTranscript {
+        thread: String,
+        live: bool,
+        reply: tokio::sync::oneshot::Sender<std::result::Result<SubagentTranscript, String>>,
+    },
 }
 
 /// A Codex follow-up Chimaera holds: queued for a later turn (FIFO: it opens
@@ -1035,6 +1052,13 @@ struct CollabAgent {
     /// phase is `final_answer` or unknown), capped at
     /// [`SUBAGENT_RESULT_MAX`]; only the last one is kept.
     answer: Option<String>,
+    /// The child thread's model and `agentRole`, from its metadata read
+    /// (capped) — re-announced on every stint's row.
+    model: Option<String>,
+    agent_type: Option<String>,
+    /// Metadata reads sent for this thread: one at the spawn, one retry at
+    /// its turn start when the first did not name a model.
+    meta_reads: u8,
 }
 
 /// How a subagent stint ended — the `SubagentFinished.status` word and the
@@ -1081,6 +1105,9 @@ impl CollabAgent {
             stint_tools: 0,
             stint_tokens: 0,
             answer: None,
+            model: None,
+            agent_type: None,
+            meta_reads: 0,
         };
         agent.begin_stint();
         agent
@@ -1150,6 +1177,45 @@ impl CollabAgent {
             content: self.progress_content(),
         }
     }
+}
+
+/// The current row's `SubagentInfo`: the child thread id is the handle the
+/// transcript read takes. `None` for a thread id that could not be sent back
+/// as one ([`valid_agent_id`]).
+fn subagent_info(agent: &CollabAgent) -> Option<AgentEvent> {
+    valid_agent_id(&agent.thread_id).then(|| AgentEvent::SubagentInfo {
+        id: agent.row_id.clone(),
+        agent_id: Some(agent.thread_id.clone()),
+        model: agent.model.clone(),
+        agent_type: agent.agent_type.clone(),
+    })
+}
+
+/// Fold a child `Thread` object's `model` and `agentRole` into `agent`,
+/// capped; true when either changed.
+fn learn_subagent_facts(agent: &mut CollabAgent, thread: &Value) -> bool {
+    let mut changed = false;
+    let mut learn = |slot: &mut Option<String>, value: Option<&str>, cap: usize| {
+        let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+            return;
+        };
+        let value = truncate_label(value, cap);
+        if slot.as_deref() != Some(value.as_str()) {
+            *slot = Some(value);
+            changed = true;
+        }
+    };
+    learn(
+        &mut agent.model,
+        thread["model"].as_str(),
+        SUBAGENT_MODEL_MAX,
+    );
+    learn(
+        &mut agent.agent_type,
+        thread["agentRole"].as_str(),
+        SUBAGENT_ID_MAX,
+    );
+    changed
 }
 
 /// Protocol → normalized-model translator for the app-server stream. Pure
@@ -2006,6 +2072,19 @@ impl CodexMapper {
                 if summary.is_empty() {
                     return step;
                 }
+                // A subagent transcript read is the one request carrying
+                // `includeTurns`; its hydration deprecation (live 0.158.0,
+                // just ahead of the answer) is the driver's business, not
+                // the user's.
+                if method == "deprecationNotice"
+                    && summary.contains("includeTurns")
+                    && self
+                        .pending_rpcs
+                        .values()
+                        .any(|p| matches!(p, PendingRpc::SubagentTranscript { .. }))
+                {
+                    return step;
+                }
                 if method == "deprecationNotice" {
                     let key = truncate_label(summary, 240);
                     if self.noticed_deprecations.contains(&key) {
@@ -2681,6 +2760,38 @@ impl CodexMapper {
             // Compact's ack is an empty result; the compaction turn's
             // contextCompaction item carries the visible notice.
             (PendingRpc::TurnStart | PendingRpc::Interrupt | PendingRpc::Compact, None) => {}
+            (PendingRpc::SubagentMeta { thread }, None) => {
+                self.on_subagent_meta(&thread, &frame["result"]["thread"], step);
+            }
+            // An older app-server without thread/read, or a child not yet
+            // readable: the model just stays unknown (a retry rides the
+            // child's turn start).
+            (PendingRpc::SubagentMeta { .. }, Some(_)) => {}
+            (
+                PendingRpc::SubagentTranscript {
+                    thread,
+                    live,
+                    reply,
+                },
+                None,
+            ) => {
+                let read = &frame["result"]["thread"];
+                if read["id"].as_str() != Some(thread.as_str()) {
+                    let _ = reply.send(Err("codex answered for a different thread".into()));
+                    return;
+                }
+                // The read names the model too; a failed metadata read
+                // learns it here.
+                self.on_subagent_meta(&thread, read, step);
+                let _ = reply.send(Ok(thread_to_events(read, live)));
+            }
+            (PendingRpc::SubagentTranscript { reply, .. }, Some(err)) => {
+                let msg = err["message"].as_str().unwrap_or("request failed");
+                let _ = reply.send(Err(format!(
+                    "codex could not read the subagent: {}",
+                    truncate_label(msg, 200)
+                )));
+            }
         }
     }
 
@@ -3502,6 +3613,11 @@ impl CodexMapper {
                     cross_turn: true,
                     command: None,
                 });
+                // SubagentInfo is keyed by row: the new stint's row needs
+                // its own copy of what is known.
+                if let Some(info) = subagent_info(&self.collab_agents[idx]) {
+                    step.events.push(info);
+                }
             }
             let agent = &mut self.collab_agents[idx];
             if !note.is_empty() {
@@ -3548,10 +3664,61 @@ impl CodexMapper {
             command: None,
         });
         let mut agent = CollabAgent::new(thread, row_id, name, note);
+        // The handle goes out at once so the row can be opened as its own
+        // view before the metadata read names the model.
+        if let Some(info) = subagent_info(&agent) {
+            step.events.push(info);
+        }
         if !note.is_empty() {
             step.events.push(agent.progress_event());
         }
         self.collab_agents.push(agent);
+        self.request_subagent_meta(thread, step);
+    }
+
+    /// Ask for a tracked child thread's metadata (`thread/read` without
+    /// turns) unless a read is already out or both attempts are spent.
+    fn request_subagent_meta(&mut self, thread: &str, step: &mut DriverStep) {
+        if !valid_agent_id(thread)
+            || self
+                .pending_rpcs
+                .values()
+                .any(|p| matches!(p, PendingRpc::SubagentMeta { thread: t } if t == thread))
+        {
+            return;
+        }
+        let Some(agent) = self.collab_agent_mut(thread) else {
+            return;
+        };
+        if agent.model.is_some() || agent.meta_reads >= 2 {
+            return;
+        }
+        agent.meta_reads += 1;
+        let id = self.rpc_id();
+        self.pending_rpcs.insert(
+            id,
+            PendingRpc::SubagentMeta {
+                thread: thread.to_string(),
+            },
+        );
+        step.outbound.push(json!({
+            "id": id, "method": "thread/read",
+            "params": { "threadId": thread, "includeTurns": false },
+        }));
+    }
+
+    /// A child thread's metadata arrived: cache its model and role and
+    /// re-announce the current row when either is news.
+    fn on_subagent_meta(&mut self, thread: &str, meta: &Value, step: &mut DriverStep) {
+        let Some(agent) = self.collab_agent_mut(thread) else {
+            return;
+        };
+        if !learn_subagent_facts(agent, meta) {
+            return;
+        }
+        if let Some(info) = subagent_info(agent) {
+            step.events.push(info);
+        }
     }
 
     /// Close a subagent's current row: it answered (its own turn completed),
@@ -3733,6 +3900,9 @@ impl CodexMapper {
                     agent.turn_running = true;
                     let name = agent.name.clone();
                     self.collab_agent_open(thread, &name, "running", step);
+                    // The thread is surely readable once it runs a turn:
+                    // retry a spawn-time metadata read that came back empty.
+                    self.request_subagent_meta(thread, step);
                 }
             }
             // The agent's turn ended: it answered and sits idle awaiting
@@ -5336,6 +5506,56 @@ impl CodexMapper {
         step
     }
 
+    /// A subagent's conversation is a child THREAD only this app-server
+    /// connection can read: answer from `thread/read {includeTurns}` once it
+    /// returns (see [`thread_to_events`]). Only threads this driver tracks
+    /// are read — the handle came from its own `SubagentInfo`.
+    fn on_query(&mut self, query: DriverQuery) -> DriverStep {
+        let mut step = DriverStep::default();
+        let DriverQuery::SubagentTranscript { agent_id, .. } = &query;
+        if !valid_agent_id(agent_id) || self.collab_agent_mut(agent_id).is_none() {
+            query.refuse("no such subagent in this conversation");
+            return step;
+        }
+        // A read whose waiter gave up (the manager's timeout) has nobody to
+        // answer, and an answer that never comes (a history past the line
+        // cap is skipped by the reader) must not hold a slot forever.
+        self.pending_rpcs.retain(
+            |_, p| !matches!(p, PendingRpc::SubagentTranscript { reply, .. } if reply.is_closed()),
+        );
+        let in_flight = self
+            .pending_rpcs
+            .values()
+            .filter(|p| matches!(p, PendingRpc::SubagentTranscript { .. }))
+            .count();
+        if in_flight >= QUERY_QUEUE {
+            query.refuse("the agent is busy with other reads");
+            return step;
+        }
+        let DriverQuery::SubagentTranscript {
+            agent_id,
+            live,
+            reply,
+        } = query;
+        let id = self.rpc_id();
+        // `includeTurns` is deprecated for paginated threads in favour of
+        // thread/turns/list + thread/items/list, but 0.158.0 still answers
+        // it whole (`itemsView: "full"`), in one response.
+        step.outbound.push(json!({
+            "id": id, "method": "thread/read",
+            "params": { "threadId": agent_id, "includeTurns": true },
+        }));
+        self.pending_rpcs.insert(
+            id,
+            PendingRpc::SubagentTranscript {
+                thread: agent_id,
+                live,
+                reply,
+            },
+        );
+        step
+    }
+
     /// The interrupt watchdog (see `INTERRUPT_GRACE_TICKS`). When the grace
     /// armed on `Interrupt` expires with a turn still open — the app-server
     /// never emitted `turn/completed`, so the session would stay "running"
@@ -5421,6 +5641,9 @@ impl Mapper for CodexMapper {
     fn on_command(&mut self, cmd: AgentCommand) -> DriverStep {
         self.on_command(cmd)
     }
+    fn on_query(&mut self, query: DriverQuery) -> DriverStep {
+        self.on_query(query)
+    }
     fn flush(&mut self) -> Option<AgentEvent> {
         self.flush()
     }
@@ -5436,6 +5659,279 @@ impl Mapper for CodexMapper {
         step.events.extend(flush.events);
         step.outbound.extend(flush.outbound);
         step
+    }
+}
+
+/// Positions a subagent transcript read translates: one per turn plus one
+/// per item.
+const SUBAGENT_READ_POSITIONS: usize = 400;
+/// Serialized item JSON a subagent transcript read translates. Events are
+/// capped at construction, so their size follows this.
+const SUBAGENT_READ_BYTES: usize = 2 * 1024 * 1024;
+/// The read window's start moves in steps of this many positions, so
+/// consecutive reads of a growing thread keep one epoch for a while.
+const SUBAGENT_READ_STEP: usize = 64;
+
+fn turn_items(turn: &Value) -> &[Value] {
+    turn["items"].as_array().map(Vec::as_slice).unwrap_or(&[])
+}
+
+/// The length of `value` serialized, without building the string.
+fn json_len(value: &Value) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    let _ = serde_json::to_writer(&mut count, value);
+    count.0
+}
+
+/// Where a subagent read starts, in positions (each turn is its header then
+/// its items): 0 while everything fits the budget, else the first
+/// [`SUBAGENT_READ_STEP`]-aligned position from which the newest positions
+/// do. Positions only accrue at the end, so the start moves once per step of
+/// growth. At least the newest position is always kept.
+fn subagent_read_start(turns: &[Value]) -> usize {
+    let total: usize = turns.iter().map(|t| 1 + turn_items(t).len()).sum();
+    let (mut count, mut bytes, mut fits) = (0usize, 0usize, total);
+    'walk: for turn in turns.iter().rev() {
+        for item in turn_items(turn).iter().rev() {
+            count += 1;
+            bytes += json_len(item);
+            if count > SUBAGENT_READ_POSITIONS || bytes > SUBAGENT_READ_BYTES {
+                break 'walk;
+            }
+            fits -= 1;
+        }
+        count += 1;
+        if count > SUBAGENT_READ_POSITIONS {
+            break 'walk;
+        }
+        fits -= 1;
+    }
+    if fits == 0 {
+        return 0;
+    }
+    let min = fits.min(total - 1);
+    let stepped = min.div_ceil(SUBAGENT_READ_STEP) * SUBAGENT_READ_STEP;
+    // Items so large that fewer than a step fit: exact, not stepped.
+    if stepped < total {
+        stepped
+    } else {
+        min
+    }
+}
+
+/// What a read-only replay of a subagent keeps: its conversation, not the
+/// live session's telemetry or the rows' handles (a nested subagent cannot
+/// be opened from here — the parent's driver does not track it).
+fn replay_keeps(event: &AgentEvent) -> bool {
+    matches!(
+        event,
+        AgentEvent::TurnStarted { .. }
+            | AgentEvent::TurnCompleted { .. }
+            | AgentEvent::TurnAborted { .. }
+            | AgentEvent::MessageChunk { .. }
+            | AgentEvent::ThoughtChunk { .. }
+            | AgentEvent::ToolCall { .. }
+            | AgentEvent::ToolCallUpdate { .. }
+            | AgentEvent::Plan { .. }
+            | AgentEvent::ContextCompaction { .. }
+            | AgentEvent::SubagentFinished { .. }
+            | AgentEvent::Notice { .. }
+            | AgentEvent::Error { .. }
+    )
+}
+
+/// A child thread from `thread/read {includeTurns: true}` as the events a
+/// chat of its own would have journaled: an offline [`CodexMapper`] scoped to
+/// the child replays each turn as `turn/started`, the items as
+/// `item/started` (+ reasoning deltas) + `item/completed`, then the turn end
+/// — the live mapping, not a second one. Its outbound frames are dropped.
+///
+/// Built to be re-read while the subagent works: deterministic for settled
+/// items, prose flushed at every item (a later item cannot merge into an
+/// earlier chunk), and the window start ([`subagent_read_start`]) named by
+/// `epoch` — while it holds, each read's events are a prefix of the next's.
+/// An item still running ends its turn's replay with only its start; with
+/// `live` the newest turn stays open, otherwise every turn and cut-off row
+/// closes, after everything a live read returned. The child's prompt is not
+/// among its items and is not invented.
+fn thread_to_events(thread: &Value, live: bool) -> SubagentTranscript {
+    let thread_id = thread["id"].as_str().unwrap_or_default();
+    let model = thread["model"]
+        .as_str()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(|m| truncate_label(m, SUBAGENT_MODEL_MAX));
+    let turns: &[Value] = thread["turns"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    let start = subagent_read_start(turns);
+    let mut events = Vec::new();
+    if start > 0 {
+        events.push(AgentEvent::Truncated);
+    }
+    let mut replay = CodexMapper::new(
+        thread_id.to_string(),
+        CodexCatalog::default(),
+        None,
+        None,
+        None,
+        None,
+        0,
+    );
+    let keep = |step: DriverStep, events: &mut Vec<AgentEvent>| {
+        events.extend(step.events.into_iter().filter(replay_keeps));
+    };
+    let mut epoch = String::new();
+    let mut pos = 0;
+    for (index, turn) in turns.iter().enumerate() {
+        let items = turn_items(turn);
+        let next = pos + 1 + items.len();
+        if next <= start {
+            pos = next;
+            continue;
+        }
+        let skip = start.saturating_sub(pos + 1);
+        pos = next;
+        let turn_id = turn["id"].as_str().unwrap_or_default();
+        if epoch.is_empty() {
+            epoch = format!("{}:{start}", truncate_label(turn_id, SUBAGENT_ID_MAX));
+        }
+        keep(
+            replay.on_frame(&json!({
+                "method": "turn/started",
+                "params": { "threadId": thread_id, "turn": { "id": turn_id } },
+            })),
+            &mut events,
+        );
+        let item_frame = |method: &str, item: &Value| {
+            json!({
+                "method": method,
+                "params": { "threadId": thread_id, "turnId": turn_id, "item": item },
+            })
+        };
+        let mut cut_row = None;
+        for item in &items[skip..] {
+            let started = replay.on_frame(&item_frame("item/started", item));
+            if matches!(item["status"].as_str(), Some("inProgress" | "in_progress")) {
+                let id = item["id"].as_str().unwrap_or_default();
+                cut_row = started
+                    .events
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::ToolCall { id: row, .. } if row == id))
+                    .then(|| id.to_string());
+                keep(started, &mut events);
+                break;
+            }
+            keep(started, &mut events);
+            if item["type"] == "reasoning" {
+                replay_reasoning(&mut replay, thread_id, turn_id, item, &mut events);
+            }
+            keep(
+                replay.on_frame(&item_frame("item/completed", item)),
+                &mut events,
+            );
+            if let Some(flushed) = replay.flush() {
+                events.push(flushed);
+            }
+        }
+        if live && index + 1 == turns.len() {
+            break;
+        }
+        if let Some(id) = cut_row {
+            events.push(AgentEvent::ToolCallUpdate {
+                id,
+                status: ToolStatus::Completed,
+                content: None,
+            });
+        }
+        keep(
+            replay.on_frame(&json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": thread_id,
+                    "turn": {
+                        "id": turn_id,
+                        "status": turn["status"],
+                        "error": turn["error"],
+                        "durationMs": turn["durationMs"],
+                    },
+                },
+            })),
+            &mut events,
+        );
+    }
+    if !live {
+        // A nested subagent's own turn end streams on ITS thread, never in
+        // this one's items: in a settled read its row must not spin forever.
+        for agent in replay.collab_agents.iter().filter(|a| a.open) {
+            events.push(AgentEvent::ToolCallUpdate {
+                id: agent.row_id.clone(),
+                status: ToolStatus::Completed,
+                content: None,
+            });
+        }
+    }
+    SubagentTranscript {
+        events,
+        epoch,
+        model,
+    }
+}
+
+/// A settled reasoning item's text, fed as the deltas the live stream would
+/// have carried (the completed item itself renders nothing): each summary
+/// part as its own section, then any raw reasoning text.
+fn replay_reasoning(
+    replay: &mut CodexMapper,
+    thread_id: &str,
+    turn_id: &str,
+    item: &Value,
+    events: &mut Vec<AgentEvent>,
+) {
+    let item_id = item["id"].as_str().unwrap_or_default();
+    let mut feed = |frame: Value| {
+        events.extend(
+            replay
+                .on_frame(&frame)
+                .events
+                .into_iter()
+                .filter(replay_keeps),
+        );
+    };
+    let parts = |key: &str| {
+        item[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .enumerate()
+    };
+    for (index, part) in parts("summary") {
+        feed(json!({
+            "method": "item/reasoning/summaryPartAdded",
+            "params": { "threadId": thread_id, "turnId": turn_id, "itemId": item_id,
+                        "summaryIndex": index },
+        }));
+        feed(json!({
+            "method": "item/reasoning/summaryTextDelta",
+            "params": { "threadId": thread_id, "turnId": turn_id, "itemId": item_id,
+                        "summaryIndex": index, "delta": part },
+        }));
+    }
+    for (index, part) in parts("content") {
+        feed(json!({
+            "method": "item/reasoning/textDelta",
+            "params": { "threadId": thread_id, "turnId": turn_id, "itemId": item_id,
+                        "contentIndex": index, "delta": part },
+        }));
     }
 }
 
@@ -9604,15 +10100,18 @@ mod tests {
         let step = m.on_frame(&sub_agent_activity("started", "sub-1"));
         assert_eq!(
             step.events,
-            vec![AgentEvent::ToolCall {
-                id: "agent:sub-1".into(),
-                kind: ToolKind::Agent,
-                title: "Agent: agent_a".into(),
-                locations: Vec::new(),
-                status: ToolStatus::InProgress,
-                cross_turn: true,
-                command: None,
-            }]
+            vec![
+                AgentEvent::ToolCall {
+                    id: "agent:sub-1".into(),
+                    kind: ToolKind::Agent,
+                    title: "Agent: agent_a".into(),
+                    locations: Vec::new(),
+                    status: ToolStatus::InProgress,
+                    cross_turn: true,
+                    command: None,
+                },
+                subagent_info_event("agent:sub-1", "sub-1", None),
+            ]
         );
 
         // The agent thread's own frames fold into the row's progress line —
@@ -9702,6 +10201,7 @@ mod tests {
                     cross_turn: true,
                     command: None,
                 },
+                subagent_info_event("agent:sub-1#2", "sub-1", None),
                 AgentEvent::ToolCallUpdate {
                     id: "agent:sub-1#2".into(),
                     status: ToolStatus::InProgress,
@@ -9728,6 +10228,457 @@ mod tests {
             }
             other => panic!("expected close update, got {other:?}"),
         }
+    }
+
+    const CHILD: &str = "01a10e1a-9700-7682-87cf-eb8448a31ad6";
+
+    fn subagent_info_event(row: &str, thread: &str, model: Option<&str>) -> AgentEvent {
+        AgentEvent::SubagentInfo {
+            id: row.into(),
+            agent_id: Some(thread.into()),
+            model: model.map(String::from),
+            agent_type: None,
+        }
+    }
+
+    /// The `thread/read` requests in `step`: (rpc id, threadId, includeTurns).
+    fn thread_reads(step: &DriverStep) -> Vec<(u64, String, bool)> {
+        step.outbound
+            .iter()
+            .filter(|f| f["method"] == "thread/read")
+            .map(|f| {
+                (
+                    f["id"].as_u64().unwrap(),
+                    f["params"]["threadId"].as_str().unwrap().to_string(),
+                    f["params"]["includeTurns"] == true,
+                )
+            })
+            .collect()
+    }
+
+    fn reasoning_item(id: &str, summary: &[&str]) -> Value {
+        json!({ "type": "reasoning", "id": id, "summary": summary, "content": [] })
+    }
+
+    fn message_item(id: &str, text: &str, phase: &str) -> Value {
+        json!({ "type": "agentMessage", "id": id, "text": text, "phase": phase,
+                "memoryCitation": null, "delivery": null, "questions": null })
+    }
+
+    /// Live 0.158.0 `commandExecution` shape (as `thread/read` returns it).
+    fn child_command_item(id: &str, command: &str, output: &str, status: &str) -> Value {
+        json!({ "type": "commandExecution", "id": id, "pluginId": null, "scriptPath": null,
+                "command": format!("/bin/zsh -lc '{command}'"), "cwd": "/tmp/w",
+                "processId": "38093", "source": "unifiedExecStartup", "status": status,
+                "commandActions": [{ "type": "unknown", "command": command }],
+                "aggregatedOutput": output,
+                "exitCode": if status == "completed" { json!(0) } else { Value::Null },
+                "durationMs": 0 })
+    }
+
+    fn child_turn(id: &str, status: &str, items: Vec<Value>) -> Value {
+        json!({ "id": id, "items": items, "itemsView": "full", "status": status,
+                "error": null, "startedAt": 1791237986, "completedAt": null,
+                "durationMs": if status == "inProgress" { Value::Null } else { json!(8202) } })
+    }
+
+    /// A child `Thread` as `thread/read {includeTurns: true}` answers (live
+    /// 0.158.0, trimmed to the fields the driver reads plus a few).
+    fn child_thread(turns: Vec<Value>) -> Value {
+        json!({ "id": CHILD, "parentThreadId": "thr-1", "model": "gpt-6-astra",
+                "reasoningEffort": "xhigh", "agentNickname": "Harvey", "agentRole": null,
+                "status": { "type": "idle" }, "threadSource": "subagent", "turns": turns })
+    }
+
+    /// The live probe's child turn: reasoning, commentary, a command, the
+    /// final answer.
+    fn echo_turn(status: &str) -> Value {
+        child_turn(
+            "turn-c1",
+            status,
+            vec![
+                reasoning_item("rs-1", &["**Running the command**"]),
+                message_item(
+                    "msg-1",
+                    "I’ll run the command and report its output.",
+                    "commentary",
+                ),
+                child_command_item("exec-1", "echo child-done", "child-done\n", "completed"),
+                message_item("msg-2", "child-done", "final_answer"),
+            ],
+        )
+    }
+
+    fn transcript_query(
+        agent_id: &str,
+        live: bool,
+    ) -> (
+        DriverQuery,
+        tokio::sync::oneshot::Receiver<std::result::Result<SubagentTranscript, String>>,
+    ) {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        (
+            DriverQuery::SubagentTranscript {
+                agent_id: agent_id.into(),
+                live,
+                reply,
+            },
+            rx,
+        )
+    }
+
+    /// One line per event, enough to compare replays.
+    fn replay_shape(events: &[AgentEvent]) -> Vec<String> {
+        events
+            .iter()
+            .map(|e| match e {
+                AgentEvent::Truncated => "truncated".into(),
+                AgentEvent::TurnStarted { turn_id } => format!("turn {turn_id}"),
+                AgentEvent::ThoughtChunk { text, .. } => format!("thought {text}"),
+                AgentEvent::MessageChunk { text, .. } => format!("message {text}"),
+                AgentEvent::ToolCall {
+                    id, kind, status, ..
+                } => format!("tool {id} {kind:?} {status:?}"),
+                AgentEvent::ToolCallUpdate { id, status, .. } => format!("update {id} {status:?}"),
+                AgentEvent::TurnCompleted { turn_id, .. } => format!("completed {turn_id}"),
+                AgentEvent::TurnAborted { turn_id, .. } => format!("aborted {turn_id}"),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn subagent_row_announces_its_thread_then_its_model() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let step = m.on_frame(&sub_agent_activity("started", CHILD));
+        let row = format!("agent:{CHILD}");
+        assert!(
+            step.events
+                .contains(&subagent_info_event(&row, CHILD, None)),
+            "the handle goes out with the row: {:?}",
+            step.events
+        );
+        let reads = thread_reads(&step);
+        assert_eq!(reads.len(), 1);
+        let (id, thread, turns) = reads[0].clone();
+        assert_eq!((thread.as_str(), turns), (CHILD, false));
+
+        // Live 0.158.0 metadata answer: model + agentRole on the Thread.
+        let mut meta = child_thread(Vec::new());
+        meta["agentRole"] = json!("explorer");
+        let step = m.on_frame(&json!({ "id": id, "result": { "thread": meta } }));
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::SubagentInfo {
+                id: row.clone(),
+                agent_id: Some(CHILD.into()),
+                model: Some("gpt-6-astra".into()),
+                agent_type: Some("explorer".into()),
+            }]
+        );
+
+        // A known model needs no retry when the child's turn starts.
+        let step = m.on_frame(&json!({ "method": "turn/started",
+            "params": { "threadId": CHILD, "turn": { "id": "turn-c1" } } }));
+        assert!(thread_reads(&step).is_empty());
+        m.on_frame(&json!({ "method": "turn/completed",
+            "params": { "threadId": CHILD, "turn": { "id": "turn-c1", "status": "completed" } } }));
+
+        // The next stint's row carries what is cached.
+        let step = m.on_frame(&sub_agent_activity("interacted", CHILD));
+        assert!(
+            step.events.contains(&AgentEvent::SubagentInfo {
+                id: format!("{row}#2"),
+                agent_id: Some(CHILD.into()),
+                model: Some("gpt-6-astra".into()),
+                agent_type: Some("explorer".into()),
+            }),
+            "{:?}",
+            step.events
+        );
+        assert!(thread_reads(&step).is_empty());
+    }
+
+    #[test]
+    fn subagent_metadata_errors_are_silent_and_retried_once() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let step = m.on_frame(&sub_agent_activity("started", CHILD));
+        let (id, ..) = thread_reads(&step)[0];
+        // An older codex without thread/read must not raise a notice.
+        let step = m.on_frame(&json!({ "id": id,
+            "error": { "code": -32601, "message": "method not found" } }));
+        assert_eq!(step.events, vec![]);
+        assert!(step.outbound.is_empty());
+
+        let turn_started = json!({ "method": "turn/started",
+            "params": { "threadId": CHILD, "turn": { "id": "turn-c1" } } });
+        let step = m.on_frame(&turn_started);
+        let reads = thread_reads(&step);
+        assert_eq!(reads.len(), 1, "one retry at the child's turn start");
+        let step = m.on_frame(&json!({ "id": reads[0].0,
+            "error": { "code": -32600, "message": "thread not found" } }));
+        assert_eq!(step.events, vec![]);
+        m.on_frame(&json!({ "method": "turn/completed",
+            "params": { "threadId": CHILD, "turn": { "id": "turn-c1", "status": "completed" } } }));
+        let step = m.on_frame(&turn_started);
+        assert!(thread_reads(&step).is_empty(), "two attempts at most");
+    }
+
+    #[test]
+    fn untracked_subagents_get_no_handle_or_read() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        for i in 0..COLLAB_AGENTS_CAP {
+            m.on_frame(&sub_agent_activity("started", &format!("sub-{i}")));
+        }
+        let step = m.on_frame(&sub_agent_activity("started", "sub-over"));
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::SubagentInfo { .. })),
+            "{:?}",
+            step.events
+        );
+        assert!(step.outbound.is_empty());
+        // Nor can it be read.
+        let (query, mut rx) = transcript_query("sub-over", false);
+        let step = m.on_query(query);
+        assert!(step.outbound.is_empty());
+        assert!(rx.try_recv().unwrap().is_err());
+    }
+
+    #[test]
+    fn transcript_queries_refuse_unknown_threads_and_a_full_queue() {
+        let mut m = mapper();
+        let (query, mut rx) = transcript_query(CHILD, false);
+        let step = m.on_query(query);
+        assert!(step.outbound.is_empty());
+        assert!(
+            rx.try_recv().unwrap().is_err(),
+            "an unknown thread is refused"
+        );
+
+        active_turn(&mut m);
+        m.on_frame(&sub_agent_activity("started", CHILD));
+        let mut waiting = Vec::new();
+        for _ in 0..QUERY_QUEUE {
+            let (query, rx) = transcript_query(CHILD, true);
+            let step = m.on_query(query);
+            assert_eq!(thread_reads(&step).len(), 1);
+            assert!(thread_reads(&step)[0].2, "a transcript read includes turns");
+            waiting.push(rx);
+        }
+        let (query, mut rx) = transcript_query(CHILD, true);
+        assert!(m.on_query(query).outbound.is_empty());
+        assert!(rx.try_recv().unwrap().is_err(), "past the queue: refused");
+
+        // A waiter that gave up frees its slot.
+        waiting.pop();
+        let (query, _rx) = transcript_query(CHILD, true);
+        assert_eq!(thread_reads(&m.on_query(query)).len(), 1);
+
+        // Teardown drops every outstanding reply: its waiter hears so.
+        drop(m);
+        assert!(matches!(
+            waiting[0].try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
+    }
+
+    #[test]
+    fn transcript_read_replays_the_child_through_the_live_mapping() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        m.on_frame(&sub_agent_activity("started", CHILD));
+        let (query, mut rx) = transcript_query(CHILD, false);
+        let step = m.on_query(query);
+        let (id, ..) = thread_reads(&step)[0];
+
+        // The hydration deprecation that precedes the answer stays quiet.
+        let step = m.on_frame(&json!({ "method": "deprecationNotice", "params": {
+            "summary": "Full-history hydration is deprecated for paginated threads; omit `includeTurns` or set it to `false`, then page with `thread/turns/list` and `thread/items/list`.",
+            "details": null } }));
+        assert_eq!(step.events, vec![]);
+
+        let step = m.on_frame(&json!({ "id": id,
+            "result": { "thread": child_thread(vec![echo_turn("completed")]) } }));
+        // The read named the model the metadata read had not yet.
+        assert_eq!(
+            step.events,
+            vec![subagent_info_event(
+                &format!("agent:{CHILD}"),
+                CHILD,
+                Some("gpt-6-astra")
+            )]
+        );
+        let transcript = rx.try_recv().unwrap().unwrap();
+        assert_eq!(transcript.model.as_deref(), Some("gpt-6-astra"));
+        assert_eq!(transcript.epoch, "turn-c1:0");
+        assert_eq!(
+            replay_shape(&transcript.events),
+            vec![
+                "turn turn-c1",
+                "thought **Running the command**",
+                "message I’ll run the command and report its output.",
+                "tool exec-1 Execute InProgress",
+                "update exec-1 Completed",
+                "message \n\nchild-done",
+                "completed turn-c1",
+            ]
+        );
+        match &transcript.events[4] {
+            AgentEvent::ToolCallUpdate {
+                content: Some(ToolContent::Output { text, .. }),
+                ..
+            } => assert_eq!(text, "child-done\n"),
+            other => panic!("expected the command output, got {other:?}"),
+        }
+
+        // An error answers the waiter with a reason.
+        let (query, mut rx) = transcript_query(CHILD, false);
+        let (id, ..) = thread_reads(&m.on_query(query))[0];
+        m.on_frame(&json!({ "id": id, "error": { "code": -32600, "message": "no rollout" } }));
+        assert!(rx.try_recv().unwrap().unwrap_err().contains("no rollout"));
+    }
+
+    #[test]
+    fn live_transcript_reads_leave_the_running_turn_open() {
+        let running = child_turn(
+            "turn-c1",
+            "inProgress",
+            vec![
+                message_item("msg-1", "Running it.", "commentary"),
+                child_command_item("exec-1", "sleep 12", "", "inProgress"),
+            ],
+        );
+        let live = thread_to_events(&child_thread(vec![running.clone()]), true);
+        assert_eq!(
+            replay_shape(&live.events),
+            vec![
+                "turn turn-c1",
+                "message Running it.",
+                "tool exec-1 Execute InProgress",
+            ]
+        );
+        // Settled: everything a live read returned, then the closes.
+        let settled = thread_to_events(&child_thread(vec![running]), false);
+        assert_eq!(
+            replay_shape(&settled.events),
+            vec![
+                "turn turn-c1",
+                "message Running it.",
+                "tool exec-1 Execute InProgress",
+                "update exec-1 Completed",
+                "completed turn-c1",
+            ]
+        );
+    }
+
+    #[test]
+    fn transcript_reads_are_append_stable() {
+        let item = |n: usize| {
+            [
+                reasoning_item("rs-1", &["**Planning**"]),
+                message_item("msg-1", "I’ll run it.", "commentary"),
+                child_command_item("exec-1", "echo hi", "hi\n", "completed"),
+                message_item("msg-2", "hi", "final_answer"),
+            ][n]
+                .clone()
+        };
+        let reads = [
+            vec![child_turn("t1", "inProgress", vec![item(0), item(1)])],
+            vec![child_turn(
+                "t1",
+                "inProgress",
+                vec![item(0), item(1), item(2)],
+            )],
+            vec![child_turn("t1", "completed", (0..4).map(item).collect())],
+            vec![
+                child_turn("t1", "completed", (0..4).map(item).collect()),
+                child_turn(
+                    "t2",
+                    "inProgress",
+                    vec![message_item("m3", "again", "commentary")],
+                ),
+            ],
+        ];
+        let mut previous: Option<SubagentTranscript> = None;
+        for turns in reads {
+            let thread = child_thread(turns);
+            let live = thread_to_events(&thread, true);
+            let settled = thread_to_events(&thread, false);
+            assert!(settled.events.starts_with(&live.events));
+            if let Some(before) = previous {
+                assert_eq!(before.epoch, live.epoch);
+                assert!(
+                    live.events.starts_with(&before.events),
+                    "{:?}\n  is not a prefix of\n{:?}",
+                    replay_shape(&before.events),
+                    replay_shape(&live.events)
+                );
+            }
+            previous = Some(live);
+        }
+    }
+
+    #[test]
+    fn long_transcripts_keep_a_stepped_window() {
+        // Five positions a turn: its header and four items.
+        let turns = |n: usize| -> Vec<Value> {
+            (0..n)
+                .map(|t| {
+                    child_turn(
+                        &format!("t{t}"),
+                        "completed",
+                        (0..4)
+                            .map(|i| message_item(&format!("m{t}-{i}"), "ok", "commentary"))
+                            .collect(),
+                    )
+                })
+                .collect()
+        };
+        // 500 positions: the newest 400 fit, so the window starts at the
+        // next step boundary, 128 — item 2 of t25.
+        let a = thread_to_events(&child_thread(turns(100)), true);
+        assert_eq!(a.events[0], AgentEvent::Truncated);
+        assert_eq!(a.epoch, "t25:128");
+        assert_eq!(
+            replay_shape(&a.events[1..3]),
+            vec!["turn t25", "message ok"],
+            "the start turn's header, then its items from the boundary"
+        );
+        // A little growth keeps the window (and appends).
+        let b = thread_to_events(&child_thread(turns(101)), true);
+        assert_eq!(b.epoch, a.epoch);
+        assert!(b.events.starts_with(&a.events));
+        // Past the next step it moves on.
+        let c = thread_to_events(&child_thread(turns(120)), true);
+        assert_eq!(c.epoch, "t51:256");
+
+        // The byte budget: of three 1 MiB outputs only the newest fits.
+        let big = "x".repeat(1024 * 1024);
+        let huge = child_turn(
+            "t0",
+            "completed",
+            (0..3)
+                .map(|i| child_command_item(&format!("exec-{i}"), "cat big", &big, "completed"))
+                .collect(),
+        );
+        let d = thread_to_events(&child_thread(vec![huge]), false);
+        assert_eq!(d.epoch, "t0:3");
+        assert_eq!(
+            replay_shape(&d.events),
+            vec![
+                "truncated",
+                "turn t0",
+                "tool exec-2 Execute InProgress",
+                "update exec-2 Completed",
+                "completed t0",
+            ]
+        );
     }
 
     #[test]

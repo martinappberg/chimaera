@@ -17,6 +17,9 @@
     block: Extract<ChatBlock, { kind: "finished" }>;
     /** Open a file the task wrote (its full output). */
     onOpenFile?: (path: string) => void;
+    /** Open the finished subagent's own conversation; provided when the
+     *  wire named it. */
+    onOpenSubagent?: (newSplit: boolean) => void;
     onOpenPath?: OpenPathFn;
     resolvePaths?: PathResolver;
     /** Local images in the report render as embed cards. */
@@ -29,6 +32,7 @@
   let {
     block,
     onOpenFile,
+    onOpenSubagent,
     onOpenPath,
     resolvePaths,
     embeds,
@@ -108,6 +112,13 @@
       <Chevron {open} />
     {/if}
   </button>
+  {#if onOpenSubagent !== undefined}
+    <button
+      class="output"
+      title="open this subagent's conversation"
+      onclick={(e) => onOpenSubagent?.(e.metaKey || e.ctrlKey)}>conversation</button
+    >
+  {/if}
   {#if block.outputFile !== null && onOpenFile !== undefined}
     <button
       class="output"

@@ -2,7 +2,7 @@
   import { copyText } from "../shared/clipboard";
   import { contextMenu } from "../shared/contextMenu.svelte";
   import { menuPoint, resolveAndOpen, type OpenPathFn, type PathResolver } from "./paths";
-  import type { ChatBlock, ToolContent } from "./store.svelte";
+  import type { ChatBlock, SubagentInfo, ToolContent } from "./store.svelte";
   import { readableToolTitle } from "./toolLabels";
 
   interface Props {
@@ -17,11 +17,28 @@
     onBackground?: () => void;
     /** Stop this running subagent (claude stop_task). */
     onStop?: () => void;
+    /** What the agent has said about this row's subagent (agent rows). */
+    subagent?: SubagentInfo;
+    /** A model id as the picker labels it. */
+    modelName?: (id: string) => string;
+    /** Open this subagent's own conversation; provided once it has one to
+     *  open (the wire named it). */
+    onOpenSubagent?: (newSplit: boolean) => void;
     /** False while the owning retained chat tab is hidden. */
     visible?: boolean;
   }
 
-  let { block, onOpenPath, resolvePaths, onBackground, onStop, visible = true }: Props = $props();
+  let {
+    block,
+    onOpenPath,
+    resolvePaths,
+    onBackground,
+    onStop,
+    subagent,
+    modelName,
+    onOpenSubagent,
+    visible = true,
+  }: Props = $props();
 
   const running = $derived(block.status === "in_progress" || block.status === "pending");
 
@@ -192,6 +209,28 @@
             fill="none"
             stroke="currentColor"
             stroke-width="1.5"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+        </svg>
+      </button>
+    {/if}
+    {#if block.tool === "agent" && subagent?.model}
+      <span class="model" title={`model: ${subagent.model}`}>{modelName?.(subagent.model) ?? subagent.model}</span>
+    {/if}
+    {#if block.tool === "agent" && onOpenSubagent !== undefined}
+      <button
+        class="act"
+        title="open this subagent's conversation"
+        aria-label="open this subagent's conversation"
+        onclick={(e) => onOpenSubagent?.(e.metaKey || e.ctrlKey)}
+      >
+        <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+          <path
+            d="M6.5 3.5H4a.5.5 0 0 0-.5.5v8a.5.5 0 0 0 .5.5h8a.5.5 0 0 0 .5-.5V9.5M9.5 3.5h3v3M12.5 3.5L7.5 8.5"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.4"
             stroke-linecap="round"
             stroke-linejoin="round"
           />
@@ -384,6 +423,19 @@
     cursor: default;
   }
   .loc,
+  .model {
+    flex: none;
+    max-width: 24ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    padding: 0 6px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--fg) 6%, transparent);
+    color: var(--muted);
+    font-family: var(--mono, monospace);
+    font-size: var(--text-xs);
+  }
   .act {
     flex: none;
     display: inline-flex;

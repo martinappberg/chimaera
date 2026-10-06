@@ -144,6 +144,20 @@ export interface ChangesTab {
   sessionId: string;
 }
 /**
+ * One subagent's own conversation, read-only: what a chat's `Agent:` row did,
+ * shown as a chat of its own. Keyed by the parent session plus the agent's
+ * own handle for the subagent (claude's task id, codex's child thread id), so
+ * re-opening focuses the existing tab. `title` is what the parent called it
+ * when it was opened — the tab's label, since nothing else names a subagent
+ * once its row has scrolled away.
+ */
+export interface SubagentTab {
+  surface: "subagent";
+  sessionId: string;
+  agentId: string;
+  title: string;
+}
+/**
  * A browser pane: a live web app (Jupyter, marimo, Streamlit…) served through
  * the daemon's reverse proxy. Keyed by a stable `id` like the Finder (several
  * browsers coexist); `host`/`port` name the TARGET the daemon dials — the
@@ -175,6 +189,7 @@ export type Tab =
   | GitDetailTab
   | GitTab
   | ChangesTab
+  | SubagentTab
   | DashboardTab
   | TimelineTab
   | KnowledgeTab
@@ -210,6 +225,8 @@ export function tabKey(t: Tab): string {
   if (t.surface === "plugin") return `x:${t.plugin}/${t.view}`;
   if (t.surface === "sessions") return "v:sessions";
   if (t.surface === "changes") return `changes:${t.sessionId}`;
+  // The title is a label, not identity: one tab per subagent.
+  if (t.surface === "subagent") return `sub:${t.sessionId}:${t.agentId}`;
   // `w:` (web) — its own namespace beside the Finder's `d:` and diff's `g:`.
   if (t.surface === "browser") return `w:${t.id}`;
   return "v:settings";
@@ -799,6 +816,11 @@ export function openChanges(l: Layout, sessionId: string): Layout {
   return openTab(l, { surface: "changes", sessionId });
 }
 
+/** Open (or focus) a subagent's conversation. */
+export function openSubagent(l: Layout, sessionId: string, agentId: string, title: string): Layout {
+  return openTab(l, { surface: "subagent", sessionId, agentId, title });
+}
+
 export function openSettings(l: Layout): Layout {
   return openTab(l, { surface: "settings" });
 }
@@ -1331,14 +1353,16 @@ function pruneTabs(l: Layout, keep: (t: Tab) => boolean): Layout {
   return normalize({ ...l, root: root ?? emptyPane() });
 }
 
-/** Drop terminal AND session-changes tabs whose sessions no longer exist; a
- *  changes review outlives nothing its session left behind. File and (path-
- *  keyed) git-diff tabs are untouched. */
+/** Drop terminal, session-changes AND subagent tabs whose sessions no longer
+ *  exist; a changes review outlives nothing its session left behind, and a
+ *  subagent's conversation is read through its parent. File and (path-keyed)
+ *  git-diff tabs are untouched. */
 export function pruneSessions(l: Layout, live: ReadonlySet<string>): Layout {
   return pruneTabs(
     l,
     (t) =>
-      (t.surface !== "terminal" && t.surface !== "changes") || live.has(t.sessionId),
+      (t.surface !== "terminal" && t.surface !== "changes" && t.surface !== "subagent") ||
+      live.has(t.sessionId),
   );
 }
 
@@ -1547,12 +1571,17 @@ type STab =
   | { gd: string; dm?: string; gr?: string; go?: string; gp?: string; pv?: 1 }
   | { gx: string; xr?: string; xs?: string; xp?: string; xv?: string; xb?: string; xt?: string; pv?: 1 }
   | { cs: string }
+  | { sa: string; sg: string; st: string }
   | { pg: string; pgv: string }
   | { w: string; wo: number; wi: string; wp: string; wb?: string };
 
 /** What a persisted session id may look like (the daemon's `s-…` ids, with
  *  room to spare); a value outside it is dropped on restore. */
 const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+/** What an agent's own handle for a subagent may look like (the daemon's
+ *  `valid_agent_id`): it goes into a URL path. */
+const SUBAGENT_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 
 /** Coerce a persisted diff mode, defaulting to unstaged. */
 function diffModeOf(x: unknown): DiffMode {
@@ -1618,6 +1647,7 @@ function serNode(node: LayoutNode): SNode {
         if (t.surface === "plugin") return { pg: t.plugin, pgv: t.view };
         if (t.surface === "sessions") return { v: "sessions" };
         if (t.surface === "changes") return { cs: t.sessionId };
+        if (t.surface === "subagent") return { sa: t.sessionId, sg: t.agentId, st: t.title };
         if (t.surface === "browser") {
           const w: { w: string; wo: number; wi: string; wp: string; wb?: string } = {
             w: t.host,
@@ -1725,6 +1755,13 @@ function deserNode(
         tab = { surface: "sessions" };
       } else if (typeof t.cs === "string" && t.cs.length > 0) {
         tab = { surface: "changes", sessionId: t.cs };
+      } else if (
+        typeof t.sa === "string" &&
+        SESSION_ID_RE.test(t.sa) &&
+        typeof t.sg === "string" &&
+        SUBAGENT_ID_RE.test(t.sg)
+      ) {
+        tab = { surface: "subagent", sessionId: t.sa, agentId: t.sg, title: optStr(t.st, 200) ?? "subagent" };
       } else if (
         typeof t.w === "string" &&
         t.w.length <= 253 &&

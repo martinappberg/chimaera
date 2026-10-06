@@ -2,6 +2,7 @@
   import { formatElapsedSeconds } from "../shared/time";
   import WorkTray from "../shared/WorkTray.svelte";
   import WorkTrayRow from "../shared/WorkTrayRow.svelte";
+  import SubagentChip from "./SubagentChip.svelte";
   import { backgroundKind, countKinds } from "./backgroundKinds";
   import type { BackgroundTask } from "./store.svelte";
 
@@ -21,13 +22,18 @@
   interface Props {
     /** The agent's live background-task set (level-set from the wire). */
     tasks: BackgroundTask[];
+    /** A model id as the picker labels it. */
+    modelName?: (id: string) => string;
+    /** Open a backgrounded agent's own conversation (its task id is the
+     *  handle the conversation is read by). */
+    onOpen?: (agentId: string, title: string, newSplit: boolean) => void;
     /** Stop one (claude stop_task, generic over its task registry).
      *  Omitted when unsupported. */
     onStop?: (id: string) => void;
     /** False while the owning retained chat tab is hidden. */
     visible?: boolean;
   }
-  let { tasks, onStop, visible = true }: Props = $props();
+  let { tasks, modelName, onOpen, onStop, visible = true }: Props = $props();
 
   /** Bound to the shell's expanded state — the clock below gates on it. */
   let open = $state(false);
@@ -94,9 +100,19 @@
       stopTitle={task.monitor ? "stop this monitor" : "stop this background task"}
       {visible}
     >
-      <span class="kind" class:ambient={task.ambient} title={task.ambient ? "housekeeping the agent runs on its own" : undefined}
-        >{backgroundKind(task)}</span
-      >
+      {#if task.taskType === "local_agent"}
+        <!-- A backgrounded subagent: its lane label opens its conversation. -->
+        <SubagentChip
+          label={backgroundKind(task)}
+          onOpen={onOpen !== undefined
+            ? (newSplit) => onOpen?.(task.id, task.description, newSplit)
+            : undefined}
+        />
+      {:else}
+        <span class="kind" class:ambient={task.ambient} title={task.ambient ? "housekeeping the agent runs on its own" : undefined}
+          >{backgroundKind(task)}</span
+        >
+      {/if}
       <!-- The lane name (local_bash, …) stays canonical in the tooltip;
            a workflow row leads with its meta.name. -->
       <span
@@ -119,6 +135,9 @@
         </span>
         <span class="count">{task.agentsDone}/{task.agentsTotal} agents</span>
       {/if}
+      {#if task.model !== null}
+        <span class="model" title={`model: ${task.model}`}>{modelName?.(task.model) ?? task.model}</span>
+      {/if}
       {#if task.status !== "running"}
         <span class="status">{task.status}</span>
       {:else if task.monitor}
@@ -140,6 +159,16 @@
     white-space: nowrap;
     color: var(--fg);
     font-family: var(--mono, monospace);
+  }
+  .model {
+    flex: none;
+    max-width: 24ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--muted);
+    font-family: var(--mono, monospace);
+    font-size: var(--text-xs);
   }
   .status {
     flex: none;
