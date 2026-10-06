@@ -89,20 +89,35 @@
    *  the compatibility path below to open Home and retire itself. */
   const showBackToHome = $derived(native && ownAlias !== null);
 
+  /** Needs-you first, then running, then by recency: what is happening sits
+   *  at the top of the scroll area. */
   const sorted = $derived(
-    [...workspaces].sort((a, b) => (b.last_opened_at ?? 0) - (a.last_opened_at ?? 0)),
+    [...workspaces].sort((a, b) => {
+      const rank = (w: Workspace) => {
+        const l = liveByWs.get(w.id);
+        return l && l.attn > 0 ? 2 : l && l.live > 0 ? 1 : 0;
+      };
+      return rank(b) - rank(a) || (b.last_opened_at ?? 0) - (a.last_opened_at ?? 0);
+    }),
   );
 
-  /** Rows shown before "Show N more": the list stays short enough that the
-   *  remote machines below it are visible without scrolling. */
-  const WORKSPACE_PREVIEW = 5;
-  let showAllWorkspaces = $state(false);
-  // Rows awaiting approval stay visible however old they are.
-  const shownWorkspaces = $derived(
-    showAllWorkspaces
-      ? sorted
-      : sorted.filter((w, i) => i < WORKSPACE_PREVIEW || (liveByWs.get(w.id)?.attn ?? 0) > 0),
-  );
+  /** Past this many workspaces the list scrolls in place (so the remote
+   *  machines below stay on screen) and a filter appears. */
+  const FILTER_THRESHOLD = 5;
+  let filter = $state("");
+  const shownWorkspaces = $derived.by(() => {
+    const q = filter.trim().toLowerCase();
+    if (q === "") return sorted;
+    return sorted.filter((w) => w.name.toLowerCase().includes(q) || w.root.toLowerCase().includes(q));
+  });
+  /** Names that appear twice keep their path visible: it is the only thing
+   *  telling those rows apart. */
+  const dupNames = $derived.by(() => {
+    const seen = new Set<string>();
+    const dup = new Set<string>();
+    for (const w of workspaces) (seen.has(w.name) ? dup : seen).add(w.name);
+    return dup;
+  });
 
   /** Live rollup per workspace: total live sessions + how many need you. */
   const liveByWs = $derived.by(() => {
@@ -768,6 +783,32 @@
     <section class="workspaces" aria-label="Workspaces on this machine">
       <div class="sec-head">
         <h2 class="sec-title">{ownAlias === null ? (native && isMac ? "This Mac" : "This computer") : "On this machine"}</h2>
+        {#if sorted.length > FILTER_THRESHOLD}
+          <label class="filter">
+            <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.4" /><path d="m10.5 10.5 3 3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" /></svg>
+            <input
+              bind:value={filter}
+              placeholder="Filter"
+              aria-label="Filter workspaces"
+              spellcheck="false"
+              autocomplete="off"
+              onkeydown={(e) => {
+                if (e.key === "Escape" && filter !== "") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  filter = "";
+                } else if (e.key === "Enter" && shownWorkspaces.length > 0) {
+                  e.preventDefault();
+                  if ((e.metaKey || e.ctrlKey) && !jobScoped) void openWindow(ownAlias, shownWorkspaces[0].id, true);
+                  else onOpen(shownWorkspaces[0]);
+                }
+              }}
+            />
+            {#if filter !== ""}
+              <button type="button" class="filter-clear" aria-label="Clear filter" onclick={() => (filter = "")}>×</button>
+            {/if}
+          </label>
+        {/if}
         <div class="where" title={health?.hostname}>
           {#if health !== null}<span class="hostname">{health.hostname}</span>{/if}
           <span class="remote-status" class:online={daemonReachable} role="status">
@@ -784,7 +825,10 @@
           <button class="cta" onclick={onOpenFolder}>Open folder</button>
         </div>
       {:else}
-        <div class="rows">
+        <div class="rows" class:scroll={sorted.length > FILTER_THRESHOLD}>
+          {#if shownWorkspaces.length === 0}
+            <p class="no-match">No workspace matches “{filter.trim()}”.</p>
+          {/if}
           {#each shownWorkspaces as w (w.id)}
             {@const live = liveByWs.get(w.id)}
             {@const wsState = !daemonReachable ? "" : live && live.attn > 0 ? "attn" : live && live.live > 0 ? "alive" : ""}
@@ -827,7 +871,7 @@
                         ? `${live?.live} live session${live?.live === 1 ? "" : "s"}`
                         : "no live sessions"}
                   ></span>
-                  <span class="workspace-label"><span class="name">{w.name}</span><span class="path">{tildify(w.root)}</span></span>
+                  <span class="workspace-label" class:dup={dupNames.has(w.name)}><span class="name">{w.name}</span><span class="path">{tildify(w.root)}</span></span>
                 </button>
                 <!-- The meta sits beside the row button (not inside it: a button
                      cannot nest a button) so the live count can turn into the
@@ -869,18 +913,6 @@
               </div>
             {/if}
           {/each}
-          {#if sorted.length > WORKSPACE_PREVIEW && (showAllWorkspaces || shownWorkspaces.length < sorted.length)}
-            <button
-              class="more"
-              onclick={() => {
-                showAllWorkspaces = !showAllWorkspaces;
-                confirmStopId = null;
-                confirmRemoveId = null;
-              }}
-            >
-              {showAllWorkspaces ? "Show fewer" : `Show ${sorted.length - shownWorkspaces.length} more`}
-            </button>
-          {/if}
         </div>
       {/if}
     </section>
@@ -1840,8 +1872,27 @@
   }
   .live-slot:hover .session-state, .live-slot:focus-within .session-state { opacity: 0; }
   .live-slot:hover .side.stop, .live-slot:focus-within .side.stop { opacity: 1; }
-  .more { appearance: none; border: none; background: none; font: inherit; font-size: var(--text-xs); color: var(--muted); padding: 8px 12px; text-align: left; cursor: pointer; border-radius: 6px; }
-  .more:hover { color: var(--fg); }
+  /* One line per workspace: the path shows on hover/focus (or always when two
+     workspaces share a name). Opacity, not display, so rows never reflow. */
+  .workspace-row .workspace-label { flex-direction: row; align-items: baseline; gap: 12px; }
+  .workspace-row .workspace-label .name { flex: none; max-width: 60%; }
+  .workspace-row .workspace-label .path { flex: 1; opacity: 0; transition: opacity 0.12s ease; }
+  .workspace-row:hover .workspace-label .path, .workspace-row:focus-within .workspace-label .path, .workspace-label.dup .path { opacity: 1; }
+  /* Past the threshold the list scrolls in place, ending on a half row so the
+     scroll is visible; the remote machines stay below it. */
+  .workspaces .rows.scroll { max-height: 268px; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
+  .no-match { margin: 0; padding: 14px 12px; color: var(--muted); font-size: var(--text-sm); }
+  .filter { flex: 0 1 190px; margin-left: 14px; display: flex; align-items: center; gap: 6px; padding: 0 8px; height: 26px; border: 1px solid var(--edge); border-radius: 7px; color: var(--muted); transition: border-color 0.12s ease; }
+  .filter:focus-within { border-color: color-mix(in srgb, var(--accent) 60%, transparent); color: var(--fg); }
+  .filter input { flex: 1; min-width: 0; appearance: none; border: none; outline: none; background: none; font: inherit; font-size: var(--text-xs); color: var(--fg); }
+  .filter-clear { appearance: none; border: none; background: none; color: var(--muted); font-size: var(--text-md); line-height: 1; padding: 0 2px; cursor: pointer; }
+  .filter-clear:hover { color: var(--fg); }
+  /* No hover on touch: the End sessions control replaces the count outright. */
+  @media (hover: none) {
+    .live-slot .session-state { opacity: 0; }
+    .live-slot .side.stop { opacity: 1; }
+    .workspace-row .workspace-label .path { opacity: 1; }
+  }
   .workspace-meta .side.stop:hover { color: var(--err); border-color: color-mix(in srgb, var(--err) 55%, transparent); background: var(--row-active); }
   .host-card { border: 1px solid var(--edge); border-radius: 10px; padding: 5px; }
   .remotes .rows { gap: 10px; }
