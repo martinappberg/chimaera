@@ -158,10 +158,27 @@ impl Snapshot {
     }
 }
 
+/// Where a store keeps its evidence. Only a session whose work can move to
+/// another machine (managed execution) needs evidence that survives a power
+/// loss and a handoff, at the price of synced writes per send and failing
+/// closed on damage. Every other chat keeps the same record in memory (the
+/// Pass 46 contract): no disk write per send, and an earlier sidecar is read
+/// when it is sound and ignored, with a log line, when it is not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Receipts {
+    Durable,
+    Memory,
+}
+
 pub(crate) struct Store {
     path: PathBuf,
     required: PathBuf,
     snapshot: Mutex<Snapshot>,
+    /// Set once by the first durable opener; never cleared while cached.
+    durable: AtomicBool,
+    /// A memory-mode open ignored unreadable evidence: a later durable opener
+    /// must fail closed rather than build on the gap.
+    damaged: bool,
     failed: AtomicBool,
     gate: Arc<Semaphore>,
     #[cfg(test)]
@@ -209,6 +226,34 @@ fn read_bounded(path: &Path, limit: usize) -> Result<Option<Vec<u8>>> {
     Ok(Some(bytes))
 }
 
+/// The sidecar's record merged with the journal's echoes; any damage is an
+/// error, which only a durable opener turns into a refusal.
+fn load(
+    path: &Path,
+    required: &Path,
+    session_id: &str,
+    legacy: &[(String, ClientIdState)],
+) -> Result<Snapshot> {
+    let marker = read_bounded(required, REQUIRED.len())?;
+    ensure!(
+        marker.as_deref().is_none_or(|bytes| bytes == REQUIRED),
+        "send state enrollment is damaged"
+    );
+    let bytes = read_bounded(path, MAX_BYTES)?;
+    ensure!(
+        marker.is_none() || bytes.is_some(),
+        "enrolled send state is missing"
+    );
+    let mut snapshot = match bytes {
+        Some(bytes) => decode(session_id, &bytes)?,
+        None => Snapshot::new(session_id),
+    };
+    // Legacy echoes are useful evidence, but never replace a withdrawal or
+    // an unresolved dispatch imported from the independent store.
+    snapshot.merge_legacy(legacy)?;
+    Ok(snapshot)
+}
+
 fn decode(session_id: &str, bytes: &[u8]) -> Result<Snapshot> {
     ensure!(bytes.len() <= MAX_BYTES, "send state exceeds limit");
     let snapshot: Snapshot = serde_json::from_slice(bytes).context("send state is damaged")?;
@@ -224,40 +269,45 @@ impl Store {
         dir: &Path,
         session_id: &str,
         legacy: &[(String, ClientIdState)],
+        receipts: Receipts,
     ) -> Result<Arc<Self>> {
         fs::create_dir_all(dir)?;
         let dir = dir.canonicalize()?;
         let (path, required) = paths(&dir, session_id)?;
         let registry = STORES.get_or_init(|| Mutex::new(HashMap::new()));
-        if let Some(store) = registry
+        let cached = registry
             .lock()
             .expect("send stores lock")
             .get(&path)
-            .and_then(Weak::upgrade)
-        {
-            return Ok(store);
+            .and_then(Weak::upgrade);
+        if let Some(store) = cached {
+            return store.reuse(receipts);
         }
-        let marker = read_bounded(&required, REQUIRED.len())?;
-        ensure!(
-            marker.as_deref().is_none_or(|bytes| bytes == REQUIRED),
-            "send state enrollment is damaged"
-        );
-        let bytes = read_bounded(&path, MAX_BYTES)?;
-        ensure!(
-            marker.is_none() || bytes.is_some(),
-            "enrolled send state is missing"
-        );
-        let mut snapshot = match bytes {
-            Some(bytes) => decode(session_id, &bytes)?,
-            None => Snapshot::new(session_id),
+        let (snapshot, damaged) = match (load(&path, &required, session_id, legacy), receipts) {
+            (Ok(snapshot), _) => (snapshot, false),
+            (Err(error), Receipts::Durable) => return Err(error),
+            (Err(error), Receipts::Memory) => {
+                tracing::warn!(
+                    session = session_id,
+                    "ignoring unreadable send receipts: {error:#}"
+                );
+                let mut snapshot = Snapshot::new(session_id);
+                if let Err(error) = snapshot.merge_legacy(legacy) {
+                    tracing::warn!(
+                        session = session_id,
+                        "ignoring conflicting journal send evidence: {error:#}"
+                    );
+                    snapshot = Snapshot::new(session_id);
+                }
+                (snapshot, true)
+            }
         };
-        // Legacy echoes are useful evidence, but never replace a withdrawal or
-        // an unresolved dispatch imported from the independent store.
-        snapshot.merge_legacy(legacy)?;
         let store = Arc::new(Self {
             path: path.clone(),
             required,
             snapshot: Mutex::new(snapshot),
+            durable: AtomicBool::new(receipts == Receipts::Durable),
+            damaged,
             failed: AtomicBool::new(false),
             gate: Arc::new(Semaphore::new(1)),
             #[cfg(test)]
@@ -266,11 +316,21 @@ impl Store {
         let mut stores = registry.lock().expect("send stores lock");
         stores.retain(|_, store| store.strong_count() > 0);
         if let Some(existing) = stores.get(&path).and_then(Weak::upgrade) {
-            return Ok(existing);
+            return existing.reuse(receipts);
         }
         ensure!(stores.len() < MAX_STORES, "send store limit reached");
         stores.insert(path, Arc::downgrade(&store));
         Ok(store)
+    }
+
+    /// A cached store serves every opener. A durable opener upgrades it: its
+    /// next write persists the whole record, so nothing kept in memory is lost.
+    fn reuse(self: Arc<Self>, receipts: Receipts) -> Result<Arc<Self>> {
+        if receipts == Receipts::Durable {
+            ensure!(!self.damaged, "send state is damaged");
+            self.durable.store(true, Ordering::Release);
+        }
+        Ok(self)
     }
 
     pub(crate) fn state(&self, id: &str) -> Result<Option<ClientIdState>> {
@@ -290,7 +350,7 @@ impl Store {
             }))
     }
 
-    fn update(&self, id: &str, state: State, withdraw_queued: bool) -> Result<()> {
+    fn update(&self, id: &str, state: State, withdraw_queued: bool, persist: bool) -> Result<()> {
         ensure!(
             !self.failed.load(Ordering::Acquire),
             "send evidence is unavailable"
@@ -304,6 +364,10 @@ impl Store {
             }
         }
         next.remember(id, state)?;
+        if !persist {
+            *self.snapshot.lock().expect("send state lock") = next;
+            return Ok(());
+        }
         self.install(next)
     }
 
@@ -363,10 +427,18 @@ impl Store {
             Err(_) => {
                 // A canceled caller may have left a hung owned write. Latch
                 // the failure so subsequent provider events do not each wait.
-                self.failed.store(true, Ordering::Release);
+                if self.durable.load(Ordering::Acquire) {
+                    self.failed.store(true, Ordering::Release);
+                }
                 anyhow::bail!("send state storage is busy");
             }
         };
+        if !self.durable.load(Ordering::Acquire) {
+            // In memory: nothing to wait for. The gate still orders this
+            // update against a write begun after a durable opener upgraded us.
+            let _permit = permit;
+            return self.update(id, state, withdraw_queued, false);
+        }
         let owner = self.clone();
         let id = id.to_owned();
         let write = tokio::task::spawn_blocking(move || {
@@ -376,7 +448,7 @@ impl Store {
                 let _ = entered.send(());
                 let _ = resume.recv();
             }
-            owner.update(&id, state, withdraw_queued)
+            owner.update(&id, state, withdraw_queued, true)
         });
         match tokio::time::timeout(IO_WAIT, write).await {
             Ok(result) => result.context("send state writer stopped")?,
@@ -460,7 +532,7 @@ pub(crate) fn export(
     session_id: &str,
     legacy: &[(String, ClientIdState)],
 ) -> Result<Vec<u8>> {
-    let store = Store::open(dir, session_id, legacy)?;
+    let store = Store::open(dir, session_id, legacy, Receipts::Durable)?;
     let _permit = store
         .gate
         .clone()
@@ -487,7 +559,7 @@ pub(crate) fn merge(
 ) -> Result<Vec<u8>> {
     let incoming = decode(session_id, bytes)?;
     let merged = if dir.exists() {
-        let store = Store::open(dir, session_id, legacy)?;
+        let store = Store::open(dir, session_id, legacy, Receipts::Durable)?;
         let _permit = store
             .gate
             .clone()
@@ -524,7 +596,7 @@ pub(crate) fn import(
     legacy: &[(String, ClientIdState)],
 ) -> Result<()> {
     let incoming = decode(session_id, bytes)?;
-    let store = Store::open(dir, session_id, legacy)?;
+    let store = Store::open(dir, session_id, legacy, Receipts::Durable)?;
     // Imports happen only for quiescent sessions. Fail instead of racing an old
     // owned writer, including one whose caller timed out or was canceled.
     let _permit = store
@@ -594,12 +666,15 @@ mod tests {
                     Box::new(|_, _| {}),
                 ));
                 let commands = Arc::new(Mutex::new(None));
+                let mut spec =
+                    SpawnSpec::new("receipt", vec!["fixture".into()], dir.path().to_path_buf());
+                spec.managed_execution = true;
                 manager
                     .spawn(
                         &crate::tests::HeldCommands {
                             commands: commands.clone(),
                         },
-                        SpawnSpec::new("receipt", vec!["fixture".into()], dir.path().to_path_buf()),
+                        spec,
                     )
                     .unwrap();
                 let mut commands = commands.lock().unwrap().take().unwrap();
@@ -682,14 +757,140 @@ mod tests {
         }
     }
 
+    /// An ordinary (not managed) chat keeps its send record in memory: no
+    /// sidecar, no synced write per send, and a slow disk cannot latch it.
+    #[tokio::test]
+    async fn an_ordinary_chat_keeps_its_send_record_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), "s-memory", &[], Receipts::Memory).unwrap();
+        store.dispatch("client-delivered").await.unwrap();
+        store.confirm("client-delivered").await.unwrap();
+        store.dispatch("client-pending").await.unwrap();
+        store.withdraw("client-withdrawn").await.unwrap();
+        assert_eq!(
+            store.state("client-delivered").unwrap(),
+            Some(ClientIdState::Confirmed)
+        );
+        assert_eq!(
+            store.state("client-pending").unwrap(),
+            Some(ClientIdState::Uncertain)
+        );
+        assert_eq!(
+            store.state("client-withdrawn").unwrap(),
+            Some(ClientIdState::Cancelled)
+        );
+        assert_eq!(
+            fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "an ordinary send writes nothing to disk"
+        );
+        // A durable opener (a transfer) upgrades the cached store and its
+        // next write persists everything kept in memory so far.
+        let upgraded = Store::open(dir.path(), "s-memory", &[], Receipts::Durable).unwrap();
+        assert!(Arc::ptr_eq(&store, &upgraded));
+        upgraded.dispatch("client-after-upgrade").await.unwrap();
+        drop((store, upgraded));
+        let reopened = Store::open(dir.path(), "s-memory", &[], Receipts::Durable).unwrap();
+        assert_eq!(
+            reopened.state("client-delivered").unwrap(),
+            Some(ClientIdState::Confirmed)
+        );
+        assert_eq!(
+            reopened.state("client-after-upgrade").unwrap(),
+            Some(ClientIdState::Uncertain)
+        );
+    }
+
+    /// Damaged evidence never stops an ordinary chat from starting; it is
+    /// ignored with a log line and left on disk untouched. A durable opener
+    /// still refuses it, cached or not.
+    #[test]
+    fn an_ordinary_chat_starts_over_damaged_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, marker) = paths(dir.path(), "s-ignored").unwrap();
+        for (state, required) in [
+            (Some(b"{".to_vec()), None),
+            (Some(vec![b'x'; MAX_BYTES + 1]), None),
+            (None, Some(REQUIRED.to_vec())),
+            (Some(b"{}".to_vec()), Some(b"0\n".to_vec())),
+        ] {
+            let _ = fs::remove_file(&path);
+            let _ = fs::remove_file(&marker);
+            if let Some(bytes) = &state {
+                fs::write(&path, bytes).unwrap();
+            }
+            if let Some(bytes) = &required {
+                fs::write(&marker, bytes).unwrap();
+            }
+            assert!(Store::open(dir.path(), "s-ignored", &[], Receipts::Durable).is_err());
+            let legacy = [("client-echoed".to_string(), ClientIdState::Confirmed)];
+            let store = Store::open(dir.path(), "s-ignored", &legacy, Receipts::Memory).unwrap();
+            assert_eq!(
+                store.state("client-echoed").unwrap(),
+                Some(ClientIdState::Confirmed),
+                "journal evidence still counts"
+            );
+            assert!(Store::open(dir.path(), "s-ignored", &[], Receipts::Durable).is_err());
+            assert_eq!(fs::read(&path).ok(), state);
+            assert_eq!(fs::read(&marker).ok(), required);
+        }
+    }
+
+    /// The receipt mode follows the session's execution: a damaged sidecar
+    /// blocks only a managed spawn, and an ordinary send writes no file.
+    #[tokio::test]
+    async fn only_managed_chats_write_or_require_durable_receipts() {
+        use crate::driver::SpawnSpec;
+        use crate::model::{AgentCommand, ContentBlock};
+        use crate::ChatManager;
+        let dir = tempfile::tempdir().unwrap();
+        let chat = dir.path().join("chat");
+        let manager = Arc::new(ChatManager::new(
+            chat.clone(),
+            Box::new(|_, _| {}),
+            Box::new(|_, _| {}),
+        ));
+        let spawn = |id: &str, managed: bool| {
+            let mut spec = SpawnSpec::new(id, vec!["fixture".into()], dir.path().to_path_buf());
+            spec.managed_execution = managed;
+            let commands = Arc::new(Mutex::new(None));
+            manager
+                .spawn(
+                    &crate::tests::HeldCommands {
+                        commands: commands.clone(),
+                    },
+                    spec,
+                )
+                .map(|_| commands)
+        };
+        fs::create_dir_all(&chat).unwrap();
+        fs::write(chat.join("s-damaged.send-state.json"), b"{").unwrap();
+        assert!(spawn("s-damaged", true).is_err());
+        spawn("s-damaged", false).unwrap();
+        manager.kill("s-damaged");
+
+        // Hold the driver's command receiver so the send is delivered.
+        let _held = spawn("s-ordinary", false).unwrap();
+        let send = AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: "hi".into() }],
+        };
+        manager
+            .send_from_client("s-ordinary", send, Some("client-ordinary"))
+            .await
+            .unwrap();
+        assert!(!chat.join("s-ordinary.send-state.json").exists());
+        assert!(!chat.join("s-ordinary.send-state-required").exists());
+        manager.kill("s-ordinary");
+    }
+
     #[tokio::test]
     async fn withdrawals_and_unreceipted_dispatch_survive_store_replacement() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path(), "s-evidence", &[]).unwrap();
+        let store = Store::open(dir.path(), "s-evidence", &[], Receipts::Durable).unwrap();
         store.withdraw("client-withdrawn").await.unwrap();
         store.dispatch("client-unknown").await.unwrap();
         drop(store);
-        let restarted = Store::open(dir.path(), "s-evidence", &[]).unwrap();
+        let restarted = Store::open(dir.path(), "s-evidence", &[], Receipts::Durable).unwrap();
         assert_eq!(
             restarted.state("client-withdrawn").unwrap(),
             Some(ClientIdState::Cancelled)
@@ -701,7 +902,8 @@ mod tests {
         let bytes = export(dir.path(), "s-evidence", &[]).unwrap();
         let destination = tempfile::tempdir().unwrap();
         import(destination.path(), "s-evidence", &bytes, &[]).unwrap();
-        let restored = Store::open(destination.path(), "s-evidence", &[]).unwrap();
+        let restored =
+            Store::open(destination.path(), "s-evidence", &[], Receipts::Durable).unwrap();
         assert_eq!(
             restored.state("client-unknown").unwrap(),
             Some(ClientIdState::Uncertain)
@@ -716,7 +918,7 @@ mod tests {
     #[tokio::test]
     async fn outstanding_ids_never_roll_over_with_the_settled_record() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path(), "s-limits", &[]).unwrap();
+        let store = Store::open(dir.path(), "s-limits", &[], Receipts::Durable).unwrap();
         for n in 0..RETAINED_SENDS_MAX {
             store.dispatch(&format!("pending-{n:03}")).await.unwrap();
         }
@@ -743,7 +945,7 @@ mod tests {
     #[tokio::test]
     async fn imports_and_delayed_writes_cannot_weaken_receipts() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path(), "s-merge", &[]).unwrap();
+        let store = Store::open(dir.path(), "s-merge", &[], Receipts::Durable).unwrap();
         store.dispatch("client-confirmed").await.unwrap();
         let older = export(dir.path(), "s-merge", &[]).unwrap();
         store.confirm("client-confirmed").await.unwrap();
@@ -775,22 +977,22 @@ mod tests {
         let (path, marker) = paths(dir.path(), "s-damaged").unwrap();
         for bytes in [b"{".to_vec(), vec![b'x'; MAX_BYTES + 1]] {
             fs::write(&path, &bytes).unwrap();
-            assert!(Store::open(dir.path(), "s-damaged", &[]).is_err());
+            assert!(Store::open(dir.path(), "s-damaged", &[], Receipts::Durable).is_err());
             assert_eq!(fs::read(&path).unwrap(), bytes);
         }
         fs::remove_file(&path).unwrap();
         fs::write(&marker, REQUIRED).unwrap();
-        assert!(Store::open(dir.path(), "s-damaged", &[]).is_err());
+        assert!(Store::open(dir.path(), "s-damaged", &[], Receipts::Durable).is_err());
         assert!(!path.exists());
         fs::write(&marker, b"0\n").unwrap();
-        assert!(Store::open(dir.path(), "s-damaged", &[]).is_err());
+        assert!(Store::open(dir.path(), "s-damaged", &[], Receipts::Durable).is_err());
         assert_eq!(fs::read(marker).unwrap(), b"0\n");
     }
 
     #[tokio::test]
     async fn a_failed_confirmation_retains_dispatch_and_blocks_admission() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path(), "s-failed", &[]).unwrap();
+        let store = Store::open(dir.path(), "s-failed", &[], Receipts::Durable).unwrap();
         store.dispatch("client-unknown").await.unwrap();
         // Directory at the marker destination makes the post-rename operation
         // fail. The state write may already have committed: do not clear it.
@@ -809,7 +1011,7 @@ mod tests {
     #[tokio::test]
     async fn canceling_before_the_io_permit_leaves_no_dispatch_and_allows_retry() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path(), "s-cancel-io", &[]).unwrap();
+        let store = Store::open(dir.path(), "s-cancel-io", &[], Receipts::Durable).unwrap();
         let hold = store.gate.clone().acquire_owned().await.unwrap();
         let owner = store.clone();
         let task = tokio::spawn(async move { owner.dispatch("client-not-sent").await });
@@ -836,7 +1038,7 @@ mod tests {
             )
             .unwrap();
         }
-        let store = Store::open(dir.path(), "s-over-cap", &[]).unwrap();
+        let store = Store::open(dir.path(), "s-over-cap", &[], Receipts::Durable).unwrap();
         assert!(store.dispatch("client-over-cap").await.is_err());
         assert!(!store.failed.load(Ordering::Acquire));
         assert_eq!(store.state("client-over-cap").unwrap(), None);
@@ -847,7 +1049,7 @@ mod tests {
     #[tokio::test]
     async fn canceled_writer_keeps_its_gate_and_survives_process_replacement() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path(), "s-owned-write", &[]).unwrap();
+        let store = Store::open(dir.path(), "s-owned-write", &[], Receipts::Durable).unwrap();
         let (entered, entrance) = std::sync::mpsc::channel();
         let (resume, paused) = std::sync::mpsc::channel();
         *store.before_write.lock().unwrap() = Some((entered, paused));
@@ -858,7 +1060,7 @@ mod tests {
             .unwrap();
         task.abort();
         let _ = task.await;
-        let replacement = Store::open(dir.path(), "s-owned-write", &[]).unwrap();
+        let replacement = Store::open(dir.path(), "s-owned-write", &[], Receipts::Durable).unwrap();
         assert!(Arc::ptr_eq(&store, &replacement));
         assert!(export(dir.path(), "s-owned-write", &[]).is_err());
         let empty = serde_json::to_vec(&Snapshot::new("s-owned-write")).unwrap();
@@ -883,7 +1085,7 @@ mod tests {
     #[tokio::test]
     async fn timed_out_confirmation_keeps_dispatch_unknown_after_restart() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path(), "s-slow-confirm", &[]).unwrap();
+        let store = Store::open(dir.path(), "s-slow-confirm", &[], Receipts::Durable).unwrap();
         store.dispatch("client-slow-confirm").await.unwrap();
         let (entered, entrance) = std::sync::mpsc::channel();
         let (resume, paused) = std::sync::mpsc::channel();
@@ -915,7 +1117,7 @@ mod tests {
         .await
         .unwrap();
         drop(store);
-        let restarted = Store::open(dir.path(), "s-slow-confirm", &[]).unwrap();
+        let restarted = Store::open(dir.path(), "s-slow-confirm", &[], Receipts::Durable).unwrap();
         assert_eq!(
             restarted.state("client-slow-confirm").unwrap(),
             Some(ClientIdState::Uncertain)
@@ -925,7 +1127,7 @@ mod tests {
     #[test]
     fn read_only_preparation_captures_new_legacy_receipts_even_with_a_cached_store() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path(), "s-hot-legacy", &[]).unwrap();
+        let store = Store::open(dir.path(), "s-hot-legacy", &[], Receipts::Durable).unwrap();
         let incoming = serde_json::to_vec(&Snapshot::new("s-hot-legacy")).unwrap();
         let bytes = merge(
             dir.path(),

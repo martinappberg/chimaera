@@ -836,8 +836,19 @@ impl ChatManager {
         let journal = Arc::new(Journal::open(&self.journal_dir, &id)?);
         // A new process of this session still refuses the sends its journal
         // already holds (a daemon restart, a respawn, a resume).
-        let send_state =
-            send_state::Store::open(&self.journal_dir, &id, journal.client_evidence_at_open())?;
+        // Durable receipts guard work that can move between machines; every
+        // other chat keeps its send record in memory (`send_state::Receipts`).
+        let receipts = if spec.managed_execution {
+            send_state::Receipts::Durable
+        } else {
+            send_state::Receipts::Memory
+        };
+        let send_state = send_state::Store::open(
+            &self.journal_dir,
+            &id,
+            journal.client_evidence_at_open(),
+            receipts,
+        )?;
         let mut command_budget = CommandBudget::default();
         for client_id in journal.client_ids_at_open() {
             command_budget

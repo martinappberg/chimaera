@@ -1404,6 +1404,7 @@ mod tests {
                 dir.path(),
                 "s-queued",
                 journal.client_evidence_at_open(),
+                crate::send_state::Receipts::Durable,
             )
             .unwrap();
             assert_eq!(
