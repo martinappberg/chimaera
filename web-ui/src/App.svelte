@@ -1205,9 +1205,10 @@
     activeWsId !== null && layoutReady ? visibleSessionIds(layout) : [],
   );
   // Tell the notifier what this window shows, so it never alerts about a
-  // session the user is looking at — and clears alerts for ones they now
-  // are. Keyed on the joined ids so a layout write that changes nothing on
-  // screen costs no IPC.
+  // session the user is looking at (a torn-off window's whole scope; a
+  // workspace window also covers its hidden tabs) — and clears alerts for
+  // ones they now are. Keyed on the joined ids so a layout write that changes
+  // nothing on screen costs no IPC.
   const visibleKey = $derived(visibleSessions.join(" "));
   $effect(() => {
     const key = visibleKey;

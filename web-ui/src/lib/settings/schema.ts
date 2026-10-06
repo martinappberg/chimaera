@@ -317,7 +317,7 @@ const DEFS = {
     title: "When an Agent Finishes",
     category: "Notifications",
     description:
-      "Notify when an agent ends its turn and hands the floor back, quoting how its reply starts. Nothing is sent for the session you're looking at.",
+      "Notify when an agent ends its turn and hands the floor back, quoting how its reply starts. Nothing is sent for sessions in the window you're working in.",
     type: "boolean",
     default: true,
     scope: "daemon",
