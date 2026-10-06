@@ -3499,10 +3499,12 @@ describe("queued delivery after process replacement", () => {
   });
 
   it("keeps an uncertain queued send dismissible and offers Send now while a turn runs", () => {
-    const store = fold([
+    const store = new ChatStore();
+    store.onReady(SESSION, 0, undefined, IDS);
+    [
       { type: "user_message", id: "steer", client_id: "client-steer", text: "steer", queued: true },
       { type: "error", message: "agent crashed", fatal: true },
-    ]);
+    ].forEach((ev, i) => store.apply({ seq: i + 1, ts: i, ev } as SeqEvent));
     const [send] = store.pendingSends;
     expect(send.uncertain).toBe(true);
     // A resumed process is running a turn again: the bubble offers what a
@@ -3549,5 +3551,70 @@ describe("MCP input request lifecycle", () => {
   it("expires asks at process boundaries", () => {
     expect(fold([request, {type: "exited", status: 0}]).elicitations).toHaveLength(0);
     expect(fold([request, {type: "forked", source_agent: "claude", source_seq: 1, native: true}]).elicitations).toHaveLength(0);
+  });
+});
+
+/** A daemon without send ids (no extension): the composer sends main's plain
+ *  frame and the store tracks nothing, so an exit, a fatal error or a refusal
+ *  leaves exactly what main left: no pending bubble, no "delivery
+ *  unconfirmed", nothing handed back to the composer. */
+describe("a daemon without send ids", () => {
+  function plainChat(): ChatStore {
+    const store = new ChatStore();
+    const wire: Record<string, unknown>[] = [];
+    store.bindSender((frame) => {
+      wire.push(frame);
+      return true;
+    });
+    store.onReady(SESSION, 0, 0, NO_IDS);
+    // ChatView's send path: no id, so no `noteSent`.
+    expect(store.sendsWithIds(true)).toBe(false);
+    expect(store.sendsWithIds(false)).toBe(false);
+    store.apply({ seq: 1, ts: 1, ev: { type: "turn_started", turn_id: "t1" } } as SeqEvent);
+    store.apply({ seq: 2, ts: 2, ev: { type: "user_message", id: "q1", text: "steer", queued: true } } as SeqEvent);
+    expect(wire).toEqual([]);
+    return store;
+  }
+  const untouched = (store: ChatStore): void => {
+    expect(store.sending).toEqual([]);
+    expect(store.restoredDrafts).toEqual([]);
+    expect(store.unshownSince).toBeNull();
+    expect(store.pendingSends.map((send) => ({ id: send.id, state: send.state, uncertain: send.uncertain })))
+      .toEqual([{ id: "q1", state: "queued", uncertain: undefined }]);
+  };
+
+  it("before any ready, only a window that can have the extension sends under an id", () => {
+    const store = new ChatStore();
+    expect(store.sendsWithIds(true)).toBe(false);
+    expect(store.sendsWithIds(false)).toBe(true);
+  });
+
+  it("an exit keeps a queued send queued, with no unconfirmed rows", () => {
+    const store = plainChat();
+    store.apply({ seq: 3, ts: 3, ev: { type: "exited", status: 1 } } as SeqEvent);
+    store.onExited(1);
+    untouched(store);
+  });
+
+  it("a fatal error keeps a queued send queued", () => {
+    const store = plainChat();
+    store.apply({ seq: 3, ts: 3, ev: { type: "error", message: "agent crashed", fatal: true } } as SeqEvent);
+    untouched(store);
+    expect(store.fatalError).toBe("agent crashed");
+  });
+
+  it("a degrade keeps a queued send queued", () => {
+    const store = plainChat();
+    store.onDegraded();
+    untouched(store);
+  });
+
+  it("a refused send only says so", () => {
+    const store = plainChat();
+    store.onCommandFailed("agent unavailable", "send", null, null);
+    untouched(store);
+    expect(store.blocks.at(-1)).toMatchObject({ kind: "notice", text: "agent unavailable", tone: "error" });
+    vi.advanceTimersByTime(RESEND_FOR_MS);
+    untouched(store);
   });
 });

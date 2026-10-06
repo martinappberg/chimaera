@@ -756,6 +756,18 @@ export class ChatStore {
   /** Whether the daemon behind the current attach takes send ids
    *  ({@link ReadyAttach.sendIds}); null before the first `ready`. */
   private sendIds: boolean | null = null;
+  /** Some `ready` on this chat advertised send ids. Until one has, nothing
+   *  here may call a waiting message's delivery uncertain: a daemon without
+   *  them reports delivery only through its own echoes, as it always did. */
+  private sawSendIds = false;
+  /** Whether the composer's next send goes out under an id
+   *  ({@link noteSent}): only to a daemon that advertised send ids, or,
+   *  before the first `ready`, in a window that can have the extension
+   *  (`free` is false). Otherwise the frame carries no id and nothing is
+   *  tracked: the daemon's own echoes and refusals say everything. */
+  sendsWithIds(free: boolean): boolean {
+    return this.sendIds === true || (this.sendIds === null && !free);
+  }
   /** The `head` of a `ready` from a daemon with send ids whose replay has to
    *  be applied before the unconfirmed sends go out again; null when none is
    *  pending. */
@@ -1040,6 +1052,7 @@ export class ChatStore {
     // dropped by whoever kept the socket. A plain reconnect pushes nothing.
     if (attach.reattach) this.thinkingPushed = false;
     this.sendIds = attach.sendIds;
+    if (attach.sendIds) this.sawSendIds = true;
     this.queuedSnapshot = head !== undefined && attach.activeQueuedIds !== undefined
       ? { head, ids: new Set(attach.activeQueuedIds) } : null;
     // Only a daemon that accepts an id at most once may be sent a send twice.
@@ -1360,6 +1373,7 @@ export class ChatStore {
   }
 
   private markQueuedUncertain(): void {
+    if (!this.sawSendIds) return;
     for (const send of this.pendingSends) {
       if (send.state === "queued") send.uncertain = true;
     }
