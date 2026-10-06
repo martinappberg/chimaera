@@ -613,6 +613,14 @@ fn apply_chat_event(state: &Arc<AppState>, id: &str, ev: &AgentEvent) {
         } => Some(AgentState::IdlePrompt),
         _ => None,
     };
+    // That Init correction fixes a stale reading; no turn ended, so the
+    // notice feed takes it as a baseline, never a "finished" edge.
+    if matches!(ev, AgentEvent::Init { .. })
+        && record.state == AgentState::Running
+        && next == Some(AgentState::Finished)
+    {
+        record.state_corrected = true;
+    }
     if let Some(next) = next {
         record.state = next;
     }
@@ -5442,6 +5450,8 @@ mod tests {
         hooked(&state);
         apply_chat_event(&state, id, &init());
         assert_eq!(crate::lock(&state.agents)[id].state, AgentState::Finished);
+        // A correction, not a turn end: the notice feed takes it as a baseline.
+        assert!(crate::lock(&state.agents)[id].state_corrected);
 
         // A turn in flight: Claude re-emits Init mid-process.
         let mut live = state.chat.attach(id, 0).unwrap().live;
