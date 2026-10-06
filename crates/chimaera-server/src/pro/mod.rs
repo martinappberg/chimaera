@@ -821,6 +821,11 @@ pub(crate) fn owner_kind(state: &crate::AppState, workspace: &str) -> Option<&'s
 pub(crate) fn restart_deferred(state: &crate::AppState, session_id: &str) -> bool {
     crate::lock(&state.pro.boot_deferred).contains(session_id)
 }
+/// Whether boot deferred any session to this life's ownership proof; only
+/// then does the one-minute device fallback have anything to resume.
+pub(crate) fn any_restart_deferred(state: &crate::AppState) -> bool {
+    !crate::lock(&state.pro.boot_deferred).is_empty()
+}
 pub(crate) fn defer_boot_session(state: &crate::AppState, session: &str) {
     let mut deferred = crate::lock(&state.pro.boot_deferred);
     if deferred.len() < 512 {
