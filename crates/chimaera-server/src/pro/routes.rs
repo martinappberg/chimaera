@@ -838,7 +838,7 @@ pub(super) async fn woke(state: &Arc<AppState>) {
     if let Err(error) = super::persist(state).await {
         tracing::warn!(%error, "Could not save project ownership after waking");
     }
-    state.pro.renew_now.notify_waiters();
+    state.pro.renew_now.notify_waiters()
 }
 pub(crate) async fn hydrate(
     State(state): State<Arc<AppState>>,
@@ -1168,3 +1168,82 @@ pub(crate) async fn projects(
 
 // Discovery is passive; adoption has a separate, explicit local action.
 pub(crate) use super::projects::{copy_project, open_project, project_list, takeover_project};
+
+/// Every route Pro serves under `/api/v1` (behind the bearer check), mounted
+/// only when the Pro policy is installed.
+pub(crate) fn router() -> axum::Router<std::sync::Arc<crate::AppState>> {
+    use axum::routing::{get, post, put};
+    axum::Router::new()
+        .route(
+            "/pro/configure",
+            post(super::configure).delete(super::disconnect),
+        )
+        .route("/pro/configure/workspace", post(super::configure_workspace))
+        .route("/pro/configure/execution", post(super::configure_execution))
+        .route("/pro/execution/recover", post(super::recover_execution))
+        .route("/pro/status", get(super::status))
+        .route("/pro/privacy", put(super::privacy))
+        .route(
+            "/pro/projects",
+            get(super::project_list).put(super::projects),
+        )
+        .route("/pro/projects/open", post(super::open_project))
+        .route("/pro/projects/copy", post(super::copy_project))
+        .route("/pro/projects/takeover", post(super::takeover_project))
+        // One project back to this computer ("Run here") or to the cloud
+        // ("Run in the cloud"), `pro/place.rs`.
+        .route("/pro/projects/{id}/here", post(super::run_here))
+        .route("/pro/projects/{id}/cloud", post(super::run_in_cloud))
+        // Both versions a return kept (`pro/kept.rs`): list, compare, choose.
+        .route("/pro/projects/{id}/kept", get(super::kept_list))
+        .route("/pro/projects/{id}/kept/file", get(super::kept_file))
+        .route("/pro/projects/{id}/kept/resolve", post(super::kept_resolve))
+        .route(
+            "/pro/projects/{id}/kept/resolve_all",
+            post(super::kept_resolve_all),
+        )
+        .route("/pro/sleep", post(super::sleep))
+        .route("/pro/handoff", post(super::handoff))
+        .route("/pro/drain", post(super::drain).delete(super::cancel_drain))
+        .route("/pro/hydrate", post(super::hydrate))
+        .route("/pro/cloud", get(crate::cloud::info))
+        .route("/pro/cloud/providers", get(crate::cloud::providers::list))
+        .route(
+            "/pro/cloud/providers/{id}/connect",
+            post(crate::cloud::providers::start),
+        )
+        .route(
+            "/pro/cloud/providers/{id}/disconnect",
+            post(crate::cloud::providers::disconnect),
+        )
+        .route(
+            "/pro/cloud/connections/{id}",
+            get(crate::cloud::providers::get),
+        )
+        .route(
+            "/pro/cloud/connections/{id}/cancel",
+            post(crate::cloud::providers::cancel),
+        )
+        .route(
+            "/pro/cloud/connections/{id}/input",
+            post(crate::cloud::providers::submit),
+        )
+        .route("/pro/cloud/project", post(crate::cloud::project))
+        .route("/pro/bundles/{id}", get(crate::bundle::snapshot_route))
+        .route(
+            "/pro/bundles/{id}/export",
+            post(crate::bundle::export_route),
+        )
+        .route(
+            "/pro/bundles",
+            post(crate::bundle::import_route).layer(axum::extract::DefaultBodyLimit::max(
+                crate::bundle::MAX_ARCHIVE as usize,
+            )),
+        )
+        .route(
+            "/pro/placements",
+            get(crate::session_proxy::inventory)
+                .post(crate::session_proxy::register)
+                .delete(crate::session_proxy::remove),
+        )
+}

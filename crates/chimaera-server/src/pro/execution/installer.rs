@@ -30,9 +30,6 @@ impl Running {
         running.check()?;
         Ok(running)
     }
-    pub(crate) fn captured(&self) -> mutation::Dispatch {
-        self.captured.clone()
-    }
     pub(crate) fn check(&self) -> Result<()> {
         self.captured.check(&self.state)
     }

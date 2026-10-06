@@ -38,6 +38,7 @@ mod notebook;
 mod notices;
 mod persist;
 mod plugins;
+mod policy;
 mod pro;
 mod proxy;
 mod quickopen;

@@ -65,7 +65,7 @@ pub(crate) fn is_change(method: &axum::http::Method, path: &str) -> bool {
     })
 }
 pub(crate) fn touch(state: &crate::AppState) {
-    if crate::pro::tier(state) != crate::pro::Tier::Active {
+    if !state.policy().active(state) {
         return;
     }
     crate::lock(&state.activity).changed = crate::session_view::now_ms();
@@ -78,9 +78,9 @@ pub(crate) fn last_change(state: &crate::AppState) -> Option<u64> {
 /// stamp is read when a sessions list is next built (`session_view`) or
 /// polled (`GET /sessions`, a cloud machine's idle check), and no window
 /// shows it, so a keystroke must never rebuild and push every window's list.
-/// Only an active plan reads it (`pro::Tier`): elsewhere input costs nothing.
+/// Only an active plan reads it (`WorkspacePolicy::active`): elsewhere input costs nothing.
 pub(crate) fn record(state: &crate::AppState, id: &str) {
-    if crate::pro::tier(state) != crate::pro::Tier::Active {
+    if !state.policy().active(state) {
         return;
     }
     crate::lock(&state.activity).record(id, crate::session_view::now_ms());

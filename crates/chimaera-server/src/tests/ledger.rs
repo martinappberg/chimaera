@@ -509,7 +509,7 @@ async fn wait_resumed(state: &Arc<AppState>, id: &str) {
     assert!(
         resumed(),
         "{id} stayed deferred: {:?}",
-        crate::ws::pause_state(state, id).map(|pause| pause.frame())
+        crate::pro::pause::pause_state(state, id).map(|pause| pause.frame())
     );
 }
 
@@ -536,7 +536,8 @@ async fn sign_out_resumes_a_returned_session_instead_of_stranding_it() {
     pro::install_execution_fixture(&state, &workspace.id, 3).unwrap();
     ledger::defer(&state, returned_chat("s-returned", &workspace.id, &root)).unwrap();
     assert_eq!(
-        crate::ws::pause_state(&state, "s-returned").map(|pause| pause.frame()["type"].clone()),
+        crate::pro::pause::pause_state(&state, "s-returned")
+            .map(|pause| pause.frame()["type"].clone()),
         Some(serde_json::json!("moved"))
     );
 
@@ -598,7 +599,7 @@ async fn boot_resumes_a_returned_session_left_deferred() {
             written_at: 1_750_000_000,
         };
         ledger::restore(&state, boot).await;
-        let pause = crate::ws::pause_state(&state, "s-stranded").map(|pause| pause.frame());
+        let pause = crate::pro::pause::pause_state(&state, "s-stranded").map(|pause| pause.frame());
         assert_eq!(
             pause.as_ref().map(|frame| frame["reason"].clone()),
             Some(serde_json::json!("restarting")),

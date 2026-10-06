@@ -59,28 +59,11 @@ pub(crate) async fn health(State(state): State<Arc<AppState>>) -> Json<serde_jso
         // The build id lets clients spot daemon/client skew (semver is the
         // 0.0.1 sentinel on every dev build, so it cannot).
         "build": chimaera_core::BUILD_ID,
-        // Assembly presence is independent of SDK build compatibility.
-        "daemon_extension": state.daemon_extension.is_some(),
         "hostname": state.hostname,
         "pid": state.pid,
         "uptime_secs": state.started.elapsed().as_secs(),
     });
-    if let Some(identity) = state
-        .daemon_extension
-        .as_ref()
-        .and_then(|runtime| runtime.assembly_identity())
-    {
-        value["daemon_assembly"] = json!(identity);
-    }
-    if let Some(ack) = crate::pro::supervisor_cleanup_ack(&state) {
-        value["supervisor_cleanup"] = json!(ack);
-    }
-    if crate::cloud::enabled() {
-        value["pro_cloud_operations"] =
-            json!(crate::cloud::active_operations() + crate::pro::active_operations(&state));
-        // Additive: the last user change that is not session input (saves,
-        // uploads, Git operations), for the machine's idle decision.
-        value["last_activity_ms"] = json!(crate::activity::last_change(&state));
-    }
+    // Additive fields a composed extension serves (nothing without one).
+    state.policy().health(&state, &mut value);
     Json(value)
 }

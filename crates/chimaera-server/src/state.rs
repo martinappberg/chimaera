@@ -78,7 +78,7 @@ pub(crate) struct AppState {
     /// every window prune the session's tabs mid-toggle.
     pub(crate) chat_switching: Mutex<HashMap<String, String>>,
     /// Durable public imports gate execution before boot ledger restoration.
-    pub(crate) bundle_imports: crate::bundle::PendingImports,
+    pub(crate) bundle_imports: Lazy<crate::bundle::PendingImports>,
     /// Workspaces with a Mastermind PUT/DELETE in flight. The routes are
     /// multi-step (retire old → bind → spawn, with rollback); two racing
     /// callers would leak the loser's spawned session and could clobber the
@@ -95,7 +95,12 @@ pub(crate) struct AppState {
     /// session id -> workspace id.
     pub(crate) session_workspaces: Mutex<HashMap<String, String>>,
     pub(crate) activity: Mutex<crate::activity::Activity>,
-    pub(crate) pro: crate::pro::ProState,
+    /// Pro's state, read from disk only when the Pro policy first uses it:
+    /// a daemon without the extension never touches it.
+    pub(crate) pro: Lazy<crate::pro::ProState>,
+    /// The workspace-admission hook (`policy`); the inert default unless a
+    /// composition installs one at startup.
+    pub(crate) policy: std::sync::OnceLock<Arc<dyn crate::policy::WorkspacePolicy>>,
     pub(crate) daemon_extension: Option<Arc<dyn crate::daemon_extension::Runtime>>,
     pub(crate) cloud_providers: crate::cloud::providers::ProviderSlot,
     pub(crate) deferred_sessions: Mutex<HashMap<String, crate::ledger::LedgerEntry>>,
@@ -290,7 +295,7 @@ impl AppState {
         let (chat, chat_signals_rx) = chat::new_manager(data_dir.join("chat"));
         let plugin_catalog = plugins::Catalog::load(data_dir.join("plugins"));
         let plugin_guard = plugins::trust::Guard::load(&plugin_catalog);
-        let state = AppState {
+        AppState {
             token,
             started: Instant::now(),
             hostname,
@@ -325,12 +330,19 @@ impl AppState {
             chat_signals: Mutex::new(Some(chat_signals_rx)),
             chat_recipes: Mutex::new(HashMap::new()),
             chat_switching: Mutex::new(HashMap::new()),
-            bundle_imports: crate::bundle::PendingImports::load(&data_dir),
+            bundle_imports: Lazy::new({
+                let data_dir = data_dir.clone();
+                move || crate::bundle::PendingImports::load(&data_dir)
+            }),
             mastermind_switching: Mutex::new(std::collections::HashSet::new()),
             spawn_reservations: Mutex::new(HashMap::new()),
             session_workspaces: Mutex::new(HashMap::new()),
             activity: Mutex::new(crate::activity::Activity::default()),
-            pro: crate::pro::ProState::new(data_dir.join("pro")),
+            pro: Lazy::new({
+                let root = data_dir.join("pro");
+                move || crate::pro::ProState::new(root)
+            }),
+            policy: std::sync::OnceLock::new(),
             daemon_extension: None,
             cloud_providers: crate::cloud::providers::ProviderSlot::default(),
             deferred_sessions: Mutex::new(HashMap::new()),
@@ -385,14 +397,42 @@ impl AppState {
             chat_catalogs: Mutex::new(HashMap::new()),
             comms: comms::Comms::new(data_dir.join("workspace")),
             knowledge: Mutex::new(knowledge::KnowledgeState::default()),
-        };
-        // An unreadable import-recovery record fences what it might name;
-        // an installation Pro never enrolled a project on has nothing it
-        // could name, so ordinary work goes on.
-        if !crate::pro::any_enrolled(&state) {
-            state.bundle_imports.release_unknown_fence();
         }
-        state
+    }
+
+    /// The installed workspace policy, or the inert one.
+    pub(crate) fn policy(&self) -> &dyn crate::policy::WorkspacePolicy {
+        self.policy.get_or_init(|| default_policy(self)).as_ref()
+    }
+
+    /// Install the policy this daemon runs with (once, at startup): the Pro
+    /// host when an extension is composed, otherwise the inert policy with
+    /// the durable fence read from `data_dir`.
+    pub(crate) fn install_policy(
+        &self,
+        composed: Option<crate::pro::ProPolicy>,
+        data_dir: &std::path::Path,
+    ) {
+        let policy: Arc<dyn crate::policy::WorkspacePolicy> = if let Some(pro) = composed {
+            crate::pro::compose(self);
+            Arc::new(pro)
+        } else {
+            Arc::new(crate::policy::Inert::new(
+                crate::policy::fence::Fence::load(data_dir),
+            ))
+        };
+        let _ = self.policy.set(policy);
+    }
+
+    /// Tests: run this state with the inert policy (no extension).
+    #[cfg(test)]
+    pub(crate) fn use_inert_policy(&self, fence: crate::policy::fence::Fence) {
+        assert!(
+            self.policy
+                .set(Arc::new(crate::policy::Inert::new(fence)))
+                .is_ok(),
+            "policy already chosen"
+        );
     }
 
     /// Wait (bounded by `RESTORE_WAIT_CAP`) until the boot ledger has been
@@ -402,6 +442,62 @@ impl AppState {
     pub(crate) async fn wait_restored(&self) {
         let mut rx = self.restored.subscribe();
         let _ = tokio::time::timeout(RESTORE_WAIT_CAP, rx.wait_for(|done| *done)).await;
+    }
+}
+
+/// Tests exercise the Pro host directly unless they install the inert
+/// policy; a real daemon chooses at startup (`lifecycle`).
+#[cfg(test)]
+fn default_policy(state: &AppState) -> Arc<dyn crate::policy::WorkspacePolicy> {
+    crate::pro::compose(state);
+    Arc::new(crate::pro::ProPolicy::default())
+}
+/// A state built outside `lifecycle` (a nondefault fixture) runs the Pro
+/// host when it carries an extension, as the composed daemon would.
+#[cfg(not(test))]
+fn default_policy(state: &AppState) -> Arc<dyn crate::policy::WorkspacePolicy> {
+    if state.daemon_extension.is_some() {
+        crate::pro::compose(state);
+        Arc::new(crate::pro::ProPolicy::default())
+    } else {
+        Arc::new(crate::policy::Inert::new(Default::default()))
+    }
+}
+
+/// A value built on first use, then shared. Field access derefs through it.
+pub(crate) struct Lazy<T> {
+    cell: std::sync::OnceLock<T>,
+    init: Mutex<Option<Box<dyn FnOnce() -> T + Send>>>,
+}
+impl<T> Lazy<T> {
+    pub(crate) fn new(init: impl FnOnce() -> T + Send + 'static) -> Self {
+        Self {
+            cell: std::sync::OnceLock::new(),
+            init: Mutex::new(Some(Box::new(init))),
+        }
+    }
+    /// Whether anything has used it yet.
+    #[cfg(test)]
+    pub(crate) fn initialized(&self) -> bool {
+        self.cell.get().is_some()
+    }
+}
+impl<T> std::ops::Deref for Lazy<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.cell.get_or_init(|| {
+            let init = crate::lock(&self.init)
+                .take()
+                .expect("lazy value initialised once");
+            init()
+        })
+    }
+}
+
+impl<T> std::ops::DerefMut for Lazy<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        let _ = &**self;
+        self.cell.get_mut().expect("initialised above")
     }
 }
 

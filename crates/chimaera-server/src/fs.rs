@@ -1344,7 +1344,7 @@ fn write_file(
     raw: &str,
     bytes: &[u8],
     pre: Precondition<'_>,
-    commit: impl FnOnce() -> anyhow::Result<Option<crate::pro::mutation::Guard>>,
+    commit: impl FnOnce() -> anyhow::Result<Option<crate::policy::Reservation>>,
 ) -> anyhow::Result<WriteOutcome> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 

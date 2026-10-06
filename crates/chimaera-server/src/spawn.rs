@@ -77,13 +77,12 @@ pub(crate) async fn spawn_session(
 ) -> Result<serde_json::Value, SpawnFailure> {
     let workspace = spec.workspace;
     let shell = matches!(spec.kind, SpawnKind::Shell);
-    let allowed = |state: &AppState, workspace: &str| {
-        if shell {
-            crate::pro::may_run_shell(state, workspace)
-        } else {
-            crate::pro::may_execute(state, workspace)
-        }
+    let need = if shell {
+        crate::policy::Need::Shell
+    } else {
+        crate::policy::Need::Execute
     };
+    let allowed = |state: &AppState, workspace: &str| state.policy().allows(state, workspace, need);
     if !allowed(state, &workspace.id) {
         return Err(SpawnFailure::Internal(anyhow::anyhow!(
             "workspace owned elsewhere"
@@ -223,8 +222,9 @@ pub(crate) async fn spawn_session(
             // communication is on (default) or a plugin with tools is active
             // here (`spawn_allow`); with neither, the argv and env stay
             // exactly what they were.
-            // Cloud projects also need where-you-run context on the TUI surface
-            // (`pro::workspace_in_scope`); otherwise that opt-in boundary stands.
+            // A workspace policy may give a project's terminal agents the
+            // daemon's tools too (`LaunchContext::tools`); otherwise that
+            // opt-in boundary stands.
             let codex_plugin_tools = if agent_kind == AgentKind::Codex {
                 crate::plugins::spawn_allow(state, &workspace.id).await
             } else {
@@ -274,7 +274,7 @@ pub(crate) async fn spawn_session(
             }
             if !codex_plugin_tools.is_empty()
                 || (agent_kind == AgentKind::Codex
-                    && crate::pro::workspace_in_scope(state, &workspace.id))
+                    && state.policy().launch_context(state, &workspace.id).tools)
             {
                 // Pre-approved: the prompt-free tools every session gets
                 // (`notify`) plus the active plugins' own.
@@ -293,8 +293,8 @@ pub(crate) async fn spawn_session(
                 opts.env
                     .push((crate::launcher::CODEX_MCP_KEY_ENV.to_string(), key.clone()));
             }
-            if agent_kind == AgentKind::Claude && crate::pro::updates_managed(state) {
-                // The cloud's agents come with its image and are updated with
+            if agent_kind == AgentKind::Claude && state.policy().updates_managed(state) {
+                // Agents that come with the machine's image are updated with
                 // it: claude's own updater could only fail there (the image
                 // prefix is not the daemon user's to write) and say so mid-turn.
                 opts.env
@@ -307,7 +307,7 @@ pub(crate) async fn spawn_session(
                 let pickup = entry.handoff.is_some().then(|| {
                     tui_pickup(
                         entry.agent.as_ref().and_then(|a| a.carryover.as_ref()),
-                        crate::pro::checkpoint_recovery_context(state, &workspace.id),
+                        state.policy().launch_context(state, &workspace.id).recovery,
                     )
                 });
                 if let Some(context) = pickup.flatten() {
@@ -366,48 +366,34 @@ pub(crate) async fn spawn_session(
             "project execution authority changed during launch"
         )));
     }
-    // Plain shells are never managed: no fence signals them and no stop
-    // waits for them. Only agents carry the project's execution evidence.
-    let managed = spawned_agent.is_some() && crate::pro::managed_execution(state, &workspace.id);
-    let intent = if managed {
-        crate::pro::prepare_managed_launch(state, &workspace.id)
-            .await
-            .map_err(SpawnFailure::Internal)?
+    // Shells share the short launch/registration gate with agents.
+    let kind = if spawned_agent.is_some() {
+        crate::policy::LaunchKind::Agent
     } else {
-        None
+        crate::policy::LaunchKind::Shell
     };
-    // Shells share the short launch/registration gate; they still do not carry
-    // an execution lease or start any account work in an unconfigured daemon.
-    let _launch = if spawned_agent.is_some() {
-        crate::pro::mutation::begin_launch(state, &workspace.id)
-    } else {
-        crate::pro::mutation::begin_shell_launch(state, &workspace.id)
-    }
-    .map_err(SpawnFailure::Internal)?;
-    if let Some(intent) = &intent {
-        intent.check().map_err(SpawnFailure::Internal)?;
-    }
-    crate::daemon_extension::apply_session_environment(
-        state,
-        &workspace.id,
-        &mut opts.env,
-        &mut opts.env_remove,
-    )
-    .await
-    .map_err(SpawnFailure::Internal)?;
+    let (launch, _reservation) = state
+        .policy()
+        .admit_launch(state, &workspace.id, kind)
+        .await
+        .map_err(SpawnFailure::Internal)?;
+    let managed = launch.managed();
+    state
+        .policy()
+        .launch_env(state, &workspace.id, &mut opts.env, &mut opts.env_remove)
+        .await
+        .map_err(SpawnFailure::Internal)?;
     let native = match &spec.kind {
         SpawnKind::Agent { resume, .. } => resume.as_deref(),
         SpawnKind::Shell => None,
     };
-    crate::pro::mutation::check_import_resume(state, &workspace.id)
-        .map_err(SpawnFailure::Internal)?;
     if let SpawnKind::Agent { kind, .. } = &spec.kind {
         crate::ledger::check_manual_native(state, Some(&id), *kind, native)
             .map_err(SpawnFailure::Internal)?;
     }
     let import_admission = state
-        .bundle_imports
-        .admit(&workspace.id, &id, native)
+        .policy()
+        .hold_session(state, &workspace.id, &id, native, false)
         .map_err(SpawnFailure::Internal)?;
     let spawned = if managed {
         state.sessions.spawn_managed(opts)
@@ -425,9 +411,7 @@ pub(crate) async fn spawn_session(
                     "project execution authority changed during launch"
                 )));
             }
-            if let Some(intent) = intent {
-                intent.registered(info.id.clone());
-            }
+            launch.registered(info.id.clone());
             // Remember the spawn theme: resurrection re-themes the session's
             // successor with it (there is no other durable record of it).
             crate::lock(&state.session_themes).insert(info.id.clone(), spec.theme.clone());

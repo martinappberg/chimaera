@@ -293,52 +293,15 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
             }),
         ));
     }
-    // Input times are for Pro's idle checks only. Without an active plan the
-    // field stays null, so a keystroke never changes the shared sessions
-    // frame and every window is not sent a new one while someone types.
-    let activity = if crate::pro::tier(state) == crate::pro::Tier::Active {
-        crate::lock(&state.activity).snapshot(rows.iter().filter_map(|(_, row)| row["id"].as_str()))
-    } else {
-        Default::default()
-    };
-    for (_, row) in &mut rows {
-        let at = row["id"].as_str().and_then(|id| activity.get(id)).copied();
-        row["last_input_ms"] = json!(at);
-        row["placement"] = json!("here");
-    }
     drop(execs);
     drop(cwds);
     drop(names);
     drop(agents);
     drop(workspaces);
-    let deferred: Vec<_> = crate::lock(&state.deferred_sessions)
-        .values()
-        .cloned()
-        .collect();
-    for entry in &deferred {
-        // A maintenance-parked leader can still exist stopped until the
-        // supervisor's positive cleanup. Its live registry row must not hide
-        // the durable manual-resume fence or suggest writable execution.
-        if entry.manual_resume_reason.is_some() {
-            rows.retain(|(_, row)| row["id"] != entry.id);
-        }
-        if !rows.iter().any(|(_, row)| row["id"] == entry.id) {
-            let label = crate::pro::paused_label(state, entry);
-            let mut row = crate::bundle::paused_row(entry, label);
-            // Additive: why it is paused, the same shape its socket says it
-            // in, so a pane that shows no socket (a paused terminal) can too.
-            if let Some(pause) = crate::ws::pause_for(state, &entry.id, Some(entry)) {
-                row["pause"] = pause.frame();
-            }
-            // Additive: the provider this paused session waits for (its
-            // project otherwise runs), so the page can say what to connect.
-            if let Some(provider) = crate::pro::blocking_provider(state, entry) {
-                row["blocked_provider"] = json!(provider);
-            }
-            rows.push((entry.created_at, row));
-        }
-    }
-    finish_rows(rows, state.session_proxy.rows(), |row| {
+    // Additive fields and rows a composed extension serves (nothing
+    // without one); rows another daemon serves replace local ones.
+    let remote = state.policy().decorate_sessions(state, &mut rows);
+    finish_rows(rows, remote, |row| {
         // Additive: `git` ({repo, worktree, branch, detached, head} or
         // null outside a repository), and an agent's hook-reported cwd
         // as its `cwd_current` (a shell's polled cwd is already there).

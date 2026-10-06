@@ -1,7 +1,7 @@
 //! Managed execution authority. A passive observation can fence execution, but
 //! only an authenticated acquire/renew response can create a fresh local lease.
 pub(crate) mod installer;
-mod launch;
+pub(crate) mod launch;
 mod lease;
 // Read old disk before-images before automatic restoration; no active channel.
 #[cfg(all(test, unix))]

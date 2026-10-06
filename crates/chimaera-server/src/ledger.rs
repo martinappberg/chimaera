@@ -581,21 +581,9 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
 /// until a ledgered chat respawns it is live nowhere, yet its journal is what
 /// it resumes from.
 pub(crate) async fn consume_boot(state: &Arc<AppState>, boot: BootLedger) {
-    let boot = crate::pro::restore_manual_parking(state, boot).await;
+    let boot = state.policy().boot(state, boot).await;
     restore(state, boot).await;
-    // Laptop first: restart-deferred work resumes even when the account never
-    // answers. A verified grant usually resumes it well before this. Only
-    // `restore` defers, so a boot that deferred nothing (every free daemon)
-    // starts no fallback timer.
-    if crate::pro::any_restart_deferred(state) {
-        let owner = state.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(crate::pro::BOOT_VERIFICATION_GRACE).await;
-            if !owner.stopping.load(std::sync::atomic::Ordering::Acquire) {
-                crate::pro::resume_unverified(&owner).await;
-            }
-        });
-    }
+    state.policy().restored(state);
     // Serving started concurrently; sessions snapshots held back by
     // `wait_restored` may flow now that the roster is whole.
     state.restored.send_replace(true);
@@ -617,23 +605,19 @@ pub(crate) async fn restore(state: &Arc<AppState>, boot: BootLedger) {
     for entry in &boot.sessions {
         // Only agents wait for this life's ownership proof; a plain shell is
         // never managed and comes back unless its project runs elsewhere.
-        let held = if entry.agent.is_some() {
-            !crate::pro::may_restore(state, &entry.workspace_id)
+        let need = if entry.agent.is_some() {
+            crate::policy::Need::Restore
         } else {
-            !crate::pro::may_run_shell(state, &entry.workspace_id)
+            crate::policy::Need::Shell
         };
-        // A returned session whose resume a sign-out or crash cut short is
-        // no hand-off in flight any more: like any session the previous
-        // daemon left, it waits for this life's ownership proof and the
-        // device fallback, instead of answering "moved" forever.
-        let interrupted = entry.suspended && crate::pro::interrupted_return(state, entry);
+        let held = !state.policy().allows(state, &entry.workspace_id, need);
         if entry.suspended || entry.manual_resume_reason.is_some() || held {
             let mut deferred = entry.clone();
             deferred.suspended = true;
             if let Err(error) = defer(state, deferred) {
                 tracing::error!(session=%entry.id,%error,"deferred ledger capacity reached");
-            } else if entry.manual_resume_reason.is_none() && (!entry.suspended || interrupted) {
-                crate::pro::defer_boot_session(state, &entry.id);
+            } else {
+                state.policy().held_at_boot(state, entry);
             }
             continue;
         }
@@ -778,12 +762,7 @@ pub(crate) async fn respawn(
     let (fork, origin) = entry.handoff.as_ref().map_or((false, None), |handoff| {
         (handoff.fork, Some(handoff.origin.as_str()))
     });
-    if entry.handoff.as_ref().is_some_and(|handoff| {
-        crate::pro::owned_epoch(state, &entry.workspace_id)
-            .is_some_and(|epoch| epoch != handoff.epoch)
-    }) {
-        anyhow::bail!("deferred bundle epoch is stale");
-    }
+    state.policy().resume_check(state, entry)?;
     respawn_transfer(state, entry, workspace, fork, origin).await
 }
 
@@ -794,7 +773,8 @@ pub(crate) async fn respawn_transfer(
     fork_head: bool,
     origin: Option<&'static str>,
 ) -> anyhow::Result<()> {
-    state.bundle_imports.check_session(
+    state.policy().check_import(
+        state,
         &entry.id,
         entry.agent.as_ref().and_then(|a| a.resume.as_deref()),
     )?;
@@ -871,7 +851,7 @@ pub(crate) async fn respawn_transfer(
 }
 
 /// A conversation a lapse fenced here that another machine ran since
-/// (`pro::settle_fenced`): it goes to Recents instead of resuming, so
+/// (the workspace policy settles it): it goes to Recents instead of resuming, so
 /// reopening it continues the conversation without re-running its turn.
 pub(crate) async fn retire_stale(state: &Arc<AppState>, entry: &LedgerEntry) {
     retire_to_recents(state, entry, unix_now()).await;
@@ -946,7 +926,10 @@ pub(crate) async fn resume_deferred_filtered(
     workspace_id: &str,
     keep: impl Fn(&LedgerEntry) -> bool,
 ) -> anyhow::Result<()> {
-    if !crate::pro::may_execute(state, workspace_id) {
+    if !state
+        .policy()
+        .allows(state, workspace_id, crate::policy::Need::Execute)
+    {
         anyhow::bail!("workspace ownership has not been verified");
     }
     let workspace = crate::lock(&state.workspaces)
@@ -985,7 +968,10 @@ pub(crate) async fn resume_deferred_sessions(
     workspace_id: &str,
     ids: &[String],
 ) -> anyhow::Result<()> {
-    if !crate::pro::may_execute(state, workspace_id) {
+    if !state
+        .policy()
+        .allows(state, workspace_id, crate::policy::Need::Execute)
+    {
         anyhow::bail!("workspace is owned elsewhere");
     }
     let workspace = crate::lock(&state.workspaces)
@@ -1024,7 +1010,7 @@ async fn resume_one(
         .filter(|entry| {
             entry.workspace_id == workspace.id
                 && keep(entry)
-                && crate::pro::fence_current(state, entry)
+                && state.policy().may_resume(state, entry)
         })
         .cloned()
     else {

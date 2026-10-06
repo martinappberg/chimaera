@@ -458,7 +458,7 @@ pub(crate) async fn update_agent(
         )
             .into_response();
     };
-    let captured = match crate::pro::mutation::Dispatch::capture(&state, &body.workspace_id) {
+    let captured = match state.policy().capture(&state, &body.workspace_id) {
         Ok(captured) => captured,
         Err(_) => return *authority_changed(),
     };
@@ -542,7 +542,9 @@ pub(crate) async fn start_install(
     action: &str,
     script: String,
 ) -> Result<String, Box<Response>> {
-    let captured = crate::pro::mutation::Dispatch::capture(state, &workspace.id)
+    let captured = state
+        .policy()
+        .capture(state, &workspace.id)
         .map_err(|_| authority_changed())?;
     start_install_captured(state, kind, workspace, action, script, captured).await
 }
@@ -561,7 +563,7 @@ async fn start_install_captured(
     workspace: &crate::workspaces::Workspace,
     action: &str,
     script: String,
-    captured: crate::pro::mutation::Dispatch,
+    captured: crate::policy::Admission,
 ) -> Result<String, Box<Response>> {
     let state = state.clone();
     let workspace = workspace.clone();
@@ -610,7 +612,7 @@ async fn start_install_owned(
     workspace: &crate::workspaces::Workspace,
     action: &str,
     script: String,
-    captured: crate::pro::mutation::Dispatch,
+    captured: crate::policy::Admission,
 ) -> Result<String, Box<Response>> {
     let session_id = crate::agents::fresh_session_id();
     {
@@ -659,17 +661,16 @@ async fn start_install_owned(
         }
     };
 
-    let mut admitted =
-        match crate::pro::installer::Running::begin(state, &workspace.id, captured).await {
-            Ok(admitted) => admitted,
-            Err(_) => {
-                let mut installs = crate::lock(&state.installs);
-                if installs.get(&kind).map(|(sid, _)| sid.as_str()) == Some(session_id.as_str()) {
-                    installs.remove(&kind);
-                }
-                return Err(authority_changed());
+    let mut admitted = match captured.installer(state, &workspace.id).await {
+        Ok(admitted) => admitted,
+        Err(_) => {
+            let mut installs = crate::lock(&state.installs);
+            if installs.get(&kind).map(|(sid, _)| sid.as_str()) == Some(session_id.as_str()) {
+                installs.remove(&kind);
             }
-        };
+            return Err(authority_changed());
+        }
+    };
     prune_install_versions(state.managed_root.clone(), kind).await;
 
     // Installer sessions run a chimaera-authored script — never a user
@@ -819,7 +820,7 @@ pub(crate) fn installation_status(state: &AppState, kind: AgentKind) -> Option<s
 /// withdraw an installer's authority mid-run, so only there is it fenced
 /// within 100 ms; everywhere else the watch keeps the ordinary agent cadence.
 pub(crate) fn install_watch_interval(state: &AppState) -> std::time::Duration {
-    if crate::pro::tier(state) == crate::pro::Tier::Active {
+    if state.policy().active(state) {
         std::time::Duration::from_millis(100)
     } else {
         crate::agents::poll_interval()
@@ -834,7 +835,7 @@ fn spawn_install_watch(
     kind: AgentKind,
     session_id: String,
     install_lock: InstallLock,
-    admitted: crate::pro::installer::Running,
+    admitted: crate::policy::Installer,
     owner: InstallOwner,
 ) {
     tokio::spawn(async move {

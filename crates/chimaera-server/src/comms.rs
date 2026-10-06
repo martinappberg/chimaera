@@ -1104,7 +1104,7 @@ pub(crate) async fn message_agent(state: &Arc<AppState>, from_sid: &str, args: &
     };
     // A project that runs elsewhere, or whose ownership is being verified,
     // starts no turns here (the same fence every mutation passes).
-    let admission = match crate::pro::mutation::Dispatch::capture(state, &from.ws) {
+    let admission = match state.policy().capture(state, &from.ws) {
         Ok(admission) => admission,
         Err(_) => return error("Project execution is paused while ownership is verified".into()),
     };
@@ -1296,7 +1296,7 @@ async fn execute(
     target: &Reader,
     plan: Plan,
     posted: &Arc<Entry>,
-    execution: (&crate::pro::mutation::Dispatch, Option<(String, u64)>),
+    execution: (&crate::policy::Admission, Option<(String, u64)>),
 ) -> String {
     let (admission, thread) = execution;
     match plan {
@@ -1449,7 +1449,7 @@ async fn execute(
 async fn send_guarded(
     state: &Arc<AppState>,
     target: &Reader,
-    admission: &crate::pro::mutation::Dispatch,
+    admission: &crate::policy::Admission,
     command: AgentCommand,
     origin: Option<&'static str>,
     claim: Option<(String, bool)>,
@@ -1510,9 +1510,11 @@ async fn deliver_all(
     reader: &Reader,
     why: Option<&str>,
     origin: &'static str,
-    admission: Option<&crate::pro::mutation::Dispatch>,
+    admission: Option<&crate::policy::Admission>,
 ) -> Result<usize, String> {
-    let captured = crate::pro::mutation::Dispatch::capture(state, &reader.ws)
+    let captured = state
+        .policy()
+        .capture(state, &reader.ws)
         .map_err(|_| "workspace execution authority changed".to_string())?;
     let admission = admission.unwrap_or(&captured);
     if !reader.chat || !state.chat.get(&reader.sid).is_some_and(|c| c.alive) {
@@ -1662,7 +1664,7 @@ async fn idle_check(state: &Arc<AppState>, sid: &str) {
     if !reader.chat || !reader.alive || reader.busy {
         return;
     }
-    let Ok(admission) = crate::pro::mutation::Dispatch::capture(state, &reader.ws) else {
+    let Ok(admission) = state.policy().capture(state, &reader.ws) else {
         return;
     };
     let key = (reader.ws.clone(), reader.sid.clone());
@@ -2308,10 +2310,16 @@ pub(crate) async fn deliver(
     // A project that runs elsewhere, or whose ownership is being verified,
     // takes no new turns here (the Pro fence every mutation passes).
     let _dispatch = match crate::workspace_scope::begin_mutation(&state, &mutation) {
-        Ok(guard) if crate::pro::may_execute(&state, &id) => guard,
+        Ok(guard)
+            if state
+                .policy()
+                .allows(&state, &id, crate::policy::Need::Execute) =>
+        {
+            guard
+        }
         _ => return fail(StatusCode::CONFLICT, "workspace_scope_changed"),
     };
-    let admission = match crate::pro::mutation::Dispatch::capture(&state, &id) {
+    let admission = match state.policy().capture(&state, &id) {
         Ok(admission) => admission,
         Err(_) => return fail(StatusCode::CONFLICT, "workspace_scope_changed"),
     };
@@ -2512,7 +2520,7 @@ mod tests {
                 seqs: vec![1],
             },
         );
-        let admission = crate::pro::mutation::Dispatch::capture(&state, "w").unwrap();
+        let admission = state.policy().capture(&state, "w").unwrap();
         let (entered, ready) = tokio::sync::oneshot::channel();
         let (resume, paused) = tokio::sync::oneshot::channel();
         *crate::lock(&state.comms.dispatch_gate) = Some((entered, paused));

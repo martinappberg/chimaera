@@ -67,11 +67,14 @@ async fn run_selected(
     ))]
     provider_fixture: Option<fn(crate::provider_fixture::Context) -> anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
-    // Consume the trusted launcher's one-shot pipe before restore or helpers
-    // can inherit it. An opted-in idle descriptor is protected and its Linux
-    // proc/ptrace gate verified here, before any startup child. Ordinary device
-    // and cluster startup have no such channel.
-    let supervisor_cleanup = crate::pro::read_supervisor_cleanup().await?;
+    // The composition point: an extension brings the Pro host as its
+    // workspace policy, prepared before restore or any helper starts.
+    // Without one the daemon runs the inert policy.
+    let pro = if runtime.is_some() {
+        Some(crate::pro::ProPolicy::prepare().await?)
+    } else {
+        None
+    };
     // A cluster workspace job: its data dir is the workspace's folder on the
     // shared filesystem, and the manifest there is the workspace's lease. A
     // previous job of the same workspace may still be shutting down (a
@@ -203,6 +206,7 @@ async fn run_selected(
         chimaera_core::config_dir(),
     );
     state.daemon_extension = runtime;
+    state.install_policy(pro, &chimaera_core::data_dir());
     let managed_root = chimaera_core::managed_agents_dir();
     if state.managed_root != managed_root {
         state.legacy_managed_root = Some(std::mem::replace(&mut state.managed_root, managed_root));
@@ -219,7 +223,7 @@ async fn run_selected(
                 .await;
     }
 
-    crate::pro::stage_supervisor_cleanup(&state, supervisor_cleanup)?;
+    state.policy().started(&state)?;
     #[cfg(all(
         unix,
         feature = "provider-authority-prototype",
@@ -272,9 +276,6 @@ async fn run_selected(
     // (crashes, unclean stops) — swept once restore has decided which
     // sessions still exist.
     crate::upload::spawn_boot_prune(state.clone());
-    // Transfer leftovers (staging copies, Git locks, temporary archives) from
-    // a previous daemon life that never finished them.
-    crate::pro::sweep_leftovers(&state);
 
     // `state.clone()` (not a move) so the post-serve ledger snapshot + handoff
     // below still own it after graceful shutdown returns.
@@ -331,9 +332,7 @@ async fn run_selected(
     // live chat agents cleanly so their own teardown stops their background
     // work (see `chat::stop_all_for_exit`); they resurrect from the ledger.
     crate::chat::stop_all_for_exit(&state).await;
-    // Managed agents are proven stopped here, so a same-boot successor (an
-    // update or restart) does not treat their launch evidence as a crash.
-    crate::pro::shutdown(&state).await;
+    state.policy().shutdown(&state).await;
     // Plugins' programs end with the daemon, their whole process groups (a
     // build is started again on the next save; nothing resumes it).
     state.plugin_platform.jobs.kill_all();
@@ -579,8 +578,7 @@ async fn shutdown_signal(state: Arc<AppState>) {
     state
         .stopping
         .store(true, std::sync::atomic::Ordering::Relaxed);
-    #[cfg(all(unix, feature = "provider-authority-prototype"))]
-    crate::pro::retire_provider_startup(&state);
+    state.policy().stopping(&state);
     state.changes.notify_waiters();
 }
 

@@ -941,46 +941,46 @@ async fn switch_to_pty(
         env_remove,
         scrollback: crate::lock(&state.settings).scrollback_lines(),
     };
-    if !crate::pro::may_execute(state, &successor_recipe.workspace_id) {
-        return false;
-    }
-    let Ok(intent) =
-        crate::pro::prepare_managed_launch(state, &successor_recipe.workspace_id).await
-    else {
-        return false;
-    };
-    let Ok(_launch) = crate::pro::mutation::begin_launch(state, &successor_recipe.workspace_id)
-    else {
-        return false;
-    };
-    if intent
-        .as_ref()
-        .is_some_and(|intent| intent.check().is_err())
-    {
-        return false;
-    }
-    if crate::daemon_extension::apply_session_environment(
+    let policy = state.policy();
+    if !policy.allows(
         state,
         &successor_recipe.workspace_id,
-        &mut opts.env,
-        &mut opts.env_remove,
-    )
-    .await
-    .is_err()
+        crate::policy::Need::Execute,
+    ) {
+        return false;
+    }
+    let Ok((launch, _reservation)) = policy
+        .admit_launch(
+            state,
+            &successor_recipe.workspace_id,
+            crate::policy::LaunchKind::Agent,
+        )
+        .await
+    else {
+        return false;
+    };
+    if policy
+        .launch_env(
+            state,
+            &successor_recipe.workspace_id,
+            &mut opts.env,
+            &mut opts.env_remove,
+        )
+        .await
+        .is_err()
     {
         return false;
     }
-    if crate::pro::mutation::check_import_resume(state, &successor_recipe.workspace_id).is_err() {
-        return false;
-    }
-    let Ok(import_admission) = state.bundle_imports.admit(
+    let Ok(import_admission) = policy.hold_session(
+        state,
         &successor_recipe.workspace_id,
         id,
         successor_recipe.resume.as_deref(),
+        false,
     ) else {
         return false;
     };
-    let spawned = if crate::pro::managed_execution(state, &successor_recipe.workspace_id) {
+    let spawned = if launch.managed() {
         state.sessions.spawn_managed(opts)
     } else {
         state.sessions.spawn(opts)
@@ -989,13 +989,15 @@ async fn switch_to_pty(
     match spawned {
         Ok(_) => {
             crate::runtime_retention::watch(state.clone(), id.to_string(), usage);
-            if !crate::pro::may_execute(state, &successor_recipe.workspace_id) {
+            if !policy.allows(
+                state,
+                &successor_recipe.workspace_id,
+                crate::policy::Need::Execute,
+            ) {
                 let _ = state.sessions.fence(id);
                 return false;
             }
-            if let Some(intent) = intent {
-                intent.registered(id.to_owned());
-            }
+            launch.registered(id.to_owned());
             crate::lock(&state.chat_recipes).insert(id.to_string(), successor_recipe);
             tracing::info!(%id, "chat session switched to PTY TUI");
             true
@@ -3309,7 +3311,9 @@ pub(crate) async fn spawn_chat_session(
     pinned_override: Option<String>,
 ) -> anyhow::Result<ChatInfo> {
     anyhow::ensure!(
-        crate::pro::may_execute(state, &recipe.workspace_id),
+        state
+            .policy()
+            .allows(state, &recipe.workspace_id, crate::policy::Need::Execute),
         "project execution authority unavailable"
     );
     crate::ledger::check_manual_native(state, Some(&id), recipe.kind, recipe.resume.as_deref())?;
@@ -3607,11 +3611,12 @@ pub(crate) async fn spawn_chat_session(
         // Return value (whether history was seeded) matters only to the
         // create-from-recent path, which pre-seeds and inspects it there; here
         // (view-switch / rewind) the session always stays in chat.
-        crate::pro::mutation::check_import_resume(state, &recipe.workspace_id)?;
-        let import_admission = state.bundle_imports.read_admission(
+        let import_admission = state.policy().hold_session(
+            state,
             &recipe.workspace_id,
             &id,
             recipe.resume.as_deref(),
+            true,
         )?;
         let _ = tokio::task::block_in_place(|| seed_resumed_journal(state, &id, &recipe));
         drop(import_admission);
@@ -3623,23 +3628,31 @@ pub(crate) async fn spawn_chat_session(
         spec.portable_context = recover_portable_context_from_disk(state, &id, recipe.kind).await;
     }
     anyhow::ensure!(
-        crate::pro::may_execute(state, &recipe.workspace_id),
+        state
+            .policy()
+            .allows(state, &recipe.workspace_id, crate::policy::Need::Execute),
         "project execution authority changed during launch"
     );
-    let intent = crate::pro::prepare_managed_launch(state, &recipe.workspace_id).await?;
-    let _launch = crate::pro::mutation::begin_launch(state, &recipe.workspace_id)?;
+    let (launch, _reservation) = state
+        .policy()
+        .admit_launch(
+            state,
+            &recipe.workspace_id,
+            crate::policy::LaunchKind::Agent,
+        )
+        .await?;
     crate::ledger::check_manual_native(state, Some(&id), recipe.kind, recipe.resume.as_deref())?;
-    if let Some(intent) = &intent {
-        intent.check()?;
-    }
-    crate::daemon_extension::apply_session_environment(
-        state,
-        &recipe.workspace_id,
-        &mut spec.env,
-        &mut spec.env_remove,
-    )
-    .await?;
-    spec.managed_execution = crate::pro::managed_execution(state, &recipe.workspace_id)
+    launch.check()?;
+    state
+        .policy()
+        .launch_env(
+            state,
+            &recipe.workspace_id,
+            &mut spec.env,
+            &mut spec.env_remove,
+        )
+        .await?;
+    spec.managed_execution = launch.managed()
         || crate::lock(&state.deferred_sessions)
             .get(&id)
             .is_some_and(|entry| {
@@ -3650,27 +3663,30 @@ pub(crate) async fn spawn_chat_session(
         .kind
         .chat_adapter()
         .ok_or_else(|| anyhow::anyhow!("no chat adapter registered"))?;
-    crate::pro::mutation::check_import_resume(state, &recipe.workspace_id)?;
-    let import_admission =
-        state
-            .bundle_imports
-            .admit(&recipe.workspace_id, &id, recipe.resume.as_deref())?;
+    let import_admission = state.policy().hold_session(
+        state,
+        &recipe.workspace_id,
+        &id,
+        recipe.resume.as_deref(),
+        false,
+    )?;
     let info = state.chat.spawn(adapter, spec);
     drop(import_admission);
     if info.is_err() {
         crate::lock(&state.chat_recipes).remove(&id);
     } else {
         crate::runtime_retention::watch(state.clone(), id.clone(), usage);
-        if !crate::pro::may_execute(state, &recipe.workspace_id) {
+        if !state
+            .policy()
+            .allows(state, &recipe.workspace_id, crate::policy::Need::Execute)
+        {
             state.chat.fence(&id);
             anyhow::bail!("project execution authority changed during launch");
         }
         if let Some(placement) = &placement {
             crate::mcp::cloud_context::told(state, placement).await;
         }
-        if let Some(intent) = intent {
-            intent.registered(id);
-        }
+        launch.registered(id);
     }
     info
 }
@@ -3725,7 +3741,10 @@ pub(crate) async fn resurrect_chat_transfer(
     fork_head: bool,
     origin: Option<&'static str>,
 ) -> anyhow::Result<()> {
-    if !crate::pro::may_execute(state, &workspace.id) {
+    if !state
+        .policy()
+        .allows(state, &workspace.id, crate::policy::Need::Execute)
+    {
         anyhow::bail!("workspace owned elsewhere");
     }
     let agent = entry
@@ -3892,7 +3911,10 @@ pub(crate) async fn resurrect_chat_transfer(
             {
                 None
             } else if let Some(origin) = origin {
-                let recovery = crate::pro::checkpoint_recovery_context(state, &entry.workspace_id);
+                let recovery = state
+                    .policy()
+                    .launch_context(state, &entry.workspace_id)
+                    .recovery;
                 // Where it runs now arrives separately, at the process start
                 // (`cloud_context`); the pick-up only says what to continue.
                 handoff_message(origin, carry.as_ref(), recovery, fork_head)

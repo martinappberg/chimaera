@@ -130,7 +130,7 @@ pub(crate) async fn start(
             "Open a workspace on this host first.",
         );
     };
-    let captured = match crate::pro::mutation::Dispatch::capture(&state, &body.workspace_id) {
+    let captured = match state.policy().capture(&state, &body.workspace_id) {
         Ok(captured) => captured,
         Err(_) => return error(StatusCode::CONFLICT, "Project execution authority changed."),
     };
@@ -156,7 +156,7 @@ async fn start_script(
     body: Request,
     script: String,
 ) -> Response {
-    let captured = match crate::pro::mutation::Dispatch::capture(&state, &body.workspace_id) {
+    let captured = match state.policy().capture(&state, &body.workspace_id) {
         Ok(captured) => captured,
         Err(_) => return error(StatusCode::CONFLICT, "Project execution authority changed."),
     };
@@ -168,7 +168,7 @@ async fn start_captured(
     cwd: PathBuf,
     body: Request,
     script: String,
-    captured: crate::pro::mutation::Dispatch,
+    captured: crate::policy::Admission,
 ) -> Response {
     let install_lock = match crate::runtimes::lock_install(&state.managed_root, kind).await {
         Ok(file) => file,
@@ -208,20 +208,19 @@ async fn start_captured(
     });
     lock(&state.agent_setup).insert(kind, operation.clone());
     tokio::spawn(async move {
-        let mut admitted =
-            match crate::pro::installer::Running::begin(&state, &workspace, captured).await {
-                Ok(admitted) => admitted,
-                Err(_) => {
-                    finish(
-                        &operation,
-                        Phase::Cancelled,
-                        None,
-                        "Project execution authority changed; installer was not started.",
-                    );
-                    state.changes.notify_waiters();
-                    return;
-                }
-            };
+        let mut admitted = match captured.installer(&state, &workspace).await {
+            Ok(admitted) => admitted,
+            Err(_) => {
+                finish(
+                    &operation,
+                    Phase::Cancelled,
+                    None,
+                    "Project execution authority changed; installer was not started.",
+                );
+                state.changes.notify_waiters();
+                return;
+            }
+        };
         crate::runtimes::prune_install_versions(state.managed_root.clone(), kind).await;
         let (phase, code, message) =
             run(&state, &operation, receiver, cwd, script, &mut admitted).await;
@@ -359,7 +358,7 @@ async fn run(
     mut cancel: watch::Receiver<bool>,
     cwd: PathBuf,
     script: String,
-    admitted: &mut crate::pro::installer::Running,
+    admitted: &mut crate::policy::Installer,
 ) -> (Phase, Option<i32>, String) {
     if *cancel.borrow() || admitted.check().is_err() {
         return (
@@ -709,7 +708,7 @@ mod tests {
     async fn stale_captured_install_never_starts_and_active_authority_loss_reaps() {
         let state = state();
         crate::pro::install_execution_fixture(&state, "test", 4).unwrap();
-        let captured = crate::pro::mutation::Dispatch::capture(&state, "test").unwrap();
+        let captured = state.policy().capture(&state, "test").unwrap();
         crate::pro::mutation::local_dispatch_owner_fixture(&state, "test", 5);
         let response = start_captured(
             state.clone(),

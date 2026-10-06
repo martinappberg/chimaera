@@ -4,18 +4,23 @@ This module retains daemon-side mirror and handoff authority, effects and recove
 [server map](../../AGENTS.md). It is inert until the native app provides a scoped,
 revocable delegation over the authenticated local API.
 
-**The free contract.** `tier(state)` is the one rule shared code asks: `Free`
-(no extension composed), `Offered` (extension, no account), `Active`
-(`/pro/configure`, or a cloud machine). Nothing Pro runs, records or writes
-below `Active` (input stamps, `last_input_ms`, the placement poll), and nothing
-at all in `Free`. Separately, an unreadable or corrupt Pro state file fences
-only projects Pro has a record of (`enrolled`); a never-enrolled installation is
-never blocked by Pro state. While `state.json` itself is unreadable every
-project counts as enrolled, so damage never lifts a real fence; the workspace
-authority record fences only on a cloud worker, the only place it is written.
+**The free contract.** Shared code asks only the workspace-admission hook
+(`crate::policy`). Without an extension the daemon runs the inert policy and
+never builds `ProState`: nothing here runs, reads or writes; only the small
+durable fence reader (`policy/fence.rs`) keeps a project an earlier composed
+daemon handed elsewhere from running twice. With the extension, `tier(state)`
+splits `Offered` (no account) from `Active` (`/pro/configure`, or a cloud
+machine): nothing Pro runs, records or writes below `Active` (input stamps,
+`last_input_ms`, the placement poll). An unreadable or corrupt Pro state file
+fences only projects Pro has a record of (`enrolled`); while `state.json`
+itself is unreadable every project counts as enrolled, so damage never lifts a
+real fence; the workspace authority record fences only on a cloud worker, the
+only place it is written.
 
 | File | Responsibility |
 | --- | --- |
+| `seam.rs` | `ProPolicy`, the Pro implementation of the shared workspace-admission hook (`crate::policy::WorkspacePolicy`); the only way shared daemon code reaches Pro. Installed by `lifecycle` when an extension is composed (tests use it by default). |
+| `pause.rs` | Why a session has no process here (`moved`/`paused` frames, paused-row reasons) and the read-only refusal words, served through the hook. |
 | `mod.rs` | Bounded, credential-free persistent state and ownership/import fences; `synced` says whether a project's agents get the where-you-run note (`mcp/cloud_context.rs`). |
 | `authority.rs` / `authority_tests.rs` | Fixed-identity workspace-bound worker acceptance, startup-only validated revision advancement, credential-free persisted latch, renewal/route/root guards and synthetic side-effect regressions. |
 | `routes.rs` | Authenticated configure/status/privacy/sleep/hydration HTTP handlers. Accepted writes retain configuration/job reservations through durable persistence even if the caller disconnects. `/pro/status` rows carry additive `place`, `reason`, `run_here` and `run_in_cloud` (see Where work runs below). `hand_over` is the one flush coordinator behind `/pro/sleep`, the macOS sleep watcher and "Run in the cloud"; `woke` is the wake. |

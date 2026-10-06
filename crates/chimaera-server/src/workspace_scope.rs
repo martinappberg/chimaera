@@ -75,7 +75,7 @@ impl Mutation {
             generation,
         }))
     }
-    pub(crate) fn begin(&self, state: &AppState) -> Result<crate::pro::mutation::Guard> {
+    pub(crate) fn begin(&self, state: &AppState) -> Result<crate::policy::Reservation> {
         self.scope
             .validate(state)
             .map_err(|_| crate::pro::mutation::Changed)?;
@@ -85,26 +85,16 @@ impl Mutation {
             self.scope.epoch,
             self.generation,
         )
+        .map(crate::policy::Reservation::new)
     }
 }
 pub(crate) fn begin_mutation(
     state: &AppState,
     mutation: &Option<Extension<Mutation>>,
-) -> Result<Option<crate::pro::mutation::Guard>> {
+) -> Result<Option<crate::policy::Reservation>> {
     mutation
         .as_ref()
-        .map(|Extension(mutation)| {
-            mutation
-                .scope
-                .validate(state)
-                .map_err(|_| crate::pro::mutation::Changed)?;
-            crate::pro::mutation::begin(
-                state,
-                &mutation.scope.workspace_id,
-                mutation.scope.epoch,
-                mutation.generation,
-            )
-        })
+        .map(|Extension(mutation)| mutation.begin(state))
         .transpose()
 }
 pub(crate) fn mutation_failure(error: &anyhow::Error) -> Option<Response> {

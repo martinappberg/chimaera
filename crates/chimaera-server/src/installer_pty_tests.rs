@@ -41,7 +41,7 @@ async fn done(state: &AppState) {
 async fn stale_pty_install_capture_is_refused_before_child_spawn() {
     let (state, workspace, root) = fixture();
     crate::pro::install_execution_fixture(&state, "project", 4).unwrap();
-    let captured = crate::pro::mutation::Dispatch::capture(&state, "project").unwrap();
+    let captured = state.policy().capture(&state, "project").unwrap();
     crate::pro::mutation::local_dispatch_owner_fixture(&state, "project", 5);
     let result = start_install_captured(
         &state,

@@ -8,7 +8,7 @@
 //! updater, `chimaera connect --update-daemon`); the daemon only reports.
 //!
 //! The account's cloud never checks: the service updates that daemon, so it
-//! reports `state: "managed"` instead (`pro::updates_managed`), with no release
+//! reports `state: "managed"` instead (`WorkspacePolicy::updates_managed`), with no release
 //! and nothing to offer, and makes no release request at all.
 //!
 //! The transport is a `curl` subprocess, deliberately: it is the one HTTP
@@ -129,7 +129,7 @@ impl UpdateStatus {
 
 /// This daemon's update status as every surface reads it.
 pub(crate) fn status_json(state: &AppState) -> serde_json::Value {
-    let managed = crate::pro::updates_managed(state);
+    let managed = state.policy().updates_managed(state);
     if !managed && state.daemon_extension.is_some() {
         // The official app's daemon is updated with the app (its signed
         // updater, or a reconnect for a remote one), never from the public
@@ -222,7 +222,7 @@ pub(crate) async fn run_checker(state: Arc<AppState>) {
 ///
 /// The account's cloud never asks: the service updates its daemon.
 pub(crate) async fn check_now(state: &Arc<AppState>) {
-    if crate::pro::updates_managed(state) || state.daemon_extension.is_some() {
+    if state.policy().updates_managed(state) || state.daemon_extension.is_some() {
         return;
     }
     // Every finished check moves the epoch (below, before the lock drops),

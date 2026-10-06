@@ -20,14 +20,10 @@ pub(crate) async fn list_workspaces(
             .into_iter()
             .filter(|workspace| !crate::cloud::is_onboarding_workspace(workspace))
             .map(|workspace| {
-                let copy = crate::pro::local_copy_view(&state, &workspace.id);
                 let mut value = json!(workspace);
-                if let Some(copy) = copy {
-                    value
-                        .as_object_mut()
-                        .expect("workspace object")
-                        .insert("local_copy".into(), copy);
-                }
+                state
+                    .policy()
+                    .decorate_workspace(&state, &workspace.id, &mut value);
                 value
             })
             .collect(),
@@ -59,7 +55,7 @@ pub(crate) async fn create_workspace(
     // marker is read in the same blocking step, and only where Pro can be:
     // without the extension a folder registers exactly as it always did.
     let input = body.root.clone();
-    let read_marker = crate::pro::tier(&state) != crate::pro::Tier::Free;
+    let read_marker = state.policy().reads_folder_identity(&state);
     let validated = tokio::task::spawn_blocking(move || {
         let root = std::fs::canonicalize(PathBuf::from(&input))
             .map_err(|err| format!("{input}: {err}"))?;
@@ -126,19 +122,13 @@ pub(crate) async fn create_workspace(
         Ok(registered) => {
             let workspace = registered.workspace;
             if registered.known {
-                // The user opened this project here: it may come home to
-                // this computer (`pro::note_opened`).
-                crate::pro::note_opened(&state, &workspace.id);
+                // The user opened this project here.
+                state.policy().workspace_known(&state, &workspace.id);
             }
-            // The marker exists for Pro's cloud copy: only a project Pro
-            // enrolled carries one, so a free user's folders never change.
-            if registered.write_marker && crate::pro::marks_folder(&state, &workspace.id) {
-                let (root, id) = (workspace.root.clone(), workspace.id.clone());
-                // Best effort, off the reactor and off the store's lock.
-                tokio::task::spawn_blocking(move || identity::write(&root, &id))
-                    .await
-                    .ok();
-            }
+            state
+                .policy()
+                .workspace_opened(&state, &workspace, Some(registered.write_marker))
+                .await;
             Json(workspace).into_response()
         }
         Err(err) => {
@@ -160,16 +150,15 @@ pub(crate) async fn open_workspace(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
-    match crate::lock(&state.workspaces).touch(&id) {
+    let touched = crate::lock(&state.workspaces).touch(&id);
+    match touched {
         Some(workspace) => {
             if !workspace.cloud_internal && !workspace.hidden {
-                crate::pro::note_opened(&state, &workspace.id);
-                if crate::pro::marks_folder(&state, &workspace.id) {
-                    let (root, id) = (workspace.root.clone(), workspace.id.clone());
-                    tokio::task::spawn_blocking(move || {
-                        crate::workspaces::identity::backfill(&root, &id)
-                    });
-                }
+                state.policy().workspace_known(&state, &workspace.id);
+                state
+                    .policy()
+                    .workspace_opened(&state, &workspace, None)
+                    .await;
             }
             Json(workspace).into_response()
         }

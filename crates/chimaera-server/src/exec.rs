@@ -48,10 +48,11 @@ pub(crate) async fn run_exec_scoped(
     admission: Option<crate::workspace_scope::Mutation>,
 ) -> Result<chimaera_pty::ExecOutcome, chimaera_pty::ExecError> {
     let workspace = crate::lock(&state.session_workspaces).get(id).cloned();
-    if workspace
-        .as_deref()
-        .is_some_and(|workspace| !crate::pro::may_execute(state, workspace))
-    {
+    if workspace.as_deref().is_some_and(|workspace| {
+        !state
+            .policy()
+            .allows(state, workspace, crate::policy::Need::Execute)
+    }) {
         return Err(chimaera_pty::ExecError::Busy(
             "Project execution is paused while ownership is verified".into(),
         ));
@@ -117,7 +118,11 @@ pub(crate) async fn run_exec_scoped(
                 if crate::lock(&dispatch_state.session_workspaces).get(&dispatch_id)
                     != workspace.as_ref()
                     || workspace.as_deref().is_some_and(|workspace| {
-                        !crate::pro::may_execute(&dispatch_state, workspace)
+                        !dispatch_state.policy().allows(
+                            &dispatch_state,
+                            workspace,
+                            crate::policy::Need::Execute,
+                        )
                     })
                 {
                     return Err(chimaera_pty::ExecError::Busy(

@@ -250,7 +250,7 @@ impl TransferHost {
         .await?
     }
     pub(crate) fn belongs_to(&self, pro: &pro::ProState, workspace: &str) -> bool {
-        self.workspace == workspace && std::ptr::eq(pro, &self.state.pro)
+        self.workspace == workspace && std::ptr::eq(pro, &*self.state.pro)
     }
     pub fn cache(&self) -> &Path {
         &self.project_cache

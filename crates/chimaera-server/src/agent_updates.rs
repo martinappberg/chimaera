@@ -61,7 +61,7 @@ pub(crate) async fn run_checker(state: Arc<AppState>) {
 /// The account's cloud never asks: its agents come with its image and are
 /// updated with it, so there is nothing a release would be offered for.
 pub(crate) async fn check_all(state: &Arc<AppState>) {
-    if crate::pro::updates_managed(state) {
+    if state.policy().updates_managed(state) {
         return;
     }
     let results = futures::future::join_all(

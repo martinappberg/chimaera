@@ -276,7 +276,7 @@ pub(crate) fn request_reserved() -> bool {
     REQUEST_RESERVED.try_with(|_| ()).is_ok()
 }
 pub(crate) async fn reserved_request<F: std::future::Future>(
-    guard: Guard,
+    guard: impl Send,
     operation: F,
 ) -> F::Output {
     REQUEST_RESERVED
@@ -508,14 +508,7 @@ fn begin_launch_admission(
         workspace: workspace.to_owned(),
     }))
 }
-#[derive(Debug)]
-pub(crate) struct Changed;
-impl std::fmt::Display for Changed {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("workspace execution authority changed")
-    }
-}
-impl std::error::Error for Changed {}
+pub(crate) use crate::policy::Changed;
 
 pub(crate) fn generation(state: &AppState) -> u64 {
     state.pro.generation.load(Ordering::Acquire)
