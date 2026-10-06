@@ -2834,6 +2834,35 @@ and `session/set_config_option` returns the authoritative current values. `confi
 can replace controls; absence removes an effort control. Grok advertised image input false;
 Google true. Buttons and attachment admission follow that negotiated capability.
 
+Grok 1.0.46 advertises no modes: `session/new` has no `modes` and no `mode` config option (its
+`configOptions` are `model` and `reasoning_effort`). Its permission and plan switches are still
+reachable (probed 2026-10-04/05, with model turns on the second day):
+
+- **Always-approve.** A `session/prompt` whose text is `/always-approve on` (or `off`) runs
+  inside Grok: it returns `end_turn` with `_meta.totalTokens: 0` and no message chunks. Measured
+  in one session with the same shell command: default asked (`session/request_permission`), after
+  `on` it ran unasked, after `off` it asked again. Nothing reads the state back mid-session
+  (`_x.ai/sessions/changed` kept `yolo: false`), so the zero-token answer is the only
+  confirmation; a slash Grok does not know (`/auto on` on an account without Auto-review) is
+  sent to the model and billed. The adapter offers Normal / Always-approve only while
+  `available_commands_update` lists `always-approve`, sends the switch between turns, and
+  treats any answer that billed tokens as "not switched". `_meta.yoloMode: true` on
+  `session/new` starts a session in it (`yolo: true` is reported then).
+- **Plan.** `session/set_mode` answers `{}` for any `modeId`; only `plan` and `default` do
+  anything, each confirmed by a `current_mode_update`. In plan mode Grok writes `plan.md` in its
+  session directory, calls `exit_plan_mode`, and sends the client a JSON-RPC request
+  `_x.ai/exit_plan_mode` (`sessionId`, `toolCallId`, `planContent`), then often
+  `_x.ai/ask_user_question`. The reply shape for the approval is undocumented: an error cancels
+  the turn, and `{}` or every guessed approval field (`approved`, `approve`, `accepted`,
+  `outcome`, `decision`, `action`, …) reads as "The user wants to revise the plan". Until that
+  shape is known the adapter does not offer Plan: a plan turn could never be approved.
+- **Auto-review** is gated per account (`_x.ai/settings/update` `auto_permission_mode_enabled`,
+  null on the probed account; `/auto` is then absent from the command list).
+
+A long-lived `grok agent stdio` process keeps the plan tier it authenticated with: after an
+account upgrade its turns kept failing `subscription:free-usage-exhausted` until the chat's
+process was restarted, while a fresh process on the same machine worked.
+
 A `session/prompt` response ends the turn (`end_turn` or `cancelled`). Permission requests are
 agent-initiated JSON-RPC requests; replies preserve the original numeric/string id and choose
 only an offered `optionId`. Cancellation resolves open permission requests as cancelled before

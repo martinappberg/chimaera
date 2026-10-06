@@ -45,6 +45,7 @@
   import ActivityFold from "./ActivityFold.svelte";
   import { FINISHED_FOLD_MIN, foldSpans } from "./activityFold";
   import FinishedFold from "./FinishedFold.svelte";
+  import { effortScale } from "./effortScale";
   import { backgroundKind } from "./backgroundKinds";
   import AgentsTray from "./AgentsTray.svelte";
   import BackgroundTray from "./BackgroundTray.svelte";
@@ -918,7 +919,7 @@
    *  concrete "default" that would flash the wrong name (slow on remote). */
   const currentModel = $derived(modelChoice(store.models, store.model));
   /** Only the active model's reported metadata establishes effort support. */
-  const effortChoices = $derived(currentModel?.efforts ?? []);
+  const effortChoices = $derived(effortScale(currentModel?.efforts ?? []));
   /** Agent read-back is the only displayed truth. Both drivers emit an
    *  effort_state after applying a selection. */
   const effortShown = $derived(store.effort);

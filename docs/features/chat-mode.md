@@ -224,6 +224,11 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   settings tuple so a prior reviewer, sandbox, approval policy, or collaboration mode cannot stay
   invisibly active. Claude's launch-gated Bypass permissions mode is not offered: structured chat
   sessions do not start with `--dangerously-skip-permissions`, so Claude would reject the switch.
+  Grok Build advertises no modes over ACP; Chimaera offers Normal and Always-approve, switched
+  with Grok's own `/always-approve on|off` (between turns: a pick made mid-turn applies when the
+  turn ends). Plan is not offered yet: Grok asks the client to approve the plan in a request
+  whose reply format is not known, so a plan turn could not be approved. Auto-review depends on
+  the account and is not offered.
   New and resumed Codex chats default to **Auto review** at thread open — workspace writes remain
   sandboxed and escalation remains on-request, while `auto_review` assesses approval requests.
   The header reflects that state from the first `Init`; `/mode auto-review` switches it explicitly,
@@ -1124,3 +1129,11 @@ _Captured 2026-10-04 (from the maintainer, in-session, PR #249)._
 - **Design constraint (verbatim):** “we are not too verbose and that we stay in line with our UI / UX that we have now which is pretty good for all of this.”
 - **Direction (verbatim):** “make sure Chimaera is generalizable in terms of this (and also in terms of how providers change, or if we add other CLIs / harnesses)”.
 - **Grade:** an addition to the existing capability-based architecture. Exact controls remain implementation choices; no new provider-specific UI contract was requested.
+
+### Grok's mode selector — why it exists
+_Captured 2026-10-05 (from the maintainer, in-session, PR #259)._
+
+- **Problem it solves (verbatim):** “Ok but all of those modes don’t show up in the top bar as they do for the other agents ?”
+- **On the first version leaving out Always-approve (verbatim):** “why is always approve not in the picker ?” — the PR was held until it was.
+- **Scope (verbatim):** “that should work with the other providers too (if it is not fully grok specific)” — the effort scale's faster → smarter ordering applies to every agent; the mode offer itself is Grok's.
+- **Grade:** parity with the other agents' header, limited to what was verified against Grok (Normal and Always-approve). Plan waits on the approval reply format.
