@@ -1489,34 +1489,78 @@ pub fn spawn_attached(
 /// why. Reads both pipes to their end (a full pipe would stall srun); `echo`
 /// also passes each line to this process's stderr (the CLI's terminal).
 pub fn attached_output(child: &mut Child, echo: bool) -> Arc<Mutex<VecDeque<String>>> {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-    const KEEP: usize = 8;
-    let tail = Arc::new(Mutex::new(VecDeque::with_capacity(KEEP)));
+    let tail = Arc::new(Mutex::new(VecDeque::with_capacity(ATTACHED_TAIL_LINES)));
     let pipes: [Option<Box<dyn tokio::io::AsyncRead + Unpin + Send>>; 2] = [
         child.stdout.take().map(|p| Box::new(p) as _),
         child.stderr.take().map(|p| Box::new(p) as _),
     ];
     for pipe in pipes.into_iter().flatten() {
         let tail = tail.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(pipe).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let line = plain_line(&line);
-                if line.is_empty() || line.starts_with("Shared connection to") {
-                    continue;
-                }
-                if echo {
-                    eprintln!("{line}");
-                }
-                let mut t = tail.lock().unwrap_or_else(|p| p.into_inner());
-                if t.len() == KEEP {
-                    t.pop_front();
-                }
-                t.push_back(line.chars().take(300).collect());
-            }
-        });
+        tokio::spawn(drain_attached(pipe, tail, echo));
     }
     tail
+}
+
+/// How many of an attached job's last lines `attached_output` keeps.
+const ATTACHED_TAIL_LINES: usize = 8;
+/// The most of one line that is kept; the rest of it is still drained.
+const ATTACHED_LINE_BYTES: usize = 4096;
+
+/// Read `pipe` to its end, keeping its last `ATTACHED_TAIL_LINES` lines in
+/// `tail`. An attached process may never print a newline, may print invalid
+/// UTF-8, or may redraw one line with carriage returns, so this reads raw
+/// blocks rather than `lines()`: a line keeps at most `ATTACHED_LINE_BYTES`,
+/// bytes decode lossily, and `\r` ends a line like `\n` does (so the last
+/// redraw is the one kept, and a pty's `\r\n` still yields one line). Nothing
+/// here may panic or return while the pipe is open: an unread pipe fills and
+/// stalls srun.
+async fn drain_attached<R>(mut pipe: R, tail: Arc<Mutex<VecDeque<String>>>, echo: bool)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use std::io::Write as _;
+    use tokio::io::AsyncReadExt;
+    let mut block = [0; ATTACHED_LINE_BYTES];
+    let mut line = Vec::with_capacity(ATTACHED_LINE_BYTES);
+    let emit = |line: &[u8]| {
+        let text = plain_line(&String::from_utf8_lossy(line));
+        if text.is_empty() || text.starts_with("Shared connection to") {
+            return;
+        }
+        if echo {
+            // Not `eprintln!`: with stderr's reader gone (`2>&1 | head`) it
+            // panics, which would end this task and leave the pipe unread.
+            let _ = writeln!(std::io::stderr().lock(), "{text}");
+        }
+        let mut tail = tail.lock().unwrap_or_else(|p| p.into_inner());
+        if tail.len() >= ATTACHED_TAIL_LINES {
+            tail.pop_front();
+        }
+        tail.push_back(text.chars().take(300).collect());
+    };
+    loop {
+        let count = match pipe.read(&mut block).await {
+            Ok(count) => count,
+            Err(err) => {
+                tracing::debug!(%err, "an attached job's output pipe failed before its end");
+                0
+            }
+        };
+        if count == 0 {
+            if !line.is_empty() {
+                emit(&line);
+            }
+            return;
+        }
+        for byte in &block[..count] {
+            if matches!(byte, b'\n' | b'\r') {
+                emit(&line);
+                line.clear();
+            } else if line.len() < ATTACHED_LINE_BYTES {
+                line.push(*byte);
+            }
+        }
+    }
 }
 
 /// A terminal line without its colors and carriage returns.
@@ -2632,6 +2676,72 @@ mod tests {
             "srun: error: Invalid partition"
         );
         assert_eq!(plain_line("  \r"), "");
+    }
+
+    #[tokio::test]
+    async fn attached_output_drains_oversized_invalid_and_unterminated_lines() {
+        use tokio::io::AsyncWriteExt;
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        let tail = Arc::new(Mutex::new(VecDeque::new()));
+        let output = tail.clone();
+        let drain = tokio::spawn(drain_attached(reader, output, false));
+        let producer = tokio::spawn(async move {
+            // A megabyte without a newline must not stall the child or grow
+            // the current-line buffer; invalid bytes must not stop draining.
+            let block = [b'x'; 8192];
+            for _ in 0..128 {
+                writer.write_all(&block).await.unwrap();
+            }
+            writer.write_all(b"\n\xff\xfe invalid\n").await.unwrap();
+            for _ in 0..9 {
+                writer.write_all(b"old\n").await.unwrap();
+            }
+            writer
+                .write_all(b"\x1b[31mfinal valid\x1b[0m\r")
+                .await
+                .unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(3), producer)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), drain)
+            .await
+            .unwrap()
+            .unwrap();
+        let tail = tail.lock().unwrap();
+        assert_eq!(tail.len(), 8);
+        assert_eq!(tail.back().unwrap(), "final valid");
+        assert!(tail.iter().all(|line| line.chars().count() <= 300));
+    }
+
+    #[tokio::test]
+    async fn attached_output_retains_a_bounded_prefix_and_reads_after_invalid_utf8() {
+        let mut bytes = vec![b'x'; ATTACHED_LINE_BYTES * 32];
+        bytes.extend_from_slice(b"\n\xff malformed\nnext line");
+        let tail = Arc::new(Mutex::new(VecDeque::new()));
+        drain_attached(bytes.as_slice(), tail.clone(), false).await;
+        let tail = tail.lock().unwrap();
+        assert_eq!(tail.len(), 3);
+        assert_eq!(tail[0], "x".repeat(300));
+        assert_eq!(tail[1], "\u{fffd} malformed");
+        assert_eq!(tail[2], "next line");
+    }
+
+    #[tokio::test]
+    async fn attached_output_keeps_the_last_redraw_of_a_carriage_return_line() {
+        let tail = Arc::new(Mutex::new(VecDeque::new()));
+        drain_attached(
+            &b"srun: job 7 queued\r\n 10%\r 50%\r100%\r\nsrun: error: x\r\n"[..],
+            tail.clone(),
+            false,
+        )
+        .await;
+        let tail = tail.lock().unwrap();
+        assert_eq!(
+            tail.iter().cloned().collect::<Vec<_>>(),
+            ["srun: job 7 queued", "10%", "50%", "100%", "srun: error: x"]
+        );
     }
 
     #[test]
