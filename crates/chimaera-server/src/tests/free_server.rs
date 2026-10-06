@@ -43,12 +43,10 @@ async fn free_codex_tui_spawn_carries_no_rollout_identity() {
         Some(serde_json::json!({"root": root.to_string_lossy()})),
     )
     .await;
-    let cwd = PathBuf::from(
-        lock(&state.workspaces)
-            .get(ws["id"].as_str().unwrap())
-            .unwrap()
-            .root,
-    );
+    let cwd = lock(&state.workspaces)
+        .get(ws["id"].as_str().unwrap())
+        .unwrap()
+        .root;
     plant_rollout(&state, &cwd);
     let (status, session) = request(
         &state,
