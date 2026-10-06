@@ -447,8 +447,7 @@ pub(crate) fn reply(app: &AppHandle, label: &str, id: u64, answer: Reply) {
 /// never becomes a Tauri `ExitRequested`: tao's app delegate does not answer
 /// `applicationShouldTerminate:`, so AppKit terminates straight away. Adding
 /// that method to the delegate's class routes those quits through the same
-/// guard, and then through the continue-in-the-cloud question (`quit`).
-/// A held one answers `NSTerminateCancel`, so macOS reports that
+/// guard. A held one answers `NSTerminateCancel`, so macOS reports that
 /// Chimaera stopped the logout, as for any app with unsaved documents; the
 /// user then answers the prompt and quits again. Our own confirmed quit
 /// (`finish_quit`) stops the event loop without `terminate:`, so it never

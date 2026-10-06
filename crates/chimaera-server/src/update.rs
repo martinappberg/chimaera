@@ -112,7 +112,6 @@ impl UpdateStatus {
             "build": chimaera_core::BUILD_ID,
             "dev": chimaera_core::version_is_dev(&current),
             "state": self.state(),
-            "managed": false,
             "checked_at": self.checked_at,
             "succeeded_at": self.succeeded_at,
             "error": self.error,
@@ -408,7 +407,7 @@ mod tests {
         assert_eq!(json["available"], !dev);
         assert_eq!(json["dev"], dev);
         assert_eq!(json["state"], if dev { "current" } else { "available" });
-        assert_eq!(json["managed"], false);
+        assert!(json.get("managed").is_none(), "{json}");
         // The account's cloud: managed for it, whatever an earlier check knew.
         let managed = status.to_json(true);
         assert_eq!(managed["state"], "managed");

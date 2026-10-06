@@ -1454,14 +1454,21 @@ async fn send_guarded(
     origin: Option<&'static str>,
     claim: Option<(String, bool)>,
 ) -> Result<(), String> {
-    let permit = match state.comms.dispatches.clone().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            if let Some((key, _)) = &claim {
-                finish(state, key, false);
+    // The delivery cap and enqueue deadline bound managed execution only; an
+    // unmanaged daemon waits on the actor queue as it always has.
+    let managed = admission.managed(state);
+    let permit = if managed {
+        match state.comms.dispatches.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                if let Some((key, _)) = &claim {
+                    finish(state, key, false);
+                }
+                return Err("agent delivery capacity exhausted".into());
             }
-            return Err("agent delivery capacity exhausted".into());
         }
+    } else {
+        None
     };
     let state = state.clone();
     let sid = target.sid.clone();
@@ -1477,20 +1484,22 @@ async fn send_guarded(
                 let _ = paused.await;
             }
         }
-        let sent = tokio::time::timeout(
-            Duration::from_secs(5),
-            state.chat.command_as_checked(&sid, command, origin, || {
-                let guard = admission.begin(&state)?;
-                anyhow::ensure!(
-                    crate::lock(&state.session_workspaces).get(&sid) == Some(&workspace),
-                    "workspace execution authority changed"
-                );
-                Ok(guard)
-            }),
-        )
-        .await
-        .map_err(|_| "agent command queue timed out".to_string())
-        .and_then(|result| result.map_err(|_| "agent command was refused".to_string()));
+        let enqueue = state.chat.command_as_checked(&sid, command, origin, || {
+            let guard = admission.begin(&state)?;
+            anyhow::ensure!(
+                crate::lock(&state.session_workspaces).get(&sid) == Some(&workspace),
+                "workspace execution authority changed"
+            );
+            Ok(guard)
+        });
+        let sent = if managed {
+            tokio::time::timeout(Duration::from_secs(5), enqueue)
+                .await
+                .map_err(|_| "agent command queue timed out".to_string())
+                .and_then(|result| result.map_err(|_| "agent command was refused".to_string()))
+        } else {
+            enqueue.await.map_err(|error| error.to_string())
+        };
         if let Some((key, settle)) = claim {
             if settle || sent.is_err() {
                 finish(&state, &key, settle && sent.is_ok());
@@ -2382,7 +2391,10 @@ pub(crate) async fn deliver(
         .is_some()
         .then_some(chimaera_agent::model::ORIGIN_AGENT);
     let Some(target_reader) = reader(&state, &target).filter(|reader| reader.ws == id) else {
-        return fail(StatusCode::CONFLICT, "workspace_scope_changed");
+        return fail(
+            StatusCode::CONFLICT,
+            "the recipient is not in this workspace",
+        );
     };
     match send_guarded(&state, &target_reader, &admission, command, origin, None).await {
         Ok(()) => {
@@ -2496,6 +2508,13 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_delivery_keeps_its_owned_claim_until_refusal_settles() {
+        cancelled_delivery(false).await;
+        cancelled_delivery(true).await;
+    }
+
+    /// Both tiers settle a cancelled caller's claim in the detached task;
+    /// only managed execution takes a bounded delivery permit.
+    async fn cancelled_delivery(managed: bool) {
         let root = std::env::temp_dir().join(format!(
             "chimaera-comms-cancel-{}",
             chimaera_core::generate_token()
@@ -2512,6 +2531,11 @@ mod tests {
         let target = reader("s-b");
         let message = note_entry(1, "s-a", Some("s-b"));
         crate::lock(&state.session_workspaces).insert(target.sid.clone(), target.ws.clone());
+        if managed {
+            crate::pro::install_execution_fixture(&state, "w", 4).unwrap();
+        }
+        assert_eq!(crate::pro::managed_execution(&state, "w"), managed);
+        let idle = if managed { 63 } else { 64 };
         crate::lock(&state.comms.inner).in_flight.insert(
             "owned-claim".into(),
             InFlight {
@@ -2544,7 +2568,7 @@ mod tests {
         ready.await.unwrap();
         caller.abort();
         assert!(caller.await.unwrap_err().is_cancelled());
-        assert_eq!(state.comms.dispatches.available_permits(), 63);
+        assert_eq!(state.comms.dispatches.available_permits(), idle);
         assert!(crate::lock(&state.comms.inner)
             .unread(&target, std::slice::from_ref(&message))
             .is_empty());
@@ -2552,7 +2576,11 @@ mod tests {
         // There is deliberately no actor. Its refusal must end the claim even
         // though the original caller can no longer run finish().
         tokio::time::timeout(Duration::from_secs(2), async {
-            while state.comms.dispatches.available_permits() != 64 {
+            while state.comms.dispatches.available_permits() != 64
+                || crate::lock(&state.comms.inner)
+                    .in_flight
+                    .contains_key("owned-claim")
+            {
                 tokio::task::yield_now().await;
             }
         })
@@ -2564,6 +2592,48 @@ mod tests {
                 .len(),
             1
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// An unmanaged daemon has no delivery cap: a send is never refused as
+    /// "capacity exhausted", it reaches the chat actor as before.
+    #[tokio::test]
+    async fn unmanaged_delivery_ignores_the_managed_capacity_cap() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-comms-free-cap-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let state = Arc::new(AppState::new(
+            "fixture".into(),
+            "fixture".into(),
+            4242,
+            0,
+            root.clone(),
+            root.join("config"),
+        ));
+        let target = reader("s-b");
+        crate::lock(&state.session_workspaces).insert(target.sid.clone(), target.ws.clone());
+        let admission = state.policy().capture(&state, "w").unwrap();
+        let occupied = state.comms.block_dispatches();
+        let error = send_guarded(
+            &state,
+            &target,
+            &admission,
+            AgentCommand::Send {
+                blocks: vec![ContentBlock::Text {
+                    text: "synthetic free delivery".into(),
+                }],
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        // No actor exists: the refusal is the chat manager's own, not a cap.
+        assert_ne!(error, "agent delivery capacity exhausted");
+        assert_ne!(error, "agent command was refused");
+        drop(occupied);
         std::fs::remove_dir_all(root).unwrap();
     }
 

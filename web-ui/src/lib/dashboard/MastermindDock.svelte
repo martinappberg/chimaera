@@ -17,6 +17,8 @@
   import ChatView from "../chat/ChatView.svelte";
   import { acquireChat, releaseChat } from "../chat/chatPool";
   import { mintSendId, type ChatStore } from "../chat/store.svelte";
+  import { get } from "svelte/store";
+  import { proTier } from "../net/plan";
   import type { ChatTransport } from "../chat/chatPool";
   import { dismiss } from "../shared/dismiss";
   import { followToBottom } from "../chat/composerBus";
@@ -216,9 +218,11 @@
     // Under its own id, like any send: a refusal then names this prompt and
     // can never be taken for the composer's message, and the store, told the
     // id, still says the refusal.
-    const id = mintSendId();
-    const sent = mm.socket.send({ type: "send", blocks: [{ type: "text", text }], client_id: id });
-    if (sent) mm.store.noteSentOutside(id);
+    // A daemon without send ids gets main's plain frame.
+    const blocks = [{ type: "text", text }];
+    const id = mm.store.sendsWithIds(get(proTier) === "free") ? mintSendId() : null;
+    const sent = mm.socket.send(id === null ? { type: "send", blocks } : { type: "send", blocks, client_id: id });
+    if (sent && id !== null) mm.store.noteSentOutside(id);
     if (!sent) mm.store.notice("not connected — not sent, try again", "error");
     // The user's click is a send: show the question and follow the reply.
     else if (mmId !== null) followToBottom(mmId);

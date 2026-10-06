@@ -1205,12 +1205,15 @@ pub fn prune_dir(
         if keep.contains(id) {
             continue;
         }
-        let (state, required) = crate::send_state::paths(dir, id)?;
         let journal = dir.join(format!("{id}.jsonl"));
+        let state = dir.join(format!("{id}.send-state.json"));
+        let required = dir.join(format!("{id}.send-state-required"));
         // Retiring history may discard prompts, never unknown delivery IDs.
         // Corruption is also protected: cleanup must not erase the latch that
-        // makes a reopened conversation fail closed.
-        let prune_evidence = crate::send_state::can_prune_evidence(dir, id).unwrap_or(false);
+        // makes a reopened conversation fail closed. A journal whose name is
+        // not a send-state session id is still pruned on its own.
+        let prune_evidence = crate::send_state::paths(dir, id).is_ok()
+            && crate::send_state::can_prune_evidence(dir, id).unwrap_or(false);
         let removed_journal = match fs::remove_file(&journal) {
             Ok(()) => true,
             Err(error) => error.kind() == std::io::ErrorKind::NotFound,
@@ -1985,6 +1988,15 @@ mod tests {
         );
         let reloaded = JournalIndex::load(dir.path());
         assert_eq!(reloaded.effort("native-old").as_deref(), Some("xhigh"));
+    }
+
+    #[test]
+    fn prune_dir_prunes_a_journal_with_a_foreign_name() {
+        let dir = tempfile::tempdir().unwrap();
+        backdated(dir.path(), "not.an-id.jsonl", 1000, 600);
+        backdated(dir.path(), "s-new.jsonl", 1000, 60);
+        prune_dir(dir.path(), u64::MAX, 1, &HashSet::new()).unwrap();
+        assert_eq!(names(dir.path()), vec!["s-new.jsonl".to_string()]);
     }
 
     #[test]

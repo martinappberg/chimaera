@@ -46,11 +46,9 @@ export const clusterOverviews = {
   /**
    * Fetch a host's overview unless one was asked for within `minAgeMs`
    * (0 = now: the page opened, an action finished, the shell said it
-   * changed). `explicit` belongs only to the manual Refresh button; polls
-   * and action reloads never authenticate or wake resources. Never throws —
-   * the error lands on the entry.
+   * changed). Never throws — the error lands on the entry.
    */
-  async refresh(alias: string, minAgeMs = 0, explicit = false): Promise<void> {
+  async refresh(alias: string, minAgeMs = 0): Promise<void> {
     const now = Date.now();
     const last = askedAt.get(alias);
     if (minAgeMs > 0 && last !== undefined && now - last < minAgeMs) return;
@@ -59,7 +57,7 @@ export const clusterOverviews = {
     seqs.set(alias, seq);
     put(alias, { loading: true });
     try {
-      const overview = await clusterOverview(alias, explicit);
+      const overview = await clusterOverview(alias);
       if (seqs.get(alias) !== seq) return;
       put(alias, { overview, receivedAt: Date.now(), error: null, loading: false });
     } catch (e) {

@@ -1865,7 +1865,7 @@ async fn driver_turn_text(
 /// codex driver: it reaches a fresh thread, and a RESUMED thread in a new
 /// process gets the new note — codex never replaces a thread's opening
 /// instructions on resume (neither `-c developer_instructions` nor
-/// thread/resume's `developerInstructions`; Pass 47), which is why the note
+/// thread/resume's `developerInstructions`; Pass 41), which is why the note
 /// rides `thread/inject_items` and not the launcher's argv.
 #[tokio::test]
 #[ignore = "live: spawns real codex via the driver, needs auth, bills two tiny turns"]

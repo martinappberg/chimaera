@@ -1105,3 +1105,9 @@ fn grant_fixture(state: &AppState, workspace: &str, epoch: u64, sequence: u64) -
         RequestStart::now(),
     )
 }
+
+/// An admitted installer holds a Pro setup reservation for its project; a
+/// free local install holds none and keeps its unmanaged lifecycle.
+pub(crate) fn installer_guarded(state: &AppState, workspace: &str) -> bool {
+    lock(&state.pro.execution.setups).contains_key(workspace)
+}

@@ -48,7 +48,7 @@ pub const UNHANDLED_REQUEST_NAME_MAX: usize = 80;
 /// session when a restart cut its work off (see `ChatManager::command_as`).
 pub const ORIGIN_RESTART: &str = "restart";
 /// `UserMessage.origin` for the pick-up message the daemon sends a
-/// conversation a Chimaera Pro transfer interrupted: [`ORIGIN_MOVED`] when it
+/// conversation a transfer by an installed extension interrupted: [`ORIGIN_MOVED`] when it
 /// arrives in the cloud, [`ORIGIN_HOME`] when it is back on the user's
 /// computer, and [`ORIGIN_RECOVERED`] (either direction) when the other
 /// machine stopped responding and the conversation continues from the last
@@ -294,7 +294,7 @@ pub enum AgentEvent {
         /// it through the agent's own bridge, so it never crossed chimaera's
         /// composer; [`ORIGIN_RESTART`] = the daemon sent it itself after a
         /// restart cut work off; [`ORIGIN_MOVED`] / [`ORIGIN_HOME`] /
-        /// [`ORIGIN_RECOVERED`] = the daemon's pick-up after a Pro transfer;
+        /// [`ORIGIN_RECOVERED`] = the daemon's pick-up after an extension's transfer;
         /// [`ORIGIN_WORKER`] = a worker's message the daemon delivered to the
         /// Mastermind. Absent = this workbench's composer. Additive.
         #[serde(default, skip_serializing_if = "Option::is_none")]

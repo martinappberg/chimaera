@@ -16,13 +16,15 @@ fn fixture() -> (Arc<crate::AppState>, Context, PathBuf) {
     std::fs::create_dir_all(base.join("project/sub")).unwrap();
     std::fs::create_dir_all(base.join("private")).unwrap();
     let base = base.canonicalize().unwrap();
-    let state = Arc::new(crate::AppState::new(
-        "fixture".into(),
-        "fixture".into(),
-        4242,
-        0,
-        base.join("data"),
-        base.join("config"),
+    let state = Arc::new(crate::daemon_extension::with_inert_for_tests(
+        crate::AppState::new(
+            "fixture".into(),
+            "fixture".into(),
+            4242,
+            0,
+            base.join("data"),
+            base.join("config"),
+        ),
     ));
     let workspace = crate::lock(&state.workspaces)
         .add(base.join("project"))
@@ -400,13 +402,15 @@ async fn saved_images_accept_a_state_root_alias_but_never_a_replaced_session_par
     drop(original);
     std::fs::create_dir_all(base.join("data/uploads/s-own")).unwrap();
     symlink(base.join("data"), base.join("state-alias")).unwrap();
-    let state = Arc::new(crate::AppState::new(
-        "fixture".into(),
-        "fixture".into(),
-        4242,
-        0,
-        base.join("state-alias"),
-        base.join("config"),
+    let state = Arc::new(crate::daemon_extension::with_inert_for_tests(
+        crate::AppState::new(
+            "fixture".into(),
+            "fixture".into(),
+            4242,
+            0,
+            base.join("state-alias"),
+            base.join("config"),
+        ),
     ));
     let workspace = crate::lock(&state.workspaces)
         .add(base.join("project"))

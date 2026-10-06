@@ -28,6 +28,7 @@
  */
 
 import { isWatching } from "./viewerMode.svelte";
+import { socketKeepers } from "../net/reconnect";
 import { refuse, setTerminalKept, setTerminalStatus } from "./refusals.svelte";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
@@ -431,7 +432,9 @@ function createEntry(id: string, parent: HTMLElement, fontOverride: number | und
     buf: new ParkedBuffer(PARKED_BUFFER_MAX_BYTES),
     // Ghosting a keystroke the closed socket silently dropped would show
     // input that was never delivered — the socket gate is non-negotiable.
-    echo: createLocalEcho(term, () => !isWatching(id) && entry.socket.isLive && (handlers?.echoArmed?.(id) ?? false)),
+    // Where a keeper may hold the socket for a sleeping owner, open is not
+    // yet live: nothing echoes before the owner's `ready`.
+    echo: createLocalEcho(term, () => !isWatching(id) && (socketKeepers() ? entry.socket.isLive : entry.socket.isOpen) && (handlers?.echoArmed?.(id) ?? false)),
     webgl: null,
     webglFailed: false,
     webglLosses: 0,

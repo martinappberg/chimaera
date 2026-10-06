@@ -64,13 +64,15 @@ impl Fixture {
         }
     }
     fn state(&self) -> Arc<AppState> {
-        let state = Arc::new(AppState::new(
-            "fixture".into(),
-            "fixture".into(),
-            4242,
-            0,
-            self.root.clone(),
-            self.root.join("config"),
+        let state = Arc::new(crate::daemon_extension::with_inert_for_tests(
+            AppState::new(
+                "fixture".into(),
+                "fixture".into(),
+                4242,
+                0,
+                self.root.clone(),
+                self.root.join("config"),
+            ),
         ));
         state.stopping.store(true, Ordering::Release);
         state

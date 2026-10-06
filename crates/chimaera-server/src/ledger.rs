@@ -116,9 +116,6 @@ impl LedgerEntry {
     pub(crate) fn to_json(&self) -> serde_json::Value {
         let mut value = json!({
             "id": self.id,
-            "suspended": self.suspended,
-            "manual_resume_reason": self.manual_resume_reason,
-            "handoff": self.handoff,
             "workspace_id": self.workspace_id,
             "cwd": self.cwd,
             "pinned_name": self.pinned_name,
@@ -130,14 +127,26 @@ impl LedgerEntry {
                 "kind": a.kind.as_str(),
                 "resume": a.resume,
                 "transcript": a.transcript,
-                "native_cwd": a.native_cwd,
                 "title": a.title,
                 "ui": a.ui,
                 "model": a.model,
                 "carryover": a.carryover,
             })),
         });
-        // Only a fenced entry carries it, so other entries keep their bytes.
+        // Pro's fields appear only when set, so an entry a daemon without the
+        // extension writes keeps exactly the bytes it always had.
+        if self.suspended {
+            value["suspended"] = json!(true);
+        }
+        if let Some(reason) = &self.manual_resume_reason {
+            value["manual_resume_reason"] = json!(reason);
+        }
+        if let Some(handoff) = &self.handoff {
+            value["handoff"] = json!(handoff);
+        }
+        if let Some(native_cwd) = self.agent.as_ref().and_then(|a| a.native_cwd.as_ref()) {
+            value["agent"]["native_cwd"] = json!(native_cwd);
+        }
         if let Some(epoch) = self.fence_epoch {
             value["fence_epoch"] = json!(epoch);
         }
@@ -709,7 +718,12 @@ fn plan_restore(entry: &LedgerEntry, restore_enabled: bool, workspace_exists: bo
             if restore_enabled
                 && workspace_exists
                 && (agent.kind == AgentKind::Claude
-                    || (agent.kind == AgentKind::Codex && agent.resume.is_some()))
+                    // Only a captured rollout (the extension's notify shim)
+                    // makes a Codex terminal resumable; otherwise it retires
+                    // to Recents as it always did.
+                    || (agent.kind == AgentKind::Codex
+                        && agent.resume.is_some()
+                        && agent.transcript.is_some()))
             {
                 RestorePlan::Respawn
             } else {
@@ -1187,10 +1201,15 @@ mod tests {
             plan_restore(&agent_entry(AgentKind::Codex, None), true, true),
             RestorePlan::Retire
         );
+        // A Codex terminal without a captured rollout (any daemon without
+        // the extension's notify shim) retires to Recents as before.
         assert_eq!(
             plan_restore(&agent_entry(AgentKind::Codex, Some("thread")), true, true),
-            RestorePlan::Respawn
+            RestorePlan::Retire
         );
+        let mut captured = agent_entry(AgentKind::Codex, Some("thread"));
+        captured.agent.as_mut().unwrap().transcript = Some("/rollout.jsonl".into());
+        assert_eq!(plan_restore(&captured, true, true), RestorePlan::Respawn);
         // Chat sessions respawn for BOTH agents (both chat drivers resume
         // in-band; the journal replays regardless) — unlike the TUI codex above.
         assert_eq!(

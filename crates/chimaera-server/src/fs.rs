@@ -383,12 +383,14 @@ struct DirEntry {
 
 /// GET /api/v1/fs/dirs?path=<path>&hidden=<bool>
 pub(crate) async fn dirs(
+    State(state): State<Arc<AppState>>,
     filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
     Query(query): Query<DirsQuery>,
 ) -> Response {
+    let staging = staging(&state);
     blocking_json(move || match filesystem {
         Some(scope) => list_scoped(&scope, &query.path, query.hidden, true),
-        None => list_dirs(&query.path, query.hidden),
+        None => list_dirs(&query.path, query.hidden, staging),
     })
     .await
 }
@@ -475,7 +477,13 @@ fn entry_is_dir(entry: &std::fs::DirEntry) -> bool {
 /// directories and symlinks resolving to directories only, dotted names
 /// excluded unless `hidden`, sorted case-insensitively by name, capped at
 /// [`MAX_DIR_ENTRIES`].
-fn list_dirs(raw: &str, hidden: bool) -> anyhow::Result<serde_json::Value> {
+/// Whether this daemon names project temp files as staging (see
+/// [`crate::persist::project_temp_sibling`]).
+fn staging(state: &AppState) -> bool {
+    state.policy().composed(state)
+}
+
+fn list_dirs(raw: &str, hidden: bool, staging: bool) -> anyhow::Result<serde_json::Value> {
     let path = canonical(raw)?;
     if !path.is_dir() {
         anyhow::bail!("{} is not a directory", path.display());
@@ -489,9 +497,7 @@ fn list_dirs(raw: &str, hidden: bool) -> anyhow::Result<serde_json::Value> {
         // Unreadable entries are skipped silently.
         let Ok(entry) = entry else { continue };
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with(crate::persist::PROJECT_STAGING_PREFIX)
-            || !hidden && name.starts_with('.')
-        {
+        if crate::persist::is_project_staging(staging, &name) || !hidden && name.starts_with('.') {
             continue;
         }
         if !entry_is_dir(&entry) {
@@ -559,11 +565,12 @@ pub(crate) async fn list(
     // service's third discovery source); the folder is handed over after.
     let saw_git: Arc<std::sync::Mutex<Option<PathBuf>>> = Arc::default();
     let seen = saw_git.clone();
+    let staging = staging(&state);
     let response = blocking_json(move || {
         let mut found = None;
         let body = match filesystem {
             Some(scope) => list_scoped(&scope, &query.path, query.hidden, false),
-            None => list_entries(&query.path, query.hidden, &mut found),
+            None => list_entries(&query.path, query.hidden, staging, &mut found),
         };
         *crate::lock(&seen) = found;
         body
@@ -678,6 +685,7 @@ fn list_scoped(
 fn list_entries(
     raw: &str,
     hidden: bool,
+    staging: bool,
     saw_git: &mut Option<PathBuf>,
 ) -> anyhow::Result<serde_json::Value> {
     let path = canonical(raw)?;
@@ -695,9 +703,7 @@ fn list_entries(
         if name == ".git" {
             *saw_git = Some(path.clone());
         }
-        if name.starts_with(crate::persist::PROJECT_STAGING_PREFIX)
-            || !hidden && name.starts_with('.')
-        {
+        if crate::persist::is_project_staging(staging, &name) || !hidden && name.starts_with('.') {
             continue;
         }
         let entry_path = entry.path();
@@ -1117,6 +1123,7 @@ pub(crate) async fn put_file(
     } else {
         None
     };
+    let staging = staging(&state);
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let expect_hash = query.expect_hash.map(|h| h.to_ascii_lowercase());
@@ -1129,7 +1136,7 @@ pub(crate) async fn put_file(
             Some(scope) => scoped::write(&scope, &query.path, &body, pre, || {
                 crate::workspace_scope::begin_mutation(&owner, &mutation)
             }),
-            None => write_file(&query.path, &body, pre, || {
+            None => write_file(&query.path, &body, pre, staging, || {
                 crate::workspace_scope::begin_mutation(&owner, &mutation)
             }),
         }
@@ -1344,6 +1351,7 @@ fn write_file(
     raw: &str,
     bytes: &[u8],
     pre: Precondition<'_>,
+    staging: bool,
     commit: impl FnOnce() -> anyhow::Result<Option<crate::policy::Reservation>>,
 ) -> anyhow::Result<WriteOutcome> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -1408,7 +1416,7 @@ fn write_file(
     let name = target
         .file_name()
         .with_context(|| format!("{} has no file name", target.display()))?;
-    let tmp = parent.join(crate::persist::project_temp_name(name));
+    let tmp = parent.join(crate::persist::project_temp_sibling(staging, name));
     let mode = existing
         .as_ref()
         .map_or(0o666, |meta| meta.permissions().mode() & 0o7777);
@@ -1607,7 +1615,7 @@ mod write_tests {
             "report.md",
         )));
         std::fs::write(&staged, b"incomplete").unwrap();
-        let listing = list_entries(dir.to_str().unwrap(), true, &mut None).unwrap();
+        let listing = list_entries(dir.to_str().unwrap(), true, true, &mut None).unwrap();
         let entries = listing["entries"].as_array().unwrap();
         assert_eq!(
             entries.len(),

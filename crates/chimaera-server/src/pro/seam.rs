@@ -54,6 +54,9 @@ impl AdmissionToken for Dispatched {
     fn begin(&self, state: &AppState) -> anyhow::Result<Option<Reservation>> {
         Ok(self.0.begin(state)?.map(Reservation::new))
     }
+    fn managed(&self, state: &AppState) -> bool {
+        super::managed_execution(state, self.0.workspace())
+    }
     fn installer<'a>(
         &'a self,
         state: &'a Arc<AppState>,
@@ -77,6 +80,9 @@ impl InstallerToken for execution::installer::Running {
     fn finish(self: Box<Self>) -> BoxFuture<'static, anyhow::Result<()>> {
         Box::pin((*self).finish())
     }
+    fn guarded(&self) -> bool {
+        self.guarded()
+    }
 }
 
 struct Launched {
@@ -98,6 +104,9 @@ impl LaunchToken for Launched {
 }
 
 impl WorkspacePolicy for ProPolicy {
+    fn composed(&self, state: &AppState) -> bool {
+        super::tier(state) != Tier::Free
+    }
     fn active(&self, state: &AppState) -> bool {
         super::tier(state) == Tier::Active
     }
@@ -224,10 +233,14 @@ impl WorkspacePolicy for ProPolicy {
         } else {
             Default::default()
         };
-        for (_, row) in rows.iter_mut() {
-            let at = row["id"].as_str().and_then(|id| activity.get(id)).copied();
-            row["last_input_ms"] = json!(at);
-            row["placement"] = json!("here");
+        // A daemon below the extension sends the rows exactly as before:
+        // the additive Pro fields are absent, not null.
+        if super::tier(state) != Tier::Free {
+            for (_, row) in rows.iter_mut() {
+                let at = row["id"].as_str().and_then(|id| activity.get(id)).copied();
+                row["last_input_ms"] = json!(at);
+                row["placement"] = json!("here");
+            }
         }
         let deferred: Vec<_> = crate::lock(&state.deferred_sessions)
             .values()
@@ -311,8 +324,11 @@ impl WorkspacePolicy for ProPolicy {
         super::note_opened(state, workspace);
     }
     fn health(&self, state: &AppState, body: &mut serde_json::Value) {
-        // Assembly presence is independent of SDK build compatibility.
-        body["daemon_extension"] = json!(state.daemon_extension.is_some());
+        // Assembly presence is independent of SDK build compatibility; a
+        // daemon without the extension answers exactly as before.
+        if state.daemon_extension.is_some() {
+            body["daemon_extension"] = json!(true);
+        }
         if let Some(identity) = state
             .daemon_extension
             .as_ref()

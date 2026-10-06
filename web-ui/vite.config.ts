@@ -134,8 +134,10 @@ const MARP_HLJS_KEEP = [
 ];
 
 export default defineConfig({
-  // The same bundle runs directly or below a per-tab browser gateway prefix.
-  base: "./",
+  // The official app's bundle runs directly or below a per-tab browser
+  // gateway prefix, so its assets are relative; a public build keeps the
+  // absolute base, so any path the daemon answers with the app still loads.
+  base: process.env.CHIMAERA_APPLICATION_ENTRY ? "./" : "/",
   plugins: [svelte(), devManifest(), entryBundleBudget(), pdfjsAssets(), marpSharesKatex(),
     applicationEntryPlugin(fileURLToPath(new URL(".", import.meta.url)))],
   resolve: {

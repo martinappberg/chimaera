@@ -33,14 +33,14 @@ impl Fixture {
         std::fs::create_dir_all(root.join("project")).unwrap();
         std::fs::create_dir_all(root.join("outside")).unwrap();
         let root = root.canonicalize().unwrap();
-        let mut state = AppState::new(
+        let mut state = crate::daemon_extension::with_inert_for_tests(AppState::new(
             "fixture-token".into(),
             "fixture".into(),
             4242,
             0,
             root.clone(),
             root.join("config"),
-        );
+        ));
         let trash = with_trash.then(|| crate::pro::trash::fixture_home_trash(&root));
         state.pro.trash = trash.clone();
         let state = Arc::new(state);

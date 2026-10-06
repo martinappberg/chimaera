@@ -2,7 +2,6 @@
   import { ApiError } from "../net/api";
   import { onMount } from "svelte";
   import { modalFocus } from "../shared/modalFocus";
-  import { focusOnMount } from "../shared/focusOnMount";
   import { pageVisible } from "../shared/visibility";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import { agentCatalog, pollAgents, type LaunchPick } from "./launcher";
@@ -103,7 +102,7 @@
     <header>
       <span class="glyph"><SessionGlyph kind="agent" agentKind={agent.id} size={25} title={agent.name} /></span>
       <h2 id="setup-title" role="status">{title}</h2>
-      <button class="close" aria-label="Close setup" use:focusOnMount onclick={onclose}>×</button>
+      <button class="close" aria-label="Close setup" onclick={onclose}>×</button>
     </header>
     <div class="body">
       {#if operation?.phase === "succeeded"}

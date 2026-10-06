@@ -146,6 +146,11 @@ pub(super) fn temp(label: &str) -> PathBuf {
     std::fs::create_dir_all(&root).unwrap();
     root.canonicalize().unwrap()
 }
+/// [`state`] composed with an inert extension, so its `/pro/*` routes exist.
+pub(super) fn state_with_extension(root: &Path) -> Arc<AppState> {
+    let state = Arc::into_inner(state(root)).unwrap();
+    Arc::new(crate::daemon_extension::with_inert_for_tests(state))
+}
 pub(super) fn state(root: &Path) -> Arc<AppState> {
     Arc::new(AppState::new(
         "fixture".into(),
@@ -320,7 +325,7 @@ async fn plain_shells_come_back_at_boot_while_agents_wait() {
 #[tokio::test]
 async fn sign_out_never_keeps_this_computers_own_return_fenced() {
     let root = temp("signout-return");
-    let state = state(&root);
+    let state = state_with_extension(&root);
     let account = FakeAccount::start(json!({})).await;
     let config = device(&account.endpoint);
     let workspace = project(&state, &root, &config, 4);
@@ -355,7 +360,7 @@ async fn delete(state: &Arc<AppState>, path: &str) -> StatusCode {
 #[tokio::test]
 async fn a_drain_waits_for_running_work_then_refuses_new_transfers_until_released() {
     let root = temp("drain");
-    let state = state(&root);
+    let state = state_with_extension(&root);
     let account = FakeAccount::start(json!({})).await;
     let mut config = device(&account.endpoint);
     config.role = Role::Worker;

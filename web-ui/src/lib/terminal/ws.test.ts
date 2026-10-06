@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SessionSocket } from "./ws";
-import { QUIET_OPEN_MS, reconnectingSockets } from "../net/reconnect";
+import { QUIET_OPEN_MS, reconnectingSockets, setSocketKeepers } from "../net/reconnect";
 import { get } from "svelte/store";
 
 class Socket {
@@ -17,9 +17,20 @@ class Socket {
   send(value: unknown): void { this.sent.push(value); }
   close(): void { this.onclose?.(); }
 }
-beforeEach(() => { Socket.all = []; vi.useFakeTimers(); vi.stubGlobal("WebSocket", Socket); });
-afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); });
+// These tests describe a window that can have Pro, where a keeper may hold
+// its sockets; one test below switches that off (a public build).
+beforeEach(() => { Socket.all = []; vi.useFakeTimers(); vi.stubGlobal("WebSocket", Socket); setSocketKeepers(true); });
+afterEach(() => { setSocketKeepers(false); vi.unstubAllGlobals(); vi.useRealTimers(); });
 const quiet = { onBinary() {}, onReset() {}, onTitle() {}, onResized() {}, onExited() {}, onError() {} };
+it("without keepers a quiet open socket is never taken for a kept one", () => {
+  setSocketKeepers(false);
+  const kept = vi.fn();
+  const session = new SessionSocket("s-fixture", { ...quiet, onKept: kept });
+  Socket.all[0].onopen?.();
+  vi.advanceTimersByTime(60_000);
+  expect(kept).not.toHaveBeenCalled();
+  session.close();
+});
 it("a viewer adopts server dimensions and never sends input, resize or wake intent", () => {
   let watching = true;
   const reset = vi.fn();

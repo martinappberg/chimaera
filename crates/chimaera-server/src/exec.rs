@@ -98,23 +98,24 @@ pub(crate) async fn run_exec_scoped(
     let dispatch_state = state.clone();
     let dispatch_id = id.to_owned();
     let bounded_lock_wait = admission.is_some();
-    let outcome = state
-        .sessions
-        .exec_guarded(
-            id,
-            chimaera_pty::ExecOptions {
-                command,
-                queue_timeout: std::time::Duration::from_millis(
-                    queue_timeout_ms.unwrap_or(15_000).min(600_000),
-                ),
-                timeout: std::time::Duration::from_millis(
-                    timeout_ms.unwrap_or(30_000).min(3_600_000),
-                ),
-                allow_sentinel_over_running,
-                stage: Some(stage_tx),
-                bounded_lock_wait,
-            },
-            move || {
+    let opts = chimaera_pty::ExecOptions {
+        command,
+        queue_timeout: std::time::Duration::from_millis(
+            queue_timeout_ms.unwrap_or(15_000).min(600_000),
+        ),
+        timeout: std::time::Duration::from_millis(timeout_ms.unwrap_or(30_000).min(3_600_000)),
+        allow_sentinel_over_running,
+        stage: Some(stage_tx),
+        bounded_lock_wait,
+    };
+    // Without the extension nothing can take a project's execution away
+    // mid-dispatch, so the command is written as it always was.
+    let outcome = if state.daemon_extension.is_none() && admission.is_none() {
+        state.sessions.exec(id, opts).await
+    } else {
+        state
+            .sessions
+            .exec_guarded(id, opts, move || {
                 if crate::lock(&dispatch_state.session_workspaces).get(&dispatch_id)
                     != workspace.as_ref()
                     || workspace.as_deref().is_some_and(|workspace| {
@@ -134,9 +135,9 @@ pub(crate) async fn run_exec_scoped(
                     .map(|a| a.begin(&dispatch_state))
                     .transpose()
                     .map_err(changed)
-            },
-        )
-        .await;
+            })
+            .await
+    };
 
     mirror.abort();
     crate::lock(&state.exec_status).remove(id);

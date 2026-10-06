@@ -53,6 +53,13 @@ pub(super) fn test_state_with_extension() -> Arc<AppState> {
     test_state_with_runtime(test_dir("data"), Arc::new(Inert))
 }
 
+/// [`test_state_with_extension`] over a given data dir (a restart).
+pub(super) fn test_state_with_extension_in(data_dir: PathBuf) -> Arc<AppState> {
+    Arc::new(crate::daemon_extension::with_inert_for_tests(
+        fixture_state(0, data_dir),
+    ))
+}
+
 /// A test daemon composed with an optional Runtime stand-in.
 pub(super) fn test_state_with_runtime(
     data_dir: PathBuf,

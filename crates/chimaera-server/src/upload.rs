@@ -180,9 +180,10 @@ pub(crate) async fn upload(
 
     // Stream to a hidden tmp sibling, then rename — a partial upload is never
     // visible under its final name (an agent could read it mid-write).
-    let tmp = dir.join(crate::persist::project_temp_name(std::ffi::OsStr::new(
-        &name,
-    )));
+    let tmp = dir.join(crate::persist::project_temp_sibling(
+        state.policy().composed(&state),
+        std::ffi::OsStr::new(&name),
+    ));
     let mut file = match tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -349,9 +350,10 @@ pub(crate) async fn upload_to_dir(
 
     // Hidden tmp sibling then rename — a partial upload never appears under its
     // final name.
-    let tmp = dir.join(crate::persist::project_temp_name(std::ffi::OsStr::new(
-        &name,
-    )));
+    let tmp = dir.join(crate::persist::project_temp_sibling(
+        state.policy().composed(&state),
+        std::ffi::OsStr::new(&name),
+    ));
     let mut file = match tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)

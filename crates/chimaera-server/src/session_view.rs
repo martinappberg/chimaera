@@ -172,8 +172,14 @@ pub(crate) fn session_json(
 /// waiting on the user. A cloud machine's supervisor keeps itself awake on it
 /// for a bounded time, so the question is still there when the answer comes.
 /// PTY rows omit it (a Claude TUI reports `agent_state: "needs_permission"`).
-fn chat_row(info: &chimaera_agent::ChatInfo, mut row: serde_json::Value) -> serde_json::Value {
-    row["needs_permission"] = json!(info.alive && info.pending_permission);
+fn chat_row(
+    state: &AppState,
+    info: &chimaera_agent::ChatInfo,
+    mut row: serde_json::Value,
+) -> serde_json::Value {
+    if state.policy().composed(state) {
+        row["needs_permission"] = json!(info.alive && info.pending_permission);
+    }
     row
 }
 
@@ -233,6 +239,7 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
         (
             info.created_at_ms / 1000,
             chat_row(
+                state,
                 info,
                 crate::chat::chat_session_json(
                     info,

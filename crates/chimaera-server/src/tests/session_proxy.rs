@@ -31,8 +31,15 @@ async fn remote_session_preserves_identity_and_read_only_cannot_resize_or_type()
     let remote_task = tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
-    let (status,error)=request(&local,Method::POST,"/api/v1/pro/placements",Some(serde_json::json!({"host_id":"worker-fixture","endpoint":format!("http://{remote_addr}"),"token":"test-token","workspace_id":workspace.id,"epoch":4}))).await;
-    assert_eq!(status, StatusCode::NO_CONTENT, "{error}");
+    // A daemon without the extension has no `/pro/*` routes; this is the
+    // relay's no-policy path, so the placement is handed to it directly.
+    let registration = serde_json::from_value(serde_json::json!({"host_id":"worker-fixture","endpoint":format!("http://{remote_addr}"),"token":"test-token","workspace_id":workspace.id,"epoch":4})).unwrap();
+    let response = crate::session_proxy::register(
+        axum::extract::State(local.clone()),
+        axum::Json(registration),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
     loop {
         if session_view::sessions_json(&local)
@@ -139,7 +146,7 @@ async fn remote_session_preserves_identity_and_read_only_cannot_resize_or_type()
         .await
         .unwrap();
     let ready = next_ws_frame(&mut socket).await;
-    assert!(ready.to_text().unwrap().contains("ready"));
+    assert!(ready.to_text().unwrap().contains("ready"), "{ready:?}");
     assert_eq!(
         remote.sessions.get(id).map(|s| (s.cols, s.rows)),
         Some((80, 24)),
@@ -176,11 +183,11 @@ async fn remote_session_preserves_identity_and_read_only_cannot_resize_or_type()
         .find(|r| r["id"] == id)
         .unwrap();
     assert_eq!(row["last_input_ms"], serde_json::Value::Null);
-    let (status, _) = request(
-        &local,
-        Method::DELETE,
-        "/api/v1/pro/placements?host_id=worker-fixture",
-        None,
+    let status = crate::session_proxy::remove(
+        axum::extract::State(local.clone()),
+        axum::extract::Query(
+            serde_json::from_value(serde_json::json!({"host_id": "worker-fixture"})).unwrap(),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
@@ -211,7 +218,7 @@ async fn remote_session_preserves_identity_and_read_only_cannot_resize_or_type()
 #[tokio::test]
 async fn old_target_that_ignores_scope_never_receives_a_mutating_request() {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    let local = test_state();
+    let local = test_state_with_extension();
     let workspace = lock(&local.workspaces)
         .add(test_dir("old-scope-target").canonicalize().unwrap())
         .unwrap();
@@ -267,7 +274,7 @@ async fn a_sleeping_owner_still_receives_mutations_and_passive_reads_never_wake_
     // The transport answers for a suspended owner in both documented ways: a
     // cached health reply marked sleeping, or 503 worker_asleep.
     for cached_health in [true, false] {
-        let local = test_state();
+        let local = test_state_with_extension();
         let workspace = lock(&local.workspaces)
             .add(test_dir("sleeping-owner").canonicalize().unwrap())
             .unwrap();
@@ -393,8 +400,8 @@ async fn a_sleeping_owner_still_receives_mutations_and_passive_reads_never_wake_
 
 #[tokio::test]
 async fn retiring_stale_project_preserves_live_sibling_on_shared_host() {
-    let remote = test_state();
-    let local = test_state();
+    let remote = test_state_with_extension();
+    let local = test_state_with_extension();
     let mut projects = Vec::new();
     for name in ["retired", "healthy"] {
         let workspace = lock(&remote.workspaces)
@@ -592,7 +599,7 @@ async fn retiring_stale_project_preserves_live_sibling_on_shared_host() {
 
 #[tokio::test]
 async fn unavailable_logical_project_never_falls_back_to_stale_local_files() {
-    let local = test_state();
+    let local = test_state_with_extension();
     let workspace = lock(&local.workspaces)
         .add(test_dir("unavailable-local-copy").canonicalize().unwrap())
         .unwrap();
@@ -654,7 +661,7 @@ async fn unavailable_logical_project_never_falls_back_to_stale_local_files() {
 #[tokio::test]
 async fn a_routed_window_keeps_this_computers_files_outside_the_project_local() {
     let remote = test_state();
-    let local = test_state();
+    let local = test_state_with_extension();
     let workspace = lock(&remote.workspaces)
         .add(test_dir("fs-owner").canonicalize().unwrap())
         .unwrap();
@@ -746,7 +753,7 @@ async fn a_routed_window_keeps_this_computers_files_outside_the_project_local() 
 #[tokio::test]
 async fn a_routed_projects_epochs_never_collide_with_this_computers() {
     let remote = test_state();
-    let local = test_state();
+    let local = test_state_with_extension();
     let workspace = lock(&remote.workspaces)
         .add(test_dir("epochs-remote").canonicalize().unwrap())
         .unwrap();
@@ -817,7 +824,7 @@ async fn a_routed_projects_epochs_never_collide_with_this_computers() {
 #[tokio::test]
 async fn an_outside_read_the_owner_cannot_show_never_serves_this_computers_file() {
     use axum::{extract::Query, http::HeaderMap, response::IntoResponse, routing::get, Router};
-    let local = test_state();
+    let local = test_state_with_extension();
     let workspace = lock(&local.workspaces)
         .add(test_dir("other-machine-viewer").canonicalize().unwrap())
         .unwrap();
@@ -931,7 +938,7 @@ async fn an_outside_read_the_owner_cannot_show_never_serves_this_computers_file(
 async fn events_for_a_routed_project_merge_only_its_frames_and_survive_an_owner_change() {
     use std::sync::atomic::Ordering;
     let remote = test_state();
-    let local = test_state();
+    let local = test_state_with_extension();
     let workspace = lock(&remote.workspaces)
         .add(test_dir("events-remote").canonicalize().unwrap())
         .unwrap();
@@ -1120,7 +1127,7 @@ async fn events_for_a_routed_project_merge_only_its_frames_and_survive_an_owner_
 async fn a_routed_conversations_permission_reaches_this_computer_once() {
     use std::sync::atomic::Ordering;
     let remote = test_state();
-    let local = test_state();
+    let local = test_state_with_extension();
     let workspace = lock(&remote.workspaces)
         .add(test_dir("relay-remote").canonicalize().unwrap())
         .unwrap();
@@ -1296,7 +1303,7 @@ async fn a_routed_conversations_permission_reaches_this_computer_once() {
 #[tokio::test]
 async fn a_routed_window_with_an_outside_tab_hears_owner_and_local_changes() {
     let remote = test_state();
-    let local = test_state();
+    let local = test_state_with_extension();
     let workspace = lock(&remote.workspaces)
         .add(test_dir("mixed-remote").canonicalize().unwrap())
         .unwrap();
@@ -1561,7 +1568,7 @@ async fn a_refused_feed_for_a_sleeping_owner_leaves_the_window_connected() {
 #[tokio::test]
 async fn routed_git_reads_use_the_viewers_root_without_buffering_diff_contents() {
     let remote = test_state();
-    let local = test_state();
+    let local = test_state_with_extension();
     let root = init_temp_repo("routed-git-owner").canonicalize().unwrap();
     let workspace = lock(&remote.workspaces).add(root).unwrap();
     let mut viewing = workspace.clone();

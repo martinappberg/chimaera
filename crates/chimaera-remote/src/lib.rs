@@ -1641,8 +1641,18 @@ impl Tunnel {
 /// forward must cancel it by the exact spec it was opened with, on the
 /// master (the `route`) it was registered with.
 async fn cancel_master_forward(host: &str, route: &Route, spec: &str) {
-    let command = scoped_master(host, route)
-        .and_then(|captured| forward_cancel_command(host, route, spec, captured.as_ref()));
+    let captured = scoped_master(host, route);
+    if matches!(captured, Ok(None)) {
+        if bounded_mux_ssh(host, route, &["-O", "cancel", "-L", spec], &[], 10)
+            .await
+            .is_none()
+        {
+            tracing::warn!("ssh -O cancel -L {spec} to {host} did not finish within 10s");
+        }
+        return;
+    }
+    let command =
+        captured.and_then(|captured| forward_cancel_command(host, route, spec, captured.as_ref()));
     if let Ok(command) = command {
         if forward_cancel(command, Duration::from_secs(10))
             .await
@@ -4093,8 +4103,15 @@ impl ComputeTunnel {
 
     /// Kill the tunnel; a master-held forward is also cancelled so local
     /// ports don't leak past the window that opened them.
-    pub async fn close(mut self) {
-        let _ = self.try_close().await;
+    pub async fn close(self) {
+        {
+            let mut child = self.child.lock().await;
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+        }
+        if let Some(spec) = &self.master_forward {
+            cancel_master_forward(&self.host, &self.route, spec).await;
+        }
     }
 
     /// Reap the tunnel child and positively acknowledge cancellation of its

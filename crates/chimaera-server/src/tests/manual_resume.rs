@@ -8,7 +8,7 @@ use std::time::Duration;
 const NATIVE: &str = "11111111-2222-4333-8444-555555555555";
 
 fn fixture() -> (Arc<AppState>, ledger::LedgerEntry, PathBuf) {
-    let mut state = test_state();
+    let mut state = test_state_with_extension();
     let root = test_dir("manual-resume-project");
     let isolated = Arc::get_mut(&mut state).unwrap();
     isolated.managed_root = root.join("managed-runtime");

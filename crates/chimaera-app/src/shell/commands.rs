@@ -157,7 +157,11 @@ pub(super) async fn list_hosts(state: State<'_, Shell>) -> Result<Vec<HostState>
             ));
         }
     }
-    Ok(out)
+    let owner = state.pro.owner().is_some();
+    Ok(out
+        .into_iter()
+        .map(|host| host.offer_direct_ssh(owner))
+        .collect())
 }
 
 /// Which home a connect targets is the BUILD's property (a dev build always
@@ -175,12 +179,17 @@ pub(super) async fn add_host(alias: String) -> Result<HostState, String> {
 
 /// Changes only this computer's next SSH connection, never the kept login or
 /// current tunnels. A device alias cannot acquire an SSH fallback this way.
+/// Granted only to local-UI windows, and refused without an account owner:
+/// the choice means nothing when every host is direct.
 #[tauri::command]
-pub(super) async fn set_host_direct_ssh(
+pub(super) async fn pro_set_host_direct_ssh(
     state: State<'_, Shell>,
     alias: String,
     on: bool,
 ) -> Result<HostState, String> {
+    if state.pro.owner().is_none() {
+        return Err(crate::account::ABSENT.into());
+    }
     let alias =
         chimaera_remote::hosts::normalize_alias(&alias).map_err(|error| error.to_string())?;
     let device = state.pro.is_device(&alias) || lock(&state.registry).is_link_device(&alias);

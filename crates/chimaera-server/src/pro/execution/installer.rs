@@ -33,6 +33,10 @@ impl Running {
     pub(crate) fn check(&self) -> Result<()> {
         self.captured.check(&self.state)
     }
+    /// The admitted installer holds a setup reservation (`setup::Guard`).
+    pub(crate) fn guarded(&self) -> bool {
+        super::installer_guarded(&self.state, &self.workspace)
+    }
     /// Attach synchronously after spawn, before allowing any authority await.
     pub(crate) fn attach(&mut self, group: u32) {
         self.spawned = true;

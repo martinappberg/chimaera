@@ -434,13 +434,15 @@ mod tests {
             chimaera_core::generate_token()
         ));
         std::fs::create_dir_all(&root).unwrap();
-        let state = Arc::new(AppState::new(
-            "fixture".into(),
-            "fixture".into(),
-            4242,
-            0,
-            root.clone(),
-            root.join("config"),
+        let state = Arc::new(crate::daemon_extension::with_inert_for_tests(
+            AppState::new(
+                "fixture".into(),
+                "fixture".into(),
+                4242,
+                0,
+                root.clone(),
+                root.join("config"),
+            ),
         ));
         (state, root)
     }
@@ -466,14 +468,14 @@ mod tests {
             chimaera_core::generate_token()
         ));
         std::fs::create_dir_all(&root).unwrap();
-        let mut state = AppState::new(
+        let mut state = crate::daemon_extension::with_inert_for_tests(AppState::new(
             "fixture".into(),
             "fixture".into(),
             4242,
             0,
             root.clone(),
             root.join("config"),
-        );
+        ));
         state.daemon_extension = Some(Arc::new(Composed));
         let state = Arc::new(state);
         let workspace = lock(&state.workspaces).add(root.clone()).unwrap().id;
@@ -751,13 +753,15 @@ mod tests {
             StatusCode::NO_CONTENT
         );
         drop(state);
-        let restarted = Arc::new(AppState::new(
-            "fixture".into(),
-            "fixture".into(),
-            4242,
-            0,
-            root.clone(),
-            root.join("config"),
+        let restarted = Arc::new(crate::daemon_extension::with_inert_for_tests(
+            AppState::new(
+                "fixture".into(),
+                "fixture".into(),
+                4242,
+                0,
+                root.clone(),
+                root.join("config"),
+            ),
         ));
         assert!(restarted.pro.signed_out.load(Ordering::Acquire));
         drop(restarted);

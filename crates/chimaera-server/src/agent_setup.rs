@@ -222,8 +222,19 @@ async fn start_captured(
             }
         };
         crate::runtimes::prune_install_versions(state.managed_root.clone(), kind).await;
-        let (phase, code, message) =
-            run(&state, &operation, receiver, cwd, script, &mut admitted).await;
+        // Only a Pro setup reservation needs its group drained on success; a
+        // free install leaves its installer's background children running.
+        let guarded = admitted.guarded();
+        let (phase, code, message) = run(
+            &state,
+            &operation,
+            receiver,
+            cwd,
+            script,
+            &mut admitted,
+            guarded,
+        )
+        .await;
         if phase == Phase::Succeeded && admitted.check().is_ok() {
             crate::runtimes::prune_install_versions(state.managed_root.clone(), kind).await;
         }
@@ -359,6 +370,7 @@ async fn run(
     cwd: PathBuf,
     script: String,
     admitted: &mut crate::policy::Installer,
+    guarded: bool,
 ) -> (Phase, Option<i32>, String) {
     if *cancel.borrow() || admitted.check().is_err() {
         return (
@@ -407,6 +419,9 @@ async fn run(
         tokio::join!(drain(stdout, op), drain(stderr, op));
     };
     tokio::pin!(reads);
+    if !guarded {
+        return run_unguarded(op, cancel, child, group, reads).await;
+    }
     // Cancellation also handles a request received before the process started.
     let stopped = async {
         if !*cancel.borrow() {
@@ -478,6 +493,66 @@ async fn run(
             if cancelled { "Installation cancelled. Files may already have changed; check the installed version before retrying." }
             else if observation_failed { "Installer process status could not be verified; it was stopped. Check the installed version before retrying." }
             else { "The installer exceeded 15 minutes and was stopped. Check the output and connection, then retry." }.into())
+    }
+}
+/// A free install: success is log EOF plus the leader's exit, and the
+/// installer's surviving background children are left alone.
+async fn run_unguarded(
+    op: &Operation,
+    mut cancel: watch::Receiver<bool>,
+    mut child: tokio::process::Child,
+    group: Group,
+    reads: std::pin::Pin<&mut impl std::future::Future<Output = ()>>,
+) -> (Phase, Option<i32>, String) {
+    let mut reads = reads;
+    // Cancellation also handles a request received before the process started.
+    let stopped = async {
+        if !*cancel.borrow() {
+            let _ = cancel.changed().await;
+        }
+    };
+    let result = tokio::select! {
+        // Keep the leader unreaped while descendants hold the pipes open, so
+        // cancellation cannot signal a recycled process-group ID.
+        result = async { (&mut reads).await; child.wait().await } => Some(result),
+        _ = stopped => None,
+        _ = tokio::time::sleep(DEADLINE) => None,
+    };
+    if let Some(result) = result {
+        // The leader is reaped; do not signal a potentially recycled group ID.
+        std::mem::forget(group);
+        let code = result.ok().and_then(|s| s.code());
+        if code == Some(0) {
+            (
+                Phase::Succeeded,
+                code,
+                "Installation finished. Sign-in and chat have not been checked.".into(),
+            )
+        } else {
+            let hint = failure_hint(&lock(&op.progress).output);
+            (Phase::Failed, code, hint.into())
+        }
+    } else {
+        let cancelled = *cancel.borrow();
+        // Give EXIT traps time to remove staging downloads, then stop the
+        // entire group. Wait AFTER kill so the group ID cannot be recycled.
+        let _ = nix::sys::signal::killpg(group.0, nix::sys::signal::Signal::SIGTERM);
+        let _ = tokio::time::timeout(Duration::from_secs(2), &mut reads).await;
+        drop(group);
+        let code = child.wait().await.ok().and_then(|s| s.code());
+        (
+            if cancelled {
+                Phase::Cancelled
+            } else {
+                Phase::Failed
+            },
+            code,
+            if cancelled {
+                "Installation cancelled. Files may already have changed; check the installed version before retrying."
+            } else {
+                "The installer exceeded 15 minutes and was stopped. Check the output and connection, then retry."
+            }.into(),
+        )
     }
 }
 fn finish(op: &Operation, phase: Phase, code: Option<i32>, message: &str) {
@@ -747,35 +822,52 @@ mod tests {
         assert!(p.phase == Phase::Cancelled);
         assert!(state.sessions.list().is_empty());
     }
+    /// A free install keeps the unmanaged lifecycle: a successful installer's
+    /// background children keep running. Only a Pro setup reservation drains
+    /// the group on success, including children that closed the logs.
     #[tokio::test]
-    async fn successful_shell_exit_cleans_background_children_that_closed_logs() {
-        let state = state();
-        let folder = std::env::temp_dir().join(format!(
-            "chimaera-installer-background-{}",
-            chimaera_core::generate_token()
-        ));
-        std::fs::create_dir_all(&folder).unwrap();
-        let release = folder.join("release");
-        let late = folder.join("late");
-        let script = format!("(while [ ! -e '{}' ]; do sleep .02; done; echo escaped > '{}') >/dev/null 2>&1 & echo ready; exit 0", release.display(), late.display());
-        start_script(
-            state.clone(),
-            AgentKind::Codex,
-            folder.clone(),
-            request("background"),
-            script,
-        )
-        .await;
-        let p = completed(&state).await;
-        assert!(p.phase == Phase::Succeeded);
-        assert!(p.output.contains("ready"));
-        assert!(!late.exists());
-        std::fs::write(release, "release only after owned cleanup").unwrap();
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(
-            !late.exists(),
-            "background child escaped successful cleanup"
-        );
-        std::fs::remove_dir_all(folder).unwrap();
+    async fn successful_shell_exit_cleans_background_children_only_when_guarded() {
+        for guarded in [false, true] {
+            let state = state();
+            if guarded {
+                crate::pro::install_execution_fixture(&state, "test", 4).unwrap();
+            }
+            let folder = std::env::temp_dir().join(format!(
+                "chimaera-installer-background-{}",
+                chimaera_core::generate_token()
+            ));
+            std::fs::create_dir_all(&folder).unwrap();
+            let release = folder.join("release");
+            let late = folder.join("late");
+            let script = format!("(while [ ! -e '{}' ]; do sleep .02; done; echo escaped > '{}') >/dev/null 2>&1 & echo ready; exit 0", release.display(), late.display());
+            start_script(
+                state.clone(),
+                AgentKind::Codex,
+                folder.clone(),
+                request("background"),
+                script,
+            )
+            .await;
+            let p = completed(&state).await;
+            assert!(p.phase == Phase::Succeeded, "guarded={guarded}");
+            assert!(p.output.contains("ready"));
+            assert!(!late.exists());
+            std::fs::write(release, "release only after owned cleanup").unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !guarded && !late.exists() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("a free installer's background child keeps running");
+            if guarded {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                assert!(
+                    !late.exists(),
+                    "background child escaped successful cleanup"
+                );
+            }
+            std::fs::remove_dir_all(folder).unwrap();
+        }
     }
 }

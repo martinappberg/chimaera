@@ -239,7 +239,9 @@ pub(crate) async fn terminal_input(
     let key = crate::lock(&state.agents)
         .get(id)
         .map(|record| record.key.clone());
-    if scope.is_none() && key.is_none() {
+    // Without the extension nothing admits or watches input (the pause
+    // evidence below is Pro's idle proof), so a keystroke is a plain send.
+    if scope.is_none() && (key.is_none() || state.daemon_extension.is_none()) {
         return input
             .send(bytes)
             .await
@@ -481,6 +483,16 @@ pub(crate) fn command_refusal(mut answer: serde_json::Value, text: &str) -> serd
         answer["client_id"] = json!(client_id);
     }
     answer
+}
+
+/// [`command_refusal`] on a daemon that advertises send ids; without the
+/// extension a refusal keeps the shape it always had.
+fn chat_refusal(send_ids: bool, answer: serde_json::Value, text: &str) -> serde_json::Value {
+    if send_ids {
+        command_refusal(answer, text)
+    } else {
+        answer
+    }
 }
 
 /// The refusal a socket sends when input cannot be delivered here.
@@ -1230,7 +1242,11 @@ async fn handle_chat(
         }
     };
 
-    let ready = json!({
+    // Send ids exist for Pro's moves between machines; a daemon without the
+    // extension answers sends exactly as before (no `send_ids`, no
+    // `send_confirmed`/`send_cancelled`, `client_id` ignored).
+    let send_ids = state.policy().composed(&state);
+    let mut ready = json!({
         "type": "ready",
         "session": attachment.info,
         // Tell every client the cursor the daemon actually honored. This can
@@ -1240,14 +1256,16 @@ async fn handle_chat(
         // this is stale (the journal was recreated and numbering restarted);
         // it hard-resets rather than silently dropping every replayed event.
         "head": attachment.head_seq,
+    });
+    if send_ids {
         // This daemon accepts a `send` under one `client_id` at most once and
         // answers `cancel_send`, so a client may resend what it could not
         // confirm. Additive: a daemon without it must never be resent to.
-        "send_ids": true,
+        ready["send_ids"] = json!(true);
         // Only these keyed sends still belong to the attached driver's queue.
         // Replayed queued echoes outside this set cannot promise future delivery.
-        "active_queued_ids": state.chat.active_queued_ids(&id),
-    });
+        ready["active_queued_ids"] = json!(state.chat.active_queued_ids(&id));
+    }
     if send_json(&mut socket, &ready).await.is_err() {
         return;
     }
@@ -1353,7 +1371,8 @@ async fn handle_chat(
                 Some(Ok(Message::Text(text))) => {
                     if scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) { scope_changed(&mut socket).await; return; }
                     let tag = command_tag(&text);
-                    if tag.kind.as_deref() == Some("cancel_send") {
+                    let tag = if send_ids { tag } else { CommandTag { client_id: None, bad_client_id: false, ..tag } };
+                    if send_ids && tag.kind.as_deref() == Some("cancel_send") {
                         // A forwarded viewer changes this session's record
                         // under the same admission as its commands.
                         let _admitted = match scope.as_ref().map(|s| s.begin_session(&state, &id)) {
@@ -1431,13 +1450,13 @@ async fn handle_chat(
                                 continue;
                             }
                             if options.read_only || !session_writable(&state, &id) {
-                                let _ = send_json(&mut socket, &command_refusal(refusal(&state, &id, options.read_only), &text)).await;
+                                let _ = send_json(&mut socket, &chat_refusal(send_ids, refusal(&state, &id, options.read_only), &text)).await;
                                 continue;
                             }
                             if is_send && tag.bad_client_id {
                                 let _ = send_json(
                                     &mut socket,
-                                    &command_refusal(json!({"type": "error", "code": "invalid_command",
+                                    &chat_refusal(send_ids, json!({"type": "error", "code": "invalid_command",
                                             "message": BAD_CLIENT_ID}), &text),
                                 )
                                 .await;
@@ -1450,7 +1469,7 @@ async fn handle_chat(
                                 // can correct the payload and retry.
                                 let _ = send_json(
                                     &mut socket,
-                                    &command_refusal(json!({"type": "error", "code": "invalid_command",
+                                    &chat_refusal(send_ids, json!({"type": "error", "code": "invalid_command",
                                             "message": err.to_string()}), &text),
                                 )
                                 .await;
@@ -1504,7 +1523,7 @@ async fn handle_chat(
                                 };
                                 let _ = send_json(
                                     &mut socket,
-                                    &command_refusal(json!({"type": "error", "code": code,
+                                    &chat_refusal(send_ids, json!({"type": "error", "code": code,
                                             "message": message}), &text),
                                 )
                                 .await;

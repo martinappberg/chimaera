@@ -9,7 +9,7 @@ fn fixture() -> (
     crate::workspaces::Workspace,
     crate::workspaces::Workspace,
 ) {
-    let state = test_state();
+    let state = test_state_with_extension();
     let root = test_dir("viewer-projects").canonicalize().unwrap();
     std::fs::create_dir_all(root.join("project")).unwrap();
     std::fs::create_dir_all(root.join("project-other")).unwrap();

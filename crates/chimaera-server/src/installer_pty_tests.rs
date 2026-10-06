@@ -2,7 +2,24 @@
 use super::*;
 use std::{path::PathBuf, time::Duration};
 
+/// A daemon composed with the Pro extension: the managed install path.
 fn fixture() -> (Arc<AppState>, crate::workspaces::Workspace, PathBuf) {
+    struct Inert;
+    impl crate::daemon_extension::Runtime for Inert {
+        fn coordinate(
+            &self,
+            _owner: crate::daemon_extension::CoordinatorOwner,
+        ) -> crate::daemon_extension::RuntimeFuture {
+            Box::pin(async {})
+        }
+    }
+    let (state, workspace, root) = free_fixture();
+    let mut state = Arc::into_inner(state).unwrap();
+    state.daemon_extension = Some(Arc::new(Inert));
+    (Arc::new(state), workspace, root)
+}
+/// A daemon without the extension: main's plain install session.
+fn free_fixture() -> (Arc<AppState>, crate::workspaces::Workspace, PathBuf) {
     let root = std::env::temp_dir().join(format!(
         "chimaera-installer-pty-{}",
         chimaera_core::generate_token()
@@ -73,6 +90,7 @@ async fn pty_installer_authority_loss_stops_before_the_deadline() {
     })
     .await
     .unwrap();
+    assert_eq!(crate::lock(&state.install_owners)[&AgentKind::Codex], id);
     crate::pro::mutation::local_dispatch_owner_fixture(&state, "project", 5);
     done(&state).await;
     assert!(state.sessions.get(&id).is_none());
@@ -144,6 +162,33 @@ async fn actual_owner_keeps_an_aged_invisible_reservation_and_clears_exact_ident
     assert_eq!(
         crate::lock(&state.install_results)[&AgentKind::Codex].session_id,
         id
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A free install is main's plain session spawn: no install owner or
+/// execution admission is tracked, and its result is recorded as before.
+#[tokio::test]
+async fn free_pty_install_is_the_plain_session_spawn() {
+    let (state, workspace, root) = free_fixture();
+    let marker = root.join("ready");
+    let script = format!("echo ready > '{}'; sleep 1", marker.display());
+    let id = start_install(&state, AgentKind::Codex, &workspace, "fixture", script)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !marker.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(state.sessions.get(&id).is_some());
+    assert!(crate::lock(&state.install_owners).is_empty());
+    done(&state).await;
+    assert_eq!(
+        crate::lock(&state.install_results)[&AgentKind::Codex].exit_status,
+        Some(0)
     );
     std::fs::remove_dir_all(root).unwrap();
 }

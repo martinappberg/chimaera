@@ -522,7 +522,7 @@ async fn sign_out_resumes_a_returned_session_instead_of_stranding_it() {
     use futures::SinkExt;
     use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-    let state = test_state();
+    let state = test_state_with_extension();
     let root = std::fs::canonicalize(test_dir("ledger-signout-return-root")).unwrap();
     let workspace = lock(&state.workspaces).add(root.clone()).unwrap();
     preset_agent(
@@ -578,7 +578,7 @@ async fn sign_out_resumes_a_returned_session_instead_of_stranding_it() {
 #[tokio::test]
 async fn boot_resumes_a_returned_session_left_deferred() {
     for enrolled in [false, true] {
-        let state = test_state();
+        let state = test_state_with_extension();
         let root = std::fs::canonicalize(test_dir("ledger-stranded-root")).unwrap();
         let workspace = lock(&state.workspaces).add(root.clone()).unwrap();
         preset_agent(

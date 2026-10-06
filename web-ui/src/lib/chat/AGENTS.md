@@ -418,7 +418,13 @@ while a turn runs, Send now (`offersSendNow`), as queued rows always did.
 Post-head live echoes are untouched. A definitive `sent`, `cancelled` or `dropped`
 update resolves uncertainty; a driver exit marks remaining queued rows uncertain.
 
-A daemon without `send_ids` is never sent anything twice and no `ready`
+A daemon without `send_ids` (no extension: main's daemon) gets main's plain
+`{type, blocks}` frame with no `client_id`, and nothing is tracked
+(`ChatStore.sendsWithIds`; before the first `ready` only a window whose
+`proTier` is not "free" sends under an id): no pending bubble, no hand-back, no
+"delivery unconfirmed". Queued rows turn uncertain only on a chat that has seen
+`send_ids`. A tracked send made against such a daemon (a window that can have
+Pro, before its first `ready`) is never sent anything twice and no `ready`
 decides anything there. Its echo has no id and confirms the oldest send with
 exactly that text (a send made against such a daemon keeps that rule after the
 daemon is replaced, `UnconfirmedSend.plain`); its refusal names no send and

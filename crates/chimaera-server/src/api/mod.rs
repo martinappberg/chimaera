@@ -38,7 +38,9 @@ pub(crate) async fn auth(State(state): State<Arc<AppState>>, req: Request, next:
         .is_some_and(|v| v == format!("Bearer {}", state.token));
 
     if authorized {
-        if crate::activity::is_change(req.method(), req.uri().path()) {
+        if state.policy().active(&state)
+            && crate::activity::is_change(req.method(), req.uri().path())
+        {
             crate::activity::touch(&state);
         }
         next.run(req).await
@@ -49,6 +51,25 @@ pub(crate) async fn auth(State(state): State<Arc<AppState>>, req: Request, next:
         )
             .into_response()
     }
+}
+
+/// `/pro/*` exists only on a daemon with the extension (or the account's
+/// cloud): a daemon without it answers those paths as any unknown route.
+pub(crate) async fn pro_routes(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let path = req.uri().path();
+    let path = path.strip_prefix("/api/v1").unwrap_or(path);
+    // Manual resume is Pro's too (`api/manual_resume.rs`).
+    let manual_resume = path
+        .strip_prefix("/sessions/")
+        .is_some_and(|rest| rest.split('/').nth(1) == Some("resume"));
+    if (path.starts_with("/pro/") || manual_resume) && !state.policy().composed(&state) {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
+    }
+    next.run(req).await
 }
 
 /// GET /api/v1/health

@@ -21,6 +21,7 @@ import {
 import type { Session } from "../workspace/sessions";
 import {
   type AgentBrowserOpen,
+  admitsAgentBrowserOpen,
   browserOpener,
   hasDirectBrowserOwner,
   parseAgentBrowserOpen,
@@ -124,6 +125,18 @@ describe("hasDirectBrowserOwner", () => {
       { placement_available: false }, { workspace_id: "w-other" }]) {
       expect(hasDirectBrowserOwner(frame(), session(over), false)).toBe(false);
     }
+  });
+});
+
+describe("admitsAgentBrowserOpen", () => {
+  it("a window that can never have Pro opens every frame, as it always did", () => {
+    expect(admitsAgentBrowserOpen(frame(), undefined, false, true)).toBe(true);
+    expect(admitsAgentBrowserOpen(frame(), { id: "s-agent", alive: false } as Session, false, true)).toBe(true);
+  });
+
+  it("otherwise only a direct owner's frame", () => {
+    expect(admitsAgentBrowserOpen(frame(), undefined, false, false)).toBe(false);
+    expect(admitsAgentBrowserOpen(frame(), { id: "s-agent", workspace_id: "w-1", alive: true } as Session, false, false)).toBe(true);
   });
 });
 
@@ -317,7 +330,7 @@ describe("who opened a browser pane", () => {
     let l = placeAgentBrowser(withAgent(), frame({ path: "/app" }));
     l = openTab(l, { surface: "pro" });
     l = openTab(l, { surface: "settings" });
-    const back = deserializeLayout(JSON.parse(JSON.stringify(serializeLayout(l))));
+    const back = deserializeLayout(JSON.parse(JSON.stringify(serializeLayout(l))), true);
     expect(back).not.toBeNull();
     expect(browserTabs(back!).map(({ tab }) => tab)).toEqual(browserTabs(l).map(({ tab }) => tab));
     expect(panes(back!.root).flatMap((p) => p.tabs).filter((t) => t.surface === "pro")).toHaveLength(1);

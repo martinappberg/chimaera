@@ -89,7 +89,7 @@ and cluster-only connections). Replacement resolution precedes any daemon stop.
 - **Direct SSH on this computer.** In a host's Home actions, expand **Advanced**
   and choose **Connect directly from this computer** when its site forbids a
   keeper connection, requires this computer's VPN, or needs local SSH settings.
-  The native `set_host_direct_ssh` command saves additive `hosts.json`
+  The native `pro_set_host_direct_ssh` command saves additive `hosts.json`
   `direct_ssh`; it overrides a known kept SSH route even while signed in.
   Existing connections remain until reconnect, and running jobs and other
   computers are unaffected. This does not change account-wide **Keep connected**.

@@ -61,14 +61,27 @@ async fn register_request(
     assert_eq!(path, "/api/v1/pro/placements");
     // Use the original authenticated router path: constructing it starts the
     // viewing daemon's passive roster poll before we wait for its remote row.
+    let body_value = body.unwrap();
     let request = Request::builder()
         .method(method)
         .uri(path)
         .header(header::AUTHORIZATION, "Bearer test-token")
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(body.unwrap().to_string()))
+        .body(Body::from(body_value.to_string()))
         .unwrap();
-    let response = app(state.clone()).oneshot(request).await.unwrap();
+    let router = app(state.clone());
+    let response = if state.daemon_extension.is_none() {
+        // The legacy scenario: a viewing daemon without the extension, which
+        // has no `/pro/*` routes, holding a placement it was given directly.
+        let registration = serde_json::from_value(body_value).unwrap();
+        crate::session_proxy::register(
+            axum::extract::State(state.clone()),
+            axum::Json(registration),
+        )
+        .await
+    } else {
+        router.oneshot(request).await.unwrap()
+    };
     let status = response.status();
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     let value = if bytes.is_empty() {

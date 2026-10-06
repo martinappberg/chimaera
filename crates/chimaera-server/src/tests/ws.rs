@@ -1267,7 +1267,7 @@ async fn ws_chat_sends_are_accepted_once_under_their_client_id() {
         WsMessage::text(serde_json::json!({"type":"cancel_send","client_id":client_id}).to_string())
     }
 
-    let state = test_state();
+    let state = test_state_with_extension();
     let cwd = test_dir("ws-send-ids");
     let capture = cwd.join("agent-stdin.txt");
     let fake = write_fake_claude("ws-send-ids-agent");
@@ -1469,7 +1469,7 @@ async fn ws_chat_sends_are_accepted_once_under_their_client_id() {
 /// must leave the previous pause evidence untouched and never write the PTY.
 #[tokio::test]
 async fn terminal_input_invalidates_completion_only_after_admission() {
-    let state = test_state();
+    let state = test_state_with_extension();
     let cwd = test_dir("terminal-input-admission");
     let workspace = lock(&state.workspaces).add(cwd.clone()).unwrap();
     let session = state

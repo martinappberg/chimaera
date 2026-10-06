@@ -358,7 +358,7 @@ async fn session_spawn_size_is_honored_and_clamped() {
 #[tokio::test]
 async fn a_chat_waiting_on_a_permission_says_so_on_its_row() {
     use std::os::unix::fs::PermissionsExt;
-    let state = test_state();
+    let state = test_state_with_extension();
     let root = test_dir("needs-permission");
     let fake = test_dir("needs-permission-agent").join("claude");
     std::fs::write(

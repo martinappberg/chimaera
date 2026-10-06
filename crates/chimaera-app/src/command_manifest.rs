@@ -6,7 +6,6 @@
 pub const DAEMON_UI_COMMANDS: &[&str] = &[
     "list_hosts",
     "add_host",
-    "set_host_direct_ssh",
     "remove_host",
     "connect_host",
     "disconnect_host",
@@ -96,6 +95,7 @@ pub const LOCAL_ACCOUNT_COMMANDS: &[&str] = &[
     "pro_sign_out_everywhere",
     "pro_hosts",
     "pro_set_host_kept",
+    "pro_set_host_direct_ssh",
     "pro_devices",
     "pro_revoke_device",
 ];

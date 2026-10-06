@@ -2,11 +2,12 @@
   import { RecentSessions } from "./lib/workspace/recentSessions";
   import { cloudOnboarding } from "./lib/pro/onboarding.svelte";
   import { KEPT_NOTICE_PREFIX, keptNoticeWorkspace } from "./lib/pro/kept";
-  import { onMount, tick, untrack, type Component } from "svelte";
+  import { onMount, tick, untrack } from "svelte";
   import { loadApplicationEntry } from "virtual:chimaera-application-entry";
+  import { selectedApplication } from "./lib/extensions/selected";
   import { paidPlan, proTier } from "./lib/net/plan";
   import { isBrowserGateway, gatewayWorkspace } from "./lib/net/base";
-  import AgentSetupLoader from "./lib/workspace/AgentSetupLoader.svelte";
+  import AgentSetupDialog from "./lib/workspace/AgentSetupDialog.svelte";
   import { agentSetup, openAgentSetup } from "./lib/workspace/agentSetup";
   import { agentCatalog } from "./lib/workspace/launcher";
   import { nextInGroup } from "./lib/workspace/sessionCycle";
@@ -96,7 +97,7 @@
     type LinkCtrl,
   } from "./lib/workspace/agentLinks";
   import { typeIntoDetachedSession } from "./lib/terminal/ws";
-  import { reconnectingSockets } from "./lib/net/reconnect";
+  import { reconnectingSockets, setSocketKeepers } from "./lib/net/reconnect";
   import {
     createReconnectListenerGate,
     selectRemoteReconnectSurface,
@@ -354,11 +355,11 @@
   import { clearBrowserNotices, deliverBrowserNotices } from "./lib/workspace/notices";
   import {
     placeAgentBrowser,
-    hasDirectBrowserOwner,
+    admitsAgentBrowserOpen,
     shouldActOnAgentBrowserOpen,
     type AgentBrowserOpen,
   } from "./lib/browser/agentOpen";
-  import UpdateToastLoader from "./lib/workspace/UpdateToastLoader.svelte";
+  import UpdateToast from "./lib/workspace/UpdateToast.svelte";
   import {
     applyAppStatus,
     checkForUpdates,
@@ -394,8 +395,9 @@
     saveRailChrome,
   } from "./lib/layout/railState";
   import { hintsActive, initChordHints } from "./lib/shared/chordHints.svelte";
+  import FolderPicker from "./lib/workspace/FolderPicker.svelte";
   import HomeNavigation from "./lib/workspace/HomeNavigation.svelte";
-  import { loadDialog, loadPaneView, retryPaneView } from "./lib/layout/lazyViews";
+  import { loadPaneView, retryPaneView } from "./lib/layout/lazyViews";
   import AskpassModal from "./lib/workspace/AskpassModal.svelte";
   import ContextMenuHost from "./lib/shared/ContextMenuHost.svelte";
   import { contextMenu } from "./lib/shared/contextMenu.svelte";
@@ -437,7 +439,7 @@
   import { sameFile, setSameFileOpener } from "./lib/workspace/sameFile.svelte";
   import { requestSettingsSection } from "./lib/settings/jump";
   import { setAgentNames } from "./lib/chat/toolLabels";
-  import QuickOpenLoader from "./lib/workspace/QuickOpenLoader.svelte";
+  import QuickOpen from "./lib/workspace/QuickOpen.svelte";
   import FileTree from "./lib/workspace/FileTree.svelte";
   import SplitTree from "./lib/layout/SplitNode.svelte";
   import Pane from "./lib/layout/Pane.svelte";
@@ -497,6 +499,9 @@
 
   // --- remote window: auto-reconnect a dropped tunnel ------------------------
   /** This window's host alias ("local" for the local daemon). */
+  // Only a window that can have Pro has keepers that hold its sockets open
+  // for a sleeping owner (`net/reconnect.ts`); set before any socket dials.
+  setSocketKeepers(get(proTier) !== "free");
   const hostAlias = getHostLabel();
   const isRemoteWindow = hostAlias !== "local";
   /** A browser view of a project (`/workspace/{id}/`) follows the project
@@ -1016,7 +1021,7 @@
     dropSpot = null;
     const body = drop.payload as { ws?: unknown; layout?: unknown } | null;
     const decoded =
-      body !== null && typeof body === "object" ? deserializeLayout(body.layout) : null;
+      body !== null && typeof body === "object" ? deserializeLayout(body.layout, selectedApplication !== null) : null;
     const incoming = decoded !== null ? allTabs(decoded) : [];
     if (
       decoded === null ||
@@ -1835,7 +1840,7 @@
       onNotices: (list) => {
         // A return that kept both versions: the chat's line and an open
         // review read the project's answer again (native or browser).
-        for (const n of list) {
+        if (get(proTier) !== "free") for (const n of list) {
           if (n.kind === "kept_both" && n.workspace_id !== null) void import("./lib/pro/keptReviews.svelte").then(({ keptReviews }) => keptReviews.refresh(n.workspace_id!)).catch(() => { /* A visible review retains its own explicit Refresh recovery. */ });
         }
         if (isNativeShell()) return;
@@ -1998,20 +2003,21 @@
       if (activeWsId === null) homeSettingsOpen = false;
       else openDashboardSurface();
     };
-    window.addEventListener("chimaera:providers-ready", providersReady);
-    window.addEventListener("chimaera:connect-providers", connectProviders);
+    // Pro's own requests: a window that can never have Pro listens for none.
+    const proListeners: [string, (event: Event) => void][] = get(proTier) === "free" ? [] : [
+      ["chimaera:providers-ready", providersReady],
+      ["chimaera:connect-providers", connectProviders],
+      ["chimaera:open-pro", openProSurface],
+      ["chimaera:kept-review", keptReviewRequested],
+    ];
+    for (const [name, listener] of proListeners) window.addEventListener(name, listener);
     window.addEventListener("keydown", onKeydown, true);
     window.addEventListener("pagehide", onPagehide);
-    window.addEventListener("chimaera:open-pro", openProSurface);
-    window.addEventListener("chimaera:kept-review", keptReviewRequested);
     document.addEventListener("copy", onCopy);
     return () => {
-      window.removeEventListener("chimaera:providers-ready", providersReady);
-      window.removeEventListener("chimaera:connect-providers", connectProviders);
+      for (const [name, listener] of proListeners) window.removeEventListener(name, listener);
       window.removeEventListener("keydown", onKeydown, true);
       window.removeEventListener("pagehide", onPagehide);
-      window.removeEventListener("chimaera:open-pro", openProSurface);
-      window.removeEventListener("chimaera:kept-review", keptReviewRequested);
       proReturnLive = false; stopProReturn();
       unlistenMenu?.();
       unlistenDaemonMoved?.();
@@ -2417,7 +2423,7 @@
    * restored yet has nothing to anchor on; the frame is not queued.
    */
   function onAgentBrowserOpen(open: AgentBrowserOpen): void {
-    if (!layoutReady || !hasDirectBrowserOwner(open, sessionsById.get(open.sessionId), projectView)) return;
+    if (!layoutReady || !admitsAgentBrowserOpen(open, sessionsById.get(open.sessionId), projectView, get(proTier) === "free")) return;
     const view = {
       layout,
       workspaceId: activeWsId,
@@ -2797,7 +2803,7 @@
     }
     if (seq !== bootSeq) return; // a later switch superseded this boot
     if (matches(raw)) {
-      const restored = deserializeLayout((raw as { layout?: unknown }).layout);
+      const restored = deserializeLayout((raw as { layout?: unknown }).layout, selectedApplication !== null);
       if (restored !== null) layout = restored;
       // Detachedness: the hash hint is authoritative (only ITS OWN blob was
       // consulted above when set); the blob's dt:1 covers pre-hint blobs. A
@@ -3188,11 +3194,6 @@
       });
   }
 
-  /** The folder picker's component, once its chunk has loaded (it is opened
-   *  on demand and stays out of the always-loaded entry). */
-  let FolderPicker = $state<Component<any> | null>(null);
-  let pickerLoadFailed = false;
-
   function openPicker(): void {
     // A folder opened here would belong to this job's chimaera alone, not
     // the cluster: a cluster workspace's window picks from the cluster page.
@@ -3204,25 +3205,6 @@
     pickerRestoreEl = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     refreshWorkspaces();
     pickerOpen = true;
-    if (FolderPicker !== null) return;
-    // A chunk can fail while a tunnel reconnects or after a daemon handoff
-    // replaced the asset set. Never leave the picker "open" with nothing
-    // drawn: close it (focus goes back) and say so the way a view that
-    // failed to load does. Opening it again tries again.
-    void loadDialog("folderPicker").then(
-      (view) => {
-        FolderPicker = view;
-        // It loaded after an earlier failure was noted: that notice is done.
-        if (pickerLoadFailed) clearChunkFailure();
-        pickerLoadFailed = false;
-      },
-      (error: unknown) => {
-        console.error("could not load the folder picker", error);
-        pickerLoadFailed = true;
-        noteChunkFailure();
-        closePicker();
-      },
-    );
   }
 
   /** Close the picker and put focus back where it was (or on the focused
@@ -3797,6 +3779,8 @@
    */
   let pendingKeptReview = $state<string | null>(null);
   async function openKeptReviewFor(workspaceId: string): Promise<void> {
+    // Only a window that can have Pro has returns to review.
+    if (get(proTier) === "free") return;
     if (workspaceId !== activeWsId) {
       let target = workspaces.find((w) => w.id === workspaceId);
       if (target === undefined) {
@@ -5515,7 +5499,7 @@
 
 {#if $agentSetup}
   {#key $agentSetup}
-    <AgentSetupLoader request={$agentSetup} onclose={() => agentSetup.set(null)} onlaunch={launcherPick} />
+    <AgentSetupDialog request={$agentSetup} onclose={() => agentSetup.set(null)} onlaunch={launcherPick} />
   {/key}
 {/if}
 
@@ -6614,12 +6598,12 @@
 {/if}
 
 
-{#if pickerOpen && FolderPicker !== null}
+{#if pickerOpen}
   <FolderPicker recents={workspaces} onOpened={activateWorkspace} onClose={closePicker} />
 {/if}
 
 {#if quickOpenOpen && activeWsId !== null}
-  <QuickOpenLoader
+  <QuickOpen
     workspaceId={activeWsId}
     sessions={wsSessions}
     sessionNames={displayNames}
@@ -6743,7 +6727,7 @@
 {/if}
 
 {#if updateNotice !== null && $assetTransition === null}
-  <UpdateToastLoader notice={updateNotice} />
+  <UpdateToast notice={updateNotice} />
 {/if}
 
 <!-- Transient outcome chip: an action that would otherwise fail in silence
@@ -7075,7 +7059,6 @@
     align-items: center;
     gap: 8px;
     padding: 0 16px 12px;
-    min-height: 40px;
   }
 
   .needs {

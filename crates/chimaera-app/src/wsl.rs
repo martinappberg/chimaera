@@ -508,9 +508,7 @@ mod imp {
     /// after sleep/resume (fixed by the ICTIMESYNCFLAG_SYNC patch).
     const MIN_WSL: (u64, u64, u64) = (2, 1, 1);
 
-    // Serialized lifecycle owners prevent a late older adoption from replacing
-    // the receipt. A positively unchanged adoption preserves pending pickers.
-    static LIFECYCLE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    // A positively unchanged adoption preserves pending pickers.
     static ACTIVE: std::sync::Mutex<Adoptions> = std::sync::Mutex::new(Adoptions { current: None });
 
     fn invalidate() {
@@ -1027,24 +1025,14 @@ mod imp {
     /// — and doubles as the liveness check (a 200 from the token handshake
     /// proves the daemon better than any kill -0 could, without the extra
     /// wsl.exe spawn per poll).
-    async fn read_manifest(t: &Target) -> anyhow::Result<Manifest> {
-        let mut cmd = wsl_command();
-        cmd.args([
-            "-d",
-            &t.distro,
-            "-u",
-            &t.user,
-            "--exec",
-            "/bin/sh",
-            "-c",
-            script::READ_MANIFEST,
-        ]);
-        let out = bounded_output(cmd, SCRIPT_TIMEOUT, 16384).await?;
-        serde_json::from_slice(&out).map_err(|_| anyhow::anyhow!("project_open_failed"))
-    }
-
     async fn probe(t: &Target) -> Option<Manifest> {
-        let m = read_manifest(t).await.ok()?;
+        let out = target_script(t, script::READ_MANIFEST, None, SCRIPT_TIMEOUT)
+            .await
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let m: Manifest = serde_json::from_str(decode_wsl_output(&out.stdout).trim()).ok()?;
         health(&m).await.then_some(m)
     }
 
@@ -1130,7 +1118,10 @@ mod imp {
         for _ in 0..50 {
             tokio::time::sleep(Duration::from_millis(300)).await;
             if manifest.is_none() {
-                manifest = read_manifest(t).await.ok();
+                let out = target_script(t, script::READ_MANIFEST, None, SCRIPT_TIMEOUT).await?;
+                if out.status.success() {
+                    manifest = serde_json::from_str(decode_wsl_output(&out.stdout).trim()).ok();
+                }
             }
             let healthy = match &manifest {
                 Some(m) => health(m).await,
@@ -1155,7 +1146,6 @@ mod imp {
     /// anything that needs provisioning/replacing runs there, visibly, not
     /// invisibly inside a window-less startup.
     pub async fn adopt_daemon() -> anyhow::Result<LocalDaemon> {
-        let _lifecycle = LIFECYCLE.lock().await;
         let mut attempt = AdoptionAttempt(false);
         let target = resolve_target(None).await?;
         prepare_target(&target);
@@ -1208,7 +1198,6 @@ mod imp {
         force_replace: bool,
         progress: &(dyn Fn(&str) + Send + Sync),
     ) -> anyhow::Result<LocalDaemon> {
-        let _lifecycle = LIFECYCLE.lock().await;
         let mut attempt = AdoptionAttempt(false);
         let target = resolve_target(distro).await?;
         prepare_target(&target);

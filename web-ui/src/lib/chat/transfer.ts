@@ -61,8 +61,10 @@ const RESTART_OPENING = "The Chimaera daemon hosting this session restarted";
  *  one (something a person wrote). For surfaces that quote a turn's prompt
  *  and only have its text — the Timeline's "Since you left" — so the
  *  agent-facing words never pass for what the person said. `viewer` is as in
- *  {@link transferNote}. */
-export function pickupNote(text: string, viewer = false): string | null {
+ *  {@link transferNote}. `free`: a window that can never have Pro
+ *  (`proTier` "free") quotes every prompt as it always did. */
+export function pickupNote(text: string, viewer = false, free = false): string | null {
+  if (free) return null;
   const head = text.trimStart();
   if (head.startsWith(RESTART_OPENING)) return RESTART_NOTE;
   if (!head.startsWith(TRANSFER_OPENING)) return null;

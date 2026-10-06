@@ -398,6 +398,12 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             crate::workspace_scope::middleware,
         ))
         .route_layer(middleware::from_fn_with_state(state.clone(), api::auth))
+        // Outermost: without the extension the `/pro/*` routes do not exist,
+        // so they answer exactly as an unknown route did before.
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            api::pro_routes,
+        ))
         // Registered after route_layer, so hook ingestion is NOT behind bearer
         // auth: claude's hooks cannot know the daemon token, so the random
         // per-session key embedded in the hook URL authorizes them instead.

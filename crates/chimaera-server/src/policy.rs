@@ -86,6 +86,8 @@ pub(crate) struct Admission {
 pub(crate) trait AdmissionToken: Send + Sync {
     fn check(&self, state: &AppState) -> anyhow::Result<()>;
     fn begin(&self, state: &AppState) -> anyhow::Result<Option<Reservation>>;
+    /// The workspace's agents run under the policy's process ownership.
+    fn managed(&self, state: &AppState) -> bool;
     fn installer<'a>(
         &'a self,
         state: &'a Arc<AppState>,
@@ -111,6 +113,11 @@ impl Admission {
             None if state.policy().allows(state, &self.workspace, Need::Execute) => Ok(()),
             None => Err(Changed.into()),
         }
+    }
+    pub(crate) fn managed(&self, state: &AppState) -> bool {
+        self.token
+            .as_ref()
+            .is_some_and(|token| token.managed(state))
     }
     /// Check, then reserve the final dispatch.
     pub(crate) fn begin(&self, state: &AppState) -> anyhow::Result<Option<Reservation>> {
@@ -149,6 +156,9 @@ pub(crate) trait InstallerToken: Send + Sync {
     /// Attach the spawned process group synchronously after spawn.
     fn attach(&mut self, group: u32);
     fn finish(self: Box<Self>) -> BoxFuture<'static, anyhow::Result<()>>;
+    /// The installer holds a setup reservation whose process group must be
+    /// drained on success.
+    fn guarded(&self) -> bool;
 }
 impl Installer {
     pub(crate) fn with(
@@ -167,6 +177,9 @@ impl Installer {
     }
     pub(crate) fn check(&self) -> anyhow::Result<()> {
         self.admission.check(&self.state)
+    }
+    pub(crate) fn guarded(&self) -> bool {
+        self.token.as_ref().is_some_and(|token| token.guarded())
     }
     pub(crate) fn attach(&mut self, group: u32) {
         if let Some(token) = &mut self.token {
@@ -227,6 +240,9 @@ pub(crate) struct LaunchContext {
 /// Every method must be cheap and must not block: shared code calls them on
 /// the reactor and on hot paths.
 pub(crate) trait WorkspacePolicy: Send + Sync + 'static {
+    /// Whether an extension is composed here at all: only then does the
+    /// daemon serve extension routes or add extension fields and frames.
+    fn composed(&self, state: &AppState) -> bool;
     /// Whether this composition is doing paid work right now; shared code
     /// skips bookkeeping only an active extension reads (input stamps).
     fn active(&self, state: &AppState) -> bool;
@@ -357,6 +373,9 @@ impl Inert {
     }
 }
 impl WorkspacePolicy for Inert {
+    fn composed(&self, _: &AppState) -> bool {
+        false
+    }
     fn active(&self, _: &AppState) -> bool {
         false
     }

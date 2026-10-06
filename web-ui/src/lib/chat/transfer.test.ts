@@ -66,6 +66,12 @@ describe("pickupNote (a surface that holds only the prompt's text)", () => {
     expect(pickupNote(title)).toBe("Continued in the cloud");
   });
 
+  it("quotes every prompt in a window that can never have Pro", () => {
+    const restart = "The Chimaera daemon hosting this session restarted, so this conversation was resumed in a new agent process.";
+    expect(pickupNote(restart, false, true)).toBeNull();
+    expect(pickupNote(MOVED, false, true)).toBeNull();
+  });
+
   it("leaves what a person wrote alone", () => {
     for (const typed of [
       "fix the QC filter",

@@ -356,6 +356,9 @@ impl Dispatch {
             )
             .await
     }
+    pub(crate) fn workspace(&self) -> &str {
+        &self.workspace
+    }
     pub(crate) fn capture(state: &AppState, workspace: &str) -> anyhow::Result<Self> {
         let generation = generation(state);
         let ownership = lock(&state.pro.ownership).get(workspace).cloned();

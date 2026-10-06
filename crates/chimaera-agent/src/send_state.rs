@@ -162,7 +162,7 @@ impl Snapshot {
 /// another machine (managed execution) needs evidence that survives a power
 /// loss and a handoff, at the price of synced writes per send and failing
 /// closed on damage. Every other chat keeps the same record in memory (the
-/// Pass 46 contract): no disk write per send, and an earlier sidecar is read
+/// Pass 48 contract): no disk write per send, and an earlier sidecar is read
 /// when it is sound and ignored, with a log line, when it is not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Receipts {
@@ -190,6 +190,28 @@ static STORES: OnceLock<Registry> = OnceLock::new();
 // Serialize first enrollment so concurrent sessions cannot all pass the last
 // retained-store slot. Existing receipts do not take this global gate.
 static ENROLLMENTS: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// Shares `store` through the registry unless another opener won the race.
+fn register(
+    stores: &mut HashMap<PathBuf, Weak<Store>>,
+    path: PathBuf,
+    store: Arc<Store>,
+    receipts: Receipts,
+    limit: usize,
+) -> Result<Arc<Store>> {
+    stores.retain(|_, store| store.strong_count() > 0);
+    if let Some(existing) = stores.get(&path).and_then(Weak::upgrade) {
+        return existing.reuse(receipts);
+    }
+    if stores.len() >= limit {
+        // An in-memory record need not be shared, so a full registry never
+        // refuses an ordinary chat; only durable receipts are limited.
+        ensure!(receipts == Receipts::Memory, "send store limit reached");
+        return Ok(store);
+    }
+    stores.insert(path, Arc::downgrade(&store));
+    Ok(store)
+}
 
 pub(crate) fn paths(dir: &Path, session_id: &str) -> Result<(PathBuf, PathBuf)> {
     ensure!(
@@ -314,13 +336,7 @@ impl Store {
             before_write: Mutex::new(None),
         });
         let mut stores = registry.lock().expect("send stores lock");
-        stores.retain(|_, store| store.strong_count() > 0);
-        if let Some(existing) = stores.get(&path).and_then(Weak::upgrade) {
-            return existing.reuse(receipts);
-        }
-        ensure!(stores.len() < MAX_STORES, "send store limit reached");
-        stores.insert(path, Arc::downgrade(&store));
-        Ok(store)
+        register(&mut stores, path, store, receipts, MAX_STORES)
     }
 
     /// A cached store serves every opener. A durable opener upgrades it: its
@@ -799,6 +815,37 @@ mod tests {
             reopened.state("client-after-upgrade").unwrap(),
             Some(ClientIdState::Uncertain)
         );
+    }
+
+    /// A full registry refuses only durable receipts: an ordinary chat still
+    /// opens, with an unshared in-memory record.
+    #[test]
+    fn a_full_registry_never_refuses_an_ordinary_chat() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = Store::open(dir.path(), "s-held", &[], Receipts::Memory).unwrap();
+        let mut stores = HashMap::from([(held.path.clone(), Arc::downgrade(&held))]);
+        let fresh = |id: &str| {
+            let other = tempfile::tempdir().unwrap();
+            let store = Store::open(other.path(), id, &[], Receipts::Memory).unwrap();
+            (store.path.clone(), store, other)
+        };
+        let (path, store, _keep) = fresh("s-memory-full");
+        let opened = register(
+            &mut stores,
+            path.clone(),
+            store.clone(),
+            Receipts::Memory,
+            1,
+        )
+        .expect("a memory store opens past the limit");
+        assert!(Arc::ptr_eq(&opened, &store));
+        assert!(
+            !stores.contains_key(&path),
+            "an overflow store is not shared"
+        );
+        let (path, store, _keep) = fresh("s-durable-full");
+        assert!(register(&mut stores, path, store, Receipts::Durable, 1).is_err());
+        assert_eq!(stores.len(), 1);
     }
 
     /// Damaged evidence never stops an ordinary chat from starting; it is

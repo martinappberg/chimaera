@@ -402,6 +402,19 @@ describe("opening surfaces", () => {
   });
 });
 
+describe("a build without the extension", () => {
+  it("drops saved Pro tabs on restore, keeping the rest of the layout", () => {
+    let l = openSession(defaultLayout(), "agent");
+    l = openKeptReview(openPro(openSettings(l)));
+    const restored = deserializeLayout(serializeLayout(l));
+    expect(restored).not.toBeNull();
+    expect(allTabs(restored!)).toEqual([
+      { surface: "terminal", sessionId: "agent" },
+      { surface: "settings" },
+    ]);
+  });
+});
+
 describe("the review of both versions", () => {
   it("is one tab per window that round-trips and reports whether it is on screen", () => {
     let l = openSession(defaultLayout(), "agent");
@@ -410,7 +423,7 @@ describe("the review of both versions", () => {
     l = openKeptReview(l);
     expect(tabCount(l)).toBe(2);
     expect(keptReviewShown(l)).toBe(true);
-    const restored = deserializeLayout(serializeLayout(l));
+    const restored = deserializeLayout(serializeLayout(l), true);
     expect(restored).not.toBeNull();
     expect(panes(restored!.root)[0].tabs).toEqual([
       { surface: "terminal", sessionId: "agent" },
@@ -426,7 +439,7 @@ describe("Pro navigation", () => {
     layout = openSettings(layout);
     layout = openPro(layout);
     layout = openPro(layout);
-    const restored = deserializeLayout(serializeLayout(layout));
+    const restored = deserializeLayout(serializeLayout(layout), true);
     expect(restored).not.toBeNull();
     expect(allTabs(restored!)).toEqual([
       { surface: "terminal", sessionId: "working-agent" },

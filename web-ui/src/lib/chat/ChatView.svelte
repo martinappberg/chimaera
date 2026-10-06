@@ -1504,10 +1504,14 @@
     for (const img of images) {
       blocks.push({ type: "image", media_type: img.media_type, data: img.data });
     }
+    const type = afterTurn ? "send_after_turn" : "send";
+    // A daemon without send ids takes the plain frame and settles it with its
+    // own echo or refusal; nothing is tracked here.
+    if (!store.sendsWithIds($proTier === "free")) return socket.send({ type, blocks });
     // The id this send goes out under: the daemon runs an id once, so the
     // store may send the same frame again until its echo names it.
     const id = mintSendId();
-    const frame = { type: afterTurn ? "send_after_turn" : "send", blocks, client_id: id };
+    const frame = { type, blocks, client_id: id };
     if (!socket.send(frame)) return false;
     store.noteSent(id, frame, text, images);
     return true;
@@ -1752,9 +1756,10 @@
       case "mcp":
         if (supports("get_mcp")) {
           if (!sendCommand({ type: "get_mcp" }, "MCP request not sent")) return false;
-          // The inventory already known stays up while this one is fetched:
-          // a read is not the user acting, so nobody answers it while a cloud
-          // machine sleeps (see `UNANSWERED_MS`).
+          // A viewed conversation keeps the inventory already known up while
+          // this one is fetched: a read is not the user acting, so nobody
+          // answers it while a cloud machine sleeps (see `UNANSWERED_MS`).
+          if (!viewed) store.mcpServers = null;
           menu = "mcp";
           return true;
         }
@@ -2190,7 +2195,7 @@
     // conversation is not live (whoever keeps a sleeping owner's socket drops
     // a `set_thinking`, and a plain reconnect does not push it again).
     const sent = sendCommand({ type: "set_thinking", enabled: next }, "thinking change not sent");
-    if (!sent || !store.connected) store.markThinkingPending();
+    if (!sent || (viewed && !store.connected)) store.markThinkingPending();
   }
   // Push the effective preference to the live driver, once per driver process.
   // It pushes whatever the user's effective choice IS (never forces a value),

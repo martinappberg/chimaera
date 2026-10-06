@@ -389,6 +389,24 @@ impl ChildGuard {
                 );
             }
         }
+        // An ordinary child is owned by this guard alone (no execution
+        // control holds it), so it is reaped exactly as before managed
+        // execution existed: wait out the grace, then kill and wait.
+        if !self.managed_execution {
+            if let Some(child) = Arc::get_mut(&mut self.child).and_then(|c| c.get_mut().ok()) {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let status = match tokio::time::timeout(remaining, child.wait()).await {
+                    Ok(Ok(status)) => status.code(),
+                    _ => {
+                        child.start_kill().ok();
+                        child.wait().await.ok().and_then(|s| s.code())
+                    }
+                };
+                let _ = tokio::time::timeout(STDERR_SETTLE, &mut self.stderr_task).await;
+                let tail = self.stderr_tail();
+                return (status, tail);
+            }
+        }
         // Keep the managed path's existing reap window; ordinary shutdown
         // still kills at the original grace, without adding another grace.
         let deadline = if self.managed_execution {
@@ -616,6 +634,39 @@ mod tests {
         assert_eq!(status, Some(0));
         assert!(tail.ends_with("tail-marker"));
         assert!(tail.lines().count() <= STDERR_TAIL_LINES);
+    }
+
+    /// An ordinary child is reaped with its status, and one that outlives
+    /// the grace is killed then and reaped at once.
+    #[tokio::test]
+    async fn an_ordinary_child_is_reaped_at_exit_or_killed_at_the_grace() {
+        let child = JsonlChild::spawn(
+            "/bin/sh",
+            &["-c".into(), "exit 3".into()],
+            Path::new("/"),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let (sink, _stream, guard) = child.split();
+        assert!(!guard.managed_execution);
+        drop(sink);
+        assert_eq!(guard.shutdown(Duration::from_secs(5)).await, Some(3));
+
+        let child = JsonlChild::spawn(
+            "/bin/sh",
+            &["-c".into(), "trap '' TERM; sleep 30".into()],
+            Path::new("/"),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let (sink, _stream, guard) = child.split();
+        guard.terminate();
+        drop(sink);
+        let started = Instant::now();
+        assert_eq!(guard.shutdown(Duration::from_millis(200)).await, None);
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[tokio::test]
