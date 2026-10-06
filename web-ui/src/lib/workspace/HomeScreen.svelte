@@ -828,7 +828,7 @@
                 </button>
                 {#if live !== undefined && live.live > 0}
                   <button
-                    class="side stop shown"
+                    class="side stop"
                     title="end this workspace's {live.live} running session{live.live === 1
                       ? ''
                       : 's'}"
@@ -836,6 +836,9 @@
                   >
                 {/if}
                 <HomeActions label={`Actions for ${w.name}`}>
+                  {#if live !== undefined && live.live > 0}
+                    <button class="stop" onclick={() => (confirmStopId = w.id)}>End sessions</button>
+                  {/if}
                   {#if !jobScoped}
                     <button
                       class="side"
@@ -1803,14 +1806,15 @@
   .session-state.stale { color: var(--muted); }
   .session-state { font-size: var(--text-xs); color: var(--accent); }
   .workspace-meta .when { font-family: inherit; font-size: var(--text-xs); margin-left: 0; }
-  /* End sessions is a real, bordered control the same height as the row's
-     "…" trigger (32px), not a bare coloured word. */
-  .workspace-row .side.stop.shown {
+  /* End sessions appears on hover beside the row (hidden controls are not
+     focusable; the keyboard reaches the same entry through the "…" menu): a
+     bordered control the height of the "…" trigger. */
+  .workspace-row .side.stop {
     height: 32px; min-height: 32px; padding: 0 10px; margin-right: 2px;
     border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
     border-radius: 6px; color: var(--warn); font-size: var(--text-sm);
   }
-  .workspace-row .side.stop.shown:hover { color: var(--err); border-color: color-mix(in srgb, var(--err) 55%, transparent); background: var(--row-hover); }
+  .workspace-row .side.stop:hover { color: var(--err); border-color: color-mix(in srgb, var(--err) 55%, transparent); background: var(--row-hover); }
   .host-card { border: 1px solid var(--edge); border-radius: 10px; padding: 5px; }
   .remotes .rows { gap: 10px; }
   .host-name { display: flex; align-items: center; gap: 9px; min-width: 0; }

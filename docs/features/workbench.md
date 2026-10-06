@@ -18,7 +18,7 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   most-recent-first, with a live-session rollup. Open one to start work.
 - **How it's used.** Click a row to open it in this window; Cmd/Ctrl-click (or **Open in new
   window** in the row's "…" menu) opens it in a new window. **Open folder** (`Mod+O`) opens the
-  folder picker. A row with live sessions shows **End sessions**; the "…" menu also offers
+  folder picker. A row with live sessions shows **End sessions** on hover and in its "…" menu, which also offers
   **Remove from list** (the folder on disk is untouched). Layout and navigation:
   [native-app.md › Home launcher](native-app.md#home-launcher).
 - **Lazy Home.** `HomeScreen.svelte` loads only in a Home window, through the cached view

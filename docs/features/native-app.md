@@ -85,9 +85,9 @@ app-build` (never the root `cargo`).
 - **What & when.** Home is workspace-first: **Open folder** registers an existing folder;
   recent workspaces on this machine show their path, live-session or approval state, and last-opened
   time. Remote machines are grouped separately, with their own connection status and workspaces.
-- **How it's used.** A workspace row opens in the launcher. A workspace with live sessions shows a
-  visible **End sessions** beside the row (ending live work is never hidden in a menu); its "…"
-  menu offers a new window or removing the registration (the folder stays untouched). Cmd/Ctrl-click
+- **How it's used.** A workspace row opens in the launcher. A workspace with live sessions shows
+  **End sessions** beside the row on hover, and the same entry in its "…" menu (the keyboard
+  route), which also offers a new window or removing the registration (the folder stays untouched). Cmd/Ctrl-click
   still opens a new window. Connected remote rows show their loopback port, and a pool alias pinned
   to one login node says so on hover. Remote menus keep **Disconnect** separate from confirmed
   **End sessions**, **Shut down**, and **Forget machine**. Cluster compute sessions remain on that
