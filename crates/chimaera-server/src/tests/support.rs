@@ -50,8 +50,15 @@ pub(super) fn test_state_with_extension() -> Arc<AppState> {
             Box::pin(async {})
         }
     }
+    test_state_with_runtime(Arc::new(Inert))
+}
+
+/// [`test_state_with_extension`] with a caller's Runtime.
+pub(super) fn test_state_with_runtime(
+    runtime: Arc<dyn crate::daemon_extension::Runtime>,
+) -> Arc<AppState> {
     let mut state = fixture_state(0, test_dir("data"));
-    state.daemon_extension = Some(Arc::new(Inert));
+    state.daemon_extension = Some(runtime);
     Arc::new(state)
 }
 

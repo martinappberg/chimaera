@@ -145,3 +145,55 @@ async fn an_install_watch_keeps_the_ordinary_cadence_without_a_plan() {
         );
     }
 }
+
+/// Without an active plan a spawn never asks the extension for an account
+/// environment (there is none); with one it does.
+#[tokio::test]
+async fn a_spawn_asks_for_no_account_environment_without_a_plan() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Counting(Arc<AtomicUsize>);
+    impl crate::daemon_extension::Runtime for Counting {
+        fn coordinate(
+            &self,
+            _owner: crate::daemon_extension::CoordinatorOwner,
+        ) -> crate::daemon_extension::RuntimeFuture {
+            Box::pin(async {})
+        }
+        fn session_environment<'a>(
+            &'a self,
+            _workspace: &'a str,
+            _worker: bool,
+        ) -> crate::daemon_extension::EnvironmentFuture<'a> {
+            self.0.fetch_add(1, Ordering::AcqRel);
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+    let asked = Arc::new(AtomicUsize::new(0));
+    let state = test_state_with_runtime(Arc::new(Counting(asked.clone())));
+    let root = std::fs::canonicalize(test_dir("free-contract-env")).unwrap();
+    let workspace = lock(&state.workspaces).add(root).unwrap();
+    let (mut env, mut remove) = (Vec::new(), Vec::new());
+    crate::daemon_extension::apply_session_environment(
+        &state,
+        &workspace.id,
+        &mut env,
+        &mut remove,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        asked.load(Ordering::Acquire),
+        0,
+        "asked below an active plan"
+    );
+    crate::pro::activate_fixture(&state);
+    crate::daemon_extension::apply_session_environment(
+        &state,
+        &workspace.id,
+        &mut env,
+        &mut remove,
+    )
+    .await
+    .unwrap();
+    assert_eq!(asked.load(Ordering::Acquire), 1);
+}

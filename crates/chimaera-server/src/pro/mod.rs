@@ -600,9 +600,10 @@ pub(crate) fn any_enrolled(state: &crate::AppState) -> bool {
 /// does not hold it: from now on the project may come home here (`lazy_handback`)
 /// even when the account's preferred installation is another one — the
 /// latest computer that had the project is the one it returns to. Bounded;
-/// nothing at all without the Pro extension ([`Tier::Free`]).
+/// nothing at all below an active plan ([`Tier::Active`]): without an account
+/// no project can come home anywhere.
 pub(crate) fn note_opened(state: &crate::AppState, workspace: &str) {
-    if tier(state) == Tier::Free {
+    if tier(state) != Tier::Active {
         return;
     }
     if project_copy::copy_only(state, workspace) {
@@ -622,6 +623,14 @@ pub(crate) fn note_opened(state: &crate::AppState, workspace: &str) {
 #[cfg(test)]
 pub(crate) fn opened_here(state: &crate::AppState, workspace: &str) -> bool {
     crate::lock(&state.pro.opened_here).contains(workspace)
+}
+/// Tests only: an account configured this daemon ([`Tier::Active`]).
+#[cfg(test)]
+pub(crate) fn activate_fixture(state: &crate::AppState) {
+    state
+        .pro
+        .configured
+        .store(true, std::sync::atomic::Ordering::Release);
 }
 /// What an account binding does to a project (`projects::bind_workspace_account`)
 /// without an account: it counts as enrolled and its folder gets its marker.

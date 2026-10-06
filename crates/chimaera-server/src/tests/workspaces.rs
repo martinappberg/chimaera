@@ -290,9 +290,7 @@ mod folder_identity {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 assert_eq!(contents(&root), before, "the folder gained nothing");
                 assert!(identity::read(&root).is_none());
-                if state.daemon_extension.is_none() {
-                    assert!(!crate::pro::opened_here(&state, id));
-                }
+                assert!(!crate::pro::opened_here(&state, id));
             }
         }
     }
@@ -343,12 +341,14 @@ mod folder_identity {
         // A different daemon with an empty registry: a reinstall, a state
         // reset, or the same folder on another computer.
         let second_state = test_state_with_extension();
+        crate::pro::activate_fixture(&second_state);
         let second = register(&second_state, &root).await;
         assert_eq!(second["id"], first["id"]);
         assert_eq!(second["root"], first["root"]);
         // The user opened an existing project here: it may come home to this
         // computer (a fresh registration is not that).
         let first_state = test_state_with_extension();
+        crate::pro::activate_fixture(&first_state);
         let fresh = folder("ident-fresh");
         let fresh_ws = register(&first_state, &fresh).await;
         assert!(!crate::pro::opened_here(
@@ -368,6 +368,7 @@ mod folder_identity {
     #[tokio::test]
     async fn a_local_duplicate_is_its_own_project_and_a_move_keeps_the_project() {
         let state = test_state_with_extension();
+        crate::pro::activate_fixture(&state);
         let parent = folder("ident-dup");
         let original = parent.join("thesis");
         std::fs::create_dir(&original).unwrap();

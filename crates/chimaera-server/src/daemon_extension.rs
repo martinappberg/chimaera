@@ -217,9 +217,16 @@ pub(crate) async fn apply_session_environment(
     let Some(extension) = state.daemon_extension.as_ref() else {
         return Ok(());
     };
+    // Below an active plan (and off a cloud worker) there is no account
+    // environment to apply: a spawn costs nothing more than on a daemon
+    // without the extension.
+    let worker = crate::pro::mutation::maintenance_worker(state);
+    if !worker && crate::pro::tier(state) != crate::pro::Tier::Active {
+        return Ok(());
+    }
     let generation = crate::pro::mutation::generation(state);
     let values = extension
-        .session_environment(workspace, crate::pro::mutation::maintenance_worker(state))
+        .session_environment(workspace, worker)
         .await
         .map_err(|_| anyhow::anyhow!("workspace environment unavailable"))?;
     anyhow::ensure!(

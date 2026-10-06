@@ -293,8 +293,8 @@ the lifecycle, keep them consistent:
   directory hosts the marker so it is never committed and a plain `git clone` is
   a separate project; the marker is never mirrored to the cloud. Opening a
   folder that names a project that already exists (`Registered.known`) also
-  flags it "opened here" (`pro::note_opened`) so the cloud project can come
-  home to this computer ([`pro/AGENTS.md`](src/pro/AGENTS.md), "Who a project
+  flags it "opened here" (`pro::note_opened`, only with an active plan) so the
+  cloud project can come home to this computer ([`pro/AGENTS.md`](src/pro/AGENTS.md), "Who a project
   returns to").
 - **Four native extension adapters, open report identities.** `agent_probe/extensions.rs`
   owns Antigravity's zero-turn skills/imports and Grok's effective inspect inventory.
