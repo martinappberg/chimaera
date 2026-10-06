@@ -3704,15 +3704,8 @@
   }
 
   function focusDirection(dir: FocusDir): void {
-    const from = layout.focusedPaneId;
     layout = moveFocus(layout, dir);
-    if (layout.focusedPaneId !== from) {
-      focusFocusedPane();
-      return;
-    }
-    // No pane that way: DOM focus stays where it was (a terminal keeps its keys).
-    const sid = focusedSessionOf(layout);
-    if (sid !== null) pool.focusTerminal(sid);
+    focusFocusedPane();
   }
 
   function cycle(delta: number): void {

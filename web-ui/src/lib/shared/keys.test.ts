@@ -79,16 +79,19 @@ describe("agent and terminal cycle chords", () => {
     expect(keys.matchChord(letter("KeyT", { ctrlKey: true, shiftKey: true }), terminals)).toBeNull();
   });
 
-  it("collides with no other default chord", async () => {
+  it("collides with no other default chord under any modifier setting", async () => {
     for (const platform of ["MacIntel", "Win32"]) {
       const { keys } = await chordsOn(platform);
-      const seen = new Map<string, string>();
-      for (const action of keys.ACTIONS) {
-        if (action.def === "") continue;
-        const p = keys.parseChord(action.def, "auto")!;
-        const sig = `${p.meta}/${p.ctrl}/${p.alt}/${p.shift}/${p.key}`;
-        expect(seen.get(sig), `${action.id} shares ${action.def} with ${seen.get(sig)}`).toBeUndefined();
-        seen.set(sig, action.id);
+      for (const setting of ["auto", "cmd", "ctrl-shift", "alt"] as const) {
+        const sig = (def: string) => {
+          const p = keys.parseChord(def, setting)!;
+          return `${p.meta}/${p.ctrl}/${p.alt}/${p.shift}/${p.key}`;
+        };
+        for (const id of ["cycleAgents", "cycleTerminals"]) {
+          const mine = sig(keys.ACTION_BY_ID.get(id)!.def);
+          const clash = keys.ACTIONS.filter((a) => a.id !== id && a.def !== "" && sig(a.def) === mine);
+          expect(clash.map((a) => a.id), `${platform}/${setting}: ${id}`).toEqual([]);
+        }
       }
     }
   });

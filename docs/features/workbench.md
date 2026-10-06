@@ -260,11 +260,11 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   a slim strip. `Mod+Arrow` moves pane focus spatially; `Mod2+Arrow` carries the active tab into
   the neighbor — or, when there is no pane in that direction, **auto-splits a new one** on that
   side (capped at `MAX_PANES` and a minimum pane size); `Mod+1–9` focuses that numbered pane;
-  `⌘±`/`⌘0` bump one pane's terminal/markdown font. Three separate chords: `Mod+Arrow` moves
-  between panes, `⌃⌘A` (`keys.cycleAgents`) opens the next agent in the sidebar's agents list
-  and `⌃⌘T` (`keys.cycleTerminals`) the next terminal in its terminals list — each wraps at the
-  end and, from outside its group, starts at the first row (off macOS, `Ctrl+Shift+Alt+A/T`).
-  They open a row the way clicking it does, so an agent already shown in another pane is
+  `⌘±`/`⌘0` bump one pane's terminal/markdown font. Two further chords step through the
+  sidebar instead of the panes: `⌃⌘A` (`keys.cycleAgents`) opens the next agent in its agents
+  list and `⌃⌘T` (`keys.cycleTerminals`) the next terminal in its terminals list (off macOS,
+  `Ctrl+Shift+Alt+A/T`). Each wraps at the end and, from outside its group, starts at the first
+  row. They open a row the way clicking it does, so an agent already shown in another pane is
   focused there; a detached window, which has no sidebar, ignores them.
 - **Empty panes & numbered moves.** `Mod+N` creates an empty pane to the right, up to
   `MAX_PANES` (4); the same action is available from Pane actions or Quick Open.
