@@ -1,4 +1,5 @@
 <script lang="ts">
+  import RemoteSettingsDialog from "./RemoteSettingsDialog.svelte";
   import { onMount, untrack } from "svelte";
   import HomeNavigation from "./HomeNavigation.svelte";
   import HomeActions from "./HomeActions.svelte";
@@ -36,16 +37,15 @@
     updateLocalDaemon,
     type ConnectProgress,
     type HostState,
-    type HostStatusEvent,
     type LocalDaemonState,
   } from "../net/native";
   import { computeStatus } from "./compute";
   import ComputeBanner from "./ComputeBanner.svelte";
   import { clusterNow, clusterOverviews } from "./clusterStore.svelte";
   import { anyJobRunning, hostSummary, schedulerLabel } from "./clusterRow";
+  import { pageVisible } from "../shared/visibility";
   import { getJobContext, isHomeHub, type Health } from "../net/api";
   import { asyncDisposer } from "../shared/asyncDisposer";
-  import { pageVisible } from "../shared/visibility";
   import { fetchOwnershipHints, readsOwnership } from "./placementHints";
   import { relativeAge } from "./launcher";
   import { APP_UPDATES, checkForUpdates, MANAGED_UPDATES, updateState } from "./update.svelte";
@@ -65,7 +65,9 @@
     onStop: (w: Workspace) => void;
     /** Open the folder picker (browse/register a new folder). */
     onOpenFolder: () => void;
+    /** Open Settings as a full page over Home (Home's navigation, ⌘,). */
     onSettings: () => void;
+    /** Open the Pro page (only offered when an installed extension can). */
     onPro: () => void;
   }
 
@@ -335,12 +337,8 @@
     if (hostLabel === "local") {
       void checkAppUpdate().then((v) => (appUpdate = v));
     }
+    // A Pro sign-in or plan change can add or drop hosts reached through it.
     const unlisteners: Array<() => void> = [asyncDisposer(onProChanged(() => { if (document.visibilityState === "visible") void refreshHosts(); }))];
-    const onVis = (): void => {
-      if (document.visibilityState === "visible") void refreshHosts();
-    };
-    document.addEventListener("visibilitychange", onVis);
-    unlisteners.push(() => document.removeEventListener("visibilitychange", onVis));
     // A cluster's workspaces changed (a start, stop, or handoff — from this
     // window or another): refresh its row. The cluster page, when open,
     // listens for itself and shares the same cache.
@@ -373,79 +371,64 @@
     unlisteners.push(
       asyncDisposer(
         onHostStatus((e) => {
-          // Job-window events belong to the cluster overview, never a host row.
+          // A job window's key (`<alias>#job<id>`) isn't a host row; its job
+          // ending is news for that cluster's row, though.
           const job = e.alias.indexOf("#job");
           if (job !== -1) {
             if (e.status === "ended") void clusterOverviews.refresh(e.alias.slice(0, job), 0);
             return;
           }
-          if (hosts.some((host) => host.alias === e.alias)) {
-            applyHostStatus(e);
-            return;
+          const row = hosts.find((h) => h.alias === e.alias);
+          if (row === undefined) return;
+          // A cluster without the login-node override has no tunnel: its
+          // state is "cluster" whatever a stray transition says, except a
+          // connect that failed.
+          const plainCluster = row.status === "cluster" && row.cluster?.login_serve !== true;
+          if (!plainCluster || e.status === "error") {
+            hosts = hosts.map((h) =>
+              h.alias === e.alias
+                ? {
+                    ...h,
+                    status: e.status === "connected" ? "connected" : "disconnected",
+                    local_port: e.status === "connected" ? (e.local_port ?? h.local_port) : null,
+                    // Authoritative on every connected event: a reconnect this
+                    // window didn't start may have re-routed the alias.
+                    node: e.status === "connected" ? (e.node ?? null) : h.node,
+                  }
+                : h,
+            );
           }
-          // Not listed yet: startup restore can report "connected" before the
-          // first list resolves. Re-list and apply the latest event only if the
-          // alias is a real row — managed cloud connections share this bus but
-          // never appear in the list, so they still never fetch workspaces.
-          unlistedStatus.set(e.alias, e);
-          void refreshHosts().then(() => {
-            const latest = unlistedStatus.get(e.alias);
-            if (latest === undefined) return;
-            unlistedStatus.delete(e.alias);
-            if (hosts.some((host) => host.alias === e.alias)) applyHostStatus(latest);
-          });
+          // Any terminal transition ends the phase line, whoever ran the connect.
+          phases = mapWithout(phases, e.alias);
+          if (e.status === "down") {
+            remoteWs = mapWithout(remoteWs, e.alias);
+          }
+          if (e.status === "error" && e.error !== undefined) {
+            hostErrors = new Map(hostErrors).set(e.alias, e.error);
+          } else if (e.status === "connected" && !plainCluster) {
+            hostErrors = mapWithout(hostErrors, e.alias);
+            // A connect this window didn't run (startup restore, another
+            // window) still gets its workspace list, so the row is browsable.
+            if (!remoteWs.has(e.alias)) {
+              void remoteWorkspaces(e.alias)
+                .then((list) => {
+                  remoteWs = new Map(remoteWs).set(
+                    e.alias,
+                    [...list].sort(
+                      (a, b) => (b.last_opened_at ?? 0) - (a.last_opened_at ?? 0),
+                    ),
+                  );
+                })
+                .catch(() => {
+                  // dropped again in between; the next transition retries
+                });
+            }
+          }
         }),
       ),
     );
     return () => unlisteners.forEach((u) => u());
   });
-
-  /** The latest status event per alias that arrived before its row was listed. */
-  const unlistedStatus = new Map<string, HostStatusEvent>();
-
-  function applyHostStatus(e: HostStatusEvent): void {
-    const row = hosts.find((h) => h.alias === e.alias);
-    if (row === undefined) return;
-    const plainCluster = row.status === "cluster" && row.cluster?.login_serve !== true;
-    if (!plainCluster || e.status === "error") hosts = hosts.map((h) =>
-      h.alias === e.alias
-        ? {
-            ...h,
-            status: e.status === "connected" ? "connected" : "disconnected",
-            local_port: e.status === "connected" ? (e.local_port ?? h.local_port) : null,
-            // Authoritative on every connected event: a reconnect this
-            // window didn't start may have re-routed the alias.
-            node: e.status === "connected" ? (e.node ?? null) : h.node,
-          }
-        : h,
-    );
-    // Any terminal transition ends the phase line, whoever ran the connect.
-    phases = mapWithout(phases, e.alias);
-    if (e.status === "down") {
-      remoteWs = mapWithout(remoteWs, e.alias);
-    }
-    if (e.status === "error" && e.error !== undefined) {
-      hostErrors = new Map(hostErrors).set(e.alias, e.error);
-    } else if (e.status === "connected" && !plainCluster) {
-      hostErrors = mapWithout(hostErrors, e.alias);
-      // A connect this window didn't run (startup restore, another
-      // window) still gets its workspace list, so the row is browsable.
-      if (!remoteWs.has(e.alias)) {
-        void remoteWorkspaces(e.alias)
-          .then((list) => {
-            remoteWs = new Map(remoteWs).set(
-              e.alias,
-              [...list].sort(
-                (a, b) => (b.last_opened_at ?? 0) - (a.last_opened_at ?? 0),
-              ),
-            );
-          })
-          .catch(() => {
-            // dropped again in between; the next transition retries
-          });
-      }
-    }
-  }
 
   async function refreshHosts(): Promise<void> {
     try {
@@ -678,6 +661,7 @@
   async function openRow(e: Pick<MouseEvent, "metaKey" | "ctrlKey">, w: Workspace): Promise<void> {
     if (copyingProject !== null) return;
     let target = w;
+    // Only a Pro cloud project carries `local_copy`; a free list never does.
     if (w.local_copy !== undefined && ownAlias === null && native) {
       copyingProject = w.id; copyError = null;
       try {
@@ -691,6 +675,9 @@
       finally { copyingProject = null; }
     }
     if ((e.metaKey || e.ctrlKey) && !jobScoped) {
+      // Cmd/Ctrl-click is the explicit "give me another window" gesture — on
+      // THIS screen's own daemon (see ownAlias). Job-scoped windows degrade
+      // to the in-window open (see jobScoped).
       await openWindow(ownAlias, target.id, true);
     } else {
       onOpen(target);
@@ -722,6 +709,8 @@
   }
 </script>
 
+<!-- Offered only where Pro is in play (a paid plan, or a host Pro kept or
+     already set to connect directly); a free build never shows it. -->
 {#snippet directPreference(host: HostState)}
   {#if host.direct_ssh !== undefined && ($paidPlan !== null || host.kept === true || host.direct_ssh === true)}
     <details class="host-advanced">
@@ -771,7 +760,11 @@
   {/if}
   <HomeNavigation active="workspaces" plan={$paidPlan} showPro={$proTier !== "free"}
     onHome={() => {
-      if (showBackToHome) void backToHome();
+      // The cluster page's own back route: a cluster workspace's window has
+      // local Home behind its page; any other Home returns to its own list —
+      // this item is the current page there. The masthead's "Home" button
+      // is a remote window's route to local Home.
+      if (clusterWs !== null) void backToHome();
       else clusterView = null;
     }} {onPro} {onSettings} />
   {#if clusterView !== null}
@@ -919,25 +912,31 @@
                         : "no live sessions"}
                   ></span>
                   <span class="workspace-label"><span class="name">{w.name}</span><span class="path">{tildify(w.root)}</span></span>
-                  <span class="workspace-meta">
-                    {#if live !== undefined && live.attn > 0}
-                      <span class="session-state" class:attention={daemonReachable} class:stale={!daemonReachable}>{live.attn} {daemonReachable ? "awaiting approval" : `approval${live.attn === 1 ? "" : "s"} last seen`}</span>
-                    {:else if live !== undefined && live.live > 0}
-                      <span class="session-state" class:stale={!daemonReachable}>{live.live} {daemonReachable ? "live " : ""}session{live.live === 1 ? "" : "s"}{daemonReachable ? "" : " last seen"}</span>
-                    {/if}
-                    <span class="when">{#if placeHint !== undefined}{placeHint} · {/if}{ago(w.last_opened_at)}</span>
-                  </span>
                 </button>
-                {#if live !== undefined && live.live > 0}
-                  <button
-                    class="side stop shown"
-                    title="end this workspace's {live.live} running session{live.live === 1
-                      ? ''
-                      : 's'}"
-                    onclick={() => (confirmStopId = w.id)}>End sessions</button
-                  >
-                {/if}
+                <!-- The meta sits beside the row button (not inside it: a button
+                     cannot nest a button) so the live count can turn into the
+                     End sessions control in place when the pointer is on the row. -->
+                <span class="workspace-meta">
+                  {#if live !== undefined && live.attn > 0}
+                    <span class="session-state" class:attention={daemonReachable} class:stale={!daemonReachable}>{live.attn} {daemonReachable ? "awaiting approval" : `approval${live.attn === 1 ? "" : "s"} last seen`}</span>
+                  {:else if live !== undefined && live.live > 0}
+                    <span class="session-state" class:stale={!daemonReachable}>{live.live} {daemonReachable ? "live " : ""}session{live.live === 1 ? "" : "s"}{daemonReachable ? "" : " last seen"}</span>
+                  {/if}
+                  {#if live !== undefined && live.live > 0}
+                    <button
+                      class="side stop"
+                      title="end this workspace's {live.live} running session{live.live === 1
+                        ? ''
+                        : 's'}"
+                      onclick={() => (confirmStopId = w.id)}>End sessions</button
+                    >
+                  {/if}
+                  <span class="when">{#if placeHint !== undefined}{placeHint} · {/if}{ago(w.last_opened_at)}</span>
+                </span>
                 <HomeActions label={`Actions for ${w.name}`}>
+                  {#if live !== undefined && live.live > 0}
+                    <button class="stop" onclick={() => (confirmStopId = w.id)}>End sessions</button>
+                  {/if}
                   {#if !jobScoped}
                     <button
                       class="side"
@@ -1255,27 +1254,13 @@
   {@const host = hosts.find((h) => h.alias === remoteSettings?.alias)}
   {#if host}
     {#key remoteSettings.alias}
-      <!-- Keep connection setup out of every local workspace's entry bundle. -->
-      {#await import("./RemoteSettingsDialog.svelte")}
-        <div class="remote-settings-notice" role="status">
-          <span>Loading connection settings…</span>
-          <button class="side shown" onclick={() => (remoteSettings = null)}>Cancel</button>
-        </div>
-      {:then { default: RemoteSettingsDialog }}
-        <RemoteSettingsDialog {host} firstSetup={remoteSettings.firstSetup} phase={phases.get(host.alias) ?? null}
-          onSave={(hpc) => saveRemoteSettings(host.alias, hpc)} onRepair={() => repairRemote(host.alias)} onClose={() => (remoteSettings = null)} />
-      {:catch}
-        <div class="remote-settings-notice" role="alert">
-          <span>Connection settings couldn’t load. Reload this window and try again.</span>
-          <button class="side shown" onclick={() => (remoteSettings = null)}>Dismiss</button>
-        </div>
-      {/await}
+      <RemoteSettingsDialog {host} firstSetup={remoteSettings.firstSetup} phase={phases.get(host.alias) ?? null}
+        onSave={(hpc) => saveRemoteSettings(host.alias, hpc)} onRepair={() => repairRemote(host.alias)} onClose={() => (remoteSettings = null)} />
     {/key}
   {/if}
 {/if}
 
 <style>
-  .remote-settings-notice { position: fixed; bottom: 16px; right: 16px; z-index: 100; display: flex; align-items: center; gap: 12px; max-width: min(420px, calc(100vw - 32px)); padding: 12px 16px; border: 1px solid var(--edge); border-radius: 8px; background: var(--bg); color: var(--fg); font-size: var(--text-sm); }
   .host-advanced { max-width: 320px; padding: 8px 10px; color: var(--fg); font-size: var(--text-sm); }
   .host-advanced summary { cursor: pointer; color: var(--muted); }
   .host-advanced label { display: flex; align-items: flex-start; gap: 8px; margin-top: 10px; }
@@ -1935,10 +1920,26 @@
   .workspace-label { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 5px; }
   .workspace-label .name { max-width: none; font-family: inherit; font-weight: 550; font-size: var(--text-md); }
   .workspace-label .path, .workspace-label .phase { flex: none; font-size: var(--text-xs); }
-  .workspace-meta { display: flex; flex-direction: column; align-items: flex-end; gap: 5px; flex: none; }
+  /* One quiet line ("1 live session · 2m ago"), vertically centred with the
+     row's "…" trigger. On hover the live count turns into the End sessions
+     control in the same slot (a hidden control is not focusable; the keyboard
+     reaches the same entry through the "…" menu). Rows awaiting approval keep
+     their amber count: that line is the attention signal, not a control. */
+  .workspace-meta { display: flex; align-items: center; gap: 6px; flex: none; padding-right: 2px; font-size: var(--text-xs); color: var(--muted); }
+  .workspace-meta .when::before { content: "·"; margin-right: 6px; opacity: 0.6; }
+  .workspace-meta .when:first-child::before { content: none; margin: 0; }
   .session-state.stale { color: var(--muted); }
   .session-state { font-size: var(--text-xs); color: var(--accent); }
-  .workspace-meta .when { font-family: inherit; font-size: var(--text-xs); }
+  .workspace-meta .when { font-family: inherit; font-size: var(--text-xs); margin-left: 0; }
+  .workspace-meta .side.stop {
+    display: none; visibility: visible; min-height: 0; height: 24px; padding: 0 8px; margin: -4px 0;
+    border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent); border-radius: 6px;
+    color: var(--warn); font-size: var(--text-xs); line-height: 1;
+  }
+  .workspace-row:hover .workspace-meta .session-state:not(.attention) { display: none; }
+  .workspace-row:hover .workspace-meta .side.stop { display: inline-flex; align-items: center; }
+  .workspace-row:hover .workspace-meta .session-state.attention + .side.stop { display: none; }
+  .workspace-meta .side.stop:hover { color: var(--err); border-color: color-mix(in srgb, var(--err) 55%, transparent); background: var(--row-active); }
   .host-card { border: 1px solid var(--edge); border-radius: 10px; padding: 5px; }
   .remotes .rows { gap: 10px; }
   .host-name { display: flex; align-items: center; gap: 9px; min-width: 0; }
@@ -1967,8 +1968,7 @@
     .inner { padding-left: 24px; padding-right: 24px; }
     .workspace-row .row { flex-wrap: wrap; gap: 10px; }
     .workspace-row .workspace-label { flex-basis: calc(100% - 24px); }
-    .workspace-meta { flex-direction: row; margin-left: 17px; align-items: center; flex-wrap: wrap; }
-    .workspace-meta .when { margin-left: 0; }
+    .workspace-meta { flex-wrap: wrap; justify-content: flex-end; }
   }
   @media (max-width: 700px) {
     .home { flex-direction: column; }

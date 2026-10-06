@@ -326,6 +326,8 @@
   }
 
   function viewKind(tab: Tab): PaneViewKind | null {
+    // A subagent's conversation renders in the chat view.
+    if (tab.surface === "subagent") return "chat";
     if (tab.surface !== "terminal") return tab.surface;
     const session = sessions.get(tab.sessionId);
     if (session === undefined) return null;
@@ -415,6 +417,8 @@
           onSwitchToTerminal={s.view_switchable === false ? undefined : () => ctrl.switchView(s.id, "term")}
           onForked={(forked: Session) =>
             ctrl.revealWorktreeSession(forked.id, forked.workspace_id)}
+          onOpenSubagent={(agentId: string, title: string, newSplit: boolean) =>
+            ctrl.openSubagentFrom(node.id, s.id, agentId, title, newSplit)}
         />
       {:else if viewErrors.chat}
         {@render loadFailure("chat", "chat view")}
@@ -490,6 +494,34 @@
       {@render loadFailure("git", "git view")}
     {:else}
       <Spinner />
+    {/if}
+  {:else if tab.surface === "subagent"}
+    <!-- One of a chat's subagents, as a read-only chat of its own. `session`
+         stays the PARENT: the view reads the subagent through it. -->
+    {@const parent = sessions.get(tab.sessionId)}
+    {#if parent === undefined}
+      <div class="hint"><span>session closed</span></div>
+    {:else}
+      {@const ChatView = views.chat}
+      {#if ChatView !== undefined}
+        <ChatView
+          session={parent}
+          subagent={{
+            agentId: tab.agentId,
+            title: tab.title,
+            parentName: names.get(parent.id) ?? parent.name,
+            onOpenParent: () => ctrl.revealWorktreeSession(parent.id, parent.workspace_id),
+          }}
+          focused={focused && active}
+          visible={active}
+          onOpenFile={(p: string) => ctrl.openFileFrom(node.id, p, false)}
+          onOpenPath={(p: string, k: "file" | "dir") => ctrl.openPathFrom(node.id, p, k, false)}
+        />
+      {:else if viewErrors.chat}
+        {@render loadFailure("chat", "chat view")}
+      {:else}
+        <Spinner />
+      {/if}
     {/if}
   {:else if tab.surface === "changes"}
     {@const cs = sessions.get(tab.sessionId)}

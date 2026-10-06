@@ -92,8 +92,10 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   turn", until the agent actually reads it (claude: the CLI's `command_lifecycle started`; codex:
   the steered message's `userMessage` item — not the RPC ack). Then it leaves the stack and enters
   the transcript right there, solid — mid-turn if that is where it was read. Each waiting bubble
-  has **Send now** (stops the current turn; every waiting message is then read at once — claude
-  keeps its queue through the interrupt, and Chimaera re-sends the steers Codex drops) and **✕**
+  has **Send now** (stops the current turn, unless Claude can take the message into it by moving what the turn waits on to the background; every waiting message is then read at once — claude
+  keeps its queue through the interrupt, and Chimaera re-sends the steers Codex drops; Claude's
+  background agents keep running, because Chimaera sends the CLI's own send-now rather than its
+  Stop, which ends them for good) and **✕**
   (pulls it back — Claude `cancel_async_message`, an ACP or Codex next-turn queue item
   removed locally; a Codex steer can't be withdrawn and says so).
   Stop never drops the queue. A genuinely undeliverable entry stays marked **"not delivered"**
@@ -222,6 +224,11 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   settings tuple so a prior reviewer, sandbox, approval policy, or collaboration mode cannot stay
   invisibly active. Claude's launch-gated Bypass permissions mode is not offered: structured chat
   sessions do not start with `--dangerously-skip-permissions`, so Claude would reject the switch.
+  Grok Build advertises no modes over ACP; Chimaera offers Normal and Always-approve, switched
+  with Grok's own `/always-approve on|off` (between turns: a pick made mid-turn applies when the
+  turn ends). Plan is not offered yet: Grok asks the client to approve the plan in a request
+  whose reply format is not known, so a plan turn could not be approved. Auto-review depends on
+  the account and is not offered.
   New and resumed Codex chats default to **Auto review** at thread open — workspace writes remain
   sandboxed and escalation remains on-request, while `auto_review` assesses approval requests.
   The header reflects that state from the first `Init`; `/mode auto-review` switches it explicitly,
@@ -312,10 +319,12 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
     a monitor's end; each links its output file.
   - **Wake markers** — a turn nobody typed (a monitor event, a scheduled wake-up) is marked "Woke
     on a monitor event · “…”" / "Resumed on its own", unless a finished row already shows why.
-  - **Folded runs** — once a reply (or a finished-work line) follows them, two or more thought and
+  - **Folded runs** — once anything follows them (a reply, a finished-work line, a permission decision, a message sent mid-turn), two or more thought and
     tool lines in a row fold into one line — "Thought, ran 6 commands, read 2 files ›" — that
     expands to the original rows. The trailing run stays open while the agent works, so live
-    progress is always in view; a hard failure inside shows on the folded line. Finished-work lines
+    progress is always in view, and so does a run whose last calls are still running when a
+    mid-turn row lands after it (a just-approved command, a long call a message arrived during),
+    until those calls end; a hard failure inside shows on the folded line. Finished-work lines
     never join that fold: they are the results, and for a woken turn the only stated cause. Three or
     more of them in a row, once something follows, fold on their own into one line that says what
     ended and how — "1 agent finished, 2 background tasks finished, 5 stopped ›" (a failure shows
@@ -555,6 +564,24 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   The plan/todo panel likewise surfaces the current step in its
   summary ("plan · 1/3 · ◐ …"). Both are pure derivations over `blocks`/`plan` — no new events
   (`AgentsTray.svelte`).
+- **Which model each subagent runs on, and open a subagent as its own chat.** Every subagent row —
+  the agents tray, the background tray's `agent` lanes, the "Agent:" tool card and the "Agent “…”
+  finished" line — shows the model actually serving it, in the agent's own words (claude's served id
+  such as `claude-haiku-4-5-20251001`, labelled through the model catalog when it lists it; codex's
+  child-thread model) once the wire names it (`subagent_info`, latest-wins per row; the background
+  lane carries `model` too). Pressing the small **agent** label on a tray row (or ↗ on the tool card,
+  or **conversation** on the finished line; ⌘-click for a split) opens the subagent's own
+  conversation as a tab next to the chat: the same transcript rendering (prose, thoughts, tool
+  cards, its nested agents), under a header that says whose it is — "Subagent of ‹chat› · what it
+  was asked · kind · model · working/finished · read-only". It has no composer, pickers, fork or
+  rewind: a subagent answers to the chat that started it, so you steer it by messaging that chat.
+  The view follows a working subagent (a re-read every 2.5 s while the tab is visible and the parent
+  still lists it as running; one closing read after), appending rather than reloading, and closes
+  with its parent chat. Where it comes from: claude writes each subagent's full conversation to
+  `<session>/subagents/agent-<id>.jsonl` beside the parent's transcript (read by the daemon,
+  `GET /sessions/{id}/subagents/{agent_id}/transcript`); codex keeps it as a child thread readable
+  only on the live app-server connection (`thread/read`, through the driver). Antigravity and Grok
+  report no subagents on their wires, so they show neither. PROTOCOL.md Pass 42.
 - **The task list is the plan panel, whichever tool spells it.** Claude replaced `TodoWrite` with an
   incremental `TaskCreate`/`TaskUpdate`/`TaskList` family; both feed the same pinned panel and
   neither leaves bookkeeping rows in the transcript. Because the new family carries more than a
@@ -1049,6 +1076,22 @@ _Intent pending — not yet captured from the maintainer (shipped 2026-07-16, au
   surface the natural mapping target. The thread-scoping gate is wire-correctness, not a choice —
   see PROTOCOL.md Pass 16. Run **capture-feature-intent** with the maintainer to replace this stub.
 
+### Subagent models + open a subagent as its own chat — why it exists
+_Captured 2026-10-05 (from the maintainer's request, in his words; the questionnaire has not run — see **capture-feature-intent**)._
+
+- **Problem it solves:** with several subagents in the background tray ("3 agents in the background")
+  one could not see "which models these subagents are running (for all different providers)", and
+  there was no way to look inside one: the maintainer wanted to "press the little 'agent' label" and
+  "open them up as their own chat so you can see everything going on in there … if you want to
+  inspect outputs".
+- **Deliberate:** the view must be "UI clearly labeled that it is a subagent of chat x" — hence the
+  header that names the parent chat and says read-only, rather than a look-alike chat tab. He
+  framed it as "still a fix I feel, because this is not really a feature anyway": parity with what
+  the agents already know, not new capability.
+- **Deliberately open:** the model is shown verbatim in the agent's vocabulary (never relabelled);
+  codex's `agentNickname` is not used as a label yet; a codex child history past the 8 MiB line cap
+  would need `thread/turns/list` paging.
+
 ### Codex parity (review · launch model · math · timed questions) — why it exists
 _Intent pending — not yet captured from the maintainer (shipped 2026-07-17, autonomous session)._
 
@@ -1124,3 +1167,11 @@ _Captured 2026-10-04 (from the maintainer, in-session, PR #249)._
 - **Design constraint (verbatim):** “we are not too verbose and that we stay in line with our UI / UX that we have now which is pretty good for all of this.”
 - **Direction (verbatim):** “make sure Chimaera is generalizable in terms of this (and also in terms of how providers change, or if we add other CLIs / harnesses)”.
 - **Grade:** an addition to the existing capability-based architecture. Exact controls remain implementation choices; no new provider-specific UI contract was requested.
+
+### Grok's mode selector — why it exists
+_Captured 2026-10-05 (from the maintainer, in-session, PR #259)._
+
+- **Problem it solves (verbatim):** “Ok but all of those modes don’t show up in the top bar as they do for the other agents ?”
+- **On the first version leaving out Always-approve (verbatim):** “why is always approve not in the picker ?” — the PR was held until it was.
+- **Scope (verbatim):** “that should work with the other providers too (if it is not fully grok specific)” — the effort scale's faster → smarter ordering applies to every agent; the mode offer itself is Grok's.
+- **Grade:** parity with the other agents' header, limited to what was verified against Grok (Normal and Always-approve). Plan waits on the approval reply format.

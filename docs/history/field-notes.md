@@ -93,6 +93,26 @@ old to have the toast. Home screen's version mark now says `daemon dev·<ref>` f
 builds instead of posing as an ordinary `v0.0.1` (field confusion: an app reinstall
 attached to a still-running dev daemon and nothing on screen said so).
 
+## Field notes: cancelling an SSH prompt asked again (2026-10-05)
+
+Cancelling the in-app password/Duo prompt brought the prompt straight back, several times.
+Two layers, both reproduced against a throwaway local `sshd` on a high port:
+
+- **OpenSSH cannot be told "cancel" through askpass.** A helper that prints nothing, or exits
+  non-zero, is read as an *empty answer* (client 10.3p1: three prompts either way, and a
+  key-passphrase prompt would then fall through to a password prompt). Invariant: **a cancel
+  has to end the ssh that asked** — the shim `kill -TERM`s its `$PPID` when the helper exits
+  `CANCELLED_EXIT`. SIGTERM mid-auth leaves no ControlPath socket and no stray process (checked).
+- **A failed first probe reads as "nothing running"** (`locate` → `Ok(None)`), so the connect
+  carried on into a fresh start: version probe, release download, scp — each a new ssh, each a
+  new prompt. Invariant: **a cancel is a verdict, not an unreachable host.** The helper leaves
+  `authentication cancelled` on stderr (ssh's stderr is captured), `ProbeFailure::cancelled`
+  reads it, and `locate` stops. A wrong password is deliberately *not* treated this way — ssh's
+  own retry on a typo is wanted, and the later steps fail the same way for the same reason.
+
+Not verified here: the WSL path (the wrapper runs under `sh` in the tests; that a Windows
+helper's exit status survives interop into `$?` is documented WSL behavior, not exercised).
+
 ## Field notes: dev binary stranded in the real home bricked release connect (2026-07-09)
 
 The day after `connect --dev` shipped (dev-is-dev on both ends: a `0.0.1` build defaults its

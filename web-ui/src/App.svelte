@@ -9,6 +9,7 @@
   import AgentSetupLoader from "./lib/workspace/AgentSetupLoader.svelte";
   import { agentSetup, openAgentSetup } from "./lib/workspace/agentSetup";
   import { agentCatalog } from "./lib/workspace/launcher";
+  import { nextInGroup } from "./lib/workspace/sessionCycle";
   import { paneTabHasKeyboardFocus } from "./lib/shared/tabNavigation";
   import { flip } from "svelte/animate";
   import { fade } from "svelte/transition";
@@ -162,6 +163,7 @@
     movePaneToIndex,
     movePaneToRootEdge,
     openChanges,
+    openSubagent,
     openFile,
     pinTab,
     openTabAs,
@@ -192,6 +194,7 @@
     pruneDeletedPath,
     pruneFiles,
     pruneSessions,
+    pruneTabs,
     rewriteTabPaths,
     adoptTabs,
     allSessionIds,
@@ -363,7 +366,7 @@
     updateState,
   } from "./lib/workspace/update.svelte";
   import * as pool from "./lib/terminal/termPool";
-  import * as chatPool from "./lib/chat/chatPool";
+  import * as chatPool from "./lib/chat/chatPoolRegistry";
   import {
     appearanceBootstrapForNavigation,
     applyRemoteSettings,
@@ -1243,9 +1246,10 @@
       : [],
   );
   // Tell the notifier what this window shows, so it never alerts about a
-  // session the user is looking at — and clears alerts for ones they now
-  // are. Keyed on the joined ids so a layout write that changes nothing on
-  // screen costs no IPC.
+  // session the user is looking at (a torn-off window's whole scope; a
+  // workspace window also covers its hidden tabs) — and clears alerts for
+  // ones they now are. Keyed on the joined ids so a layout write that changes
+  // nothing on screen costs no IPC.
   const visibleKey = $derived(visibleSessions.join(" "));
   $effect(() => {
     const key = visibleKey;
@@ -1837,6 +1841,7 @@
         if (isNativeShell()) return;
         deliverBrowserNotices(list, {
           visible: untrack(() => visibleSessions),
+          workspaceId: untrack(() => (detachedWindow ? null : activeWsId)),
           onClick: focusFromNotification,
         });
       },
@@ -2618,6 +2623,26 @@
     return displayNames.get(target.id) ?? displayName(target);
   }
 
+  /** Open (or focus) one of a chat's subagents as a read-only view of its
+   *  own — a tab next to the chat it belongs to (it is that chat's work, not
+   *  a neighbour's), or a split beside it on a modified click. */
+  function openSubagentFromPane(
+    paneId: string,
+    sessionId: string,
+    agentId: string,
+    title: string,
+    newSplit: boolean,
+  ): void {
+    const existing = paneForTab(layout.root, { surface: "subagent", sessionId, agentId, title });
+    if (existing !== null) {
+      layout = activateTab(layout, existing.paneId, existing.index);
+      return;
+    }
+    if (newSplit) layout = splitPane(layout, paneId, "row");
+    else layout = focusPane(layout, paneId);
+    layout = openSubagent(layout, sessionId, agentId, title);
+  }
+
   /** The "N files changed" chip: open (or focus) this session's changes review,
    *  beside the source pane — adjacent pane, or a split when it stands alone. */
   function openChangesFromPane(paneId: string, sessionId: string, newSplit: boolean): void {
@@ -2971,11 +2996,7 @@
         const pane = panesOf(layout.root).find((p) => p.number === n);
         if (pane !== undefined) {
           layout = focusPane(layout, pane.id);
-          const sid = focusedSessionOf(layout);
-          void tick().then(() => {
-            if (sid !== null) pool.focusTerminal(sid);
-            else paneRootEl(pane.id)?.focus();
-          });
+          focusFocusedPane();
         }
       }
       return;
@@ -2983,8 +3004,18 @@
 
     // Arrow chords in an editable surface belong to the text caret (rename
     // fields, search boxes, the file editor) — xterm's hidden textarea is
-    // exempt, terminals don't use modifier-arrows for editing.
-    if (hit.dir !== null && isEditableTarget(e.target)) return;
+    // exempt, terminals don't use modifier-arrows for editing. The chat
+    // composer is the one editable that also gives pane focus away, but only
+    // when a pane lies that way: with none, the caret keeps ⌘←/→ (line
+    // start/end), so a single-pane window loses nothing.
+    if (hit.dir !== null && isEditableTarget(e.target)) {
+      const leaves =
+        hit.id === "focusArrows" &&
+        e.target instanceof HTMLElement &&
+        e.target.hasAttribute("data-pane-arrows") &&
+        moveFocus(layout, hit.dir as FocusDir).focusedPaneId !== layout.focusedPaneId;
+      if (!leaves) return;
+    }
 
     switch (hit.id) {
       case "newPane":
@@ -3062,6 +3093,11 @@
       case "focusArrows":
         intercept();
         focusDirection(hit.dir as FocusDir);
+        return;
+      case "cycleAgents":
+      case "cycleTerminals":
+        intercept();
+        cycleRail(hit.id === "cycleAgents");
         return;
       case "moveTab":
         intercept();
@@ -3427,7 +3463,12 @@
     // degrade frame and stopped reconnecting; it's dead weight).
     for (const s of list) {
       if (s.ui === "chat") pool.disposeSession(s.id);
-      else if (s.ui === "term") chatPool.disposeChat(s.id);
+      else if (s.ui === "term") {
+        chatPool.disposeChat(s.id);
+        // Its subagent views read through that chat: without it they could
+        // neither follow nor tell working from finished. They go with it.
+        layout = pruneTabs(layout, (t) => t.surface !== "subagent" || t.sessionId !== s.id);
+      }
     }
     const agentIds = new Set(list.filter((s) => s.kind === "agent").map((s) => s.id));
     const changed =
@@ -3683,6 +3724,11 @@
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   }
 
+  /** Settings opened from Home: a full page over Home (no workspace, so no
+   *  layout tab to hold it). Its view loads on demand like a pane's. Home
+   *  stays mounted underneath, parked (hidden + inert): the cluster page, an
+   *  open Add-machine form and a connect's progress line are still there on
+   *  return, and Home's mount-time fetches don't run again. */
   let pendingProReturn = $state(false);
   $effect(() => {
     if (pendingProReturn && (activeWsId === null || layoutReady)) {
@@ -3691,19 +3737,24 @@
     }
   });
   let homeSettingsOpen = $state(false);
+  /** Which page Home's sheet shows: Settings, or the Pro page an installed
+   *  extension provides. */
+  let homeSurface = $state<"settings" | "pro">("settings");
+  let homeSettingsLoad = $state<ReturnType<typeof loadPaneView> | null>(null);
   // Workspace windows defer Home until it is visible. The shared view cache
   // retains successes; the same asset recovery used by panes owns retries.
   let homeLoad = $state<ReturnType<typeof loadPaneView> | null>(null);
   $effect(() => {
-    if (activeWsId === null && !homeSettingsOpen && homeLoad === null) {
-      homeLoad = untrack(() => loadPaneView("home"));
-    }
+    if (activeWsId !== null) return;
+    // One-shot: homeLoad is read and written untracked so the effect depends
+    // on activeWsId alone and can never re-run on its own write.
+    untrack(() => {
+      if (homeLoad === null) homeLoad = loadPaneView("home");
+    });
   });
 
-  let homeSurface = $state<"settings" | "pro">("settings");
-  let homeSettingsLoad = $state<ReturnType<typeof loadPaneView> | null>(null);
-
-  /** Account settings are useful before the first workspace exists. */
+  /** Open/focus the settings surface (gear button, ⌘,). In a workspace it is
+   *  a layout tab; on Home it opens as Home's Settings page. */
   function openSettingsSurface(): void {
     if (activeWsId === null) {
       homeSurface = "settings";
@@ -3902,20 +3953,43 @@
     ];
   }
 
-  function focusDirection(dir: FocusDir): void {
-    layout = moveFocus(layout, dir);
-    const sid = focusedSessionOf(layout);
-    if (sid !== null) pool.focusTerminal(sid);
-  }
-
-  function cycle(delta: number): void {
-    layout = cycleTab(layout, delta);
+  /** Put DOM focus where the focused pane takes keys — its terminal, else the
+   *  pane root — so typing after a chord lands in the pane the chord chose
+   *  rather than in whatever held focus before (a composer, an xterm). */
+  function focusFocusedPane(): void {
     const sid = focusedSessionOf(layout);
     const paneId = layout.focusedPaneId;
     void tick().then(() => {
       if (sid !== null) pool.focusTerminal(sid);
       else paneRootEl(paneId)?.focus();
     });
+  }
+
+  function focusDirection(dir: FocusDir): void {
+    layout = moveFocus(layout, dir);
+    focusFocusedPane();
+  }
+
+  function cycle(delta: number): void {
+    layout = cycleTab(layout, delta);
+    focusFocusedPane();
+  }
+
+  /** ⌃⌘A / ⌃⌘T: open the next agent (or terminal) in the rail's own order. */
+  function cycleRail(agents: boolean): void {
+    // A detached window has no roster to step through (its chips are gone).
+    if (detachedWindow) return;
+    const group = agents ? agentSessions : shellSessions;
+    const next = nextInGroup(
+      group.map((s) => s.id),
+      focusedSessionId,
+    );
+    if (next !== null) {
+      openSess(next);
+      return;
+    }
+    const make = keyHint(agents ? "newAgent" : "newTerminal");
+    showFlash(`No ${agents ? "agents" : "terminals"} in this workspace yet${make ? ` — ${make} starts one` : ""}.`);
   }
 
   function split(dir: SplitDir): void {
@@ -4516,6 +4590,9 @@
     },
     openChangesFrom(paneId, sessionId, newSplit) {
       openChangesFromPane(paneId, sessionId, newSplit);
+    },
+    openSubagentFrom(paneId, sessionId, agentId, title, newSplit) {
+      openSubagentFromPane(paneId, sessionId, agentId, title, newSplit);
     },
     revealPathInTree(path) {
       revealInTree(path);
@@ -5148,6 +5225,8 @@
               ? "Source Control"
               : tab.surface === "changes"
                 ? "Changes"
+                : tab.surface === "subagent"
+                  ? tab.title
                 : tab.surface === "dashboard"
                   ? "Dashboard"
                   : tab.surface === "timeline"
@@ -5460,6 +5539,56 @@
     <!-- Home: a real launcher, not an empty IDE. The rail and stage only
          exist once a workspace scopes this window. A Mastermind is never a
          worker: keep it out of the per-workspace live/attention rollups. -->
+    <!-- Home stays mounted under its Settings page (parked: hidden + inert)
+         so the page is a sheet over Home, not a replacement. Both surfaces
+         sit in a boundary, like every pane view: a render error in one
+         settings panel must not freeze the whole Home window. -->
+    {#if homeLoad !== null}
+      {#await homeLoad}
+        {#if !homeSettingsOpen}<p role="status">Loading Home…</p>{/if}
+      {:then HomeScreen}
+        <div class="home-host" class:parked={homeSettingsOpen} inert={homeSettingsOpen}>
+          <svelte:boundary onerror={(e) => console.error("home failed", e)}>
+            <HomeScreen
+              {workspaces}
+              sessions={sessions.filter((s) => !isMastermind(s))}
+              hostLabel={getHostLabel()}
+              {health}
+              daemonReachable={eventsUp || healthUp}
+              onOpen={activateWorkspace}
+              onRemove={removeWorkspace}
+              onStop={stopWorkspace}
+              onOpenFolder={openPicker}
+              onSettings={openSettingsSurface}
+              onPro={openProSurface}
+            />
+            {#snippet failed(_error, reset)}
+              <div class="home-settings-shell">
+                <HomeNavigation active="workspaces" plan={$paidPlan} showPro={$proTier !== "free"}
+                  onHome={reset} onPro={openProSurface} onSettings={openSettingsSurface} />
+                <div class="home-settings-content home-surface-failed">
+                  <p role="alert">Home hit an error and stopped.</p>
+                  <button onclick={reset}>Try again</button>
+                  <button onclick={openPicker}>Open a folder</button>
+                </div>
+              </div>
+            {/snippet}
+          </svelte:boundary>
+        </div>
+      {:catch error}
+        {#if !homeSettingsOpen}
+          <div class="home-settings-shell">
+            <HomeNavigation active="workspaces" plan={$paidPlan} showPro={$proTier !== "free"}
+              onHome={() => (homeLoad = retryPaneView("home", error))} onPro={openProSurface} onSettings={openSettingsSurface} />
+            <div class="home-settings-content home-surface-failed">
+              <p role="alert">Couldn't open Home.</p>
+              <button onclick={() => (homeLoad = retryPaneView("home", error))}>Retry</button>
+              <button onclick={openPicker}>Open a folder</button>
+            </div>
+          </div>
+        {/if}
+      {/await}
+    {/if}
     {#if homeSettingsOpen}
       <div class="home-settings-shell">
         <HomeNavigation active={homeSurface} plan={$paidPlan} showPro={$proTier !== "free"}
@@ -5478,44 +5607,29 @@
           {#await homeSettingsLoad}
             <p>Loading {homeSurface === "pro" ? "Chimaera Pro" : "settings"}…</p>
           {:then SettingsView}
-            {#if SettingsView}<SettingsView onClose={() => (homeSettingsOpen = false)} />{/if}
-          {:catch}
-            <p role="alert">Couldn't open {homeSurface === "pro" ? "Chimaera Pro" : "settings"}.</p>
-            <button onclick={homeSurface === "pro" ? openProSurface : openSettingsSurface}>Retry</button>
+            {#if SettingsView}
+              <svelte:boundary onerror={(e) => console.error("settings failed", e)}>
+                <SettingsView onClose={() => (homeSettingsOpen = false)} />
+                {#snippet failed(_error, reset)}
+                  <div class="home-surface-failed">
+                    <p role="alert">{homeSurface === "pro" ? "Chimaera Pro" : "Settings"} hit an error and stopped.</p>
+                    <button onclick={reset}>Try again</button>
+                  </div>
+                {/snippet}
+              </svelte:boundary>
+            {/if}
+          {:catch error}
+            <div class="home-surface-failed">
+              <p role="alert">Couldn't open {homeSurface === "pro" ? "Chimaera Pro" : "settings"}.</p>
+              <!-- The same asset recovery as a pane's retry: a failed CSS
+                   preload is memoized by Vite, so a plain re-import would
+                   fail the same way every time. -->
+              <button onclick={() => (homeSettingsLoad = retryPaneView(homeSurface, error))}>Retry</button>
+            </div>
           {/await}
         </div>
       </div>
       </div>
-    {:else}
-    {#if homeLoad !== null}
-      {#await homeLoad}
-        <p role="status">Loading Home…</p>
-      {:then HomeScreen}
-    <HomeScreen
-      {workspaces}
-      sessions={sessions.filter((s) => !isMastermind(s))}
-      hostLabel={getHostLabel()}
-      {health}
-      daemonReachable={eventsUp || healthUp}
-      onOpen={activateWorkspace}
-      onRemove={removeWorkspace}
-      onStop={stopWorkspace}
-      onOpenFolder={openPicker}
-      onSettings={openSettingsSurface}
-      onPro={openProSurface}
-    />
-      {:catch error}
-        <div class="home-settings-shell">
-          <HomeNavigation active="workspaces" plan={$paidPlan} showPro={$proTier !== "free"}
-            onHome={() => (homeLoad = retryPaneView("home", error))} onPro={openProSurface} onSettings={openSettingsSurface} />
-          <div class="home-settings-content">
-            <p role="alert">Couldn't open Home.</p>
-            <button onclick={() => (homeLoad = retryPaneView("home", error))}>Retry</button>
-            <button onclick={openPicker}>Open a folder</button>
-          </div>
-        </div>
-      {/await}
-    {/if}
     {/if}
   {:else}
   <div class="body" bind:clientWidth={bodyWidth}>
@@ -6766,11 +6880,28 @@
 {/if}
 
 <style>
+  /* Parked Home under its Settings page: opacity + inert (never visibility,
+     which inherits and makes WebKit re-resolve the subtree). The opacity
+     stacking context also contains Home's fixed-position version stamp. */
+  .home-host.parked {
+    opacity: 0;
+  }
   .home-settings-shell {
     position: absolute;
     inset: 0;
     display: flex;
     background: var(--bg);
+  }
+  .home-surface-failed {
+    padding: 24px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px;
+  }
+  .home-surface-failed p {
+    margin: 0;
+    flex-basis: 100%;
   }
   .home-settings-surface {
     flex: 1;

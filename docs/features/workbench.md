@@ -18,10 +18,16 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
 
 - **What & when.** The landing surface when no workspace is open: your registered folders,
   most-recent-first, with a live-session rollup. Open one to start work.
-- **How it's used.** Click a row to open it in this window; Cmd/Ctrl-click (or the hover
-  "new window" button) opens it in a new window. `Mod+O` opens the folder picker.
-  Per-row hover reveals `stop` (end its running sessions), `new window`, and `×` (remove
-  from the list — the folder on disk is untouched).
+- **How it's used.** Click a row to open it in this window; Cmd/Ctrl-click (or **Open in new
+  window** in the row's "…" menu) opens it in a new window. **Open folder** (`Mod+O`) opens the
+  folder picker. A row with live sessions shows **End sessions** on hover and in its "…" menu, which also offers
+  **Remove from list** (the folder on disk is untouched). Layout and navigation:
+  [native-app.md › Home launcher](native-app.md#home-launcher).
+- **Lazy Home.** `HomeScreen.svelte` loads only in a Home window, through the cached view
+  loader and asset retry path (`layout/lazyViews.ts`); it stays mounted, parked (hidden + inert),
+  under Home's Settings page so its state survives the round trip. Home navigation stays eager; a
+  failed load keeps Retry, Settings and Open a folder, and a render error inside either surface is
+  contained by a boundary (Try again) like a pane view's.
 - **Where it lives.** `web-ui/src/lib/workspace/HomeScreen.svelte` + `sessions.ts`
   (`listWorkspaces`/`deleteWorkspace`/`touchWorkspace`). Routes: `GET/POST /api/v1/workspaces`,
   `DELETE /api/v1/workspaces/{id}`, `POST /api/v1/workspaces/{id}/open` (stamps recency).
@@ -269,7 +275,12 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   a slim strip. `Mod+Arrow` moves pane focus spatially; `Mod2+Arrow` carries the active tab into
   the neighbor — or, when there is no pane in that direction, **auto-splits a new one** on that
   side (capped at `MAX_PANES` and a minimum pane size); `Mod+1–9` focuses that numbered pane;
-  `⌘±`/`⌘0` bump one pane's terminal/markdown font.
+  `⌘±`/`⌘0` bump one pane's terminal/markdown font. Two further chords step through the
+  sidebar instead of the panes: `⌃⌘A` (`keys.cycleAgents`) opens the next agent in its agents
+  list and `⌃⌘T` (`keys.cycleTerminals`) the next terminal in its terminals list (off macOS,
+  `Alt+Shift+A/T`). Each wraps at the end and, from outside its group, starts at the first
+  row. They open a row the way clicking it does, so an agent already shown in another pane is
+  focused there; a detached window, which has no sidebar, ignores them.
 - **Empty panes & numbered moves.** `Mod+N` creates an empty pane to the right, up to
   `MAX_PANES` (4); the same action is available from Pane actions or Quick Open.
   The first split puts panes side by side (`1 | 2`). Subsequent new panes split the
@@ -292,11 +303,18 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   are available in either host. `Cmd+Tab` remains macOS application switching.
 - **Where it lives.** `layout.ts` (`toggleZoom`, `focusMode`, `moveFocus`, `moveTabDirection`,
   `moveTabToPane`, `navigateFileHistory`, `newPaneSplitDirection`, `setPaneFont` with `FONT_MIN 9`/`FONT_MAX 28`),
-  `App.svelte` chords, `keys.ts`, `shared/chordHints.svelte.ts`.
+  `App.svelte` chords, `keys.ts`, `workspace/sessionCycle.ts` (the cycle order),
+  `shared/chordHints.svelte.ts`.
 - **Key behaviors.** Zoom always tracks the focused pane (focusing elsewhere clears it, so you
   can't get "stuck" zoomed). Focus mode is part of the persisted layout. Arrow chords defer to a
   text caret in editable surfaces but **not** in xterm's helper textarea (app chords must work
-  over a focused terminal). Per-pane font override is persisted per pane.
+  over a focused terminal). The chat composer is the one editable that opts in (`data-pane-arrows`
+  on its textarea) — for `Mod+Arrow` only, and only when a pane lies that way, so a pane you
+  entered by chord is one you can leave by chord while a single-pane window keeps `⌘←/→` as
+  line start/end; `Mod2+Arrow` still belongs to the caret there (select to line edge). After any
+  pane move, DOM focus follows to the pane's terminal/composer or, for a document or workbench
+  view, to the pane root, so typing never lands in the pane you just left. Per-pane font override
+  is persisted per pane.
 
 ## Layout & rail persistence
 

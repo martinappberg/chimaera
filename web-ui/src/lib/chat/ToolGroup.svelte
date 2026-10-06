@@ -2,7 +2,8 @@
   import ActivityRows from "./ActivityRows.svelte";
   import ActivitySummary from "./ActivitySummary.svelte";
   import type { OpenPathFn, PathResolver } from "./paths";
-  import type { ChatBlock } from "./store.svelte";
+  import type { ChatBlock, SubagentInfo } from "./store.svelte";
+  import { subagentTitle } from "./subagentView";
   import ToolCallCard from "./ToolCallCard.svelte";
   import { isLive, toolGroupTitle, toolRunHealth, type TurnTail } from "./toolLabels";
   import ModSite from "./ModSite.svelte";
@@ -28,6 +29,11 @@
      *  for agents without the capability). Called with the tool row id. */
     onBackground?: (id: string) => void;
     onStopTask?: (id: string) => void;
+    /** What the agent has said about each subagent, by tool row id. */
+    subagents?: ReadonlyMap<string, SubagentInfo>;
+    modelName?: (id: string) => string;
+    /** Open a subagent's own conversation (its agent handle + label). */
+    onOpenSubagent?: (agentId: string, title: string, newSplit: boolean) => void;
     /** False while a retained chat tab is hidden; suppresses layout work in
      *  streaming child rows without destroying their expanded state. */
     visible?: boolean;
@@ -48,12 +54,22 @@
     resolvePaths,
     onBackground,
     onStopTask,
+    subagents,
+    modelName,
+    onOpenSubagent,
     visible = true,
     sourceIndex,
     sourceEnd,
     sourceUid,
     mods,
   }: Props = $props();
+
+  /** The opener for one agent row, once the wire has named its subagent. */
+  function openSubagentOf(tool: Extract<ChatBlock, { kind: "tool" }>) {
+    const agentId = tool.tool === "agent" ? subagents?.get(tool.id)?.agentId : null;
+    if (agentId == null || onOpenSubagent === undefined) return undefined;
+    return (newSplit: boolean) => onOpenSubagent?.(agentId, subagentTitle(tool.title), newSplit);
+  }
 
   const running = $derived(tools.some(isLive));
   /** Failed / recovered badge — see toolLabels.ts. */
@@ -96,6 +112,9 @@
           {resolvePaths}
           onBackground={onBackground !== undefined ? () => onBackground?.(tool.id) : undefined}
           onStop={onStopTask !== undefined ? () => onStopTask?.(tool.id) : undefined}
+          subagent={tool.tool === "agent" ? subagents?.get(tool.id) : undefined}
+          {modelName}
+          onOpenSubagent={openSubagentOf(tool)}
         />
         {/snippet}
         {#if mods && tool.nativeName && tool.nativeInput !== undefined}

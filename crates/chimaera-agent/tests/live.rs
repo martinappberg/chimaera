@@ -1042,6 +1042,122 @@ async fn claude_cancel_async_message_behavior() {
         .expect("shutdown");
 }
 
+/// Send now must not be a Stop. Live 2.1.289: a plain `interrupt` kills every
+/// running background agent and marks it "stopped by the user", after which
+/// SendMessage refuses to resume it; `interrupt {send_now, message_uuid}` ends
+/// only the turn (receipt `send_now: "stopped"`, or `"delivering"` when the
+/// CLI moves the turn's tools to the background instead).
+#[tokio::test]
+#[ignore = "live: spawns real claude, needs auth, bills two tiny turns + a background agent"]
+async fn claude_send_now_spares_background_agents() {
+    let dir = tmpdir();
+    let mut chat = spawn_claude(dir.path(), &[]);
+    chat.initialize(HANDSHAKE).await.expect("initialize");
+    chat.send_user_text(
+        "Do exactly this. Step 1: call the Agent tool once with run_in_background true, \
+         subagent_type general-purpose, description 'sleeper', and this prompt: \"Run the Bash \
+         command python3 -c 'import time; time.sleep(60)' with a 120000 ms timeout, then reply \
+         DONE.\" Step 2: right after, run this Bash command yourself in the foreground with a \
+         60000 ms timeout: python3 -c 'import time; time.sleep(40)'. Step 3: reply FINISHED.",
+    )
+    .await
+    .expect("send");
+
+    let mut send_now_capable = false;
+    let mut agent_task: Option<String> = None;
+    let mut waiting: Option<String> = None;
+    let mut ctl: Option<String> = None;
+    let mut receipt = Value::Null;
+    let mut agent_ended = false;
+    let mut read = false;
+    // The waiting message's own turn end: the aborted turn's result lands
+    // before it is read, a turn that folded it in ends after.
+    loop {
+        let frame = chat
+            .recv(TURN)
+            .await
+            .expect("recv")
+            .expect("claude exited before the waiting message ran");
+        let subtype = frame["subtype"].as_str().unwrap_or_default();
+        match frame["type"].as_str() {
+            Some("control_request") if frame["request"]["subtype"] == "can_use_tool" => {
+                let input = frame["request"]["input"].clone();
+                chat.respond_permission(
+                    &frame["request_id"],
+                    PermissionDecision::Allow {
+                        updated_input: input,
+                    },
+                )
+                .await
+                .expect("respond allow");
+            }
+            Some("system") if subtype == "init" => {
+                send_now_capable |= frame["capabilities"]
+                    .as_array()
+                    .is_some_and(|caps| caps.iter().any(|c| c == "interrupt_send_now_v1"));
+            }
+            Some("system") if subtype == "task_started" => {
+                if frame["task_type"] == "local_agent" {
+                    agent_task = frame["task_id"].as_str().map(String::from);
+                } else if agent_task.is_some()
+                    && waiting.is_none()
+                    && frame["owned_by_subagent"] != json!(true)
+                {
+                    // The parent's foreground sleep is running: queue a
+                    // message behind the turn and press Send now on it.
+                    let uuid = chat
+                        .send_user_text_with_uuid("Reply with exactly: BANANA")
+                        .await
+                        .expect("send waiting message");
+                    ctl = Some(
+                        chat.send_control(json!({
+                            "subtype": "interrupt",
+                            "send_now": true,
+                            "message_uuid": uuid,
+                        }))
+                        .await
+                        .expect("send now"),
+                    );
+                    waiting = Some(uuid);
+                }
+            }
+            Some("system") if subtype == "task_updated" || subtype == "task_notification" => {
+                let ended = frame["patch"]["status"] == "killed" || frame["status"] == "stopped";
+                if ended && frame["task_id"].as_str() == agent_task.as_deref() {
+                    agent_ended = true;
+                }
+            }
+            Some("control_response")
+                if ctl.is_some() && frame["response"]["request_id"].as_str() == ctl.as_deref() =>
+            {
+                receipt = frame["response"]["response"].clone();
+            }
+            Some("command_lifecycle")
+                if frame["state"] == "started"
+                    && frame["command_uuid"].as_str() == waiting.as_deref() =>
+            {
+                read = true;
+            }
+            Some("result") if read => break,
+            _ => {}
+        }
+    }
+
+    eprintln!("LIVE send now: receipt={receipt}, agent_ended={agent_ended}, read={read}");
+    assert!(send_now_capable, "init advertises interrupt_send_now_v1");
+    assert!(waiting.is_some(), "the turn reached its foreground command");
+    assert!(
+        matches!(receipt["send_now"].as_str(), Some("stopped" | "delivering")),
+        "send now acted on the waiting message: {receipt}"
+    );
+    assert!(read, "the waiting message was read");
+    assert!(!agent_ended, "send now left the background agent running");
+
+    chat.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+}
+
 /// Three rapid sends against the REAL claude driver — the user's exact
 /// scenario. The driver must (a) settle idle: every turn the CLI opens also
 /// ends, and (b) DELIVER every waiting message: each `queued:true` echo

@@ -43,16 +43,20 @@
   import UserText from "./UserText.svelte";
   import ThoughtRow from "./ThoughtRow.svelte";
   import ToolGroup from "./ToolGroup.svelte";
-  import type { TurnTail } from "./toolLabels";
+  import { isLive, type TurnTail } from "./toolLabels";
   import FinishedRow from "./FinishedRow.svelte";
   import AgentMessageCards from "./AgentMessageCards.svelte";
   import { isAgentOrigin, parseAgentText } from "./agentMessages";
   import ActivityFold from "./ActivityFold.svelte";
   import { FINISHED_FOLD_MIN, foldSpans } from "./activityFold";
   import FinishedFold from "./FinishedFold.svelte";
+  import { effortScale } from "./effortScale";
   import { backgroundKind } from "./backgroundKinds";
   import AgentsTray from "./AgentsTray.svelte";
   import BackgroundTray from "./BackgroundTray.svelte";
+  import SubagentBanner from "./SubagentBanner.svelte";
+  import { SubagentSocket } from "./subagentSocket.svelte";
+  import { subagentChatId, subagentModel, subagentRunning } from "./subagentView";
   import WorkTray from "../shared/WorkTray.svelte";
   import Chevron from "../shared/Chevron.svelte";
   import ArtifactGallery from "./ArtifactGallery.svelte";
@@ -120,7 +124,7 @@
     type PagePlan,
   } from "./transcriptWindow";
   import { measureShift, rowsInReach, selectAnchor, type ReadingAnchor } from "./readingAnchor";
-  import { HistoryWeights, tailWeights, weightAt } from "./heightModel";
+  import { HistoryWeights, tailWeights, unfoldedFrom, weightAt } from "./heightModel";
   import { activeTheme, getSetting, setSetting } from "../settings/store.svelte";
   import { hostCanDictate, voiceProblem } from "./voice.svelte";
   import { keyHint } from "../shared/keybindings";
@@ -145,6 +149,20 @@
     onSwitchToTerminal?: () => void;
     /** Focus the newly-created session while the source remains alive. */
     onForked?: (session: Session) => void;
+    /** Show one of this session's SUBAGENTS instead of the session itself:
+     *  its own conversation, read-only, under a header that says whose
+     *  subagent it is. `session` stays the parent (the chat that started it). */
+    subagent?: {
+      /** The agent's own handle for the subagent (`SubagentInfo.agentId`). */
+      agentId: string;
+      /** What the parent called it. */
+      title: string;
+      /** The parent chat, as the rail names it. */
+      parentName: string;
+      onOpenParent?: () => void;
+    };
+    /** Open one of this chat's subagents as a view of its own. */
+    onOpenSubagent?: (agentId: string, title: string, newSplit: boolean) => void;
   }
 
   let {
@@ -156,6 +174,8 @@
     onOpenPath,
     onSwitchToTerminal,
     onForked,
+    subagent,
+    onOpenSubagent,
   }: Props = $props();
 
   // The component is keyed on session id by its parent: one instance per
@@ -164,13 +184,48 @@
   // move remounts it, the session-keyed pool still reuses the warm store and
   // open socket instead of re-fetching the journal. Release keeps them warm;
   // the pool disposes them when the session ends or toggles to a PTY.
+  // A subagent view pools under its own key (never the parent's: the two are
+  // different conversations), and is read-only throughout.
   // svelte-ignore state_referenced_locally
-  const { store, socket } = acquireChat(session.id);
+  const chatId =
+    subagent === undefined
+      ? session.id
+      : subagentChatId({ parentId: session.id, agentId: subagent.agentId });
+  // svelte-ignore state_referenced_locally
+  const readOnly = subagent !== undefined;
+  const { store, socket } = acquireChat(chatId);
   const mods = modsFor(socket.nativeUi);
   let composerApi = $state<NativeComposer>();
   let modDockWidth = $state(0);
+  onDestroy(() => releaseChat(chatId));
+  // The parent chat says whether the subagent is still working and which
+  // model serves it; the reader already holds it, this is one more hold.
   // svelte-ignore state_referenced_locally
-  onDestroy(() => releaseChat(session.id));
+  const parentStore = readOnly ? acquireChat(session.id).store : null;
+  // svelte-ignore state_referenced_locally
+  if (readOnly) onDestroy(() => releaseChat(session.id));
+  const subagentState = $derived.by(() => {
+    if (subagent === undefined || parentStore === null) return null;
+    const known = parentStore.connected && !parentStore.hydrating;
+    let agentType: string | null = null;
+    for (const info of parentStore.subagents.values()) {
+      if (info.agentId === subagent.agentId) agentType = info.agentType ?? agentType;
+    }
+    return {
+      running: known ? subagentRunning(parentStore, subagent.agentId) : null,
+      model:
+        subagentModel(parentStore, subagent.agentId) ??
+        (socket instanceof SubagentSocket ? socket.model : null),
+      agentType,
+      problem: socket instanceof SubagentSocket ? socket.problem : null,
+    };
+  });
+  // The reader works only while this view is on screen.
+  $effect(() => {
+    if (!(socket instanceof SubagentSocket)) return;
+    socket.setWatched(visible);
+    return () => socket.setWatched(false);
+  });
   onDestroy(() => {
     if (followFrame !== null) cancelAnimationFrame(followFrame);
     if (prefetchFrame !== null) cancelAnimationFrame(prefetchFrame);
@@ -217,7 +272,7 @@
   // Seed scroll intent from the pool so a remount restores the reading
   // position instead of snapping to the bottom.
   // svelte-ignore state_referenced_locally
-  let atBottom = $state(chatScroll(session.id).atBottom);
+  let atBottom = $state(chatScroll(chatId).atBottom);
   let menu = $state<"model" | "mode" | "effort" | "mcp" | "remote" | "options" | null>(null);
 
   // --- bounded transcript DOM ------------------------------------------------
@@ -228,7 +283,7 @@
   // snapshot, so incoming work updates the store without re-rendering a tab no
   // one can see; activation reconciles one bounded page in a single paint.
   // svelte-ignore state_referenced_locally
-  const savedRenderWindow = chatRenderWindow(session.id);
+  const savedRenderWindow = chatRenderWindow(chatId);
   /** Raw array shell: visible rows are the reducer's reactive block proxies,
    *  so a streamed text delta updates only that Markdown row. Hidden/paged
    *  views swap this once for plain data. Deep-cloning the whole 192-row page
@@ -258,7 +313,7 @@
    *  an uncorrected scroll position. */
   let anchorSettled = true;
   // svelte-ignore state_referenced_locally
-  let followedVersion = $state(chatFollowedVersion(session.id) ?? -1);
+  let followedVersion = $state(chatFollowedVersion(chatId) ?? -1);
   /** A non-empty draft pauses bottom-following, never transcript rendering. */
   let composerEngaged = $state(false);
   /** An explicit history page is stable. Ordinary scrolling inside a tail page
@@ -279,7 +334,7 @@
 
   function markFollowed(version = store.transcriptVersion): void {
     followedVersion = version;
-    saveChatFollowedVersion(session.id, version);
+    saveChatFollowedVersion(chatId, version);
   }
 
   let anchorRevision = 0;
@@ -290,7 +345,7 @@
    *  the wrong rows (stale ones are discarded at restore). */
   function saveWindowVirtual(start: number, end: number, tail: boolean): void {
     const trimmed = store.trimmedCount;
-    saveChatRenderWindow(session.id, start + trimmed, end + trimmed, tail, store.epoch);
+    saveChatRenderWindow(chatId, start + trimmed, end + trimmed, tail, store.epoch);
   }
 
   function setRange(
@@ -446,7 +501,7 @@
   function saveReadingPosition(bottom: boolean): void {
     const el = transcriptEl;
     if (el === null) return;
-    saveChatScroll(session.id, Math.max(0, el.scrollTop - spacerPx), bottom);
+    saveChatScroll(chatId, Math.max(0, el.scrollTop - spacerPx), bottom);
   }
 
   function pinReadingAnchor(): void {
@@ -504,17 +559,9 @@
     // Bounded by the live array: a reset or tail splice can shrink it before
     // the windowing effect repairs renderEnd.
     const end = Math.min(renderEnd, store.blocks.length);
-    // The window's trailing run is unfolded: the finished lines that end it,
-    // else the activity after its last reply.
-    let settledEnd = end;
-    while (settledEnd > renderStart && store.blocks[settledEnd - 1].kind === "finished") settledEnd--;
-    if (settledEnd === end) {
-      while (settledEnd > renderStart) {
-        const kind = store.blocks[settledEnd - 1].kind;
-        if (kind === "message" || kind === "finished") break;
-        settledEnd--;
-      }
-    }
+    // The window's trailing run is unfolded; every run before it has a row
+    // after it and renders as its fold's one line.
+    const settledEnd = unfoldedFrom(store.blocks, renderStart, end);
     for (let i = renderStart; i < end; i++) {
       weight += weightAt(store.blocks, i, cpl, i < settledEnd);
     }
@@ -841,7 +888,7 @@
           });
         } else {
           if (!atBottom && savedRenderWindow !== null) {
-            saveChatScroll(session.id, 0, true);
+            saveChatScroll(chatId, 0, true);
             atBottom = true;
           }
           setTail();
@@ -936,7 +983,7 @@
    *  concrete "default" that would flash the wrong name (slow on remote). */
   const currentModel = $derived(modelChoice(store.models, store.model));
   /** Only the active model's reported metadata establishes effort support. */
-  const effortChoices = $derived(currentModel?.efforts ?? []);
+  const effortChoices = $derived(effortScale(currentModel?.efforts ?? []));
   /** Agent read-back is the only displayed truth. Both drivers emit an
    *  effort_state after applying a selection. */
   const effortShown = $derived(store.effort);
@@ -1271,7 +1318,7 @@
     const el = transcriptEl;
     if (el === null || didRestore || store.hydrating || !renderReady) return;
     didRestore = true;
-    const saved = chatScroll(session.id);
+    const saved = chatScroll(chatId);
     void tick().then(() => {
       if (transcriptEl === null) return;
       if (saved.atBottom) {
@@ -1400,9 +1447,24 @@
     ) {
       return;
     }
+    let viewportHeight = transcript.clientHeight;
     const observer = new ResizeObserver(() => {
+      const height = transcript.clientHeight;
+      const shrunk = viewportHeight - height;
+      viewportHeight = height;
       if (atBottom) {
         if (!composerEngaged) queueBottomScroll();
+        else if (
+          shrunk > 0 ||
+          (shrunk < 0 && transcript.scrollHeight - transcript.scrollTop - height >= 1)
+        ) {
+          // A draft pauses following new rows, not the viewport's bottom
+          // edge: a composer growing a line keeps the lines above it in view.
+          // A growing viewport flush with the end was already clamped by
+          // layout; shifting it again would open a gap under the newest line.
+          transcript.scrollTop += shrunk;
+          lastScrollTop = transcript.scrollTop;
+        }
       } else if (readingAnchor === null) {
         pinReadingAnchor();
       } else {
@@ -1454,7 +1516,7 @@
   // A send made outside the composer (the Mastermind panel's one-click
   // prompts) follows exactly like onSubmit below.
   $effect(() =>
-    registerFollow(session.id, () => {
+    registerFollow(chatId, () => {
       atBottom = true;
       queueBottomScroll(true);
     }),
@@ -1520,6 +1582,8 @@
    *  socket cannot queue locally (replay would make that ambiguous), so keep
    *  the authoritative UI state unchanged and tell the user to retry. */
   function sendCommand(command: Record<string, unknown>, failure: string): boolean {
+    // A subagent view sends nothing, and that is not a failure to report.
+    if (readOnly) return false;
     if (socket.send(command)) return true;
     store.notice(`not connected — ${failure}, try again in a moment`, "error");
     return false;
@@ -2144,6 +2208,9 @@
   const modeLabel = $derived(
     store.modes.find((m) => m.id === store.currentMode)?.label ?? store.currentMode,
   );
+  /** A subagent's model as the picker would label it; an id the catalog
+   *  does not list stays intact, in the agent's own words. */
+  const modelName = (id: string): string => modelChoice(modelChoices, id)?.label ?? id;
   /** Unlisted IDs stay intact: namespaces and punctuation can identify a provider. */
   const modelLabel = $derived.by(() => {
     if (store.pendingModel !== null) {
@@ -2202,7 +2269,7 @@
   $effect(() => {
     const key = reachKey;
     if (lastReachKey !== null && lastReachKey !== key && !untrack(() => store.connected)) {
-      socket.retrySoon();
+      socket.retrySoon?.();
     }
     lastReachKey = key;
   });
@@ -2301,7 +2368,7 @@
   // interval tears down when the turn ends or the component unmounts.
   let turnElapsedMs = $state(0);
   $effect(() => {
-    const start = chatTurnStart(session.id, agentBusy, performance.now());
+    const start = chatTurnStart(chatId, agentBusy, performance.now());
     if (start === null) {
       turnElapsedMs = 0;
       return;
@@ -2425,8 +2492,8 @@
   );
 
   /** Render list for the bounded page: consecutive tool blocks coalesce into
-   *  one ToolGroup, a settled run of activity rows folds under the reply
-   *  that followed it, and a settled run of finished-work lines folds on its
+   *  one ToolGroup, a settled run of activity rows folds above whatever row
+   *  followed it, and a settled run of finished-work lines folds on its
    *  own (activityFold.ts). Visible tail rows are live proxies;
    *  hidden/history rows are inert snapshots. Every item carries its absolute
    *  source index for scroll anchoring and boundary-sensitive actions. */
@@ -2482,11 +2549,13 @@
     let turnTools: Extract<ChatBlock, { kind: "tool" }>[] = [];
     renderBlocks.forEach((block, i) => {
       const originalIndex = renderStart + i;
+      // A message the agent read mid-turn joined that turn: a retry after it
+      // still clears a failure before it.
       if (
-        block.kind === "user" ||
+        ((block.kind === "user" || (block.kind === "agent_message" && block.via === "send")) &&
+          block.midTurn !== true) ||
         block.kind === "wake" ||
-        block.kind === "turn_end" ||
-        (block.kind === "agent_message" && block.via === "send")
+        block.kind === "turn_end"
       )
         turnTools = [];
       // Every user block in `blocks` is delivered — queued/undelivered sends
@@ -2517,15 +2586,26 @@
         items.push({ t: "single", key: `b-${block.uid}`, index: originalIndex, block });
       }
     });
-    const spans = foldSpans(
-      items,
-      isActivityRow,
-      (item) =>
-        item.t === "single" && (item.block.kind === "message" || item.block.kind === "finished"),
-    );
+    // Whatever follows a run settles it — a reply, a finished line, a
+    // permission decision, a message sent mid-turn. Only the trailing run
+    // is live work.
+    const spans = foldSpans(items, isActivityRow).filter(([, end]) => {
+      // A row can land while the run's last calls still run: a permission
+      // decision (as its command starts), a message read mid-turn, a peer's
+      // note. The run stays open until those calls end, so nothing hides
+      // work in progress. Any call of the group counts — in a parallel
+      // batch the approved one is often not the last. A reply or a finished
+      // line settles the run regardless: what outlives those is background
+      // work, which the fold's live dot shows.
+      const closer = items[end];
+      const last = items[end - 1];
+      const settles =
+        closer.t !== "single" || closer.block.kind === "message" || closer.block.kind === "finished";
+      return settles || !(last.t === "group" && last.tools.some(isLive));
+    });
     // Finished-work lines never join an activity fold, but a long settled
     // run of them folds on its own. The two kinds of run never overlap.
-    const finishedSpans = foldSpans(items, isFinishedItem, () => true, FINISHED_FOLD_MIN);
+    const finishedSpans = foldSpans(items, isFinishedItem, FINISHED_FOLD_MIN);
     if (spans.length === 0 && finishedSpans.length === 0) return items;
     const finishedAt = new Set(finishedSpans.map(([start]) => start));
     const allSpans = [...spans, ...finishedSpans].sort((a, b) => a[0] - b[0]);
@@ -2671,7 +2751,11 @@
   // break. A chat that can't take a message offers no quote.
   const quoteOwner = {};
   let quoteChip = $state<{ x: number; y: number } | null>(null);
-  const composerDisabled = $derived(store.exited !== null || store.degraded || store.fatalError !== null);
+  /** Nothing to type into (and so nothing to quote into): a read-only
+   *  subagent view, or a session that ended, degraded or failed. */
+  const composerDisabled = $derived(
+    readOnly || store.exited !== null || store.degraded || store.fatalError !== null,
+  );
   const incompatibleRuntime = $derived(/GLIBC_[\d.]+[^\n]*not found/.test(store.fatalError ?? ""));
 
   function dropQuote(): void {
@@ -2764,11 +2848,12 @@
   bind:this={chatEl}
   class:focused
   class:visible
+  class:read-only={readOnly}
   style:--chat-font-size={`${chatFontSize}px`}
   style:--chat-line-height={chatLineHeight}
   style:--chat-measure={`${chatContentWidth}px`}
   style:--chat-font-family={chatFontFamily}
-  style:padding-right={agentKind === "claude" && store.exited === null ? `${modDockWidth}px` : undefined}
+  style:padding-right={agentKind === "claude" && store.exited === null && !readOnly ? `${modDockWidth}px` : undefined}
   use:dismiss={{
     enabled: menu !== null,
     onDismiss: () => (menu = null),
@@ -2780,6 +2865,18 @@
          the window's indicator names the one place once. -->
     <div class="placement-note">{runsElsewhere}</div>
   {/if}
+  {#if subagent !== undefined}
+  <SubagentBanner
+    {agentKind}
+    title={subagent.title}
+    parentName={subagent.parentName}
+    model={subagentState?.model ?? null}
+    {modelName}
+    agentType={subagentState?.agentType ?? null}
+    running={subagentState?.running ?? null}
+    onOpenParent={subagent.onOpenParent}
+  />
+  {:else}
   <ChatHeader
     {store}
     {agentKind}
@@ -2808,6 +2905,7 @@
     onInterrupt={interrupt}
     onSetRemoteControl={setRemoteControl}
   />
+  {/if}
 
   <ChatFind target={chatEl} blocks={() => store.blocks} revision={store.transcriptVersion} {visible}
     trimmed={store.trimmedCount > 0} reveal={revealFindMessage} />
@@ -2879,7 +2977,14 @@
            instead of vanishing from the composer. -->
       {@render unconfirmedBubbles()}
     {:else}
-    {#if store.exited === null && !store.fatalError && (!store.initialized || store.blocks.length === 0)}
+    {#if readOnly}
+      {#if store.blocks.length === 0}
+        <div class="empty" role="status">
+          <SessionGlyph kind="agent" {agentKind} size={18} />
+          <span>{subagentState?.problem ?? (store.initialized ? "this subagent has not done anything yet" : "loading this subagent's conversation…")}</span>
+        </div>
+      {/if}
+    {:else if store.exited === null && !store.fatalError && (!store.initialized || store.blocks.length === 0)}
       <div class="empty" role="status">
         <SessionGlyph kind="agent" {agentKind} size={18} />
         <span>{!store.connected ? `connecting to ${agentName}…` : store.initialized ? `${agentName} is ready` : `starting ${agentName}…`}</span>
@@ -2920,8 +3025,11 @@
           {visible}
           onOpenPath={openProsePath}
           resolvePaths={prosePaths}
-          onBackground={supports("background_tool") ? backgroundTool : undefined}
-          onStopTask={supports("stop_task") ? stopTask : undefined}
+          onBackground={!readOnly && supports("background_tool") ? backgroundTool : undefined}
+          onStopTask={!readOnly && supports("stop_task") ? stopTask : undefined}
+          subagents={store.subagents}
+          {modelName}
+          {onOpenSubagent}
           mods={agentKind === "claude" ? mods : undefined}
         />
       {:else}
@@ -2939,10 +3047,14 @@
       {/if}
     {/snippet}
     {#snippet finishedRow(block: Extract<ChatBlock, { kind: "finished" }>, index: number)}
+      {@const finishedAgent = block.rowId !== null ? store.subagents.get(block.rowId)?.agentId : null}
       <FinishedRow
         {block}
         {visible}
         onOpenFile={openLocation}
+        onOpenSubagent={finishedAgent != null && onOpenSubagent !== undefined
+          ? (newSplit) => onOpenSubagent?.(finishedAgent, block.title, newSplit)
+          : undefined}
         onOpenPath={openProsePath}
         resolvePaths={prosePaths}
         embeds={proseEmbeds}
@@ -3240,7 +3352,7 @@
         <span class="status-spark">
           <SessionGlyph kind="agent" {agentKind} size={12} state="alive" />
         </span>
-        {#if turnElapsedLabel !== null}
+        {#if turnElapsedLabel !== null && !readOnly}
           <span class="status-elapsed">{turnElapsedLabel}</span>
         {/if}
         {#if turnTokensLabel !== null}
@@ -3399,8 +3511,11 @@
   {#if pinnedAgents.length > 0}
     <AgentsTray
       agents={pinnedAgents}
+      subagents={store.subagents}
+      {modelName}
       {visible}
-      onStop={supports("stop_task") ? stopTask : undefined}
+      onOpen={onOpenSubagent}
+      onStop={!readOnly && supports("stop_task") ? stopTask : undefined}
     />
   {/if}
 
@@ -3409,8 +3524,10 @@
          native task key the wire gave us; the driver passes it through. -->
     <BackgroundTray
       tasks={pinnedBackgroundTasks}
+      {modelName}
       {visible}
-      onStop={supports("stop_task") ? stopTask : undefined}
+      onOpen={onOpenSubagent}
+      onStop={!readOnly && supports("stop_task") ? stopTask : undefined}
     />
   {/if}
 
@@ -3531,7 +3648,7 @@
   {:else if reconnectingShown}
     <div class="connection-status" role="status">Reconnecting…</div>
   {/if}
-  {#if session.git || sameFile.notesFor(session.id).length > 0}
+  {#if !readOnly && (session.git || sameFile.notesFor(session.id).length > 0)}
     <!-- One quiet line just above the input. Left: the branch this
          conversation works on (only in a repository; hover names the
          worktree; never a prompt to do anything with git). Right: another
@@ -3546,10 +3663,11 @@
     </div>
   {/if}
 
-  {#if agentKind === "claude" && store.exited === null}
+  {#if agentKind === "claude" && store.exited === null && !readOnly}
     <ModsWorkbench transport={socket.nativeUi} host={chatEl} onDockWidth={(width) => (modDockWidth = width)} {visible} {focused} running={agentBusy} hasSurvey={store.questions.length > 0 || store.elicitations.length > 0} composer={composerApi} canEdit={!composerDisabled && store.pending.length === 0 && store.questions.length === 0 && store.elicitations.length === 0 && rewindIntent === null && forkIntent === null} canFocus={focused && !composerEngaged && !agentBusy && store.pending.length === 0 && store.questions.length === 0 && store.elicitations.length === 0 && rewindIntent === null && forkIntent === null} />
   {/if}
 
+  {#if !readOnly}
   <Composer
     bind:this={composerApi}
     onNativeEdit={agentKind === "claude" && mods.attached ? (request) => socket.nativeUi.request(request) : undefined}
@@ -3572,6 +3690,7 @@
     onCycleMode={cycleMode}
     {onSlash}
   />
+  {/if}
 </div>
 
 <style>
@@ -4099,6 +4218,10 @@
     align-items: center;
     gap: 6px;
     max-width: 100%;
+  }
+  /* A subagent's conversation is read-only: nothing to fork or rewind. */
+  .chat.read-only .message-action {
+    display: none;
   }
   .message-action {
     background: none;

@@ -419,6 +419,7 @@
       const n = names.get(tab.sessionId) ?? sessions.get(tab.sessionId)?.name;
       return n !== undefined ? `Changes · ${n}` : "Changes";
     }
+    if (tab.surface === "subagent") return tab.title;
     if (tab.surface === "browser") {
       // The live page title (Jupyter renames it per notebook), else the target.
       return $browserTitles.get(tab.id) ?? targetLabel(tab.host, tab.port);
@@ -844,6 +845,19 @@
               <title>{tab.view === "commit" ? "commit" : tab.view === "branch" ? "changes on this branch" : "history"}</title>
               <path d="M8 1.5v4M8 10.5v4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
               <circle cx="8" cy="8" r="2.5" fill="none" stroke="currentColor" stroke-width="1.3" />
+            </svg>
+          {:else if tab.surface === "subagent"}
+            <!-- A branch off a line: work one chat handed to another agent. -->
+            <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+              <title>subagent</title>
+              <path
+                d="M4 2.5v11M4 8h4.5a3 3 0 0 0 3-3V4.5"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.3"
+                stroke-linecap="round"
+              />
+              <circle cx="11.5" cy="3.5" r="1.6" fill="none" stroke="currentColor" stroke-width="1.3" />
             </svg>
           {:else if tab.surface === "changes"}
             <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">

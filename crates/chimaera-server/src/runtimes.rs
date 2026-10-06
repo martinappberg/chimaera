@@ -75,7 +75,7 @@
 //!   theme detection"). The injected names are the ones codex itself picks
 //!   per scheme (light → catppuccin-latte, dark → catppuccin-mocha), pinned
 //!   so a mis-answered OSC-11 background query cannot flip them. Skipped
-//!   when `~/.codex/config.toml` sets a theme.
+//!   when `${CODEX_HOME:-~/.codex}/config.toml` sets a theme.
 //! - gemini 0.49.0: no theme CLI flag (`--help`) and no theme env var (the
 //!   bundle resolves `ui.theme` from its own settings files only). Its
 //!   settings.json is the user's — never edited — so gemini spawns
@@ -744,18 +744,11 @@ pub(crate) async fn prune_install_versions(root: PathBuf, kind: AgentKind) {
     }
 }
 
-/// All workspace daemons share this advisory lock. Explicit unlock prevents an
-/// unrelated fork's inherited descriptor from delaying release until exec.
-#[derive(Debug)]
-pub(crate) struct InstallLock(std::fs::File);
-
-impl Drop for InstallLock {
-    fn drop(&mut self) {
-        if let Err(error) = self.0.unlock() {
-            tracing::warn!(%error, "agent installation lock release deferred until descriptor close");
-        }
-    }
-}
+/// All workspace daemons share this advisory lock; process death releases it
+/// without a stale lockdir. It unlocks explicitly on drop (see `LeaseLock`):
+/// a child forked in the meantime shares the open file description until it
+/// execs, and closing only our descriptor would leave the lock held by it.
+pub(crate) use crate::runtime_retention::LeaseLock as InstallLock;
 
 pub(crate) async fn lock_install(
     root: &Path,

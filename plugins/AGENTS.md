@@ -111,13 +111,14 @@ does not activate it. Rebuild, copy and reinstall the same version to iterate.
    so `tier` and `caps` carry over. Otherwise the PR waits for a maintainer:
    review the release, set `tier` and `caps` to what `chimaera plugin caps`
    prints for its `plugin.toml` (CI stays red until they match), merge. CI
-   installs the release against the new lock; the merge cuts a patch release,
-   and from it **Install** fetches that version. Run it by hand with **Actions →
+   installs the release against the new lock; the merge requests a patch
+   release, and from that release (the next daily batch) **Install** fetches
+   that version. Run it by hand with **Actions →
    plugin-lock → Run workflow**, or locally without writing:
    `node .github/scripts/plugin-lock.mjs`. One bump PR at a time: a newer
-   release waits for the open one, which the workflow keeps up to date with
-   `main`, and one that can no longer land (it conflicts with a lock edited
-   on `main`, or `main` already has its change) is closed as "Superseded:"
+   release waits for the open one to land, and one that can no longer land
+   (it conflicts with a lock edited on `main`, or `main` already has its
+   change) is closed as "Superseded:"
    and redone from `main`'s lock. Closing a bump PR unmerged yourself turns
    that version down for good; the workflow never reopens it. A release
    still uploading its files is picked up by the next run. A release that fails a
@@ -127,18 +128,17 @@ does not activate it. Rebuild, copy and reinstall the same version to iterate.
    **One-time setup — the `PLUGIN_LOCK_TOKEN` secret.** A PR opened with the
    workflow's own `GITHUB_TOKEN` triggers no workflows (no CI, no `cla`
    status, so auto-merge never fires) and a merge made with it doesn't start
-   `release.yml`, so the workflow writes with a token of the maintainer's: a
+   `ci.yml`'s run on `main`, which a release waits on, so the workflow writes
+   with a token of the maintainer's: a
    fine-grained personal access token on the maintainer's account (so the PR
    author passes the CLA allowlist), repository access `martinappberg/chimaera`
    and every plugin repository in the lock, permissions **Contents: Read and
    write** and **Pull requests: Read and write**, saved as the repository
    secret `PLUGIN_LOCK_TOKEN`. Without it a run only reports the bump it would
    make (a warning). Replace it before it expires. The same secret lets
-   `.github/workflows/pr-auto-update.yml` bring pull requests with
-   auto-merge up to date with `main` (update-branch needs the same two
-   permissions), and `release.yml`'s `plugin-pins` job publish the plugin
-   pre-releases a new chimaera release pins (Contents on the plugin
-   repositories; a new plugin repository needs adding to the token).
+   `release.yml`'s `plugin-pins` job publish the plugin pre-releases a new
+   chimaera release pins (Contents on the plugin repositories; a new plugin
+   repository needs adding to the token).
 
 ## Rules
 

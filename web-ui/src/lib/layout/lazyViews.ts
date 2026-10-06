@@ -21,10 +21,15 @@ export type PaneViewKind =
   | "settings"
   | "pro";
 
+/** A view that is not a pane but still stays out of the always-loaded entry:
+ *  Home loads only while it is visible. It shares the pane cache and asset
+ *  recovery below. */
+export type LazyViewKind = PaneViewKind | "home";
+
 /** A dialog opened on demand. It stays out of the always-loaded entry and is
  *  loaded through the same cache and recovery as a pane's view. */
-export type LazyDialogKind = "folderPicker" | "quickOpen" | "home";
-type LazyKind = PaneViewKind | LazyDialogKind;
+export type LazyDialogKind = "folderPicker" | "quickOpen";
+type LazyKind = LazyViewKind | LazyDialogKind;
 
 type PaneViewModule = { default: Component<any> };
 

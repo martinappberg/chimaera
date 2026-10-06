@@ -667,6 +667,28 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stats: Option<String>,
     },
+    /// What the driver has learned about one subagent since its row opened:
+    /// which model actually serves it and the agent's own handle for it.
+    /// LATEST-WINS per `id`; a field the driver has not learned yet is
+    /// absent, and a later event never clears a known one. Strictly additive.
+    SubagentInfo {
+        /// The subagent's transcript row (tool call id).
+        id: String,
+        /// The agent's own key for the subagent — what
+        /// `GET /sessions/{id}/subagents/{agent_id}/transcript` takes
+        /// (claude: the task id, which also names its transcript file;
+        /// codex: the child thread id).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        /// The model serving the subagent, in the agent's own words (claude:
+        /// the served id on its frames; codex: the child thread's model).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// The agent's name for the kind of subagent (claude
+        /// `subagent_type`, codex `agentRole`), verbatim.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_type: Option<String>,
+    },
     /// Output tokens the agent has generated so far in the running turn —
     /// the live status line's counter (claude: each API call's own
     /// `message_delta` usage summed across the turn, plus the in-flight
@@ -802,6 +824,10 @@ pub struct BackgroundTask {
     /// list it, the transcript never announces it. Additive.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ambient: bool,
+    /// The model serving a subagent lane (claude `local_agent`), once the
+    /// driver has seen it. Additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// The tool_use that launched this task (claude `task_started
     /// .tool_use_id`) — driver-internal card binding, never on the wire:
     /// it rides the task identity through the live set and the departed

@@ -44,7 +44,9 @@
 
   let open = $state(false);
   const title = $derived(foldTitle(thoughts, tools));
-  /** Backgrounded or cross-turn work can outlive the reply that followed it. */
+  /** Work can outlive the reply or finished line that settled its run: a
+   *  backgrounded or cross-turn call. A run a mid-turn row follows is kept
+   *  open by ChatView until its calls end. */
   const running = $derived(tools.some(isLive));
   /** Only a hard failure surfaces on the fold; a recovered one is the
    *  inner group's detail. */

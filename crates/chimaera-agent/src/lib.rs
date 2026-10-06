@@ -30,6 +30,7 @@ pub mod model;
 pub mod native_ui;
 pub mod ndjson;
 mod send_state;
+pub mod subagent;
 pub mod transcript;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -55,6 +56,9 @@ pub type ExitHook = Box<dyn Fn(&str, &DriverExit) + Send + Sync>;
 
 /// Bounded channels: an unresponsive driver stalls its callers instead of
 /// growing queues (login-node discipline).
+/// How long a subagent-transcript read waits on the live driver. The
+/// answer is one local RPC; past this the view shows the failure and retries.
+const SUBAGENT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const CMD_QUEUE: usize = 32;
 const EVENT_QUEUE: usize = 256;
 const BROADCAST_QUEUE: usize = 256;
@@ -680,6 +684,7 @@ struct ChatSession {
     events_tx: broadcast::Sender<Arc<SeqEvent>>,
     native_ui_tx: mpsc::Sender<NativeUiCommand>,
     native_ui_events: broadcast::Sender<Arc<NativeUiEvent>>,
+    query_tx: mpsc::Sender<subagent::DriverQuery>,
     kill_tx: watch::Sender<bool>,
     process_control: Arc<ndjson::ProcessControl>,
     /// Serializes reservations with channel enqueue so driver echoes consume
@@ -862,6 +867,7 @@ impl ChatManager {
         let (events_tx, _) = broadcast::channel(BROADCAST_QUEUE);
         let (native_ui_tx, native_ui_rx) = mpsc::channel(UI_QUEUE);
         let (native_ui_events, _) = broadcast::channel(UI_EVENT_QUEUE);
+        let (query_tx, query_rx) = mpsc::channel(subagent::QUERY_QUEUE);
         let (kill_tx, kill_rx) = watch::channel(false);
 
         // Background work survives TURNS, not driver processes. A hard daemon
@@ -911,6 +917,7 @@ impl ChatManager {
             events_tx: events_tx.clone(),
             native_ui_tx,
             native_ui_events: native_ui_events.clone(),
+            query_tx,
             kill_tx,
             process_control: process_control.clone(),
             command_order: tokio::sync::Mutex::new(()),
@@ -944,6 +951,7 @@ impl ChatManager {
                     maintenance: maintenance_rx,
                     native_ui_commands: native_ui_rx,
                     native_ui_events,
+                    queries: query_rx,
                 },
             )
             .context("spawn agent driver")?;
@@ -1351,6 +1359,42 @@ impl ChatManager {
         }
         permit.send(command);
         Ok(())
+    }
+
+    /// Ask the session's LIVE driver for one subagent's conversation (codex:
+    /// the child thread, readable only on its app-server connection). Never
+    /// journaled. Errors when the session is gone, the driver is busy with
+    /// other reads, it does not answer in time, or the agent has no such read.
+    pub async fn subagent_transcript(
+        &self,
+        id: &str,
+        agent_id: &str,
+        live: bool,
+    ) -> Result<subagent::SubagentTranscript> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        self.get_session(id)?
+            .query_tx
+            .try_send(subagent::DriverQuery::SubagentTranscript {
+                agent_id: agent_id.to_string(),
+                live,
+                reply,
+            })
+            .map_err(|err| match err {
+                mpsc::error::TrySendError::Full(_) => {
+                    anyhow::anyhow!("the agent is busy with other reads")
+                }
+                // The driver task dropped its receiver: a dead session kept
+                // in the registry so the UI can show why.
+                mpsc::error::TrySendError::Closed(_) => {
+                    anyhow::anyhow!("the agent is no longer running")
+                }
+            })?;
+        match tokio::time::timeout(SUBAGENT_READ_TIMEOUT, answer).await {
+            Ok(Ok(Ok(transcript))) => Ok(transcript),
+            Ok(Ok(Err(reason))) => Err(anyhow::anyhow!(reason)),
+            Ok(Err(_)) => Err(anyhow::anyhow!("the agent stopped before it answered")),
+            Err(_) => Err(anyhow::anyhow!("the agent did not answer in time")),
+        }
     }
 
     pub async fn detach_native_ui(&self, id: &str, client_id: &str) {
@@ -2535,6 +2579,7 @@ mod tests {
             agents_done: 0,
             monitor: false,
             ambient: false,
+            model: None,
             tool_use_id: None,
         }
     }

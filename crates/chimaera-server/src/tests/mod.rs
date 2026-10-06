@@ -44,6 +44,7 @@ mod session_proxy;
 mod sessions;
 mod settings;
 mod shell;
+mod subagents;
 mod support;
 mod update;
 mod upload;

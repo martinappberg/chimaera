@@ -216,7 +216,9 @@ pub struct WindowScope {
     pub detached: bool,
     /// Session ids on screen in this window (each pane's active tab),
     /// reported by the page. A notice about one of these is not posted while
-    /// this window has focus — the user is already looking at it.
+    /// this window has focus — the user is already looking at it. (A
+    /// non-detached window also covers its workspace's hidden tabs: see
+    /// `notices::covers`.)
     pub(crate) visible: Vec<String>,
 }
 
@@ -843,8 +845,12 @@ pub(crate) fn show_local_home(
     Ok(())
 }
 
-/// Whether focus belongs to a managed daemon window. The setup wizard has no
-/// scope-map entry and cannot show the daemon-served Settings surface.
+/// Whether focus belongs to a managed daemon window (Home or a workspace).
+/// Drives the menu's Settings item. Reads the scope map (populated by
+/// `open_ui_window` and `report_window_scope`); false before startup, for the
+/// WSL wizard, which cannot show the daemon-served Settings surface, and for a
+/// login-node terminal window (`cluster_open_terminal`): daemon-served, but a
+/// bare terminal page with no settings surface and no `menu` listener.
 pub(crate) fn focused_daemon_open(app: &AppHandle) -> bool {
     let Some(focused) = app
         .webview_windows()
@@ -853,9 +859,17 @@ pub(crate) fn focused_daemon_open(app: &AppHandle) -> bool {
     else {
         return false;
     };
-    app.try_state::<Shell>()
-        .map(|shell| lock(&shell.windows).contains_key(focused.label()))
-        .unwrap_or(false)
+    let Some(shell) = app.try_state::<Shell>() else {
+        return false;
+    };
+    // Two short locks, never held together.
+    let stable_id = lock(&shell.windows)
+        .get(focused.label())
+        .map(|scope| scope.stable_id.clone());
+    match stable_id {
+        Some(id) => !lock(&shell.terminal_windows).contains_key(&id),
+        None => false,
+    }
 }
 
 /// Startup completion is a real three-state gate, NOT `try_state::<Shell>()`:
@@ -1187,8 +1201,8 @@ pub fn run(
                     }
                 }
                 // Focus moved to this window — Settings tracks whether the now-
-                // focused window has a workspace open, and the drag hit-test's
-                // recency order promotes it.
+                // focused window is a daemon page (`focused_daemon_open`), and
+                // the drag hit-test's recency order promotes it.
                 tauri::WindowEvent::Focused(true) => {
                     *lock(&shell.last_focused_window) = Some(window.label().to_string());
                     {

@@ -28,7 +28,7 @@
   import GuidanceRow from "./GuidanceRow.svelte";
   import { acquireChat, releaseChat } from "../chat/chatPool";
   import type { ChatStore } from "../chat/store.svelte";
-  import type { ChatSocket } from "../chat/chatWs";
+  import type { ChatTransport } from "../chat/chatPool";
   import { gitStatus } from "../workspace/git";
   import { computeStatus, formatSlurmDuration, parseSlurmTimeLeft } from "../workspace/compute";
   import { keyHint } from "../shared/keybindings";
@@ -176,7 +176,7 @@
     return out;
   });
 
-  let rich = $state(new Map<string, { store: ChatStore; socket: ChatSocket }>());
+  let rich = $state(new Map<string, { store: ChatStore; socket: ChatTransport }>());
   $effect(() => {
     const want = richIds;
     untrack(() => {

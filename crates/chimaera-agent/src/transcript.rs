@@ -105,6 +105,133 @@ pub fn import_transcript(path: &Path) -> Vec<AgentEvent> {
     out
 }
 
+/// A subagent transcript is read from a window that only moves in steps of
+/// this many bytes, so consecutive reads of a growing file start at the same
+/// record (see [`subagent_window_start`]).
+const SUBAGENT_WINDOW_STEP: u64 = 1024 * 1024;
+/// The most a subagent read translates: the window is between this minus one
+/// step and this.
+const SUBAGENT_WINDOW_MAX: u64 = 3 * 1024 * 1024;
+
+/// Where a subagent read of a `len`-byte transcript starts. The whole file
+/// while it fits; past that the newest 2–3 MiB, from a step boundary — so
+/// the start moves once per step of growth, not on every read.
+fn subagent_window_start(len: u64) -> u64 {
+    if len <= SUBAGENT_WINDOW_MAX {
+        0
+    } else {
+        ((len - SUBAGENT_WINDOW_MAX) / SUBAGENT_WINDOW_STEP + 1) * SUBAGENT_WINDOW_STEP
+    }
+}
+
+/// Read one subagent's own transcript (claude's
+/// `<session>/subagents/agent-<id>.jsonl`, every record a sidechain one) into
+/// the event stream a chat of its own would have produced.
+///
+/// Built to be re-read while the subagent works. The window is stable (see
+/// [`subagent_window_start`]) and translation is append-only within it: the
+/// events of one read are a prefix of the next read's until `epoch` changes.
+/// `live` leaves the last turn and its unanswered tool calls open; a read of
+/// a finished subagent closes them, after everything a live read returned.
+/// `None` when the file cannot be opened. Blocking fs — call off the reactor.
+pub fn import_subagent_transcript(
+    path: &Path,
+    live: bool,
+) -> Option<crate::subagent::SubagentTranscript> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = subagent_window_start(len);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    // Never read past the window's end as measured above: a file that grows
+    // mid-read is picked up by the next read.
+    let mut reader = std::io::BufReader::new(std::io::Read::take(file, len - start));
+    let mut line: Vec<u8> = Vec::new();
+    let mut out: Vec<AgentEvent> = Vec::new();
+    if start > 0 {
+        // The boundary falls inside a record: drop the rest of it.
+        let _ = read_line_capped(&mut reader, &mut line, 0);
+        out.push(AgentEvent::Truncated);
+    }
+    let mut tx = Translator {
+        subagent: true,
+        ..Translator::default()
+    };
+    let mut model = None;
+    let mut timestamps: Vec<u64> = vec![0; out.len()];
+    loop {
+        line.clear();
+        match read_line_capped(&mut reader, &mut line, MAX_LINE_BYTES) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        // A record still being written has no newline yet and would parse
+        // differently once complete; it belongs to the next read.
+        // (An over-long record was cut at the cap: it fails to parse below.)
+        if line.len() < MAX_LINE_BYTES && line.last() != Some(&b'\n') {
+            break;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        if let Some(served) = value["message"]["model"].as_str() {
+            if !served.is_empty() && served != "<synthetic>" {
+                model = Some(truncate_label(served, crate::subagent::SUBAGENT_MODEL_MAX));
+            }
+        }
+        tx.on_record(&value, &mut out);
+        // Every record is stamped; its events happened then.
+        let at = value["timestamp"]
+            .as_str()
+            .and_then(iso_utc_ms)
+            .unwrap_or(0);
+        timestamps.resize(out.len(), at);
+    }
+    if !live {
+        tx.finish(&mut out);
+    }
+    timestamps.resize(out.len(), 0);
+    Some(crate::subagent::SubagentTranscript {
+        events: out,
+        epoch: start.to_string(),
+        model,
+        timestamps,
+    })
+}
+
+/// Claude's record `timestamp` (`2026-10-05T12:34:56.789Z`) as epoch ms.
+/// UTC only — the CLI writes `Z` — and lenient about the fraction; anything
+/// else is "not known" rather than a guess.
+fn iso_utc_ms(s: &str) -> Option<u64> {
+    let s = s.strip_suffix('Z')?;
+    let (date, time) = s.split_once('T')?;
+    let mut d = date.split('-').map(|p| p.parse::<i64>().ok());
+    let (y, m, day) = (d.next()??, d.next()??, d.next()??);
+    let (hms, frac) = time.split_once('.').unwrap_or((time, ""));
+    let mut t = hms.split(':').map(|p| p.parse::<i64>().ok());
+    let (h, min, sec) = (t.next()??, t.next()??, t.next()??);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&day) || h > 23 || min > 59 || sec > 60 {
+        return None;
+    }
+    // Days since 1970-01-01 (Howard Hinnant's days_from_civil).
+    let (y, m) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * m + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let millis: i64 = frac
+        .chars()
+        .take(3)
+        .filter_map(|c| c.to_digit(10))
+        .fold((0i64, 100i64), |(acc, place), digit| {
+            (acc + i64::from(digit) * place, place / 10)
+        })
+        .0;
+    let ms = ((days * 86_400 + h * 3_600 + min * 60 + sec) * 1_000) + millis;
+    u64::try_from(ms).ok()
+}
+
 /// Read one `\n`-terminated line, capping `out` at `cap` bytes: the rest of an
 /// over-long line is consumed from the reader and discarded (its truncated
 /// `out` then fails to parse and is skipped). Returns raw bytes consumed;
@@ -163,6 +290,13 @@ struct Translator {
     /// history rebuilds its plan panel instead of replaying the bookkeeping
     /// as rows. Shared (not reimplemented) so the two cannot drift.
     task_list: TaskTracker,
+    /// Reading a subagent's own file: its records are all sidechain ones
+    /// (the very thing a parent import skips), and its tool calls stay
+    /// in-progress until their result arrives, so a read taken mid-run shows
+    /// what is still running.
+    subagent: bool,
+    /// Tool calls shown in progress, in call order (subagent reads only).
+    open_tools: Vec<String>,
 }
 
 impl Translator {
@@ -199,7 +333,7 @@ impl Translator {
         // Subagent (sidechain) and injected-meta records are noise the live
         // surface hides too — skip before any translation (mirrors the
         // launcher's `first_prompt_text` filter).
-        if rec.get("isSidechain").and_then(Value::as_bool) == Some(true)
+        if (!self.subagent && rec.get("isSidechain").and_then(Value::as_bool) == Some(true))
             || rec.get("isMeta").and_then(Value::as_bool) == Some(true)
         {
             return;
@@ -342,19 +476,25 @@ impl Translator {
 
         let kind = tool_kind(name);
         self.tool_kinds.insert(id.clone(), kind);
+        let status = if self.subagent {
+            self.open_tools.push(id.clone());
+            ToolStatus::InProgress
+        } else {
+            ToolStatus::Completed
+        };
         out.push(AgentEvent::ToolCall {
             id: id.clone(),
             kind,
             title: tool_title(name, input),
             locations: tool_locations(input),
-            status: ToolStatus::Completed,
+            status,
             cross_turn: false,
             command: None,
         });
         if let Some(diff) = edit_diff_content(name, input) {
             out.push(AgentEvent::ToolCallUpdate {
                 id,
-                status: ToolStatus::Completed,
+                status,
                 content: Some(diff),
             });
         }
@@ -371,6 +511,7 @@ impl Translator {
         if id.is_empty() {
             return;
         }
+        self.open_tools.retain(|open| open != &id);
         let failed = block["is_error"].as_bool() == Some(true);
         let kind = self.tool_kinds.get(&id).copied();
         // A task-list call carries its id/state only in the result text; the
@@ -405,6 +546,15 @@ impl Translator {
     }
 
     fn finish(mut self, out: &mut Vec<AgentEvent>) {
+        // A call the subagent never got an answer to (it was stopped) must
+        // not spin forever in a finished conversation.
+        for id in std::mem::take(&mut self.open_tools) {
+            out.push(AgentEvent::ToolCallUpdate {
+                id,
+                status: ToolStatus::Completed,
+                content: None,
+            });
+        }
         self.close_turn(out);
     }
 }
@@ -475,6 +625,160 @@ mod tests {
         let path = dir.path().join("t.jsonl");
         std::fs::write(&path, s).unwrap();
         import_transcript(&path)
+    }
+
+    fn subagent_line(body: &str) -> String {
+        format!(r#"{{"isSidechain":true,"agentId":"a1",{body}}}"#) + "\n"
+    }
+
+    fn subagent_fixture() -> Vec<String> {
+        vec![
+            subagent_line(r#""type":"user","message":{"role":"user","content":"read notes.txt"}"#),
+            subagent_line(r#""type":"attachment","attachment":{"type":"environment"}"#),
+            subagent_line(
+                r#""type":"assistant","message":{"id":"m1","model":"claude-opus-5-5","content":[{"type":"tool_use","id":"tu_read","name":"Read","input":{"file_path":"/tmp/notes.txt"}}]}"#,
+            ),
+            subagent_line(
+                r#""type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_read","content":"hello"}]}"#,
+            ),
+            subagent_line(
+                r#""type":"assistant","message":{"id":"m2","model":"claude-opus-5-5","content":[{"type":"text","text":"It says hello."}]}"#,
+            ),
+        ]
+    }
+
+    fn import_subagent(lines: &[String], live: bool) -> crate::subagent::SubagentTranscript {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent-a1.jsonl");
+        std::fs::write(&path, lines.concat()).unwrap();
+        import_subagent_transcript(&path, live).unwrap()
+    }
+
+    #[test]
+    fn subagent_transcript_reads_its_sidechain_records() {
+        let read = import_subagent(&subagent_fixture(), false);
+        assert_eq!(read.model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(read.epoch, "0");
+        assert!(matches!(
+            &read.events[0],
+            AgentEvent::UserMessage { text, .. } if text == "read notes.txt"
+        ));
+        assert!(read.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolCall { id, status: ToolStatus::InProgress, .. } if id == "tu_read"
+        )));
+        assert!(read.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolCallUpdate { id, status: ToolStatus::Completed, content: Some(_) }
+                if id == "tu_read"
+        )));
+        assert!(read.events.iter().any(
+            |e| matches!(e, AgentEvent::MessageChunk { text, .. } if text == "It says hello.")
+        ));
+        assert!(matches!(
+            read.events.last(),
+            Some(AgentEvent::TurnCompleted { .. })
+        ));
+        assert!(
+            import_subagent_transcript(Path::new("/nonexistent/agent-x.jsonl"), false).is_none()
+        );
+    }
+
+    #[test]
+    fn a_live_subagent_read_is_a_prefix_of_every_later_read() {
+        let lines = subagent_fixture();
+        // Mid-run: the tool call has no result yet and a record is half
+        // written (no newline) — it belongs to the next read.
+        let mut partial = lines[..3].to_vec();
+        partial.push(lines[3].trim_end().chars().take(40).collect());
+        let early = import_subagent(&partial, true);
+        assert!(
+            !early
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TurnCompleted { .. })),
+            "a working subagent's turn stays open"
+        );
+        assert!(matches!(
+            early.events.last(),
+            Some(AgentEvent::ToolCall {
+                status: ToolStatus::InProgress,
+                ..
+            })
+        ));
+        let later = import_subagent(&lines, true);
+        assert_eq!(later.epoch, early.epoch);
+        assert_eq!(later.events[..early.events.len()], early.events[..]);
+        // The finished read only ADDS the closes.
+        let done = import_subagent(&lines, false);
+        assert_eq!(done.events[..later.events.len()], later.events[..]);
+
+        // A subagent stopped mid-call: the finished read closes the call.
+        let stopped = import_subagent(&lines[..3], false);
+        let n = stopped.events.len();
+        assert!(matches!(
+            &stopped.events[n - 2],
+            AgentEvent::ToolCallUpdate { id, status: ToolStatus::Completed, content: None }
+                if id == "tu_read"
+        ));
+    }
+
+    #[test]
+    fn subagent_records_stamp_their_events() {
+        assert_eq!(iso_utc_ms("1970-01-01T00:00:00.000Z"), Some(0));
+        assert_eq!(
+            iso_utc_ms("2026-10-05T12:34:56.789Z"),
+            Some(1_791_203_696_789)
+        );
+        assert_eq!(iso_utc_ms("2026-10-05T12:34:56Z"), Some(1_791_203_696_000));
+        assert_eq!(iso_utc_ms("2026-10-05 12:34:56"), None);
+        assert_eq!(iso_utc_ms("2026-13-05T12:34:56Z"), None);
+        let lines = vec![
+            subagent_line(
+                r#""timestamp":"2026-10-05T12:00:00.000Z","type":"user","message":{"role":"user","content":"go"}"#,
+            ),
+            subagent_line(
+                r#""timestamp":"2026-10-05T12:00:05.000Z","type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"ok"}]}"#,
+            ),
+        ];
+        let read = import_subagent(&lines, false);
+        assert_eq!(read.timestamps.len(), read.events.len());
+        assert_eq!(read.timestamps[0], 1_791_201_600_000);
+        // The turn opens with the assistant record; the synthesized close
+        // has no time of its own.
+        assert_eq!(read.timestamps[1], 1_791_201_605_000);
+        assert_eq!(*read.timestamps.last().unwrap(), 0);
+    }
+
+    #[test]
+    fn subagent_window_moves_in_steps() {
+        assert_eq!(subagent_window_start(0), 0);
+        assert_eq!(subagent_window_start(SUBAGENT_WINDOW_MAX), 0);
+        let step = SUBAGENT_WINDOW_STEP;
+        // Just past the cap the window starts one step in, and stays there
+        // for a whole step of growth.
+        assert_eq!(subagent_window_start(SUBAGENT_WINDOW_MAX + 1), step);
+        assert_eq!(subagent_window_start(SUBAGENT_WINDOW_MAX + step - 1), step);
+        assert_eq!(subagent_window_start(SUBAGENT_WINDOW_MAX + step), 2 * step);
+
+        // A file past the cap: the read starts mid-file, says so, and skips
+        // the record the boundary cut.
+        let filler = subagent_line(&format!(
+            r#""type":"assistant","message":{{"id":"f","content":[{{"type":"text","text":"{}"}}]}}"#,
+            "x".repeat(64 * 1024)
+        ));
+        let mut lines = vec![subagent_line(
+            r#""type":"user","message":{"role":"user","content":"the first prompt"}"#,
+        )];
+        let count = (SUBAGENT_WINDOW_MAX as usize / filler.len()) + 2;
+        lines.extend(std::iter::repeat_n(filler, count));
+        let read = import_subagent(&lines, false);
+        assert_eq!(read.epoch, step.to_string());
+        assert!(matches!(read.events[0], AgentEvent::Truncated));
+        assert!(!read
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::UserMessage { .. })));
     }
 
     /// Imported assistant messages with several text blocks re-render with

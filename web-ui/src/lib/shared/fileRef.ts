@@ -485,17 +485,18 @@ export interface LinkContext {
  * The absolute directories to resolve `path` against, in order (the first
  * is the request's `base`, the rest its `bases`). An absolute or `~` path
  * needs none, but the API requires a base. `./` and `../` are relative to
- * where the session is, nothing else. Empty when nothing is known.
+ * where the session is, then where it started (an agent that moved into a
+ * worktree still wrote earlier paths from there) — never the workspace
+ * root. Empty when nothing is known.
  */
 export function resolveBases(ctx: LinkContext, path: string): string[] {
   if (path.startsWith("/") || path.startsWith("~")) {
     const any = ctx.cwd ?? ctx.spawnCwd ?? ctx.root ?? "/";
     return [any];
   }
-  const here = ctx.cwd ?? ctx.spawnCwd ?? null;
-  if (path.startsWith("./") || path.startsWith("../")) return here !== null ? [here] : [];
+  const dotted = path.startsWith("./") || path.startsWith("../");
   const out: string[] = [];
-  for (const b of [ctx.cwd, ctx.spawnCwd, ctx.root]) {
+  for (const b of dotted ? [ctx.cwd, ctx.spawnCwd] : [ctx.cwd, ctx.spawnCwd, ctx.root]) {
     if (b != null && b.startsWith("/") && !out.includes(b)) out.push(b);
   }
   return out;

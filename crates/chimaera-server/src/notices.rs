@@ -789,7 +789,7 @@ fn observe(
     let mut agents = crate::lock(&state.agents);
     let now = Instant::now();
     for (id, record) in agents.iter_mut() {
-        let corrected = std::mem::take(&mut record.state_corrected);
+        let corrected = record.state_corrected.take();
         // First sight (a new session, or every session at boot) is a
         // baseline, not an edge: a resurrected session must not announce
         // the state it was restored into.
@@ -799,7 +799,10 @@ fn observe(
         };
         // So is a correction of a stale reading (a resumed idle chat read
         // Running from its SessionStart hook until its Init): no turn ended.
-        if corrected {
+        // Only while the record still reads the corrected state — a change
+        // since (a failed process, a permission asked by a queued turn) is
+        // an edge as usual.
+        if corrected == Some(record.state) {
             *prev = record.state;
             pending.remove(id);
             continue;
@@ -1144,12 +1147,14 @@ mod tests {
             let mut agents = crate::lock(&state.agents);
             let record = agents.get_mut("s-resumed").unwrap();
             record.state = AgentState::Finished;
-            record.state_corrected = true;
+            record.state_corrected = Some(AgentState::Finished);
         }
         observe(&state, &mut seen, &mut pending);
         assert!(pending.is_empty(), "a correction is not a turn end");
         assert_eq!(seen["s-resumed"], AgentState::Finished);
-        assert!(!crate::lock(&state.agents)["s-resumed"].state_corrected);
+        assert!(crate::lock(&state.agents)["s-resumed"]
+            .state_corrected
+            .is_none());
         // An ordinary turn end afterwards is still news.
         crate::lock(&state.agents)
             .get_mut("s-resumed")
@@ -1162,6 +1167,24 @@ mod tests {
             .state = AgentState::Finished;
         observe(&state, &mut seen, &mut pending);
         assert_eq!(pending["s-resumed"].kind, NoticeKind::Done);
+        // A correction the record has since moved past is no baseline: the
+        // process failed right after its Init, and that is news.
+        crate::lock(&state.agents)
+            .get_mut("s-resumed")
+            .unwrap()
+            .state = AgentState::Running;
+        observe(&state, &mut seen, &mut pending);
+        {
+            let mut agents = crate::lock(&state.agents);
+            let record = agents.get_mut("s-resumed").unwrap();
+            record.state = AgentState::Errored;
+            record.state_corrected = Some(AgentState::Finished);
+        }
+        observe(&state, &mut seen, &mut pending);
+        assert_eq!(pending["s-resumed"].kind, NoticeKind::Error);
+        assert!(crate::lock(&state.agents)["s-resumed"]
+            .state_corrected
+            .is_none());
         drop(state);
         let _ = std::fs::remove_dir_all(dir);
     }

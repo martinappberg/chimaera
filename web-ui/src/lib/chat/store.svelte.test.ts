@@ -523,6 +523,23 @@ describe("ChatStore pending-send ordering", () => {
     expect(tool).toMatchObject({ kind: "tool", denied: true, allowed: false });
   });
 
+  it("records a decision as one line, however long the agent's title", () => {
+    const store = fold([
+      { type: "tool_call", id: "c1", kind: "execute", title: "python3", status: "in_progress" },
+      {
+        type: "permission_request",
+        request_id: "r1",
+        tool_call_id: "c1",
+        title: "Execute `python3 -c '\nimport json\n… [982 bytes omitted] …\n",
+        options: [{ id: "allow-once", label: "Yes, proceed", kind: "allow_once" }],
+      },
+      { type: "permission_resolved", request_id: "r1", option_id: "allow-once" },
+    ]);
+    expect(store.blocks.find((b) => b.kind === "notice")).toMatchObject({
+      text: "Execute `python3 -c ' … — Yes, proceed",
+    });
+  });
+
   it("upserts repeated permission/question identities without duplicate keyed cards", () => {
     const store = fold([
       {

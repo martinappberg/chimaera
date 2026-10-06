@@ -346,19 +346,16 @@ impl Journal {
             let mut line = serde_json::to_vec(&*entry).expect("AgentEvent serializes");
             if line.len() > MAX_ENTRY_BYTES {
                 let bytes = line.len();
-                let replacement = shortened_user_message(&entry.ev, seq, ts);
-                tracing::warn!(
-                    seq,
-                    bytes,
-                    "{}",
-                    if replacement.is_some() {
+                if let Some(shortened) = shortened_user_message(&entry.ev, seq, ts) {
+                    tracing::warn!(
+                        seq,
+                        bytes,
                         "journal entry exceeded size cap; user message cut"
-                    } else {
-                        "journal entry exceeded size cap; replaced"
-                    }
-                );
-                let replacement = replacement.unwrap_or_else(|| {
-                    let entry = Arc::new(SeqEvent {
+                    );
+                    (entry, line) = shortened;
+                } else {
+                    tracing::warn!(seq, bytes, "journal entry exceeded size cap; replaced");
+                    entry = Arc::new(SeqEvent {
                         seq,
                         ts,
                         ev: AgentEvent::Error {
@@ -368,10 +365,8 @@ impl Journal {
                             fatal: false,
                         },
                     });
-                    let line = serde_json::to_vec(&*entry).expect("Error event serializes");
-                    (entry, line)
-                });
-                (entry, line) = replacement;
+                    line = serde_json::to_vec(&*entry).expect("Error event serializes");
+                }
             }
             line.push(b'\n');
             debug_assert_eq!(
@@ -1097,9 +1092,10 @@ pub async fn append_marker(dir: &Path, session_id: &str, ev: AgentEvent) -> Resu
 ///
 /// `create_new` refuses to clobber an existing journal — the caller owns the
 /// fresh-target guarantee, and never seeding over a live session's file is the
-/// same invariant the copy-seed path enforces. Oversized events are replaced
-/// with an `Error` marker, matching [`Journal::append`]'s cap so the ring and
-/// replay budgets downstream still hold.
+/// same invariant the copy-seed path enforces. Oversized events are cut or
+/// replaced exactly as [`Journal::append`] does (a user message is cut to
+/// fit, anything else becomes an `Error` marker) so the ring and replay
+/// budgets downstream still hold.
 pub fn seed_journal(dir: &Path, session_id: &str, events: &[AgentEvent]) -> Result<()> {
     fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     let path = dir.join(format!("{session_id}.jsonl"));
@@ -1137,11 +1133,15 @@ pub fn seed_journal(dir: &Path, session_id: &str, events: &[AgentEvent]) -> Resu
         };
         let mut line = serde_json::to_vec(&entry)?;
         if line.len() > MAX_ENTRY_BYTES {
-            entry.ev = AgentEvent::Error {
-                message: format!("event exceeded the {MAX_ENTRY_BYTES}-byte journal cap"),
-                fatal: false,
-            };
-            line = serde_json::to_vec(&entry)?;
+            if let Some((_, shortened)) = shortened_user_message(&entry.ev, seq, ts) {
+                line = shortened;
+            } else {
+                entry.ev = AgentEvent::Error {
+                    message: format!("event exceeded the {MAX_ENTRY_BYTES}-byte journal cap"),
+                    fatal: false,
+                };
+                line = serde_json::to_vec(&entry)?;
+            }
         }
         line.push(b'\n');
         debug_assert_eq!(
@@ -1663,6 +1663,11 @@ mod tests {
             journal.client_ids_at_open(),
             ["client-large-1", "client-plain-1"]
         );
+        let events = blocking_replay(&journal, 0);
+        assert!(matches!(
+            &events[0].ev,
+            AgentEvent::UserMessage { id: Some(id), .. } if id == "u-large"
+        ));
     }
 
     #[tokio::test]

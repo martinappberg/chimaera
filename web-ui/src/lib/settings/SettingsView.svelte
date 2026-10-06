@@ -293,6 +293,16 @@
         bind:value={query}
         bind:this={searchEl}
         aria-label="search settings"
+        onkeydown={(e) => {
+          // Escape clears a query first; the next one leaves — App closes
+          // Home's Settings page only over an empty field, and a text input
+          // never clears itself on Escape (only type=search does).
+          if (e.key === "Escape" && query !== "") {
+            e.preventDefault();
+            e.stopPropagation();
+            query = "";
+          }
+        }}
       />
     {/if}
   </header>

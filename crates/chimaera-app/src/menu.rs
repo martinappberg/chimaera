@@ -225,8 +225,11 @@ fn focused_window(app: &AppHandle) -> Option<WebviewWindow> {
         .find(|w| w.is_focused().unwrap_or(false))
 }
 
-/// Enable Settings for a focused daemon page, including Home so account sign-in
-/// is reachable before a first workspace exists. The WSL wizard stays excluded.
+/// Enable Settings for a focused daemon page, including Home, which shows it
+/// as a full page. The WSL wizard (no scope-map entry) and a login-node
+/// terminal window (no settings surface) stay excluded. Called whenever focus
+/// or the focused window's scope changes. Cheap; a no-op before the menu is
+/// managed.
 pub(crate) fn sync_settings_enabled(app: &AppHandle) {
     if let Some(state) = app.try_state::<MenuState>() {
         let _ = state

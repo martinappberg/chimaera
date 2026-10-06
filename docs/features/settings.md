@@ -14,7 +14,8 @@ a `settings` frame on `/ws/events`. Map: [settings/AGENTS.md](../../web-ui/src/l
 - **What & when.** The single store for user preferences — interface/chat/editor/terminal
   typography, themes, dashboard behavior, file and quick-open behavior, keybindings, runtime paths,
   daemon persistence, and update behavior.
-- **How it's used.** The Settings pane (a singleton tab) edits keys through typed rows; a raw-JSON
+- **How it's used.** The Settings pane (a singleton tab in a workspace; a full page over Home, see
+  [native-app.md › Home launcher](native-app.md#home-launcher)) edits keys through typed rows; a raw-JSON
   editor (`SettingsJson.svelte`) is available for anything the schema doesn't surface. `GET
   /api/v1/settings` returns the map; `PUT /api/v1/settings` replaces it whole (≤256 KB, 204). Changes
   broadcast on `/ws/events` so every window converges.

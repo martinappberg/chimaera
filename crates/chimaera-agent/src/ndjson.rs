@@ -9,8 +9,7 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -19,7 +18,8 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 /// stderr kept for diagnostics only — a runaway child must not grow memory.
 const STDERR_TAIL_BUDGET: usize = 8 * 1024;
-// Empty lines still allocate ring entries; byte limits alone do not bound them.
+/// Empty lines still allocate ring entries; the byte budget alone does not
+/// bound them.
 const STDERR_TAIL_LINES: usize = 256;
 /// Hard ceiling on a single stdout line. A real stream-json / app-server frame
 /// (diffs, small inline images) fits well under this; a child that emits bytes
@@ -33,6 +33,10 @@ const MAX_STDERR_LINE_BYTES: usize = 16 * 1024;
 /// for one line can never exceed `max`: once a line reaches the cap the reader
 /// keeps consuming (and discarding) input until the next newline, so a child
 /// that never emits `\n` cannot blow the daemon's RSS budget.
+///
+/// The line being assembled lives on the reader, not in the future, so
+/// `next_line` is cancel-safe: a driver `select!` or a `recv` timeout that
+/// drops a read midway keeps the bytes already consumed for the next call.
 struct CappedLines<R> {
     reader: BufReader<R>,
     max: usize,
@@ -132,12 +136,12 @@ impl JsonlChild {
             "managed process was fenced before spawn"
         );
         let mut cmd = Command::new(bin);
-        // The executable can be a launcher (for example npm's Codex entry),
-        // so direct-child kill alone may strand its native subprocess.
-        // Group ownership is independent of managed lease admission.
+        // Its own process group: the executable can be a launcher (npm's
+        // codex entry is a node script around the native binary), and
+        // killing only the direct child would strand that native process,
+        // still running and still holding the stdout pipe open.
         #[cfg(unix)]
         cmd.process_group(0);
-
         cmd.args(args)
             .current_dir(cwd)
             .stdin(Stdio::piped())
@@ -172,7 +176,12 @@ impl JsonlChild {
                 let mut tail = tail.lock().expect("stderr tail lock");
                 tail.push_back(line);
                 let mut total: usize = tail.iter().map(|l| l.len()).sum();
-                while total > STDERR_TAIL_BUDGET || tail.len() > STDERR_TAIL_LINES {
+                // The newest line stays even when it alone exceeds the byte
+                // budget (a line can be up to MAX_STDERR_LINE_BYTES): popping
+                // it would turn a long stack trace into an empty tail.
+                while (total > STDERR_TAIL_BUDGET && tail.len() > 1)
+                    || tail.len() > STDERR_TAIL_LINES
+                {
                     match tail.pop_front() {
                         Some(dropped) => total -= dropped.len(),
                         None => break,
@@ -347,6 +356,12 @@ impl ChildGuard {
     /// the status: the reader task gets a bounded moment to drain the pipe
     /// after the child died. A fast-crashing child otherwise loses the race
     /// and its failure diagnostics read as an empty tail.
+    ///
+    /// On unix the whole process group is SIGKILLed once the leader has
+    /// exited or the grace has run out, so a launcher's native child or a
+    /// helper left in the group does not outlive the session. The leader's
+    /// exit is observed without reaping it (`exited_unreaped`), so its pid,
+    /// and with it the group id, cannot be recycled before the group kill.
     pub async fn shutdown_with_stderr(mut self, grace: Duration) -> (Option<i32>, String) {
         let deadline = Instant::now() + grace;
         if cfg!(unix) || self.managed_execution {
@@ -428,8 +443,11 @@ fn exited_unreaped(pid: u32) -> bool {
         )
     };
     if result != 0 {
-        // Already reaped or not our child: nothing left to wait for.
-        return true;
+        // ECHILD: already reaped, nothing left to wait for. Any other error
+        // (EINTR, a rejected flag) says nothing about the child; reporting
+        // it as an exit would cut the grace short and SIGKILL the group
+        // before the leader's own SIGTERM cleanup has run.
+        return std::io::Error::last_os_error().raw_os_error() == Some(nix::libc::ECHILD);
     }
     // SAFETY: zero-initialised and possibly written by waitid above.
     let info = unsafe { info.assume_init() };
@@ -598,6 +616,27 @@ mod tests {
         assert_eq!(status, Some(0));
         assert!(tail.ends_with("tail-marker"));
         assert!(tail.lines().count() <= STDERR_TAIL_LINES);
+    }
+
+    #[tokio::test]
+    async fn an_oversize_stderr_line_is_kept_not_dropped() {
+        let over_budget = STDERR_TAIL_BUDGET + 1024;
+        let child = JsonlChild::spawn(
+            "/bin/sh",
+            &[
+                "-c".into(),
+                format!("head -c {over_budget} /dev/zero | tr '\\0' x >&2; printf '\\n' >&2"),
+            ],
+            Path::new("/"),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let (sink, _stream, guard) = child.split();
+        drop(sink);
+        let (status, tail) = guard.shutdown_with_stderr(Duration::from_secs(5)).await;
+        assert_eq!(status, Some(0));
+        assert_eq!(tail.trim_end().len(), over_budget, "{}", tail.len());
     }
 
     #[tokio::test]

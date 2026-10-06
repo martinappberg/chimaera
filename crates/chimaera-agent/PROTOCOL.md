@@ -3006,6 +3006,35 @@ and `session/set_config_option` returns the authoritative current values. `confi
 can replace controls; absence removes an effort control. Grok advertised image input false;
 Google true. Buttons and attachment admission follow that negotiated capability.
 
+Grok 1.0.46 advertises no modes: `session/new` has no `modes` and no `mode` config option (its
+`configOptions` are `model` and `reasoning_effort`). Its permission and plan switches are still
+reachable (probed 2026-10-04/05, with model turns on the second day):
+
+- **Always-approve.** A `session/prompt` whose text is `/always-approve on` (or `off`) runs
+  inside Grok: it returns `end_turn` with `_meta.totalTokens: 0` and no message chunks. Measured
+  in one session with the same shell command: default asked (`session/request_permission`), after
+  `on` it ran unasked, after `off` it asked again. Nothing reads the state back mid-session
+  (`_x.ai/sessions/changed` kept `yolo: false`), so the zero-token answer is the only
+  confirmation; a slash Grok does not know (`/auto on` on an account without Auto-review) is
+  sent to the model and billed. The adapter offers Normal / Always-approve only while
+  `available_commands_update` lists `always-approve`, sends the switch between turns, and
+  treats any answer that billed tokens as "not switched". `_meta.yoloMode: true` on
+  `session/new` starts a session in it (`yolo: true` is reported then).
+- **Plan.** `session/set_mode` answers `{}` for any `modeId`; only `plan` and `default` do
+  anything, each confirmed by a `current_mode_update`. In plan mode Grok writes `plan.md` in its
+  session directory, calls `exit_plan_mode`, and sends the client a JSON-RPC request
+  `_x.ai/exit_plan_mode` (`sessionId`, `toolCallId`, `planContent`), then often
+  `_x.ai/ask_user_question`. The reply shape for the approval is undocumented: an error cancels
+  the turn, and `{}` or every guessed approval field (`approved`, `approve`, `accepted`,
+  `outcome`, `decision`, `action`, …) reads as "The user wants to revise the plan". Until that
+  shape is known the adapter does not offer Plan: a plan turn could never be approved.
+- **Auto-review** is gated per account (`_x.ai/settings/update` `auto_permission_mode_enabled`,
+  null on the probed account; `/auto` is then absent from the command list).
+
+A long-lived `grok agent stdio` process keeps the plan tier it authenticated with: after an
+account upgrade its turns kept failing `subscription:free-usage-exhausted` until the chat's
+process was restarted, while a fresh process on the same machine worked.
+
 A `session/prompt` response ends the turn (`end_turn` or `cancelled`). Permission requests are
 agent-initiated JSON-RPC requests; replies preserve the original numeric/string id and choose
 only an offered `optionId`. Cancellation resolves open permission requests as cancelled before
@@ -3360,3 +3389,43 @@ Chimaera Pro moves a project's conversations between the user's computer and the
 - The interrupted-work pick-up (`moved`/`home`/`recovered` user message, Pass 38) no longer carries the note; the note arrives through the carriers above.
 
 Hermetic: server `tests/cloud_context.rs` (a Runtime stand-in: an unenrolled project gets nothing, once per conversation per change of machine, a restart's new process of the same conversation gets nothing, first-prompt fallback, never on a subagent hook, a new kept-both pair re-delivered, the Codex developer note once; and without the Runtime the free values pinned as literals: hook answers, MCP instructions, tools, pre-approved tools, Codex developer note); private `pro-daemon-runtime` `placement_tests` drives recording stand-ins for both CLIs through the real chat, terminal, move-resume and hook paths with the actual Runtime; the private loopback harness's coming-home case records what its stand-in claude's SessionStart hook was told after a real move to the cloud (before the pick-up turn), after a real return home (kept-both file named) and after a laptop daemon restart (nothing repeated; a new conversation still told). Still required (billed, live): a real Claude chat and terminal and a real Codex chat in a synced project, each asked "where are you running, which OS, are node_modules here, which files are not here?" after an idle move to the cloud, after a mid-turn move, after an idle return, after an app restart following a return (and that it was not told twice) and fresh on the cloud machine; whether a real Codex terminal calls `where_am_i` unprompted; and the Codex session-flag SessionStart hook above (does its `additionalContext` reach the model, does it fire on resume).
+
+### Send now is `interrupt {send_now}`, not a Stop (2026-10-05, live probes, claude 2.1.289). ADOPTED.
+
+A maintainer pressed Send now on a waiting message while three background agents were twelve minutes into their work. All three ended at once, and the agent could not bring them back.
+
+- **A plain `interrupt` is the CLI's Stop, and a Stop ends background agents.** With one background `Agent` running: `background_tasks_changed {tasks: []}`, `task_updated {patch: {status: "killed"}}` and `task_notification {status: "stopped"}` for the agent land before the receipt `{still_queued: [...]}`. Every interrupted tool gets the "The user doesn't want to proceed with this tool use" result, in the subagent too.
+- **A stopped agent cannot be resumed.** `ListAgents` shows it `killed`, and `SendMessage` to it answers `{"success": false, "message": "Agent <id> was stopped by the user and won't be resumed. Treat its work as cancelled; only launch a new agent if the user explicitly asks."}`.
+- **`system/init` advertises `interrupt_send_now_v1`.** The full list in this build: `interrupt_receipt_v1`, `interrupt_cancel_queued_v1`, `interrupt_send_now_v1`, `msg_lifecycle_v1`, `sdk_mcp_tools_list_changed`, `sdk_mcp_manifests`, `mcp_read_resource_v1`, `mcp_tool_ui_meta_v1`, `ui_surface_v1`.
+- **`interrupt {send_now: true, message_uuid}`** is the terminal's send-now key for a client. The schema text: "It is not a Stop: it makes no later turn start aborted, cancels nothing that is queued, and ends no background task, subscription or other thing outside the running turn that a Stop ends." `message_uuid` names the waiting message and is compared as an exact string; the message must already be in the CLI's queue. With `cancel_queued: true` the request is a Stop again. A CLI without the capability treats it as a plain interrupt.
+- **The receipt gains `send_now`:** `stopped` (the turn was aborted, its result follows), `delivering` (no turn was stopped: the CLI is moving what the turn waits on to the background, or the message is already on its way in; it may still stop the turn later, without a marker), or `nothing_waiting` (nothing was done).
+- **Live, the same scene with `send_now`:** receipt `{still_queued: [B], send_now: "stopped"}` first, then the foreground Bash's `task_notification {status: "stopped"}`, the interruption marker, the `error_during_execution` result, A `cancelled`, B `started`. No frame for the background agent; afterwards `SendMessage` to it answered `success: true`. Sent in the same instant as the message itself, it still found the message (`stopped`).
+- **A subagent's own Bash task says so:** its `task_started` carries `owned_by_subagent: true` (`task_type: "local_bash"`, `is_backgrounded: false`); the parent's foreground command has no such field. The live test keys on it.
+
+ADOPTED: `AgentCommand::SendNow` on a CLI that advertises `interrupt_send_now_v1`, for a message in the CLI's queue, sends `interrupt {send_now: true, message_uuid}`. The interrupt watchdog is armed by a `stopped` receipt instead of the request, because a `delivering` turn keeps running; `nothing_waiting` clears the user-stop flag. A message the driver still holds (the pre-init fallback, or an older CLI) keeps the plain interrupt. An aborted turn no longer closes the row of a backgrounded agent the CLI still lists in `background_tasks_changed`: after a send-now it is running. `AgentCommand::Interrupt` is unchanged: Stop is the CLI's Stop and ends background agents, with no request field that spares them.
+
+Tests: claude `send_now_spares_background_agents_on_a_capable_cli`, `send_now_that_finds_nothing_waiting_leaves_no_interrupt_behind`, `an_aborted_turn_leaves_a_listed_background_agent_row_alone`, `a_send_now_receipt_never_clears_a_stop_in_flight`; live `claude_send_now_spares_background_agents`.
+
+## Pass 42 (2026-10-05 — live probes claude 2.1.289 + codex 0.158.0): a subagent's model, and reading its conversation. ADOPTED.
+
+The chat's subagent surface named the work but never the model doing it, and a subagent's own conversation was reachable only on disk. Both agents turn out to expose both.
+
+### Claude: the served model rides the hidden frames; the transcript is a file
+
+- Every hidden subagent `assistant` frame (`parent_tool_use_id` set) carries `message.model` — the SERVED id (`claude-opus-5-5`, `claude-haiku-4-5-20251001`), plus `subagent_type` and `task_description` at the top level. Foreground and background agents alike. ADOPTED: `AgentEvent::SubagentInfo {id: <tool_use id>, agent_id, model, agent_type}` (latest-wins per row; a nested subagent's frames name a tool call inside a hidden transcript and are ignored), and `BackgroundTask.model` on the `local_agent` lane.
+- A background launch answers at once: the launching `user` frame's top-level `tool_use_result` is `{isAsync: true, status: "async_launched", agentId, description, resolvedModel, prompt, outputFile, canReadOutputFile}` — `resolvedModel` is the served id, before the subagent's first frame. ADOPTED as the first source of the model.
+- `task_started.task_id` IS the subagent's agent id (`a0dd2a5017a275850`), the same id the Agent tool_result prints ("agentId: …") and the name of its transcript: `~/.claude/projects/<cwd slug>/<session uuid>/subagents/agent-<id>.jsonl`, beside `agent-<id>.meta.json` (`{agentType, description, toolUseId, spawnDepth, requestShape: "foreground" | "background", requestNonInteractive, model: "haiku" | "opus" | …}` — the REQUESTED alias, not the served id). The file is a plain transcript whose records all carry `isSidechain: true` and `agentId`: the prompt as the first `user` record (a string), `attachment` records (environment, skill_listing, …), then the usual assistant/user pairs. ADOPTED: `transcript::import_subagent_transcript` (sidechain records kept, tool calls in progress until answered, a stable byte window) behind `GET /sessions/{id}/subagents/{agent_id}/transcript`, which looks beside the hook-reported transcript, then under the cwd slug, then across project folders.
+- In `-p` mode a foreground Agent call still launched `is_backgrounded: true` with `spawn_depth: 1` (2.1.289) — the lanes are the same as Pass 31 described; nothing here depends on the flag.
+
+### Codex: `thread/read` on the live connection
+
+- No `thread/started` arrives for a child thread; its first frame is `thread/status/changed {idle}`, between the spawn marker's `item/started` and `item/completed`.
+- `thread/read {threadId: <child>, includeTurns: false}` answers at the spawn marker already (live: `status: {type: "idle"}`, `turns: []`) with the child's `model` ("gpt-5.6-sol" — the parent's model in every probe), `reasoningEffort`, `agentNickname` ("Dewey", "Harvey" — random), `agentRole` (null), `parentThreadId`, `threadSource: "subagent"`, `source: {subAgent: {thread_spawn: {parent_thread_id, depth, agent_path, agent_nickname, agent_role}}}`, `canAcceptDirectInput: false`, `historyMode: "paginated"`, and the rollout `path`. It also reads threads the server has not loaded (`status: {type: "notLoaded"}`), i.e. saved history. ADOPTED: `SubagentInfo` with the model, read once per child at row open (retried once at the child's `turn/started`).
+- `thread/read {includeTurns: true}` on the child returns `thread.turns[{id, status, items, itemsView: "full", startedAt, completedAt, durationMs, error}]` in the `ThreadItem` shapes the live mapper already handles. **A read of a RUNNING turn returns only its COMPLETED items** (live: at a command's `item/started` the read listed every item before it and not the command; at an `agentMessage` delta, not the message) — so successive reads extend each other, which is what makes the view incremental. The child's prompt is NOT among its items (the parent's own read does include its `userMessage`). A failed turn reads back `{status: "failed", error: {message, codexErrorInfo, additionalDetails, misalignment}}`. ADOPTED: `DriverQuery::SubagentTranscript` → `thread_to_events` (an offline mapper replays the turns), `live` leaving the newest turn open.
+- `includeTurns: true` is preceded by `deprecationNotice {summary: "Full-history hydration is deprecated for paginated threads; omit `includeTurns` or set it to `false`, then page with `thread/turns/list` and `thread/items/list`."}` — suppressed while a read is pending. A thread history over the 8 MiB ndjson line cap cannot be read whole this way; paging is the follow-up.
+- An invalid id answers `-32600 "invalid thread id: …"`.
+
+### ACP (Antigravity, Grok): no subagent surface
+
+Neither ACP adapter reports subagents on its wire today, so there is nothing to name a model for or open; the chip and the view are claude- and codex-only by wire reality.
+

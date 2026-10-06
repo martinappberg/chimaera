@@ -17,7 +17,7 @@
   import ChatView from "../chat/ChatView.svelte";
   import { acquireChat, releaseChat } from "../chat/chatPool";
   import { mintSendId, type ChatStore } from "../chat/store.svelte";
-  import type { ChatSocket } from "../chat/chatWs";
+  import type { ChatTransport } from "../chat/chatPool";
   import { dismiss } from "../shared/dismiss";
   import { followToBottom } from "../chat/composerBus";
   import type { MastermindContext } from "./mastermindPanelState.svelte";
@@ -126,7 +126,7 @@
   const mmId = $derived(
     cfg !== null && live !== null && live.ui === "chat" ? live.id : null,
   );
-  let mm = $state<{ store: ChatStore; socket: ChatSocket } | null>(null);
+  let mm = $state<{ store: ChatStore; socket: ChatTransport } | null>(null);
   const mmStore = $derived(mm?.store ?? null);
   $effect(() => {
     const id = mmId;

@@ -129,6 +129,13 @@ fn queued_message_frame(uuid: &str, content: Value, priority: &str) -> Value {
 /// `command_lifecycle` frames (`queued` → `started` → a terminal state).
 const MSG_LIFECYCLE_CAPABILITY: &str = "msg_lifecycle_v1";
 
+/// The `system/init` capability of a CLI whose `interrupt` takes
+/// `send_now: true` (2.1.289): the waiting messages are read now, and nothing
+/// outside the running turn is ended. A plain `interrupt` is the CLI's Stop,
+/// which also kills every background agent and marks it "stopped by the
+/// user" — the CLI then refuses to resume it.
+const SEND_NOW_CAPABILITY: &str = "interrupt_send_now_v1";
+
 fn control_request_frame(id: &str, request: Value) -> Value {
     json!({
         "type": "control_request",
@@ -163,8 +170,18 @@ fn background_task_from_wire(t: &Value, now: u64) -> Option<BackgroundTask> {
         agents_done: 0,
         monitor: false,
         ambient: t["ambient"] == json!(true),
+        model: None,
         tool_use_id: wire_tool_use_id(t),
     })
+}
+
+/// What the wire has said about one subagent (see `ClaudeMapper::subagents`).
+#[derive(Default, PartialEq, Eq)]
+struct SubagentFacts {
+    /// The task id — also the name of its transcript file.
+    agent_id: Option<String>,
+    model: Option<String>,
+    agent_type: Option<String>,
 }
 
 /// The two workflow-binding fields, extracted ONCE for both frames that can
@@ -683,6 +700,9 @@ enum PendingControl {
     Background,
     /// stop_task ack (subagent stop).
     StopTask,
+    /// `interrupt {send_now}` receipt: its `send_now` word says whether the
+    /// running turn was stopped for the waiting messages.
+    SendNow,
     /// cancel_async_message ack: `{cancelled}` for this queued message.
     CancelQueued(String),
     /// remote_control round-trip: enable answers `{session_url, connect_url,
@@ -793,6 +813,10 @@ struct ClaudeMapper {
     /// (the close frame carries no description). Same lifetime as
     /// `task_rows`; bounded by [`TASK_LABELS_CAP`].
     task_labels: HashMap<String, String>,
+    /// Subagent row id → what the wire has said about it so far (its task
+    /// id, served model, kind). Opens with the row's `task_started`, closes
+    /// with its `task_notification`; bounded by [`TASK_LABELS_CAP`].
+    subagents: HashMap<String, SubagentFacts>,
     /// tool_use ids of this turn's `Monitor` calls: the lane their
     /// task_started announces is a watch, not a job (`BackgroundTask.monitor`).
     /// Bounded by [`TASK_LABELS_CAP`]; cleared per turn like `agent_tools`.
@@ -821,6 +845,9 @@ struct ClaudeMapper {
     /// agent's next step and reports when (`awaiting_read`) — the official
     /// clients' behavior. Without it, messages are held (`queued_sends`).
     native_queue: Option<bool>,
+    /// Whether the CLI advertised [`SEND_NOW_CAPABILITY`] on its latest
+    /// `system/init`.
+    send_now_capable: bool,
     /// Mid-turn messages already written to the CLI's own queue that the
     /// agent has not read yet, in send order. Each resolves on its
     /// `command_lifecycle` frame: `started` → `sent` (folded into the running
@@ -1016,6 +1043,7 @@ impl ClaudeMapper {
             native_ui: crate::native_ui::ClaudeUi::default(),
             noticed_controls: HashSet::new(),
             task_rows: HashMap::new(),
+            subagents: HashMap::new(),
             agent_tools: HashMap::new(),
             task_labels: HashMap::new(),
             monitor_tools: HashSet::new(),
@@ -1023,6 +1051,7 @@ impl ClaudeMapper {
             background_tasks: Vec::new(),
             departed_background: VecDeque::new(),
             native_queue: None,
+            send_now_capable: false,
             awaiting_read: VecDeque::new(),
             turn_starting: false,
             queued_sends: VecDeque::new(),
@@ -1269,6 +1298,20 @@ impl ClaudeMapper {
                 .as_str()
                 .is_some_and(|s| s.starts_with("task_"))
         {
+            // Hidden, but each of the subagent's own assistant frames names
+            // the model serving it (live 2.1.289) — the one thing read here.
+            if let (Some(row), Some(model)) = (
+                frame["parent_tool_use_id"].as_str(),
+                frame["message"]["model"].as_str(),
+            ) {
+                self.note_subagent(
+                    row,
+                    None,
+                    Some(model),
+                    frame["subagent_type"].as_str(),
+                    &mut step,
+                );
+            }
             return step;
         }
         match frame["type"].as_str() {
@@ -1359,10 +1402,14 @@ impl ClaudeMapper {
                 if let Some(id) = frame["session_id"].as_str() {
                     self.native_session_id = Some(id.to_string());
                 }
-                let native = frame["capabilities"]
-                    .as_array()
-                    .is_some_and(|caps| caps.iter().any(|c| c == MSG_LIFECYCLE_CAPABILITY));
+                let advertises = |capability: &str| {
+                    frame["capabilities"]
+                        .as_array()
+                        .is_some_and(|caps| caps.iter().any(|c| c == capability))
+                };
+                let native = advertises(MSG_LIFECYCLE_CAPABILITY);
                 self.native_queue = Some(native);
+                self.send_now_capable = advertises(SEND_NOW_CAPABILITY);
                 if native {
                     // Sent before this first init could say which kind of CLI
                     // this is: the CLI's own queue takes them from here.
@@ -1475,15 +1522,16 @@ impl ClaudeMapper {
                         .find(|(id, desc)| desc.as_str() == description && !claimed.contains(*id))
                         .map(|(id, _)| id.clone())
                 });
-                match existing {
+                let row = match existing {
                     Some(id) => {
-                        self.task_rows.insert(task_id, id);
+                        self.task_rows.insert(task_id.clone(), id.clone());
+                        id
                     }
                     None => {
                         let row = format!("task:{task_id}");
-                        self.task_rows.insert(task_id, row.clone());
+                        self.task_rows.insert(task_id.clone(), row.clone());
                         step.events.push(AgentEvent::ToolCall {
-                            id: row,
+                            id: row.clone(),
                             kind: ToolKind::Agent,
                             title: format!("Agent: {description}"),
                             locations: Vec::new(),
@@ -1491,8 +1539,19 @@ impl ClaudeMapper {
                             cross_turn: false,
                             command: None,
                         });
+                        row
                     }
+                };
+                if self.subagents.len() < TASK_LABELS_CAP {
+                    self.subagents.entry(row.clone()).or_default();
                 }
+                self.note_subagent(
+                    &row,
+                    Some(&task_id),
+                    None,
+                    frame["subagent_type"].as_str(),
+                    step,
+                );
             }
             Some("task_progress") => {
                 // A workflow lane's progress carries the per-agent
@@ -1783,6 +1842,15 @@ impl ClaudeMapper {
                         };
                     // The flag can flip on a live entry (the set re-emits).
                     task.ambient = t["ambient"] == json!(true);
+                    // A foreground subagent moved to the background arrives
+                    // here with its model already known.
+                    if task.model.is_none() {
+                        task.model = self
+                            .subagents
+                            .values()
+                            .find(|facts| facts.agent_id.as_deref() == Some(id))
+                            .and_then(|facts| facts.model.clone());
+                    }
                     next.push(task);
                 }
                 next.reverse();
@@ -1805,6 +1873,8 @@ impl ClaudeMapper {
                 // outlived its turn is a `local_agent` lane in the set.
                 let row = self.task_rows.remove(task_id);
                 let row_label = self.task_labels.remove(task_id);
+                self.subagents
+                    .retain(|_, facts| facts.agent_id.as_deref() != Some(task_id));
                 // take_background consumes the ONE residency the id has —
                 // live set (notification first) or departed (set-removal
                 // first, the live-verified settle order) — so the verdict
@@ -2090,6 +2160,58 @@ impl ClaudeMapper {
         }
     }
 
+    /// Fold what a frame says about the subagent on `row` and tell clients
+    /// when it is news: one `SubagentInfo` carrying everything known, and the
+    /// model onto the agent's background lane, if it has one. Only for a
+    /// subagent whose row this driver opened or is about to (`agent_tools`) —
+    /// a nested subagent's frames name a tool call inside a hidden
+    /// transcript, which has no row here.
+    fn note_subagent(
+        &mut self,
+        row: &str,
+        agent_id: Option<&str>,
+        model: Option<&str>,
+        agent_type: Option<&str>,
+        step: &mut DriverStep,
+    ) {
+        if !self.subagents.contains_key(row) {
+            if !self.agent_tools.contains_key(row) || self.subagents.len() >= TASK_LABELS_CAP {
+                return;
+            }
+            self.subagents
+                .insert(row.to_string(), SubagentFacts::default());
+        }
+        let Some(facts) = self.subagents.get_mut(row) else {
+            return;
+        };
+        use crate::subagent::{learn_label, SUBAGENT_ID_MAX, SUBAGENT_MODEL_MAX};
+        // `<synthetic>` is the CLI's own placeholder on error frames.
+        fn real(value: Option<&str>) -> Option<&str> {
+            value.filter(|v| *v != "<synthetic>")
+        }
+        let mut changed = learn_label(&mut facts.agent_id, real(agent_id), SUBAGENT_ID_MAX);
+        changed |= learn_label(&mut facts.model, real(model), SUBAGENT_MODEL_MAX);
+        changed |= learn_label(&mut facts.agent_type, real(agent_type), SUBAGENT_ID_MAX);
+        if !changed {
+            return;
+        }
+        step.events.push(AgentEvent::SubagentInfo {
+            id: row.to_string(),
+            agent_id: facts.agent_id.clone(),
+            model: facts.model.clone(),
+            agent_type: facts.agent_type.clone(),
+        });
+        let (Some(agent_id), Some(model)) = (facts.agent_id.clone(), facts.model.clone()) else {
+            return;
+        };
+        if let Some(task) = self.background_tasks.iter_mut().find(|t| t.id == agent_id) {
+            if task.model.as_deref() != Some(model.as_str()) {
+                task.model = Some(model);
+                self.emit_background_tasks(Vec::new(), step);
+            }
+        }
+    }
+
     /// One `BackgroundTasks` event carrying the WHOLE current set (level-set
     /// semantics — the reducer replaces, so replay converges on the last
     /// event) plus any tasks that just left it with a verdict.
@@ -2177,6 +2299,27 @@ impl ClaudeMapper {
             self.last_msg_uuid = Some(uuid.to_string());
         }
         self.on_tool_results(&frame["message"], frame.get("tool_use_result"), step);
+        // An agent launched in the background answers at once with the model
+        // it resolved to (live 2.1.289: `tool_use_result {status:
+        // "async_launched", agentId, resolvedModel}`) — before the subagent's
+        // first frame.
+        if let Some(model) = frame["tool_use_result"]["resolvedModel"].as_str() {
+            let row = frame["message"]["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|b| b["type"] == "tool_result")
+                .and_then(|b| b["tool_use_id"].as_str());
+            if let Some(row) = row {
+                self.note_subagent(
+                    row,
+                    frame["tool_use_result"]["agentId"].as_str(),
+                    Some(model),
+                    None,
+                    step,
+                );
+            }
+        }
         self.on_remote_user_text(frame, step);
     }
 
@@ -3012,6 +3155,11 @@ impl ClaudeMapper {
                 }
                 return;
             }
+            // A refused send-now stopped nothing: a later genuine error must
+            // not read as the user's stop (unless a Stop is also in flight).
+            if matches!(pending, PendingControl::SendNow) && self.interrupt_grace.is_none() {
+                self.interrupt_requested = false;
+            }
             step.events.push(AgentEvent::Error {
                 message: if matches!(pending, PendingControl::SetModel(_)) {
                     let detail = frame["response"]["error"]
@@ -3074,6 +3222,28 @@ impl ClaudeMapper {
                 self.request_settings(step);
             }
             PendingControl::Interrupt | PendingControl::SetThinking => {}
+            // Live 2.1.289: the receipt lands before the stopped turn's
+            // result. `stopped` promises that result, so the watchdog covers
+            // a CLI that never sends it. `delivering` keeps the turn (what it
+            // waited on moved to the background, or the message was already
+            // on its way in) and may still end it for the message later —
+            // the user's doing either way, so the flag stays. Only
+            // `nothing_waiting` did nothing at all.
+            PendingControl::SendNow => match payload["send_now"].as_str() {
+                // The flag is consumed at every result: once it is gone the
+                // stopped turn has ended, and the open one is the next.
+                Some("stopped")
+                    if self.interrupt_requested && (self.turn_active || self.turn_starting) =>
+                {
+                    self.interrupt_grace = Some(INTERRUPT_GRACE_TICKS);
+                }
+                // A Stop pressed while this request was in flight armed the
+                // watchdog and owns the flag: its abort is still the user's.
+                Some("nothing_waiting") if self.interrupt_grace.is_none() => {
+                    self.interrupt_requested = false;
+                }
+                _ => {}
+            },
             PendingControl::ContextUsage => {
                 let usage = if payload.get("usage").is_some() {
                     &payload["usage"]
@@ -3241,7 +3411,13 @@ impl ClaudeMapper {
     /// Clears the map it drains.
     fn settle_dangling_tasks(&mut self, interrupted: bool, step: &mut DriverStep) {
         self.task_labels.clear();
-        for row in std::mem::take(&mut self.task_rows).into_values() {
+        for (task_id, row) in std::mem::take(&mut self.task_rows) {
+            // A backgrounded agent the CLI still lists outlives the turn: a
+            // send-now abort ends only the turn (a Stop empties the set and
+            // closes each agent before its result).
+            if self.background_tasks.iter().any(|t| t.id == task_id) {
+                continue;
+            }
             step.events.push(AgentEvent::ToolCallUpdate {
                 id: row,
                 status: if interrupted {
@@ -4022,13 +4198,21 @@ impl ClaudeMapper {
             // as a duplicate, and a fresh one would orphan the bubble's
             // rewind key. Already read (or nothing running): nothing to do.
             AgentCommand::SendNow { id } => {
-                let waiting = self.awaiting_read.contains(&id)
-                    || self.queued_sends.iter().any(|(q, _, _)| *q == id);
+                let at_cli = self.awaiting_read.contains(&id);
+                let waiting = at_cli || self.queued_sends.iter().any(|(q, _, _)| *q == id);
                 // A turn that is starting (a waiting batch was just read) is
                 // interrupted the same way: the CLI aborts it and runs what
                 // is still queued.
                 if waiting && (self.turn_active || self.turn_starting) {
-                    self.interrupt(&mut step);
+                    // A plain interrupt is a Stop: it also kills the
+                    // background agents, for good. The CLI's own send-now
+                    // ends only the turn — but it finds only a message that
+                    // is already in its queue, so a held one stays a Stop.
+                    if at_cli && self.send_now_capable {
+                        self.send_now(&id, &mut step);
+                    } else {
+                        self.interrupt(&mut step);
+                    }
                 }
             }
             // Codex alone exposes queue-vs-steer as two user actions. Claude's
@@ -4095,6 +4279,20 @@ impl ClaudeMapper {
         step.outbound.push(control_request_frame(
             &id,
             json!({ "subtype": "interrupt" }),
+        ));
+    }
+
+    /// The CLI's send-now: `interrupt {send_now, message_uuid}`. The abort it
+    /// may answer with is the user's, so the flag is set here; the watchdog
+    /// waits for the receipt, because the CLI may keep the turn running.
+    fn send_now(&mut self, message_id: &str, step: &mut DriverStep) {
+        self.interrupt_requested = true;
+        let id = self.ctl_id();
+        self.pending_controls
+            .insert(id.clone(), PendingControl::SendNow);
+        step.outbound.push(control_request_frame(
+            &id,
+            json!({ "subtype": "interrupt", "send_now": true, "message_uuid": message_id }),
         ));
     }
 
@@ -5892,6 +6090,139 @@ pub(crate) mod tests {
                 ..
             }]
         ));
+    }
+
+    /// Live 2.1.289: a plain interrupt killed a running background agent for
+    /// good (SendMessage: "was stopped by the user and won't be resumed");
+    /// `interrupt {send_now, message_uuid}` stopped the turn and left it
+    /// running. The watchdog waits for the `stopped` receipt.
+    #[test]
+    fn send_now_spares_background_agents_on_a_capable_cli() {
+        let mut m = native_mapper_mid_turn();
+        m.on_frame(&json!({
+            "type": "system", "subtype": "init", "session_id": "native-1",
+            "capabilities": ["msg_lifecycle_v1", "interrupt_send_now_v1"],
+        }));
+        let (b, _) = send_text(&mut m, "B", false);
+        let step = m.on_command(AgentCommand::SendNow { id: b.clone() });
+        assert_eq!(
+            step.outbound[0]["request"],
+            json!({ "subtype": "interrupt", "send_now": true, "message_uuid": b })
+        );
+        assert!(m.interrupt_requested);
+        assert!(m.interrupt_grace.is_none(), "the turn may keep running");
+        let ctl = step.outbound[0]["request_id"].clone();
+        m.on_frame(&json!({
+            "type": "control_response",
+            "response": { "subtype": "success", "request_id": ctl,
+                "response": { "still_queued": [b], "send_now": "stopped" } },
+        }));
+        assert!(m.interrupt_grace.is_some(), "a promised result is watched");
+        // The Stop button stays the CLI's Stop.
+        let step = m.on_command(AgentCommand::Interrupt);
+        assert_eq!(
+            step.outbound[0]["request"],
+            json!({ "subtype": "interrupt" })
+        );
+    }
+
+    /// The turn a send-now aborts takes its foreground agents with it, not a
+    /// backgrounded one the CLI still lists: that row must not read "stopped".
+    #[test]
+    fn an_aborted_turn_leaves_a_listed_background_agent_row_alone() {
+        let mut m = native_mapper_mid_turn();
+        for (id, backgrounded) in [("tk-bg", true), ("tk-fg", false)] {
+            m.on_frame(&json!({
+                "type": "system", "subtype": "task_started", "task_type": "local_agent",
+                "task_id": id, "description": id, "is_backgrounded": backgrounded,
+            }));
+        }
+        m.on_frame(&json!({
+            "type": "system", "subtype": "background_tasks_changed",
+            "tasks": [{ "task_id": "tk-bg", "task_type": "local_agent", "description": "tk-bg" }],
+        }));
+        m.on_frame(&json!({
+            "type": "stream_event",
+            "event": { "type": "content_block_delta", "index": 0,
+                "delta": { "type": "text_delta", "text": "working" } },
+        }));
+        m.interrupt_requested = true;
+        let step = m.on_frame(&json!({ "type": "result", "is_error": true }));
+        let closed: Vec<&str> = step
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ToolCallUpdate { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(closed, ["task:tk-fg"]);
+    }
+
+    /// A send-now that found nothing waiting did nothing: a later genuine
+    /// error must not read as the user's stop.
+    #[test]
+    fn send_now_that_finds_nothing_waiting_leaves_no_interrupt_behind() {
+        let mut m = native_mapper_mid_turn();
+        m.on_frame(&json!({
+            "type": "system", "subtype": "init", "session_id": "native-1",
+            "capabilities": ["msg_lifecycle_v1", "interrupt_send_now_v1"],
+        }));
+        let (b, _) = send_text(&mut m, "B", false);
+        let step = m.on_command(AgentCommand::SendNow { id: b });
+        let ctl = step.outbound[0]["request_id"].clone();
+        m.on_frame(&json!({
+            "type": "control_response",
+            "response": { "subtype": "success", "request_id": ctl,
+                "response": { "still_queued": [], "send_now": "nothing_waiting" } },
+        }));
+        assert!(!m.interrupt_requested);
+        assert!(m.interrupt_grace.is_none());
+    }
+
+    /// A Stop pressed while a send-now is in flight stays the user's stop,
+    /// whatever the send-now's receipt says; a refused send-now on its own
+    /// leaves no flag behind.
+    #[test]
+    fn a_send_now_receipt_never_clears_a_stop_in_flight() {
+        let capable = || {
+            let mut m = native_mapper_mid_turn();
+            m.on_frame(&json!({
+                "type": "system", "subtype": "init", "session_id": "native-1",
+                "capabilities": ["msg_lifecycle_v1", "interrupt_send_now_v1"],
+            }));
+            let (b, _) = send_text(&mut m, "B", false);
+            let step = m.on_command(AgentCommand::SendNow { id: b });
+            let ctl = step.outbound[0]["request_id"].clone();
+            (m, ctl)
+        };
+        let nothing_waiting = |ctl: &Value| {
+            json!({
+                "type": "control_response",
+                "response": { "subtype": "success", "request_id": ctl,
+                    "response": { "still_queued": [], "send_now": "nothing_waiting" } },
+            })
+        };
+        let refused = |ctl: &Value| {
+            json!({
+                "type": "control_response",
+                "response": { "subtype": "error", "request_id": ctl, "error": "no" },
+            })
+        };
+
+        let (mut m, ctl) = capable();
+        m.on_command(AgentCommand::Interrupt);
+        m.on_frame(&nothing_waiting(&ctl));
+        assert!(m.interrupt_requested, "the Stop's abort is the user's");
+
+        let (mut m, ctl) = capable();
+        m.on_command(AgentCommand::Interrupt);
+        m.on_frame(&refused(&ctl));
+        assert!(m.interrupt_requested);
+
+        let (mut m, ctl) = capable();
+        m.on_frame(&refused(&ctl));
+        assert!(!m.interrupt_requested, "a refused send-now stopped nothing");
     }
 
     /// Send now ends the running turn; the CLI then runs what is still in its
@@ -7729,6 +8060,146 @@ pub(crate) mod tests {
         ));
     }
 
+    /// One `SubagentInfo` as (row, agent_id, model, type).
+    type InfoRow = (String, Option<String>, Option<String>, Option<String>);
+
+    /// The `SubagentInfo` events of a step.
+    fn subagent_infos(step: &DriverStep) -> Vec<InfoRow> {
+        step.events
+            .iter()
+            .filter_map(|ev| match ev {
+                AgentEvent::SubagentInfo {
+                    id,
+                    agent_id,
+                    model,
+                    agent_type,
+                } => Some((
+                    id.clone(),
+                    agent_id.clone(),
+                    model.clone(),
+                    agent_type.clone(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn agent_tool_use(id: &str, description: &str) -> Value {
+        json!({
+            "type": "assistant",
+            "message": { "id": format!("m-{id}"), "content": [{
+                "type": "tool_use", "id": id, "name": "Agent",
+                "input": { "description": description, "prompt": "…" },
+            }]},
+        })
+    }
+
+    #[test]
+    fn subagent_info_names_the_task_then_the_served_model() {
+        // Live order (2.1.289): the Agent tool_use, `task_started` (the task
+        // id — also its transcript's file name), then the subagent's own
+        // hidden frames, each naming the model serving it.
+        let mut m = mapper();
+        m.on_frame(&agent_tool_use("tu-a", "audit the tests"));
+        let started = m.on_frame(&json!({
+            "type": "system", "subtype": "task_started", "task_type": "local_agent",
+            "task_id": "a0dd2a5017a275850", "tool_use_id": "tu-a",
+            "description": "audit the tests", "subagent_type": "general-purpose",
+        }));
+        assert_eq!(
+            subagent_infos(&started),
+            vec![(
+                "tu-a".into(),
+                Some("a0dd2a5017a275850".into()),
+                None,
+                Some("general-purpose".into())
+            )]
+        );
+        let hidden = json!({
+            "type": "assistant", "parent_tool_use_id": "tu-a",
+            "subagent_type": "general-purpose",
+            "message": { "id": "sub-1", "model": "claude-opus-5-5", "content": [{
+                "type": "tool_use", "id": "tu-inner", "name": "Read", "input": {},
+            }]},
+        });
+        let first = m.on_frame(&hidden);
+        assert_eq!(
+            subagent_infos(&first),
+            vec![(
+                "tu-a".into(),
+                Some("a0dd2a5017a275850".into()),
+                Some("claude-opus-5-5".into()),
+                Some("general-purpose".into())
+            )]
+        );
+        assert_eq!(first.events.len(), 1, "the frame itself stays hidden");
+        // Every later frame repeats the model: nothing new, nothing emitted.
+        assert!(m.on_frame(&hidden).events.is_empty());
+        // The CLI's placeholder on error frames is not a model.
+        let mut synthetic = hidden.clone();
+        synthetic["message"]["model"] = json!("<synthetic>");
+        assert!(m.on_frame(&synthetic).events.is_empty());
+    }
+
+    #[test]
+    fn nested_subagent_frames_have_no_row_to_describe() {
+        // A subagent's own subagent names a tool call inside the hidden
+        // transcript; there is no row here for it.
+        let mut m = mapper();
+        let step = m.on_frame(&json!({
+            "type": "assistant", "parent_tool_use_id": "tu-inner-agent",
+            "message": { "id": "x", "model": "claude-haiku-4-5", "content": [] },
+        }));
+        assert!(step.events.is_empty());
+    }
+
+    #[test]
+    fn background_agent_lane_carries_its_resolved_model() {
+        // Live order for a background launch: the set adopts the lane,
+        // `task_started` binds it to the card, and the launch tool_result
+        // carries `resolvedModel` before the subagent's first frame.
+        let mut m = mapper();
+        m.on_frame(&agent_tool_use("tu-b", "bg read"));
+        m.on_frame(&json!({
+            "type": "system", "subtype": "background_tasks_changed",
+            "tasks": [{ "task_id": "ae12", "task_type": "local_agent", "description": "bg read" }],
+        }));
+        m.on_frame(&json!({
+            "type": "system", "subtype": "task_started", "task_type": "local_agent",
+            "task_id": "ae12", "tool_use_id": "tu-b", "description": "bg read",
+            "is_backgrounded": true,
+        }));
+        let launched = m.on_frame(&json!({
+            "type": "user",
+            "message": { "role": "user", "content": [{
+                "type": "tool_result", "tool_use_id": "tu-b",
+                "content": [{ "type": "text", "text": "Async agent launched successfully." }],
+            }]},
+            "tool_use_result": {
+                "isAsync": true, "status": "async_launched", "agentId": "ae12",
+                "resolvedModel": "claude-haiku-4-5-20251001",
+            },
+        }));
+        assert_eq!(
+            subagent_infos(&launched),
+            vec![(
+                "tu-b".into(),
+                Some("ae12".into()),
+                Some("claude-haiku-4-5-20251001".into()),
+                None
+            )]
+        );
+        let (tasks, _) = background_event(&launched);
+        assert_eq!(tasks[0].id, "ae12");
+        assert_eq!(tasks[0].model.as_deref(), Some("claude-haiku-4-5-20251001"));
+        // The close forgets the facts: a recycled row id starts clean.
+        m.on_frame(&json!({
+            "type": "system", "subtype": "task_notification", "task_id": "ae12",
+            "tool_use_id": "tu-b", "status": "completed", "summary": "done",
+        }));
+        assert!(m.subagents.is_empty());
+    }
+
     /// The one BackgroundTasks event a step should carry, destructured.
     fn background_event(step: &DriverStep) -> (&Vec<BackgroundTask>, &Vec<BackgroundTaskClose>) {
         let mut found = None;
@@ -8535,9 +9006,13 @@ pub(crate) mod tests {
             "tool_use_id": "tu-b", "description": "explore",
         }));
         assert!(
-            step.events.is_empty(),
+            !step
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolCall { .. })),
             "bound to the card, no synthetic row"
         );
+        assert_eq!(subagent_infos(&step)[0].0, "tu-b");
         let step = m.on_frame(&json!({
             "type": "system", "subtype": "task_progress",
             "task_id": "tk-b", "usage": { "tool_uses": 3 },
@@ -8577,7 +9052,13 @@ pub(crate) mod tests {
             "task_type": "local_agent", "task_id": "tk-r",
             "tool_use_id": "tu-r", "description": "scan crates",
         }));
-        assert!(step.events.is_empty(), "claims the card, no duplicate row");
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolCall { .. })),
+            "claims the card, no duplicate row"
+        );
     }
 
     #[test]

@@ -2,7 +2,8 @@
  * Files a chat shows as embed cards: agent prose `![alt](figs/plot.png)`
  * and the paths a turn's gallery weighs. Targets resolve the way the chat's
  * path links do — against the session's live directory, then where it
- * started, then the workspace root (`shared/fileRef.ts` `resolveBases`) —
+ * started, then (except `./` and `../`) the workspace root
+ * (`shared/fileRef.ts` `resolveBases`) —
  * but strictly (`fs/resolve_targets`): an embed names one file, so no
  * basename guess ever picks a different one. Every card that asks within a
  * few milliseconds shares one request per base ladder, and an answer is

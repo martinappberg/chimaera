@@ -20,7 +20,7 @@
       ? `${formatFullTimestamp(sentAtMs)} · turn took ${turnDuration}`
       : formatFullTimestamp(sentAtMs),
   );
-  const isoTime = $derived(new Date(sentAtMs).toISOString());
+  const isoTime = $derived(sentAtMs > 0 ? new Date(sentAtMs).toISOString() : "");
 
   let copied = $state(false);
   let copiedTimer: ReturnType<typeof setTimeout> | null = null;
@@ -44,7 +44,11 @@
 </script>
 
 <div class="agent-message-meta">
-  <time datetime={isoTime} title={fullTime}>{timeLabel}</time>
+  <!-- An imported conversation may not know when a message was sent
+       (a subagent's replay): no time rather than the epoch. -->
+  {#if sentAtMs > 0}
+    <time datetime={isoTime} title={fullTime}>{timeLabel}</time>
+  {/if}
   <span class="actions">
     <button
       class="copy-action"

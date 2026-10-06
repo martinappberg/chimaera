@@ -420,6 +420,28 @@ fn optional_env(name: &str) -> String {
     format!("${{{name}-}}")
 }
 
+/// The distro-side `SSH_ASKPASS` wrapper: pipes the prompt to the Windows
+/// helper over interop, then — as the unix shim does — ends the ssh that ran
+/// it when the user cancelled (`askpass::cancel_epilogue`). Pure for the same
+/// reason as [`optional_env`]; `exe_quoted` is already escaped for single
+/// quotes, port and token are `u16`/hex.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn askpass_wrapper(exe_quoted: &str, port: u16, token: &str, askpass_alias: &str) -> String {
+    let scope_frame = crate::askpass::SCOPE_FRAME;
+    let epilogue = crate::askpass::cancel_epilogue();
+    format!(
+        "#!/bin/sh\n\
+         # chimaera ssh-askpass relay (generated at app launch; do not edit).\n\
+         exe='{exe_quoted}'\n\
+         [ -x \"$exe\" ] || exit 0\n\
+         {{ printf '%s %s\\n' '{port}' '{token}'; \
+            printf '%s\\n' '{scope_frame}'; \
+            printf '%s\\n' \"{askpass_alias}\"; \
+            printf '%s' \"$1\"; }} | \"$exe\" --askpass\n\
+         {epilogue}"
+    )
+}
+
 /// Everything runs through POSIX sh inside the distro; `$HOME` expansion is
 /// the reason these are `sh -c` scripts and not bare `--exec` argv.
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -1303,17 +1325,7 @@ mod imp {
         // argv. Missing exe / disabled interop exits 0 with no output — ssh
         // gets an empty answer and fails cleanly.
         let askpass_alias = optional_env(chimaera_remote::ASKPASS_ALIAS_ENV);
-        let scope_frame = crate::askpass::SCOPE_FRAME;
-        let wrapper = format!(
-            "#!/bin/sh\n\
-             # chimaera ssh-askpass relay (generated at app launch; do not edit).\n\
-             exe='{exe_quoted}'\n\
-             [ -x \"$exe\" ] || exit 0\n\
-             {{ printf '%s %s\\n' '{port}' '{token}'; \
-                printf '%s\\n' '{scope_frame}'; \
-                printf '%s\\n' \"{askpass_alias}\"; \
-                printf '%s' \"$1\"; }} | \"$exe\" --askpass\n"
-        );
+        let wrapper = askpass_wrapper(&exe_quoted, port, &token, &askpass_alias);
         let out = target_script(
             t,
             "cat > \"$HOME/.chimaera/askpass.sh\" && \
@@ -1584,6 +1596,56 @@ mod tests {
             optional_env(chimaera_remote::ASKPASS_ALIAS_ENV),
             "${CHIMAERA_ASKPASS_ALIAS-}"
         );
+    }
+
+    /// The wrapper is what ssh execs inside the distro, so run the real
+    /// script: a helper that reports a cancel ends the process that ran the
+    /// wrapper (ssh, here an outer `sh`); an answer passes through and leaves
+    /// it alone.
+    #[cfg(unix)]
+    #[test]
+    fn askpass_wrapper_ends_the_asking_process_on_a_cancel_only() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::ExitStatusExt;
+
+        let run = |tag: &str, helper_status: i32, printed: &str| {
+            let _exec = crate::askpass::EXEC_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let dir =
+                std::env::temp_dir().join(format!("wsl-wrapper-{tag}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let fake = dir.join("helper.exe");
+            std::fs::write(
+                &fake,
+                format!("#!/bin/sh\ncat >/dev/null\nprintf '{printed}'\nexit {helper_status}\n"),
+            )
+            .unwrap();
+            let wrapper = dir.join("askpass.sh");
+            let script = askpass_wrapper(&fake.to_string_lossy(), 4242, "tok", "${ALIAS-}");
+            std::fs::write(&wrapper, script).unwrap();
+            for f in [&fake, &wrapper] {
+                std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("'{}' 'a prompt'; echo survived", wrapper.display()))
+                .output()
+                .unwrap();
+            std::fs::remove_dir_all(&dir).ok();
+            (
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                out.status,
+            )
+        };
+
+        let (out, status) = run("cancel", crate::askpass::CANCELLED_EXIT, "");
+        assert_eq!(status.signal(), Some(15), "asker is sent SIGTERM");
+        assert!(!out.contains("survived"), "{out}");
+
+        let (out, status) = run("answer", 0, "hunter2");
+        assert_eq!(out, "hunter2survived\n");
+        assert!(status.success());
     }
 
     #[test]

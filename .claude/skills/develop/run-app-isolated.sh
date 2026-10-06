@@ -74,7 +74,8 @@ if [ "$(uname -s)" = "Darwin" ]; then
   DEV_BIN="$DEV_APP/Contents/MacOS/chimaera-dev"
   DEV_PLIST="$DEV_APP/Contents/Info.plist"
   mkdir -p "$DEV_APP/Contents/MacOS"
-  # Replace an older hard-linked executable before signing this independent copy.
+  # A copy, not a hard link: codesign rewrites the file it signs, which would
+  # also alter the Cargo binary. Replace an older hard link atomically.
   cp "$BUILD_BIN" "$DEV_BIN.new"
   mv -f "$DEV_BIN.new" "$DEV_BIN"
   plutil -create xml1 "$DEV_PLIST"
@@ -87,8 +88,8 @@ if [ "$(uname -s)" = "Darwin" ]; then
   plutil -insert CFBundleShortVersionString -string "0.0.1" "$DEV_PLIST"
   plutil -insert CFBundleVersion -string "0.0.1" "$DEV_PLIST"
   plutil -insert NSHighResolutionCapable -bool true "$DEV_PLIST"
-  # Keep Dock/Finder relaunches isolated without replacing the signed Mach-O
-  # with a script. Keychain validates the executable's bound Info.plist.
+  # A Dock/Finder relaunch gets no shell environment; LSEnvironment keeps it
+  # on this isolated CHIMAERA_HOME instead of the user's real one.
   plutil -insert LSEnvironment -xml '<dict/>' "$DEV_PLIST"
   plutil -insert LSEnvironment.CHIMAERA_HOME -string "$CHIMAERA_HOME" "$DEV_PLIST"
   plutil -insert LSEnvironment.PATH -string "$PATH" "$DEV_PLIST"
@@ -100,9 +101,9 @@ if [ "$(uname -s)" = "Darwin" ]; then
   # signature covers only the executable ("Info.plist=not bound"), and
   # macOS's notification center refuses such a bundle outright — no prompt,
   # no alerts — so native notifications could never be tried in dev.
+  # Fail loudly: an unsealed bundle still opens a window, so a broken
+  # signature would otherwise surface later as silently missing OS features.
   codesign --force --sign - "$DEV_APP"
-  # A signature failure is not a cosmetic notification issue: it can prevent
-  # both reading and saving valid account credentials with no useful OS prompt.
   codesign --verify --deep --strict --verbose=2 "$DEV_APP"
 else
   DEV_BIN="$ROOT/crates/chimaera-app/target/debug/chimaera-dev"

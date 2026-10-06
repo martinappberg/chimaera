@@ -11,8 +11,8 @@
  * every tab receives each notice and the tabs settle among themselves who
  * shows it:
  *
- * - A tab that is focused AND showing the session claims the notice as
- *   seen — nothing is posted anywhere.
+ * - A tab that is focused AND on the session's workspace (or showing the
+ *   session) claims the notice as seen — nothing is posted anywhere.
  * - Every other tab waits a beat for such a claim, then posts under a
  *   per-notice `tag`, so two tabs posting the same notice collapse into one
  *   alert (the browser replaces same-tag notifications silently).
@@ -60,6 +60,8 @@ export interface Notice {
 export interface NoticeContext {
   /** Sessions on screen in this tab (each pane's active tab). */
   visible: readonly string[];
+  /** The workspace this tab is on; null for a tab that isn't a workspace window (Home, torn-off pane). */
+  workspaceId: string | null;
   /** Open the session in this tab (the notification was clicked). */
   onClick(sessionId: string): void;
 }
@@ -127,7 +129,12 @@ export function deliverBrowserNotices(notices: readonly Notice[], ctx: NoticeCon
   for (const n of notices) {
     if (n.age_ms > MAX_AGE_MS) continue;
     const focused = tabFocused();
-    const looking = focused && ctx.visible.includes(n.session_id);
+    // A workspace tab owns all its sessions, shown or not (the rail's unread
+    // mark says which one needs you); a torn-off pane owns only what it shows.
+    const looking =
+      focused &&
+      (ctx.visible.includes(n.session_id) ||
+        (ctx.workspaceId !== null && n.workspace_id === ctx.workspaceId));
     // Tell the siblings what this tab sees before anyone decides.
     b?.postMessage({ id: n.id, seen: looking, focused } satisfies ChannelMessage);
     if (looking) continue;

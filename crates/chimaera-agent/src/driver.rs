@@ -18,6 +18,7 @@ use tokio::task::JoinHandle;
 use crate::model::{cap_output, AgentCommand, AgentEvent, COALESCE_INTERVAL_MS};
 use crate::native_ui::{NativeUiCommand, NativeUiEvent};
 use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
+use crate::subagent::DriverQuery;
 
 /// Login setup, workspace hooks and MCP discovery can precede initialization
 /// (a real SessionStart hook alone took 15s). Shared by every provider; this
@@ -197,6 +198,8 @@ pub struct DriverIo {
     pub kill: watch::Receiver<bool>,
     pub native_ui_commands: mpsc::Receiver<NativeUiCommand>,
     pub native_ui_events: broadcast::Sender<Arc<NativeUiEvent>>,
+    /// Ephemeral reads of driver-held state (a subagent's conversation).
+    pub queries: mpsc::Receiver<DriverQuery>,
 }
 
 /// How a driver task ended — the server's degrade logic keys on this. Clone
@@ -236,6 +239,12 @@ pub trait Mapper: Send {
     fn on_frame(&mut self, frame: &Value) -> DriverStep;
     /// Translate one client command.
     fn on_command(&mut self, cmd: AgentCommand) -> DriverStep;
+    /// Answer an ephemeral read. The default refuses: an agent whose
+    /// subagents the daemon reads from disk, or that has none.
+    fn on_query(&mut self, query: DriverQuery) -> DriverStep {
+        query.refuse("this agent's subagents cannot be read this way");
+        DriverStep::default()
+    }
     fn on_native_ui(&mut self, command: NativeUiCommand) -> DriverStep {
         DriverStep {
             native_ui: vec![command.failed("This agent does not provide native UI")],
@@ -609,6 +618,13 @@ pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo)
             _ = io.kill.changed() => break DriverExit::Killed,
             Some(command) = io.native_ui_commands.recv() => {
                 match deliver(&mut sink, &io, mapper.on_native_ui(command)).await {
+                    Delivery::Ok => {}
+                    Delivery::WriteFailed(reason) => break DriverExit::ProtocolError(reason),
+                    Delivery::ReceiverGone => break DriverExit::Killed,
+                }
+            },
+            Some(query) = io.queries.recv() => {
+                match deliver(&mut sink, &io, mapper.on_query(query)).await {
                     Delivery::Ok => {}
                     Delivery::WriteFailed(reason) => break DriverExit::ProtocolError(reason),
                     Delivery::ReceiverGone => break DriverExit::Killed,

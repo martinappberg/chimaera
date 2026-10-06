@@ -166,8 +166,8 @@ mod platform {
 
         unsafe impl UNUserNotificationCenterDelegate for Delegate {
             // Present banners even while Chimaera is frontmost: the shell has
-            // already dropped alerts for what the user is looking at, so
-            // anything that reaches here is about another tab or window.
+            // already dropped alerts for the window the user is in, so
+            // anything that reaches here is about another window.
             #[unsafe(method(userNotificationCenter:willPresentNotification:withCompletionHandler:))]
             fn will_present(
                 &self,

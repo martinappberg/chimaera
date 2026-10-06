@@ -6,11 +6,12 @@
 //! only the ones with a window open.
 //!
 //! Decisions made here, with the window facts only the shell has:
-//! - **Is the user already looking?** A notice about a session visible in
-//!   the focused window is dropped (windows report what they show via
-//!   `report_window_view`). Everything else is posted — while Chimaera is
-//!   frontmost too (the `whileFocused` setting can mute that), because a
-//!   finish in another tab or window is exactly what a banner is for.
+//! - **Is the user already in that window?** A notice about a session of the
+//!   focused window's workspace is dropped, on screen or not (a torn-off
+//!   window covers only the tabs it reports via `report_window_view`).
+//!   Everything else is posted — while Chimaera is frontmost too (the
+//!   `whileFocused` setting can mute that), because a finish in another
+//!   window is exactly what a banner is for.
 //! - **One alert per session.** A newer state supersedes a session's older
 //!   alert in Notification Center (agent-sent messages are kept), a resolved
 //!   blocker takes its alert back, and viewing a session clears its alerts.
@@ -28,7 +29,7 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use tauri::{AppHandle, Emitter, Manager};
 
-use super::{lock, Shell};
+use super::{lock, Shell, WindowScope};
 use crate::notify::{self, Route, Toast};
 
 /// A daemon's identity, as window scopes name it: `None` = the local daemon,
@@ -314,9 +315,9 @@ fn apply(app: &AppHandle, key: &Key, poll: Poll) {
             if n.age_ms > MAX_NOTICE_AGE_MS {
                 continue;
             }
-            let looking = focused
-                .as_ref()
-                .is_some_and(|(alias, visible)| alias == key && visible.contains(&n.session_id));
+            let looking = focused.as_ref().is_some_and(|(scope, others)| {
+                covers(scope, others, key, n.workspace_id.as_deref(), &n.session_id)
+            });
             if looking || (app_active && !prefs.while_focused) {
                 tracing::debug!(daemon = ?key, kind = %n.kind, looking, "notice not posted");
                 continue;
@@ -403,17 +404,50 @@ fn apply(app: &AppHandle, key: &Key, poll: Poll) {
     }
 }
 
-/// The focused window's (daemon, visible sessions), or `None` while no
+/// The focused window's scope and every other window's, or `None` while no
 /// Chimaera window has focus (the app is in the background).
-fn focused_view(app: &AppHandle) -> Option<(Key, Vec<String>)> {
+fn focused_view(app: &AppHandle) -> Option<(WindowScope, Vec<WindowScope>)> {
     let shell = app.try_state::<Shell>()?;
     let focused = app
         .webview_windows()
         .into_values()
         .find(|w| w.is_focused().unwrap_or(false))?;
     let windows = lock(&shell.windows);
-    let scope = windows.get(focused.label())?;
-    Some((scope.alias.clone(), scope.visible.clone()))
+    let scope = windows.get(focused.label())?.clone();
+    let others = windows
+        .iter()
+        .filter(|(label, _)| label.as_str() != focused.label())
+        .map(|(_, s)| s.clone())
+        .collect();
+    Some((scope, others))
+}
+
+/// Whether the user is already in the window a notice belongs to. A workspace
+/// window owns every session of its workspace — one in a tab that isn't on
+/// screen too, since the rail's unread mark and approval count already say
+/// which tab needs them — unless another window is showing that session,
+/// which then speaks for it. A torn-off window is only its own tab, so it
+/// covers just what it shows.
+fn covers(
+    focused: &WindowScope,
+    others: &[WindowScope],
+    daemon: &Key,
+    workspace: Option<&str>,
+    session: &str,
+) -> bool {
+    let shows =
+        |scope: &WindowScope| &scope.alias == daemon && scope.visible.iter().any(|s| s == session);
+    if &focused.alias != daemon {
+        return false;
+    }
+    shows(focused) || (owns_workspace(focused, workspace) && !others.iter().any(shows))
+}
+
+/// Whether this window is the workspace window for `workspace`: not a
+/// torn-off pane (a solo tab that merely shares the scope), and not Home or a
+/// workspace-less notice (`None` never matches).
+fn owns_workspace(scope: &WindowScope, workspace: Option<&str>) -> bool {
+    !scope.detached && workspace.is_some() && scope.ws.as_deref() == workspace
 }
 
 /// Re-derive the Dock badge and the tray's per-window counts.
@@ -547,7 +581,7 @@ pub(crate) fn route_click(app: &AppHandle, route: Route) {
                 .filter_map(|(label, scope)| {
                     let tier = if scope.visible.contains(&route.session) {
                         0
-                    } else if !scope.detached && route.ws.is_some() && scope.ws == route.ws {
+                    } else if owns_workspace(scope, route.ws.as_deref()) {
                         1
                     } else {
                         return None;
@@ -596,4 +630,86 @@ pub(crate) fn route_click(app: &AppHandle, route: Route) {
             tracing::warn!("could not open a window for a notification: {e}");
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn window(alias: Option<&str>, ws: Option<&str>, visible: &[&str]) -> WindowScope {
+        let mut scope = WindowScope::new(
+            alias.map(str::to_string),
+            ws.map(str::to_string),
+            "w".to_string(),
+        );
+        scope.visible = visible.iter().map(|s| s.to_string()).collect();
+        scope
+    }
+
+    #[test]
+    fn a_workspace_window_covers_its_hidden_tabs() {
+        let scope = window(None, Some("ws1"), &["shown"]);
+        assert!(covers(&scope, &[], &None, Some("ws1"), "shown"));
+        assert!(covers(&scope, &[], &None, Some("ws1"), "in-another-tab"));
+    }
+
+    #[test]
+    fn another_workspace_or_daemon_still_alerts() {
+        let scope = window(None, Some("ws1"), &["shown"]);
+        assert!(!covers(&scope, &[], &None, Some("ws2"), "other"));
+        let remote = Some("host".to_string());
+        assert!(!covers(&scope, &[], &remote, Some("ws1"), "shown"));
+        let remote_window = window(Some("host"), Some("ws1"), &[]);
+        assert!(!covers(&remote_window, &[], &None, Some("ws1"), "x"));
+        assert!(covers(&remote_window, &[], &remote, Some("ws1"), "x"));
+    }
+
+    #[test]
+    fn a_torn_off_window_covers_only_what_it_shows() {
+        let mut scope = window(None, Some("ws1"), &["pane"]);
+        scope.detached = true;
+        assert!(covers(&scope, &[], &None, Some("ws1"), "pane"));
+        assert!(!covers(
+            &scope,
+            &[],
+            &None,
+            Some("ws1"),
+            "in-the-main-window"
+        ));
+    }
+
+    #[test]
+    fn a_session_on_screen_in_an_unfocused_window_still_alerts() {
+        let main = window(None, Some("ws1"), &["shown"]);
+        let mut torn_off = window(None, Some("ws1"), &["pane"]);
+        torn_off.detached = true;
+        let others = [torn_off];
+        // Hidden in the focused window and shown in another one: that window
+        // isn't focused, so its session is news.
+        assert!(!covers(&main, &others, &None, Some("ws1"), "pane"));
+        // The rest of the workspace is still the focused window's.
+        assert!(covers(&main, &others, &None, Some("ws1"), "in-another-tab"));
+        // Shown in the focused window too: the user is looking at it.
+        let both = window(None, Some("ws1"), &["pane"]);
+        assert!(covers(&both, &others, &None, Some("ws1"), "pane"));
+        // Another daemon's window showing the same id says nothing.
+        let elsewhere = [window(Some("host"), Some("ws9"), &["in-another-tab"])];
+        assert!(covers(
+            &main,
+            &elsewhere,
+            &None,
+            Some("ws1"),
+            "in-another-tab"
+        ));
+    }
+
+    #[test]
+    fn home_and_workspace_less_notices_fall_back_to_what_is_on_screen() {
+        let home = window(None, None, &[]);
+        assert!(!covers(&home, &[], &None, Some("ws1"), "s"));
+        assert!(!covers(&home, &[], &None, None, "s"));
+        let scope = window(None, Some("ws1"), &["s"]);
+        assert!(covers(&scope, &[], &None, None, "s"));
+        assert!(!covers(&scope, &[], &None, None, "other"));
+    }
 }

@@ -215,7 +215,8 @@ pub(crate) struct AppState {
     /// an explicit theme there suppresses chimaera's theme injection. Tests
     /// point it at a fixture.
     pub(crate) claude_settings_path: PathBuf,
-    /// The user's codex config (`~/.codex/config.toml`); same respect rule.
+    /// The user's codex config (`$CODEX_HOME/config.toml`, default
+    /// `~/.codex`); same respect rule.
     pub(crate) codex_config_path: PathBuf,
     /// The per-workspace Timeline (`<data_dir>/workspace/<ws>/timeline.jsonl`):
     /// what happened, written from signals the daemon already receives. Its
@@ -366,9 +367,7 @@ impl AppState {
             install_results: Mutex::new(HashMap::new()),
             agent_setup: Mutex::new(HashMap::new()),
             claude_settings_path: home.join(".claude").join("settings.json"),
-            codex_config_path: std::env::var_os("CODEX_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(".codex"))
+            codex_config_path: codex_home(&home, std::env::var_os("CODEX_HOME"))
                 .join("config.toml"),
             timeline: timeline::TimelineService::new(data_dir.join("workspace")),
             history: crate::history::HistoryService::new(&data_dir),
@@ -461,6 +460,15 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Codex's own home: `CODEX_HOME` when set and non-empty, else `~/.codex`.
+/// Matches the shim's `${CODEX_HOME:-$HOME/.codex}`, so the daemon and the
+/// terminal agree on whether the user set a theme.
+fn codex_home(home: &std::path::Path, env: Option<std::ffi::OsString>) -> PathBuf {
+    env.filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".codex"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,6 +492,17 @@ mod tests {
             bus.generation(),
             1,
             "a woken waiter must observe the generation stamped by its wake"
+        );
+    }
+
+    #[test]
+    fn codex_home_honours_codex_home_like_the_shim() {
+        let home = std::path::Path::new("/home/u");
+        assert_eq!(codex_home(home, None), home.join(".codex"));
+        assert_eq!(codex_home(home, Some("".into())), home.join(".codex"));
+        assert_eq!(
+            codex_home(home, Some("/opt/codex-home".into())),
+            PathBuf::from("/opt/codex-home")
         );
     }
 }

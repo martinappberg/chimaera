@@ -24,13 +24,14 @@
 </script>
 
 {#if askpass !== null}
+  <!-- Only Escape or the cancel button cancels: a cancel ends the ssh attempt
+       (see askpass.rs), so a stray click on the backdrop — on the way to a
+       password manager or the Duo app — must not. -->
   <div
     class="askpass-backdrop"
     role="presentation"
-    onclick={cancel}
     onkeydown={(e) => e.key === "Escape" && cancel()}
   >
-    <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
     <div
       class="askpass"
       role="dialog"
@@ -38,7 +39,6 @@
       aria-label={presentation?.type === "host_key" ? "Trust SSH host" : "SSH authentication"}
       tabindex="-1"
       use:modalFocus={{ priority: 1 }}
-      onclick={(e) => e.stopPropagation()}
     >
       <!-- Keep one restoration owner across the queue; only prompt controls
            remount so each next prompt gets its safe initial focus. -->

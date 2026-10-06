@@ -964,7 +964,8 @@ pub(super) async fn app_update_status(
 }
 
 /// Answer an in-flight SSH auth prompt (see `askpass`): `secret` None means
-/// the user cancelled, which lets the waiting ssh fail cleanly. The done
+/// the user cancelled, which ends the waiting ssh (it would only ask again)
+/// and with it the connect, with no further prompts. The done
 /// scoped completion event dismisses the prompt in every eligible window
 /// showing it.
 #[tauri::command]
@@ -1190,14 +1191,15 @@ pub(super) fn report_window_scope(
     // The reported label names this window in the tray's list; rebuild so it
     // shows the fresh name (the store above happened before this call).
     crate::tray::rebuild(webview.app_handle());
-    // Its workspace also decides whether Settings applies (home screen = no).
+    // A newly scoped window may now enable Settings (any daemon page does).
     crate::menu::sync_settings_enabled(webview.app_handle());
     Ok(())
 }
 
 /// What this window shows right now: the session in each pane's active tab.
-/// The notifier drops a notice about one of these while the window has
-/// focus, and a focused window's report clears their delivered alerts.
+/// The notifier drops a notice about one of these while the window has focus
+/// (a workspace window also covers its hidden tabs; a torn-off one only these),
+/// and a focused window's report clears their delivered alerts.
 #[tauri::command]
 pub(super) fn report_window_view(
     webview: tauri::WebviewWindow,
