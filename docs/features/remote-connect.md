@@ -112,12 +112,17 @@ and cluster-only connections). Replacement resolution precedes any daemon stop.
   tunnel key, so the shape of an ordinary SSH alias can never imply access to another host's prompt.
 - **Cancel means cancel.** OpenSSH reads a failed askpass as an *empty answer* and asks again —
   three times per auth method, then the next method — so no exit status or output can end a
-  prompt; only ending ssh itself does. A cancelled (or timed-out) prompt gets an empty relay
-  reply — an empty *secret* is `"\n"`, so Enter on a prompt stays an answer — the helper exits
-  75, and its shim (unix `askpass.sh`, the WSL wrapper) sends `SIGTERM` to the ssh that ran it
-  after leaving `authentication cancelled` on stderr. `locate` reads that line off the first
-  probe's failure and stops the connect: an unreachable host reads as "nothing running" and
-  would carry on into a fresh ssh (version probe, release download, scp), each asking again.
+  prompt; only ending ssh itself does. A cancelled (or timed-out) prompt gets an explicit
+  `cancelled` relay reply — a secret always ends in a newline and that never does, so Enter on a
+  prompt (an empty secret) stays an answer, and a relay that refused or died, replying nothing,
+  is no cancel: ssh keeps its old "no answer" — the helper exits 75, and its shim (unix
+  `askpass.sh`, the WSL wrapper) sends `SIGTERM` to the ssh that ran it after leaving
+  `authentication cancelled` on stderr. Only Escape or the modal's cancel button cancels; a
+  click on the backdrop does not, since a cancel now ends the attempt. `resolve_daemon` and `locate` read that line
+  off a probe's failure — the first probe (before the cached scheduler is consulted, so a known
+  cluster cannot land as "connected"), a learned route's, and a pool alias's node probe — and
+  stop the connect: an unreachable host reads as "nothing running" and would carry on into a
+  fresh ssh (version probe, release download, scp), each asking again.
   The row shows "authentication cancelled"; there is no automatic retry, only the normal Retry.
 - **Liveness is an authenticated HTTP state machine, not a bare TCP connect.** After laptop sleep an
   ssh forward's local listener still accepts while the connection behind it is dead. Initial

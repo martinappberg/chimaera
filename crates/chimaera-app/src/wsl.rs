@@ -1118,6 +1118,9 @@ mod tests {
         use std::os::unix::process::ExitStatusExt;
 
         let run = |tag: &str, helper_status: i32, printed: &str| {
+            let _exec = crate::askpass::EXEC_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             let dir =
                 std::env::temp_dir().join(format!("wsl-wrapper-{tag}-{}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();

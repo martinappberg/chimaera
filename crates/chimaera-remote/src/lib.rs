@@ -1226,6 +1226,7 @@ async fn locate(
                 ops.set_route(host, Route::Alias);
                 match ops.remote_probe(host, false).await? {
                     ProbeRun::Ran(None) => return Ok(None),
+                    ProbeRun::Failed(f) if f.cancelled() => bail!("{ASKPASS_CANCELLED}"),
                     _ => {
                         why = format!(
                             "dialing {node} reached a machine that doesn't see {host}'s manifest"
@@ -1244,11 +1245,17 @@ async fn locate(
                     format!("dialing {node} reached a machine calling itself {}", p.node)
                 };
             }
+            // The user said no to this node's prompt: say so, not "could not
+            // reach" it — and nothing is wrong with the node or its manifest.
+            Ok(ProbeRun::Failed(f)) if f.cancelled() => {
+                ops.set_route(host, Route::Alias);
+                bail!("{ASKPASS_CANCELLED}")
+            }
             Ok(ProbeRun::Failed(f)) => {
                 let network = f.network_level();
                 why = f.to_string();
-                // An auth failure or a cancelled prompt must not raise a
-                // second prompt along another route.
+                // An auth failure must not raise a second prompt along
+                // another route.
                 if !network {
                     break;
                 }
@@ -1301,6 +1308,11 @@ async fn resolve_daemon(
     // adds execs only for a manifest another node wrote, and leaves every op
     // below routed to the daemon's node.
     let first = ops.remote_probe(host, true).await?;
+    // Before anything reads the scheduler: that answer is cached from an
+    // earlier connect, so a cancelled reconnect to a known cluster would
+    // otherwise land as "a cluster" (a success) — or, with `update_daemon`,
+    // go on to download and scp, each asking again.
+    first.bail_if_cancelled()?;
     let scheduler = ops.scheduler(host);
     if scheduler.is_cluster() && !opts.login_serve && !opts.not_cluster {
         // A cluster: nothing of ours may keep running on its login node, so
@@ -1620,6 +1632,17 @@ enum ProbeRun {
     Ran(Option<Probe>),
     /// ssh (or the remote shell) failed before the script could answer.
     Failed(ProbeFailure),
+}
+
+impl ProbeRun {
+    /// The connect ends here if the user cancelled the probe's sign-in
+    /// prompt (see [`ProbeFailure::cancelled`]); any other outcome passes.
+    fn bail_if_cancelled(&self) -> anyhow::Result<()> {
+        match self {
+            ProbeRun::Failed(f) if f.cancelled() => bail!("{ASKPASS_CANCELLED}"),
+            _ => Ok(()),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -4916,6 +4939,52 @@ mod tests {
             vec![(Call::RemoteProbe, Route::Node(LN01.into()))]
         );
         assert_eq!(*fake.route.borrow(), Route::Node(LN01.into()));
+    }
+
+    /// A known cluster's scheduler is cached from an earlier connect, so a
+    /// cancelled reconnect must stop before the cluster branch reads it: that
+    /// branch answers "a cluster" (a success that also forgets the host's
+    /// saved windows) and, on an update, downloads and scps — each asking again.
+    #[tokio::test]
+    async fn a_cancelled_probe_on_a_known_cluster_is_a_cancel_not_a_cluster() {
+        let fake = FakeOps {
+            scheduler: Scheduler::Slurm,
+            probe: Some(Box::new(|_| ssh_failed(ASKPASS_CANCELLED))),
+            ..FakeOps::base()
+        };
+        let (out, _) = try_resolve(&fake, true).await;
+        let err = out.expect_err("a cancel is not a cluster");
+        assert!(err.downcast_ref::<ClusterHost>().is_none(), "{err:#}");
+        assert_eq!(format!("{err:#}"), ASKPASS_CANCELLED);
+        assert_eq!(fake.calls(), vec![Call::RemoteProbe], "nothing else runs");
+    }
+
+    /// The prompt for the daemon's own node is the second one a pool alias
+    /// raises. Refusing it is a cancel, not "ln01 could not be reached" with
+    /// advice to delete a manifest that is fine — and it is not retried along
+    /// another route.
+    #[tokio::test]
+    async fn a_cancelled_prompt_for_the_daemons_node_is_a_cancel_not_an_unreachable_node() {
+        let fake = pool(
+            manifest_on(LN01, Some(chimaera_core::BUILD_ID), 42),
+            false,
+            Some(true),
+            |_, _| ssh_failed(ASKPASS_CANCELLED),
+        );
+        let (out, phases) = try_resolve(&fake, false).await;
+        assert_eq!(
+            format!("{:#}", out.expect_err("a cancel is not a start")),
+            ASKPASS_CANCELLED
+        );
+        assert_eq!(
+            fake.routed(),
+            vec![
+                (Call::RemoteProbe, Route::Alias),
+                (Call::RemoteProbe, Route::Node(LN01.into())),
+            ]
+        );
+        assert_eq!(*fake.route.borrow(), Route::Alias, "no half-learned route");
+        assert_eq!(phases, vec!["probing", "routing"]);
     }
 
     /// A direct dial that never reached ln01's sshd (the name doesn't

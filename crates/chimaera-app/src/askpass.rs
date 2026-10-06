@@ -65,20 +65,41 @@ pub(crate) fn cancel_epilogue() -> String {
     )
 }
 
-/// What the relay writes back: the secret and ONE newline, or nothing for a
-/// prompt that got no answer. The newline is what marks an answer — an empty
-/// secret is a real one (Enter on a prompt), an empty reply is not.
-fn encode_reply(answer: Option<&str>) -> Vec<u8> {
-    match answer {
-        Some(secret) => format!("{secret}\n").into_bytes(),
-        None => Vec::new(),
-    }
+/// What the relay answers a prompt that got no answer (cancelled, timed out,
+/// its window gone). A secret always ends in a newline and this never does, so
+/// the two cannot be confused — and an empty or cut-off reply, a relay that
+/// refused or died, stays [`Reply::Unanswered`]: ssh's old "no answer" rather
+/// than the user's cancel.
+const CANCEL_REPLY: &str = "cancelled";
+
+/// What the helper makes of the relay's reply.
+#[derive(Debug, PartialEq)]
+enum Reply {
+    Secret(String),
+    Cancelled,
+    Unanswered,
 }
 
-/// The secret in a relay reply; `None` for no answer, including a reply cut
-/// short before its newline — a half-read password is never handed to ssh.
-fn decode_reply(reply: &str) -> Option<&str> {
-    reply.strip_suffix('\n')
+/// What the relay writes back: the secret and ONE newline — an empty secret
+/// (Enter on a prompt) is still an answer — or [`CANCEL_REPLY`].
+fn encode_reply(answer: Option<&str>) -> Vec<u8> {
+    match answer {
+        Some(secret) => format!("{secret}\n"),
+        None => CANCEL_REPLY.to_string(),
+    }
+    .into_bytes()
+}
+
+/// A reply cut short before its newline is never a secret: a half-read
+/// password is never handed to ssh.
+fn decode_reply(reply: &str) -> Reply {
+    if let Some(secret) = reply.strip_suffix('\n') {
+        Reply::Secret(secret.to_string())
+    } else if reply == CANCEL_REPLY {
+        Reply::Cancelled
+    } else {
+        Reply::Unanswered
+    }
 }
 
 /// The helper's cancel: leave the note the connect flow reads on stderr
@@ -88,9 +109,15 @@ fn cancelled() -> ! {
     std::process::exit(CANCELLED_EXIT)
 }
 
+/// Held by the tests that write a script and exec it. A fork in one test
+/// thread while another still has its fresh script open for writing makes
+/// that exec fail with ETXTBSY on Linux.
+#[cfg(all(test, unix))]
+pub(crate) static EXEC_LOCK: Mutex<()> = Mutex::new(());
+
 /// How long a prompt waits for the UI before giving up. A dropped window or
 /// an ignored modal must not pin an ssh process open forever — on timeout we
-/// return no answer and ssh fails cleanly.
+/// return no answer, which the helper turns into ending that ssh (a cancel).
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Prompts awaiting a UI answer, keyed by a per-request id. Managed as Tauri
@@ -517,9 +544,9 @@ pub fn run_helper() {
         .ok()
         .filter(|alias| !alias.is_empty());
     match ask(&sock, alias.as_deref(), &prompt) {
-        Ok(Some(secret)) => print!("{secret}"),
-        Ok(None) => cancelled(),
-        Err(_) => {}
+        Ok(Reply::Secret(secret)) => print!("{secret}"),
+        Ok(Reply::Cancelled) => cancelled(),
+        Ok(Reply::Unanswered) | Err(_) => {}
     }
     std::io::stdout().flush().ok();
 }
@@ -562,16 +589,16 @@ pub fn run_helper() {
         return;
     }
     match decode_reply(&reply) {
-        Some(secret) => print!("{secret}"),
-        None => cancelled(),
+        Reply::Secret(secret) => print!("{secret}"),
+        Reply::Cancelled => cancelled(),
+        Reply::Unanswered => {}
     }
     let _ = std::io::stdout().flush();
 }
 
-/// One relay round trip: the prompt out, the secret back — `None` when the
-/// prompt got no answer.
+/// One relay round trip: the prompt out, the relay's reply back.
 #[cfg(unix)]
-fn ask(sock: &std::ffi::OsStr, alias: Option<&str>, prompt: &str) -> Result<Option<String>> {
+fn ask(sock: &std::ffi::OsStr, alias: Option<&str>, prompt: &str) -> Result<Reply> {
     let mut stream = StdUnixStream::connect(sock).context("connect askpass socket")?;
     stream.write_all(SCOPE_FRAME.as_bytes())?;
     stream.write_all(b"\n")?;
@@ -582,8 +609,7 @@ fn ask(sock: &std::ffi::OsStr, alias: Option<&str>, prompt: &str) -> Result<Opti
     stream.shutdown(Shutdown::Write)?;
     let mut reply = String::new();
     stream.read_to_string(&mut reply)?;
-    // The server terminates an answer with a newline; hand ssh just the secret.
-    Ok(decode_reply(&reply).map(str::to_string))
+    Ok(decode_reply(&reply))
 }
 
 #[cfg(all(test, unix))]
@@ -622,15 +648,17 @@ mod tests {
         assert_ne!(other, deep);
     }
 
-    /// Serve one canned reply on a fresh socket and return what the helper's
-    /// `ask` made of it, plus the prompt the server saw.
-    fn ask_against(tag: &str, reply: Option<&str>) -> (Option<String>, String) {
-        let sock = chimaera_core::runtime_dir()
-            .join(format!("askpass-test-{tag}-{}.sock", std::process::id()));
+    /// Serve the bytes `reply` on a fresh socket and return what the helper's
+    /// `ask` made of them, plus the prompt the server saw.
+    fn ask_against(tag: &str, reply: Vec<u8>) -> (Reply, String) {
+        // A private dir, not `runtime_dir()`: another test points CHIMAERA_HOME
+        // at a temp dir and removes it again while the suite runs in parallel.
+        let dir = std::env::temp_dir().join(format!("askpass-ask-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("s");
         std::fs::remove_file(&sock).ok();
         let listener = UnixListener::bind(&sock).unwrap();
 
-        let reply = encode_reply(reply); // the bytes serve_one writes
         let server = std::thread::spawn(move || {
             let (mut s, _) = listener.accept().unwrap();
             let mut prompt = String::new();
@@ -641,7 +669,7 @@ mod tests {
 
         let got = ask(sock.as_os_str(), Some("cluster"), "user@host's password:").unwrap();
         let prompt = server.join().unwrap();
-        std::fs::remove_file(&sock).ok();
+        std::fs::remove_dir_all(&dir).ok();
         (got, prompt)
     }
 
@@ -650,22 +678,30 @@ mod tests {
     /// which the client strips.
     #[test]
     fn helper_round_trips_prompt_and_secret() {
-        let (got, prompt) = ask_against("secret", Some("hunter2"));
+        let (got, prompt) = ask_against("secret", encode_reply(Some("hunter2")));
         assert_eq!(
             prompt,
             "chimaera-askpass-scope-v1\ncluster\nuser@host's password:"
         );
-        assert_eq!(got.as_deref(), Some("hunter2"));
+        assert_eq!(got, Reply::Secret("hunter2".into()));
     }
 
-    /// A cancel is an empty reply; Enter on a prompt is an empty SECRET and
-    /// must stay an answer. Only the first ends the ssh that asked.
+    /// Only an explicit cancel ends the ssh that asked. Enter on a prompt is
+    /// an empty SECRET and stays an answer; a relay that refused or died
+    /// replies nothing (or is cut off), which is no cancel and no password.
     #[test]
-    fn no_reply_is_a_cancel_and_an_empty_secret_is_an_answer() {
-        assert_eq!(ask_against("cancel", None).0, None);
-        assert_eq!(ask_against("enter", Some("")).0.as_deref(), Some(""));
-        // A reply cut off before its newline is never used as a password.
-        assert_eq!(decode_reply("hunt"), None);
+    fn only_an_explicit_reply_cancels() {
+        assert_eq!(
+            ask_against("cancel", encode_reply(None)).0,
+            Reply::Cancelled
+        );
+        assert_eq!(
+            ask_against("enter", encode_reply(Some(""))).0,
+            Reply::Secret(String::new())
+        );
+        assert_eq!(ask_against("refused", Vec::new()).0, Reply::Unanswered);
+        assert_eq!(decode_reply("hunt"), Reply::Unanswered);
+        assert_eq!(decode_reply("cancel"), Reply::Unanswered);
     }
 
     /// Run a shim built around a fake helper that exits `helper_status`
@@ -677,6 +713,7 @@ mod tests {
         helper_status: i32,
         printed: &str,
     ) -> (String, std::process::ExitStatus) {
+        let _exec = lock(&EXEC_LOCK);
         let dir = std::env::temp_dir().join(format!("askpass-shim-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let fake = dir.join("helper");
