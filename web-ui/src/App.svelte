@@ -329,6 +329,7 @@
     onFocusSession,
     onMenu,
     onUnsavedPrompt,
+    openWindow,
     openDetachedPopup,
     openDetachedWindow,
     replyUnsaved,
@@ -3288,7 +3289,10 @@
   /** Home screen: unregister a workspace (the folder itself is untouched). */
   function removeWorkspace(w: Workspace): void {
     workspaces = workspaces.filter((x) => x.id !== w.id);
-    void deleteWorkspace(w.id)
+    // Its running sessions end with it: the daemon's unregister leaves them
+    // alive but orphaned (no workspace row to find them from).
+    void stopWorkspace(w)
+      .then(() => deleteWorkspace(w.id))
       .catch(() => {
         // already gone or unreachable; the refresh below reconciles
       })
@@ -6418,7 +6422,19 @@
 
 
 {#if pickerOpen}
-  <FolderPicker recents={workspaces} onOpened={activateWorkspace} onClose={closePicker} />
+  <!-- Home row: raises (or opens) this host's Home launcher without leaving
+       this window's workspace — a promoted window never turns back into Home. -->
+  <FolderPicker
+    recents={workspaces}
+    onOpened={activateWorkspace}
+    onClose={closePicker}
+    onHome={activeWsId !== null
+      ? () => {
+          closePicker();
+          void openWindow(scopeAlias, null);
+        }
+      : undefined}
+  />
 {/if}
 
 {#if quickOpenOpen && activeWsId !== null}

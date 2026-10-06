@@ -15,13 +15,34 @@
   // Home full of rows would otherwise run every row's handlers on every click
   // and key anywhere in the window. `toggle` fires after the opening click has
   // finished dispatching, so that click never dismisses its own menu.
+  // The list is position:fixed so a scrolling ancestor (Home's workspace list)
+  // cannot clip it; it is placed from the trigger on open, flips above the
+  // trigger when it would run off the bottom, and a scroll closes it rather
+  // than leaving it detached from its row.
+  let list: HTMLElement;
+  function place(): void {
+    const t = trigger.getBoundingClientRect();
+    const h = list.offsetHeight;
+    const below = t.bottom + 4;
+    const top = below + h > window.innerHeight - 8 && t.top - 4 - h > 8 ? t.top - 4 - h : below;
+    list.style.top = `${top}px`;
+    list.style.right = `${Math.max(8, window.innerWidth - t.right)}px`;
+  }
+  function close(): void {
+    details.open = false;
+  }
   $effect(() => {
     if (!open) return;
+    place();
     window.addEventListener("click", dismiss);
     window.addEventListener("keydown", escape);
+    window.addEventListener("scroll", close, true);
+    window.addEventListener("resize", close);
     return () => {
       window.removeEventListener("click", dismiss);
       window.removeEventListener("keydown", escape);
+      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("resize", close);
     };
   });
 </script>
@@ -34,7 +55,7 @@
   </summary>
   <!-- Native buttons preserve ordinary tab navigation; this is a disclosure,
        not an ARIA menu with a second keyboard interaction model. -->
-  <div class="action-list" onclick={(event) => {
+  <div class="action-list" bind:this={list} onclick={(event) => {
     if (event.target instanceof Element && event.target.closest("button")) details.open = false;
   }} role="presentation">{@render children()}</div>
 </details>
@@ -46,7 +67,7 @@
   summary:hover, .actions[open] summary { color: var(--fg); background: var(--row-active); }
   summary:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
   @media (pointer: coarse), (max-width: 700px) { summary { width: 40px; height: 40px; } .action-list :global(button) { min-height: 40px; } }
-  .action-list { position: absolute; z-index: 30; top: calc(100% + 4px); right: 0; min-width: 190px; padding: 5px; border: 1px solid var(--edge); border-radius: 8px; background: var(--overlay-bg); box-shadow: 0 8px 28px color-mix(in srgb, var(--fg) 12%, transparent); }
+  .action-list { position: fixed; z-index: 30; min-width: 190px; padding: 5px; border: 1px solid var(--edge); border-radius: 8px; background: var(--overlay-bg); box-shadow: 0 8px 28px color-mix(in srgb, var(--fg) 12%, transparent); }
   .action-list :global(button) { display: block; visibility: visible; width: 100%; margin: 0; padding: 8px 10px; border: 0; border-radius: 4px; background: transparent; color: var(--fg); text-align: left; white-space: nowrap; font: inherit; font-size: var(--text-sm); cursor: pointer; }
   .action-list :global(button:hover) { background: var(--row-hover); }
   .action-list :global(button.stop) { color: var(--warn); }
