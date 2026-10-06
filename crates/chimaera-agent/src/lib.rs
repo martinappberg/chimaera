@@ -387,6 +387,12 @@ impl CommandBudget {
             AgentEvent::TurnStarted { .. }
             | AgentEvent::TurnCompleted { .. }
             | AgentEvent::TurnAborted { .. } => self.awaiting_turn = false,
+            // A refused turn start never begins the turn its echoed input was
+            // waiting for; a promoted queued send re-arms this on its `Sent`.
+            AgentEvent::Error {
+                fatal: false,
+                message,
+            } if message.starts_with(codex::TURN_START_FAILED) => self.awaiting_turn = false,
             AgentEvent::Exited { .. } => self.clear(),
             _ => {}
         }
@@ -2183,6 +2189,34 @@ mod tests {
             interrupted: true,
         });
         assert!(!budget.awaiting_turn);
+    }
+
+    #[test]
+    fn a_refused_turn_start_leaves_no_input_awaiting_a_turn() {
+        let mut budget = CommandBudget::default();
+        budget.reserve(1, None, None, None).unwrap();
+        budget.observe(&mut AgentEvent::UserMessage {
+            text: "work".into(),
+            attachments: 0,
+            attachment_paths: vec![],
+            id: Some("u".into()),
+            queued: false,
+            after_turn: false,
+            origin: None,
+            client_id: None,
+        });
+        assert!(budget.awaiting_turn);
+        budget.observe(&mut AgentEvent::Error {
+            message: "a transient warning".into(),
+            fatal: false,
+        });
+        assert!(budget.awaiting_turn, "an unrelated error proves nothing");
+        budget.observe(&mut AgentEvent::Error {
+            message: format!("{}\"usage limit reached\"", codex::TURN_START_FAILED),
+            fatal: false,
+        });
+        assert!(!budget.awaiting_turn);
+        assert_eq!(budget.sends, 0);
     }
 
     #[test]

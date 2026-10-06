@@ -36,6 +36,10 @@ use crate::ndjson::JsonlChild;
 /// October runtime refresh records the pending experimental-steering probe).
 pub const TESTED_CODEX_VERSION: &str = "0.160.0";
 
+/// Prefix of the non-fatal error for a refused `turn/start`: its input was
+/// delivered yet will never start a turn.
+pub(crate) const TURN_START_FAILED: &str = "turn/start failed: ";
+
 /// The `initialize` request both the probe client and the driver handshake
 /// send. Declares `experimentalApi` so `thread/settings/update` is available
 /// (live: -32600 "requires experimentalApi capability" without it).
@@ -2475,22 +2479,15 @@ impl CodexMapper {
                     self.last_thought_item = None;
                     self.flush_requested_steers(step);
                 } else {
+                    // The manager reads this prefix as "the delivered input
+                    // will never start a turn" (`CommandBudget::observe`).
                     step.events.push(AgentEvent::Error {
-                        message: format!("turn/start failed: {}", err["message"]),
+                        message: format!("{TURN_START_FAILED}{}", err["message"]),
                         fatal: false,
                     });
                     // A pending or refused model choice still owns its
                     // queued input; every promotion uses the same gates.
                     self.start_next_queued(step);
-                    if !self.turn_pending && self.queued_sends.is_empty() {
-                        // Failed input has no successor turn; keep pause and
-                        // delivery observers from waiting for a start.
-                        step.events.push(AgentEvent::TurnAborted {
-                            turn_id: String::new(),
-                            reason: "turn failed".into(),
-                            interrupted: false,
-                        });
-                    }
                 }
             }
             (
@@ -6303,10 +6300,9 @@ mod tests {
     }
 
     /// A send whose turn/start is refused (usage limit, expired sign-in)
-    /// ends as a failed turn, so the session is idle again rather than
-    /// waiting forever for a turn that never starts.
+    /// reports one non-fatal error and no turn event: no turn ever started.
     #[test]
-    fn a_refused_turn_start_ends_the_turn_it_never_began() {
+    fn a_refused_turn_start_reports_only_the_error() {
         let mut m = mapper();
         let step = m.on_command(AgentCommand::Send {
             blocks: vec![ContentBlock::Text {
@@ -6323,13 +6319,13 @@ mod tests {
             "id": rpc_id,
             "error": { "code": -32000, "message": "usage limit reached" },
         }));
-        assert!(step
-            .events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::Error { fatal: false, .. })));
         assert!(step.events.iter().any(|e| matches!(
             e,
-            AgentEvent::TurnAborted { interrupted: false, reason, .. } if reason == "turn failed"
+            AgentEvent::Error { fatal: false, message } if message.starts_with(TURN_START_FAILED)
+        )));
+        assert!(!step.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::TurnAborted { .. } | AgentEvent::TurnCompleted { .. }
         )));
     }
 
