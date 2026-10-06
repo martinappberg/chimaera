@@ -1187,7 +1187,7 @@
     background: color-mix(in srgb, var(--fg) 5%, transparent);
     border: 1px solid var(--edge);
     border-radius: 6px;
-    padding: 8px 10px;
+    padding: 8px 10px 4px; /* the bottom 4px lives on the code child, see below */
     overflow-x: auto;
     margin: 0.4em 0;
   }
@@ -1199,7 +1199,9 @@
     overflow-x: auto;
     scrollbar-width: thin;
     background: none;
-    padding: 0;
+    /* Inside the scroller so a wide line's scrollbar sits below this gap,
+       not flush against the last line of code. */
+    padding: 0 0 4px;
     font-size: var(--text-sm);
   }
   /* Fenced-block copy chrome: hover-reveal (the .rewind-btn language). The
