@@ -927,6 +927,7 @@ mod tests {
             build: None,
             slurm_job_id: Some("7".into()),
             runtime_leases: false,
+            daemon_extension: false,
         };
         std::fs::write(
             data.join("manifest.json"),

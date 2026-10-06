@@ -2347,11 +2347,23 @@ async fn resolve_daemon(
                         sessions.map_or("unknown".to_string(), |n| n.to_string()),
                     );
                     progress(Phase::Updating);
+                    // Only a daemon whose own manifest says it was composed
+                    // with an extension costs a probe; every other replacement
+                    // runs exactly as before extensions existed. A probe that
+                    // cannot confirm (no curl, a hung daemon, an ssh stall)
+                    // proceeds like that: only a confirmed composed daemon
+                    // refuses the public release.
                     if opts.deployment_source == DeploymentSource::PublicRelease
                         && opts.binary.is_none()
-                        && ops.remote_daemon_extension(host, &m).await? == Some(true)
+                        && m.daemon_extension
                     {
-                        bail!("The remote daemon has a selected runtime; automatic public release replacement is unavailable. Supply an explicit compatible --binary artifact");
+                        match ops.remote_daemon_extension(host, &m).await {
+                            Ok(Some(true)) => bail!("The remote daemon has a selected runtime; automatic public release replacement is unavailable. Supply an explicit compatible --binary artifact"),
+                            Ok(_) => {}
+                            Err(error) => tracing::warn!(
+                                "could not confirm the composition of the daemon on {host} ({error:#}); replacing it"
+                            ),
+                        }
                     }
                     // Secure the replacement binary BEFORE stopping the
                     // running daemon: a failed download/build must never leave
@@ -6803,6 +6815,7 @@ mod tests {
             build: build.map(str::to_string),
             slurm_job_id: None,
             runtime_leases: false,
+            daemon_extension: false,
         }
     }
 
@@ -7106,57 +7119,81 @@ mod tests {
         );
     }
 
+    /// An automatic public-release replacement probes composition only for a
+    /// daemon whose manifest says it was composed, and refuses only when the
+    /// probe confirms it. Every free daemon is replaced with no extra exec,
+    /// and an unconfirmed probe replaces it as before extensions existed.
     #[tokio::test]
-    async fn public_implicit_replacement_refuses_selected_or_unconfirmed_remote_composition() {
-        for unconfirmed in [false, true] {
+    async fn public_implicit_replacement_refuses_only_a_confirmed_composed_daemon() {
+        let replaced = vec![
+            Call::RemoteProbe,
+            Call::RemoteSessionsCount,
+            Call::RemoteDaemonExtension,
+            Call::ResolveLocalBinary,
+            Call::StopRemote,
+            Call::DeployBinary,
+            Call::StartRemote,
+        ];
+        let composed = || Manifest {
+            daemon_extension: true,
+            ..fake_manifest(None, 42)
+        };
+        let refused = FakeOps {
+            probe_manifest: Some(composed()),
+            alive: true,
+            sessions: Some(0),
+            daemon_extension: Some(true),
+            ..FakeOps::base()
+        };
+        assert!(
+            resolve_daemon(&refused, "host", &ConnectOpts::default(), &|_| {})
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            refused.calls(),
+            vec![
+                Call::RemoteProbe,
+                Call::RemoteSessionsCount,
+                Call::RemoteDaemonExtension
+            ]
+        );
+        for (composition, unconfirmed) in [(Some(true), true), (None, false), (Some(false), false)]
+        {
             let fake = FakeOps {
+                probe_manifest: Some(composed()),
+                alive: true,
+                sessions: Some(0),
+                daemon_extension: composition,
+                composition_unconfirmed: unconfirmed,
+                ..FakeOps::base()
+            };
+            resolve_daemon(&fake, "host", &ConnectOpts::default(), &|_| {})
+                .await
+                .unwrap();
+            assert_eq!(fake.calls(), replaced);
+        }
+        // A free daemon's manifest carries no extension mark: no probe exec.
+        for opts in [
+            ConnectOpts::default(),
+            ConnectOpts {
+                update_daemon: true,
+                ..Default::default()
+            },
+        ] {
+            let free = FakeOps {
                 probe_manifest: Some(fake_manifest(None, 42)),
                 alive: true,
                 sessions: Some(0),
                 daemon_extension: Some(true),
-                composition_unconfirmed: unconfirmed,
+                composition_unconfirmed: true,
                 ..FakeOps::base()
             };
-            assert!(
-                resolve_daemon(&fake, "host", &ConnectOpts::default(), &|_| {})
-                    .await
-                    .is_err()
-            );
-            assert_eq!(
-                fake.calls(),
-                vec![
-                    Call::RemoteProbe,
-                    Call::RemoteSessionsCount,
-                    Call::RemoteDaemonExtension
-                ]
-            );
-        }
-        for composition in [None, Some(false)] {
-            let compatible = FakeOps {
-                probe_manifest: Some(fake_manifest(None, 42)),
-                alive: true,
-                sessions: Some(0),
-                daemon_extension: composition,
-                ..FakeOps::base()
-            };
-            resolve_daemon(&compatible, "host", &ConnectOpts::default(), &|_| {})
-                .await
-                .unwrap();
-            assert_eq!(
-                compatible.calls(),
-                vec![
-                    Call::RemoteProbe,
-                    Call::RemoteSessionsCount,
-                    Call::RemoteDaemonExtension,
-                    Call::ResolveLocalBinary,
-                    Call::StopRemote,
-                    Call::DeployBinary,
-                    Call::StartRemote
-                ]
-            );
+            resolve_daemon(&free, "host", &opts, &|_| {}).await.unwrap();
+            assert!(!free.calls().contains(&Call::RemoteDaemonExtension));
         }
         let fake = FakeOps {
-            probe_manifest: Some(fake_manifest(None, 42)),
+            probe_manifest: Some(composed()),
             alive: true,
             sessions: Some(0),
             daemon_extension: Some(true),
@@ -7204,7 +7241,6 @@ mod tests {
             vec![
                 Call::RemoteProbe,
                 Call::RemoteSessionsCount,
-                Call::RemoteDaemonExtension,
                 Call::ResolveLocalBinary,
                 Call::StopRemote,
                 Call::DeployBinary,
@@ -7236,7 +7272,6 @@ mod tests {
             vec![
                 Call::RemoteProbe,
                 Call::RemoteSessionsCount,
-                Call::RemoteDaemonExtension,
                 Call::ResolveLocalBinary,
                 Call::StopRemote,
                 Call::DeployBinary,
@@ -7477,7 +7512,6 @@ mod tests {
                 (Call::RemoteProbe, Route::Alias),
                 (Call::RemoteProbe, ln01.clone()),
                 (Call::RemoteSessionsCount, ln01.clone()),
-                (Call::RemoteDaemonExtension, ln01.clone()),
                 (Call::ResolveLocalBinary, ln01.clone()),
                 (Call::StopRemote, ln01.clone()),
                 (Call::DeployBinary, ln01.clone()),

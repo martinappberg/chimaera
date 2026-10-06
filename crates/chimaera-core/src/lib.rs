@@ -339,6 +339,12 @@ pub struct Manifest {
     /// Cleanup must defer while an older daemon could still use those files.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub runtime_leases: bool,
+    /// This daemon was composed with a daemon extension (the official app's
+    /// Pro runtime). Read from the connect probe's own manifest read, so an
+    /// automatic public-release replacement only pays a composition probe for
+    /// such a daemon; absent (every free daemon) means none.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub daemon_extension: bool,
 }
 
 impl Manifest {
@@ -639,6 +645,7 @@ mod tests {
             build: Some(BUILD_ID.to_string()),
             slurm_job_id: None,
             runtime_leases: false,
+            daemon_extension: false,
         };
         manifest.write().unwrap();
 
@@ -656,6 +663,10 @@ mod tests {
         assert_eq!(loaded.version, manifest.version);
         assert_eq!(loaded.started_at, manifest.started_at);
         assert_eq!(loaded.build, manifest.build, "build id round-trips");
+        // A daemon without an extension writes the manifest it always wrote.
+        let written = std::fs::read_to_string(Manifest::path()).unwrap();
+        assert!(!written.contains("daemon_extension"), "{written}");
+        assert!(!loaded.daemon_extension);
         assert!(loaded.is_alive(), "our own pid is alive");
 
         Manifest::remove().unwrap();
@@ -713,6 +724,7 @@ mod tests {
             build: None,
             slurm_job_id: None,
             runtime_leases: false,
+            daemon_extension: false,
         };
         assert!(manifest(&here).written_here());
         assert!(!manifest("chimaera-test-other-node.invalid").written_here());

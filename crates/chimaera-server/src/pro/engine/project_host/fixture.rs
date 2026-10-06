@@ -431,6 +431,7 @@ impl Harness {
             build: Some(chimaera_core::BUILD_ID.into()),
             slurm_job_id: None,
             runtime_leases: false,
+            daemon_extension: false,
         })
     }
     pub async fn jobs_reservation(&self) -> Reservation {

@@ -1522,6 +1522,7 @@ mod tests {
             build: None,
             slurm_job_id: None,
             runtime_leases: false,
+            daemon_extension: false,
         };
         let local = crate::daemon::attached(manifest.clone(), false, None);
         rows.publish(target.clone(), manifest.clone());

@@ -187,6 +187,7 @@ async fn run_selected(
         build: Some(chimaera_core::BUILD_ID.to_string()),
         slurm_job_id: own_job.clone(),
         runtime_leases: true,
+        daemon_extension: runtime.is_some(),
     };
     manifest.write().context("failed to write manifest")?;
 
@@ -666,6 +667,7 @@ mod tests {
             build: None,
             slurm_job_id: job.map(str::to_string),
             runtime_leases: false,
+            daemon_extension: false,
         };
         std::fs::write(path, serde_json::to_vec(&m).unwrap()).unwrap();
     }

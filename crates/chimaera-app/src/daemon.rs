@@ -975,6 +975,7 @@ mod tests {
             build: Some("fixture-build".into()),
             slurm_job_id: None,
             runtime_leases: false,
+            daemon_extension: false,
         };
         let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = closed.local_addr().unwrap().port();

@@ -2614,6 +2614,7 @@ mod tests {
             build: None,
             slurm_job_id: Some(slurm.into()),
             runtime_leases: false,
+            daemon_extension: false,
         }
     }
 

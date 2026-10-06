@@ -906,6 +906,7 @@ mod tests {
             build: Some("abcdef1.123".into()),
             slurm_job_id: Some("77".into()),
             runtime_leases: false,
+            daemon_extension: false,
         };
         std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
         assert_eq!(
