@@ -263,7 +263,10 @@ per-chunk work proportional to the TRAILING OPEN SEGMENT, not the message:
   resize follow requests coalesce into one frame. Pinned-tray/composer height
   changes are inputs to that same writer, never independent scroll owners. A
   live tail continues rendering while the reader scrolls or types, but a
-  non-empty draft pauses auto-follow. Hidden tabs snapshot once and must not
+  non-empty draft pauses auto-follow — of new rows only: a pinned reader's
+  viewport keeps its bottom edge as the composer grows or shrinks, and the
+  composer measures its content on an off-flow clone (collapsing the live
+  textarea clamped the pinned transcript's scrollTop every keystroke). Hidden tabs snapshot once and must not
   retain reactive block proxies. Replay never remounts the entire transcript.
   A visible top sentinel while a short live tail fills the viewport is layout,
   not reader intent: it may prepend only while retaining the tail, and stops at

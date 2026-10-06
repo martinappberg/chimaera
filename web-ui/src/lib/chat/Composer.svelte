@@ -279,14 +279,48 @@
     return Math.max(COMPOSER_MIN_HEIGHT, Math.min(maxComposerHeight(), height));
   }
 
+  /** Off-flow twin of the textarea, so measuring never collapses the live
+   *  field: a forced layout with the composer collapsed grows the transcript,
+   *  which clamps a bottom-pinned reader's scrollTop, and restoring the height
+   *  then hid the newest lines behind the composer on every keystroke. */
+  let measurer: HTMLTextAreaElement | null = null;
+  $effect(() => () => {
+    measurer?.remove();
+    measurer = null;
+  });
+
   /** Measure the content independently of the current inline height. */
   function naturalComposerHeight(t: HTMLTextAreaElement): number {
-    const previousHeight = t.style.height;
-    t.style.height = "auto";
+    const host = t.parentElement;
+    if (host === null) return COMPOSER_MIN_HEIGHT;
+    if (measurer === null || measurer.parentElement !== host) {
+      measurer?.remove();
+      // A shallow clone keeps the scoped class, so padding, font and wrapping match.
+      measurer = t.cloneNode(false) as HTMLTextAreaElement;
+      measurer.removeAttribute("id");
+      measurer.removeAttribute("role");
+      measurer.removeAttribute("data-pane-arrows");
+      measurer.setAttribute("aria-hidden", "true");
+      measurer.tabIndex = -1;
+      measurer.inert = true;
+      Object.assign(measurer.style, {
+        position: "absolute",
+        visibility: "hidden",
+        pointerEvents: "none",
+        top: "0",
+        left: "0",
+        zIndex: "-1",
+      });
+      host.appendChild(measurer);
+    }
+    // Voice, dictation and mod state change the padding after the clone is made.
+    measurer.className = t.className;
+    measurer.placeholder = t.placeholder;
+    measurer.style.width = `${t.offsetWidth}px`;
+    measurer.style.height = "auto";
+    measurer.value = t.value;
     // +2: 1px border × 2, box-sizing is border-box.
-    const height = t.scrollHeight + 2;
-    t.style.height = previousHeight;
-    return height;
+    return measurer.scrollHeight + 2;
   }
 
   function chooseComposerHeight(height: number | null, contentHeight?: number) {
