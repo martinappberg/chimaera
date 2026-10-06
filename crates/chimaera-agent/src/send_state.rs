@@ -162,7 +162,7 @@ impl Snapshot {
 /// another machine (managed execution) needs evidence that survives a power
 /// loss and a handoff, at the price of synced writes per send and failing
 /// closed on damage. Every other chat keeps the same record in memory (the
-/// Pass 46 contract): no disk write per send, and an earlier sidecar is read
+/// Pass 48 contract): no disk write per send, and an earlier sidecar is read
 /// when it is sound and ignored, with a log line, when it is not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Receipts {

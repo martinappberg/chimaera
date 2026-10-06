@@ -536,7 +536,7 @@ async fn codex_handshake(
     // stdin, never argv, which anyone on a shared node can read. Codex keeps
     // a thread's opening instructions for good — neither `-c
     // developer_instructions` nor thread/resume's `developerInstructions`
-    // reach a resumed thread (live 0.157.1, Pass 47) — so this is also what
+    // reach a resumed thread (live 0.157.1, Pass 41) — so this is also what
     // tells a chat continued in a new job where it now runs. After the
     // rewind, which could otherwise drop it. Best-effort: an app-server
     // without the method still opens the chat.
@@ -8820,7 +8820,7 @@ mod tests {
 
     #[test]
     fn developer_note_is_one_developer_message_for_inject_items() {
-        // The live-verified shape (Pass 47): a raw Responses API item.
+        // The live-verified shape (Pass 41): a raw Responses API item.
         assert_eq!(
             developer_note_params("thr-1", "You are inside Slurm job 7."),
             json!({
