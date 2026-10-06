@@ -174,10 +174,6 @@
   let daemonError = $state<string | null>(null);
   let moreBtn = $state<HTMLButtonElement | null>(null);
 
-  function refreshExplicit(): void {
-    void clusterOverviews.refresh(alias, 0, true);
-  }
-
   function refresh(): void {
     void clusterOverviews.refresh(alias, 0);
   }
@@ -486,7 +482,7 @@
       : "Refresh"}
     aria-label="Refresh"
     disabled={entry?.loading === true}
-    onclick={refreshExplicit}
+    onclick={refresh}
   >
     <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
       <path
@@ -644,7 +640,7 @@
     {#if entry !== undefined && entry.error !== null}
       <div class="err-line">
         Couldn't read the cluster: {entry.error}
-        <button class="inline-act" onclick={refreshExplicit}>Try again</button>
+        <button class="inline-act" onclick={refresh}>Try again</button>
       </div>
     {:else}
       <div class="reading" role="status">Reading the cluster…</div>
@@ -672,7 +668,7 @@
     {#if entry !== undefined && entry.error !== null}
       <div class="err-line quiet">
         Couldn't refresh: {entry.error}
-        <button class="inline-act" onclick={refreshExplicit}>Try again</button>
+        <button class="inline-act" onclick={refresh}>Try again</button>
       </div>
     {/if}
 

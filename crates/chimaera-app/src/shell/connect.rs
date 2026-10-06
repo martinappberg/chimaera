@@ -51,9 +51,12 @@ pub struct HostState {
     /// login nodes and the connection is pinned to one other than where a
     /// new ssh connection lands (`None` = wherever the alias lands).
     node: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     via_pro: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     kept: bool,
-    /// Present only for SSH hosts; older shells/devices do not offer the toggle.
+    /// The direct-SSH choice: present when an account owner offers it or it
+    /// is on; absent otherwise (devices, and builds without an owner).
     #[serde(skip_serializing_if = "Option::is_none")]
     direct_ssh: Option<bool>,
     /// Set when the host is a cluster: from this process's connect, else the
@@ -81,6 +84,15 @@ struct LoginDaemonWire {
 }
 
 impl HostState {
+    /// With an account owner, a direct row offers the direct-SSH choice even
+    /// while it is off; without one the field stays absent unless it is on.
+    pub(super) fn offer_direct_ssh(mut self, owner: bool) -> Self {
+        if owner && !self.via_pro && self.direct_ssh.is_none() {
+            self.direct_ssh = Some(false);
+        }
+        self
+    }
+
     pub fn mark_kept(mut self) -> Self {
         self.via_pro = true;
         self.kept = true;
@@ -95,9 +107,10 @@ impl HostState {
         live: Option<&super::cluster::ClusterInfo>,
     ) -> Self {
         self.not_cluster = entry.not_cluster;
-        if self.direct_ssh.is_some() {
-            self.direct_ssh = Some(entry.direct_ssh);
-        }
+        self.direct_ssh = match self.direct_ssh {
+            Some(_) => Some(entry.direct_ssh),
+            None => entry.direct_ssh.then_some(true),
+        };
         let scheduler = live
             .map(|i| i.scheduler)
             .or(entry.scheduler)
@@ -206,7 +219,7 @@ pub(super) fn state_for(
         node: tunnel.and_then(|t| t.node().map(str::to_string)),
         via_pro: tunnel.is_some_and(|t| t.link_id().is_some()),
         kept: entry.kept,
-        direct_ssh: Some(entry.direct_ssh),
+        direct_ssh: entry.direct_ssh.then_some(true),
         cluster: None,
         not_cluster: entry.not_cluster,
         cluster_setup_complete: entry.cluster_setup_complete,
@@ -347,7 +360,6 @@ async fn connect_with_intent(
 ) -> Result<HostState, String> {
     let state = app.state::<Shell>();
     tracing::info!("ipc: connect_host {alias} (update_daemon: {update_daemon})");
-    super::cluster::note_user_touch(&state, &alias);
     loop {
         let tx = match claim_connect_flight(&state.connecting, &alias) {
             // Someone else owns the attempt: await its outcome. The clone
@@ -401,13 +413,19 @@ async fn connect_with_intent(
         let reused = if update_daemon {
             None
         } else {
-            let entry = host_entry(&alias).await;
-            let via_pro = (!entry.direct_ssh && entry.kept)
-                || keeper_route_selected(
-                    entry.direct_ssh,
-                    state.pro.active(),
-                    state.pro.hosts().iter().any(|host| host.alias == alias),
-                );
+            // Only an account owner routes through a keeper; without one no
+            // hosts.json read is needed to know the route is direct.
+            let via_pro = if state.pro.owner().is_some() {
+                let entry = host_entry(&alias).await;
+                (!entry.direct_ssh && entry.kept)
+                    || keeper_route_selected(
+                        entry.direct_ssh,
+                        state.pro.active(),
+                        state.pro.hosts().iter().any(|host| host.alias == alias),
+                    )
+            } else {
+                false
+            };
             // Probe liveness WITHOUT holding the tunnels lock: this is a ~2s
             // HTTP round-trip, and holding the map locked across it would
             // stall every other tunnel op. A 401 from a stale/foreign daemon
@@ -459,7 +477,8 @@ async fn connect_with_intent(
                 },
             );
         }
-        return result;
+        let owner = state.pro.owner().is_some();
+        return result.map(|reply| reply.offer_direct_ssh(owner));
     }
 }
 
@@ -483,14 +502,6 @@ async fn run_flight(
             .await?
         {
             return Ok(reply);
-        }
-    } else {
-        let saved_alias = alias.to_owned();
-        let entry = with_hosts(move |hosts| Ok(hosts.get(&saved_alias))).await?;
-        if entry.is_some_and(|entry| entry.kept && !entry.direct_ssh)
-            || lock(&state.registry).is_link_device(alias)
-        {
-            return Err("This kept host needs Chimaera Pro. Choose Direct in advanced host settings to connect from this computer.".into());
         }
     }
     // Remove under the map lock, then do process/network teardown without it.
@@ -944,6 +955,35 @@ mod tests {
         drop(held);
         assert!(old.await.unwrap().is_err());
         assert_eq!(tunnels.lock().await.get("host"), Some(&"replacement"));
+    }
+
+    #[test]
+    fn a_direct_host_row_keeps_the_original_wire_shape() {
+        let mut entry = super::HostEntry {
+            alias: "hpc".into(),
+            binary: None,
+            added_at: 0,
+            last_connected_at: None,
+            kept: false,
+            direct_ssh: false,
+            login_serve: false,
+            cluster_setup_complete: false,
+            not_cluster: false,
+            scheduler: None,
+        };
+        let row = super::state_for(&entry, "disconnected", None).with_cluster(&entry, None);
+        let wire = serde_json::to_value(row.clone().offer_direct_ssh(false)).unwrap();
+        for added in ["via_pro", "kept", "direct_ssh"] {
+            assert!(wire.get(added).is_none(), "{added} leaked: {wire}");
+        }
+        // An account owner offers the choice while it is off.
+        let wire = serde_json::to_value(row.offer_direct_ssh(true)).unwrap();
+        assert_eq!(wire["direct_ssh"], false);
+        // A saved choice stays visible so it can be turned off.
+        entry.direct_ssh = true;
+        let row = super::state_for(&entry, "disconnected", None).with_cluster(&entry, None);
+        let wire = serde_json::to_value(row.offer_direct_ssh(false)).unwrap();
+        assert_eq!(wire["direct_ssh"], true);
     }
 
     #[test]

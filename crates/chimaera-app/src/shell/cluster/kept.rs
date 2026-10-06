@@ -21,15 +21,8 @@ pub(super) async fn select(shell: &Shell, alias: &str) -> Result<Option<Selected
             .select_cluster(alias.to_owned())
             .await
             .map(|s| s.map(Selected)),
-        None => {
-            let alias = alias.to_owned();
-            let entry = super::super::connect::with_hosts(move |s| Ok(s.get(&alias))).await?;
-            if entry.is_some_and(|e| e.kept && !e.direct_ssh) {
-                Err("This kept host needs Chimaera Pro. Choose Direct in advanced host settings to connect from this computer.".into())
-            } else {
-                Ok(None)
-            }
-        }
+        // Without an owner every cluster is a direct one: nothing to read.
+        None => Ok(None),
     }
 }
 pub(super) fn endpoints(shell: &Shell) -> Vec<(String, u16, String)> {
