@@ -18,7 +18,7 @@
   import { insertIntoComposer, registerFollow, returnableCount, returnToComposer } from "./composerBus";
   import { isBrowserGateway } from "../net/base";
   import { ownerIsCloud, pauseLabel, placementLabel, projectWhere, sessionPause } from "../net/placement";
-  import { accountSignedOut } from "../net/plan";
+  import { accountSignedOut, proTier } from "../net/plan";
   import { pausedConnect } from "../pro/providers";
   import { canOpenOnboarding, cloudOnboarding } from "../pro/onboarding.svelte";
   import BranchChip from "../shared/BranchChip.svelte";
@@ -2578,7 +2578,9 @@
   // time: before the first row sent after the return; after the last row
   // when nothing followed yet. A chat that began after the return, or whose
   // return point is outside the mounted window, shows nothing.
-  const keptWorkspace = $derived(session.workspace_id ?? null);
+  // Only an active plan has returns to review: without one a chat asks the
+  // daemon nothing about Pro (`proTier`).
+  const keptWorkspace = $derived($proTier === "active" ? session.workspace_id ?? null : null);
   $effect(() => {
     const id = keptWorkspace;
     if (id === null || !visible) return;
