@@ -1079,6 +1079,35 @@ pub(crate) fn encode_cwd(cwd: &Path) -> String {
         .collect()
 }
 
+/// Where claude keeps conversation `id`: the project dir for `cwd` first, then
+/// any other project dir. Claude files a transcript under the cwd it is in
+/// when it writes — an agent that enters a git worktree moves its conversation
+/// into that worktree's dir, which stays behind when the worktree is removed —
+/// and `--resume <id>` finds it from anywhere, so a check that only looked
+/// under the workspace root called a live conversation "gone" and restarted it
+/// empty. Blocking fs: call off the reactor.
+pub(crate) fn find_claude_transcript(
+    projects_dir: &Path,
+    cwd: &Path,
+    id: &str,
+) -> Option<std::path::PathBuf> {
+    // An id from a hook or a journal is a uuid; refuse anything that could
+    // walk out of the store.
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return None;
+    }
+    let file = format!("{id}.jsonl");
+    let home = projects_dir.join(encode_cwd(cwd)).join(&file);
+    if home.is_file() {
+        return Some(home);
+    }
+    std::fs::read_dir(projects_dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|dir| dir.path().join(&file))
+        .find(|candidate| candidate.is_file())
+}
+
 /// Cap on the resume list (the UI adds search past ~8 entries).
 const RESUMABLE_CAP: usize = 20;
 
@@ -1398,6 +1427,41 @@ mod tests {
             "-Users-x-dev-chimaera--claude-worktrees-elastic-margulis-62efae"
         );
         assert_eq!(encode_cwd(Path::new("/tmp/my_proj.v2")), "-tmp-my-proj-v2");
+    }
+
+    #[test]
+    fn transcript_is_found_in_any_project_dir() {
+        let dir =
+            std::env::temp_dir().join(format!("chimaera-transcript-find-{}", std::process::id()));
+        let store = dir.join("projects");
+        let root = Path::new("/work/proj");
+        assert_eq!(find_claude_transcript(&store, root, "conv-1"), None);
+
+        // An agent that entered a worktree left its conversation in that
+        // worktree's project dir, not the workspace root's.
+        let worktree = store.join(encode_cwd(Path::new("/work/proj/.claude/worktrees/wt")));
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree.join("conv-1.jsonl"), "{}\n").unwrap();
+        assert_eq!(
+            find_claude_transcript(&store, root, "conv-1"),
+            Some(worktree.join("conv-1.jsonl"))
+        );
+
+        // The root's own dir wins when both hold it.
+        let home = store.join(encode_cwd(root));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("conv-1.jsonl"), "{}\n").unwrap();
+        assert_eq!(
+            find_claude_transcript(&store, root, "conv-1"),
+            Some(home.join("conv-1.jsonl"))
+        );
+
+        // Ids that could leave the store never resolve.
+        std::fs::write(dir.join("evil.jsonl"), "{}\n").unwrap();
+        assert_eq!(find_claude_transcript(&store, root, "../evil"), None);
+        assert_eq!(find_claude_transcript(&store, root, ""), None);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

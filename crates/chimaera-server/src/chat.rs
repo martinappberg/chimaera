@@ -1457,13 +1457,8 @@ pub(crate) async fn switch_view(
     // Validate against the project store; no transcript = fresh start.
     let resume = match resume {
         Some(uuid) if record.kind == AgentKind::Claude => {
-            let path = state
-                .claude_projects_dir
-                .join(crate::launcher::encode_cwd(&workspace_root))
-                .join(format!("{uuid}.jsonl"));
-            tokio::fs::try_exists(&path)
+            claude_transcript_exists(&state, &workspace_root, &uuid)
                 .await
-                .unwrap_or(false)
                 .then_some(uuid)
         }
         other => other,
@@ -2822,6 +2817,25 @@ pub(crate) async fn fork_session(
     }
 }
 
+/// Whether claude still holds conversation `uuid` — under any project dir, not
+/// only the workspace root's (see `launcher::find_claude_transcript`).
+async fn claude_transcript_exists(
+    state: &Arc<AppState>,
+    root: &std::path::Path,
+    uuid: &str,
+) -> bool {
+    let (dir, root, uuid) = (
+        state.claude_projects_dir.clone(),
+        root.to_path_buf(),
+        uuid.to_string(),
+    );
+    tokio::task::spawn_blocking(move || {
+        crate::launcher::find_claude_transcript(&dir, &root, &uuid).is_some()
+    })
+    .await
+    .unwrap_or(false)
+}
+
 /// Spawn (or respawn) a chat driver for `id` from a recipe. Shared by
 /// create_session and the view switch. `pinned_override` lets create pass a
 /// fresh --session-id uuid; resumes leave it None (the id comes from
@@ -2881,13 +2895,13 @@ pub(crate) fn seed_resumed_journal(state: &Arc<AppState>, id: &str, recipe: &Cha
     if recipe.kind != AgentKind::Claude {
         return false;
     }
-    let transcript = state
-        .claude_projects_dir
-        .join(crate::launcher::encode_cwd(&recipe.workspace_root))
-        .join(format!("{native}.jsonl"));
-    if !transcript.exists() {
+    let Some(transcript) = crate::launcher::find_claude_transcript(
+        &state.claude_projects_dir,
+        &recipe.workspace_root,
+        native,
+    ) else {
         return false;
-    }
+    };
     let events = chimaera_agent::transcript::import_transcript(&transcript);
     if events.is_empty() {
         return false;
@@ -3578,11 +3592,7 @@ pub(crate) async fn resurrect_chat(
     // reader (the same "nothing to lose" fallback the TUI path takes).
     let resume = match &agent.resume {
         Some(uuid) if agent.kind == AgentKind::Claude => {
-            let path = state
-                .claude_projects_dir
-                .join(crate::launcher::encode_cwd(&root))
-                .join(format!("{uuid}.jsonl"));
-            if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            if claude_transcript_exists(state, &root, uuid).await {
                 Some(uuid.clone())
             } else {
                 tracing::info!(session = %entry.id, "chat transcript is gone; resurrecting fresh");

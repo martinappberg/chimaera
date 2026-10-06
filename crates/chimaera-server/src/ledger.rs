@@ -545,7 +545,7 @@ fn plan_restore(entry: &LedgerEntry, restore_enabled: bool, workspace_exists: bo
 }
 
 /// The resume id to actually pass, verified against disk: the recorded
-/// transcript path, or the conventional store location for this cwd. A
+/// transcript path, or wherever the store holds it (this cwd's dir first). A
 /// conversation whose transcript does not exist gets `None` — resuming it
 /// would only produce an instantly-dead "No conversation found" pane.
 /// (Claude 2.1.204 interactive sessions persist no transcript, so this is
@@ -557,11 +557,8 @@ fn resolve_resume(claude_projects_dir: &std::path::Path, entry: &LedgerEntry) ->
         .transcript
         .as_deref()
         .is_some_and(|path| path.is_file());
-    let derived = claude_projects_dir
-        .join(crate::launcher::encode_cwd(&entry.cwd))
-        .join(id)
-        .with_extension("jsonl")
-        .is_file();
+    let derived =
+        crate::launcher::find_claude_transcript(claude_projects_dir, &entry.cwd, id).is_some();
     (recorded || derived).then(|| id.to_string())
 }
 
