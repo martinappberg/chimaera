@@ -148,11 +148,20 @@ impl CoordinatorTick {
                         if let Err(error) = &result {
                             record_error(&state, &workspace, error);
                         }
-                        result.err().is_some_and(|error| {
+                        let unauthorized = result.err().is_some_and(|error| {
                             error
                                 .chain()
                                 .any(|cause| cause.to_string() == transport::UNAUTHORIZED)
-                        })
+                        });
+                        // Kept for the next pass too: the policy may have
+                        // stopped waiting for this one (review R4 N3).
+                        if unauthorized {
+                            state
+                                .pro
+                                .late_unauthorized
+                                .store(true, std::sync::atomic::Ordering::Release);
+                        }
+                        unauthorized
                     });
                     running.retain(|_, task| !task.is_finished());
                     running.insert(project.id.clone(), task.abort_handle());
@@ -162,6 +171,12 @@ impl CoordinatorTick {
             if let Some(task) = task {
                 unauthorized = task.await.unwrap_or(false);
             }
+            // A refusal a pass that already stopped waiting never heard.
+            unauthorized |= self
+                .state
+                .pro
+                .late_unauthorized
+                .swap(false, std::sync::atomic::Ordering::AcqRel);
         }
         Reconciled {
             unauthorized,

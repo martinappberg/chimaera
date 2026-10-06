@@ -69,6 +69,10 @@ pub(crate) struct ProState {
     /// their lease deadline and nothing resumes them without the account.
     /// Persisted, at most 128; cleared by the next configure.
     unreleased: Mutex<std::collections::BTreeSet<String>>,
+    /// A lease pass refused this daemon's credential after the policy had
+    /// stopped waiting for it (`CoordinatorTick::reconcile`); the next
+    /// pass reports it, so the delegation is renewed (review R4 N3).
+    late_unauthorized: AtomicBool,
     /// The background retry of those stand-downs (`sign_out::retry`).
     stand_down: Mutex<Option<tokio::task::JoinHandle<()>>>,
     generation: AtomicU64,
@@ -513,6 +517,7 @@ impl ProState {
                     .collect(),
             ),
             stand_down: Mutex::new(None),
+            late_unauthorized: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             runtime: Mutex::new(None),
             authority: Mutex::new(authority),
