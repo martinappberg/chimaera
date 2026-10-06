@@ -82,6 +82,7 @@ hard-resets and rebuilds.
 | `AgentsTray.svelte` / `BackgroundTray.svelte` / `backgroundKinds.ts` | Two of the three pinned strips above the composer: live subagents (derived from in-flight Agent tool rows; a lone agent is named with its step) and live background tasks (the `background_tasks` level-set; the header names a Monitor watch and counts the rest per kind via `backgroundKinds.ts`, so it doubles as the between-turns "still waiting" signal), each with a stop affordance. Chrome lives in the shared `../shared/WorkTray.svelte` + `WorkTrayRow.svelte` shell; elapsed/duration text uses `../shared/time.ts`. The **plan strip** is the third, rendered inline in `ChatView` on the same `WorkTray` shell (`pulse` off unless a step is in flight) — three orthogonal readings of the same session: what the agent *means* to do (plan), *who* is working (subagents), what is *detached* (background). |
 | `PermissionCard` / `QuestionCard` | The permission prompt and structured-question cards (their answers ride `socket.send`; `PermissionCard` also carries the deny-with-feedback field; `QuestionCard` presents Codex auto-resolution deadlines without owning the authoritative timeout). |
 | `ElicitationCard.svelte` / `ElicitationFields.svelte` / `elicitation.ts` | MCP typed forms, nested object groups, URL requests and explicit submit/decline/cancel decisions; native browser opener, bounded driver schema, no optimistic dismissal. `McpPanel` routes Claude needs-auth rows to the existing connection dialog and reconnects after confirmed sign-in. |
+| `../extensions/ConversationSlot.svelte` | After those cards: the optional extension's place in this conversation (today a setup command its agent proposed for the cloud, with Confirm/Dismiss). Renders nothing, scans nothing and requests nothing without the extension, an active plan, a native window and an `update_cloud_profile` call in the transcript. |
 | `PlanApprovalCard.svelte` | Claude `ExitPlanMode` plan-approval card — renders the sanitized plan markdown + the three official options (auto-accept / manual / keep-planning) with an optional comment that rides the permission reply. |
 | `RewindDialog.svelte` | The destructive in-place rewind/fork-point confirmation overlay (claude rewind + codex `thread/rollback`). |
 | `ForkDialog.svelte` | The non-destructive conversation-branch picker: target agent plus native-vs-portable boundary disclosure. |
@@ -453,8 +454,8 @@ shows until the owner confirms.
 
 The rest of this paragraph applies when the connected keeper refuses or
 closes those sockets, and for another computer as owner. In a native window the daemon holds the first command while a paused
-owner wakes (the additive `{"type":"waking"}` → `store.waking`, "Waking the
-cloud machine…"), refuses further acting commands until it answers, and answers
+owner wakes (the additive `{"type":"waking"}` → `store.waking`, shown as the send's own
+progress, "Sending…"), refuses further acting commands until it answers, and answers
 anything it cannot deliver with `command_failed`. Only acting commands (the
 daemon's `activity::is_interaction`) wake its current owner; the
 seven settings commands are held with them (above), everything else is
@@ -474,8 +475,8 @@ kept it; the send it names comes back to the composer). A move to another comput
 other computer…"). In a browser view, `send()` into a
 dropped socket reconnects once with `?wake=interaction` and returns false (the
 composer keeps the draft). Socket states that are not errors: `worker_asleep` →
-`store.asleep` ("Asleep in the cloud. Send a message to wake it.", and the
-header's "In the cloud · asleep" instead of "· reconnecting"; it survives a
+`store.asleep` (no status line: the composer stays ready, and the header says
+only "In the cloud", never "· reconnecting"; it survives a
 dropped socket and ends with an accepted send, `waking`, a move or `ready`; a
 socket that drops meanwhile waits with no retry timer until a send dials it with
 wake intent or `retrySoon` / `ownerAwake` dials it passively — `reachKey`

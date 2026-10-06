@@ -17,7 +17,7 @@
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import { insertIntoComposer, registerFollow, returnableCount, returnToComposer } from "./composerBus";
   import { isBrowserGateway } from "../net/base";
-  import { ownerIsCloud, pauseLabel, placementLabel, projectWhere, sessionPause } from "../net/placement";
+  import { ownerIsCloud, pauseLabel, placementLabel, placesSplit, projectWhere, sessionPause } from "../net/placement";
   import { accountSignedOut, proTier } from "../net/plan";
   import { pausedConnect } from "../pro/providers";
   import { canOpenOnboarding, cloudOnboarding } from "../pro/onboarding.svelte";
@@ -62,6 +62,7 @@
   import { HoverPreviews } from "../previews/doc/hoverController.svelte";
   import PermissionCard from "./PermissionCard.svelte";
   import ElicitationCard from "./ElicitationCard.svelte";
+  import ConversationSlot from "../extensions/ConversationSlot.svelte";
   import type { PendingElicitation } from "./elicitation";
   import PlanApprovalCard from "./PlanApprovalCard.svelte";
   import QuestionCard from "./QuestionCard.svelte";
@@ -2776,7 +2777,9 @@
     keepOpenWithin: ".menu-host",
   }}
 >
-  {#if runsElsewhere !== null}
+  {#if runsElsewhere !== null && $placesSplit}
+    <!-- Only when the project's sessions run in different places: otherwise
+         the window's indicator names the one place once. -->
     <div class="placement-note">{runsElsewhere}</div>
   {/if}
   <ChatHeader
@@ -2864,11 +2867,10 @@
       {/if}
     {/snippet}
     {#if waitsForCloud}
-      <!-- Asleep before the first replay: nothing to load yet, and no spinner
-           for a wait that only a send ends (the footer says the same when a
-           relay said the machine is asleep). -->
+      <!-- Idle in the cloud before the first replay: nothing to load yet,
+           and no spinner for a wait that only a send ends. -->
       <div class="empty asleep-note" role="status">
-        <span>The conversation shows once the cloud wakes. Sending a message wakes it.</span>
+        <span>This conversation shows here when you send a message.</span>
       </div>
     {:else if store.hydrating}
       <div class="empty hydrate" aria-live="polite">
@@ -3232,6 +3234,10 @@
       <ElicitationCard {request} {visible} onRespond={(action, content) => sendCommand({type: "elicitation", request_id: request.requestId, action, content}, "MCP response not sent")} />
     {/each}
 
+    <!-- A decision only the optional extension can take (a setup command
+         this agent proposed): nothing at all without it or without a plan. -->
+    <ConversationSlot workspaceId={session.workspace_id ?? null} sessionId={session.id} blocks={store.blocks} {visible} />
+
     {#if agentBusy && pinnedPermissions.length === 0 && pinnedQuestions.length === 0 && pinnedElicitations.length === 0}
       <div class="status-row" aria-live={visible ? "polite" : "off"}>
         <span class="status-spark">
@@ -3519,13 +3525,14 @@
     <div class="connection-status"><span role="status">{continuingLabel}</span>{#if connect !== null}<button type="button" class="connect" onclick={() => cloudOnboarding.request({ providerIds: [connect.providerId], workspaceId: connect.workspaceId })}>Connect {connect.label} to continue</button>{/if}</div>
   {:else if store.bringing}
     <!-- Acting here is bringing the work over; the send waits for it. -->
-    <div class="connection-status" role="status">Bringing the work here…</div>
+    <div class="connection-status" role="status">Moving this conversation here…</div>
   {:else if store.waking && !store.connected}
-    <div class="connection-status" role="status">Waking the cloud machine…</div>
+    <!-- The cloud starting for the user's own send: the send's progress, not
+         a state of the cloud. -->
+    <div class="connection-status" role="status">Sending…</div>
   {:else if store.asleep}
-    <!-- Asleep is the owner's state, not this socket's: it holds across a
-         dropped connection and ends with a wake or the next ready. -->
-    <div class="connection-status" role="status">Asleep in the cloud. Send a message to wake it.</div>
+    <!-- Idle in the cloud is not this socket reconnecting: nothing to say,
+         and the composer stays ready (a send continues it). -->
   {:else if reconnectingShown}
     <div class="connection-status" role="status">Reconnecting…</div>
   {/if}

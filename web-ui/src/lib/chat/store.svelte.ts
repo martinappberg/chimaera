@@ -11,7 +11,7 @@ import { isImagePath } from "../previews/files";
 import { artifactMentions, isArtifactPath, proseCovered, proseEmbedTargets } from "./artifacts";
 import { agentMessageFromEvent, isAgentOrigin, parseAgentText, type AgentMessage } from "./agentMessages";
 import type { AgentEvent, ChatSessionInfo, ReadyAttach, SeqEvent } from "./chatWs";
-import type { MovedTo, SessionPause } from "../net/placement";
+import { refusalWords, type MovedTo, type SessionPause } from "../net/placement";
 import type { ImageAttachment } from "./images";
 import { parseCapabilities, type ChatCapabilities } from "./capabilities";
 
@@ -1276,6 +1276,7 @@ export class ChatStore {
     // not act right now): nothing the user did, and the next `ready` asks
     // again.
     if (command === "cancel_send") return;
+    message = refusalWords(message, reason);
     // Only a refused SEND hands text back: a refused interrupt, permission
     // answer or anything else says so without resurrecting a message that
     // may already have been delivered (a re-send would be a second turn).

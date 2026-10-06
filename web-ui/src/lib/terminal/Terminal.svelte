@@ -3,6 +3,7 @@
   import { paneTabHasKeyboardFocus } from "../shared/tabNavigation";
   import { pastedImageName, uploadAndInsert } from "../net/uploads";
   import { isBrowserGateway } from "../net/base";
+  import { placesSplit } from "../net/placement";
   import { isWatching, setWatching } from "./viewerMode.svelte";
   import { refusalFor } from "./refusals.svelte";
   import { beginFind, focusTerminal, release, show, refreshAccess, retryTerminal } from "./termPool";
@@ -141,9 +142,10 @@
 
 {#if showAccess}
   <div class="terminal-access" role="toolbar" aria-label="Terminal access">
-    {#if placement !== null}<span class="where">{placement}</span>{/if}
+    <!-- The window names one shared place once; a split project labels each. -->
+    {#if placement !== null && $placesSplit}<span class="where">{placement}</span>{/if}
     {#if watching}<span>Just watching</span>{/if}
-    <button type="button" aria-pressed={!watching} onclick={toggleAccess}>{watching ? "Take control" : "Just watch"}</button>
+    <button type="button" aria-pressed={!watching} onclick={toggleAccess}>{watching ? "Type here" : "Just watch"}</button>
   </div>
 {/if}
 <div class="term-view" class:watching class:with-access={showAccess} use:findTarget={find}>

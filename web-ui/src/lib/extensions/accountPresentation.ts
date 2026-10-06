@@ -10,7 +10,10 @@ import type { CloudOnboardingContext } from "../pro/onboarding.svelte";
 import type { Workspace } from "../workspace/sessions";
 import type { Observable } from "./application";
 export type { ProStatus, CloudProjectOpen, ProHost, ProDevice, ProAuthScreenHint, CloudProject, CloudProviderConnection, CloudProviderStatus, CloudProviderState, CloudSetupInfo, CloudSetupRequest, CloudProvisioningStatus, MirrorStatus, MirrorWorkspace, ProBillingAttempt, ProPlanPrice, RememberedProvider } from "../net/native";
-export interface HomeProject { workspace_id: string; name: string | null; href: string; available: boolean }
+/** An account-hosted Home row. `place` and `reason` are additive: where the
+ *  project is right now (absent when idle and available) and, when the cloud
+ *  could not run it, the account's closed reason value. */
+export interface HomeProject { workspace_id: string; name: string | null; href: string; available: boolean; place?: "computer" | "cloud" | null; reason?: string | null }
 export interface HomeProjects { projects: HomeProject[]; pending: boolean }
 export interface BrowserAccountStatus extends Native.ProStatus { account_lifetime: string | null }
 export type SecretFailureCode = "unsupported" | "invalid_request" | "state_changed" | "unavailable" | "operation_unavailable" | "limit_reached" | "sign_in_required" | "context_changed" | "unconfirmed" | "account_home_required";

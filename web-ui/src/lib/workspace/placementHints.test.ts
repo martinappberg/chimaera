@@ -16,8 +16,8 @@ describe("a Home row's place hint", () => {
     });
     expect(configured).toBe(true);
     expect(hints.get("w-cloud")).toBe("Running elsewhere");
-    expect(hints.get("w-home")).toBe("Coming home…");
-    expect(hints.get("w-leaving")).toBe("Moving work…");
+    expect(hints.get("w-home")).toBe("Coming back here…");
+    expect(hints.get("w-leaving")).toBe("Moving…");
   });
 
   it("says nothing for a project that is here or not owned elsewhere", () => {

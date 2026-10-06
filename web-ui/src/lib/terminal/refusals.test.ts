@@ -47,12 +47,12 @@ it("running elsewhere names the cloud or your computer, and another device never
   }
 });
 
-it("an asleep terminal says a keystroke wakes it, until a wake or ready clears it", () => {
+it("a terminal idle in the cloud says a keystroke continues it, until it is live again", () => {
   setTerminalStatus("s-asleep", "asleep");
   expect(terminalStatus("s-asleep")).toBe("asleep");
-  expect(refusalFor("s-asleep")).toBe("Asleep in the cloud. Press a key to wake it.");
+  expect(refusalFor("s-asleep")).toBe("Idle in your cloud. Press a key to continue.");
   expect(refusalFor("s-asleep", { watching: true })).toBe(statusText("asleep", true));
-  expect(statusText("asleep", true)).toContain("Take control");
+  expect(statusText("asleep", true)).toContain("Type here");
   setTerminalStatus("s-asleep", "waking");
   expect(terminalStatus("s-asleep")).toBe("waking");
   setTerminalStatus("s-asleep", null);

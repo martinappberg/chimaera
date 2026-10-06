@@ -361,10 +361,10 @@ export function runningElsewhere(where: "cloud" | "computer" | "other" | null): 
  *  identifiers and must never reach the screen as-is. */
 const PLAIN_ERRORS: Record<string, string> = {
   project_unavailable: "This project isn’t reachable right now.",
-  remote_unavailable: "Your project is reconnecting.",
-  workspace_scope_changed: "Your project is reconnecting.",
-  workspace_unavailable: "Your project is reconnecting.",
-  worker_asleep: "The cloud machine is asleep.",
+  remote_unavailable: "This project can’t be reached right now.",
+  workspace_scope_changed: "This project can’t be reached right now.",
+  workspace_unavailable: "This project can’t be reached right now.",
+  worker_asleep: "This project is idle in your cloud.",
   outside_project: "This file is outside the project.",
 };
 /** Codes meaning "this daemon may not run that project": the sentence names
@@ -381,7 +381,7 @@ function otherFile(where: "cloud" | "computer" | "other" | null): string {
     case "computer":
       return "This file is on your computer and can’t be opened here.";
     default:
-      return "This file is on the other machine and can’t be opened here.";
+      return "This file is on another computer and can’t be opened here.";
   }
 }
 
@@ -400,9 +400,9 @@ export function plainError(message: string, where: "cloud" | "computer" | "other
  *  never paints it as an error. */
 const STATE_CODES = new Set(["worker_asleep", "project_unavailable", "remote_unavailable", "workspace_scope_changed", "workspace_unavailable"]);
 
-/** The line for a sleeping owner: the chat's footer says the same, and a
- *  dashboard or panel has the room for the way out. */
-export const ASLEEP_NOTE = "Asleep in the cloud. Send a message to wake it.";
+/** The line for a project idle in the cloud: a dashboard or panel has the
+ *  room for the way out (the chat itself just stays ready to send). */
+export const ASLEEP_NOTE = "Idle in your cloud. Send a message to continue.";
 
 /** The failure is a sleeping cloud machine: its wake is announced (a socket
  *  ready, a placement read), so nothing needs to poll for it. */
@@ -410,7 +410,7 @@ export function isOwnerAsleep(e: unknown): boolean {
   return e instanceof ApiError && e.code === "worker_asleep";
 }
 
-/** The quiet note a state-code failure reads as ("Asleep in the cloud. …",
+/** The quiet note a state-code failure reads as ("Idle in your cloud. …",
  *  "This project isn’t reachable right now."), or null for anything else —
  *  a real failure, which keeps its error styling. */
 export function projectStateNote(e: unknown): string | null {

@@ -72,5 +72,32 @@ export function installedExtension(load: ApplicationEntryLoader): ApplicationExt
       if (scope.signal.aborted) throw new Error("Optional view retired");
       return module.mount(kind, target, scope);
     },
+    async mountPlace(target, scope) {
+      if (scope.signal.aborted) throw new Error("Optional view retired");
+      const module = await entry();
+      if (scope.signal.aborted) throw new Error("Optional view retired");
+      if (typeof module.mountPlace !== "function") throw new Error("Optional place unavailable");
+      const owner = await module.mountPlace(target, scope);
+      if (scope.signal.aborted) { owner.dispose(); throw new Error("Optional view retired"); }
+      return owner;
+    },
+    async mountConversation(target, scope) {
+      if (scope.signal.aborted) throw new Error("Optional view retired");
+      const module = await entry();
+      if (scope.signal.aborted) throw new Error("Optional view retired");
+      if (typeof module.mountConversation !== "function") throw new Error("Optional conversation view unavailable");
+      const owner = await module.mountConversation(target, scope);
+      if (scope.signal.aborted) { owner.dispose(); throw new Error("Optional view retired"); }
+      return owner;
+    },
+    async mountHost(target, scope) {
+      if (scope.signal.aborted) throw new Error("Optional view retired");
+      const module = await entry();
+      if (scope.signal.aborted) throw new Error("Optional view retired");
+      if (typeof module.mountHost !== "function") throw new Error("Optional host view unavailable");
+      const owner = await module.mountHost(target, scope);
+      if (scope.signal.aborted) { owner.dispose(); throw new Error("Optional view retired"); }
+      return owner;
+    },
   } satisfies ApplicationExtension);
 }

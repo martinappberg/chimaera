@@ -36,8 +36,6 @@ export function parsePlacement(value: unknown, workspace: string): WorkspacePlac
 const IN_THE_CLOUD = "In the cloud";
 const ON_ANOTHER_COMPUTER = "On another computer";
 const RECONNECTING = " · reconnecting";
-const ASLEEP = " · asleep";
-const WAKING = " · waking";
 
 /** What a view knows about the owner beyond its row: its socket heard the
  *  owner is asleep (`worker_asleep`) or waking (`waking`), and whether the
@@ -57,17 +55,31 @@ export interface OwnerNote {
 
 /** Where a routed session runs, in plain words; null for a session here.
  *  `available: false` means its owner cannot be reached right now — which is
- *  also what a sleeping owner looks like to the daemon's passive roster read,
- *  so a view that heard the owner is asleep (or waking) says that instead of
- *  "reconnecting", and one whose own socket is answered or kept open says
- *  only where it runs. */
+ *  also what an idle cloud looks like to the daemon's passive roster read,
+ *  so a view that heard the cloud is idle (or starting for a send) says only
+ *  where it runs, never "reconnecting", and never a state name: the send in
+ *  progress says itself. Same for one whose own socket is answered or kept. */
 export function placementLabel(placement: unknown, available: boolean | undefined, note: OwnerNote = {}): string | null {
   if (typeof placement !== "object" || placement === null) return null;
   const remote = (placement as { remote?: unknown }).remote;
   const where = typeof remote === "string" && remote.startsWith("device-") ? ON_ANOTHER_COMPUTER : typeof remote === "string" && remote.startsWith("worker-") ? IN_THE_CLOUD : "Running elsewhere";
-  if (note.owner === "asleep") return where + ASLEEP;
-  if (note.owner === "waking") return where + WAKING;
+  if (note.owner === "asleep" || note.owner === "waking") return where;
   return available === false && note.reconnectingShown !== true && note.reachable !== true ? where + RECONNECTING : where;
+}
+
+/** Whether the shown project's conversations and terminals run in more than
+ *  one place. When they all run in one, the window says that place once (the
+ *  host indicator, or a browser view's strip) and per-session labels stay
+ *  quiet; only a split project labels each session. The window sets it from
+ *  its own session list ({@link notePlaces}). */
+const placesSplitStore = writable(false);
+export const placesSplit: Readable<boolean> = { subscribe: placesSplitStore.subscribe };
+export function notePlaces(sessions: readonly { placement?: unknown }[]): void {
+  const places = new Set(sessions.map(row => {
+    const remote = typeof row.placement === "object" && row.placement !== null ? (row.placement as { remote?: unknown }).remote : undefined;
+    return typeof remote === "string" ? remote : "here";
+  }));
+  placesSplitStore.set(places.size > 1);
 }
 
 /**
@@ -130,7 +142,7 @@ export function pauseLabel(pause: SessionPause | null, { signedOut = false }: { 
     case "needs_provider": {
       // The catalog name, the same one the connect action and Pro use.
       const name = pause.provider === null ? "the agent" : providerLabel(pause.provider);
-      return { status: `Waiting for ${name} in the cloud`, detail: `Sign in to ${name} there from Chimaera Pro, and this continues.` };
+      return { status: `Waiting for ${name} in your cloud`, detail: `Connect ${name} in Chimaera Pro, and this continues.` };
     }
     case "stays_on_computer":
       return { status: "This terminal stays on your computer", detail: "It opens again when the project is back on your computer." };
@@ -144,7 +156,7 @@ function elsewherePause(signedOut: boolean): { status: string; detail: null } {
 }
 
 export class PlacementError extends Error {
-  constructor(readonly status: number) { super("Your project is reconnecting. This action was not sent."); }
+  constructor(readonly status: number) { super("This project can’t be reached right now. That wasn’t sent."); }
 }
 let pending: { workspace: string; context: object; promise: Promise<WorkspacePlacement> } | null = null;
 export interface PlacementOwner {
@@ -174,7 +186,8 @@ function admitPlacement(row: WorkspacePlacement): void {
   currentPlacement = original; placementOwnerStore.set(original);
 }
 
-/** Where this browser view's project runs and whether it is asleep there. */
+/** Where this browser view's project runs, and whether it is idle in the
+ *  cloud (routing and reconnecting read it; the words never say it). */
 export interface ProjectWhere {
   where: "cloud" | "computer";
   asleep: boolean;
@@ -215,13 +228,12 @@ export function ownerIsCloud(placement: unknown, project: ProjectWhere | null): 
   return gatewayPrefix().startsWith("/app/worker-");
 }
 
-/** A project view's machine in plain words for its status strip and Home:
- *  it follows the project, so it names where the project runs now. `state`
- *  adds "· asleep" for a sleeping owner (the status strip). */
-export function projectWhereLabel(project: ProjectWhere | null, { state = false }: { state?: boolean } = {}): string {
+/** A project view's place in plain words for its status strip and Home:
+ *  it follows the project, so it names where the project runs now. An idle
+ *  cloud is still the cloud: a send starts it and says so itself. */
+export function projectWhereLabel(project: ProjectWhere | null): string {
   if (project === null) return "This project";
-  const where = project.where === "cloud" ? IN_THE_CLOUD : "On your computer";
-  return state && project.asleep ? where + ASLEEP : where;
+  return project.where === "cloud" ? IN_THE_CLOUD : "On your computer";
 }
 
 /** Coalesce simultaneous reads; every later request checks the owner again. */
@@ -296,4 +308,18 @@ export function sendSocketAuth(socket: WebSocket, auth: Record<string, unknown>,
   void readPlacement().then(placement => send({ workspace_id: placement.workspace_id, epoch: placement.epoch, viewer_root: "L3Byb2plY3Q" }), () => {
     if (current()) socket.close(4000, "Project connection changed");
   });
+}
+
+/** A refused send or keystroke in place words. Holders between this view and
+ *  the project (the account's relay, the cloud's front door) answer with
+ *  their own sentences, which name machinery ("waking the cloud machine");
+ *  the closed `reason` they carry picks the words here instead. Unknown
+ *  reasons keep the holder's sentence. */
+export function refusalWords(message: string, reason: string | null): string {
+  switch (reason) {
+    case "waking": return "That wasn’t sent yet. Send it again in a moment.";
+    case "bringing": return "That wasn’t sent while this conversation moves here. Send it again in a moment.";
+    case "reconnecting": return "That wasn’t sent: this project can’t be reached right now.";
+    default: return message;
+  }
 }

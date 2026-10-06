@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { get } from "svelte/store";
-import { ownerSuspended, parsePause, parsePlacement, pauseLabel, placementLabel, projectWhere, projectWhereLabel, sessionPause } from "./placement";
+import { notePlaces, ownerSuspended, parsePause, parsePlacement, pauseLabel, placementLabel, placesSplit, projectWhere, projectWhereLabel, sessionPause } from "./placement";
 const live = { workspace_id: "w-one", holder_id: "d-home", route_host_id: "device-d-home", epoch: 4, policy_revision: 1, availability: "owned", server_now: "2026-09-28T19:00:00Z", expires_at: "2026-09-28T19:01:30Z" };
 describe("workspace routing authority", () => {
   it("accepts exact current owner without choosing a home or worker", () => {
@@ -138,18 +138,31 @@ describe("unknown owner presentation", () => {
 
 describe("where a routed session runs", () => {
   const cloud = { remote: "worker-w1" };
-  it("says asleep, not reconnecting, once the owner said it is asleep", () => {
+  it("labels sessions only while the project runs in more than one place", () => {
+    notePlaces([]);
+    expect(get(placesSplit)).toBe(false);
+    notePlaces([{ placement: "here" }, {}]);
+    expect(get(placesSplit)).toBe(false);
+    notePlaces([{ placement: cloud }, { placement: { remote: "worker-w1" } }]);
+    expect(get(placesSplit)).toBe(false);
+    notePlaces([{ placement: cloud }, { placement: "here" }]);
+    expect(get(placesSplit)).toBe(true);
+    notePlaces([{ placement: cloud }, { placement: { remote: "device-d1" } }]);
+    expect(get(placesSplit)).toBe(true);
+    notePlaces([]);
+  });
+  it("names only the place, never reconnecting, once the cloud said it is idle or starting", () => {
     expect(placementLabel(cloud, false)).toBe("In the cloud · reconnecting");
-    expect(placementLabel(cloud, false, { owner: "asleep" })).toBe("In the cloud · asleep");
-    expect(placementLabel(cloud, true, { owner: "asleep" })).toBe("In the cloud · asleep");
-    expect(placementLabel(cloud, false, { owner: "waking" })).not.toContain("reconnecting");
+    expect(placementLabel(cloud, false, { owner: "asleep" })).toBe("In the cloud");
+    expect(placementLabel(cloud, true, { owner: "asleep" })).toBe("In the cloud");
+    expect(placementLabel(cloud, false, { owner: "waking" })).toBe("In the cloud");
   });
   it("does not say reconnecting while the view's own socket is answered or kept open", () => {
     // A sleeping owner fails the roster read while its socket is kept open.
     expect(placementLabel(cloud, false, { reachable: true })).toBe("In the cloud");
     expect(placementLabel(cloud, false, { reachable: false })).toBe("In the cloud · reconnecting");
     // What the socket heard still wins.
-    expect(placementLabel(cloud, false, { owner: "asleep", reachable: true })).toBe("In the cloud · asleep");
+    expect(placementLabel(cloud, false, { owner: "asleep", reachable: true })).toBe("In the cloud");
   });
   it("says reconnecting once: not in the label while the view's status line says it", () => {
     expect(placementLabel(cloud, false, { reconnectingShown: true })).toBe("In the cloud");
@@ -164,15 +177,14 @@ describe("where a routed session runs", () => {
     await readPlacement();
     expect(projectWhereLabel(get(projectWhere))).toBe("In the cloud");
     expect(ownerSuspended()).toBe(false);
-    // A sleeping owner is routed (the read resolves) and named asleep.
+    // An idle cloud is routed (the read resolves) and named only by place.
     const asleep = await readPlacement();
     expect(asleep.route_host_id).toBe("worker-worker-id");
     expect(ownerSuspended()).toBe(true);
-    expect(projectWhereLabel(get(projectWhere), { state: true })).toBe("In the cloud · asleep");
     expect(projectWhereLabel(get(projectWhere))).toBe("In the cloud");
     await readPlacement();
     expect(ownerSuspended()).toBe(false);
-    expect(projectWhereLabel(get(projectWhere), { state: true })).toBe("On your computer");
+    expect(projectWhereLabel(get(projectWhere))).toBe("On your computer");
     expect(projectWhereLabel(null)).toBe("This project");
   });
   it("a sleeping owner's scope is sent like an owner's: reading it never wakes it", async () => {

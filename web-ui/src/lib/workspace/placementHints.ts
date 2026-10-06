@@ -25,9 +25,9 @@ const HINTS: Record<string, string> = {
   remote: "Running elsewhere",
   // Files and conversations installing back onto this computer: a return
   // under way (`Ownership::Hydrating` on the receiving daemon).
-  hydrating: "Coming home…",
+  hydrating: "Coming back here…",
   // This computer is handing the project over (its sessions are stopping).
-  transferring: "Moving work…",
+  transferring: "Moving…",
 };
 
 /** Workspace id → its hint, from a `/pro/status` body; empty unless Pro is
