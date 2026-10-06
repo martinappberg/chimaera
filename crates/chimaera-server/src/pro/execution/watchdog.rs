@@ -89,6 +89,18 @@ pub(in crate::pro) fn check_now(state: &AppState) {
         signal(state, &workspace);
     }
 }
+/// The fences to preserve sessions for: projects expired now that were not
+/// already expired at the last tick. A project that holds a valid lease again
+/// is forgotten, so its next lapse preserves its sessions again; otherwise a
+/// second lapse in one daemon life stopped its conversations without keeping
+/// them, and they were lost (coordinator follow-up to review R4).
+fn newly_fenced(recorded: &mut HashSet<String>, expired: Vec<String>) -> Vec<String> {
+    recorded.retain(|workspace| expired.contains(workspace));
+    expired
+        .into_iter()
+        .filter(|workspace| recorded.insert(workspace.clone()))
+        .collect()
+}
 pub(in crate::pro) fn start(state: &Arc<AppState>) {
     let weak = Arc::downgrade(state);
     let runtime = tokio::runtime::Handle::current();
@@ -133,10 +145,7 @@ pub(in crate::pro) fn start(state: &Arc<AppState>) {
             for workspace in &expired {
                 signal(&state, workspace);
             }
-            let fresh: Vec<_> = expired
-                .into_iter()
-                .filter(|workspace| recorded.insert(workspace.clone()))
-                .collect();
+            let fresh = newly_fenced(&mut recorded, expired);
             if fresh.is_empty() {
                 continue;
             }
@@ -193,4 +202,22 @@ pub(in crate::pro) async fn stop(
     }
     super::super::persist(state).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_second_lapse_preserves_its_sessions_again() {
+        let mut recorded = HashSet::new();
+        assert_eq!(newly_fenced(&mut recorded, vec!["w-a".into()]), ["w-a"]);
+        assert!(
+            newly_fenced(&mut recorded, vec!["w-a".into()]).is_empty(),
+            "same fence"
+        );
+        // Renewed: no longer expired, so forgotten.
+        assert!(newly_fenced(&mut recorded, Vec::new()).is_empty());
+        assert_eq!(newly_fenced(&mut recorded, vec!["w-a".into()]), ["w-a"]);
+    }
 }

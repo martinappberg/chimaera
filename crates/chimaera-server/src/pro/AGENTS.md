@@ -107,7 +107,9 @@ written by `/pro/disconnect`, persisted in `state.json`, cleared by the next
 configure) and the account acknowledged that project's stand-down
 (`sign_out::released`; nothing else proves the cloud is not running the work),
 unless another owner was verified meanwhile. Sessions a lease fence preserved
-(`watchdog::preserve`, also marking a running agent `Unknown`) record the
+(`watchdog::preserve`, once per lapse: a project that holds a lease again is
+preserved again at its next lapse, `newly_fenced`; also marking a running
+agent `Unknown`) record the
 fence's epoch on their ledger entry (`LedgerEntry.fence_epoch`, persisted).
 They resume (`ledger::resume_one`) or travel (`engine::transfer_session_ids`)
 only while `fence_current`: the computer holds that epoch with a valid lease.
