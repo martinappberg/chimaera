@@ -4,7 +4,7 @@
 //! and this computer holds it while its daemon can reach the account. The
 //! lease loop's own calls are that fact ([`answered`], [`unreachable`]); the
 //! guard for bringing cloud work home is that they have succeeded without a
-//! gap for a minute ([`settled`]), the only rule against bouncing.
+//! gap for a few seconds ([`settled`]), the only rule against bouncing.
 //!
 //! The same daemon keeps this computer reachable from the user's other
 //! devices, so quitting the app changes nothing: [`start`] dials the keeper's
@@ -26,8 +26,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::Message;
 
 /// Seconds the account must have answered without a gap before live cloud
-/// work comes home: a lid opened for a moment or a network blip pulls nothing
-/// home only to lose it again. A development build (the loopback harness) may
+/// work comes home: three renewals, so one lucky request after a wake pulls
+/// nothing home only to lose it again. Short on purpose: a return is cheap
+/// (this computer has the files), and losing it again costs the cloud the
+/// full lease-plus-grace path, so a flapping computer cannot bounce work
+/// fast. A development build (the loopback harness) may
 /// change it with `CHIMAERA_PRO_SETTLE_SECS` (at most five minutes); release
 /// builds ignore the variable.
 pub(super) fn guard_seconds() -> u64 {
@@ -40,7 +43,7 @@ pub(super) fn guard_seconds() -> u64 {
     })
 }
 fn guard_override(dev: bool, value: Option<&str>) -> u64 {
-    const GUARD: u64 = 60;
+    const GUARD: u64 = 15;
     value
         .filter(|_| dev)
         .and_then(|value| value.parse::<u64>().ok())
@@ -404,12 +407,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_return_guard_is_a_minute_and_fixed_in_release_builds() {
-        assert_eq!(guard_override(false, Some("5")), 60);
-        assert_eq!(guard_override(true, None), 60);
+    fn the_return_guard_is_fifteen_seconds_and_fixed_in_release_builds() {
+        assert_eq!(guard_override(false, Some("5")), 15);
+        assert_eq!(guard_override(true, None), 15);
         assert_eq!(guard_override(true, Some("5")), 5);
         assert_eq!(guard_override(true, Some("9000")), 300);
-        assert_eq!(guard_override(true, Some("soon")), 60);
+        assert_eq!(guard_override(true, Some("soon")), 15);
     }
 
     /// A daemon without Pro (or not a personal Pro computer) never dials.

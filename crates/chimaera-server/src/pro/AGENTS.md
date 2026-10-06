@@ -10,7 +10,7 @@ revocable delegation over the authenticated local API.
 | `authority.rs` / `authority_tests.rs` | Fixed-identity workspace-bound worker acceptance, startup-only validated revision advancement, credential-free persisted latch, renewal/route/root guards and synthetic side-effect regressions. |
 | `routes.rs` | Authenticated configure/status/privacy/sleep/hydration HTTP handlers. Accepted writes retain configuration/job reservations through durable persistence even if the caller disconnects. `/pro/status` rows carry additive `place`, `reason`, `run_here` and `run_in_cloud` (see Where work runs below). `hand_over` is the one flush coordinator behind `/pro/sleep`, the macOS sleep watcher and "Run in the cloud"; `woke` is the wake. |
 | `place.rs` | Where a synced project's work runs and the user's two choices: `run_here` (`POST /pro/projects/{id}/here`), `run_in_cloud` (`POST /pro/projects/{id}/cloud`), `observed` (the ownership read's `reason`/`holder_kind`/`holder_name`), the cloud machine's `arrived` report (`PUT /v2/workspaces/{id}/reason`). |
-| `reach.rs` | Whether this computer can reach the account (the lease loop's own calls: `answered`, `unreachable`, `settled` after a 60 s guard, `erroring`) and the daemon-owned reverse-serve link to the keeper. |
+| `reach.rs` | Whether this computer can reach the account (the lease loop's own calls: `answered`, `unreachable`, `settled` after a 15 s guard, `erroring`) and the daemon-owned reverse-serve link to the keeper. |
 | `sleep_watch.rs` | macOS only: the daemon's own IOKit sleep/wake watcher; a will-sleep runs `routes::sleeping` (23 s) and always acknowledges, a power-on runs `routes::woke`. |
 | `projects.rs` / `projects/catalog.rs` | Passive published-account discovery (negotiated `/v2/projects`, at most 128 rows/pages; legacy capability absence or 404 falls back to passive worker discovery), explicit copy/takeover routes, native-picked folder validation and inode/account-bound retry. Catalog rows infer no host or execution authority; errors retain cached rows and destination bindings. Legacy `/open` refuses rather than transferring execution. Nine original shared guard cases remain public; five actual runtime project compositions live privately, including four original ignored companion integrations run by the required private companion job. |
 | `project_copy.rs` / `project_copy/tests.rs` | Immutable read-only checkpoint copies with the existing file/Git transaction, independent durable copy enrollment, exact pending baselines, counted admission and explicit post-commit role promotion. Copy selects its receipt through passive `/v2/baton` GET; the legacy v1 response has no checkpoint and is never a fallback. Missing negotiated receipt refuses enrollment/install. No agent/session/configuration restore or copied-edit publication. |
@@ -415,7 +415,7 @@ cached readiness never grants permission to resume. After sign-in the page's
 resumes the now-ready sessions (`provider_gate::resume_ready`); nothing is
 fetched or reinstalled. One session failing to resume never stops the others.
 Live cloud work moves home at its next pause once the guard holds
-(`lazy_handback`, `reach::settled`, 60 s); a development build may set the guard
+(`lazy_handback`, `reach::settled`, 15 s); a development build may set the guard
 with `CHIMAERA_PRO_SETTLE_SECS` (up to 300), release builds ignore it.
 A worker asked to hydrate the epoch it already verifiably holds (same holder,
 same epoch, managed or not) only re-verifies it with the account: its running

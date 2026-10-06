@@ -426,7 +426,7 @@ past its deadline renews first only while nobody could have taken the project
 yet (by wall clock, lease end plus grace less a margin); otherwise it is fenced
 at once and re-acquires its own epoch without a fork or install if nobody took
 it. Cloud work returns to the computer at the conversation's next pause once
-its renewals have succeeded without a gap for a minute, the only guard against
+its renewals have succeeded without a gap for fifteen seconds, the only guard against
 bouncing. Exactly-once covers the managed agents' turns; external side effects
 an agent made before a sudden loss can repeat, which its recovery context says.
 
