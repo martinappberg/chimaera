@@ -19,6 +19,22 @@ pub(super) fn category(error: &Error) -> &'static str {
         "session handoff timed out" => "session_timeout",
         "session archive exceeds mirror file limit"
         | "workspace and conversations exceed mirror storage quota" => "quota",
+        // Why one conversation could not be saved into a copy (the fixed
+        // texts of `bundle::export_for_mirror`), so a "left out" line says
+        // which (review R4 follow-up: these all read "other").
+        "unknown session" => "session_unknown",
+        "session lifecycle operation already in progress" => "session_busy",
+        "bundle operation limit" => "session_saves_busy",
+        "native conversation is not ready to export" => "conversation_not_started",
+        "invalid native conversation ID" => "conversation_id_invalid",
+        "Claude transcript is unavailable" | "Codex rollout is unavailable" => "transcript_missing",
+        "this agent does not support portable session archives" => "agent_unsupported",
+        "session input did not pause before transfer deadline"
+        | "agent did not stop before bundle deadline" => "session_timeout",
+        "suspended session limit reached" => "session_limit",
+        "Session is not in the original transfer roster" => "session_not_in_roster",
+        "unknown workspace" => "workspace_unknown",
+        text if text.starts_with("Session import needs recovery.") => "import_pending",
         text if text
             .strip_prefix("service request returned HTTP ")
             .is_some_and(|status| {
@@ -62,6 +78,23 @@ mod tests {
         assert_eq!(
             category(&anyhow::anyhow!("service request returned HTTP 403")),
             "service_rejected"
+        );
+        // A conversation left out of a copy says why.
+        assert_eq!(
+            category(&anyhow::anyhow!("Claude transcript is unavailable")),
+            "transcript_missing"
+        );
+        assert_eq!(
+            category(
+                &anyhow::anyhow!("inner").context("native conversation is not ready to export")
+            ),
+            "conversation_not_started"
+        );
+        assert_eq!(
+            category(&anyhow::anyhow!(
+                "session lifecycle operation already in progress"
+            )),
+            "session_busy"
         );
         assert_eq!(
             category(&anyhow::anyhow!(
