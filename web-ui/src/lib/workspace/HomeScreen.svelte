@@ -97,8 +97,11 @@
    *  remote machines below it are visible without scrolling. */
   const WORKSPACE_PREVIEW = 5;
   let showAllWorkspaces = $state(false);
+  // Rows awaiting approval stay visible however old they are.
   const shownWorkspaces = $derived(
-    showAllWorkspaces ? sorted : sorted.slice(0, WORKSPACE_PREVIEW),
+    showAllWorkspaces
+      ? sorted
+      : sorted.filter((w, i) => i < WORKSPACE_PREVIEW || (liveByWs.get(w.id)?.attn ?? 0) > 0),
   );
 
   /** Live rollup per workspace: total live sessions + how many need you. */
@@ -866,9 +869,16 @@
               </div>
             {/if}
           {/each}
-          {#if sorted.length > WORKSPACE_PREVIEW}
-            <button class="more" onclick={() => (showAllWorkspaces = !showAllWorkspaces)}>
-              {showAllWorkspaces ? "Show fewer" : `Show ${sorted.length - WORKSPACE_PREVIEW} more`}
+          {#if sorted.length > WORKSPACE_PREVIEW && (showAllWorkspaces || shownWorkspaces.length < sorted.length)}
+            <button
+              class="more"
+              onclick={() => {
+                showAllWorkspaces = !showAllWorkspaces;
+                confirmStopId = null;
+                confirmRemoveId = null;
+              }}
+            >
+              {showAllWorkspaces ? "Show fewer" : `Show ${sorted.length - shownWorkspaces.length} more`}
             </button>
           {/if}
         </div>
@@ -1824,12 +1834,12 @@
   .live-slot { display: inline-grid; align-items: center; justify-items: end; }
   .live-slot > * { grid-area: 1 / 1; }
   .workspace-meta .side.stop {
-    display: inline-flex; visibility: hidden; min-height: 0; height: 24px; padding: 0 8px; margin: -4px 0;
+    display: inline-flex; visibility: visible; opacity: 0; min-height: 0; height: 24px; padding: 0 8px; margin: -4px 0;
     border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent); border-radius: 6px;
     color: var(--warn); font-size: var(--text-xs); line-height: 1;
   }
-  .live-slot:hover .session-state { visibility: hidden; }
-  .live-slot:hover .side.stop { visibility: visible; }
+  .live-slot:hover .session-state, .live-slot:focus-within .session-state { opacity: 0; }
+  .live-slot:hover .side.stop, .live-slot:focus-within .side.stop { opacity: 1; }
   .more { appearance: none; border: none; background: none; font: inherit; font-size: var(--text-xs); color: var(--muted); padding: 8px 12px; text-align: left; cursor: pointer; border-radius: 6px; }
   .more:hover { color: var(--fg); }
   .workspace-meta .side.stop:hover { color: var(--err); border-color: color-mix(in srgb, var(--err) 55%, transparent); background: var(--row-active); }
