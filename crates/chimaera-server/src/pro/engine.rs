@@ -882,6 +882,13 @@ async fn hydrate_generation(
             epoch = expected_epoch,
             "project hydration failed; installation remains fenced"
         );
+        // Opt-in only (debug): the cause chain can name a stage path. Without
+        // it a category of "other" was undiagnosable from any log.
+        tracing::debug!(
+            epoch = expected_epoch,
+            causes = ?error.chain().map(ToString::to_string).collect::<Vec<_>>(),
+            "project hydration failure causes"
+        );
     }
     result
 }
@@ -1636,11 +1643,19 @@ fn chat_at_pause(
             || chat.status_needs_action
             || (!carry.turn_in_flight
                 && (chat.status_category.as_deref() == Some("idle")
+                    // A turn that ended in an error, or one the vendor
+                    // refused for its limit, is over: nothing is in flight
+                    // and nothing will be until the user sends again. A
+                    // project waiting on such a conversation would never
+                    // reach its pause otherwise (its return home, and
+                    // "Run here", hung after a usage-limit abort).
                     || matches!(
                         agent_state,
                         Some(
                             crate::agent_state::AgentState::Finished
                                 | crate::agent_state::AgentState::IdlePrompt
+                                | crate::agent_state::AgentState::Errored
+                                | crate::agent_state::AgentState::RateLimited
                         )
                     ))))
 }
@@ -2701,6 +2716,44 @@ mod pause_tests {
             Some(crate::agent_state::AgentState::NeedsPermission)
         ));
         assert!(!chat_at_pause(&chat, Some(&carry), true, finished));
+    }
+
+    #[test]
+    fn an_aborted_or_rate_limited_turn_is_a_pause() {
+        let chat = chimaera_agent::ChatInfo {
+            id: "s-claude".into(),
+            agent: "claude".into(),
+            cwd: "/tmp".into(),
+            created_at_ms: 0,
+            alive: true,
+            exit_status: None,
+            native_session_id: None,
+            model: None,
+            current_mode: None,
+            pending_permission: false,
+            status_detail: None,
+            status_category: None,
+            status_needs_action: false,
+            remote_control_url: None,
+            background_running: 0,
+        };
+        let mut carry = chimaera_agent::Carryover::default();
+        for ended in [
+            crate::agent_state::AgentState::Errored,
+            crate::agent_state::AgentState::RateLimited,
+        ] {
+            assert!(chat_at_pause(&chat, Some(&carry), false, Some(ended)));
+            // Input queued behind the failure is not a pause: it runs next.
+            assert!(!chat_at_pause(&chat, Some(&carry), true, Some(ended)));
+        }
+        // An error mid-flight (the row is stale while a turn still runs) is not.
+        carry.turn_in_flight = true;
+        assert!(!chat_at_pause(
+            &chat,
+            Some(&carry),
+            false,
+            Some(crate::agent_state::AgentState::Errored)
+        ));
     }
 }
 
