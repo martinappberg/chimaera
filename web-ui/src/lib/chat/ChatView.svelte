@@ -62,7 +62,6 @@
   import { HoverPreviews } from "../previews/doc/hoverController.svelte";
   import PermissionCard from "./PermissionCard.svelte";
   import ElicitationCard from "./ElicitationCard.svelte";
-  import ConversationSlot from "../extensions/ConversationSlot.svelte";
   import type { PendingElicitation } from "./elicitation";
   import PlanApprovalCard from "./PlanApprovalCard.svelte";
   import QuestionCard from "./QuestionCard.svelte";
@@ -79,8 +78,6 @@
   import { isTransferOrigin } from "./transfer";
   import { keptReviews, requestKeptReview, waitingReview } from "../pro/keptReviews.svelte";
   import Composer from "./Composer.svelte";
-  import ManualResume from "./ManualResume.svelte";
-  import { manualResumeNote } from "../workspace/manualResume";
   import { hookNotice } from "./hookNotice";
   import HookRow from "./HookRow.svelte";
   import SameFileNotice from "../workspace/SameFileNotice.svelte";
@@ -2175,12 +2172,13 @@
    *  exit: its row is paused, or its socket said it moved or is paused and it
    *  has not been reached since. The transcript stays mounted. */
   const rowPause = $derived(sessionPause(session));
-  const manualPause = $derived(manualResumeNote(session));
+  // A row an older version left paused by hand (`manual_resume_reason`)
+  // stays paused, with the ordinary paused words.
   const continuing = $derived(
-    manualPause !== null || session.suspended === true || ((store.moving !== null || store.pausedFor !== null) && !store.connected),
+    session.manual_resume_reason != null || session.suspended === true || ((store.moving !== null || store.pausedFor !== null) && !store.connected),
   );
   const continuingLabel = $derived(
-    manualPause ?? pauseLabel(
+    pauseLabel(
       store.moving !== null && !store.connected
         ? { type: "moved", to: store.moving }
         : store.pausedFor !== null && !store.connected
@@ -3236,7 +3234,6 @@
 
     <!-- A decision only the optional extension can take (a setup command
          this agent proposed): nothing at all without it or without a plan. -->
-    <ConversationSlot workspaceId={session.workspace_id ?? null} sessionId={session.id} blocks={store.blocks} {visible} />
 
     {#if agentBusy && pinnedPermissions.length === 0 && pinnedQuestions.length === 0 && pinnedElicitations.length === 0}
       <div class="status-row" aria-live={visible ? "polite" : "off"}>
@@ -3519,9 +3516,7 @@
     </div>
   {/if}
 
-  {#if manualPause !== null}
-    <ManualResume {session} onResumed={() => socket.retrySoon()} />
-  {:else if continuing}
+  {#if continuing}
     <div class="connection-status"><span role="status">{continuingLabel}</span>{#if connect !== null}<button type="button" class="connect" onclick={() => cloudOnboarding.request({ providerIds: [connect.providerId], workspaceId: connect.workspaceId })}>Connect {connect.label} to continue</button>{/if}</div>
   {:else if store.bringing}
     <!-- Acting here is bringing the work over; the send waits for it. -->

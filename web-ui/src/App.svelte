@@ -6071,7 +6071,7 @@
         <!-- Inside an allocation the label carries the node ("cluster ›
              n042") so a compute-node window never poses as its login
              node — derived from the daemon's self block, hash-independent. -->
-        <PlaceSlot workspaceId={placeWorkspaceId} sessions={wsSessions} onChanged={() => void refreshWorkspaces()}>
+        <PlaceSlot workspaceId={placeWorkspaceId} sessions={wsSessions}>
           {#snippet label()}<span class="daemon-host" class:remote={isRemoteWindow} title={health?.hostname}
             >{$computeStatus?.self
               ? `${getHostLabel()} › ${$computeStatus.self.node}`
@@ -6468,7 +6468,7 @@
           re-attach
         </button>
       {/if}
-      <PlaceSlot workspaceId={placeWorkspaceId} sessions={wsSessions} onChanged={() => void refreshWorkspaces()}>
+      <PlaceSlot workspaceId={placeWorkspaceId} sessions={wsSessions}>
         {#snippet label()}<span class="strip-host" class:remote={isRemoteWindow} title={health?.hostname}
           >{stripHost}</span
         >{/snippet}

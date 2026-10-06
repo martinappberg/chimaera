@@ -1,37 +1,27 @@
-/** The one daemon operation behind the host indicator's "Run in the cloud",
- * on the window's existing API owner: the quit hand-off (`POST /pro/sleep`
- * with `park`) for exactly one project. A parked project stays in the cloud
- * until this computer leaves and comes back (`/pro/wake`), so the laptop does
- * not pull it straight home again. No retries: a refusal is the answer. */
+/** The two daemon operations behind the host indicator's menu, on the
+ * window's existing API owner: "Run here" (`POST /pro/projects/{id}/here`)
+ * and "Run in the cloud" (`POST /pro/projects/{id}/cloud`). Both answer at
+ * once (202) and finish on their own; the status row's `place` says when.
+ * No retries: a refusal is the answer. */
 import { api } from "../net/api";
 import type { PlaceMoveResult } from "./application";
 
-/** The daemon's own budget for the hand-off; past it the move finishes by
- *  itself and the reply says so (`deadline`). */
-const BUDGET_MS = 60_000;
 const ID = /^[A-Za-z0-9_-]{1,128}$/;
 const CODE = /^[a-z_]{1,64}$/;
+const TIMEOUT_MS = 15_000;
 
-export async function runInCloud(workspaceId: string): Promise<PlaceMoveResult> {
-  if (!ID.test(workspaceId)) return { moved: false, reason: "unavailable" };
+async function post(workspaceId: string, to: "here" | "cloud"): Promise<PlaceMoveResult> {
+  if (!ID.test(workspaceId)) return { started: false, error: "unavailable" };
   let response: Response;
   try {
-    response = await api("/pro/sleep", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ park: true, workspace_ids: [workspaceId], deadline_ms: BUDGET_MS }),
-      signal: AbortSignal.timeout(BUDGET_MS + 15_000),
-    });
-  } catch { return { moved: false, reason: "unavailable" }; }
-  // 204: this daemon has no account configured, so nothing could move.
-  if (!response.ok || response.status === 204) return { moved: false, reason: "unavailable" };
-  const reply = await response.json().catch(() => null) as { handoff?: unknown; reason?: unknown; pending?: unknown; failed?: unknown } | null;
-  if (reply?.handoff === true) return { moved: true };
-  // Still publishing at the budget: the daemon finishes (or undoes) it alone.
-  if (reply?.reason === "deadline" && Array.isArray(reply.pending) && reply.pending.includes(workspaceId)) return { moved: true };
-  const failed = Array.isArray(reply?.failed)
-    ? (reply.failed as { workspace_id?: unknown; error?: unknown }[]).find(row => row?.workspace_id === workspaceId)
-    : undefined;
-  const reason = typeof failed?.error === "string" ? failed.error : reply?.reason;
-  return { moved: false, reason: typeof reason === "string" && CODE.test(reason) ? reason : "unavailable" };
+    response = await api(`/pro/projects/${encodeURIComponent(workspaceId)}/${to}`, { method: "POST", signal: AbortSignal.timeout(TIMEOUT_MS) });
+  } catch { return { started: false, error: "unavailable" }; }
+  if (response.status === 202) return { started: true };
+  if (response.status !== 409) return { started: false, error: "unavailable" };
+  const reply = await response.json().catch(() => null) as { error?: unknown } | null;
+  const error = reply?.error;
+  return { started: false, error: typeof error === "string" && CODE.test(error) ? error : "unavailable" };
 }
+
+export function runHere(workspaceId: string): Promise<PlaceMoveResult> { return post(workspaceId, "here"); }
+export function runInCloud(workspaceId: string): Promise<PlaceMoveResult> { return post(workspaceId, "cloud"); }

@@ -1367,7 +1367,7 @@ export interface CloudProjectOpen {
 
 export async function proOpenCloudProject(workspaceId: string, expectedAccountLifetime?: string): Promise<CloudProjectOpen | null> {
   const t = tauri();
-  if (t === null) throw new Error("Open the desktop app to save a local project copy.");
+  if (t === null) throw new Error("Open the desktop app to open this project here.");
   // A distinct command refuses old native shells before their legacy Open
   // implementation can acquire execution. Never fall back to that command.
   return t.core.invoke<CloudProjectOpen | null>("pro_copy_project", { workspaceId, ...accountGuard(expectedAccountLifetime) }).catch(reason => {
@@ -1480,18 +1480,17 @@ export interface MirrorWorkspace {
     error_code?: string | null; kept_both?: number; kept_paths?: string[]; git_staging?: GitStagingStatus } | null;
   git_branches?: string[] | null;
   blocked_providers?: CloudBlockedProvider[];
-  /** Additive (newer daemons): where this project's work went the last time
-   *  the app left (`moved`, `staying_here` with a closed `reason`, or
-   *  `pending` while that runs; `at` in Unix ms). Reasons the UI does not
-   *  know read as a generic true sentence. */
-  leave?: { state: "moved" | "staying_here" | "pending" | (string & {}); reason?: string | null; at: number } | null;
-  /** Additive: the cloud could take this project's work right now. */
-  cloud_handoff?: boolean;
-  /** Additive: the agent kinds working or waiting on the user there now. */
-  working_agents?: string[];
-  /** Additive: handed to the cloud and kept there until this computer
-   *  leaves and comes back. */
-  parked?: boolean;
+  /** Additive: where this project's work runs now (another computer by its
+   *  account name, which may be absent), or null when it is not synced. */
+  place?: { where: "here" } | { where: "cloud" } | { where: "computer"; computer?: string | null } | null;
+  /** Additive: why the work is not where it would be, in the daemon's closed
+   *  plain categories (`agent_not_connected_in_cloud`, `cloud_time_used_up`,
+   *  …). Values the UI does not know read as a generic true sentence. */
+  reason?: string | null;
+  /** Additive: whether "Run here" (`POST /pro/projects/{id}/here`) and "Run
+   *  in the cloud" (`POST /pro/projects/{id}/cloud`) apply right now. */
+  run_here?: boolean;
+  run_in_cloud?: boolean;
 }
 export interface MirrorStatus {
   configured: boolean; projects_root: string; projects_root_confirmed: boolean; workspaces: MirrorWorkspace[];

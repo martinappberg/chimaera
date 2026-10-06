@@ -79,8 +79,8 @@ app-build` (never the root `cargo`).
   hidden it restores ONLY the most recently used one (the rest stay in the Dock); with no window (only
   during startup) it opens Home. A repeated launch focuses the most recent on-screen window the same way. Minimized
   windows are never mass-restored.
-- **Project windows for cloud work.** Chimaera Pro offers **Take over** on the project to move
-  execution to this Mac. The account's cloud is not a separate host page: every window opens through
+- **Project windows for cloud work.** Chimaera Pro offers **Run here** in the project's host
+  indicator to move its work to this Mac. The account's cloud is not a separate host page: every window opens through
   `open_shell_window`, which refuses the cloud's alias, and a connect to the cloud is refused before
   anything reaches it (`shell/connect.rs` `run_flight`, `shell/tunnel.rs` `app_host`). A window on it
   saved by an older build is not restored; launch logs it and drops the record. Cloud projects open in

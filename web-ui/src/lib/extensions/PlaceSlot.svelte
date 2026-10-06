@@ -12,7 +12,6 @@
    * exactly the label, with no wrapper element and no request.
    */
   import type { Snippet } from "svelte";
-  import { untrack } from "svelte";
   import { writable } from "svelte/store";
   import { paidPlan } from "../net/plan";
   import { pageVisible } from "../shared/visibility";
@@ -20,12 +19,11 @@
   import type { Session } from "../workspace/sessions";
   import type { PlaceSession } from "./application";
 
-  let { workspaceId, sessions, onChanged, label }: {
+  let { workspaceId, sessions, label }: {
     /** The local project this window shows, or null (Home, a remote window,
      *  a browser view): null never mounts the extension. */
     workspaceId: string | null;
     sessions: Session[];
-    onChanged: () => void;
     label: Snippet;
   } = $props();
 
@@ -48,9 +46,8 @@
     if (!active || host === undefined || id === null || selectedApplication?.mountPlace === undefined) return;
     const controller = new AbortController();
     const signal = controller.signal;
-    const changed = untrack(() => onChanged);
     let owner: { dispose(): void } | null = null;
-    void import("./placeHost").then(({ runInCloud }) => {
+    void import("./placeHost").then(({ runHere, runInCloud }) => {
       if (signal.aborted) throw new Error("Place retired");
       return selectedApplication!.mountPlace!(host, {
         version: 1, workspaceId: id, signal,
@@ -60,8 +57,8 @@
         connectAgents: (providerIds) => {
           if (!signal.aborted) cloudOnboarding.request({ providerIds: [...providerIds], workspaceId: id });
         },
-        runInCloud: () => signal.aborted ? Promise.resolve({ moved: false, reason: "unavailable" }) : runInCloud(id),
-        refreshProjects: () => { if (!signal.aborted) changed(); },
+        runHere: () => signal.aborted ? Promise.resolve({ started: false, error: "unavailable" }) : runHere(id),
+        runInCloud: () => signal.aborted ? Promise.resolve({ started: false, error: "unavailable" }) : runInCloud(id),
       });
     }).then((mounted) => {
       if (signal.aborted) mounted.dispose(); else owner = mounted;

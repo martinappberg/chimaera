@@ -3,9 +3,6 @@
 import type * as Native from "../net/native";
 import type { CloudSetupRequest, CloudSetupInfo, CloudProviderConnection, CloudProviderStatus } from "../net/native";
 
-import type { SecretPage, SecretResult, SecretCommand, SecretAttempt } from "../pro/projectSecrets";
-
-
 import type { CloudOnboardingContext } from "../pro/onboarding.svelte";
 import type { Workspace } from "../workspace/sessions";
 import type { Observable } from "./application";
@@ -16,7 +13,6 @@ export type { ProStatus, CloudProjectOpen, ProHost, ProDevice, ProAuthScreenHint
 export interface HomeProject { workspace_id: string; name: string | null; href: string; available: boolean; place?: "computer" | "cloud" | null; reason?: string | null }
 export interface HomeProjects { projects: HomeProject[]; pending: boolean }
 export interface BrowserAccountStatus extends Native.ProStatus { account_lifetime: string | null }
-export type SecretFailureCode = "unsupported" | "invalid_request" | "state_changed" | "unavailable" | "operation_unavailable" | "limit_reached" | "sign_in_required" | "context_changed" | "unconfirmed" | "account_home_required";
 
 export type { CloudOnboardingContext } from "../pro/onboarding.svelte";
 export type { Workspace } from "../workspace/sessions";
@@ -68,14 +64,6 @@ export interface AccountPresentationServices {
   cloudRequest(request: Native.CloudSetupRequest, signal?: AbortSignal): Promise<Native.CloudSetupInfo>;
   readBrowserMirrorStatus(signal?: AbortSignal): Promise<Native.MirrorStatus | null>;
   openBrowserWorkspace(workspaceId: string): void;
-  readSecretPage(after?: string | null, signal?: AbortSignal): Promise<SecretPage>;
-  readSecretOperation(context: string, operation: string, signal?: AbortSignal): Promise<SecretResult>;
-  sendSecretCommand(context: string, command: SecretCommand): Promise<SecretResult>;
-  secretFailure(reason: unknown, fallback?: SecretFailureCode): Error & { readonly code: SecretFailureCode };
-  observeSecretContext(context: string): void;
-  retainSecretAttempt(attempt: SecretAttempt): boolean;
-  secretReconciliation: Observable<{ context: string | null; attempts: SecretAttempt[] }>;
-  settleSecretAttempt(context: string, operation: string): void;
   requestKeptReview(workspaceId: string): void;
   cloudOnboarding: {
     readonly context: CloudOnboardingContext | null;

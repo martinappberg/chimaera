@@ -49,10 +49,11 @@ export interface SurfaceOwner { update(presentation: Readonly<SurfacePresentatio
  *  `remote` is the host a routed session runs on (`worker-…` / `device-…`),
  *  null for one on this computer. */
 export interface PlaceSession { readonly id: string; readonly agentKind: string | null; readonly remote: string | null }
-/** Why moving the project's work to the cloud did not happen: the daemon's
- *  own fixed reason (`cloud_hours_exhausted`, `draining`, a failure code), or
- *  `unavailable` when it could not be asked. */
-export type PlaceMoveResult = { moved: true } | { moved: false; reason: string };
+/** The daemon's answer to "Run here" or "Run in the cloud": started (202:
+ *  the status row's `place` says when it has arrived), or refused with the
+ *  daemon's own fixed code (`not_here`, `not_elsewhere`,
+ *  `cloud_time_used_up`), or `unavailable` when it could not be asked. */
+export type PlaceMoveResult = { started: true } | { started: false; error: string };
 /** The window's host indicator for one local project. The host owns the
  *  label it shows today; the extension may take its place (`claim`) and say
  *  where the project's work runs. Only these finite facts and actions cross:
@@ -68,26 +69,12 @@ export interface PlaceMount {
   sessions: Observable<readonly PlaceSession[]>;
   /** Opens Chimaera Pro's agent connection flow for this project. */
   connectAgents(providerIds: readonly string[]): void;
-  /** The clean hand-off of this one project to the cloud (the same daemon
-   *  operation quitting uses), resolved when the daemon has answered. */
+  /** "Run here": `POST /pro/projects/{id}/here` on the window's daemon. */
+  runHere(): Promise<PlaceMoveResult>;
+  /** "Run in the cloud": `POST /pro/projects/{id}/cloud` on the window's daemon. */
   runInCloud(): Promise<PlaceMoveResult>;
-  /** Reads the window's project list again (after this computer took it). */
-  refreshProjects(): void;
 }
 export interface PlaceOwner { dispose(): void }
-/** One conversation that asked for something only the extension can answer:
- *  the setup commands it proposed with the chimaera `update_cloud_profile`
- *  tool, read from its own transcript (oldest first). The host mounts the
- *  extension only while that list is non-empty, so other conversations cost
- *  nothing; the extension decides whether one of them still waits. */
-export interface ConversationMount {
-  version: 1;
-  workspaceId: string;
-  sessionId: string;
-  signal: AbortSignal;
-  visibility: Observable<boolean>;
-  proposals: Observable<readonly string[]>;
-}
 /** One remote machine row on Home, by its SSH alias. */
 export interface HostMount {
   version: 1;
@@ -103,8 +90,6 @@ export interface ApplicationExtension {
   bindAccountBranding?(scope: AccountBrandingSubscription): Promise<() => void>;
   /** Optional: an extension without it leaves the host indicator alone. */
   mountPlace?(target: HTMLElement, mount: PlaceMount): Promise<PlaceOwner>;
-  /** Optional: rendered in a conversation's own approval area. */
-  mountConversation?(target: HTMLElement, mount: ConversationMount): Promise<PlaceOwner>;
   /** Optional: one quiet line under a remote machine's Home row. */
   mountHost?(target: HTMLElement, mount: HostMount): Promise<PlaceOwner>;
 }

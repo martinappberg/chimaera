@@ -32,6 +32,17 @@ Who sees what is one tier rule, decided once in the daemon (`pro::tier`) and onc
 
 Words shown to the user name places (this computer, the cloud, another computer), never the machinery; a vocabulary test in the web UI enforces this.
 
+### The host indicator
+
+The window's host label (the connection dot and "local" at the foot of the rail, or in the focus-mode strip) is the one place that says where a synced project's work runs. Only the official app with an active plan, on a local project in a native window, mounts the extension there (`web-ui/src/lib/extensions/PlaceSlot.svelte`); everyone else, including a signed-out or no-plan user of the official app, sees exactly the free app's label, with no wrapper and no request.
+
+- The label reads the project's `/pro/status` row: `place` here is "This Mac" (or "This computer" off a Mac), cloud is "In the cloud", computer is "On <name>" ("On another computer" when the account has no name for it). A project with no `place` (not synced, or kept on this computer only) keeps the host's own label.
+- Clicking it opens a small menu: one sentence ("Running on this Mac", "Running in your cloud", "Running on Studio"), at most one note, and only the entries that apply. The note is one plain sentence for the row's `reason` (an agent not signed in in the cloud, with one **Connect** action; cloud time or storage used up; the cloud unavailable; a conversation too large or not saved; the project not synced yet; any other value reads as "This project couldn't move just now."), else the project's own problem (a sync problem, staged Git changes kept apart, branches to merge).
+- **Run here** shows only when the row's `run_here` is true and calls `POST /pro/projects/{id}/here`; **Run in the cloud** shows only when `run_in_cloud` is true and calls `POST /pro/projects/{id}/cloud` (`web-ui/src/lib/extensions/placeHost.ts`). After a 202 the label shows that action's own progress ("Moving here…", "Moving…") until a status read shows the project arrived, a reason, or the entry applying again; a 409 is one sentence in the menu.
+- The status is read every 15 s while the window is visible, every 3 s while a move runs, and on the account's change event; nothing else polls. Per-conversation and per-terminal labels name a place only while the project's sessions run in more than one place (`net/placement.ts` `placesSplit`).
+
+The presentation and its words live in the private package (`account/ProjectPlace.svelte`, `account/place.ts`).
+
 ## What the daemon does
 
 - **Reachability** (`crates/chimaera-server/src/pro/reach.rs`). For a personal computer configured with an active account and the extension composed in, the daemon opens the keeper's reverse-serve socket with its own daemon delegation (an account-wide credential limited to sync, leases and keeper transport, held in memory only, at most 24 hours, renewed by the daemon) and bridges each stream the keeper opens to its own loopback port. Remote viewers still need this daemon's own token. Sign-out, a new configuration, device revocation and sign-out everywhere end the socket; reconnects back off from half a second to ten seconds, and a credential the keeper refuses, or one that expired, ends the link until the daemon is configured again. At most 8 MiB read from the daemon wait to be written to the keeper across all streams. The same module records whether the lease loop's calls reach the account (a success or a 409; a refused credential does not count), which drives the return guard, and whether the account itself answers with server errors (only an answer with its `X-Chimaera-Account` header), which drives the server-error exception.
@@ -77,7 +88,7 @@ The account's ownership read carries the additive `reason`, `holder_kind` (`comp
 | The seam the extension plugs into | `crates/chimaera-server/src/daemon_extension.rs` (daemon), `crates/chimaera-app/src/account/` (native app) |
 | Viewing a project another machine runs | `crates/chimaera-server/src/session_proxy.rs`, [VIEWING](../../crates/chimaera-link/VIEWING.md) |
 | Agents' note | `crates/chimaera-server/src/mcp/cloud_context.rs` |
-| Web UI | `web-ui/src/lib/pro/`, `web-ui/src/lib/extensions/` |
+| Web UI | `web-ui/src/lib/pro/`, `web-ui/src/lib/extensions/` (the host indicator slot: `PlaceSlot.svelte`, `placeHost.ts`) |
 | Contracts | [`crates/chimaera-link`](../../crates/chimaera-link/) |
 
 ## Constraints and edge cases
