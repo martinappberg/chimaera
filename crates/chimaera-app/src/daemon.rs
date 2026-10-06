@@ -195,7 +195,7 @@ pub async fn ensure_local_daemon() -> anyhow::Result<LocalDaemon> {
 pub(crate) async fn ensure_local_daemon_for(
     requirement: RuntimeRequirement,
 ) -> anyhow::Result<LocalDaemon> {
-    if let Some(probed) = probe(requirement).await? {
+    if let Some(probed) = first_look(Manifest::load(), requirement).await {
         let m = &probed.manifest;
         let compatible = chimaera_core::builds_match(chimaera_core::BUILD_ID, m.build.as_deref())
             && requirement.matches(probed.extension, probed.identity.as_deref());
@@ -257,7 +257,7 @@ pub async fn update_local_daemon() -> anyhow::Result<LocalDaemon> {
 pub(crate) async fn update_local_daemon_for(
     requirement: RuntimeRequirement,
 ) -> anyhow::Result<LocalDaemon> {
-    if let Some(probed) = probe(requirement).await? {
+    if let Some(probed) = first_look(Manifest::load(), requirement).await {
         let m = &probed.manifest;
         let decision = runtime_decision_with_identity(
             requirement,
@@ -343,6 +343,28 @@ impl Probed {
 #[cfg(unix)]
 async fn probe(requirement: RuntimeRequirement) -> anyhow::Result<Option<Probed>> {
     probe_loaded_for(Manifest::load(), requirement).await
+}
+
+/// The first look before attaching or starting. A daemon that does not
+/// answer its health check plainly (busy past the 2 s budget, hung, a token
+/// that no longer authenticates) does not abort the launch, as it never did:
+/// fall through to spawning. A second daemon refuses to start beside a live
+/// one, and the readiness wait attaches only to a daemon that answers and
+/// matches.
+#[cfg(unix)]
+async fn first_look(
+    loaded: anyhow::Result<Option<Manifest>>,
+    requirement: RuntimeRequirement,
+) -> Option<Probed> {
+    match probe_loaded_for(loaded, requirement).await {
+        Ok(probed) => probed,
+        Err(error) => {
+            tracing::warn!(
+                "the local daemon did not answer its health check ({error:#}); starting one"
+            );
+            None
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -992,10 +1014,15 @@ mod tests {
                 br#"{"name":"chimaera","pid":0,"daemon_extension":true}"#.to_vec(),
             ),
         ] {
-            let (port, task) = serve_response(status, body);
+            let (port, task) = serve_response(status, body.clone());
             let result = probe_loaded(Ok(Some(manifest(port)))).await;
             task.join().unwrap();
             assert!(result.is_err());
+            // The launch itself never aborts on it: it starts a daemon.
+            let (port, task) = serve_response(status, body);
+            let first = first_look(Ok(Some(manifest(port))), RuntimeRequirement::Extension).await;
+            task.join().unwrap();
+            assert!(first.is_none());
         }
         // Ambiguous failures remain protective; only positive connection refusal recovers.
         assert!(!refused_hint(&ureq::Error::ConnectionFailed.into()));
