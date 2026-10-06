@@ -502,11 +502,13 @@ fn apply_chat_event(state: &Arc<AppState>, id: &str, ev: &AgentEvent) {
         return;
     };
     let next = match ev {
-        // Claude answers `initialize` only after its SessionStart hook ran,
-        // and that hook reads as Running: a process with no turn in flight
-        // or asked for is idle at its Init whichever arrived first.
-        // Otherwise a resumed idle conversation reads "running" until its
-        // next turn ends.
+        // Claude's SessionStart hook reads as Running and always lands
+        // before this Init: an `http` hook blocks the `initialize` answer
+        // (claude.rs `await_initialize`). A process with no turn in flight
+        // and no send waiting is idle — without this a resumed idle
+        // conversation reads "running" until its next turn ends. No turn
+        // ended, so the notice feed is told to take the correction as a
+        // baseline, never a "finished" edge.
         AgentEvent::Init { .. }
             if record.state == AgentState::Unknown
                 || (record.state == AgentState::Running
@@ -515,6 +517,9 @@ fn apply_chat_event(state: &Arc<AppState>, id: &str, ev: &AgentEvent) {
                         .input_activity(id)
                         .is_some_and(|(carry, pending)| carry.turn_in_flight || pending)) =>
         {
+            if record.state == AgentState::Running {
+                record.state_corrected = Some(AgentState::Finished);
+            }
             Some(AgentState::Finished)
         }
         // Structured questions block the turn on a human exactly like
@@ -611,14 +616,6 @@ fn apply_chat_event(state: &Arc<AppState>, id: &str, ev: &AgentEvent) {
         } => Some(AgentState::IdlePrompt),
         _ => None,
     };
-    // That Init correction fixes a stale reading; no turn ended, so the
-    // notice feed takes it as a baseline, never a "finished" edge.
-    if matches!(ev, AgentEvent::Init { .. })
-        && record.state == AgentState::Running
-        && next == Some(AgentState::Finished)
-    {
-        record.state_corrected = true;
-    }
     if let Some(next) = next {
         record.state = next;
     }
@@ -3895,6 +3892,25 @@ fn restart_message(carry: &chimaera_agent::Carryover) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// A chat driver that never speaks: alive until killed, then one Exited.
+    struct IdleAdapter;
+    impl chimaera_agent::driver::AgentAdapter for IdleAdapter {
+        fn kind(&self) -> &'static str {
+            "claude"
+        }
+        fn spawn(
+            &self,
+            _: chimaera_agent::driver::SpawnSpec,
+            mut io: chimaera_agent::driver::DriverIo,
+        ) -> anyhow::Result<tokio::task::JoinHandle<DriverExit>> {
+            Ok(tokio::spawn(async move {
+                let _ = io.kill.changed().await;
+                let _ = io.events.send(AgentEvent::Exited { status: None }).await;
+                DriverExit::Killed
+            }))
+        }
+    }
+
     /// Codex elicits every MCP call; the driver answers the prompt-free
     /// tools (notify and the read-only document tools) for every session.
     #[test]
@@ -4960,25 +4976,7 @@ mod tests {
 
     #[tokio::test]
     async fn standalone_mcp_attention_survives_start_and_interrupt() {
-        use chimaera_agent::driver::{AgentAdapter, DriverIo, SpawnSpec};
-
-        struct IdleAdapter;
-        impl AgentAdapter for IdleAdapter {
-            fn kind(&self) -> &'static str {
-                "claude"
-            }
-            fn spawn(
-                &self,
-                _: SpawnSpec,
-                mut io: DriverIo,
-            ) -> anyhow::Result<tokio::task::JoinHandle<DriverExit>> {
-                Ok(tokio::spawn(async move {
-                    let _ = io.kill.changed().await;
-                    let _ = io.events.send(AgentEvent::Exited { status: None }).await;
-                    DriverExit::Killed
-                }))
-            }
-        }
+        use chimaera_agent::driver::SpawnSpec;
 
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -5072,25 +5070,7 @@ mod tests {
     /// repeated Init during a turn leaves it running.
     #[tokio::test]
     async fn a_session_start_hook_before_init_leaves_an_idle_chat_idle() {
-        use chimaera_agent::driver::{AgentAdapter, DriverIo, SpawnSpec};
-
-        struct IdleAdapter;
-        impl AgentAdapter for IdleAdapter {
-            fn kind(&self) -> &'static str {
-                "claude"
-            }
-            fn spawn(
-                &self,
-                _: SpawnSpec,
-                mut io: DriverIo,
-            ) -> anyhow::Result<tokio::task::JoinHandle<DriverExit>> {
-                Ok(tokio::spawn(async move {
-                    let _ = io.kill.changed().await;
-                    let _ = io.events.send(AgentEvent::Exited { status: None }).await;
-                    DriverExit::Killed
-                }))
-            }
-        }
+        use chimaera_agent::driver::SpawnSpec;
 
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -5140,7 +5120,14 @@ mod tests {
         apply_chat_event(&state, id, &init());
         assert_eq!(crate::lock(&state.agents)[id].state, AgentState::Finished);
         // A correction, not a turn end: the notice feed takes it as a baseline.
-        assert!(crate::lock(&state.agents)[id].state_corrected);
+        assert_eq!(
+            crate::lock(&state.agents)
+                .get_mut(id)
+                .unwrap()
+                .state_corrected
+                .take(),
+            Some(AgentState::Finished)
+        );
 
         // A turn in flight: Claude re-emits Init mid-process.
         let mut live = state.chat.attach(id, 0).unwrap().live;
@@ -5157,6 +5144,7 @@ mod tests {
         assert!(state.chat.carryover(id).unwrap().turn_in_flight);
         apply_chat_event(&state, id, &init());
         assert_eq!(crate::lock(&state.agents)[id].state, AgentState::Running);
+        assert!(crate::lock(&state.agents)[id].state_corrected.is_none());
 
         state.chat.kill(id);
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
