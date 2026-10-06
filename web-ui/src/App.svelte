@@ -396,7 +396,8 @@
   import ContextMenuHost from "./lib/shared/ContextMenuHost.svelte";
   import { contextMenu } from "./lib/shared/contextMenu.svelte";
   import ConfirmDialog from "./lib/shared/ConfirmDialog.svelte";
-  import CloseDirtyLoader from "./lib/layout/CloseDirtyLoader.svelte";
+  // Static: the unsaved-changes question must show even when a chunk cannot load.
+  import CloseDirtyDialog from "./lib/layout/CloseDirtyDialog.svelte";
   import { WindowCloseGuard } from "./lib/layout/windowClose.svelte";
   import { fsDeleteOp, lastFsMutation, notifyCreated, pendingDelete } from "./lib/workspace/fsEvents";
   import {
@@ -3707,7 +3708,8 @@
   }
 
   function openProSurface(): void {
-    if (!isNativeShell() && !isBrowserGateway()) return;
+    // A build or window that can never offer Pro has no Pro page to open.
+    if (get(proTier) === "free") return;
     if (activeWsId === null) {
       homeSurface = "pro";
       homeSettingsLoad = loadPaneView("pro");
@@ -6588,7 +6590,7 @@
 <!-- The native window close / app quit over every unsaved file here; it takes
      precedence over a tab close already asking (whose files it includes). -->
 {#if windowClose.prompt !== null}
-  <CloseDirtyLoader
+  <CloseDirtyDialog
     paths={windowClose.prompt.paths}
     saving={windowClose.saving}
     error={windowClose.error}
@@ -6599,7 +6601,7 @@
   />
 <!-- Closing tabs whose files hold unsaved edits: save / don't save / cancel. -->
 {:else if pendingClosePaths.length > 0}
-  <CloseDirtyLoader
+  <CloseDirtyDialog
     paths={pendingClosePaths}
     saving={closeSaving}
     error={closeError}
