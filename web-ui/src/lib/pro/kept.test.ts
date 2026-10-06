@@ -36,10 +36,10 @@ it("maps a notice key to its project only", () => {
 
 it("says where the work came back and how many files both sides changed", () => {
     expect(backNote(3, "this Mac")).toBe(
-      "Back on this Mac. Both copies changed 3 files while apart.",
+      "Back on this Mac. 3 files changed in both places while apart.",
     );
     expect(backNote(1, "your computer")).toBe(
-      "Back on your computer. Both copies changed 1 file while apart.",
+      "Back on your computer. 1 file changed in both places while apart.",
     );
   });
 

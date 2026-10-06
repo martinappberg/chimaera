@@ -10,7 +10,7 @@ import { projectCopyError } from "./projectCopy";
 // cloud", a computer is "this computer" or its name, and an action in
 // progress reads as that action's progress. The only sentences allowed to
 // say a machine are about the user's own SSH hosts.
-const BANNED = /\b(asleep|sleeping|waking|wake[sn]?|owner|lease[sd]?|checkpoints?|epochs?|baton|worker|keeper|mirror(?:s|ed|ing)?|take over|takeover|moving execution|execution|index snapshots?|copy-only)\b/i;
+const BANNED = /\b(asleep|sleeping|waking|wake[sn]?|owners?|lease[sd]?|checkpoints?|epochs?|baton|workers?|keeper|mirror(?:s|ed|ing)?|cop(?:y|ies)|parked|pending|take over|takeover|take control|moving execution|execution|index snapshots?|copy-only)\b/i;
 
 const sources = Object.fromEntries(Object.entries(import.meta.glob<string>([
   "/src/lib/pro/**/*.{svelte,ts}",
@@ -18,7 +18,21 @@ const sources = Object.fromEntries(Object.entries(import.meta.glob<string>([
   "/src/lib/workspace/placementHints.ts",
   "/src/lib/net/placement.ts",
   "/src/lib/terminal/refusals.svelte.ts",
+  "/src/lib/net/native.ts",
 ], { query: "?raw", import: "default", eager: true })).filter(([file]) => !file.endsWith(".test.ts")));
+
+// Free-product files the indicator and the Pro states also write into. Their
+// sentences are scanned too; only these free features may use a listed word
+// (Claude Code's own "checkpoint", the Mastermind's workers, the clipboard).
+const shared = Object.fromEntries(Object.entries(import.meta.glob<string>([
+  "/src/App.svelte",
+  "/src/lib/chat/ChatView.svelte",
+  "/src/lib/chat/store.svelte.ts",
+  "/src/lib/net/api.ts",
+  "/src/lib/terminal/Terminal.svelte",
+  "/src/lib/workspace/HomeScreen.svelte",
+], { query: "?raw", import: "default", eager: true })));
+const FREE = [/^files restored to checkpoint$/, /\bto copy$/, /^from a worker$/, /^a worker in this workspace sent this to the Mastermind/];
 
 // Cluster logins the user added on Home (their own SSH hosts, which Home
 // lists as "Remote machines"), never the cloud.
@@ -31,7 +45,10 @@ function copy(src: string): string {
     .replace(/\/\*[\s\S]*?\*\//g, "")
     .replace(/<!--[\s\S]*?-->/g, "")
     .replace(/(^|\s)\/\/.*$/gm, "$1")
-    .replace(/\sd="[^"]*"/g, "");
+    .replace(/\sd="[^"]*"/g, "")
+    // Class names and interpolated code are not words anyone reads.
+    .replace(/\sclass="[^"]*"/g, "")
+    .replace(/\$\{[^{}]*\}/g, "…");
 }
 
 function hits(pattern: RegExp): string[] {
@@ -74,8 +91,9 @@ describe("Chimaera Pro vocabulary", () => {
     expect(hits(/waking up|is asleep|wakes it|going to sleep|starting up|still starting/gi)).toEqual([]);
   });
   it("names places, never the machinery, in every sentence of these sources", () => {
-    const found = Object.entries(sources).flatMap(([file, raw]) => sentences(file, raw)
-      .filter(sentence => BANNED.test(sentence))
+    expect(Object.keys(shared)).toHaveLength(6);
+    const found = Object.entries({ ...sources, ...shared }).flatMap(([file, raw]) => sentences(file, raw)
+      .filter(sentence => BANNED.test(sentence) && !FREE.some(free => free.test(sentence.trim())))
       .map(sentence => `${file}: ${sentence}`));
     expect(found).toEqual([]);
   });

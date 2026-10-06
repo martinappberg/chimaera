@@ -62,14 +62,14 @@ function files(n: number): string {
 
 /** The chat's line where the work came home with files both sides changed. */
 export function backNote(total: number, here = hereName()): string {
-  return `Back on ${here}. Both copies changed ${files(total)} while apart.`;
+  return `Back on ${here}. ${files(total)} changed in both places while apart.`;
 }
 
 /** The file tree badge's hover hint beside a kept copy. */
 export function keptCopyHint(name: string, here = hereName()): string {
   const original = keptOriginal(name) ?? "the file";
   return (
-    `${here.charAt(0).toUpperCase()}${here.slice(1)}'s version of ${original}, kept when both copies changed it while apart. Right-click to review both versions.`
+    `${here.charAt(0).toUpperCase()}${here.slice(1)}'s version of ${original}, kept because it changed in both places while apart. Right-click to review both versions.`
   );
 }
 
