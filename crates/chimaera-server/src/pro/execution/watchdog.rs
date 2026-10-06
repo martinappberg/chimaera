@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-/// A tick (100 ms on a cloud machine, 1 s on a computer) that took this long
+/// A tick (100 ms, or 1 s on a computer holding no lease; see `tick`) that took this long
 /// was not scheduled normally: the process was frozen.
 pub(super) const FREEZE: Duration = Duration::from_secs(3);
 /// Wall and monotonic time disagreeing by this much across one tick is a
@@ -64,6 +64,31 @@ fn preserve(state: &AppState, workspaces: &[String]) {
         }
     }
 }
+/// The watchdog's tick: 100 ms on a cloud machine and on a computer while it
+/// holds any lease proof, so thawed agents stop within a tick of the thaw
+/// (review R4 S5); 1 s otherwise, keeping an idle laptop's CPU asleep.
+const BUSY_TICK: Duration = Duration::from_millis(100);
+const IDLE_TICK: Duration = Duration::from_secs(1);
+pub(super) fn tick(state: &AppState) -> Duration {
+    if super::worker(state) || !lock(&state.pro.execution.proofs).is_empty() {
+        BUSY_TICK
+    } else {
+        IDLE_TICK
+    }
+}
+/// A wake (`routes::woke`) checks every deadline at once instead of at the
+/// next tick: the machine was frozen, so a lease that lapsed past anyone's
+/// takeover fences now, before thawed agents run on, and one still inside
+/// that window gets its one renewal first (`resumed`), as a tick would.
+pub(in crate::pro) fn check_now(state: &AppState) {
+    let generation = state.pro.generation.load(Ordering::Acquire);
+    if super::resumed(state, generation) {
+        state.pro.renew_now.notify_one();
+    }
+    for workspace in super::expire(state, generation) {
+        signal(state, &workspace);
+    }
+}
 pub(in crate::pro) fn start(state: &Arc<AppState>) {
     let weak = Arc::downgrade(state);
     let runtime = tokio::runtime::Handle::current();
@@ -72,11 +97,8 @@ pub(in crate::pro) fn start(state: &Arc<AppState>) {
         let mut recorded = HashSet::new();
         let mut last = (std::time::Instant::now(), std::time::SystemTime::now());
         loop {
-            // A cloud machine's fence is tight (100 ms); a personal computer
-            // keeps a 15 s margin before the account's expiry, so a 1 s tick
-            // is enough and keeps a laptop's CPU asleep between ticks.
-            let worker = weak.upgrade().is_some_and(|state| super::worker(&state));
-            std::thread::sleep(Duration::from_millis(if worker { 100 } else { 1000 }));
+            let tick = weak.upgrade().map_or(IDLE_TICK, |state| tick(&state));
+            std::thread::sleep(tick);
             let Some(state) = weak.upgrade() else {
                 return;
             };

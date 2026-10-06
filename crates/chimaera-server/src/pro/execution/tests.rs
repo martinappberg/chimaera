@@ -717,3 +717,40 @@ async fn a_fenced_conversation_resumes_only_in_its_own_epoch() {
     assert!(!current("s-late"));
     std::fs::remove_dir_all(root).unwrap();
 }
+
+/// Review R4 S5: a wake checks the deadlines at once. A computer whose lease
+/// lapsed past anyone's takeover while it slept is fenced by the wake itself,
+/// not a tick later; one still inside that window renews first.
+#[tokio::test]
+async fn a_wake_fences_a_long_lapsed_lease_at_once() {
+    let (state, _config, root) = fixture();
+    crate::pro::install_execution_fixture(&state, "w-a", 2).unwrap();
+    assert_eq!(
+        watchdog::tick(&state),
+        Duration::from_millis(100),
+        "a held lease"
+    );
+    lock(&state.pro.execution.proofs)
+        .get_mut("w-a")
+        .unwrap()
+        .deadline = lease::Deadline::lapsed_recently_fixture();
+    crate::pro::routes::woke(&state).await;
+    assert!(!fenced(&state, "w-a"), "inside the window: renewal first");
+    assert!(resuming(&state, "w-a"));
+    {
+        let mut proofs = lock(&state.pro.execution.proofs);
+        let proof = proofs.get_mut("w-a").unwrap();
+        proof.renew_until = None;
+        proof.deadline = lease::Deadline::expired_fixture();
+    }
+    crate::pro::routes::woke(&state).await;
+    assert!(fenced(&state, "w-a"), "fenced by the wake itself");
+    assert!(!crate::pro::may_execute(&state, "w-a"));
+    lock(&state.pro.execution.proofs).clear();
+    assert_eq!(
+        watchdog::tick(&state),
+        Duration::from_secs(1),
+        "nothing held"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}

@@ -81,7 +81,7 @@ acquire/renew proof, never a passive GET; a request-start deadline reserves stop
 time; clock divergence closes admission; and the watchdog (started only on
 workers) fences chat/PTY input and owned agent process groups. Renew before
 fencing: when the watchdog sees the process was frozen (a tick, 100 ms on a
-worker and 1 s on a computer, taking over 3 s, or wall and monotonic time disagreeing by over 1 s) and a deadline
+worker and on a computer holding any proof, 1 s on a computer holding none (`watchdog::tick`); `routes::woke` also runs `watchdog::check_now` at once, review R4 S5; taking over 3 s, or wall and monotonic time disagreeing by over 1 s) and a deadline
 lapsed across it, it wakes the lease loop, which renews the recorded epoch
 (the account keeps a suspended owner's lease: same epoch, no fork, never an
 acquire/checkpoint install); input stays admitted meanwhile. A personal

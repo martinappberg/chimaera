@@ -824,6 +824,8 @@ pub(super) async fn hand_over(
 pub(super) async fn woke(state: &Arc<AppState>) {
     state.pro.sleep_generation.fetch_add(1, Ordering::AcqRel);
     super::reach::unreachable(state);
+    // Thawed agents must not run on until the watchdog's next tick.
+    execution::check_now(state);
     lock(&state.pro.release_pending).clear();
     {
         let mut ownership = lock(&state.pro.ownership);

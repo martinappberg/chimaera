@@ -619,7 +619,8 @@ mechanism](#one-handoff-mechanism)), and a resumed worker renews before fencing:
 daemon first renews the recorded epoch, which the account grants to a suspended
 owner at the same epoch with no fork; only a refused renewal (or no answer within
 20 seconds) fences. That renewal starts the moment the thaw is noticed (by the
-daemon's watchdog, 100 ms on a cloud machine and 1 s on a computer, or by the first request or socket frame to arrive
+daemon's watchdog, every 100 ms on a cloud machine and on a computer holding a lease, by the
+daemon's own wake notice, which checks every deadline at once, or by the first request or socket frame to arrive
 after it), never at the next 5-second renewal tick, because a viewer's socket
 is admitted only once it answers. A personal computer is also fenced by its
 lapsed lease (above), a verified other owner (an authenticated read naming

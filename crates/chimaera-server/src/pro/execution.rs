@@ -49,7 +49,7 @@ use std::{
     sync::{atomic::Ordering, Mutex},
     time::Duration,
 };
-pub(super) use watchdog::{start, stop};
+pub(super) use watchdog::{check_now, start, stop};
 
 #[derive(Default)]
 pub(super) struct State {
