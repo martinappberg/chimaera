@@ -39,9 +39,6 @@ fn fixture_state() -> AppState {
     state.legacy_managed_root = None;
     state
 }
-fn test_state() -> Arc<AppState> {
-    Arc::new(fixture_state())
-}
 fn write_fake_claude(label: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let path = test_dir(label).join("claude");
@@ -421,7 +418,10 @@ pub async fn routed_remote(
     asleep: bool,
     factory: Option<fn() -> Arc<dyn crate::daemon_extension::Runtime>>,
 ) -> SleepingChat {
-    let remote = test_state();
+    // Both machines of a routed project run the composed daemon.
+    let mut remote = fixture_state();
+    remote.daemon_extension = factory.map(|factory| factory());
+    let remote = Arc::new(remote);
     let mut local = fixture_state();
     local.daemon_extension = factory.map(|factory| factory());
     let local = Arc::new(local);
