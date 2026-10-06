@@ -1740,25 +1740,29 @@ async fn master_presence(mut command: Command, seconds: u64) -> anyhow::Result<b
     if master_already_absent(&output) {
         return Ok(false);
     }
-    let running = output.status.success()
-        && output.stdout.is_empty()
-        && output.stderr.len() <= 128
-        && std::str::from_utf8(&output.stderr)
-            .ok()
-            .is_some_and(|stderr| {
-                let line = stderr.strip_suffix('\n').unwrap_or(stderr);
-                line.strip_suffix('\r')
-                    .unwrap_or(line)
-                    .strip_prefix("Master running (pid=")
-                    .and_then(|rest| rest.strip_suffix(')'))
-                    .is_some_and(|pid| {
-                        !pid.is_empty()
-                            && pid.bytes().all(|b| b.is_ascii_digit())
-                            && pid.parse::<u32>().ok().is_some_and(|pid| pid > 0)
-                    })
-            });
-    anyhow::ensure!(running, "SSH master check unverified");
+    anyhow::ensure!(
+        running_master_pid(&output).is_some(),
+        "SSH master check unverified"
+    );
     Ok(true)
+}
+
+/// The pid in an exact `-O check` "Master running (pid=N)" receipt.
+fn running_master_pid(output: &std::process::Output) -> Option<u32> {
+    if !output.status.success() || !output.stdout.is_empty() || output.stderr.len() > 128 {
+        return None;
+    }
+    let stderr = std::str::from_utf8(&output.stderr).ok()?;
+    let line = stderr.strip_suffix('\n').unwrap_or(stderr);
+    let pid = line
+        .strip_suffix('\r')
+        .unwrap_or(line)
+        .strip_prefix("Master running (pid=")?
+        .strip_suffix(')')?;
+    if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    pid.parse::<u32>().ok().filter(|pid| *pid > 0)
 }
 
 fn close_masters_owned<F, Fut>(
@@ -1839,6 +1843,75 @@ async fn clear_wedged_master_via(host: &str, route: &Route, session_bound_secs: 
         ),
     }
     true
+}
+
+/// What one unattended look found at one ControlMaster leg (see
+/// [`look_at_masters`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MasterLook {
+    /// No master listens on the socket.
+    Absent,
+    /// `-O check` gave no exact receipt in time: could not tell.
+    Unclear,
+    /// The session test ended within its bound, whether it ran or the far
+    /// end refused it: the link carries answers.
+    Responds,
+    /// Master `pid` answered `-O check` (locally), but a session open got no
+    /// answer at all within the bound.
+    Silent { pid: u32 },
+}
+
+/// The session-open bound of an unattended look: twice the 15 s a
+/// confirmed-down reconnect uses, since no health verdict backs it and a
+/// loaded login node takes seconds to run `true`.
+pub const UNATTENDED_SESSION_BOUND_SECS: u64 = 30;
+
+/// Look at each ControlMaster leg of `host` (the routed node's first, then
+/// the alias's own) without dialing or prompting: `-O check` is answered by
+/// the master's local event loop, and the session test runs on that existing
+/// master only, so a master that leaves mid-look fails it instead of a fresh
+/// login replacing it. Nothing is cleared; the caller weighs two looks and
+/// closes a leg through its handle.
+pub async fn look_at_masters(host: &str) -> anyhow::Result<Vec<(MasterHandle, MasterLook)>> {
+    let mut legs = Vec::new();
+    for handle in master_handles(host).await? {
+        let look = handle.look(UNATTENDED_SESSION_BOUND_SECS).await;
+        legs.push((handle, look));
+    }
+    Ok(legs)
+}
+
+impl MasterHandle {
+    async fn look(&self, session_secs: u64) -> MasterLook {
+        let mut check = self.command();
+        check
+            .args(["-O", "check"])
+            .arg(&self.host)
+            .env("LC_ALL", "C")
+            .env("LANG", "C");
+        let Ok(output) = output_bounded(&mut check, 10, "SSH master check").await else {
+            return MasterLook::Unclear;
+        };
+        if master_already_absent(&output) {
+            return MasterLook::Absent;
+        }
+        let Some(pid) = running_master_pid(&output) else {
+            return MasterLook::Unclear;
+        };
+        let session = self
+            .with_existing(bounded_mux_ssh(
+                &self.host,
+                &self.route,
+                &[],
+                &["true"],
+                session_secs,
+            ))
+            .await;
+        match session {
+            None => MasterLook::Silent { pid },
+            Some(_) => MasterLook::Responds,
+        }
+    }
 }
 
 /// A non-interactive ssh at `host`'s ControlMaster along `route`: `BatchMode`
