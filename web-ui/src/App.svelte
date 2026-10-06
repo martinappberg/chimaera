@@ -1790,6 +1790,7 @@
         if (isNativeShell()) return;
         deliverBrowserNotices(list, {
           visible: untrack(() => visibleSessions),
+          workspaceId: untrack(() => (detachedWindow ? null : activeWsId)),
           onClick: focusFromNotification,
         });
       },

@@ -352,7 +352,7 @@ const DEFS = {
     title: "Notify While Chimaera Is in Front",
     category: "Notifications",
     description:
-      "Also show notifications while you're working in Chimaera, for sessions in other tabs or windows. Off: only when Chimaera is in the background.",
+      "Also show notifications while you're working in Chimaera, for sessions in your other windows (never the window you're in). Off: only when Chimaera is in the background.",
     type: "boolean",
     default: true,
     scope: "daemon",
