@@ -252,6 +252,11 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             "/sessions/{id}/edits",
             get(crate::history::routes::session_edits),
         )
+        // One subagent's own conversation, read-only (`subagents`).
+        .route(
+            "/sessions/{id}/subagents/{agent_id}/transcript",
+            get(crate::subagents::subagent_transcript),
+        )
         .route("/sessions/{id}/view", post(chat::switch_view))
         .route("/sessions/{id}/rewind", post(chat::rewind_session))
         .route("/sessions/{id}/fork", post(chat::fork_session))

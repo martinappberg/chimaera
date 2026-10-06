@@ -263,7 +263,7 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   `⌘±`/`⌘0` bump one pane's terminal/markdown font. Two further chords step through the
   sidebar instead of the panes: `⌃⌘A` (`keys.cycleAgents`) opens the next agent in its agents
   list and `⌃⌘T` (`keys.cycleTerminals`) the next terminal in its terminals list (off macOS,
-  `Ctrl+Shift+Alt+A/T`). Each wraps at the end and, from outside its group, starts at the first
+  `Alt+Shift+A/T`). Each wraps at the end and, from outside its group, starts at the first
   row. They open a row the way clicking it does, so an agent already shown in another pane is
   focused there; a detached window, which has no sidebar, ignores them.
 - **Empty panes & numbered moves.** `Mod+N` creates an empty pane to the right, up to

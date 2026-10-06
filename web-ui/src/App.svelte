@@ -156,6 +156,7 @@
     movePaneToIndex,
     movePaneToRootEdge,
     openChanges,
+    openSubagent,
     openFile,
     pinTab,
     openTabAs,
@@ -183,6 +184,7 @@
     pruneDeletedPath,
     pruneFiles,
     pruneSessions,
+    pruneTabs,
     rewriteTabPaths,
     adoptTabs,
     allSessionIds,
@@ -352,7 +354,7 @@
     updateState,
   } from "./lib/workspace/update.svelte";
   import * as pool from "./lib/terminal/termPool";
-  import * as chatPool from "./lib/chat/chatPool";
+  import * as chatPool from "./lib/chat/chatPoolRegistry";
   import {
     appearanceBootstrapForNavigation,
     applyRemoteSettings,
@@ -1205,9 +1207,10 @@
     activeWsId !== null && layoutReady ? visibleSessionIds(layout) : [],
   );
   // Tell the notifier what this window shows, so it never alerts about a
-  // session the user is looking at — and clears alerts for ones they now
-  // are. Keyed on the joined ids so a layout write that changes nothing on
-  // screen costs no IPC.
+  // session the user is looking at (a torn-off window's whole scope; a
+  // workspace window also covers its hidden tabs) — and clears alerts for
+  // ones they now are. Keyed on the joined ids so a layout write that changes
+  // nothing on screen costs no IPC.
   const visibleKey = $derived(visibleSessions.join(" "));
   $effect(() => {
     const key = visibleKey;
@@ -1790,6 +1793,7 @@
         if (isNativeShell()) return;
         deliverBrowserNotices(list, {
           visible: untrack(() => visibleSessions),
+          workspaceId: untrack(() => (detachedWindow ? null : activeWsId)),
           onClick: focusFromNotification,
         });
       },
@@ -2546,6 +2550,26 @@
     return displayNames.get(target.id) ?? displayName(target);
   }
 
+  /** Open (or focus) one of a chat's subagents as a read-only view of its
+   *  own — a tab next to the chat it belongs to (it is that chat's work, not
+   *  a neighbour's), or a split beside it on a modified click. */
+  function openSubagentFromPane(
+    paneId: string,
+    sessionId: string,
+    agentId: string,
+    title: string,
+    newSplit: boolean,
+  ): void {
+    const existing = paneForTab(layout.root, { surface: "subagent", sessionId, agentId, title });
+    if (existing !== null) {
+      layout = activateTab(layout, existing.paneId, existing.index);
+      return;
+    }
+    if (newSplit) layout = splitPane(layout, paneId, "row");
+    else layout = focusPane(layout, paneId);
+    layout = openSubagent(layout, sessionId, agentId, title);
+  }
+
   /** The "N files changed" chip: open (or focus) this session's changes review,
    *  beside the source pane — adjacent pane, or a split when it stands alone. */
   function openChangesFromPane(paneId: string, sessionId: string, newSplit: boolean): void {
@@ -3298,7 +3322,12 @@
     // degrade frame and stopped reconnecting; it's dead weight).
     for (const s of list) {
       if (s.ui === "chat") pool.disposeSession(s.id);
-      else if (s.ui === "term") chatPool.disposeChat(s.id);
+      else if (s.ui === "term") {
+        chatPool.disposeChat(s.id);
+        // Its subagent views read through that chat: without it they could
+        // neither follow nor tell working from finished. They go with it.
+        layout = pruneTabs(layout, (t) => t.surface !== "subagent" || t.sessionId !== s.id);
+      }
     }
     const agentIds = new Set(list.filter((s) => s.kind === "agent").map((s) => s.id));
     const changed =
@@ -4329,6 +4358,9 @@
     openChangesFrom(paneId, sessionId, newSplit) {
       openChangesFromPane(paneId, sessionId, newSplit);
     },
+    openSubagentFrom(paneId, sessionId, agentId, title, newSplit) {
+      openSubagentFromPane(paneId, sessionId, agentId, title, newSplit);
+    },
     revealPathInTree(path) {
       revealInTree(path);
     },
@@ -4960,6 +4992,8 @@
               ? "Source Control"
               : tab.surface === "changes"
                 ? "Changes"
+                : tab.surface === "subagent"
+                  ? tab.title
                 : tab.surface === "dashboard"
                   ? "Dashboard"
                   : tab.surface === "timeline"
