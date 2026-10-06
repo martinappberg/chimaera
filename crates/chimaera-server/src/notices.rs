@@ -500,6 +500,7 @@ fn observe(
     let mut agents = crate::lock(&state.agents);
     let now = Instant::now();
     for (id, record) in agents.iter_mut() {
+        let corrected = std::mem::take(&mut record.state_corrected);
         // First sight (a new session, or every session at boot) is a
         // baseline, not an edge: a resurrected session must not announce
         // the state it was restored into.
@@ -507,6 +508,13 @@ fn observe(
             seen.insert(id.clone(), record.state);
             continue;
         };
+        // So is a correction of a stale reading (a resumed idle chat read
+        // Running from its SessionStart hook until its Init): no turn ended.
+        if corrected {
+            *prev = record.state;
+            pending.remove(id);
+            continue;
+        }
         if *prev == record.state {
             continue;
         }
@@ -800,6 +808,58 @@ mod tests {
             classify(NeedsPermission, RateLimited),
             Edge::Notice(NoticeKind::RateLimited)
         );
+    }
+
+    /// A resumed idle chat reads Running from its SessionStart hook until
+    /// its Init corrects it to Finished. That correction is a baseline: no
+    /// turn ended, so it never becomes a "finished" notice (review R4 S2).
+    /// A real turn end still does.
+    #[test]
+    fn a_corrected_reading_is_a_baseline_not_a_finished_notice() {
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-notices-corrected-{}",
+            chimaera_core::generate_token()
+        ));
+        let state = AppState::new(
+            "test-token".into(),
+            "test-host".into(),
+            std::process::id(),
+            0,
+            dir.join("data"),
+            dir.join("config"),
+        );
+        let mut record = crate::agent_state::AgentRecord::new(
+            "key".into(),
+            crate::agent_state::AgentKind::Claude,
+        );
+        record.state = AgentState::Running;
+        crate::lock(&state.agents).insert("s-resumed".into(), record);
+        let (mut seen, mut pending) = (HashMap::new(), HashMap::new());
+        observe(&state, &mut seen, &mut pending);
+        {
+            let mut agents = crate::lock(&state.agents);
+            let record = agents.get_mut("s-resumed").unwrap();
+            record.state = AgentState::Finished;
+            record.state_corrected = true;
+        }
+        observe(&state, &mut seen, &mut pending);
+        assert!(pending.is_empty(), "a correction is not a turn end");
+        assert_eq!(seen["s-resumed"], AgentState::Finished);
+        assert!(!crate::lock(&state.agents)["s-resumed"].state_corrected);
+        // An ordinary turn end afterwards is still news.
+        crate::lock(&state.agents)
+            .get_mut("s-resumed")
+            .unwrap()
+            .state = AgentState::Running;
+        observe(&state, &mut seen, &mut pending);
+        crate::lock(&state.agents)
+            .get_mut("s-resumed")
+            .unwrap()
+            .state = AgentState::Finished;
+        observe(&state, &mut seen, &mut pending);
+        assert_eq!(pending["s-resumed"].kind, NoticeKind::Done);
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
