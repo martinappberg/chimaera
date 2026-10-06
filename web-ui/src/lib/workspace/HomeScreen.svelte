@@ -1795,10 +1795,22 @@
   .workspace-label { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 5px; }
   .workspace-label .name { max-width: none; font-family: inherit; font-weight: 550; font-size: var(--text-md); }
   .workspace-label .path, .workspace-label .phase { flex: none; font-size: var(--text-xs); }
-  .workspace-meta { display: flex; flex-direction: column; align-items: flex-end; gap: 5px; flex: none; }
+  /* One quiet line ("1 live session · 2m ago"), vertically centred with the
+     row's controls, so the row end reads as a single cluster rather than a
+     stack beside two unrelated buttons. */
+  .workspace-meta { display: flex; align-items: center; gap: 6px; flex: none; font-size: var(--text-xs); color: var(--muted); }
+  .workspace-meta .session-state + .when::before { content: "·"; margin-right: 6px; opacity: 0.6; }
   .session-state.stale { color: var(--muted); }
   .session-state { font-size: var(--text-xs); color: var(--accent); }
-  .workspace-meta .when { font-family: inherit; font-size: var(--text-xs); }
+  .workspace-meta .when { font-family: inherit; font-size: var(--text-xs); margin-left: 0; }
+  /* End sessions is a real, bordered control the same height as the row's
+     "…" trigger (32px), not a bare coloured word. */
+  .workspace-row .side.stop.shown {
+    height: 32px; min-height: 32px; padding: 0 10px; margin-right: 2px;
+    border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
+    border-radius: 6px; color: var(--warn); font-size: var(--text-sm);
+  }
+  .workspace-row .side.stop.shown:hover { color: var(--err); border-color: color-mix(in srgb, var(--err) 55%, transparent); background: var(--row-hover); }
   .host-card { border: 1px solid var(--edge); border-radius: 10px; padding: 5px; }
   .remotes .rows { gap: 10px; }
   .host-name { display: flex; align-items: center; gap: 9px; min-width: 0; }
@@ -1827,8 +1839,7 @@
     .inner { padding-left: 24px; padding-right: 24px; }
     .workspace-row .row { flex-wrap: wrap; gap: 10px; }
     .workspace-row .workspace-label { flex-basis: calc(100% - 24px); }
-    .workspace-meta { flex-direction: row; margin-left: 17px; align-items: center; flex-wrap: wrap; }
-    .workspace-meta .when { margin-left: 0; }
+    .workspace-meta { margin-left: 17px; flex-wrap: wrap; }
   }
   @media (max-width: 700px) {
     .home { flex-direction: column; }
