@@ -87,15 +87,11 @@ objc2-user-notifications = { version = "0.3", default-features = false, features
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 notify-rust = "4.18"
 
-# System sleep signals and bounded logind delay inhibition; app-only.
-[target.'cfg(target_os = "linux")'.dependencies]
-dbus = "0.9"
-
 # Windows-only: registry-first WSL detection (never poke wsl.exe blind — the
 # 24H2 stub can block 60s interactively when WSL is absent).
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56"
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_System_Power", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 # The root workspace's dev profile (see the comment there): file:line debug
 # info for our code, none for dependencies. Here the chimaera crates are path

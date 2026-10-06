@@ -777,7 +777,6 @@ dependencies = [
  "chimaera-link",
  "chimaera-remote",
  "chimaera-server",
- "dbus",
  "nix 0.31.3",
  "notify-rust",
  "objc2",
