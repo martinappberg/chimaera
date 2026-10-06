@@ -56,12 +56,19 @@ describe("hrefRef", () => {
 
 describe("groupByBases", () => {
   const ctx = { cwd: "/w/sub", spawnCwd: "/w", root: "/w", workspaceId: "ws" };
-  it("gives relative paths the whole ladder, ./ only the cwd, absolute any base", () => {
+  it("gives relative paths the whole ladder, ./ the cwd then the spawn dir, absolute any base", () => {
     const groups = groupByBases(["results/x.csv", "./run.sh", "/etc/hosts", "figs/a.png"], ctx);
     expect(groups).toEqual([
-      { bases: ["/w/sub", "/w"], candidates: ["results/x.csv", "figs/a.png"] },
-      { bases: ["/w/sub"], candidates: ["./run.sh", "/etc/hosts"] },
+      { bases: ["/w/sub", "/w"], candidates: ["results/x.csv", "./run.sh", "figs/a.png"] },
+      { bases: ["/w/sub"], candidates: ["/etc/hosts"] },
     ]);
+  });
+  it("never resolves ./ or ../ against the workspace root alone", () => {
+    const moved = { cwd: "/w/.claude/worktrees/x", spawnCwd: "/w", root: "/root", workspaceId: "ws" };
+    expect(groupByBases(["../../tmp/a.png"], moved)).toEqual([
+      { bases: ["/w/.claude/worktrees/x", "/w"], candidates: ["../../tmp/a.png"] },
+    ]);
+    expect(groupByBases(["./a.png"], { cwd: null, root: "/root", workspaceId: "ws" })).toEqual([]);
   });
   it("drops what has nowhere to resolve", () => {
     expect(groupByBases(["x.rs"], { cwd: null, root: null, workspaceId: null })).toEqual([]);
