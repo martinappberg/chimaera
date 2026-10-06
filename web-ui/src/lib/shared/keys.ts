@@ -174,7 +174,7 @@ export const ACTIONS = [
     id: "focusArrows",
     label: "Move Pane Focus",
     description:
-      "Switch focus to the neighboring pane (all four arrows) — the spatial cousin of Mod+1–9.",
+      "Switch focus to the neighboring pane (all four arrows) — the spatial cousin of Mod+1–9. Works from terminals and the chat composer (which keeps the arrows for its caret when no pane lies that way); other text fields keep them for the caret.",
     def: "Mod+Arrow",
     arrowSet: true,
   },
@@ -185,6 +185,22 @@ export const ACTIONS = [
       "Carry the focused pane's active tab into the neighboring pane (all four arrows).",
     def: "Mod2+Arrow",
     arrowSet: true,
+  },
+  {
+    id: "cycleAgents",
+    label: "Next Agent",
+    description:
+      "Open the next agent in the sidebar's agents list, wrapping at the end. From anywhere else it opens the first one.",
+    // Control joins ⌘ like the numbered tab moves (⌃⌘1–9); where the base is
+    // already Ctrl+Shift, the second layer adds Alt instead.
+    def: isMac ? "Mod+Ctrl+a" : "Mod2+a",
+  },
+  {
+    id: "cycleTerminals",
+    label: "Next Terminal",
+    description:
+      "Open the next terminal in the sidebar's terminals list, wrapping at the end. From anywhere else it opens the first one.",
+    def: isMac ? "Mod+Ctrl+t" : "Mod2+t",
   },
   {
     id: "dictate",

@@ -1031,6 +1031,7 @@
     <textarea
       bind:this={el}
       bind:value={draft}
+      data-pane-arrows
       {@attach uploadChips(uploadTokens, trackCaret)}
       onkeydown={onKeydown}
       onkeyup={() => { trackCaret(); pendingNativeKey = undefined; }}
