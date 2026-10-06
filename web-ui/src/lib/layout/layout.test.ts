@@ -33,6 +33,7 @@ import {
   splitPane,
   closePane,
   pruneSessions,
+  openSubagent,
   pruneFiles,
   pruneDeletedPath,
   serializeLayout,
@@ -432,6 +433,29 @@ describe("pruning dead tabs", () => {
     // the s2 changes tab is gone too
     expect(
       panes(pruned.root).some((p) => p.tabs.some((t) => t.surface === "changes")),
+    ).toBe(false);
+  });
+
+  it("a subagent view lives and dies with its parent chat, and round-trips", () => {
+    let l = openSession(defaultLayout(), "s1");
+    l = openSubagent(l, "s1", "a0dd2a5017a275850", "audit the tests");
+    // One tab per subagent: the title is a label, not identity.
+    l = openSubagent(l, "s1", "a0dd2a5017a275850", "renamed");
+    const subs = panes(l.root).flatMap((p) => p.tabs.filter((t) => t.surface === "subagent"));
+    expect(subs).toHaveLength(1);
+    const round = deserializeLayout(JSON.parse(JSON.stringify(serializeLayout(l))));
+    expect(round).not.toBeNull();
+    expect(
+      panes(round!.root).flatMap((p) => p.tabs.filter((t) => t.surface === "subagent")),
+    ).toEqual([{ surface: "subagent", sessionId: "s1", agentId: "a0dd2a5017a275850", title: "audit the tests" }]);
+    // A persisted agent id goes into a URL path: anything else is dropped.
+    const forged = deserializeLayout({
+      ...(serializeLayout(l) as object),
+      root: { t: "p", id: "p1", tabs: [{ sa: "s1", sg: "../x", st: "t" }], active: 0 },
+    });
+    expect(forged === null || panes(forged.root).every((p) => p.tabs.length === 0)).toBe(true);
+    expect(
+      panes(pruneSessions(l, new Set()).root).some((p) => p.tabs.some((t) => t.surface === "subagent")),
     ).toBe(false);
   });
 

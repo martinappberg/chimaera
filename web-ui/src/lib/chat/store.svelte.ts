@@ -1,3 +1,4 @@
+import { SvelteMap } from "svelte/reactivity";
 import type { PendingElicitation } from "./elicitation";
 /**
  * Per-session chat state: a pure reducer over the normalized agent-event
@@ -403,6 +404,9 @@ export type ChatBlock = BlockIdentity &
       result: string | null;
       /** File holding a background task's full output. */
       outputFile: string | null;
+      /** The subagent's tool row, when its end named one — the key its
+       *  model and conversation are known by (`ChatStore.subagents`). */
+      rowId: string | null;
     }
   | {
       kind: "turn_end";
@@ -485,7 +489,25 @@ export interface BackgroundTask {
   monitor: boolean;
   /** Housekeeping the agent flags ambient: listed, never announced. */
   ambient: boolean;
+  /** The model serving a subagent lane, in the agent's own words. */
+  model: string | null;
 }
+
+/** What the agent has said about one subagent (the `subagent_info` event,
+ *  latest-wins per tool row). A field stays null until the wire names it. */
+export interface SubagentInfo {
+  /** The agent's own key for the subagent: what its conversation is read
+   *  by (claude's task id, codex's child thread id). */
+  agentId: string | null;
+  /** The model serving it, in the agent's own words. */
+  model: string | null;
+  /** The agent's name for the kind of subagent ("general-purpose"). */
+  agentType: string | null;
+}
+
+/** Subagents remembered per chat. Far above what one conversation spawns;
+ *  past it the oldest are forgotten (their rows lose the model chip). */
+const SUBAGENTS_CAP = 512;
 
 /** One workflow agent's progress (a `BackgroundTask.agents` member). */
 export interface WorkflowAgent {
@@ -655,6 +677,11 @@ export class ChatStore {
    *  in the tray directly — without the old per-event re-filter of EVERY
    *  block through its Svelte proxy (O(blocks) per structural/tool event). */
   activeAgents = $state<Extract<ChatBlock, { kind: "tool" }>[]>([]);
+  /** What the agent has said about each subagent, by tool row id. Folded
+   *  from the journal like everything else, so a replay names the same
+   *  models; a row keeps its facts after it finishes (the finished line and
+   *  the tool card still open the subagent's conversation). */
+  subagents = new SvelteMap<string, SubagentInfo>();
 
   /** Extended-thinking preference (claude). NOT journal-derived — the CLI has
    *  no read-back — but kept HERE (pooled per session, surviving a ChatView
@@ -851,6 +878,7 @@ export class ChatStore {
     this.outputClip.clear();
     this.turnStartedAt = null;
     this.activeAgents = [];
+    this.subagents.clear();
     // Pending asks and sends belong to the journal being rebuilt; the fresh
     // replay re-delivers any that are still live.
     this.pending = [];
@@ -1062,6 +1090,7 @@ export class ChatStore {
             agentsDone: (t.agents_done as number) ?? 0,
             monitor: t.monitor === true,
             ambient: t.ambient === true,
+            model: typeof t.model === "string" && t.model !== "" ? t.model : null,
           }))
           // Keep the newest duplicate. Level-set producers should never emit
           // one, but an older/corrupt journal must not crash Svelte's keyed
@@ -1096,6 +1125,7 @@ export class ChatStore {
               stats: !selfContained && summary !== "" && summary !== desc ? summary : null,
               result: null,
               outputFile: (c.output_file as string) ?? null,
+              rowId: null,
             }),
           );
           this.touchTranscript();
@@ -1247,9 +1277,27 @@ export class ChatStore {
             stats: (ev.stats as string) ?? null,
             result: (ev.result as string) ?? null,
             outputFile: null,
+            rowId: typeof ev.id === "string" ? ev.id : null,
           }),
         );
         break;
+      case "subagent_info": {
+        if (typeof ev.id !== "string" || ev.id === "") break;
+        const known = this.subagents.get(ev.id);
+        const text = (value: unknown, prior: string | null) =>
+          typeof value === "string" && value !== "" ? value.slice(0, 256) : prior;
+        const next: SubagentInfo = {
+          agentId: text(ev.agent_id, known?.agentId ?? null),
+          model: text(ev.model, known?.model ?? null),
+          agentType: text(ev.agent_type, known?.agentType ?? null),
+        };
+        if (known === undefined && this.subagents.size >= SUBAGENTS_CAP) {
+          const oldest = this.subagents.keys().next().value;
+          if (oldest !== undefined) this.subagents.delete(oldest);
+        }
+        this.subagents.set(ev.id, next);
+        break;
+      }
       case "message_identity":
         if (typeof ev.turn_id === "string" && typeof ev.message_id === "string" && (this.nativeMessage?.id !== ev.message_id || this.nativeMessage.turnId !== ev.turn_id)) this.nativeMessage = { turnId: ev.turn_id, id: ev.message_id, hasProse: false };
         break;
