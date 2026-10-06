@@ -340,9 +340,15 @@ fn retire_inner(
         let workspace_root = crate::lock(&state.workspaces)
             .get(&workspace_id)
             .map(|w| w.root);
-        let resume = if ui == SessionUi::Chat && record.kind != AgentKind::Claude {
+        // A Codex TUI only carries a verified rollout where the Pro notify
+        // shim runs; elsewhere it keeps the plain hint/ancestor fallback.
+        let codex_rollout =
+            record.kind == AgentKind::Codex && crate::pro::workspace_in_scope(state, &workspace_id);
+        let resume = if (ui == SessionUi::Chat && record.kind != AgentKind::Claude)
+            || (record.kind == AgentKind::Codex && !codex_rollout)
+        {
             resume_hint.or_else(|| record.resumed_from.clone())
-        } else if record.kind == AgentKind::Codex {
+        } else if codex_rollout {
             record.resume_id().filter(|_| {
                 record
                     .transcript_path
