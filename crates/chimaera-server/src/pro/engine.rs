@@ -368,7 +368,9 @@ fn sessions(state: &AppState, workspace: &str) -> Vec<String> {
 /// for this project (a conversation waiting here for its agent's sign-in, or
 /// one an earlier stop preserved). Leaving a stopped one out would lose it
 /// once the project leaves: a cloud machine that cannot run a conversation
-/// hands it back with the project.
+/// hands it back with the project. Live sessions come first and are never
+/// left out (over 64 of them refuses the transfer); stopped ones past the cap
+/// stay here and are logged, never refusing the whole project (review R4 S3).
 fn transfer_session_ids(state: &AppState, workspace: &str) -> Result<Vec<String>> {
     let mut ids: Vec<_> = lock(&state.session_workspaces)
         .iter()
@@ -376,24 +378,32 @@ fn transfer_session_ids(state: &AppState, workspace: &str) -> Result<Vec<String>
         .map(|(id, _)| id.clone())
         .take(65)
         .collect();
-    for (id, entry) in lock(&state.deferred_sessions).iter() {
-        if ids.len() > 64 {
-            break;
-        }
-        // A conversation a lapse fenced travels only from the epoch it was
-        // fenced at: from any other, another machine may have finished its
-        // turn (review R4 S1).
-        if entry.workspace_id == workspace
-            && !ids.contains(id)
-            && super::fence_current(state, entry)
-        {
-            ids.push(id.clone());
-        }
-    }
     ensure!(
         ids.len() <= 64,
         "Project transfer supports at most 64 sessions; close some sessions and try again"
     );
+    let mut stopped: Vec<String> = lock(&state.deferred_sessions)
+        .iter()
+        // A conversation a lapse fenced travels only from the epoch it was
+        // fenced at: from any other, another machine may have finished its
+        // turn (review R4 S1).
+        .filter(|(id, entry)| {
+            entry.workspace_id == workspace
+                && !ids.contains(id)
+                && super::fence_current(state, entry)
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    // A stable choice of which stopped sessions travel when not all fit.
+    stopped.sort();
+    let room = 64 - ids.len();
+    if stopped.len() > room {
+        tracing::warn!(
+            left = stopped.len() - room,
+            "Stopped conversations past the 64-session limit stay on this computer"
+        );
+    }
+    ids.extend(stopped.into_iter().take(room));
     Ok(ids)
 }
 /// A clean flush before this computer sleeps: one shared deadline, and no
@@ -2258,6 +2268,64 @@ mod tests {
         lock(&state.session_workspaces).remove(&omitted_shell);
         assert_eq!(transfer_session_ids(&state, "w-project").unwrap().len(), 64);
         state.sessions.kill(&session.id).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Review R4 S3: stopped conversations never refuse a project's
+    /// transfer. Live ones all travel; stopped ones fill the rest of the 64,
+    /// and one fenced at an epoch this computer no longer holds is not
+    /// exported at all.
+    #[test]
+    fn stopped_conversations_past_the_cap_stay_and_never_refuse_the_transfer() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-roster-cap-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let state = Arc::new(AppState::new(
+            "fixture".into(),
+            "fixture".into(),
+            4242,
+            0,
+            root.clone(),
+            root.join("config"),
+        ));
+        for n in 0..60 {
+            lock(&state.session_workspaces).insert(format!("s-live-{n:02}"), "w-project".into());
+        }
+        let stopped = |id: String, fence: Option<u64>| crate::ledger::LedgerEntry {
+            id,
+            suspended: true,
+            manual_resume_reason: None,
+            fence_epoch: fence,
+            handoff: None,
+            workspace_id: "w-project".into(),
+            cwd: root.clone(),
+            pinned_name: None,
+            cols: 80,
+            rows: 24,
+            theme: "dark".into(),
+            created_at: 0,
+            agent: None,
+        };
+        for n in 0..6 {
+            let id = format!("s-stopped-{n}");
+            lock(&state.deferred_sessions).insert(id.clone(), stopped(id, None));
+        }
+        lock(&state.deferred_sessions)
+            .insert("s-fenced".into(), stopped("s-fenced".into(), Some(3)));
+        let ids = transfer_session_ids(&state, "w-project").unwrap();
+        assert_eq!(ids.len(), 64);
+        assert_eq!(
+            ids.iter().filter(|id| id.starts_with("s-live-")).count(),
+            60
+        );
+        assert!(!ids.contains(&"s-fenced".to_string()), "not this epoch's");
+        assert_eq!(
+            &ids[60..],
+            ["s-stopped-0", "s-stopped-1", "s-stopped-2", "s-stopped-3"]
+        );
+        drop(state);
         std::fs::remove_dir_all(root).unwrap();
     }
 

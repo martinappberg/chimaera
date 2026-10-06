@@ -141,7 +141,9 @@ prefix never proves the omitted work stopped. Same-boot overflow stays unknown
 through subsequent truncated writes and reprobes; a cold boot or verified
 supervisor cleanup is required to establish complete evidence. Persisted worker
 identity keeps this fence even if a later runtime configuration says Device.
-Clean transfer admits at most 64 sessions before any mutation and rechecks the
+Clean transfer admits at most 64 live sessions before any mutation (stopped
+ones fill the rest of the 64; the surplus stays here and is logged, never
+refusing the project, review R4 S3) and rechecks the
 roster after draining all agents. Truth predicates inspect the whole existing
 registry. The final synchronous agent spawn/registration window has a counted
 reservation even for legacy/device ownership, so a pre-fence launch cannot
