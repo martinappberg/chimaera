@@ -191,16 +191,17 @@ export const ACTIONS = [
     label: "Next Agent",
     description:
       "Open the next agent in the sidebar's agents list, wrapping at the end. From anywhere else it opens the first one.",
-    // Control joins ⌘ like the numbered tab moves (⌃⌘1–9); where the base is
-    // already Ctrl+Shift, the second layer adds Alt instead.
-    def: isMac ? "Mod+Ctrl+a" : "Mod2+a",
+    // Control joins ⌘ like the numbered tab moves (⌃⌘1–9). Elsewhere `Mod` is
+    // already Ctrl+Shift, and a third modifier is too much for a chord this
+    // frequent, so it is the concrete Alt+Shift pair, independent of the base.
+    def: isMac ? "Mod+Ctrl+a" : "Alt+Shift+a",
   },
   {
     id: "cycleTerminals",
     label: "Next Terminal",
     description:
       "Open the next terminal in the sidebar's terminals list, wrapping at the end. From anywhere else it opens the first one.",
-    def: isMac ? "Mod+Ctrl+t" : "Mod2+t",
+    def: isMac ? "Mod+Ctrl+t" : "Alt+Shift+t",
   },
   {
     id: "dictate",

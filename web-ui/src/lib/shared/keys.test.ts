@@ -70,17 +70,31 @@ describe("agent and terminal cycle chords", () => {
     expect(keys.displayChord("Mod+Ctrl+a", "auto")).toBe("⌃⌘A");
   });
 
-  it.each(["Win32", "Linux x86_64"])("adds Alt to Ctrl+Shift off macOS (%s)", async (platform) => {
+  it.each(["Win32", "Linux x86_64"])("is Alt+Shift+A and Alt+Shift+T off macOS (%s)", async (platform) => {
     const { keys, agents, terminals } = await chordsOn(platform);
-    const layer = { ctrlKey: true, shiftKey: true, altKey: true };
-    expect(keys.matchChord(letter("KeyA", layer), agents)).toBe("hit");
-    expect(keys.matchChord(letter("KeyT", layer), terminals)).toBe("hit");
-    // Ctrl+Shift+T is the browser's reopen-tab; the second layer keeps clear of it.
+    const altShift = { altKey: true, shiftKey: true };
+    expect(keys.matchChord(letter("KeyA", altShift), agents)).toBe("hit");
+    expect(keys.matchChord(letter("KeyT", altShift), terminals)).toBe("hit");
+    // Two modifiers, not three: neither the Ctrl+Shift base nor a third modifier fires them.
+    // (Ctrl+Shift+T is the browser's reopen-tab.)
     expect(keys.matchChord(letter("KeyT", { ctrlKey: true, shiftKey: true }), terminals)).toBeNull();
+    expect(keys.matchChord(letter("KeyA", { ctrlKey: true, shiftKey: true, altKey: true }), agents)).toBeNull();
+    expect(keys.matchChord(letter("KeyA", { altKey: true }), agents)).toBeNull();
+    expect(keys.displayChord("Alt+Shift+a", "auto")).toBe("Alt+Shift+A");
+  });
+
+  it.each(["Win32", "Linux x86_64"])("keeps the chord on Alt+Shift whatever the base modifier is (%s)", async (platform) => {
+    const { keys } = await chordsOn(platform);
+    for (const setting of ["auto", "cmd", "ctrl-shift", "alt"] as const) {
+      for (const id of ["cycleAgents", "cycleTerminals"]) {
+        const p = keys.parseChord(keys.ACTION_BY_ID.get(id)!.def, setting)!;
+        expect([p.meta, p.ctrl, p.alt, p.shift], `${platform}/${setting}/${id}`).toEqual([false, false, true, true]);
+      }
+    }
   });
 
   it("collides with no other default chord under any modifier setting", async () => {
-    for (const platform of ["MacIntel", "Win32"]) {
+    for (const platform of ["MacIntel", "Win32", "Linux x86_64"]) {
       const { keys } = await chordsOn(platform);
       for (const setting of ["auto", "cmd", "ctrl-shift", "alt"] as const) {
         const sig = (def: string) => {
