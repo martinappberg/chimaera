@@ -1153,6 +1153,15 @@ impl ChatManager {
             .is_ok_and(|session| session.unused_startup.load(Ordering::Relaxed))
     }
 
+    /// Coherent lifecycle evidence: the process's carryover and whether any
+    /// input is still queued for it (accepted, not yet answered by a turn).
+    pub fn input_activity(&self, id: &str) -> Option<(Carryover, bool)> {
+        let session = self.get_session(id).ok()?;
+        let budget = session.command_budget.lock().expect("command budget lock");
+        let carry = session.carryover.lock().expect("carryover lock").clone();
+        Some((carry, budget.sends != 0))
+    }
+
     /// The live process's [`Carryover`] — what a restart would cut off.
     pub fn carryover(&self, id: &str) -> Option<Carryover> {
         self.sessions
