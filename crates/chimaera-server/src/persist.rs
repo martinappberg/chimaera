@@ -32,6 +32,37 @@ pub(crate) fn project_temp_name(name: &std::ffi::OsStr) -> std::ffi::OsString {
     std::ffi::OsString::from_vec(out)
 }
 
+/// The hidden temp sibling for a write into a project. `staging` (a daemon
+/// with the extension) reserves the [`PROJECT_STAGING_PREFIX`] names a mirror
+/// skips; otherwise it is the plain `.{name}.{8 random}.tmp` sibling, shortened
+/// at a UTF-8 boundary so the whole stays within NAME_MAX.
+pub(crate) fn project_temp_sibling(staging: bool, name: &std::ffi::OsStr) -> std::ffi::OsString {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    if staging {
+        return project_temp_name(name);
+    }
+    let nonce = &chimaera_core::generate_token()[..8];
+    let budget = 255 - (".".len() + ".".len() + nonce.len() + ".tmp".len());
+    let bytes = name.as_bytes();
+    let mut cut = bytes.len().min(budget);
+    while cut > 0 && cut < bytes.len() && (bytes[cut] & 0b1100_0000) == 0b1000_0000 {
+        cut -= 1;
+    }
+    let mut out = Vec::with_capacity(cut + 14);
+    out.push(b'.');
+    out.extend_from_slice(&bytes[..cut]);
+    out.push(b'.');
+    out.extend_from_slice(nonce.as_bytes());
+    out.extend_from_slice(b".tmp");
+    std::ffi::OsString::from_vec(out)
+}
+
+/// Whether a listing hides `name` as an incomplete staged write: only on a
+/// daemon that stages (`project_temp_sibling`).
+pub(crate) fn is_project_staging(staging: bool, name: &str) -> bool {
+    staging && name.starts_with(PROJECT_STAGING_PREFIX)
+}
+
 /// Like [`atomic_write_json`], but the bytes and the rename reach stable
 /// storage before returning (F_FULLFSYNC on macOS, where fsync alone may stay
 /// in the drive cache). For state whose loss after a crash or power cut would
@@ -113,6 +144,30 @@ pub(crate) fn atomic_write_json(path: &Path, contents: impl AsRef<[u8]>) -> anyh
 
 #[cfg(test)]
 mod tests {
+
+    /// A daemon without the extension writes the same hidden temp sibling
+    /// it always did and hides nothing extra from listings.
+    #[test]
+    fn a_free_daemons_temp_files_keep_their_names() {
+        let free = project_temp_sibling(false, std::ffi::OsStr::new("notes.md"));
+        let free = free.to_str().unwrap();
+        assert!(
+            free.starts_with(".notes.md.") && free.ends_with(".tmp"),
+            "{free}"
+        );
+        assert_eq!(free.len(), ".notes.md.".len() + 8 + ".tmp".len());
+        assert!(!free.starts_with(PROJECT_STAGING_PREFIX));
+        let staged = project_temp_sibling(true, std::ffi::OsStr::new("notes.md"));
+        assert!(staged.to_str().unwrap().starts_with(PROJECT_STAGING_PREFIX));
+        assert!(!is_project_staging(
+            false,
+            ".chimaera-staging-notes.md.x.tmp"
+        ));
+        assert!(is_project_staging(true, ".chimaera-staging-notes.md.x.tmp"));
+        let long = "é".repeat(200);
+        let name = project_temp_sibling(false, std::ffi::OsStr::new(&long));
+        assert!(name.len() <= 255 && name.to_str().is_some());
+    }
     use super::*;
     /// After a successful rename, a filesystem that cannot sync a directory
     /// does not turn the write into a failure; a real I/O error still does.
