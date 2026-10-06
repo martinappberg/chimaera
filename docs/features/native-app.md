@@ -85,7 +85,7 @@ app-build` (never the root `cargo`).
   anything reaches it (`shell/connect.rs` `run_flight`, `shell/tunnel.rs` `app_host`). A window on it
   saved by an older build is not restored; launch logs it and drops the record. Cloud projects open in
   local windows after their folder is synced; execution stays with its current owner until a separate
-  takeover ([pro.md](pro.md#cloud-readiness)).
+  takeover ([pro.md](pro.md#what-the-user-sees-and-does)).
 
 ## Home launcher
 
@@ -139,10 +139,8 @@ app-build` (never the root `cargo`).
   covers it. Remote-host windows behave the same — the commands are granted per window like
   every daemon-window command — and a window whose UI predates the guard never reports, so it
   closes as it always did.
-- **Then, with Pro, working agents.** A quit (or closing the last window when that ends the
-  app) that the unsaved guard let through can ask a second, separate question when an agent is
-  working in a project the cloud could take: keep working on this Mac, or continue in the
-  cloud. See [Pro › Quitting](pro.md#quitting); `shell/quit.rs`.
+- **Nothing else.** With Pro too, a quit asks nothing more and moves no work: the daemon keeps
+  running it and keeps the computer reachable. See [Pro › The model](pro.md#the-model).
 
 ## Notifications
 
@@ -290,9 +288,9 @@ app-build` (never the root `cargo`).
 - **The unsaved-edits guard on close and quit** has unit-tested decisions (the shell's `Guard`,
   the page's dialog controller) and CI's bundle builds, but has not yet been hand-driven in the
   app; the macOS `applicationShouldTerminate:` hook (Dock › Quit, logout) is compile-checked only.
-- **Leaving on quit (Pro)** asks nothing: the private shell posts `/pro/leave` and quits. The
-  daemon's decision is unit-tested and driven end to end by the private loopback harness, but
-  the quit paths have not yet been hand-driven in the app.
+- **Quitting with Pro** asks nothing and sends nothing: the daemon keeps the work and keeps the
+  computer reachable. The daemon's own sleep watcher (macOS) is unit-tested; a real lid close has
+  not yet been hand-driven.
 - **Reload Window** was hand-driven on macOS (⌘R, the held and cancelled notice, a page that never
   booted); its F5 path on Linux (GTK accelerator) and Windows (WebView2) is compile-checked only.
 

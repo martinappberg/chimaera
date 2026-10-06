@@ -270,7 +270,7 @@ nothing echoes until it answers, and more typing meanwhile is refused with a
 note rather than run twice). When the service keeps the connection, it queues
 typing within its byte budget and delivers it in order after wake. With an older
 service whose connection has closed, a browser view drops that keystroke,
-reconnects with wake intent and says so over the pane (see [Pro: continuing and viewing](pro.md#continuing-and-viewing-a-remote-session)).
+reconnects with wake intent and says so over the pane (see [Pro: continuing and viewing](pro.md#what-the-user-sees-and-does)).
 Typing the daemon refuses (watching, busy, running in the cloud or on your
 computer) is said in a short note over the pane, never in the scrollback; an
 asleep cloud machine is said there too ("Asleep in the cloud. Press a key to

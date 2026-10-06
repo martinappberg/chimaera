@@ -30,7 +30,7 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   folder carries its workspace id (`.git/chimaera-workspace`, the private git directory of a
   linked worktree, or a `.chimaera-workspace` file when there is no git directory), so reopening it after a reinstall or a data reset, or
   on another computer, is the same workspace; a moved folder keeps its workspace and a local
-  duplicate gets its own (see [pro.md](pro.md#after-a-reinstall-or-reset)). Opening a
+  duplicate gets its own (see [pro.md](pro.md#what-the-daemon-does)). Opening a
   workspace writes the marker if it is missing; a folder that cannot be written registers
   without one. Recency sorts by
   `last_opened_at`. The rollup dot is muted (dormant) / accent (live) / amber (needs

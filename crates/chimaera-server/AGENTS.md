@@ -398,13 +398,15 @@ the lifecycle, keep them consistent:
   in the PR.
 
 Pro ownership gates restore and mutation, including terminal input and resize.
-On a personal computer only a verified other owner (or its own in-progress
-transfer) fences them; lease expiry, sign-out and restarts never do (laptop
-first). The ledger retains suspended imports and restart-deferred sessions until
-the coordinator verifies local ownership (a computer resumes restart-deferred
-ones after a one-minute grace when the account cannot confirm, including a
-returned import whose resume a sign-out or crash cut short); staged native
-fork intent survives restart.
+On a personal computer a verified other owner, its own in-progress transfer and
+its own lapsed lease fence agents (plain shells keep working under a lapse,
+`pro::may_run_shell`; nothing is fenced while the account answers with server
+errors); sign-out and restarts never do. The ledger retains suspended imports
+and restart-deferred sessions until the coordinator verifies local ownership (a
+computer resumes restart-deferred ones after a one-minute grace only when the
+account answers with server errors or nobody is signed in, including a returned
+import whose resume a sign-out or crash cut short); staged native fork intent
+survives restart.
 Scoped Git reads validate the selected repository and every supplied file path
 against the project root; known external worktrees and enclosing repositories
 do not widen authority. History/branches/show/compare are allowed reads, while
