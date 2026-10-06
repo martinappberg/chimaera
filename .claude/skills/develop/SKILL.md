@@ -234,6 +234,16 @@ and launches the generated `chimaera-dev` app identity. Computer Use must
 target `chimaera-dev`, which prevents it from driving the user's released app.
 Then tell the human: open a folder → start an agent → here's what to click.
 
+On macOS the script copies the built binary into the bundle (codesign rewrites
+the file it signs, so a hard link would alter the Cargo binary), records the
+isolated `CHIMAERA_HOME` and `PATH` in the bundle's `LSEnvironment` so a Dock or
+Finder relaunch stays isolated, and fails if `codesign --verify --deep --strict`
+does not pass. For a hand-made preview bundle, keep the real built Mach-O as
+`CFBundleExecutable` (no shell or Python launcher in its place) and sign only the
+finished bundle: an unsealed bundle still opens a window but silently loses OS
+features such as notifications and Keychain access. Never change Keychain ACLs
+to get past a prompt; ad-hoc builds change identity on every build.
+
 **2. To test against a REMOTE host from that isolated app** (e.g. an HPC cluster): a
 dev connect deploys **your** build, never a release, so a musl daemon of this
 branch must exist where THIS app looks. The trap: the in-app hint says

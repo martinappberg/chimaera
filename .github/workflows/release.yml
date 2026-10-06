@@ -130,7 +130,7 @@ jobs:
       - run: rustup show
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - run: cargo install cargo-zigbuild
+      - run: cargo install cargo-zigbuild --locked --version 0.23.0
       # Stamp the release version so the daemon reports it (health / manifest).
       - run: sed -i "s/^version = \"0.0.1\"/version = \"${{ needs.version.outputs.version }}\"/" Cargo.toml
       - run: cargo zigbuild --release --target ${{ matrix.target }} -p chimaera

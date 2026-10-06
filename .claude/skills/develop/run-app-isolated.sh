@@ -67,14 +67,17 @@ fi
 # keep the released `chimaera` app open while testing; launching the build under
 # that same identity makes Computer Use and Activity Monitor ambiguous. macOS
 # keys accessibility apps by bundle id, not merely executable name, so wrap the
-# exact Cargo binary in a generated development bundle. Other platforms only
-# need the distinct executable name. Hard links keep both paths cheap and exact.
+# exact Cargo binary in a generated development bundle. The macOS copy is signed
+# independently; other platforms can use a hard link with a distinct name.
 if [ "$(uname -s)" = "Darwin" ]; then
   DEV_APP="$ROOT/crates/chimaera-app/target/debug/chimaera-dev.app"
   DEV_BIN="$DEV_APP/Contents/MacOS/chimaera-dev"
   DEV_PLIST="$DEV_APP/Contents/Info.plist"
   mkdir -p "$DEV_APP/Contents/MacOS"
-  ln -f "$BUILD_BIN" "$DEV_BIN"
+  # A copy, not a hard link: codesign rewrites the file it signs, which would
+  # also alter the Cargo binary. Replace an older hard link atomically.
+  cp "$BUILD_BIN" "$DEV_BIN.new"
+  mv -f "$DEV_BIN.new" "$DEV_BIN"
   plutil -create xml1 "$DEV_PLIST"
   plutil -insert CFBundleDisplayName -string "chimaera-dev" "$DEV_PLIST"
   plutil -insert CFBundleExecutable -string "chimaera-dev" "$DEV_PLIST"
@@ -85,6 +88,11 @@ if [ "$(uname -s)" = "Darwin" ]; then
   plutil -insert CFBundleShortVersionString -string "0.0.1" "$DEV_PLIST"
   plutil -insert CFBundleVersion -string "0.0.1" "$DEV_PLIST"
   plutil -insert NSHighResolutionCapable -bool true "$DEV_PLIST"
+  # A Dock/Finder relaunch gets no shell environment; LSEnvironment keeps it
+  # on this isolated CHIMAERA_HOME instead of the user's real one.
+  plutil -insert LSEnvironment -xml '<dict/>' "$DEV_PLIST"
+  plutil -insert LSEnvironment.CHIMAERA_HOME -string "$CHIMAERA_HOME" "$DEV_PLIST"
+  plutil -insert LSEnvironment.PATH -string "$PATH" "$DEV_PLIST"
   # The bundle's own usage strings (crates/chimaera-app/Info.plist): macOS
   # kills an app that opens the microphone (voice dictation) without one.
   MIC_USAGE="$(plutil -extract NSMicrophoneUsageDescription raw "$ROOT/crates/chimaera-app/Info.plist")"
@@ -93,8 +101,10 @@ if [ "$(uname -s)" = "Darwin" ]; then
   # signature covers only the executable ("Info.plist=not bound"), and
   # macOS's notification center refuses such a bundle outright — no prompt,
   # no alerts — so native notifications could never be tried in dev.
-  codesign --force --sign - "$DEV_APP" >/dev/null 2>&1 \
-    || echo "warning: could not ad-hoc sign $DEV_APP (notifications won't work)" >&2
+  # Fail loudly: an unsealed bundle still opens a window, so a broken
+  # signature would otherwise surface later as silently missing OS features.
+  codesign --force --sign - "$DEV_APP"
+  codesign --verify --deep --strict --verbose=2 "$DEV_APP"
 else
   DEV_BIN="$ROOT/crates/chimaera-app/target/debug/chimaera-dev"
   ln -f "$BUILD_BIN" "$DEV_BIN"
