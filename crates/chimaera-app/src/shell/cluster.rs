@@ -575,7 +575,7 @@ fn ensure_watcher(app: &AppHandle, alias: &str) {
         let mut failures = 0u32;
         loop {
             tokio::time::sleep(interval).await;
-            let ov = match live_overview(&app, &alias).await {
+            let ov = match watch_overview(&app, &alias).await {
                 Ok(ov) => {
                     failures = 0;
                     ov
@@ -667,6 +667,19 @@ async fn live_overview_refresh(
     } else {
         fresh_overview(alias).await?
     };
+    overlay_live(app, alias, &mut ov).await;
+    Ok(ov)
+}
+
+/// The watcher's unattended look: `live_overview` without its recovery. It
+/// never clears a wedged SSH master (which would cut the user's other
+/// sessions through it); only something the user did may, and a failed look
+/// just backs off.
+async fn watch_overview(app: &AppHandle, alias: &str) -> Result<ClusterOverview, String> {
+    if let Some(selected) = kept::select(&app.state::<Shell>(), alias).await? {
+        return selected.overview(&app.state::<Shell>(), false).await;
+    }
+    let mut ov = cluster::overview(alias, home()).await.map_err(err)?;
     overlay_live(app, alias, &mut ov).await;
     Ok(ov)
 }
