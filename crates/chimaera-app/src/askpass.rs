@@ -14,6 +14,13 @@
 //! key in `~/.ssh/known_hosts`).
 //! Each child also frames its normalized host alias with the prompt, so the
 //! native relay can target only that host's windows (plus local home).
+//!
+//! Cancel means cancel. OpenSSH reads an askpass that fails as an empty answer
+//! and asks again (three times per method, then the next method), so a cancel
+//! cannot be conveyed by what the helper prints or how it exits. Instead the
+//! helper exits [`CANCELLED_EXIT`] and its shim ends the ssh that asked; the
+//! "authentication cancelled" line it leaves on stderr tells the connect flow
+//! not to carry on into a fresh ssh (see `ASKPASS_CANCELLED`).
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -42,9 +49,75 @@ use tokio::sync::oneshot;
 const SOCK_ENV: &str = "CHIMAERA_ASKPASS_SOCK";
 pub(crate) const SCOPE_FRAME: &str = "chimaera-askpass-scope-v1";
 
+/// Exit status of `--askpass` for a prompt that got no answer (cancelled,
+/// timed out, or its window gone). The shim ends the asking ssh on it.
+pub(crate) const CANCELLED_EXIT: i32 = 75;
+
+/// The tail of every askpass shim, unix and WSL: run right after the helper
+/// with its status in `$?`. A cancel ends the process that exec'd the shim —
+/// ssh, whose `$PPID` this is — because the only other thing a cancelled
+/// ssh does is ask again.
+pub(crate) fn cancel_epilogue() -> String {
+    format!(
+        "rc=$?\n\
+         [ \"$rc\" -eq {CANCELLED_EXIT} ] && kill -TERM \"$PPID\"\n\
+         exit \"$rc\"\n"
+    )
+}
+
+/// What the relay answers a prompt that got no answer (cancelled, timed out,
+/// its window gone). A secret always ends in a newline and this never does, so
+/// the two cannot be confused — and an empty or cut-off reply, a relay that
+/// refused or died, stays [`Reply::Unanswered`]: ssh's old "no answer" rather
+/// than the user's cancel.
+const CANCEL_REPLY: &str = "cancelled";
+
+/// What the helper makes of the relay's reply.
+#[derive(Debug, PartialEq)]
+enum Reply {
+    Secret(String),
+    Cancelled,
+    Unanswered,
+}
+
+/// What the relay writes back: the secret and ONE newline — an empty secret
+/// (Enter on a prompt) is still an answer — or [`CANCEL_REPLY`].
+fn encode_reply(answer: Option<&str>) -> Vec<u8> {
+    match answer {
+        Some(secret) => format!("{secret}\n"),
+        None => CANCEL_REPLY.to_string(),
+    }
+    .into_bytes()
+}
+
+/// A reply cut short before its newline is never a secret: a half-read
+/// password is never handed to ssh.
+fn decode_reply(reply: &str) -> Reply {
+    if let Some(secret) = reply.strip_suffix('\n') {
+        Reply::Secret(secret.to_string())
+    } else if reply == CANCEL_REPLY {
+        Reply::Cancelled
+    } else {
+        Reply::Unanswered
+    }
+}
+
+/// The helper's cancel: leave the note the connect flow reads on stderr
+/// (ssh's stderr is captured) and exit with the status the shim acts on.
+fn cancelled() -> ! {
+    eprintln!("{}", chimaera_remote::ASKPASS_CANCELLED);
+    std::process::exit(CANCELLED_EXIT)
+}
+
+/// Held by the tests that write a script and exec it. A fork in one test
+/// thread while another still has its fresh script open for writing makes
+/// that exec fail with ETXTBSY on Linux.
+#[cfg(all(test, unix))]
+pub(crate) static EXEC_LOCK: Mutex<()> = Mutex::new(());
+
 /// How long a prompt waits for the UI before giving up. A dropped window or
 /// an ignored modal must not pin an ssh process open forever — on timeout we
-/// return no answer and ssh fails cleanly.
+/// return no answer, which the helper turns into ending that ssh (a cancel).
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Prompts awaiting a UI answer, keyed by a per-request id. Managed as Tauri
@@ -226,6 +299,15 @@ fn shim_path() -> PathBuf {
     chimaera_core::runtime_dir().join("askpass.sh")
 }
 
+/// ssh runs `$SSH_ASKPASS "<prompt>"` with exactly one arg, so a tiny shim
+/// re-invokes us in --askpass mode (`$@` forwards that single prompt arg) and
+/// then acts on the helper's status (see [`cancel_epilogue`]). No `exec`: the
+/// shim has to outlive the helper to end ssh after it.
+#[cfg(unix)]
+fn shim_script(exe: &Path) -> String {
+    format!("#!/bin/sh\n{exe:?} --askpass \"$@\"\n{}", cancel_epilogue())
+}
+
 /// Wire ssh/scp spawned from this process (and their ControlMaster children)
 /// to prompt through the app: write the askpass shim, export the ssh env, and
 /// start the socket listener. Called once at startup, before any connect.
@@ -237,9 +319,7 @@ pub fn install(app: &AppHandle) -> Result<()> {
 
     let exe = std::env::current_exe().context("resolve current executable")?;
     let shim = shim_path();
-    // ssh runs `$SSH_ASKPASS "<prompt>"` with exactly one arg, so a tiny shim
-    // re-invokes us in --askpass mode. `$@` forwards that single prompt arg.
-    std::fs::write(&shim, format!("#!/bin/sh\nexec {exe:?} --askpass \"$@\"\n"))
+    std::fs::write(&shim, shim_script(&exe))
         .with_context(|| format!("write {}", shim.display()))?;
     let mut perms = std::fs::metadata(&shim)?.permissions();
     perms.set_mode(0o700);
@@ -400,8 +480,7 @@ async fn serve_one_tcp(app: AppHandle, mut stream: tokio::net::TcpStream, token:
     }
     let (alias, prompt) = split_prompt_request(request.to_string());
     let answer = resolve_prompt(&app, alias, prompt).await;
-    let _ = stream.write_all(answer.as_bytes()).await;
-    let _ = stream.write_all(b"\n").await;
+    let _ = stream.write_all(&encode_reply(answer.as_deref())).await;
     let _ = stream.shutdown().await;
 }
 
@@ -416,15 +495,14 @@ async fn serve_one(app: AppHandle, mut stream: UnixStream) {
     }
     let (alias, prompt) = split_prompt_request(request);
     let answer = resolve_prompt(&app, alias, prompt).await;
-    // ssh reads the secret up to the first newline; terminate with exactly one.
-    let _ = stream.write_all(answer.as_bytes()).await;
-    let _ = stream.write_all(b"\n").await;
+    let _ = stream.write_all(&encode_reply(answer.as_deref())).await;
     let _ = stream.shutdown().await;
 }
 
 /// Register the prompt, ask the UI, wait out the timeout — the transport-
 /// agnostic middle both the unix socket and the Windows TCP relay feed.
-async fn resolve_prompt(app: &AppHandle, alias: Option<String>, prompt: String) -> String {
+/// `None` = no answer was given.
+async fn resolve_prompt(app: &AppHandle, alias: Option<String>, prompt: String) -> Option<String> {
     let state = app.state::<Askpass>();
     let (tx, rx) = oneshot::channel();
     let prompt = prompt.trim_end().to_string();
@@ -435,22 +513,24 @@ async fn resolve_prompt(app: &AppHandle, alias: Option<String>, prompt: String) 
     // zero targets at emit time is fine during startup restore.
     emit_scoped(app, "ssh-askpass", event.clone(), event.alias.as_deref());
     match tokio::time::timeout(PROMPT_TIMEOUT, rx).await {
-        Ok(Ok(Some(secret))) => secret,
+        Ok(Ok(Some(secret))) => Some(secret),
         // Cancelled, timed out, or the app dropped the sender: no answer, so
-        // ssh moves on and fails cleanly rather than hanging. Windows still
-        // showing the prompt must drop it — there is no one left to receive
-        // an answer.
+        // the helper ends the waiting ssh rather than leave it hanging (or
+        // asking again). Windows still showing the prompt must drop it —
+        // there is no one left to receive an answer.
         _ => {
             state.discard(id);
             emit_done(app, id, event.alias.as_deref());
-            String::new()
+            None
         }
     }
 }
 
 /// `chimaera-app --askpass <prompt>`: the helper ssh execs. Relays the prompt
-/// to the running app and prints the answer for ssh to read. A missing socket
-/// or app yields an empty answer (ssh then fails cleanly, never hangs).
+/// to the running app and prints the answer for ssh to read. A prompt that
+/// gets no answer — cancelled or timed out — exits [`CANCELLED_EXIT`] for the
+/// shim to end ssh; a missing socket or app yields an empty answer (ssh then
+/// fails cleanly, never hangs).
 #[cfg(unix)]
 pub fn run_helper() {
     let prompt = std::env::args()
@@ -463,8 +543,11 @@ pub fn run_helper() {
     let alias = std::env::var(chimaera_remote::ASKPASS_ALIAS_ENV)
         .ok()
         .filter(|alias| !alias.is_empty());
-    let answer = ask(&sock, alias.as_deref(), &prompt).unwrap_or_default();
-    print!("{answer}");
+    match ask(&sock, alias.as_deref(), &prompt) {
+        Ok(Reply::Secret(secret)) => print!("{secret}"),
+        Ok(Reply::Cancelled) => cancelled(),
+        Ok(Reply::Unanswered) | Err(_) => {}
+    }
     std::io::stdout().flush().ok();
 }
 
@@ -473,7 +556,8 @@ pub fn run_helper() {
 /// then the versioned scope frame, alias, and prompt to EOF — never argv,
 /// whose Linux→Windows marshaling for arbitrary prompt text is unverified.
 /// Any failure prints nothing: ssh gets an empty answer and fails cleanly,
-/// never hangs.
+/// never hangs. A prompt that got no answer exits [`CANCELLED_EXIT`], which
+/// the wrapper turns into ending ssh (see [`cancel_epilogue`]).
 #[cfg(windows)]
 pub fn run_helper() {
     let mut input = String::new();
@@ -500,16 +584,21 @@ pub fn run_helper() {
     {
         return;
     }
-    let mut answer = String::new();
-    if stream.read_to_string(&mut answer).is_err() {
+    let mut reply = String::new();
+    if stream.read_to_string(&mut reply).is_err() {
         return;
     }
-    print!("{}", answer.strip_suffix('\n').unwrap_or(&answer));
+    match decode_reply(&reply) {
+        Reply::Secret(secret) => print!("{secret}"),
+        Reply::Cancelled => cancelled(),
+        Reply::Unanswered => {}
+    }
     let _ = std::io::stdout().flush();
 }
 
+/// One relay round trip: the prompt out, the relay's reply back.
 #[cfg(unix)]
-fn ask(sock: &std::ffi::OsStr, alias: Option<&str>, prompt: &str) -> Result<String> {
+fn ask(sock: &std::ffi::OsStr, alias: Option<&str>, prompt: &str) -> Result<Reply> {
     let mut stream = StdUnixStream::connect(sock).context("connect askpass socket")?;
     stream.write_all(SCOPE_FRAME.as_bytes())?;
     stream.write_all(b"\n")?;
@@ -518,10 +607,9 @@ fn ask(sock: &std::ffi::OsStr, alias: Option<&str>, prompt: &str) -> Result<Stri
     stream.write_all(prompt.as_bytes())?;
     // Half-close so the server's read-to-EOF returns the whole prompt.
     stream.shutdown(Shutdown::Write)?;
-    let mut answer = String::new();
-    stream.read_to_string(&mut answer)?;
-    // The server terminates the answer with a newline; hand ssh just the secret.
-    Ok(answer.strip_suffix('\n').unwrap_or(&answer).to_string())
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply)?;
+    Ok(decode_reply(&reply))
 }
 
 #[cfg(all(test, unix))]
@@ -560,13 +648,14 @@ mod tests {
         assert_ne!(other, deep);
     }
 
-    /// The helper and server must agree on framing: the client half-closes to
-    /// mark the prompt's end, the server replies with the secret + one newline
-    /// which the client strips. This mirrors `serve_one`'s write framing.
-    #[test]
-    fn helper_round_trips_prompt_and_secret() {
-        let sock =
-            chimaera_core::runtime_dir().join(format!("askpass-test-{}.sock", std::process::id()));
+    /// Serve the bytes `reply` on a fresh socket and return what the helper's
+    /// `ask` made of them, plus the prompt the server saw.
+    fn ask_against(tag: &str, reply: Vec<u8>) -> (Reply, String) {
+        // A private dir, not `runtime_dir()`: another test points CHIMAERA_HOME
+        // at a temp dir and removes it again while the suite runs in parallel.
+        let dir = std::env::temp_dir().join(format!("askpass-ask-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("s");
         std::fs::remove_file(&sock).ok();
         let listener = UnixListener::bind(&sock).unwrap();
 
@@ -574,17 +663,104 @@ mod tests {
             let (mut s, _) = listener.accept().unwrap();
             let mut prompt = String::new();
             s.read_to_string(&mut prompt).unwrap(); // returns on the client's half-close
-            assert_eq!(
-                prompt,
-                "chimaera-askpass-scope-v1\ncluster\nuser@host's password:"
-            );
-            s.write_all(b"hunter2\n").unwrap(); // secret + newline, same as serve_one
+            s.write_all(&reply).unwrap();
+            prompt
         });
 
         let got = ask(sock.as_os_str(), Some("cluster"), "user@host's password:").unwrap();
-        assert_eq!(got, "hunter2");
-        server.join().unwrap();
-        std::fs::remove_file(&sock).ok();
+        let prompt = server.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        (got, prompt)
+    }
+
+    /// The helper and server must agree on framing: the client half-closes to
+    /// mark the prompt's end, the server replies with the secret + one newline
+    /// which the client strips.
+    #[test]
+    fn helper_round_trips_prompt_and_secret() {
+        let (got, prompt) = ask_against("secret", encode_reply(Some("hunter2")));
+        assert_eq!(
+            prompt,
+            "chimaera-askpass-scope-v1\ncluster\nuser@host's password:"
+        );
+        assert_eq!(got, Reply::Secret("hunter2".into()));
+    }
+
+    /// Only an explicit cancel ends the ssh that asked. Enter on a prompt is
+    /// an empty SECRET and stays an answer; a relay that refused or died
+    /// replies nothing (or is cut off), which is no cancel and no password.
+    #[test]
+    fn only_an_explicit_reply_cancels() {
+        assert_eq!(
+            ask_against("cancel", encode_reply(None)).0,
+            Reply::Cancelled
+        );
+        assert_eq!(
+            ask_against("enter", encode_reply(Some(""))).0,
+            Reply::Secret(String::new())
+        );
+        assert_eq!(ask_against("refused", Vec::new()).0, Reply::Unanswered);
+        assert_eq!(decode_reply("hunt"), Reply::Unanswered);
+        assert_eq!(decode_reply("cancel"), Reply::Unanswered);
+    }
+
+    /// Run a shim built around a fake helper that exits `helper_status`
+    /// (printing `printed`), as a child of an `sh` that would go on to print
+    /// "survived" — the stand-in for ssh. Returns that outer sh's stdout and
+    /// how it ended.
+    fn run_shim(
+        tag: &str,
+        helper_status: i32,
+        printed: &str,
+    ) -> (String, std::process::ExitStatus) {
+        let _exec = lock(&EXEC_LOCK);
+        let dir = std::env::temp_dir().join(format!("askpass-shim-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("helper");
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\nprintf '{printed}'\nexit {helper_status}\n"),
+        )
+        .unwrap();
+        let shim = dir.join("askpass.sh");
+        std::fs::write(&shim, shim_script(&fake)).unwrap();
+        for f in [&fake, &shim] {
+            std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("'{}' 'a prompt'; echo survived", shim.display()))
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            out.status,
+        )
+    }
+
+    /// THE bug: OpenSSH takes a failed askpass for an empty answer and asks
+    /// again, so the shim ends the process that ran it when the helper reports
+    /// a cancel — and only then.
+    #[test]
+    fn the_shim_ends_the_asking_process_on_a_cancel_only() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let (out, status) = run_shim("cancel", CANCELLED_EXIT, "");
+        assert_eq!(status.signal(), Some(15), "asker is sent SIGTERM");
+        assert!(!out.contains("survived"), "{out}");
+
+        // An answer passes through untouched, and the asker lives on.
+        let (out, status) = run_shim("answer", 0, "hunter2");
+        assert_eq!(out, "hunter2survived\n");
+        assert!(status.success());
+
+        // Any other helper failure keeps its old meaning: no answer, ssh
+        // decides.
+        let (out, status) = run_shim("failed", 1, "");
+        assert_eq!(out, "survived\n");
+        assert!(status.success());
     }
 
     #[test]
