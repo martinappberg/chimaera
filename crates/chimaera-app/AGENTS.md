@@ -37,14 +37,11 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
 | `Info.plist` | Merged into the bundle's by the Tauri bundler: `NSMicrophoneUsageDescription` (voice dictation records in the web view; macOS kills an app that opens the mic without it). |
 | `account/` | Fixed typed optional owner interface, unchanged named IPC commands/presentation DTOs (no sign-in URL or billing timing policy) and finite host effects. The free absent path performs no account effects. |
 | `command_manifest.rs` | Shared daemon/wizard command vocabulary for build-time permission generation and exact runtime daemon grants. The exported finite vocabulary also verifies selected assembly permission parity without changing dispatch or scope. |
-| `shell.rs` | Module root: app-global `Shell` state, `WindowScope`, `lock`, and the Tauri `Builder` assembly (`run`). Closing the last non-Home window opens local Home; closing the last local Home exits, while explicit Quit preserves restore state. A quit (`finish_quit`) or a close that would end the app (`closing_ends_app`) first passes the unsaved-edits guard, then `quit`'s question. Re-exports `open_ui_window`. |
-| `shell/quit.rs` | Fixed optional native quit hooks, after the original unsaved and last-window admission. The absent free owner passes immediately without status/credential/network work or a cloud phase machine. Native dialog registration and its dependency are supplied only by the private assembly. The private owner supplies the one cloud quit policy; final quitting/registry/window/focus cleanup remains host-owned. |
-| Private account auxiliary window | The optional owner uses its own shell-local cloud handoff page/capability. The original host intercepts only its fixed close label and owns final native teardown; the free default context carries no handoff asset or grant. |
+| `shell.rs` | Module root: app-global `Shell` state, `WindowScope`, `lock`, and the Tauri `Builder` assembly (`run`). Closing the last non-Home window opens local Home; closing the last local Home exits, while explicit Quit preserves restore state. A quit (`finish_quit`) or a window close first passes the unsaved-edits guard; nothing else holds it. Quitting never moves work: the daemon outlives it, keeps a Pro computer reachable and hears system sleep itself (`chimaera-server` `pro/reach.rs`, `pro/sleep_watch.rs`). Re-exports `open_ui_window`. |
 | `shell/commands.rs` | The IPC command surface (`#[tauri::command]` fns wired into `generate_handler!`) — thin delegators. |
 | `shell/connect.rs` | The `connect` flight state machine (one coalesced ssh attempt per host; a flight for a wedge suspect — or with no live tunnel — first clears a wedged ControlMaster, before the old tunnel's teardown — both masters for an alias routed to its daemon's login node) + the host-row wire vocabulary (`HostState` — incl. `node`, the login node a pool alias is pinned to — /`HostStatus`, and the `routing` progress phase) + `with_hosts`, the app's single path to hosts.json (serialized, off the reactor via `spawn_blocking`; the CLI writes it directly in crates/chimaera/src/connect.rs). A direct or capability-confirmed kept SSH connect that finds Slurm returns the cluster page without starting a login-node daemon; the persisted scheduled-jobs/login-host choice remains explicit, with legacy `not_cluster` migrated to the login-host choice without suppressing scheduler facts. Launch restore only attaches an already connected keeper route; explicit Connect/Reconnect owns new authentication. The default-off native prototype starts its original authentication deadline before capability negotiation, cancels that HTTP wait on account retirement, and rechecks the original account before key/trust selection; later grant, Ready and signing phases spend that same deadline. Kept transport failures never silently choose direct SSH. A flight whose keeper row is the account's cloud is refused before any reconnect (nothing wakes it) and drops that alias's saved windows (an older build's), so launch restore skips them with a log line. |
 | `shell/cluster/kept.rs` | Fixed delegate facade for an optional account-owned cluster. Free Direct cluster operations retain their original host implementation; unavailable selected kept routes refuse without fallback. |
 | `shell/cluster.rs` | Clusters: the `cluster_*` commands behind the cluster page — overview, discovery, add/remove a workspace, the folder picker (`cluster_list_dir` → `chimaera browse --dir`), start/continue/stop/dismiss a job (direct `sbatch`/app-held `srun`, or capability-confirmed keeper job control), open/close/move a workspace in a job (job-host's API over a plain `ssh -L`; one forward per job-host and per workspace window; kept hosts use exact resource Link listeners), startup commands (the cluster's Environment scopes), rules for agents, the persisted scheduled-jobs/login-host choice (first-setup completion in `hosts.json`; legacy `set_not_cluster` maps to direct-host mode without suppressing scheduler facts), the login-node terminal (a terminal-only `term=` window, `web-ui/src/lib/terminal/TerminalWindow.svelte`, on a shell in the local daemon's hidden workspace; never restored, its session ends with the window and a crash's leftover at the next launch — `sweep_terminals`). Direct reads lay each running job's own job-host answer over the cluster folder (`overlay_live`; the folder can show an open or a close a minute late), and a workspace window opens straight into its workspace (`ws=`). Per-cluster live state (endpoints kept Rust-side, the notification diff), `absorb` (toasts: ready / an hour / ten minutes / stopped; a window whose workspace closed, failed, or whose job ended learns why; one on its way to another job is told "moving" and reopened there), and the passive watcher that runs only while a job this app knows of is alive (woken at the end-of-job marks). A connect that lands on a cluster (`ClusterHost`) is a success in `shell/connect.rs` (`landed_on_cluster`), never a daemon start. |
-| `shell/power.rs` | Original system sleep/wake notifications (macOS IOKit, Linux logind delay inhibitor, Windows callbacks), AC queries and finite OS acknowledgments. The same optional account owner may receive a closed native PowerEvent under the original25s/logind/1.2s budget. No provider eligibility, Pro HTTP routing or sleep JSON policy remains here; absent free owner starts no account power watcher. |
 | `shell/pro.rs` | Optional account lifecycle facade and saved Direct choice. No credential, Client, billing, installation or account task implementation remains in this crate. |
 | `shell/tunnel.rs` | App-only SSH / keeper transport wrapper. Both expose one loopback daemon endpoint; keep chimaera-link out of the daemon dependency graph. `app_host`: the account's cloud (`HostKind::Worker`) is never one of the app's hosts; `offers_daemon_update` never flags it outdated (the service updates it), while SSH hosts and other computers keep the note and the update toast. |
 | `shell/restore.rs` | `open_ui_window` (every window opens through `open_shell_window`, which refuses the account's cloud: the app never shows its own page), the tunnel health monitor (a 3 s `interval` tick — a down host's probe burns its 2 s timeout inside it; 3-miss hysteresis; confirmed-down keys back off per miss up to 10 ticks, compute keys 2; a `down` edge files a wedge suspect), and launch-time window restore. |
@@ -74,9 +71,9 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
 - An injected native account owner uses fixed typed `account::AccountExtension`
   operations. The host still owns original windows, prompts, connect flights, tunnels,
   unsaved guards and the serialized hosts.json writer. The private assembly retains
-  account generations, credentials, operation admission, reverse serve and transport
-  ownership. Extraction is source-only until the new assemblies pass compile/runtime
-  gates; the native lifetime follow-up adds optional original-account receipts to named operations and a fixed setup-proposal decision. The free absent path has no lifetime or account owner; the private guarded path still needs its own compile/runtime acceptance.
+  account generations, credentials, operation admission and transport ownership
+  (the reverse-serve link belongs to the daemon). Extraction is source-only until the new assemblies pass compile/runtime
+  gates; the native lifetime follow-up adds optional original-account receipts to named operations. The free absent path has no lifetime or account owner; the private guarded path still needs its own compile/runtime acceptance.
 
 - **The command list is a lockstep** the type system does NOT fully enforce, so a
   drift only surfaces at runtime: `shell.rs` `generate_handler!` ↔
@@ -101,24 +98,14 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
   daemon-served pages include REMOTE hosts' UIs. Each daemon window instead
   receives a capability for its exact volatile label + current loopback port;
   the navigation guard advances with reconnects so stale granted ports cannot
-  be revisited after reuse. The quit handover page is the second static
-  capability in the selected private context: no command, only closing its
-  own window.
+  be revisited after reuse.
 - **Window/quit lifecycle, in order.** A window close runs `CloseRequested`:
-  the handover window's close is "quit now"; otherwise the unsaved-edits guard
-  (`unsaved`) holds it first; only a close that passed it and would end the
-  app (`closing_ends_app`: the only window left, and not a workspace, remote
-  or torn-off window, whose last close opens Home) reaches `quit`, which may
-  hold it too and later `destroy()`s it (never `close()`, so neither guard
-  asks twice). A quit reaches `finish_quit` only after the unsaved guard; that
-  is where `quit::hold_quit` may hold it (a held quit comes back through
-  `finish_quit` once the gate is `Settled`). macOS terminate (Dock › Quit,
-  logout) runs the same two in `unsaved::os_quit_may_proceed`, deciding
-  synchronously. The two dialogs are never merged. The updater's
-  `app.restart()` asks neither. The daemon outlives every quit (daemon.rs).
-  With Pro composed in, the private owner's `hold_quit` never holds: it tells
-  the daemon the app is leaving (`POST /pro/leave`) and the daemon decides
-  which work continues in the cloud; nothing is asked.
+  the unsaved-edits guard (`unsaved`) may hold it. A quit reaches `finish_quit`
+  only after the unsaved guard. macOS terminate (Dock › Quit, logout) runs the
+  same guard in `unsaved::os_quit_may_proceed`, deciding synchronously. The
+  updater's `app.restart()` asks nothing. The daemon outlives every quit
+  (daemon.rs); with Pro composed in, nothing about a quit reaches the account:
+  the daemon's own lease and reverse link keep the work where it is.
 - **The single-instance plugin must stay first** in `shell.rs`'s builder. The
   shell owns process-global window persistence, tunnels, and askpass state; two
   app processes would race and corrupt that ownership. A repeated launch raises

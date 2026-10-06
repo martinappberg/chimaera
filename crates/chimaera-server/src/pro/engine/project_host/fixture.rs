@@ -38,6 +38,8 @@ pub enum Request {
     Drain(Value),
     Handoff { workspace: String, epoch: u64 },
     Hydrate(Value),
+    RunHere { workspace: String },
+    RunInCloud { workspace: String },
     Configure(Value),
     ConfigureLegacy(Value),
     ConfigureWorkspace(Value),
@@ -316,6 +318,26 @@ impl Harness {
                 )
             }
             Request::Hydrate(body) => ("/api/v1/pro/hydrate", body),
+            Request::RunHere { workspace } => {
+                ensure!(crate::pro::valid_id(&workspace), "invalid fixture project");
+                return self
+                    .fixed_request_method(
+                        &format!("/api/v1/pro/projects/{workspace}/here"),
+                        None,
+                        axum::http::Method::POST,
+                    )
+                    .await;
+            }
+            Request::RunInCloud { workspace } => {
+                ensure!(crate::pro::valid_id(&workspace), "invalid fixture project");
+                return self
+                    .fixed_request_method(
+                        &format!("/api/v1/pro/projects/{workspace}/cloud"),
+                        None,
+                        axum::http::Method::POST,
+                    )
+                    .await;
+            }
             Request::ConfigureWorkspace(body) => {
                 configuration(&body)?;
                 let root = body

@@ -624,7 +624,7 @@ pub(crate) use execution::{
     resumed_fixture as resume_execution_fixture, worker_fixture as worker_execution_fixture,
 };
 /// The account answered the lease loop with a server error just now.
-#[cfg(any(test, feature = "daemon-extension-fixture"))]
+#[cfg(test)]
 pub(crate) fn account_erroring_fixture(state: &crate::AppState) {
     reach::answered(state, 503);
 }

@@ -26,11 +26,9 @@ mod commands;
 pub(crate) mod connect;
 mod drag;
 pub(crate) mod notices;
-pub(crate) mod power;
 #[cfg(target_os = "macos")]
 mod print_frame;
 mod pro;
-mod quit;
 mod restore;
 pub(crate) mod tunnel;
 mod unsaved;
@@ -67,7 +65,6 @@ type ConnectFlight = tokio::sync::watch::Receiver<Option<Result<(), String>>>;
 
 /// App-global shell state.
 pub struct Shell {
-    pub(crate) app: AppHandle,
     /// The local daemon (mutable: the update affordance replaces it).
     pub local: Mutex<LocalDaemon>,
     pub(crate) pro: crate::account::OptionalAccount,
@@ -558,12 +555,6 @@ pub(crate) fn finish_quit(app: &AppHandle) {
         if shell.quitting.load(Ordering::Relaxed) {
             return;
         }
-        // Past the unsaved-edits guard: an agent working on this computer
-        // may continue in the cloud instead (`quit`). A held quit comes
-        // back here once the question is settled.
-        if quit::hold_quit(app) {
-            return;
-        }
         // Idempotent: do the exit once however many paths arrive here.
         if shell.quitting.swap(true, Ordering::Relaxed) {
             return;
@@ -571,35 +562,6 @@ pub(crate) fn finish_quit(app: &AppHandle) {
         lock(&shell.registry).save_if_dirty();
     }
     app.exit(0);
-}
-
-/// Whether closing `label` ends the app: it is the only window left, and not
-/// one whose last close opens Home instead (`last_close_needs_home`).
-fn closing_ends_app(app: &AppHandle, shell: &Shell, label: &str) -> bool {
-    !shell.quitting.load(Ordering::Relaxed)
-        && app.webview_windows().keys().all(|other| other == label)
-        && !lock(&shell.windows)
-            .get(label)
-            .is_some_and(WindowScope::reopens_home)
-}
-
-/// Focus only the existing native handoff/closing/last-focused window. The
-/// account contribution cannot access or mutate the host's registry tables.
-pub(crate) fn raise_quit_question(app: &AppHandle, original_close: Option<&str>) {
-    let target = app
-        .get_webview_window(quit::HANDOFF_WINDOW)
-        .or_else(|| original_close.and_then(|label| app.get_webview_window(label)))
-        .or_else(|| {
-            let label = lock(&app.state::<Shell>().last_focused_window).clone();
-            label.and_then(|label| app.get_webview_window(&label))
-        });
-    #[cfg(target_os = "macos")]
-    let _ = app.show();
-    if let Some(window) = target {
-        let _ = window.unminimize();
-        let _ = window.show();
-        let _ = window.set_focus();
-    }
 }
 
 /// Activate the app the way a macOS app conventionally answers a Dock click
@@ -964,7 +926,6 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
     let fresh = handle.try_state::<Shell>().is_none();
     if fresh {
         handle.manage(Shell {
-            app: handle.clone(),
             local: Mutex::new(local),
             pro: crate::account::OptionalAccount::default(),
             tunnels: tokio::sync::Mutex::new(HashMap::new()),
@@ -1000,15 +961,7 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
         // and a window's first scope report may already owe it a focus.
         notices::start(handle);
     }
-    let installed = activate_account(handle);
-    if !fresh && !installed {
-        if let Some(owner) = handle.state::<Shell>().pro.owner().cloned() {
-            let app = handle.clone();
-            tauri::async_runtime::spawn(async move {
-                owner.refresh_serve(app.clone()).await;
-            });
-        }
-    }
+    activate_account(handle);
     // Reopen last session's windows. Restore itself registers a home surface
     // before launching any remote ssh that may need askpass, and also covers
     // the empty/failed local restore case so the app never comes up invisible.
@@ -1175,18 +1128,7 @@ pub fn run(
                 // unsaved closes as it always has.
                 tauri::WindowEvent::CloseRequested { api, .. } => {
                     let app = window.app_handle();
-                    if window.label() == quit::HANDOFF_WINDOW {
-                        // Its Quit button or title bar: quit now; the daemon
-                        // finishes (or already ended) the handover itself.
-                        api.prevent_close();
-                        quit::handoff_window_closing(app);
-                    } else if unsaved::hold_window_close(app, window.label()) {
-                        api.prevent_close();
-                    } else if closing_ends_app(app, &shell, window.label())
-                        && quit::hold_last_close(app, window.label())
-                    {
-                        // Unsaved edits were settled first; this asks whether
-                        // working agents continue in the cloud.
+                    if unsaved::hold_window_close(app, window.label()) {
                         api.prevent_close();
                     }
                 }

@@ -31,25 +31,6 @@ impl AccountHost {
     pub fn finish_quit(&self) {
         shell::finish_quit(&self.app);
     }
-    pub fn finish_last_close(&self, original_label: &str) {
-        if let Some(window) = self.app.get_webview_window(original_label) {
-            let _ = window.destroy();
-        }
-    }
-    pub fn close_handoff_window(&self) {
-        if let Some(window) = self.app.get_webview_window("cloud-handoff") {
-            let _ = window.destroy();
-        }
-    }
-    pub fn raise_quit_question(&self, original_close: Option<&str>) {
-        shell::raise_quit_question(&self.app, original_close);
-    }
-    pub fn install_power(&self) {
-        shell::power::install(&self.app);
-    }
-    pub fn suitable_power() -> bool {
-        shell::power::suitable()
-    }
     pub fn new(app: AppHandle) -> Self {
         Self { app }
     }

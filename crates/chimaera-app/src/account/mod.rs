@@ -39,7 +39,6 @@ impl OptionalAccount {
 pub trait AccountExtension: Send + Sync {
     fn start(&self, app: tauri::AppHandle);
     fn stop(&self, app: tauri::AppHandle) -> Task<()>;
-    fn refresh_serve(&self, app: tauri::AppHandle) -> Task<()>;
     fn reconfigure(&self, app: tauri::AppHandle);
     fn is_device(&self, alias: &str) -> bool;
     fn is_cloud(&self, alias: &str) -> bool;
@@ -62,10 +61,6 @@ pub trait AccountExtension: Send + Sync {
     fn reconcile_cluster(&self, alias: &str, overview: &chimaera_remote::cluster::ClusterOverview);
     fn cluster_endpoints(&self) -> Vec<(String, u16, String)>;
     fn cluster_current(&self, key: &str, port: u16, token: &str) -> bool;
-    /// Called only after original native unsaved/last-window admission.
-    fn hold_quit(&self, app: tauri::AppHandle, intent: QuitIntent) -> bool;
-    fn handoff_window_closing(&self, app: tauri::AppHandle);
-    fn system_power(&self, app: tauri::AppHandle, event: PowerEvent) -> Task<()>;
     fn pro_status(&self, app: tauri::AppHandle) -> Task<Result<types::account::Status, String>>;
     fn pro_refresh_account(
         &self,
@@ -286,18 +281,6 @@ pub trait DelegatedCluster: Send + Sync {
 pub enum ClusterPolicy {
     LoginServe(bool),
     NotCluster(bool),
-}
-/// Native-only quit admission points; never an IPC command or HTTP selector.
-pub enum QuitIntent {
-    Quit,
-    LastClose(String),
-    #[cfg(target_os = "macos")]
-    OsQuit,
-}
-/// Actual OS notifications under the host's original acknowledgement budget.
-pub enum PowerEvent {
-    Sleep { budget: std::time::Duration },
-    Wake,
 }
 /// The retained delegated transport owns actual close, not a detached observer.
 pub trait DelegatedTransport: Send + Sync {

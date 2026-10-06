@@ -1,10 +1,5 @@
 //! Optional typed account host adapters. No credentials, Client or account tasks here.
 use super::Shell;
-pub(super) async fn refresh_serve(state: &Shell) {
-    if let Some(owner) = state.pro.owner().cloned() {
-        owner.refresh_serve(state.app.clone()).await;
-    }
-}
 pub(super) fn reconfigure(app: &tauri::AppHandle) {
     use tauri::Manager;
     if let Some(owner) = app.state::<Shell>().pro.owner() {

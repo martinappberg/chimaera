@@ -470,12 +470,6 @@ fn os_quit_may_proceed(app: &AppHandle) -> bool {
     if !quit_may_proceed(app) {
         return false;
     }
-    // Unsaved edits settled: an agent working here may continue in the
-    // cloud instead (`quit`, decided before this returns). A held quit is
-    // finished by `finish_quit`, which never comes back through here.
-    if super::quit::hold_os_quit(app) {
-        return false;
-    }
     // AppKit ends the process itself (tao turns applicationWillTerminate
     // into RunEvent::Exit, which closes tunnels); flag the quit first so the
     // window set is kept for the next launch, exactly like `finish_quit`.
