@@ -504,7 +504,19 @@ fn apply_chat_event(state: &Arc<AppState>, id: &str, ev: &AgentEvent) {
         return;
     };
     let next = match ev {
-        AgentEvent::Init { .. } if record.state == AgentState::Unknown => {
+        // Claude answers `initialize` only after its SessionStart hook ran,
+        // and that hook reads as Running: a process with no turn in flight
+        // or asked for is idle at its Init whichever arrived first.
+        // Otherwise a resumed idle conversation reads "running" until its
+        // next turn ends.
+        AgentEvent::Init { .. }
+            if record.state == AgentState::Unknown
+                || (record.state == AgentState::Running
+                    && !state
+                        .chat
+                        .input_activity(id)
+                        .is_some_and(|(carry, pending)| carry.turn_in_flight || pending)) =>
+        {
             Some(AgentState::Finished)
         }
         // Structured questions block the turn on a human exactly like
@@ -5346,6 +5358,107 @@ mod tests {
             apply_chat_event(&state, id, &event);
             assert_eq!(crate::lock(&state.agents)[id].state, expected);
         }
+        state.chat.kill(id);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while state.chat.get(id).is_some_and(|info| info.alive) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        state.chat.remove(id);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Claude's SessionStart hook (Running) lands before the handshake's
+    /// Init. A resumed conversation with no turn reads idle at its Init; a
+    /// repeated Init during a turn leaves it running.
+    #[tokio::test]
+    async fn a_session_start_hook_before_init_leaves_an_idle_chat_idle() {
+        use chimaera_agent::driver::{AgentAdapter, DriverIo, SpawnSpec};
+
+        struct IdleAdapter;
+        impl AgentAdapter for IdleAdapter {
+            fn kind(&self) -> &'static str {
+                "claude"
+            }
+            fn spawn(
+                &self,
+                _: SpawnSpec,
+                mut io: DriverIo,
+            ) -> anyhow::Result<tokio::task::JoinHandle<DriverExit>> {
+                Ok(tokio::spawn(async move {
+                    let _ = io.kill.changed().await;
+                    let _ = io.events.send(AgentEvent::Exited { status: None }).await;
+                    DriverExit::Killed
+                }))
+            }
+        }
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-init-after-hook-{}-{nonce}",
+            std::process::id()
+        ));
+        let config = dir.join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        let state = Arc::new(AppState::new(
+            "test-token".into(),
+            "test-host".into(),
+            std::process::id(),
+            0,
+            dir.join("data"),
+            config,
+        ));
+        let id = "resumed-idle";
+        state
+            .chat
+            .spawn(&IdleAdapter, SpawnSpec::new(id, Vec::new(), dir.clone()))
+            .unwrap();
+        crate::lock(&state.agents).insert(
+            id.into(),
+            crate::agent_state::AgentRecord::new("test-key".into(), AgentKind::Claude),
+        );
+        let init = || AgentEvent::Init {
+            native_session_id: "native".into(),
+            model: None,
+            modes: Vec::new(),
+            current_mode: None,
+            slash_commands: Vec::new(),
+            models: Vec::new(),
+            agent_version: None,
+            remote_control_available: false,
+            remote_control_auto_enable: false,
+            remote_control: None,
+        };
+        // The SessionStart hook, as `agents::ingest` maps it.
+        let hooked = |state: &AppState| {
+            crate::lock(&state.agents).get_mut(id).unwrap().state =
+                crate::agent_state::map_event("SessionStart", &serde_json::Value::Null).unwrap();
+        };
+        hooked(&state);
+        apply_chat_event(&state, id, &init());
+        assert_eq!(crate::lock(&state.agents)[id].state, AgentState::Finished);
+
+        // A turn in flight: Claude re-emits Init mid-process.
+        let mut live = state.chat.attach(id, 0).unwrap().live;
+        let start = AgentEvent::TurnStarted {
+            turn_id: "turn".into(),
+        };
+        state.chat.annotate(id, start.clone()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while live.recv().await.unwrap().ev != start {}
+        })
+        .await
+        .unwrap();
+        apply_chat_event(&state, id, &start);
+        assert!(state.chat.carryover(id).unwrap().turn_in_flight);
+        apply_chat_event(&state, id, &init());
+        assert_eq!(crate::lock(&state.agents)[id].state, AgentState::Running);
+
         state.chat.kill(id);
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while state.chat.get(id).is_some_and(|info| info.alive) {
