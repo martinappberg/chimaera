@@ -636,7 +636,7 @@ revoked computer. After a restart no agent starts or resumes in a synced
 project until the account confirms the computer still holds it; only a
 sign-out the account acknowledged, which the daemon records on disk, lets
 interrupted sessions resume without the account.
-Sessions a lapse stopped are dropped once another machine held the project. A verified other owner refuses local input at once; the computer's
+Sessions a lapse stopped carry the epoch they were stopped at in the ledger (`fence_epoch`); they resume or travel only at that epoch or one the computer re-acquired straight from it (epoch + 1, nobody in between), and go to Recents once a grant or ownership read shows another machine held the project. A verified other owner refuses local input at once; the computer's
 agents stop at their next safe pause, at most five minutes later.
 Re-acquiring the epoch this installation itself held (its own clean release, or
 its own lapsed lease) continues local work: no checkpoint install and no fork,

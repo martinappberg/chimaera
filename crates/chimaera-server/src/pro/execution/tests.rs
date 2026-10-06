@@ -631,3 +631,89 @@ fn keeping_a_project_on_this_computer_never_fences_its_agents() {
     assert_eq!(expire(&state, 0), vec!["w-a"]);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+/// Review R4 S1: what a lapse fence preserved carries the epoch it was fenced
+/// at, persisted with the ledger. It resumes only while this computer holds
+/// that epoch or one it re-acquired straight from it; once a grant shows
+/// another machine held the project in between, it leaves for Recents, even
+/// after a restart lost every in-memory record of the fence.
+#[tokio::test]
+async fn a_fenced_conversation_resumes_only_in_its_own_epoch() {
+    let (state, config, root) = fixture();
+    let grant = |epoch: u64| -> Baton {
+        serde_json::from_value(json!({"workspace_id":"w-a","holder_id":"d-home","epoch":epoch,
+            "requires_fork":false,"server_now":"2026-09-28T00:00:00Z","expires_at":"2026-09-28T00:01:30Z",
+            "continuity":{"version":2,"mode":"managed_v1","policy_revision":1,"preferred_installation_id":"i-home"},
+            "execution_capability":{"version":1,"boundary":"managed_processes","expired_takeover":false},
+            "execution_lease":{"id":format!("lease-{epoch}"),"sequence":1}}))
+        .unwrap()
+    };
+    accept(&state, &config, &grant(2), 0, RequestStart::now()).unwrap();
+    lock(&state.pro.ownership).insert("w-a".into(), Ownership::Local { epoch: 2 });
+    let entry = |id: &str, fence: Option<u64>, handoff: bool| crate::ledger::LedgerEntry {
+        id: id.into(),
+        suspended: true,
+        manual_resume_reason: None,
+        fence_epoch: fence,
+        handoff: handoff.then_some(crate::bundle::HandoffResume {
+            fork: false,
+            origin: crate::bundle::Origin::Home,
+            epoch: 4,
+        }),
+        workspace_id: "w-a".into(),
+        cwd: root.clone(),
+        pinned_name: None,
+        cols: 80,
+        rows: 24,
+        theme: "dark".into(),
+        created_at: 0,
+        agent: None,
+    };
+    // Survives a restart: the ledger keeps the fence epoch (and only then).
+    let stale = entry("s-stale", Some(2), false);
+    let saved = stale.to_json();
+    assert_eq!(saved["fence_epoch"], 2);
+    assert!(entry("s-other", None, false)
+        .to_json()
+        .get("fence_epoch")
+        .is_none());
+    let restored = crate::ledger::LedgerEntry::from_json(&saved).unwrap();
+    assert_eq!(restored.fence_epoch, Some(2));
+    {
+        let mut deferred = lock(&state.deferred_sessions);
+        deferred.insert("s-stale".into(), restored);
+        deferred.insert("s-imported".into(), entry("s-imported", None, true));
+        deferred.insert("s-other".into(), entry("s-other", None, false));
+    }
+    let current = |id: &str| {
+        let entry = lock(&state.deferred_sessions).get(id).cloned().unwrap();
+        crate::pro::fence_current(&state, &entry)
+    };
+    assert!(current("s-stale"), "still this computer's epoch");
+    // Its own lapsed epoch re-acquired, nobody in between: still its own.
+    lock(&state.pro.execution.proofs)
+        .get_mut("w-a")
+        .unwrap()
+        .stopped = true;
+    lock(&state.pro.execution.proofs).remove("w-a");
+    accept(&state, &config, &grant(3), 0, RequestStart::now()).unwrap();
+    lock(&state.pro.ownership).insert("w-a".into(), Ownership::Local { epoch: 3 });
+    assert_eq!(
+        lock(&state.deferred_sessions)["s-stale"].fence_epoch,
+        Some(3)
+    );
+    assert!(current("s-stale"));
+    // Lapsed again; the cloud held epoch 4 and gave it back at 5: stale.
+    lock(&state.pro.execution.proofs).remove("w-a");
+    accept(&state, &config, &grant(5), 0, RequestStart::now()).unwrap();
+    let deferred = lock(&state.deferred_sessions);
+    assert!(!deferred.contains_key("s-stale"), "ran elsewhere: settled");
+    assert!(deferred.contains_key("s-imported"));
+    assert!(deferred.contains_key("s-other"), "not fenced: left alone");
+    drop(deferred);
+    assert_eq!(lock(&state.pro.settled).len(), 1, "on its way to Recents");
+    // A fenced entry whose epoch this computer does not hold never resumes.
+    lock(&state.deferred_sessions).insert("s-late".into(), entry("s-late", Some(4), false));
+    assert!(!current("s-late"));
+    std::fs::remove_dir_all(root).unwrap();
+}

@@ -259,6 +259,7 @@ fn shell_entry(id: &str, workspace: &crate::workspaces::Workspace) -> crate::led
         id: id.into(),
         suspended: false,
         manual_resume_reason: None,
+        fence_epoch: None,
         handoff: None,
         workspace_id: workspace.id.clone(),
         cwd: workspace.root.clone(),

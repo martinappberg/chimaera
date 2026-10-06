@@ -180,7 +180,16 @@ pub(super) fn retry(state: &Arc<AppState>, config: Configure, mut owed: Vec<(Str
 
 /// The project is this computer's alone again: what a fence stopped at the
 /// stood-down epoch resumes, as a signed-out computer's work does.
-pub(super) async fn resume(state: &Arc<AppState>, workspace: &str, _epoch: u64) {
+pub(super) async fn resume(state: &Arc<AppState>, workspace: &str, epoch: u64) {
+    // Stood down at `epoch`: what a fence kept at that epoch is the newest
+    // state of its conversations and nobody continues it elsewhere; anything
+    // fenced at an older epoch ran elsewhere since.
+    super::settle_fenced(state, workspace, Some(epoch));
+    for entry in lock(&state.deferred_sessions).values_mut() {
+        if entry.workspace_id == workspace {
+            entry.fence_epoch = None;
+        }
+    }
     if let Err(error) = crate::ledger::resume_deferred_workspace(state, workspace).await {
         tracing::warn!(%error, "Could not resume a project's sessions after sign-out");
     }

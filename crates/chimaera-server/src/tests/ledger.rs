@@ -55,6 +55,7 @@ async fn ledger_resurrects_sessions_across_restart() {
     boot.sessions.push(ledger::LedgerEntry {
         suspended: false,
         manual_resume_reason: None,
+        fence_epoch: None,
         handoff: None,
         id: "s-dead-codex".to_string(),
         workspace_id: workspace_id.clone(),
@@ -148,6 +149,7 @@ async fn ledger_restore_disabled_still_lands_recents() {
             ledger::LedgerEntry {
                 suspended: false,
                 manual_resume_reason: None,
+                fence_epoch: None,
                 handoff: None,
                 id: "s-shell".to_string(),
                 workspace_id: workspace_id.clone(),
@@ -162,6 +164,7 @@ async fn ledger_restore_disabled_still_lands_recents() {
             ledger::LedgerEntry {
                 suspended: false,
                 manual_resume_reason: None,
+                fence_epoch: None,
                 handoff: None,
                 id: "s-claude".to_string(),
                 workspace_id: workspace_id.clone(),
@@ -262,6 +265,7 @@ async fn journal_budget_spares_chats_the_ledger_resurrects() {
     let chat_entry = |id: &str| ledger::LedgerEntry {
         suspended: false,
         manual_resume_reason: None,
+        fence_epoch: None,
         handoff: None,
         id: id.to_string(),
         workspace_id: workspace_id.clone(),
@@ -333,6 +337,7 @@ async fn restart_deferred_sessions_resume_unless_another_owner_is_verified() {
         let entry = |id: &str, agent: Option<ledger::LedgerAgent>| ledger::LedgerEntry {
             suspended: false,
             manual_resume_reason: None,
+            fence_epoch: None,
             handoff: None,
             id: id.to_string(),
             workspace_id: workspace.id.clone(),
@@ -414,6 +419,7 @@ fn returned_chat(id: &str, workspace: &str, root: &std::path::Path) -> ledger::L
     ledger::LedgerEntry {
         suspended: true,
         manual_resume_reason: None,
+        fence_epoch: None,
         handoff: Some(crate::bundle::HandoffResume {
             fork: false,
             origin: crate::bundle::Origin::Home,

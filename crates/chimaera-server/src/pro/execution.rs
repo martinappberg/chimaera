@@ -470,6 +470,24 @@ pub(super) fn accept(
             "previous execution is stopping"
         );
     }
+    // The epoch this installation held last, if this grant continues it with
+    // nobody in between (the same epoch renewed, or its own re-acquired: every
+    // acquisition advances the epoch by one): what a fence preserved stays
+    // resumable. Any other grant settles those entries (review R4 S1).
+    let continued = lock(&state.pro.preferences)
+        .get(&baton.workspace_id)
+        .and_then(|p| p.execution_identity.as_ref())
+        .filter(|identity| {
+            identity.holder_id == config.delegation.device_id
+                && identity.endpoint == config.endpoint
+                && Some(&identity.account_id) == config.account_id.as_ref()
+                && (identity.epoch == baton.epoch || identity.epoch + 1 == baton.epoch)
+        })
+        .map(|identity| identity.epoch);
+    match continued {
+        Some(from) => super::carry_fenced(state, &baton.workspace_id, from, baton.epoch),
+        None => super::settle_fenced_here(state, &baton.workspace_id, Some(baton.epoch)),
+    }
     lock(&state.pro.preferences)
         .entry(baton.workspace_id.clone())
         .or_default()

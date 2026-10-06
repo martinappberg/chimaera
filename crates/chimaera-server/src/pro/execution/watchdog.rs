@@ -34,15 +34,24 @@ fn signal(state: &AppState, workspace: &str) {
     }
 }
 fn preserve(state: &AppState, workspaces: &[String]) {
+    // The epoch each fence stopped its project at: what it preserves resumes
+    // or travels only while this computer still holds it (review R4 S1).
+    let epochs: std::collections::HashMap<String, u64> = {
+        let proofs = lock(&state.pro.execution.proofs);
+        workspaces
+            .iter()
+            .filter_map(|workspace| Some((workspace.clone(), proofs.get(workspace)?.epoch)))
+            .collect()
+    };
     for mut entry in crate::ledger::snapshot(state).0 {
         if workspaces.contains(&entry.workspace_id) {
             entry.suspended = true;
             entry.handoff = None;
             if entry.agent.is_some() {
-                let mut fenced = lock(&state.pro.fenced_sessions);
-                if fenced.len() < 512 {
-                    fenced.insert(entry.id.clone());
-                }
+                // A conversation already preserved keeps its first fence.
+                entry.fence_epoch = entry
+                    .fence_epoch
+                    .or_else(|| epochs.get(&entry.workspace_id).copied());
                 // Its process is stopped mid-turn: the row must not keep
                 // saying it runs. Unknown raises no notice.
                 if let Some(record) = lock(&state.agents).get_mut(&entry.id) {

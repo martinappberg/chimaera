@@ -371,6 +371,7 @@ async fn suspended_ledger_never_respawns_until_verified_resume() {
         id: "s-deferred".into(),
         suspended: true,
         manual_resume_reason: None,
+        fence_epoch: None,
         handoff: None,
         workspace_id: workspace.id.clone(),
         cwd: root,

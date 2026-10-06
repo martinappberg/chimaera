@@ -110,12 +110,9 @@ pub(crate) struct ProState {
     /// kind and name of what holds each one elsewhere, both from the last
     /// ownership read (`place::observed`). Hot state, bounded.
     reasons: place::Reasons,
-    /// Sessions a lease fence stopped and kept for resuming here
-    /// (`execution::watchdog::preserve`). They resume only while this computer
-    /// still holds the epoch they ran under: once another machine held the
-    /// project, or a return installed its own copy, they are stale and dropped
-    /// (`drop_fenced`), so a finished turn never runs again. Hot, bounded.
-    fenced_sessions: Mutex<std::collections::HashSet<String>>,
+    /// Conversations a lapse fence preserved that another machine ran since
+    /// (`settle_fenced`), on their way to Recents. Hot, at most 64.
+    settled: Mutex<Vec<crate::ledger::LedgerEntry>>,
     holders: Mutex<HashMap<String, (String, Option<String>)>>,
     /// The last bytes written, so an unchanged tick costs no disk sync.
     persistence: Arc<AsyncMutex<Option<Vec<u8>>>>,
@@ -538,7 +535,7 @@ impl ProState {
             release_pending: Mutex::new(Default::default()),
             parked: Mutex::new(parked),
             reasons: Default::default(),
-            fenced_sessions: Mutex::new(Default::default()),
+            settled: Mutex::new(Vec::new()),
             holders: Mutex::new(HashMap::new()),
             persistence: Arc::new(AsyncMutex::new(None)),
             #[cfg(test)]
@@ -957,26 +954,87 @@ pub(crate) fn signed_out(state: &crate::AppState) -> bool {
         .signed_out
         .load(std::sync::atomic::Ordering::Acquire)
 }
-/// A fence's preserved sessions of `workspace` that nothing replaced: the
-/// project ran elsewhere since (another holder, or a return that installed its
-/// own copy, whose imported sessions carry a hand-off record), so they are
-/// dropped instead of resuming a stale turn (review R3, harness cause 2).
-pub(super) fn drop_fenced(state: &crate::AppState, workspace: &str) {
-    let mut fenced = crate::lock(&state.pro.fenced_sessions);
-    if fenced.is_empty() {
+/// The verified epoch `verified` (none: another machine holds the project)
+/// settles what lapse fences preserved in `workspace` (review R4 S1): an
+/// entry fenced at another epoch may have had its turn finished elsewhere, so
+/// it leaves the deferred set for Recents (reopening it never re-runs that
+/// turn; `retire_settled`), persisted with the ledger like the fence itself.
+/// Entries a return imported carry no fence epoch and stay.
+pub(crate) fn settle_fenced(
+    state: &std::sync::Arc<crate::AppState>,
+    workspace: &str,
+    verified: Option<u64>,
+) {
+    settle_fenced_here(state, workspace, verified);
+    retire_settled(state);
+}
+/// [`settle_fenced`]'s synchronous half: the stale entries wait (at most 64)
+/// for `retire_settled` to put them in Recents.
+pub(super) fn settle_fenced_here(state: &crate::AppState, workspace: &str, verified: Option<u64>) {
+    let stale: Vec<crate::ledger::LedgerEntry> = {
+        let mut deferred = crate::lock(&state.deferred_sessions);
+        let ids: Vec<String> = deferred
+            .values()
+            .filter(|entry| {
+                entry.workspace_id == workspace
+                    && entry.fence_epoch.is_some()
+                    && entry.fence_epoch != verified
+            })
+            .map(|entry| entry.id.clone())
+            .collect();
+        ids.iter().filter_map(|id| deferred.remove(id)).collect()
+    };
+    if stale.is_empty() {
         return;
     }
-    let mut deferred = crate::lock(&state.deferred_sessions);
-    fenced.retain(|id| match deferred.get(id) {
-        Some(entry) if entry.workspace_id == workspace => {
-            if entry.handoff.is_none() {
-                deferred.remove(id);
-            }
-            false
+    tracing::info!(
+        count = stale.len(),
+        "Conversations a lapse stopped here ran elsewhere since; they move to Recents"
+    );
+    let mut settled = crate::lock(&state.pro.settled);
+    let room = 64usize.saturating_sub(settled.len());
+    settled.extend(stale.into_iter().take(room));
+    drop(settled);
+    state.changes.notify_waiters();
+}
+/// Puts the conversations [`settle_fenced_here`] took out of the deferred set
+/// in Recents, off the caller.
+pub(crate) fn retire_settled(state: &std::sync::Arc<crate::AppState>) {
+    let settled = std::mem::take(&mut *crate::lock(&state.pro.settled));
+    if settled.is_empty() {
+        return;
+    }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let owner = state.clone();
+    runtime.spawn(async move {
+        for entry in settled {
+            crate::ledger::retire_stale(&owner, &entry).await;
         }
-        Some(_) => true,
-        None => false,
     });
+}
+/// This computer continues `from` as `to` with nobody in between (it renewed
+/// it, or re-acquired its own lapsed epoch; every acquisition advances the
+/// epoch by one): what a fence preserved at `from` is still the newest state
+/// of its conversations, so it stays resumable at `to`.
+pub(super) fn carry_fenced(state: &crate::AppState, workspace: &str, from: u64, to: u64) {
+    if from == to {
+        return;
+    }
+    for entry in crate::lock(&state.deferred_sessions).values_mut() {
+        if entry.workspace_id == workspace && entry.fence_epoch == Some(from) {
+            entry.fence_epoch = Some(to);
+        }
+    }
+}
+/// Whether a deferred entry may resume or travel now: unfenced, or fenced at
+/// the epoch this computer currently holds with a valid lease.
+pub(crate) fn fence_current(state: &crate::AppState, entry: &crate::ledger::LedgerEntry) -> bool {
+    entry.fence_epoch.is_none_or(|epoch| {
+        execution::lease_valid(state, &entry.workspace_id)
+            && execution::proof_epoch(state, &entry.workspace_id) == Some(epoch)
+    })
 }
 /// No longer kept in the cloud: "Run here", a handover that did not
 /// complete, or the cloud saying it cannot run the project.
@@ -1653,6 +1711,7 @@ mod tests {
             id: "s-a".into(),
             suspended: true,
             manual_resume_reason: None,
+            fence_epoch: None,
             handoff: None,
             workspace_id: "w-a".into(),
             cwd: root.clone(),

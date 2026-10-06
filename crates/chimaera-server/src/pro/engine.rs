@@ -380,7 +380,13 @@ fn transfer_session_ids(state: &AppState, workspace: &str) -> Result<Vec<String>
         if ids.len() > 64 {
             break;
         }
-        if entry.workspace_id == workspace && !ids.contains(id) {
+        // A conversation a lapse fenced travels only from the epoch it was
+        // fenced at: from any other, another machine may have finished its
+        // turn (review R4 S1).
+        if entry.workspace_id == workspace
+            && !ids.contains(id)
+            && super::fence_current(state, entry)
+        {
             ids.push(id.clone());
         }
     }
@@ -1028,6 +1034,7 @@ async fn hydrate_scoped(
     );
     current()?;
     execution::accept(state, config, &grant, generation, request_start)?;
+    super::retire_settled(state);
     // A project taken here (a return, an adoption, a reopened folder) is this
     // device's from now on: bind it to the account at once, as reconcile does
     // after its own acquire, so the cloud-project listing can match the folder
@@ -2051,7 +2058,7 @@ async fn finish_hydration_checked(
         // the ones a fence kept here. (A cloud machine resuming its own fenced
         // epoch installs nothing new and keeps them.)
         if !execution::worker(state) {
-            super::drop_fenced(state, workspace);
+            super::settle_fenced(state, workspace, Some(epoch));
         }
         super::persist(state).await?;
     }
@@ -2313,6 +2320,7 @@ mod tests {
                 id: "s-returned".into(),
                 suspended: true,
                 manual_resume_reason: None,
+                fence_epoch: None,
                 handoff: Some(crate::bundle::HandoffResume {
                     fork: false,
                     origin: crate::bundle::Origin::Home,

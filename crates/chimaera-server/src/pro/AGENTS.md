@@ -107,9 +107,16 @@ written by `/pro/disconnect`, persisted in `state.json`, cleared by the next
 configure) and the account acknowledged that project's stand-down
 (`sign_out::released`; nothing else proves the cloud is not running the work),
 unless another owner was verified meanwhile. Sessions a lease fence preserved
-(`watchdog::preserve`, also marking a running agent `Unknown`) are tracked in
-`fenced_sessions` and dropped (`drop_fenced`) once the project is seen held
-elsewhere or a return installs its own copy, so a finished turn never resumes.
+(`watchdog::preserve`, also marking a running agent `Unknown`) record the
+fence's epoch on their ledger entry (`LedgerEntry.fence_epoch`, persisted).
+They resume (`ledger::resume_one`) or travel (`engine::transfer_session_ids`)
+only while `fence_current`: the computer holds that epoch with a valid lease.
+`execution::accept` carries the epoch forward when a grant continues the one
+this installation last held (same epoch, or + 1: nobody acquired in between,
+`carry_fenced`); any other grant, a verified other owner (`set_ownership`
+Remote) or a return's hydration settles them (`settle_fenced`): they leave the
+deferred set for Recents (`ledger::retire_stale`), so a finished turn never
+runs again, also after a restart (review R4 S1).
 The lease loop's per-project pass (`CoordinatorTick::reconcile`) runs as an
 owned task tracked in `ProState.reconciling` (aborted by `stop_tasks`); the
 policy waits for a pass at most a budget and a later pass skips a project still
