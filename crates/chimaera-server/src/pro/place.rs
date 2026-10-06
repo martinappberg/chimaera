@@ -434,14 +434,16 @@ mod tests {
             chimaera_core::generate_token()
         ));
         std::fs::create_dir_all(&root).unwrap();
-        let state = Arc::new(crate::daemon_extension::with_inert_for_tests(AppState::new(
-            "fixture".into(),
-            "fixture".into(),
-            4242,
-            0,
-            root.clone(),
-            root.join("config"),
-        )));
+        let state = Arc::new(crate::daemon_extension::with_inert_for_tests(
+            AppState::new(
+                "fixture".into(),
+                "fixture".into(),
+                4242,
+                0,
+                root.clone(),
+                root.join("config"),
+            ),
+        ));
         (state, root)
     }
 
@@ -751,14 +753,16 @@ mod tests {
             StatusCode::NO_CONTENT
         );
         drop(state);
-        let restarted = Arc::new(crate::daemon_extension::with_inert_for_tests(AppState::new(
-            "fixture".into(),
-            "fixture".into(),
-            4242,
-            0,
-            root.clone(),
-            root.join("config"),
-        )));
+        let restarted = Arc::new(crate::daemon_extension::with_inert_for_tests(
+            AppState::new(
+                "fixture".into(),
+                "fixture".into(),
+                4242,
+                0,
+                root.clone(),
+                root.join("config"),
+            ),
+        ));
         assert!(restarted.pro.signed_out.load(Ordering::Acquire));
         drop(restarted);
         std::fs::remove_dir_all(root).unwrap();
