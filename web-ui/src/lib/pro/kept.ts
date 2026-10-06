@@ -50,12 +50,6 @@ export function hereName(): string {
   return "this Mac";
 }
 
-/** "This Mac" at the start of a sentence. */
-export function hereTitle(): string {
-  const here = hereName();
-  return here.charAt(0).toUpperCase() + here.slice(1);
-}
-
 function files(n: number): string {
   return n === 1 ? "1 file" : `${n} files`;
 }
