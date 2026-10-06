@@ -83,16 +83,18 @@ describe("agent and terminal cycle chords", () => {
     expect(keys.displayChord("Alt+Shift+a", "auto")).toBe("Alt+Shift+A");
   });
 
-  it("keeps the Windows and Linux chord on Alt+Shift whatever the base modifier is", async () => {
-    const { keys } = await chordsOn("Win32");
+  it.each(["Win32", "Linux x86_64"])("keeps the chord on Alt+Shift whatever the base modifier is (%s)", async (platform) => {
+    const { keys } = await chordsOn(platform);
     for (const setting of ["auto", "cmd", "ctrl-shift", "alt"] as const) {
-      const p = keys.parseChord(keys.ACTION_BY_ID.get("cycleAgents")!.def, setting)!;
-      expect([p.meta, p.ctrl, p.alt, p.shift]).toEqual([false, false, true, true]);
+      for (const id of ["cycleAgents", "cycleTerminals"]) {
+        const p = keys.parseChord(keys.ACTION_BY_ID.get(id)!.def, setting)!;
+        expect([p.meta, p.ctrl, p.alt, p.shift], `${platform}/${setting}/${id}`).toEqual([false, false, true, true]);
+      }
     }
   });
 
   it("collides with no other default chord under any modifier setting", async () => {
-    for (const platform of ["MacIntel", "Win32"]) {
+    for (const platform of ["MacIntel", "Win32", "Linux x86_64"]) {
       const { keys } = await chordsOn(platform);
       for (const setting of ["auto", "cmd", "ctrl-shift", "alt"] as const) {
         const sig = (def: string) => {
