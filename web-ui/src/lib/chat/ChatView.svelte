@@ -1437,9 +1437,19 @@
     ) {
       return;
     }
+    let viewportHeight = transcript.clientHeight;
     const observer = new ResizeObserver(() => {
+      const height = transcript.clientHeight;
+      const shrunk = viewportHeight - height;
+      viewportHeight = height;
       if (atBottom) {
         if (!composerEngaged) queueBottomScroll();
+        else if (shrunk !== 0) {
+          // A draft pauses following new rows, not the viewport's bottom
+          // edge: a composer growing a line keeps the lines above it in view.
+          transcript.scrollTop += shrunk;
+          lastScrollTop = transcript.scrollTop;
+        }
       } else if (readingAnchor === null) {
         pinReadingAnchor();
       } else {
