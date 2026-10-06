@@ -25,7 +25,7 @@ const TERM_KEY = "chimaera.term";
  * daemon. The frame shares the host window's origin, so booting here would
  * consume the other daemon's `#token=` and overwrite the host's own token in
  * the shared sessionStorage, then call the host's `/api` with the wrong one.
- * Nothing is read or written; `main.ts` shows a notice instead of mounting.
+ * No storage is read or written; `main.ts` shows a notice instead of mounting.
  */
 export function isNestedInProxy(): boolean {
   try {
@@ -48,8 +48,12 @@ export function isNestedInProxy(): boolean {
  * SAME window, layout and all.
  */
 function initFromHash(): string | null {
-  // Leave the fragment and sessionStorage untouched when nested: see above.
-  if (isNestedInProxy()) return null;
+  // Nested: touch no storage, but still scrub the fragment — the pane records
+  // the frame's location (hash included) into the persisted tab path.
+  if (isNestedInProxy()) {
+    if (location.hash !== "") history.replaceState(null, "", location.pathname + location.search);
+    return null;
+  }
   const params = new URLSearchParams(location.hash.slice(1));
   const tokenFromHash = params.get("token");
   const wsFromHash = params.get("ws");

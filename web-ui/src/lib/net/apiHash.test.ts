@@ -64,7 +64,7 @@ describe("nested in a browser-pane proxy frame", () => {
     g.window = originalWindow;
   });
 
-  it("neither consumes the fragment nor overwrites the host's token", async () => {
+  it("scrubs the fragment without storing it or overwriting the host's token", async () => {
     g.window = { self: {}, top: {} };
     g.location = new URL("http://127.0.0.1:4100/proxy/p-abc/#token=other");
     const replaced: string[] = [];
@@ -76,6 +76,23 @@ describe("nested in a browser-pane proxy frame", () => {
     expect(api.isNestedInProxy()).toBe(true);
     expect(api.getToken()).toBeNull();
     expect(sessionStorage.getItem("chimaera:token")).toBe("host");
-    expect(replaced).toHaveLength(0);
+    expect(replaced).toEqual(["/proxy/p-abc/"]);
+  });
+
+  it("still boots a top-level window and a framed page outside /proxy/", async () => {
+    const top = {};
+    for (const [self, path] of [
+      [top, "/proxy/p-abc/"],
+      [{}, "/"],
+    ] as const) {
+      g.window = { self, top };
+      g.location = new URL(`http://127.0.0.1:4100${path}#token=t`);
+      g.history = { replaceState: () => undefined };
+      sessionStorage.clear();
+      vi.resetModules();
+      const api = await import("./api");
+      expect(api.isNestedInProxy()).toBe(false);
+      expect(api.getToken()).toBe("t");
+    }
   });
 });

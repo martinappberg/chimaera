@@ -31,7 +31,8 @@ if (!target) {
 if (isNestedInProxy()) {
   target.textContent =
     "This is another Chimaera. It can't run inside a browser pane — open it in your browser instead.";
-  target.style.cssText = "font:14px system-ui,sans-serif;color:#888;padding:24px;line-height:1.5";
+  // Theme tokens, inherited font: the page background already follows the theme.
+  target.style.cssText = "color:var(--muted);padding:24px;line-height:1.5";
   throw new Error("chimaera UI nested in a proxy frame");
 }
 
