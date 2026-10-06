@@ -185,42 +185,12 @@ pub trait AccountExtension: Send + Sync {
         original: chimaera_link::providers::Original,
         expected_account_lifetime: Option<String>,
     ) -> Task<Result<(), String>>;
-    fn pro_project_secrets_catalog(
-        &self,
-        app: tauri::AppHandle,
-        window: tauri::WebviewWindow,
-        after: Option<String>,
-        expected_account_lifetime: Option<String>,
-    ) -> Task<Result<chimaera_link::project_secrets::CatalogPage, String>>;
-    fn pro_project_secret_command(
-        &self,
-        app: tauri::AppHandle,
-        window: tauri::WebviewWindow,
-        context_tag: String,
-        payload: String,
-        expected_account_lifetime: Option<String>,
-    ) -> Task<Result<chimaera_link::project_secrets::CommandResult, String>>;
-    fn pro_project_secret_operation(
-        &self,
-        app: tauri::AppHandle,
-        window: tauri::WebviewWindow,
-        context_tag: String,
-        operation_id: String,
-        expected_account_lifetime: Option<String>,
-    ) -> Task<Result<chimaera_link::project_secrets::CommandResult, String>>;
     fn pro_cloud_projects(
         &self,
         app: tauri::AppHandle,
         expected_account_lifetime: Option<String>,
     ) -> Task<Result<Vec<types::projects::CloudProject>, String>>;
     fn pro_copy_project(
-        &self,
-        app: tauri::AppHandle,
-        window: tauri::WebviewWindow,
-        workspace_id: String,
-        expected_account_lifetime: Option<String>,
-    ) -> Task<Result<Option<types::projects::CloudProjectOpen>, String>>;
-    fn pro_open_cloud_project(
         &self,
         app: tauri::AppHandle,
         window: tauri::WebviewWindow,

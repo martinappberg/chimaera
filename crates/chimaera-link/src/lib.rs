@@ -6,7 +6,6 @@ mod continuity;
 mod error;
 pub mod handoff;
 pub mod placement;
-pub mod project_secrets;
 pub mod protocol;
 pub mod providers;
 pub mod ssh_auth;

@@ -303,12 +303,7 @@ fn browse(
 
 /// Run the ordinary free CLI without an account runtime.
 pub fn run() -> anyhow::Result<()> {
-    run_selected(
-        Cli::parse(),
-        None,
-        #[cfg(all(unix, feature = "provider-fixture-host"))]
-        None,
-    )
+    run_selected(Cli::parse(), None)
 }
 
 /// Compose a trusted optional daemon runtime. The factory is called only for
@@ -316,12 +311,7 @@ pub fn run() -> anyhow::Result<()> {
 pub fn run_with_extension(
     factory: fn() -> std::sync::Arc<dyn chimaera_server::daemon_extension::Runtime>,
 ) -> anyhow::Result<()> {
-    run_selected(
-        Cli::parse(),
-        Some(factory),
-        #[cfg(all(unix, feature = "provider-fixture-host"))]
-        None,
-    )
+    run_selected(Cli::parse(), Some(factory))
 }
 
 type RuntimeFactory = fn() -> std::sync::Arc<dyn chimaera_server::daemon_extension::Runtime>;
@@ -334,39 +324,7 @@ fn deployment_source(extension: Option<RuntimeFactory>) -> chimaera_remote::Depl
     }
 }
 
-/// Pure shared parsing for explicit private fixture tests; no setup/effect.
-#[cfg(all(unix, feature = "provider-fixture-host"))]
-pub fn provider_fixture_args_valid(args: &[std::ffi::OsString]) -> bool {
-    Cli::try_parse_from(args.iter().cloned()).is_ok_and(|cli| fixture_command(&cli))
-}
-#[cfg(all(unix, feature = "provider-fixture-host"))]
-fn fixture_command(cli: &Cli) -> bool {
-    matches!(
-        &cli.command,
-        Command::Serve {
-            bind_routable: false,
-            ..
-        }
-    )
-}
-/// Original CLI parsing/startup, with one nondefault host fixture callback.
-/// Validate serve/loopback before daemonization, tracing or any runtime effect.
-#[cfg(all(target_os = "linux", feature = "provider-fixture-host"))]
-pub fn run_with_provider_fixture(
-    args: Vec<std::ffi::OsString>,
-    start: fn(chimaera_server::provider_fixture::Context) -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
-    let cli = Cli::parse_from(args);
-    anyhow::ensure!(fixture_command(&cli), "Fixture requires loopback serve");
-    run_selected(cli, None, Some(start))
-}
-fn run_selected(
-    cli: Cli,
-    extension: Option<RuntimeFactory>,
-    #[cfg(all(unix, feature = "provider-fixture-host"))] fixture: Option<
-        fn(chimaera_server::provider_fixture::Context) -> anyhow::Result<()>,
-    >,
-) -> anyhow::Result<()> {
+fn run_selected(cli: Cli, extension: Option<RuntimeFactory>) -> anyhow::Result<()> {
     // Detach BEFORE the async runtime exists. `fork` is only safe while the
     // process is single-threaded, and the tokio runtime spawns worker threads —
     // so the parent must exit (inside `detach`) before we build the runtime.
@@ -421,21 +379,10 @@ fn run_selected(
         .max_blocking_threads(128)
         .enable_all()
         .build()?
-        .block_on(dispatch(
-            cli.command,
-            extension,
-            #[cfg(all(unix, feature = "provider-fixture-host"))]
-            fixture,
-        ))
+        .block_on(dispatch(cli.command, extension))
 }
 
-async fn dispatch(
-    command: Command,
-    extension: Option<RuntimeFactory>,
-    #[cfg(all(unix, feature = "provider-fixture-host"))] fixture: Option<
-        fn(chimaera_server::provider_fixture::Context) -> anyhow::Result<()>,
-    >,
-) -> anyhow::Result<()> {
+async fn dispatch(command: Command, extension: Option<RuntimeFactory>) -> anyhow::Result<()> {
     match command {
         Command::Serve {
             port,
@@ -449,16 +396,6 @@ async fn dispatch(
                 port,
                 routable_bind: bind_routable,
             };
-            #[cfg(all(unix, feature = "provider-fixture-host"))]
-            if let Some(start) = fixture {
-                #[cfg(target_os = "linux")]
-                return chimaera_server::run_with_provider_fixture(config, start).await;
-                #[cfg(not(target_os = "linux"))]
-                {
-                    let _ = start;
-                    anyhow::bail!("Fixture requires Linux");
-                }
-            }
             match extension {
                 Some(factory) => chimaera_server::run_with_extension(config, factory()).await,
                 None => chimaera_server::run(config).await,

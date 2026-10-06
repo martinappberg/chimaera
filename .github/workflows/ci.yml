@@ -106,13 +106,12 @@ jobs:
       - run: cargo clippy --manifest-path plugins/Cargo.toml --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo test -p chimaera-link
-      - name: Check public provider ownership and fixture host
-        run: cargo clippy --locked -p chimaera -p chimaera-server --all-targets --features chimaera/provider-fixture-host,chimaera-server/daemon-extension-fixture -- -D warnings
-      - name: Test public provider ownership and fixture host
+      - name: Check the daemon's feature-gated extension fixtures
+        run: cargo clippy --locked -p chimaera-server --all-targets --features provider-authority-prototype,daemon-extension-fixture -- -D warnings
+      - name: Test the daemon's feature-gated extension fixtures
         run: |
           cargo test --locked -p chimaera-server --lib --features provider-authority-prototype,daemon-extension-fixture cloud::providers
           cargo test --locked -p chimaera-server --lib --features provider-authority-prototype,daemon-extension-fixture pro::execution::
-          cargo test --locked -p chimaera --features provider-fixture-host
       - run: cargo test --manifest-path plugins/Cargo.toml
 
   musl:
