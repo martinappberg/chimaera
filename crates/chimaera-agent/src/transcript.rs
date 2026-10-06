@@ -158,6 +158,7 @@ pub fn import_subagent_transcript(
         ..Translator::default()
     };
     let mut model = None;
+    let mut timestamps: Vec<u64> = vec![0; out.len()];
     loop {
         line.clear();
         match read_line_capped(&mut reader, &mut line, MAX_LINE_BYTES) {
@@ -179,15 +180,56 @@ pub fn import_subagent_transcript(
             }
         }
         tx.on_record(&value, &mut out);
+        // Every record is stamped; its events happened then.
+        let at = value["timestamp"]
+            .as_str()
+            .and_then(iso_utc_ms)
+            .unwrap_or(0);
+        timestamps.resize(out.len(), at);
     }
     if !live {
         tx.finish(&mut out);
     }
+    timestamps.resize(out.len(), 0);
     Some(crate::subagent::SubagentTranscript {
         events: out,
         epoch: start.to_string(),
         model,
+        timestamps,
     })
+}
+
+/// Claude's record `timestamp` (`2026-10-05T12:34:56.789Z`) as epoch ms.
+/// UTC only — the CLI writes `Z` — and lenient about the fraction; anything
+/// else is "not known" rather than a guess.
+fn iso_utc_ms(s: &str) -> Option<u64> {
+    let s = s.strip_suffix('Z')?;
+    let (date, time) = s.split_once('T')?;
+    let mut d = date.split('-').map(|p| p.parse::<i64>().ok());
+    let (y, m, day) = (d.next()??, d.next()??, d.next()??);
+    let (hms, frac) = time.split_once('.').unwrap_or((time, ""));
+    let mut t = hms.split(':').map(|p| p.parse::<i64>().ok());
+    let (h, min, sec) = (t.next()??, t.next()??, t.next()??);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&day) || h > 23 || min > 59 || sec > 60 {
+        return None;
+    }
+    // Days since 1970-01-01 (Howard Hinnant's days_from_civil).
+    let (y, m) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * m + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let millis: i64 = frac
+        .chars()
+        .take(3)
+        .filter_map(|c| c.to_digit(10))
+        .fold((0i64, 100i64), |(acc, place), digit| {
+            (acc + i64::from(digit) * place, place / 10)
+        })
+        .0;
+    let ms = ((days * 86_400 + h * 3_600 + min * 60 + sec) * 1_000) + millis;
+    u64::try_from(ms).ok()
 }
 
 /// Read one `\n`-terminated line, capping `out` at `cap` bytes: the rest of an
@@ -678,6 +720,33 @@ mod tests {
             AgentEvent::ToolCallUpdate { id, status: ToolStatus::Completed, content: None }
                 if id == "tu_read"
         ));
+    }
+
+    #[test]
+    fn subagent_records_stamp_their_events() {
+        assert_eq!(iso_utc_ms("1970-01-01T00:00:00.000Z"), Some(0));
+        assert_eq!(
+            iso_utc_ms("2026-10-05T12:34:56.789Z"),
+            Some(1_791_203_696_789)
+        );
+        assert_eq!(iso_utc_ms("2026-10-05T12:34:56Z"), Some(1_791_203_696_000));
+        assert_eq!(iso_utc_ms("2026-10-05 12:34:56"), None);
+        assert_eq!(iso_utc_ms("2026-13-05T12:34:56Z"), None);
+        let lines = vec![
+            subagent_line(
+                r#""timestamp":"2026-10-05T12:00:00.000Z","type":"user","message":{"role":"user","content":"go"}"#,
+            ),
+            subagent_line(
+                r#""timestamp":"2026-10-05T12:00:05.000Z","type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"ok"}]}"#,
+            ),
+        ];
+        let read = import_subagent(&lines, false);
+        assert_eq!(read.timestamps.len(), read.events.len());
+        assert_eq!(read.timestamps[0], 1_791_201_600_000);
+        // The turn opens with the assistant record; the synthesized close
+        // has no time of its own.
+        assert_eq!(read.timestamps[1], 1_791_201_605_000);
+        assert_eq!(*read.timestamps.last().unwrap(), 0);
     }
 
     #[test]

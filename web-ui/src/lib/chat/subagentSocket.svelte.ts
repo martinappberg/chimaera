@@ -25,7 +25,7 @@ const READ_TIMEOUT_MS = 20_000;
 
 type Delivery =
   | { kind: "restart"; model: string | null; total: number }
-  | { kind: "event"; seq: number; ev: SubagentRead["events"][number] };
+  | { kind: "event"; seq: number; ts: number; ev: SubagentRead["events"][number] };
 
 /**
  * The chat-socket stand-in behind a subagent view: it feeds a ChatStore the
@@ -179,14 +179,19 @@ export class SubagentSocket {
     // Seq 1 is the synthetic `init` a restart delivers; event i of the
     // epoch is seq i + 2.
     this.deliveries.pushMany(
-      step.events.map((ev, i) => ({ kind: "event" as const, seq: base + i + 2, ev })),
+      step.events.map((ev, i) => ({
+        kind: "event" as const,
+        seq: base + i + 2,
+        ts: step.timestamps[i] ?? 0,
+        ev,
+      })),
     );
   }
 
   private deliver(delivery: Delivery): void {
     try {
       if (delivery.kind === "event") {
-        this.handlers.onEvent({ seq: delivery.seq, ts: 0, ev: delivery.ev });
+        this.handlers.onEvent({ seq: delivery.seq, ts: delivery.ts, ev: delivery.ev });
         return;
       }
       const info = {

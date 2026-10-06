@@ -5883,6 +5883,8 @@ fn thread_to_events(thread: &Value, live: bool) -> SubagentTranscript {
         events,
         epoch,
         model,
+        // The read's items carry no times of their own.
+        timestamps: Vec::new(),
     }
 }
 

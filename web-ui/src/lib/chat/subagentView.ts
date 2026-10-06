@@ -73,6 +73,9 @@ export interface SubagentRead {
   /** Index of `events[0]` within the epoch. */
   from: number;
   events: { type: string; [key: string]: unknown }[];
+  /** When each event happened (epoch ms, 0 = not known), parallel to
+   *  `events`; absent when the source keeps no times. */
+  ts?: number[];
   model?: string | null;
   /** Opaque; sent back so an unchanged source answers without a read. */
   stamp?: string | null;
@@ -99,7 +102,12 @@ export const EMPTY_CURSOR: SubagentCursor = { epoch: null, held: 0, stamp: null 
 export function advanceCursor(
   cursor: SubagentCursor,
   read: SubagentRead,
-): { cursor: SubagentCursor; restart: boolean; events: SubagentRead["events"] } | null {
+): {
+  cursor: SubagentCursor;
+  restart: boolean;
+  events: SubagentRead["events"];
+  timestamps: number[];
+} | null {
   const sameWindow = cursor.epoch !== null && read.epoch === cursor.epoch;
   if (sameWindow && read.from !== cursor.held) return null;
   if (!sameWindow && read.from !== 0) return null;
@@ -111,5 +119,6 @@ export function advanceCursor(
     },
     restart: !sameWindow,
     events: read.events,
+    timestamps: read.ts ?? [],
   };
 }

@@ -175,15 +175,19 @@ pub(crate) async fn subagent_transcript(
             } else {
                 0
             };
-            Json(json!({
+            let mut body = json!({
                 "agent": kind,
                 "epoch": read.epoch,
                 "from": from,
                 "events": &read.events[from..],
                 "model": read.model,
                 "stamp": stamp,
-            }))
-            .into_response()
+            });
+            // When the source dates its records: epoch ms per event, 0 = unknown.
+            if read.timestamps.len() == read.events.len() {
+                body["ts"] = json!(&read.timestamps[from..]);
+            }
+            Json(body).into_response()
         }
         Err(reason) => refuse(StatusCode::NOT_FOUND, reason),
     }

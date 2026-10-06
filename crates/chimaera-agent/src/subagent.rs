@@ -36,6 +36,9 @@ pub struct SubagentTranscript {
     pub epoch: String,
     /// The model serving the subagent, when the source names one.
     pub model: Option<String>,
+    /// When each of `events` happened (epoch ms; 0 = not known), parallel
+    /// to `events`. Empty when the source records no times at all.
+    pub timestamps: Vec<u64>,
 }
 
 /// A read the daemon asks of a LIVE driver. Ephemeral: the answer goes back
