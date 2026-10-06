@@ -28,14 +28,16 @@ pub(super) enum Event {
     CanSleep,
     /// `kIOMessageSystemWillSleep`: hand over, then acknowledge.
     WillSleep,
-    /// `kIOMessageSystemHasPoweredOn`.
+    /// `kIOMessageSystemHasPoweredOn`, or `kIOMessageSystemWillNotSleep`
+    /// (a sleep that was announced and then cancelled): either way this
+    /// computer is awake and its flush, if any, must not release.
     PoweredOn,
 }
 pub(super) fn event(message: u32) -> Option<Event> {
     match message {
         0xe000_0270 => Some(Event::CanSleep),
         0xe000_0280 => Some(Event::WillSleep),
-        0xe000_0300 => Some(Event::PoweredOn),
+        0xe000_0300 | 0xe000_0290 => Some(Event::PoweredOn),
         _ => None,
     }
 }
@@ -47,18 +49,28 @@ pub(super) async fn handle(state: Weak<AppState>, event: Event, acknowledge: imp
     match event {
         Event::CanSleep => acknowledge(),
         Event::WillSleep => {
-            if let Some(state) = state.upgrade() {
+            if let Some(state) = state.upgrade().filter(|state| active(state)) {
                 let flush = super::routes::sleeping(&state, BUDGET);
                 let _ = tokio::time::timeout(BUDGET, flush).await;
             }
             acknowledge();
         }
         Event::PoweredOn => {
-            if let Some(state) = state.upgrade() {
+            if let Some(state) = state.upgrade().filter(|state| active(state)) {
                 super::routes::woke(&state).await;
             }
         }
     }
+}
+
+/// Signed in with Pro and the Runtime composed in: the only state in which a
+/// power notice does anything (the watcher outlives a sign-out).
+fn active(state: &AppState) -> bool {
+    state.daemon_extension.is_some()
+        && state
+            .pro
+            .configured
+            .load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Starts the watcher for this process if this daemon may hand work over.
@@ -178,6 +190,7 @@ mod tests {
         assert_eq!(event(0xe000_0270), Some(Event::CanSleep));
         assert_eq!(event(0xe000_0280), Some(Event::WillSleep));
         assert_eq!(event(0xe000_0300), Some(Event::PoweredOn));
+        assert_eq!(event(0xe000_0290), Some(Event::PoweredOn));
         assert_eq!(event(0xe000_0320), None);
     }
 
@@ -196,5 +209,48 @@ mod tests {
         })
         .await;
         assert!(heard.try_recv().is_ok());
+    }
+
+    /// Review R3 S7: without the Runtime, or signed out, a power notice is
+    /// acknowledged and changes nothing.
+    #[tokio::test]
+    async fn a_daemon_without_pro_only_acknowledges() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-sleep-watch-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let state = Arc::new(AppState::new(
+            "fixture".into(),
+            "fixture".into(),
+            4242,
+            0,
+            root.clone(),
+            root.join("config"),
+        ));
+        start(&state);
+        let generation = state
+            .pro
+            .sleep_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        for event in [Event::WillSleep, Event::PoweredOn] {
+            let (sent, mut heard) = tokio::sync::oneshot::channel();
+            let will_sleep = event == Event::WillSleep;
+            handle(Arc::downgrade(&state), event, move || {
+                let _ = sent.send(());
+            })
+            .await;
+            assert_eq!(heard.try_recv().is_ok(), will_sleep);
+        }
+        assert_eq!(
+            state
+                .pro
+                .sleep_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+            generation
+        );
+        assert!(!state.pro.root.join("state.json").exists());
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
