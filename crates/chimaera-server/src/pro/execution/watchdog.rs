@@ -33,7 +33,7 @@ fn signal(state: &AppState, workspace: &str) {
         }
     }
 }
-fn preserve(state: &AppState, workspaces: &[String]) {
+pub(super) fn preserve(state: &AppState, workspaces: &[String]) {
     // The epoch each fence stopped its project at: what it preserves resumes
     // or travels only while this computer still holds it (review R4 S1).
     let epochs: std::collections::HashMap<String, u64> = {
@@ -43,15 +43,17 @@ fn preserve(state: &AppState, workspaces: &[String]) {
             .filter_map(|workspace| Some((workspace.clone(), proofs.get(workspace)?.epoch)))
             .collect()
     };
+    // Only what this fence stops: a session already kept (a clean hand-over's
+    // stopped conversation, one waiting for verification) is not the lapse's,
+    // keeps its own record, and is never marked stale by it.
+    let kept: std::collections::HashSet<String> =
+        lock(&state.deferred_sessions).keys().cloned().collect();
     for mut entry in crate::ledger::snapshot(state).0 {
-        if workspaces.contains(&entry.workspace_id) {
+        if workspaces.contains(&entry.workspace_id) && !kept.contains(&entry.id) {
             entry.suspended = true;
             entry.handoff = None;
             if entry.agent.is_some() {
-                // A conversation already preserved keeps its first fence.
-                entry.fence_epoch = entry
-                    .fence_epoch
-                    .or_else(|| epochs.get(&entry.workspace_id).copied());
+                entry.fence_epoch = epochs.get(&entry.workspace_id).copied();
                 // Its process is stopped mid-turn: the row must not keep
                 // saying it runs. Unknown raises no notice.
                 if let Some(record) = lock(&state.agents).get_mut(&entry.id) {

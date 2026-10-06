@@ -759,3 +759,39 @@ async fn a_wake_fences_a_long_lapsed_lease_at_once() {
     );
     std::fs::remove_dir_all(root).unwrap();
 }
+
+/// A lapse fence keeps only what it stops: a conversation a clean hand-over
+/// already stopped and recorded keeps its own record (its hand-off, no fence
+/// epoch), so seeing the project held elsewhere never sends it to Recents
+/// (the full loopback run's step 11).
+#[tokio::test]
+async fn a_lapse_never_marks_a_conversation_a_hand_over_already_kept() {
+    let (state, _config, root) = fixture();
+    crate::pro::install_execution_fixture(&state, "w-a", 2).unwrap();
+    let handed = crate::ledger::LedgerEntry {
+        id: "s-handed".into(),
+        suspended: true,
+        manual_resume_reason: None,
+        fence_epoch: None,
+        handoff: Some(crate::bundle::HandoffResume {
+            fork: false,
+            origin: crate::bundle::Origin::Home,
+            epoch: 2,
+        }),
+        workspace_id: "w-a".into(),
+        cwd: root.clone(),
+        pinned_name: None,
+        cols: 80,
+        rows: 24,
+        theme: "dark".into(),
+        created_at: 0,
+        agent: None,
+    };
+    lock(&state.deferred_sessions).insert("s-handed".into(), handed.clone());
+    watchdog::preserve(&state, &["w-a".to_string()]);
+    assert_eq!(lock(&state.deferred_sessions)["s-handed"], handed);
+    crate::pro::install_remote_owner_fixture(&state, "w-a", 3);
+    super::super::settle_fenced_here(&state, "w-a", None);
+    assert!(lock(&state.deferred_sessions).contains_key("s-handed"));
+    std::fs::remove_dir_all(root).unwrap();
+}
