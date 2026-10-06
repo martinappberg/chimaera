@@ -37,7 +37,11 @@ plane `ANY /proxy/{id}[/{*path}]`; agent-opened panes add the MCP `open_browser`
     target that forwards back to the daemon.
   - The registry is capped (32) with a 24h idle TTL; mounted panes keep-alive via the
     health route; the UI revokes a target's session when its last tab closes.
-  - The daemon's own port is refused as a target (a same-origin loop).
+  - The daemon's own port is refused as a target (a same-origin loop). Another
+    Chimaera daemon is reachable but not runnable: its UI served under `/proxy/…` shares
+    the host window's origin, so `main.ts` shows a notice instead of booting
+    (`net/api.ts::isNestedInProxy`) — booting would overwrite the host's token in the
+    shared sessionStorage.
 
 ## The data plane (HTTP + WebSocket pass-through)
 

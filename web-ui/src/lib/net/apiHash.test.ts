@@ -57,3 +57,25 @@ describe("open request", () => {
     expect(api.takeOpenRequest()).toBeNull();
   });
 });
+
+describe("nested in a browser-pane proxy frame", () => {
+  const originalWindow = g.window;
+  afterEach(() => {
+    g.window = originalWindow;
+  });
+
+  it("neither consumes the fragment nor overwrites the host's token", async () => {
+    g.window = { self: {}, top: {} };
+    g.location = new URL("http://127.0.0.1:4100/proxy/p-abc/#token=other");
+    const replaced: string[] = [];
+    g.history = { replaceState: (_s: unknown, _t: string, url: string) => replaced.push(url) };
+    sessionStorage.clear();
+    sessionStorage.setItem("chimaera:token", "host");
+    vi.resetModules();
+    const api = await import("./api");
+    expect(api.isNestedInProxy()).toBe(true);
+    expect(api.getToken()).toBeNull();
+    expect(sessionStorage.getItem("chimaera:token")).toBe("host");
+    expect(replaced).toHaveLength(0);
+  });
+});

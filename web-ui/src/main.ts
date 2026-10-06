@@ -12,7 +12,7 @@ import "@fontsource/jetbrains-mono/latin-ext-600.css";
 import "./app.css";
 import App from "./App.svelte";
 import { installReloadHook } from "./lib/layout/windowReload";
-import { terminalWindowSession } from "./lib/net/api";
+import { isNestedInProxy, terminalWindowSession } from "./lib/net/api";
 import TerminalWindow from "./lib/terminal/TerminalWindow.svelte";
 
 // Before mount: the native Reload Window must still reach a window whose App
@@ -24,6 +24,15 @@ installReloadHook();
 const target = document.getElementById("app");
 if (!target) {
   throw new Error("missing #app mount point");
+}
+
+// Another Chimaera daemon opened in a browser pane loads this same UI under the
+// host's origin; it must not boot (see isNestedInProxy).
+if (isNestedInProxy()) {
+  target.textContent =
+    "This is another Chimaera. It can't run inside a browser pane — open it in your browser instead.";
+  target.style.cssText = "font:14px system-ui,sans-serif;color:#888;padding:24px;line-height:1.5";
+  throw new Error("chimaera UI nested in a proxy frame");
 }
 
 // A terminal-only window (a cluster's login-node terminal) is just that

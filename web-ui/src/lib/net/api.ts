@@ -20,6 +20,22 @@ const DETACHED_KEY = "chimaera.dt";
 const TERM_KEY = "chimaera.term";
 
 /**
+ * True when this page is a Chimaera UI served THROUGH a browser-pane proxy
+ * (`/proxy/{id}/…` inside a frame): the target app is another Chimaera
+ * daemon. The frame shares the host window's origin, so booting here would
+ * consume the other daemon's `#token=` and overwrite the host's own token in
+ * the shared sessionStorage, then call the host's `/api` with the wrong one.
+ * Nothing is read or written; `main.ts` shows a notice instead of mounting.
+ */
+export function isNestedInProxy(): boolean {
+  try {
+    return window.self !== window.top && location.pathname.startsWith("/proxy/");
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Read the access token, workspace id, host label, and window id from the
  * URL fragment (#token=...&ws=...&host=...&win=...&hub=1) once, persist them to
  * sessionStorage, and strip the fragment from the address bar. Falls back
@@ -32,6 +48,8 @@ const TERM_KEY = "chimaera.term";
  * SAME window, layout and all.
  */
 function initFromHash(): string | null {
+  // Leave the fragment and sessionStorage untouched when nested: see above.
+  if (isNestedInProxy()) return null;
   const params = new URLSearchParams(location.hash.slice(1));
   const tokenFromHash = params.get("token");
   const wsFromHash = params.get("ws");
