@@ -137,8 +137,10 @@ async fn free_manual_resume_is_missing_and_creates_no_pro_state() {
         None,
     )
     .await;
+    // The route does not exist without the extension (`api::pro_routes`);
+    // the handler's own guard answers `manual_resume_missing` behind it.
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-    assert_eq!(body["error"], "manual_resume_missing");
+    assert_eq!(body["error"], "not found");
     assert!(!pro::manual_resume_storage(&state).exists());
     assert!(!lock(&state.chat_switching).contains_key(&entry.id));
 }

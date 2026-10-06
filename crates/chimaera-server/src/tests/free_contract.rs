@@ -261,6 +261,8 @@ async fn a_free_daemons_wire_has_no_pro_fields_or_routes() {
         (Method::GET, "/api/v1/pro/bundles/x"),
         (Method::POST, "/api/v1/pro/bundles"),
         (Method::POST, "/api/v1/pro/sleep"),
+        (Method::GET, "/api/v1/sessions/s-x/resume"),
+        (Method::POST, "/api/v1/sessions/s-x/resume"),
     ] {
         let (status, body) =
             request(&state, method.clone(), uri, Some(serde_json::json!({}))).await;

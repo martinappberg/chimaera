@@ -62,7 +62,13 @@ pub(crate) async fn pro_routes(
 ) -> Response {
     let path = req.uri().path();
     let path = path.strip_prefix("/api/v1").unwrap_or(path);
-    if path.starts_with("/pro/") && crate::pro::tier(&state) == crate::pro::Tier::Free {
+    // Manual resume is Pro's too (`api/manual_resume.rs`).
+    let manual_resume = path
+        .strip_prefix("/sessions/")
+        .is_some_and(|rest| rest.split('/').nth(1) == Some("resume"));
+    if (path.starts_with("/pro/") || manual_resume)
+        && crate::pro::tier(&state) == crate::pro::Tier::Free
+    {
         return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
     }
     next.run(req).await
