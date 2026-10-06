@@ -199,20 +199,28 @@ impl Journal {
             let mut entry = Arc::new(SeqEvent { seq, ts, ev });
             let mut line = serde_json::to_vec(&*entry).expect("AgentEvent serializes");
             if line.len() > MAX_ENTRY_BYTES {
-                tracing::warn!(
-                    seq,
-                    bytes = line.len(),
-                    "journal entry exceeded size cap; replaced"
-                );
-                entry = Arc::new(SeqEvent {
-                    seq,
-                    ts,
-                    ev: AgentEvent::Error {
-                        message: format!("event exceeded the {MAX_ENTRY_BYTES}-byte journal cap"),
-                        fatal: false,
-                    },
-                });
-                line = serde_json::to_vec(&*entry).expect("Error event serializes");
+                let bytes = line.len();
+                if let Some(shortened) = shortened_user_message(&entry.ev, seq, ts) {
+                    tracing::warn!(
+                        seq,
+                        bytes,
+                        "journal entry exceeded size cap; user message cut"
+                    );
+                    (entry, line) = shortened;
+                } else {
+                    tracing::warn!(seq, bytes, "journal entry exceeded size cap; replaced");
+                    entry = Arc::new(SeqEvent {
+                        seq,
+                        ts,
+                        ev: AgentEvent::Error {
+                            message: format!(
+                                "event exceeded the {MAX_ENTRY_BYTES}-byte journal cap"
+                            ),
+                            fatal: false,
+                        },
+                    });
+                    line = serde_json::to_vec(&*entry).expect("Error event serializes");
+                }
             }
             line.push(b'\n');
             debug_assert_eq!(
@@ -462,6 +470,43 @@ impl WriterThread {
         fs::rename(&tmp, &self.path)?;
         self.file = fs::OpenOptions::new().append(true).open(&self.path)?;
         Ok(())
+    }
+}
+
+/// A user's message too long for one journal line, cut to fit instead of
+/// replaced. A send near the text limit, or a shorter one full of characters
+/// JSON escapes six to one, serializes past the line cap; an `Error` in its
+/// place would erase the user's own message from the transcript and drop its
+/// delivery id, so the later `UserMessageUpdate` for it resolves nothing.
+/// Every field but the text is kept (all small and bounded); the text keeps
+/// its head and tail around the marker tool output uses. `None` for any other
+/// event.
+fn shortened_user_message(ev: &AgentEvent, seq: u64, ts: u64) -> Option<(Arc<SeqEvent>, Vec<u8>)> {
+    let AgentEvent::UserMessage { text, .. } = ev else {
+        return None;
+    };
+    // The serialized size depends on how the kept text escapes: halve what
+    // is kept until the line fits. Bounded: the text is at most the command
+    // limit, so this is a handful of rounds.
+    let mut keep = MAX_ENTRY_BYTES / 2;
+    loop {
+        let mut shortened = ev.clone();
+        if let AgentEvent::UserMessage { text: kept, .. } = &mut shortened {
+            *kept = crate::model::cap_head_tail(text, keep / 2, keep / 2).0;
+        }
+        let entry = Arc::new(SeqEvent {
+            seq,
+            ts,
+            ev: shortened,
+        });
+        let line = serde_json::to_vec(&*entry).expect("AgentEvent serializes");
+        if line.len() <= MAX_ENTRY_BYTES {
+            return Some((entry, line));
+        }
+        if keep == 0 {
+            return None;
+        }
+        keep /= 2;
     }
 }
 
@@ -1010,6 +1055,80 @@ mod tests {
         for pair in all.windows(2) {
             assert_eq!(pair[1].seq, pair[0].seq + 1);
         }
+    }
+
+    /// A send at the text limit whose characters escape six to one serializes
+    /// to several times the line cap. Its echo must still be journaled as the
+    /// user's message, with its delivery id and every other field.
+    #[tokio::test]
+    async fn an_oversize_user_message_is_cut_not_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        // Control characters, quotes and backslashes: the worst escaping.
+        let unit = "\u{1}\"\\\u{7f}é";
+        let mut text = String::from("START ");
+        while text.len() + unit.len() + 4 <= crate::model::COMMAND_TEXT_TOTAL_MAX {
+            text.push_str(unit);
+        }
+        text.push_str(" END");
+        let sent = AgentEvent::UserMessage {
+            text: text.clone(),
+            attachments: 2,
+            attachment_paths: vec!["/uploads/a.png".into(), "/uploads/b.png".into()],
+            id: Some("u-large".into()),
+            queued: true,
+            after_turn: true,
+            origin: None,
+        };
+        assert!(serde_json::to_vec(&sent).unwrap().len() > 2 * MAX_ENTRY_BYTES);
+        {
+            let journal = Journal::open(dir.path(), "s").unwrap();
+            let entry = journal.append(sent).await;
+            assert!(serde_json::to_vec(&*entry).unwrap().len() <= MAX_ENTRY_BYTES);
+            let AgentEvent::UserMessage {
+                text: kept,
+                attachments,
+                attachment_paths,
+                id,
+                queued,
+                after_turn,
+                origin,
+            } = &entry.ev
+            else {
+                panic!("replaced by {:?}", entry.ev);
+            };
+            assert_eq!(id.as_deref(), Some("u-large"));
+            assert_eq!((*attachments, attachment_paths.len()), (2, 2));
+            assert!(*queued && *after_turn && origin.is_none());
+            assert!(
+                kept.starts_with("START ") && kept.ends_with(" END"),
+                "head and tail kept"
+            );
+            assert!(kept.contains("bytes omitted"), "and says what was cut");
+            assert!(kept.len() < text.len());
+            // An ordinary long message is untouched.
+            let plain = journal
+                .append(AgentEvent::UserMessage {
+                    text: "x".repeat(200 * 1024),
+                    attachments: 0,
+                    attachment_paths: Vec::new(),
+                    id: Some("u-plain".into()),
+                    queued: false,
+                    after_turn: false,
+                    origin: None,
+                })
+                .await;
+            assert!(
+                matches!(&plain.ev, AgentEvent::UserMessage { text, .. } if text.len() == 200 * 1024)
+            );
+            journal.sync_async().await;
+        }
+        // The file holds the cut message, not an error, on replay.
+        let journal = Journal::open(dir.path(), "s").unwrap();
+        let events = blocking_replay(&journal, 0);
+        assert!(matches!(
+            &events[0].ev,
+            AgentEvent::UserMessage { id: Some(id), .. } if id == "u-large"
+        ));
     }
 
     #[tokio::test]
