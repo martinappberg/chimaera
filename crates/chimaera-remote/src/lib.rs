@@ -1739,17 +1739,6 @@ pub async fn close_master(host: &str) -> anyhow::Result<()> {
     .context("SSH login cleanup task did not finish")?
 }
 
-/// Bounded local mux evidence only; no network session, authentication or
-/// destructive wedge check. `false` requires the exact absent-socket receipt;
-/// an unknown/refused/stalled check is an error, never disappearance proof.
-pub async fn master_present(host: &str) -> anyhow::Result<bool> {
-    let host = hosts::normalize_alias(host)?;
-    capture_master(&host, route_of(&host))
-        .await?
-        .present()
-        .await
-}
-
 async fn master_presence(mut command: Command, seconds: u64) -> anyhow::Result<bool> {
     command.env("LC_ALL", "C").env("LANG", "C");
     let output = output_bounded(&mut command, seconds, "SSH master check")

@@ -323,10 +323,15 @@ impl Session {
             let state = Arc::clone(&state);
             let events_tx = events_tx.clone();
             let id = id.clone();
+            let managed = managed.clone();
+            let master = master.clone();
             std::thread::Builder::new()
                 .name(format!("pty-wait-{id}"))
-                .spawn({let managed=managed.clone();let master=master.clone();move || {
-                    let result=match managed {Some(managed)=>managed.wait(&mut *child,&master),None=>child.wait()};
+                .spawn(move || {
+                    let result = match managed {
+                        Some(managed) => managed.wait(&mut *child, &master),
+                        None => child.wait(),
+                    };
                     let status = match result {
                         Ok(status) => {
                             if status.signal().is_some() {
@@ -352,7 +357,7 @@ impl Session {
                     // the session's last words before unregistering it.
                     std::thread::sleep(std::time::Duration::from_millis(60));
                     on_exit();
-                }})
+                })
                 .context("failed to spawn child wait thread")?;
         }
 
@@ -531,6 +536,15 @@ impl Session {
         Ok(())
     }
 
+    /// Fence the session: a managed session's owned process-group stop,
+    /// otherwise [`Self::kill`].
+    pub(crate) fn fence(&self) {
+        if let Some(managed) = &self.managed {
+            managed.fence(&self.master);
+        } else {
+            self.kill();
+        }
+    }
     /// Terminate the child: SIGHUP first (via portable-pty, so a shell can run
     /// its exit traps and vanish tmux-style), escalating to SIGKILL if it is
     /// still alive after a short grace period. The escalation matters — a child
@@ -539,13 +553,6 @@ impl Session {
     /// in the registry forever. Non-blocking: the escalation runs on a detached
     /// thread. Killing a session whose child already exited is a no-op. Reaping
     /// and state bookkeeping still happen on the wait thread.
-    pub(crate) fn fence(&self) {
-        if let Some(managed) = &self.managed {
-            managed.fence(&self.master);
-        } else {
-            self.kill();
-        }
-    }
     pub(crate) fn kill(&self) {
         if let Some(managed) = &self.managed {
             managed.fence(&self.master);

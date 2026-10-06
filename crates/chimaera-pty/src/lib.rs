@@ -327,9 +327,8 @@ impl SessionManager {
         .await
     }
 
-    /// Signal the session's child to terminate (SIGHUP); the wait thread
-    /// reaps it and the session unregisters itself. Killing an unknown or
-    /// already-exited session is a no-op, so deletes are idempotent.
+    /// Fence a session: a managed session's owned process-group stop; a plain
+    /// session is killed. An unknown session is an error.
     pub fn fence(&self, id: &str) -> anyhow::Result<()> {
         let session = self
             .session(id)
@@ -337,6 +336,9 @@ impl SessionManager {
         session.fence();
         Ok(())
     }
+    /// Signal the session's child to terminate (SIGHUP); the wait thread
+    /// reaps it and the session unregisters itself. Killing an unknown or
+    /// already-exited session is a no-op, so deletes are idempotent.
     pub fn kill(&self, id: &str) -> anyhow::Result<()> {
         if let Some(session) = self.session(id) {
             session.kill();
