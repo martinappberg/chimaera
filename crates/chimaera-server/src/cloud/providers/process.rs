@@ -60,24 +60,6 @@ impl Child {
         self.child.wait().await
     }
 
-    #[cfg(feature = "provider-authority-prototype")]
-    pub async fn terminate(&mut self, original: Option<u32>) -> Result<(), &'static str> {
-        #[cfg(unix)]
-        self.stop_group();
-        let _ = self.child.start_kill();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            self.child.wait().await.map_err(|_| "cleanup_failed")?;
-            // Only observe after reap. Never signal this numeric identity again:
-            // reuse can produce a conservative refusal, never a foreign kill.
-            while original.is_some_and(group_alive) {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|_| "cleanup_failed")?
-    }
-
     #[cfg(unix)]
     fn stop_group(&mut self) {
         if let Some(group) = self.group.take() {

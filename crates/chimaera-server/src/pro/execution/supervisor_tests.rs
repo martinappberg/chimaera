@@ -344,23 +344,7 @@ fn provider_descriptor_requires_feature_and_refuses_retired_idle_metadata() {
     let state = fixture.state();
     let mut value = serde_json::to_value(fixture.receipt(&state, 2, 1)).unwrap();
     value["provider_runtime"] = json!({"version":1,"fd":70});
-    #[cfg(not(feature = "provider-authority-prototype"))]
     assert!(decode(&serde_json::to_vec(&value).unwrap()).is_err());
-    #[cfg(feature = "provider-authority-prototype")]
-    {
-        assert!(decode(&serde_json::to_vec(&value).unwrap()).is_ok());
-        value["maintenance_control"] = json!({"version":1,"fd":70,"channel_nonce":"A".repeat(43)});
-        assert!(decode(&serde_json::to_vec(&value).unwrap()).is_err());
-        value["maintenance_control"]["fd"] = json!(71);
-        assert!(decode(&serde_json::to_vec(&value).unwrap()).is_err());
-        value.as_object_mut().unwrap().remove("maintenance_control");
-        for fd in [0, 2, 256, -1] {
-            value["provider_runtime"]["fd"] = json!(fd);
-            assert!(decode(&serde_json::to_vec(&value).unwrap()).is_err());
-        }
-        value["provider_runtime"] = json!({"version":1,"fd":70,"capability":"A".repeat(43)});
-        assert!(decode(&serde_json::to_vec(&value).unwrap()).is_err());
-    }
 }
 
 #[tokio::test]

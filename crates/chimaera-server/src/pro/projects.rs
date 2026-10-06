@@ -742,14 +742,6 @@ pub(in crate::pro) async fn copy(
     .await
 }
 
-pub(crate) async fn open_project(
-    State(state): State<Arc<AppState>>,
-    Json(request): Json<Open>,
-) -> Response {
-    let _ = (state, request);
-    (StatusCode::UPGRADE_REQUIRED, Json(json!({"error":"Update this client to open a local copy; opening no longer transfers execution","error_code":"copy_upgrade_required","copy_version":1}))).into_response()
-}
-
 #[derive(Deserialize)]
 pub(crate) struct CopyRequest {
     copy_version: u16,

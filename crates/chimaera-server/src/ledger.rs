@@ -581,7 +581,6 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
 /// until a ledgered chat respawns it is live nowhere, yet its journal is what
 /// it resumes from.
 pub(crate) async fn consume_boot(state: &Arc<AppState>, boot: BootLedger) {
-    let boot = state.policy().boot(state, boot).await;
     restore(state, boot).await;
     state.policy().restored(state);
     // Serving started concurrently; sessions snapshots held back by

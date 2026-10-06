@@ -22,15 +22,10 @@ pub(crate) struct CleanupReceipt {
     launch_generation: u64,
     previous_generation: u64,
     os_boot_id: String,
-    #[cfg(all(unix, feature = "provider-authority-prototype"))]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    provider_runtime: Option<chimaera_core::provider_runtime::StartupDescriptor>,
 }
 /// Startup moves once; provider credentials stay separate from cleanup metadata.
 pub(crate) struct Startup {
     receipt: CleanupReceipt,
-    #[cfg(all(unix, feature = "provider-authority-prototype"))]
-    provider: Option<super::provider_startup::Pending>,
 }
 #[derive(Clone, serde::Serialize)]
 pub(crate) struct CleanupAck {
@@ -61,75 +56,12 @@ fn decode(bytes: &[u8]) -> Result<CleanupReceipt> {
                 .all(|b| b.is_ascii_hexdigit() || b == b'-'),
         "invalid supervisor cleanup binding"
     );
-    #[cfg(all(unix, feature = "provider-authority-prototype"))]
-    if let Some(provider) = &receipt.provider_runtime {
-        provider
-            .validate(None)
-            .map_err(|_| anyhow::anyhow!("invalid provider startup descriptor"))?;
-    }
     Ok(receipt)
-}
-#[cfg(all(target_os = "linux", feature = "provider-authority-prototype"))]
-impl CleanupReceipt {
-    fn provider_binding(&self) -> chimaera_core::project_secret_idle::Binding {
-        use chimaera_core::project_secret_idle::{Binding, RootIdentity};
-        Binding {
-            account_id: self.account_id.clone(),
-            workspace_id: self.workspace_id.clone(),
-            root_identity: RootIdentity {
-                device: self.root_identity.device,
-                inode: self.root_identity.inode,
-            },
-            registration_revision: self.registration_revision,
-            launch_generation: self.launch_generation,
-            os_boot_id: self.os_boot_id.clone(),
-        }
-    }
 }
 #[cfg(target_os = "linux")]
 fn own_startup_until(receipt: CleanupReceipt, deadline: std::time::Instant) -> Result<Startup> {
-    #[cfg(feature = "provider-authority-prototype")]
-    use std::os::fd::FromRawFd;
-    #[cfg(feature = "provider-authority-prototype")]
-    let mut receipt = receipt;
-    #[cfg(not(feature = "provider-authority-prototype"))]
     let _ = deadline;
-    #[cfg(feature = "provider-authority-prototype")]
-    let provider = match receipt.provider_runtime.take() {
-        None => None,
-        Some(provider) => {
-            provider
-                .validate(None)
-                .map_err(|_| anyhow::anyhow!("invalid provider startup descriptor"))?;
-            ensure!(
-                unsafe { nix::libc::fcntl(provider.fd, nix::libc::F_GETFD) } >= 0,
-                "provider startup descriptor unavailable"
-            );
-            // Take ownership before any later protection/read failure. This
-            // startup-only path runs before children, descriptor clones or IO.
-            let descriptor = unsafe { std::os::fd::OwnedFd::from_raw_fd(provider.fd) };
-            Some((descriptor, provider))
-        }
-    };
-    #[cfg(feature = "provider-authority-prototype")]
-    let provider = match provider {
-        None => None,
-        Some((descriptor, control)) => {
-            let protection = super::provider_protection::Protection::startup()?;
-            Some(super::provider_startup::Pending::transferred(
-                descriptor,
-                control,
-                receipt.provider_binding(),
-                deadline,
-                protection,
-            )?)
-        }
-    };
-    Ok(Startup {
-        receipt,
-        #[cfg(feature = "provider-authority-prototype")]
-        provider,
-    })
+    Ok(Startup { receipt })
 }
 #[cfg(all(test, target_os = "linux"))]
 fn own_startup(receipt: CleanupReceipt) -> Result<Startup> {
@@ -233,26 +165,10 @@ pub(crate) fn stage_startup(state: &AppState, startup: Option<Startup>) -> Resul
     };
     let mut pending = lock(&state.pro.execution.supervisor_pending);
     ensure!(pending.is_none(), "supervisor startup already staged");
-    #[cfg(all(unix, feature = "provider-authority-prototype"))]
-    let mut provider = {
-        let provider = lock(&state.pro.execution.provider_pending);
-        ensure!(provider.is_none(), "provider startup already staged");
-        provider
-    };
-    #[cfg(all(unix, feature = "provider-authority-prototype"))]
-    {
-        *provider = startup.provider.map(std::sync::Arc::new);
-    }
     *pending = Some(startup.receipt);
     Ok(())
 }
-#[cfg(any(
-    test,
-    all(
-        feature = "daemon-extension-fixture",
-        feature = "provider-authority-prototype"
-    )
-))]
+#[cfg(test)]
 pub(crate) fn stage(state: &AppState, receipt: Option<CleanupReceipt>) {
     *lock(&state.pro.execution.supervisor_pending) = receipt;
 }
@@ -266,39 +182,6 @@ pub(super) fn supervised(state: &AppState) -> bool {
     lock(&state.pro.execution.supervisor_ack).is_some()
 }
 /// Compare the accepted provider launch; this is not a process census.
-#[cfg(all(unix, feature = "provider-authority-prototype"))]
-pub(super) fn matches_provider_launch(
-    state: &AppState,
-    binding: &chimaera_core::project_secret_idle::Binding,
-) -> bool {
-    if !state.pro.configured.load(Ordering::Acquire)
-        || state.pro.execution.boot.as_deref() != Some(&binding.os_boot_id)
-    {
-        return false;
-    }
-    let runtime_matches = {
-        let runtime = lock(&state.pro.runtime);
-        runtime.as_ref().is_some_and(|config| {
-            config.role == crate::pro::protocol::Role::Worker
-                && config.account_id.as_deref() == Some(&binding.account_id)
-        })
-    };
-    let ack_matches = {
-        let ack = lock(&state.pro.execution.supervisor_ack);
-        ack.as_ref().is_some_and(|ack| {
-            ack.workspace_id == binding.workspace_id
-                && ack.registration_revision == binding.registration_revision
-                && ack.launch_generation == binding.launch_generation
-        })
-    };
-    let authority_matches = {
-        let authority = lock(&state.pro.authority);
-        matches!(&*authority, crate::pro::authority::Authority::Bound(accepted)
-            if accepted.cleanup_binding(&binding.account_id, &binding.workspace_id,
-                binding.registration_revision,(binding.root_identity.device,binding.root_identity.inode)))
-    };
-    runtime_matches && ack_matches && authority_matches
-}
 /// Shared startup admission. It has no effects and does not consume the pipe
 /// receipt; both authority preparation and durable application use it.
 pub(in crate::pro) fn validate(

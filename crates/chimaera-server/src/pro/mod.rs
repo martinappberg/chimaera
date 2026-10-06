@@ -817,10 +817,6 @@ pub(super) fn delegation_lapsed(state: &crate::AppState) -> bool {
 }
 
 pub(crate) fn may_execute(state: &crate::AppState, workspace: &str) -> bool {
-    #[cfg(all(unix, feature = "provider-authority-prototype"))]
-    if !execution::provider_startup::allows(state) {
-        return false;
-    }
     may_write(state, workspace) && execution::allows(state, workspace)
 }
 /// A plain shell's gate. Plain shells are never managed: a computer whose
@@ -1370,10 +1366,6 @@ pub(crate) fn paused_label(
 /// Graceful daemon stop: clear managed-execution evidence once this life's
 /// agents are proven stopped, so a same-boot successor is not fenced.
 pub(crate) async fn shutdown(state: &std::sync::Arc<crate::AppState>) {
-    #[cfg(all(unix, feature = "provider-authority-prototype"))]
-    if execution::provider_ready::stop(state).await.is_err() {
-        tracing::warn!("Provider startup cleanup could not be confirmed");
-    }
     if let Err(error) = execution::shutdown(state).await {
         tracing::warn!(%error, "Project execution state could not be saved at shutdown");
     }
@@ -1415,16 +1407,9 @@ pub(super) fn report_return(
 /// project caches (finalizers keep theirs past a canceled caller) and Git
 /// helpers. A completed drain reports zero.
 pub(crate) fn active_operations(state: &crate::AppState) -> usize {
-    let active = project_operations(state) + transport::helpers_busy();
-    #[cfg(all(unix, feature = "provider-authority-prototype"))]
-    let active = active + execution::provider_ready::active(state);
-    active
+    project_operations(state) + transport::helpers_busy()
 }
 
-#[cfg(all(unix, feature = "provider-authority-prototype"))]
-pub(crate) fn retire_provider_startup(state: &crate::AppState) {
-    execution::provider_ready::retire(state);
-}
 fn project_operations(state: &crate::AppState) -> usize {
     let draining = drain::draining(state);
     usize::from(!draining && state.pro.jobs.try_lock().is_err())
@@ -1466,8 +1451,6 @@ pub(crate) fn manual_resume_storage(state: &crate::AppState) -> &std::path::Path
 pub(crate) fn storage(state: &crate::AppState) -> &std::path::Path {
     &state.pro.root
 }
-
-pub(crate) use execution::restore_manual_parking;
 
 fn projects_root(state: &crate::AppState) -> PathBuf {
     crate::lock(&state.pro.projects_root)

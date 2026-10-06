@@ -9,8 +9,6 @@ repository.workspace = true
 default = []
 # Pure optional personal-control DTOs, not startup or capability enablement.
 personal-providers = ["dep:url", "dep:zeroize"]
-# Correlation/codec types only; activation still requires opaque controller authority.
-provider-runtime = ["personal-providers"]
 
 [dependencies]
 anyhow.workspace = true

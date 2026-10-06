@@ -46,24 +46,32 @@ impl std::error::Error for Changed {}
 
 /// A counted reservation held until a commit or child registration is
 /// done; dropping it releases. Opaque to shared code.
-pub(crate) struct Reservation(#[allow(dead_code)] Box<dyn Any + Send + Sync>);
+pub(crate) struct Reservation {
+    _held: Box<dyn Any + Send + Sync>,
+}
 impl Reservation {
     pub(crate) fn new(inner: impl Any + Send + Sync) -> Self {
-        Self(Box::new(inner))
+        Self {
+            _held: Box::new(inner),
+        }
     }
 }
 
 /// A short synchronous hold (it may own a lock guard) kept until a child is
 /// registered or a read finished; never held across an await.
-pub(crate) struct Hold<'a>(#[allow(dead_code)] Option<Box<dyn Held + 'a>>);
+pub(crate) struct Hold<'a> {
+    _held: Option<Box<dyn Held + 'a>>,
+}
 pub(crate) trait Held {}
 impl<T> Held for T {}
 impl<'a> Hold<'a> {
     pub(crate) fn none() -> Self {
-        Self(None)
+        Self { _held: None }
     }
     pub(crate) fn new(inner: impl Held + 'a) -> Self {
-        Self(Some(Box::new(inner)))
+        Self {
+            _held: Some(Box::new(inner)),
+        }
     }
 }
 
@@ -319,12 +327,6 @@ pub(crate) trait WorkspacePolicy: Send + Sync + 'static {
     // Lifecycle.
     /// After the state exists, before serving.
     fn started(&self, state: &Arc<AppState>) -> anyhow::Result<()>;
-    /// The boot ledger, before ordinary restore.
-    fn boot<'a>(
-        &'a self,
-        state: &'a Arc<AppState>,
-        boot: crate::ledger::BootLedger,
-    ) -> BoxFuture<'a, crate::ledger::BootLedger>;
     /// Restore deferred this entry (it is held, not restored).
     fn held_at_boot(&self, state: &AppState, entry: &crate::ledger::LedgerEntry);
     /// Restore finished.
@@ -465,13 +467,6 @@ impl WorkspacePolicy for Inert {
     }
     fn started(&self, _: &Arc<AppState>) -> anyhow::Result<()> {
         Ok(())
-    }
-    fn boot<'a>(
-        &'a self,
-        _: &'a Arc<AppState>,
-        boot: crate::ledger::BootLedger,
-    ) -> BoxFuture<'a, crate::ledger::BootLedger> {
-        Box::pin(async move { boot })
     }
     fn held_at_boot(&self, _: &AppState, _: &crate::ledger::LedgerEntry) {}
     fn restored(&self, _: &Arc<AppState>) {}

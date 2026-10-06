@@ -327,7 +327,7 @@ async fn cache_wait_cannot_admit_an_old_account_configuration() {
 }
 
 #[tokio::test]
-async fn legacy_open_refuses_without_acquiring_and_owning_copy_is_inert() {
+async fn copying_a_project_this_computer_owns_is_inert() {
     let root = temp();
     let laptop = state(&root.join("daemon"));
     configure(&laptop, "http://127.0.0.1:1");
@@ -358,9 +358,6 @@ async fn legacy_open_refuses_without_acquiring_and_owning_copy_is_inert() {
         expected_account_id: "account-fixture".into(),
         expected_endpoint: "http://127.0.0.1:1".into(),
     };
-    let response = open_project(State(laptop.clone()), Json(request())).await;
-    assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
-    assert!(lock(&laptop.pro.adoptions).is_empty());
     let ack = copy(&laptop, request()).await.unwrap();
     assert_eq!(ack["state"], "owned_local");
     assert!(super::super::may_execute(&laptop, "w-cloud"));
@@ -375,7 +372,7 @@ async fn legacy_open_refuses_without_acquiring_and_owning_copy_is_inert() {
         "owned local work"
     );
     drop(laptop);
-    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(root).ok();
 }
 
 #[tokio::test]

@@ -332,13 +332,6 @@ impl WorkspacePolicy for ProPolicy {
             body["last_activity_ms"] = json!(crate::activity::last_change(state));
         }
     }
-    fn boot<'a>(
-        &'a self,
-        state: &'a Arc<AppState>,
-        boot: crate::ledger::BootLedger,
-    ) -> BoxFuture<'a, crate::ledger::BootLedger> {
-        Box::pin(super::restore_manual_parking(state, boot))
-    }
     fn held_at_boot(&self, state: &AppState, entry: &crate::ledger::LedgerEntry) {
         // A returned session whose resume a sign-out or crash cut short is no
         // hand-off in flight any more: like any session the previous daemon
@@ -388,8 +381,6 @@ impl WorkspacePolicy for ProPolicy {
         Ok(())
     }
     fn stopping(&self, state: &AppState) {
-        #[cfg(all(unix, feature = "provider-authority-prototype"))]
-        super::retire_provider_startup(state);
         let _ = state;
     }
     fn shutdown<'a>(&'a self, state: &'a Arc<AppState>) -> BoxFuture<'a, ()> {

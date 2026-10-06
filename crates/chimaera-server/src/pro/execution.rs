@@ -3,28 +3,7 @@
 pub(crate) mod installer;
 pub(crate) mod launch;
 mod lease;
-// Read old disk before-images before automatic restoration; no active channel.
-#[cfg(all(test, unix))]
-mod legacy_parking_fixture;
-#[cfg(any(target_os = "linux", all(test, unix)))]
-mod maintenance_store;
 pub(crate) mod mutation;
-#[cfg(any(test, all(unix, feature = "provider-authority-prototype")))]
-pub(super) mod provider_protection;
-// Original protected admission remains host-owned; vendor consumers are private.
-#[cfg(all(unix, feature = "provider-authority-prototype"))]
-#[allow(dead_code)]
-pub(super) mod provider_client;
-#[cfg(all(
-    unix,
-    feature = "provider-authority-prototype",
-    feature = "daemon-extension-fixture"
-))]
-pub mod provider_fixture_host;
-#[cfg(all(unix, feature = "provider-authority-prototype"))]
-pub(super) mod provider_ready;
-#[cfg(all(unix, feature = "provider-authority-prototype"))]
-pub(super) mod provider_startup;
 mod restart;
 pub(super) mod setup;
 pub(super) mod supervisor;
@@ -69,8 +48,6 @@ pub(super) struct State {
     /// Cleanup cannot repair unreadable enrollment or ownership state.
     supervisor_state_invalid: bool,
     supervisor_pending: Mutex<Option<supervisor::CleanupReceipt>>,
-    #[cfg(all(unix, feature = "provider-authority-prototype"))]
-    provider_pending: Mutex<Option<std::sync::Arc<provider_startup::Pending>>>,
     supervisor_ack: Mutex<Option<supervisor::CleanupAck>>,
     /// The watchdog's latest tick (see `thawed`).
     tick: Mutex<Option<std::time::Instant>>,
@@ -1127,58 +1104,4 @@ fn grant_fixture(state: &AppState, workspace: &str, epoch: u64, sequence: u64) -
         state.pro.generation.load(Ordering::Acquire),
         RequestStart::now(),
     )
-}
-
-/// Read off-reactor before any boot resurrection. An unknown existing parking
-/// receipt never downgrades to an absent receipt and automatic agent restore.
-pub(crate) async fn restore_manual_parking(
-    state: &std::sync::Arc<AppState>,
-    boot: crate::ledger::BootLedger,
-) -> crate::ledger::BootLedger {
-    #[cfg(target_os = "linux")]
-    {
-        let owner = state.clone();
-        let fallback = boot.sessions.clone();
-        let fallback_links = boot.links.clone();
-        let fallback_written_at = boot.written_at;
-        let result = tokio::task::spawn_blocking(move || {
-            let mut boot = boot;
-            if maintenance_store::overlay_boot(&owner, &mut boot).is_err() {
-                // The receipt only ever names an enrolled project's
-                // sessions: a project Pro never took on keeps its
-                // automatic restore (`super::enrolled`).
-                for entry in &mut boot.sessions {
-                    if !super::enrolled(&owner, &entry.workspace_id) {
-                        continue;
-                    }
-                    entry.suspended = true;
-                    entry.manual_resume_reason = Some("unknown".into());
-                }
-                tracing::warn!(
-                    "maintenance parking receipt unavailable; automatic restoration fenced"
-                );
-            }
-            boot
-        })
-        .await;
-        // A panicked parser worker must not expose a previously owned roster.
-        // It normally cannot panic; retain the original roster outside it.
-        result.unwrap_or_else(|_| crate::ledger::BootLedger {
-            sessions: fallback
-                .into_iter()
-                .map(|mut entry| {
-                    entry.suspended = true;
-                    entry.manual_resume_reason = Some("unknown".into());
-                    entry
-                })
-                .collect(),
-            links: fallback_links,
-            written_at: fallback_written_at,
-        })
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = state;
-        boot
-    }
 }

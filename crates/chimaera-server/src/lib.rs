@@ -84,18 +84,5 @@ pub use plugins::capabilities::describe_manifest as plugin_capabilities;
 pub(crate) use router::app;
 pub(crate) use state::{lock, AppState};
 
-#[cfg(all(
-    target_os = "linux",
-    feature = "provider-authority-prototype",
-    feature = "daemon-extension-fixture"
-))]
-pub use lifecycle::run_with_provider_fixture;
-#[cfg(all(
-    unix,
-    feature = "provider-authority-prototype",
-    feature = "daemon-extension-fixture"
-))]
-pub use pro::execution::provider_fixture_host as provider_fixture;
-
 #[cfg(test)]
 mod tests;

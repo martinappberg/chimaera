@@ -10,17 +10,7 @@ use crate::{app, lock, AppState, ServerConfig};
 
 /// Bind on 127.0.0.1, write the manifest, and serve until SIGINT/SIGTERM.
 pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
-    run_selected(
-        cfg,
-        None,
-        #[cfg(all(
-            unix,
-            feature = "provider-authority-prototype",
-            feature = "daemon-extension-fixture"
-        ))]
-        None,
-    )
-    .await
+    run_selected(cfg, None).await
 }
 
 /// Trusted composed assembly. Optional policy is supplied after CLI daemonization;
@@ -29,43 +19,12 @@ pub async fn run_with_extension(
     cfg: ServerConfig,
     runtime: Arc<dyn crate::daemon_extension::Runtime>,
 ) -> anyhow::Result<()> {
-    run_selected(
-        cfg,
-        Some(runtime),
-        #[cfg(all(
-            unix,
-            feature = "provider-authority-prototype",
-            feature = "daemon-extension-fixture"
-        ))]
-        None,
-    )
-    .await
-}
-
-/// Nondefault closed fixture composition; ordinary daemon entrypoints never
-/// receive this callback. Actual inherited startup is consumed by the same host.
-#[cfg(all(
-    target_os = "linux",
-    feature = "provider-authority-prototype",
-    feature = "daemon-extension-fixture"
-))]
-pub async fn run_with_provider_fixture(
-    cfg: ServerConfig,
-    start: fn(crate::provider_fixture::Context) -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
-    anyhow::ensure!(!cfg.routable_bind, "Fixture requires loopback binding");
-    run_selected(cfg, None, Some(start)).await
+    run_selected(cfg, Some(runtime)).await
 }
 
 async fn run_selected(
     cfg: ServerConfig,
     runtime: Option<Arc<dyn crate::daemon_extension::Runtime>>,
-    #[cfg(all(
-        unix,
-        feature = "provider-authority-prototype",
-        feature = "daemon-extension-fixture"
-    ))]
-    provider_fixture: Option<fn(crate::provider_fixture::Context) -> anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
     // The composition point: an extension brings the Pro host as its
     // workspace policy, prepared before restore or any helper starts.
@@ -224,14 +183,6 @@ async fn run_selected(
     }
 
     state.policy().started(&state)?;
-    #[cfg(all(
-        unix,
-        feature = "provider-authority-prototype",
-        feature = "daemon-extension-fixture"
-    ))]
-    if let Some(start) = provider_fixture {
-        start(crate::provider_fixture::Context::from_state(state.clone())?)?;
-    }
 
     // Theming shims: regenerated at every daemon start (and after installs /
     // uninstalls / settings edits) so they always match this build's resolution

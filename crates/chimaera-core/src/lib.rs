@@ -4,9 +4,6 @@ pub mod cloud_providers;
 pub mod cluster;
 #[cfg(feature = "personal-providers")]
 pub mod personal_providers;
-pub mod project_secret_idle;
-#[cfg(feature = "provider-runtime")]
-pub mod provider_runtime;
 #[cfg(unix)]
 pub mod shellint;
 pub mod slurm;

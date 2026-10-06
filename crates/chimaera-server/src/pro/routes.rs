@@ -296,8 +296,6 @@ async fn configure_inner(
         }
     }
     state.pro.configured.store(true, Ordering::Release);
-    #[cfg(all(unix, feature = "provider-authority-prototype"))]
-    execution::provider_ready::configured(&state);
     engine::start(state.clone());
     // Every managed host is fenced by lease expiry: a computer whose lease
     // lapsed stops its own agents so the cloud continues exactly once.
@@ -318,8 +316,6 @@ async fn configure_inner(
     response
 }
 pub(super) async fn stop_tasks(state: &Arc<AppState>) -> anyhow::Result<()> {
-    #[cfg(all(unix, feature = "provider-authority-prototype"))]
-    execution::provider_ready::replacing(state);
     // Captured before the runtime changes: replacing or removing a device's
     // configuration never stops its local work (laptop first).
     let worker = execution::worker(state);
@@ -338,8 +334,6 @@ pub(super) async fn stop_tasks(state: &Arc<AppState>) -> anyhow::Result<()> {
     for (_, task) in lock(&state.pro.reconciling).drain() {
         task.abort();
     }
-    #[cfg(all(unix, feature = "provider-authority-prototype"))]
-    execution::provider_ready::settle(state).await?;
     if worker {
         execution::stop(state, &stopping).await?;
     }
@@ -348,8 +342,6 @@ pub(super) async fn stop_tasks(state: &Arc<AppState>) -> anyhow::Result<()> {
 }
 pub(crate) async fn disconnect(State(state): State<Arc<AppState>>) -> Response {
     let _configuration = state.pro.configuration.lock().await;
-    #[cfg(all(unix, feature = "provider-authority-prototype"))]
-    execution::provider_ready::retire(&state);
     let device = !execution::worker(&state);
     // Captured before the lease loop stops: the leases this computer holds,
     // and the credential that stands them down (`sign_out`).
@@ -1167,7 +1159,7 @@ pub(crate) async fn projects(
 }
 
 // Discovery is passive; adoption has a separate, explicit local action.
-pub(crate) use super::projects::{copy_project, open_project, project_list, takeover_project};
+pub(crate) use super::projects::{copy_project, project_list, takeover_project};
 
 /// Every route Pro serves under `/api/v1` (behind the bearer check), mounted
 /// only when the Pro policy is installed.
@@ -1187,7 +1179,6 @@ pub(crate) fn router() -> axum::Router<std::sync::Arc<crate::AppState>> {
             "/pro/projects",
             get(super::project_list).put(super::projects),
         )
-        .route("/pro/projects/open", post(super::open_project))
         .route("/pro/projects/copy", post(super::copy_project))
         .route("/pro/projects/takeover", post(super::takeover_project))
         // One project back to this computer ("Run here") or to the cloud

@@ -111,11 +111,11 @@ jobs:
       - run: cargo test --workspace
       - run: cargo test -p chimaera-link
       - name: Check the daemon's feature-gated extension fixtures
-        run: cargo clippy --locked -p chimaera-server --all-targets --features provider-authority-prototype,daemon-extension-fixture -- -D warnings
+        run: cargo clippy --locked -p chimaera-server --all-targets --features daemon-extension-fixture -- -D warnings
       - name: Test the daemon's feature-gated extension fixtures
         run: |
-          cargo test --locked -p chimaera-server --lib --features provider-authority-prototype,daemon-extension-fixture cloud::providers
-          cargo test --locked -p chimaera-server --lib --features provider-authority-prototype,daemon-extension-fixture pro::execution::
+          cargo test --locked -p chimaera-server --lib --features daemon-extension-fixture cloud::providers
+          cargo test --locked -p chimaera-server --lib --features daemon-extension-fixture pro::execution::
       - run: cargo test --manifest-path plugins/Cargo.toml
 
   musl:
