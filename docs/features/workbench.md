@@ -16,10 +16,14 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
 
 - **What & when.** The landing surface when no workspace is open: your registered folders,
   most-recent-first, with a live-session rollup. Open one to start work.
-- **How it's used.** Click a row to open it in this window; Cmd/Ctrl-click (or the hover
-  "new window" button) opens it in a new window. `Mod+O` opens the folder picker.
-  Per-row hover reveals `stop` (end its running sessions), `new window`, and `×` (remove
-  from the list — the folder on disk is untouched).
+- **How it's used.** Click a row to open it in this window; Cmd/Ctrl-click (or **Open in new
+  window** in the row's "…" menu) opens it in a new window. **Open folder** (`Mod+O`) opens the
+  folder picker. A row with live sessions shows **End sessions**; the "…" menu also offers
+  **Remove from list** (the folder on disk is untouched). Layout and navigation:
+  [native-app.md › Home launcher](native-app.md#home-launcher).
+- **Lazy Home.** `HomeScreen.svelte` loads only while Home is visible, through the cached view
+  loader and asset retry path (`layout/lazyViews.ts`). Home navigation stays eager; a failed load
+  keeps Retry, Settings and Open a folder.
 - **Where it lives.** `web-ui/src/lib/workspace/HomeScreen.svelte` + `sessions.ts`
   (`listWorkspaces`/`deleteWorkspace`/`touchWorkspace`). Routes: `GET/POST /api/v1/workspaces`,
   `DELETE /api/v1/workspaces/{id}`, `POST /api/v1/workspaces/{id}/open` (stamps recency).

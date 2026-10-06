@@ -383,7 +383,8 @@
   } from "./lib/layout/railState";
   import { hintsActive, initChordHints } from "./lib/shared/chordHints.svelte";
   import FolderPicker from "./lib/workspace/FolderPicker.svelte";
-  import HomeScreen from "./lib/workspace/HomeScreen.svelte";
+  import HomeNavigation from "./lib/workspace/HomeNavigation.svelte";
+  import { loadPaneView, retryPaneView } from "./lib/layout/lazyViews";
   import AskpassModal from "./lib/workspace/AskpassModal.svelte";
   import ContextMenuHost from "./lib/shared/ContextMenuHost.svelte";
   import { contextMenu } from "./lib/shared/contextMenu.svelte";
@@ -1875,7 +1876,8 @@
           if (modalOpen() && action !== "check-updates") return;
           switch (action) {
             case "close-view":
-              if (activeWsId === null) closeThisWindow();
+              if (homeSettingsOpen) homeSettingsOpen = false;
+              else if (activeWsId === null) closeThisWindow();
               else if (layoutReady) closeView(layout.focusedPaneId);
               break;
             case "new-terminal":
@@ -2843,6 +2845,16 @@
       return;
     }
     if (pickerOpen) return;
+    if (homeSettingsOpen && e.key === "Escape" && !escapeBelongsElsewhere(e.target)) {
+      intercept();
+      homeSettingsOpen = false;
+      return;
+    }
+    if (hit?.id === "settings" && activeWsId === null) {
+      intercept();
+      openSettingsSurface();
+      return;
+    }
     if (activeWsId === null || !layoutReady) return;
 
     if (hit?.id === "quickOpen") {
@@ -3025,6 +3037,22 @@
     return t.isContentEditable || t.closest(".cm-content") !== null;
   }
 
+  /**
+   * Escape on the Home settings page closes it only when nothing closer owns
+   * the key: a field holding text, a select, an editor, or an open dialog. An
+   * empty field — Settings focuses its search box on open — still closes.
+   * This handler runs in the capture phase, before any of those see the key.
+   */
+  function escapeBelongsElsewhere(t: EventTarget | null): boolean {
+    const choice = ["checkbox", "radio", "button", "submit", "reset", "range", "color", "file"];
+    if (t instanceof HTMLTextAreaElement || (t instanceof HTMLInputElement && !choice.includes(t.type))) return t.value !== "";
+    if (t instanceof HTMLSelectElement) return true;
+    if (!(t instanceof HTMLInputElement) && isEditableTarget(t)) return true;
+    const modal = "dialog[open], [role='dialog'], [role='alertdialog'], [aria-modal='true']";
+    if (t instanceof Element && t.closest(modal) !== null) return true;
+    return document.querySelector("dialog[open], [aria-modal='true']") !== null;
+  }
+
   $effect(() => {
     // The workspace leads; a remote window wears its host so a wall of similar
     // windows is legible:
@@ -3201,6 +3229,7 @@
       ? workspaces.map((x) => (x.id === w.id ? w : x))
       : [w, ...workspaces];
     closePicker();
+    homeSettingsOpen = false;
     createError = null;
     // Stamp recency for the home screen (fire-and-forget; old daemons 404).
     void touchWorkspace(w.id).catch(() => {});
@@ -3577,10 +3606,28 @@
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   }
 
-  /** Open/focus the settings surface (gear button, ⌘,). Needs a workspace —
-   *  the settings tab lives in the layout like any other surface. */
+  /** Settings opened from Home: a full page over Home (no workspace, so no
+   *  layout tab to hold it). Its view loads on demand like a pane's. */
+  let homeSettingsOpen = $state(false);
+  let homeSettingsLoad = $state<ReturnType<typeof loadPaneView> | null>(null);
+  // Workspace windows defer Home until it is visible. The shared view cache
+  // retains successes; the same asset recovery used by panes owns retries.
+  let homeLoad = $state<ReturnType<typeof loadPaneView> | null>(null);
+  $effect(() => {
+    if (activeWsId === null && !homeSettingsOpen && homeLoad === null) {
+      homeLoad = untrack(() => loadPaneView("home"));
+    }
+  });
+
+  /** Open/focus the settings surface (gear button, ⌘,). In a workspace it is
+   *  a layout tab; on Home it opens as Home's Settings page. */
   function openSettingsSurface(): void {
-    if (activeWsId === null || !layoutReady) return;
+    if (activeWsId === null) {
+      homeSettingsLoad = loadPaneView("settings");
+      homeSettingsOpen = true;
+      return;
+    }
+    if (!layoutReady) return;
     layout = openSettings(layout);
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   }
@@ -5306,6 +5353,37 @@
     <!-- Home: a real launcher, not an empty IDE. The rail and stage only
          exist once a workspace scopes this window. A Mastermind is never a
          worker: keep it out of the per-workspace live/attention rollups. -->
+    {#if homeSettingsOpen}
+      <div class="home-settings-shell">
+        <HomeNavigation active="settings"
+          onHome={() => (homeSettingsOpen = false)} onSettings={openSettingsSurface} />
+      <div class="home-settings-surface">
+        <nav class="home-surface-nav" aria-label="Home navigation">
+          <button class="home-settings-back" onclick={() => (homeSettingsOpen = false)}>
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="m9.5 4-4 4 4 4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" /></svg>
+            Home
+          </button>
+          <span class="home-surface-divider" aria-hidden="true">/</span>
+          <span aria-current="page">Settings</span>
+          <kbd class="home-back-hint">esc</kbd>
+        </nav>
+        <div class="home-settings-content">
+          {#await homeSettingsLoad}
+            <p>Loading settings…</p>
+          {:then SettingsView}
+            {#if SettingsView}<SettingsView />{/if}
+          {:catch}
+            <p role="alert">Couldn't open settings.</p>
+            <button onclick={openSettingsSurface}>Retry</button>
+          {/await}
+        </div>
+      </div>
+      </div>
+    {:else}
+    {#if homeLoad !== null}
+      {#await homeLoad}
+        <p role="status">Loading Home…</p>
+      {:then HomeScreen}
     <HomeScreen
       {workspaces}
       sessions={sessions.filter((s) => !isMastermind(s))}
@@ -5316,7 +5394,21 @@
       onRemove={removeWorkspace}
       onStop={stopWorkspace}
       onOpenFolder={openPicker}
+      onSettings={openSettingsSurface}
     />
+      {:catch error}
+        <div class="home-settings-shell">
+          <HomeNavigation active="workspaces"
+            onHome={() => (homeLoad = retryPaneView("home", error))} onSettings={openSettingsSurface} />
+          <div class="home-settings-content">
+            <p role="alert">Couldn't open Home.</p>
+            <button onclick={() => (homeLoad = retryPaneView("home", error))}>Retry</button>
+            <button onclick={openPicker}>Open a folder</button>
+          </div>
+        </div>
+      {/await}
+    {/if}
+    {/if}
   {:else}
   <div class="body" bind:clientWidth={bodyWidth}>
     <aside
@@ -6551,6 +6643,62 @@
 {/if}
 
 <style>
+  .home-settings-shell {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    background: var(--bg);
+  }
+  .home-settings-surface {
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    padding: 44px 24px 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .home-surface-nav {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-height: 34px;
+    font-size: var(--text-sm);
+    color: var(--fg);
+  }
+  .home-settings-back {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    color: var(--muted);
+    background: transparent;
+    border: 0;
+    border-radius: 6px;
+    padding: 8px;
+    font: inherit;
+    cursor: pointer;
+  }
+  .home-settings-back:hover { color: var(--fg); background: var(--row-hover); }
+  .home-settings-back:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+  .home-surface-divider, .home-back-hint { color: var(--muted); }
+  .home-back-hint { margin-left: auto; font-size: var(--text-xs); }
+  .home-settings-content {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+    border: 1px solid var(--edge);
+    border-radius: 8px;
+  }
+  /* On a phone the navigation bar above already says where you are: drop
+     the breadcrumb and the card frame so the page gets the whole width. */
+  @media (max-width: 700px) {
+    .home-settings-shell { flex-direction: column; }
+    .home-settings-surface { padding: 0; gap: 0; }
+    .home-surface-nav { display: none; }
+    .home-settings-content { border: 0; border-radius: 0; }
+  }
+
   .shell {
     display: flex;
     flex-direction: column;

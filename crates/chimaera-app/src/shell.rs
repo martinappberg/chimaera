@@ -815,11 +815,11 @@ pub(crate) fn show_local_home(
     Ok(())
 }
 
-/// Whether the currently-focused window has a workspace open (vs the home
-/// screen or no window focused). Drives the menu's Settings item, which is
-/// workspace/daemon-scoped. Reads the scope map (populated by `open_ui_window`
-/// and `report_window_scope`); false before startup or for the WSL wizard.
-pub(crate) fn focused_ws_open(app: &AppHandle) -> bool {
+/// Whether focus belongs to a managed daemon window (Home or a workspace).
+/// Drives the menu's Settings item. Reads the scope map (populated by
+/// `open_ui_window` and `report_window_scope`); false before startup or for the
+/// WSL wizard, which cannot show the daemon-served Settings surface.
+pub(crate) fn focused_daemon_open(app: &AppHandle) -> bool {
     let Some(focused) = app
         .webview_windows()
         .into_values()
@@ -828,11 +828,7 @@ pub(crate) fn focused_ws_open(app: &AppHandle) -> bool {
         return false;
     };
     app.try_state::<Shell>()
-        .map(|shell| {
-            lock(&shell.windows)
-                .get(focused.label())
-                .is_some_and(|s| s.ws.is_some())
-        })
+        .map(|shell| lock(&shell.windows).contains_key(focused.label()))
         .unwrap_or(false)
 }
 

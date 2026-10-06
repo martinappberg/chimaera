@@ -11,8 +11,7 @@ use tauri::{App, AppHandle, Emitter, Manager, WebviewWindow, Wry};
 /// Handles to menu items whose enabled state tracks runtime context, so
 /// [`sync_settings_enabled`] can toggle them. Managed on the app at install.
 pub(crate) struct MenuState {
-    /// Settings is workspace/daemon-scoped, so it's greyed out unless the
-    /// focused window actually has a workspace open (not the home screen).
+    /// A daemon page, including Home, can show Settings. The setup wizard cannot.
     settings: MenuItem<Wry>,
 }
 
@@ -45,7 +44,7 @@ pub fn install(app: &App) -> tauri::Result<()> {
     let handle = app.handle();
 
     // One Settings item, shared between the platform submenus below and the
-    // managed handle. Starts disabled; the first focused workspace window
+    // managed handle. Starts disabled; the first focused daemon window
     // enables it (see `sync_settings_enabled`).
     let settings = MenuItemBuilder::with_id("settings", "Settings…")
         .accelerator("CmdOrCtrl+,")
@@ -226,15 +225,14 @@ fn focused_window(app: &AppHandle) -> Option<WebviewWindow> {
         .find(|w| w.is_focused().unwrap_or(false))
 }
 
-/// Enable the Settings menu item only when the focused window has a workspace
-/// open — it's daemon/workspace-scoped, so on the home screen (or with no window
-/// focused) it has nothing to act on and would open an empty surface. Called
-/// whenever focus or the focused window's workspace changes. Cheap; a no-op
-/// before the menu is managed.
+/// Enable Settings for a focused daemon page, including Home, which shows it
+/// as a full page. The WSL wizard (no scope-map entry) stays excluded. Called
+/// whenever focus or the focused window's scope changes. Cheap; a no-op before
+/// the menu is managed.
 pub(crate) fn sync_settings_enabled(app: &AppHandle) {
     if let Some(state) = app.try_state::<MenuState>() {
         let _ = state
             .settings
-            .set_enabled(crate::shell::focused_ws_open(app));
+            .set_enabled(crate::shell::focused_daemon_open(app));
     }
 }
