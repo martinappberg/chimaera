@@ -4,6 +4,16 @@ This module retains daemon-side mirror and handoff authority, effects and recove
 [server map](../../AGENTS.md). It is inert until the native app provides a scoped,
 revocable delegation over the authenticated local API.
 
+**The free contract.** `tier(state)` is the one rule shared code asks: `Free`
+(no extension composed), `Offered` (extension, no account), `Active`
+(`/pro/configure`, or a cloud machine). Nothing Pro runs, records or writes
+below `Active` (input stamps, `last_input_ms`, the placement poll), and nothing
+at all in `Free`. Separately, an unreadable or corrupt Pro state file fences
+only projects Pro has a record of (`enrolled`); a never-enrolled installation is
+never blocked by Pro state. While `state.json` itself is unreadable every
+project counts as enrolled, so damage never lifts a real fence; the workspace
+authority record fences only on a cloud worker, the only place it is written.
+
 | File | Responsibility |
 | --- | --- |
 | `mod.rs` | Bounded, credential-free persistent state and ownership/import fences; `synced` says whether a project's agents get the where-you-run note (`mcp/cloud_context.rs`). |
@@ -18,7 +28,7 @@ revocable delegation over the authenticated local API.
 | `execution.rs` / `execution/` | Negotiated execution leases, independent stop watchdog, durable launch/crash evidence, immutable receipts and stopped same-installation recovery. |
 | `execution/supervisor.rs` / `supervisor_tests.rs` | Optional Linux startup-only cleanup receipt from a trusted fixed launcher, exact account/project/root/revision/boot binding, persisted launch generation and authenticated acknowledgment. The superseded namespace-idle descriptor/channel is retired; retained provider startup protections remain separate. Cleanup clears process uncertainty only; missing policy and execution authority remain fenced. |
 | `execution/provider_protection.rs` / `provider_protection_tests.rs` | Retained fixed provider-launch process protections: matching nonzero UID/GID, no supplementary groups or retained capabilities, inherited no-new-privileges and positively checked dumpable-zero. The original process and descriptor-exclusion tests remain explicit Linux gates. No namespace-idle channel. |
-| `execution/maintenance_store.rs` / `legacy_parking_fixture.rs` | Bounded historical before-image reader restores exact native chat identity as manual-only on boot; unknown/malformed records fence automatic restore. Legacy disk tests retain the original capped writer only under tests. Active custom-secret maintenance uses shared WorkspaceHost; the former inherited namespace-idle actor is retired. |
+| `execution/maintenance_store.rs` / `legacy_parking_fixture.rs` | Bounded historical before-image reader restores exact native chat identity as manual-only on boot; unknown/malformed records fence automatic restore of enrolled projects' sessions only. Legacy disk tests retain the original capped writer only under tests. Active custom-secret maintenance uses shared WorkspaceHost; the former inherited namespace-idle actor is retired. |
 | `execution/installer.rs` / `installer_tests.rs` | Exact pre-wait dispatch and shared setup-group/durable pending admission for owned noninteractive and legacy PTY installers. Final spawn and cleanup stay counted, authority loss fences promptly, and incomplete crash evidence never relaunches an installer. |
 | `execution/provider_startup.rs` / `provider_startup_tests.rs` / `provider_ready.rs` / `provider_ready_tests.rs` | Optional protected one-shot provider startup pipe: distinct bounded read-only FIFO, zeroizing4096-byte payload plus EOF within the original cleanup deadline, exact launch correlation and pre-child closure. After the first successful real Configure, one owned Ready continuation uses the fixed Unix socket and its original five-second budget; only an exactly correlated Inactive can retry the same request. Ordinary polls and same-identity refresh never reset it. Replacement/disconnect/drain/shutdown retire authority before waiting for actual IO cleanup; work stays counted until closure. Staged/Checking/Verified/Closed all retain the execution/restore fence: provider consumers and production enablement remain absent. Synthetic Configure/socket fixtures do not prove protected Linux startup or the private supervisor service. |
 | `execution/provider_fixture_host.rs` / `provider_test_fixture.rs` | Explicit nondefault protected fixture context and actual Configure/Ready test owner. Context pins original Pending, exposes no AppState/credential/socket setter, and refuses replacement before admission. Private daemon owns the fixed vendor consumers and diagnostic receipt policy. Public startup/refusal/current/root/quota/actual process cleanup guards remain loaded independently; normal execution remains fenced. |

@@ -14,6 +14,7 @@
 import { api, isRemoteHost, type ApiGuard } from "../net/api";
 import { isBrowserGateway } from "../net/base";
 import { isMac } from "../shared/keys";
+import type { ProTier } from "../net/plan";
 
 /** The `.mine-<yyyymmdd-hhmm>` stamp, with the `-<n>` a second copy in the
  *  same minute gets (mirrors `canonical::kept_copy_name`). */
@@ -23,6 +24,14 @@ const KEPT_COPY = /\.mine-\d{8}-\d{4}(?:-\d+)?$/;
 export function isKeptCopy(name: string): boolean {
   const match = KEPT_COPY.exec(name);
   return match !== null && match.index > 0;
+}
+
+/** Whether the file tree marks this name as a kept copy (badge and "Review
+ *  both versions"). Only Pro leaves kept copies and only its extension can
+ *  review them, so a build without it (`proTier` `free`) shows any
+ *  `.mine-<stamp>` name as the ordinary file it is there. */
+export function keptMark(name: string, tier: ProTier): boolean {
+  return tier !== "free" && isKeptCopy(name);
 }
 
 /** The file a kept copy sits beside (`notes.md` for

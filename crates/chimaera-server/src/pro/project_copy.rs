@@ -79,14 +79,19 @@ pub(super) fn copy_only(state: &AppState, workspace: &str) -> bool {
     }
     let known_account = known.is_some_and(|entry| entry.account.is_some());
     drop(preferences);
+    // An unreadable copy latch keeps every project Pro has a record of
+    // read-only. Only when Pro's own records are unreadable too can a copy
+    // hide among ordinary projects, and only then is every registered one
+    // fenced; a project Pro never enrolled is otherwise never touched.
     state.pro.copies.unknown
         && (known_account
             || lock(&state.pro.adoptions).contains_key(workspace)
             || super::execution::managed(state, workspace)
-            || state
-                .workspaces
-                .try_lock()
-                .map_or(true, |workspaces| workspaces.get(workspace).is_some()))
+            || state.pro.records_unknown
+                && state
+                    .workspaces
+                    .try_lock()
+                    .map_or(true, |workspaces| workspaces.get(workspace).is_some()))
 }
 
 /// State corruption cannot discard an enrolled copy's execution restriction.

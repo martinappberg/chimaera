@@ -347,6 +347,7 @@ async fn connect_with_intent(
 ) -> Result<HostState, String> {
     let state = app.state::<Shell>();
     tracing::info!("ipc: connect_host {alias} (update_daemon: {update_daemon})");
+    super::cluster::note_user_touch(&state, &alias);
     loop {
         let tx = match claim_connect_flight(&state.connecting, &alias) {
             // Someone else owns the attempt: await its outcome. The clone
@@ -906,7 +907,7 @@ mod tests {
     fn row(status: HostStatus, daemon: bool) -> Host {
         Host {
             id: "h-1".into(),
-            alias: "Sherlock".into(),
+            alias: "hpc".into(),
             kind: HostKind::Ssh,
             status,
             daemon: daemon.then(|| Daemon {

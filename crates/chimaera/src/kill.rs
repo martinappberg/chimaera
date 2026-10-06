@@ -87,6 +87,7 @@ mod tests {
             build: None,
             slurm_job_id: None,
             runtime_leases: false,
+            daemon_extension: false,
         };
 
         // Another node's record whose pid happens to be a live process here

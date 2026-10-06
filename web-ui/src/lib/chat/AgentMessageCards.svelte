@@ -112,7 +112,7 @@
   {#if state !== null}
     <div class="delivery" class:dropped={state === "dropped"}>
       <span>{state === "uncertain" ? "delivery unconfirmed" : state === "dropped" ? "not delivered — it's in their inbox" : "next step"}</span>
-      {#if state === "dropped" && onDismiss !== undefined}
+      {#if (state === "dropped" || state === "uncertain") && onDismiss !== undefined}
         <button
           class="dismiss"
           title="dismiss (the message stays in the agent's inbox)"

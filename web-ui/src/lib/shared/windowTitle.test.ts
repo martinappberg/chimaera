@@ -4,16 +4,16 @@ import { titleHost, windowTitle } from "./windowTitle";
 
 describe("windowTitle", () => {
   it("leads with the workspace and wears a remote host", () => {
-    expect(windowTitle({ workspace: "crc_finish", host: "Sherlock", needsYou: 0 })).toBe("crc_finish •Sherlock | chimaera");
-    expect(windowTitle({ workspace: "crc_finish", host: null, needsYou: 0 })).toBe("crc_finish | chimaera");
-    expect(windowTitle({ workspace: null, host: "Sherlock", needsYou: 0 })).toBe("Sherlock | chimaera");
+    expect(windowTitle({ workspace: "my-analysis", host: "hpc", needsYou: 0 })).toBe("my-analysis •hpc | chimaera");
+    expect(windowTitle({ workspace: "my-analysis", host: null, needsYou: 0 })).toBe("my-analysis | chimaera");
+    expect(windowTitle({ workspace: null, host: "hpc", needsYou: 0 })).toBe("hpc | chimaera");
     expect(windowTitle({ workspace: null, host: null, needsYou: 0 })).toBe("chimaera");
   });
 
   it("appends a compute node, counts what needs you, and lets a detached tab lead", () => {
-    expect(windowTitle({ workspace: "crc_finish", host: "Sherlock", node: "sh02-02n44", needsYou: 0 })).toBe("crc_finish •Sherlock › sh02-02n44 | chimaera");
-    expect(windowTitle({ workspace: "crc_finish", host: null, needsYou: 2 })).toBe("(2) crc_finish | chimaera");
-    expect(windowTitle({ workspace: "crc_finish", host: null, tab: "claude (2)", needsYou: 0 })).toBe("claude (2) — crc_finish | chimaera");
+    expect(windowTitle({ workspace: "my-analysis", host: "hpc", node: "node-044", needsYou: 0 })).toBe("my-analysis •hpc › node-044 | chimaera");
+    expect(windowTitle({ workspace: "my-analysis", host: null, needsYou: 2 })).toBe("(2) my-analysis | chimaera");
+    expect(windowTitle({ workspace: "my-analysis", host: null, tab: "claude (2)", needsYou: 0 })).toBe("claude (2) — my-analysis | chimaera");
     expect(windowTitle({ workspace: null, host: null, tab: "claude (2)", needsYou: 0 })).toBe("claude (2) | chimaera");
   });
 });
@@ -33,7 +33,7 @@ describe("titleHost", () => {
   });
 
   it("keeps the host alias for any other window, and none when local", () => {
-    expect(titleHost({ projectView: false, projectLabel: null, hostAlias: "Sherlock", remote: true })).toBe("Sherlock");
+    expect(titleHost({ projectView: false, projectLabel: null, hostAlias: "hpc", remote: true })).toBe("hpc");
     expect(titleHost({ projectView: false, projectLabel: null, hostAlias: "local", remote: false })).toBeNull();
   });
 });

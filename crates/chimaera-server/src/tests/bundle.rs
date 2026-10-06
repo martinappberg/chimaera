@@ -269,9 +269,9 @@ async fn bundle_preserves_shell_identity_and_defers_moved_terminal() {
         source.sessions.get(id).unwrap().alive,
         "plain terminal stays on laptop"
     );
-    // The registering daemon recorded the id in the folder; a folder that
-    // lost it gets it back when a session import registers the workspace.
-    std::fs::remove_file(root.join(".chimaera-workspace")).unwrap();
+    // A daemon without Pro never marks the folder; the session import (Pro
+    // work) registers the workspace and records its id there.
+    assert!(!root.join(".chimaera-workspace").exists());
     let imported = bundle::import(
         target.clone(),
         &path,
@@ -616,9 +616,17 @@ async fn public_bundle_failed_metadata_is_fenced_across_restart_and_exact_retry(
 
 #[tokio::test]
 async fn malformed_pending_import_record_blocks_restoration_and_new_workspace_launch() {
+    // Once Pro holds a project here, a damaged record could name any of them.
+    // (Never enrolled, it blocks nothing: `tests::free_contract`.)
     let data = test_dir("public-damaged-pending");
     std::fs::create_dir(data.join("bundles")).unwrap();
     std::fs::write(data.join("bundles/pending.json"), b"broken").unwrap();
+    std::fs::create_dir(data.join("pro")).unwrap();
+    std::fs::write(
+        data.join("pro/state.json"),
+        br#"{"ownership":{"w-enrolled":{"state":"local","epoch":1}},"preferences":{}}"#,
+    )
+    .unwrap();
     let state = test_state_with_data_dir(0, data);
     assert!(!crate::pro::may_execute(&state, "unrelated-free-project"));
     assert!(state.bundle_imports.admit("w-new", "s-new", None).is_err());

@@ -149,6 +149,18 @@ impl PendingImports {
             }),
         }
     }
+    /// A record that could not be read fences every launch (`invalid`).
+    /// Called only when no project was ever enrolled in Pro: such a record
+    /// cannot name anything here, so it must not block a free user.
+    pub(crate) fn release_unknown_fence(&self) {
+        let mut state = crate::lock(&self.state);
+        if state.invalid {
+            tracing::warn!(
+                "ignoring an unreadable import recovery record: no project uses Pro here"
+            );
+            state.invalid = false;
+        }
+    }
     pub(crate) fn blocks_workspace(&self, workspace: &str) -> bool {
         let state = crate::lock(&self.state);
         state.invalid

@@ -178,8 +178,27 @@ pub(super) fn bind_workspace_account(
         entry.account.as_ref().is_none_or(|saved| saved == &account),
         refuse("other_account", "This project belongs to another account")
     );
+    let newly_enrolled = entry.account.is_none();
     entry.account = Some(account);
+    drop(preferences);
+    if newly_enrolled {
+        mark_folder(state, workspace);
+    }
     Ok(())
+}
+/// The project was just enrolled: from now on its folder carries its id, so
+/// a reinstall or another computer finds the same cloud copy
+/// (`workspaces::identity`). Free projects never get one. Best effort, off
+/// the reactor and never awaited.
+pub(super) fn mark_folder(state: &AppState, workspace: &str) {
+    let Some(root) = lock(&state.workspaces).get(workspace).map(|w| w.root) else {
+        return;
+    };
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let id = workspace.to_owned();
+    runtime.spawn_blocking(move || crate::workspaces::identity::write(&root, &id));
 }
 async fn discover(state: &Arc<AppState>, config: &Configure) -> Result<Vec<Project>> {
     anyhow::ensure!(

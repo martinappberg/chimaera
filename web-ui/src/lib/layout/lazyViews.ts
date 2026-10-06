@@ -23,7 +23,7 @@ export type PaneViewKind =
 
 /** A dialog opened on demand. It stays out of the always-loaded entry and is
  *  loaded through the same cache and recovery as a pane's view. */
-export type LazyDialogKind = "folderPicker" | "quickOpen" | "closeDirty" | "askpass" | "home";
+export type LazyDialogKind = "folderPicker" | "quickOpen" | "home";
 type LazyKind = PaneViewKind | LazyDialogKind;
 
 type PaneViewModule = { default: Component<any> };
@@ -58,8 +58,6 @@ const loaders: Record<LazyKind, () => Promise<PaneViewModule>> = {
   settings: () => import("../settings/SettingsView.svelte"),
   folderPicker: () => import("../workspace/FolderPicker.svelte"),
   quickOpen: () => import("../workspace/QuickOpen.svelte"),
-  closeDirty: () => import("./CloseDirtyDialog.svelte"),
-  askpass: () => import("../workspace/AskpassDialog.svelte"),
   home: () => import("../workspace/HomeScreen.svelte"),
 };
 
@@ -86,8 +84,6 @@ const viewChunkPrefixes: Record<LazyKind, string> = {
   pro: "AccountApplicationView-",
   folderPicker: "FolderPicker-",
   quickOpen: "QuickOpen-",
-  closeDirty: "CloseDirtyDialog-",
-  askpass: "AskpassDialog-",
   home: "HomeScreen-",
 };
 

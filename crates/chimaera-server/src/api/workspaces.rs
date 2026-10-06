@@ -56,15 +56,17 @@ pub(crate) async fn create_workspace(
     // `canonicalize` and `is_dir` are blocking fs syscalls on a user-supplied
     // path — a slow or dead NFS mount would otherwise stall the async reactor.
     // Validate off the reactor; the error strings are unchanged. The folder's
-    // marker is read in the same blocking step.
+    // marker is read in the same blocking step, and only where Pro can be:
+    // without the extension a folder registers exactly as it always did.
     let input = body.root.clone();
+    let read_marker = crate::pro::tier(&state) != crate::pro::Tier::Free;
     let validated = tokio::task::spawn_blocking(move || {
         let root = std::fs::canonicalize(PathBuf::from(&input))
             .map_err(|err| format!("{input}: {err}"))?;
         if !root.is_dir() {
             return Err(format!("{} is not a directory", root.display()));
         }
-        let marker = identity::read(&root);
+        let marker = read_marker.then(|| identity::read(&root)).flatten();
         Ok::<_, String>((root, marker))
     })
     .await;
@@ -128,7 +130,9 @@ pub(crate) async fn create_workspace(
                 // this computer (`pro::note_opened`).
                 crate::pro::note_opened(&state, &workspace.id);
             }
-            if registered.write_marker {
+            // The marker exists for Pro's cloud copy: only a project Pro
+            // enrolled carries one, so a free user's folders never change.
+            if registered.write_marker && crate::pro::marks_folder(&state, &workspace.id) {
                 let (root, id) = (workspace.root.clone(), workspace.id.clone());
                 // Best effort, off the reactor and off the store's lock.
                 tokio::task::spawn_blocking(move || identity::write(&root, &id))
@@ -149,9 +153,9 @@ pub(crate) async fn create_workspace(
 }
 
 /// POST /api/v1/workspaces/{id}/open — stamp a workspace as freshly opened
-/// (home-screen recency), returning it. Also gives a folder that has no
-/// identity marker yet its own (one stat, best effort, never awaited): folders
-/// registered before markers existed gain one over time.
+/// (home-screen recency), returning it. Also gives an enrolled Pro project's
+/// folder that has no identity marker yet its own (one stat, best effort,
+/// never awaited); a project Pro never enrolled is left untouched.
 pub(crate) async fn open_workspace(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -160,10 +164,12 @@ pub(crate) async fn open_workspace(
         Some(workspace) => {
             if !workspace.cloud_internal && !workspace.hidden {
                 crate::pro::note_opened(&state, &workspace.id);
-                let (root, id) = (workspace.root.clone(), workspace.id.clone());
-                tokio::task::spawn_blocking(move || {
-                    crate::workspaces::identity::backfill(&root, &id)
-                });
+                if crate::pro::marks_folder(&state, &workspace.id) {
+                    let (root, id) = (workspace.root.clone(), workspace.id.clone());
+                    tokio::task::spawn_blocking(move || {
+                        crate::workspaces::identity::backfill(&root, &id)
+                    });
+                }
             }
             Json(workspace).into_response()
         }

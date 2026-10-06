@@ -26,13 +26,14 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   (`listWorkspaces`/`deleteWorkspace`/`touchWorkspace`). Routes: `GET/POST /api/v1/workspaces`,
   `DELETE /api/v1/workspaces/{id}`, `POST /api/v1/workspaces/{id}/open` (stamps recency).
 - **Key behaviors.** Registration is idempotent per canonical root; `canonicalize`+`is_dir`
-  run under `spawn_blocking` (a dead NFS mount must not stall the reactor). A registered
-  folder carries its workspace id (`.git/chimaera-workspace`, the private git directory of a
-  linked worktree, or a `.chimaera-workspace` file when there is no git directory), so reopening it after a reinstall or a data reset, or
-  on another computer, is the same workspace; a moved folder keeps its workspace and a local
-  duplicate gets its own (see [pro.md](pro.md#what-the-daemon-does)). Opening a
-  workspace writes the marker if it is missing; a folder that cannot be written registers
-  without one. Recency sorts by
+  run under `spawn_blocking` (a dead NFS mount must not stall the reactor). Registering or
+  opening a folder never writes into it. Only a project Chimaera Pro enrolled carries its
+  workspace id (`.git/chimaera-workspace`, the private git directory of a linked worktree, or
+  a `.chimaera-workspace` file when there is no git directory), so reopening it after a
+  reinstall or a data reset, or on another computer, is the same workspace; a moved folder
+  keeps its workspace and a local duplicate gets its own (see
+  [pro.md](pro.md#what-the-daemon-does)). Any folder that already carries a marker is
+  registered under its id. Recency sorts by
   `last_opened_at`. The rollup dot is muted (dormant) / accent (live) / amber (needs
   attention). `stop` stays always-visible for a running workspace and asks an inline confirm.
 

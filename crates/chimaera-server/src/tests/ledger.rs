@@ -372,6 +372,7 @@ async fn restart_deferred_sessions_resume_unless_another_owner_is_verified() {
             "waits for verification"
         );
         assert!(lock(&state.deferred_sessions).contains_key("s-restart-chat"));
+        assert!(pro::any_restart_deferred(&state), "the fallback has work");
         if remote {
             pro::install_remote_owner_fixture(&state, &workspace.id, 4);
         }
@@ -405,6 +406,55 @@ async fn restart_deferred_sessions_resume_unless_another_owner_is_verified() {
             .stopping
             .store(true, std::sync::atomic::Ordering::Release);
     }
+}
+
+/// A free daemon's boot defers nothing, so it starts no one-minute fallback
+/// timer: its chat comes back at boot like its shell.
+#[tokio::test]
+async fn a_free_boot_defers_nothing() {
+    let state = test_state_with_data_dir(0, test_dir("ledger-free-boot"));
+    let root = std::fs::canonicalize(test_dir("ledger-free-boot-root")).unwrap();
+    let workspace = lock(&state.workspaces).add(root.clone()).unwrap();
+    preset_agent(
+        &state,
+        agents::AgentKind::Claude,
+        Ok(write_fake_claude("ledger-free-boot-fake")),
+        Some("9.9.9-fake"),
+    );
+    let boot = ledger::BootLedger {
+        sessions: vec![ledger::LedgerEntry {
+            suspended: false,
+            manual_resume_reason: None,
+            handoff: None,
+            id: "s-free-chat".to_string(),
+            workspace_id: workspace.id.clone(),
+            cwd: root.clone(),
+            pinned_name: None,
+            cols: 80,
+            rows: 24,
+            theme: "dark".to_string(),
+            created_at: 0,
+            agent: Some(ledger::LedgerAgent {
+                kind: agents::AgentKind::Claude,
+                resume: None,
+                transcript: None,
+                native_cwd: None,
+                title: "claude".to_string(),
+                ui: chimaera_agent::model::SessionUi::Chat,
+                model: None,
+                carryover: None,
+            }),
+        }],
+        links: std::collections::HashMap::new(),
+        written_at: 1_750_000_000,
+    };
+    ledger::restore(&state, boot).await;
+    assert!(state.chat.contains("s-free-chat"), "comes back at boot");
+    assert!(!pro::any_restart_deferred(&state));
+    state.chat.kill("s-free-chat");
+    state
+        .stopping
+        .store(true, std::sync::atomic::Ordering::Release);
 }
 
 /// A chat a return from the cloud imported here, still waiting for that

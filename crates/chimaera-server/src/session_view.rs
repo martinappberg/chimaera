@@ -293,8 +293,14 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
             }),
         ));
     }
-    let activity = crate::lock(&state.activity)
-        .snapshot(rows.iter().filter_map(|(_, row)| row["id"].as_str()));
+    // Input times are for Pro's idle checks only. Without an active plan the
+    // field stays null, so a keystroke never changes the shared sessions
+    // frame and every window is not sent a new one while someone types.
+    let activity = if crate::pro::tier(state) == crate::pro::Tier::Active {
+        crate::lock(&state.activity).snapshot(rows.iter().filter_map(|(_, row)| row["id"].as_str()))
+    } else {
+        Default::default()
+    };
     for (_, row) in &mut rows {
         let at = row["id"].as_str().and_then(|id| activity.get(id)).copied();
         row["last_input_ms"] = json!(at);

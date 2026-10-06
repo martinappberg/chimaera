@@ -42,6 +42,10 @@ versions). Run `cargo test` in the app workspace too when you touch core deps.
   old manifest still parses.
   `Manifest.runtime_leases` defaults false: old daemons do not protect managed
   agent packages, so automatic package cleanup defers while their manifest is live.
+  `Manifest.daemon_extension` (default false, omitted when false, so a free
+  daemon's manifest is unchanged) marks a daemon composed with an extension:
+  `connect` probes composition before an automatic public-release replacement
+  only when it is set.
 - **A manifest's pid means something only on the node that wrote it.** HPC login
   nodes share `$HOME`, so every node reads the same file: check `written_here()`
   (`this_node()` vs `hostname`, via `same_node`) before trusting `is_alive()`, and

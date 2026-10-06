@@ -289,7 +289,7 @@ impl AppState {
         let (chat, chat_signals_rx) = chat::new_manager(data_dir.join("chat"));
         let plugin_catalog = plugins::Catalog::load(data_dir.join("plugins"));
         let plugin_guard = plugins::trust::Guard::load(&plugin_catalog);
-        AppState {
+        let state = AppState {
             token,
             started: Instant::now(),
             hostname,
@@ -386,7 +386,14 @@ impl AppState {
             chat_catalogs: Mutex::new(HashMap::new()),
             comms: comms::Comms::new(data_dir.join("workspace")),
             knowledge: Mutex::new(knowledge::KnowledgeState::default()),
+        };
+        // An unreadable import-recovery record fences what it might name;
+        // an installation Pro never enrolled a project on has nothing it
+        // could name, so ordinary work goes on.
+        if !crate::pro::any_enrolled(&state) {
+            state.bundle_imports.release_unknown_fence();
         }
+        state
     }
 
     /// Wait (bounded by `RESTORE_WAIT_CAP`) until the boot ledger has been

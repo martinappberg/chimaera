@@ -7,7 +7,8 @@
   let presentation = $state<ToastPresentation>({ phase: "loading" });
   let retry = $state<() => void>(() => {});
   const answer = $derived(notice.kind === "checking" || notice.kind === "current" ||
-    notice.kind === "dev" || notice.kind === "managed" || notice.kind === "failed");
+    notice.kind === "dev" || notice.kind === "managed" || notice.kind === "with-app" ||
+    notice.kind === "failed");
   onMount(() => {
     const original = updateToastPresentation(() => import("./UpdateToast.svelte"),
       (next) => { presentation = next; });

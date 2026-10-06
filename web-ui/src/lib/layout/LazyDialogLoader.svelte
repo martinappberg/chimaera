@@ -2,16 +2,14 @@
   import { loadDialog } from "./lazyViews";
   import type { ComponentProps } from "svelte";
   import type QuickOpen from "../workspace/QuickOpen.svelte";
-  import type CloseDirtyDialog from "./CloseDirtyDialog.svelte";
   import { focusOnMount } from "../shared/focusOnMount";
   import { modalFocus } from "../shared/modalFocus";
 
   type Props = { onCancel(): void } & (
     { kind: "quickOpen"; dialogProps: ComponentProps<typeof QuickOpen> }
-    | { kind: "closeDirty"; dialogProps: ComponentProps<typeof CloseDirtyDialog> }
   );
   let { kind, dialogProps, onCancel }: Props = $props();
-  const title = $derived(kind === "quickOpen" ? "quick open" : "close confirmation");
+  const title = "quick open";
   function requestDialog() { return loadDialog(kind); }
   let surface = $state(requestDialog());
   function retry(): void { surface = requestDialog(); }

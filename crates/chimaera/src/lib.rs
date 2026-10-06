@@ -316,8 +316,16 @@ pub fn run_with_extension(
 
 type RuntimeFactory = fn() -> std::sync::Arc<dyn chimaera_server::daemon_extension::Runtime>;
 
-fn deployment_source(extension: Option<RuntimeFactory>) -> chimaera_remote::DeploymentSource {
-    if extension.is_some() {
+/// A composed CLI deploys only an artifact the user named (`--binary`); with
+/// none it connects like the open build (the public release), so the
+/// official app's CLI works without a Pro account. Replacing a remote daemon
+/// that has a selected runtime still refuses the public release
+/// (`chimaera_remote::connect`).
+fn deployment_source(
+    extension: Option<RuntimeFactory>,
+    binary: bool,
+) -> chimaera_remote::DeploymentSource {
+    if extension.is_some() && binary {
         chimaera_remote::DeploymentSource::ExplicitBinary
     } else {
         chimaera_remote::DeploymentSource::PublicRelease
@@ -418,7 +426,7 @@ async fn dispatch(command: Command, extension: Option<RuntimeFactory>) -> anyhow
                 no_open,
                 update_daemon,
                 login_node,
-                deployment_source(extension),
+                deployment_source(extension, binary.is_some()),
             )
             .await
         }
@@ -523,13 +531,20 @@ mod tests {
         fn never_constructed() -> std::sync::Arc<dyn chimaera_server::daemon_extension::Runtime> {
             panic!("deployment selection must not construct a runtime");
         }
+        for binary in [false, true] {
+            assert_eq!(
+                super::deployment_source(None, binary),
+                chimaera_remote::DeploymentSource::PublicRelease
+            );
+        }
         assert_eq!(
-            super::deployment_source(None),
-            chimaera_remote::DeploymentSource::PublicRelease
-        );
-        assert_eq!(
-            super::deployment_source(Some(never_constructed)),
+            super::deployment_source(Some(never_constructed), true),
             chimaera_remote::DeploymentSource::ExplicitBinary
+        );
+        // No --binary: the composed CLI connects like the open build.
+        assert_eq!(
+            super::deployment_source(Some(never_constructed), false),
+            chimaera_remote::DeploymentSource::PublicRelease
         );
     }
 

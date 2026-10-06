@@ -82,6 +82,9 @@ pub(crate) struct ClusterLive {
     binary_ok: bool,
     /// The background watcher is running.
     watching: bool,
+    /// Counts what the user (or a page or window acting for them) did with
+    /// this cluster; an unattended master verdict defers to any change.
+    user_touches: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -138,6 +141,7 @@ fn valid_job(id: &str) -> Result<(), String> {
 /// lives on) and holds its ControlMaster — a connect, which on a cluster
 /// starts nothing.
 async fn ensure_cluster(app: &AppHandle, alias: &str) -> Result<(), String> {
+    note_user_touch(&app.state::<Shell>(), alias);
     if let Some(selected) = kept::select(&app.state::<Shell>(), alias).await? {
         return selected.ensure_cluster();
     }
@@ -573,9 +577,12 @@ fn ensure_watcher(app: &AppHandle, alias: &str) {
     tauri::async_runtime::spawn(async move {
         let mut interval = cluster::SQUEUE_FLOOR;
         let mut failures = 0u32;
+        // Set once this watcher cleared a dead master: the next login is the
+        // user's to make, so no later look may dial or prompt for one.
+        let mut existing_only = false;
         loop {
             tokio::time::sleep(interval).await;
-            let ov = match live_overview(&app, &alias).await {
+            let ov = match watch_overview(&app, &alias, existing_only).await {
                 Ok(ov) => {
                     failures = 0;
                     ov
@@ -583,6 +590,9 @@ fn ensure_watcher(app: &AppHandle, alias: &str) {
                 Err(e) => {
                     failures += 1;
                     tracing::debug!("cluster watch {alias}: {e}");
+                    if clear_dead_master_unattended(&app, &alias).await {
+                        existing_only = true;
+                    }
                     if failures >= 5 {
                         break;
                     }
@@ -669,6 +679,158 @@ async fn live_overview_refresh(
     };
     overlay_live(app, alias, &mut ov).await;
     Ok(ov)
+}
+
+/// The watcher's unattended look: `live_overview` without its one-shot
+/// recovery (a failed look backs off, and only a confirmed-dead verdict,
+/// [`clear_dead_master_unattended`], clears a master). After such a clear,
+/// `existing_only` keeps it on an existing master: it fails rather than
+/// dial or raise a password/two-factor prompt with nobody there.
+async fn watch_overview(
+    app: &AppHandle,
+    alias: &str,
+    existing_only: bool,
+) -> Result<ClusterOverview, String> {
+    if let Some(selected) = kept::select(&app.state::<Shell>(), alias).await? {
+        return selected.overview(&app.state::<Shell>(), false).await;
+    }
+    let mut ov = if existing_only {
+        chimaera_remote::with_existing_master(alias, cluster::overview(alias, home()))
+            .await
+            .map_err(err)?
+            .map_err(err)?
+    } else {
+        cluster::overview(alias, home()).await.map_err(err)?
+    };
+    overlay_live(app, alias, &mut ov).await;
+    Ok(ov)
+}
+
+/// How far apart the two looks of an unattended master verdict start.
+const DEAD_MASTER_RECHECK: Duration = Duration::from_secs(60);
+
+/// What an unattended verdict weighs about one ControlMaster leg.
+#[derive(Clone, Copy, Debug)]
+struct MasterEvidence {
+    /// The same socket's first look (None: that leg wasn't there then).
+    first: Option<chimaera_remote::MasterLook>,
+    second: chimaera_remote::MasterLook,
+    /// From the start of the first look to the start of the second.
+    gap: Duration,
+    /// Something the user did reached this cluster in between.
+    user_touched: bool,
+    /// A tunnel this app holds through the cluster's masters was not
+    /// confirmed down by the health monitor.
+    tunnel_answers: bool,
+}
+
+/// Dead, not slow: the same master process (pid) took a session open and
+/// gave no answer at all, twice, looks at least [`DEAD_MASTER_RECHECK`]
+/// apart; nothing the user did touched the cluster in between; and no
+/// tunnel riding it still answers. Any answer, even a slow one or a
+/// refusal, means the link lives, and a master the user may be leaning on
+/// is theirs to reset. With `ServerAliveInterval=15 × 3` a master whose TCP
+/// link died usually exits by itself within ~45 s, so this is deliberately
+/// rare: it catches the master that keeps its process and socket yet opens
+/// nothing.
+fn master_confirmed_dead(e: &MasterEvidence) -> bool {
+    use chimaera_remote::MasterLook::Silent;
+    !e.user_touched
+        && !e.tunnel_answers
+        && e.gap >= DEAD_MASTER_RECHECK
+        && matches!(
+            (e.first, e.second),
+            (Some(Silent { pid: a }), Silent { pid: b }) if a == b
+        )
+}
+
+/// Something the user did, or a page or window acting for them, reached
+/// `alias`. Counted only for a cluster this process tracks (its watcher's).
+pub(super) fn note_user_touch(shell: &Shell, alias: &str) {
+    if let Some(c) = lock(&shell.clusters).get_mut(alias) {
+        c.user_touches = c.user_touches.wrapping_add(1);
+    }
+}
+
+fn user_touches(shell: &Shell, alias: &str) -> u64 {
+    lock(&shell.clusters)
+        .get(alias)
+        .map_or(0, |c| c.user_touches)
+}
+
+/// Whether a tunnel through `alias`'s masters (its login daemon's, a job's,
+/// a workspace window's) is not confirmed down: traffic may still ride them.
+async fn tunnel_answers(shell: &Shell, alias: &str) -> bool {
+    let prefix = format!("{alias}#");
+    let mut keys: Vec<String> = shell
+        .compute_tunnels
+        .lock()
+        .await
+        .keys()
+        .filter(|k| k.starts_with(&prefix))
+        .cloned()
+        .collect();
+    if shell.tunnels.lock().await.contains_key(alias) {
+        keys.push(alias.to_string());
+    }
+    let unhealthy = lock(&shell.unhealthy_tunnels);
+    keys.iter().any(|k| !unhealthy.contains(k))
+}
+
+/// The watcher's recovery for a Direct SSH cluster: clear a ControlMaster
+/// only on a confirmed-dead verdict ([`master_confirmed_dead`]). It only
+/// `-O exit`s the dead master: no reconnect, no `host-status`, no
+/// `cluster-changed`, no prompt. The user's next action (or a window's own
+/// reconnect) logs in again while they are there. Kept clusters are the
+/// keeper's. Returns whether it closed (or tried to close) a master.
+async fn clear_dead_master_unattended(app: &AppHandle, alias: &str) -> bool {
+    let shell = app.state::<Shell>();
+    if !matches!(kept::select(&shell, alias).await, Ok(None)) {
+        return false;
+    }
+    let touches = user_touches(&shell, alias);
+    let started = Instant::now();
+    let Ok(first) = chimaera_remote::look_at_masters(alias).await else {
+        return false;
+    };
+    if !first
+        .iter()
+        .any(|(_, look)| matches!(look, chimaera_remote::MasterLook::Silent { .. }))
+    {
+        return false;
+    }
+    let wait = DEAD_MASTER_RECHECK.saturating_sub(started.elapsed());
+    tokio::time::sleep(wait).await;
+    let gap = started.elapsed();
+    let Ok(second) = chimaera_remote::look_at_masters(alias).await else {
+        return false;
+    };
+    let mut cleared = false;
+    for (handle, look) in &second {
+        let evidence = MasterEvidence {
+            first: first
+                .iter()
+                .find(|(h, _)| h.identity() == handle.identity())
+                .map(|(_, l)| *l),
+            second: *look,
+            gap,
+            user_touched: user_touches(&shell, alias) != touches,
+            tunnel_answers: tunnel_answers(&shell, alias).await,
+        };
+        if !master_confirmed_dead(&evidence) {
+            continue;
+        }
+        match handle.close().await {
+            Ok(()) => tracing::info!(
+                "cluster watch {alias}: cleared a ControlMaster that opened nothing on two \
+                 looks {}s apart; the next login waits for the user",
+                gap.as_secs()
+            ),
+            Err(e) => tracing::warn!("cluster watch {alias}: clearing a dead ControlMaster: {e}"),
+        }
+        cleared = true;
+    }
+    cleared
 }
 
 /// Ask the job-host of every running job this app already holds a forward
@@ -775,6 +937,7 @@ pub(super) async fn cluster_overview(
     alias: String,
     refresh: Option<bool>,
 ) -> Result<serde_json::Value, String> {
+    note_user_touch(&app.state::<Shell>(), &alias);
     let refresh = refresh.unwrap_or(false);
     if refresh && kept::select(&app.state::<Shell>(), &alias).await?.is_none() {
         require_discovered_cluster(&alias)?;
@@ -792,6 +955,7 @@ pub(super) async fn cluster_facts(
     alias: String,
     refresh: Option<bool>,
 ) -> Result<chimaera_core::cluster::ClusterFacts, String> {
+    note_user_touch(&app.state::<Shell>(), &alias);
     if let Some(selected) = kept::select(&app.state::<Shell>(), &alias).await? {
         return match selected
             .read(
@@ -2103,6 +2267,7 @@ pub(super) async fn cluster_open_terminal(
 ) -> Result<(), String> {
     let alias = chimaera_remote::hosts::normalize_alias(&alias).map_err(err)?;
     tracing::info!("ipc: cluster_open_terminal {alias}");
+    note_user_touch(&state, &alias);
     let (port, token) = {
         let local = lock(&state.local);
         (local.port, local.token.clone())
@@ -2279,5 +2444,69 @@ mod tests {
         assert_eq!(left_words(9 * 60_000 + 30_000), "10 minutes");
         assert_eq!(left_words(40_000), "1 minute");
         assert_eq!(left_words(0), "1 minute");
+    }
+
+    #[test]
+    fn an_unattended_clear_needs_the_same_master_silent_twice_and_nobody_using_it() {
+        use chimaera_remote::MasterLook::{Absent, Responds, Silent, Unclear};
+        let dead = MasterEvidence {
+            first: Some(Silent { pid: 41 }),
+            second: Silent { pid: 41 },
+            gap: DEAD_MASTER_RECHECK,
+            user_touched: false,
+            tunnel_answers: false,
+        };
+        assert!(master_confirmed_dead(&dead));
+        let not_dead = [
+            // Slow, not dead: one look got an answer (a slow `true` or a refusal).
+            MasterEvidence {
+                second: Responds,
+                ..dead
+            },
+            MasterEvidence {
+                first: Some(Responds),
+                ..dead
+            },
+            // A different master process: a login replaced it in between.
+            MasterEvidence {
+                second: Silent { pid: 42 },
+                ..dead
+            },
+            // Seen once only, or not seen at all.
+            MasterEvidence {
+                first: None,
+                ..dead
+            },
+            MasterEvidence {
+                first: Some(Unclear),
+                ..dead
+            },
+            MasterEvidence {
+                second: Absent,
+                ..dead
+            },
+            MasterEvidence {
+                second: Unclear,
+                ..dead
+            },
+            // The two looks too close together.
+            MasterEvidence {
+                gap: DEAD_MASTER_RECHECK - Duration::from_millis(1),
+                ..dead
+            },
+            // The user acted on the cluster in between: their path decides.
+            MasterEvidence {
+                user_touched: true,
+                ..dead
+            },
+            // A tunnel through it still answers: it carries traffic.
+            MasterEvidence {
+                tunnel_answers: true,
+                ..dead
+            },
+        ];
+        for evidence in not_dead {
+            assert!(!master_confirmed_dead(&evidence), "{evidence:?}");
+        }
     }
 }

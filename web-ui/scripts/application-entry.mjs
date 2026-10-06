@@ -98,10 +98,6 @@ export async function captureApplicationEntry(selected, publicRoot) {
   if (reached.size !== graph.size) throw new Error("Unreachable application chunk");
   return { entry: selected, directory, files,
     async verify() { for (const [file, hash] of files) if (sha(await bounded(file)) !== hash) throw new Error("Application input changed during assembly"); },
-    receipt: { version: 1, selected: true, installedAuthority: false,
-      privateVerifiedReceipt: files.get(join(directory, "verified-closure.json")),
-      privateInputsReceipt: files.get(join(directory, "build-input.json")),
-      inputFiles: [...files].map(([file, sha256]) => ({ file, sha256 })) },
   };
 }
 export function applicationEntryPlugin(publicRoot, selected = process.env.CHIMAERA_APPLICATION_ENTRY) {
@@ -114,13 +110,11 @@ export function applicationEntryPlugin(publicRoot, selected = process.env.CHIMAE
       return capture === null ? "export const loadApplicationEntry = null;" :
         `import ${JSON.stringify(join(capture.directory, "pro-client-ui.css"))}; export const loadApplicationEntry = () => import(${JSON.stringify(capture.entry)});`;
     },
-    generateBundle: { order: "post", async handler(_options, bundle) {
+    // The selected inputs must not change while the bundle is written. No
+    // receipt is emitted: nothing reads one, and it would ship the build
+    // machine's file paths inside every daemon.
+    generateBundle: { order: "post", async handler() {
       if (capture !== null) await capture.verify();
-      const emitted = Object.values(bundle).filter((item) => item.type === "chunk");
-      this.emitFile({ type: "asset", fileName: "application-assembly.json", source: JSON.stringify({
-        ...(capture?.receipt ?? { version: 1, selected: false, installedAuthority: false }),
-        chunks: emitted.map((chunk) => ({ file: chunk.fileName, sha256: sha(Buffer.from(chunk.code)), imports: chunk.imports, dynamicImports: chunk.dynamicImports })),
-      }, null, 2) + "\n" });
     } },
   };
 }

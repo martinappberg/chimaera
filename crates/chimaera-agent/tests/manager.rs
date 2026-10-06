@@ -56,6 +56,14 @@ fn spec(id: &str, cwd: &Path, mode: &str) -> SpawnSpec {
     SpawnSpec::new(id, vec![fake, mode.to_string()], cwd.to_path_buf())
 }
 
+/// Durable send receipts belong to managed execution (work that can move to
+/// another machine); an ordinary chat keeps its send record in memory.
+fn durable_spec(id: &str, cwd: &Path, mode: &str) -> SpawnSpec {
+    let mut spec = spec(id, cwd, mode);
+    spec.managed_execution = true;
+    spec
+}
+
 /// The cleanup owner survives removal of the registry row. Synthetic agent,
 /// real managed process group; no provider, network or billing.
 #[cfg(unix)]
@@ -3270,7 +3278,7 @@ async fn a_send_too_long_for_one_journal_line_keeps_its_ids_and_runs_once() {
 async fn a_withdrawn_send_id_survives_process_replacement_and_restart() {
     let mut fx = fixture();
     fx.manager
-        .spawn(&ClaudeAdapter, spec("s-keeps", &fx.cwd, "normal"))
+        .spawn(&ClaudeAdapter, durable_spec("s-keeps", &fx.cwd, "normal"))
         .unwrap();
     assert!(fx
         .manager
@@ -3284,7 +3292,7 @@ async fn a_withdrawn_send_id_survives_process_replacement_and_restart() {
         .unwrap();
     assert!(fx.manager.remove("s-keeps").is_some());
     fx.manager
-        .spawn(&ClaudeAdapter, spec("s-keeps", &fx.cwd, "normal"))
+        .spawn(&ClaudeAdapter, durable_spec("s-keeps", &fx.cwd, "normal"))
         .unwrap();
     assert_eq!(
         fx.manager.client_id_state("s-keeps", "client-withdrawn"),
@@ -3308,7 +3316,7 @@ async fn a_withdrawn_send_id_survives_process_replacement_and_restart() {
         Box::new(|_, _| {}),
     ));
     restarted
-        .spawn(&ClaudeAdapter, spec("s-keeps", &fx.cwd, "normal"))
+        .spawn(&ClaudeAdapter, durable_spec("s-keeps", &fx.cwd, "normal"))
         .unwrap();
     assert!(restarted
         .cancel_send("s-keeps", "client-withdrawn")
@@ -3372,7 +3380,10 @@ async fn queued_echo_is_uncertain_after_replacement_but_sent_update_confirms_it(
             cancel: false,
         };
         fx.manager
-            .spawn(&adapter, spec("s-queued-receipt", &fx.cwd, "normal"))
+            .spawn(
+                &adapter,
+                durable_spec("s-queued-receipt", &fx.cwd, "normal"),
+            )
             .unwrap();
         let mut live = fx.manager.attach("s-queued-receipt", 0).unwrap().live;
         fx.manager
@@ -3434,7 +3445,10 @@ async fn queued_echo_is_uncertain_after_replacement_but_sent_update_confirms_it(
             Box::new(|_, _| {}),
         ));
         restarted
-            .spawn(&adapter, spec("s-queued-receipt", &fx.cwd, "normal"))
+            .spawn(
+                &adapter,
+                durable_spec("s-queued-receipt", &fx.cwd, "normal"),
+            )
             .unwrap();
         assert_eq!(
             restarted.client_id_state("s-queued-receipt", "client-queued"),
@@ -3472,7 +3486,7 @@ async fn live_queued_cancellations_release_the_durable_cap_and_late_cancel_canno
             cancel: true,
         };
         fx.manager
-            .spawn(&adapter, spec("s-cancel-queue", &fx.cwd, "normal"))
+            .spawn(&adapter, durable_spec("s-cancel-queue", &fx.cwd, "normal"))
             .unwrap();
         let mut live = fx.manager.attach("s-cancel-queue", 0).unwrap().live;
         for n in 0..70 {
@@ -3526,7 +3540,7 @@ async fn live_queued_cancellations_release_the_durable_cap_and_late_cancel_canno
             .unwrap();
         fx.manager.remove("s-cancel-queue");
         fx.manager
-            .spawn(&adapter, spec("s-cancel-queue", &fx.cwd, "normal"))
+            .spawn(&adapter, durable_spec("s-cancel-queue", &fx.cwd, "normal"))
             .unwrap();
         assert_eq!(
             fx.manager
@@ -3578,7 +3592,7 @@ async fn a_received_send_without_an_echo_is_uncertain_after_restart_and_never_re
     let (received, mut commands) = mpsc::unbounded_channel();
     let adapter = ReceiptlessAdapter { received, drain };
     fx.manager
-        .spawn(&adapter, spec("s-unknown", &fx.cwd, "normal"))
+        .spawn(&adapter, durable_spec("s-unknown", &fx.cwd, "normal"))
         .unwrap();
     assert_eq!(
         fx.manager
@@ -3625,7 +3639,7 @@ async fn a_received_send_without_an_echo_is_uncertain_after_restart_and_never_re
         Box::new(|_, _| {}),
     ));
     restarted
-        .spawn(&adapter, spec("s-unknown", &fx.cwd, "normal"))
+        .spawn(&adapter, durable_spec("s-unknown", &fx.cwd, "normal"))
         .unwrap();
     let resend = restarted
         .send_from_client("s-unknown", text_send("once"), Some("client-unknown"))
@@ -3654,7 +3668,7 @@ async fn an_independent_receipt_without_journal_echo_is_confirmed_and_never_rese
     let (received, mut commands) = mpsc::unbounded_channel();
     let adapter = ReceiptlessAdapter { received, drain };
     fx.manager
-        .spawn(&adapter, spec("s-receipt", &fx.cwd, "normal"))
+        .spawn(&adapter, durable_spec("s-receipt", &fx.cwd, "normal"))
         .unwrap();
     assert_eq!(
         fx.manager.client_id_state("s-receipt", "client-confirmed"),
@@ -3697,7 +3711,7 @@ async fn canceling_an_enqueue_before_the_channel_permit_is_proven_undispatched()
         drain: held,
     };
     fx.manager
-        .spawn(&adapter, spec("s-backpressure", &fx.cwd, "normal"))
+        .spawn(&adapter, durable_spec("s-backpressure", &fx.cwd, "normal"))
         .unwrap();
     // Fill the manager's bounded command channel without letting the driver
     // receive. No persisted dispatch is needed for these unkeyed fixture sends.
@@ -3755,7 +3769,7 @@ async fn failed_dispatch_storage_and_failed_withdrawal_never_reach_the_driver() 
         let (received, mut commands) = mpsc::unbounded_channel();
         let adapter = ReceiptlessAdapter { received, drain };
         fx.manager
-            .spawn(&adapter, spec("s-storage", &fx.cwd, "normal"))
+            .spawn(&adapter, durable_spec("s-storage", &fx.cwd, "normal"))
             .unwrap();
         std::fs::create_dir(fx.manager.journal_dir().join("s-storage.send-state.json")).unwrap();
         if cancel {

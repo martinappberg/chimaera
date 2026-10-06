@@ -131,13 +131,13 @@ impl UpdateStatus {
 pub(crate) fn status_json(state: &AppState) -> serde_json::Value {
     let managed = crate::pro::updates_managed(state);
     if !managed && state.daemon_extension.is_some() {
-        // A composed executable cannot be updated from the public release feed.
-        // Keep the existing failure wire shape until its assembly has a channel.
-        return UpdateStatus {
-            error: Some("Updates for this daemon require its original application".into()),
-            ..UpdateStatus::default()
-        }
-        .to_json(false);
+        // The official app's daemon is updated with the app (its signed
+        // updater, or a reconnect for a remote one), never from the public
+        // release feed, so it never checks. That is not a failed check: say
+        // `with_app` (additive), with nothing checked and nothing offered.
+        let mut value = UpdateStatus::default().to_json(false);
+        value["with_app"] = json!(true);
+        return value;
     }
     crate::lock(&state.update).to_json(managed)
 }

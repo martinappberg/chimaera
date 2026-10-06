@@ -4,7 +4,7 @@
   import { KEPT_NOTICE_PREFIX, keptNoticeWorkspace } from "./lib/pro/kept";
   import { onMount, tick, untrack, type Component } from "svelte";
   import { loadApplicationEntry } from "virtual:chimaera-application-entry";
-  import { paidPlan, proOffered } from "./lib/net/plan";
+  import { paidPlan, proTier } from "./lib/net/plan";
   import { isBrowserGateway, gatewayWorkspace } from "./lib/net/base";
   import AgentSetupLoader from "./lib/workspace/AgentSetupLoader.svelte";
   import { agentSetup, openAgentSetup } from "./lib/workspace/agentSetup";
@@ -396,7 +396,8 @@
   import ContextMenuHost from "./lib/shared/ContextMenuHost.svelte";
   import { contextMenu } from "./lib/shared/contextMenu.svelte";
   import ConfirmDialog from "./lib/shared/ConfirmDialog.svelte";
-  import CloseDirtyLoader from "./lib/layout/CloseDirtyLoader.svelte";
+  // Static: the unsaved-changes question must show even when a chunk cannot load.
+  import CloseDirtyDialog from "./lib/layout/CloseDirtyDialog.svelte";
   import { WindowCloseGuard } from "./lib/layout/windowClose.svelte";
   import { fsDeleteOp, lastFsMutation, notifyCreated, pendingDelete } from "./lib/workspace/fsEvents";
   import {
@@ -3707,7 +3708,8 @@
   }
 
   function openProSurface(): void {
-    if (!isNativeShell() && !isBrowserGateway()) return;
+    // A build or window that can never offer Pro has no Pro page to open.
+    if (get(proTier) === "free") return;
     if (activeWsId === null) {
       homeSurface = "pro";
       homeSettingsLoad = loadPaneView("pro");
@@ -5451,7 +5453,7 @@
          worker: keep it out of the per-workspace live/attention rollups. -->
     {#if homeSettingsOpen}
       <div class="home-settings-shell">
-        <HomeNavigation active={homeSurface} plan={$paidPlan} showPro={isBrowserGateway() || (isNativeShell() && $proOffered === true)}
+        <HomeNavigation active={homeSurface} plan={$paidPlan} showPro={$proTier !== "free"}
           onHome={() => (homeSettingsOpen = false)} onPro={openProSurface} onSettings={openSettingsSurface} />
       <div class="home-settings-surface">
         <nav class="home-surface-nav" aria-label="Home navigation">
@@ -5495,7 +5497,7 @@
     />
       {:catch error}
         <div class="home-settings-shell">
-          <HomeNavigation active="workspaces" plan={$paidPlan} showPro={isBrowserGateway() || (isNativeShell() && $proOffered === true)}
+          <HomeNavigation active="workspaces" plan={$paidPlan} showPro={$proTier !== "free"}
             onHome={() => (homeLoad = retryPaneView("home", error))} onPro={openProSurface} onSettings={openSettingsSurface} />
           <div class="home-settings-content">
             <p role="alert">Couldn't open Home.</p>
@@ -5540,7 +5542,7 @@
             />
           </svg>
         </button>
-        {#if $paidPlan !== null && (isNativeShell() || isBrowserGateway())}
+        {#if $paidPlan !== null && $proTier === "active"}
           {#await import("./lib/pro/ProNavigation.svelte") then { default: ProNavigation }}
             <ProNavigation plan={$paidPlan} onOpen={openProSurface} />
           {/await}
@@ -6588,7 +6590,7 @@
 <!-- The native window close / app quit over every unsaved file here; it takes
      precedence over a tab close already asking (whose files it includes). -->
 {#if windowClose.prompt !== null}
-  <CloseDirtyLoader
+  <CloseDirtyDialog
     paths={windowClose.prompt.paths}
     saving={windowClose.saving}
     error={windowClose.error}
@@ -6599,7 +6601,7 @@
   />
 <!-- Closing tabs whose files hold unsaved edits: save / don't save / cancel. -->
 {:else if pendingClosePaths.length > 0}
-  <CloseDirtyLoader
+  <CloseDirtyDialog
     paths={pendingClosePaths}
     saving={closeSaving}
     error={closeError}

@@ -570,14 +570,18 @@ pub(crate) async fn consume_boot(state: &Arc<AppState>, boot: BootLedger) {
     let boot = crate::pro::restore_manual_parking(state, boot).await;
     restore(state, boot).await;
     // Laptop first: restart-deferred work resumes even when the account never
-    // answers. A verified grant usually resumes it well before this.
-    let owner = state.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(crate::pro::BOOT_VERIFICATION_GRACE).await;
-        if !owner.stopping.load(std::sync::atomic::Ordering::Acquire) {
-            crate::pro::resume_unverified(&owner).await;
-        }
-    });
+    // answers. A verified grant usually resumes it well before this. Only
+    // `restore` defers, so a boot that deferred nothing (every free daemon)
+    // starts no fallback timer.
+    if crate::pro::any_restart_deferred(state) {
+        let owner = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(crate::pro::BOOT_VERIFICATION_GRACE).await;
+            if !owner.stopping.load(std::sync::atomic::Ordering::Acquire) {
+                crate::pro::resume_unverified(&owner).await;
+            }
+        });
+    }
     // Serving started concurrently; sessions snapshots held back by
     // `wait_restored` may flow now that the roster is whole.
     state.restored.send_replace(true);

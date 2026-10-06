@@ -33,13 +33,14 @@ the opt-in "teach agents the document dialect" installs over
 owns the text; the confirm dialog shows it verbatim before anything is written.
 
 **Pro is a separate account surface.** the private optional account view is a singleton
-workbench tab and Home view. When Pro is offered (`net/plan.ts` `proOffered`;
-a build without an account endpoint offers none) Settings ends with a small
+workbench tab and Home view. When Pro is offered (`net/plan.ts` `proTier` is
+not `free`: the extension is composed and the window is this computer's own or
+the account gateway; decided without asking anything) Settings ends with a small
 Chimaera Pro group that opens it (Pro is an optional add-on, so it follows every
 working section, and its entry is neutral for every plan, never accent-tinted);
-Home retains its Pro navigation. Confirmed free/signed-out users see a short
-optional-benefit Get Pro entry; paid users see Your Chimaera Pro/Max and View
-account. The Keyboard section carries its reference chords inside it, so a
+Home retains its Pro navigation. Until a plan is active (`proTier` `active`)
+the entry is the short optional-benefit Get Pro card, never "checking your
+plan"; paid users see Your Chimaera Pro/Max and View account. The Keyboard section carries its reference chords inside it, so a
 group after it never splits them off. `../net/plan.ts` shares its existing subscription between this entry
 and the badges: loading or failed/unknown entitlement stays neutral, never a
 sales prompt or an active-plan claim. There is no extra poll or cloud wake. A paid workspace plan badge also
@@ -148,7 +149,7 @@ wakes row always shows.
 | `PluginsSettings.svelte` | Settings → Plugins: every installed plugin's declared settings (see the exception above); slotted after Extensions. |
 | `ActivitySettings.svelte` | The Activity panel (see the exception above): this week's sessions and tokens + time worked, one 14-day sessions chart, by agent and model / by workspace, Export CSV. Fetches while Settings is visible and on the history nudge. |
 | `jump.ts` | `settingsJump` / `requestSettingsSection`: open Settings scrolled to a section (Quick Open "Activity", the dashboard's activity line) or to a setting's row by id (the Mastermind panel's "Agent communication is off"). |
-| `UpdatesStatus.svelte` | The Updates section's status block: app / daemon / agents, each up to date, available, or couldn't check (with why), plus "check now". A `managed` daemon (the account's cloud) reads `MANAGED_UPDATES` with no "check now" and no auto-check switch (`SettingsView` hides the row). Reads `workspace/update.svelte.ts`; the auto-check switch below it is a schema row. |
+| `UpdatesStatus.svelte` | The Updates section's status block: app / daemon / agents, each up to date, available, or couldn't check (with why), plus "check now". A `managed` daemon (the account's cloud) reads `MANAGED_UPDATES` with no "check now" and no auto-check switch (`SettingsView` hides the row). A `with_app` daemon (the official app's, which updates with the app) reads `APP_UPDATES`, never "couldn't check". Reads `workspace/update.svelte.ts`; the auto-check switch below it is a schema row. |
 | `NotificationStatus.svelte` | The Notifications section's status line: whether the OS (native) or browser will show alerts, with Allow / Open System Settings / Send test. The switches below it are ordinary schema rows. |
 | `SettingRow.svelte` | One schema-driven control. |
 | `SettingsJson.svelte` | The raw-JSON editor (validates against the schema). |

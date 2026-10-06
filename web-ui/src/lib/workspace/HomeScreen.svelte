@@ -1,9 +1,9 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import HomeNavigation from "./HomeNavigation.svelte";
   import HomeActions from "./HomeActions.svelte";
   import { isMac } from "../shared/keys";
-  import { paidPlan, proOffered } from "../net/plan";
+  import { paidPlan, proTier } from "../net/plan";
   import { gatewayWorkspace, isBrowserGateway } from "../net/base";
   import { projectWhere, projectWhereLabel } from "../net/placement";
   import type ClusterPage from "./ClusterPage.svelte";
@@ -45,9 +45,9 @@
   import { getJobContext, isHomeHub, type Health } from "../net/api";
   import { asyncDisposer } from "../shared/asyncDisposer";
   import { pageVisible } from "../shared/visibility";
-  import { fetchOwnershipHints } from "./placementHints";
+  import { fetchOwnershipHints, readsOwnership } from "./placementHints";
   import { relativeAge } from "./launcher";
-  import { checkForUpdates, MANAGED_UPDATES, updateState } from "./update.svelte";
+  import { APP_UPDATES, checkForUpdates, MANAGED_UPDATES, updateState } from "./update.svelte";
 
   interface Props {
     workspaces: Workspace[];
@@ -124,7 +124,10 @@
    *  remote host's Home or in a project view, which have no ownership here. */
   let placeHints = $state(new Map<string, string>());
   $effect(() => {
-    if (ownAlias !== null || isBrowserGateway() || !$pageVisible) return;
+    // Only an active plan has ownership to show: without one Home asks the
+    // daemon nothing about Pro (`proTier`).
+    if ($proTier !== "active" && untrack(() => placeHints.size) > 0) placeHints = new Map();
+    if (!readsOwnership({ tier: $proTier, remoteHome: ownAlias !== null, gateway: isBrowserGateway(), visible: $pageVisible })) return;
     let stopped = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
     const read = async (): Promise<void> => {
@@ -258,6 +261,7 @@
     // The account's cloud: nothing to check (a click shows the same line).
     if (d.managed) return `${v}. ${MANAGED_UPDATES}`;
     if (d.dev) return `${v}: release updates don't apply. Click to check anyway.`;
+    if (d.withApp) return `${v}. ${APP_UPDATES}`;
     const checked = d.checked_at === null ? null : relativeAge(d.checked_at, stampNow);
     const when = checked === null ? "" : checked === "now" ? " (checked just now)" : ` (checked ${checked} ago)`;
     switch (d.state) {
@@ -764,7 +768,7 @@
         >{/if}
     </button>
   {/if}
-  <HomeNavigation active="workspaces" plan={$paidPlan} showPro={isBrowserGateway() || (native && $proOffered === true)}
+  <HomeNavigation active="workspaces" plan={$paidPlan} showPro={$proTier !== "free"}
     onHome={() => {
       if (showBackToHome) void backToHome();
       else clusterView = null;
@@ -953,7 +957,7 @@
       {/if}
     </section>
 
-    {#if native && ownAlias === null && $paidPlan !== null}
+    {#if native && ownAlias === null && $proTier === "active"}
       <!-- The cloud projects list (and the Pro presentation copy behind it)
            loads only for a paid plan: it stays out of the always-loaded
            entry, whose budget the shell is close to. -->

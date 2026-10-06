@@ -3186,6 +3186,20 @@ journal replacement; checked settings failures; companion pruning and protection
 of unresolved/damaged orphan evidence. These tests use fixtures, not paid agents.
 The driver wire is unchanged; this pass does not claim new live CLI verification.
 
+Scope (2026-10-05): the durable sidecar applies only to a session spawned with
+`SpawnSpec.managed_execution` (work that can move to another machine). Every
+other chat keeps the same dispatch/receipt/withdrawal record in memory
+(`send_state::Receipts::Memory`): no sidecar or marker is written, a send costs
+no synced write, a slow disk cannot latch "delivery unconfirmed", and an
+existing sidecar is read when sound and ignored with a log line when damaged,
+so it never stops a chat from starting. Within one daemon life the client-visible
+answers (`Accepted`/`Duplicate`, `send_confirmed`, `send_cancelled`,
+`send_uncertain`) are unchanged; across a daemon restart such a chat has Pass 46's
+limits (journal echoes only: a send dispatched without an echo, or a withdrawal,
+is not remembered). A durable opener (managed spawn, transfer export/import)
+upgrades a cached store, whose next write persists everything kept so far, and
+refuses one whose evidence was ignored as damaged.
+
 `ChatManager::active_queued_ids` exposes at most 64 current-driver client IDs for
 ready/replay reconciliation. Only replayed queued rows at or before ready.head
 absent from this live set can be classified as lost/uncertain; newly arriving
