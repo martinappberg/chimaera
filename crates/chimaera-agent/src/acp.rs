@@ -326,20 +326,39 @@ impl AcpMapper {
     fn offer_grok_modes(&mut self, kind: &str) {
         self.grok_modes = kind == GROK.kind && self.modes.is_empty();
     }
-    fn list_grok_modes(&mut self) {
+    /// Called on every command list. The listing itself reads the current
+    /// mode back: the handshake's `Init` preceded it with no mode at all.
+    fn list_grok_modes(&mut self, step: &mut DriverStep) {
+        // A session that starts advertising a mode control owns the list.
+        if rows(&self.config).any(|c| c["category"] == "mode") {
+            self.grok_modes = false;
+            return;
+        }
         let listed = self.commands.iter().any(|c| c.name == ALWAYS_APPROVE);
-        self.modes = [("default", "Normal"), (ALWAYS_APPROVE, "Always-approve")]
-            .into_iter()
-            .filter(|_| listed)
-            .map(|(id, label)| ModeInfo {
-                id: id.into(),
-                label: label.into(),
-            })
-            .collect();
+        let before = self.modes.len();
+        self.modes = if listed {
+            [("default", "Normal"), (ALWAYS_APPROVE, "Always-approve")]
+                .into_iter()
+                .map(|(id, label)| ModeInfo {
+                    id: id.into(),
+                    label: label.into(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.mode = listed.then(|| self.grok_mode().into());
         self.caps.commands.retain(|c| c != "set_mode");
         if listed {
             self.caps.commands.push("set_mode".into());
+        }
+        if self.modes.len() == before {
+            step.events.push(self.catalog());
+            return;
+        }
+        step.events.extend(self.config_state(false).events);
+        if listed {
+            self.changed("mode", self.grok_mode().into(), false, step);
         }
     }
     fn grok_mode(&self) -> &'static str {
@@ -349,16 +368,25 @@ impl AcpMapper {
             "default"
         }
     }
+    /// The switch travels as a `session/prompt`, so it occupies the session
+    /// like a turn: sends wait behind it, and it waits behind a turn.
+    fn switching(&self) -> bool {
+        self.pending
+            .values()
+            .any(|p| matches!(p, Pending::AlwaysApprove(..)))
+    }
+    fn busy(&self) -> bool {
+        self.turn.is_some() || self.switching()
+    }
     fn set_grok_mode(&mut self, target: &str, chosen: bool, step: &mut DriverStep) {
         let offered = self.modes.iter().any(|m| m.id == target);
+        if self.turn.is_some() {
+            step.events.push(AgentEvent::Notice {
+                text: "Grok changes this between turns. It will switch when this turn ends.".into(),
+            });
+        }
         // A restore runs before Grok has listed its commands.
-        if self.turn.is_some() || (!offered && self.restoring) {
-            if self.turn.is_some() {
-                step.events.push(AgentEvent::Notice {
-                    text: "Grok changes this between turns. It will switch when this turn ends."
-                        .into(),
-                });
-            }
+        if self.busy() || (!offered && self.restoring) {
             self.deferred_mode = Some((target.into(), chosen));
             return;
         }
@@ -369,6 +397,13 @@ impl AcpMapper {
             return;
         }
         let on = target == ALWAYS_APPROVE;
+        if on == self.always_approve {
+            // Already there: a pick still reads back, a restore has nothing to say.
+            if chosen {
+                self.changed("mode", target.into(), true, step);
+            }
+            return;
+        }
         let text = format!("/{ALWAYS_APPROVE} {}", if on { "on" } else { "off" });
         self.request(
             "session/prompt",
@@ -377,12 +412,19 @@ impl AcpMapper {
             step,
         );
     }
-    fn send_deferred_mode(&mut self, step: &mut DriverStep) {
-        if self.turn.is_none() && self.deferred_mode.is_some() {
-            let offered = self.modes.iter().any(|m| m.id == ALWAYS_APPROVE);
-            if offered {
-                let (target, chosen) = self.deferred_mode.take().unwrap();
-                self.set_grok_mode(&target, chosen, step);
+    /// The session is free: first a held mode switch, then the next queued
+    /// send — never both in one step, as each is a `session/prompt`.
+    fn resume(&mut self, step: &mut DriverStep) {
+        if self.busy() {
+            return;
+        }
+        let listed = self.modes.iter().any(|m| m.id == ALWAYS_APPROVE);
+        if let Some((target, chosen)) = self.deferred_mode.take_if(|_| listed) {
+            self.set_grok_mode(&target, chosen, step);
+        }
+        if !self.busy() {
+            if let Some(item) = self.queue.pop_front() {
+                self.start(item, true, step);
             }
         }
     }
@@ -689,7 +731,7 @@ impl Mapper for AcpMapper {
                     });
                     return step;
                 }
-                if self.turn.is_some() {
+                if self.busy() {
                     step.events
                         .push(Self::echo(&blocks, id.clone(), true, true));
                     self.queue.push_back(Queued { id, blocks });
@@ -787,10 +829,28 @@ impl Mapper for AcpMapper {
                             option_id: "cancelled".into(),
                         });
                     }
-                    self.send_deferred_mode(&mut step);
-                    if let Some(item) = self.queue.pop_front() {
-                        self.start(item, true, &mut step);
+                    self.resume(&mut step);
+                }
+                // The command ran inside Grok when no model call was billed
+                // for it; anything else was read as an ordinary message.
+                Pending::AlwaysApprove(on, chosen) => {
+                    let result = &frame["result"];
+                    if let Some(message) = error {
+                        step.events.push(AgentEvent::Error {
+                            message,
+                            fatal: false,
+                        });
+                    } else if result["_meta"]["totalTokens"] == 0
+                        && result["stopReason"] != "cancelled"
+                    {
+                        self.always_approve = on;
+                        self.changed("mode", self.grok_mode().into(), chosen, &mut step);
+                    } else {
+                        step.events.push(AgentEvent::Notice {
+                            text: "Grok did not change always-approve".into(),
+                        });
                     }
+                    self.resume(&mut step);
                 }
                 _ if error.is_some() => step.events.push(AgentEvent::Error {
                     message: error.unwrap(),
@@ -812,17 +872,6 @@ impl Mapper for AcpMapper {
                     step.events.extend(self.config_state(false).events);
                 }
                 Pending::Model(value) => self.changed("model", value, true, &mut step),
-                // The command ran inside Grok when no model call was billed
-                // for it; anything else was read as an ordinary message.
-                Pending::AlwaysApprove(on, chosen)
-                    if frame["result"]["_meta"]["totalTokens"] == 0 =>
-                {
-                    self.always_approve = on;
-                    self.changed("mode", self.grok_mode().into(), chosen, &mut step);
-                }
-                Pending::AlwaysApprove(..) => step.events.push(AgentEvent::Notice {
-                    text: "Grok did not change always-approve".into(),
-                }),
                 Pending::Mode(value, chosen) => self.changed("mode", value, chosen, &mut step),
             }
             return step;
@@ -991,15 +1040,10 @@ impl Mapper for AcpMapper {
                     })
                     .collect();
                 if self.grok_modes {
-                    let before = self.modes.len();
-                    self.list_grok_modes();
-                    if self.modes.len() != before {
-                        step.events.extend(self.config_state(false).events);
-                    } else {
-                        step.events.push(self.catalog());
-                    }
-                    self.send_deferred_mode(&mut step);
-                } else {
+                    self.list_grok_modes(&mut step);
+                    self.resume(&mut step);
+                }
+                if !self.grok_modes {
                     step.events.push(self.catalog());
                 }
             }
@@ -1099,6 +1143,14 @@ mod tests {
         );
         assert_eq!(m.mode.as_deref(), Some("default"));
         assert!(step.events.iter().any(|e| matches!(e, AgentEvent::Capabilities { capabilities } if capabilities.commands.contains(&"set_mode".into()))));
+        // Init carried no mode: the listing reads the current one back.
+        assert_eq!(mode_events(&step), [("default".to_string(), false)]);
+        // Picking the mode already current sends nothing and still reads back.
+        let step = m.on_command(AgentCommand::SetMode {
+            mode_id: "default".into(),
+        });
+        assert!(step.outbound.is_empty());
+        assert_eq!(mode_events(&step), [("default".to_string(), true)]);
 
         let step = m.on_command(AgentCommand::SetMode {
             mode_id: "always-approve".into(),
@@ -1110,8 +1162,18 @@ mod tests {
         );
         // No turn, no user message: the switch is not conversation.
         assert!(step.events.is_empty());
+        // The switch is a prompt: a send meanwhile waits behind it.
+        let queued = send(&mut m, "hi");
+        assert!(queued.outbound.is_empty());
+        assert!(queued
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::UserMessage { queued: true, .. })));
         let acked = m.on_frame(&json!({"id":step.outbound[0]["id"],"result":{"stopReason":"end_turn","_meta":{"totalTokens":0}}}));
         assert_eq!(mode_events(&acked), [("always-approve".to_string(), true)]);
+        assert_eq!(acked.outbound[0]["params"]["prompt"][0]["text"], "hi");
+        assert!(m.turn.is_some());
+        m.on_frame(&json!({"id":acked.outbound[0]["id"],"result":{"stopReason":"end_turn"}}));
 
         // Tokens were billed: Grok read the text as a message, not a command.
         let step = m.on_command(AgentCommand::SetMode {
@@ -1124,6 +1186,24 @@ mod tests {
         let acked = m.on_frame(&json!({"id":step.outbound[0]["id"],"result":{"stopReason":"end_turn","_meta":{"totalTokens":120}}}));
         assert!(mode_events(&acked).is_empty());
         assert!(m.always_approve);
+
+        // A cancelled prompt ran nothing; an error frees the session too.
+        let step = m.on_command(AgentCommand::SetMode {
+            mode_id: "default".into(),
+        });
+        let acked = m.on_frame(&json!({"id":step.outbound[0]["id"],"result":{"stopReason":"cancelled","_meta":{"totalTokens":0}}}));
+        assert!(mode_events(&acked).is_empty());
+        assert!(m.always_approve);
+        let step = m.on_command(AgentCommand::SetMode {
+            mode_id: "default".into(),
+        });
+        send(&mut m, "after");
+        let acked = m.on_frame(&json!({"id":step.outbound[0]["id"],"error":{"message":"nope"}}));
+        assert!(acked
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Error { .. })));
+        assert_eq!(acked.outbound[0]["params"]["prompt"][0]["text"], "after");
 
         // The command disappears: so does the control.
         commands(&mut m, &["compact"]);
@@ -1160,12 +1240,30 @@ mod tests {
             .events
             .iter()
             .any(|e| matches!(e, AgentEvent::Notice { .. })));
+        // A message queued behind the turn goes out after the switch, not with it.
+        send(&mut m, "next");
         let done =
             m.on_frame(&json!({"id":turn.outbound[0]["id"],"result":{"stopReason":"end_turn"}}));
+        assert_eq!(done.outbound.len(), 1);
         assert_eq!(
             done.outbound[0]["params"]["prompt"][0]["text"],
             "/always-approve off"
         );
+        let acked = m.on_frame(&json!({"id":done.outbound[0]["id"],"result":{"stopReason":"end_turn","_meta":{"totalTokens":0}}}));
+        assert_eq!(mode_events(&acked), [("default".to_string(), true)]);
+        assert_eq!(acked.outbound[0]["params"]["prompt"][0]["text"], "next");
+
+        // A restore of the mode already current is silent: no prompt, no pick.
+        let mut fresh = mapper();
+        fresh.offer_grok_modes(GROK.kind);
+        fresh.restoring = true;
+        fresh.on_command(AgentCommand::SetMode {
+            mode_id: "default".into(),
+        });
+        fresh.restoring = false;
+        let step = commands(&mut fresh, &["always-approve"]);
+        assert!(step.outbound.is_empty());
+        assert_eq!(mode_events(&step), [("default".to_string(), false)]);
 
         // Other adapters, and a session with its own modes, are untouched.
         let mut agy = mapper();
