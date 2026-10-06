@@ -1634,11 +1634,16 @@ fn submission_lines(args: &str, stable: bool) -> String {
     } else {
         "rm -f \"$D/job.pending\"\n[ \"$rc\" -eq 0 ] || rm -rf \"$D\"\n"
     };
+    // Only a stable submission turns a failed record write into its own
+    // outcome. An ordinary one keeps main's behaviour: the job was queued,
+    // so it is reported started and its folder (its job.sh) is never
+    // removed under it.
+    let record_failed = if stable { " || rc=96" } else { "" };
     format!("{preflight}{before}out=$({locale}sbatch {args} \"$D/job.sh\" 2>\"$D/.sbatch.err\"); rc=$?\n{after}\
              id=${{out%%;*}}\n\
              case \"$id\" in ''|*[!0-9_]*) if [ \"$rc\" -eq 0 ]; then rc=97; fi ;; esac\n\
              if [ \"$rc\" -eq 0 ]; then\n\
-              sed \"s/__CHIMAERA_JOB_ID__/$id/\" \"$D/job.pending\" > \"$D/job.json.tmp\" && mv -f \"$D/job.json.tmp\" \"$D/job.json\" || rc=96\n\
+              sed \"s/__CHIMAERA_JOB_ID__/$id/\" \"$D/job.pending\" > \"$D/job.json.tmp\" && mv -f \"$D/job.json.tmp\" \"$D/job.json\"{record_failed}\n\
              fi\n\
              printf '===rc %s\\n===id %s\\n===err\\n' \"$rc\" \"$id\"; cat \"$D/.sbatch.err\" 2>/dev/null || true; rm -f \"$D/.sbatch.err\"\n\
              {remove}printf '===end\\n'\n")
@@ -3456,6 +3461,34 @@ mod tests {
         }
     }
 
+    /// An ordinary start whose record cannot be written (the folder is full
+    /// or read-only) still reports the job it queued, and never removes the
+    /// folder holding that job's script, as on main.
+    #[test]
+    fn ordinary_submission_keeps_a_queued_job_when_its_record_fails() {
+        let f =
+            SubmissionFixture::new("chmod 500 \"$HOME/cluster/j/j-1234abcd\"; printf '12345\\n'");
+        let mut script = String::from("umask 077\n");
+        script.push_str(&submission_claim("$HOME/cluster/j/j-1234abcd", false));
+        script.push_str(&write_file_lines("$D/job.pending", "{}"));
+        script.push_str(&write_file_lines("$D/job.sh", "exit 0"));
+        script.push_str(&submission_lines("--parsable", false));
+        let out = f.run(&script);
+        let dir = f.0.join("cluster/j/j-1234abcd");
+        let restore = || {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let kept = dir.join("job.sh").is_file();
+        restore();
+        assert!(
+            stdout.contains("===rc 0") && stdout.contains("===id 12345"),
+            "{stdout}"
+        );
+        assert!(kept, "the queued job's script stays");
+        assert!(!dir.join("job.json").exists());
+    }
     #[test]
     fn stable_submission_claim_prevents_duplicate_after_lost_reply() {
         let f = SubmissionFixture::new("printf '12345;cluster\\n'");
