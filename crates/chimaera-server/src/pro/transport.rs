@@ -23,6 +23,14 @@ static CHILDREN: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore:
 /// Account and keeper requests have their own small budget: a lease renewal
 /// must never queue behind a 16-minute push or fetch holding both Git slots.
 static REQUESTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(6)));
+/// The lease loop's own account calls (`/v1|v2/baton/...`: ownership reads,
+/// renewals, acquires, policy) never wait behind handoff or transfer calls,
+/// which hold a `REQUESTS` permit for up to 93 s: a reachable computer whose
+/// renewal queued past its local deadline would fence itself (review R4 S4).
+static LEASES: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(16)));
+fn lease_call(path: &str) -> bool {
+    path.starts_with("/v1/baton/") || path.starts_with("/v2/baton/")
+}
 static MIRROR_GIT: OnceCell<MirrorGit> = OnceCell::const_new();
 static UNCERTAIN_CACHES: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
@@ -1318,8 +1326,20 @@ async fn request_inner(
     } else {
         Duration::from_secs(15)
     };
-    let permit = Arc::new(REQUESTS.clone().acquire_owned().await?);
-    let mut output = run_reserved(command, input, timeout, JSON_CAP + 64, permit, None).await?;
+    // Waiting for a permit counts inside the same budget as the request.
+    let deadline = tokio::time::Instant::now() + timeout;
+    let pool: Arc<Semaphore> = if lease_call(path) {
+        Arc::clone(&LEASES)
+    } else {
+        Arc::clone(&REQUESTS)
+    };
+    let permit = Arc::new(
+        tokio::time::timeout_at(deadline, pool.acquire_owned())
+            .await
+            .map_err(|_| anyhow::anyhow!("service request timed out"))??,
+    );
+    let mut output =
+        run_reserved_prepared(command, input, deadline, JSON_CAP + 64, permit, None, None).await?;
     ensure!(output.success, "service is unavailable");
     let (status, from_account, marker) = trailer(&output.stdout)?;
     output.stdout.truncate(marker);
@@ -1540,6 +1560,67 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((plain.status, plain.from_account), (200, false));
+    }
+
+    /// Review R4 S4: handoff calls holding every ordinary request permit
+    /// (each up to 93 s) never starve a lease renewal, which has its own pool.
+    #[tokio::test]
+    async fn handoff_calls_never_starve_a_lease_renewal() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let held = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (seen, released) = (held.clone(), release.clone());
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let (seen, released) = (seen.clone(), released.clone());
+                tokio::spawn(async move {
+                    let mut request = vec![0u8; 4096];
+                    let n = socket.read(&mut request).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&request[..n]).into_owned();
+                    if request.contains("/pro/handoff") {
+                        // Held unanswered until the renewal is through.
+                        let wait = released.notified();
+                        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        wait.await;
+                        return;
+                    }
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                        )
+                        .await;
+                });
+            }
+        });
+        let handoffs: Vec<_> = (0..6)
+            .map(|_| {
+                let base = base.clone();
+                tokio::spawn(async move {
+                    let _ = request(&base, "/pro/handoff", "POST", "synthetic", None).await;
+                })
+            })
+            .collect();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while held.load(std::sync::atomic::Ordering::SeqCst) < 6 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("six handoff calls hold every ordinary permit");
+        let renewed = tokio::time::timeout(
+            Duration::from_secs(5),
+            request(&base, "/v2/baton/w-a/renew", "POST", "synthetic", None),
+        )
+        .await;
+        release.notify_waiters();
+        for handoff in handoffs {
+            let _ = handoff.await;
+        }
+        server.abort();
+        let renewed = renewed.expect("the renewal waited behind handoff calls");
+        assert_eq!(renewed.unwrap().status, 200);
     }
 
     #[tokio::test]

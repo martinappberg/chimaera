@@ -425,7 +425,9 @@ running. The account marks every answer it gives, errors included, with
 `X-Chimaera-Account: 1`, which only tells its own errors apart from a proxy's
 in the daemon's log. A success or a 409 counts as reaching it. A project
 whose "keep on this computer only" switch the account acknowledged holds no
-lease and is never fenced for one. The daemon renews up to 16 projects at once
+lease and is never fenced for one. The lease loop's account calls have their
+own 16 request slots, apart from handoff and transfer calls, and the wait for a
+slot counts inside each call's 15 seconds. The daemon renews up to 16 projects at once
 and waits for a pass at most 20 seconds; a slower project's renewal continues
 on its own and later passes skip it until it ends.
 
