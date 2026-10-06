@@ -1345,10 +1345,7 @@ impl ChatManager {
     pub fn native_ui(&self, id: &str, command: NativeUiCommand) -> Result<()> {
         let session = self.get_session(id)?;
         let budget = session.command_budget.lock().expect("command budget lock");
-        anyhow::ensure!(
-            !budget.commands_paused,
-            "session is paused for transfer; retry after the project returns"
-        );
+        anyhow::ensure!(!budget.commands_paused, "session is paused; retry shortly");
         // Serialize this separate channel with the same lifecycle fence.
         let permit = session
             .native_ui_tx
@@ -1607,7 +1604,7 @@ impl ChatManager {
                 .lock()
                 .expect("command budget lock")
                 .commands_paused,
-            "session is paused for transfer; retry after the project returns"
+            "session is paused; retry shortly"
         );
         let mut reservation = if let Some(bytes) = cmd.retained_send_bytes() {
             let token = session
