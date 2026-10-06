@@ -592,10 +592,6 @@ impl SnapshotOwner {
         };
         config::export_with_image(sources, destination, budget, image).await
     }
-    /// Environment variable names the last move into this project left out.
-    pub fn missing_environment(&self) -> Vec<String> {
-        crate::pro::missing_environment(&self.project.state, &self.project.workspace)
-    }
     pub fn metadata(&self) -> Option<super::super::projects::catalog::Metadata> {
         super::super::projects::catalog::metadata(self.name(), self.visible())
     }
