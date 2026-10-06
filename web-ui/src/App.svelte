@@ -329,6 +329,7 @@
     onFocusSession,
     onMenu,
     onUnsavedPrompt,
+    openWindow,
     openDetachedPopup,
     openDetachedWindow,
     replyUnsaved,
@@ -6418,7 +6419,19 @@
 
 
 {#if pickerOpen}
-  <FolderPicker recents={workspaces} onOpened={activateWorkspace} onClose={closePicker} />
+  <!-- Home row: raises (or opens) this host's Home launcher without leaving
+       this window's workspace — a promoted window never turns back into Home. -->
+  <FolderPicker
+    recents={workspaces}
+    onOpened={activateWorkspace}
+    onClose={closePicker}
+    onHome={activeWsId !== null
+      ? () => {
+          closePicker();
+          void openWindow(scopeAlias, null);
+        }
+      : undefined}
+  />
 {/if}
 
 {#if quickOpenOpen && activeWsId !== null}

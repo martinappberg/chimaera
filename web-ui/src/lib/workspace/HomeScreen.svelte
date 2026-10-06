@@ -108,7 +108,11 @@
   const shownWorkspaces = $derived.by(() => {
     const q = filter.trim().toLowerCase();
     if (q === "") return sorted;
-    return sorted.filter((w) => w.name.toLowerCase().includes(q) || w.root.toLowerCase().includes(q));
+    // Short queries match names only: every path under ~ shares letters, so
+    // one or two characters would match everything.
+    return sorted.filter(
+      (w) => w.name.toLowerCase().includes(q) || (q.length >= 3 && w.root.toLowerCase().includes(q)),
+    );
   });
   /** Names that appear twice keep their path visible: it is the only thing
    *  telling those rows apart. */
@@ -1860,10 +1864,15 @@
   .workspace-meta .when { font-family: inherit; font-size: var(--text-xs); margin-left: 0; }
   .live-slot { display: inline-grid; align-items: center; justify-items: end; }
   .live-slot > * { grid-area: 1 / 1; }
+  /* End sessions replaces the live count in place: same size and type, no
+     chrome — it reads as the count turning into an action. The count must not
+     catch the pointer (an opacity:0 sibling would paint over the button). */
+  .live-slot .session-state { pointer-events: none; }
   .workspace-meta .side.stop {
-    display: inline-flex; visibility: visible; opacity: 0; min-height: 0; height: 24px; padding: 0 8px; margin: -4px 0;
-    border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent); border-radius: 6px;
-    color: var(--warn); font-size: var(--text-xs); line-height: 1;
+    display: inline-flex; visibility: visible; opacity: 0; min-height: 0; padding: 0; margin: 0;
+    border: none; background: none; font-size: var(--text-xs); line-height: inherit; color: var(--warn);
+    text-decoration: underline; text-decoration-color: color-mix(in srgb, var(--warn) 40%, transparent); text-underline-offset: 3px;
+    white-space: nowrap;
   }
   .live-slot:hover .session-state, .live-slot:focus-within .session-state { opacity: 0; }
   .live-slot:hover .side.stop, .live-slot:focus-within .side.stop { opacity: 1; }
@@ -1885,7 +1894,7 @@
     .live-slot .side.stop { opacity: 1; }
     .workspace-row .workspace-label .path { opacity: 1; }
   }
-  .workspace-meta .side.stop:hover { color: var(--err); border-color: color-mix(in srgb, var(--err) 55%, transparent); background: var(--row-active); }
+  .workspace-meta .side.stop:hover { color: var(--err); text-decoration-color: currentColor; }
   .host-card { border: 1px solid var(--edge); border-radius: 10px; padding: 5px; }
   .remotes .rows { gap: 10px; }
   .host-name { display: flex; align-items: center; gap: 9px; min-width: 0; }
