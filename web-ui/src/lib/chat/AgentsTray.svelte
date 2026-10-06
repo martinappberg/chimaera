@@ -1,7 +1,10 @@
 <script lang="ts">
   import WorkTray from "../shared/WorkTray.svelte";
   import WorkTrayRow from "../shared/WorkTrayRow.svelte";
-  import type { ChatBlock } from "./store.svelte";
+  import SubagentChip from "./SubagentChip.svelte";
+  import ModelChip from "./ModelChip.svelte";
+  import type { ChatBlock, SubagentInfo } from "./store.svelte";
+  import { subagentTitle } from "./subagentView";
 
   /**
    * A live monitor for the subagents running RIGHT NOW, pinned above the
@@ -19,21 +22,21 @@
   interface Props {
     /** Subagent tool rows still in flight (kind "agent", pending/running). */
     agents: Extract<ChatBlock, { kind: "tool" }>[];
+    /** What the agent has said about each subagent, by tool row id — the
+     *  model chip, and the handle its conversation opens by. */
+    subagents?: ReadonlyMap<string, SubagentInfo>;
+    /** A model id as the picker labels it. */
+    modelName?: (id: string) => string;
+    /** Open a subagent's own conversation (its agent handle + label). */
+    onOpen?: (agentId: string, title: string, newSplit: boolean) => void;
     /** Stop a subagent (claude stop_task). Omitted when unsupported. */
     onStop?: (id: string) => void;
     /** False while the owning retained chat tab is hidden. */
     visible?: boolean;
   }
-  let { agents, onStop, visible = true }: Props = $props();
+  let { agents, subagents, modelName, onOpen, onStop, visible = true }: Props = $props();
 
-  /** The driver titles these "Agent: {description}" — the prefix is the tray's
-   *  own label, so drop it from each row. */
-  function name(title: string): string {
-    for (const prefix of ["Agent: ", "Task: "]) {
-      if (title.startsWith(prefix)) return title.slice(prefix.length);
-    }
-    return title;
-  }
+  const name = subagentTitle;
   function progress(b: Extract<ChatBlock, { kind: "tool" }>): string {
     return b.content?.kind === "output" ? (b.content.text ?? "").trim() : "";
   }
@@ -53,9 +56,18 @@
       stopTitle="stop this subagent"
       {visible}
     >
+      {@const info = subagents?.get(agent.id)}
+      <SubagentChip
+        onOpen={info?.agentId != null && onOpen !== undefined
+          ? (newSplit) => onOpen?.(info.agentId as string, name(agent.title), newSplit)
+          : undefined}
+      />
       <span class="name">{name(agent.title)}</span>
       {#if progress(agent)}
         <span class="progress">{progress(agent)}</span>
+      {/if}
+      {#if info?.model}
+        <ModelChip model={info.model} {modelName} />
       {/if}
     </WorkTrayRow>
   {/each}

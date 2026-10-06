@@ -15,52 +15,32 @@
  */
 
 import { ChatSocket, type ChatSessionInfo, type SeqEvent } from "./chatWs";
+import { disposeChat, POOL_CAP, pool, tick, type ChatTransport } from "./chatPoolRegistry";
 import { ChatStore } from "./store.svelte";
+import { parseSubagentChatId, type SubagentRef } from "./subagentView";
 
-interface ChatEntry {
-  store: ChatStore;
-  socket: ChatSocket;
-  /** Saved transcript scroll position, restored on the next mount. */
-  scrollTop: number;
-  atBottom: boolean;
-  /** Block range last rendered by ChatView, in trim-stable VIRTUAL
-   *  coordinates (array index + the store's trimmedCount at save time), so a
-   *  reducer cap trim while the view is unmounted cannot leave the cursor
-   *  naming the wrong rows. `epoch` stamps the transcript generation the
-   *  coordinates belong to — a journal reset restarts the numbering, so a
-   *  cursor from another generation must be discarded, never converted.
-   *  Keeping this tiny view cursor separate from the reducer lets an evicted
-   *  view restore the same reading window without remounting the entire
-   *  transcript. */
-  renderWindow: { start: number; end: number; tail: boolean; epoch: number } | null;
-  /** Transcript revision the reader has actually followed. This is separate
-   *  from the socket sequence: model/rate-limit/control events should not
-   *  manufacture a "new activity" badge, and an MRU eviction must not forget
-   *  that background output is still unread. */
-  followedVersion: number | null;
-  /** performance.now() when the current turn started (null when idle). Kept
-   *  here, NOT in the reducer, so the elapsed-turn counter survives a remount
-   *  (a tab switch mid-turn) without ever leaking a clock into journal replay. */
-  turnStart: number | null;
-  /** Outstanding acquireChat holds (mounted ChatViews, dashboard rich cards).
-   *  LRU eviction only ever touches entries at zero — disposing a held
-   *  entry's socket would silently kill a mounted view's event stream. */
-  refs: number;
-  lastUsed: number;
+export { disposeAllChats, disposeChat, syncChatSessions, type ChatTransport } from "./chatPoolRegistry";
+
+let subagentTransport: ((ref: SubagentRef, store: ChatStore) => ChatTransport) | null = null;
+
+/** Registered by the chat chunk at load: how to feed a subagent view's
+ *  store. Only a mounted ChatView ever acquires a subagent id, so the
+ *  factory is always in place by the time one is needed. */
+export function provideSubagentTransport(
+  factory: (ref: SubagentRef, store: ChatStore) => ChatTransport,
+): void {
+  subagentTransport = factory;
 }
-
-/** Warm entries beyond this many (not currently mounted) are LRU-evicted. */
-const POOL_CAP = 8;
-
-const pool = new Map<string, ChatEntry>();
-/** Monotonic clock stand-in (Date.now is unavailable in some contexts and
- *  irrelevant here — we only need ordering). */
-let tick = 0;
 
 /** Wire a fresh socket to `store` for `sessionId`, moving the handler set that
  *  used to live in ChatView. The store IS the sink — every handler is a pure
  *  store mutation, so the same wiring works whether the store is new or warm. */
-function makeSocket(sessionId: string, store: ChatStore): ChatSocket {
+function makeSocket(sessionId: string, store: ChatStore): ChatTransport {
+  const subagent = parseSubagentChatId(sessionId);
+  if (subagent !== null) {
+    if (subagentTransport === null) throw new Error("subagent view opened before the chat chunk loaded");
+    return subagentTransport(subagent, store);
+  }
   return new ChatSocket(sessionId, {
     onReady: (info: ChatSessionInfo, replayFrom: number, head: number | undefined) =>
       store.onReady(info, replayFrom, head),
@@ -83,7 +63,7 @@ function makeSocket(sessionId: string, store: ChatStore): ChatSocket {
  * surviving store — lastSeq is preserved, so the re-attach gap-replays from
  * the ring rather than refetching the whole journal.
  */
-export function acquireChat(sessionId: string): { store: ChatStore; socket: ChatSocket } {
+export function acquireChat(sessionId: string): { store: ChatStore; socket: ChatTransport } {
   let entry = pool.get(sessionId);
   if (entry === undefined) {
     const store = new ChatStore();
@@ -96,16 +76,16 @@ export function acquireChat(sessionId: string): { store: ChatStore; socket: Chat
       followedVersion: null,
       turnStart: null,
       refs: 0,
-      lastUsed: ++tick,
+      lastUsed: tick.next(),
     };
     pool.set(sessionId, entry);
   } else if (!entry.socket.healthy) {
     // The socket died while parked; heal it without losing the transcript.
     entry.socket.close();
     entry.socket = makeSocket(sessionId, entry.store);
-    entry.lastUsed = ++tick;
+    entry.lastUsed = tick.next();
   } else {
-    entry.lastUsed = ++tick;
+    entry.lastUsed = tick.next();
   }
   entry.refs += 1;
   return { store: entry.store, socket: entry.socket };
@@ -119,7 +99,7 @@ export function releaseChat(sessionId: string): void {
   const entry = pool.get(sessionId);
   if (entry !== undefined) {
     entry.refs = Math.max(0, entry.refs - 1);
-    entry.lastUsed = ++tick;
+    entry.lastUsed = tick.next();
   }
   if (pool.size > POOL_CAP) {
     const parked = [...pool.entries()]
@@ -194,26 +174,4 @@ export function chatTurnStart(sessionId: string, running: boolean, now: number):
   }
   entry.turnStart ??= now;
   return entry.turnStart;
-}
-
-/** Close the socket and drop the entry (a session that ended, toggled to a
- *  terminal, or the app unmounting). Idempotent. */
-export function disposeChat(sessionId: string): void {
-  const entry = pool.get(sessionId);
-  if (entry === undefined) return;
-  entry.socket.close();
-  pool.delete(sessionId);
-}
-
-/** Drop every pooled chat whose session is no longer live (mirrors termPool's
- *  syncSessions). Called from App's session-snapshot effect. */
-export function syncChatSessions(liveIds: ReadonlySet<string>): void {
-  for (const id of [...pool.keys()]) {
-    if (!liveIds.has(id)) disposeChat(id);
-  }
-}
-
-/** Tear the whole pool down (app unmount). */
-export function disposeAllChats(): void {
-  for (const id of [...pool.keys()]) disposeChat(id);
 }

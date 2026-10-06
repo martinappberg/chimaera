@@ -368,6 +368,7 @@ async fn spawn_neutralizes_stale_background_set_in_reused_journal() {
                     agents_done: 0,
                     monitor: false,
                     ambient: false,
+                    model: None,
                     tool_use_id: None,
                 }],
                 closed: Vec::new(),

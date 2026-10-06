@@ -146,6 +146,15 @@ export interface LayoutCtrl {
    * the window has one pane / `newSplit` (Cmd/Ctrl) is set.
    */
   openChangesFrom(paneId: string, sessionId: string, newSplit: boolean): void;
+  /** Open (or focus) one of a chat's subagents as a read-only view of its
+   *  own: a tab beside the chat, or a split with `newSplit`. */
+  openSubagentFrom(
+    paneId: string,
+    sessionId: string,
+    agentId: string,
+    title: string,
+    newSplit: boolean,
+  ): void;
   /** Persist a Finder instance's current directory (its navigation state). */
   navigateFinder(id: string, path: string): void;
   /** Persist a browser instance's current in-app path (navigation state). */

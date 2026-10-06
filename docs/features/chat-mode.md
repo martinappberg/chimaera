@@ -564,6 +564,24 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   The plan/todo panel likewise surfaces the current step in its
   summary ("plan · 1/3 · ◐ …"). Both are pure derivations over `blocks`/`plan` — no new events
   (`AgentsTray.svelte`).
+- **Which model each subagent runs on, and open a subagent as its own chat.** Every subagent row —
+  the agents tray, the background tray's `agent` lanes, the "Agent:" tool card and the "Agent “…”
+  finished" line — shows the model actually serving it, in the agent's own words (claude's served id
+  such as `claude-haiku-4-5-20251001`, labelled through the model catalog when it lists it; codex's
+  child-thread model) once the wire names it (`subagent_info`, latest-wins per row; the background
+  lane carries `model` too). Pressing the small **agent** label on a tray row (or ↗ on the tool card,
+  or **conversation** on the finished line; ⌘-click for a split) opens the subagent's own
+  conversation as a tab next to the chat: the same transcript rendering (prose, thoughts, tool
+  cards, its nested agents), under a header that says whose it is — "Subagent of ‹chat› · what it
+  was asked · kind · model · working/finished · read-only". It has no composer, pickers, fork or
+  rewind: a subagent answers to the chat that started it, so you steer it by messaging that chat.
+  The view follows a working subagent (a re-read every 2.5 s while the tab is visible and the parent
+  still lists it as running; one closing read after), appending rather than reloading, and closes
+  with its parent chat. Where it comes from: claude writes each subagent's full conversation to
+  `<session>/subagents/agent-<id>.jsonl` beside the parent's transcript (read by the daemon,
+  `GET /sessions/{id}/subagents/{agent_id}/transcript`); codex keeps it as a child thread readable
+  only on the live app-server connection (`thread/read`, through the driver). Antigravity and Grok
+  report no subagents on their wires, so they show neither. PROTOCOL.md Pass 42.
 - **The task list is the plan panel, whichever tool spells it.** Claude replaced `TodoWrite` with an
   incremental `TaskCreate`/`TaskUpdate`/`TaskList` family; both feed the same pinned panel and
   neither leaves bookkeeping rows in the transcript. Because the new family carries more than a
@@ -1053,6 +1071,22 @@ _Intent pending — not yet captured from the maintainer (shipped 2026-07-16, au
   improvement in the PR #63 intent capture, and the two-driver-symmetry rule made claude's Agent-row
   surface the natural mapping target. The thread-scoping gate is wire-correctness, not a choice —
   see PROTOCOL.md Pass 16. Run **capture-feature-intent** with the maintainer to replace this stub.
+
+### Subagent models + open a subagent as its own chat — why it exists
+_Captured 2026-10-05 (from the maintainer's request, in his words; the questionnaire has not run — see **capture-feature-intent**)._
+
+- **Problem it solves:** with several subagents in the background tray ("3 agents in the background")
+  one could not see "which models these subagents are running (for all different providers)", and
+  there was no way to look inside one: the maintainer wanted to "press the little 'agent' label" and
+  "open them up as their own chat so you can see everything going on in there … if you want to
+  inspect outputs".
+- **Deliberate:** the view must be "UI clearly labeled that it is a subagent of chat x" — hence the
+  header that names the parent chat and says read-only, rather than a look-alike chat tab. He
+  framed it as "still a fix I feel, because this is not really a feature anyway": parity with what
+  the agents already know, not new capability.
+- **Deliberately open:** the model is shown verbatim in the agent's vocabulary (never relabelled);
+  codex's `agentNickname` is not used as a label yet; a codex child history past the 8 MiB line cap
+  would need `thread/turns/list` paging.
 
 ### Codex parity (review · launch model · math · timed questions) — why it exists
 _Intent pending — not yet captured from the maintainer (shipped 2026-07-17, autonomous session)._

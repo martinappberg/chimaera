@@ -170,8 +170,18 @@ fn background_task_from_wire(t: &Value, now: u64) -> Option<BackgroundTask> {
         agents_done: 0,
         monitor: false,
         ambient: t["ambient"] == json!(true),
+        model: None,
         tool_use_id: wire_tool_use_id(t),
     })
+}
+
+/// What the wire has said about one subagent (see `ClaudeMapper::subagents`).
+#[derive(Default, PartialEq, Eq)]
+struct SubagentFacts {
+    /// The task id — also the name of its transcript file.
+    agent_id: Option<String>,
+    model: Option<String>,
+    agent_type: Option<String>,
 }
 
 /// The two workflow-binding fields, extracted ONCE for both frames that can
@@ -803,6 +813,10 @@ struct ClaudeMapper {
     /// (the close frame carries no description). Same lifetime as
     /// `task_rows`; bounded by [`TASK_LABELS_CAP`].
     task_labels: HashMap<String, String>,
+    /// Subagent row id → what the wire has said about it so far (its task
+    /// id, served model, kind). Opens with the row's `task_started`, closes
+    /// with its `task_notification`; bounded by [`TASK_LABELS_CAP`].
+    subagents: HashMap<String, SubagentFacts>,
     /// tool_use ids of this turn's `Monitor` calls: the lane their
     /// task_started announces is a watch, not a job (`BackgroundTask.monitor`).
     /// Bounded by [`TASK_LABELS_CAP`]; cleared per turn like `agent_tools`.
@@ -1029,6 +1043,7 @@ impl ClaudeMapper {
             native_ui: crate::native_ui::ClaudeUi::default(),
             noticed_controls: HashSet::new(),
             task_rows: HashMap::new(),
+            subagents: HashMap::new(),
             agent_tools: HashMap::new(),
             task_labels: HashMap::new(),
             monitor_tools: HashSet::new(),
@@ -1283,6 +1298,20 @@ impl ClaudeMapper {
                 .as_str()
                 .is_some_and(|s| s.starts_with("task_"))
         {
+            // Hidden, but each of the subagent's own assistant frames names
+            // the model serving it (live 2.1.289) — the one thing read here.
+            if let (Some(row), Some(model)) = (
+                frame["parent_tool_use_id"].as_str(),
+                frame["message"]["model"].as_str(),
+            ) {
+                self.note_subagent(
+                    row,
+                    None,
+                    Some(model),
+                    frame["subagent_type"].as_str(),
+                    &mut step,
+                );
+            }
             return step;
         }
         match frame["type"].as_str() {
@@ -1493,15 +1522,16 @@ impl ClaudeMapper {
                         .find(|(id, desc)| desc.as_str() == description && !claimed.contains(*id))
                         .map(|(id, _)| id.clone())
                 });
-                match existing {
+                let row = match existing {
                     Some(id) => {
-                        self.task_rows.insert(task_id, id);
+                        self.task_rows.insert(task_id.clone(), id.clone());
+                        id
                     }
                     None => {
                         let row = format!("task:{task_id}");
-                        self.task_rows.insert(task_id, row.clone());
+                        self.task_rows.insert(task_id.clone(), row.clone());
                         step.events.push(AgentEvent::ToolCall {
-                            id: row,
+                            id: row.clone(),
                             kind: ToolKind::Agent,
                             title: format!("Agent: {description}"),
                             locations: Vec::new(),
@@ -1509,8 +1539,19 @@ impl ClaudeMapper {
                             cross_turn: false,
                             command: None,
                         });
+                        row
                     }
+                };
+                if self.subagents.len() < TASK_LABELS_CAP {
+                    self.subagents.entry(row.clone()).or_default();
                 }
+                self.note_subagent(
+                    &row,
+                    Some(&task_id),
+                    None,
+                    frame["subagent_type"].as_str(),
+                    step,
+                );
             }
             Some("task_progress") => {
                 // A workflow lane's progress carries the per-agent
@@ -1801,6 +1842,15 @@ impl ClaudeMapper {
                         };
                     // The flag can flip on a live entry (the set re-emits).
                     task.ambient = t["ambient"] == json!(true);
+                    // A foreground subagent moved to the background arrives
+                    // here with its model already known.
+                    if task.model.is_none() {
+                        task.model = self
+                            .subagents
+                            .values()
+                            .find(|facts| facts.agent_id.as_deref() == Some(id))
+                            .and_then(|facts| facts.model.clone());
+                    }
                     next.push(task);
                 }
                 next.reverse();
@@ -1823,6 +1873,8 @@ impl ClaudeMapper {
                 // outlived its turn is a `local_agent` lane in the set.
                 let row = self.task_rows.remove(task_id);
                 let row_label = self.task_labels.remove(task_id);
+                self.subagents
+                    .retain(|_, facts| facts.agent_id.as_deref() != Some(task_id));
                 // take_background consumes the ONE residency the id has —
                 // live set (notification first) or departed (set-removal
                 // first, the live-verified settle order) — so the verdict
@@ -2108,6 +2160,58 @@ impl ClaudeMapper {
         }
     }
 
+    /// Fold what a frame says about the subagent on `row` and tell clients
+    /// when it is news: one `SubagentInfo` carrying everything known, and the
+    /// model onto the agent's background lane, if it has one. Only for a
+    /// subagent whose row this driver opened or is about to (`agent_tools`) —
+    /// a nested subagent's frames name a tool call inside a hidden
+    /// transcript, which has no row here.
+    fn note_subagent(
+        &mut self,
+        row: &str,
+        agent_id: Option<&str>,
+        model: Option<&str>,
+        agent_type: Option<&str>,
+        step: &mut DriverStep,
+    ) {
+        if !self.subagents.contains_key(row) {
+            if !self.agent_tools.contains_key(row) || self.subagents.len() >= TASK_LABELS_CAP {
+                return;
+            }
+            self.subagents
+                .insert(row.to_string(), SubagentFacts::default());
+        }
+        let Some(facts) = self.subagents.get_mut(row) else {
+            return;
+        };
+        use crate::subagent::{learn_label, SUBAGENT_ID_MAX, SUBAGENT_MODEL_MAX};
+        // `<synthetic>` is the CLI's own placeholder on error frames.
+        fn real(value: Option<&str>) -> Option<&str> {
+            value.filter(|v| *v != "<synthetic>")
+        }
+        let mut changed = learn_label(&mut facts.agent_id, real(agent_id), SUBAGENT_ID_MAX);
+        changed |= learn_label(&mut facts.model, real(model), SUBAGENT_MODEL_MAX);
+        changed |= learn_label(&mut facts.agent_type, real(agent_type), SUBAGENT_ID_MAX);
+        if !changed {
+            return;
+        }
+        step.events.push(AgentEvent::SubagentInfo {
+            id: row.to_string(),
+            agent_id: facts.agent_id.clone(),
+            model: facts.model.clone(),
+            agent_type: facts.agent_type.clone(),
+        });
+        let (Some(agent_id), Some(model)) = (facts.agent_id.clone(), facts.model.clone()) else {
+            return;
+        };
+        if let Some(task) = self.background_tasks.iter_mut().find(|t| t.id == agent_id) {
+            if task.model.as_deref() != Some(model.as_str()) {
+                task.model = Some(model);
+                self.emit_background_tasks(Vec::new(), step);
+            }
+        }
+    }
+
     /// One `BackgroundTasks` event carrying the WHOLE current set (level-set
     /// semantics — the reducer replaces, so replay converges on the last
     /// event) plus any tasks that just left it with a verdict.
@@ -2195,6 +2299,27 @@ impl ClaudeMapper {
             self.last_msg_uuid = Some(uuid.to_string());
         }
         self.on_tool_results(&frame["message"], frame.get("tool_use_result"), step);
+        // An agent launched in the background answers at once with the model
+        // it resolved to (live 2.1.289: `tool_use_result {status:
+        // "async_launched", agentId, resolvedModel}`) — before the subagent's
+        // first frame.
+        if let Some(model) = frame["tool_use_result"]["resolvedModel"].as_str() {
+            let row = frame["message"]["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|b| b["type"] == "tool_result")
+                .and_then(|b| b["tool_use_id"].as_str());
+            if let Some(row) = row {
+                self.note_subagent(
+                    row,
+                    frame["tool_use_result"]["agentId"].as_str(),
+                    Some(model),
+                    None,
+                    step,
+                );
+            }
+        }
         self.on_remote_user_text(frame, step);
     }
 
@@ -7930,6 +8055,146 @@ pub(crate) mod tests {
         ));
     }
 
+    /// One `SubagentInfo` as (row, agent_id, model, type).
+    type InfoRow = (String, Option<String>, Option<String>, Option<String>);
+
+    /// The `SubagentInfo` events of a step.
+    fn subagent_infos(step: &DriverStep) -> Vec<InfoRow> {
+        step.events
+            .iter()
+            .filter_map(|ev| match ev {
+                AgentEvent::SubagentInfo {
+                    id,
+                    agent_id,
+                    model,
+                    agent_type,
+                } => Some((
+                    id.clone(),
+                    agent_id.clone(),
+                    model.clone(),
+                    agent_type.clone(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn agent_tool_use(id: &str, description: &str) -> Value {
+        json!({
+            "type": "assistant",
+            "message": { "id": format!("m-{id}"), "content": [{
+                "type": "tool_use", "id": id, "name": "Agent",
+                "input": { "description": description, "prompt": "…" },
+            }]},
+        })
+    }
+
+    #[test]
+    fn subagent_info_names_the_task_then_the_served_model() {
+        // Live order (2.1.289): the Agent tool_use, `task_started` (the task
+        // id — also its transcript's file name), then the subagent's own
+        // hidden frames, each naming the model serving it.
+        let mut m = mapper();
+        m.on_frame(&agent_tool_use("tu-a", "audit the tests"));
+        let started = m.on_frame(&json!({
+            "type": "system", "subtype": "task_started", "task_type": "local_agent",
+            "task_id": "a0dd2a5017a275850", "tool_use_id": "tu-a",
+            "description": "audit the tests", "subagent_type": "general-purpose",
+        }));
+        assert_eq!(
+            subagent_infos(&started),
+            vec![(
+                "tu-a".into(),
+                Some("a0dd2a5017a275850".into()),
+                None,
+                Some("general-purpose".into())
+            )]
+        );
+        let hidden = json!({
+            "type": "assistant", "parent_tool_use_id": "tu-a",
+            "subagent_type": "general-purpose",
+            "message": { "id": "sub-1", "model": "claude-opus-5-5", "content": [{
+                "type": "tool_use", "id": "tu-inner", "name": "Read", "input": {},
+            }]},
+        });
+        let first = m.on_frame(&hidden);
+        assert_eq!(
+            subagent_infos(&first),
+            vec![(
+                "tu-a".into(),
+                Some("a0dd2a5017a275850".into()),
+                Some("claude-opus-5-5".into()),
+                Some("general-purpose".into())
+            )]
+        );
+        assert_eq!(first.events.len(), 1, "the frame itself stays hidden");
+        // Every later frame repeats the model: nothing new, nothing emitted.
+        assert!(m.on_frame(&hidden).events.is_empty());
+        // The CLI's placeholder on error frames is not a model.
+        let mut synthetic = hidden.clone();
+        synthetic["message"]["model"] = json!("<synthetic>");
+        assert!(m.on_frame(&synthetic).events.is_empty());
+    }
+
+    #[test]
+    fn nested_subagent_frames_have_no_row_to_describe() {
+        // A subagent's own subagent names a tool call inside the hidden
+        // transcript; there is no row here for it.
+        let mut m = mapper();
+        let step = m.on_frame(&json!({
+            "type": "assistant", "parent_tool_use_id": "tu-inner-agent",
+            "message": { "id": "x", "model": "claude-haiku-4-5", "content": [] },
+        }));
+        assert!(step.events.is_empty());
+    }
+
+    #[test]
+    fn background_agent_lane_carries_its_resolved_model() {
+        // Live order for a background launch: the set adopts the lane,
+        // `task_started` binds it to the card, and the launch tool_result
+        // carries `resolvedModel` before the subagent's first frame.
+        let mut m = mapper();
+        m.on_frame(&agent_tool_use("tu-b", "bg read"));
+        m.on_frame(&json!({
+            "type": "system", "subtype": "background_tasks_changed",
+            "tasks": [{ "task_id": "ae12", "task_type": "local_agent", "description": "bg read" }],
+        }));
+        m.on_frame(&json!({
+            "type": "system", "subtype": "task_started", "task_type": "local_agent",
+            "task_id": "ae12", "tool_use_id": "tu-b", "description": "bg read",
+            "is_backgrounded": true,
+        }));
+        let launched = m.on_frame(&json!({
+            "type": "user",
+            "message": { "role": "user", "content": [{
+                "type": "tool_result", "tool_use_id": "tu-b",
+                "content": [{ "type": "text", "text": "Async agent launched successfully." }],
+            }]},
+            "tool_use_result": {
+                "isAsync": true, "status": "async_launched", "agentId": "ae12",
+                "resolvedModel": "claude-haiku-4-5-20251001",
+            },
+        }));
+        assert_eq!(
+            subagent_infos(&launched),
+            vec![(
+                "tu-b".into(),
+                Some("ae12".into()),
+                Some("claude-haiku-4-5-20251001".into()),
+                None
+            )]
+        );
+        let (tasks, _) = background_event(&launched);
+        assert_eq!(tasks[0].id, "ae12");
+        assert_eq!(tasks[0].model.as_deref(), Some("claude-haiku-4-5-20251001"));
+        // The close forgets the facts: a recycled row id starts clean.
+        m.on_frame(&json!({
+            "type": "system", "subtype": "task_notification", "task_id": "ae12",
+            "tool_use_id": "tu-b", "status": "completed", "summary": "done",
+        }));
+        assert!(m.subagents.is_empty());
+    }
+
     /// The one BackgroundTasks event a step should carry, destructured.
     fn background_event(step: &DriverStep) -> (&Vec<BackgroundTask>, &Vec<BackgroundTaskClose>) {
         let mut found = None;
@@ -8736,9 +9001,13 @@ pub(crate) mod tests {
             "tool_use_id": "tu-b", "description": "explore",
         }));
         assert!(
-            step.events.is_empty(),
+            !step
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolCall { .. })),
             "bound to the card, no synthetic row"
         );
+        assert_eq!(subagent_infos(&step)[0].0, "tu-b");
         let step = m.on_frame(&json!({
             "type": "system", "subtype": "task_progress",
             "task_id": "tk-b", "usage": { "tool_uses": 3 },
@@ -8778,7 +9047,13 @@ pub(crate) mod tests {
             "task_type": "local_agent", "task_id": "tk-r",
             "tool_use_id": "tu-r", "description": "scan crates",
         }));
-        assert!(step.events.is_empty(), "claims the card, no duplicate row");
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolCall { .. })),
+            "claims the card, no duplicate row"
+        );
     }
 
     #[test]
