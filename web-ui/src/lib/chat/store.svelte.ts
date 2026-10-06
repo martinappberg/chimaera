@@ -284,6 +284,14 @@ export function mintSendId(): string {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+/** Whether a waiting message offers Send now: while a turn runs, whether or
+ *  not its delivery is uncertain (its process ended or was replaced before
+ *  the agent read it), as a queued message always did. Its ✕ is always there;
+ *  only the wording says an uncertain one may have been delivered. */
+export function offersSendNow(send: Pick<PendingSend, "state">, running: boolean): boolean {
+  return send.state === "queued" && running;
+}
+
 export interface PendingSend {
   /** Delivery key (the wire's client-minted uuid) — the `UserMessageUpdate` /
    *  `CancelQueued` match key. */
@@ -1088,6 +1096,13 @@ export class ChatStore {
   onSendConfirmed(clientId: string): void {
     this.unconfirmed = this.unconfirmed.map((send) => send.id === clientId
       ? { ...send, shown: true, uncertain: undefined, confirmed: true } : send);
+  }
+
+  /** Dismiss a send whose delivery is unconfirmed (its process ended before
+   *  the echo). Nothing is sent: the daemon keeps its own record of the id,
+   *  and a late echo still lands in the transcript. */
+  dismissUnconfirmed(key: number): void {
+    this.unconfirmed = this.unconfirmed.filter((send) => send.key !== key || !send.uncertain);
   }
 
   private handBack(sends: UnconfirmedSend[]): void {

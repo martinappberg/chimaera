@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { SeqEvent } from "./chatWs";
-import { ChatStore, RESEND_FOR_MS, RESEND_GAP_MS, SHOW_UNCONFIRMED_AFTER_MS } from "./store.svelte";
+import { ChatStore, offersSendNow, RESEND_FOR_MS, RESEND_GAP_MS, SHOW_UNCONFIRMED_AFTER_MS } from "./store.svelte";
 
 // The store paces its own resends with a timer: no test may leave one behind.
 beforeEach(() => {
@@ -2461,6 +2461,19 @@ describe("ChatStore on a socket kept open while its owner sleeps", () => {
     expect(returned()).toEqual([]);
   });
 
+  it("an unconfirmed send left by an exit can be dismissed", () => {
+    const { store, send, returned } = wired();
+    store.onHeld();
+    send("never got there");
+    send("still sending");
+    store.onExited(null);
+    const [first] = store.sending;
+    expect(first).toMatchObject({ text: "never got there", uncertain: true });
+    store.dismissUnconfirmed(first.key);
+    expect(store.sending.map((s) => s.text)).toEqual(["still sending"]);
+    expect(returned()).toEqual([]);
+  });
+
   it("an open, quiet socket is neither live nor reconnecting, and a send on it shows as sending", () => {
     const { store, send } = wired();
     store.onHeld();
@@ -3465,6 +3478,23 @@ describe("queued delivery after process replacement", () => {
     store.apply({ seq: 4, ts: 4, ev: { type: "user_message_update", id: "queued", state: "dropped" } });
     expect(store.pendingSends[0].state).toBe("dropped");
     expect(store.pendingSends[0].uncertain).toBeUndefined();
+    expect(store.restoredDrafts).toEqual([]);
+  });
+
+  it("keeps an uncertain queued send dismissible and offers Send now while a turn runs", () => {
+    const store = fold([
+      { type: "user_message", id: "steer", client_id: "client-steer", text: "steer", queued: true },
+      { type: "error", message: "agent crashed", fatal: true },
+    ]);
+    const [send] = store.pendingSends;
+    expect(send.uncertain).toBe(true);
+    // A resumed process is running a turn again: the bubble offers what a
+    // queued one always did; only its wording says it may have arrived.
+    expect(offersSendNow(send, true)).toBe(true);
+    expect(offersSendNow(send, false)).toBe(false);
+    // Its ✕ (cancel_queued) is answered by a `cancelled` tombstone.
+    store.apply({ seq: 3, ts: 3, ev: { type: "user_message_update", id: "steer", state: "cancelled" } });
+    expect(store.pendingSends).toEqual([]);
     expect(store.restoredDrafts).toEqual([]);
   });
 });

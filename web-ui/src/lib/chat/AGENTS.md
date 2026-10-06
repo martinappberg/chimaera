@@ -408,7 +408,9 @@ is not shown and is asked again at the next `ready`.
 
 `ready.active_queued_ids` is a bounded snapshot of the current driver's keyed
 queue. After replay through `head`, older queued echoes absent from the snapshot
-remain visible as delivery unconfirmed; their Send now/cancel controls are hidden.
+remain visible as delivery unconfirmed and keep their ✕ (`cancel_queued`; a
+live process holding nothing under that id answers a `cancelled` tombstone) and,
+while a turn runs, Send now (`offersSendNow`), as queued rows always did.
 Post-head live echoes are untouched. A definitive `sent`, `cancelled` or `dropped`
 update resolves uncertainty; a driver exit marks remaining queued rows uncertain.
 
@@ -425,7 +427,7 @@ until it has waited `SHOW_UNCONFIRMED_AFTER_MS` for its echo (ChatView's timer
 calls `showOverdue`; ids daemons only). `onDisconnected` (the pool calls it
 too when it heals a dead socket) shows what is unconfirmed as pending; an exit
 or a fall back to the terminal retains it as uncertain instead of claiming it
-was unsent; a move forgets nothing.
+was unsent (its ✕ dismisses it locally, `dismissUnconfirmed`); a move forgets nothing.
 The Mastermind panel's one-click prompts go out under their own id and tell
 the store (`noteSentOutside`): nothing to confirm or return, but a refusal
 that names one is still said, and is never taken for the composer's send.

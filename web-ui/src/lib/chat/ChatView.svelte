@@ -103,7 +103,7 @@
     PendingSend,
     PlanEntry,
   } from "./store.svelte";
-  import { mintSendId, SHOW_UNCONFIRMED_AFTER_MS } from "./store.svelte";
+  import { mintSendId, offersSendNow, SHOW_UNCONFIRMED_AFTER_MS } from "./store.svelte";
   import {
     advanceTailWindow,
     autoPageEarlier,
@@ -2845,6 +2845,14 @@
                 <div class="bubble">
                   <UserText text={pending.text} onOpenPath={openProsePath} resolvePaths={prosePaths} />
                 </div>
+                {#if pending.uncertain && !pending.confirmed}
+                  <button
+                    class="cancel-btn"
+                    title="dismiss (check the conversation before sending it again)"
+                    aria-label="dismiss unconfirmed message"
+                    onclick={() => store.dismissUnconfirmed(pending.key)}
+                  >✕</button>
+                {/if}
               </div>
               <span class="delivery">{pending.confirmed ? "delivered" : pending.uncertain ? "delivery unconfirmed · check the conversation before sending again" : "sending…"}</span>
               {#if pending.images > 0}
@@ -3281,7 +3289,7 @@
          ✕ cancels one. Dropped sends remain visible as "not delivered" until
          dismissed, with replay-safe state owned by the daemon. -->
     {#if pinnedSends.length > 0}
-      {@const waiting = pinnedSends.filter((s) => s.state === "queued" && !s.uncertain).length}
+      {@const waiting = pinnedSends.filter((s) => s.state === "queued").length}
       <div
         class="pending"
         aria-label="messages waiting for the agent"
@@ -3300,7 +3308,7 @@
               text={send.text}
               mastermind={send.origin === "mastermind"}
               state={send.uncertain ? "uncertain" : send.state}
-              onDismiss={send.uncertain ? undefined : () => cancelQueued(send.id)}
+              onDismiss={() => cancelQueued(send.id)}
               {visible}
               onOpenPath={openProsePath}
               resolvePaths={prosePaths}
@@ -3324,7 +3332,7 @@
                   />
                 </div>
               {/if}
-              {#if send.state === "queued" && !send.uncertain && store.running}
+              {#if offersSendNow(send, store.running)}
                 <button
                   class="send-now-btn"
                   title={waiting > 1
@@ -3334,7 +3342,7 @@
                   onclick={() => sendQueuedNow(send.id)}
                 >Send now</button>
               {/if}
-              {#if !send.uncertain}<button
+              <button
                 class="cancel-btn"
                 title={send.state === "dropped"
                   ? "dismiss (this message was never delivered)"
@@ -3345,7 +3353,7 @@
                 onclick={() => cancelQueued(send.id)}
               >
                 ✕
-              </button>{/if}
+              </button>
             </div>
             <span class="delivery" class:dropped={send.state === "dropped"}>
               {send.uncertain ? "delivery unconfirmed · check the conversation before sending again" : send.state === "dropped"
