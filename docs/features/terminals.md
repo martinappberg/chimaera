@@ -149,7 +149,7 @@ official `@xterm/addon-search`; shared routing is described in
   whole-viewport prefetch, throttled to one pass per 300 ms (a debounce never fired under a TUI
   that animates every frame), keeps hovers instant. One request per candidate carries the
   session's base ladder — live cwd, then the spawn directory (scrollback printed before a `cd`),
-  then the workspace root; `./` and `../` resolve against the live cwd only. When those miss, the
+  then the workspace root; `./` and `../` resolve against the live cwd, then the spawn directory (never the workspace root). When those miss, the
   daemon strips a diff prefix and falls back to the bounded quickopen index: a unique basename
   (`FIGURE_PLAN.md` about `paper/FIGURE_PLAN.md`) or a unique path suffix (`figs/plot.png` about
   `results/figs/plot.png`), and several matches come back as the pick list — so links stay
