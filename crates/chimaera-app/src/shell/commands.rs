@@ -890,7 +890,8 @@ pub(super) async fn app_update_status(
 }
 
 /// Answer an in-flight SSH auth prompt (see `askpass`): `secret` None means
-/// the user cancelled, which lets the waiting ssh fail cleanly. The done
+/// the user cancelled, which ends the waiting ssh (it would only ask again)
+/// and with it the connect, with no further prompts. The done
 /// scoped completion event dismisses the prompt in every eligible window
 /// showing it.
 #[tauri::command]

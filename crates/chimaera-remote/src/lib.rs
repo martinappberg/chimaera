@@ -31,6 +31,14 @@ use tokio::process::{Child, Command};
 /// show one host's authentication prompt in another host's windows.
 pub const ASKPASS_ALIAS_ENV: &str = "CHIMAERA_ASKPASS_ALIAS";
 
+/// The line the app's askpass helper writes to stderr when the user cancels
+/// an authentication prompt — right before it ends the ssh that asked, since
+/// OpenSSH reads a failed askpass as an empty answer and just asks again.
+/// ssh's stderr is captured, so the line is how a cancel reaches the connect
+/// flow (and the user, as the failure text) instead of reading as an
+/// unreachable host.
+pub const ASKPASS_CANCELLED: &str = "authentication cancelled";
+
 /// The ssh ControlMaster socket path pattern for chimaera connections. `%C`
 /// is ssh's own hash of (localhost, remotehost, port, user): unique per
 /// destination and short. The parent dir is created on demand (ssh will not
@@ -1140,6 +1148,8 @@ async fn locate(
             Ok(ProbeRun::Ran(None)) => return Ok(None),
             Ok(ProbeRun::Ran(Some(p))) if p.here() => return Ok(Some((p.manifest, p.alive))),
             Ok(ProbeRun::Ran(Some(p))) => format!("registered on {} now", p.manifest.hostname),
+            // Probing afresh would dial the alias and prompt a second time.
+            Ok(ProbeRun::Failed(f)) if f.cancelled() => bail!("{ASKPASS_CANCELLED}"),
             Ok(ProbeRun::Failed(f)) => f.to_string(),
             Err(e) => format!("{e:#}"),
         };
@@ -1155,6 +1165,9 @@ async fn locate(
         None => ops.remote_probe(host, false).await?,
     };
     let landed = match run {
+        // The user said no: stop here. The start path below runs more ssh
+        // execs, each of which would ask again.
+        ProbeRun::Failed(f) if f.cancelled() => bail!("{ASKPASS_CANCELLED}"),
         // An unreachable host reads as nothing running, as it always has:
         // the start path then surfaces ssh's own error.
         ProbeRun::Failed(_) | ProbeRun::Ran(None) => return Ok(None),
@@ -1631,6 +1644,13 @@ impl ProbeFailure {
         ]
         .iter()
         .any(|marker| self.stderr.contains(marker))
+    }
+
+    /// Whether the user cancelled an authentication prompt. Unlike an
+    /// unreachable host this is a verdict, not "nothing running": carrying on
+    /// would start a fresh ssh (version probe, download, scp) that asks again.
+    fn cancelled(&self) -> bool {
+        self.stderr.lines().any(|l| l.trim() == ASKPASS_CANCELLED)
     }
 }
 
@@ -4856,6 +4876,46 @@ mod tests {
         );
         assert_eq!(*fake.route.borrow(), Route::Alias, "no half-learned route");
         assert_eq!(phases, vec!["probing", "routing"]);
+    }
+
+    /// Cancelling the sign-in prompt cancels the connect. A failed probe
+    /// normally reads as "nothing running" and the start path carries on —
+    /// version probe, download, scp — each a new ssh that asks again; a
+    /// cancel must end it at the first probe, with no start of any kind.
+    #[tokio::test]
+    async fn a_cancelled_first_probe_stops_the_connect() {
+        let fake = FakeOps {
+            probe: Some(Box::new(|_| {
+                ssh_failed(&format!("Last login: Mon\n{ASKPASS_CANCELLED}\n"))
+            })),
+            ..FakeOps::base()
+        };
+        let (out, phases) = try_resolve(&fake, false).await;
+        assert_eq!(
+            format!("{:#}", out.expect_err("a cancel is not a fresh start")),
+            ASKPASS_CANCELLED
+        );
+        assert_eq!(fake.calls(), vec![Call::RemoteProbe], "nothing else runs");
+        assert_eq!(phases, vec!["probing"]);
+    }
+
+    /// The same on a learned node route: probing afresh would dial the alias
+    /// and raise a second prompt. The route itself says nothing about a
+    /// cancel, so it is kept.
+    #[tokio::test]
+    async fn a_cancelled_probe_on_a_learned_route_does_not_prompt_along_the_alias() {
+        let fake = FakeOps {
+            route: RefCell::new(Route::Node(LN01.into())),
+            probe: Some(Box::new(|_| ssh_failed(ASKPASS_CANCELLED))),
+            ..FakeOps::base()
+        };
+        let (out, _) = try_resolve(&fake, false).await;
+        assert_eq!(format!("{:#}", out.unwrap_err()), ASKPASS_CANCELLED);
+        assert_eq!(
+            fake.routed(),
+            vec![(Call::RemoteProbe, Route::Node(LN01.into()))]
+        );
+        assert_eq!(*fake.route.borrow(), Route::Node(LN01.into()));
     }
 
     /// A direct dial that never reached ln01's sshd (the name doesn't
