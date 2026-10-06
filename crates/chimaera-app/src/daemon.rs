@@ -213,10 +213,31 @@ pub(crate) async fn ensure_local_daemon_for(
             sessions,
             false,
         )? {
-            Decision::Reuse => return Ok(probed.attached(false, sessions)),
-            Decision::Update => stop_local(m).await?,
+            Decision::Reuse => {
+                tracing::info!("attaching to running daemon on 127.0.0.1:{}", m.port);
+                return Ok(probed.attached(false, sessions));
+            }
+            Decision::Update => {
+                tracing::info!(
+                    "local daemon (build {}) is not ours ({}) and has no live \
+                     sessions — replacing it",
+                    m.build.as_deref().unwrap_or("pre-build-id"),
+                    chimaera_core::BUILD_ID,
+                );
+                stop_local(m).await?;
+                // Fall through to the spawn below.
+            }
             Decision::ConnectOutdated => {
-                tracing::warn!("local daemon replacement deferred: build or selected assembly differs and safe replacement is unavailable");
+                tracing::warn!(
+                    "local daemon (build {}) is older than this app ({}) but has {} — \
+                     attaching to it; the home screen offers the update",
+                    m.build.as_deref().unwrap_or("pre-build-id"),
+                    chimaera_core::BUILD_ID,
+                    sessions.map_or("an unknown session count".to_string(), |n| format!(
+                        "{n} live session{}",
+                        if n == 1 { "" } else { "s" }
+                    )),
+                );
                 return Ok(probed.attached(true, sessions));
             }
         }
@@ -238,11 +259,12 @@ pub(crate) async fn ensure_local_daemon_for(
             false,
         )? == Decision::Reuse
         {
+            tracing::info!("local daemon up on 127.0.0.1:{}", probed.manifest.port);
             return Ok(probed.attached(false, None));
         }
     }
     bail!(
-        "The local daemon did not become ready — check {}",
+        "the local daemon did not come up within 15s — check {}",
         log_path().display()
     )
 }
