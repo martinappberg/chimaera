@@ -338,6 +338,11 @@ pub(crate) async fn run_in_cloud(
     let Some(config) = config else {
         return (StatusCode::CONFLICT, Json(json!({"error": "not_here"}))).into_response();
     };
+    // Claimed before answering, so a second request (or a sleep flush) sees
+    // the project already on its way and nothing hands it over twice.
+    if !lock(&state.pro.sleeping).insert(workspace.clone()) {
+        return (StatusCode::CONFLICT, Json(json!({"error": "not_here"}))).into_response();
+    }
     tracing::info!(
         target: "chimaera_server::pro::place",
         "a project was asked to run in the cloud"
@@ -369,6 +374,7 @@ pub(crate) async fn run_in_cloud(
                 }
             }
         };
+        lock(&owner.pro.sleeping).remove(&workspace);
         if let Some(reason) = failure {
             owner.pro.reasons.set(&workspace, reason, false);
             tracing::info!(
@@ -437,6 +443,82 @@ mod tests {
             root.join("config"),
         ));
         (state, root)
+    }
+
+    struct Composed;
+    impl crate::daemon_extension::Runtime for Composed {
+        fn coordinate(
+            &self,
+            _owner: crate::daemon_extension::CoordinatorOwner,
+        ) -> crate::daemon_extension::RuntimeFuture {
+            Box::pin(async {})
+        }
+    }
+
+    /// Review R3 S1: "Run in the cloud" claims its project before answering,
+    /// so a second request (or a sleep flush) never hands it over twice, and
+    /// only a wake (never a sleep or a handover) advances the generation a
+    /// flush checks.
+    #[tokio::test]
+    async fn run_in_the_cloud_claims_its_project_before_answering() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-place-claim-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut state = AppState::new(
+            "fixture".into(),
+            "fixture".into(),
+            4242,
+            0,
+            root.clone(),
+            root.join("config"),
+        );
+        state.daemon_extension = Some(Arc::new(Composed));
+        let state = Arc::new(state);
+        let workspace = lock(&state.workspaces).add(root.clone()).unwrap().id;
+        crate::pro::install_execution_fixture(&state, &workspace, 3).unwrap();
+        *lock(&state.pro.runtime) = Some(device());
+        state.pro.configured.store(true, Ordering::Release);
+        let generation = state.pro.sleep_generation.load(Ordering::Acquire);
+        // Nothing yields between the two requests: the first's task has not
+        // run, so only its synchronous claim can refuse the second.
+        let first = run_in_cloud(State(state.clone()), Path(workspace.clone())).await;
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let second = run_in_cloud(State(state.clone()), Path(workspace.clone())).await;
+        assert_eq!(second.status(), StatusCode::CONFLICT);
+        // The handover ends (here: it cannot reach the cloud) and releases
+        // its claim.
+        for _ in 0..200 {
+            if lock(&state.pro.sleeping).is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(lock(&state.pro.sleeping).is_empty());
+        // A sleep starting while a project is claimed leaves it to that
+        // handover and advances nothing.
+        lock(&state.pro.sleeping).insert(workspace.clone());
+        let handover = routes::Handover {
+            deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+            park: false,
+        };
+        let (flushes, unavailable) = routes::hand_over(&state, device(), handover, None)
+            .await
+            .unwrap();
+        assert!(unavailable.is_empty());
+        let flushed = flushes.await.unwrap();
+        assert!(
+            flushed.iter().all(|(id, _)| *id != workspace),
+            "{flushed:?}"
+        );
+        assert_eq!(
+            state.pro.sleep_generation.load(Ordering::Acquire),
+            generation
+        );
+        drop(state);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -634,6 +716,8 @@ mod tests {
     #[tokio::test]
     async fn waking_never_resumes_work_the_cloud_may_be_running() {
         let (state, root) = fixture("woke");
+        crate::pro::install_execution_fixture(&state, "w-a", 3).unwrap();
+        crate::pro::lapse_execution_fixture(&state, "w-a");
         lock(&state.pro.ownership).insert("w-a".into(), Ownership::Transferring { epoch: 3 });
         lock(&state.pro.release_pending).insert("w-a".into());
         state.pro.reachable_since.store(1, Ordering::Release);
@@ -647,6 +731,75 @@ mod tests {
         assert!(state.pro.sleep_generation.load(Ordering::Acquire) > generation);
         // The guard for bringing work home starts over.
         assert!(!super::super::reach::settled(&state));
+        // Review R3 B3: no agent starts or resumes before the lease loop
+        // verified the project is still this computer's; terminals still work.
+        assert!(!crate::pro::may_execute(&state, "w-a"));
+        assert!(crate::pro::may_run_shell(&state, "w-a"));
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Review R3 B2: signing out is remembered across a restart, and only
+    /// that (not a configuration that has not arrived yet) lets interrupted
+    /// sessions resume without the account; signing in again clears it.
+    #[tokio::test]
+    async fn signing_out_is_remembered_across_a_restart() {
+        let (state, root) = fixture("signed-out");
+        assert!(!state.pro.signed_out.load(Ordering::Acquire));
+        assert_eq!(
+            call(&state, "DELETE", "/api/v1/pro/configure").await,
+            StatusCode::NO_CONTENT
+        );
+        drop(state);
+        let restarted = Arc::new(AppState::new(
+            "fixture".into(),
+            "fixture".into(),
+            4242,
+            0,
+            root.clone(),
+            root.join("config"),
+        ));
+        assert!(restarted.pro.signed_out.load(Ordering::Acquire));
+        drop(restarted);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Review R3 harness cause 2: a conversation a lease fence stopped stops
+    /// saying it runs, and once another machine held the project it is not
+    /// resumed here (a finished turn would run again); the return's own copy
+    /// replaces it.
+    #[tokio::test]
+    async fn a_fenced_conversation_is_dropped_once_the_project_ran_elsewhere() {
+        let (state, root) = fixture("fenced");
+        let entry = |id: &str, handoff: bool| crate::ledger::LedgerEntry {
+            id: id.into(),
+            suspended: true,
+            manual_resume_reason: None,
+            handoff: handoff.then_some(crate::bundle::HandoffResume {
+                fork: false,
+                origin: crate::bundle::Origin::Home,
+                epoch: 4,
+            }),
+            workspace_id: "w-a".into(),
+            cwd: root.clone(),
+            pinned_name: None,
+            cols: 80,
+            rows: 24,
+            theme: "dark".into(),
+            created_at: 0,
+            agent: None,
+        };
+        lock(&state.deferred_sessions).insert("s-stale".into(), entry("s-stale", false));
+        lock(&state.deferred_sessions).insert("s-imported".into(), entry("s-imported", true));
+        lock(&state.deferred_sessions).insert("s-other".into(), entry("s-other", false));
+        lock(&state.pro.fenced_sessions).extend(["s-stale".into(), "s-imported".into()]);
+        super::super::drop_fenced(&state, "w-a");
+        let deferred = lock(&state.deferred_sessions);
+        assert!(!deferred.contains_key("s-stale"));
+        assert!(deferred.contains_key("s-imported"));
+        assert!(deferred.contains_key("s-other"), "not fenced: left alone");
+        drop(deferred);
+        assert!(lock(&state.pro.fenced_sessions).is_empty());
         drop(state);
         std::fs::remove_dir_all(root).unwrap();
     }

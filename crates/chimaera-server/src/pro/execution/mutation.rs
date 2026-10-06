@@ -453,7 +453,14 @@ fn begin_launch_admission(
     workspace: &str,
     require_agent_proof: bool,
 ) -> anyhow::Result<Option<Guard>> {
-    if workspace_closed(state, workspace) || !crate::pro::may_execute(state, workspace) {
+    // Plain shells are never managed: a computer whose agents wait for its
+    // own lease keeps its terminals (`pro::may_run_shell`).
+    let allowed = if require_agent_proof {
+        crate::pro::may_execute(state, workspace)
+    } else {
+        crate::pro::may_run_shell(state, workspace)
+    };
+    if workspace_closed(state, workspace) || !allowed {
         return Err(Changed.into());
     }
     let generation = generation(state);

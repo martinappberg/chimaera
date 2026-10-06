@@ -6,8 +6,8 @@ use std::{
     time::Duration,
 };
 
-/// A 100 ms tick that took this long was not scheduled normally: the process
-/// was frozen.
+/// A tick (100 ms on a cloud machine, 1 s on a computer) that took this long
+/// was not scheduled normally: the process was frozen.
 pub(super) const FREEZE: Duration = Duration::from_secs(3);
 /// Wall and monotonic time disagreeing by this much across one tick is a
 /// clock step (a resumed machine correcting its clock), as the lease sees it.
@@ -38,6 +38,19 @@ fn preserve(state: &AppState, workspaces: &[String]) {
         if workspaces.contains(&entry.workspace_id) {
             entry.suspended = true;
             entry.handoff = None;
+            if entry.agent.is_some() {
+                let mut fenced = lock(&state.pro.fenced_sessions);
+                if fenced.len() < 512 {
+                    fenced.insert(entry.id.clone());
+                }
+                // Its process is stopped mid-turn: the row must not keep
+                // saying it runs. Unknown raises no notice.
+                if let Some(record) = lock(&state.agents).get_mut(&entry.id) {
+                    if record.state == crate::agent_state::AgentState::Running {
+                        record.state = crate::agent_state::AgentState::Unknown;
+                    }
+                }
+            }
             lock(&state.deferred_sessions).insert(entry.id.clone(), entry);
         }
     }
@@ -50,7 +63,11 @@ pub(in crate::pro) fn start(state: &Arc<AppState>) {
         let mut recorded = HashSet::new();
         let mut last = (std::time::Instant::now(), std::time::SystemTime::now());
         loop {
-            std::thread::sleep(Duration::from_millis(100));
+            // A cloud machine's fence is tight (100 ms); a personal computer
+            // keeps a 15 s margin before the account's expiry, so a 1 s tick
+            // is enough and keeps a laptop's CPU asleep between ticks.
+            let worker = weak.upgrade().is_some_and(|state| super::worker(&state));
+            std::thread::sleep(Duration::from_millis(if worker { 100 } else { 1000 }));
             let Some(state) = weak.upgrade() else {
                 return;
             };

@@ -55,19 +55,29 @@ fn guard_override(dev: bool, value: Option<&str>) -> u64 {
 /// nobody else can acquire through a failing account either.
 const ERRORING_FOR: u64 = 30;
 
-/// The lease loop got an HTTP answer from the account.
-pub(super) fn answered(state: &AppState, status: u16) {
+/// The lease loop got an HTTP answer. Reachable means a success or the
+/// account's conflict (409, a quiet wait); a refused credential is not. A
+/// server error says the account is up but failing (nobody can acquire
+/// through it either, so a computer keeps its own work, `execution::expire`)
+/// only when it carries the account's own marker (`from_account`): a 5xx
+/// without it is a proxy, captive portal or edge in between, which proves
+/// nothing and counts as unreachable. Successes do not need the marker: the
+/// account is reached over TLS, and a curl too old to report a header
+/// (before 7.84) must still see its successes.
+pub(super) fn answered(state: &AppState, status: u16, from_account: bool) {
     let now = super::now();
-    if status >= 500 {
+    if status >= 500 && from_account {
         state.pro.erroring_at.store(now, Ordering::Release);
         state.pro.reachable_since.store(0, Ordering::Release);
-    } else {
+    } else if (200..300).contains(&status) || status == 409 {
         let _ = state.pro.reachable_since.compare_exchange(
             0,
             now.max(1),
             Ordering::AcqRel,
             Ordering::Acquire,
         );
+    } else {
+        unreachable(state);
     }
 }
 /// The account could not be reached, or this computer slept or froze: the
@@ -91,6 +101,10 @@ pub(super) fn erroring(state: &AppState) -> bool {
 const MAX_STREAMS: usize = 128;
 const MAX_DATA_FRAME: usize = 64 * 1024;
 const MAX_CONTROL_FRAME: usize = 128 * 1024;
+/// Bytes read from this daemon and not yet written to the keeper, across all
+/// streams of the link (KiB): a slow keeper holds the readers back instead of
+/// queueing up to 16 frames per stream on each of 128 streams (review R3 S3).
+const QUEUED_KIB: usize = 8 * 1024;
 const PING_EVERY: Duration = Duration::from_secs(20);
 const PONG_WITHIN: Duration = Duration::from_secs(60);
 
@@ -185,7 +199,9 @@ async fn run(weak: std::sync::Weak<AppState>, generation: u64) {
         let Some(state) = weak.upgrade() else {
             return;
         };
-        if !current(&state, generation) {
+        // A refused or expired delegation can do nothing; the app mints a new
+        // one and configures again, which starts a new link.
+        if !current(&state, generation) || super::delegation_lapsed(&state) {
             return;
         }
         // Read each time: a renewed or re-minted delegation is used at once.
@@ -200,17 +216,20 @@ async fn run(weak: std::sync::Weak<AppState>, generation: u64) {
         if started.elapsed() >= Duration::from_secs(20) {
             attempts = 0;
         }
-        let wait = match outcome {
-            // Refused: the delegation was revoked or replaced. The account
-            // side closes every route it opened; wait for a new configuration
-            // rather than hammering the keeper.
-            Ended::Refused => Duration::from_secs(60),
-            Ended::Lost => backoff(attempts),
-        };
+        // Refused: the delegation was revoked, replaced or signed out
+        // everywhere. Nothing is dialed again until a new configuration
+        // starts a new link (review R3 S2).
+        if matches!(outcome, Ended::Refused) {
+            tracing::info!(
+                target: "chimaera_server::pro::reach",
+                "the keeper refused this computer's link; it stays closed until set up again"
+            );
+            return;
+        }
+        let wait = backoff(attempts);
         attempts = attempts.saturating_add(1);
         tracing::info!(
             target: "chimaera_server::pro::reach",
-            refused = matches!(outcome, Ended::Refused),
             "the link that keeps this computer reachable ended; reconnecting"
         );
         tokio::time::sleep(wait).await;
@@ -268,6 +287,7 @@ async fn serve(
     }
     drop(token);
     let mut streams: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    let queued = Arc::new(tokio::sync::Semaphore::new(QUEUED_KIB));
     let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + PING_EVERY, PING_EVERY);
     let mut last_pong = tokio::time::Instant::now();
     let ended = loop {
@@ -296,8 +316,9 @@ async fn serve(
                             (Some("open"), Some(id)) if !streams.contains_key(id) && streams.len() < MAX_STREAMS => {
                                 let url = format!("{}/{id}", target.url);
                                 let bearer = target.bearer.clone();
+                                let queued = queued.clone();
                                 streams.insert(id.to_owned(), tokio::spawn(async move {
-                                    let _ = stream(&url, &bearer, port).await;
+                                    let _ = stream(&url, &bearer, port, queued).await;
                                 }));
                             }
                             (Some("close"), Some(id)) => {
@@ -333,7 +354,12 @@ fn valid_stream(id: &str) -> bool {
 /// One stream the keeper opened: a WebSocket of raw bytes bridged to this
 /// daemon's loopback port. End of either side ends both; at most 16 frames
 /// of 64 KiB are read ahead, so a slow side holds the other back.
-async fn stream(url: &str, bearer: &str, port: u16) -> anyhow::Result<()> {
+async fn stream(
+    url: &str,
+    bearer: &str,
+    port: u16,
+    queued: Arc<tokio::sync::Semaphore>,
+) -> anyhow::Result<()> {
     let headers = [("Authorization", format!("Bearer {bearer}"))];
     let socket = crate::voice::upstream::connect(url, &headers)
         .await
@@ -345,19 +371,25 @@ async fn stream(url: &str, bearer: &str, port: u16) -> anyhow::Result<()> {
     .await??;
     let (mut tcp_rx, mut tcp_tx) = tcp.into_split();
     let (mut ws_tx, mut ws_rx) = socket.split();
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(16);
+    type Queued = (Message, Option<tokio::sync::OwnedSemaphorePermit>);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Queued>(16);
     let outbound = {
         let tx = tx.clone();
         async move {
             let mut buffer = vec![0; MAX_DATA_FRAME];
             loop {
+                // Room in the link-wide budget first, then read at most that.
+                let permit = queued
+                    .clone()
+                    .acquire_many_owned((MAX_DATA_FRAME / 1024) as u32)
+                    .await?;
                 let n = tcp_rx.read(&mut buffer).await?;
                 if n == 0 {
-                    let _ = tx.send(Message::Close(None)).await;
+                    let _ = tx.send((Message::Close(None), None)).await;
                     return anyhow::Ok(());
                 }
                 if tx
-                    .send(Message::Binary(buffer[..n].to_vec().into()))
+                    .send((Message::Binary(buffer[..n].to_vec().into()), Some(permit)))
                     .await
                     .is_err()
                 {
@@ -366,6 +398,7 @@ async fn stream(url: &str, bearer: &str, port: u16) -> anyhow::Result<()> {
             }
         }
     };
+    let closing = tx.clone();
     let inbound = async move {
         while let Some(message) = ws_rx.next().await {
             match message? {
@@ -373,7 +406,7 @@ async fn stream(url: &str, bearer: &str, port: u16) -> anyhow::Result<()> {
                     tcp_tx.write_all(&data).await?
                 }
                 Message::Ping(data) => {
-                    if tx.send(Message::Pong(data)).await.is_err() {
+                    if tx.send((Message::Pong(data), None)).await.is_err() {
                         break;
                     }
                 }
@@ -386,19 +419,36 @@ async fn stream(url: &str, bearer: &str, port: u16) -> anyhow::Result<()> {
         anyhow::Ok(())
     };
     let writer = async move {
-        while let Some(message) = rx.recv().await {
+        while let Some((message, permit)) = rx.recv().await {
             let closing = matches!(message, Message::Close(_));
             tokio::time::timeout(Duration::from_secs(60), ws_tx.send(message)).await??;
+            drop(permit);
             if closing {
                 break;
             }
         }
         anyhow::Ok(())
     };
+    // The daemon's reply and its close are queued for the writer: the stream
+    // ends once the writer has sent them, or when the keeper's side ends.
+    // Ending as soon as the reading side finished dropped a reply this daemon
+    // had already read off its own port (a `Connection: close` request's
+    // whole answer).
+    let sending = async move {
+        let reading = async move {
+            let read = outbound.await;
+            // A failed read sent no close of its own: end the stream anyway.
+            if read.is_err() {
+                let _ = closing.send((Message::Close(None), None)).await;
+            }
+            read
+        };
+        let (read, written) = tokio::join!(reading, writer);
+        read.and(written)
+    };
     tokio::select! {
-        result = outbound => result,
+        result = sending => result,
         result = inbound => result,
-        result = writer => result,
     }
 }
 
@@ -465,15 +515,27 @@ mod tests {
             root.clone(),
             root.join("config"),
         );
-        answered(&state, 200);
+        answered(&state, 200, true);
         let since = state.pro.reachable_since.load(Ordering::Acquire);
         assert!(since > 0);
-        answered(&state, 409);
+        answered(&state, 409, true);
         assert_eq!(state.pro.reachable_since.load(Ordering::Acquire), since);
-        answered(&state, 503);
+        // A proxy's or captive portal's 5xx (no account marker) proves
+        // nothing: not erroring, not reachable.
+        answered(&state, 502, false);
+        assert_eq!(state.pro.reachable_since.load(Ordering::Acquire), 0);
+        assert!(!erroring(&state));
+        // A refused credential is not reachable either.
+        answered(&state, 200, true);
+        answered(&state, 401, true);
+        assert_eq!(state.pro.reachable_since.load(Ordering::Acquire), 0);
+        // A success needs no marker (an old curl cannot report one).
+        answered(&state, 200, false);
+        assert!(state.pro.reachable_since.load(Ordering::Acquire) > 0);
+        answered(&state, 503, true);
         assert_eq!(state.pro.reachable_since.load(Ordering::Acquire), 0);
         assert!(erroring(&state));
-        answered(&state, 200);
+        answered(&state, 200, true);
         unreachable(&state);
         assert_eq!(state.pro.reachable_since.load(Ordering::Acquire), 0);
         state.pro.reachable_since.store(1, Ordering::Release);
@@ -495,5 +557,160 @@ mod tests {
         assert!(!valid_stream(""));
         assert!(!valid_stream("../x"));
         assert!(!valid_stream(&"a".repeat(129)));
+    }
+
+    /// A reply the daemon writes and closes at once (a `Connection: close`
+    /// answer) reaches the keeper whole before the stream ends.
+    #[tokio::test]
+    async fn a_reply_the_daemon_closes_after_still_reaches_the_keeper() {
+        const REPLY: &[u8] = b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok";
+        let daemon = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = daemon.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut socket, _) = daemon.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            socket.write_all(REPLY).await.unwrap();
+        });
+        let keeper = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/v1/serve/s-1", keeper.local_addr().unwrap());
+        let received = tokio::spawn(async move {
+            let (socket, _) = keeper.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            socket
+                .send(Message::Binary(b"GET / HTTP/1.1\r\n\r\n".to_vec().into()))
+                .await
+                .unwrap();
+            let mut bytes = Vec::new();
+            while let Some(Ok(message)) = socket.next().await {
+                match message {
+                    Message::Binary(data) => bytes.extend_from_slice(&data),
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+            bytes
+        });
+        let queued = Arc::new(tokio::sync::Semaphore::new(QUEUED_KIB));
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            stream(&url, "synthetic", port, queued.clone()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let bytes = tokio::time::timeout(Duration::from_secs(10), received)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bytes, REPLY);
+        // Every byte read was released from the link-wide budget.
+        assert_eq!(queued.available_permits(), QUEUED_KIB);
+    }
+
+    struct Composed;
+    impl crate::daemon_extension::Runtime for Composed {
+        fn coordinate(
+            &self,
+            _owner: crate::daemon_extension::CoordinatorOwner,
+        ) -> crate::daemon_extension::RuntimeFuture {
+            Box::pin(async {})
+        }
+    }
+
+    /// A configured personal Pro computer with the Runtime, whose keeper is a
+    /// local fake at `port`.
+    fn configured(name: &str, port: u16) -> (Arc<AppState>, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-reach-{name}-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut state = AppState::new(
+            "fixture".into(),
+            "fixture".into(),
+            4242,
+            0,
+            root.clone(),
+            root.join("config"),
+        );
+        state.daemon_extension = Some(Arc::new(Composed));
+        let state = Arc::new(state);
+        *lock(&state.pro.runtime) = Some(
+            serde_json::from_value(serde_json::json!({
+                "role":"device","endpoint":"http://127.0.0.1:1",
+                "keeper_url": format!("http://127.0.0.1:{port}"),
+                "delegation":{"access_token":"synthetic","expires_at":"2099-01-01T00:00:00Z",
+                "scope":["baton","mirror","keeper"],"device_id":"d-home"}
+            }))
+            .unwrap(),
+        );
+        state.pro.configured.store(true, Ordering::Release);
+        (state, root)
+    }
+
+    async fn ended(state: &AppState) -> bool {
+        for _ in 0..100 {
+            if !running(state) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    /// Review R3 S2: a keeper that refuses the delegation (revoked, signed out
+    /// everywhere) ends the link; it is not dialed again until set up anew.
+    #[tokio::test]
+    async fn a_refused_delegation_ends_the_link_for_good() {
+        let keeper = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = keeper.local_addr().unwrap().port();
+        let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = dials.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = keeper.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let mut request = [0u8; 4096];
+                let _ = socket.read(&mut request).await;
+                let _ = socket
+                    .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+        let (state, root) = configured("refused", port);
+        start(&state);
+        assert!(
+            ended(&state).await,
+            "the link kept dialing a refusing keeper"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(dials.load(Ordering::SeqCst), 1);
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Signing out (`DELETE /pro/configure`) ends a running link at once.
+    #[tokio::test]
+    async fn signing_out_ends_the_link() {
+        // A keeper that accepts and then says nothing keeps the link open.
+        let keeper = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = keeper.local_addr().unwrap().port();
+        let held = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let holder = held.clone();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = keeper.accept().await {
+                lock(&holder).push(socket);
+            }
+        });
+        let (state, root) = configured("sign-out", port);
+        start(&state);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(running(&state));
+        let response = super::super::routes::disconnect(axum::extract::State(state.clone())).await;
+        assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+        assert!(ended(&state).await);
+        assert!(target(&state).is_none());
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

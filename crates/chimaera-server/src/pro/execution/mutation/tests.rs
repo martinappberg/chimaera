@@ -457,7 +457,8 @@ async fn queued_real_shell_command_keeps_original_generation_and_epoch() {
 fn asynchronous_dispatch_keeps_exact_ownership_account_and_worker_deadline() {
     let (state, root) = fixture();
     let admission = Dispatch::capture(&state, "w-a").unwrap();
-    // A laptop's expired publication lease must not stop its own local work.
+    // A laptop's expired lease alone, before its watchdog fenced it, still
+    // admits its own work (the fence decides, `execution::expire`).
     lock(&state.pro.execution.proofs)
         .get_mut("w-a")
         .unwrap()
@@ -466,9 +467,9 @@ fn asynchronous_dispatch_keeps_exact_ownership_account_and_worker_deadline() {
     lock(&state.pro.ownership).insert("w-a".into(), Ownership::Local { epoch: 5 });
     assert!(admission.begin(&state).is_err());
     lock(&state.pro.ownership).insert("w-a".into(), Ownership::AwaitingVerification { epoch: 5 });
-    let awaiting = Dispatch::capture(&state, "w-a").unwrap();
-    lock(&state.pro.ownership).insert("w-a".into(), Ownership::AwaitingVerification { epoch: 6 });
-    assert!(awaiting.begin(&state).is_err());
+    // Unverified after a wake or restart with no live lease: no agent work is
+    // admitted until the lease loop verified the project is still here.
+    assert!(Dispatch::capture(&state, "w-a").is_err());
     let free = Dispatch::capture(&state, "free").unwrap();
     assert!(free.begin(&state).unwrap().is_none());
     state.pro.generation.fetch_add(1, Ordering::AcqRel);

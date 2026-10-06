@@ -289,6 +289,11 @@ async fn configure_inner(
     }
     *lock(&state.pro.runtime) = Some(config);
     state.pro.delegation_refused.store(false, Ordering::Release);
+    if state.pro.signed_out.swap(false, Ordering::AcqRel) {
+        if let Err(error) = super::persist(&state).await {
+            return failure(error);
+        }
+    }
     state.pro.configured.store(true, Ordering::Release);
     #[cfg(all(unix, feature = "provider-authority-prototype"))]
     execution::provider_ready::configured(&state);
@@ -329,6 +334,9 @@ pub(super) async fn stop_tasks(state: &Arc<AppState>) -> anyhow::Result<()> {
     for task in [lease_task, mirror_task].into_iter().flatten() {
         let _ = task.await;
     }
+    for (_, task) in lock(&state.pro.reconciling).drain() {
+        task.abort();
+    }
     #[cfg(all(unix, feature = "provider-authority-prototype"))]
     execution::provider_ready::settle(state).await?;
     if worker {
@@ -364,6 +372,9 @@ pub(crate) async fn disconnect(State(state): State<Arc<AppState>>) -> Response {
     lock(&state.pro.reclaim).clear();
     lock(&state.pro.holders).clear();
     state.pro.reasons.clear();
+    // Recorded before the state write below, so a restart remembers that the
+    // computer's interrupted work is its own again (`resume_unverified`).
+    state.pro.signed_out.store(true, Ordering::Release);
     let mut dropped = Vec::new();
     let mut returned: Vec<String> = {
         let mut ownership = lock(&state.pro.ownership);
@@ -642,7 +653,9 @@ pub(super) async fn hand_over(
     workspace_ids: Option<Vec<String>>,
 ) -> Result<(Flushes, Vec<String>), &'static str> {
     let Handover { deadline, park } = handover;
-    let generation = state.pro.sleep_generation.fetch_add(1, Ordering::AcqRel) + 1;
+    // Only a wake advances this: a sleep flush and "Run in the cloud" running
+    // at once never cancel each other (review R3 S1).
+    let generation = state.pro.sleep_generation.load(Ordering::Acquire);
     let sleep = engine::Sleep {
         generation,
         deadline,
@@ -678,6 +691,9 @@ pub(super) async fn hand_over(
             .as_ref()
             .is_some_and(|ids| !ids.contains(&workspace.id))
             || !flushable(state, &workspace.id)
+            // Already being handed over (a "Run in the cloud" claim, or an
+            // earlier flush still running): never flushed twice at once.
+            || (!park && lock(&state.pro.sleeping).contains(&workspace.id))
         {
             continue;
         }

@@ -56,10 +56,12 @@ impl CoordinatorProject {
     pub fn id(&self) -> &str {
         &self.id
     }
+    /// Kept on this computer only, as the account acknowledged
+    /// (`execution::kept_here`): out of the lease loop. A switch the account
+    /// has not acknowledged yet keeps renewing, since the cloud could still
+    /// take the project.
     pub fn never_mirror(&self) -> bool {
-        lock(&self.state.pro.preferences)
-            .get(&self.id)
-            .is_some_and(|p| p.never_mirror)
+        execution::kept_here(&self.state, &self.id)
     }
     pub fn awaiting_verification(&self) -> bool {
         matches!(
@@ -121,16 +123,44 @@ impl CoordinatorTick {
             remaining: 128,
         }
     }
+    /// One project's lease pass (renewal, acquisition, verification). It runs
+    /// as an owned task: a caller that stops waiting (the policy's per-pass
+    /// budget) never cancels it halfway, and while it still runs, later
+    /// passes skip the project instead of starting a second one.
     pub async fn reconcile(&self, project: &CoordinatorProject) -> Reconciled {
         let mut unauthorized = false;
         if self.generation_current() && project.generation == self.generation {
-            if let Err(error) =
-                reconcile_generation(&self.state, &self.config, &project.id, self.generation).await
-            {
-                unauthorized = error
-                    .chain()
-                    .any(|cause| cause.to_string() == transport::UNAUTHORIZED);
-                record_error(&self.state, &project.id, &error);
+            let task = {
+                let mut running = lock(&self.state.pro.reconciling);
+                if running
+                    .get(&project.id)
+                    .is_some_and(|task| !task.is_finished())
+                {
+                    None
+                } else {
+                    let state = self.state.clone();
+                    let config = self.config.clone();
+                    let workspace = project.id.clone();
+                    let generation = self.generation;
+                    let task = tokio::spawn(async move {
+                        let result =
+                            reconcile_generation(&state, &config, &workspace, generation).await;
+                        if let Err(error) = &result {
+                            record_error(&state, &workspace, error);
+                        }
+                        result.err().is_some_and(|error| {
+                            error
+                                .chain()
+                                .any(|cause| cause.to_string() == transport::UNAUTHORIZED)
+                        })
+                    });
+                    running.retain(|_, task| !task.is_finished());
+                    running.insert(project.id.clone(), task.abort_handle());
+                    Some(task)
+                }
+            };
+            if let Some(task) = task {
+                unauthorized = task.await.unwrap_or(false);
             }
         }
         Reconciled {

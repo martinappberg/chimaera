@@ -161,6 +161,9 @@ impl ProjectOwner {
             .cloned()
     }
     pub fn set_ownership(&self, value: Option<Ownership>) {
+        if matches!(value, Some(Ownership::Remote { .. })) {
+            super::super::drop_fenced(&self.state, &self.workspace);
+        }
         let mut entries = lock(&self.state.pro.ownership);
         match value {
             Some(value) => {
@@ -215,7 +218,9 @@ impl ProjectOwner {
         response: Result<super::super::transport::Response>,
     ) -> Result<super::super::transport::Response> {
         match &response {
-            Ok(response) => super::super::reach::answered(&self.state, response.status),
+            Ok(response) => {
+                super::super::reach::answered(&self.state, response.status, response.from_account)
+            }
             Err(_) => super::super::reach::unreachable(&self.state),
         }
         response
@@ -691,13 +696,6 @@ impl SnapshotOwner {
     }
     pub fn require_upgrade(&self) {
         execution::require_v2(&self.project.state, self.project.id());
-    }
-    pub async fn resume_stopped(&self, ids: &[String]) -> Result<()> {
-        ensure!(
-            ids.iter().all(|id| self.session_ids.contains(id)),
-            "Session is not in the original transfer roster"
-        );
-        crate::ledger::resume_deferred_sessions(&self.project.state, self.project.id(), ids).await
     }
     pub fn release_pending(&self) {
         lock(&self.project.state.pro.release_pending).insert(self.project.workspace.clone());

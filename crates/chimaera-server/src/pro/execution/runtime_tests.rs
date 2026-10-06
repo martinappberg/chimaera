@@ -119,9 +119,11 @@ async fn real_http_negotiation_status_and_restart_cannot_downgrade_enrolled_work
         root.join("config"),
     ));
     restored.stopping.store(true, Ordering::Release);
-    // A restarted device keeps working, but its previous sessions wait for
-    // this life's verified ownership before resuming.
-    assert!(crate::pro::may_execute(&restored, "w-a"));
+    // A restarted device keeps its terminals, but its agents (new or
+    // previous) wait for this life's verified ownership: the cloud may hold
+    // the project by now.
+    assert!(!crate::pro::may_execute(&restored, "w-a"));
+    assert!(crate::pro::may_run_shell(&restored, "w-a"));
     assert!(!crate::pro::may_restore(&restored, "w-a"));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());

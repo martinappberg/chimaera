@@ -58,6 +58,11 @@ pub(crate) struct ProState {
     root: PathBuf,
     configured: AtomicBool,
     worker: AtomicBool,
+    /// The user signed out of Pro on this computer (`/pro/disconnect`), and
+    /// has not signed in since. Persisted: after a restart, only this (never
+    /// a configuration that has not arrived yet) lets interrupted sessions
+    /// resume without the account (`resume_unverified`).
+    signed_out: AtomicBool,
     generation: AtomicU64,
     runtime: Mutex<Option<protocol::Configure>>,
     authority: Mutex<authority::Authority>,
@@ -73,9 +78,15 @@ pub(crate) struct ProState {
     status: Mutex<HashMap<String, WorkspaceStatus>>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     mirror_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The lease loop's per-project passes still running after their pass
+    /// moved on (`CoordinatorTick::reconcile`): owned, so a slow project is
+    /// never cancelled halfway, and skipped by later passes until it ends.
+    /// Aborted with the lease loop (`routes::stop_tasks`). At most one per
+    /// project.
+    reconciling: Mutex<HashMap<String, tokio::task::AbortHandle>>,
     jobs: Arc<AsyncMutex<()>>,
-    /// Advanced by every sleep and wake: a flush started for an older sleep
-    /// keeps its publication but never releases a project after the wake.
+    /// Advanced by every wake (only): a flush started before it keeps its
+    /// publication but never releases a project after the wake.
     sleep_generation: AtomicU64,
     sleeping: Mutex<std::collections::HashSet<String>>,
     /// Projects a sleep flush stopped but did not hand over (its release ran
@@ -91,6 +102,12 @@ pub(crate) struct ProState {
     /// kind and name of what holds each one elsewhere, both from the last
     /// ownership read (`place::observed`). Hot state, bounded.
     reasons: place::Reasons,
+    /// Sessions a lease fence stopped and kept for resuming here
+    /// (`execution::watchdog::preserve`). They resume only while this computer
+    /// still holds the epoch they ran under: once another machine held the
+    /// project, or a return installed its own copy, they are stale and dropped
+    /// (`drop_fenced`), so a finished turn never runs again. Hot, bounded.
+    fenced_sessions: Mutex<std::collections::HashSet<String>>,
     holders: Mutex<HashMap<String, (String, Option<String>)>>,
     /// The last bytes written, so an unchanged tick costs no disk sync.
     persistence: Arc<AsyncMutex<Option<Vec<u8>>>>,
@@ -269,6 +286,8 @@ struct DiskState {
     /// sorted so an unchanged set writes the same bytes.
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     parked: std::collections::BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    signed_out: bool,
 }
 /// A return's kept-both report as persisted: the count, and the kept copies'
 /// project-relative paths (fewer than `files` when bounded, see
@@ -480,6 +499,7 @@ impl ProState {
             root,
             configured: AtomicBool::new(false),
             worker: AtomicBool::new(disk.worker),
+            signed_out: AtomicBool::new(disk.signed_out),
             generation: AtomicU64::new(0),
             runtime: Mutex::new(None),
             authority: Mutex::new(authority),
@@ -495,12 +515,14 @@ impl ProState {
             status: Mutex::new(status),
             task: Mutex::new(None),
             mirror_task: Mutex::new(None),
+            reconciling: Mutex::new(HashMap::new()),
             jobs: Arc::new(AsyncMutex::new(())),
             sleep_generation: AtomicU64::new(0),
             sleeping: Mutex::new(Default::default()),
             release_pending: Mutex::new(Default::default()),
             parked: Mutex::new(parked),
             reasons: Default::default(),
+            fenced_sessions: Mutex::new(Default::default()),
             holders: Mutex::new(HashMap::new()),
             persistence: Arc::new(AsyncMutex::new(None)),
             #[cfg(test)]
@@ -626,25 +648,21 @@ pub(crate) use execution::{
 /// The account answered the lease loop with a server error just now.
 #[cfg(test)]
 pub(crate) fn account_erroring_fixture(state: &crate::AppState) {
-    reach::answered(state, 503);
+    reach::answered(state, 503, true);
+}
+/// The user signed out on this computer (as `/pro/disconnect` records it).
+#[cfg(test)]
+pub(crate) fn signed_out_fixture(state: &crate::AppState) {
+    state
+        .pro
+        .signed_out
+        .store(true, std::sync::atomic::Ordering::Release);
 }
 /// This life has not renewed a project's lease yet (its deadline passed), as
 /// after a restart, without the watchdog having fenced anything.
 #[cfg(test)]
 pub(crate) fn lapse_execution_fixture(state: &crate::AppState, workspace: &str) {
     execution::lapse_fixture(state, workspace);
-}
-/// A signed-in configuration, for tests of what depends only on being signed in.
-#[cfg(test)]
-pub(crate) fn signed_in_fixture(state: &crate::AppState) {
-    *crate::lock(&state.pro.runtime) = Some(
-        serde_json::from_value(serde_json::json!({
-            "role":"device","endpoint":"http://127.0.0.1:1","keeper_url":"",
-            "delegation":{"access_token":"synthetic","expires_at":"2099-01-01T00:00:00Z",
-            "scope":["baton","mirror"],"device_id":"d-home"}
-        }))
-        .unwrap(),
-    );
 }
 pub(crate) fn managed_execution(state: &crate::AppState, workspace: &str) -> bool {
     execution::managed(state, workspace)
@@ -678,13 +696,13 @@ pub(crate) fn may_execute(state: &crate::AppState, workspace: &str) -> bool {
     }
     may_write(state, workspace) && execution::allows(state, workspace)
 }
-/// A plain shell's gate. Plain shells are never managed: a computer fenced
-/// only by its own lapsed lease (`execution::expire`) stops its agents, but
-/// its terminals keep working. Every other fence applies as to agents. Without
-/// Pro this is exactly `may_execute`.
+/// A plain shell's gate. Plain shells are never managed: a computer whose
+/// agents wait for its own lease (lapsed, or not verified yet after a wake)
+/// keeps its terminals working. Every ownership fence (`may_write`) applies
+/// as to agents. Without Pro this is exactly `may_execute`.
 pub(crate) fn may_run_shell(state: &crate::AppState, workspace: &str) -> bool {
     may_execute(state, workspace)
-        || (may_write(state, workspace) && execution::lapsed_here(state, workspace))
+        || (may_write(state, workspace) && execution::shells_allowed(state, workspace))
 }
 /// Sessions left by a previous daemon wait for this life's ownership proof, so
 /// a project the cloud took over while this computer was off never resumes a
@@ -766,18 +784,17 @@ pub(crate) fn defer_boot_session(state: &crate::AppState, session: &str) {
         deferred.insert(session.to_owned());
     }
 }
-/// Restart-deferred sessions on a device resume when ownership was not
-/// verified in time only because the account itself answers with server
-/// errors (nobody can acquire through it either) or no account is signed in
-/// (sign-out never stops a computer's work), unless another owner was
-/// verified meanwhile or old processes may still be running. An account that
-/// cannot be reached proves nothing: the cloud may run the work by now, so
-/// those sessions wait for the verified path (exactly once). Sessions a clean
-/// handoff suspended stay suspended; they belong to whoever now owns the
-/// project.
+/// Restart-deferred sessions of a synced project on a device resume without
+/// the account only when the user signed out (`signed_out`, written by
+/// `/pro/disconnect` and persisted, so a restart before the configuration
+/// arrives is never mistaken for it): sign-out never stops a computer's
+/// work. Anything else proves nothing (the cloud may run the work by now), so
+/// those sessions wait for the verified path (exactly once). Unsynced
+/// projects resume unless old processes may still be running. Sessions a
+/// clean handoff suspended stay suspended; they belong to whoever now owns
+/// the project.
 pub(crate) async fn resume_unverified(state: &std::sync::Arc<crate::AppState>) {
-    let signed_in = crate::lock(&state.pro.runtime).is_some();
-    if execution::worker(state) || (signed_in && !reach::erroring(state)) {
+    if execution::worker(state) {
         return;
     }
     let waiting = resume_unverified_once(state).await;
@@ -836,6 +853,16 @@ async fn resume_unverified_once(state: &std::sync::Arc<crate::AppState>) -> Vec<
             continue;
         }
         if !may_execute(state, &workspace) {
+            continue;
+        }
+        // A synced project waits for the account unless the user signed out
+        // (or it is kept on this computer: nobody else may take it).
+        if execution::managed(state, &workspace)
+            && !signed_out(state)
+            && !execution::kept_here(state, &workspace)
+        {
+            // Still waiting for the verified path (or a later fallback).
+            crate::lock(&state.pro.boot_deferred).extend(ids);
             continue;
         }
         if let Err(error) = crate::ledger::resume_deferred_sessions(state, &workspace, &ids).await {
@@ -909,6 +936,35 @@ fn park(state: &crate::AppState, workspace: &str, generation: u64) -> bool {
     }
     true
 }
+/// The user signed out of Pro on this computer and has not signed in since
+/// (persisted across restarts).
+pub(crate) fn signed_out(state: &crate::AppState) -> bool {
+    state
+        .pro
+        .signed_out
+        .load(std::sync::atomic::Ordering::Acquire)
+}
+/// A fence's preserved sessions of `workspace` that nothing replaced: the
+/// project ran elsewhere since (another holder, or a return that installed its
+/// own copy, whose imported sessions carry a hand-off record), so they are
+/// dropped instead of resuming a stale turn (review R3, harness cause 2).
+pub(super) fn drop_fenced(state: &crate::AppState, workspace: &str) {
+    let mut fenced = crate::lock(&state.pro.fenced_sessions);
+    if fenced.is_empty() {
+        return;
+    }
+    let mut deferred = crate::lock(&state.deferred_sessions);
+    fenced.retain(|id| match deferred.get(id) {
+        Some(entry) if entry.workspace_id == workspace => {
+            if entry.handoff.is_none() {
+                deferred.remove(id);
+            }
+            false
+        }
+        Some(_) => true,
+        None => false,
+    });
+}
 /// No longer kept in the cloud: "Run here", a handover that did not
 /// complete, or the cloud saying it cannot run the project.
 fn unpark(state: &crate::AppState, workspace: &str) {
@@ -965,6 +1021,7 @@ async fn persist(state: &crate::AppState) -> anyhow::Result<()> {
         ownership,
         preferences,
         parked,
+        signed_out: signed_out(state),
     })?;
     anyhow::ensure!(bytes.len() <= 1024 * 1024, "mirror settings exceed limit");
     // State first, then the enrollment latch: a crash between them leaves a
@@ -1258,14 +1315,25 @@ pub(crate) fn workspace_in_scope(state: &crate::AppState, workspace: &str) -> bo
         && crate::lock(&state.workspaces).get(workspace).is_some()
 }
 /// A project that actually moves between this computer and the cloud: an
-/// account is configured for it here, it is enrolled (this daemon holds an
+/// account is configured for it here (or, after a restart, was and did not
+/// sign out), it is enrolled (this daemon holds an
 /// ownership record for it, as only a first copy, a move or a hydrate
 /// writes), it is not kept on this computer, and it is not the cloud's own
 /// setup scratch project. `workspace_in_scope` alone also answers for a
 /// project that never enrolled. Answers the kept-both copies still waiting
 /// for a choice, each with the file it sits beside (project-relative).
 pub(crate) fn synced(state: &crate::AppState, workspace: &str) -> Option<Vec<(PathBuf, PathBuf)>> {
-    if !workspace_in_scope(state, workspace)
+    // After a restart the configuration arrives a few seconds later; an
+    // enrolled project of an account that did not sign out is still synced
+    // meanwhile, so a conversation started then hears where it runs (review
+    // R3, harness cause 3). Once configured, the account must match.
+    let restarting = crate::lock(&state.pro.runtime).is_none()
+        && !signed_out(state)
+        && authority::workspace(state, workspace).is_ok()
+        && crate::lock(&state.pro.preferences)
+            .get(workspace)
+            .is_some_and(|p| p.account.is_some());
+    if !(workspace_in_scope(state, workspace) || restarting)
         || !crate::lock(&state.pro.ownership).contains_key(workspace)
         || crate::lock(&state.pro.preferences)
             .get(workspace)
@@ -1306,6 +1374,66 @@ pub(crate) fn enroll_for_tests(state: &crate::AppState, workspace: &str) {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// Review R3 harness cause 3: after a restart the configuration arrives
+    /// a little later, and a conversation started meanwhile in an enrolled
+    /// project still hears where it runs. A recorded sign-out ends that.
+    #[tokio::test]
+    async fn a_restarted_computer_tells_its_agents_before_it_is_set_up_again() {
+        struct Noting;
+        impl crate::daemon_extension::Runtime for Noting {
+            fn coordinate(
+                &self,
+                _owner: crate::daemon_extension::CoordinatorOwner,
+            ) -> crate::daemon_extension::RuntimeFuture {
+                Box::pin(async {})
+            }
+            fn placement_note(
+                &self,
+                _facts: &crate::daemon_extension::guidance::Facts,
+            ) -> Option<String> {
+                Some("PLACE".into())
+            }
+        }
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-restart-note-{}",
+            chimaera_core::generate_token()
+        ));
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut state = crate::AppState::new(
+            "local-test".into(),
+            "test-host".into(),
+            4242,
+            0,
+            root.clone(),
+            root.join("config"),
+        );
+        state.daemon_extension = Some(Arc::new(Noting));
+        let state = Arc::new(state);
+        let workspace = crate::lock(&state.workspaces).add(project).unwrap().id;
+        // Enrolled for an account in an earlier life; not configured yet.
+        enroll_for_tests(&state, &workspace);
+        crate::lock(&state.pro.preferences)
+            .entry(workspace.clone())
+            .or_default()
+            .account = Some("a-fixture".into());
+        assert!(crate::lock(&state.pro.runtime).is_none());
+        assert_eq!(
+            crate::mcp::cloud_context::note(&state, &workspace)
+                .await
+                .as_deref(),
+            Some("PLACE")
+        );
+        // Signed out: nothing is synced any more.
+        signed_out_fixture(&state);
+        assert_eq!(
+            crate::mcp::cloud_context::note(&state, &workspace).await,
+            None
+        );
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
     fn state(root: &std::path::Path) -> Arc<crate::AppState> {
         Arc::new(crate::AppState::new(
             "local-test".into(),

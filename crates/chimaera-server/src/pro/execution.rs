@@ -168,6 +168,18 @@ pub(super) fn require_v2(state: &AppState, workspace: &str) -> bool {
     true
 }
 
+/// "Keep on this computer only", acknowledged by the account (its privacy
+/// fence stops any cloud takeover): the project is out of the lease loop. It
+/// holds no lease proof, so its agents are never fenced for a lease nobody
+/// renews, and its sessions restore without one (review R3 B4). While the
+/// switch is still unacknowledged (`privacy_pending`) the cloud could still
+/// take the project, so it keeps renewing like any other.
+pub(super) fn kept_here(state: &AppState, workspace: &str) -> bool {
+    lock(&state.pro.preferences)
+        .get(workspace)
+        .is_some_and(|p| p.never_mirror && !p.privacy_pending)
+}
+
 pub(super) fn managed(state: &AppState, workspace: &str) -> bool {
     let latched = lock(&state.pro.execution.latched).contains(workspace);
     uncertain(state, workspace)
@@ -324,11 +336,11 @@ pub(super) fn held_here(state: &AppState, config: &Configure, baton: &Baton) -> 
 }
 /// A worker's watchdog fenced this epoch; a later renewal of the same epoch
 /// must resume what the fence preserved.
-/// A personal computer fenced only by its own lapsed lease.
-pub(super) fn lapsed_here(state: &AppState, workspace: &str) -> bool {
+/// A personal computer whose agents wait only for its own lease (lapsed, or
+/// not verified yet): its plain shells are not managed and keep working.
+pub(super) fn shells_allowed(state: &AppState, workspace: &str) -> bool {
     !worker(state)
         && !supervisor::pending(state)
-        && fenced(state, workspace)
         && !lock(&state.pro.preferences)
             .get(workspace)
             .is_some_and(|p| p.recovery_pending)
@@ -509,8 +521,22 @@ pub(super) fn allows(state: &AppState, workspace: &str) -> bool {
     // A resumed machine keeps admitting the input that woke it while it renews
     // its own paused lease; a refused renewal fences it at once. A computer
     // runs its own work until its lease lapsed and it was fenced (`expire`).
+    // A computer whose ownership is unverified (after a restart, a wake or a
+    // failed flush) starts no agent until the lease loop verified it still
+    // holds the project: the cloud may have taken it meanwhile (review R3
+    // B3). Signed out, nothing will verify it and sign-out never stops a
+    // computer's work.
     if !worker(state) {
-        return !fenced(state, workspace) || resuming(state, workspace);
+        let unverified = !super::signed_out(state)
+            && matches!(
+                lock(&state.pro.ownership).get(workspace),
+                Some(super::Ownership::AwaitingVerification { .. })
+            );
+        return if unverified {
+            lease_valid(state, workspace)
+        } else {
+            !fenced(state, workspace) || resuming(state, workspace)
+        };
     }
     lease_valid(state, workspace)
         || resuming(state, workspace)
@@ -596,7 +622,8 @@ pub(super) fn resumed(state: &AppState, generation: u64) -> bool {
 /// Sessions a previous daemon left running resume only once this life has
 /// verified ownership; `resume_unverified` applies the device fallback.
 pub(super) fn restorable(state: &AppState, workspace: &str) -> bool {
-    lease_valid(state, workspace) && !unclean(state, workspace)
+    (lease_valid(state, workspace) || (!worker(state) && kept_here(state, workspace)))
+        && !unclean(state, workspace)
 }
 /// A fresh, unexpired acquire/renew proof for the current local epoch. It
 /// gates publication and forwarded viewers on every host, and all execution
@@ -771,6 +798,17 @@ pub(super) fn expire(state: &AppState, generation: u64) -> Vec<String> {
         return Vec::new();
     }
     let mut proofs = lock(&state.pro.execution.proofs);
+    if !worker {
+        // A project kept on this computer left the lease loop: nothing renews
+        // its proof any more and nobody else may take it, so it holds none
+        // and its agents are never fenced for it (`kept_here`).
+        let preferences = lock(&state.pro.preferences);
+        proofs.retain(|workspace, _| {
+            !preferences
+                .get(workspace)
+                .is_some_and(|p| p.never_mirror && !p.privacy_pending)
+        });
+    }
     let mut expired = Vec::new();
     let mut fenced = false;
     let now = std::time::Instant::now();

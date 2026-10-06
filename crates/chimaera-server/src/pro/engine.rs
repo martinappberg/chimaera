@@ -2034,6 +2034,12 @@ async fn finish_hydration_checked(
             );
             ownership.insert(workspace.into(), Ownership::SettingUp { epoch });
         }
+        // A return installed the other machine's copy: its sessions replaced
+        // the ones a fence kept here. (A cloud machine resuming its own fenced
+        // epoch installs nothing new and keeps them.)
+        if !execution::worker(state) {
+            super::drop_fenced(state, workspace);
+        }
         super::persist(state).await?;
     }
     let blocked = providers.await;

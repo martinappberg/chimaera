@@ -1239,6 +1239,12 @@ fn curl(
 pub(super) struct Response {
     pub status: u16,
     pub body: Vec<u8>,
+    /// The answer carries the account's own marker (`X-Chimaera-Account: 1`,
+    /// set on every account answer, errors included):
+    /// it came from the account, not from a proxy, captive portal or edge
+    /// between here and it. An old curl that cannot report a header leaves
+    /// this false, which is the safe reading.
+    pub from_account: bool,
 }
 
 /// The keeper's answer while the account is down (503 `account_unavailable`):
@@ -1305,7 +1311,7 @@ async fn request_inner(
 ) -> Result<Response> {
     let url = checked_url(base, path)?;
     let (mut command, input) = curl(&url, method, token, body, wake)?;
-    command.args(["--write-out", "\n%{http_code}"]);
+    command.args(["--write-out", "\n%{http_code}%header{x-chimaera-account}"]);
     let timeout = if path.ends_with("/pro/handoff") {
         command.args(["--max-time", "90"]);
         Duration::from_secs(93)
@@ -1313,19 +1319,31 @@ async fn request_inner(
         Duration::from_secs(15)
     };
     let permit = Arc::new(REQUESTS.clone().acquire_owned().await?);
-    let mut output = run_reserved(command, input, timeout, JSON_CAP + 4, permit, None).await?;
-    ensure!(
-        output.success && output.stdout.len() >= 4,
-        "service is unavailable"
-    );
-    let marker = output.stdout.len() - 4;
-    ensure!(output.stdout[marker] == b'\n', "invalid service response");
-    let status = std::str::from_utf8(&output.stdout[marker + 1..])?.parse()?;
+    let mut output = run_reserved(command, input, timeout, JSON_CAP + 64, permit, None).await?;
+    ensure!(output.success, "service is unavailable");
+    let (status, from_account, marker) = trailer(&output.stdout)?;
     output.stdout.truncate(marker);
     Ok(Response {
         status,
         body: output.stdout,
+        from_account,
     })
+}
+
+/// The status and the account marker curl appends after the body
+/// (`\n<status><marker value>`), and where the body ends.
+fn trailer(stdout: &[u8]) -> Result<(u16, bool, usize)> {
+    let marker = stdout
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .context("invalid service response")?;
+    let tail = std::str::from_utf8(&stdout[marker + 1..])?;
+    ensure!(
+        tail.len() >= 3 && tail.is_char_boundary(3),
+        "invalid service response"
+    );
+    let status = tail[..3].parse()?;
+    Ok((status, tail[3..].trim() == "1", marker))
 }
 
 /// The clean mirror repository owns its Git configuration. A helper reads its
@@ -1466,6 +1484,63 @@ async fn git_output_selected(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_an_answer_with_the_account_marker_is_the_accounts() {
+        assert_eq!(trailer(b"{}\n2001").unwrap(), (200, true, 2));
+        assert_eq!(trailer(b"{\"a\":\n1}\n5031").unwrap(), (503, true, 8));
+        // A proxy or captive portal answers without the marker.
+        assert_eq!(trailer(b"<html>\n502").unwrap(), (502, false, 6));
+        // An old curl prints the unsupported variable literally: not marked.
+        assert_eq!(
+            trailer(b"\n503%header{x-chimaera-account}").unwrap(),
+            (503, false, 0)
+        );
+        assert!(trailer(b"no trailer").is_err());
+        assert!(trailer(b"\n5").is_err());
+    }
+
+    /// Review R3 B1, through the real curl: a 5xx from something between this
+    /// computer and the account (no marker) is told apart from the account's
+    /// own 5xx, and a marker in the body is not a header.
+    #[tokio::test]
+    async fn the_account_marker_is_read_from_the_answer_headers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = vec![0u8; 4096];
+                let n = socket.read(&mut request).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..n]).into_owned();
+                let (status, marker, body) = if request.contains("/proxy") {
+                    ("502 Bad Gateway", "", "x-chimaera-account: 1")
+                } else if request.contains("/failing") {
+                    ("503 Service Unavailable", "X-Chimaera-Account: 1\r\n", "{}")
+                } else {
+                    ("200 OK", "", "{}")
+                };
+                let answer = format!(
+                    "HTTP/1.1 {status}\r\n{marker}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(answer.as_bytes()).await;
+            }
+        });
+        let proxy = request(&base, "/proxy", "GET", "synthetic", None)
+            .await
+            .unwrap();
+        assert_eq!((proxy.status, proxy.from_account), (502, false));
+        assert_eq!(proxy.body, b"x-chimaera-account: 1");
+        let failing = request(&base, "/failing", "GET", "synthetic", None)
+            .await
+            .unwrap();
+        assert_eq!((failing.status, failing.from_account), (503, true));
+        assert_eq!(failing.body, b"{}");
+        let plain = request(&base, "/ok", "GET", "synthetic", None)
+            .await
+            .unwrap();
+        assert_eq!((plain.status, plain.from_account), (200, false));
+    }
 
     #[tokio::test]
     async fn canceled_or_expired_capture_retains_actual_slot_and_cache_until_settlement() {

@@ -197,8 +197,11 @@ fn device_lease_expiry_fences_its_own_agents_unless_the_account_is_erroring() {
     assert!(expire(&state, 0).is_empty());
     assert!(crate::pro::may_execute(&state, "w-a"));
     assert!(!lease_valid(&state, "w-a"), "publication waits for renewal");
-    // Unreachable (no recent server error): fenced at the deadline.
+    // A 5xx from a proxy, captive portal or edge (no account marker) proves
+    // nothing about the account: fenced at the deadline, as unreachable.
     state.pro.erroring_at.store(0, Ordering::Release);
+    crate::pro::reach::answered(&state, 502, false);
+    assert!(!crate::pro::reach::erroring(&state));
     assert_eq!(expire(&state, 0), vec!["w-a"]);
     assert!(!crate::pro::may_execute(&state, "w-a"));
     assert!(crate::pro::validate_execution_scope(&state, "w-a", 2).is_err());
@@ -585,5 +588,49 @@ async fn graceful_same_boot_restart_does_not_fence_but_a_crash_probes_survivors(
     let restarted = crate::pro::ProState::new(state.pro.root.clone());
     assert!(lock(&restarted.execution.unclean).is_empty());
     assert!(!lock(&restarted.preferences)["w-a"].execution_active);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Review R3 B4: switching "Keep on this computer only" on takes the project
+/// out of the lease loop; its agents are never fenced for a lease nobody
+/// renews any more.
+#[test]
+fn keeping_a_project_on_this_computer_never_fences_its_agents() {
+    let (state, _config, root) = fixture();
+    crate::pro::install_execution_fixture(&state, "w-a", 2).unwrap();
+    lock(&state.pro.preferences)
+        .entry("w-a".into())
+        .or_default()
+        .never_mirror = true;
+    lock(&state.pro.execution.proofs)
+        .get_mut("w-a")
+        .unwrap()
+        .deadline = lease::Deadline::expired_fixture();
+    assert!(expire(&state, 0).is_empty());
+    assert!(!fenced(&state, "w-a"));
+    assert!(crate::pro::may_execute(&state, "w-a"));
+    // Its sessions restore after a restart without a lease.
+    assert!(restorable(&state, "w-a"));
+    // Switching it back puts it in the loop again; the next renewal installs
+    // a fresh proof.
+    lock(&state.pro.preferences)
+        .get_mut("w-a")
+        .unwrap()
+        .never_mirror = false;
+    assert!(expire(&state, 0).is_empty());
+    // A switch the account has not acknowledged yet keeps the lease: the
+    // cloud could still take the project, so a lapse still fences.
+    crate::pro::install_execution_fixture(&state, "w-a", 3).unwrap();
+    {
+        let mut preferences = lock(&state.pro.preferences);
+        let preference = preferences.get_mut("w-a").unwrap();
+        preference.never_mirror = true;
+        preference.privacy_pending = true;
+    }
+    lock(&state.pro.execution.proofs)
+        .get_mut("w-a")
+        .unwrap()
+        .deadline = lease::Deadline::expired_fixture();
+    assert_eq!(expire(&state, 0), vec!["w-a"]);
     std::fs::remove_dir_all(root).unwrap();
 }
