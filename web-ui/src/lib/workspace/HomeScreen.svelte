@@ -106,7 +106,9 @@
   const FILTER_THRESHOLD = 5;
   let filter = $state("");
   const shownWorkspaces = $derived.by(() => {
-    const q = filter.trim().toLowerCase();
+    // The filter input only exists past the threshold: a stale query must not
+    // keep hiding rows once removals shrink the list below it.
+    const q = sorted.length > FILTER_THRESHOLD ? filter.trim().toLowerCase() : "";
     if (q === "") return sorted;
     // Short queries match names only: every path under ~ shares letters, so
     // one or two characters would match everything.

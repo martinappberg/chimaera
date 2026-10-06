@@ -190,7 +190,8 @@
     // Else the first subdirectory (Enter descends); fall back to "open this
     // folder" when nothing matches.
     const firstDir = rows.findIndex((r) => r.kind === "dir");
-    highlight = firstDir >= 0 ? firstDir : 0;
+    // Never default onto the Home row: a stray Enter keeps its old meaning.
+    highlight = firstDir >= 0 ? firstDir : homeOffset;
   }
 
   async function browse(path: string): Promise<boolean> {
