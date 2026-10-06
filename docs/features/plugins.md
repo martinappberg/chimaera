@@ -506,7 +506,7 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     (sandboxed with the pinned capabilities, or the exact pinned privileged release); the card names the pin ("chimaera pins 0.1.0") only in a tooltip. What the lock
     pins changes only with a chimaera release, and that follows a plugin release on its own: the
     hourly `plugin-lock` workflow checks the newer release, bumps the lock in a `fix:` PR with
-    auto-merge, CI installs it, and the merge cuts a patch release (setup and how to turn a
+    auto-merge, CI installs it, and the merge requests a patch release, which the next daily batch ships (setup and how to turn a
     version down: `plugins/AGENTS.md`).
   - **Knobs** (tests and live proofs): `CHIMAERA_PLUGIN_RELEASES_API` replaces the GitHub API
     base the checker and third-party installs ask; `CHIMAERA_PLUGIN_DOWNLOADS` replaces

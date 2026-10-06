@@ -15,7 +15,7 @@ on:
 # A superseded PR run is worthless: cancel it the moment a new commit lands.
 # Pushes to main are never cancelled — they prime the caches described above.
 # The group is per-workflow, so this can never interfere with release.yml
-# (which runs on a schedule and owns the `release` group).
+# (which runs on a schedule and owns the `release-<ref>` groups).
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}

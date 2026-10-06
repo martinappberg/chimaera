@@ -26,6 +26,10 @@ users get at most one scheduled update a day.
 Why the newest *green* commit and not the tip: a PR's checks ran on its branch, not
 necessarily on the tree its squash-merge produced, so `main`'s own CI run is the gate.
 A red `main` holds releases at the last green commit until a fix lands and passes.
+One exception: a run's steps come from `release.yml` at the commit it ran on, so
+when that file differs at the green commit, the run skips with a warning rather
+than build a tree with steps written for another; a run whose copy agrees ships
+the batch.
 
 **Ship now** (a hotfix, or anything that shouldn't wait for the schedule): once the
 merge's `ci.yml` run on `main` has passed, run

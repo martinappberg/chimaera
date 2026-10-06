@@ -700,8 +700,8 @@ A first-party bump:
    `fix: update <Name> to <version>`. Auto-merge is limited to sandboxed
    releases whose capability declarations match the pinned release; other
    bumps wait for a maintainer to approve `tier` and `caps`. CI installs the
-   release against the new lock, and the merge cuts a patch release: from it,
-   **Install** fetches that version. Details, the one-time token and how to
+   release against the new lock, and the merge requests a patch release: from
+   that release (the next daily batch), **Install** fetches that version. Details, the one-time token and how to
    turn a version down: [plugins/AGENTS.md](../../plugins/AGENTS.md).
 
 To add a first-party plugin: a repository shaped like the examples, its first release, a

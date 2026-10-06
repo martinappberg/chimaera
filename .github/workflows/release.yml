@@ -31,7 +31,10 @@ on:
 permissions:
   contents: read
 
-concurrency: release
+# One release at a time, the next waiting. Per ref: a run dispatched from
+# another branch ships nothing (see `version`), yet in a shared group it would
+# replace a main run waiting there.
+concurrency: release-${{ github.ref }}
 
 jobs:
   version:
@@ -66,7 +69,7 @@ jobs:
             exit 1
           fi
           if [ "$sha" != "$TIP" ]; then
-            echo "::notice title=release::main's tip ${TIP:0:8} hasn't passed ci.yml (running or failed); releasing from ${sha:0:8}, the newest commit that has"
+            echo "::notice title=release::releasing from ${sha:0:8}, the newest main commit ci.yml passed on, not this run's ${TIP:0:8}"
           fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -75,9 +78,21 @@ jobs:
           fetch-depth: 0
       - id: bump
         run: |
+          # This run's steps are release.yml as of $GITHUB_SHA; the tree it
+          # builds is the green commit's. Where that file differs, a step can
+          # miss what the tree needs (a version-stamp sed that no-ops ships a
+          # 0.0.1 app) or run what it lacks. A later run, once they agree,
+          # ships this batch.
+          if ! git diff --quiet "$GITHUB_SHA" HEAD -- .github/workflows/release.yml; then
+            echo "::warning title=release::release.yml at ${GITHUB_SHA:0:8} (this run's steps) differs from the release commit's; not releasing until main's tip passes ci.yml"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           latest=$(git tag --list 'v*' --sort=-v:refname | head -1)
           # Every merge since the last release: that is the batch this run
-          # ships. A re-run after a release finds none and skips.
+          # ships. To finish a release that failed partway, re-run its failed
+          # jobs (they keep this job's outputs); re-running this job reads
+          # afresh, and skips unless more merges have gone green since.
           if [ -n "$latest" ]; then range="$latest..HEAD"; else range=HEAD; fi
           mapfile -t subjects < <(git log --first-parent --format=%s "$range")
           echo "merges since ${latest:-the start}:"
