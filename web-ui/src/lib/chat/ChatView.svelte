@@ -2638,7 +2638,7 @@
     title={subagent.title}
     parentName={subagent.parentName}
     model={subagentState?.model ?? null}
-    modelName={subagentState?.model ? modelName(subagentState.model) : null}
+    {modelName}
     agentType={subagentState?.agentType ?? null}
     running={subagentState?.running ?? null}
     onOpenParent={subagent.onOpenParent}

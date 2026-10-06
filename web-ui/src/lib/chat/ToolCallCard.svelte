@@ -3,6 +3,7 @@
   import { contextMenu } from "../shared/contextMenu.svelte";
   import { menuPoint, resolveAndOpen, type OpenPathFn, type PathResolver } from "./paths";
   import type { ChatBlock, SubagentInfo, ToolContent } from "./store.svelte";
+  import ModelChip from "./ModelChip.svelte";
   import { readableToolTitle } from "./toolLabels";
 
   interface Props {
@@ -216,7 +217,7 @@
       </button>
     {/if}
     {#if block.tool === "agent" && subagent?.model}
-      <span class="model" title={`model: ${subagent.model}`}>{modelName?.(subagent.model) ?? subagent.model}</span>
+      <ModelChip model={subagent.model} {modelName} pill />
     {/if}
     {#if block.tool === "agent" && onOpenSubagent !== undefined}
       <button
@@ -423,19 +424,6 @@
     cursor: default;
   }
   .loc,
-  .model {
-    flex: none;
-    max-width: 24ch;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    padding: 0 6px;
-    border-radius: 999px;
-    background: color-mix(in srgb, var(--fg) 6%, transparent);
-    color: var(--muted);
-    font-family: var(--mono, monospace);
-    font-size: var(--text-xs);
-  }
   .act {
     flex: none;
     display: inline-flex;

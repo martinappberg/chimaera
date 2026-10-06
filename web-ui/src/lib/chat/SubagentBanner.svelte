@@ -1,5 +1,6 @@
 <script lang="ts">
   import SessionGlyph from "../shared/SessionGlyph.svelte";
+  import ModelChip from "./ModelChip.svelte";
 
   /**
    * The header of a subagent view, in place of the chat header: it says
@@ -15,8 +16,8 @@
     parentName: string;
     /** The model serving it, in the agent's own words; null until known. */
     model: string | null;
-    /** `model` as the picker would label it. */
-    modelName: string | null;
+    /** A model id as the picker labels it. */
+    modelName?: (id: string) => string;
     /** The agent's name for the kind of subagent ("general-purpose"). */
     agentType: string | null;
     /** Working, finished, or not known yet (the parent is still loading). */
@@ -45,7 +46,7 @@
       <span class="chip" title="the kind of subagent">{agentType}</span>
     {/if}
     {#if model !== null}
-      <span class="chip model" title={`model: ${model}`}>{modelName ?? model}</span>
+      <ModelChip {model} {modelName} pill />
     {/if}
     <span class="end">
       {#if running !== null}
@@ -142,7 +143,7 @@
   }
   /* A narrow pane keeps who and what; the kind is the first to go. */
   @container pane-chrome (max-width: 520px) {
-    .chip:not(.model) {
+    .chip {
       display: none;
     }
   }

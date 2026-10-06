@@ -3,6 +3,7 @@
   import WorkTray from "../shared/WorkTray.svelte";
   import WorkTrayRow from "../shared/WorkTrayRow.svelte";
   import SubagentChip from "./SubagentChip.svelte";
+  import ModelChip from "./ModelChip.svelte";
   import { backgroundKind, countKinds } from "./backgroundKinds";
   import type { BackgroundTask } from "./store.svelte";
 
@@ -136,7 +137,7 @@
         <span class="count">{task.agentsDone}/{task.agentsTotal} agents</span>
       {/if}
       {#if task.model !== null}
-        <span class="model" title={`model: ${task.model}`}>{modelName?.(task.model) ?? task.model}</span>
+        <ModelChip model={task.model} {modelName} />
       {/if}
       {#if task.status !== "running"}
         <span class="status">{task.status}</span>
@@ -159,16 +160,6 @@
     white-space: nowrap;
     color: var(--fg);
     font-family: var(--mono, monospace);
-  }
-  .model {
-    flex: none;
-    max-width: 24ch;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    color: var(--muted);
-    font-family: var(--mono, monospace);
-    font-size: var(--text-xs);
   }
   .status {
     flex: none;

@@ -2,6 +2,7 @@
   import WorkTray from "../shared/WorkTray.svelte";
   import WorkTrayRow from "../shared/WorkTrayRow.svelte";
   import SubagentChip from "./SubagentChip.svelte";
+  import ModelChip from "./ModelChip.svelte";
   import type { ChatBlock, SubagentInfo } from "./store.svelte";
   import { subagentTitle } from "./subagentView";
 
@@ -66,7 +67,7 @@
         <span class="progress">{progress(agent)}</span>
       {/if}
       {#if info?.model}
-        <span class="model" title={`model: ${info.model}`}>{modelName?.(info.model) ?? info.model}</span>
+        <ModelChip model={info.model} {modelName} />
       {/if}
     </WorkTrayRow>
   {/each}
@@ -81,16 +82,6 @@
     white-space: nowrap;
     color: var(--fg);
     font-family: var(--mono, monospace);
-  }
-  .model {
-    flex: none;
-    max-width: 24ch;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    color: var(--muted);
-    font-family: var(--mono, monospace);
-    font-size: var(--text-xs);
   }
   .progress {
     flex: 1;
