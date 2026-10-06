@@ -48,8 +48,8 @@ jobs:
         with:
           node-version-file: .nvmrc
 
-      # An open bump lands first; newer releases wait for the next run. With
-      # `main` requiring up-to-date branches, a bump that fell behind would
+      # An open bump lands first; newer releases wait for the next run. Should
+      # `main` require up-to-date branches again, a bump that fell behind would
       # never auto-merge, so bring it up to date (its checks rerun). One that
       # can't land any more — it conflicts with a lock edited on main, or main
       # already carries its change (an empty squash would cut an empty

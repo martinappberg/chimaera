@@ -116,9 +116,9 @@ does not activate it. Rebuild, copy and reinstall the same version to iterate.
    that version. Run it by hand with **Actions →
    plugin-lock → Run workflow**, or locally without writing:
    `node .github/scripts/plugin-lock.mjs`. One bump PR at a time: a newer
-   release waits for the open one, which the workflow keeps up to date with
-   `main`, and one that can no longer land (it conflicts with a lock edited
-   on `main`, or `main` already has its change) is closed as "Superseded:"
+   release waits for the open one to land, and one that can no longer land
+   (it conflicts with a lock edited on `main`, or `main` already has its
+   change) is closed as "Superseded:"
    and redone from `main`'s lock. Closing a bump PR unmerged yourself turns
    that version down for good; the workflow never reopens it. A release
    still uploading its files is picked up by the next run. A release that fails a
@@ -136,11 +136,9 @@ does not activate it. Rebuild, copy and reinstall the same version to iterate.
    write** and **Pull requests: Read and write**, saved as the repository
    secret `PLUGIN_LOCK_TOKEN`. Without it a run only reports the bump it would
    make (a warning). Replace it before it expires. The same secret lets
-   `.github/workflows/pr-auto-update.yml` bring pull requests with
-   auto-merge up to date with `main` (update-branch needs the same two
-   permissions), and `release.yml`'s `plugin-pins` job publish the plugin
-   pre-releases a new chimaera release pins (Contents on the plugin
-   repositories; a new plugin repository needs adding to the token).
+   `release.yml`'s `plugin-pins` job publish the plugin pre-releases a new
+   chimaera release pins (Contents on the plugin repositories; a new plugin
+   repository needs adding to the token).
 
 ## Rules
 

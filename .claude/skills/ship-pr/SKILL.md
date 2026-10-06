@@ -84,13 +84,15 @@ End the PR body with an accurate agent trailer. For Codex:
 
 Claude Code uses its corresponding Claude Code trailer instead.
 
-**Landing it.** With squash auto-merge on, you don't merge `origin/main` in by
-hand just to catch up: `main` requires branches to be up to date, and
-`.github/workflows/pr-auto-update.yml` brings the oldest pull request with
-auto-merge that fell behind up to date after each merge, one at a time, so it
-lands on its own. Merge `origin/main` in yourself only to resolve a conflict (the
-PR says it has conflicts), which the workflow can't. A PR whose required checks
-fail is skipped until it's fixed.
+**Landing it.** `main` doesn't require branches to be up to date, so a PR with
+squash auto-merge on lands as soon as its required checks (`ui`, `rust`, `cla`)
+pass, however far behind it is. Merge `origin/main` in yourself only to resolve a
+conflict (the PR says it has conflicts). The merged tree is tested by `main`'s own
+CI run, and a release only ships a commit that run passed on, so a merge that
+breaks `main` holds releases back until a fix lands; fix forward. That run needs
+every `ci.yml` job green, not just the required ones: auto-merge doesn't wait
+for `scripts` or `musl`, and a PR that lands with either red breaks `main` the
+same way, so watch them pass too.
 
 ## After merge
 
@@ -102,9 +104,11 @@ worktree). If another session still uses it, leave it intact and report why.
 
 Nothing publishes on merge. The next scheduled `release.yml` run ships the
 merge with everything else merged since the last release, once `main`'s CI has
-passed on it. A fix that shouldn't wait: after its `ci.yml` run on `main` passes,
-`gh workflow run release.yml --ref main`. The run's `version` job lists the merges it
-read and the version it chose; a no-release type or `[skip release]` merge
+passed on it. A fix that shouldn't wait: after its `ci.yml` run on `main` passes
+(or, when a merge right behind it replaced that run before it started, the later
+merge's run), `gh workflow run release.yml --ref main`. The run's `version` job
+lists the merges it read and the version it chose; a no-release type or
+`[skip release]` merge
 contributes no bump, so a batch of only those reports `release=false` and cuts
 nothing. If a release came out that nothing asked for, a marker didn't make it
 into a squash message.
