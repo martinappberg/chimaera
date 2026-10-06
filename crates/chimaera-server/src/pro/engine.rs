@@ -364,13 +364,26 @@ fn sessions(state: &AppState, workspace: &str) -> Vec<String> {
         .collect()
 }
 
+/// Every session a transfer carries: the live ones and the stopped ones kept
+/// for this project (a conversation waiting here for its agent's sign-in, or
+/// one an earlier stop preserved). Leaving a stopped one out would lose it
+/// once the project leaves: a cloud machine that cannot run a conversation
+/// hands it back with the project.
 fn transfer_session_ids(state: &AppState, workspace: &str) -> Result<Vec<String>> {
-    let ids: Vec<_> = lock(&state.session_workspaces)
+    let mut ids: Vec<_> = lock(&state.session_workspaces)
         .iter()
         .filter(|(_, id)| id.as_str() == workspace)
         .map(|(id, _)| id.clone())
         .take(65)
         .collect();
+    for (id, entry) in lock(&state.deferred_sessions).iter() {
+        if ids.len() > 64 {
+            break;
+        }
+        if entry.workspace_id == workspace && !ids.contains(id) {
+            ids.push(id.clone());
+        }
+    }
     ensure!(
         ids.len() <= 64,
         "Project transfer supports at most 64 sessions; close some sessions and try again"

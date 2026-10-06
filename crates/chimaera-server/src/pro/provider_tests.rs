@@ -168,3 +168,33 @@ async fn provider_checks_cannot_grant_after_cancellation_account_or_owner_change
     drop(state);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+/// A conversation the cloud machine keeps stopped because its agent is not
+/// signed in there has no live session, yet it travels with the project:
+/// handing the project back without it would lose the conversation.
+#[tokio::test]
+async fn a_conversation_waiting_for_its_sign_in_travels_with_the_project() {
+    let root = std::env::temp_dir().join(format!(
+        "chimaera-provider-roster-{}",
+        chimaera_core::generate_token()
+    ));
+    let state = fixture(&root);
+    crate::ledger::defer(&state, entry(AgentKind::Claude)).unwrap();
+    let mut other = entry(AgentKind::Codex);
+    other.workspace_id = "other-project".into();
+    crate::ledger::defer(&state, other).unwrap();
+    lock(&state.session_workspaces).insert("s-live".into(), "w-project".into());
+    let mut ids = super::transfer_session_ids(&state, "w-project").unwrap();
+    ids.sort();
+    assert_eq!(ids, ["s-claude", "s-live"]);
+    // A stopped session that is also listed live is carried once.
+    lock(&state.session_workspaces).insert("s-claude".into(), "w-project".into());
+    assert_eq!(
+        super::transfer_session_ids(&state, "w-project")
+            .unwrap()
+            .len(),
+        2
+    );
+    drop(state);
+    std::fs::remove_dir_all(root).unwrap();
+}
