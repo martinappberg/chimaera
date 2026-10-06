@@ -6,11 +6,6 @@
 //! once the job reservation, every transfer task, every project cache and
 //! every Git helper slot is free and state is flushed to disk. The drain holds
 //! until DELETE, or lapses on its own a while after the machine resumes.
-//!
-//! Before it answers, a cloud machine publishes each project it holds as it is
-//! now: the copy a computer takes the work home from when a phone acts while
-//! this machine sleeps (`moves`), so that never needs to wake it. The account
-//! trusts that copy only when it was acknowledged around this suspension.
 use super::{detached, transport};
 use crate::{lock, AppState};
 use axum::{
@@ -134,14 +129,6 @@ pub(crate) async fn start(State(state): State<Arc<AppState>>, body: axum::body::
     if settle().await.is_err() {
         return busy();
     }
-    if super::execution::worker(&state) {
-        publish_before_sleep(&state, deadline).await;
-        // Its Git helpers and cache guards are released again before the
-        // machine may freeze.
-        if settle().await.is_err() {
-            return busy();
-        }
-    }
     if let Err(error) = super::persist(&state).await {
         return super::routes::failure(error);
     }
@@ -151,47 +138,6 @@ pub(crate) async fn start(State(state): State<Arc<AppState>>, body: axum::body::
     let _ = tokio::time::timeout_at(deadline, tokio::task::spawn_blocking(nix::unistd::sync)).await;
     pending.armed = false;
     Json(json!({"token":token})).into_response()
-}
-
-/// Publishes each project this cloud machine holds under a live lease, within
-/// the drain's deadline (with a margin for the rest of the drain). A failure
-/// or a timeout leaves the last copy in place: the account then does not
-/// trust it for a takeover, and a phone's action wakes this machine as before.
-async fn publish_before_sleep(state: &Arc<AppState>, deadline: tokio::time::Instant) {
-    let Some(config) = lock(&state.pro.runtime).clone() else {
-        return;
-    };
-    let until = deadline
-        .checked_sub(Duration::from_secs(10))
-        .unwrap_or(deadline)
-        .min(tokio::time::Instant::now() + Duration::from_secs(30));
-    let workspaces = lock(&state.workspaces).list();
-    for workspace in workspaces.into_iter().take(128) {
-        if super::owned_epoch(state, &workspace.id).is_none()
-            || !super::execution::lease_valid(state, &workspace.id)
-            || lock(&state.pro.preferences)
-                .get(&workspace.id)
-                .is_some_and(|p| p.never_mirror)
-        {
-            continue;
-        }
-        match tokio::time::timeout_at(
-            until,
-            super::engine::snapshot(state, &config, &workspace.id, false),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => tracing::info!(
-                category = super::engine::failure_code(&error),
-                "A project was not published before the cloud machine slept"
-            ),
-            Err(_) => {
-                tracing::info!("Publishing before the cloud machine slept ran out of time");
-                return;
-            }
-        }
-    }
 }
 
 struct Pending<'a> {

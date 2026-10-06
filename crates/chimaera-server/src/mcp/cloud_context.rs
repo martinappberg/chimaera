@@ -17,8 +17,8 @@
 //! Names that came from the project or the other machine (file paths, folder
 //! paths, sign-in labels) pass `clean_name` before the Runtime sees them: an
 //! untrusted name can never break out of a list or start a line of its own.
-use crate::{pro::CloudProfile, AppState};
-use serde::{Deserialize, Deserializer, Serialize};
+use crate::AppState;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -26,7 +26,6 @@ use std::{
     sync::Arc,
 };
 
-const PROFILE_CAP: usize = 32 * 1024;
 /// The longest note an agent start carries. A longer one is cut at a line
 /// boundary with a pointer to the lookup, never withheld: its first line
 /// (where the agent runs now, and that earlier statements no longer apply)
@@ -47,7 +46,7 @@ pub(crate) const LOOKUP: &str = "where_am_i";
 /// The tools a synced project's agents get. Not reserved from plugins: a
 /// plugin tool of the same name keeps working everywhere these are not
 /// offered (every project of a daemon without the Runtime).
-pub(super) const NAMES: &[&str] = &[LOOKUP, "update_cloud_profile"];
+pub(super) const NAMES: &[&str] = &[LOOKUP];
 
 /// The last move into this machine, kept beside the project's other transfer
 /// state (`<data>/pro/<workspace>/arrival.json`), never in the project folder.
@@ -100,14 +99,6 @@ pub struct Facts {
     /// machine only; nothing is assumed on the user's computer).
     pub signed_in: Vec<String>,
     pub not_signed_in: Vec<String>,
-    pub setup_command: Option<String>,
-    pub proposed_setup_waiting: bool,
-}
-
-pub struct GuidanceSetup {
-    pub setup_command: Option<String>,
-    pub pending_setup_command: Option<String>,
-    pub note: &'static str,
 }
 
 /// A name that came from the project or the other machine, made safe to put
@@ -245,9 +236,10 @@ pub(crate) async fn read_arrival(state: &AppState, workspace: &str) -> Option<Ar
 }
 
 /// The facts for a synced project on a daemon with the Runtime, else None.
-async fn facts(state: &AppState, workspace: &str) -> Option<(Facts, CloudProfile)> {
+async fn facts(state: &AppState, workspace: &str) -> Option<Facts> {
     state.daemon_extension.as_ref()?;
-    let (profile, kept) = crate::pro::synced(state, workspace)?;
+    let kept = crate::pro::synced(state, workspace)?;
+    let missing_environment = crate::pro::missing_environment(state, workspace);
     let root = crate::lock(&state.workspaces).get(workspace)?.root;
     let cloud = crate::pro::is_worker(state);
     let arrival = read_arrival(state, workspace).await;
@@ -287,8 +279,7 @@ async fn facts(state: &AppState, workspace: &str) -> Option<(Facts, CloudProfile
                 copy: name(copy, NAME_CAP),
             })
             .collect(),
-        environment_not_copied: profile
-            .missing_environment
+        environment_not_copied: missing_environment
             .iter()
             .filter(|name| environment_name(name))
             .take(32)
@@ -296,10 +287,8 @@ async fn facts(state: &AppState, workspace: &str) -> Option<(Facts, CloudProfile
             .collect(),
         signed_in,
         not_signed_in,
-        setup_command: profile.setup_command.clone(),
-        proposed_setup_waiting: profile.pending_setup_command.is_some(),
     };
-    Some((facts, profile))
+    Some(facts)
 }
 
 /// The Runtime's words, bounded to [`NOTE_CAP`]: whole lines are kept while
@@ -341,7 +330,7 @@ fn fit(text: &str) -> Option<String> {
 #[cfg(test)]
 pub(crate) async fn note(state: &AppState, workspace: &str) -> Option<String> {
     let runtime = state.daemon_extension.as_ref()?;
-    let (facts, _) = facts(state, workspace).await?;
+    let facts = facts(state, workspace).await?;
     fit(&runtime.placement_note(&facts)?)
 }
 
@@ -390,7 +379,7 @@ pub(crate) async fn pending(state: &AppState, workspace: &str, session: &str) ->
     if !safe_id(session) {
         return None;
     }
-    let (facts, _) = facts(state, workspace).await?;
+    let facts = facts(state, workspace).await?;
     let arrival = facts.arrival.as_ref();
     let machine = digest(&[
         if facts.cloud { "cloud" } else { "computer" },
@@ -535,28 +524,6 @@ pub(super) fn definitions(state: &AppState) -> Vec<Value> {
         .map_or_else(Vec::new, |runtime| runtime.guidance_definitions())
 }
 
-fn revision(profile: &CloudProfile, generation: u64) -> String {
-    Sha256::digest(serde_json::to_vec(&(generation, profile)).unwrap_or_default())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-/// An agent may propose (never set) the command a cloud machine runs before
-/// work continues there. Everything else in the profile is written by moves
-/// and by the user.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Update {
-    expected_revision: String,
-    /// Absent keeps the current command (and any proposal); `null` clears
-    /// it. An omitted field must never clear what the user confirmed.
-    #[serde(default, deserialize_with = "present")]
-    setup_command: Option<Option<String>>,
-}
-fn present<'de, D: Deserializer<'de>>(value: D) -> Result<Option<Option<String>>, D::Error> {
-    Option::<String>::deserialize(value).map(Some)
-}
 fn environment_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 128
@@ -564,94 +531,32 @@ fn environment_name(name: &str) -> bool {
             byte == b'_' || byte.is_ascii_alphabetic() || (index > 0 && byte.is_ascii_digit())
         })
 }
-fn update(args: &Value) -> anyhow::Result<Update> {
-    anyhow::ensure!(
-        serde_json::to_vec(args)?.len() <= PROFILE_CAP,
-        "Cloud profile exceeds 32 KiB"
-    );
-    let request: Update = serde_json::from_value(args.clone())?;
-    anyhow::ensure!(
-        request.expected_revision.len() == 64
-            && request
-                .expected_revision
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit()),
-        "Call where_am_i first and pass its profile_revision"
-    );
-    Ok(request)
-}
-
-pub(super) async fn call(state: &Arc<AppState>, session: &str, name: &str, args: &Value) -> Value {
+/// `where_am_i`, the only tool in [`NAMES`].
+pub(super) async fn call(state: &Arc<AppState>, session: &str, args: &Value) -> Value {
     let Some(runtime) = state.daemon_extension.as_ref() else {
         return super::tool_error("This project does not move between machines".into());
     };
     let result = async {
-        let generation = crate::pro::profile_generation(state);
         let workspace = super::workspace_of(state, session)
             .ok_or_else(|| anyhow::anyhow!("This session has no project"))?;
-        let (facts, profile) = facts(state, &workspace.id)
+        let facts = facts(state, &workspace.id)
             .await
             .ok_or_else(|| anyhow::anyhow!("This project does not move between machines"))?;
-        profile.validate()?;
-        if name == LOOKUP {
-            anyhow::ensure!(
-                args.as_object().is_none_or(|object| object.is_empty()),
-                "where_am_i takes no arguments"
-            );
-            let note = runtime.placement_note(&facts).unwrap_or_default();
-            return Ok(json!({
-                "note": note,
-                "facts": facts,
-                "profile_revision": revision(&profile, generation),
-            })
-            .to_string());
-        }
-        let request = update(args)?;
-        anyhow::ensure!(
-            request.expected_revision == revision(&profile, generation),
-            "The profile changed; call where_am_i again before saving"
-        );
-        let proposed = request
-            .setup_command
-            .unwrap_or_else(|| profile.setup_command.clone());
-        let proposal = runtime
-            .guidance_setup(&profile, proposed.as_deref())
-            .ok_or_else(|| anyhow::anyhow!("This project does not move between machines"))?;
-        let awaiting_confirmation = proposal.pending_setup_command.is_some();
-        let next = CloudProfile {
-            setup_command: proposal.setup_command,
-            pending_setup_command: proposal.pending_setup_command,
-            missing_environment: profile.missing_environment.clone(),
-        };
-        next.validate()?;
-        crate::pro::save_workspace_profile(
+        crate::pro::policy::validate_missing_environment(&crate::pro::missing_environment(
             state,
             &workspace.id,
-            generation,
-            &profile,
-            next.clone(),
-        )
-        .await?;
-        Ok::<_, anyhow::Error>(
-            json!({
-                "saved": true,
-                "profile_revision": revision(&next, generation),
-                "executed": false,
-                "awaiting_confirmation": awaiting_confirmation,
-                "note": proposal.note,
-            })
-            .to_string(),
-        )
+        ))?;
+        anyhow::ensure!(
+            args.as_object().is_none_or(|object| object.is_empty()),
+            "where_am_i takes no arguments"
+        );
+        let note = runtime.placement_note(&facts).unwrap_or_default();
+        Ok::<_, anyhow::Error>(json!({"note": note, "facts": facts}).to_string())
     }
     .await;
     match result {
         Ok(text) => super::tool_text(text),
-        // Never return parse diagnostics containing a submitted field/value.
-        Err(error) => super::tool_error(if error.is::<serde_json::Error>() {
-            "Invalid cloud profile fields".into()
-        } else {
-            error.to_string()
-        }),
+        Err(error) => super::tool_error(error.to_string()),
     }
 }
 
@@ -659,50 +564,12 @@ pub(super) async fn call(state: &Arc<AppState>, session: &str, name: &str, args:
 mod tests {
     use super::*;
     #[test]
-    fn profile_writes_keep_normal_agent_permissions() {
-        assert!(!super::super::ALWAYS_ALLOWED_TOOLS.contains(&"update_cloud_profile"));
-        assert!(!super::super::MASTERMIND_READ_TOOLS.contains(&"update_cloud_profile"));
-    }
-    #[test]
-    fn profile_proposals_cannot_smuggle_scope_or_unbounded_data() {
-        let profile = CloudProfile {
-            setup_command: Some("npm ci".into()),
-            ..Default::default()
-        };
-        let args = json!({"expected_revision":revision(&profile, 0),"setup_command":"npm ci"});
-        assert!(update(&args).is_ok());
-        assert_ne!(revision(&profile, 0), revision(&profile, 1));
-        let mut foreign = args.clone();
-        foreign["workspace_id"] = json!("other");
-        assert!(update(&foreign).is_err());
-        // Agents no longer write device-only lists or environment names.
-        let mut old = args.clone();
-        old["missing_environment"] = json!(["API_TOKEN"]);
-        assert!(update(&old).is_err());
-        assert!(update(
-            &json!({"expected_revision":"0".repeat(64),"setup_command":"x".repeat(40_000)})
-        )
-        .is_err());
-    }
-    #[test]
     fn arrival_names_are_short_identifiers_only() {
         assert_eq!(short_name(Some("macos")).as_deref(), Some("macos"));
         assert_eq!(short_name(Some("x86_64")).as_deref(), Some("x86_64"));
         assert_eq!(short_name(Some("mac os")), None);
         assert_eq!(short_name(Some(&"a".repeat(33))), None);
         assert_eq!(short_name(None), None);
-    }
-    #[test]
-    fn an_omitted_setup_command_is_not_a_request_to_clear_it() {
-        let revision = "0".repeat(64);
-        let omitted = update(&json!({"expected_revision": revision})).unwrap();
-        assert_eq!(omitted.setup_command, None);
-        let cleared =
-            update(&json!({"expected_revision": revision, "setup_command": null})).unwrap();
-        assert_eq!(cleared.setup_command, Some(None));
-        let set =
-            update(&json!({"expected_revision": revision, "setup_command": "npm ci"})).unwrap();
-        assert_eq!(set.setup_command, Some(Some("npm ci".into())));
     }
     #[test]
     fn untrusted_names_cannot_start_a_line_or_run_long() {
@@ -792,9 +659,9 @@ mod tests {
         forget_all(&state).await;
         forget(&state, "w-1").await;
         assert!(!crate::pro::storage(&state).join("w-1").exists());
+        let refusal = call(&state, "missing-session", &json!({})).await;
+        assert_eq!(refusal["isError"], true);
         for name in NAMES {
-            let refusal = call(&state, "missing-session", name, &json!({})).await;
-            assert_eq!(refusal["isError"], true);
             // As on a daemon before Pro: a plugin may offer a tool of this name.
             assert!(!super::super::is_core_tool(name));
         }

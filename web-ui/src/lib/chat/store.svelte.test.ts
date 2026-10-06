@@ -2178,8 +2178,8 @@ describe("ChatStore unsent text", () => {
     const first = send("carry on here");
     // Live when sent, so no pending bubble yet; the relay then says it holds it.
     expect(store.sending).toEqual([]);
-    store.onBringing("here");
-    expect(store.bringing).toBe("here");
+    store.onBringing();
+    expect(store.bringing).toBe(true);
     expect(store.sending.map((pending) => pending.text)).toEqual(["carry on here"]);
     // A send while the work is coming is pending too, after the first.
     const second = send("and this");
@@ -2188,20 +2188,20 @@ describe("ChatStore unsent text", () => {
     // and comes back; nothing is coming.
     const kept = "Your other computer is still working on this. Try again when it pauses.";
     store.onCommandFailed(kept, "send", "still_working", first);
-    expect(store.bringing).toBeNull();
+    expect(store.bringing).toBe(false);
     expect(store.sending.map((pending) => pending.text)).toEqual(["and this"]);
     store.onCommandFailed(kept, "send", "still_working", second);
     expect(returned()).toEqual(["carry on here", "and this"]);
     // It survives the socket that closes once the work arrived; the next ready ends it.
-    store.onBringing("computer");
+    store.onBringing();
     store.onDisconnected();
-    expect(store.bringing).toBe("computer");
+    expect(store.bringing).toBe(true);
     store.onReady(SESSION, 0, 0, IDS);
-    expect(store.bringing).toBeNull();
-    // A wake (the phone's computer did not take it) ends it too.
-    store.onBringing("computer");
+    expect(store.bringing).toBe(false);
+    // A wake ends it too.
+    store.onBringing();
     store.onWaking();
-    expect(store.bringing).toBeNull();
+    expect(store.bringing).toBe(false);
     expect(store.waking).toBe(true);
   });
 
@@ -3175,7 +3175,7 @@ describe("ChatStore behind a holder, between two daemons", () => {
       say(text: string): string {
         const id = client.send(text);
         answer(holder.receive({ type: "send", blocks: [{ type: "text", text }], client_id: id }));
-        client.store.onBringing("here");
+        client.store.onBringing();
         return id;
       },
       /** The daemon the work is leaving answers `ready` on the viewer's socket. */

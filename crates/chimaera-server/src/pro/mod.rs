@@ -38,12 +38,10 @@ pub(crate) use kept::{
 pub(crate) use moves::device_fixture;
 pub(crate) use moves::{acted_here, other_computer};
 pub(crate) use place::{run_here, run_in_cloud};
-pub(crate) use policy::CloudProfile;
 pub(crate) use provider_gate::{
     blocking_provider, cloud_provider_blocks, workspace_provider_blocks,
 };
 pub(crate) use routes::*;
-tokio::task_local! { static PROFILE_SETUP: (String, u64); }
 
 use serde::{Deserialize, Serialize};
 use std::{
@@ -212,8 +210,10 @@ struct Preference {
     /// Exact acknowledged handoff baseline, including portable Git staging.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     published_handoff: Option<String>,
-    #[serde(default)]
-    profile: policy::CloudProfile,
+    /// Environment variable names the last move's configuration export left
+    /// out (`policy::validate_missing_environment`), for the agents' note.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    missing_environment: Vec<String>,
 }
 #[derive(Clone, Default, Serialize)]
 struct WorkspaceStatus {
@@ -582,21 +582,6 @@ pub(crate) fn may_write(state: &crate::AppState, workspace: &str) -> bool {
                 .load(std::sync::atomic::Ordering::Acquire))
     {
         return false;
-    }
-    if matches!(
-        crate::lock(&state.pro.ownership).get(workspace),
-        Some(Ownership::SettingUp { .. })
-    ) {
-        return PROFILE_SETUP
-            .try_with(|(id, generation)| {
-                id == workspace
-                    && *generation
-                        == state
-                            .pro
-                            .generation
-                            .load(std::sync::atomic::Ordering::Acquire)
-            })
-            .unwrap_or(false);
     }
     if crate::lock(&state.pro.legacy_pending).contains(workspace) {
         return false;
@@ -1243,12 +1228,6 @@ fn projects_root(state: &crate::AppState) -> PathBuf {
         })
 }
 
-pub(crate) fn profile_generation(state: &crate::AppState) -> u64 {
-    state
-        .pro
-        .generation
-        .load(std::sync::atomic::Ordering::Acquire)
-}
 /// Whether the native app configured this daemon for Pro at all.
 pub(crate) fn configured(state: &crate::AppState) -> bool {
     state
@@ -1267,38 +1246,27 @@ pub(crate) fn is_worker(state: &crate::AppState) -> bool {
         .as_ref()
         .is_some_and(|config| config.role == protocol::Role::Worker)
 }
-pub(crate) fn workspace_profile(state: &crate::AppState, workspace: &str) -> Option<CloudProfile> {
-    authority::workspace(state, workspace).ok()?;
-    if !state
-        .pro
-        .configured
-        .load(std::sync::atomic::Ordering::Acquire)
-        || !projects::account_matches(state, workspace)
-        || crate::lock(&state.workspaces).get(workspace).is_none()
-    {
-        return None;
-    }
-    Some(
-        crate::lock(&state.pro.preferences)
-            .get(workspace)
-            .map(|entry| entry.profile.clone())
-            .unwrap_or_default(),
-    )
+/// An account is configured here and this project is in its scope (whether
+/// or not it ever enrolled).
+pub(crate) fn workspace_in_scope(state: &crate::AppState, workspace: &str) -> bool {
+    authority::workspace(state, workspace).is_ok()
+        && state
+            .pro
+            .configured
+            .load(std::sync::atomic::Ordering::Acquire)
+        && projects::account_matches(state, workspace)
+        && crate::lock(&state.workspaces).get(workspace).is_some()
 }
 /// A project that actually moves between this computer and the cloud: an
 /// account is configured for it here, it is enrolled (this daemon holds an
 /// ownership record for it, as only a first copy, a move or a hydrate
 /// writes), it is not kept on this computer, and it is not the cloud's own
-/// setup scratch project. `workspace_profile` alone also answers for a
-/// project that never enrolled. Answers its saved profile and the kept-both
-/// copies still waiting for a choice, each with the file it sits beside
-/// (project-relative).
-pub(crate) fn synced(
-    state: &crate::AppState,
-    workspace: &str,
-) -> Option<(CloudProfile, Vec<(PathBuf, PathBuf)>)> {
-    let profile = workspace_profile(state, workspace)?;
-    if !crate::lock(&state.pro.ownership).contains_key(workspace)
+/// setup scratch project. `workspace_in_scope` alone also answers for a
+/// project that never enrolled. Answers the kept-both copies still waiting
+/// for a choice, each with the file it sits beside (project-relative).
+pub(crate) fn synced(state: &crate::AppState, workspace: &str) -> Option<Vec<(PathBuf, PathBuf)>> {
+    if !workspace_in_scope(state, workspace)
+        || !crate::lock(&state.pro.ownership).contains_key(workspace)
         || crate::lock(&state.pro.preferences)
             .get(workspace)
             .is_some_and(|p| p.never_mirror)
@@ -1319,7 +1287,14 @@ pub(crate) fn synced(
             Some((copy, original))
         })
         .collect();
-    Some((profile, kept))
+    Some(kept)
+}
+/// The environment variable names the last move into this project left out.
+pub(crate) fn missing_environment(state: &crate::AppState, workspace: &str) -> Vec<String> {
+    crate::lock(&state.pro.preferences)
+        .get(workspace)
+        .map(|entry| entry.missing_environment.clone())
+        .unwrap_or_default()
 }
 /// Enrolls a project as its first copy would, for tests of what enrolled
 /// projects get.
@@ -1327,73 +1302,6 @@ pub(crate) fn synced(
 pub(crate) fn enroll_for_tests(state: &crate::AppState, workspace: &str) {
     crate::lock(&state.pro.ownership).insert(workspace.into(), Ownership::Local { epoch: 1 });
 }
-pub(crate) async fn save_workspace_profile(
-    state: &std::sync::Arc<crate::AppState>,
-    workspace: &str,
-    expected_generation: u64,
-    expected: &CloudProfile,
-    updated: CloudProfile,
-) -> anyhow::Result<()> {
-    authority::workspace(state, workspace)?;
-    updated.validate()?;
-    let configuration = state.pro.configuration.clone().lock_owned().await;
-    anyhow::ensure!(
-        profile_generation(state) == expected_generation,
-        "Account changed; read the cloud profile again before updating"
-    );
-    let job = state
-        .pro
-        .jobs
-        .clone()
-        .try_lock_owned()
-        .map_err(|_| anyhow::anyhow!("Project transfer is active; retry after it finishes"))?;
-    anyhow::ensure!(
-        may_write(state, workspace) && projects::account_matches(state, workspace),
-        "Project is currently read-only"
-    );
-    anyhow::ensure!(
-        workspace_profile(state, workspace).is_some(),
-        "Cloud profile is unavailable"
-    );
-    let state = state.clone();
-    let workspace = workspace.to_owned();
-    let expected = expected.clone();
-    // The MCP caller can disappear while the blocking persistence completes.
-    // Keep account and transfer admission until that accepted write settles.
-    tokio::spawn(async move {
-        let _configuration = configuration;
-        let _job = job;
-        let previous = {
-            let mut preferences = crate::lock(&state.pro.preferences);
-            anyhow::ensure!(
-                preferences.len() < 128 || preferences.contains_key(&workspace),
-                "Cloud profile limit reached"
-            );
-            let previous = preferences
-                .get(&workspace)
-                .map(|p| p.profile.clone())
-                .unwrap_or_default();
-            anyhow::ensure!(
-                previous == expected,
-                "Cloud profile changed; read it again before updating"
-            );
-            preferences.entry(workspace.clone()).or_default().profile = updated.clone();
-            previous
-        };
-        if let Err(error) = persist(&state).await {
-            let mut preferences = crate::lock(&state.pro.preferences);
-            let current = &mut preferences.entry(workspace).or_default().profile;
-            if *current == updated {
-                *current = previous;
-            }
-            return Err(error);
-        }
-        state.changes.notify_waiters();
-        Ok(())
-    })
-    .await?
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

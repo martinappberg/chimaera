@@ -182,7 +182,7 @@ pub(crate) async fn args_in(
     id: &str,
     key: &str,
 ) -> Vec<String> {
-    if crate::pro::workspace_profile(state, workspace).is_none() {
+    if !crate::pro::workspace_in_scope(state, workspace) {
         return Vec::new();
     }
     let Some(project) = crate::lock(&state.workspaces)

@@ -101,14 +101,14 @@ merges of shared workspace/index/view/ledger state. Local delivery evidence is
 captured before the journal can be replaced. A failed metadata write leaves the
 return fenced; an exact retry after restart uses the original preparation and
 never starts an agent. Missing or damaged preparation fails closed. The return
-commits only after every session's durable metadata is installed; profile setup
-and agent admission follow that commit. New incoming directories may be prepared
+commits only after every session's durable metadata is installed; the provider
+readiness check and agent admission follow that commit. New incoming directories may be prepared
 before they exist locally, but must be canonical and present at finalization.
 Owned configuration and mutation reservations fence file application, metadata
 finalization, and commit against account replacement and ownership changes. Caller
 cancellation cannot release those reservations while an admitted write continues.
 The commit retains its reservation through the exact Hydrating→SettingUp transition
-and durable state write; initial profile setup uses the same configuration lock
+and durable state write; finishing hydration uses the same configuration lock
 and ownership check.
 
 The public session-import route uses the same preparation and file transaction.

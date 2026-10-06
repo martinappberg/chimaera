@@ -529,9 +529,8 @@ credentials. It leaves the Link transport protocol number unchanged.
 ### Acting brings the work to you
 
 Additive (2026-09-30): `POST|DELETE /v2/baton/{workspace}/move`, the
-`move_to`/`move_requested_at`/`move_reason` fields of ownership answers, the
-passive read's `ready`/`power` query, the `{"type":"bringing","to":"here"|"computer"}`
-socket frame, the `bringing`/`still_working` refusal reasons and the `other`
+`move_to`/`move_requested_at` fields of ownership answers, the
+`{"type":"bringing","to":"here"}` socket frame, the `bringing`/`still_working` refusal reasons and the `other`
 flag of `moved`. Clients that ignore them keep today's behavior (the work
 stays where it runs and a send wakes a sleeping cloud machine). In current
 native clients, opening synchronizes a local copy and ordinary input stays
@@ -610,10 +609,9 @@ Content-Type and the explicit wake marker, and never accepts a destination URL.
 
 Allowed method/path pairs after `/http/` are `GET api/v1/sessions`,
 `GET|POST api/v1/workspaces`, `GET api/v1/pro/bundles/{session_id}`,
-`POST api/v1/pro/bundles/{session_id}/export`, `POST api/v1/pro/bundles`, and
-`GET|PUT api/v1/pro/profile`. Profile GET adds `ETag` and `Cache-Control: no-store`; PUT accepts one exact quoted SHA-256 `If-Match` and returns 412 if the profile or account generation changed. Missing `If-Match` retains legacy unconditional behavior; malformed or multiple conditions return 400. This changes no JSON fields. Bundle import accepts only `fork=true|false`,
-`origin=moved|home`, and unsigned `epoch` query parameters; profile accepts only
-`workspace_id`. Session and workspace identifiers use letters, digits, `_` and
+`POST api/v1/pro/bundles/{session_id}/export` and `POST api/v1/pro/bundles`.
+Bundle import accepts only `fork=true|false`, `origin=moved|home`, and
+unsigned `epoch` query parameters. Session and workspace identifiers use letters, digits, `_` and
 `-`, up to 128 bytes. Other routes, methods and query keys are rejected.
 
 Bodies stream with a 128 MiB ceiling; response preparation is bounded to two

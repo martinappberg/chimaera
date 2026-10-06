@@ -48,14 +48,8 @@ impl Scenario {
         crate::ledger::defer(&self.harness.state, entry)
     }
     pub async fn finish_fixture_hydration(&self, epoch: u64, generation: u64) -> Result<()> {
-        super::super::super::finish_hydration(
-            &self.harness.state,
-            &self.key,
-            epoch,
-            generation,
-            async { Ok(()) },
-        )
-        .await
+        super::super::super::finish_hydration(&self.harness.state, &self.key, epoch, generation)
+            .await
     }
     pub fn provider_blocks(&self) -> Vec<Value> {
         crate::pro::cloud_provider_blocks(&self.harness.state)

@@ -3507,9 +3507,9 @@
     <ManualResume {session} onResumed={() => socket.retrySoon()} />
   {:else if continuing}
     <div class="connection-status"><span role="status">{continuingLabel}</span>{#if connect !== null}<button type="button" class="connect" onclick={() => cloudOnboarding.request({ providerIds: [connect.providerId], workspaceId: connect.workspaceId })}>Connect {connect.label} to continue</button>{/if}</div>
-  {:else if store.bringing !== null}
+  {:else if store.bringing}
     <!-- Acting here is bringing the work over; the send waits for it. -->
-    <div class="connection-status" role="status">{store.bringing === "here" ? "Bringing the work here…" : "Bringing the work to your computer…"}</div>
+    <div class="connection-status" role="status">Bringing the work here…</div>
   {:else if store.waking && !store.connected}
     <div class="connection-status" role="status">Waking the cloud machine…</div>
   {:else if store.asleep}

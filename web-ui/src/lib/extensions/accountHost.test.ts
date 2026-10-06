@@ -1,5 +1,5 @@
 import { beforeEach, expect, it, vi } from "vitest";
-const mocks = vi.hoisted(() => ({ intent: { providerIds: ["claude"], workspaceId: "project-a" }, clear: vi.fn(), request: vi.fn(), daemon: vi.fn(), profileRead: vi.fn(), profileSave: vi.fn() }));
+const mocks = vi.hoisted(() => ({ intent: { providerIds: ["claude"], workspaceId: "project-a" }, clear: vi.fn(), request: vi.fn(), daemon: vi.fn() }));
 vi.mock("../net/native", () => ({ isNativeShell: () => true, writeClipboard: vi.fn(), navigateHome: vi.fn() }));
 vi.mock("../net/base", () => ({ isAccountHome: () => false, isBrowserGateway: () => false, gatewayWorkspace: () => null, gatewayPrefix: () => "", workbenchPath: () => "/" }));
 vi.mock("../net/plan", () => ({ paidPlan: { subscribe: vi.fn() } }));
@@ -7,7 +7,6 @@ vi.mock("../shared/visibility", () => ({ pageVisible: { subscribe: vi.fn() } }))
 vi.mock("../shared/keybindings", () => ({ matchAction: () => null, keyHint: () => "" }));
 vi.mock("../pro/onboarding.svelte", () => ({ cloudOnboarding: { get context() { return mocks.intent; }, clear: mocks.clear, request: mocks.request } }));
 vi.mock("./accountDaemon", () => ({ legacyCloudRequest: mocks.daemon, readBrowserMirrorStatus: vi.fn() }));
-vi.mock("../pro/profile", () => ({ readSetupProfile: mocks.profileRead, saveSetupProfile: mocks.profileSave }));
 vi.mock("../pro/kept", () => ({ requestKeptReview: vi.fn() }));
 import { accountHostScope } from "./accountHost";
 beforeEach(() => vi.clearAllMocks());

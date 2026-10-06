@@ -129,18 +129,11 @@ async fn provider_checks_cannot_grant_after_cancellation_account_or_owner_change
         let task_entered = entered.clone();
         let task_release = release.clone();
         let task = tokio::spawn(async move {
-            finish_hydration_checked(
-                &task_state,
-                "w-project",
-                3,
-                generation,
-                async { Ok(()) },
-                async move {
-                    task_entered.notify_one();
-                    task_release.notified().await;
-                    vec![]
-                },
-            )
+            finish_hydration_checked(&task_state, "w-project", 3, generation, async move {
+                task_entered.notify_one();
+                task_release.notified().await;
+                vec![]
+            })
             .await
         });
         tokio::time::timeout(Duration::from_secs(5), entered.notified())

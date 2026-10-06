@@ -175,9 +175,6 @@ in one run with production lease, reconnect and idle timings:
 11. Ordinary input from Mac B still runs on Mac A. Explicit **Take over** then
     moves execution A → B → A at safe pauses, retaining the logical conversation,
     independent local copies and exactly one executor.
-12. The cloud asleep with the project and a computer online on power: a phone
-    read wakes nothing, and a phone send brings the work to the computer,
-    which answers it, while the cloud machine stays asleep.
 
 Its last run on this branch is recorded in the PR. Passing it is the bar for
 "the flow works"; unit and integration tests alone are not.

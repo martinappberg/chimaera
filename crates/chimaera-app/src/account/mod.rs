@@ -239,15 +239,6 @@ pub trait AccountExtension: Send + Sync {
         expected_epoch: u64,
         expected_account_lifetime: Option<String>,
     ) -> Task<Result<(), String>>;
-    fn pro_settle_setup_proposal(
-        &self,
-        app: tauri::AppHandle,
-        window: tauri::WebviewWindow,
-        workspace_id: String,
-        shown: String,
-        decision: types::profile::Decision,
-        expected_account_lifetime: Option<String>,
-    ) -> Task<Result<types::profile::Outcome, String>>;
     fn pro_cloud_status(
         &self,
         app: tauri::AppHandle,

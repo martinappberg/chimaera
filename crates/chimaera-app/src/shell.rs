@@ -1091,7 +1091,6 @@ pub fn run(
             crate::account::commands::pro_take_return,
             crate::account::commands::pro_mirror_status,
             crate::account::commands::pro_set_never_mirror,
-            crate::account::commands::pro_settle_setup_proposal,
             crate::account::commands::pro_sign_in,
             crate::account::commands::pro_cancel_sign_in,
             crate::account::commands::pro_sign_out,

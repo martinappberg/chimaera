@@ -47,7 +47,6 @@ export function refusalText(reason: string | null, message: string | null, where
 export function statusText(status: TerminalStatus, watching = false): string {
   if (status === "waking") return "Waking the cloud machine…";
   if (status === "bringing") return "Bringing the work here…";
-  if (status === "bringing-computer") return "Bringing the work to your computer…";
   return watching ? "Asleep in the cloud. Take control, then press a key to wake it." : "Asleep in the cloud. Press a key to wake it.";
 }
 

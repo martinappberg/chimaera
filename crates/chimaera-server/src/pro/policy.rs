@@ -1,6 +1,5 @@
 //! Conservative transfer policy. A path denied here cannot be opted into by a
 //! project ignore file; account and agent login material never leaves its host.
-use serde::{Deserialize, Serialize};
 use std::path::{Component, Path};
 
 pub const MAX_FILE_BYTES: u64 = 100_000_000;
@@ -81,41 +80,18 @@ pub fn contains_credential(bytes: &[u8]) -> bool {
     false
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CloudProfile {
-    /// Runs before conversations continue on a cloud machine. Only the user
-    /// sets it (Chimaera Pro, `PUT /pro/profile`).
-    #[serde(default)]
-    pub setup_command: Option<String>,
-    /// Additive: a setup command an agent proposed (`update_cloud_profile`).
-    /// It never runs until the user confirms it, which moves it into
-    /// `setup_command`; injected repository text cannot schedule execution
-    /// on the credentialed cloud machine by itself.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pending_setup_command: Option<String>,
-    /// Environment variable NAMES the last move's agent-configuration export
-    /// left out (values never travel). Written by the sender, never by an agent.
-    #[serde(default)]
-    pub missing_environment: Vec<String>,
-}
-impl CloudProfile {
-    pub fn validate(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.setup_command
-                .iter()
-                .chain(&self.pending_setup_command)
-                .all(|s| s.len() <= 16 * 1024 && !contains_credential(s.as_bytes()))
-                && self.missing_environment.len() <= 128,
-            "cloud profile exceeds limits or contains a credential"
-        );
-        anyhow::ensure!(
-            self.missing_environment
+/// Environment variable NAMES a move's agent-configuration export left out
+/// (values never travel): written by the sender, never by an agent, and only
+/// ever shown to agents as names.
+pub fn validate_missing_environment(names: &[String]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        names.len() <= 128
+            && names
                 .iter()
                 .all(|v| v.len() <= 2048 && !contains_credential(v.as_bytes())),
-            "cloud profile entry exceeds limits or contains a credential"
-        );
-        Ok(())
-    }
+        "missing environment names exceed limits or contain a credential"
+    );
+    Ok(())
 }
 
 #[cfg(test)]

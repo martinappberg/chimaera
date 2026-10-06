@@ -8,7 +8,7 @@ revocable delegation over the authenticated local API.
 | --- | --- |
 | `mod.rs` | Bounded, credential-free persistent state and ownership/import fences; `synced` says whether a project's agents get the where-you-run note (`mcp/cloud_context.rs`). |
 | `authority.rs` / `authority_tests.rs` | Fixed-identity workspace-bound worker acceptance, startup-only validated revision advancement, credential-free persisted latch, renewal/route/root guards and synthetic side-effect regressions. |
-| `routes.rs` | Authenticated configure/status/privacy/profile/power/hydration HTTP handlers. Profile GET returns an account-generation-bound ETag; PUT optionally checks one exact If-Match under the same preference lock as replacement (412 on change). Older unconditional PUT remains supported. Accepted writes retain configuration/job reservations through durable persistence even if the caller disconnects. `profile_tests.rs` covers stale confirmation, generation changes and disk failure. `/pro/status` rows carry additive `place`, `reason`, `run_here` and `run_in_cloud` (see Where work runs below). `hand_over` is the one flush coordinator behind `/pro/sleep`, the macOS sleep watcher and "Run in the cloud"; `woke` is the wake. |
+| `routes.rs` | Authenticated configure/status/privacy/sleep/hydration HTTP handlers. Accepted writes retain configuration/job reservations through durable persistence even if the caller disconnects. `/pro/status` rows carry additive `place`, `reason`, `run_here` and `run_in_cloud` (see Where work runs below). `hand_over` is the one flush coordinator behind `/pro/sleep`, the macOS sleep watcher and "Run in the cloud"; `woke` is the wake. |
 | `place.rs` | Where a synced project's work runs and the user's two choices: `run_here` (`POST /pro/projects/{id}/here`), `run_in_cloud` (`POST /pro/projects/{id}/cloud`), `observed` (the ownership read's `reason`/`holder_kind`/`holder_name`), the cloud machine's `arrived` report (`PUT /v2/workspaces/{id}/reason`). |
 | `reach.rs` | Whether this computer can reach the account (the lease loop's own calls: `answered`, `unreachable`, `settled` after a 60 s guard, `erroring`) and the daemon-owned reverse-serve link to the keeper. |
 | `sleep_watch.rs` | macOS only: the daemon's own IOKit sleep/wake watcher; a will-sleep runs `routes::sleeping` (23 s) and always acknowledges, a power-on runs `routes::woke`. |
@@ -27,8 +27,8 @@ revocable delegation over the authenticated local API.
 | `engine.rs` / `engine/coordinator_host.rs` | Public authority/effect host for snapshot, reconciliation, staged hydration and live return. Private runtime owns coordinator timing, snapshot/reconcile policy and move/release loops over the same captured generation and ProjectOwner. Public `engine::start` retains the spawned task. Without a runtime no coordinator/account loop starts; durable enrollment, ownership and recovery still load. |
 | `install.rs` / `install/tests.rs` | Durable, account/epoch/checkpoint-bound return file intents: private before/after blobs, descriptor-relative no-follow replacement, exact restart roll-forward, checkout invariants and refusal to overwrite newer user edits. Planning opens enumerated images nonblocking beneath pinned roots; a missing or nonregular image refuses rather than silently changing the write intent. |
 | `detached.rs` | Owned transfer tasks keyed by (kind, project, epoch): a caller that disconnects never cancels a flush or hydration; repeats join; a completed release is remembered ten minutes. |
-| `drain.rs` | `POST/DELETE /pro/drain`: refuse new transfer work and wait for jobs, transfer tasks, project caches and Git helpers before a cloud machine suspends; on a cloud machine it first publishes each project it holds (the copy a computer takes when a phone acts while it sleeps). |
-| `moves.rs` / `engine/project_host/move_host.rs` | Single bounded pull/answered/acted/yielding/leaving stores, original task admission/outcome cleanup, explicit Take over and exact captured fixed move effects. Private optional policy owns the original pull/read-retry/hydrate and pause/last-actor handover loops over the same ProjectOwner; original generation flows through request and hydration, and the same yield tuple retires only after completion. No-runtime pull refuses and releases its original request. Phone90s/computer300s selection, renewal target/dedup selection and passive readiness query remain public paid behavior alongside shared custody; this is a bounded reduction, not a claim that the whole family is free. Original older-wire test stays public; private move tests cover original policy, observed epoch and replacement before mutation. |
+| `drain.rs` | `POST/DELETE /pro/drain`: refuse new transfer work and wait for jobs, transfer tasks, project caches and Git helpers before a cloud machine suspends. |
+| `moves.rs` / `engine/project_host/move_host.rs` | Single bounded pull/answered/acted/yielding/leaving stores, original task admission/outcome cleanup, explicit Take over and exact captured fixed move effects. Private optional policy owns the original pull/read-retry/hydrate and pause/last-actor handover loops over the same ProjectOwner; original generation flows through request and hydration, and the same yield tuple retires only after completion. No-runtime pull refuses and releases its original request. The 300 s request bound and renewal target/dedup selection remain public paid behavior alongside shared custody; this is a bounded reduction, not a claim that the whole family is free. Original older-wire test stays public; private move tests cover original policy, observed epoch and replacement before mutation. |
 | `continuity_tests.rs` | Eight retained original free/admission cases: hidden workspace eligibility, boot shells, sign-out recovery, drain custody/refusal, stable failure codes, ended-return presentation, thaw admission and release settle bounds. Shared loopback fixtures remain for original public custody tests. The 24 original paid continuity journeys now live in private `pro-daemon-runtime` under `orchestration::continuity_tests`, using the actual optional Runtime and original host effects; five original companion-prerequisite annotations remain and require exact execution with a normally installed compatible helper. The required companion job runs the complete private runtime suite and every historical companion selector; migration adds no ignores. |
 | `snapshot_diagnostics.rs` | Fixed snapshot failure categories; no response bodies, paths, identifiers or error text enter diagnostic logs. |
 | `handback.rs` | Forwards the original captured project owner to optional private return policy; original live authority and cleanup stay host-owned. |
@@ -37,7 +37,7 @@ revocable delegation over the authenticated local API.
 | `protocol.rs` | Additive account contract subset and strict worker host-to-holder identity translation; intentionally no link/TLS dependency in the daemon. |
 | `transfer_dispatch.rs`, `transfer_types.rs`, `transfer_host.rs` | Eighteen typed original repository operations, immutable existing DTOs and one original source/cache/generation owner. Trusted private policy can use only fixed Git with captured roots/clean environment/sealed original mirror grants. The original daemon data/home cache anchor resolves once, while fixed Pro/project suffixes remain no-follow; cache descriptions bind to that pinned canonical inode, never a later alias. Real filesystem checks run in retained blocking work; staged output and checkout lock cleanup retain the same cache exclusion through cancellation. Nondefault fixture constructors use caller-owned disposable roots and real host Git/install effects. The original paid engine/projects suites live in the private actual runtime; the full assembly and installed-companion gates verify this boundary. Authoritative configured/ownership fields retain their meanings; affected rows use the existing fixed `optional_runtime_unavailable` error, and executable cloud handoff is false without the runtime. |
 | `transport.rs` | Bounded external curl/git children; cached mirror-only Git compatibility selection; credentials only in memory, never argv or Git config. The account's 403 `{"error":"return_window_ended"}` (a plan that ended and whose time to bring cloud work home has passed) becomes an error of its own in `engine::account`, so its mirror-row and open `error_code` read `return_window_ended`; any other 403 stays a plain response. |
-| `policy.rs` | Mirrored-path policy (credentials, `.git`, staging names, kept copies and a folder's `.chimaera-workspace` identity marker at any depth are never mirrored), `REBUILT_DIRS` (dependency and cache folders that never travel as untracked content, used by the mirror inventory and the agent-config export), credential filtering, size budgets and the cloud profile (a user-confirmed setup command, an agent's proposal, and the environment variable names the last configuration export left out). |
+| `policy.rs` | Mirrored-path policy (credentials, `.git`, staging names, kept copies and a folder's `.chimaera-workspace` identity marker at any depth are never mirrored), `REBUILT_DIRS` (dependency and cache folders that never travel as untracked content, used by the mirror inventory and the agent-config export), credential filtering, size budgets and `validate_missing_environment` (limits for the environment variable names the last configuration export left out, kept on the project's preference and the move manifest as `missing_environment`). |
 | `mirror.rs` | Public pinned snapshot confinement and interrupted-cache cleanup remain single-sourced; paid Git inventory/commit/fetch/push/validation policy dispatches to private `pro-daemon-runtime`. No-runtime transfers refuse before mirror initialization or managed stops. |
 | `shadow_cache.rs` | Validated reconstruction of an objectively damaged outgoing shadow, retaining its complete prior store in a bounded no-overwrite quarantine. |
 | `repository.rs` | Thin original portable-repository dispatch plus free cloud-branch recovery and live install-root discovery. Original remote/config/ref allowlists and staged checkout/index/ref-transaction policy and tests live privately. The public host retains actual live transaction/CAS authority. |
@@ -120,7 +120,7 @@ roster after draining all agents. Truth predicates inspect the whole existing
 registry. The final synchronous agent spawn/registration window has a counted
 reservation even for legacy/device ownership, so a pre-fence launch cannot
 appear after a successful empty-workload check. Plain shells remain unaffected.
-Cloud setup shells and both managed installer paths are also counted execution:
+Both managed installer paths are also counted execution:
 their groups and background descendants are fenced on authority loss and observed before stop completes.
 Installer admission (`execution/installer.rs`) retains the exact pre-detection
 `Dispatch` through shared install-lock waits, final spawn and actual detached
@@ -130,7 +130,7 @@ cannot confuse an installer with an idle workspace. Caller loss cannot release a
 cleanup reservation while its group is unreaped; bounded admission capacity and a
 200 ms cleanup floor retain unknown groups until positive absence. A restored
 pending marker never relaunches an installer.
-A shared synced pending marker precedes agent/setup spawn, survives cancellation, and makes
+A shared synced pending marker precedes agent/installer spawn, survives cancellation, and makes
 same-boot restart evidence unknown until group cleanup is durably settled.
 A graceful stop clears the ordinary agent evidence once they
 exit; a same-boot successor after a crash probes the recorded groups and waits
@@ -236,7 +236,7 @@ config/session targets require the same captured original; native session import
 then supplies the final file. The original common/private Git stores reserve
 HEAD, index, config, packed refs and named refs through installation commit.
 Crash recovery recognizes only this journal's exact lock markers and removes
-owned committed locks before profiles run. File installation, workspace
+owned committed locks before agents run. File installation, workspace
 registration and commit run in counted, configuration-serialized owned tasks,
 with authority rechecked immediately before canonical filesystem mutations. The
 final reservation survives commit, the exact `Hydrating` → `SettingUp` transition
@@ -245,8 +245,7 @@ configuration lock and compares the current epoch. Existing
 shared workspace/index/view/ledger stores are merged under their usual locks,
 never replaced with stale whole-store snapshots; all imports stay deferred.
 After those merges are durable, installation commits and `SettingUp` is persisted
-before recovery cleanup. Only then do profiles and agents run. Arbitrary profile
-command effects are not rolled back: failures remain actionable and fenced.
+before recovery cleanup. Only then do agents run.
 Staging is capped at 4 GiB, journal before/after data at 1 GiB, files at the mirror
 ceiling, path inventories at the existing path ceiling, with available-space
 checks before copies. Oversized preparation refuses before changing the project.
@@ -278,7 +277,7 @@ its identity marker, and changes neither execution owner nor preferred home.
 A failed copy retains its exact pending checkpoint and journal for retry. A saved
 folder is reused when `destination_saved` is true, even before `local_root` is
 ready. Fresh folders must already exist, be writable and empty, outside another
-project/repository. No profiles, global agent configuration or sessions restore
+project/repository. No global agent configuration or sessions restore
 on this path. Copy files are never automatically published.
 
 `POST /api/v1/pro/projects/takeover` requires
@@ -290,8 +289,8 @@ waits for drain/release, then uses the normal leased hydration. Failed old inten
 cannot clear a newer one. Copy enrollment and the old-daemon `legacy_pending`
 fence retire only after the file transaction committed, under `ImportGuard`
 through durable `SettingUp`; failed role persistence restores both restrictions.
-Copied projects never resume, renew/acquire in background, publish, advertise
-phone readiness or enter lazy return. A persisted explicit pending takeover may
+Copied projects never resume, renew/acquire in background, publish or enter
+lazy return. A persisted explicit pending takeover may
 resume its own interrupted move; ordinary passive owner reads do not admit one.
 
 Workspace list/status rows expose additive `local_copy` when enrolled:
@@ -330,7 +329,6 @@ A signed-out computer's live lease is retried only with the account's bounded
 `retry_after_ms` hint for that exact holder and epoch. The captured account and
 project remain current through the five-minute deadline; lease expiry and the
 account's thirty-second reconnect grace both precede hydration.
-Phone requests target only eligible executors, never ordinary local copies.
 Ordinary viewer input is forwarded to the current owner, including sleeping-owner
 wake behavior; `session_proxy` does not submit account moves. The native
 conversation identity still remains in the ledger until its first resumed turn.
@@ -383,16 +381,12 @@ shadow is set aside (`working-tree.damaged`, one slot) and rebuilt from the
 published remote. No worker
 project is adopted merely because this daemon starts or becomes suitable for work.
 
-Required worker setup runs before any imported agent resumes. Persisted
-`SettingUp` ownership fences ordinary writers and ledger restore while its
-explicit daemon setup task alone runs the setup command (a background login-shell
-child in the project root, 10-minute bound, output tail in `<pro root>/<ws>/setup.log`;
-no terminal session). Only the user-confirmed `setup_command` runs; an agent's
-proposal (`pending_setup_command`) never does. Failure (`cloud_setup_failed`)
-keeps that fence and exposes an attention error; a hydrate retry runs the updated
-setup against already installed files. Nothing refuses or queues a step that
-needs the user's computer: the agents' where-you-run note says what the cloud
-machine cannot do, and they leave such a step for when the user is back.
+Persisted `SettingUp` ownership fences ordinary writers and ledger restore
+while hydration finishes (the provider readiness check, then resume). No
+command runs there: nothing refuses or queues a step that needs installing or
+the user's computer; the agents' where-you-run note says what did not travel
+and what the cloud machine cannot do, and they install it or leave it for when
+the user is back.
 Before any agent resumes, hydration records what the move left behind for the
 note (`mcp::cloud_context::record_arrival`: the manifest's `left_out` and the
 sender's OS/CPU, `source_os`/`source_arch`, additive on the manifest) in
@@ -400,11 +394,11 @@ sender's OS/CPU, `source_os`/`source_arch`, additive on the manifest) in
 reader accepts. Which conversations heard which note is `told.json` beside it;
 `disconnect` removes both for every project, `privacy` (keep on this computer)
 for that project. Only an enrolled project (an ownership record here) counts as
-synced (`pro::synced`); `workspace_profile` alone also answers for projects that
+synced (`pro::synced`); `workspace_in_scope` alone also answers for projects that
 never enrolled.
 
 Cloud resume additionally checks the providers named by actual deferred ledger
-agents after setup, using fresh bounded worker-local readiness probes, per
+agents during `SettingUp`, using fresh bounded worker-local readiness probes, per
 session: a provider must be installed and signed in to resume its own sessions;
 another provider's login, unknown provider ids, timeouts and missing evidence
 cannot satisfy it. A provider that is not ready holds back only its sessions

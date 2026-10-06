@@ -39,7 +39,9 @@ pub struct Manifest {
     pub clean: bool,
     #[serde(default)]
     pub continuation: execution::wire::Continuation,
-    pub profile: super::policy::CloudProfile,
+    /// Environment variable names the sender's configuration export left out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_environment: Vec<String>,
     pub sessions: Vec<SessionArchive>,
     /// Additive: project paths this snapshot deliberately left out. Only a
     /// snapshot that carries this inventory can show that a file is gone.
@@ -891,14 +893,7 @@ async fn hydrate_scoped(
         .await??;
         let _ =
             tokio::fs::remove_dir_all(state.pro.root.join(workspace).join("return-stage")).await;
-        finish_hydration(
-            state,
-            workspace,
-            expected_epoch,
-            generation,
-            run_profile_steps(state, config, workspace),
-        )
-        .await?;
+        finish_hydration(state, workspace, expected_epoch, generation).await?;
         return Ok(());
     }
     // Existing durable worker work must never be replaced with an older remote
@@ -1285,10 +1280,9 @@ async fn hydrate_scoped(
         current()?;
         let execution_uncertain = grant.requires_fork
             || receipt.is_some_and(|receipt|receipt.continuation==execution::wire::Continuation::Uncertain);
-        let profile=manifest.profile;
+        let missing_environment=manifest.missing_environment;
         let received_handoff = receipt.map(|receipt|receipt.handoff_oid.clone());
-        // Installation commits before profile commands can have external effects
-        // and before any deferred agent is eligible to start.
+        // Installation commits before any deferred agent is eligible to start.
         let commit_guard=super::mutation::begin_import(state,workspace,epoch,generation).await?;
         let commit_state=state.clone();
         let commit_workspace=workspace.to_owned();
@@ -1303,7 +1297,7 @@ async fn hydrate_scoped(
                 let mut preferences=lock(&commit_state.pro.preferences);
                 let preference=preferences.entry(commit_workspace.clone()).or_default();
                 preference.execution_uncertain=execution_uncertain;
-                preference.profile=profile;
+                preference.missing_environment=missing_environment;
                 preference.git_branches=git_branches;
             }
             super::persist(&commit_state).await?;
@@ -1341,7 +1335,6 @@ async fn hydrate_scoped(
             workspace,
             grant.epoch,
             generation,
-            run_profile_steps(state, config, workspace),
         )
         .await?;
         drop(cache_guard);
@@ -1992,14 +1985,12 @@ async fn finish_hydration(
     workspace: &str,
     epoch: u64,
     generation: u64,
-    setup: impl std::future::Future<Output = Result<()>>,
 ) -> Result<()> {
     finish_hydration_checked(
         state,
         workspace,
         epoch,
         generation,
-        setup,
         super::provider_gate::check(state, workspace, true),
     )
     .await
@@ -2010,7 +2001,6 @@ async fn finish_hydration_checked(
     workspace: &str,
     epoch: u64,
     generation: u64,
-    setup: impl std::future::Future<Output = Result<()>>,
     providers: impl std::future::Future<Output = Vec<super::provider_gate::BlockedProvider>>,
 ) -> Result<()> {
     {
@@ -2028,14 +2018,6 @@ async fn finish_hydration_checked(
             ownership.insert(workspace.into(), Ownership::SettingUp { epoch });
         }
         super::persist(state).await?;
-    }
-    if let Err(error) = super::PROFILE_SETUP
-        .scope((workspace.to_owned(), generation), setup)
-        .await
-    {
-        record_error(state, workspace, &error);
-        state.changes.notify_waiters();
-        return Err(error);
     }
     let blocked = providers.await;
     // Account replacement cannot race a successful readiness check into a new
@@ -2089,163 +2071,6 @@ async fn finish_hydration_checked(
     }
     // On the cloud machine: say whether it runs the work that arrived.
     super::place::arrived(state, workspace, held_back);
-    Ok(())
-}
-
-async fn run_profile_steps(
-    state: &Arc<AppState>,
-    config: &Configure,
-    workspace: &str,
-) -> Result<()> {
-    // Deferred laptop steps are agent guidance, never daemon auto-exec.
-    if config.role != Role::Worker {
-        return Ok(());
-    }
-    let profile = lock(&state.pro.preferences)
-        .get(workspace)
-        .map(|preference| preference.profile.clone())
-        .unwrap_or_default();
-    let Some(command) = profile.setup_command else {
-        return Ok(());
-    };
-    let root = lock(&state.workspaces)
-        .get(workspace)
-        .context("unknown workspace")?
-        .root;
-    ensure!(
-        super::may_write(state, workspace),
-        "Account changed before project setup execution"
-    );
-    // Setup is the system's job, not a terminal the user must watch: it runs
-    // in the background in the user's login shell; a failure leaves one plain
-    // status line and its output tail in the project's setup log.
-    let log = state.pro.root.join(workspace).join("setup.log");
-    // Boxed: this runs inside the hydrate future, which callers hold inline.
-    let guard = execution::setup::Guard::begin(state, workspace).await?;
-    Box::pin(run_setup_command_guarded(
-        &root,
-        &command,
-        &log,
-        Some(guard),
-    ))
-    .await
-}
-
-/// How long a project's setup may run, and how much of its output is kept.
-const SETUP_DEADLINE: Duration = Duration::from_secs(600);
-const SETUP_LOG_BYTES: usize = 64 * 1024;
-
-#[cfg(test)]
-async fn run_setup_command(root: &Path, command: &str, log: &Path) -> Result<()> {
-    run_setup_command_guarded(root, command, log, None).await
-}
-
-async fn run_setup_command_guarded(
-    root: &Path,
-    command: &str,
-    log: &Path,
-    guard: Option<execution::setup::Guard>,
-) -> Result<()> {
-    use tokio::io::AsyncReadExt;
-    if let Some(guard) = &guard {
-        guard.check()?;
-    }
-    let mut child = tokio::process::Command::new(crate::launcher::login_shell())
-        .args(["-lc", command])
-        .current_dir(root)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .process_group(0)
-        .kill_on_drop(true)
-        .spawn()
-        .context("project setup could not start")?;
-    let group = child.id();
-    if let Some(guard) = &guard {
-        guard.attach(group.context("project setup group unavailable")?);
-        guard.check()?;
-    }
-    let tail = std::sync::Mutex::new(Vec::<u8>::new());
-    let keep = |bytes: &[u8]| {
-        let mut tail = lock(&tail);
-        tail.extend_from_slice(bytes);
-        if tail.len() > SETUP_LOG_BYTES {
-            let excess = tail.len() - SETUP_LOG_BYTES;
-            tail.drain(..excess);
-        }
-    };
-    let (mut stdout, mut stderr) = (child.stdout.take(), child.stderr.take());
-    let drain = |stream: Option<tokio::process::ChildStdout>| async {
-        let Some(mut stream) = stream else { return };
-        let mut block = vec![0u8; 8192];
-        while let Ok(count) = stream.read(&mut block).await {
-            if count == 0 {
-                break;
-            }
-            keep(&block[..count]);
-        }
-    };
-    let drain_err = |stream: Option<tokio::process::ChildStderr>| async {
-        let Some(mut stream) = stream else { return };
-        let mut block = vec![0u8; 8192];
-        while let Ok(count) = stream.read(&mut block).await {
-            if count == 0 {
-                break;
-            }
-            keep(&block[..count]);
-        }
-    };
-    let finished = tokio::time::timeout(SETUP_DEADLINE, async {
-        let wait = async {
-            let status = child.wait().await;
-            if let Some(guard) = &guard { guard.kill(); }
-            status
-        };
-        let joined = async {
-            let (_, _, status) = tokio::join!(drain(stdout.take()), drain_err(stderr.take()), wait);
-            status
-        };
-        tokio::pin!(joined);
-        loop {
-            tokio::select! {
-                status = &mut joined => return status,
-                () = tokio::time::sleep(Duration::from_millis(100)), if guard.is_some() => {
-                    if guard.as_ref().unwrap().check().is_err() {
-                        guard.as_ref().unwrap().kill();
-                        return Err(std::io::Error::other("project setup execution authority changed"));
-                    }
-                }
-            }
-        }
-    })
-    .await;
-    let succeeded = match finished {
-        Ok(Ok(status)) => status.success(),
-        _ => {
-            // Timed out: stop the whole setup process group.
-            if let Some(group) = group.and_then(|id| i32::try_from(id).ok()) {
-                let _ = nix::sys::signal::killpg(
-                    nix::unistd::Pid::from_raw(group),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
-            }
-            let _ = child.kill().await;
-            false
-        }
-    };
-    let output = std::mem::take(&mut *lock(&tail));
-    let log = log.to_path_buf();
-    let _ = tokio::task::spawn_blocking(move || {
-        if let Some(parent) = log.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(log, output)
-    })
-    .await;
-    if let Some(guard) = guard {
-        guard.finish().await?;
-    }
-    ensure!(succeeded, "project setup did not finish");
     Ok(())
 }
 
@@ -2393,218 +2218,6 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    #[tokio::test]
-    async fn setup_failure_fences_agents_until_success_and_laptop_steps_never_autoplay() {
-        let root = std::env::temp_dir().join(format!(
-            "chimaera-setup-fence-{}",
-            chimaera_core::generate_token()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let state = Arc::new(AppState::new(
-            "fixture".into(),
-            "fixture".into(),
-            4242,
-            0,
-            root.clone(),
-            root.join("config"),
-        ));
-        lock(&state.workspaces)
-            .import_exact(crate::workspaces::Workspace {
-                id: "w-project".into(),
-                root: root.clone(),
-                name: "Fixture".into(),
-                last_opened_at: super::super::now(),
-                mastermind: None,
-                plugins_on: vec![],
-                cloud_internal: false,
-                hidden: false,
-            })
-            .unwrap();
-        lock(&state.pro.ownership).insert("w-project".into(), Ownership::Hydrating { epoch: 3 });
-        let owner = state.clone();
-        let result = finish_hydration(&state, "w-project", 3, 0, async move {
-            assert!(super::super::may_write(&owner, "w-project"));
-            let outside = owner.clone();
-            assert!(
-                !tokio::spawn(async move { super::super::may_write(&outside, "w-project") })
-                    .await
-                    .unwrap()
-            );
-            anyhow::bail!("fixture setup failed")
-        })
-        .await;
-        assert!(result.is_err());
-        assert!(!super::super::may_write(&state, "w-project"));
-        assert_eq!(super::super::owned_epoch(&state, "w-project"), None);
-        assert!(lock(&state.pro.status)
-            .get("w-project")
-            .unwrap()
-            .error
-            .is_some());
-        let restarted = Arc::new(AppState::new(
-            "fixture".into(),
-            "fixture".into(),
-            4242,
-            0,
-            root.clone(),
-            root.join("config"),
-        ));
-        assert!(!super::super::may_write(&restarted, "w-project"));
-        finish_hydration(&state, "w-project", 3, 0, async { Ok(()) })
-            .await
-            .unwrap();
-        assert_eq!(super::super::owned_epoch(&state, "w-project"), Some(3));
-        let config = Configure {
-            recovery: false,
-            execution: None,
-            account_id: None,
-            role: Role::Device,
-            endpoint: String::new(),
-            keeper_url: String::new(),
-            hours_exhausted: false,
-            alias: None,
-            delegation: super::super::protocol::Delegation {
-                workspace: None,
-                access_token: String::new(),
-                expires_at: String::new(),
-                scope: vec![],
-                device_id: String::new(),
-            },
-        };
-        lock(&state.pro.preferences)
-            .entry("w-project".into())
-            .or_default()
-            .profile
-            .missing_environment = vec!["MUST_NOT_BE_EXECUTED".into()];
-        run_profile_steps(&state, &config, "w-project")
-            .await
-            .unwrap();
-        assert_eq!(
-            lock(&state.pro.preferences)
-                .get("w-project")
-                .unwrap()
-                .profile
-                .missing_environment,
-            ["MUST_NOT_BE_EXECUTED"]
-        );
-        drop(restarted);
-        drop(state);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-    /// A project's cloud setup runs in the background, never as a terminal
-    /// the user has to watch; a failure leaves a status code and a log.
-    #[tokio::test]
-    async fn cloud_setup_runs_in_the_background_without_a_terminal() {
-        let root = std::env::temp_dir().join(format!(
-            "chimaera-setup-background-{}",
-            chimaera_core::generate_token()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let log = root.join("setup.log");
-        run_setup_command(&root, "echo installed > marker; echo done", &log)
-            .await
-            .unwrap();
-        assert!(root.join("marker").exists(), "ran in the project root");
-        let error = run_setup_command(&root, "echo broken; exit 3", &log)
-            .await
-            .unwrap_err();
-        assert_eq!(
-            super::super::routes::error_code(&error),
-            "cloud_setup_failed"
-        );
-        assert!(std::fs::read_to_string(&log).unwrap().contains("broken"));
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn managed_setup_drains_descendants_on_expiry_cancellation_and_shell_exit() {
-        for fault in ["expired", "cancelled", "success"] {
-            let root = std::env::temp_dir().join(format!(
-                "chimaera-setup-group-{}",
-                chimaera_core::generate_token()
-            ));
-            std::fs::create_dir_all(&root).unwrap();
-            let state = Arc::new(AppState::new(
-                "fixture".into(),
-                "fixture".into(),
-                4242,
-                0,
-                root.clone(),
-                root.join("config"),
-            ));
-            execution::install_fixture(&state, "w-project", 4).unwrap();
-            execution::worker_fixture(&state);
-            lock(&state.pro.ownership)
-                .insert("w-project".into(), Ownership::SettingUp { epoch: 4 });
-            let guard = super::super::PROFILE_SETUP
-                .scope(
-                    ("w-project".into(), 0),
-                    execution::setup::Guard::begin(&state, "w-project"),
-                )
-                .await
-                .unwrap();
-            let restarted = Arc::new(AppState::new(
-                "fixture".into(),
-                "fixture".into(),
-                4242,
-                0,
-                root.clone(),
-                root.join("config"),
-            ));
-            assert!(
-                execution::unclean(&restarted, "w-project"),
-                "durable pre-spawn intent must remain unknown after crash"
-            );
-            let cwd = root.clone();
-            let command = if fault == "success" {
-                "sleep 30 & echo $! > descendant; echo ready > started"
-            } else {
-                "sleep 30 & echo $! > descendant; echo ready > started; wait"
-            };
-            let task = tokio::spawn(async move {
-                run_setup_command_guarded(&cwd, command, &cwd.join("setup.log"), Some(guard)).await
-            });
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while !root.join("started").exists() {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .unwrap();
-            assert!(!execution::quiescent(&state, "w-project") || fault == "success");
-            match fault {
-                "expired" => {
-                    super::super::expire_execution_fixture(&state, "w-project");
-                    assert!(task.await.unwrap().is_err());
-                }
-                "cancelled" => {
-                    task.abort();
-                    assert!(task.await.unwrap_err().is_cancelled());
-                }
-                _ => {
-                    task.await.unwrap().unwrap();
-                }
-            }
-            tokio::time::timeout(Duration::from_secs(3), async {
-                while !execution::quiescent(&state, "w-project") {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            })
-            .await
-            .unwrap();
-            assert!(!execution::setup::active(&state, "w-project"));
-            let pending = lock(&state.pro.preferences)
-                .get("w-project")
-                .unwrap()
-                .execution_launch_pending;
-            assert_eq!(
-                pending,
-                fault == "cancelled",
-                "only observed cleanup durably settles intent"
-            );
-            std::fs::remove_dir_all(root).unwrap();
-        }
-    }
     /// Sign-out aborts the mirror task that finishes a return. The returned
     /// sessions that finish was respawning start anyway: a respawn cut half
     /// way would leave them deferred, answering "moved" forever.
@@ -2690,9 +2303,7 @@ mod tests {
         )
         .unwrap();
         let owner = state.clone();
-        let task = tokio::spawn(async move {
-            finish_hydration(&owner, "w-project", 3, 0, async { Ok(()) }).await
-        });
+        let task = tokio::spawn(async move { finish_hydration(&owner, "w-project", 3, 0).await });
         // Queued while the finish makes the project Local, so it is handed
         // over the moment the finish releases it: the resume has started
         // and waits for this admission when the task is aborted.

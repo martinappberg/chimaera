@@ -338,11 +338,6 @@ async fn foreign_workspace_fails_before_network_files_or_local_mutation() {
             Method::PUT,
             json!({"workspace_id":"w-b","never_mirror":true}),
         ),
-        (
-            "/api/v1/pro/profile?workspace_id=w-b",
-            Method::PUT,
-            json!({}),
-        ),
     ] {
         assert_eq!(
             request(&fixture.state, method, path, Some(body)).await.0,
@@ -418,7 +413,7 @@ async fn foreign_registered_workspace_remains_fenced() {
     assert!(!crate::pro::may_write(&fixture.state, &foreign.id));
     assert!(!crate::pro::may_import(&fixture.state, &foreign.id, 2));
     assert!(!engine::eligible(&fixture.state, &foreign));
-    assert!(crate::pro::workspace_profile(&fixture.state, &foreign.id).is_none());
+    assert!(!crate::pro::workspace_in_scope(&fixture.state, &foreign.id));
     // Placement is the system's decision: there is no pin route to try.
     let (code, _) = request(
         &fixture.state,

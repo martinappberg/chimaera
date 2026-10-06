@@ -7,10 +7,9 @@ import type { SecretPage, SecretResult, SecretCommand, SecretAttempt } from "../
 
 
 import type { CloudOnboardingContext } from "../pro/onboarding.svelte";
-import type { ProposalDecision, StoredProfile } from "../pro/profile";
 import type { Workspace } from "../workspace/sessions";
 import type { Observable } from "./application";
-export type { ProStatus, CloudProjectOpen, ProHost, ProDevice, ProAuthScreenHint, CloudProject, CloudProviderConnection, CloudProviderStatus, CloudProviderState, CloudSetupInfo, CloudSetupRequest, CloudProvisioningStatus, MirrorStatus, MirrorWorkspace, MirrorProfile, ProBillingAttempt, ProPlanPrice, RememberedProvider } from "../net/native";
+export type { ProStatus, CloudProjectOpen, ProHost, ProDevice, ProAuthScreenHint, CloudProject, CloudProviderConnection, CloudProviderStatus, CloudProviderState, CloudSetupInfo, CloudSetupRequest, CloudProvisioningStatus, MirrorStatus, MirrorWorkspace, ProBillingAttempt, ProPlanPrice, RememberedProvider } from "../net/native";
 export interface HomeProject { workspace_id: string; name: string | null; href: string; available: boolean }
 export interface HomeProjects { projects: HomeProject[]; pending: boolean }
 export interface BrowserAccountStatus extends Native.ProStatus { account_lifetime: string | null }
@@ -74,7 +73,6 @@ export interface AccountPresentationServices {
   retainSecretAttempt(attempt: SecretAttempt): boolean;
   secretReconciliation: Observable<{ context: string | null; attempts: SecretAttempt[] }>;
   settleSecretAttempt(context: string, operation: string): void;
-  settleProposal(workspaceId: string, shown: string, decision: ProposalDecision): Promise<"saved" | "changed">;
   requestKeptReview(workspaceId: string): void;
   cloudOnboarding: {
     readonly context: CloudOnboardingContext | null;
@@ -90,11 +88,7 @@ export interface AccountPresentationServices {
 }
 
 /** Captured host services only; no generic request/invoke/URL/token capability. */
-export interface SetupProfileTransport {
-  readSetupProfile(workspaceId: string, lifetime?: string): Promise<Response>;
-  saveSetupProfile(workspaceId: string, profile: StoredProfile, revision: string, lifetime?: string): Promise<Response>;
-}
-export interface AccountHostScope extends SetupProfileTransport {
+export interface AccountHostScope {
   current(): boolean;
   signal: AbortSignal;
   retire(preserveIntent: boolean): void;

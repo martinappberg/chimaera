@@ -94,7 +94,6 @@ pub const LOCAL_ACCOUNT_COMMANDS: &[&str] = &[
     "pro_take_return",
     "pro_mirror_status",
     "pro_set_never_mirror",
-    "pro_settle_setup_proposal",
     "pro_sign_in",
     "pro_cancel_sign_in",
     "pro_sign_out",

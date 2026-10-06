@@ -223,8 +223,8 @@ pub(crate) async fn spawn_session(
             // communication is on (default) or a plugin with tools is active
             // here (`spawn_allow`); with neither, the argv and env stay
             // exactly what they were.
-            // Cloud projects also need host/profile context on the TUI surface
-            // (`pro::workspace_profile`); otherwise that opt-in boundary stands.
+            // Cloud projects also need where-you-run context on the TUI surface
+            // (`pro::workspace_in_scope`); otherwise that opt-in boundary stands.
             let codex_plugin_tools = if agent_kind == AgentKind::Codex {
                 crate::plugins::spawn_allow(state, &workspace.id).await
             } else {
@@ -274,7 +274,7 @@ pub(crate) async fn spawn_session(
             }
             if !codex_plugin_tools.is_empty()
                 || (agent_kind == AgentKind::Codex
-                    && crate::pro::workspace_profile(state, &workspace.id).is_some())
+                    && crate::pro::workspace_in_scope(state, &workspace.id))
             {
                 // Pre-approved: the prompt-free tools every session gets
                 // (`notify`) plus the active plugins' own.

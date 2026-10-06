@@ -70,10 +70,6 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             "/pro/projects/{id}/kept/resolve_all",
             post(crate::pro::kept_resolve_all),
         )
-        .route(
-            "/pro/profile",
-            get(crate::pro::profile).put(crate::pro::put_profile),
-        )
         .route("/pro/sleep", post(crate::pro::sleep))
         .route("/pro/handoff", post(crate::pro::handoff))
         .route(

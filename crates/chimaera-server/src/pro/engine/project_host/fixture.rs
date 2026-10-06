@@ -21,8 +21,9 @@ pub enum Seed {
         sleeping: bool,
         parked: bool,
         release_pending: bool,
-        awake_since: u64,
-        power_suitable: bool,
+        /// Since when this computer has reached the account (0: long ago).
+        reachable_since: u64,
+        /// Ignored: nothing reads power any more.
         backoff: Option<(u64, u64)>,
     },
     DeferredSession(Value),
@@ -654,7 +655,7 @@ impl Scenario {
             Seed::CopyAndPreference(value) => {
                 bounded(&value)?;
                 let preference: crate::pro::Preference = serde_json::from_value(value)?;
-                preference.profile.validate()?;
+                crate::pro::policy::validate_missing_environment(&preference.missing_environment)?;
                 lock(&state.pro.preferences).insert(key.clone(), preference);
             }
             Seed::ExecutionObservation { baton, accept } => {
@@ -681,8 +682,7 @@ impl Scenario {
                 sleeping,
                 parked,
                 release_pending,
-                awake_since,
-                power_suitable,
+                reachable_since,
                 backoff,
             } => {
                 state
@@ -693,11 +693,7 @@ impl Scenario {
                 state
                     .pro
                     .reachable_since
-                    .store(awake_since.max(1), Ordering::Release);
-                state
-                    .pro
-                    .power_suitable
-                    .store(power_suitable, Ordering::Release);
+                    .store(reachable_since.max(1), Ordering::Release);
                 for (record, value) in [
                     (&state.pro.sleeping, sleeping),
                     (&state.pro.parked, parked),

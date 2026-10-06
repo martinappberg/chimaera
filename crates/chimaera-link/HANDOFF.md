@@ -662,10 +662,9 @@ for the project ends. `DELETE /v2/baton/{workspace}/move` withdraws the
 caller's own request (204; the same call from any other computer changes
 nothing).
 
-While a request is fresh (six minutes for a computer's, two for a phone's)
-every ownership answer (GET, acquire, renew, release, move) carries the
-additive `move_to` (the holder the work goes to), `move_requested_at` (the
-account's clock) and `move_reason` (`computer` or `phone`); a stale request
+While a request is fresh (six minutes) every ownership answer (GET, acquire,
+renew, release, move) carries the additive `move_to` (the holder the work
+goes to) and `move_requested_at` (the account's clock); a stale request
 reads as none. Only `move_to` may acquire the project while it is fresh
 (anyone else, including a cloud machine the release would otherwise wake, is
 409 `held`); the worker's discovery does not offer it and a release for it
@@ -689,43 +688,6 @@ out; no fork), resumes the sessions and delivers the held input once. After
 five minutes without a release it withdraws the request and refuses the held
 input (`reason:"still_working"`); a holder that released for a request that
 was then withdrawn takes its own epoch back (no install, no fork).
-
-**From a phone.** A computer's daemon adds `?ready=1&power=ac|battery` to its
-passive ownership read when it could take the project now (a negotiated
-personal computer, the project registered there, not handed to the cloud on
-quit, allowed to leave its computer). While a cloud machine holds the project
-the account remembers that computer for a few seconds. When a phone sends or
-types into a project whose owner is a sleeping cloud machine (`suspended`) —
-the first input the account would hold for that machine
-([VIEWING](VIEWING.md#forwarded-requests), "A sleeping cloud machine's
-sockets"), or a reconnect carrying wake intent from a client that parks — the
-account's browser gateway asks one such computer to take the work home
-instead: it must be reachable over the keeper (its app online),
-seen in the last fifteen seconds, and the machine must have gone to sleep
-cleanly — its latest checkpoint is its own, of its current epoch, with
-continuation `idle`, acknowledged no earlier than two minutes before the
-suspension, with no wake requested since. The project's home comes first,
-then a computer on power, then any. The request (`move_reason:"phone"`) lets
-that computer acquire from the sleeping owner cleanly (`requires_fork:false`,
-no wake; the machine finds its epoch gone when it next resumes and fences).
-The computer takes it without its settle wait. The gateway tells the phone
-`{"type":"bringing","to":"computer"}`, holds its socket authentication and
-first input, and delivers them once to the computer when its session
-answers; if the computer has not acquired within about twenty seconds the
-request is withdrawn and the machine is woken as before
-(`{"type":"waking"}`), with the held input delivered to it instead. While
-the work is being brought the gateway holds only a chat's acting commands,
-its seven settings commands and a terminal's typing, as a keeper does
-([VIEWING](VIEWING.md#forwarded-requests)); a view's other frames are not
-held. It is a holder like any other: a second copy of a send it holds is
-dropped, and a `cancel_send` for one is answered `cancelled:false` there. Held input the owner's session does not take is refused to the phone
-(`command_failed` or `read_only` with reason `reconnecting`; a refused chat
-command carries the `client_id` it was sent under, so exactly that send
-returns to the composer), never dropped.
-
-A cloud machine's drain (`POST /api/v1/pro/drain`) therefore publishes each
-project it holds before it answers, within the drain's deadline; a failure
-only means the machine is woken for the work instead.
 
 ### v2 refusals
 

@@ -1,5 +1,6 @@
-//! Setup is execution too: the lease watchdog and clean handoff must see its
-//! shell and background descendants, including the spawn/journal crash window.
+//! An agent-CLI install is execution too: the lease watchdog and clean
+//! handoff must see its process group and background descendants, including
+//! the spawn/journal crash window.
 use super::*;
 use std::sync::Arc;
 
@@ -11,10 +12,9 @@ pub(super) struct Entry {
 pub(in crate::pro) struct Guard {
     state: Arc<AppState>,
     workspace: String,
-    epoch: u64,
     generation: u64,
-    _commit: Option<mutation::Guard>,
-    installer: Option<mutation::Dispatch>,
+    _commit: mutation::Guard,
+    installer: mutation::Dispatch,
 }
 
 fn alive(group: (u32, u64)) -> bool {
@@ -49,52 +49,6 @@ pub(in crate::pro) fn active(state: &AppState, workspace: &str) -> bool {
     }
 }
 impl Guard {
-    pub(in crate::pro) async fn begin(state: &Arc<AppState>, workspace: &str) -> Result<Self> {
-        let _configuration = state.pro.configuration.lock().await;
-        let generation = mutation::generation(state);
-        let epoch = match lock(&state.pro.ownership).get(workspace) {
-            Some(Ownership::SettingUp { epoch }) => *epoch,
-            _ => anyhow::bail!("project setup authority changed"),
-        };
-        let commit = mutation::begin_launch(state, workspace)?;
-        {
-            let mut setups = lock(&state.pro.execution.setups);
-            ensure!(
-                setups.len() < 64 && !setups.contains_key(workspace),
-                "previous project setup is still stopping"
-            );
-            setups.insert(
-                workspace.to_owned(),
-                Entry {
-                    group: None,
-                    held: true,
-                },
-            );
-        }
-        let guard = Self {
-            state: state.clone(),
-            workspace: workspace.to_owned(),
-            epoch,
-            generation,
-            _commit: commit,
-            installer: None,
-        };
-        guard.check()?;
-        {
-            let mut preferences = lock(&state.pro.preferences);
-            ensure!(
-                preferences.len() < 128 || preferences.contains_key(workspace),
-                "project setup identity limit"
-            );
-            let preference = preferences.entry(workspace.to_owned()).or_default();
-            preference.execution_active = true;
-            preference.execution_boot = state.pro.execution.boot.clone();
-            preference.execution_launch_pending = true;
-        }
-        crate::pro::persist(state).await?;
-        guard.check()?;
-        Ok(guard)
-    }
     pub(super) async fn installer(
         state: &Arc<AppState>,
         workspace: &str,
@@ -123,10 +77,9 @@ impl Guard {
         let guard = Self {
             state: state.clone(),
             workspace: workspace.to_owned(),
-            epoch: 0,
             generation: mutation::generation(state),
-            _commit: Some(commit),
-            installer: Some(captured),
+            _commit: commit,
+            installer: captured,
         };
         guard.check()?;
         {
@@ -145,26 +98,7 @@ impl Guard {
         Ok(Some(guard))
     }
     pub(in crate::pro) fn check(&self) -> Result<()> {
-        if let Some(captured) = &self.installer {
-            return captured.check(&self.state);
-        }
-        let managed = managed(&self.state, &self.workspace);
-        // Match lease admission's proof -> ownership order.
-        let proofs = lock(&self.state.pro.execution.proofs);
-        let ownership = lock(&self.state.pro.ownership);
-        ensure!(
-            self.generation == mutation::generation(&self.state)
-                && matches!(ownership.get(&self.workspace), Some(Ownership::SettingUp { epoch }) if *epoch == self.epoch)
-                && (!managed
-                    || proofs.get(&self.workspace).is_some_and(|proof| {
-                        !proof.stopped
-                            && proof.generation == self.generation
-                            && proof.epoch == self.epoch
-                            && proof.deadline.valid()
-                    })),
-            "project setup execution authority changed"
-        );
-        Ok(())
+        self.installer.check(&self.state)
     }
     /// No await may separate spawning the group from registering it.
     pub(in crate::pro) fn attach(&self, group: u32) {

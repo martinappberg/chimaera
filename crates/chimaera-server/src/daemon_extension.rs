@@ -64,7 +64,6 @@ pub mod project {
     pub use crate::pro::engine::{Manifest as SnapshotManifest, SessionArchive, Sleep};
     pub use crate::pro::execution::wire::Continuation;
     pub use crate::pro::moves::Decision as MoveDecision;
-    pub use crate::pro::policy::CloudProfile;
     pub use crate::pro::Ownership;
 }
 pub type SnapshotFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>>;
@@ -85,9 +84,7 @@ pub mod providers {
     };
 }
 pub mod guidance {
-    pub use crate::mcp::cloud_context::{
-        clean_name, Arrival, Facts, GuidanceSetup, KeptPair, NAME_CAP, NOTE_CAP,
-    };
+    pub use crate::mcp::cloud_context::{clean_name, Arrival, Facts, KeptPair, NAME_CAP, NOTE_CAP};
     pub use chimaera_agent::model::truncate_label;
 }
 pub use crate::workspace_maintenance::{PreparedWorkspace, WorkspaceHost};
@@ -119,8 +116,8 @@ pub trait Runtime: Send + Sync + 'static {
         axum::Router::new()
     }
 
-    /// Tool descriptions for a synced project's agents (`where_am_i`,
-    /// `update_cloud_profile`); offered only where the host has a note.
+    /// Tool descriptions for a synced project's agents (`where_am_i`);
+    /// offered only where the host has a note.
     fn guidance_definitions(&self) -> Vec<serde_json::Value> {
         Vec::new()
     }
@@ -130,13 +127,6 @@ pub trait Runtime: Send + Sync + 'static {
     /// `where_am_i`. Keep it within `guidance::NOTE_CAP` with the essential
     /// first line first: the host cuts a longer note at a line boundary.
     fn placement_note(&self, _facts: &guidance::Facts) -> Option<String> {
-        None
-    }
-    fn guidance_setup(
-        &self,
-        _profile: &project::CloudProfile,
-        _proposed: Option<&str>,
-    ) -> Option<guidance::GuidanceSetup> {
         None
     }
 

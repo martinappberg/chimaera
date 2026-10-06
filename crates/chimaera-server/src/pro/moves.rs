@@ -5,11 +5,6 @@
 //! request, waits for the holder to drain/release, then hydrates the checkpoint.
 //! The last actor rule still lets the current owner keep its work.
 //!
-//! **From a phone.** When a phone acts on a project a sleeping cloud machine
-//! holds, the account names one of the user's online computers (`move_to`,
-//! reason `phone`); that computer takes the project at once, without waking
-//! the cloud machine and without the five-minute settle wait.
-//!
 //! Only negotiated (v2) personal computers take part; the account keeps the
 //! request and refuses anyone else's acquire while it is fresh.
 use super::{engine, protocol::Baton, protocol::Configure, protocol::Role, Ownership};
@@ -22,10 +17,6 @@ use tokio::sync::watch;
 /// How long a request waits for the other computer to let go: the same bound
 /// a computer gives its agents to reach a pause once another owner is verified.
 pub(super) const BOUND: Duration = Duration::from_secs(300);
-/// A phone's request is answered within the account's own short wait (it wakes
-/// the cloud machine after about twenty seconds); this computer stops trying
-/// shortly after.
-const PHONE_BOUND: Duration = Duration::from_secs(90);
 const LIMIT: usize = 32;
 /// Two readings of one request's time on this clock differ by the round trips
 /// that carried them; a new request from the same computer is further apart.
@@ -133,17 +124,6 @@ pub(in crate::pro) fn can_take(state: &AppState, config: &Configure, workspace: 
             .is_some_and(|p| p.never_mirror)
 }
 
-/// The passive ownership read's additive query: whether this computer could
-/// take the project now (so a phone's action may be sent here rather than
-/// waking the cloud) and whether it is on power. Only a personal computer on
-/// the negotiated protocol says anything.
-pub(super) fn watch_query(state: &AppState, config: &Configure, workspace: &str) -> &'static str {
-    if super::project_copy::copy_only(state, workspace) || !can_take(state, config, workspace) {
-        return "";
-    }
-    "?ready=1&power=battery"
-}
-
 /// A signed-in personal computer on the negotiated protocol whose account is
 /// at `endpoint`: one that may take a project another computer runs, for
 /// fixtures that exercise its current-owner viewer relay.
@@ -180,9 +160,9 @@ pub(crate) fn settle_fixture(state: &AppState, workspace: &str, outcome: Outcome
     }
 }
 
-/// The account asked this computer to take `workspace` (a phone acted while
-/// the cloud slept, or this computer's own earlier request outlived the
-/// daemon that made it): take it at once, unless a request is under way.
+/// The account asked this computer to take `workspace` (this computer's own
+/// earlier request outlived the daemon that made it): take it at once, unless
+/// a request is under way.
 pub(super) fn answer(state: &Arc<AppState>, config: &Configure, workspace: &str, baton: &Baton) {
     if !can_take(state, config, workspace)
         || pulling(state, workspace)
@@ -205,12 +185,7 @@ pub(super) fn answer(state: &Arc<AppState>, config: &Configure, workspace: &str,
         }
         answered.insert(workspace.to_owned(), request);
     }
-    let bound = if baton.move_reason.as_deref() == Some("phone") {
-        PHONE_BOUND
-    } else {
-        BOUND
-    };
-    let _ = start(state, config.clone(), workspace, false, None, bound);
+    let _ = start(state, config.clone(), workspace, false, None, BOUND);
 }
 
 fn start(

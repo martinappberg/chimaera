@@ -203,16 +203,8 @@ impl ProjectOwner {
     pub async fn persist(&self) -> Result<()> {
         super::super::persist(&self.state).await
     }
-    pub async fn read_owner(&self, advertise_return: bool) -> Result<ProjectBaton> {
-        let path = format!(
-            "{}{}",
-            execution::path(&self.config, &self.workspace, ""),
-            if advertise_return {
-                super::super::moves::watch_query(&self.state, &self.config, &self.workspace)
-            } else {
-                ""
-            }
-        );
+    pub async fn read_owner(&self) -> Result<ProjectBaton> {
+        let path = execution::path(&self.config, &self.workspace, "");
         let response = self.reached(super::account(&self.config, &path, "GET", None).await)?;
         Ok(ProjectBaton::capture(response.json()?))
     }
@@ -366,14 +358,7 @@ impl ProjectOwner {
         .await
     }
     pub async fn finish_existing_hydration(&self, epoch: u64) -> Result<()> {
-        super::finish_hydration(
-            &self.state,
-            &self.workspace,
-            epoch,
-            self.generation,
-            async { Ok(()) },
-        )
-        .await
+        super::finish_hydration(&self.state, &self.workspace, epoch, self.generation).await
     }
     pub async fn resume_deferred(&self) -> Result<()> {
         crate::ledger::resume_deferred_workspace(&self.state, &self.workspace).await
@@ -628,13 +613,6 @@ impl SnapshotOwner {
         };
         config::export_with_image(sources, destination, budget, image).await
     }
-    pub fn profile(&self) -> super::super::policy::CloudProfile {
-        lock(&self.project.state.pro.preferences)
-            .entry(self.project.workspace.clone())
-            .or_default()
-            .profile
-            .clone()
-    }
     pub fn metadata(&self) -> Option<super::super::projects::catalog::Metadata> {
         super::super::projects::catalog::metadata(self.name(), self.visible())
     }
@@ -662,7 +640,7 @@ impl SnapshotOwner {
     }
     pub fn record_publication(
         &self,
-        profile: super::super::policy::CloudProfile,
+        missing_environment: Vec<String>,
         tree: String,
         handoff: String,
         report: super::super::mirror::Report,
@@ -672,7 +650,7 @@ impl SnapshotOwner {
         {
             let mut entries = lock(&state.pro.preferences);
             let preference = entries.entry(workspace.into()).or_default();
-            preference.profile = profile;
+            preference.missing_environment = missing_environment;
             preference.published_tree = Some(tree);
             if self.negotiated() {
                 preference.published_handoff = Some(handoff);
