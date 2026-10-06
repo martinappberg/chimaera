@@ -817,24 +817,27 @@
                         : "no live sessions"}
                   ></span>
                   <span class="workspace-label"><span class="name">{w.name}</span><span class="path">{tildify(w.root)}</span></span>
-                  <span class="workspace-meta">
-                    {#if live !== undefined && live.attn > 0}
-                      <span class="session-state" class:attention={daemonReachable} class:stale={!daemonReachable}>{live.attn} {daemonReachable ? "awaiting approval" : `approval${live.attn === 1 ? "" : "s"} last seen`}</span>
-                    {:else if live !== undefined && live.live > 0}
-                      <span class="session-state" class:stale={!daemonReachable}>{live.live} {daemonReachable ? "live " : ""}session{live.live === 1 ? "" : "s"}{daemonReachable ? "" : " last seen"}</span>
-                    {/if}
-                    <span class="when">{ago(w.last_opened_at)}</span>
-                  </span>
                 </button>
-                {#if live !== undefined && live.live > 0}
-                  <button
-                    class="side stop"
-                    title="end this workspace's {live.live} running session{live.live === 1
-                      ? ''
-                      : 's'}"
-                    onclick={() => (confirmStopId = w.id)}>End sessions</button
-                  >
-                {/if}
+                <!-- The meta sits beside the row button (not inside it: a button
+                     cannot nest a button) so the live count can turn into the
+                     End sessions control in place when the pointer is on the row. -->
+                <span class="workspace-meta">
+                  {#if live !== undefined && live.attn > 0}
+                    <span class="session-state" class:attention={daemonReachable} class:stale={!daemonReachable}>{live.attn} {daemonReachable ? "awaiting approval" : `approval${live.attn === 1 ? "" : "s"} last seen`}</span>
+                  {:else if live !== undefined && live.live > 0}
+                    <span class="session-state" class:stale={!daemonReachable}>{live.live} {daemonReachable ? "live " : ""}session{live.live === 1 ? "" : "s"}{daemonReachable ? "" : " last seen"}</span>
+                  {/if}
+                  {#if live !== undefined && live.live > 0}
+                    <button
+                      class="side stop"
+                      title="end this workspace's {live.live} running session{live.live === 1
+                        ? ''
+                        : 's'}"
+                      onclick={() => (confirmStopId = w.id)}>End sessions</button
+                    >
+                  {/if}
+                  <span class="when">{ago(w.last_opened_at)}</span>
+                </span>
                 <HomeActions label={`Actions for ${w.name}`}>
                   {#if live !== undefined && live.live > 0}
                     <button class="stop" onclick={() => (confirmStopId = w.id)}>End sessions</button>
@@ -1799,22 +1802,25 @@
   .workspace-label .name { max-width: none; font-family: inherit; font-weight: 550; font-size: var(--text-md); }
   .workspace-label .path, .workspace-label .phase { flex: none; font-size: var(--text-xs); }
   /* One quiet line ("1 live session · 2m ago"), vertically centred with the
-     row's controls, so the row end reads as a single cluster rather than a
-     stack beside two unrelated buttons. */
-  .workspace-meta { display: flex; align-items: center; gap: 6px; flex: none; font-size: var(--text-xs); color: var(--muted); }
-  .workspace-meta .session-state + .when::before { content: "·"; margin-right: 6px; opacity: 0.6; }
+     row's "…" trigger. On hover the live count turns into the End sessions
+     control in the same slot (a hidden control is not focusable; the keyboard
+     reaches the same entry through the "…" menu). Rows awaiting approval keep
+     their amber count: that line is the attention signal, not a control. */
+  .workspace-meta { display: flex; align-items: center; gap: 6px; flex: none; padding-right: 2px; font-size: var(--text-xs); color: var(--muted); }
+  .workspace-meta .when::before { content: "·"; margin-right: 6px; opacity: 0.6; }
+  .workspace-meta .when:first-child::before { content: none; margin: 0; }
   .session-state.stale { color: var(--muted); }
   .session-state { font-size: var(--text-xs); color: var(--accent); }
   .workspace-meta .when { font-family: inherit; font-size: var(--text-xs); margin-left: 0; }
-  /* End sessions appears on hover beside the row (hidden controls are not
-     focusable; the keyboard reaches the same entry through the "…" menu): a
-     bordered control the height of the "…" trigger. */
-  .workspace-row .side.stop {
-    height: 32px; min-height: 32px; padding: 0 10px; margin-right: 2px;
-    border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
-    border-radius: 6px; color: var(--warn); font-size: var(--text-sm);
+  .workspace-meta .side.stop {
+    display: none; visibility: visible; min-height: 0; height: 24px; padding: 0 8px; margin: -4px 0;
+    border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent); border-radius: 6px;
+    color: var(--warn); font-size: var(--text-xs); line-height: 1;
   }
-  .workspace-row .side.stop:hover { color: var(--err); border-color: color-mix(in srgb, var(--err) 55%, transparent); background: var(--row-hover); }
+  .workspace-row:hover .workspace-meta .session-state:not(.attention) { display: none; }
+  .workspace-row:hover .workspace-meta .side.stop { display: inline-flex; align-items: center; }
+  .workspace-row:hover .workspace-meta .session-state.attention + .side.stop { display: none; }
+  .workspace-meta .side.stop:hover { color: var(--err); border-color: color-mix(in srgb, var(--err) 55%, transparent); background: var(--row-active); }
   .host-card { border: 1px solid var(--edge); border-radius: 10px; padding: 5px; }
   .remotes .rows { gap: 10px; }
   .host-name { display: flex; align-items: center; gap: 9px; min-width: 0; }
@@ -1843,7 +1849,7 @@
     .inner { padding-left: 24px; padding-right: 24px; }
     .workspace-row .row { flex-wrap: wrap; gap: 10px; }
     .workspace-row .workspace-label { flex-basis: calc(100% - 24px); }
-    .workspace-meta { margin-left: 17px; flex-wrap: wrap; }
+    .workspace-meta { flex-wrap: wrap; justify-content: flex-end; }
   }
   @media (max-width: 700px) {
     .home { flex-direction: column; }
