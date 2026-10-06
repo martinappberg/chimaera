@@ -49,7 +49,7 @@ use std::{
     sync::{atomic::Ordering, Mutex},
     time::Duration,
 };
-pub(super) use watchdog::{start, stop};
+pub(super) use watchdog::{check_now, start, stop};
 
 #[derive(Default)]
 pub(super) struct State {
@@ -79,6 +79,7 @@ pub(super) struct State {
     /// the moment it lands instead of polling.
     changed: tokio::sync::Notify,
 }
+#[derive(Clone)]
 struct Proof {
     lease: wire::ExecutionLease,
     epoch: u64,
@@ -469,6 +470,34 @@ pub(super) fn accept(
             "previous execution is stopping"
         );
     }
+    // The epoch this installation held last, if this grant continues it with
+    // nobody in between (the same epoch renewed, or its own re-acquired: every
+    // acquisition advances the epoch by one): what a fence preserved stays
+    // resumable. Any other grant settles those entries (review R4 S1).
+    let continued = lock(&state.pro.preferences)
+        .get(&baton.workspace_id)
+        .and_then(|p| p.execution_identity.as_ref())
+        .filter(|identity| {
+            identity.holder_id == config.delegation.device_id
+                && identity.endpoint == config.endpoint
+                && Some(&identity.account_id) == config.account_id.as_ref()
+                && (identity.epoch == baton.epoch || identity.epoch + 1 == baton.epoch)
+        })
+        .map(|identity| identity.epoch);
+    match continued {
+        Some(from) => super::carry_fenced(state, &baton.workspace_id, from, baton.epoch),
+        // A return in progress settles them once it installed its own copy
+        // (`finish_hydration`), so a conversation it brings back is never
+        // also sent to Recents.
+        None if !matches!(
+            lock(&state.pro.ownership).get(&baton.workspace_id),
+            Some(Ownership::Hydrating { .. } | Ownership::SettingUp { .. })
+        ) =>
+        {
+            super::settle_fenced_here(state, &baton.workspace_id, Some(baton.epoch))
+        }
+        None => {}
+    }
     lock(&state.pro.preferences)
         .entry(baton.workspace_id.clone())
         .or_default()
@@ -524,9 +553,15 @@ pub(super) fn allows(state: &AppState, workspace: &str) -> bool {
     // A computer whose ownership is unverified (after a restart, a wake or a
     // failed flush) starts no agent until the lease loop verified it still
     // holds the project: the cloud may have taken it meanwhile (review R3
-    // B3). Signed out, nothing will verify it and sign-out never stops a
-    // computer's work.
+    // B3). Signed out and stood down at the account, nothing will verify it
+    // and nobody else takes it.
     if !worker(state) {
+        // Signed out, but the account never acknowledged that this project
+        // stood down: the cloud may still take it, so its agents run only
+        // until the kept lease's deadline (review R4 B2).
+        if super::sign_out::unreleased(state, workspace) {
+            return held_alive(state, workspace);
+        }
         let unverified = !super::signed_out(state)
             && matches!(
                 lock(&state.pro.ownership).get(workspace),
@@ -789,14 +824,12 @@ pub(super) fn quiescent(state: &AppState, workspace: &str) -> bool {
 /// A personal computer is fenced like a cloud machine: its lease ending means
 /// the cloud may continue the work, so its own agents stop first (the local
 /// deadline keeps a margin before the account's expiry, and the account waits
-/// a grace after it), and a turn never runs in two places. One exception: while
-/// the account itself answers with server errors, nobody can acquire through
-/// it either, so a computer keeps its own work running.
+/// a grace after it), and a turn never runs in two places. Only a successful
+/// renewal moves the deadline: no answer, a refusal and the account's own
+/// server errors all fence at it, since the account's takeover runs apart
+/// from the requests that failed (review R4 B1). Shells keep running.
 pub(super) fn expire(state: &AppState, generation: u64) -> Vec<String> {
     let worker = worker(state);
-    if !worker && super::reach::erroring(state) {
-        return Vec::new();
-    }
     let mut proofs = lock(&state.pro.execution.proofs);
     if !worker {
         // A project kept on this computer left the lease loop: nothing renews
@@ -852,6 +885,51 @@ pub(super) fn invalidate(state: &AppState) -> Vec<String> {
     }
     state.pro.execution.changed.notify_waiters();
     workspaces
+}
+/// The leases this computer holds right now, as sign-out stands them down
+/// (`sign_out`): each project's current-generation proof and its epoch.
+pub(super) fn held(state: &AppState) -> Vec<(String, u64, HeldProof)> {
+    let generation = state.pro.generation.load(Ordering::Acquire);
+    lock(&state.pro.execution.proofs)
+        .iter()
+        .filter(|(_, proof)| proof.generation == generation)
+        .map(|(workspace, proof)| (workspace.clone(), proof.epoch, HeldProof(proof.clone())))
+        .collect()
+}
+/// A held lease's proof, carried across sign-out's configuration change.
+#[derive(Clone)]
+pub(super) struct HeldProof(Proof);
+/// Sign-out could not stand a project down at the account: its proof stays,
+/// moved to the current generation with its own deadline, so `expire` still
+/// fences its agents at that deadline (fail closed) and the watchdog runs.
+pub(super) fn keep_held(state: &std::sync::Arc<AppState>, kept: Vec<(String, HeldProof)>) {
+    if kept.is_empty() {
+        return;
+    }
+    let generation = state.pro.generation.load(Ordering::Acquire);
+    {
+        let mut proofs = lock(&state.pro.execution.proofs);
+        for (workspace, HeldProof(mut proof)) in kept {
+            proof.generation = generation;
+            proof.renew_until = None;
+            proofs.insert(workspace, proof);
+        }
+    }
+    state.pro.execution.changed.notify_waiters();
+    start(state);
+}
+/// The account acknowledged that a signed-out computer stood a project down:
+/// nobody takes it on this computer's behalf, so its proof goes and its
+/// agents are no longer fenced for it.
+pub(super) fn drop_held(state: &AppState, workspace: &str) {
+    lock(&state.pro.execution.proofs).remove(workspace);
+    state.pro.execution.changed.notify_waiters();
+}
+/// A kept proof that `expire` has not fenced yet (see `keep_held`).
+pub(super) fn held_alive(state: &AppState, workspace: &str) -> bool {
+    lock(&state.pro.execution.proofs)
+        .get(workspace)
+        .is_some_and(|proof| !proof.stopped && proof.deadline.valid())
 }
 pub(super) fn clear_stopped(state: &AppState) {
     lock(&state.pro.execution.proofs).clear();

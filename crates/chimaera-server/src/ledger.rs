@@ -44,6 +44,11 @@ pub(crate) struct LedgerEntry {
     /// Fixed manual parking reason. Unknown persisted reasons stay manual;
     /// automatic ownership/provider recovery never clears this fence.
     pub(crate) manual_resume_reason: Option<String>,
+    /// The lease epoch a lapse fenced this conversation at (`pro`'s watchdog
+    /// `preserve`). It resumes or travels only while this computer holds that
+    /// epoch, or one it acquired straight from it with nobody in between;
+    /// otherwise another machine may have finished its turn (review R4 S1).
+    pub(crate) fence_epoch: Option<u64>,
     pub(crate) handoff: Option<crate::bundle::HandoffResume>,
     pub(crate) workspace_id: String,
     /// Last polled cwd (shells) or spawn cwd (agents).
@@ -109,7 +114,7 @@ pub(crate) struct BootLedger {
 
 impl LedgerEntry {
     pub(crate) fn to_json(&self) -> serde_json::Value {
-        json!({
+        let mut value = json!({
             "id": self.id,
             "suspended": self.suspended,
             "manual_resume_reason": self.manual_resume_reason,
@@ -131,7 +136,12 @@ impl LedgerEntry {
                 "model": a.model,
                 "carryover": a.carryover,
             })),
-        })
+        });
+        // Only a fenced entry carries it, so other entries keep their bytes.
+        if let Some(epoch) = self.fence_epoch {
+            value["fence_epoch"] = json!(epoch);
+        }
+        value
     }
 
     pub(crate) fn from_json(value: &serde_json::Value) -> Option<LedgerEntry> {
@@ -171,6 +181,8 @@ impl LedgerEntry {
                 }
                 _ => Some("unknown".into()),
             },
+            // Additive: absent in an older ledger (not fenced).
+            fence_epoch: value.get("fence_epoch").and_then(|v| v.as_u64()),
             handoff: value
                 .get("handoff")
                 .and_then(|v| serde_json::from_value(v.clone()).ok()),
@@ -462,6 +474,7 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
             Some(LedgerEntry {
                 suspended: false,
                 manual_resume_reason: None,
+                fence_epoch: None,
                 handoff: None,
                 id: info.id.clone(),
                 workspace_id,
@@ -508,6 +521,7 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
             Some(LedgerEntry {
                 suspended: false,
                 manual_resume_reason: None,
+                fence_epoch: None,
                 handoff: None,
                 id: c.id.clone(),
                 workspace_id,
@@ -856,6 +870,14 @@ pub(crate) async fn respawn_transfer(
     }
 }
 
+/// A conversation a lapse fenced here that another machine ran since
+/// (`pro::settle_fenced`): it goes to Recents instead of resuming, so
+/// reopening it continues the conversation without re-running its turn.
+pub(crate) async fn retire_stale(state: &Arc<AppState>, entry: &LedgerEntry) {
+    retire_to_recents(state, entry, unix_now()).await;
+    state.changes.notify_waiters();
+}
+
 /// Remember a non-resurrectable agent conversation in its workspace's
 /// Recents, honoring `retire()`'s rules (untitled claude boots carry
 /// nothing recognizable and are skipped). Returns whether a row landed.
@@ -994,9 +1016,16 @@ async fn resume_one(
 ) -> anyhow::Result<()> {
     let turn = ResumeTurn::take(state, id);
     let _turn = turn.wait().await;
+    // A conversation a lapse fenced resumes only while this computer holds
+    // the epoch it was fenced at (review R4 S1): otherwise another machine
+    // may have finished its turn. It stays deferred until that is settled.
     let Some(entry) = crate::lock(&state.deferred_sessions)
         .get(id)
-        .filter(|entry| entry.workspace_id == workspace.id && keep(entry))
+        .filter(|entry| {
+            entry.workspace_id == workspace.id
+                && keep(entry)
+                && crate::pro::fence_current(state, entry)
+        })
         .cloned()
     else {
         return Ok(());
@@ -1075,6 +1104,7 @@ mod tests {
         LedgerEntry {
             suspended: false,
             manual_resume_reason: None,
+            fence_epoch: None,
             handoff: None,
             id: "s-1".into(),
             workspace_id: "w1".into(),

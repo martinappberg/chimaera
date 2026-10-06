@@ -272,6 +272,7 @@ async fn a_resurrected_chat_opens_a_restart_record() {
             handoff: None,
             suspended: false,
             manual_resume_reason: None,
+            fence_epoch: None,
         }],
         links: std::collections::HashMap::new(),
         written_at: 0,

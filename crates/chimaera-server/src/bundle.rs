@@ -979,6 +979,7 @@ mod tests {
             id: "s-bundle".into(),
             suspended: false,
             manual_resume_reason: None,
+            fence_epoch: None,
             handoff: None,
             workspace_id: workspace.id.clone(),
             cwd: directory.clone(),

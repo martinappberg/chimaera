@@ -416,14 +416,18 @@ account's lease is 60 seconds and it refuses anyone else's takeover for a
 15-second grace after expiry (`failover_grace_seconds`). A computer's local
 deadline ends 15 seconds before the account's expiry, and at that deadline the
 computer stops its own managed agents (plain shells are never managed), so a
-turn never runs in two places. While the account answers with server errors
-nobody can acquire through it, and the computer keeps its own work running.
-The account marks every answer it gives, errors included, with
-`X-Chimaera-Account: 1`; a 5xx without it (a proxy, captive portal or edge in
-between) proves nothing about the account and counts as not reaching it, as
-does a refused credential. A success or a 409 counts as reaching it. A project
+turn never runs in two places. Only a successful renewal moves that deadline:
+no answer, a refused credential and every server error fence at it, the
+account's own errors included, because its takeover runs apart from the
+requests that failed. If the account cannot be reached for about a minute,
+agents on the computer pause until it is reachable again; shells keep
+running. The account marks every answer it gives, errors included, with
+`X-Chimaera-Account: 1`, which only tells its own errors apart from a proxy's
+in the daemon's log. A success or a 409 counts as reaching it. A project
 whose "keep on this computer only" switch the account acknowledged holds no
-lease and is never fenced for one. The daemon renews up to 16 projects at once
+lease and is never fenced for one. The lease loop's account calls have their
+own 16 request slots, apart from handoff and transfer calls, and the wait for a
+slot counts inside each call's 15 seconds. The daemon renews up to 16 projects at once
 and waits for a pass at most 20 seconds; a slower project's renewal continues
 on its own and later passes skip it until it ends.
 
@@ -615,16 +619,27 @@ mechanism](#one-handoff-mechanism)), and a resumed worker renews before fencing:
 daemon first renews the recorded epoch, which the account grants to a suspended
 owner at the same epoch with no fork; only a refused renewal (or no answer within
 20 seconds) fences. That renewal starts the moment the thaw is noticed (by the
-daemon's watchdog, 100 ms on a cloud machine and 1 s on a computer, or by the first request or socket frame to arrive
+daemon's watchdog, every 100 ms on a cloud machine and on a computer holding a lease, by the
+daemon's own wake notice, which checks every deadline at once, or by the first request or socket frame to arrive
 after it), never at the next 5-second renewal tick, because a viewer's socket
 is admitted only once it answers. A personal computer is also fenced by its
 lapsed lease (above), a verified other owner (an authenticated read naming
-another holder) or its own in-progress transfer; sign-out, a lapsed plan, the
+another holder) or its own in-progress transfer; a lapsed plan, the
 privacy switch and a daemon restart stop publication, never its agents or
-shells. After a restart no agent starts or resumes in a synced project until
-the account confirms the computer still holds it; only a sign-out, which the
-daemon records on disk, lets interrupted sessions resume without the account.
-Sessions a lapse stopped are dropped once another machine held the project. A verified other owner refuses local input at once; the computer's
+shells. Sign-out (`DELETE /api/v1/pro/configure`) first publishes
+`{handoff_enabled,offline_takeover,has_agents}` all false through
+`PUT /v1/baton/{workspace}/policy` for every project the computer holds, at
+most 8 s in all; an acknowledged project keeps running and is never taken over
+on the computer's behalf. A project without an acknowledgment keeps its lease
+deadline and is fenced there (fail closed); a failure or no answer is retried
+in the background with the credential held in memory, and any other refusal
+leaves it fenced until the next sign-in (persisted as `unreleased`). The
+account never offers, takes over or wakes for a lapsed lease whose holder is a
+revoked computer. After a restart no agent starts or resumes in a synced
+project until the account confirms the computer still holds it; only a
+sign-out the account acknowledged, which the daemon records on disk, lets
+interrupted sessions resume without the account.
+Sessions a lapse stopped carry the epoch they were stopped at in the ledger (`fence_epoch`); they resume or travel only at that epoch or one the computer re-acquired straight from it (epoch + 1, nobody in between), and go to Recents once a grant or ownership read shows another machine held the project. A verified other owner refuses local input at once; the computer's
 agents stop at their next safe pause, at most five minutes later.
 Re-acquiring the epoch this installation itself held (its own clean release, or
 its own lapsed lease) continues local work: no checkpoint install and no fork,

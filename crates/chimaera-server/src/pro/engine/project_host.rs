@@ -162,7 +162,7 @@ impl ProjectOwner {
     }
     pub fn set_ownership(&self, value: Option<Ownership>) {
         if matches!(value, Some(Ownership::Remote { .. })) {
-            super::super::drop_fenced(&self.state, &self.workspace);
+            super::super::settle_fenced(&self.state, &self.workspace, None);
         }
         let mut entries = lock(&self.state.pro.ownership);
         match value {
@@ -212,7 +212,8 @@ impl ProjectOwner {
         Ok(ProjectBaton::capture(response.json()?))
     }
     /// The lease loop's own account calls are what "reachable" means
-    /// (`reach`): any answer counts, a server error or no answer does not.
+    /// (`reach`): a success or a 409 counts; a refusal, any server error
+    /// (the account's own included) or no answer does not.
     fn reached(
         &self,
         response: Result<super::super::transport::Response>,
@@ -333,7 +334,9 @@ impl ProjectOwner {
             &baton.original,
             self.generation,
             started.0,
-        )
+        )?;
+        super::super::retire_settled(&self.state);
+        Ok(())
     }
     pub fn bind_account(&self) -> Result<()> {
         super::super::projects::bind_workspace_account(&self.state, &self.config, &self.workspace)

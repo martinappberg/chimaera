@@ -289,6 +289,11 @@ pub(crate) struct AgentRecord {
     /// capped at [`NOTICE_TEXT_MAX`] chars. A tool call starts a new segment,
     /// so at turn end this holds the start of the reply the turn ended on.
     pub(crate) reply_draft: String,
+    /// The latest state change only corrected a stale reading (a resumed
+    /// idle chat's Init after its SessionStart hook read Running); the
+    /// notice feed (`notices`) takes it as a baseline, not an edge, and
+    /// clears it.
+    pub(crate) state_corrected: bool,
 }
 
 /// The descriptive half of an attention edge, stashed by whichever surface
@@ -368,6 +373,7 @@ impl AgentRecord {
             usage: None,
             notice_note: None,
             reply_draft: String::new(),
+            state_corrected: false,
         }
     }
 

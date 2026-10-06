@@ -763,44 +763,4 @@ mod tests {
         drop(restarted);
         std::fs::remove_dir_all(root).unwrap();
     }
-
-    /// Review R3 harness cause 2: a conversation a lease fence stopped stops
-    /// saying it runs, and once another machine held the project it is not
-    /// resumed here (a finished turn would run again); the return's own copy
-    /// replaces it.
-    #[tokio::test]
-    async fn a_fenced_conversation_is_dropped_once_the_project_ran_elsewhere() {
-        let (state, root) = fixture("fenced");
-        let entry = |id: &str, handoff: bool| crate::ledger::LedgerEntry {
-            id: id.into(),
-            suspended: true,
-            manual_resume_reason: None,
-            handoff: handoff.then_some(crate::bundle::HandoffResume {
-                fork: false,
-                origin: crate::bundle::Origin::Home,
-                epoch: 4,
-            }),
-            workspace_id: "w-a".into(),
-            cwd: root.clone(),
-            pinned_name: None,
-            cols: 80,
-            rows: 24,
-            theme: "dark".into(),
-            created_at: 0,
-            agent: None,
-        };
-        lock(&state.deferred_sessions).insert("s-stale".into(), entry("s-stale", false));
-        lock(&state.deferred_sessions).insert("s-imported".into(), entry("s-imported", true));
-        lock(&state.deferred_sessions).insert("s-other".into(), entry("s-other", false));
-        lock(&state.pro.fenced_sessions).extend(["s-stale".into(), "s-imported".into()]);
-        super::super::drop_fenced(&state, "w-a");
-        let deferred = lock(&state.deferred_sessions);
-        assert!(!deferred.contains_key("s-stale"));
-        assert!(deferred.contains_key("s-imported"));
-        assert!(deferred.contains_key("s-other"), "not fenced: left alone");
-        drop(deferred);
-        assert!(lock(&state.pro.fenced_sessions).is_empty());
-        drop(state);
-        std::fs::remove_dir_all(root).unwrap();
-    }
 }

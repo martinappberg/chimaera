@@ -368,26 +368,52 @@ fn sessions(state: &AppState, workspace: &str) -> Vec<String> {
 /// for this project (a conversation waiting here for its agent's sign-in, or
 /// one an earlier stop preserved). Leaving a stopped one out would lose it
 /// once the project leaves: a cloud machine that cannot run a conversation
-/// hands it back with the project.
+/// hands it back with the project. Live sessions come first and are never
+/// left out (over 64 of them refuses the transfer); stopped ones past the cap
+/// stay here and are logged, never refusing the whole project (review R4 S3).
 fn transfer_session_ids(state: &AppState, workspace: &str) -> Result<Vec<String>> {
+    // A session whose process ended (a shell that exited, still listed) has
+    // nothing to save; asking for it only logged "left out" warnings.
+    let ended = |id: &String| {
+        let pty = state.sessions.get(id);
+        let chat = state.chat.get(id);
+        (pty.is_some() || chat.is_some())
+            && !pty.is_some_and(|s| s.alive)
+            && !chat.is_some_and(|s| s.alive)
+    };
     let mut ids: Vec<_> = lock(&state.session_workspaces)
         .iter()
         .filter(|(_, id)| id.as_str() == workspace)
         .map(|(id, _)| id.clone())
+        .filter(|id| !ended(id))
         .take(65)
         .collect();
-    for (id, entry) in lock(&state.deferred_sessions).iter() {
-        if ids.len() > 64 {
-            break;
-        }
-        if entry.workspace_id == workspace && !ids.contains(id) {
-            ids.push(id.clone());
-        }
-    }
     ensure!(
         ids.len() <= 64,
         "Project transfer supports at most 64 sessions; close some sessions and try again"
     );
+    let mut stopped: Vec<String> = lock(&state.deferred_sessions)
+        .iter()
+        // A conversation a lapse fenced travels only from the epoch it was
+        // fenced at: from any other, another machine may have finished its
+        // turn (review R4 S1).
+        .filter(|(id, entry)| {
+            entry.workspace_id == workspace
+                && !ids.contains(id)
+                && super::fence_current(state, entry)
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    // A stable choice of which stopped sessions travel when not all fit.
+    stopped.sort();
+    let room = 64 - ids.len();
+    if stopped.len() > room {
+        tracing::warn!(
+            left = stopped.len() - room,
+            "Stopped conversations past the 64-session limit stay on this computer"
+        );
+    }
+    ids.extend(stopped.into_iter().take(room));
     Ok(ids)
 }
 /// A clean flush before this computer sleeps: one shared deadline, and no
@@ -1028,6 +1054,7 @@ async fn hydrate_scoped(
     );
     current()?;
     execution::accept(state, config, &grant, generation, request_start)?;
+    super::retire_settled(state);
     // A project taken here (a return, an adoption, a reopened folder) is this
     // device's from now on: bind it to the account at once, as reconcile does
     // after its own acquire, so the cloud-project listing can match the folder
@@ -2051,7 +2078,7 @@ async fn finish_hydration_checked(
         // the ones a fence kept here. (A cloud machine resuming its own fenced
         // epoch installs nothing new and keeps them.)
         if !execution::worker(state) {
-            super::drop_fenced(state, workspace);
+            super::settle_fenced(state, workspace, Some(epoch));
         }
         super::persist(state).await?;
     }
@@ -2254,6 +2281,89 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// Review R4 S3: stopped conversations never refuse a project's
+    /// transfer. Live ones all travel; stopped ones fill the rest of the 64,
+    /// and one fenced at an epoch this computer no longer holds is not
+    /// exported at all.
+    #[test]
+    fn stopped_conversations_past_the_cap_stay_and_never_refuse_the_transfer() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-roster-cap-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let state = Arc::new(AppState::new(
+            "fixture".into(),
+            "fixture".into(),
+            4242,
+            0,
+            root.clone(),
+            root.join("config"),
+        ));
+        for n in 0..60 {
+            lock(&state.session_workspaces).insert(format!("s-live-{n:02}"), "w-project".into());
+        }
+        let stopped = |id: String, fence: Option<u64>| crate::ledger::LedgerEntry {
+            id,
+            suspended: true,
+            manual_resume_reason: None,
+            fence_epoch: fence,
+            handoff: None,
+            workspace_id: "w-project".into(),
+            cwd: root.clone(),
+            pinned_name: None,
+            cols: 80,
+            rows: 24,
+            theme: "dark".into(),
+            created_at: 0,
+            agent: None,
+        };
+        for n in 0..6 {
+            let id = format!("s-stopped-{n}");
+            lock(&state.deferred_sessions).insert(id.clone(), stopped(id, None));
+        }
+        lock(&state.deferred_sessions)
+            .insert("s-fenced".into(), stopped("s-fenced".into(), Some(3)));
+        // A shell that already exited (still listed) has nothing to carry.
+        let ended = state
+            .sessions
+            .spawn(chimaera_pty::SpawnOpts {
+                cwd: root.clone(),
+                name: None,
+                cols: 80,
+                rows: 24,
+                command: Some(vec!["/usr/bin/true".into()]),
+                id: Some("s-ended".into()),
+                env: vec![],
+                env_remove: vec![],
+                scrollback: None,
+            })
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while state.sessions.get(&ended.id).is_some_and(|s| s.alive) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the shell never exited"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        lock(&state.session_workspaces).insert("s-ended".into(), "w-project".into());
+        let ids = transfer_session_ids(&state, "w-project").unwrap();
+        assert!(!ids.contains(&"s-ended".to_string()), "an ended shell");
+        assert_eq!(ids.len(), 64);
+        assert_eq!(
+            ids.iter().filter(|id| id.starts_with("s-live-")).count(),
+            60
+        );
+        assert!(!ids.contains(&"s-fenced".to_string()), "not this epoch's");
+        assert_eq!(
+            &ids[60..],
+            ["s-stopped-0", "s-stopped-1", "s-stopped-2", "s-stopped-3"]
+        );
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     /// Sign-out aborts the mirror task that finishes a return. The returned
     /// sessions that finish was respawning start anyway: a respawn cut half
     /// way would leave them deferred, answering "moved" forever.
@@ -2313,6 +2423,7 @@ mod tests {
                 id: "s-returned".into(),
                 suspended: true,
                 manual_resume_reason: None,
+                fence_epoch: None,
                 handoff: Some(crate::bundle::HandoffResume {
                     fork: false,
                     origin: crate::bundle::Origin::Home,

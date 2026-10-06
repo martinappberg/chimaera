@@ -20,7 +20,8 @@ authority record fences only on a cloud worker, the only place it is written.
 | `authority.rs` / `authority_tests.rs` | Fixed-identity workspace-bound worker acceptance, startup-only validated revision advancement, credential-free persisted latch, renewal/route/root guards and synthetic side-effect regressions. |
 | `routes.rs` | Authenticated configure/status/privacy/sleep/hydration HTTP handlers. Accepted writes retain configuration/job reservations through durable persistence even if the caller disconnects. `/pro/status` rows carry additive `place`, `reason`, `run_here` and `run_in_cloud` (see Where work runs below). `hand_over` is the one flush coordinator behind `/pro/sleep`, the macOS sleep watcher and "Run in the cloud"; `woke` is the wake. |
 | `place.rs` | Where a synced project's work runs and the user's two choices: `run_here` (`POST /pro/projects/{id}/here`), `run_in_cloud` (`POST /pro/projects/{id}/cloud`), `observed` (the ownership read's `reason`/`holder_kind`/`holder_name`), the cloud machine's `arrived` report (`PUT /v2/workspaces/{id}/reason`). |
-| `reach.rs` | Whether this computer can reach the account (the lease loop's own calls: `answered` (a 2xx or 409 is reachable; a 5xx is `erroring` only with the account's marker), `unreachable`, `settled` after a 15 s guard, `erroring`) and the daemon-owned reverse-serve link to the keeper (ends for good on a refused or expired delegation; at most 8 MiB read from the daemon queued across all streams). |
+| `reach.rs` | Whether this computer can reach the account (the lease loop's own calls: `answered` (a 2xx or 409 is reachable; every 5xx, marked or not, and a refused credential are not), `unreachable`, `settled` after a 15 s guard) and the daemon-owned reverse-serve link to the keeper (ends for good on a refused or expired delegation; at most 8 MiB read from the daemon queued across all streams). |
+| `sign_out.rs` | `/pro/disconnect` stands every held project down first (`PUT /v1/baton/{id}/policy`, all false, 8 at a time, at most 8 s): acknowledged projects are `released`; the rest stay `unreleased` (persisted in `state.json`, cleared by the next configure), keep their proof (`execution::keep_held`) and are fenced at its deadline; failures are retried in the background (`retry`, credential in memory only) and a later acknowledgment drops the proof and resumes the project's sessions (review R4 B2). |
 | `sleep_watch.rs` | macOS only: the daemon's own IOKit sleep/wake watcher; a will-sleep runs `routes::sleeping` (23 s) and always acknowledges, a power-on or will-not-sleep runs `routes::woke`; signed out or without the Runtime a notice is only acknowledged. |
 | `projects.rs` / `projects/catalog.rs` | Passive published-account discovery (negotiated `/v2/projects`, at most 128 rows/pages; legacy capability absence or 404 falls back to passive worker discovery), explicit copy/takeover routes, native-picked folder validation and inode/account-bound retry. Catalog rows infer no host or execution authority; errors retain cached rows and destination bindings. Legacy `/open` refuses rather than transferring execution. Nine original shared guard cases remain public; five actual runtime project compositions live privately, including four original ignored companion integrations run by the required private companion job. |
 | `project_copy.rs` / `project_copy/tests.rs` | Immutable read-only checkpoint copies with the existing file/Git transaction, independent durable copy enrollment, exact pending baselines, counted admission and explicit post-commit role promotion. Copy selects its receipt through passive `/v2/baton` GET; the legacy v1 response has no checkpoint and is never a fallback. Missing negotiated receipt refuses enrollment/install. No agent/session/configuration restore or copied-edit publication. |
@@ -46,7 +47,7 @@ authority record fences only on a cloud worker, the only place it is written.
 | `provider_gate.rs` / `provider_tests.rs` | Shared per-agent readiness and bounded blocked-provider status/refusal tests. Actual paid staged retry/cancellation journeys use the optional private runtime with a synthetic CLI and real PTY. |
 | `protocol.rs` | Additive account contract subset and strict worker host-to-holder identity translation; intentionally no link/TLS dependency in the daemon. |
 | `transfer_dispatch.rs`, `transfer_types.rs`, `transfer_host.rs` | Eighteen typed original repository operations, immutable existing DTOs and one original source/cache/generation owner. Trusted private policy can use only fixed Git with captured roots/clean environment/sealed original mirror grants. The original daemon data/home cache anchor resolves once, while fixed Pro/project suffixes remain no-follow; cache descriptions bind to that pinned canonical inode, never a later alias. Real filesystem checks run in retained blocking work; staged output and checkout lock cleanup retain the same cache exclusion through cancellation. Nondefault fixture constructors use caller-owned disposable roots and real host Git/install effects. The original paid engine/projects suites live in the private actual runtime; the full assembly and installed-companion gates verify this boundary. Authoritative configured/ownership fields retain their meanings; affected rows use the existing fixed `optional_runtime_unavailable` error, and executable cloud handoff is false without the runtime. |
-| `transport.rs` | Bounded external curl/git children; cached mirror-only Git compatibility selection; credentials only in memory, never argv or Git config. The account's 403 `{"error":"return_window_ended"}` (a plan that ended and whose time to bring cloud work home has passed) becomes an error of its own in `engine::account`, so its mirror-row and open `error_code` read `return_window_ended`; any other 403 stays a plain response. |
+| `transport.rs` | Bounded external curl/git children; account and keeper requests share 6 permits, while the lease loop's own `/v1|v2/baton/...` calls have their own 16 (handoff calls hold a permit up to 93 s and must never starve a renewal); waiting for a permit counts inside the request's 15 s budget (review R4 S4); cached mirror-only Git compatibility selection; credentials only in memory, never argv or Git config. The account's 403 `{"error":"return_window_ended"}` (a plan that ended and whose time to bring cloud work home has passed) becomes an error of its own in `engine::account`, so its mirror-row and open `error_code` read `return_window_ended`; any other 403 stays a plain response. |
 | `policy.rs` | Mirrored-path policy (credentials, `.git`, staging names, kept copies and a folder's `.chimaera-workspace` identity marker at any depth are never mirrored), `REBUILT_DIRS` (dependency and cache folders that never travel as untracked content, used by the mirror inventory and the agent-config export), credential filtering, size budgets and `validate_missing_environment` (limits for the environment variable names the last configuration export left out, kept on the project's preference and the move manifest as `missing_environment`). |
 | `mirror.rs` | Public pinned snapshot confinement and interrupted-cache cleanup remain single-sourced; paid Git inventory/commit/fetch/push/validation policy dispatches to private `pro-daemon-runtime`. No-runtime transfers refuse before mirror initialization or managed stops. |
 | `shadow_cache.rs` | Validated reconstruction of an objectively damaged outgoing shadow, retaining its complete prior store in a bounded no-overwrite quarantine. |
@@ -67,11 +68,13 @@ owner (`Ownership::Remote`, from an authenticated read) or by its own
 in-progress transfer (`Transferring`, `Hydrating`, `SettingUp`);
 `AwaitingVerification` (after a restart, a wake or a failed flush) keeps
 writes and terminals but starts and resumes no agent until the lease loop
-verified the project (`execution::allows`; not when signed out). While the
-account answers with server errors carrying its own `X-Chimaera-Account`
-marker (`reach::erroring`; `transport::Response::from_account`) a computer
-keeps its own work; an unmarked 5xx (a proxy or captive portal) counts as
-unreachable. A project kept on this computer whose switch the account
+verified the project (`execution::allows`; not when signed out). Only a
+successful renewal moves the local deadline: no answer, a refusal and every
+server error, the account's own included (its `X-Chimaera-Account` marker only
+labels the log line, `transport::Response::from_account`), fence at it. If the
+account cannot be reached for about a minute, agents on this computer pause at
+the deadline until it is reachable again; shells keep running (review R4 B1).
+A project kept on this computer whose switch the account
 acknowledged (`execution::kept_here`) holds no lease proof (`expire` drops it)
 and restores without one. Sign-out
 (`disconnect` never stops sessions), plan changes, the privacy switch and daemon
@@ -88,7 +91,7 @@ acquire/renew proof, never a passive GET; a request-start deadline reserves stop
 time; clock divergence closes admission; and the watchdog (started only on
 workers) fences chat/PTY input and owned agent process groups. Renew before
 fencing: when the watchdog sees the process was frozen (a tick, 100 ms on a
-worker and 1 s on a computer, taking over 3 s, or wall and monotonic time disagreeing by over 1 s) and a deadline
+worker and on a computer holding any proof, 1 s on a computer holding none (`watchdog::tick`); `routes::woke` also runs `watchdog::check_now` at once, review R4 S5; taking over 3 s, or wall and monotonic time disagreeing by over 1 s) and a deadline
 lapsed across it, it wakes the lease loop, which renews the recorded epoch
 (the account keeps a suspended owner's lease: same epoch, no fork, never an
 acquire/checkpoint install); input stays admitted meanwhile. A personal
@@ -111,11 +114,21 @@ a previous daemon left running wait for this life's lease (`may_restore`); on a
 device `resume_unverified` resumes the restart-deferred ones of a synced
 project after one minute only when the user signed out (`ProState.signed_out`,
 written by `/pro/disconnect`, persisted in `state.json`, cleared by the next
-configure; nothing else proves the cloud is not running the work), unless
-another owner was verified meanwhile. Sessions a lease fence preserved
-(`watchdog::preserve`, also marking a running agent `Unknown`) are tracked in
-`fenced_sessions` and dropped (`drop_fenced`) once the project is seen held
-elsewhere or a return installs its own copy, so a finished turn never resumes.
+configure) and the account acknowledged that project's stand-down
+(`sign_out::released`; nothing else proves the cloud is not running the work),
+unless another owner was verified meanwhile. Sessions a lease fence preserved
+(`watchdog::preserve`, once per lapse: a project that holds a lease again is
+preserved again at its next lapse, `newly_fenced`; also marking a running
+agent `Unknown`) record the
+fence's epoch on their ledger entry (`LedgerEntry.fence_epoch`, persisted).
+They resume (`ledger::resume_one`) or travel (`engine::transfer_session_ids`)
+only while `fence_current`: the computer holds that epoch with a valid lease.
+`execution::accept` carries the epoch forward when a grant continues the one
+this installation last held (same epoch, or + 1: nobody acquired in between,
+`carry_fenced`); any other grant, a verified other owner (`set_ownership`
+Remote) or a return's hydration settles them (`settle_fenced`): they leave the
+deferred set for Recents (`ledger::retire_stale`), so a finished turn never
+runs again, also after a restart (review R4 S1).
 The lease loop's per-project pass (`CoordinatorTick::reconcile`) runs as an
 owned task tracked in `ProState.reconciling` (aborted by `stop_tasks`); the
 policy waits for a pass at most a budget and a later pass skips a project still
@@ -140,7 +153,9 @@ prefix never proves the omitted work stopped. Same-boot overflow stays unknown
 through subsequent truncated writes and reprobes; a cold boot or verified
 supervisor cleanup is required to establish complete evidence. Persisted worker
 identity keeps this fence even if a later runtime configuration says Device.
-Clean transfer admits at most 64 sessions before any mutation and rechecks the
+Clean transfer admits at most 64 live sessions before any mutation (stopped
+ones fill the rest of the 64; the surplus stays here and is logged, never
+refusing the project, review R4 S3) and rechecks the
 roster after draining all agents. Truth predicates inspect the whole existing
 registry. The final synchronous agent spawn/registration window has a counted
 reservation even for legacy/device ownership, so a pre-fence launch cannot

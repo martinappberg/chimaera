@@ -43,6 +43,7 @@ fn fixture() -> (Arc<AppState>, ledger::LedgerEntry, PathBuf) {
         id: "s-manual-resume".into(),
         suspended: true,
         manual_resume_reason: Some("project_secrets_idle".into()),
+        fence_epoch: None,
         handoff: None,
         workspace_id: workspace.id,
         cwd: root,

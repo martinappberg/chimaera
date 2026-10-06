@@ -179,36 +179,33 @@ fn grant_replay_stale_generation_and_capability_downgrade_do_not_extend_deadline
     std::fs::remove_dir_all(root).unwrap();
 }
 /// A computer whose lease lapsed stops its own agents, like a cloud machine,
-/// so the cloud continues exactly once; unless the account itself answers
-/// with server errors, when nobody can acquire through it either.
+/// so the cloud continues exactly once, whatever the failure: the account
+/// answering with its own server errors on every renewal fences at the
+/// deadline too (review R4 B1), and so does a proxy's.
 #[test]
-fn device_lease_expiry_fences_its_own_agents_unless_the_account_is_erroring() {
-    let (state, _config, root) = fixture();
-    crate::pro::install_execution_fixture(&state, "w-a", 2).unwrap();
-    let lapse = |state: &AppState| {
+fn device_lease_expiry_fences_its_own_agents_whatever_the_account_answered() {
+    for from_account in [true, false] {
+        let (state, _config, root) = fixture();
+        crate::pro::install_execution_fixture(&state, "w-a", 2).unwrap();
+        // Every renewal of this lease got a 503 (with or without the
+        // account's marker); nothing moved the deadline.
+        for _ in 0..3 {
+            crate::pro::reach::answered(&state, 503, from_account);
+        }
+        assert!(expire(&state, 0).is_empty(), "the deadline has not passed");
         lock(&state.pro.execution.proofs)
             .get_mut("w-a")
             .unwrap()
             .deadline = lease::Deadline::expired_fixture();
-    };
-    lapse(&state);
-    // The account answering 5xx: the computer keeps its own work.
-    crate::pro::account_erroring_fixture(&state);
-    assert!(expire(&state, 0).is_empty());
-    assert!(crate::pro::may_execute(&state, "w-a"));
-    assert!(!lease_valid(&state, "w-a"), "publication waits for renewal");
-    // A 5xx from a proxy, captive portal or edge (no account marker) proves
-    // nothing about the account: fenced at the deadline, as unreachable.
-    state.pro.erroring_at.store(0, Ordering::Release);
-    crate::pro::reach::answered(&state, 502, false);
-    assert!(!crate::pro::reach::erroring(&state));
-    assert_eq!(expire(&state, 0), vec!["w-a"]);
-    assert!(!crate::pro::may_execute(&state, "w-a"));
-    assert!(crate::pro::validate_execution_scope(&state, "w-a", 2).is_err());
-    // Its own sessions stay resumable once it holds the project again.
-    assert!(!lock(&state.pro.preferences)["w-a"].execution_uncertain);
-    assert!(resume_allowed(&state, "w-a"));
-    std::fs::remove_dir_all(root).unwrap();
+        crate::pro::reach::answered(&state, 503, from_account);
+        assert_eq!(expire(&state, 0), vec!["w-a"], "marked={from_account}");
+        assert!(!crate::pro::may_execute(&state, "w-a"));
+        assert!(crate::pro::validate_execution_scope(&state, "w-a", 2).is_err());
+        // Its own sessions stay resumable once it holds the project again.
+        assert!(!lock(&state.pro.preferences)["w-a"].execution_uncertain);
+        assert!(resume_allowed(&state, "w-a"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 /// A computer that thaws before anyone could have taken its project renews
 /// first and keeps running; one that thaws later is fenced at once.
@@ -632,5 +629,169 @@ fn keeping_a_project_on_this_computer_never_fences_its_agents() {
         .unwrap()
         .deadline = lease::Deadline::expired_fixture();
     assert_eq!(expire(&state, 0), vec!["w-a"]);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Review R4 S1: what a lapse fence preserved carries the epoch it was fenced
+/// at, persisted with the ledger. It resumes only while this computer holds
+/// that epoch or one it re-acquired straight from it; once a grant shows
+/// another machine held the project in between, it leaves for Recents, even
+/// after a restart lost every in-memory record of the fence.
+#[tokio::test]
+async fn a_fenced_conversation_resumes_only_in_its_own_epoch() {
+    let (state, config, root) = fixture();
+    let grant = |epoch: u64| -> Baton {
+        serde_json::from_value(json!({"workspace_id":"w-a","holder_id":"d-home","epoch":epoch,
+            "requires_fork":false,"server_now":"2026-09-28T00:00:00Z","expires_at":"2026-09-28T00:01:30Z",
+            "continuity":{"version":2,"mode":"managed_v1","policy_revision":1,"preferred_installation_id":"i-home"},
+            "execution_capability":{"version":1,"boundary":"managed_processes","expired_takeover":false},
+            "execution_lease":{"id":format!("lease-{epoch}"),"sequence":1}}))
+        .unwrap()
+    };
+    accept(&state, &config, &grant(2), 0, RequestStart::now()).unwrap();
+    lock(&state.pro.ownership).insert("w-a".into(), Ownership::Local { epoch: 2 });
+    let entry = |id: &str, fence: Option<u64>, handoff: bool| crate::ledger::LedgerEntry {
+        id: id.into(),
+        suspended: true,
+        manual_resume_reason: None,
+        fence_epoch: fence,
+        handoff: handoff.then_some(crate::bundle::HandoffResume {
+            fork: false,
+            origin: crate::bundle::Origin::Home,
+            epoch: 4,
+        }),
+        workspace_id: "w-a".into(),
+        cwd: root.clone(),
+        pinned_name: None,
+        cols: 80,
+        rows: 24,
+        theme: "dark".into(),
+        created_at: 0,
+        agent: None,
+    };
+    // Survives a restart: the ledger keeps the fence epoch (and only then).
+    let stale = entry("s-stale", Some(2), false);
+    let saved = stale.to_json();
+    assert_eq!(saved["fence_epoch"], 2);
+    assert!(entry("s-other", None, false)
+        .to_json()
+        .get("fence_epoch")
+        .is_none());
+    let restored = crate::ledger::LedgerEntry::from_json(&saved).unwrap();
+    assert_eq!(restored.fence_epoch, Some(2));
+    {
+        let mut deferred = lock(&state.deferred_sessions);
+        deferred.insert("s-stale".into(), restored);
+        deferred.insert("s-imported".into(), entry("s-imported", None, true));
+        deferred.insert("s-other".into(), entry("s-other", None, false));
+    }
+    let current = |id: &str| {
+        let entry = lock(&state.deferred_sessions).get(id).cloned().unwrap();
+        crate::pro::fence_current(&state, &entry)
+    };
+    assert!(current("s-stale"), "still this computer's epoch");
+    // Its own lapsed epoch re-acquired, nobody in between: still its own.
+    lock(&state.pro.execution.proofs)
+        .get_mut("w-a")
+        .unwrap()
+        .stopped = true;
+    lock(&state.pro.execution.proofs).remove("w-a");
+    accept(&state, &config, &grant(3), 0, RequestStart::now()).unwrap();
+    lock(&state.pro.ownership).insert("w-a".into(), Ownership::Local { epoch: 3 });
+    assert_eq!(
+        lock(&state.deferred_sessions)["s-stale"].fence_epoch,
+        Some(3)
+    );
+    assert!(current("s-stale"));
+    // Lapsed again; the cloud held epoch 4 and gave it back at 5. While
+    // that return is still installing, nothing is settled yet: its own copy
+    // may bring the conversation back (`finish_hydration` settles after).
+    lock(&state.pro.execution.proofs).remove("w-a");
+    lock(&state.pro.ownership).insert("w-a".into(), Ownership::Hydrating { epoch: 5 });
+    accept(&state, &config, &grant(5), 0, RequestStart::now()).unwrap();
+    assert!(lock(&state.deferred_sessions).contains_key("s-stale"));
+    super::super::settle_fenced_here(&state, "w-a", Some(5));
+    let deferred = lock(&state.deferred_sessions);
+    assert!(!deferred.contains_key("s-stale"), "ran elsewhere: settled");
+    assert!(deferred.contains_key("s-imported"));
+    assert!(deferred.contains_key("s-other"), "not fenced: left alone");
+    drop(deferred);
+    assert_eq!(lock(&state.pro.settled).len(), 1, "on its way to Recents");
+    // A fenced entry whose epoch this computer does not hold never resumes.
+    lock(&state.deferred_sessions).insert("s-late".into(), entry("s-late", Some(4), false));
+    assert!(!current("s-late"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Review R4 S5: a wake checks the deadlines at once. A computer whose lease
+/// lapsed past anyone's takeover while it slept is fenced by the wake itself,
+/// not a tick later; one still inside that window renews first.
+#[tokio::test]
+async fn a_wake_fences_a_long_lapsed_lease_at_once() {
+    let (state, _config, root) = fixture();
+    crate::pro::install_execution_fixture(&state, "w-a", 2).unwrap();
+    assert_eq!(
+        watchdog::tick(&state),
+        Duration::from_millis(100),
+        "a held lease"
+    );
+    lock(&state.pro.execution.proofs)
+        .get_mut("w-a")
+        .unwrap()
+        .deadline = lease::Deadline::lapsed_recently_fixture();
+    crate::pro::routes::woke(&state).await;
+    assert!(!fenced(&state, "w-a"), "inside the window: renewal first");
+    assert!(resuming(&state, "w-a"));
+    {
+        let mut proofs = lock(&state.pro.execution.proofs);
+        let proof = proofs.get_mut("w-a").unwrap();
+        proof.renew_until = None;
+        proof.deadline = lease::Deadline::expired_fixture();
+    }
+    crate::pro::routes::woke(&state).await;
+    assert!(fenced(&state, "w-a"), "fenced by the wake itself");
+    assert!(!crate::pro::may_execute(&state, "w-a"));
+    lock(&state.pro.execution.proofs).clear();
+    assert_eq!(
+        watchdog::tick(&state),
+        Duration::from_secs(1),
+        "nothing held"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A lapse fence keeps only what it stops: a conversation a clean hand-over
+/// already stopped and recorded keeps its own record (its hand-off, no fence
+/// epoch), so seeing the project held elsewhere never sends it to Recents
+/// (the full loopback run's step 11).
+#[tokio::test]
+async fn a_lapse_never_marks_a_conversation_a_hand_over_already_kept() {
+    let (state, _config, root) = fixture();
+    crate::pro::install_execution_fixture(&state, "w-a", 2).unwrap();
+    let handed = crate::ledger::LedgerEntry {
+        id: "s-handed".into(),
+        suspended: true,
+        manual_resume_reason: None,
+        fence_epoch: None,
+        handoff: Some(crate::bundle::HandoffResume {
+            fork: false,
+            origin: crate::bundle::Origin::Home,
+            epoch: 2,
+        }),
+        workspace_id: "w-a".into(),
+        cwd: root.clone(),
+        pinned_name: None,
+        cols: 80,
+        rows: 24,
+        theme: "dark".into(),
+        created_at: 0,
+        agent: None,
+    };
+    lock(&state.deferred_sessions).insert("s-handed".into(), handed.clone());
+    watchdog::preserve(&state, &["w-a".to_string()]);
+    assert_eq!(lock(&state.deferred_sessions)["s-handed"], handed);
+    crate::pro::install_remote_owner_fixture(&state, "w-a", 3);
+    super::super::settle_fenced_here(&state, "w-a", None);
+    assert!(lock(&state.deferred_sessions).contains_key("s-handed"));
     std::fs::remove_dir_all(root).unwrap();
 }

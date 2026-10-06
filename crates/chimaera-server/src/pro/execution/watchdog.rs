@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-/// A tick (100 ms on a cloud machine, 1 s on a computer) that took this long
+/// A tick (100 ms, or 1 s on a computer holding no lease; see `tick`) that took this long
 /// was not scheduled normally: the process was frozen.
 pub(super) const FREEZE: Duration = Duration::from_secs(3);
 /// Wall and monotonic time disagreeing by this much across one tick is a
@@ -33,16 +33,27 @@ fn signal(state: &AppState, workspace: &str) {
         }
     }
 }
-fn preserve(state: &AppState, workspaces: &[String]) {
+pub(super) fn preserve(state: &AppState, workspaces: &[String]) {
+    // The epoch each fence stopped its project at: what it preserves resumes
+    // or travels only while this computer still holds it (review R4 S1).
+    let epochs: std::collections::HashMap<String, u64> = {
+        let proofs = lock(&state.pro.execution.proofs);
+        workspaces
+            .iter()
+            .filter_map(|workspace| Some((workspace.clone(), proofs.get(workspace)?.epoch)))
+            .collect()
+    };
+    // Only what this fence stops: a session already kept (a clean hand-over's
+    // stopped conversation, one waiting for verification) is not the lapse's,
+    // keeps its own record, and is never marked stale by it.
+    let kept: std::collections::HashSet<String> =
+        lock(&state.deferred_sessions).keys().cloned().collect();
     for mut entry in crate::ledger::snapshot(state).0 {
-        if workspaces.contains(&entry.workspace_id) {
+        if workspaces.contains(&entry.workspace_id) && !kept.contains(&entry.id) {
             entry.suspended = true;
             entry.handoff = None;
             if entry.agent.is_some() {
-                let mut fenced = lock(&state.pro.fenced_sessions);
-                if fenced.len() < 512 {
-                    fenced.insert(entry.id.clone());
-                }
+                entry.fence_epoch = epochs.get(&entry.workspace_id).copied();
                 // Its process is stopped mid-turn: the row must not keep
                 // saying it runs. Unknown raises no notice.
                 if let Some(record) = lock(&state.agents).get_mut(&entry.id) {
@@ -55,6 +66,43 @@ fn preserve(state: &AppState, workspaces: &[String]) {
         }
     }
 }
+/// The watchdog's tick: 100 ms on a cloud machine and on a computer while it
+/// holds any lease proof, so thawed agents stop within a tick of the thaw
+/// (review R4 S5); 1 s otherwise, keeping an idle laptop's CPU asleep.
+const BUSY_TICK: Duration = Duration::from_millis(100);
+const IDLE_TICK: Duration = Duration::from_secs(1);
+pub(super) fn tick(state: &AppState) -> Duration {
+    if super::worker(state) || !lock(&state.pro.execution.proofs).is_empty() {
+        BUSY_TICK
+    } else {
+        IDLE_TICK
+    }
+}
+/// A wake (`routes::woke`) checks every deadline at once instead of at the
+/// next tick: the machine was frozen, so a lease that lapsed past anyone's
+/// takeover fences now, before thawed agents run on, and one still inside
+/// that window gets its one renewal first (`resumed`), as a tick would.
+pub(in crate::pro) fn check_now(state: &AppState) {
+    let generation = state.pro.generation.load(Ordering::Acquire);
+    if super::resumed(state, generation) {
+        state.pro.renew_now.notify_one();
+    }
+    for workspace in super::expire(state, generation) {
+        signal(state, &workspace);
+    }
+}
+/// The fences to preserve sessions for: projects expired now that were not
+/// already expired at the last tick. A project that holds a valid lease again
+/// is forgotten, so its next lapse preserves its sessions again; otherwise a
+/// second lapse in one daemon life stopped its conversations without keeping
+/// them, and they were lost (coordinator follow-up to review R4).
+fn newly_fenced(recorded: &mut HashSet<String>, expired: Vec<String>) -> Vec<String> {
+    recorded.retain(|workspace| expired.contains(workspace));
+    expired
+        .into_iter()
+        .filter(|workspace| recorded.insert(workspace.clone()))
+        .collect()
+}
 pub(in crate::pro) fn start(state: &Arc<AppState>) {
     let weak = Arc::downgrade(state);
     let runtime = tokio::runtime::Handle::current();
@@ -63,11 +111,8 @@ pub(in crate::pro) fn start(state: &Arc<AppState>) {
         let mut recorded = HashSet::new();
         let mut last = (std::time::Instant::now(), std::time::SystemTime::now());
         loop {
-            // A cloud machine's fence is tight (100 ms); a personal computer
-            // keeps a 15 s margin before the account's expiry, so a 1 s tick
-            // is enough and keeps a laptop's CPU asleep between ticks.
-            let worker = weak.upgrade().is_some_and(|state| super::worker(&state));
-            std::thread::sleep(Duration::from_millis(if worker { 100 } else { 1000 }));
+            let tick = weak.upgrade().map_or(IDLE_TICK, |state| tick(&state));
+            std::thread::sleep(tick);
             let Some(state) = weak.upgrade() else {
                 return;
             };
@@ -102,10 +147,7 @@ pub(in crate::pro) fn start(state: &Arc<AppState>) {
             for workspace in &expired {
                 signal(&state, workspace);
             }
-            let fresh: Vec<_> = expired
-                .into_iter()
-                .filter(|workspace| recorded.insert(workspace.clone()))
-                .collect();
+            let fresh = newly_fenced(&mut recorded, expired);
             if fresh.is_empty() {
                 continue;
             }
@@ -162,4 +204,22 @@ pub(in crate::pro) async fn stop(
     }
     super::super::persist(state).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_second_lapse_preserves_its_sessions_again() {
+        let mut recorded = HashSet::new();
+        assert_eq!(newly_fenced(&mut recorded, vec!["w-a".into()]), ["w-a"]);
+        assert!(
+            newly_fenced(&mut recorded, vec!["w-a".into()]).is_empty(),
+            "same fence"
+        );
+        // Renewed: no longer expired, so forgotten.
+        assert!(newly_fenced(&mut recorded, Vec::new()).is_empty());
+        assert_eq!(newly_fenced(&mut recorded, vec!["w-a".into()]), ["w-a"]);
+    }
 }

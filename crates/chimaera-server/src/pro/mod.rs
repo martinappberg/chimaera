@@ -24,6 +24,7 @@ mod reach;
 mod repository;
 pub(crate) mod routes;
 pub(crate) mod shadow_cache;
+mod sign_out;
 mod sleep_watch;
 pub(crate) mod transfer_dispatch;
 pub(crate) mod transfer_host;
@@ -67,6 +68,17 @@ pub(crate) struct ProState {
     /// a configuration that has not arrived yet) lets interrupted sessions
     /// resume without the account (`resume_unverified`).
     signed_out: AtomicBool,
+    /// Projects sign-out could not stand down at the account (`sign_out`):
+    /// the signed-out exemptions skip them, so their agents stay fenced at
+    /// their lease deadline and nothing resumes them without the account.
+    /// Persisted, at most 128; cleared by the next configure.
+    unreleased: Mutex<std::collections::BTreeSet<String>>,
+    /// A lease pass refused this daemon's credential after the policy had
+    /// stopped waiting for it (`CoordinatorTick::reconcile`); the next
+    /// pass reports it, so the delegation is renewed (review R4 N3).
+    late_unauthorized: AtomicBool,
+    /// The background retry of those stand-downs (`sign_out::retry`).
+    stand_down: Mutex<Option<tokio::task::JoinHandle<()>>>,
     generation: AtomicU64,
     runtime: Mutex<Option<protocol::Configure>>,
     authority: Mutex<authority::Authority>,
@@ -106,12 +118,9 @@ pub(crate) struct ProState {
     /// kind and name of what holds each one elsewhere, both from the last
     /// ownership read (`place::observed`). Hot state, bounded.
     reasons: place::Reasons,
-    /// Sessions a lease fence stopped and kept for resuming here
-    /// (`execution::watchdog::preserve`). They resume only while this computer
-    /// still holds the epoch they ran under: once another machine held the
-    /// project, or a return installed its own copy, they are stale and dropped
-    /// (`drop_fenced`), so a finished turn never runs again. Hot, bounded.
-    fenced_sessions: Mutex<std::collections::HashSet<String>>,
+    /// Conversations a lapse fence preserved that another machine ran since
+    /// (`settle_fenced`), on their way to Recents. Hot, at most 64.
+    settled: Mutex<Vec<crate::ledger::LedgerEntry>>,
     holders: Mutex<HashMap<String, (String, Option<String>)>>,
     /// The last bytes written, so an unchanged tick costs no disk sync.
     persistence: Arc<AsyncMutex<Option<Vec<u8>>>>,
@@ -141,10 +150,8 @@ pub(crate) struct ProState {
     remote_since: Mutex<HashMap<String, u64>>,
     return_backoff: Mutex<HashMap<String, (u64, u64)>>,
     /// Whether this computer can reach the account, from the lease loop's own
-    /// calls (`reach`): since when it has answered without a gap (0: not now),
-    /// and when it last answered with a server error.
+    /// calls (`reach`): since when it has answered without a gap (0: not now).
     reachable_since: AtomicU64,
-    erroring_at: AtomicU64,
     /// The daemon-owned reverse link to the keeper (`reach::Link`).
     link: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Projects being brought back here ("Run here", or the cloud could not
@@ -292,6 +299,8 @@ struct DiskState {
     parked: std::collections::BTreeSet<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     signed_out: bool,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    unreleased: std::collections::BTreeSet<String>,
 }
 /// A return's kept-both report as persisted: the count, and the kept copies'
 /// project-relative paths (fewer than `files` when bounded, see
@@ -519,6 +528,15 @@ impl ProState {
             records_unknown: unknown,
             worker: AtomicBool::new(disk.worker),
             signed_out: AtomicBool::new(disk.signed_out),
+            unreleased: Mutex::new(
+                disk.unreleased
+                    .into_iter()
+                    .filter(|id| valid_id(id))
+                    .take(128)
+                    .collect(),
+            ),
+            stand_down: Mutex::new(None),
+            late_unauthorized: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             runtime: Mutex::new(None),
             authority: Mutex::new(authority),
@@ -541,7 +559,7 @@ impl ProState {
             release_pending: Mutex::new(Default::default()),
             parked: Mutex::new(parked),
             reasons: Default::default(),
-            fenced_sessions: Mutex::new(Default::default()),
+            settled: Mutex::new(Vec::new()),
             holders: Mutex::new(HashMap::new()),
             persistence: Arc::new(AsyncMutex::new(None)),
             #[cfg(test)]
@@ -559,7 +577,6 @@ impl ProState {
             remote_since: Mutex::new(HashMap::new()),
             return_backoff: Mutex::new(HashMap::new()),
             reachable_since: AtomicU64::new(0),
-            erroring_at: AtomicU64::new(0),
             link: Mutex::new(None),
             reclaim: Mutex::new(Default::default()),
             return_pass: AtomicU64::new(0),
@@ -723,17 +740,17 @@ pub(crate) fn may_write(state: &crate::AppState, workspace: &str) -> bool {
             | Ownership::SettingUp { .. }
             | Ownership::Transferring { .. },
         ) => false,
-        // Unverified after a restart, wake or failed flush: a device keeps
-        // working until an authenticated read shows another owner, unless a
-        // checkpoint install is already scheduled (before its own fence).
+        // Unverified after a restart, wake or failed flush: a device's file
+        // writes and shells keep working until an authenticated read shows
+        // another owner, unless a checkpoint install is already scheduled
+        // (before its own fence). Its agents wait for that verification
+        // (`execution::allows`).
         Some(Ownership::AwaitingVerification { .. }) => {
             !execution::worker(state) && !crate::lock(&state.pro.installing).contains(workspace)
         }
         _ => true,
     }
 }
-#[cfg(test)]
-pub(crate) use execution::expired_lease_fixture as expire_execution_fixture;
 /// Execution has a stricter lease boundary than local file editing.
 #[cfg(any(test, feature = "daemon-extension-fixture"))]
 pub(crate) use execution::install_fixture as install_execution_fixture;
@@ -752,9 +769,10 @@ pub(crate) use execution::{
     refused_fixture as refuse_renewal_fixture, renewed_fixture as renew_execution_fixture,
     resumed_fixture as resume_execution_fixture, worker_fixture as worker_execution_fixture,
 };
-/// The account answered the lease loop with a server error just now.
+/// The account itself answered the lease loop with a server error (its own
+/// marker) just now.
 #[cfg(test)]
-pub(crate) fn account_erroring_fixture(state: &crate::AppState) {
+pub(crate) fn account_failing_fixture(state: &crate::AppState) {
     reach::answered(state, 503, true);
 }
 /// The user signed out on this computer (as `/pro/disconnect` records it).
@@ -897,10 +915,9 @@ pub(crate) fn defer_boot_session(state: &crate::AppState, session: &str) {
     }
 }
 /// Restart-deferred sessions of a synced project on a device resume without
-/// the account only when the user signed out (`signed_out`, written by
-/// `/pro/disconnect` and persisted, so a restart before the configuration
-/// arrives is never mistaken for it): sign-out never stops a computer's
-/// work. Anything else proves nothing (the cloud may run the work by now), so
+/// the account only when the user signed out and the account acknowledged
+/// that sign-out stood the project down (`sign_out::released`, persisted, so
+/// a restart before the configuration arrives is never mistaken for it). Anything else proves nothing (the cloud may run the work by now), so
 /// those sessions wait for the verified path (exactly once). Unsynced
 /// projects resume unless old processes may still be running. Sessions a
 /// clean handoff suspended stay suspended; they belong to whoever now owns
@@ -970,7 +987,7 @@ async fn resume_unverified_once(state: &std::sync::Arc<crate::AppState>) -> Vec<
         // A synced project waits for the account unless the user signed out
         // (or it is kept on this computer: nobody else may take it).
         if execution::managed(state, &workspace)
-            && !signed_out(state)
+            && !sign_out::released(state, &workspace)
             && !execution::kept_here(state, &workspace)
         {
             // Still waiting for the verified path (or a later fallback).
@@ -1056,26 +1073,87 @@ pub(crate) fn signed_out(state: &crate::AppState) -> bool {
         .signed_out
         .load(std::sync::atomic::Ordering::Acquire)
 }
-/// A fence's preserved sessions of `workspace` that nothing replaced: the
-/// project ran elsewhere since (another holder, or a return that installed its
-/// own copy, whose imported sessions carry a hand-off record), so they are
-/// dropped instead of resuming a stale turn (review R3, harness cause 2).
-pub(super) fn drop_fenced(state: &crate::AppState, workspace: &str) {
-    let mut fenced = crate::lock(&state.pro.fenced_sessions);
-    if fenced.is_empty() {
+/// The verified epoch `verified` (none: another machine holds the project)
+/// settles what lapse fences preserved in `workspace` (review R4 S1): an
+/// entry fenced at another epoch may have had its turn finished elsewhere, so
+/// it leaves the deferred set for Recents (reopening it never re-runs that
+/// turn; `retire_settled`), persisted with the ledger like the fence itself.
+/// Entries a return imported carry no fence epoch and stay.
+pub(crate) fn settle_fenced(
+    state: &std::sync::Arc<crate::AppState>,
+    workspace: &str,
+    verified: Option<u64>,
+) {
+    settle_fenced_here(state, workspace, verified);
+    retire_settled(state);
+}
+/// [`settle_fenced`]'s synchronous half: the stale entries wait (at most 64)
+/// for `retire_settled` to put them in Recents.
+pub(super) fn settle_fenced_here(state: &crate::AppState, workspace: &str, verified: Option<u64>) {
+    let stale: Vec<crate::ledger::LedgerEntry> = {
+        let mut deferred = crate::lock(&state.deferred_sessions);
+        let ids: Vec<String> = deferred
+            .values()
+            .filter(|entry| {
+                entry.workspace_id == workspace
+                    && entry.fence_epoch.is_some()
+                    && entry.fence_epoch != verified
+            })
+            .map(|entry| entry.id.clone())
+            .collect();
+        ids.iter().filter_map(|id| deferred.remove(id)).collect()
+    };
+    if stale.is_empty() {
         return;
     }
-    let mut deferred = crate::lock(&state.deferred_sessions);
-    fenced.retain(|id| match deferred.get(id) {
-        Some(entry) if entry.workspace_id == workspace => {
-            if entry.handoff.is_none() {
-                deferred.remove(id);
-            }
-            false
+    tracing::info!(
+        count = stale.len(),
+        "Conversations a lapse stopped here ran elsewhere since; they move to Recents"
+    );
+    let mut settled = crate::lock(&state.pro.settled);
+    let room = 64usize.saturating_sub(settled.len());
+    settled.extend(stale.into_iter().take(room));
+    drop(settled);
+    state.changes.notify_waiters();
+}
+/// Puts the conversations [`settle_fenced_here`] took out of the deferred set
+/// in Recents, off the caller.
+pub(crate) fn retire_settled(state: &std::sync::Arc<crate::AppState>) {
+    let settled = std::mem::take(&mut *crate::lock(&state.pro.settled));
+    if settled.is_empty() {
+        return;
+    }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let owner = state.clone();
+    runtime.spawn(async move {
+        for entry in settled {
+            crate::ledger::retire_stale(&owner, &entry).await;
         }
-        Some(_) => true,
-        None => false,
     });
+}
+/// This computer continues `from` as `to` with nobody in between (it renewed
+/// it, or re-acquired its own lapsed epoch; every acquisition advances the
+/// epoch by one): what a fence preserved at `from` is still the newest state
+/// of its conversations, so it stays resumable at `to`.
+pub(super) fn carry_fenced(state: &crate::AppState, workspace: &str, from: u64, to: u64) {
+    if from == to {
+        return;
+    }
+    for entry in crate::lock(&state.deferred_sessions).values_mut() {
+        if entry.workspace_id == workspace && entry.fence_epoch == Some(from) {
+            entry.fence_epoch = Some(to);
+        }
+    }
+}
+/// Whether a deferred entry may resume or travel now: unfenced, or fenced at
+/// the epoch this computer currently holds with a valid lease.
+pub(crate) fn fence_current(state: &crate::AppState, entry: &crate::ledger::LedgerEntry) -> bool {
+    entry.fence_epoch.is_none_or(|epoch| {
+        execution::lease_valid(state, &entry.workspace_id)
+            && execution::proof_epoch(state, &entry.workspace_id) == Some(epoch)
+    })
 }
 /// No longer kept in the cloud: "Run here", a handover that did not
 /// complete, or the cloud saying it cannot run the project.
@@ -1134,6 +1212,7 @@ async fn persist(state: &crate::AppState) -> anyhow::Result<()> {
         preferences,
         parked,
         signed_out: signed_out(state),
+        unreleased: crate::lock(&state.pro.unreleased).clone(),
     })?;
     anyhow::ensure!(bytes.len() <= 1024 * 1024, "mirror settings exceed limit");
     // State first, then the enrollment latch: a crash between them leaves a
@@ -1755,6 +1834,7 @@ mod tests {
             id: "s-a".into(),
             suspended: true,
             manual_resume_reason: None,
+            fence_epoch: None,
             handoff: None,
             workspace_id: "w-a".into(),
             cwd: root.clone(),
