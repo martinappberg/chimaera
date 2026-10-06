@@ -822,6 +822,17 @@ pub(crate) fn installation_status(state: &AppState, kind: AgentKind) -> Option<s
     })
 }
 
+/// How often an install watch looks at its session. Only an active plan can
+/// withdraw an installer's authority mid-run, so only there is it fenced
+/// within 100 ms; everywhere else the watch keeps the ordinary agent cadence.
+pub(crate) fn install_watch_interval(state: &AppState) -> std::time::Duration {
+    if crate::pro::tier(state) == crate::pro::Tier::Active {
+        std::time::Duration::from_millis(100)
+    } else {
+        crate::agents::poll_interval()
+    }
+}
+
 /// Watch an install session; when it ends, re-detect that agent (bypassing
 /// the daemon-lifetime cache) and regenerate the shims so the next spawn —
 /// and the open popover, via the change notification — sees the new binary.
@@ -839,7 +850,7 @@ fn spawn_install_watch(
             if admitted.check().is_err() {
                 let _ = state.sessions.fence(&session_id);
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(install_watch_interval(&state)).await;
         }
         let exit_status = state
             .sessions

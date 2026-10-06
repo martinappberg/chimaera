@@ -133,3 +133,15 @@ async fn typing_on_a_free_daemon_changes_no_session_row() {
     )
     .await;
 }
+
+/// An agent install's watch polls at the ordinary cadence unless a plan is
+/// active (only an account can withdraw the installer's authority mid-run).
+#[tokio::test]
+async fn an_install_watch_keeps_the_ordinary_cadence_without_a_plan() {
+    for state in [test_state(), test_state_with_extension()] {
+        assert_eq!(
+            crate::runtimes::install_watch_interval(&state),
+            crate::agents::poll_interval()
+        );
+    }
+}
