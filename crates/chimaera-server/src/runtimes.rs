@@ -75,7 +75,7 @@
 //!   theme detection"). The injected names are the ones codex itself picks
 //!   per scheme (light → catppuccin-latte, dark → catppuccin-mocha), pinned
 //!   so a mis-answered OSC-11 background query cannot flip them. Skipped
-//!   when `~/.codex/config.toml` sets a theme.
+//!   when `${CODEX_HOME:-~/.codex}/config.toml` sets a theme.
 //! - gemini 0.49.0: no theme CLI flag (`--help`) and no theme env var (the
 //!   bundle resolves `ui.theme` from its own settings files only). Its
 //!   settings.json is the user's — never edited — so gemini spawns
@@ -635,14 +635,27 @@ pub(crate) async fn prune_install_versions(root: PathBuf, kind: AgentKind) {
     }
 }
 
-/// All workspace daemons share this advisory lock. The descriptor stays alive
-/// until the installer exits; process death releases it without a stale lockdir.
+/// All workspace daemons share this advisory lock; process death releases it
+/// without a stale lockdir. Explicit unlock on drop: a child forked in the
+/// meantime shares the open file description until it execs, and closing
+/// only our descriptor would leave the lock held by that unrelated child.
+#[derive(Debug)]
+pub(crate) struct InstallLock(std::fs::File);
+
+impl Drop for InstallLock {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.unlock() {
+            tracing::warn!(%error, "agent installation lock release deferred until descriptor close");
+        }
+    }
+}
+
 pub(crate) async fn lock_install(
     root: &Path,
     kind: AgentKind,
-) -> Result<std::fs::File, Box<Response>> {
+) -> Result<InstallLock, Box<Response>> {
     let lock_root = root.to_path_buf();
-    let result = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
+    let result = tokio::task::spawn_blocking(move || -> std::io::Result<InstallLock> {
         std::fs::create_dir_all(&lock_root)?;
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -650,7 +663,7 @@ pub(crate) async fn lock_install(
             .write(true)
             .open(lock_root.join(format!(".{}.lock", kind.as_str())))?;
         file.try_lock().map_err(std::io::Error::from)?;
-        Ok(file)
+        Ok(InstallLock(file))
     })
     .await;
     match result {
@@ -709,7 +722,7 @@ fn spawn_install_watch(
     state: Arc<AppState>,
     kind: AgentKind,
     session_id: String,
-    install_lock: std::fs::File,
+    install_lock: InstallLock,
 ) {
     tokio::spawn(async move {
         while state.sessions.get(&session_id).is_some() {
@@ -1250,6 +1263,35 @@ mod tests {
         drop(first);
         let next = lock_install(&dir, AgentKind::Codex).await.unwrap();
         drop((other, next));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn install_lock_release_does_not_wait_for_inherited_descriptor() {
+        let dir = test_dir("inherited-install-lock");
+        let first = lock_install(&dir, AgentKind::Codex).await.unwrap();
+        // Like a pre-exec fork, try_clone retains the same open file description.
+        let inherited = first.0.try_clone().unwrap();
+        assert_eq!(
+            lock_install(&dir, AgentKind::Codex)
+                .await
+                .unwrap_err()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        drop(first);
+        let successor = lock_install(&dir, AgentKind::Codex).await.unwrap();
+        drop(inherited);
+        // Closing the old description must not unlock the successor's lock.
+        assert_eq!(
+            lock_install(&dir, AgentKind::Codex)
+                .await
+                .unwrap_err()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        drop(successor);
+        drop(lock_install(&dir, AgentKind::Codex).await.unwrap());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
