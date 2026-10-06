@@ -603,8 +603,8 @@ function shell(): TauriGlobal {
  * The cluster page's data in one ssh exec. The queue itself is asked at most
  * once a minute per host (a cached read fills in between).
  */
-export async function clusterOverview(alias: string, refresh = false): Promise<ClusterOverview> {
-  return shell().core.invoke<ClusterOverview>("cluster_overview", { alias, refresh });
+export async function clusterOverview(alias: string): Promise<ClusterOverview> {
+  return shell().core.invoke<ClusterOverview>("cluster_overview", { alias });
 }
 
 /** Partitions, limits and accounts the start sheet offers (cached a day). */
@@ -745,7 +745,7 @@ export async function setNotCluster(alias: string, on: boolean): Promise<HostSta
 
 /** Choose direct SSH on this computer's next connection, keeping existing work. */
 export async function setHostDirectSsh(alias: string, on: boolean): Promise<HostState> {
-  return shell().core.invoke<HostState>("set_host_direct_ssh", { alias, on });
+  return shell().core.invoke<HostState>("pro_set_host_direct_ssh", { alias, on });
 }
 
 /** SIGTERM a daemon an earlier connect left on the cluster's login node. */

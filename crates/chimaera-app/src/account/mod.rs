@@ -9,7 +9,7 @@ pub mod host;
 pub mod types;
 pub type Task<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 pub type BorrowedTask<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
-const ABSENT: &str = "Chimaera Pro is not installed. Direct SSH and local work remain available.";
+pub(crate) const ABSENT: &str = "Not available in this build.";
 /// The factory runs once, after the original shell is managed and before restoration.
 pub type Factory = Arc<dyn Fn(tauri::AppHandle) -> Arc<dyn AccountExtension> + Send + Sync>;
 #[derive(Default)]

@@ -37,8 +37,7 @@ pub use restore::open_ui_window;
 
 /// Permissions exposed to a daemon-served workbench window. These grants are
 /// installed at runtime for one volatile window label and one exact loopback
-/// origin; the only static capabilities are the shell-local WSL wizard and
-/// the quit handover window (`quit`, which may only close itself).
+/// origin; the only static capability is the shell-local WSL wizard.
 const DAEMON_UI_CORE_PERMISSIONS: &[&str] = &[
     "core:default",
     "core:window:allow-close",
@@ -554,9 +553,6 @@ pub(crate) fn request_quit(app: &AppHandle) {
 /// flag is what tells "the user quit" from "the user closed the last window").
 pub(crate) fn finish_quit(app: &AppHandle) {
     if let Some(shell) = app.try_state::<Shell>() {
-        if shell.quitting.load(Ordering::Relaxed) {
-            return;
-        }
         // Idempotent: do the exit once however many paths arrive here.
         if shell.quitting.swap(true, Ordering::Relaxed) {
             return;
@@ -1060,11 +1056,11 @@ pub fn run(
             crate::account::commands::pro_sign_out_everywhere,
             crate::account::commands::pro_hosts,
             crate::account::commands::pro_set_host_kept,
+            commands::pro_set_host_direct_ssh,
             crate::account::commands::pro_devices,
             crate::account::commands::pro_revoke_device,
             commands::list_hosts,
             commands::add_host,
-            commands::set_host_direct_ssh,
             commands::remove_host,
             commands::connect_host,
             commands::disconnect_host,

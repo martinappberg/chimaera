@@ -50,7 +50,7 @@
           </span>
         </div>
         {#if askpass.source?.type === "keeper"}
-          <p class="askpass-source">Asked by your Pro connection</p>
+          <p class="askpass-source">Asked by a background connection</p>
         {/if}
         {#if presentation?.type === "host_key"}
           <p class="askpass-trust-note">

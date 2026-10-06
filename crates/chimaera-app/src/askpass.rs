@@ -9,10 +9,9 @@
 //!
 //! Keyboard-interactive prompts (Duo's "Passcode or option (1-3):") reach
 //! askpass too, so the same modal — prompt text over a single input — covers
-//! both password and 2FA. Prototype Connect also relays first-use fingerprint
-//! approval through its original owner. The separate native trust verifier
-//! decides whether a positively verified candidate may enter known_hosts;
-//! displaying or answering a prompt alone never grants that permission.
+//! both password and 2FA. Host-key confirmation is not an askpass prompt and
+//! is out of scope here (a first connect to an unknown host still needs the
+//! key in `~/.ssh/known_hosts`).
 //! Each child also frames its normalized host alias with the prompt, so the
 //! native relay can target only that host's windows (plus local home).
 //!
@@ -178,9 +177,22 @@ pub struct PromptEvent {
     id: u64,
     alias: Option<String>,
     prompt: String,
-    source: PromptSource,
+    /// Absent for this computer's own ssh prompts (the original wire shape);
+    /// present only for a prompt relayed from elsewhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<PromptSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     kind: Option<PromptKind>,
+}
+
+impl PromptSource {
+    /// The event's `source` field: `None` for a local prompt.
+    fn on_wire(&self) -> Option<PromptSource> {
+        match self {
+            PromptSource::Local => None,
+            relayed => Some(relayed.clone()),
+        }
+    }
 }
 
 impl PromptEvent {
@@ -289,7 +301,7 @@ impl Askpass {
                 id: *id,
                 alias: p.alias.clone(),
                 prompt: p.prompt.clone(),
-                source: p.source.clone(),
+                source: p.source.on_wire(),
                 kind: p.kind.clone(),
             })
             .collect();
@@ -359,7 +371,7 @@ pub async fn native_owned_prompt(
             id,
             alias: Some(alias.into()),
             prompt,
-            source: PromptSource::Local,
+            source: None,
             kind,
         },
         Some(alias),
@@ -445,7 +457,7 @@ fn relay_keeper_inner(
         id,
         alias: Some(alias.clone()),
         prompt,
-        source,
+        source: source.on_wire(),
         kind: None,
     };
     emit_scoped(app, "ssh-askpass", event, Some(&alias));
@@ -790,7 +802,7 @@ async fn resolve_prompt(app: &AppHandle, alias: Option<String>, prompt: String) 
         id,
         alias,
         prompt,
-        source: PromptSource::Local,
+        source: None,
         kind: None,
     };
     // Emit only to matching windows that are ALREADY listening. Windows that
@@ -1126,7 +1138,7 @@ mod tests {
         );
         let pending = askpass.pending_scoped(&scope);
         assert!(
-            matches!(&pending[0].source, PromptSource::Keeper { keeper_prompt_id, .. } if keeper_prompt_id == "prompt-1")
+            matches!(&pending[0].source, Some(PromptSource::Keeper { keeper_prompt_id, .. }) if keeper_prompt_id == "prompt-1")
         );
         assert_eq!(
             askpass.answer_scoped(id, None, &scope),
@@ -1205,6 +1217,30 @@ mod tests {
             AnswerResult::Answered(Some("cluster".into()))
         );
         assert_eq!(rx.blocking_recv().unwrap(), Some("secret".into()));
+    }
+
+    #[test]
+    fn a_local_prompt_keeps_the_original_wire_shape() {
+        let askpass = Askpass::default();
+        let (local_tx, _local_rx) = oneshot::channel();
+        askpass.register(Some("cluster".into()), "Password:".into(), local_tx);
+        let (relayed_tx, _relayed_rx) = oneshot::channel();
+        askpass.register_source(
+            Some("cluster".into()),
+            "Duo code:".into(),
+            relayed_tx,
+            PromptSource::Keeper {
+                host_id: "host-1".into(),
+                keeper_prompt_id: "prompt-1".into(),
+            },
+        );
+        let scope = crate::shell::WindowScope::new(Some("cluster".into()), None, "w".into());
+        let wire = serde_json::to_value(askpass.pending_scoped(&scope)).unwrap();
+        assert_eq!(
+            wire[0],
+            serde_json::json!({ "id": 0, "alias": "cluster", "prompt": "Password:" })
+        );
+        assert_eq!(wire[1]["source"]["type"], "keeper");
     }
 }
 
