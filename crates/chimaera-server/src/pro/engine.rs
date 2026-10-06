@@ -372,10 +372,20 @@ fn sessions(state: &AppState, workspace: &str) -> Vec<String> {
 /// left out (over 64 of them refuses the transfer); stopped ones past the cap
 /// stay here and are logged, never refusing the whole project (review R4 S3).
 fn transfer_session_ids(state: &AppState, workspace: &str) -> Result<Vec<String>> {
+    // A session whose process ended (a shell that exited, still listed) has
+    // nothing to save; asking for it only logged "left out" warnings.
+    let ended = |id: &String| {
+        let pty = state.sessions.get(id);
+        let chat = state.chat.get(id);
+        (pty.is_some() || chat.is_some())
+            && !pty.is_some_and(|s| s.alive)
+            && !chat.is_some_and(|s| s.alive)
+    };
     let mut ids: Vec<_> = lock(&state.session_workspaces)
         .iter()
         .filter(|(_, id)| id.as_str() == workspace)
         .map(|(id, _)| id.clone())
+        .filter(|id| !ended(id))
         .take(65)
         .collect();
     ensure!(
@@ -2314,7 +2324,32 @@ mod tests {
         }
         lock(&state.deferred_sessions)
             .insert("s-fenced".into(), stopped("s-fenced".into(), Some(3)));
+        // A shell that already exited (still listed) has nothing to carry.
+        let ended = state
+            .sessions
+            .spawn(chimaera_pty::SpawnOpts {
+                cwd: root.clone(),
+                name: None,
+                cols: 80,
+                rows: 24,
+                command: Some(vec!["/usr/bin/true".into()]),
+                id: Some("s-ended".into()),
+                env: vec![],
+                env_remove: vec![],
+                scrollback: None,
+            })
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while state.sessions.get(&ended.id).is_some_and(|s| s.alive) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the shell never exited"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        lock(&state.session_workspaces).insert("s-ended".into(), "w-project".into());
         let ids = transfer_session_ids(&state, "w-project").unwrap();
+        assert!(!ids.contains(&"s-ended".to_string()), "an ended shell");
         assert_eq!(ids.len(), 64);
         assert_eq!(
             ids.iter().filter(|id| id.starts_with("s-live-")).count(),

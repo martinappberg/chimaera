@@ -486,7 +486,17 @@ pub(super) fn accept(
         .map(|identity| identity.epoch);
     match continued {
         Some(from) => super::carry_fenced(state, &baton.workspace_id, from, baton.epoch),
-        None => super::settle_fenced_here(state, &baton.workspace_id, Some(baton.epoch)),
+        // A return in progress settles them once it installed its own copy
+        // (`finish_hydration`), so a conversation it brings back is never
+        // also sent to Recents.
+        None if !matches!(
+            lock(&state.pro.ownership).get(&baton.workspace_id),
+            Some(Ownership::Hydrating { .. } | Ownership::SettingUp { .. })
+        ) =>
+        {
+            super::settle_fenced_here(state, &baton.workspace_id, Some(baton.epoch))
+        }
+        None => {}
     }
     lock(&state.pro.preferences)
         .entry(baton.workspace_id.clone())

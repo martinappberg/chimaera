@@ -703,9 +703,14 @@ async fn a_fenced_conversation_resumes_only_in_its_own_epoch() {
         Some(3)
     );
     assert!(current("s-stale"));
-    // Lapsed again; the cloud held epoch 4 and gave it back at 5: stale.
+    // Lapsed again; the cloud held epoch 4 and gave it back at 5. While
+    // that return is still installing, nothing is settled yet: its own copy
+    // may bring the conversation back (`finish_hydration` settles after).
     lock(&state.pro.execution.proofs).remove("w-a");
+    lock(&state.pro.ownership).insert("w-a".into(), Ownership::Hydrating { epoch: 5 });
     accept(&state, &config, &grant(5), 0, RequestStart::now()).unwrap();
+    assert!(lock(&state.deferred_sessions).contains_key("s-stale"));
+    super::super::settle_fenced_here(&state, "w-a", Some(5));
     let deferred = lock(&state.deferred_sessions);
     assert!(!deferred.contains_key("s-stale"), "ran elsewhere: settled");
     assert!(deferred.contains_key("s-imported"));
