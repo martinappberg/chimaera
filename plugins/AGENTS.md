@@ -127,7 +127,8 @@ does not activate it. Rebuild, copy and reinstall the same version to iterate.
    **One-time setup — the `PLUGIN_LOCK_TOKEN` secret.** A PR opened with the
    workflow's own `GITHUB_TOKEN` triggers no workflows (no CI, no `cla`
    status, so auto-merge never fires) and a merge made with it doesn't start
-   `release.yml`, so the workflow writes with a token of the maintainer's: a
+   `ci.yml`'s run on `main`, which a release waits on, so the workflow writes
+   with a token of the maintainer's: a
    fine-grained personal access token on the maintainer's account (so the PR
    author passes the CLA allowlist), repository access `martinappberg/chimaera`
    and every plugin repository in the lock, permissions **Contents: Read and

@@ -6,21 +6,37 @@ The single source of truth for how Chimaera versions and ships. The root
 point here — change the policy here (and in the script + its test), not by editing
 five copies.
 
-## Every merge to `main` MAY cut a release
+## Releases ship in batches, not per merge
 
-`release.yml` runs on every push to `main`. `scripts/version-bump.sh` decides the
-next version — or `skip` — from the squash-commit **subjects** (each defaults to its
-PR title) of **every merge since the last `v*` tag**; the largest bump any of them
-asks for wins. The build + publish jobs run only when a release is actually due; a
-`skip` sets `release=false` and they're gated off.
+A merge to `main` publishes nothing. `release.yml` runs once a day (its `schedule`)
+and whenever a maintainer runs it by hand. Each run:
 
-Why every merge since the tag, not just the one that triggered the run: the
-`release` concurrency group keeps one waiting run, and a newer push cancels it. When
-merges land while a release is still building, the waiting runs are replaced, and
-reading only the newest subject lost the rest — after v0.48.1 a `feat:`, a `fix:` and
-a `test:` merged close together, only the `test:` was read, and nothing shipped.
-Whichever run executes now covers every unreleased merge, and a re-run on an
-already-tagged commit finds none and skips.
+1. picks the newest `main` commit whose `ci.yml` push run **succeeded**, which is
+   not necessarily `main`'s tip, since the tip may still be under test or red;
+2. reads the squash-commit **subjects** (each defaults to its PR title) of **every
+   merge since the last `v*` tag** up to that commit, and `scripts/version-bump.sh`
+   decides the next version or `skip`; the largest bump any of them asks for wins;
+3. builds and publishes only when a release is actually due; a `skip` sets
+   `release=false` and the build + publish jobs are gated off.
+
+Why batched: every installed app auto-updates to each release, and a release per
+merge meant up to six updates a day, each a 40–95 minute build. Merging stays cheap;
+users get at most one scheduled update a day.
+
+Why the newest *green* commit and not the tip: a PR's checks ran on its branch, not
+necessarily on the tree its squash-merge produced, so `main`'s own CI run is the gate.
+A red `main` holds releases at the last green commit until a fix lands and passes.
+
+**Ship now** (a hotfix, or anything that shouldn't wait for the schedule): once the
+merge's `ci.yml` run on `main` has passed, run
+
+```sh
+gh workflow run release.yml --ref main
+```
+
+Run it sooner and it releases the newest commit that *has* passed, which leaves the
+fix for the next run. The run's `version` job logs the merges it read and its
+decision.
 
 ## The version mapping (read from the SUBJECT)
 

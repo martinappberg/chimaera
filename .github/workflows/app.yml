@@ -6,7 +6,13 @@ name: app
 # it — this catches app breakage before merge. The windows leg is the ONLY
 # compile gate for the app's cfg(windows) code paths (macOS dev machines
 # cannot cross-check them: dependency C builds need the Windows SDK).
-# release.yml builds and publishes on merge, so no main-push trigger here.
+# release.yml builds every bundle again before it publishes, so no main-push
+# trigger here.
+#
+# No `web-ui/**` path: the app's own frontend is crates/chimaera-app/assets,
+# and web-ui reaches the bundle only as the dist chimaera-server embeds, which
+# ci.yml's `ui` job already builds. A UI-only change can't break this build,
+# and it was most PRs' slowest check.
 #
 # `ready_for_review` is in `types` (which overrides the default set, so the
 # defaults are respelled) purely so promoting a draft re-triggers the build
@@ -17,7 +23,6 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - "crates/chimaera-app/**"
-      - "web-ui/**"
       - "crates/chimaera-server/**"
       - "plugins/**"
       - "scripts/build-plugins.sh"

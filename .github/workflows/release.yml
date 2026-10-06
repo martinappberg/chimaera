@@ -1,6 +1,10 @@
 name: release
 
-# NOT every merge cuts a release. scripts/version-bump.sh decides from the squash
+# Releases are BATCHED, not cut per merge: one scheduled run a day, plus a manual
+# run (`gh workflow run release.yml`) to ship now. Every user's app auto-updates
+# to each release, so a release per merge meant several updates a day.
+#
+# NOT every run cuts a release. scripts/version-bump.sh decides from the squash
 # SUBJECTS of every merge since the last v-tag (Conventional Commits): feat ->
 # minor, fix|perf|revert -> patch, `!` -> major, and
 # refactor|chore|docs|test|ci|build|style (and [skip release]) -> NO release; the
@@ -10,14 +14,19 @@ name: release
 # in ci.yml. A single workflow does version + build + publish: a tag pushed by
 # GITHUB_TOKEN cannot trigger a second workflow, so the release cannot be split.
 #
-# Releases are PUBLISHED (not draft) so the installed app auto-updates; the
-# required-CI branch protection on main is the safety gate that a merge is
-# already green. App update signing needs TAURI_SIGNING_PRIVATE_KEY[_PASSWORD]
+# Releases are PUBLISHED (not draft) so the installed app auto-updates. The
+# safety gate is main's own CI: a run releases the newest main commit whose
+# ci.yml push run succeeded, never main's tip blindly, since a PR's checks ran
+# on its branch and not necessarily on the tree its merge produced.
+# App update signing needs TAURI_SIGNING_PRIVATE_KEY[_PASSWORD]
 # repo secrets (see .github/CONTRIBUTING.md); auto-update only resolves once the repo
 # (or its releases) is public.
 on:
-  push:
-    branches: [main]
+  schedule:
+    # 16:41 UTC: morning in the maintainer's time zone, so a bad release
+    # meets someone awake. An odd minute dodges the top-of-hour cron rush.
+    - cron: "41 16 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -26,23 +35,49 @@ concurrency: release
 
 jobs:
   version:
+    # A run dispatched from another branch would use that branch's copy of
+    # this file; only main's ships.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     # No job-level skip gate: the script owns the decision (incl. [skip release]
     # and the no-release types) and emits `release=false`; downstream build/publish
     # jobs are gated on `needs.version.outputs.release == 'true'`.
     outputs:
       release: ${{ steps.bump.outputs.release }}
       version: ${{ steps.bump.outputs.version }}
+      sha: ${{ steps.green.outputs.sha }}
     steps:
+      # The newest main commit ci.yml passed on. Main's tip may still be
+      # under test, or red; releasing the last green commit holds back only
+      # what came after it, and the next run picks that up once it passes.
+      - id: green
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TIP: ${{ github.sha }}
+        run: |
+          sha=$(gh run list --repo "$REPO" --workflow ci.yml --branch main --event push \
+            --status success --limit 1 --json headSha --jq '.[0].headSha // empty')
+          if [ -z "$sha" ]; then
+            echo "::error title=release::no successful ci.yml run on main to release from"
+            exit 1
+          fi
+          if [ "$sha" != "$TIP" ]; then
+            echo "::notice title=release::main's tip ${TIP:0:8} hasn't passed ci.yml (running or failed); releasing from ${sha:0:8}, the newest commit that has"
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          ref: ${{ steps.green.outputs.sha }}
           fetch-depth: 0
       - id: bump
         run: |
           latest=$(git tag --list 'v*' --sort=-v:refname | head -1)
-          # Every merge since the last release, not just this push: the
-          # `release` group keeps one waiting run and a newer push cancels
-          # it, so a merge that landed mid-release was otherwise never read.
+          # Every merge since the last release: that is the batch this run
+          # ships. A re-run after a release finds none and skips.
           if [ -n "$latest" ]; then range="$latest..HEAD"; else range=HEAD; fi
           mapfile -t subjects < <(git log --first-parent --format=%s "$range")
           echo "merges since ${latest:-the start}:"
@@ -66,6 +101,8 @@ jobs:
         target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.version.outputs.sha }}
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: .nvmrc
@@ -94,6 +131,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.version.outputs.sha }}
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: .nvmrc
@@ -132,6 +171,8 @@ jobs:
       APP_BUILD_CONFIG: '{"build":{"beforeBuildCommand":""}}'
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.version.outputs.sha }}
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: .nvmrc
@@ -186,6 +227,7 @@ jobs:
           projectPath: crates/chimaera-app
           args: --config '${{ env.APP_BUILD_CONFIG }}'
           tagName: v${{ needs.version.outputs.version }}
+          releaseCommitish: ${{ needs.version.outputs.sha }}
           releaseName: "chimaera v${{ needs.version.outputs.version }}"
           releaseDraft: false
           uploadUpdaterJson: true
@@ -214,6 +256,8 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.version.outputs.sha }}
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: .nvmrc
@@ -247,6 +291,7 @@ jobs:
         with:
           projectPath: crates/chimaera-app
           tagName: v${{ needs.version.outputs.version }}
+          releaseCommitish: ${{ needs.version.outputs.sha }}
           releaseName: "chimaera v${{ needs.version.outputs.version }}"
           releaseDraft: false
           uploadUpdaterJson: true
@@ -284,6 +329,7 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          ref: ${{ needs.version.outputs.sha }}
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:

@@ -2,10 +2,11 @@ name: ci
 
 # `push: [main]` looks redundant with the PR run — squash-merging an up-to-date
 # branch lands a byte-identical tree, so it re-tests something already green.
-# Keep it anyway: it is the ONLY writer of the base-branch Rust caches every PR
-# restores from. rust-cache keys on job name, so release.yml's `daemon`/`app`
-# jobs never populate `rust`/`musl`. Delete this trigger and every PR pays a
-# cold clippy+test build.
+# Keep it anyway, for two reasons. It is the release gate: release.yml ships
+# only a main commit this run passed on. And it is the ONLY writer of the
+# base-branch Rust caches every PR restores from. rust-cache keys on job name,
+# so release.yml's `daemon`/`app` jobs never populate `rust`/`musl`. Delete
+# this trigger and nothing releases, and every PR pays a cold clippy+test build.
 on:
   push:
     branches: [main]
@@ -14,7 +15,7 @@ on:
 # A superseded PR run is worthless: cancel it the moment a new commit lands.
 # Pushes to main are never cancelled — they prime the caches described above.
 # The group is per-workflow, so this can never interfere with release.yml
-# (which triggers independently on push:[main] and owns the `release` group).
+# (which runs on a schedule and owns the `release` group).
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}

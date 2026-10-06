@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
 # Decide the next release version — or "skip" — from the latest v-tag and the
 # squash-commit SUBJECTS of every merge since it. release.yml calls this on
-# every push to main.
+# each scheduled or manual run.
 #
-# Every merge since the tag, not just the one that triggered the run: the
-# `release` concurrency group keeps one waiting run, and a newer push cancels
-# it, so a merge that landed while a release was still running was otherwise
-# never looked at (v0.48.1 → a feat, a fix and a test merged close together;
-# only the test's subject was read, so nothing shipped). Whichever run
-# executes now covers them all, and a re-run on an already-tagged commit
-# finds no subjects and skips.
+# Every merge since the tag, not just the newest: a release ships the whole
+# batch merged since the last one (back when a release ran per push, reading
+# one subject lost merges that landed mid-release: v0.48.1 → a feat, a fix and
+# a test merged close together; only the test's subject was read, so nothing
+# shipped). A re-run on an already-tagged commit finds no subjects and skips.
 #
 # SUBJECT-anchored on purpose: the squash message body is the folded PR
 # description, so reading the type / `!` / `[skip release]` from the whole message

@@ -14,8 +14,9 @@ name: plugin-lock
 # Writes use the PLUGIN_LOCK_TOKEN secret, not GITHUB_TOKEN: a branch pushed
 # and a PR opened with GITHUB_TOKEN trigger no workflows, so ci.yml and the
 # cla status would never report and auto-merge would never fire, and a merge
-# it made would not start release.yml. Without the secret a bump is only
-# reported (a warning), never opened. Setup: plugins/AGENTS.md.
+# it made would not start ci.yml's main run, which a release waits on.
+# Without the secret a bump is only reported (a warning), never opened.
+# Setup: plugins/AGENTS.md.
 on:
   schedule:
     - cron: "23 * * * *"
