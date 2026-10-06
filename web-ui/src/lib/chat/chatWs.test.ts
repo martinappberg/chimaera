@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { ChatSocket, type ChatSocketHandlers } from "./chatWs";
 import { readPlacement } from "../net/placement";
-import { QUIET_OPEN_MS, reconnectingSockets } from "../net/reconnect";
+import { QUIET_OPEN_MS, reconnectingSockets, setSocketKeepers } from "../net/reconnect";
 import { get } from "svelte/store";
 
 class Socket {
@@ -49,14 +49,29 @@ async function drain(): Promise<void> {
   await vi.advanceTimersByTimeAsync(50);
 }
 
+// These tests describe a window that can have Pro, where a keeper may hold
+// its sockets; one test below switches that off (a public build).
 beforeEach(() => {
   Socket.all = [];
   vi.useFakeTimers();
   vi.stubGlobal("WebSocket", Socket);
+  setSocketKeepers(true);
 });
 afterEach(() => {
+  setSocketKeepers(false);
   vi.unstubAllGlobals();
   vi.useRealTimers();
+});
+
+it("without keepers a quiet open socket is never taken for a kept one", async () => {
+  setSocketKeepers(false);
+  const h = handlers();
+  h.onHeld = vi.fn();
+  const socket = new ChatSocket("s-chat", h);
+  Socket.all[0].onopen?.();
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(h.onHeld).not.toHaveBeenCalled();
+  socket.close();
 });
 
 it("attaching is passive and a paused owner is a state, not an error", async () => {

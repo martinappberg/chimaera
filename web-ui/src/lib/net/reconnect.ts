@@ -63,6 +63,18 @@ export const UNKNOWN_SESSION_RETRIES = 12;
  */
 export const QUIET_OPEN_MS = 1500;
 
+/** Whether a keeper may hold this window's sockets for a sleeping owner: only
+ *  a window that can have Pro (App sets it once from `proTier`). Without one
+ *  a socket means what it always did: open and quiet is still reconnecting
+ *  ({@link QUIET_OPEN_MS} never applies), and open is live. */
+let keepersPossible = false;
+export function setSocketKeepers(possible: boolean): void {
+  keepersPossible = possible;
+}
+export function socketKeepers(): boolean {
+  return keepersPossible;
+}
+
 /**
  * The actual delay for one retry: the backoff, floored at the slow tier while
  * the document is hidden — but only once `attempt` (1-based count of

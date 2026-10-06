@@ -1,7 +1,7 @@
 import { daemonSocketUrl, isBrowserGateway } from "../net/base";
 import { movedTo, ownerSuspended, parsePause, sendSocketAuth, type MovedTo, type SessionPause } from "../net/placement";
 import { getToken } from "../net/api";
-import { ownerAwake, parkUntilAwake, QUIET_OPEN_MS, Reconnector, UNKNOWN_SESSION_RETRIES } from "../net/reconnect";
+import { ownerAwake, parkUntilAwake, QUIET_OPEN_MS, Reconnector, socketKeepers, UNKNOWN_SESSION_RETRIES } from "../net/reconnect";
 import { CooperativeQueue } from "./cooperativeQueue";
 import { NativeUiTransport, isNativeUiAction } from "./nativeUi";
 
@@ -493,6 +493,7 @@ export class ChatSocket {
    *  drop continues) and the view stops counting it as down. */
   private awaitQuiet(ws: WebSocket): void {
     this.stopQuiet();
+    if (!socketKeepers()) return;
     this.quietTimer = setTimeout(() => {
       this.quietTimer = null;
       if (this.ws !== ws || this.closed) return;

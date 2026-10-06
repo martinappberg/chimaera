@@ -1,7 +1,7 @@
 import { ownerSuspended, sendSocketAuth } from "../net/placement";
 import { daemonSocketUrl, isBrowserGateway } from "../net/base";
 import { getToken } from "../net/api";
-import { ownerAwake, parkUntilAwake, QUIET_OPEN_MS, Reconnector, UNKNOWN_SESSION_RETRIES } from "../net/reconnect";
+import { ownerAwake, parkUntilAwake, QUIET_OPEN_MS, Reconnector, socketKeepers, UNKNOWN_SESSION_RETRIES } from "../net/reconnect";
 
 export interface SessionSocketHandlers {
   readOnly?(): boolean;
@@ -226,6 +226,7 @@ export class SessionSocket {
    *  drop continues). */
   private awaitQuiet(ws: WebSocket): void {
     this.stopQuiet();
+    if (!socketKeepers()) return;
     this.quietTimer = setTimeout(() => {
       this.quietTimer = null;
       if (this.ws !== ws || this.closed) return;
