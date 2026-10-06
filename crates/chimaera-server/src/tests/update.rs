@@ -31,7 +31,7 @@ async fn the_clouds_daemon_never_checks_for_its_own_updates() {
     let (status, body) = request(&state, Method::GET, "/api/v1/update?refresh=true", None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(releases.hits(), 1);
-    assert_eq!(body["managed"], false);
+    assert!(body.get("managed").is_none(), "{body}");
     assert_eq!(body["latest"]["version"], "99.0.0");
 
     // The account's cloud: the service updates it, so it asks nobody, and
@@ -67,7 +67,7 @@ async fn the_official_apps_daemon_updates_with_the_app_without_a_warning() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["with_app"], true);
     assert_eq!(body["state"], "unchecked");
-    assert_eq!(body["managed"], false);
+    assert!(body.get("managed").is_none(), "{body}");
     assert_eq!(body["available"], false);
     assert!(
         body["error"].is_null() && body["latest"].is_null(),

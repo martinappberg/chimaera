@@ -38,7 +38,9 @@ pub(crate) async fn auth(State(state): State<Arc<AppState>>, req: Request, next:
         .is_some_and(|v| v == format!("Bearer {}", state.token));
 
     if authorized {
-        if crate::activity::is_change(req.method(), req.uri().path()) {
+        if crate::pro::tier(&state) == crate::pro::Tier::Active
+            && crate::activity::is_change(req.method(), req.uri().path())
+        {
             crate::activity::touch(&state);
         }
         next.run(req).await
@@ -51,6 +53,21 @@ pub(crate) async fn auth(State(state): State<Arc<AppState>>, req: Request, next:
     }
 }
 
+/// `/pro/*` exists only on a daemon with the extension (or the account's
+/// cloud): a daemon without it answers those paths as any unknown route.
+pub(crate) async fn pro_routes(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let path = req.uri().path();
+    let path = path.strip_prefix("/api/v1").unwrap_or(path);
+    if path.starts_with("/pro/") && crate::pro::tier(&state) == crate::pro::Tier::Free {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
+    }
+    next.run(req).await
+}
+
 /// GET /api/v1/health
 pub(crate) async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let mut value = json!({
@@ -59,12 +76,16 @@ pub(crate) async fn health(State(state): State<Arc<AppState>>) -> Json<serde_jso
         // The build id lets clients spot daemon/client skew (semver is the
         // 0.0.1 sentinel on every dev build, so it cannot).
         "build": chimaera_core::BUILD_ID,
-        // Assembly presence is independent of SDK build compatibility.
-        "daemon_extension": state.daemon_extension.is_some(),
         "hostname": state.hostname,
         "pid": state.pid,
         "uptime_secs": state.started.elapsed().as_secs(),
     });
+    if state.daemon_extension.is_some() {
+        // Additive, and only when composed: a daemon without the extension
+        // answers exactly as before. Assembly presence is independent of SDK
+        // build compatibility.
+        value["daemon_extension"] = json!(true);
+    }
     if let Some(identity) = state
         .daemon_extension
         .as_ref()

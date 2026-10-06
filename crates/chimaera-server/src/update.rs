@@ -112,7 +112,6 @@ impl UpdateStatus {
             "build": chimaera_core::BUILD_ID,
             "dev": chimaera_core::version_is_dev(&current),
             "state": self.state(),
-            "managed": false,
             "checked_at": self.checked_at,
             "succeeded_at": self.succeeded_at,
             "error": self.error,

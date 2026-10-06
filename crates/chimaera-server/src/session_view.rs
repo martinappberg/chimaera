@@ -172,8 +172,14 @@ pub(crate) fn session_json(
 /// waiting on the user. A cloud machine's supervisor keeps itself awake on it
 /// for a bounded time, so the question is still there when the answer comes.
 /// PTY rows omit it (a Claude TUI reports `agent_state: "needs_permission"`).
-fn chat_row(info: &chimaera_agent::ChatInfo, mut row: serde_json::Value) -> serde_json::Value {
-    row["needs_permission"] = json!(info.alive && info.pending_permission);
+fn chat_row(
+    state: &AppState,
+    info: &chimaera_agent::ChatInfo,
+    mut row: serde_json::Value,
+) -> serde_json::Value {
+    if crate::pro::tier(state) != crate::pro::Tier::Free {
+        row["needs_permission"] = json!(info.alive && info.pending_permission);
+    }
     row
 }
 
@@ -233,6 +239,7 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
         (
             info.created_at_ms / 1000,
             chat_row(
+                state,
                 info,
                 crate::chat::chat_session_json(
                     info,
@@ -296,15 +303,20 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
     // Input times are for Pro's idle checks only. Without an active plan the
     // field stays null, so a keystroke never changes the shared sessions
     // frame and every window is not sent a new one while someone types.
-    let activity = if crate::pro::tier(state) == crate::pro::Tier::Active {
+    // A daemon without the extension sends the rows exactly as before: the
+    // additive Pro fields are absent, not null.
+    let tier = crate::pro::tier(state);
+    let activity = if tier == crate::pro::Tier::Active {
         crate::lock(&state.activity).snapshot(rows.iter().filter_map(|(_, row)| row["id"].as_str()))
     } else {
         Default::default()
     };
-    for (_, row) in &mut rows {
-        let at = row["id"].as_str().and_then(|id| activity.get(id)).copied();
-        row["last_input_ms"] = json!(at);
-        row["placement"] = json!("here");
+    if tier != crate::pro::Tier::Free {
+        for (_, row) in &mut rows {
+            let at = row["id"].as_str().and_then(|id| activity.get(id)).copied();
+            row["last_input_ms"] = json!(at);
+            row["placement"] = json!("here");
+        }
     }
     drop(execs);
     drop(cwds);
