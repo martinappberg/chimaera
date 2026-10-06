@@ -1129,6 +1129,26 @@ fn grant_fixture(state: &AppState, workspace: &str, epoch: u64, sequence: u64) -
     )
 }
 
+/// Park the sessions of enrolled projects as an unknown manual resume. The
+/// receipt only ever names an enrolled project's sessions: a project Pro never
+/// took on keeps its automatic restore (`super::enrolled`).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn fence_unknown(state: &AppState, sessions: &mut [crate::ledger::LedgerEntry]) {
+    for entry in sessions {
+        if !super::enrolled(state, &entry.workspace_id) {
+            continue;
+        }
+        entry.suspended = true;
+        entry.manual_resume_reason = Some("unknown".into());
+    }
+}
+
+/// An admitted installer holds a Pro setup reservation for its project; a
+/// free local install holds none and keeps its unmanaged lifecycle.
+pub(crate) fn installer_guarded(state: &AppState, workspace: &str) -> bool {
+    lock(&state.pro.execution.setups).contains_key(workspace)
+}
+
 /// Read off-reactor before any boot resurrection. An unknown existing parking
 /// receipt never downgrades to an absent receipt and automatic agent restore.
 pub(crate) async fn restore_manual_parking(
@@ -1144,16 +1164,7 @@ pub(crate) async fn restore_manual_parking(
         let result = tokio::task::spawn_blocking(move || {
             let mut boot = boot;
             if maintenance_store::overlay_boot(&owner, &mut boot).is_err() {
-                // The receipt only ever names an enrolled project's
-                // sessions: a project Pro never took on keeps its
-                // automatic restore (`super::enrolled`).
-                for entry in &mut boot.sessions {
-                    if !super::enrolled(&owner, &entry.workspace_id) {
-                        continue;
-                    }
-                    entry.suspended = true;
-                    entry.manual_resume_reason = Some("unknown".into());
-                }
+                fence_unknown(&owner, &mut boot.sessions);
                 tracing::warn!(
                     "maintenance parking receipt unavailable; automatic restoration fenced"
                 );
@@ -1163,22 +1174,56 @@ pub(crate) async fn restore_manual_parking(
         .await;
         // A panicked parser worker must not expose a previously owned roster.
         // It normally cannot panic; retain the original roster outside it.
-        result.unwrap_or_else(|_| crate::ledger::BootLedger {
-            sessions: fallback
-                .into_iter()
-                .map(|mut entry| {
-                    entry.suspended = true;
-                    entry.manual_resume_reason = Some("unknown".into());
-                    entry
-                })
-                .collect(),
-            links: fallback_links,
-            written_at: fallback_written_at,
+        result.unwrap_or_else(|_| {
+            let mut sessions = fallback;
+            fence_unknown(state, &mut sessions);
+            crate::ledger::BootLedger {
+                sessions,
+                links: fallback_links,
+                written_at: fallback_written_at,
+            }
         })
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = state;
         boot
+    }
+}
+
+#[cfg(test)]
+mod fence_unknown_tests {
+    use super::*;
+
+    /// The panicked-parser fallback and the unreadable-receipt branch share
+    /// one filter: a never-enrolled project's sessions keep automatic restore.
+    #[test]
+    fn unknown_parking_fences_only_enrolled_projects() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-fence-unknown-{}",
+            chimaera_core::generate_token()
+        ));
+        let state = AppState::new(
+            "token".into(),
+            "test".into(),
+            1,
+            0,
+            root.join("data"),
+            root.join("config"),
+        );
+        let entry = |id: &str, workspace: &str| {
+            crate::ledger::LedgerEntry::from_json(&serde_json::json!({
+                "id": id, "workspace_id": workspace, "cwd": "/tmp",
+                "cols": 80, "rows": 24, "theme": "dark", "agent": null
+            }))
+            .unwrap()
+        };
+        let mut sessions = vec![entry("s-free", "w-free"), entry("s-pro", "w-pro")];
+        lock(&state.pro.parked).insert("w-pro".into());
+        fence_unknown(&state, &mut sessions);
+        assert!(!sessions[0].suspended);
+        assert_eq!(sessions[0].manual_resume_reason, None);
+        assert!(sessions[1].suspended);
+        assert_eq!(sessions[1].manual_resume_reason.as_deref(), Some("unknown"));
     }
 }
