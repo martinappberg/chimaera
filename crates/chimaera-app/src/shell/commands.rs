@@ -1119,8 +1119,9 @@ pub(super) fn report_window_scope(
 }
 
 /// What this window shows right now: the session in each pane's active tab.
-/// The notifier drops a notice about one of these while the window has
-/// focus, and a focused window's report clears their delivered alerts.
+/// The notifier drops a notice about one of these while the window has focus
+/// (a workspace window also covers its hidden tabs; a torn-off one only these),
+/// and a focused window's report clears their delivered alerts.
 #[tauri::command]
 pub(super) fn report_window_view(
     webview: tauri::WebviewWindow,

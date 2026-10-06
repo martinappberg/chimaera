@@ -98,12 +98,14 @@ and in `App.svelte` the view reporting + `focusFromNotification`.
     port + token before every poll (both move on reconnect); a supervisor starts watchers as
     tunnels appear, and a watcher ends — dropping its badge contribution — when its daemon
     goes away.
-  - **Never alert about what you're looking at.** Windows report the sessions on screen
-    (each pane's active tab; only the zoomed pane while zoomed); a notice about one of them
-    in the focused window is dropped. Other tabs and windows DO alert while Chimaera is in
-    front — that is the "which tab needs you" case — unless "Notify While Chimaera Is in
-    Front" is off. macOS presents these banners in the foreground (the delegate's
-    `willPresent`).
+  - **Never alert from the window you're in.** A notice about any session of the focused
+    window's workspace is dropped, whether or not its tab is on screen — the rail's unread
+    mark and approval count say which tab needs you. A torn-off window is only its own
+    tab, so it covers just the sessions it reports on screen (each pane's active tab; only
+    the zoomed pane while zoomed). Sessions in a window that isn't focused DO alert while
+    Chimaera is in front — another workspace, or a session on screen in another window
+    (even of the same workspace) — unless "Notify While Chimaera Is in Front" is off. macOS
+    presents these banners in the foreground (the delegate's `willPresent`).
   - **One alert per session.** A newer state takes back the session's older alert (agent
     messages are kept); a blocker that stops blocking (answered anywhere) takes its alert
     back; focusing a window clears alerts for the sessions it shows. Alerts group per
@@ -130,10 +132,13 @@ and in `App.svelte` the view reporting + `focusFromNotification`.
   Needs permission (Settings → Notifications → Allow; browsers require the click).
 - **Where it lives.** `workspace/notices.ts` (`deliverBrowserNotices`, `clearBrowserNotices`).
 - **Key behaviors.** Every tab receives each notice, so tabs coordinate over a
-  `BroadcastChannel`: a focused tab showing the session claims it as seen (nothing posts);
-  the others wait 250ms for a claim, then post under a per-notice `tag`, so duplicates
-  collapse into one alert. A newer alert about a session closes that tab's older one;
-  returning to a tab clears alerts for what it shows. The native app never takes this path.
+  `BroadcastChannel`: a focused tab on the session's workspace (or showing the session)
+  claims it as seen (nothing posts); the others wait 250ms for a claim, then post under a
+  per-notice `tag`, so duplicates collapse into one alert. A newer alert about a session
+  closes that tab's older one; returning to a tab clears alerts for what it shows. A tab
+  can't see what its siblings show, so unlike the native app a session on screen in another
+  tab of the same workspace is still covered by the focused one. The native app never takes
+  this path.
 
 ## Counts and the unread mark (in the workbench)
 

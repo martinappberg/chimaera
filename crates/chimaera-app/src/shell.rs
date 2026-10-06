@@ -212,7 +212,9 @@ pub struct WindowScope {
     pub detached: bool,
     /// Session ids on screen in this window (each pane's active tab),
     /// reported by the page. A notice about one of these is not posted while
-    /// this window has focus — the user is already looking at it.
+    /// this window has focus — the user is already looking at it. (A
+    /// non-detached window also covers its workspace's hidden tabs: see
+    /// `notices::covers`.)
     pub(crate) visible: Vec<String>,
 }
 

@@ -317,7 +317,7 @@ const DEFS = {
     title: "When an Agent Finishes",
     category: "Notifications",
     description:
-      "Notify when an agent ends its turn and hands the floor back, quoting how its reply starts. Nothing is sent for the session you're looking at.",
+      "Notify when an agent ends its turn and hands the floor back, quoting how its reply starts. Nothing is sent for sessions in the window you're working in.",
     type: "boolean",
     default: true,
     scope: "daemon",
@@ -352,7 +352,7 @@ const DEFS = {
     title: "Notify While Chimaera Is in Front",
     category: "Notifications",
     description:
-      "Also show notifications while you're working in Chimaera, for sessions in other tabs or windows. Off: only when Chimaera is in the background.",
+      "Also show notifications while you're working in Chimaera, for sessions in your other windows (never the window you're in). Off: only when Chimaera is in the background.",
     type: "boolean",
     default: true,
     scope: "daemon",
