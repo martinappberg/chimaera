@@ -1152,7 +1152,11 @@ pub(crate) async fn defer_command(
 /// Leftovers of transfers a previous daemon life never finished: staging
 /// copies and Git locks per project (each under its cache guard, so a transfer
 /// that starts meanwhile is never touched) and old temporary bundle archives.
+/// Only Pro makes them, so a daemon without the extension does nothing here.
 pub(crate) fn sweep_leftovers(state: &std::sync::Arc<crate::AppState>) {
+    if tier(state) == Tier::Free {
+        return;
+    }
     let owner = state.clone();
     tokio::spawn(async move {
         let root = owner.pro.root.clone();
