@@ -37,6 +37,66 @@ describe("numbered pane shortcuts", () => {
   });
 });
 
+function letter(code: string, modifiers: Partial<KeyboardEvent>): KeyboardEvent {
+  return { code, key: code.slice(3).toLowerCase(), metaKey: false, ctrlKey: false, altKey: false, shiftKey: false, ...modifiers } as KeyboardEvent;
+}
+
+describe("agent and terminal cycle chords", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.resetModules();
+  });
+
+  async function chordsOn(platform: string) {
+    vi.stubGlobal("window", {});
+    vi.stubGlobal("navigator", { platform });
+    vi.resetModules();
+    const keys = await import("./keys");
+    const chord = (id: string) => keys.parseChord(keys.ACTION_BY_ID.get(id)!.def, "auto")!;
+    return { keys, agents: chord("cycleAgents"), terminals: chord("cycleTerminals") };
+  }
+
+  it("is Control+Cmd+A and Control+Cmd+T on macOS, and nothing wider", async () => {
+    const { keys, agents, terminals } = await chordsOn("MacIntel");
+    const ctrlCmd = { metaKey: true, ctrlKey: true };
+    expect(keys.matchChord(letter("KeyA", ctrlCmd), agents)).toBe("hit");
+    expect(keys.matchChord(letter("KeyT", ctrlCmd), terminals)).toBe("hit");
+    // ⌘T is New Terminal (the app menu), ⌘A is Select All, ⌃A is the shell's line start.
+    expect(keys.matchChord(letter("KeyT", { metaKey: true }), terminals)).toBeNull();
+    expect(keys.matchChord(letter("KeyA", { metaKey: true }), agents)).toBeNull();
+    expect(keys.matchChord(letter("KeyA", { ctrlKey: true }), agents)).toBeNull();
+    expect(keys.matchChord(letter("KeyA", { ...ctrlCmd, shiftKey: true }), agents)).toBeNull();
+    expect(keys.matchChord(letter("KeyT", ctrlCmd), agents)).toBeNull();
+    expect(keys.displayChord("Mod+Ctrl+a", "auto")).toBe("⌃⌘A");
+  });
+
+  it.each(["Win32", "Linux x86_64"])("adds Alt to Ctrl+Shift off macOS (%s)", async (platform) => {
+    const { keys, agents, terminals } = await chordsOn(platform);
+    const layer = { ctrlKey: true, shiftKey: true, altKey: true };
+    expect(keys.matchChord(letter("KeyA", layer), agents)).toBe("hit");
+    expect(keys.matchChord(letter("KeyT", layer), terminals)).toBe("hit");
+    // Ctrl+Shift+T is the browser's reopen-tab; the second layer keeps clear of it.
+    expect(keys.matchChord(letter("KeyT", { ctrlKey: true, shiftKey: true }), terminals)).toBeNull();
+  });
+
+  it("collides with no other default chord under any modifier setting", async () => {
+    for (const platform of ["MacIntel", "Win32"]) {
+      const { keys } = await chordsOn(platform);
+      for (const setting of ["auto", "cmd", "ctrl-shift", "alt"] as const) {
+        const sig = (def: string) => {
+          const p = keys.parseChord(def, setting)!;
+          return `${p.meta}/${p.ctrl}/${p.alt}/${p.shift}/${p.key}`;
+        };
+        for (const id of ["cycleAgents", "cycleTerminals"]) {
+          const mine = sig(keys.ACTION_BY_ID.get(id)!.def);
+          const clash = keys.ACTIONS.filter((a) => a.id !== id && a.def !== "" && sig(a.def) === mine);
+          expect(clash.map((a) => a.id), `${platform}/${setting}: ${id}`).toEqual([]);
+        }
+      }
+    }
+  });
+});
+
 describe("host-specific pane-tab defaults", () => {
   afterEach(() => {
     vi.unstubAllGlobals();

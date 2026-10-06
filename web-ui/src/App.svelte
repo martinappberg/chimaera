@@ -3,6 +3,7 @@
   import AgentSetupDialog from "./lib/workspace/AgentSetupDialog.svelte";
   import { agentSetup, openAgentSetup } from "./lib/workspace/agentSetup";
   import { agentCatalog } from "./lib/workspace/launcher";
+  import { nextInGroup } from "./lib/workspace/sessionCycle";
   import { onMount, tick, untrack } from "svelte";
   import { paneTabHasKeyboardFocus } from "./lib/shared/tabNavigation";
   import { flip } from "svelte/animate";
@@ -2877,11 +2878,7 @@
         const pane = panesOf(layout.root).find((p) => p.number === n);
         if (pane !== undefined) {
           layout = focusPane(layout, pane.id);
-          const sid = focusedSessionOf(layout);
-          void tick().then(() => {
-            if (sid !== null) pool.focusTerminal(sid);
-            else paneRootEl(pane.id)?.focus();
-          });
+          focusFocusedPane();
         }
       }
       return;
@@ -2889,8 +2886,18 @@
 
     // Arrow chords in an editable surface belong to the text caret (rename
     // fields, search boxes, the file editor) — xterm's hidden textarea is
-    // exempt, terminals don't use modifier-arrows for editing.
-    if (hit.dir !== null && isEditableTarget(e.target)) return;
+    // exempt, terminals don't use modifier-arrows for editing. The chat
+    // composer is the one editable that also gives pane focus away, but only
+    // when a pane lies that way: with none, the caret keeps ⌘←/→ (line
+    // start/end), so a single-pane window loses nothing.
+    if (hit.dir !== null && isEditableTarget(e.target)) {
+      const leaves =
+        hit.id === "focusArrows" &&
+        e.target instanceof HTMLElement &&
+        e.target.hasAttribute("data-pane-arrows") &&
+        moveFocus(layout, hit.dir as FocusDir).focusedPaneId !== layout.focusedPaneId;
+      if (!leaves) return;
+    }
 
     switch (hit.id) {
       case "newPane":
@@ -2968,6 +2975,11 @@
       case "focusArrows":
         intercept();
         focusDirection(hit.dir as FocusDir);
+        return;
+      case "cycleAgents":
+      case "cycleTerminals":
+        intercept();
+        cycleRail(hit.id === "cycleAgents");
         return;
       case "moveTab":
         intercept();
@@ -3679,20 +3691,43 @@
     ];
   }
 
-  function focusDirection(dir: FocusDir): void {
-    layout = moveFocus(layout, dir);
-    const sid = focusedSessionOf(layout);
-    if (sid !== null) pool.focusTerminal(sid);
-  }
-
-  function cycle(delta: number): void {
-    layout = cycleTab(layout, delta);
+  /** Put DOM focus where the focused pane takes keys — its terminal, else the
+   *  pane root — so typing after a chord lands in the pane the chord chose
+   *  rather than in whatever held focus before (a composer, an xterm). */
+  function focusFocusedPane(): void {
     const sid = focusedSessionOf(layout);
     const paneId = layout.focusedPaneId;
     void tick().then(() => {
       if (sid !== null) pool.focusTerminal(sid);
       else paneRootEl(paneId)?.focus();
     });
+  }
+
+  function focusDirection(dir: FocusDir): void {
+    layout = moveFocus(layout, dir);
+    focusFocusedPane();
+  }
+
+  function cycle(delta: number): void {
+    layout = cycleTab(layout, delta);
+    focusFocusedPane();
+  }
+
+  /** ⌃⌘A / ⌃⌘T: open the next agent (or terminal) in the rail's own order. */
+  function cycleRail(agents: boolean): void {
+    // A detached window has no roster to step through (its chips are gone).
+    if (detachedWindow) return;
+    const group = agents ? agentSessions : shellSessions;
+    const next = nextInGroup(
+      group.map((s) => s.id),
+      focusedSessionId,
+    );
+    if (next !== null) {
+      openSess(next);
+      return;
+    }
+    const make = keyHint(agents ? "newAgent" : "newTerminal");
+    showFlash(`No ${agents ? "agents" : "terminals"} in this workspace yet${make ? ` — ${make} starts one` : ""}.`);
   }
 
   function split(dir: SplitDir): void {

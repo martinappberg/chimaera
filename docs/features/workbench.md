@@ -260,7 +260,12 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   a slim strip. `Mod+Arrow` moves pane focus spatially; `Mod2+Arrow` carries the active tab into
   the neighbor — or, when there is no pane in that direction, **auto-splits a new one** on that
   side (capped at `MAX_PANES` and a minimum pane size); `Mod+1–9` focuses that numbered pane;
-  `⌘±`/`⌘0` bump one pane's terminal/markdown font.
+  `⌘±`/`⌘0` bump one pane's terminal/markdown font. Two further chords step through the
+  sidebar instead of the panes: `⌃⌘A` (`keys.cycleAgents`) opens the next agent in its agents
+  list and `⌃⌘T` (`keys.cycleTerminals`) the next terminal in its terminals list (off macOS,
+  `Ctrl+Shift+Alt+A/T`). Each wraps at the end and, from outside its group, starts at the first
+  row. They open a row the way clicking it does, so an agent already shown in another pane is
+  focused there; a detached window, which has no sidebar, ignores them.
 - **Empty panes & numbered moves.** `Mod+N` creates an empty pane to the right, up to
   `MAX_PANES` (4); the same action is available from Pane actions or Quick Open.
   The first split puts panes side by side (`1 | 2`). Subsequent new panes split the
@@ -283,11 +288,18 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   are available in either host. `Cmd+Tab` remains macOS application switching.
 - **Where it lives.** `layout.ts` (`toggleZoom`, `focusMode`, `moveFocus`, `moveTabDirection`,
   `moveTabToPane`, `navigateFileHistory`, `newPaneSplitDirection`, `setPaneFont` with `FONT_MIN 9`/`FONT_MAX 28`),
-  `App.svelte` chords, `keys.ts`, `shared/chordHints.svelte.ts`.
+  `App.svelte` chords, `keys.ts`, `workspace/sessionCycle.ts` (the cycle order),
+  `shared/chordHints.svelte.ts`.
 - **Key behaviors.** Zoom always tracks the focused pane (focusing elsewhere clears it, so you
   can't get "stuck" zoomed). Focus mode is part of the persisted layout. Arrow chords defer to a
   text caret in editable surfaces but **not** in xterm's helper textarea (app chords must work
-  over a focused terminal). Per-pane font override is persisted per pane.
+  over a focused terminal). The chat composer is the one editable that opts in (`data-pane-arrows`
+  on its textarea) — for `Mod+Arrow` only, and only when a pane lies that way, so a pane you
+  entered by chord is one you can leave by chord while a single-pane window keeps `⌘←/→` as
+  line start/end; `Mod2+Arrow` still belongs to the caret there (select to line edge). After any
+  pane move, DOM focus follows to the pane's terminal/composer or, for a document or workbench
+  view, to the pane root, so typing never lands in the pane you just left. Per-pane font override
+  is persisted per pane.
 
 ## Layout & rail persistence
 
