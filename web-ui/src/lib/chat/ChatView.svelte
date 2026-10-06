@@ -2195,7 +2195,7 @@
     // conversation is not live (whoever keeps a sleeping owner's socket drops
     // a `set_thinking`, and a plain reconnect does not push it again).
     const sent = sendCommand({ type: "set_thinking", enabled: next }, "thinking change not sent");
-    if (!sent || !store.connected) store.markThinkingPending();
+    if (!sent || (viewed && !store.connected)) store.markThinkingPending();
   }
   // Push the effective preference to the live driver, once per driver process.
   // It pushes whatever the user's effective choice IS (never forces a value),
