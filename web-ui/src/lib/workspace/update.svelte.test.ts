@@ -96,6 +96,19 @@ describe("update awareness", () => {
     expect(store.currentOffer(null, true)).toBeNull();
   });
 
+  it("reads the official app's daemon as updating with the app, never as a failed check", async () => {
+    const store = await load();
+    expect(store.APP_UPDATES).toBe("Updates arrive with the app.");
+    const status = store.parseUpdateStatus(daemonStatus({ state: "unchecked", with_app: true, latest: null, checked_at: null }));
+    expect(status).toMatchObject({ withApp: true, managed: false, available: false });
+    // Other daemons omit it.
+    expect(store.parseUpdateStatus(daemonStatus())?.withApp).toBe(false);
+    // Seen from a browser, an explicit check answers with the neutral line.
+    mocks.api.mockResolvedValue(respond(daemonStatus({ state: "unchecked", with_app: true, latest: null, checked_at: null })));
+    await store.checkForUpdates(true);
+    expect(store.currentNotice(null)).toEqual({ kind: "with-app" });
+  });
+
   it("stays silent until asked, then answers even when up to date", async () => {
     const store = await load();
     store.updateState.daemon = store.parseUpdateStatus(daemonStatus());

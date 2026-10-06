@@ -21,6 +21,7 @@
 <script lang="ts">
   import type { UpdateNotice } from "./update.svelte";
   import {
+    APP_UPDATES,
     checkForUpdates,
     dismissAnswer,
     MANAGED_UPDATES,
@@ -44,11 +45,13 @@
       notice.kind === "current" ||
       notice.kind === "dev" ||
       notice.kind === "managed" ||
+      notice.kind === "with-app" ||
       notice.kind === "failed",
   );
 
   $effect(() => {
-    if ((notice.kind !== "current" && notice.kind !== "dev" && notice.kind !== "managed") || hovered) return;
+    if ((notice.kind !== "current" && notice.kind !== "dev" && notice.kind !== "managed" &&
+      notice.kind !== "with-app") || hovered) return;
     const timer = setTimeout(dismissAnswer, ANSWER_MS);
     return () => clearTimeout(timer);
   });
@@ -70,6 +73,8 @@
         return "Development build";
       case "managed":
         return MANAGED_UPDATES;
+      case "with-app":
+        return APP_UPDATES;
       case "failed":
         return "Couldn't check for updates";
     }
@@ -94,6 +99,7 @@
       case "dev":
         return "Release updates don't apply to a development build.";
       case "managed":
+      case "with-app":
         return null;
       case "failed":
         return notice.error;

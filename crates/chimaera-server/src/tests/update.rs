@@ -53,3 +53,33 @@ async fn the_clouds_daemon_never_checks_for_its_own_updates() {
         "the cloud's daemon made a release request"
     );
 }
+
+/// The official app's daemon (composed with the extension) updates with the
+/// app: with or without a plan it neither asks the public feed nor reports
+/// a failed check, and says so (`with_app`). A daemon without the extension
+/// reports exactly what it always did.
+#[tokio::test]
+async fn the_official_apps_daemon_updates_with_the_app_without_a_warning() {
+    let releases = releases_with("99.0.0").await;
+    let state = test_state_with_extension();
+    crate::update::set_api_for_tests(&state, &format!("{}/latest", releases.base()));
+    let (status, body) = request(&state, Method::GET, "/api/v1/update?refresh=true", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["with_app"], true);
+    assert_eq!(body["state"], "unchecked");
+    assert_eq!(body["managed"], false);
+    assert_eq!(body["available"], false);
+    assert!(
+        body["error"].is_null() && body["latest"].is_null(),
+        "{body}"
+    );
+    assert_eq!(
+        releases.hits(),
+        0,
+        "the official app's daemon asked the feed"
+    );
+
+    let free = test_state();
+    let (_, body) = request(&free, Method::GET, "/api/v1/update", None).await;
+    assert!(body.get("with_app").is_none(), "{body}");
+}

@@ -160,6 +160,12 @@ conversation. All four chat providers retain their native resume handle through 
   version stamp's hover says it). Its agents' release checks stop too (`agent_updates`; no release
   fields on its `GET /agents` rows), since they come with the cloud's image and are updated with it.
   Its plugins' release checks are unchanged.
+- **The official app's daemon updates with the app.** A daemon composed with the app's extension
+  (signed in or not, with or without a plan) is updated by the app's signed updater, or by a reconnect
+  for a remote one, never from the public release feed. It makes no release request and reports
+  `state: "unchecked"` with an additive `with_app: true` (no error, nothing available), and every view
+  shows "Updates arrive with the app." instead of a failed check. A daemon without the extension never
+  sends `with_app` and checks exactly as before.
 - **A failed check is reported as one.** The status carries one `state` word
   (`unchecked | current | available | failed | managed`), `checked_at` (last attempt) vs `succeeded_at`
   (last answer), the failure in plain words (`error`: curl's own diagnosis minus its prefix; a

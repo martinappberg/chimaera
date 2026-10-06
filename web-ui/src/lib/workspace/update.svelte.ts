@@ -37,6 +37,9 @@ export interface UpdateStatus {
   /** This daemon is the account's cloud: the service updates it, so it
    * never checks and nothing is offered. Older daemons omit it. */
   managed: boolean;
+  /** The official app's daemon: it updates with the app and never checks
+   * the release feed itself (`with_app`). Other daemons omit it. */
+  withApp: boolean;
   available: boolean;
   latest: { version: string; url: string; published_at?: string | null } | null;
   /** Last attempt / last success, unix seconds. */
@@ -67,6 +70,8 @@ export type UpdateAnswer =
   | { kind: "dev" }
   /** The account's cloud: updates are the service's, nothing to check. */
   | { kind: "managed" }
+  /** The official app's daemon, seen from a browser: it updates with the app. */
+  | { kind: "with-app" }
   | { kind: "failed"; error: string };
 
 export type UpdateNotice = UpdateOffer | UpdateAnswer;
@@ -80,6 +85,9 @@ const STATES = new Set(["unchecked", "current", "available", "failed", "managed"
 
 /** The one line every view of the account's cloud shows for its updates. */
 export const MANAGED_UPDATES = "Updates for your cloud are managed for you.";
+
+/** The one line for the official app's daemon, which updates with the app. */
+export const APP_UPDATES = "Updates arrive with the app.";
 
 /** Raw signals; each arrives from its own listener. */
 export const updateState = $state({
@@ -138,6 +146,7 @@ export function parseUpdateStatus(raw: unknown): UpdateStatus | null {
     dev: r.dev === true,
     state: (state ?? (r.available ? "available" : latest !== null ? "current" : "unchecked")) as UpdateStatus["state"],
     managed,
+    withApp: r.with_app === true,
     available: managed ? false : r.available,
     latest: managed ? null : latest,
     checked_at: num(r.checked_at),
@@ -339,6 +348,7 @@ function currentAnswer(): UpdateAnswer {
   if (daemon === null) return { kind: "failed", error: "the daemon did not answer" };
   if (daemon.managed) return { kind: "managed" };
   if (daemon.dev) return { kind: "dev" };
+  if (daemon.withApp) return { kind: "with-app" };
   if (daemon.state === "failed" || daemon.state === "unchecked") {
     return { kind: "failed", error: daemon.error ?? "the check did not finish" };
   }

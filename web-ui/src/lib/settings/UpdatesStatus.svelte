@@ -26,7 +26,7 @@
     relativeAge,
     versionNumber,
   } from "../workspace/launcher";
-  import { applyAppStatus, checkForUpdates, MANAGED_UPDATES, updateState } from "../workspace/update.svelte";
+  import { APP_UPDATES, applyAppStatus, checkForUpdates, MANAGED_UPDATES, updateState } from "../workspace/update.svelte";
   import { agentUpdateStatus } from "./agentStatus";
   import { getSetting } from "./store.svelte";
 
@@ -190,6 +190,8 @@
         sub: "release checks don't apply to a dev build",
       };
     }
+    // The official app's daemon never checks the feed itself.
+    if (d.withApp) return { ...base, version, verdict: "with the app", tone: "idle", sub: APP_UPDATES };
     const checked = ago(d.checked_at);
     const cadence = autoCheck ? `checks ${every(d.interval_secs)}` : "automatic checks are off";
     if (d.state === "available" && d.latest !== null) {

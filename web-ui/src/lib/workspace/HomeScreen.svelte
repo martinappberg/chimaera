@@ -47,7 +47,7 @@
   import { pageVisible } from "../shared/visibility";
   import { fetchOwnershipHints, readsOwnership } from "./placementHints";
   import { relativeAge } from "./launcher";
-  import { checkForUpdates, MANAGED_UPDATES, updateState } from "./update.svelte";
+  import { APP_UPDATES, checkForUpdates, MANAGED_UPDATES, updateState } from "./update.svelte";
 
   interface Props {
     workspaces: Workspace[];
@@ -261,6 +261,7 @@
     // The account's cloud: nothing to check (a click shows the same line).
     if (d.managed) return `${v}. ${MANAGED_UPDATES}`;
     if (d.dev) return `${v}: release updates don't apply. Click to check anyway.`;
+    if (d.withApp) return `${v}. ${APP_UPDATES}`;
     const checked = d.checked_at === null ? null : relativeAge(d.checked_at, stampNow);
     const when = checked === null ? "" : checked === "now" ? " (checked just now)" : ` (checked ${checked} ago)`;
     switch (d.state) {
