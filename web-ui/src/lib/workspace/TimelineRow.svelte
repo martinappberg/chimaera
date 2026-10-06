@@ -13,6 +13,7 @@
    */
   import { pickupNote } from "../chat/transfer";
   import { isBrowserGateway } from "../net/base";
+  import { proTier } from "../net/plan";
   import { inlineMarkdown } from "../shared/inlineMarkdown";
   import type { Session } from "./sessions";
   import type { TimelineEntry } from "./timeline.svelte";
@@ -95,7 +96,9 @@
   /** A turn the daemon opened itself (a transfer's or a restart's pick-up)
    *  quotes its agent-facing message as the "prompt"; say what happened, as
    *  the chat's divider does, instead of showing it as the person's words. */
-  const pickup = $derived(first.kind === "episode" ? pickupNote(first.title ?? "", isBrowserGateway()) : null);
+  const pickup = $derived(
+    first.kind === "episode" ? pickupNote(first.title ?? "", isBrowserGateway(), $proTier === "free") : null,
+  );
   const evidence = $derived(groupEvidence(group));
   const durationMs = $derived(groupDurationMs(group));
 
