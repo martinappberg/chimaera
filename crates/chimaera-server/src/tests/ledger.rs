@@ -329,7 +329,8 @@ async fn restart_deferred_sessions_resume_unless_another_owner_is_verified() {
         );
         // Enrolled earlier; this life has not renewed its lease yet.
         pro::install_execution_fixture(&state, &workspace.id, 3).unwrap();
-        pro::expire_execution_fixture(&state, &workspace.id);
+        pro::lapse_execution_fixture(&state, &workspace.id);
+        pro::signed_in_fixture(&state);
         let entry = |id: &str, agent: Option<ledger::LedgerAgent>| ledger::LedgerEntry {
             suspended: false,
             manual_resume_reason: None,
@@ -375,6 +376,16 @@ async fn restart_deferred_sessions_resume_unless_another_owner_is_verified() {
         if remote {
             pro::install_remote_owner_fixture(&state, &workspace.id, 4);
         }
+        // An account that cannot be reached proves nothing: the cloud may run
+        // the work by now, so nothing resumes on the fallback.
+        pro::resume_unverified(&state).await;
+        assert!(
+            !state.chat.contains("s-restart-chat"),
+            "unreachable account"
+        );
+        // An account answering with server errors cannot hand the work to
+        // anyone else either: the computer's own work resumes.
+        pro::account_erroring_fixture(&state);
         pro::resume_unverified(&state).await;
         assert_eq!(
             state.chat.contains("s-restart-chat"),

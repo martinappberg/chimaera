@@ -116,6 +116,7 @@ async fn run(
         endpoint: request.endpoint,
         keeper_url: String::new(),
         hours_exhausted: false,
+        alias: None,
         execution: Some(ExecutionConfiguration {
             version: 1,
             installation_id: Some(request.installation_id),

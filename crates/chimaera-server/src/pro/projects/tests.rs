@@ -68,6 +68,7 @@ fn configure(state: &AppState, origin: &str) {
         endpoint: origin.into(),
         keeper_url: origin.into(),
         hours_exhausted: false,
+        alias: None,
         delegation: super::super::protocol::Delegation {
             workspace: None,
             access_token: "synthetic".into(),

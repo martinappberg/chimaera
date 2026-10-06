@@ -42,7 +42,7 @@ transition on acquisition increments the epoch; acquiring again as the current
 unexpired holder is idempotent. A different unexpired holder prevents acquisition.
 Release verifies holder and epoch, clears holder/expiry, and preserves the epoch.
 The next acquisition increments it. Renew verifies the same holder and epoch and
-fails after expiry; it cannot resurrect an expired lease. Leases last 90 seconds;
+fails after expiry; it cannot resurrect an expired lease. Leases last 60 seconds;
 clients renew every 5 seconds while active. `server_now` makes expiry interpretable
 without trusting the client wall clock.
 
@@ -149,8 +149,9 @@ Private Git services additionally test real receive-pack quota and ref updates.
 
 ## Daemon delegation
 
-An app can authorize its daemon to keep mirroring after the app exits without
-sharing its rotating OAuth refresh token. `POST /v1/delegations` with `{}` and
+An app authorizes its daemon to keep working after the app exits (mirroring,
+renewing its leases, and keeping the computer reachable from the user's other
+devices) without sharing its rotating OAuth refresh token. `POST /v1/delegations` with `{}` and
 a full device bearer returns:
 
 ```json
@@ -180,9 +181,20 @@ plus its own renewal. It cannot read `/v1/me`, enumerate or revoke devices, acce
 billing, start OAuth or mint another delegation. The keeper introspector accepts
 it as the same account and original device holder, restricted to the keeper
 scope. Parent device revocation and sign-out-everywhere invalidate it and close
-its keeper transport. Servers store only a token hash. The app passes this
+its keeper transport (the keeper revalidates every open socket's bearer every
+five seconds). Servers store only a token hash. The app passes this
 credential only to its authenticated local daemon; it never persists the value
 in configuration, logs, bundles or mirrors.
+
+The daemon itself opens the keeper's reverse-serve socket with this credential
+([PROTOCOL](PROTOCOL.md#reverse-serve)), so quitting the app does not hide the
+computer from the user's other devices. It does so only for a personal computer
+(`role: device`, no workspace binding, `keeper` in `scope`, a keeper URL) with
+the optional Runtime composed in; it registers under Configure's additive
+`alias` (the app's machine name) with its own local bearer, reconnects with
+jittered backoff (half a second doubling to ten; a minute after a 401/403), and
+ends the socket on `DELETE /api/v1/pro/configure` (sign-out) or a new
+configuration.
 
 ## Workspace-bound worker delegation
 
@@ -382,7 +394,10 @@ flags, and v2 has no other resource that sets them). It is published while the
 epoch is still owned and before any snapshot bytes are pushed, so a refusal
 cannot strand a published checkpoint that nothing will continue.
 `handoff_enabled` and `offline_takeover` are `!hours_exhausted`; `has_agents`
-says whether the snapshot archived an agent session. A workspace-scoped
+says whether the cloud should start for this copy if the computer goes away: a
+Claude or Codex conversation was working or waiting on the user when the copy
+started (and the copy carries an agent session), or the user chose "Run in the
+cloud". An idle project therefore costs nothing until someone opens it. A workspace-scoped
 delegation may reach this one `/v1` path under v2 as well.
 
 Policy survives ownership changes. Automatic worker wake considers an expired
@@ -391,36 +406,29 @@ current entitlement and budget. An expired worker lease alone never wakes a
 worker. These flags do not change the lease compare-and-swap rules or permit
 active-owner takeover.
 
-## Required placement and execution-fencing follow-up
+## One handoff mechanism
 
-The maintainer's requested next placement contract is distinct from the current
-v1 behavior above. Both protocol versions deliberately let a personal computer
-keep running during account unreachability until it verifies a newer epoch
-("laptop first"); remote write fences do not prove that an offline old process
-has stopped. The workspace credential consumer contract does not resolve that
-execution-partition gap.
+Whoever holds a project's lease runs it, and a personal computer holds it while
+its daemon can reach the account. The daemon renews every five seconds; the
+account's lease is 60 seconds and it refuses anyone else's takeover for a
+15-second grace after expiry (`failover_grace_seconds`). A computer's local
+deadline ends 15 seconds before the account's expiry, and at that deadline the
+computer stops its own managed agents (plain shells are never managed), so a
+turn never runs in two places. While the account answers with server errors
+nobody can acquire through it, and the computer keeps its own work running.
 
-Acceptance for the placement follow-up requires:
-
-- A preferred home host, current execution holder and viewer device are separate
-  identities. A phone/browser follows the logical workspace and current session;
-  opening that view cannot choose or wake a different execution host.
-- Available home execution stays at home. Cloud is the synchronized handoff and
-  recovery fallback when home is unavailable; safe return prefers home again.
-- Abrupt loss recovers only the latest durably published project/conversation
-  checkpoint. It cannot recover uncheckpointed bytes or blindly replay external
-  actions that may already have happened.
-- Before cloud takeover, an execution lease or equally strong end-to-end fence
-  must prevent old-home execution from continuing concurrently during a network
-  partition. Account write fencing alone is insufficient for arbitrary external
-  tool side effects. Expiry, resume from sleep and return must preserve the same
-  single-runner guarantee, with deliberate safe handling of uncertain effects.
-- Browser/native routing, current-host changes and recovery are verified together;
-  no cloud-machine chooser is part of the normal continuity flow.
-
-These are required follow-up gates, not claims that v1 or the workspace-bound
-credential addition already implements automatic home-first routing or complete
-execution fencing.
+The account acts at the earliest lease end plus grace rather than polling, so
+the cloud continues about 75 seconds after the last renewal (plus the cloud
+machine's start) from the latest synced state. The daemon copies a project
+when a turn starts (so the user's prompt is in the copy), when a turn ends, every
+minute while an agent works, and every two minutes otherwise. A computer frozen
+past its deadline renews first only while nobody could have taken the project
+yet (by wall clock, lease end plus grace less a margin); otherwise it is fenced
+at once and re-acquires its own epoch without a fork or install if nobody took
+it. Cloud work returns to the computer at the conversation's next pause once
+its renewals have succeeded without a gap for a minute, the only guard against
+bouncing. Exactly-once covers the managed agents' turns; external side effects
+an agent made before a sudden loss can repeat, which its recovery context says.
 
 ## Transfer operations, sleep and drain (daemon routes)
 
@@ -441,7 +449,9 @@ worker handoff is final for that return pass unless the worker woke into a new
 epoch.
 
 `POST /api/v1/pro/sleep` accepts an optional `{deadline_ms}` (additive; an empty
-body keeps the 25-second default) and answers within it. It preempts the
+body keeps the 25-second default) and answers within it. On macOS the daemon
+hears system sleep itself (IOKit) and runs the same flush with a 23-second
+budget before acknowledging, app or not; other platforms rely on the lease. It preempts the
 periodic mirror pass, flushes every owned project in parallel (projects with
 live agents first, the rest only while time remains) as owned tasks, and does
 not wait out the account's publication fence past the deadline (an unreleased
@@ -451,13 +461,20 @@ reply is `{handoff, failed:[{workspace_id, error:<code>}]}`, plus
 their own. A flush that could not hand its project over (its release ran out
 of time, or publication failed) never renews the lease or resumes agents inside
 the sleep window: an unreleased lease lapses and the cloud continues from the
-acknowledged checkpoint. `POST /api/v1/pro/wake` advances a sleep generation and
-returns every project a sleep flush holds to this computer at once (writable
-immediately): a flush still running keeps its publication, stops no further
-sessions, never releases and resumes the sessions it stopped; one that finished
-without handing over resumes its stopped sessions right away. Neither waits for
-the account. Signing out does the same for any transfer or return this computer
-itself started.
+acknowledged checkpoint. On waking (the daemon's own power notification) a
+flush still running keeps its publication, stops no further sessions, never
+releases and resumes the sessions it stopped; a project whose flush ended
+without handing over waits for the lease loop to verify who holds it now, since
+the cloud may have taken it during sleep. Signing out returns any transfer or
+return this computer itself started to it.
+
+`POST /api/v1/pro/projects/{id}/cloud` ("Run in the cloud") hands one project
+over now with a 90-second budget and keeps it there (parked: the computer
+neither renews nor takes it back) until `POST /api/v1/pro/projects/{id}/here`
+("Run here") or until the account reports a `reason` the cloud cannot run it on
+the ownership read; it carries every working or waiting conversation or none.
+Run here brings it back at the conversation's next pause. Both answer 202, 409
+(`cloud_time_used_up`, `not_here`, `not_elsewhere`) or 404.
 
 `POST /api/v1/pro/drain {deadline_ms?}` is the public half of a fenced cloud
 suspension. It takes the job reservation, stops new periodic passes, refuses new
@@ -524,7 +541,7 @@ physical process extinction on a disconnected computer or exactly-once external
 effects. Process groups do not contain deliberately detached descendants.
 
 `GET /v2/capabilities` returns execution_authority 2, the exact default capability,
-supported_execution_capabilities, failover_grace_seconds 30, installation_binding
+supported_execution_capabilities, failover_grace_seconds 15, installation_binding
 1, workspace_placement 2 and checkpoint_receipts 1. Clients decode the advertised
 capabilities leniently and then compare each exactly with what they implement.
 They use the service default when they implement it; otherwise their own
@@ -562,7 +579,7 @@ an acquire is never refused for not being the preferred installation, only for
 Clean transfer selects exactly the receipt's working-tree/config/handoff Git
 object IDs. Unknown continuation evidence is uncertain, never a blind replay of
 external actions. In checkpoint_fork_v1, after the recorded lease expiry plus
-30 seconds, an acknowledged checkpoint permits a new canonical epoch and a
+15 seconds, an acknowledged checkpoint permits a new canonical epoch and a
 forked native conversation. The logical session identity remains stable. The
 receipt may originate from an earlier epoch if an intervening executor never
 published; its own source epoch, not the incoming grant epoch, binds the manifest.
@@ -580,19 +597,21 @@ in the cloud), `home` (a clean return, back on the user's computer) and
 the other machine stopped responding). A terminal agent gets one neutral
 positional prompt instead, and only for a turn that was cut off.
 
-Lease expiry fences execution only on a cloud worker, and a resumed worker
-renews before fencing: after a suspension (seen as a clock discontinuity) its
+Lease expiry fences execution on every managed host ([One handoff
+mechanism](#one-handoff-mechanism)), and a resumed worker renews before fencing: after a suspension (seen as a clock discontinuity) its
 daemon first renews the recorded epoch, which the account grants to a suspended
 owner at the same epoch with no fork; only a refused renewal (or no answer within
 20 seconds) fences. That renewal starts the moment the thaw is noticed (by the
 daemon's 100 ms watchdog, or by the first request or socket frame to arrive
 after it), never at the next 5-second renewal tick, because a viewer's socket
-is admitted only once it answers. A personal computer is
-fenced only by a verified other owner (an authenticated read naming another
-holder) or its own in-progress transfer: account unreachability, sign-out, a
-lapsed plan, the privacy switch or a daemon restart stop publication, never its
-agents or shells. A verified other owner refuses local input at once; the
-computer's agents stop at their next safe pause, at most five minutes later.
+is admitted only once it answers. A personal computer is also fenced by its
+lapsed lease (above), a verified other owner (an authenticated read naming
+another holder) or its own in-progress transfer; sign-out, a lapsed plan, the
+privacy switch and a daemon restart stop publication, never its agents or
+shells, and after a restart its interrupted sessions resume only once the
+account confirms it still holds them (or the account answers with server
+errors). A verified other owner refuses local input at once; the computer's
+agents stop at their next safe pause, at most five minutes later.
 Re-acquiring the epoch this installation itself held (its own clean release, or
 its own lapsed lease) continues local work: no checkpoint install and no fork,
 even though the account marks a lapsed-lease acquisition `requires_fork`. The
@@ -602,7 +621,7 @@ managed processes.
 A cloud machine that suspends keeps ownership (placement `suspended`, lease
 expired by design); the account answers anyone else's acquire with 409 `held`
 for as long as it stays paused. A computer that wants the project back reads
-placement (passive, never wakes) and, once settled on power, POSTs the worker's
+placement (passive, never wakes) and, once it has reached the account without a gap for a minute, POSTs the worker's
 `/api/v1/pro/handoff` through the keeper's HTTP adapter with `X-Chimaera-Wake:
 interaction`: the keeper wakes the machine, which renews its own epoch, flushes
 at a safe pause and releases, and the computer then hydrates. A `held` refusal
@@ -636,7 +655,7 @@ the lease remainder on the account's clock. Clients may retry only this explicit
 hint while the workspace, holder, epoch and local account generation remain the
 same, within the existing five-minute action deadline. An absent/invalid hint or
 another conflict ends the request; a cloud-holder refusal never carries the hint.
-Expiry still does not bypass the thirty-second reconnect grace before acquisition.
+Expiry still does not bypass the fifteen-second reconnect grace before acquisition.
 The holder asking for its own project is its user
 acting there: the last actor wins (by the account's clock) and any request
 for the project ends. `DELETE /v2/baton/{workspace}/move` withdraws the
@@ -718,7 +737,7 @@ permanent refusals:
 | --- | --- | --- |
 | `stale_epoch` | Epoch mismatch or not the current holder (carries `baton`) | Re-read and decide; never force |
 | `held` | Another live holder owns the project, or a fresh request to move it reserves it for another computer (carries `baton`) | View it; no takeover |
-| `takeover_grace` | Expired holder still inside the 30 s grace (carries `baton`) | Retry after the grace |
+| `takeover_grace` | Expired holder still inside the 15 s grace (carries `baton`) | Retry after the grace |
 | `unsafe_takeover` | Expired holder but the project is not in `checkpoint_fork_v1` (carries `baton`) | No automatic takeover |
 | `mirror_commit_in_progress` | A verified push is publishing refs (≤10 s) | Retry with jitter |
 | `checkpoint_required` | No acknowledged checkpoint for this epoch (also on a clean release that has not published) | Publish first, then retry |

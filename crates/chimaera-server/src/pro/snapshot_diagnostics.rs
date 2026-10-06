@@ -129,6 +129,7 @@ mod tests {
                 workspace: None,
             },
             hours_exhausted: false,
+            alias: None,
         };
         let mut phase = "ownership";
         let error = engine::snapshot_inner(&state, &config, "w-diagnostic", true, None, &mut phase)

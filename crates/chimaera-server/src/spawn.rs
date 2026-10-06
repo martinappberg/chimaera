@@ -76,7 +76,15 @@ pub(crate) async fn spawn_session(
     spec: SpawnSpec,
 ) -> Result<serde_json::Value, SpawnFailure> {
     let workspace = spec.workspace;
-    if !crate::pro::may_execute(state, &workspace.id) {
+    let shell = matches!(spec.kind, SpawnKind::Shell);
+    let allowed = |state: &AppState, workspace: &str| {
+        if shell {
+            crate::pro::may_run_shell(state, workspace)
+        } else {
+            crate::pro::may_execute(state, workspace)
+        }
+    };
+    if !allowed(state, &workspace.id) {
         return Err(SpawnFailure::Internal(anyhow::anyhow!(
             "workspace owned elsewhere"
         )));
@@ -353,7 +361,7 @@ pub(crate) async fn spawn_session(
         }
     }
 
-    if !crate::pro::may_execute(state, &workspace.id) {
+    if !allowed(state, &workspace.id) {
         return Err(SpawnFailure::Internal(anyhow::anyhow!(
             "project execution authority changed during launch"
         )));
@@ -411,7 +419,7 @@ pub(crate) async fn spawn_session(
         Ok(info) => {
             crate::runtime_retention::watch(state.clone(), info.id.clone(), usage);
             crate::lock(&state.session_workspaces).insert(info.id.clone(), workspace.id.clone());
-            if !crate::pro::may_execute(state, &workspace.id) {
+            if !allowed(state, &workspace.id) {
                 let _ = state.sessions.kill(&info.id);
                 return Err(SpawnFailure::Internal(anyhow::anyhow!(
                     "project execution authority changed during launch"

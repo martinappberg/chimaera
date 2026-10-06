@@ -730,7 +730,14 @@ pub(crate) fn session_writable(state: &AppState, id: &str) -> bool {
         return false;
     }
     let workspace = crate::lock(&state.session_workspaces).get(id).cloned();
-    workspace.is_none_or(|workspace| crate::pro::may_execute(state, &workspace))
+    let managed = state.chat.get(id).is_some() || crate::lock(&state.agents).contains_key(id);
+    workspace.is_none_or(|workspace| {
+        if managed {
+            crate::pro::may_execute(state, &workspace)
+        } else {
+            crate::pro::may_run_shell(state, &workspace)
+        }
+    })
 }
 
 /// GET /ws/sessions/{id}

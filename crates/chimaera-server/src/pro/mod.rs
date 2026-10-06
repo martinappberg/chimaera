@@ -12,17 +12,19 @@ pub(crate) mod engine;
 pub(crate) mod execution;
 pub(crate) mod install;
 mod kept;
-mod leave;
 pub(crate) mod mirror;
 pub(crate) mod moves;
+mod place;
 pub(crate) mod policy;
 mod project_copy;
 mod projects;
 mod protocol;
 mod provider_gate;
+mod reach;
 mod repository;
 pub(crate) mod routes;
 pub(crate) mod shadow_cache;
+mod sleep_watch;
 pub(crate) mod transfer_dispatch;
 pub(crate) mod transfer_host;
 pub(crate) mod transfer_types;
@@ -32,12 +34,11 @@ pub(crate) use drain::{cancel as cancel_drain, start as drain};
 pub(crate) use kept::{
     file as kept_file, list as kept_list, resolve as kept_resolve, resolve_all as kept_resolve_all,
 };
-pub(crate) use leave::{leave, run_here};
 #[cfg(feature = "daemon-extension-fixture")]
 pub(crate) use moves::device_fixture;
 pub(crate) use moves::{acted_here, other_computer};
+pub(crate) use place::{run_here, run_in_cloud};
 pub(crate) use policy::CloudProfile;
-pub(crate) use provider_gate::report_cloud_agents;
 pub(crate) use provider_gate::{
     blocking_provider, cloud_provider_blocks, workspace_provider_blocks,
 };
@@ -83,18 +84,16 @@ pub(crate) struct ProState {
     /// out of time, or the flush failed): no renewal or resume happens inside
     /// the sleep window; the next wake returns them to this computer locally.
     release_pending: Mutex<std::collections::HashSet<String>>,
-    /// Projects handed to the cloud when the app quit (`/pro/sleep` with
-    /// `park`): this computer neither takes them back nor renews them until
-    /// the app returns (`/pro/wake`) or the account signs out. Persisted, so
-    /// a daemon restart keeps them away too.
+    /// Projects the user chose to run in the cloud (`place::run_in_cloud`):
+    /// this computer neither renews nor takes them back until "Run here",
+    /// the cloud saying it cannot run them, or sign-out. Persisted, so a
+    /// daemon restart keeps them there too.
     parked: Mutex<std::collections::HashSet<String>>,
-    /// Each project's last leave outcome (`leave.rs`). Persisted.
-    left: Mutex<HashMap<String, leave::Outcome>>,
-    /// Projects a leave is deciding or moving right now, and those whose
-    /// cloud answer is being watched (`leave.rs`). Hot state: each entry is
-    /// held by its owned task and removed when that task ends, however it ends.
-    leaving: Mutex<std::collections::HashSet<String>>,
-    watching: Mutex<std::collections::HashSet<String>>,
+    /// The plain reason each project's work is not where it would be, and the
+    /// kind and name of what holds each one elsewhere, both from the last
+    /// ownership read (`place::observed`). Hot state, bounded.
+    reasons: place::Reasons,
+    holders: Mutex<HashMap<String, (String, Option<String>)>>,
     /// The last bytes written, so an unchanged tick costs no disk sync.
     persistence: Arc<AsyncMutex<Option<Vec<u8>>>>,
     #[cfg(test)]
@@ -122,18 +121,16 @@ pub(crate) struct ProState {
     drain_started: tokio::sync::Notify,
     remote_since: Mutex<HashMap<String, u64>>,
     return_backoff: Mutex<HashMap<String, (u64, u64)>>,
-    /// When the native app last arrived (its first `/pro/power` while it was
-    /// away, or `/pro/wake`); 0 while it is away (`/pro/leave` when it quit,
-    /// `/pro/sleep` before the computer sleeps). While it is here, cloud work
-    /// of a project this computer runs comes home at its next pause
-    /// (`engine::lazy_handback`, `leave::app_settled`).
-    app_since: AtomicU64,
-    /// Only reported to the account (`moves::watch_query`); no longer gates
-    /// coming home.
-    power_suitable: AtomicBool,
-    /// Projects the cloud did not take, or cannot run, after the app left
-    /// (`leave::take_back`): they come back here at once, app or not. Hot
-    /// state, bounded by enrolled projects.
+    /// Whether this computer can reach the account, from the lease loop's own
+    /// calls (`reach`): since when it has answered without a gap (0: not now),
+    /// and when it last answered with a server error.
+    reachable_since: AtomicU64,
+    erroring_at: AtomicU64,
+    /// The daemon-owned reverse link to the keeper (`reach::Link`).
+    link: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Projects being brought back here ("Run here", or the cloud could not
+    /// run them): they come back at once, whatever the guard. Hot state,
+    /// bounded by enrolled projects.
     reclaim: Mutex<std::collections::HashSet<String>>,
     /// When the last return-only pass started (`CoordinatorTick::start_return`).
     return_pass: AtomicU64,
@@ -268,13 +265,10 @@ struct DiskState {
     /// still says it after a restart (the kept copies are still on disk).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     kept_both: HashMap<String, KeptRecord>,
-    /// Projects handed to the cloud on quit (see `ProState::parked`); sorted
-    /// so an unchanged set writes the same bytes.
+    /// Projects the user chose to run in the cloud (see `ProState::parked`);
+    /// sorted so an unchanged set writes the same bytes.
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     parked: std::collections::BTreeSet<String>,
-    /// Each project's last leave outcome; sorted for stable bytes.
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    left: std::collections::BTreeMap<String, leave::Outcome>,
 }
 /// A return's kept-both report as persisted: the count, and the kept copies'
 /// project-relative paths (fewer than `files` when bounded, see
@@ -505,22 +499,9 @@ impl ProState {
             sleep_generation: AtomicU64::new(0),
             sleeping: Mutex::new(Default::default()),
             release_pending: Mutex::new(Default::default()),
-            // A move the daemon died during is no outcome unless it finished
-            // (still parked): then the cloud's answer is still awaited and
-            // the next lease tick watches for it again (`leave::observed`).
-            left: Mutex::new(
-                disk.left
-                    .into_iter()
-                    .filter(|(id, outcome)| {
-                        valid_id(id)
-                            && (outcome.state != leave::Where::Pending || parked.contains(id))
-                    })
-                    .take(128)
-                    .collect(),
-            ),
             parked: Mutex::new(parked),
-            leaving: Mutex::new(Default::default()),
-            watching: Mutex::new(Default::default()),
+            reasons: Default::default(),
+            holders: Mutex::new(HashMap::new()),
             persistence: Arc::new(AsyncMutex::new(None)),
             #[cfg(test)]
             persistence_pause: Mutex::new(None),
@@ -536,8 +517,9 @@ impl ProState {
             drain_started: tokio::sync::Notify::new(),
             remote_since: Mutex::new(HashMap::new()),
             return_backoff: Mutex::new(HashMap::new()),
-            app_since: AtomicU64::new(0),
-            power_suitable: AtomicBool::new(false),
+            reachable_since: AtomicU64::new(0),
+            erroring_at: AtomicU64::new(0),
+            link: Mutex::new(None),
             reclaim: Mutex::new(Default::default()),
             return_pass: AtomicU64::new(0),
             renew_now: tokio::sync::Notify::new(),
@@ -656,6 +638,29 @@ pub(crate) use execution::{
     refused_fixture as refuse_renewal_fixture, renewed_fixture as renew_execution_fixture,
     resumed_fixture as resume_execution_fixture, worker_fixture as worker_execution_fixture,
 };
+/// The account answered the lease loop with a server error just now.
+#[cfg(any(test, feature = "daemon-extension-fixture"))]
+pub(crate) fn account_erroring_fixture(state: &crate::AppState) {
+    reach::answered(state, 503);
+}
+/// This life has not renewed a project's lease yet (its deadline passed), as
+/// after a restart, without the watchdog having fenced anything.
+#[cfg(test)]
+pub(crate) fn lapse_execution_fixture(state: &crate::AppState, workspace: &str) {
+    execution::lapse_fixture(state, workspace);
+}
+/// A signed-in configuration, for tests of what depends only on being signed in.
+#[cfg(test)]
+pub(crate) fn signed_in_fixture(state: &crate::AppState) {
+    *crate::lock(&state.pro.runtime) = Some(
+        serde_json::from_value(serde_json::json!({
+            "role":"device","endpoint":"http://127.0.0.1:1","keeper_url":"",
+            "delegation":{"access_token":"synthetic","expires_at":"2099-01-01T00:00:00Z",
+            "scope":["baton","mirror"],"device_id":"d-home"}
+        }))
+        .unwrap(),
+    );
+}
 pub(crate) fn managed_execution(state: &crate::AppState, workspace: &str) -> bool {
     execution::managed(state, workspace)
 }
@@ -687,6 +692,14 @@ pub(crate) fn may_execute(state: &crate::AppState, workspace: &str) -> bool {
         return false;
     }
     may_write(state, workspace) && execution::allows(state, workspace)
+}
+/// A plain shell's gate. Plain shells are never managed: a computer fenced
+/// only by its own lapsed lease (`execution::expire`) stops its agents, but
+/// its terminals keep working. Every other fence applies as to agents. Without
+/// Pro this is exactly `may_execute`.
+pub(crate) fn may_run_shell(state: &crate::AppState, workspace: &str) -> bool {
+    may_execute(state, workspace)
+        || (may_write(state, workspace) && execution::lapsed_here(state, workspace))
 }
 /// Sessions left by a previous daemon wait for this life's ownership proof, so
 /// a project the cloud took over while this computer was off never resumes a
@@ -769,11 +782,17 @@ pub(crate) fn defer_boot_session(state: &crate::AppState, session: &str) {
     }
 }
 /// Restart-deferred sessions on a device resume when ownership was not
-/// verified in time, unless another owner was verified meanwhile or old
-/// processes may still be running. Sessions a clean handoff suspended stay
-/// suspended; they belong to whoever now owns the project.
+/// verified in time only because the account itself answers with server
+/// errors (nobody can acquire through it either) or no account is signed in
+/// (sign-out never stops a computer's work), unless another owner was
+/// verified meanwhile or old processes may still be running. An account that
+/// cannot be reached proves nothing: the cloud may run the work by now, so
+/// those sessions wait for the verified path (exactly once). Sessions a clean
+/// handoff suspended stay suspended; they belong to whoever now owns the
+/// project.
 pub(crate) async fn resume_unverified(state: &std::sync::Arc<crate::AppState>) {
-    if execution::worker(state) {
+    let signed_in = crate::lock(&state.pro.runtime).is_some();
+    if execution::worker(state) || (signed_in && !reach::erroring(state)) {
         return;
     }
     let waiting = resume_unverified_once(state).await;
@@ -883,14 +902,13 @@ pub(crate) fn owned_epoch(state: &crate::AppState, workspace: &str) -> Option<u6
         _ => None,
     }
 }
-/// Handed to the cloud when the app quit, and the app has not come back yet.
+/// The user chose to run this project in the cloud ("Run in the cloud").
 fn parked(state: &crate::AppState, workspace: &str) -> bool {
     crate::lock(&state.pro.parked).contains(workspace)
 }
-/// Marks a quit handover as it starts, unless the app came back meanwhile
-/// (`generation` is the handover's sleep generation). Checked and inserted
-/// under the lock `wake_parked` advances the generation under, so a wake can
-/// never be followed by a stale park. The caller persists.
+/// Marks a "Run in the cloud" handover as it starts, unless another sleep or
+/// wake advanced the generation since it began (`generation` is the
+/// handover's): the newer one decides. The caller persists.
 fn park(state: &crate::AppState, workspace: &str, generation: u64) -> bool {
     let mut parked = crate::lock(&state.pro.parked);
     if state
@@ -906,20 +924,10 @@ fn park(state: &crate::AppState, workspace: &str, generation: u64) -> bool {
     }
     true
 }
-/// A quit handover that did not complete: its work stays on this computer.
+/// No longer kept in the cloud: "Run here", a handover that did not
+/// complete, or the cloud saying it cannot run the project.
 fn unpark(state: &crate::AppState, workspace: &str) {
     crate::lock(&state.pro.parked).remove(workspace);
-}
-/// The app is back (or this computer woke): any flush still running for the
-/// sleep or quit that ended is no longer allowed to release, and nothing
-/// stays parked. The caller persists.
-fn wake_parked(state: &crate::AppState) {
-    let mut parked = crate::lock(&state.pro.parked);
-    state
-        .pro
-        .sleep_generation
-        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    parked.clear();
 }
 fn valid_id(value: &str) -> bool {
     !value.is_empty()
@@ -951,10 +959,6 @@ async fn persist(state: &crate::AppState) -> anyhow::Result<()> {
     let adoptions = crate::lock(&state.pro.adoptions).clone();
     let legacy_pending = crate::lock(&state.pro.legacy_pending).clone();
     let parked = crate::lock(&state.pro.parked).iter().cloned().collect();
-    let left = crate::lock(&state.pro.left)
-        .iter()
-        .map(|(id, outcome)| (id.clone(), outcome.clone()))
-        .collect();
     let (provider_blocks, kept_both) = {
         let statuses = crate::lock(&state.pro.status);
         let blocks = statuses
@@ -976,7 +980,6 @@ async fn persist(state: &crate::AppState) -> anyhow::Result<()> {
         ownership,
         preferences,
         parked,
-        left,
     })?;
     anyhow::ensure!(bytes.len() <= 1024 * 1024, "mirror settings exceed limit");
     // State first, then the enrollment latch: a crash between them leaves a
@@ -1639,6 +1642,7 @@ mod tests {
             keeper_url: String::new(),
             role: protocol::Role::Worker,
             hours_exhausted: false,
+            alias: None,
             delegation: protocol::Delegation {
                 workspace: None,
                 access_token: "MUST_NEVER_PERSIST".into(),

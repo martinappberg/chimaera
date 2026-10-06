@@ -191,11 +191,11 @@ impl CoordinatorTick {
         true
     }
     /// A pass that only brings work home (`lazy_handback`), between the copy
-    /// passes (which run it every two minutes): while the app is here and
-    /// settled and the cloud holds a project, so its work comes home at the
-    /// conversation's next pause, or while a project the cloud did not keep
-    /// is being taken back. At most every ten seconds; never beside another
-    /// pass.
+    /// passes (which run it every two minutes): once this computer has
+    /// reached the account without a gap for the guard (`reach::settled`) and
+    /// the cloud holds a project, so its work comes home at the conversation's
+    /// next pause, or while a project is asked back ("Run here"). At most every
+    /// ten seconds; never beside another pass.
     pub fn start_return(&self) -> bool {
         const EVERY: u64 = 10;
         if !self.can_mirror() || self.config.role != Role::Device {
@@ -212,7 +212,7 @@ impl CoordinatorTick {
             lock(&self.state.pro.reclaim).retain(|id| !home.contains(id));
         }
         let wanted = !lock(&self.state.pro.reclaim).is_empty()
-            || (super::super::leave::app_settled(&self.state)
+            || (super::super::reach::settled(&self.state)
                 && lock(&self.state.pro.ownership).values().any(|owner| {
                     matches!(
                         owner,

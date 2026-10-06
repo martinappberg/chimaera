@@ -288,9 +288,10 @@ mod tests {
         state.sessions.fence(&session.id).unwrap();
         stop(&state, &["w-project".into()]).await.unwrap();
         let device = prepare_launch(&state, "w-project").await.unwrap().unwrap();
+        // A computer's lapsed lease fences it like a cloud machine: no new
+        // launch starts until it holds the project again.
         expired_lease_fixture(&state, "w-project");
-        assert!(device.check().is_ok());
-        assert!(mutation::begin_launch(&state, "w-project").is_ok());
+        assert!(mutation::begin_launch(&state, "w-project").is_err());
         drop(device);
         std::fs::remove_dir_all(root).unwrap();
     }

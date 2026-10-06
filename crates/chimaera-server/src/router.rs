@@ -55,9 +55,11 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/pro/projects/open", post(crate::pro::open_project))
         .route("/pro/projects/copy", post(crate::pro::copy_project))
         .route("/pro/projects/takeover", post(crate::pro::takeover_project))
-        // Both versions a return kept (`pro/kept.rs`): list, compare, choose.
-        // One project back to this computer ("Run here", `pro/leave.rs`).
+        // One project back to this computer ("Run here") or to the cloud
+        // ("Run in the cloud"), `pro/place.rs`.
         .route("/pro/projects/{id}/here", post(crate::pro::run_here))
+        .route("/pro/projects/{id}/cloud", post(crate::pro::run_in_cloud))
+        // Both versions a return kept (`pro/kept.rs`): list, compare, choose.
         .route("/pro/projects/{id}/kept", get(crate::pro::kept_list))
         .route("/pro/projects/{id}/kept/file", get(crate::pro::kept_file))
         .route(
@@ -73,9 +75,6 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             get(crate::pro::profile).put(crate::pro::put_profile),
         )
         .route("/pro/sleep", post(crate::pro::sleep))
-        .route("/pro/leave", post(crate::pro::leave))
-        .route("/pro/wake", post(crate::pro::wake))
-        .route("/pro/power", put(crate::pro::power))
         .route("/pro/handoff", post(crate::pro::handoff))
         .route(
             "/pro/drain",

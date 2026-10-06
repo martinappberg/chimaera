@@ -288,7 +288,15 @@ impl Harness {
                     .fixed_request_method("/api/v1/pro/sleep", body, axum::http::Method::POST)
                     .await;
             }
-            Request::Wake => ("/api/v1/pro/wake", Value::Null),
+            // The daemon hears a wake from the OS itself (`sleep_watch`); the
+            // fixture calls the same function.
+            Request::Wake => {
+                crate::pro::routes::woke(&self.state).await;
+                return Ok(crate::pro::engine::coordinator_host::fixture::Reply {
+                    status: axum::http::StatusCode::NO_CONTENT,
+                    body: Value::Null,
+                });
+            }
             Request::Disconnect => {
                 return self
                     .fixed_request_method(
@@ -681,10 +689,10 @@ impl Scenario {
                     .pro
                     .sleep_generation
                     .store(sleep_generation, Ordering::Release);
-                // The fixture's computer has had its app open since then (0: long ago).
+                // The fixture's computer has reached the account since then (0: long ago).
                 state
                     .pro
-                    .app_since
+                    .reachable_since
                     .store(awake_since.max(1), Ordering::Release);
                 state
                     .pro

@@ -71,8 +71,13 @@ pub(in crate::pro) fn start(state: &Arc<AppState>) {
                     .duration_since(last.1)
                     .map_or(true, |wall| wall.abs_diff(monotonic) > JUMP);
             last = now;
-            if frozen && super::resumed(&state, generation) {
-                state.pro.renew_now.notify_one();
+            if frozen {
+                // A frozen computer was not reachable: the guard for bringing
+                // work home starts over.
+                super::super::reach::unreachable(&state);
+                if super::resumed(&state, generation) {
+                    state.pro.renew_now.notify_one();
+                }
             }
             super::ticked(&state, now.0);
             let expired = super::expire(&state, generation);

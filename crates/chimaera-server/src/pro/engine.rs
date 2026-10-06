@@ -381,14 +381,10 @@ fn transfer_session_ids(state: &AppState, workspace: &str) -> Result<Vec<String>
 pub struct Sleep {
     pub generation: u64,
     pub deadline: tokio::time::Instant,
-    /// The app is quitting, not the computer sleeping: a flush that cannot
+    /// "Run in the cloud", not the computer sleeping: a flush that cannot
     /// hand over recovers at once and its work continues here, instead of
     /// waiting for a wake with its lease left to lapse.
     pub park: bool,
-    /// A browser asked the cloud to run this project after the app quit
-    /// (`leave::open_elsewhere`): it moves even when no conversation does,
-    /// since the account wakes the cloud for that request itself.
-    pub opened: bool,
 }
 impl Sleep {
     pub(super) fn woke(&self, state: &AppState) -> bool {
@@ -556,13 +552,14 @@ async fn snapshot_inner_scoped(
     )
     .await?;
     let grant = transfer.host.grant(grant)?;
-    // A quit handover carries every conversation that made it move, or
+    // "Run in the cloud" carries every working or waiting conversation, or
     // moves nothing (the private snapshot checks before stopping any).
-    let must_carry = if sleep.is_some_and(|sleep| sleep.park && !sleep.opened) {
+    let must_carry = if sleep.is_some_and(|sleep| sleep.park) {
         leaving_sessions(state, &workspace.id)
     } else {
         Vec::new()
     };
+    let needs_cloud = needs_cloud(state, &workspace.id);
     let owner = project_host::SnapshotOwner {
         project: project_host::ProjectOwner::capture(
             state.clone(),
@@ -575,6 +572,7 @@ async fn snapshot_inner_scoped(
         workspace,
         epoch,
         must_carry,
+        needs_cloud,
         session_ids,
         companion: std::sync::Mutex::new(Some(companion)),
         transfer: transfer.clone(),
@@ -1660,17 +1658,17 @@ fn chat_working(
 }
 
 /// The agents (`claude`, `codex`, ...) running work in this project right
-/// now, each named once (the coordinator's turn-end copies; leaving uses
-/// [`leaving_agents`]). The inverse of `at_pause` per session, except that a session nothing is known
-/// about is not counted as working.
+/// now, each named once (the coordinator's copy triggers). The inverse of
+/// `at_pause` per session, except that a session nothing is known about is
+/// not counted as working.
 pub(super) fn working_agents(state: &AppState, workspace: &str) -> Vec<String> {
     agents_at_work(state, workspace, false)
 }
-/// The agents working or waiting on the user (a permission or a question)
-/// in this project: what leaving moves, since the user will want to answer
-/// from a browser.
-pub(super) fn leaving_agents(state: &AppState, workspace: &str) -> Vec<String> {
-    agents_at_work(state, workspace, true)
+/// Whether a conversation here is working or waiting on the user (a
+/// permission or a question): what makes the cloud worth starting for this
+/// project if this computer goes away (`has_agents` in its published policy).
+pub(super) fn needs_cloud(state: &AppState, workspace: &str) -> bool {
+    !agents_at_work(state, workspace, true).is_empty()
 }
 fn agents_at_work(state: &AppState, workspace: &str, waiting_counts: bool) -> Vec<String> {
     let mut kinds: Vec<String> = Vec::new();
@@ -1681,13 +1679,13 @@ fn agents_at_work(state: &AppState, workspace: &str, waiting_counts: bool) -> Ve
     }
     kinds
 }
-/// The conversations a quit moves: those of a kind the cloud continues
-/// (`leave::movable`) that are working or waiting on the user. A quit
-/// handover carries every one of them or nothing (`SnapshotOwner::must_carry`).
+/// The conversations "Run in the cloud" moves: those of a kind the cloud
+/// continues (`place::movable`) that are working or waiting on the user. It
+/// carries every one of them or nothing (`SnapshotOwner::must_carry`).
 pub(super) fn leaving_sessions(state: &AppState, workspace: &str) -> Vec<String> {
     sessions_at_work(state, workspace, true)
         .into_iter()
-        .filter(|(_, kind)| super::leave::movable(kind))
+        .filter(|(_, kind)| super::place::movable(kind))
         .map(|(id, _)| id)
         .collect()
 }
@@ -1762,41 +1760,16 @@ async fn owner_suspended(config: &Configure, workspace: &str) -> bool {
     })
 }
 
-/// How long the app must have been here before live cloud work moves home:
-/// a short guard, so a computer opened for a moment (lid lifted and closed
-/// again, a wake the user did not ask for) does not pull work home only to
-/// send it straight back. Power no longer matters: an open app brings its
-/// work home on battery too. A development build (the loopback end-to-end
-/// harness) may change it with `CHIMAERA_PRO_SETTLE_SECS`, up to five
-/// minutes; release builds ignore the variable.
-pub(super) fn settle_seconds() -> u64 {
-    static SETTLE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *SETTLE.get_or_init(|| {
-        settle_override(
-            chimaera_core::is_dev_build(),
-            std::env::var("CHIMAERA_PRO_SETTLE_SECS").ok().as_deref(),
-        )
-    })
-}
-fn settle_override(dev: bool, value: Option<&str>) -> u64 {
-    const SETTLE: u64 = 20;
-    value
-        .filter(|_| dev)
-        .and_then(|value| value.parse::<u64>().ok())
-        .map_or(SETTLE, |seconds| seconds.min(300))
-}
-
 pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> Result<()> {
     if config.delegation.workspace.is_some() || config.role != Role::Device {
         return Ok(());
     }
-    // Live cloud work moves home once the app has been here for the short
-    // guard (`settle_seconds`), at the conversation's next pause (the cloud
-    // refuses a hand-back while busy, and the next pass asks again); work
-    // the cloud is not running returns at once (laptop first). A project
-    // the cloud did not take or cannot run after the app left comes back at
-    // once, app or not (`leave::take_back`).
-    let settled = super::leave::app_settled(state);
+    // Live cloud work moves home once this computer has reached the account
+    // without a gap for the guard (`reach::settled`), at the conversation's
+    // next pause (the cloud refuses a hand-back while busy, and the next pass
+    // asks again); work the cloud is not running returns at once (laptop
+    // first). A project the user asked back ("Run here") does not wait.
+    let settled = super::reach::settled(state);
     let candidates: Vec<_> = lock(&state.pro.ownership)
         .iter()
         .filter_map(|(id, owner)| match owner {
@@ -1819,9 +1792,8 @@ pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> 
         {
             continue;
         }
-        // Handed to the cloud when the app quit: it stays there, live or
-        // released, until the app returns (`/pro/wake`). A project being
-        // brought here because the user acted on it is that request's.
+        // The user chose the cloud for it: it stays there, live or released,
+        // until "Run here" (or the cloud says it cannot run it).
         let reclaiming = lock(&state.pro.reclaim).contains(&workspace);
         if (super::parked(state, &workspace) && !reclaiming)
             || super::moves::pulling(state, &workspace)
@@ -1945,10 +1917,8 @@ pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> 
         match result {
             Ok(()) => {
                 lock(&state.pro.return_backoff).remove(&workspace);
-                if super::owned_epoch(state, &workspace).is_some()
-                    && lock(&state.pro.reclaim).remove(&workspace)
-                {
-                    super::leave::back_here(state, config, &workspace).await;
+                if super::owned_epoch(state, &workspace).is_some() {
+                    lock(&state.pro.reclaim).remove(&workspace);
                 }
             }
             Err(error) => {
@@ -2118,7 +2088,7 @@ async fn finish_hydration_checked(
         .context("project resume stopped")??;
     }
     // On the cloud machine: say whether it runs the work that arrived.
-    super::leave::arrived(state, workspace, held_back);
+    super::place::arrived(state, workspace, held_back);
     Ok(())
 }
 
@@ -2492,6 +2462,7 @@ mod tests {
             endpoint: String::new(),
             keeper_url: String::new(),
             hours_exhausted: false,
+            alias: None,
             delegation: super::super::protocol::Delegation {
                 workspace: None,
                 access_token: String::new(),

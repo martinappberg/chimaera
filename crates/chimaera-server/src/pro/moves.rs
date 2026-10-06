@@ -141,15 +141,7 @@ pub(super) fn watch_query(state: &AppState, config: &Configure, workspace: &str)
     if super::project_copy::copy_only(state, workspace) || !can_take(state, config, workspace) {
         return "";
     }
-    if state
-        .pro
-        .power_suitable
-        .load(std::sync::atomic::Ordering::Acquire)
-    {
-        "?ready=1&power=ac"
-    } else {
-        "?ready=1&power=battery"
-    }
+    "?ready=1&power=battery"
 }
 
 /// A signed-in personal computer on the negotiated protocol whose account is

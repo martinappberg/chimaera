@@ -6,7 +6,7 @@ pub mod fixture;
 pub(crate) mod move_host;
 pub(crate) mod policy_host;
 pub use crate::pro::config_wire::Report as ConfigurationReport;
-pub use crate::pro::leave::ConversationStays;
+pub use crate::pro::place::ConversationStays;
 pub use crate::pro::projects::catalog::Metadata as ProjectMetadata;
 
 /// One public route/coordinator admission. Cloning retains the same original
@@ -213,11 +213,20 @@ impl ProjectOwner {
                 ""
             }
         );
-        Ok(ProjectBaton::capture(
-            super::account(&self.config, &path, "GET", None)
-                .await?
-                .json()?,
-        ))
+        let response = self.reached(super::account(&self.config, &path, "GET", None).await)?;
+        Ok(ProjectBaton::capture(response.json()?))
+    }
+    /// The lease loop's own account calls are what "reachable" means
+    /// (`reach`): any answer counts, a server error or no answer does not.
+    fn reached(
+        &self,
+        response: Result<super::super::transport::Response>,
+    ) -> Result<super::super::transport::Response> {
+        match &response {
+            Ok(response) => super::super::reach::answered(&self.state, response.status),
+            Err(_) => super::super::reach::unreachable(&self.state),
+        }
+        response
     }
     pub fn observe(&self, baton: &ProjectBaton) -> Result<()> {
         ensure!(
@@ -225,7 +234,7 @@ impl ProjectOwner {
             "project observation changed"
         );
         execution::observe(&self.state, &self.config, &baton.original)?;
-        super::super::leave::observed(&self.state, &self.config, &baton.original);
+        super::super::place::observed(&self.state, &self.config, &baton.original);
         Ok(())
     }
     pub fn effective(&self, unowned_device: bool) -> Result<ProjectConfiguration> {
@@ -293,18 +302,21 @@ impl ProjectOwner {
         let acquire = matches!(operation, LeaseOperation::Acquire);
         let body = execution::body(&config.original, epoch, acquire);
         let started = execution::RequestStart::now();
-        let response = super::account(
-            &config.original,
-            &execution::path(
-                &config.original,
-                &self.workspace,
-                if acquire { "acquire" } else { "renew" },
-            ),
-            "POST",
-            Some(&body),
-        )
-        .await
-        .context("Could not renew project ownership")?;
+        let response = self
+            .reached(
+                super::account(
+                    &config.original,
+                    &execution::path(
+                        &config.original,
+                        &self.workspace,
+                        if acquire { "acquire" } else { "renew" },
+                    ),
+                    "POST",
+                    Some(&body),
+                )
+                .await,
+            )
+            .context("Could not renew project ownership")?;
         Ok(ProjectLeaseReply { response, started })
     }
     pub fn accept(
@@ -449,8 +461,11 @@ pub struct SnapshotOwner {
     pub(super) workspace: crate::workspaces::Workspace,
     pub(super) epoch: u64,
     pub(super) session_ids: Vec<String>,
-    /// The conversations a quit handover must carry (`engine::leaving_sessions`).
+    /// The conversations "Run in the cloud" must carry (`engine::leaving_sessions`).
     pub(super) must_carry: Vec<String>,
+    /// A conversation was working or waiting on the user when this copy
+    /// started (`engine::needs_cloud`), captured before anything stopped.
+    pub(super) needs_cloud: bool,
     pub(super) companion: std::sync::Mutex<Option<super::super::companion::CompatibleImage>>,
     pub(super) transfer: super::super::transfer_dispatch::TransferScope,
     pub(super) grant: super::super::transfer_host::MirrorGrant,
@@ -544,9 +559,15 @@ impl SnapshotOwner {
         )
         .await
     }
-    /// The working or waiting conversations a quit handover exists for: it
-    /// carries every one of them or none ([`ConversationStays`]), decided
-    /// before anything stops. Empty for every other flush.
+    /// Whether the cloud should start for this copy if this computer goes
+    /// away: published as the account's `has_agents`, so an idle project
+    /// costs nothing until someone opens it.
+    pub fn needs_cloud(&self) -> bool {
+        self.needs_cloud
+    }
+    /// The working or waiting conversations "Run in the cloud" carries: every
+    /// one of them or none ([`ConversationStays`]), decided before anything
+    /// stops. Empty for every other flush.
     pub fn must_carry(&self) -> &[String] {
         &self.must_carry
     }

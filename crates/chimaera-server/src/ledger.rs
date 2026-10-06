@@ -602,7 +602,7 @@ pub(crate) async fn restore(state: &Arc<AppState>, boot: BootLedger) {
         let held = if entry.agent.is_some() {
             !crate::pro::may_restore(state, &entry.workspace_id)
         } else {
-            !crate::pro::may_execute(state, &entry.workspace_id)
+            !crate::pro::may_run_shell(state, &entry.workspace_id)
         };
         // A returned session whose resume a sign-out or crash cut short is
         // no hand-off in flight any more: like any session the previous

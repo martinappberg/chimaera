@@ -8,7 +8,10 @@ revocable delegation over the authenticated local API.
 | --- | --- |
 | `mod.rs` | Bounded, credential-free persistent state and ownership/import fences; `synced` says whether a project's agents get the where-you-run note (`mcp/cloud_context.rs`). |
 | `authority.rs` / `authority_tests.rs` | Fixed-identity workspace-bound worker acceptance, startup-only validated revision advancement, credential-free persisted latch, renewal/route/root guards and synthetic side-effect regressions. |
-| `routes.rs` | Authenticated configure/status/privacy/profile/power/hydration HTTP handlers. Profile GET returns an account-generation-bound ETag; PUT optionally checks one exact If-Match under the same preference lock as replacement (412 on change). Older unconditional PUT remains supported. Accepted writes retain configuration/job reservations through durable persistence even if the caller disconnects. `profile_tests.rs` covers stale confirmation, generation changes and disk failure. `/pro/status` rows carry additive `parked`, `leave`, `working_agents` and `cloud_handoff`, and the top level `leaving` (see Leaving below). `hand_over` is the one flush coordinator behind `/pro/sleep` and leaving. |
+| `routes.rs` | Authenticated configure/status/privacy/profile/power/hydration HTTP handlers. Profile GET returns an account-generation-bound ETag; PUT optionally checks one exact If-Match under the same preference lock as replacement (412 on change). Older unconditional PUT remains supported. Accepted writes retain configuration/job reservations through durable persistence even if the caller disconnects. `profile_tests.rs` covers stale confirmation, generation changes and disk failure. `/pro/status` rows carry additive `place`, `reason`, `run_here` and `run_in_cloud` (see Where work runs below). `hand_over` is the one flush coordinator behind `/pro/sleep`, the macOS sleep watcher and "Run in the cloud"; `woke` is the wake. |
+| `place.rs` | Where a synced project's work runs and the user's two choices: `run_here` (`POST /pro/projects/{id}/here`), `run_in_cloud` (`POST /pro/projects/{id}/cloud`), `observed` (the ownership read's `reason`/`holder_kind`/`holder_name`), the cloud machine's `arrived` report (`PUT /v2/workspaces/{id}/reason`). |
+| `reach.rs` | Whether this computer can reach the account (the lease loop's own calls: `answered`, `unreachable`, `settled` after a 60 s guard, `erroring`) and the daemon-owned reverse-serve link to the keeper. |
+| `sleep_watch.rs` | macOS only: the daemon's own IOKit sleep/wake watcher; a will-sleep runs `routes::sleeping` (23 s) and always acknowledges, a power-on runs `routes::woke`. |
 | `projects.rs` / `projects/catalog.rs` | Passive published-account discovery (negotiated `/v2/projects`, at most 128 rows/pages; legacy capability absence or 404 falls back to passive worker discovery), explicit copy/takeover routes, native-picked folder validation and inode/account-bound retry. Catalog rows infer no host or execution authority; errors retain cached rows and destination bindings. Legacy `/open` refuses rather than transferring execution. Nine original shared guard cases remain public; five actual runtime project compositions live privately, including four original ignored companion integrations run by the required private companion job. |
 | `project_copy.rs` / `project_copy/tests.rs` | Immutable read-only checkpoint copies with the existing file/Git transaction, independent durable copy enrollment, exact pending baselines, counted admission and explicit post-commit role promotion. Copy selects its receipt through passive `/v2/baton` GET; the legacy v1 response has no checkpoint and is never a fallback. Missing negotiated receipt refuses enrollment/install. No agent/session/configuration restore or copied-edit publication. |
 | `projects/tests.rs` | Nine shared destination/account/cache, refusal and legacy recovery tests. Paid real Git copy/return and worker roundtrip compositions live with the optional private runtime. |
@@ -44,14 +47,20 @@ revocable delegation over the authenticated local API.
 | `trash.rs` | Where a discarded kept copy goes: renamed (through its folder's descriptor, never replacing a name) into the home Trash (`~/.Trash`; the freedesktop.org home trash on Linux, with its `.trashinfo`), else its drive's existing Trash (`.Trashes/<uid>`; `.Trash/<uid>`, `.Trash-<uid>`), else deleted. A filesystem without exclusive rename refuses and retains the copy, never falling back to a racy replacing rename or deletion. `ProState::trash` holds the home Trash; tests point it at a fixture (never the real one). |
 | `config.rs`, `config_wire.rs`, `config_exec.rs` | Public transaction host and fixed v1 companion contract for portable configuration. Explicit Pro transfer alone preflights a compatible installed image after original destination/credential admission and before mirror initialization, ownership changes or managed stops; hydration preserves existing no-op/recovery shortcuts. The same original image reaches Export/MergeStaged. Before/after snapshots, counted mutation/cache ownership, positive child/group cleanup, bounded actual staged-path/file/credential validation and generic install/recovery remain public. Private file selection and JSON/TOML/MCP/Git sanitizing policy remain in the companion; merge sees only staged images, never live home. Linux executes the captured descriptor; macOS copies at most128MiB into an exclusive0700 stage/0500 leaf retained through positive settlement. Admission/preparation/work share one ten-second deadline; uncertain cleanup retains evidence/cache quarantine. Required gates cover compatible metadata, original captured-image/root replacement, unchanged live home, cancellation and all companion-dependent continuity/project journeys through normal managed installation. Linux delivery and automatic installer/packaging require their own platform acceptance; local composition does not certify them. |
 
-One recorded holder and epoch controls shared writes. **Laptop first (D1):** a
-personal computer is fenced only by a verified other owner (`Ownership::Remote`,
-from an authenticated read) or its own in-progress transfer (`Transferring`,
-`Hydrating`, `SettingUp`); `AwaitingVerification` stays writable there. Lease
-expiry, account unreachability, sign-out (`disconnect` never stops sessions),
-plan changes, the privacy switch and daemon restarts stop publication only. A
-verified other owner refuses input at once (`may_write`); the device's agents
-then stop at their next safe pause, bounded to five minutes, as an owned task.
+One recorded holder and epoch controls shared writes. **One handoff mechanism:**
+whoever holds a project's lease runs it, and a personal computer holds it while
+its daemon can reach the account. A computer is fenced by its own lapsed lease
+(`execution::expire`, started for every managed host: the local deadline ends
+15 s before the account's 60 s expiry, and the account waits a 15 s grace, so
+the cloud never runs a turn the computer is still running), by a verified other
+owner (`Ownership::Remote`, from an authenticated read) or by its own
+in-progress transfer (`Transferring`, `Hydrating`, `SettingUp`);
+`AwaitingVerification` stays writable there. While the account answers with
+server errors (`reach::erroring`) a computer keeps its own work. Sign-out
+(`disconnect` never stops sessions), plan changes, the privacy switch and daemon
+restarts stop publication only. A verified other owner refuses input at once
+(`may_write`); the device's agents then stop at their next safe pause, bounded
+to five minutes, as an owned task.
 The saved state has a 1 MiB input bound. Loading preserves every existing
 ownership, preference, destination adoption, legacy import and parked-transfer
 fence within that bound; the 128-project runtime admission ceiling never
@@ -65,7 +74,10 @@ fencing: when the watchdog sees the process was frozen (a 100 ms tick taking
 over 3 s, or wall and monotonic time disagreeing by over 1 s) and a deadline
 lapsed across it, it wakes the lease loop, which renews the recorded epoch
 (the account keeps a suspended owner's lease: same epoch, no fork, never an
-acquire/checkpoint install); input stays admitted meanwhile. Admission and the
+acquire/checkpoint install); input stays admitted meanwhile. A personal
+computer gets that window only while nobody could have taken the project yet
+(`Deadline::before_takeover`, by wall clock); otherwise it is fenced at once and
+resumes only after re-acquiring its own untouched epoch. Admission and the
 lease loop notice a freeze themselves when the watchdog has been silent for
 longer than one (`execution::thawed`), so the request that woke the machine is
 never refused before the watchdog's next tick. A forwarded viewer scoped to the epoch
@@ -80,7 +92,9 @@ or another verified owner fences at once; no answer within 20 s fences too.
 managed: not signalled by fences, not awaited by stops, never evidence. Sessions
 a previous daemon left running wait for this life's lease (`may_restore`); on a
 device `resume_unverified` resumes the restart-deferred ones after one minute
-when the account cannot confirm, unless another owner was verified meanwhile.
+only when the account answered with server errors (an unreachable account
+proves nothing: the cloud may run the work), unless another owner was verified
+meanwhile.
 Plain shells never wait at boot. The fallback leaves alone projects the account
 answered for this life and projects with a checkpoint install scheduled (fenced
 from scheduling, before hydrate's own fence), and re-runs once recorded old
@@ -322,9 +336,10 @@ wake behavior; `session_proxy` does not submit account moves. The native
 conversation identity still remains in the ledger until its first resumed turn.
 
 Normal lazy return only handles registered projects without a pending adoption.
-Moving live cloud work waits for the settle gate (the app here for 20 s,
-`leave::app_settled`; power plays no part) in both protocol versions, and a
-project being taken back (`reclaim`) skips it. Work the cloud is not running returns at
+Moving live cloud work waits for the one guard (`reach::settled`: the lease
+loop's account calls answered without a gap for 60 s; the app, power and how
+the computer left play no part) in both protocol versions, and a project asked
+back with "Run here" (`reclaim`) skips it. Work the cloud is not running returns at
 once: a cloud release (holder none), a lapsed cloud lease (the device takes it
 from the last acknowledged checkpoint; the account's reconnect grace answers
 409 `takeover_grace`, treated as a quiet wait), or this device's own unfinished
@@ -405,9 +420,9 @@ cached readiness never grants permission to resume. After sign-in the page's
 `POST /pro/hydrate {workspace_id, expected_epoch}` re-checks (fresh) and
 resumes the now-ready sessions (`provider_gate::resume_ready`); nothing is
 fetched or reinstalled. One session failing to resume never stops the others.
-Live cloud work moves home at its next pause once the app has been here for
-the 20 s guard (`lazy_handback`); a development build may set the guard with
-`CHIMAERA_PRO_SETTLE_SECS` (up to 300), release builds ignore it.
+Live cloud work moves home at its next pause once the guard holds
+(`lazy_handback`, `reach::settled`, 60 s); a development build may set the guard
+with `CHIMAERA_PRO_SETTLE_SECS` (up to 300), release builds ignore it.
 A worker asked to hydrate the epoch it already verifiably holds (same holder,
 same epoch, managed or not) only re-verifies it with the account: its running
 agents are not stopped and nothing is reinstalled; a managed project with
@@ -484,111 +499,57 @@ does not list it. Fast-forwards set identical untracked files aside and keep
 the cloud branch separate on a differing one; only `refs/heads` get `@cloud`
 copies.
 
-The lease loop starts a copy of every eligible project every 120 s (`TIMED_COPY`), and of one project as soon as one of
-its agents finishes a turn (`TurnEnds`: fed each 5 s tick from `working_agents`, a working → not working transition marks
-the project; copied once 20 s have passed since the last copy started, `TURN_COPY_GAP`; a turn that ends while a copy runs
-is copied next; that pass skips `lazy_handback`). One copy task at a time, never while draining. Between copies,
-`CoordinatorTick::start_return` runs `lazy_handback` alone, at most every ten seconds, while the app is settled and the
-cloud holds a project, or while a project is being taken back.
+The lease loop starts a copy of every eligible project every 120 s (`TIMED_COPY`), of a project with an agent at work every
+60 s (`WORKING_COPY`), and of one project as soon as one of its agents starts or finishes a turn (`TurnEnds`: fed each 5 s tick
+from `working_agents`; copied once 20 s have passed since the last copy started, `TURN_COPY_GAP`, so the user's prompt is in
+the synced state; a change while a copy runs is copied next; those passes skip `lazy_handback`). One copy task at a time,
+never while draining. Between copies, `CoordinatorTick::start_return` runs `lazy_handback` alone, at most every ten seconds,
+once the guard holds and the cloud holds a project, or while a project is asked back.
 
-The sleep flush (`/pro/sleep {deadline_ms?}`) preempts the periodic pass, flushes
-projects in parallel as owned tasks (live agents first), releases within the
-remaining deadline only, and reports `pending` flushes that continue after it
-answers. A sleep flush that did not hand over (release out of time, or a failed
-publication) marks the project `release_pending`: the lease loop leaves it alone
-(no renewal, no resume) so the lease lapses. `/pro/wake` advances
-`sleep_generation` and turns every `Transferring` project into
-`AwaitingVerification` (writable on a device) at once; a running flush then
-stops no further sessions, keeps its publication, skips release and resumes the
-sessions it stopped; a `release_pending` project resumes its deferred sessions
-locally, without the account. Sign-out does the same for `Transferring`, and on
-a device also for its own `Hydrating`/`SettingUp` return and for every project
-whose `Local` ownership it drops that still holds deferred sessions (a
-return's resume runs as its own task, so aborting the mirror task never cuts
-it; `ledger::resume_one` gives each session one resumer at a time). At boot a
-returned session still deferred on a device (`interrupted_return`) waits like
-a restart-deferred one instead of answering "moved" forever. A device's own
-unfinished return retries after 15 s, doubling to two minutes. Failures and
-refusals carry stable codes (`routes::error_code`; mirror row `error_code`).
+The sleep flush (`/pro/sleep {deadline_ms?}`, and on macOS the daemon's own
+`sleep_watch`) preempts the periodic pass, flushes projects in parallel as owned
+tasks (live agents first), releases within the remaining deadline only, and
+reports `pending` flushes that continue after it answers. A sleep flush that did
+not hand over (release out of time, or a failed publication) marks the project
+`release_pending`: the lease loop leaves it alone (no renewal, no resume) so the
+lease lapses. On wake (`routes::woke`) the sleep generation advances (a running
+flush stops no further sessions, keeps its publication, skips release and
+resumes what it stopped), `release_pending` is cleared and every `Transferring`
+project becomes `AwaitingVerification`: the lease loop verifies who holds it, and
+nothing resumes on sight. Sign-out returns `Transferring` projects, and on a
+device its own `Hydrating`/`SettingUp` return and every project whose `Local`
+ownership it drops that still holds deferred sessions (a return's resume runs as
+its own task; `ledger::resume_one` gives each session one resumer at a time). At
+boot a returned session still deferred on a device (`interrupted_return`) waits
+like a restart-deferred one. A device's own unfinished return retries after
+15 s, doubling to two minutes. Failures and refusals carry stable codes
+(`routes::error_code`; mirror row `error_code`).
 
-**Leaving (`leave.rs`).** App presence: `ProState.app_since` is set when the
-app arrives (`/pro/wake`, or its first `/pro/power` while away) and cleared by
-`/pro/leave` and `/pro/sleep`; an arrival also advances `sleep_generation` (an
-in-flight leave or sleep flush then parks or releases nothing) and clears the
-last absence's outcomes here and at the account (`DELETE
-/v2/workspaces/{id}/leave`). `POST /pro/leave` (no body, from the native app on
-quit) answers 202 at once and runs everything in one owned task, so a client
-that disconnects cancels nothing; the projects a leave or a watch is handling
-sit in `ProState.leaving`/`watching`, each held by its task through a drop
-guard (no stuck entry). The task records `sleep_generation` at arrival and
-`routes::hand_over` takes the next generation only if no wake happened since
-(`Handover::since`, else `woke`). For each enrolled project in scope and not
-parked: `engine::leaving_agents` names the active kinds; `leave::plan` moves the
-project when a Claude or Codex one is active and the account does not say every
-such provider is signed out on the cloud machine (`GET /v2/cloud/agents`, written
-by that machine's readiness checks, once per change; unknown is tried). Others
-stay with a non-clean copy (`nothing_running`, `agent_kind_stays_here`,
-`agent_not_connected_in_cloud`); refusals before any flush (`cloud_time_used_up`,
-`cloud_unavailable`, `not_synced_yet`) record without a copy. A move carries
-`engine::leaving_sessions` (working or waiting Claude/Codex conversations) as
-`SnapshotOwner::must_carry`: the private snapshot probes each one in snapshot
-mode before stopping anything and refuses with the typed
-`ConversationStays::{TooLarge,NotSaved}`. A parked move stays `pending` with the
-kinds it stopped that the cloud does not continue (`stopped`); `leave::watch`
-then reads the account placement every 5 s (`verdict`): `leave.state` `moved`
-(the cloud machine's own report after its resume, `leave::arrived`) records
-`moved`; `staying_here` (the cloud machine found every moved conversation
-waiting for a provider, the account refused for budget or allowlist, the worker
-supervisor gave up) or no taker within `TAKE_BOUND` (4 min), or a cloud holder
-silent past 15 min, takes the work back while the app is away
-(`leave::take_back`: unpark, `Transferring` → `AwaitingVerification` so the
-lease loop re-acquires its own epoch, or `reclaim` so `lazy_handback` brings it
-home from the cloud at its pause; `release_pending` resumes locally at once).
-A browser that opens a project held here while the app is away
-(`Baton::open_in_cloud` in the ownership read, checked by `leave::observed` on
-every tick) hands it over the same way when nothing in it works, waits or is
-busy (`Sleep::opened`: no conversation needed). `/pro/sleep` records the same
-outcomes without account calls (`leave::sleeping`, `leave::slept`). Each outcome
-(`ProState.left`, persisted as `left`; `pending` survives a restart only while
-parked, and its watch restarts on the next tick; pruned to registered projects,
-cleared on sign-out) is one `chimaera_server::pro::leave` info line, the
-additive `leave {state, reason?, at, stopped?}` on the status row, and a
-best-effort `PUT /v2/workspaces/{id}/leave`. `POST /pro/projects/{id}/here` ("Run here") brings one
-project back the same way whatever the app's presence (`leave::bring_back`, plus
-`opened_here` so the return applies; 202 `{returning: true}`, 409
-`not_elsewhere`, 404); rows carry additive `run_here` (it applies: the project's
-work is in the cloud or on its way, `may_run_here`) and `returning` (in
-`reclaim` until held here again; `start_return` prunes it). `/pro/status` has an additive
-top-level `leaving {ready, reason?}` for a personal computer
-(`optional_runtime_unavailable` without the Runtime). A daemon without the
-optional Runtime answers leave with `{"leaving":[],"reason":"optional_runtime_unavailable"}`;
-a free daemon answers 204.
-
-**Quit handover (`park`).** `/pro/sleep {deadline_ms, park: true,
-workspace_ids}` (older apps) and leaving's moves share one flush with three
-differences from sleep. Only the listed
-projects move (≤128 valid ids, all of them regardless of the time left; a
-listed one that is not flushable is reported in `failed` as `unavailable`).
-The computer stays awake, but the user chose the cloud: a flush whose copy is
-published and whose release the account could not confirm in time takes the
-same `release_pending` branch as sleep (it answers handed over, stays parked,
-and the cloud continues from that copy once the lease lapses, as after a lost
-connection); only a flush whose copy never published recovers at once
-(`unpark`, AwaitingVerification, then renew and resume here), and the app says
-so. And each flushed project is **parked**
-(`ProState.parked`, persisted as a sorted `parked` list in `state.json`) from
-the moment its flush starts until such a flush fails (`unpark`), the app returns
-(`/pro/wake` clears every park; the app posts it at every launch), the work
-is taken back (`leave::take_back`) or the account signs out. While parked, on a device the lease loop
-neither renews nor acquires the project (`reconcile_generation`; a flush still
-`Transferring` keeps renewing its own lease until it releases) and
-`lazy_handback` skips it, however long this computer has been awake on power
-and even when the cloud's lease lapsed or it released the project. `park`
-checks the flush's `sleep_generation` and inserts under the same lock
-`wake_parked` advances it under, so a wake is never followed by a stale park.
-At load a parked project keeps its `Transferring` fence (not
-AwaitingVerification); a parked entry whose ownership is neither
-`Transferring` nor `Remote` (the daemon died mid-flush) is dropped.
+**Where work runs (`place.rs`, `reach.rs`).** Nothing tracks the app: quitting
+it changes nothing, and the daemon keeps the computer reachable itself
+(`reach::start`, the keeper's reverse-serve socket with the daemon delegation,
+for a personal computer with the Runtime and `keeper` scope). Status rows carry
+additive `place` (`{where: here|cloud|computer, computer?}` from the ownership
+and the last read's `holder_kind`/`holder_name`; null when not synced), `reason`
+(a closed set: the account's `agent_not_connected_in_cloud`,
+`cloud_time_used_up`, `cloud_storage_full`, `cloud_unavailable`, or a "Run in
+the cloud" that could not start: `conversation_too_large`,
+`conversation_not_saved`, `not_synced_yet`), `run_here` and `run_in_cloud`.
+"Run in the cloud" (`POST /pro/projects/{id}/cloud`) is `hand_over` with `park`
+for that one project: it carries `engine::leaving_sessions` (working or waiting
+Claude/Codex conversations) as `SnapshotOwner::must_carry` or refuses with the
+typed `ConversationStays::{TooLarge,NotSaved}`, and the project is **parked**
+(`ProState.parked`, persisted sorted in `state.json`): the lease loop neither
+renews nor acquires it and `lazy_handback` skips it. A parked project is unparked
+by "Run here" (`POST /pro/projects/{id}/here`: `reclaim`, `opened_here`, back at
+the conversation's next pause, or its own released epoch re-acquired without a
+fork), by the ownership read carrying a `reason` (the cloud cannot run it), or by
+sign-out. At load a parked project keeps its `Transferring` fence; a parked
+entry whose ownership is neither `Transferring` nor `Remote` is dropped. The
+cloud machine reports after each arrival whether it runs the work
+(`place::arrived`, `PUT /v2/workspaces/{id}/reason`, retried). `has_agents` in
+the published policy is `SnapshotOwner::needs_cloud` (a conversation working or
+waiting when the copy started) or the user's "Run in the cloud".
 
 Structured pause checks accept authoritative completed-turn/idle agent state even when a provider emits no textual idle status, but reject queued input, active turns, and background work (explicit permission/action waits remain safe pause points). Terminal agents (`agent_state::tui_at_pause`): Claude hook states decide (idle, finished, needs permission, errored and rate limited are pauses; running is not); a Codex TUI, which has no hook state, is at a pause once its authenticated `agent-turn-complete` notify arrived with no output after it, or once its terminal has been quiet for 10 s with the agent itself in the foreground.
 

@@ -23,6 +23,7 @@ fn fixture() -> (Arc<AppState>, Configure, std::path::PathBuf) {
         endpoint: "http://127.0.0.1:1".into(),
         keeper_url: String::new(),
         hours_exhausted: false,
+        alias: None,
         execution: Some(wire::ExecutionConfiguration {
             version: 1,
             installation_id: Some("i-home".into()),
@@ -177,28 +178,61 @@ fn grant_replay_stale_generation_and_capability_downgrade_do_not_extend_deadline
     assert_eq!(lock(&state.pro.execution.proofs)["w-a"].lease.sequence, 1);
     std::fs::remove_dir_all(root).unwrap();
 }
+/// A computer whose lease lapsed stops its own agents, like a cloud machine,
+/// so the cloud continues exactly once; unless the account itself answers
+/// with server errors, when nobody can acquire through it either.
 #[test]
-fn device_lease_expiry_stops_publication_but_never_local_work() {
+fn device_lease_expiry_fences_its_own_agents_unless_the_account_is_erroring() {
     let (state, _config, root) = fixture();
     crate::pro::install_execution_fixture(&state, "w-a", 2).unwrap();
-    lock(&state.pro.execution.proofs)
-        .get_mut("w-a")
-        .unwrap()
-        .deadline = lease::Deadline::expired_fixture();
+    let lapse = |state: &AppState| {
+        lock(&state.pro.execution.proofs)
+            .get_mut("w-a")
+            .unwrap()
+            .deadline = lease::Deadline::expired_fixture();
+    };
+    lapse(&state);
+    // The account answering 5xx: the computer keeps its own work.
+    crate::pro::account_erroring_fixture(&state);
     assert!(expire(&state, 0).is_empty());
     assert!(crate::pro::may_execute(&state, "w-a"));
     assert!(!lease_valid(&state, "w-a"), "publication waits for renewal");
-    assert!(!lock(&state.pro.preferences)["w-a"].execution_uncertain);
-    // Forwarded viewers act only under a live lease.
+    // Unreachable (no recent server error): fenced at the deadline.
+    state.pro.erroring_at.store(0, Ordering::Release);
+    assert_eq!(expire(&state, 0), vec!["w-a"]);
+    assert!(!crate::pro::may_execute(&state, "w-a"));
     assert!(crate::pro::validate_execution_scope(&state, "w-a", 2).is_err());
-    // A verified other owner is the one fence on a device.
-    lock(&state.pro.ownership).insert(
-        "w-a".into(),
-        Ownership::Remote {
-            epoch: 3,
-            holder: "worker-a".into(),
-        },
-    );
+    // Its own sessions stay resumable once it holds the project again.
+    assert!(!lock(&state.pro.preferences)["w-a"].execution_uncertain);
+    assert!(resume_allowed(&state, "w-a"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+/// A computer that thaws before anyone could have taken its project renews
+/// first and keeps running; one that thaws later is fenced at once.
+#[test]
+fn a_thawed_computer_renews_first_only_while_nobody_could_have_taken_over() {
+    let (state, _config, root) = fixture();
+    crate::pro::install_execution_fixture(&state, "w-a", 2).unwrap();
+    // The fixture's lease was granted just now: a thaw right after its local
+    // deadline is still inside the account's lease plus grace.
+    {
+        let mut proofs = lock(&state.pro.execution.proofs);
+        let proof = proofs.get_mut("w-a").unwrap();
+        proof.deadline = lease::Deadline::lapsed_recently_fixture();
+    }
+    assert!(resumed(&state, 0));
+    assert!(resuming(&state, "w-a"));
+    assert!(expire(&state, 0).is_empty(), "renewal first");
+    assert!(crate::pro::may_execute(&state, "w-a"));
+    // A deadline long past (anyone may hold the project now): no window.
+    {
+        let mut proofs = lock(&state.pro.execution.proofs);
+        let proof = proofs.get_mut("w-a").unwrap();
+        proof.renew_until = None;
+        proof.deadline = lease::Deadline::expired_fixture();
+    }
+    assert!(!resumed(&state, 0));
+    assert_eq!(expire(&state, 0), vec!["w-a"]);
     assert!(!crate::pro::may_execute(&state, "w-a"));
     std::fs::remove_dir_all(root).unwrap();
 }

@@ -462,7 +462,10 @@ socket writes and opening handshakes so a stalled peer cannot retain tasks forev
 
 ## Reverse serve
 
-A signed-in device opens `/v1/serve` (one control socket per device). Its first
+A signed-in device opens `/v1/serve` (one control socket per device). The
+device's own daemon holds it, authenticated with its daemon delegation (an
+account-wide `keeper`-scoped bearer that the keeper accepts as the same account
+and device), so the computer stays reachable while the app is closed. Its first
 text frame, within 10 seconds, is:
 
 ```json

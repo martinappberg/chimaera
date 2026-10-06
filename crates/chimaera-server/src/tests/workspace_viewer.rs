@@ -797,7 +797,7 @@ async fn established_scoped_sockets_cannot_rejoin_a_replacement_account_at_the_s
 }
 
 #[tokio::test]
-async fn laptop_first_sign_out_and_unreachable_account_keep_local_work_running() {
+async fn sign_out_and_an_erroring_account_keep_local_work_running() {
     let (state, project, _) = fixture();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -855,7 +855,10 @@ async fn laptop_first_sign_out_and_unreachable_account_keep_local_work_running()
         .unwrap();
     lock(&state.session_workspaces).insert("s-laptop-chat".into(), project.id.clone());
 
-    // The account stops answering: the lease lapses without another owner.
+    // The account answers with server errors: the lease lapses, but nobody
+    // can acquire through a failing account either, so local work continues.
+    // (An unreachable account fences the agents: `execution::tests`.)
+    pro::account_erroring_fixture(&state);
     assert!(pro::expire_execution_fixture(&state, &project.id).is_empty());
     assert!(pro::may_execute(&state, &project.id));
     // Then the user signs out (or the plan lapses).

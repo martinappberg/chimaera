@@ -43,6 +43,10 @@ pub(crate) struct Configure {
     pub delegation: Delegation,
     #[serde(default)]
     pub hours_exhausted: bool,
+    /// Additive: the name other devices show for this computer (the app's
+    /// machine name); the daemon's reverse link registers under it (`reach`).
+    #[serde(default)]
+    pub alias: Option<String>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -76,10 +80,16 @@ pub struct Baton {
     /// (a phone acted while the cloud slept).
     #[serde(default)]
     pub move_reason: Option<String>,
-    /// Additive: a browser opened this project while the computer holding it
-    /// has no app open; that computer hands it to the cloud (`leave::observed`).
+    /// Additive: why the cloud is not running this project although it needed
+    /// to (a closed set of plain codes, `place::Reason`); null otherwise.
     #[serde(default)]
-    pub open_in_cloud: bool,
+    pub reason: Option<String>,
+    /// Additive: what holds it, `computer` or `cloud` (null when nobody does),
+    /// and a computer's display name, so a status row names a place.
+    #[serde(default)]
+    pub holder_kind: Option<String>,
+    #[serde(default)]
+    pub holder_name: Option<String>,
 }
 
 #[derive(Clone, Deserialize)]

@@ -324,6 +324,15 @@ pub(super) fn held_here(state: &AppState, config: &Configure, baton: &Baton) -> 
 }
 /// A worker's watchdog fenced this epoch; a later renewal of the same epoch
 /// must resume what the fence preserved.
+/// A personal computer fenced only by its own lapsed lease.
+pub(super) fn lapsed_here(state: &AppState, workspace: &str) -> bool {
+    !worker(state)
+        && !supervisor::pending(state)
+        && fenced(state, workspace)
+        && !lock(&state.pro.preferences)
+            .get(workspace)
+            .is_some_and(|p| p.recovery_pending)
+}
 pub(super) fn fenced(state: &AppState, workspace: &str) -> bool {
     lock(&state.pro.execution.proofs)
         .get(workspace)
@@ -498,9 +507,12 @@ pub(super) fn allows(state: &AppState, workspace: &str) -> bool {
         return false;
     }
     // A resumed machine keeps admitting the input that woke it while it renews
-    // its own paused lease; a refused renewal fences it at once.
-    !worker(state)
-        || lease_valid(state, workspace)
+    // its own paused lease; a refused renewal fences it at once. A computer
+    // runs its own work until its lease lapsed and it was fenced (`expire`).
+    if !worker(state) {
+        return !fenced(state, workspace) || resuming(state, workspace);
+    }
+    lease_valid(state, workspace)
         || resuming(state, workspace)
         || (thawed(state) && resuming(state, workspace))
 }
@@ -548,8 +560,15 @@ pub(super) fn proof_epoch(state: &AppState, workspace: &str) -> Option<u64> {
 /// the clock jumped. Each proof whose deadline lapsed across the freeze gets
 /// one bounded renewal at its recorded epoch before any fence (renew before
 /// fencing). Returns whether any renewal is now due.
+///
+/// A personal computer gets that window only while nobody else can have taken
+/// the project yet (its lease plus the account's takeover grace, by wall time,
+/// since sleep stops the monotonic clock): renewing first then loses nothing.
+/// Past that point the cloud may already run the work, so it is fenced at once
+/// and resumes only after re-acquiring its own untouched epoch.
 pub(super) fn resumed(state: &AppState, generation: u64) -> bool {
-    let until = std::time::Instant::now() + RESUME_RENEW;
+    let now = std::time::Instant::now();
+    let device = !worker(state);
     let mut due = false;
     for proof in lock(&state.pro.execution.proofs).values_mut() {
         if proof.generation == generation
@@ -557,7 +576,18 @@ pub(super) fn resumed(state: &AppState, generation: u64) -> bool {
             && proof.renew_until.is_none()
             && !proof.deadline.valid()
         {
-            proof.renew_until = Some(until);
+            let window = if device {
+                proof
+                    .deadline
+                    .before_takeover()
+                    .map_or(Duration::ZERO, |left| left.min(RESUME_RENEW))
+            } else {
+                RESUME_RENEW
+            };
+            if window.is_zero() {
+                continue;
+            }
+            proof.renew_until = Some(now + window);
             due = true;
         }
     }
@@ -728,9 +758,16 @@ pub(super) fn quiescent(state: &AppState, workspace: &str) -> bool {
 }
 /// Close ingress before signalling. Return each stopped workspace repeatedly
 /// until all registered children are gone, including a concurrent in-flight spawn.
+///
+/// A personal computer is fenced like a cloud machine: its lease ending means
+/// the cloud may continue the work, so its own agents stop first (the local
+/// deadline keeps a margin before the account's expiry, and the account waits
+/// a grace after it), and a turn never runs in two places. One exception: while
+/// the account itself answers with server errors, nobody can acquire through
+/// it either, so a computer keeps its own work running.
 pub(super) fn expire(state: &AppState, generation: u64) -> Vec<String> {
-    // Lease expiry without a verified other owner never stops a device.
-    if !worker(state) {
+    let worker = worker(state);
+    if !worker && super::reach::erroring(state) {
         return Vec::new();
     }
     let mut proofs = lock(&state.pro.execution.proofs);
@@ -745,10 +782,15 @@ pub(super) fn expire(state: &AppState, generation: u64) -> Vec<String> {
             }
             fenced |= !proof.stopped;
             proof.stopped = true;
-            lock(&state.pro.preferences)
-                .entry(workspace.clone())
-                .or_default()
-                .execution_uncertain = true;
+            // A cloud machine cannot prove its processes stopped; a computer
+            // signals its own and resumes them itself once it holds the
+            // project again (`watchdog::preserve`).
+            if worker {
+                lock(&state.pro.preferences)
+                    .entry(workspace.clone())
+                    .or_default()
+                    .execution_uncertain = true;
+            }
             expired.push(workspace.clone());
         }
     }
@@ -877,6 +919,12 @@ pub(crate) fn expired_lease_fixture(state: &AppState, workspace: &str) -> Vec<St
         proof.deadline = lease::Deadline::expired_fixture();
     }
     expire(state, state.pro.generation.load(Ordering::Acquire))
+}
+#[cfg(test)]
+pub(crate) fn lapse_fixture(state: &AppState, workspace: &str) {
+    if let Some(proof) = lock(&state.pro.execution.proofs).get_mut(workspace) {
+        proof.deadline = lease::Deadline::expired_fixture();
+    }
 }
 /// A suspended machine resumed after its lease deadline passed, as the
 /// watchdog's freeze detection sees it. Returns what the watchdog would fence.
