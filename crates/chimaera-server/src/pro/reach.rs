@@ -50,35 +50,35 @@ fn guard_override(dev: bool, value: Option<&str>) -> u64 {
         .map_or(GUARD, |seconds| seconds.min(300))
 }
 
-/// A server error this recent means the account is up but failing: a computer
-/// then keeps running its own work past its lease (`execution::expire`), since
-/// nobody else can acquire through a failing account either.
-const ERRORING_FOR: u64 = 30;
-
 /// The lease loop got an HTTP answer. Reachable means a success or the
-/// account's conflict (409, a quiet wait); a refused credential is not. A
-/// server error says the account is up but failing (nobody can acquire
-/// through it either, so a computer keeps its own work, `execution::expire`)
-/// only when it carries the account's own marker (`from_account`): a 5xx
-/// without it is a proxy, captive portal or edge in between, which proves
-/// nothing and counts as unreachable. Successes do not need the marker: the
-/// account is reached over TLS, and a curl too old to report a header
-/// (before 7.84) must still see its successes.
+/// account's conflict (409, a quiet wait); anything else is not: a refused
+/// credential, and every server error, whether the account's own (it carries
+/// the `X-Chimaera-Account` marker, `from_account`) or a proxy's, captive
+/// portal's or edge's in between. Only a successful renewal keeps this
+/// computer's agents running past its local deadline (`execution::expire`):
+/// a failing account still has its own takeover path, which a request-local
+/// failure here proves nothing about (review R4 B1). The marker only tells
+/// the two kinds of failure apart in the log. Successes do not need the
+/// marker: the account is reached over TLS, and a curl too old to report a
+/// header (before 7.84) must still see its successes.
 pub(super) fn answered(state: &AppState, status: u16, from_account: bool) {
-    let now = super::now();
-    if status >= 500 && from_account {
-        state.pro.erroring_at.store(now, Ordering::Release);
-        state.pro.reachable_since.store(0, Ordering::Release);
-    } else if (200..300).contains(&status) || status == 409 {
+    if (200..300).contains(&status) || status == 409 {
         let _ = state.pro.reachable_since.compare_exchange(
             0,
-            now.max(1),
+            super::now().max(1),
             Ordering::AcqRel,
             Ordering::Acquire,
         );
-    } else {
-        unreachable(state);
+        return;
     }
+    if status >= 500 {
+        tracing::debug!(
+            status,
+            account = from_account,
+            "the lease loop got a server error; the account counts as unreachable"
+        );
+    }
+    unreachable(state);
 }
 /// The account could not be reached, or this computer slept or froze: the
 /// guard starts over.
@@ -89,11 +89,6 @@ pub(super) fn unreachable(state: &AppState) {
 pub(super) fn settled(state: &AppState) -> bool {
     let since = state.pro.reachable_since.load(Ordering::Acquire);
     since != 0 && super::now().saturating_sub(since) >= guard_seconds()
-}
-/// The account answered with a server error within the last half minute.
-pub(super) fn erroring(state: &AppState) -> bool {
-    let at = state.pro.erroring_at.load(Ordering::Acquire);
-    at != 0 && super::now().saturating_sub(at) <= ERRORING_FOR
 }
 
 /// Streams the keeper may open at once, and the largest message either side
@@ -521,10 +516,9 @@ mod tests {
         answered(&state, 409, true);
         assert_eq!(state.pro.reachable_since.load(Ordering::Acquire), since);
         // A proxy's or captive portal's 5xx (no account marker) proves
-        // nothing: not erroring, not reachable.
+        // nothing: not reachable.
         answered(&state, 502, false);
         assert_eq!(state.pro.reachable_since.load(Ordering::Acquire), 0);
-        assert!(!erroring(&state));
         // A refused credential is not reachable either.
         answered(&state, 200, true);
         answered(&state, 401, true);
@@ -532,9 +526,10 @@ mod tests {
         // A success needs no marker (an old curl cannot report one).
         answered(&state, 200, false);
         assert!(state.pro.reachable_since.load(Ordering::Acquire) > 0);
+        // The account's own server error is not reachable either (review
+        // R4 B1).
         answered(&state, 503, true);
         assert_eq!(state.pro.reachable_since.load(Ordering::Acquire), 0);
-        assert!(erroring(&state));
         answered(&state, 200, true);
         unreachable(&state);
         assert_eq!(state.pro.reachable_since.load(Ordering::Acquire), 0);

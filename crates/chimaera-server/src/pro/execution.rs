@@ -789,14 +789,12 @@ pub(super) fn quiescent(state: &AppState, workspace: &str) -> bool {
 /// A personal computer is fenced like a cloud machine: its lease ending means
 /// the cloud may continue the work, so its own agents stop first (the local
 /// deadline keeps a margin before the account's expiry, and the account waits
-/// a grace after it), and a turn never runs in two places. One exception: while
-/// the account itself answers with server errors, nobody can acquire through
-/// it either, so a computer keeps its own work running.
+/// a grace after it), and a turn never runs in two places. Only a successful
+/// renewal moves the deadline: no answer, a refusal and the account's own
+/// server errors all fence at it, since the account's takeover runs apart
+/// from the requests that failed (review R4 B1). Shells keep running.
 pub(super) fn expire(state: &AppState, generation: u64) -> Vec<String> {
     let worker = worker(state);
-    if !worker && super::reach::erroring(state) {
-        return Vec::new();
-    }
     let mut proofs = lock(&state.pro.execution.proofs);
     if !worker {
         // A project kept on this computer left the lease loop: nothing renews

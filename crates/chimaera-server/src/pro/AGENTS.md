@@ -10,7 +10,7 @@ revocable delegation over the authenticated local API.
 | `authority.rs` / `authority_tests.rs` | Fixed-identity workspace-bound worker acceptance, startup-only validated revision advancement, credential-free persisted latch, renewal/route/root guards and synthetic side-effect regressions. |
 | `routes.rs` | Authenticated configure/status/privacy/sleep/hydration HTTP handlers. Accepted writes retain configuration/job reservations through durable persistence even if the caller disconnects. `/pro/status` rows carry additive `place`, `reason`, `run_here` and `run_in_cloud` (see Where work runs below). `hand_over` is the one flush coordinator behind `/pro/sleep`, the macOS sleep watcher and "Run in the cloud"; `woke` is the wake. |
 | `place.rs` | Where a synced project's work runs and the user's two choices: `run_here` (`POST /pro/projects/{id}/here`), `run_in_cloud` (`POST /pro/projects/{id}/cloud`), `observed` (the ownership read's `reason`/`holder_kind`/`holder_name`), the cloud machine's `arrived` report (`PUT /v2/workspaces/{id}/reason`). |
-| `reach.rs` | Whether this computer can reach the account (the lease loop's own calls: `answered` (a 2xx or 409 is reachable; a 5xx is `erroring` only with the account's marker), `unreachable`, `settled` after a 15 s guard, `erroring`) and the daemon-owned reverse-serve link to the keeper (ends for good on a refused or expired delegation; at most 8 MiB read from the daemon queued across all streams). |
+| `reach.rs` | Whether this computer can reach the account (the lease loop's own calls: `answered` (a 2xx or 409 is reachable; every 5xx, marked or not, and a refused credential are not), `unreachable`, `settled` after a 15 s guard) and the daemon-owned reverse-serve link to the keeper (ends for good on a refused or expired delegation; at most 8 MiB read from the daemon queued across all streams). |
 | `sleep_watch.rs` | macOS only: the daemon's own IOKit sleep/wake watcher; a will-sleep runs `routes::sleeping` (23 s) and always acknowledges, a power-on or will-not-sleep runs `routes::woke`; signed out or without the Runtime a notice is only acknowledged. |
 | `projects.rs` / `projects/catalog.rs` | Passive published-account discovery (negotiated `/v2/projects`, at most 128 rows/pages; legacy capability absence or 404 falls back to passive worker discovery), explicit copy/takeover routes, native-picked folder validation and inode/account-bound retry. Catalog rows infer no host or execution authority; errors retain cached rows and destination bindings. Legacy `/open` refuses rather than transferring execution. Nine original shared guard cases remain public; five actual runtime project compositions live privately, including four original ignored companion integrations run by the required private companion job. |
 | `project_copy.rs` / `project_copy/tests.rs` | Immutable read-only checkpoint copies with the existing file/Git transaction, independent durable copy enrollment, exact pending baselines, counted admission and explicit post-commit role promotion. Copy selects its receipt through passive `/v2/baton` GET; the legacy v1 response has no checkpoint and is never a fallback. Missing negotiated receipt refuses enrollment/install. No agent/session/configuration restore or copied-edit publication. |
@@ -57,11 +57,13 @@ owner (`Ownership::Remote`, from an authenticated read) or by its own
 in-progress transfer (`Transferring`, `Hydrating`, `SettingUp`);
 `AwaitingVerification` (after a restart, a wake or a failed flush) keeps
 writes and terminals but starts and resumes no agent until the lease loop
-verified the project (`execution::allows`; not when signed out). While the
-account answers with server errors carrying its own `X-Chimaera-Account`
-marker (`reach::erroring`; `transport::Response::from_account`) a computer
-keeps its own work; an unmarked 5xx (a proxy or captive portal) counts as
-unreachable. A project kept on this computer whose switch the account
+verified the project (`execution::allows`; not when signed out). Only a
+successful renewal moves the local deadline: no answer, a refusal and every
+server error, the account's own included (its `X-Chimaera-Account` marker only
+labels the log line, `transport::Response::from_account`), fence at it. If the
+account cannot be reached for about a minute, agents on this computer pause at
+the deadline until it is reachable again; shells keep running (review R4 B1).
+A project kept on this computer whose switch the account
 acknowledged (`execution::kept_here`) holds no lease proof (`expire` drops it)
 and restores without one. Sign-out
 (`disconnect` never stops sessions), plan changes, the privacy switch and daemon

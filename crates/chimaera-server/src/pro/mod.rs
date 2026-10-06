@@ -137,10 +137,8 @@ pub(crate) struct ProState {
     remote_since: Mutex<HashMap<String, u64>>,
     return_backoff: Mutex<HashMap<String, (u64, u64)>>,
     /// Whether this computer can reach the account, from the lease loop's own
-    /// calls (`reach`): since when it has answered without a gap (0: not now),
-    /// and when it last answered with a server error.
+    /// calls (`reach`): since when it has answered without a gap (0: not now).
     reachable_since: AtomicU64,
-    erroring_at: AtomicU64,
     /// The daemon-owned reverse link to the keeper (`reach::Link`).
     link: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Projects being brought back here ("Run here", or the cloud could not
@@ -540,7 +538,6 @@ impl ProState {
             remote_since: Mutex::new(HashMap::new()),
             return_backoff: Mutex::new(HashMap::new()),
             reachable_since: AtomicU64::new(0),
-            erroring_at: AtomicU64::new(0),
             link: Mutex::new(None),
             reclaim: Mutex::new(Default::default()),
             return_pass: AtomicU64::new(0),
@@ -625,8 +622,6 @@ pub(crate) fn may_write(state: &crate::AppState, workspace: &str) -> bool {
         _ => true,
     }
 }
-#[cfg(test)]
-pub(crate) use execution::expired_lease_fixture as expire_execution_fixture;
 /// Execution has a stricter lease boundary than local file editing.
 #[cfg(any(test, feature = "daemon-extension-fixture"))]
 pub(crate) use execution::install_fixture as install_execution_fixture;
@@ -645,9 +640,10 @@ pub(crate) use execution::{
     refused_fixture as refuse_renewal_fixture, renewed_fixture as renew_execution_fixture,
     resumed_fixture as resume_execution_fixture, worker_fixture as worker_execution_fixture,
 };
-/// The account answered the lease loop with a server error just now.
+/// The account itself answered the lease loop with a server error (its own
+/// marker) just now.
 #[cfg(test)]
-pub(crate) fn account_erroring_fixture(state: &crate::AppState) {
+pub(crate) fn account_failing_fixture(state: &crate::AppState) {
     reach::answered(state, 503, true);
 }
 /// The user signed out on this computer (as `/pro/disconnect` records it).

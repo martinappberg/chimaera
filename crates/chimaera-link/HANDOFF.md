@@ -416,12 +416,14 @@ account's lease is 60 seconds and it refuses anyone else's takeover for a
 15-second grace after expiry (`failover_grace_seconds`). A computer's local
 deadline ends 15 seconds before the account's expiry, and at that deadline the
 computer stops its own managed agents (plain shells are never managed), so a
-turn never runs in two places. While the account answers with server errors
-nobody can acquire through it, and the computer keeps its own work running.
-The account marks every answer it gives, errors included, with
-`X-Chimaera-Account: 1`; a 5xx without it (a proxy, captive portal or edge in
-between) proves nothing about the account and counts as not reaching it, as
-does a refused credential. A success or a 409 counts as reaching it. A project
+turn never runs in two places. Only a successful renewal moves that deadline:
+no answer, a refused credential and every server error fence at it, the
+account's own errors included, because its takeover runs apart from the
+requests that failed. If the account cannot be reached for about a minute,
+agents on the computer pause until it is reachable again; shells keep
+running. The account marks every answer it gives, errors included, with
+`X-Chimaera-Account: 1`, which only tells its own errors apart from a proxy's
+in the daemon's log. A success or a 409 counts as reaching it. A project
 whose "keep on this computer only" switch the account acknowledged holds no
 lease and is never fenced for one. The daemon renews up to 16 projects at once
 and waits for a pass at most 20 seconds; a slower project's renewal continues

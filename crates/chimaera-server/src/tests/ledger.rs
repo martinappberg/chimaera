@@ -384,9 +384,9 @@ async fn restart_deferred_sessions_resume_unless_another_owner_is_verified() {
             !state.chat.contains("s-restart-chat"),
             "unreachable account"
         );
-        pro::account_erroring_fixture(&state);
+        pro::account_failing_fixture(&state);
         pro::resume_unverified(&state).await;
-        assert!(!state.chat.contains("s-restart-chat"), "erroring account");
+        assert!(!state.chat.contains("s-restart-chat"), "failing account");
         // Signed out before the restart: the computer's own work resumes.
         pro::signed_out_fixture(&state);
         pro::resume_unverified(&state).await;

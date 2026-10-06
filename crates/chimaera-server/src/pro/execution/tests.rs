@@ -179,36 +179,33 @@ fn grant_replay_stale_generation_and_capability_downgrade_do_not_extend_deadline
     std::fs::remove_dir_all(root).unwrap();
 }
 /// A computer whose lease lapsed stops its own agents, like a cloud machine,
-/// so the cloud continues exactly once; unless the account itself answers
-/// with server errors, when nobody can acquire through it either.
+/// so the cloud continues exactly once, whatever the failure: the account
+/// answering with its own server errors on every renewal fences at the
+/// deadline too (review R4 B1), and so does a proxy's.
 #[test]
-fn device_lease_expiry_fences_its_own_agents_unless_the_account_is_erroring() {
-    let (state, _config, root) = fixture();
-    crate::pro::install_execution_fixture(&state, "w-a", 2).unwrap();
-    let lapse = |state: &AppState| {
+fn device_lease_expiry_fences_its_own_agents_whatever_the_account_answered() {
+    for from_account in [true, false] {
+        let (state, _config, root) = fixture();
+        crate::pro::install_execution_fixture(&state, "w-a", 2).unwrap();
+        // Every renewal of this lease got a 503 (with or without the
+        // account's marker); nothing moved the deadline.
+        for _ in 0..3 {
+            crate::pro::reach::answered(&state, 503, from_account);
+        }
+        assert!(expire(&state, 0).is_empty(), "the deadline has not passed");
         lock(&state.pro.execution.proofs)
             .get_mut("w-a")
             .unwrap()
             .deadline = lease::Deadline::expired_fixture();
-    };
-    lapse(&state);
-    // The account answering 5xx: the computer keeps its own work.
-    crate::pro::account_erroring_fixture(&state);
-    assert!(expire(&state, 0).is_empty());
-    assert!(crate::pro::may_execute(&state, "w-a"));
-    assert!(!lease_valid(&state, "w-a"), "publication waits for renewal");
-    // A 5xx from a proxy, captive portal or edge (no account marker) proves
-    // nothing about the account: fenced at the deadline, as unreachable.
-    state.pro.erroring_at.store(0, Ordering::Release);
-    crate::pro::reach::answered(&state, 502, false);
-    assert!(!crate::pro::reach::erroring(&state));
-    assert_eq!(expire(&state, 0), vec!["w-a"]);
-    assert!(!crate::pro::may_execute(&state, "w-a"));
-    assert!(crate::pro::validate_execution_scope(&state, "w-a", 2).is_err());
-    // Its own sessions stay resumable once it holds the project again.
-    assert!(!lock(&state.pro.preferences)["w-a"].execution_uncertain);
-    assert!(resume_allowed(&state, "w-a"));
-    std::fs::remove_dir_all(root).unwrap();
+        crate::pro::reach::answered(&state, 503, from_account);
+        assert_eq!(expire(&state, 0), vec!["w-a"], "marked={from_account}");
+        assert!(!crate::pro::may_execute(&state, "w-a"));
+        assert!(crate::pro::validate_execution_scope(&state, "w-a", 2).is_err());
+        // Its own sessions stay resumable once it holds the project again.
+        assert!(!lock(&state.pro.preferences)["w-a"].execution_uncertain);
+        assert!(resume_allowed(&state, "w-a"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 /// A computer that thaws before anyone could have taken its project renews
 /// first and keeps running; one that thaws later is fenced at once.
