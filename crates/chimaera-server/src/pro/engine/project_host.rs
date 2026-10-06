@@ -212,7 +212,8 @@ impl ProjectOwner {
         Ok(ProjectBaton::capture(response.json()?))
     }
     /// The lease loop's own account calls are what "reachable" means
-    /// (`reach`): any answer counts, a server error or no answer does not.
+    /// (`reach`): a success or a 409 counts; a refusal, any server error
+    /// (the account's own included) or no answer does not.
     fn reached(
         &self,
         response: Result<super::super::transport::Response>,

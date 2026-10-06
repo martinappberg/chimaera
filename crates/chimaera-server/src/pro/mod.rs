@@ -628,9 +628,11 @@ pub(crate) fn may_write(state: &crate::AppState, workspace: &str) -> bool {
             | Ownership::SettingUp { .. }
             | Ownership::Transferring { .. },
         ) => false,
-        // Unverified after a restart, wake or failed flush: a device keeps
-        // working until an authenticated read shows another owner, unless a
-        // checkpoint install is already scheduled (before its own fence).
+        // Unverified after a restart, wake or failed flush: a device's file
+        // writes and shells keep working until an authenticated read shows
+        // another owner, unless a checkpoint install is already scheduled
+        // (before its own fence). Its agents wait for that verification
+        // (`execution::allows`).
         Some(Ownership::AwaitingVerification { .. }) => {
             !execution::worker(state) && !crate::lock(&state.pro.installing).contains(workspace)
         }
