@@ -84,13 +84,12 @@ End the PR body with an accurate agent trailer. For Codex:
 
 Claude Code uses its corresponding Claude Code trailer instead.
 
-**Landing it.** With squash auto-merge on, you don't merge `origin/main` in by
-hand just to catch up: `main` requires branches to be up to date, and
-`.github/workflows/pr-auto-update.yml` brings the oldest pull request with
-auto-merge that fell behind up to date after each merge, one at a time, so it
-lands on its own. Merge `origin/main` in yourself only to resolve a conflict (the
-PR says it has conflicts), which the workflow can't. A PR whose required checks
-fail is skipped until it's fixed.
+**Landing it.** `main` doesn't require branches to be up to date, so a PR with
+squash auto-merge on lands as soon as its required checks (`ui`, `rust`, `cla`)
+pass, however far behind it is. Merge `origin/main` in yourself only to resolve a
+conflict (the PR says it has conflicts). The merged tree is tested by `main`'s own
+CI run, and a release only ships a commit that run passed on, so a merge that
+breaks `main` holds releases back until a fix lands; fix forward.
 
 ## After merge
 

@@ -136,10 +136,7 @@ does not activate it. Rebuild, copy and reinstall the same version to iterate.
    write** and **Pull requests: Read and write**, saved as the repository
    secret `PLUGIN_LOCK_TOKEN`. Without it a run only reports the bump it would
    make (a warning). Replace it before it expires. The same secret lets
-   `.github/workflows/pr-auto-update.yml` bring pull requests with
-   auto-merge up to date with `main` (update-branch needs the same two
-   permissions), and `release.yml`'s `plugin-pins` job publish the plugin
-   pre-releases a new chimaera release pins (Contents on the plugin
+   `release.yml`'s `plugin-pins` job publish the plugin pre-releases a new chimaera release pins (Contents on the plugin
    repositories; a new plugin repository needs adding to the token).
 
 ## Rules

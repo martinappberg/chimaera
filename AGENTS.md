@@ -134,8 +134,9 @@ CI + releases are automatic. `ci.yml` (fmt/clippy/test + UI + musl cross-builds)
 gates every PR; `app.yml` build-checks the Tauri bundle when the app or server change.
 Releases ship in **daily batches**, not per merge: `release.yml` runs on a schedule
 (or by hand, `gh workflow run release.yml`), takes the newest `main` commit that
-passed CI, and publishes when any unreleased squash-commit subject requests a release. `pr-auto-update.yml` keeps pull requests with auto-merge up
-to date with `main` (which requires it), the oldest behind first, one at a time.
+passed CI, and publishes when any unreleased squash-commit subject requests a
+release. `main` doesn't require branches to be up to date: a PR merges once its
+required checks pass, and `main`'s own CI run is what a release waits on.
 Get the prefix right — or add `[skip release]` — via the
 **[ship-pr](.claude/skills/ship-pr/SKILL.md)** skill, which owns the exact version
 mapping and the no-release path.
