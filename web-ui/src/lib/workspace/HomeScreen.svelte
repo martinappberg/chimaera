@@ -93,6 +93,14 @@
     [...workspaces].sort((a, b) => (b.last_opened_at ?? 0) - (a.last_opened_at ?? 0)),
   );
 
+  /** Rows shown before "Show N more": the list stays short enough that the
+   *  remote machines below it are visible without scrolling. */
+  const WORKSPACE_PREVIEW = 5;
+  let showAllWorkspaces = $state(false);
+  const shownWorkspaces = $derived(
+    showAllWorkspaces ? sorted : sorted.slice(0, WORKSPACE_PREVIEW),
+  );
+
   /** Live rollup per workspace: total live sessions + how many need you. */
   const liveByWs = $derived.by(() => {
     const map = new Map<string, { live: number; attn: number }>();
@@ -774,7 +782,7 @@
         </div>
       {:else}
         <div class="rows">
-          {#each sorted as w (w.id)}
+          {#each shownWorkspaces as w (w.id)}
             {@const live = liveByWs.get(w.id)}
             {@const wsState = !daemonReachable ? "" : live && live.attn > 0 ? "attn" : live && live.live > 0 ? "alive" : ""}
             {#if confirmStopId === w.id}
@@ -825,16 +833,16 @@
                   {#if live !== undefined && live.attn > 0}
                     <span class="session-state" class:attention={daemonReachable} class:stale={!daemonReachable}>{live.attn} {daemonReachable ? "awaiting approval" : `approval${live.attn === 1 ? "" : "s"} last seen`}</span>
                   {:else if live !== undefined && live.live > 0}
-                    <span class="session-state" class:stale={!daemonReachable}>{live.live} {daemonReachable ? "live " : ""}session{live.live === 1 ? "" : "s"}{daemonReachable ? "" : " last seen"}</span>
-                  {/if}
-                  {#if live !== undefined && live.live > 0}
-                    <button
-                      class="side stop"
-                      title="end this workspace's {live.live} running session{live.live === 1
-                        ? ''
-                        : 's'}"
-                      onclick={() => (confirmStopId = w.id)}>End sessions</button
-                    >
+                    <span class="live-slot">
+                      <span class="session-state" class:stale={!daemonReachable}>{live.live} {daemonReachable ? "live " : ""}session{live.live === 1 ? "" : "s"}{daemonReachable ? "" : " last seen"}</span>
+                      <button
+                        class="side stop"
+                        title="end this workspace's {live.live} running session{live.live === 1
+                          ? ''
+                          : 's'}"
+                        onclick={() => (confirmStopId = w.id)}>End sessions</button
+                      >
+                    </span>
                   {/if}
                   <span class="when">{ago(w.last_opened_at)}</span>
                 </span>
@@ -858,6 +866,11 @@
               </div>
             {/if}
           {/each}
+          {#if sorted.length > WORKSPACE_PREVIEW}
+            <button class="more" onclick={() => (showAllWorkspaces = !showAllWorkspaces)}>
+              {showAllWorkspaces ? "Show fewer" : `Show ${sorted.length - WORKSPACE_PREVIEW} more`}
+            </button>
+          {/if}
         </div>
       {/if}
     </section>
@@ -1123,11 +1136,6 @@
                         </button>
                       </div>
                     </div>
-                  {:else if cluster}
-                    <!-- The login-node override is on, so the row connects to
-                         the login daemon as before; the cluster page (jobs)
-                         stays one click away. -->
-                    <div class="remote-ws">{@render jobsRow(h.alias)}</div>
                   {/if}
                 {/if}
                 </div>
@@ -1797,8 +1805,9 @@
 
   .workspaces .rows { border: 1px solid var(--edge); border-radius: 10px; padding: 5px; }
   .workspace-row, .host-row { padding-right: 8px; }
-  .workspace-row .row, .host-row .row { padding: 14px 12px; gap: 14px; }
-  .workspace-label { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 5px; }
+  .workspace-row .row, .host-row .row { padding: 9px 12px; gap: 14px; }
+  .workspace-row:hover, .host-row:hover { background: color-mix(in srgb, var(--row-hover) 45%, transparent); }
+  .workspace-label { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
   .workspace-label .name { max-width: none; font-family: inherit; font-weight: 550; font-size: var(--text-md); }
   .workspace-label .path, .workspace-label .phase { flex: none; font-size: var(--text-xs); }
   /* One quiet line ("1 live session · 2m ago"), vertically centred with the
@@ -1812,14 +1821,17 @@
   .session-state.stale { color: var(--muted); }
   .session-state { font-size: var(--text-xs); color: var(--accent); }
   .workspace-meta .when { font-family: inherit; font-size: var(--text-xs); margin-left: 0; }
+  .live-slot { display: inline-grid; align-items: center; justify-items: end; }
+  .live-slot > * { grid-area: 1 / 1; }
   .workspace-meta .side.stop {
-    display: none; visibility: visible; min-height: 0; height: 24px; padding: 0 8px; margin: -4px 0;
+    display: inline-flex; visibility: hidden; min-height: 0; height: 24px; padding: 0 8px; margin: -4px 0;
     border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent); border-radius: 6px;
     color: var(--warn); font-size: var(--text-xs); line-height: 1;
   }
-  .workspace-row:hover .workspace-meta .session-state:not(.attention) { display: none; }
-  .workspace-row:hover .workspace-meta .side.stop { display: inline-flex; align-items: center; }
-  .workspace-row:hover .workspace-meta .session-state.attention + .side.stop { display: none; }
+  .live-slot:hover .session-state { visibility: hidden; }
+  .live-slot:hover .side.stop { visibility: visible; }
+  .more { appearance: none; border: none; background: none; font: inherit; font-size: var(--text-xs); color: var(--muted); padding: 8px 12px; text-align: left; cursor: pointer; border-radius: 6px; }
+  .more:hover { color: var(--fg); }
   .workspace-meta .side.stop:hover { color: var(--err); border-color: color-mix(in srgb, var(--err) 55%, transparent); background: var(--row-active); }
   .host-card { border: 1px solid var(--edge); border-radius: 10px; padding: 5px; }
   .remotes .rows { gap: 10px; }
@@ -1828,7 +1840,7 @@
   .host-open { flex: none; font-size: var(--text-sm); color: var(--muted); }
   .host-open span { margin-left: 4px; }
   .host-row.connected, .workspace-row.live { background: transparent; }
-  .host-row.connected:hover, .workspace-row.live:hover { background: var(--row-hover); }
+  .host-row.connected:hover, .workspace-row.live:hover { background: color-mix(in srgb, var(--row-hover) 45%, transparent); }
   .remote-ws { margin: 0 9px 7px 26px; padding: 6px 0 0 12px; border-color: var(--edge); }
   .remote-ws .name { font-family: inherit; font-size: var(--text-sm); }
   .remote-ws .path, .remote-ws .when { font-size: var(--text-xs); }
