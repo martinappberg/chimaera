@@ -1,4 +1,4 @@
-//! The one workspace-admission hook shared daemon code consults. A composed
+//! The one hook shared daemon code consults about an extension. A composed
 //! extension installs its own [`WorkspacePolicy`]; without one the daemon
 //! uses [`Inert`]: everything is admitted, nothing is recorded, no timer or
 //! connection starts and no state file is written. The only thing an
@@ -6,12 +6,38 @@
 //! composed daemon may have left ([`fence`]), so a project that runs on
 //! another machine is not run twice, while its files stay readable here.
 //!
-//! Shared code never names the extension: it asks this module.
+//! Shared code never names the extension: it asks this module. The trait is
+//! wide on purpose (one hook per decision shared code cannot make itself),
+//! so it is laid out in groups. Each group names the shared modules that
+//! call it; a new hook joins the group whose callers it serves.
+//!
+//! | Group | Decides | Called from |
+//! |---|---|---|
+//! | Composition | whether an extension is here, its routes and layers, `/health` | `router`, `api`, `lifecycle` |
+//! | Admission | whether work may start or continue in a workspace | `chat`, `spawn`, `comms`, `exec`, `ws`, `ledger`, `download` |
+//! | Launch | what a child process is told and given | `spawn`, `chat`, `recents`, `update`, `launcher` |
+//! | Restore | which deferred sessions come back after a restart | `ledger` |
+//! | Presentation | what rows, sockets and refusals say about work elsewhere | `ws`, `session_view`, `api/sessions`, `api/workspaces`, `plugins` |
+//! | Routed projects | a project served by another daemon, seen from here | `ws`, `notices` |
+//! | Viewer scope | a forwarded viewer bound to one project and epoch | `workspace_scope` |
+//! | Agents | tools and notes the extension gives a project's agents | `mcp`, `plugins`, `agents`, `chat` |
+//! | Workspaces | registering and opening folders | `api/workspaces` |
+//!
+//! The handles the admission group hands back live in [`admission`]; the
+//! inert implementation in [`inert`].
 use std::{any::Any, future::Future, pin::Pin, sync::Arc};
 
 use crate::AppState;
 
+pub mod admission;
 pub mod fence;
+pub mod inert;
+
+pub use admission::{
+    Admission, AdmissionToken, Changed, Held, Hold, Installer, InstallerToken, Launch,
+    LaunchContext, LaunchKind, LaunchToken, Reservation,
+};
+pub use inert::Inert;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -26,222 +52,6 @@ pub enum Need {
     Restore,
 }
 
-/// The kind of process a launch starts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LaunchKind {
-    Agent,
-    Shell,
-}
-
-/// The admission changed between capture and use. The one error type
-/// callers match on (`err.is::<Changed>()`).
-#[derive(Debug)]
-pub struct Changed;
-impl std::fmt::Display for Changed {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("workspace execution authority changed")
-    }
-}
-impl std::error::Error for Changed {}
-
-/// A counted reservation held until a commit or child registration is
-/// done; dropping it releases. Opaque to shared code.
-pub struct Reservation {
-    _held: Box<dyn Any + Send + Sync>,
-}
-impl Reservation {
-    pub fn new(inner: impl Any + Send + Sync) -> Self {
-        Self {
-            _held: Box::new(inner),
-        }
-    }
-}
-
-/// A short synchronous hold (it may own a lock guard) kept until a child is
-/// registered or a read finished; never held across an await.
-pub struct Hold<'a> {
-    _held: Option<Box<dyn Held + 'a>>,
-}
-pub trait Held {}
-impl<T> Held for T {}
-impl<'a> Hold<'a> {
-    pub fn none() -> Self {
-        Self { _held: None }
-    }
-    pub fn new(inner: impl Held + 'a) -> Self {
-        Self {
-            _held: Some(Box::new(inner)),
-        }
-    }
-}
-
-/// An admission captured before asynchronous work and re-checked at the
-/// final commit. `None` inside is the inert admission: it only re-asks
-/// [`Need::Execute`].
-#[derive(Clone)]
-pub struct Admission {
-    workspace: String,
-    token: Option<Arc<dyn AdmissionToken>>,
-}
-pub trait AdmissionToken: Send + Sync {
-    fn check(&self, state: &AppState) -> anyhow::Result<()>;
-    /// The admission generation this was captured at: two admissions of the
-    /// same workspace and generation are the same authority.
-    fn generation(&self) -> u64;
-    fn begin(&self, state: &AppState) -> anyhow::Result<Option<Reservation>>;
-    /// The workspace's agents run under the policy's process ownership.
-    fn managed(&self, state: &AppState) -> bool;
-    fn installer<'a>(
-        &'a self,
-        state: &'a Arc<AppState>,
-        workspace: &'a str,
-    ) -> BoxFuture<'a, anyhow::Result<Installer>>;
-}
-impl Admission {
-    pub fn inert(workspace: &str) -> Self {
-        Self {
-            workspace: workspace.to_owned(),
-            token: None,
-        }
-    }
-    pub fn with(workspace: &str, token: Arc<dyn AdmissionToken>) -> Self {
-        Self {
-            workspace: workspace.to_owned(),
-            token: Some(token),
-        }
-    }
-    pub fn check(&self, state: &AppState) -> anyhow::Result<()> {
-        match &self.token {
-            Some(token) => token.check(state),
-            None if state.policy().allows(state, &self.workspace, Need::Execute) => Ok(()),
-            None => Err(Changed.into()),
-        }
-    }
-    pub fn managed(&self, state: &AppState) -> bool {
-        self.token
-            .as_ref()
-            .is_some_and(|token| token.managed(state))
-    }
-    pub fn generation(&self) -> u64 {
-        self.token.as_ref().map_or(0, |token| token.generation())
-    }
-    /// Check, then reserve the final dispatch.
-    pub fn begin(&self, state: &AppState) -> anyhow::Result<Option<Reservation>> {
-        match &self.token {
-            Some(token) => token.begin(state),
-            None => self.check(state).map(|()| None),
-        }
-    }
-    /// Admit an installer child under this admission.
-    pub async fn installer(
-        &self,
-        state: &Arc<AppState>,
-        workspace: &str,
-    ) -> anyhow::Result<Installer> {
-        match &self.token {
-            Some(token) => token.installer(state, workspace).await,
-            None => {
-                self.check(state)?;
-                Ok(Installer {
-                    admission: self.clone(),
-                    state: state.clone(),
-                    token: None,
-                })
-            }
-        }
-    }
-}
-
-/// An admitted installer process; its cleanup stays counted until finished.
-pub struct Installer {
-    admission: Admission,
-    state: Arc<AppState>,
-    token: Option<Box<dyn InstallerToken>>,
-}
-pub trait InstallerToken: Send + Sync {
-    /// Attach the spawned process group synchronously after spawn.
-    fn attach(&mut self, group: u32);
-    fn finish(self: Box<Self>) -> BoxFuture<'static, anyhow::Result<()>>;
-    /// The installer holds a setup reservation whose process group must be
-    /// drained on success.
-    fn guarded(&self) -> bool;
-}
-impl Installer {
-    pub fn with(
-        admission: Admission,
-        state: Arc<AppState>,
-        token: Box<dyn InstallerToken>,
-    ) -> Self {
-        Self {
-            admission,
-            state,
-            token: Some(token),
-        }
-    }
-    pub fn captured(&self) -> Admission {
-        self.admission.clone()
-    }
-    pub fn check(&self) -> anyhow::Result<()> {
-        self.admission.check(&self.state)
-    }
-    pub fn guarded(&self) -> bool {
-        self.token.as_ref().is_some_and(|token| token.guarded())
-    }
-    pub fn attach(&mut self, group: u32) {
-        if let Some(token) = &mut self.token {
-            token.attach(group);
-        }
-    }
-    pub async fn finish(mut self) -> anyhow::Result<()> {
-        match self.token.take() {
-            Some(token) => token.finish().await,
-            None => Ok(()),
-        }
-    }
-}
-
-/// One admitted launch, held until its child is registered.
-pub struct Launch {
-    token: Option<Box<dyn LaunchToken>>,
-}
-pub trait LaunchToken: Send + Sync {
-    /// The child runs under the policy's process ownership (a fenceable,
-    /// counted process group).
-    fn managed(&self) -> bool;
-    fn check(&self) -> anyhow::Result<()>;
-    fn registered(self: Box<Self>, id: String);
-}
-impl Launch {
-    pub fn inert() -> Self {
-        Self { token: None }
-    }
-    pub fn with(token: Box<dyn LaunchToken>) -> Self {
-        Self { token: Some(token) }
-    }
-    pub fn managed(&self) -> bool {
-        self.token.as_ref().is_some_and(|token| token.managed())
-    }
-    pub fn check(&self) -> anyhow::Result<()> {
-        self.token.as_ref().map_or(Ok(()), |token| token.check())
-    }
-    pub fn registered(self, id: String) {
-        if let Some(token) = self.token {
-            token.registered(id);
-        }
-    }
-}
-
-/// What a launch adds to an agent's start, beyond its environment.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct LaunchContext {
-    /// The agent continues work an interrupted earlier run left: its pick-up
-    /// says to check the files first.
-    pub recovery: bool,
-    /// The project's agents get the daemon's tools even in a terminal agent
-    /// that otherwise has none.
-    pub tools: bool,
-}
-
 /// A frame a project that runs on another daemon sends the window that
 /// watches it, in place of this daemon's own file, git and timeline
 /// watching.
@@ -254,8 +64,9 @@ pub enum ProjectFrame {
     Timeline(u64),
 }
 
-/// The live view of a routed project for one window (`routed`): ends when
-/// the project stops being served elsewhere or its owner refuses it.
+/// The live view of a routed project for one window
+/// ([`WorkspacePolicy::routed`]): ends when the project stops being served
+/// elsewhere or its owner refuses it.
 pub trait ProjectFeed: Send {
     fn workspace(&self) -> &str;
     /// The window's mounted previews and listed folders, in its own paths.
@@ -271,22 +82,56 @@ pub struct StartNote {
     /// Identifies the note's substance within one agent process, so two
     /// carriers racing at one start deliver it once.
     pub digest: u64,
-    /// The policy's own record of it, handed back in `note_told`.
+    /// The policy's own record of it, handed back in
+    /// [`WorkspacePolicy::note_told`].
     pub record: Box<dyn Any + Send + Sync>,
 }
 
-/// The workspace-admission hook. Implementations are trusted in-process.
-/// Every method must be cheap and must not block: shared code calls them on
-/// the reactor and on hot paths.
+/// The extension hook. Implementations are trusted in-process. Every
+/// method must be cheap and must not block: shared code calls them on the
+/// reactor and on hot paths. Asynchronous hooks return a [`BoxFuture`] so
+/// the trait stays object-safe.
 pub trait WorkspacePolicy: Send + Sync + 'static {
+    // ----------------------------------------------------------------------
+    // Composition: is an extension here, and what does it add to the app?
+    // ----------------------------------------------------------------------
+
     /// Whether an extension is composed here at all: only then does the
     /// daemon serve extension routes or add extension fields and frames.
     fn composed(&self, state: &AppState) -> bool;
     /// Whether this composition is doing paid work right now; shared code
     /// skips bookkeeping only an active extension reads (input stamps).
     fn active(&self, state: &AppState) -> bool;
+    /// After the state exists, before serving.
+    fn started(&self, state: &Arc<AppState>) -> anyhow::Result<()>;
+    /// The shutdown signal arrived.
+    fn stopping(&self, state: &AppState);
+    /// Daemon shutdown, after the live agents were stopped.
+    fn shutdown<'a>(&'a self, state: &'a Arc<AppState>) -> BoxFuture<'a, ()>;
+    /// Additive `/health` fields.
+    fn health(&self, state: &AppState, body: &mut serde_json::Value);
+    /// Routes served under `/api/v1`, behind the bearer check.
+    fn routes(&self, state: &Arc<AppState>) -> axum::Router<Arc<AppState>>;
+    /// The policy's own middleware around the authenticated API routes
+    /// (inside the bearer check): identity without an extension.
+    fn api_layers(
+        &self,
+        state: &Arc<AppState>,
+        api: axum::Router<Arc<AppState>>,
+    ) -> axum::Router<Arc<AppState>>;
+    /// The same around the ticket and WebSocket routes (outside it).
+    fn ticket_layers(
+        &self,
+        state: &Arc<AppState>,
+        routes: axum::Router<Arc<AppState>>,
+    ) -> axum::Router<Arc<AppState>>;
+    /// The outermost layer over the whole app.
+    fn outer_layers(&self, app: axum::Router) -> axum::Router;
 
-    // Admission.
+    // ----------------------------------------------------------------------
+    // Admission: may this work start or continue in this workspace?
+    // ----------------------------------------------------------------------
+
     fn allows(&self, state: &AppState, workspace: &str, need: Need) -> bool;
     /// Reserve a launch or input window synchronously.
     fn reserve(
@@ -322,8 +167,25 @@ pub trait WorkspacePolicy: Send + Sync + 'static {
     ) -> anyhow::Result<()>;
     /// Capture the admission an asynchronous dispatch commits under.
     fn capture(&self, state: &AppState, workspace: &str) -> anyhow::Result<Admission>;
+    /// The admission a local command in `workspace` commits under, when the
+    /// policy ties commands to a live lease; `None` admits by ownership alone.
+    fn capture_command(
+        &self,
+        state: &AppState,
+        workspace: &str,
+    ) -> anyhow::Result<Option<Admission>>;
+    /// Run a reserved request to its end under its reservation: a
+    /// disconnected observer never cancels it.
+    fn run_reserved<'a>(
+        &'a self,
+        reservation: Reservation,
+        operation: BoxFuture<'a, axum::response::Response>,
+    ) -> BoxFuture<'a, axum::response::Response>;
 
-    // What a launch carries.
+    // ----------------------------------------------------------------------
+    // Launch: what a child process is told and given.
+    // ----------------------------------------------------------------------
+
     fn launch_context(&self, state: &AppState, workspace: &str) -> LaunchContext;
     /// The child-process environment overlay, applied at the final spawn
     /// point under the launch's admission.
@@ -350,7 +212,30 @@ pub trait WorkspacePolicy: Send + Sync + 'static {
     /// it may go too.
     fn session_retired(&self, state: &AppState, session: &str);
 
-    // Presentation.
+    // ----------------------------------------------------------------------
+    // Restore: which deferred sessions come back after a restart.
+    // ----------------------------------------------------------------------
+
+    /// Restore deferred this entry (it is held, not restored).
+    fn held_at_boot(&self, state: &AppState, entry: &crate::ledger::LedgerEntry);
+    /// Restore finished.
+    fn restored(&self, state: &Arc<AppState>);
+    /// A deferred session may resume now.
+    fn may_resume(&self, state: &AppState, entry: &crate::ledger::LedgerEntry) -> bool;
+    /// The last check before a deferred session respawns.
+    fn resume_check(
+        &self,
+        state: &AppState,
+        entry: &crate::ledger::LedgerEntry,
+    ) -> anyhow::Result<()>;
+    /// Deferred sessions of `workspace` are resuming here: rows another
+    /// daemon served for it are no longer current.
+    fn workspace_resuming(&self, state: &AppState, workspace: &str);
+
+    // ----------------------------------------------------------------------
+    // Presentation: what rows, sockets and refusals say about work elsewhere.
+    // ----------------------------------------------------------------------
+
     /// Why session `id` has no process here (a frame for its socket and its
     /// row), when the policy knows.
     fn session_pause(
@@ -374,105 +259,11 @@ pub trait WorkspacePolicy: Send + Sync + 'static {
     ) -> Vec<serde_json::Value>;
     /// Additive fields on a listed workspace.
     fn decorate_workspace(&self, state: &AppState, workspace: &str, value: &mut serde_json::Value);
-    /// Additive `/health` fields.
-    fn health(&self, state: &AppState, body: &mut serde_json::Value);
 
-    // A forwarded viewer's project scope.
-    /// Admit a viewer bound to `workspace` at `epoch`: the admission its
-    /// reads prove and its writes reserve under.
-    fn scope_admission(
-        &self,
-        state: &AppState,
-        workspace: &str,
-        epoch: u64,
-    ) -> anyhow::Result<Admission>;
-    /// Whether `workspace` is served to a viewer at `epoch` right now.
-    fn scope_check(&self, state: &AppState, workspace: &str, epoch: u64) -> anyhow::Result<()>;
-    /// A scope this machine cannot admit yet only because its own renewal of
-    /// exactly `epoch` is still out.
-    fn scope_renewing(&self, state: &AppState, workspace: &str, epoch: u64) -> bool;
-    /// Wait for that renewal (bounded); `true` once a fresh proof exists. The
-    /// caller checks the scope again.
-    fn await_scope_renewal<'a>(
-        &'a self,
-        state: &'a AppState,
-        workspace: &'a str,
-        epoch: u64,
-    ) -> BoxFuture<'a, bool>;
-    /// The admission a local command in `workspace` commits under, when the
-    /// policy ties commands to a live lease; `None` admits by ownership alone.
-    fn capture_command(
-        &self,
-        state: &AppState,
-        workspace: &str,
-    ) -> anyhow::Result<Option<Admission>>;
-    /// Run a reserved request to its end under its reservation: a
-    /// disconnected observer never cancels it.
-    fn run_reserved<'a>(
-        &'a self,
-        reservation: Reservation,
-        operation: BoxFuture<'a, axum::response::Response>,
-    ) -> BoxFuture<'a, axum::response::Response>;
+    // ----------------------------------------------------------------------
+    // Routed projects: a project served by another daemon, seen from here.
+    // ----------------------------------------------------------------------
 
-    // What a project's agents are told and offered.
-    /// Tools the policy offers `session`'s agent; each replaces a plugin
-    /// tool of the same name.
-    fn tools(&self, state: &AppState, session: &str) -> Vec<serde_json::Value>;
-    /// Answer a call to one of [`Self::tools`]; `None` when `name` is not
-    /// the policy's.
-    fn call_tool<'a>(
-        &'a self,
-        state: &'a Arc<AppState>,
-        session: &'a str,
-        name: &'a str,
-        args: &'a serde_json::Value,
-    ) -> Option<BoxFuture<'a, serde_json::Value>>;
-    /// The policy's tools `workspace`'s agents use without asking.
-    fn auto_tools(&self, state: &AppState, workspace: &str) -> Vec<String>;
-    /// The note `session` (in `workspace`) carries as it starts, when it
-    /// has not heard it yet.
-    fn start_note<'a>(
-        &'a self,
-        state: &'a AppState,
-        workspace: &'a str,
-        session: &'a str,
-    ) -> BoxFuture<'a, Option<StartNote>>;
-    /// The note was delivered.
-    fn note_told<'a>(&'a self, state: &'a AppState, note: &'a StartNote) -> BoxFuture<'a, ()>;
-
-    // Workspaces.
-    /// Whether registering a folder reads its identity marker.
-    fn reads_folder_identity(&self, state: &AppState) -> bool;
-    /// The user opened a registered workspace here.
-    fn workspace_known(&self, state: &AppState, workspace: &str);
-    /// After a folder registered (`Some(write_marker)`) or a registered
-    /// workspace opened again (`None`).
-    fn workspace_opened<'a>(
-        &'a self,
-        state: &'a Arc<AppState>,
-        workspace: &'a crate::workspaces::Workspace,
-        registered: Option<bool>,
-    ) -> BoxFuture<'a, ()>;
-
-    // Lifecycle.
-    /// After the state exists, before serving.
-    fn started(&self, state: &Arc<AppState>) -> anyhow::Result<()>;
-    /// Restore deferred this entry (it is held, not restored).
-    fn held_at_boot(&self, state: &AppState, entry: &crate::ledger::LedgerEntry);
-    /// Restore finished.
-    fn restored(&self, state: &Arc<AppState>);
-    /// A deferred session may resume now.
-    fn may_resume(&self, state: &AppState, entry: &crate::ledger::LedgerEntry) -> bool;
-    /// The last check before a deferred session respawns.
-    fn resume_check(
-        &self,
-        state: &AppState,
-        entry: &crate::ledger::LedgerEntry,
-    ) -> anyhow::Result<()>;
-    /// The shutdown signal arrived.
-    fn stopping(&self, state: &AppState);
-    /// Daemon shutdown, after the live agents were stopped.
-    fn shutdown<'a>(&'a self, state: &'a Arc<AppState>) -> BoxFuture<'a, ()>;
     /// Whether `workspace`'s files are served by another daemon right now,
     /// so a window watches its feed instead of this disk.
     fn routed(&self, state: &AppState, workspace: &str) -> bool;
@@ -500,281 +291,79 @@ pub trait WorkspacePolicy: Send + Sync + 'static {
         auth: serde_json::Value,
         socket: &'a mut axum::extract::ws::WebSocket,
     ) -> BoxFuture<'a, bool>;
-    /// Deferred sessions of `workspace` are resuming here: rows another
-    /// daemon served for it are no longer current.
-    fn workspace_resuming(&self, state: &AppState, workspace: &str);
     /// Sessions another daemon serves that wait on a permission decision
     /// (`(session, workspace)`), so a relayed alert stays up until answered.
     fn routed_decisions(&self, state: &AppState) -> Vec<(String, String)>;
-    /// Routes served under `/api/v1`, behind the bearer check.
-    fn routes(&self, state: &Arc<AppState>) -> axum::Router<Arc<AppState>>;
-    /// The policy's own middleware around the authenticated API routes
-    /// (inside the bearer check): identity without an extension.
-    fn api_layers(
-        &self,
-        state: &Arc<AppState>,
-        api: axum::Router<Arc<AppState>>,
-    ) -> axum::Router<Arc<AppState>>;
-    /// The same around the ticket and WebSocket routes (outside it).
-    fn ticket_layers(
-        &self,
-        state: &Arc<AppState>,
-        routes: axum::Router<Arc<AppState>>,
-    ) -> axum::Router<Arc<AppState>>;
-    /// The outermost layer over the whole app.
-    fn outer_layers(&self, app: axum::Router) -> axum::Router;
-}
 
-/// No extension: admit everything, record nothing, run nothing.
-pub struct Inert {
-    fence: fence::Fence,
-}
-impl Inert {
-    pub fn new(fence: fence::Fence) -> Self {
-        Self { fence }
-    }
-}
-impl WorkspacePolicy for Inert {
-    fn composed(&self, _: &AppState) -> bool {
-        false
-    }
-    fn active(&self, _: &AppState) -> bool {
-        false
-    }
-    fn allows(&self, _: &AppState, workspace: &str, _: Need) -> bool {
-        !self.fence.fenced(workspace)
-    }
-    fn reserve(
+    // ----------------------------------------------------------------------
+    // Viewer scope: a forwarded viewer bound to one project and epoch.
+    // ----------------------------------------------------------------------
+
+    /// Admit a viewer bound to `workspace` at `epoch`: the admission its
+    /// reads prove and its writes reserve under.
+    fn scope_admission(
         &self,
         state: &AppState,
         workspace: &str,
-        kind: LaunchKind,
-    ) -> anyhow::Result<Option<Reservation>> {
-        let need = match kind {
-            LaunchKind::Agent => Need::Execute,
-            LaunchKind::Shell => Need::Shell,
-        };
-        if self.allows(state, workspace, need) {
-            Ok(None)
-        } else {
-            Err(Changed.into())
-        }
-    }
-    fn admit_launch<'a>(
-        &'a self,
-        state: &'a Arc<AppState>,
-        workspace: &'a str,
-        kind: LaunchKind,
-    ) -> BoxFuture<'a, anyhow::Result<(Launch, Option<Reservation>)>> {
-        Box::pin(async move {
-            self.reserve(state, workspace, kind)?;
-            Ok((Launch::inert(), None))
-        })
-    }
-    fn hold_session<'a>(
-        &'a self,
-        _: &'a AppState,
-        _: &str,
-        _: &str,
-        _: Option<&str>,
-        _: bool,
-    ) -> anyhow::Result<Hold<'a>> {
-        Ok(Hold::none())
-    }
-    fn check_import(&self, _: &AppState, _: &str, _: Option<&str>) -> anyhow::Result<()> {
-        Ok(())
-    }
-    fn capture(&self, state: &AppState, workspace: &str) -> anyhow::Result<Admission> {
-        let admission = Admission::inert(workspace);
-        admission.check(state)?;
-        Ok(admission)
-    }
-    fn launch_context(&self, _: &AppState, _: &str) -> LaunchContext {
-        LaunchContext::default()
-    }
-    fn launch_env<'a>(
-        &'a self,
-        _: &'a AppState,
-        _: &'a str,
-        _: &'a mut Vec<(String, String)>,
-        _: &'a mut Vec<String>,
-    ) -> BoxFuture<'a, anyhow::Result<()>> {
-        Box::pin(async { Ok(()) })
-    }
-    fn updates_managed(&self, _: &AppState) -> bool {
-        false
-    }
-    fn codex_notify_args<'a>(
-        &'a self,
-        _: &'a AppState,
-        _: &'a str,
-        _: &'a str,
-        _: &'a str,
-    ) -> BoxFuture<'a, Vec<String>> {
-        Box::pin(async { Vec::new() })
-    }
-    fn session_retired(&self, _: &AppState, _: &str) {}
-    fn session_pause(
-        &self,
-        _: &AppState,
-        _: &str,
-        _: Option<&crate::ledger::LedgerEntry>,
-    ) -> Option<serde_json::Value> {
-        None
-    }
-    fn owner(&self, _: &AppState, _: &str) -> Option<&'static str> {
-        None
-    }
-    fn refusal(&self, _: &AppState, _: &str, watching: bool) -> serde_json::Value {
-        if watching {
-            serde_json::json!({"type":"error","code":"read_only","reason":"watching",
-                "message":"You're watching. Take control to type."})
-        } else {
-            serde_json::json!({"type":"error","code":"read_only","reason":"elsewhere",
-                "message":"This project is not available here right now. That was not sent."})
-        }
-    }
-    fn acted(&self, _: &AppState, _: &str) {}
-    fn decorate_sessions(
-        &self,
-        _: &AppState,
-        _: &mut Vec<(u64, serde_json::Value)>,
-    ) -> Vec<serde_json::Value> {
-        Vec::new()
-    }
-    fn decorate_workspace(&self, _: &AppState, _: &str, _: &mut serde_json::Value) {}
-    fn health(&self, _: &AppState, _: &mut serde_json::Value) {}
-    fn scope_admission(&self, _: &AppState, _: &str, _: u64) -> anyhow::Result<Admission> {
-        Err(Changed.into())
-    }
-    fn scope_check(&self, _: &AppState, _: &str, _: u64) -> anyhow::Result<()> {
-        Err(Changed.into())
-    }
-    fn scope_renewing(&self, _: &AppState, _: &str, _: u64) -> bool {
-        false
-    }
+        epoch: u64,
+    ) -> anyhow::Result<Admission>;
+    /// Whether `workspace` is served to a viewer at `epoch` right now.
+    fn scope_check(&self, state: &AppState, workspace: &str, epoch: u64) -> anyhow::Result<()>;
+    /// A scope this machine cannot admit yet only because its own renewal of
+    /// exactly `epoch` is still out.
+    fn scope_renewing(&self, state: &AppState, workspace: &str, epoch: u64) -> bool;
+    /// Wait for that renewal (bounded); `true` once a fresh proof exists. The
+    /// caller checks the scope again.
     fn await_scope_renewal<'a>(
         &'a self,
-        _: &'a AppState,
-        _: &'a str,
-        _: u64,
-    ) -> BoxFuture<'a, bool> {
-        Box::pin(async { false })
-    }
-    fn capture_command(&self, _: &AppState, _: &str) -> anyhow::Result<Option<Admission>> {
-        Ok(None)
-    }
-    fn run_reserved<'a>(
-        &'a self,
-        reservation: Reservation,
-        operation: BoxFuture<'a, axum::response::Response>,
-    ) -> BoxFuture<'a, axum::response::Response> {
-        Box::pin(async move {
-            let _reservation = reservation;
-            operation.await
-        })
-    }
-    fn tools(&self, _: &AppState, _: &str) -> Vec<serde_json::Value> {
-        Vec::new()
-    }
+        state: &'a AppState,
+        workspace: &'a str,
+        epoch: u64,
+    ) -> BoxFuture<'a, bool>;
+
+    // ----------------------------------------------------------------------
+    // Agents: tools and notes the extension gives a project's agents.
+    // ----------------------------------------------------------------------
+
+    /// Tools the policy offers `session`'s agent; each replaces a plugin
+    /// tool of the same name.
+    fn tools(&self, state: &AppState, session: &str) -> Vec<serde_json::Value>;
+    /// Answer a call to one of [`Self::tools`]; `None` when `name` is not
+    /// the policy's.
     fn call_tool<'a>(
         &'a self,
-        _: &'a Arc<AppState>,
-        _: &'a str,
-        _: &'a str,
-        _: &'a serde_json::Value,
-    ) -> Option<BoxFuture<'a, serde_json::Value>> {
-        None
-    }
-    fn auto_tools(&self, _: &AppState, _: &str) -> Vec<String> {
-        Vec::new()
-    }
+        state: &'a Arc<AppState>,
+        session: &'a str,
+        name: &'a str,
+        args: &'a serde_json::Value,
+    ) -> Option<BoxFuture<'a, serde_json::Value>>;
+    /// The policy's tools `workspace`'s agents use without asking.
+    fn auto_tools(&self, state: &AppState, workspace: &str) -> Vec<String>;
+    /// The note `session` (in `workspace`) carries as it starts, when it
+    /// has not heard it yet.
     fn start_note<'a>(
         &'a self,
-        _: &'a AppState,
-        _: &'a str,
-        _: &'a str,
-    ) -> BoxFuture<'a, Option<StartNote>> {
-        Box::pin(async { None })
-    }
-    fn note_told<'a>(&'a self, _: &'a AppState, _: &'a StartNote) -> BoxFuture<'a, ()> {
-        Box::pin(async {})
-    }
-    fn reads_folder_identity(&self, _: &AppState) -> bool {
-        false
-    }
-    fn workspace_known(&self, _: &AppState, _: &str) {}
+        state: &'a AppState,
+        workspace: &'a str,
+        session: &'a str,
+    ) -> BoxFuture<'a, Option<StartNote>>;
+    /// The note was delivered.
+    fn note_told<'a>(&'a self, state: &'a AppState, note: &'a StartNote) -> BoxFuture<'a, ()>;
+
+    // ----------------------------------------------------------------------
+    // Workspaces: registering and opening folders.
+    // ----------------------------------------------------------------------
+
+    /// Whether registering a folder reads its identity marker.
+    fn reads_folder_identity(&self, state: &AppState) -> bool;
+    /// The user opened a registered workspace here.
+    fn workspace_known(&self, state: &AppState, workspace: &str);
+    /// After a folder registered (`Some(write_marker)`) or a registered
+    /// workspace opened again (`None`).
     fn workspace_opened<'a>(
         &'a self,
-        _: &'a Arc<AppState>,
-        _: &'a crate::workspaces::Workspace,
-        _: Option<bool>,
-    ) -> BoxFuture<'a, ()> {
-        Box::pin(async {})
-    }
-    fn started(&self, _: &Arc<AppState>) -> anyhow::Result<()> {
-        Ok(())
-    }
-    fn held_at_boot(&self, _: &AppState, _: &crate::ledger::LedgerEntry) {}
-    fn restored(&self, _: &Arc<AppState>) {}
-    fn may_resume(&self, _: &AppState, entry: &crate::ledger::LedgerEntry) -> bool {
-        !self.fence.fenced(&entry.workspace_id)
-    }
-    fn resume_check(&self, _: &AppState, _: &crate::ledger::LedgerEntry) -> anyhow::Result<()> {
-        Ok(())
-    }
-    fn stopping(&self, _: &AppState) {}
-    fn shutdown<'a>(&'a self, _: &'a Arc<AppState>) -> BoxFuture<'a, ()> {
-        Box::pin(async {})
-    }
-    fn routed(&self, _: &AppState, _: &str) -> bool {
-        false
-    }
-    fn outside_project(&self, _: &AppState, _: &str, paths: &[String]) -> Vec<String> {
-        paths.to_vec()
-    }
-    fn project_feed(
-        &self,
-        _: &Arc<AppState>,
-        _: &str,
-        _: Vec<String>,
-        _: Vec<String>,
-    ) -> Option<Box<dyn ProjectFeed>> {
-        None
-    }
-    fn proxy_socket<'a>(
-        &'a self,
-        _: &'a Arc<AppState>,
-        _: &'a str,
-        _: &'a str,
-        _: &'a crate::ws::SocketOptions,
-        _: serde_json::Value,
-        _: &'a mut axum::extract::ws::WebSocket,
-    ) -> BoxFuture<'a, bool> {
-        Box::pin(async { false })
-    }
-    fn workspace_resuming(&self, _: &AppState, _: &str) {}
-    fn routed_decisions(&self, _: &AppState) -> Vec<(String, String)> {
-        Vec::new()
-    }
-    fn routes(&self, _: &Arc<AppState>) -> axum::Router<Arc<AppState>> {
-        axum::Router::new()
-    }
-    fn api_layers(
-        &self,
-        _: &Arc<AppState>,
-        api: axum::Router<Arc<AppState>>,
-    ) -> axum::Router<Arc<AppState>> {
-        api
-    }
-    fn ticket_layers(
-        &self,
-        _: &Arc<AppState>,
-        routes: axum::Router<Arc<AppState>>,
-    ) -> axum::Router<Arc<AppState>> {
-        routes
-    }
-    fn outer_layers(&self, app: axum::Router) -> axum::Router {
-        app
-    }
+        state: &'a Arc<AppState>,
+        workspace: &'a crate::workspaces::Workspace,
+        registered: Option<bool>,
+    ) -> BoxFuture<'a, ()>;
 }
