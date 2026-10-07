@@ -105,9 +105,11 @@ async fn run(
         generation == state.pro.generation.load(Ordering::Acquire),
         "account changed during recovery"
     );
-    lock(&state.pro.ownership).insert(
-        grant.workspace_id.clone(),
-        Ownership::Local { epoch: grant.epoch },
+    crate::pro::transition::set_ownership(
+        state,
+        &grant.workspace_id,
+        Some(Ownership::Local { epoch: grant.epoch }),
+        "recovery",
     );
     let config = Configure {
         recovery: true,
@@ -135,9 +137,11 @@ async fn run(
         generation == state.pro.generation.load(Ordering::Acquire),
         "account changed during recovery"
     );
-    lock(&state.pro.ownership).insert(
-        grant.workspace_id.clone(),
-        Ownership::AwaitingVerification { epoch: grant.epoch },
+    crate::pro::transition::set_ownership(
+        state,
+        &grant.workspace_id,
+        Some(Ownership::AwaitingVerification { epoch: grant.epoch }),
+        "recovery",
     );
     lock(&state.pro.preferences)
         .get_mut(&grant.workspace_id)

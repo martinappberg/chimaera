@@ -24,9 +24,10 @@ use std::{
     time::Duration,
 };
 
-/// What a "Run in the cloud" handover may spend: nothing is about to freeze
-/// this computer, and a release the account confirms beats one that lapses.
-const BUDGET: Duration = Duration::from_secs(90);
+/// What the local save of a "Run in the cloud" may spend: nothing is about
+/// to freeze this computer, and a release the account confirms beats one that
+/// lapses. The transfer as a whole runs on `moving::transfer_deadline`.
+const BUDGET: Duration = Duration::from_secs(30);
 
 /// Why work is not where it would be. A closed set of plain categories: never
 /// error text or identifiers.
@@ -45,6 +46,12 @@ pub(super) enum Reason {
     ConversationNotSaved,
     /// This computer does not hold the project's current copy yet.
     NotSyncedYet,
+    /// A hand-over to the cloud that nobody took within its deadline: the
+    /// project came back here and runs here (`moving`).
+    CouldNotMoveToCloud,
+    /// A return whose restore failed every try: the project runs here with
+    /// the files it has; the cloud's latest changes are kept for review.
+    CloudChangesKept,
 }
 
 impl Reason {
@@ -107,6 +114,11 @@ impl Reasons {
     }
     pub(super) fn get(&self, workspace: &str) -> Option<Reason> {
         lock(&self.0).get(workspace).map(|(reason, _)| *reason)
+    }
+    /// A reason this computer decided (a deadline): shown until the account's
+    /// next read replaces or clears it.
+    pub(super) fn set_here(&self, workspace: &str, reason: Reason) {
+        self.set(workspace, reason, false);
     }
     pub(super) fn clear(&self) {
         lock(&self.0).clear();
@@ -188,20 +200,55 @@ pub(super) fn place(state: &AppState, workspace: &str) -> serde_json::Value {
     }
 }
 
+/// The transfer under way for a project's status row (`moving`): its
+/// direction, the step it is at (derived from ownership, not a new state) and
+/// when it was triggered. Null when nothing is moving.
+pub(super) fn moving(state: &AppState, workspace: &str) -> serde_json::Value {
+    let Some(since_ms) = super::moving::started(state, workspace) else {
+        return serde_json::Value::Null;
+    };
+    let ownership = lock(&state.pro.ownership).get(workspace).cloned();
+    let (direction, step) = match ownership {
+        Some(Ownership::Transferring { .. } | Ownership::Local { .. }) => (
+            "cloud",
+            if lock(&state.pro.sleeping).contains(workspace) {
+                "saving_here"
+            } else {
+                "starting_in_cloud"
+            },
+        ),
+        Some(Ownership::Remote { .. }) => (
+            "here",
+            if super::moving::retry(state, workspace).busy_ms > 0 {
+                "waiting_for_reply"
+            } else {
+                "saving_in_cloud"
+            },
+        ),
+        Some(_) => ("here", "restoring_here"),
+        None => return serde_json::Value::Null,
+    };
+    json!({"direction": direction, "step": step, "since_ms": since_ms})
+}
+
 /// Starts bringing one project back to this computer: unparked; a release
 /// nobody took is re-acquired at its own epoch (`Transferring` →
 /// `AwaitingVerification`, no install, no fork), one the cloud holds comes
 /// home at its next pause (`reclaim`, `lazy_handback`, conflicts kept in both
 /// versions). Returns whether its stopped sessions resume here at once (a
 /// release that never went out). The caller persists.
-fn bring_back(state: &AppState, workspace: &str) -> bool {
+pub(super) fn bring_back(state: &AppState, workspace: &str) -> bool {
+    super::moving::begin(state, workspace);
     super::unpark(state, workspace);
     {
         let mut ownership = lock(&state.pro.ownership);
         if let Some(Ownership::Transferring { epoch }) = ownership.get(workspace).cloned() {
-            ownership.insert(
-                workspace.to_owned(),
-                Ownership::AwaitingVerification { epoch },
+            super::transition::apply(
+                state,
+                &mut ownership,
+                workspace,
+                Some(Ownership::AwaitingVerification { epoch }),
+                "brought_back",
             );
         }
     }
@@ -709,6 +756,67 @@ mod tests {
         );
         drop(state);
         tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A transfer's status: null until a trigger starts it; then its
+    /// direction and step follow ownership; a settled ownership ends it.
+    #[tokio::test]
+    async fn moving_follows_the_transfer_from_trigger_to_settled() {
+        let (state, root) = fixture("moving");
+        assert_eq!(moving(&state, "w-a"), serde_json::Value::Null);
+        lock(&state.pro.ownership).insert("w-a".into(), Ownership::Transferring { epoch: 3 });
+        assert!(crate::pro::moving::begin(&state, "w-a"));
+        assert!(
+            !crate::pro::moving::begin(&state, "w-a"),
+            "an earlier trigger stands"
+        );
+        let row = moving(&state, "w-a");
+        assert_eq!(row["direction"], "cloud");
+        assert_eq!(row["step"], "starting_in_cloud");
+        assert!(row["since_ms"].as_u64().is_some());
+        lock(&state.pro.sleeping).insert("w-a".into());
+        assert_eq!(moving(&state, "w-a")["step"], "saving_here");
+        lock(&state.pro.sleeping).remove("w-a");
+        // The cloud took it: the hand-over settled, nothing is moving.
+        crate::pro::transition::set_ownership(
+            &state,
+            "w-a",
+            Some(Ownership::Remote {
+                epoch: 3,
+                holder: "m-1".into(),
+            }),
+            "test",
+        );
+        assert_eq!(moving(&state, "w-a"), serde_json::Value::Null);
+        // Bringing it back starts a new one; a mid-turn answer names the step.
+        assert!(!bring_back(&state, "w-a"));
+        assert_eq!(moving(&state, "w-a")["direction"], "here");
+        assert_eq!(moving(&state, "w-a")["step"], "saving_in_cloud");
+        crate::pro::moving::set_retry(
+            &state,
+            "w-a",
+            crate::pro::moving::Retry {
+                busy_ms: 1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(moving(&state, "w-a")["step"], "waiting_for_reply");
+        crate::pro::transition::set_ownership(
+            &state,
+            "w-a",
+            Some(Ownership::Hydrating { epoch: 4 }),
+            "test",
+        );
+        assert_eq!(moving(&state, "w-a")["step"], "restoring_here");
+        crate::pro::transition::set_ownership(
+            &state,
+            "w-a",
+            Some(Ownership::Local { epoch: 4 }),
+            "test",
+        );
+        assert_eq!(moving(&state, "w-a"), serde_json::Value::Null);
+        drop(state);
         let _ = std::fs::remove_dir_all(root);
     }
 

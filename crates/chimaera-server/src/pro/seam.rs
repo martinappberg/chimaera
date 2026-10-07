@@ -242,10 +242,15 @@ impl WorkspacePolicy for ProPolicy {
                 row["placement"] = json!("here");
                 // Additive: the one pause verdict transfers use, so a cloud
                 // machine's idle check never re-derives it from `agent_state`.
-                if let Some(id) = row["id"].as_str() {
+                if let Some(id) = row["id"].as_str().map(str::to_owned) {
                     let paused =
-                        super::activity::session(state, id) != super::activity::Activity::Working;
+                        super::activity::session(state, &id) != super::activity::Activity::Working;
                     row["at_pause"] = json!(paused);
+                    // Additive: a deadline brought it home before the cloud
+                    // finished its turn; gone once the user acts here.
+                    if crate::lock(&state.pro.unfinished).contains_key(&id) {
+                        row["unfinished_in"] = json!("cloud");
+                    }
                 }
             }
         }

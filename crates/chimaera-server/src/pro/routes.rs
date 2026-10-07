@@ -405,26 +405,24 @@ pub(crate) async fn disconnect(State(state): State<Arc<AppState>>) -> Response {
     let mut dropped = Vec::new();
     let mut returned: Vec<String> = {
         let mut ownership = lock(&state.pro.ownership);
-        ownership.retain(|id, owner| {
-            let local = matches!(owner, Ownership::Local { .. });
-            if local {
-                dropped.push(id.clone());
-            }
-            !local
-        });
         let mut returned = Vec::new();
-        for (id, owner) in ownership.iter_mut() {
-            match owner {
+        for (id, owner) in ownership.clone() {
+            let next = match owner {
+                Ownership::Local { .. } => {
+                    dropped.push(id.clone());
+                    None
+                }
                 Ownership::Transferring { epoch } => {
-                    *owner = Ownership::AwaitingVerification { epoch: *epoch };
                     returned.push(id.clone());
+                    Some(Ownership::AwaitingVerification { epoch })
                 }
                 Ownership::Hydrating { epoch } | Ownership::SettingUp { epoch } if device => {
-                    *owner = Ownership::AwaitingVerification { epoch: *epoch };
                     returned.push(id.clone());
+                    Some(Ownership::AwaitingVerification { epoch })
                 }
-                _ => {}
-            }
+                owner => Some(owner),
+            };
+            super::transition::apply(&state, &mut ownership, &id, next, "signed_out");
         }
         returned
     };
@@ -517,7 +515,7 @@ pub(crate) async fn status(State(state): State<Arc<AppState>>) -> Json<serde_jso
     // that needed it, or why "Run in the cloud" could not start), and the
     // two choices that apply now, `run_here` and `run_in_cloud`.
     Json(
-        json!({"configured":state.pro.configured.load(Ordering::Acquire) && !renewal_failed,"renewal_failed":renewal_failed,"workspace_configuration":authority.acknowledgment(),"projects_root":super::projects_root(&state),"projects_root_confirmed":lock(&state.pro.projects_root).is_some(),"sessions":sessions,"workspaces":workspaces.into_iter().filter(|workspace| authority.allows(&workspace.id)).take(128).map(|workspace|json!({"workspace_id":workspace.id,"name":workspace.name,"root":workspace.root,"never_mirror":preferences.get(&workspace.id).is_some_and(|p|p.never_mirror),"privacy_pending":preferences.get(&workspace.id).is_some_and(|p|p.privacy_pending),"ownership":ownership.get(&workspace.id),"continuity":preferences.get(&workspace.id).and_then(|p|p.continuity.as_ref()),"local_copy":super::local_copy_view(&state,&workspace.id),"git_staging":preferences.get(&workspace.id).and_then(|p|p.git_staging.as_ref()),"execution_allowed":super::may_execute(&state,&workspace.id),"bundle_import":state.bundle_imports.view(&workspace.id),"execution_uncertain":preferences.get(&workspace.id).is_some_and(|p|p.execution_uncertain),"mirror":statuses.get(&workspace.id),"blocked_providers":statuses.get(&workspace.id).map(|status|status.blocked_providers.clone()).unwrap_or_default(),"git_branches":preferences.get(&workspace.id).map(|p|&p.git_branches),"place":super::place::place(&state,&workspace.id),"reason":state.pro.reasons.get(&workspace.id),"run_here":super::place::may_run_here(&state,config.as_ref(),&workspace.id),"run_in_cloud":!renewal_failed && super::place::may_run_in_cloud(&state,config.as_ref(),&workspace.id)})).collect::<Vec<_>>()}),
+        json!({"configured":state.pro.configured.load(Ordering::Acquire) && !renewal_failed,"renewal_failed":renewal_failed,"workspace_configuration":authority.acknowledgment(),"projects_root":super::projects_root(&state),"projects_root_confirmed":lock(&state.pro.projects_root).is_some(),"sessions":sessions,"workspaces":workspaces.into_iter().filter(|workspace| authority.allows(&workspace.id)).take(128).map(|workspace|json!({"workspace_id":workspace.id,"name":workspace.name,"root":workspace.root,"never_mirror":preferences.get(&workspace.id).is_some_and(|p|p.never_mirror),"privacy_pending":preferences.get(&workspace.id).is_some_and(|p|p.privacy_pending),"ownership":ownership.get(&workspace.id),"continuity":preferences.get(&workspace.id).and_then(|p|p.continuity.as_ref()),"local_copy":super::local_copy_view(&state,&workspace.id),"git_staging":preferences.get(&workspace.id).and_then(|p|p.git_staging.as_ref()),"execution_allowed":super::may_execute(&state,&workspace.id),"bundle_import":state.bundle_imports.view(&workspace.id),"execution_uncertain":preferences.get(&workspace.id).is_some_and(|p|p.execution_uncertain),"mirror":statuses.get(&workspace.id),"blocked_providers":statuses.get(&workspace.id).map(|status|status.blocked_providers.clone()).unwrap_or_default(),"git_branches":preferences.get(&workspace.id).map(|p|&p.git_branches),"place":super::place::place(&state,&workspace.id),"reason":state.pro.reasons.get(&workspace.id),"run_here":super::place::may_run_here(&state,config.as_ref(),&workspace.id),"run_in_cloud":!renewal_failed && super::place::may_run_in_cloud(&state,config.as_ref(),&workspace.id),"moving":super::place::moving(&state,&workspace.id)})).collect::<Vec<_>>(),"now_ms":super::moving::now_ms()}),
     )
 }
 /// A project a sleep flush or "Run in the cloud" may hand over: this computer owns it, the
@@ -563,7 +561,13 @@ pub(crate) async fn privacy(
             ownership.get(&request.workspace_id),
             Some(Ownership::Local { .. })
         ) {
-            ownership.remove(&request.workspace_id);
+            super::transition::apply(
+                &state,
+                &mut ownership,
+                &request.workspace_id,
+                None,
+                "kept_on_this_computer",
+            );
         }
     }
     if request.never_mirror {
@@ -741,6 +745,12 @@ pub(super) async fn hand_over(
             quiet.push(workspace.id);
         }
     }
+    for id in active.iter().chain(quiet.iter()) {
+        super::moving::begin(state, id);
+    }
+    if let Err(error) = super::persist(state).await {
+        tracing::warn!(%error, "Could not save that projects are moving");
+    }
     // A listed project this computer cannot hand over (not owned here, kept
     // on this computer, unknown) keeps working here; the caller hears so.
     let unavailable: Vec<String> = workspace_ids
@@ -821,9 +831,10 @@ pub(super) async fn woke(state: &Arc<AppState>) {
     lock(&state.pro.release_pending).clear();
     {
         let mut ownership = lock(&state.pro.ownership);
-        for owner in ownership.values_mut() {
+        for (id, owner) in ownership.clone() {
             if let Ownership::Transferring { epoch } = owner {
-                *owner = Ownership::AwaitingVerification { epoch: *epoch };
+                let verifying = Some(Ownership::AwaitingVerification { epoch });
+                super::transition::apply(state, &mut ownership, &id, verifying, "woke");
             }
         }
     }
@@ -1122,6 +1133,7 @@ fn handoff_refusal(
         return Some(detached::Outcome::refused(StatusCode::CONFLICT, None));
     }
     if !force && !engine::at_pause(state, workspace) {
+        super::transition::refused(workspace, epoch, "mid_turn");
         return Some(detached::Outcome::refused(
             StatusCode::CONFLICT,
             Some(json!({"error":"workspace_busy"})),

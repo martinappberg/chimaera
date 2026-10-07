@@ -16,7 +16,7 @@ use tokio::sync::watch;
 
 /// How long a request waits for the other computer to let go: the same bound
 /// a computer gives its agents to reach a pause once another owner is verified.
-pub(super) const BOUND: Duration = Duration::from_secs(300);
+pub(super) const BOUND: Duration = super::moving::DEADLINE;
 const LIMIT: usize = 32;
 /// Two readings of one request's time on this clock differ by the round trips
 /// that carried them; a new request from the same computer is further apart.
@@ -94,6 +94,8 @@ pub(crate) fn acted_here(state: &AppState, workspace: &str) {
     if workspace.is_empty() || lock(&state.pro.runtime).is_none() {
         return;
     }
+    // The user is working here again: nothing of it is unfinished elsewhere.
+    lock(&state.pro.unfinished).retain(|_, project| project != workspace);
     let mut acted = lock(&state.pro.moves.acted);
     if acted.len() >= 128 && !acted.contains_key(workspace) {
         acted.clear();
@@ -196,6 +198,7 @@ fn start(
     expected_epoch: Option<u64>,
     bound: Duration,
 ) -> Option<watch::Receiver<Outcome>> {
+    super::moving::begin(state, workspace);
     let mut pulls = lock(&state.pro.moves.pulls);
     if let Some(waiting) = pulls.get(workspace) {
         if *waiting.borrow() == Outcome::Waiting {

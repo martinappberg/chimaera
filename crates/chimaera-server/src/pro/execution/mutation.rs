@@ -153,9 +153,12 @@ impl ImportGuard {
         {
             return Err(Changed.into());
         }
-        ownership.insert(
-            self.workspace.clone(),
-            Ownership::SettingUp { epoch: self.epoch },
+        crate::pro::transition::apply(
+            state,
+            &mut ownership,
+            &self.workspace,
+            Some(Ownership::SettingUp { epoch: self.epoch }),
+            "setting_up",
         );
         Ok(())
     }

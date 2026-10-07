@@ -238,8 +238,9 @@ fn install_owned(
 }
 
 /// Upper bound on how long a device's agent may finish its turn after another
-/// owner was verified. Its input is already refused (`may_write`).
-const VERIFIED_OWNER_PAUSE_WAIT: u64 = 300;
+/// owner was verified. Its input is already refused (`may_write`). The one
+/// transfer deadline (`moving`).
+const VERIFIED_OWNER_PAUSE_WAIT: u64 = super::moving::DEADLINE.as_secs();
 
 /// A verified other owner fences input at once. A device's agents then stop at
 /// their next safe pause (or after a bounded wait) and are preserved for the
@@ -461,7 +462,13 @@ pub(super) async fn sleep_flush(
         let _configuration = state.pro.configuration.lock().await;
         let mut ownership = lock(&state.pro.ownership);
         if let Some(Ownership::Transferring { epoch }) = ownership.get(workspace).cloned() {
-            ownership.insert(workspace.into(), Ownership::AwaitingVerification { epoch });
+            super::transition::apply(
+                state,
+                &mut ownership,
+                workspace,
+                Some(Ownership::AwaitingVerification { epoch }),
+                "woke_during_flush",
+            );
         }
     }
     result
@@ -1082,9 +1089,11 @@ async fn hydrate_scoped(
     } else {
         None
     };
-    lock(&state.pro.ownership).insert(
-        workspace.into(),
-        Ownership::Hydrating { epoch: grant.epoch },
+    super::transition::set_ownership(
+        state,
+        workspace,
+        Some(Ownership::Hydrating { epoch: grant.epoch }),
+        "restoring",
     );
     super::persist(state).await?;
     let manifest = if let Some(receipt) = receipt {
@@ -1694,9 +1703,6 @@ fn sessions_at_work(
     }
     found
 }
-/// A device waits this long between automatic attempts to finish one return.
-const RETURN_BACKOFF_MAX: u64 = 1800;
-
 /// Whether the account reports this project's owner as a cloud machine that
 /// is suspended but keeps ownership (placement availability `suspended`).
 /// Passive: reading placement never wakes anything. Any failure reads as not
@@ -1729,6 +1735,7 @@ pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> 
     // next pause (the cloud refuses a hand-back while busy, and the next pass
     // asks again); work the cloud is not running returns at once (laptop
     // first). A project the user asked back ("Run here") does not wait.
+    overdue_handovers(state, config).await;
     let settled = super::reach::settled(state);
     let candidates: Vec<_> = lock(&state.pro.ownership)
         .iter()
@@ -1772,14 +1779,23 @@ pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> 
         {
             continue;
         }
-        if lock(&state.pro.return_backoff)
-            .get(&workspace)
-            .is_some_and(|(next, _)| *next > super::now())
-        {
+        let mut retry = super::moving::retry(state, &workspace);
+        if retry.next > super::now() {
             continue;
         }
+        // The first live attempt to bring cloud work home starts its deadline
+        // (a "Run here" or a wake may have started it already).
+        if holder.is_some() && super::moving::begin(state, &workspace) {
+            if let Err(error) = super::persist(state).await {
+                tracing::warn!(%error, "Could not save that a project is coming back");
+            }
+        }
+        let now_ms = super::moving::now_ms();
+        let overdue = super::moving::started(state, &workspace).is_some_and(|started| {
+            retry.deadline(started, now_ms) == super::moving::Deadline::Overdue
+        });
         // The cloud refused a hand-back because its conversation is mid-turn:
-        // asked again after a growing wait, not every pass.
+        // asked again a few seconds later, and its pause restarts the clock.
         let mut busy = false;
         let result = async {
             let operation_config = execution::effective(state, config, &workspace)?;
@@ -1849,6 +1865,8 @@ pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> 
                     });
                     match host {
                         Some(host) => {
+                            // Past the deadline the cloud yields now, with the
+                            // turn exported as it stands (`force`).
                             let prepared = handback::prepare(
                                 state,
                                 config,
@@ -1856,6 +1874,7 @@ pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> 
                                 &host,
                                 current,
                                 baton.epoch,
+                                overdue,
                             )
                             .await?;
                             busy = prepared.is_none();
@@ -1866,9 +1885,18 @@ pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> 
                 }
                 _ => None,
             };
+            if overdue && target.is_none() && !busy && !retry.requested {
+                // The cloud cannot be asked (no connection to it): the lease
+                // lapses on its own and the branch above takes the project.
+                super::transition::deadline(&workspace, Some(epoch), "return_overdue");
+                retry.requested = true;
+            }
             let Some(epoch) = target else {
                 return Ok::<_, anyhow::Error>(());
             };
+            if overdue && holder.is_some() {
+                mark_unfinished(state, &workspace);
+            }
             hydrate(state, config, &workspace, epoch, false, None)
                 .await
                 .context("Could not restore your saved work on this computer")?;
@@ -1881,16 +1909,11 @@ pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> 
         .await;
         match result {
             Ok(()) if busy => {
-                // Ten seconds doubling to thirty while the cloud works: at most half a
-                // minute late after its pause, three requests a minute at most.
-                let mut backoff = lock(&state.pro.return_backoff);
-                if backoff.len() >= 128 && !backoff.contains_key(&workspace) {
-                    backoff.clear();
-                }
-                let delay = backoff
-                    .get(&workspace)
-                    .map_or(10, |(_, delay)| (delay * 2).clamp(10, 30));
-                backoff.insert(workspace.clone(), (super::now() + delay, delay));
+                // Mid-turn in the cloud: the deadline runs from its pause, so
+                // the clock restarts at every busy answer.
+                retry.busy_ms = now_ms;
+                retry.next = super::now() + super::moving::BUSY_RETRY_SECS;
+                super::moving::set_retry(state, &workspace, retry);
             }
             Ok(()) => {
                 lock(&state.pro.return_backoff).remove(&workspace);
@@ -1899,30 +1922,114 @@ pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> 
                 }
             }
             Err(error) => {
-                {
-                    let mut backoff = lock(&state.pro.return_backoff);
-                    if backoff.len() >= 128 && !backoff.contains_key(&workspace) {
-                        backoff.clear();
-                    }
-                    // This computer's own unfinished return keeps its project
-                    // fenced here, so it retries quickly (15 s doubling to two
-                    // minutes); moving cloud work home can wait longer.
-                    let (first, most) = if holder.is_none() {
-                        (15, 120)
-                    } else {
-                        (120, RETURN_BACKOFF_MAX)
-                    };
-                    let delay = backoff
-                        .get(&workspace)
-                        .map_or(first, |(_, delay)| (delay * 2).min(most));
-                    backoff.insert(workspace.clone(), (super::now() + delay, delay));
+                retry.tries = retry.tries.saturating_add(1);
+                retry.next = super::now() + super::moving::RETRY_SECS;
+                // This computer already holds the lease: a restore that fails
+                // every try gives up and keeps the cloud's changes for review.
+                if holder.is_none() && retry.tries >= super::moving::RESTORE_TRIES {
+                    lock(&state.pro.return_backoff).remove(&workspace);
+                    record_error(state, &workspace, &error);
+                    restore_gave_up(state, &workspace, epoch).await;
+                } else {
+                    super::moving::set_retry(state, &workspace, retry);
+                    record_error(state, &workspace, &error);
+                    tracing::warn!(phase="automatic_return", try=retry.tries, error=%error, "Project return did not complete");
                 }
-                record_error(state, &workspace, &error);
-                tracing::warn!(phase="automatic_return", error=%error, "Project return did not complete");
             }
         }
     }
     Ok(())
+}
+
+/// A transfer to the cloud that nobody took within its deadline: the project
+/// is re-acquired here at its own epoch and resumes, with one reason.
+async fn overdue_handovers(state: &Arc<AppState>, config: &Configure) {
+    let now_ms = super::moving::now_ms();
+    let stale: Vec<(String, u64)> = lock(&state.pro.ownership)
+        .iter()
+        .filter_map(|(id, owner)| match owner {
+            Ownership::Transferring { epoch } => Some((id.clone(), *epoch)),
+            _ => None,
+        })
+        .take(128)
+        .collect();
+    for (workspace, epoch) in stale {
+        // Still being handed over, or not past its deadline.
+        if lock(&state.pro.sleeping).contains(&workspace)
+            || !super::moving::started(state, &workspace).is_some_and(|started| {
+                super::moving::transfer_deadline(now_ms, started)
+                    == super::moving::Deadline::Overdue
+            })
+        {
+            continue;
+        }
+        let taken = async {
+            let operation_config = execution::effective(state, config, &workspace)?;
+            let baton: Baton = account(
+                &operation_config,
+                &execution::path(&operation_config, &workspace, ""),
+                "GET",
+                None,
+            )
+            .await?
+            .json()?;
+            ensure!(baton.workspace_id == workspace, "baton workspace mismatch");
+            Ok::<_, anyhow::Error>(baton.holder_id.is_some())
+        }
+        .await;
+        match taken {
+            // The cloud has it after all: ownership settles at the next read.
+            Ok(true) => {}
+            Ok(false) => {
+                super::transition::deadline(&workspace, Some(epoch), "handover_untaken");
+                state
+                    .pro
+                    .reasons
+                    .set_here(&workspace, super::place::Reason::CouldNotMoveToCloud);
+                super::place::bring_back(state, &workspace);
+                if let Err(error) = super::persist(state).await {
+                    tracing::warn!(%error, "Could not save that a project comes back here");
+                }
+            }
+            // Unreachable account: nothing to decide on; the next pass asks.
+            Err(_) => {}
+        }
+    }
+}
+
+/// A restore this computer gave up on (`RESTORE_TRIES`): it holds the lease,
+/// so the project runs here with the files it has; the cloud's latest commit
+/// stays fetched for the kept review, and the user sees one reason.
+async fn restore_gave_up(state: &Arc<AppState>, workspace: &str, epoch: u64) {
+    super::transition::deadline(workspace, Some(epoch), "restore_gave_up");
+    super::transition::set_ownership(
+        state,
+        workspace,
+        Some(Ownership::Local { epoch }),
+        "restore_gave_up",
+    );
+    state
+        .pro
+        .reasons
+        .set_here(workspace, super::place::Reason::CloudChangesKept);
+    if let Err(error) = super::persist(state).await {
+        tracing::warn!(%error, "Could not save that a project runs here");
+    }
+    if let Err(error) = crate::ledger::resume_deferred_workspace(state, workspace).await {
+        tracing::warn!(%error, "Could not resume a project that runs here");
+    }
+}
+
+/// The conversations a deadline brings home before the cloud finished them:
+/// their rows say so (`unfinished_in`) until the user sends again.
+fn mark_unfinished(state: &AppState, workspace: &str) {
+    let mut unfinished = lock(&state.pro.unfinished);
+    for id in sessions(state, workspace) {
+        if state.chat.get(&id).is_some() && (unfinished.len() < 64 || unfinished.contains_key(&id))
+        {
+            unfinished.insert(id, workspace.to_owned());
+        }
+    }
 }
 
 fn same_file(left: &Path, right: &Path) -> Result<bool> {
@@ -1999,7 +2106,13 @@ async fn finish_hydration_checked(
                 matches!(ownership.get(workspace),Some(Ownership::Hydrating{epoch:current} | Ownership::SettingUp{epoch:current}) if *current==epoch),
                 "Project ownership changed before setup"
             );
-            ownership.insert(workspace.into(), Ownership::SettingUp { epoch });
+            super::transition::apply(
+                state,
+                &mut ownership,
+                workspace,
+                Some(Ownership::SettingUp { epoch }),
+                "setting_up",
+            );
         }
         // A return installed the other machine's copy: its sessions replaced
         // the ones a fence kept here. (A cloud machine resuming its own fenced
@@ -2027,7 +2140,13 @@ async fn finish_hydration_checked(
             matches!(ownership.get(workspace), Some(Ownership::SettingUp { epoch: current }) if *current == epoch),
             "Project ownership changed before resume"
         );
-        ownership.insert(workspace.into(), Ownership::Local { epoch });
+        super::transition::apply(
+            state,
+            &mut ownership,
+            workspace,
+            Some(Ownership::Local { epoch }),
+            "restored",
+        );
     }
     super::persist(state).await?;
     if blocked.is_empty() {

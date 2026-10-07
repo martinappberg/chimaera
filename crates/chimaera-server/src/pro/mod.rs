@@ -15,6 +15,7 @@ pub(crate) mod install;
 mod kept;
 pub(crate) mod mirror;
 pub(crate) mod moves;
+mod moving;
 pub(crate) mod pause;
 mod seam;
 pub(crate) use seam::{compose, ProPolicy};
@@ -33,6 +34,7 @@ mod sleep_watch;
 pub(crate) mod transfer_dispatch;
 pub(crate) mod transfer_host;
 pub(crate) mod transfer_types;
+mod transition;
 mod transport;
 mod trash;
 pub(crate) use drain::{cancel as cancel_drain, start as drain};
@@ -152,7 +154,15 @@ pub(crate) struct ProState {
     /// Wakes transfers waiting for the job reservation when a drain takes it.
     drain_started: tokio::sync::Notify,
     remote_since: Mutex<HashMap<String, u64>>,
-    return_backoff: Mutex<HashMap<String, (u64, u64)>>,
+    /// Each automatic return's retry state between passes (`moving::Retry`).
+    return_backoff: Mutex<HashMap<String, moving::Retry>>,
+    /// When each transfer under way was triggered (unix ms; `moving`).
+    /// Persisted, at most 128; ended when ownership settles the project.
+    moving: Mutex<HashMap<String, u64>>,
+    /// Conversations a return took home before they finished in the cloud
+    /// (session id → project), for the rows' additive `unfinished_in`. Hot,
+    /// at most 64; cleared when the user acts in that project.
+    unfinished: Mutex<HashMap<String, String>>,
     /// Whether this computer can reach the account, from the lease loop's own
     /// calls (`reach`): since when it has answered without a gap (0: not now).
     reachable_since: AtomicU64,
@@ -305,6 +315,10 @@ struct DiskState {
     signed_out: bool,
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     unreleased: std::collections::BTreeSet<String>,
+    /// Transfers under way and when each was triggered (`moving`); sorted so
+    /// an unchanged set writes the same bytes.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    moving: std::collections::BTreeMap<String, u64>,
 }
 /// A return's kept-both report as persisted: the count, and the kept copies'
 /// project-relative paths (fewer than `files` when bounded, see
@@ -461,12 +475,20 @@ impl ProState {
                         Ownership::Transferring { epoch }
                     }
                     Ownership::Local { epoch } | Ownership::Transferring { epoch } => {
-                        Ownership::AwaitingVerification { epoch }
+                        let verifying = Ownership::AwaitingVerification { epoch };
+                        transition::log(&id, Some(&owner), Some(&verifying), "restart");
+                        verifying
                     }
                     owner => owner,
                 };
                 (id, owner)
             })
+            .collect();
+        let moving = disk
+            .moving
+            .into_iter()
+            .filter(|(id, _)| valid_id(id) && ownership.contains_key(id))
+            .take(128)
             .collect();
         let mut status: HashMap<String, WorkspaceStatus> = disk
             .provider_blocks
@@ -580,6 +602,8 @@ impl ProState {
             drain_started: tokio::sync::Notify::new(),
             remote_since: Mutex::new(HashMap::new()),
             return_backoff: Mutex::new(HashMap::new()),
+            moving: Mutex::new(moving),
+            unfinished: Mutex::new(HashMap::new()),
             reachable_since: AtomicU64::new(0),
             link: Mutex::new(None),
             reclaim: Mutex::new(Default::default()),
@@ -1212,6 +1236,10 @@ async fn persist(state: &crate::AppState) -> anyhow::Result<()> {
         parked,
         signed_out: signed_out(state),
         unreleased: crate::lock(&state.pro.unreleased).clone(),
+        moving: crate::lock(&state.pro.moving)
+            .iter()
+            .map(|(id, at)| (id.clone(), *at))
+            .collect(),
     })?;
     anyhow::ensure!(bytes.len() <= 1024 * 1024, "mirror settings exceed limit");
     // State first, then the enrollment latch: a crash between them leaves a

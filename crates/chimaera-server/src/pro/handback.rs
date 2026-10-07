@@ -9,6 +9,7 @@ pub(super) async fn prepare(
     host: &super::super::protocol::Host,
     holder: &str,
     initial_epoch: u64,
+    force: bool,
 ) -> Result<Option<u64>> {
     let owner = super::project_host::policy_host::HandbackOwner::capture(
         state.clone(),
@@ -17,6 +18,7 @@ pub(super) async fn prepare(
         host.clone(),
         holder.into(),
         initial_epoch,
+        force,
     )?;
     state
         .daemon_extension

@@ -20,6 +20,9 @@ only place it is written.
 | File | Responsibility |
 | --- | --- |
 | `seam.rs` | `ProPolicy`, the Pro implementation of the shared workspace-admission hook (`crate::policy::WorkspacePolicy`); the only way shared daemon code reaches Pro. Installed by `lifecycle` when an extension is composed (tests use it by default). |
+| `activity.rs` | The one activity verdict (`Working` / `WaitingOnUser` / `Paused`) every pause and busy decision derives from: a turn in flight, queued input or background work is working; a permission or a question waits on the user; everything else, including a failed, refused or unknown-state conversation, is paused. |
+| `moving.rs` | The one transfer deadline: `move_started_ms` per project (persisted in `state.json`, wall clock, ended when ownership settles), `transfer_deadline` (3 min; a return counts from the cloud's pause), the return's `Retry` record (5 s while the cloud is mid-turn, 20 s after a failure, three restore tries). |
+| `transition.rs` | The one write path for ownership (`apply` / `set_ownership`): one info line per change, deadline hit or refused hand-back under `chimaera_server::pro::transition`; a settled ownership ends the project's transfer record. |
 | `pause.rs` | Why a session has no process here (`moved`/`paused` frames, paused-row reasons) and the read-only refusal words, served through the hook. |
 | `mod.rs` | Bounded, credential-free persistent state and ownership/import fences; `synced` says whether a project's agents get the where-you-run note (`mcp/cloud_context.rs`). |
 | `authority.rs` / `authority_tests.rs` | Fixed-identity workspace-bound worker acceptance, startup-only validated revision advancement, credential-free persisted latch, renewal/route/root guards and synthetic side-effect regressions. |

@@ -233,7 +233,7 @@ pub(super) async fn sync(
                 selected
             };
             if let Some(holder)=holder.as_ref().filter(|holder|*holder!=&config.delegation.device_id) {
-                lock(&state.pro.ownership).insert(workspace.to_owned(),super::Ownership::Remote {epoch,holder:holder.clone()});
+                super::transition::set_ownership(state,workspace,Some(super::Ownership::Remote {epoch,holder:holder.clone()}),"copy");
             }
             // Older daemons understand this fence even though they do not know
             // the additive copy role. Never clear it during a copy import.

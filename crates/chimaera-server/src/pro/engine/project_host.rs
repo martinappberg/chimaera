@@ -164,15 +164,7 @@ impl ProjectOwner {
         if matches!(value, Some(Ownership::Remote { .. })) {
             super::super::settle_fenced(&self.state, &self.workspace, None);
         }
-        let mut entries = lock(&self.state.pro.ownership);
-        match value {
-            Some(value) => {
-                entries.insert(self.workspace.clone(), value);
-            }
-            None => {
-                entries.remove(&self.workspace);
-            }
-        }
+        crate::pro::transition::set_ownership(&self.state, &self.workspace, value, "lease");
     }
     pub fn copy_epoch(&self, epoch: u64) {
         if let Some(copy) = lock(&self.state.pro.preferences)
@@ -399,7 +391,13 @@ impl ProjectOwner {
                 )
             );
         if fenced {
-            ownership.insert(self.workspace.clone(), Ownership::Hydrating { epoch });
+            crate::pro::transition::apply(
+                &self.state,
+                &mut ownership,
+                &self.workspace,
+                Some(Ownership::Hydrating { epoch }),
+                "restoring",
+            );
         }
         Ok(Some(IdleWorker { _job: job, fenced }))
     }
@@ -713,9 +711,12 @@ impl SnapshotOwner {
             if self.project.generation_current()
                 && matches!(ownership.get(self.project.id()), Some(Ownership::Transferring{epoch}) if *epoch==self.epoch)
             {
-                ownership.insert(
-                    self.project.workspace.clone(),
-                    Ownership::AwaitingVerification { epoch: self.epoch },
+                crate::pro::transition::apply(
+                    &self.project.state,
+                    &mut ownership,
+                    &self.project.workspace,
+                    Some(Ownership::AwaitingVerification { epoch: self.epoch }),
+                    "publication_failed",
                 );
                 true
             } else {

@@ -112,8 +112,15 @@ pub struct HandbackOwner {
     host: crate::pro::protocol::Host,
     holder: String,
     initial_epoch: u64,
+    /// The return is past its deadline: the cloud yields now, exporting a
+    /// running turn as it is, instead of at its next pause.
+    force: bool,
 }
 impl HandbackOwner {
+    /// Whether the cloud is asked to yield at once (`moving` deadline).
+    pub fn force(&self) -> bool {
+        self.force
+    }
     pub(in crate::pro::engine) fn capture(
         state: Arc<AppState>,
         config: Configure,
@@ -121,6 +128,7 @@ impl HandbackOwner {
         host: crate::pro::protocol::Host,
         holder: String,
         initial_epoch: u64,
+        force: bool,
     ) -> Result<Self> {
         ensure!(
             host.worker_holder() == Some(holder.as_str()),
@@ -137,6 +145,7 @@ impl HandbackOwner {
             host,
             holder,
             initial_epoch,
+            force,
         })
     }
     pub fn workspace(&self) -> &str {
