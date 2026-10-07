@@ -113,7 +113,7 @@ pub(super) async fn check(
 /// holds the project or other sessions: those resume, and these wait as
 /// paused rows naming their provider.
 pub(super) fn record(state: &AppState, workspace: &str, blocked: Vec<BlockedProvider>) {
-    let mut statuses = lock(&state.pro.status);
+    let mut statuses = lock(&state.pro().status);
     let status = statuses.entry(workspace.into()).or_default();
     let changed = status.blocked_providers.len() != blocked.len();
     status.blocked_providers = blocked;
@@ -149,7 +149,7 @@ pub(crate) fn blocking_provider(
     state: &AppState,
     entry: &crate::ledger::LedgerEntry,
 ) -> Option<String> {
-    let statuses = lock(&state.pro.status);
+    let statuses = lock(&state.pro().status);
     let blocked = &statuses.get(&entry.workspace_id)?.blocked_providers;
     waits_for_provider(entry, blocked)
         .then(|| {
@@ -184,8 +184,8 @@ pub(crate) fn cloud_provider_blocks(state: &AppState) -> Vec<serde_json::Value> 
     if !super::is_worker(state) {
         return Vec::new();
     }
-    let ownership = lock(&state.pro.ownership).clone();
-    let statuses = lock(&state.pro.status).clone();
+    let ownership = lock(&state.pro().ownership).clone();
+    let statuses = lock(&state.pro().status).clone();
     lock(&state.workspaces)
         .list()
         .into_iter()
@@ -215,13 +215,13 @@ pub(crate) fn cloud_provider_blocks(state: &AppState) -> Vec<serde_json::Value> 
 pub(crate) fn workspace_provider_blocks(state: &AppState, workspace: &str) -> serde_json::Value {
     if !super::is_worker(state)
         || !matches!(
-            lock(&state.pro.ownership).get(workspace),
+            lock(&state.pro().ownership).get(workspace),
             Some(Ownership::SettingUp { .. } | Ownership::Local { .. })
         )
     {
         return serde_json::json!([]);
     }
-    let statuses = lock(&state.pro.status);
+    let statuses = lock(&state.pro().status);
     serde_json::json!(statuses
         .get(workspace)
         .map(|status| status.blocked_providers.iter().take(16).collect::<Vec<_>>())

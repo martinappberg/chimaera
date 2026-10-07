@@ -200,8 +200,8 @@ impl ProviderSlot {
         }
         self.resolve(|| {
             state
-                .daemon_extension
-                .as_ref()
+                .pro()
+                .runtime()
                 .and_then(|runtime| runtime.worker_providers(ProviderHost::new(state)))
         })
     }

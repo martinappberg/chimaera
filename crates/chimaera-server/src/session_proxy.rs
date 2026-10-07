@@ -184,11 +184,6 @@ fn endpoint(raw: &str) -> Result<std::net::SocketAddr> {
     Ok(address)
 }
 impl Store {
-    /// Whether the roster poll runs (only after a placement registered).
-    #[cfg(test)]
-    pub(crate) fn polling(&self) -> bool {
-        self.started.load(Ordering::Acquire)
-    }
     fn register(&self, request: Registration, local_root: std::path::PathBuf) -> Result<()> {
         if !valid_id(&request.host_id)
             || !valid_id(&request.workspace_id)
@@ -509,7 +504,7 @@ impl Store {
 /// Authenticated local inventory lets a restarted native shell retire stale
 /// project routes without exposing the transport credentials or real roots.
 pub(crate) async fn inventory(State(state): State<Arc<AppState>>) -> Response {
-    Json(state.session_proxy.inventory()).into_response()
+    Json(state.pro().session_proxy.inventory()).into_response()
 }
 pub(crate) async fn register(
     State(state): State<Arc<AppState>>,
@@ -522,7 +517,7 @@ pub(crate) async fn register(
         )
             .into_response();
     };
-    match state.session_proxy.register(body, workspace.root) {
+    match state.pro().session_proxy.register(body, workspace.root) {
         Ok(()) => {
             // The roster poll exists only once a project runs elsewhere: a
             // daemon nobody registered a placement with runs no timer.
@@ -545,14 +540,14 @@ pub(crate) async fn remove(
         if body.host_id.is_some() || !valid_id(&workspace) {
             return StatusCode::BAD_REQUEST;
         }
-        state.session_proxy.clear_workspace(&workspace);
+        state.pro().session_proxy.clear_workspace(&workspace);
         state.changes.notify_waiters();
         return StatusCode::NO_CONTENT;
     }
     let Some(host_id) = body.host_id.filter(|id| valid_id(id)) else {
         return StatusCode::BAD_REQUEST;
     };
-    let mut data = crate::lock(&state.session_proxy.inner);
+    let mut data = crate::lock(&state.pro().session_proxy.inner);
     let generation = data.mint();
     if let Some(route) = data.routes.get_mut(&host_id) {
         route.address = None;
@@ -570,7 +565,12 @@ pub(crate) async fn remove(
 }
 /// Starts the roster poll on the first registered placement (idempotent).
 fn start(state: Arc<AppState>) {
-    if state.session_proxy.started.swap(true, Ordering::AcqRel) {
+    if state
+        .pro()
+        .session_proxy
+        .started
+        .swap(true, Ordering::AcqRel)
+    {
         return;
     }
     // Deliberate visibility exemption: one daemon-wide directory keeps remote
@@ -583,7 +583,7 @@ fn start(state: Arc<AppState>) {
             if state.stopping.load(Ordering::Acquire) {
                 return;
             }
-            poll_workspaces(&state.session_proxy, &state.changes).await;
+            poll_workspaces(&state.pro().session_proxy, &state.changes).await;
         }
     });
 }
@@ -976,7 +976,7 @@ pub(crate) async fn api_proxy(
         .to_owned();
     let id = session_id(&path);
     let session_route = id.and_then(|id| {
-        let data = crate::lock(&state.session_proxy.inner);
+        let data = crate::lock(&state.pro().session_proxy.inner);
         let row = data.rows.get(id)?;
         let workspace = row["workspace_id"].as_str()?.to_owned();
         let route = data
@@ -993,6 +993,7 @@ pub(crate) async fn api_proxy(
         .map(str::to_owned);
     let hinted = hint.clone().and_then(|workspace| {
         state
+            .pro()
             .session_proxy
             .for_workspace(&workspace)
             .map(|route| (route, workspace))
@@ -1011,6 +1012,7 @@ pub(crate) async fn api_proxy(
         if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
             target = value["workspace_id"].as_str().and_then(|workspace| {
                 state
+                    .pro()
                     .session_proxy
                     .for_workspace(workspace)
                     .map(|route| (route, workspace.to_owned()))
@@ -1089,7 +1091,14 @@ pub(crate) async fn api_proxy(
         if !path_query.starts_with("/api/v1/") {
             *incoming.uri_mut() = format!("/api/v1{path_query}").parse()?;
         }
-        let response = request(&state.session_proxy, &route, &workspace, incoming, budget).await?;
+        let response = request(
+            &state.pro().session_proxy,
+            &route,
+            &workspace,
+            incoming,
+            budget,
+        )
+        .await?;
         tokio::time::timeout(ADAPTER_DEADLINE, async {
             let response = alias_response(response, &path, &alias, &target_keys).await?;
             let response = epoch_response(response, &path, &route, &workspace).await?;
@@ -1383,7 +1392,7 @@ async fn ticket_response(
     let (mut parts, body) = response.into_parts();
     let bytes = axum::body::to_bytes(body, MAX_METADATA).await?;
     let mut value: Value = serde_json::from_slice(&bytes)?;
-    let mut data = crate::lock(&state.session_proxy.inner);
+    let mut data = crate::lock(&state.pro().session_proxy.inner);
     let now = std::time::Instant::now();
     data.tickets.retain(|_, ticket| ticket.expires > now);
     let mut mint = |value: &mut Value| -> Result<()> {
@@ -1438,7 +1447,7 @@ pub(crate) async fn ticket_proxy(
     if pieces.len() < 3 || !matches!(pieces[1], "raw" | "download") {
         return next.run(incoming).await;
     }
-    let ticket = crate::lock(&state.session_proxy.inner)
+    let ticket = crate::lock(&state.pro().session_proxy.inner)
         .tickets
         .get(pieces[2])
         .cloned();
@@ -1447,6 +1456,7 @@ pub(crate) async fn ticket_proxy(
     };
     if ticket.expires <= std::time::Instant::now()
         || !state
+            .pro()
             .session_proxy
             .current(&ticket.route, &ticket.workspace)
     {
@@ -1469,7 +1479,7 @@ pub(crate) async fn ticket_proxy(
     // The head is bounded; the body (a video, a large download) then streams
     // for as long as it keeps moving.
     match request(
-        &state.session_proxy,
+        &state.pro().session_proxy,
         &ticket.route,
         &ticket.workspace,
         incoming,
@@ -1530,7 +1540,7 @@ pub(crate) async fn socket(
     auth: Value,
     downstream: &mut axum::extract::ws::WebSocket,
 ) -> bool {
-    let Some((route, workspace)) = state.session_proxy.for_session(id) else {
+    let Some((route, workspace)) = state.pro().session_proxy.for_session(id) else {
         return false;
     };
     let Ok(permit) = SOCKETS.try_acquire() else {
@@ -1550,7 +1560,7 @@ pub(crate) async fn socket(
     };
     let wake = !options.read_only && options.wake.as_deref() == Some("interaction");
     let admission = viewer_host::ViewerAdmission::new(link, wake, permit);
-    match &state.daemon_extension {
+    match state.pro().runtime() {
         Some(runtime) => runtime.viewer(admission, downstream).await,
         None => viewer_host::ready(admission, downstream).await,
     }
@@ -1650,7 +1660,7 @@ impl Link<'_> {
     }
     /// Where the session continues after its project changed owner.
     fn moved(&self) -> Value {
-        let to = match self.state.session_proxy.for_session(&self.session) {
+        let to = match self.state.pro().session_proxy.for_session(&self.session) {
             Some((route, _)) if route.host_id.starts_with("worker-") => "cloud",
             Some(_) => "computer",
             None if crate::pro::is_worker(self.state) => "cloud",
@@ -1771,14 +1781,7 @@ fn upward(frame: Down) -> Option<Up> {
 /// conversations are not forwarded as frames either: they are relayed into
 /// this daemon's own notice feed (`notices::relay`), which the window's loop
 /// already sends and the native app already polls.
-pub(crate) enum FeedFrame {
-    /// A path-only invalidation, already in this window's paths.
-    Fs(Value),
-    /// The project's Git epoch on its owner, as [`routed_epoch`] reports it.
-    Git(u64),
-    /// The project's Timeline epoch on its owner, as [`routed_epoch`] reports it.
-    Timeline(u64),
-}
+pub(crate) type FeedFrame = crate::policy::ProjectFrame;
 /// An owner's Git or Timeline epoch as a window reports it: in a range of its
 /// own per project registration, above any daemon's own counter. A window
 /// refetches only when an epoch it was sent changes, and this computer's
@@ -1833,6 +1836,17 @@ impl Feed {
         self.frames.recv().await
     }
 }
+impl crate::policy::ProjectFeed for Feed {
+    fn workspace(&self) -> &str {
+        &self.workspace
+    }
+    fn watch(&self, files: Vec<String>, dirs: Vec<String>) {
+        Feed::watch(self, files, dirs)
+    }
+    fn next(&mut self) -> crate::policy::BoxFuture<'_, Option<FeedFrame>> {
+        Box::pin(Feed::next(self))
+    }
+}
 async fn feed(
     state: &AppState,
     workspace: &str,
@@ -1840,11 +1854,12 @@ async fn feed(
     frames: tokio::sync::mpsc::Sender<FeedFrame>,
 ) -> Result<()> {
     let route = state
+        .pro()
         .session_proxy
         .for_workspace(workspace)
         .context("project route retired")?;
     let _permit = SOCKETS.try_acquire().context("remote stream limit")?;
-    let reach = verify_scope(&state.session_proxy, &route, workspace).await?;
+    let reach = verify_scope(&state.pro().session_proxy, &route, workspace).await?;
     // Viewing never wakes a sleeping owner, so the attach below stays
     // passive. A cloud machine's transport may take it while the machine
     // sleeps and keep it open; one that refuses (503 `worker_asleep`) fails
@@ -1852,7 +1867,7 @@ async fn feed(
     // sleeping owner always did, and is remembered so those retries cost no
     // further refused upgrade. Another computer's is never tried.
     let cloud = route.host_id.starts_with("worker-");
-    if reach == Reach::Sleeping && (!cloud || state.session_proxy.passive_refused(&route)) {
+    if reach == Reach::Sleeping && (!cloud || state.pro().session_proxy.passive_refused(&route)) {
         bail!("owner asleep");
     }
     let address = route.address.context("remote placement unavailable")?;
@@ -1875,7 +1890,7 @@ async fn feed(
         Ok(Ok(attached)) => attached,
         failed => {
             if reach == Reach::Sleeping {
-                state.session_proxy.note_passive_refused(&route);
+                state.pro().session_proxy.note_passive_refused(&route);
             }
             failed??
         }
@@ -1916,10 +1931,11 @@ async fn feed(
     let mut ownership = tokio::time::interval(Duration::from_secs(2));
     ownership.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let retired = || {
-        let gone = !state.session_proxy.current(&route, workspace);
+        let gone = !state.pro().session_proxy.current(&route, workspace);
         #[cfg(test)]
         if gone {
             state
+                .pro()
                 .session_proxy
                 .feeds_retired
                 .fetch_add(1, Ordering::AcqRel);
@@ -1974,7 +1990,7 @@ async fn feed(
                             // on this computer is never pruned.
                             alias.response("/sessions", &mut value["sessions"]);
                             let rows = serde_json::from_value(value["sessions"].take()).unwrap_or_default();
-                            if state.session_proxy.install_workspace(&route, workspace, rows) {
+                            if state.pro().session_proxy.install_workspace(&route, workspace, rows) {
                                 state.changes.notify_waiters();
                             }
                         }

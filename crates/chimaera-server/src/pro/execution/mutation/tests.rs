@@ -44,7 +44,7 @@ fn commits_are_bounded_and_old_account_generations_cannot_enter() {
     assert!(begin(&state, "w-a", 4, 0).is_err());
     drop(commits);
     assert!(idle(&state, "w-a"));
-    state.pro.generation.fetch_add(1, Ordering::AcqRel);
+    state.pro().generation.fetch_add(1, Ordering::AcqRel);
     assert!(begin(&state, "w-a", 4, 0).is_err());
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -58,7 +58,7 @@ async fn cancelled_final_launch_is_drained_after_its_child_registers() {
     let workspace = lock(&state.workspaces).add(root.clone()).unwrap();
     install_fixture(&state, &workspace.id, 4).unwrap();
     // Laptop work must remain available even when the publication lease lapses.
-    lock(&state.pro.execution.proofs)
+    lock(&state.pro().execution.proofs)
         .get_mut(&workspace.id)
         .unwrap()
         .deadline = super::super::lease::Deadline::expired_fixture();
@@ -99,7 +99,7 @@ async fn cancelled_final_launch_is_drained_after_its_child_registers() {
     });
     ready.await.unwrap();
     launch.abort();
-    lock(&state.pro.ownership).insert(workspace.id.clone(), Ownership::Transferring { epoch: 4 });
+    lock(&state.pro().ownership).insert(workspace.id.clone(), Ownership::Transferring { epoch: 4 });
     assert!(begin_launch(&state, &workspace.id).is_err());
     let stopping = state.clone();
     let workspace_id = workspace.id.clone();
@@ -125,7 +125,7 @@ fn final_worker_launch_still_requires_its_live_proof() {
     super::super::worker_fixture(&state);
     let guard = begin_launch(&state, "w-a").unwrap().unwrap();
     drop(guard);
-    lock(&state.pro.execution.proofs)
+    lock(&state.pro().execution.proofs)
         .get_mut("w-a")
         .unwrap()
         .deadline = super::super::lease::Deadline::expired_fixture();
@@ -140,7 +140,7 @@ async fn plain_shell_renewal_window_keeps_original_execution_and_counted_mainten
     let workspace = lock(&state.workspaces).add(root.clone()).unwrap();
     install_fixture(&state, &workspace.id, 4).unwrap();
     super::super::worker_fixture(&state);
-    lock(&state.pro.execution.proofs)
+    lock(&state.pro().execution.proofs)
         .get_mut(&workspace.id)
         .unwrap()
         .deadline = super::super::lease::Deadline::expired_fixture();
@@ -193,7 +193,7 @@ async fn plain_shell_renewal_window_keeps_original_execution_and_counted_mainten
     })
     .await
     .unwrap();
-    lock(&state.pro.ownership).insert(
+    lock(&state.pro().ownership).insert(
         workspace.id.clone(),
         Ownership::Remote {
             epoch: 5,
@@ -208,12 +208,12 @@ async fn plain_shell_renewal_window_keeps_original_execution_and_counted_mainten
 #[tokio::test]
 async fn import_reservation_accepts_hydration_and_rejects_stale_generation_epoch_and_expiry() {
     let (state, root) = fixture();
-    lock(&state.pro.ownership).insert("w-a".into(), Ownership::Hydrating { epoch: 4 });
+    lock(&state.pro().ownership).insert("w-a".into(), Ownership::Hydrating { epoch: 4 });
     let guard = begin_import(&state, "w-a", 4, 0).await.unwrap();
     guard.check(&state).unwrap();
     assert!(!idle(&state, "w-a"));
-    assert!(state.pro.configuration.try_lock().is_err());
-    lock(&state.pro.execution.proofs)
+    assert!(state.pro().configuration.try_lock().is_err());
+    lock(&state.pro().execution.proofs)
         .get_mut("w-a")
         .unwrap()
         .deadline = super::super::lease::Deadline::expired_fixture();
@@ -223,7 +223,7 @@ async fn import_reservation_accepts_hydration_and_rejects_stale_generation_epoch
     super::super::renewed_fixture(&state, "w-a", 4).unwrap();
     assert!(begin_import(&state, "w-a", 5, 0).await.is_err());
     let guard = begin_import(&state, "w-a", 4, 0).await.unwrap();
-    state.pro.generation.fetch_add(1, Ordering::AcqRel);
+    state.pro().generation.fetch_add(1, Ordering::AcqRel);
     assert!(guard.check(&state).is_err());
     drop(guard);
     assert!(begin_import(&state, "w-a", 4, 0).await.is_err());
@@ -233,7 +233,7 @@ async fn import_reservation_accepts_hydration_and_rejects_stale_generation_epoch
 #[tokio::test]
 async fn owned_import_survives_caller_cancellation_and_blocks_replacement_until_settled() {
     let (state, root) = fixture();
-    lock(&state.pro.ownership).insert("w-a".into(), Ownership::Hydrating { epoch: 4 });
+    lock(&state.pro().ownership).insert("w-a".into(), Ownership::Hydrating { epoch: 4 });
     let guard = begin_import(&state, "w-a", 4, 0).await.unwrap();
     let (entered, ready) = tokio::sync::oneshot::channel();
     let (resume, paused) = std::sync::mpsc::channel();
@@ -250,11 +250,11 @@ async fn owned_import_survives_caller_cancellation_and_blocks_replacement_until_
     clear_stopped(&state);
     assert!(!quiescent(&state, "w-a"));
     assert!(install_fixture(&state, "w-a", 5).is_err());
-    assert!(state.pro.configuration.try_lock().is_err());
+    assert!(state.pro().configuration.try_lock().is_err());
     resume.send(()).unwrap();
     task.await.unwrap();
     assert!(idle(&state, "w-a"));
-    assert!(state.pro.configuration.try_lock().is_ok());
+    assert!(state.pro().configuration.try_lock().is_ok());
     install_fixture(&state, "w-a", 5).unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -263,33 +263,34 @@ async fn owned_import_survives_caller_cancellation_and_blocks_replacement_until_
 async fn setup_transition_rechecks_commit_authority_and_keeps_its_reservation() {
     for fault in ["none", "expired", "stopped", "generation", "epoch", "local"] {
         let (state, root) = fixture();
-        lock(&state.pro.ownership).insert("w-a".into(), Ownership::Hydrating { epoch: 4 });
+        lock(&state.pro().ownership).insert("w-a".into(), Ownership::Hydrating { epoch: 4 });
         let guard = begin_import(&state, "w-a", 4, 0).await.unwrap();
         match fault {
             "expired" => {
-                lock(&state.pro.execution.proofs)
+                lock(&state.pro().execution.proofs)
                     .get_mut("w-a")
                     .unwrap()
                     .deadline = super::super::lease::Deadline::expired_fixture();
             }
             "stopped" => fence_workspace(&state, "w-a"),
             "generation" => {
-                state.pro.generation.fetch_add(1, Ordering::AcqRel);
+                state.pro().generation.fetch_add(1, Ordering::AcqRel);
             }
             "epoch" => {
-                lock(&state.pro.ownership).insert("w-a".into(), Ownership::Hydrating { epoch: 5 });
+                lock(&state.pro().ownership)
+                    .insert("w-a".into(), Ownership::Hydrating { epoch: 5 });
             }
             "local" => {
-                lock(&state.pro.ownership).insert("w-a".into(), Ownership::Local { epoch: 4 });
+                lock(&state.pro().ownership).insert("w-a".into(), Ownership::Local { epoch: 4 });
             }
             _ => {}
         }
-        let previous = lock(&state.pro.ownership).get("w-a").cloned();
+        let previous = lock(&state.pro().ownership).get("w-a").cloned();
         let result = guard.setting_up(&state);
         if fault == "none" {
             result.unwrap();
             assert!(matches!(
-                lock(&state.pro.ownership).get("w-a"),
+                lock(&state.pro().ownership).get("w-a"),
                 Some(Ownership::SettingUp { epoch: 4 })
             ));
             assert!(guard.setting_up(&state).is_err());
@@ -299,13 +300,13 @@ async fn setup_transition_rechecks_commit_authority_and_keeps_its_reservation() 
             );
         } else {
             assert!(result.is_err(), "{fault} cannot publish setup");
-            assert!(lock(&state.pro.ownership).get("w-a").cloned() == previous);
+            assert!(lock(&state.pro().ownership).get("w-a").cloned() == previous);
         }
         assert!(!idle(&state, "w-a"));
-        assert!(state.pro.configuration.try_lock().is_err());
+        assert!(state.pro().configuration.try_lock().is_err());
         drop(guard);
         assert!(idle(&state, "w-a"));
-        assert!(state.pro.configuration.try_lock().is_ok());
+        assert!(state.pro().configuration.try_lock().is_ok());
         std::fs::remove_dir_all(root).unwrap();
     }
 }
@@ -316,7 +317,7 @@ async fn unconfigured_legacy_import_is_still_generation_bound_and_counted() {
     let guard = begin_import(&state, "w-legacy", 7, 0).await.unwrap();
     guard.check(&state).unwrap();
     assert!(!idle(&state, "w-legacy"));
-    state.pro.generation.fetch_add(1, Ordering::AcqRel);
+    state.pro().generation.fetch_add(1, Ordering::AcqRel);
     assert!(guard.check(&state).is_err());
     drop(guard);
     assert!(idle(&state, "w-legacy"));
@@ -351,7 +352,7 @@ async fn cancelling_a_caller_keeps_its_blocking_commit_reserved_until_finished()
 async fn reserved_launch_never_waits_on_configuration_that_is_draining_it() {
     let (state, root) = fixture();
     let guard = begin(&state, "w-a", 4, generation(&state)).unwrap();
-    let _configuration = state.pro.configuration.lock().await;
+    let _configuration = state.pro().configuration.lock().await;
     let result = tokio::time::timeout(
         std::time::Duration::from_millis(100),
         reserved_request(guard, super::super::prepare_launch(&state, "w-a")),
@@ -428,8 +429,8 @@ async fn queued_real_shell_command_keeps_original_generation_and_epoch() {
         .unwrap();
         // Deliberately leave the old shell alive: admission must work even
         // before managed process shutdown gets a scheduling opportunity.
-        state.pro.generation.fetch_add(1, Ordering::AcqRel);
-        lock(&state.pro.execution.proofs).clear();
+        state.pro().generation.fetch_add(1, Ordering::AcqRel);
+        lock(&state.pro().execution.proofs).clear();
         install_fixture(&state, &workspace.id, epoch).unwrap();
         assert!(crate::pro::may_execute(&state, &workspace.id));
         std::fs::write(root.join("allow-prompt"), b"").unwrap();
@@ -459,20 +460,20 @@ fn asynchronous_dispatch_keeps_exact_ownership_account_and_worker_deadline() {
     let admission = Dispatch::capture(&state, "w-a").unwrap();
     // A laptop's expired lease alone, before its watchdog fenced it, still
     // admits its own work (the fence decides, `execution::expire`).
-    lock(&state.pro.execution.proofs)
+    lock(&state.pro().execution.proofs)
         .get_mut("w-a")
         .unwrap()
         .deadline = super::super::lease::Deadline::expired_fixture();
     drop(admission.begin(&state).unwrap());
-    lock(&state.pro.ownership).insert("w-a".into(), Ownership::Local { epoch: 5 });
+    lock(&state.pro().ownership).insert("w-a".into(), Ownership::Local { epoch: 5 });
     assert!(admission.begin(&state).is_err());
-    lock(&state.pro.ownership).insert("w-a".into(), Ownership::AwaitingVerification { epoch: 5 });
+    lock(&state.pro().ownership).insert("w-a".into(), Ownership::AwaitingVerification { epoch: 5 });
     // Unverified after a wake or restart with no live lease: no agent work is
     // admitted until the lease loop verified the project is still here.
     assert!(Dispatch::capture(&state, "w-a").is_err());
     let free = Dispatch::capture(&state, "free").unwrap();
     assert!(free.begin(&state).unwrap().is_none());
-    state.pro.generation.fetch_add(1, Ordering::AcqRel);
+    state.pro().generation.fetch_add(1, Ordering::AcqRel);
     assert!(free.begin(&state).unwrap().is_none());
     assert!(admission.begin(&state).is_err());
     install_fixture(&state, "free", 9).unwrap();
@@ -481,7 +482,7 @@ fn asynchronous_dispatch_keeps_exact_ownership_account_and_worker_deadline() {
     let (state, root) = fixture();
     super::super::worker_fixture(&state);
     let admission = Dispatch::capture(&state, "w-a").unwrap();
-    lock(&state.pro.execution.proofs)
+    lock(&state.pro().execution.proofs)
         .get_mut("w-a")
         .unwrap()
         .deadline = super::super::lease::Deadline::expired_fixture();
@@ -513,7 +514,7 @@ async fn imported_resume_retains_exact_account_epoch_but_never_inherits_into_chi
         local_dispatch_owner_fixture(&state, "w-a", 5);
         assert!(check_import_resume(&state, "w-a").is_err());
         local_dispatch_owner_fixture(&state, "w-a", 4);
-        state.pro.generation.fetch_add(1, Ordering::AcqRel);
+        state.pro().generation.fetch_add(1, Ordering::AcqRel);
         assert!(check_import_resume(&state, "w-a").is_err());
     })
     .await;
@@ -549,19 +550,19 @@ fn free_dispatch_refuses_same_project_account_enrollment_and_copy_transition() {
         let captured = Dispatch::capture(&state, "free").unwrap();
         match transition {
             0 => {
-                lock(&state.pro.preferences)
+                lock(&state.pro().preferences)
                     .entry("free".into())
                     .or_default()
                     .account = Some("https://account.invalid/a-fixture".into());
             }
             1 => {
-                lock(&state.pro.execution.latched).insert("free".into());
+                lock(&state.pro().execution.latched).insert("free".into());
             }
             2 => {
-                lock(&state.pro.ownership).insert("free".into(), Ownership::Local { epoch: 1 });
+                lock(&state.pro().ownership).insert("free".into(), Ownership::Local { epoch: 1 });
             }
             _ => {
-                lock(&state.pro.preferences)
+                lock(&state.pro().preferences)
                     .entry("free".into())
                     .or_default()
                     .copy = Some(crate::pro::project_copy::CopyState {
@@ -584,8 +585,8 @@ fn scoped_account_authority_pins_dispatch_before_policy_or_ownership() {
     let (state, root) = fixture();
     let unbound = Dispatch::capture(&state, "free").unwrap();
     assert!(unbound.begin(&state).unwrap().is_none());
-    std::fs::create_dir_all(&state.pro.root).unwrap();
-    let path = state.pro.root.join("workspace-authority.json");
+    std::fs::create_dir_all(&state.pro().root).unwrap();
+    let path = state.pro().root.join("workspace-authority.json");
     std::fs::write(
         path,
         serde_json::to_vec(&serde_json::json!({
@@ -596,19 +597,19 @@ fn scoped_account_authority_pins_dispatch_before_policy_or_ownership() {
         .unwrap(),
     )
     .unwrap();
-    *lock(&state.pro.authority) = crate::pro::authority::Authority::load(&state.pro.root);
-    state.pro.configured.store(true, Ordering::Release);
-    assert!(lock(&state.pro.authority).restricted());
-    assert!(lock(&state.pro.authority).allows("free"));
+    *lock(&state.pro().authority) = crate::pro::authority::Authority::load(&state.pro().root);
+    state.pro().configured.store(true, Ordering::Release);
+    assert!(lock(&state.pro().authority).restricted());
+    assert!(lock(&state.pro().authority).allows("free"));
     assert!(!super::super::managed(&state, "free"));
-    assert!(!lock(&state.pro.preferences).contains_key("free"));
-    assert!(!lock(&state.pro.ownership).contains_key("free"));
+    assert!(!lock(&state.pro().preferences).contains_key("free"));
+    assert!(!lock(&state.pro().ownership).contains_key("free"));
     // The accepted scoped record is already account authority: no old free
     // dispatch may adopt it, even before ownership/policy publication.
     assert!(unbound.begin(&state).is_err());
     let scoped = Dispatch::capture(&state, "free").unwrap();
     assert!(scoped.begin(&state).unwrap().is_none());
-    state.pro.generation.fetch_add(1, Ordering::AcqRel);
+    state.pro().generation.fetch_add(1, Ordering::AcqRel);
     assert!(scoped.begin(&state).is_err());
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -633,7 +634,7 @@ async fn free_import_resume_keeps_original_generation_without_fencing_free_dispa
                     assert!(check_import_resume(&state, "unrelated").is_err());
                 })
                 .await;
-            state.pro.generation.fetch_add(1, Ordering::AcqRel);
+            state.pro().generation.fetch_add(1, Ordering::AcqRel);
             // Unrelated account replacement still leaves ordinary free work alone.
             assert!(free.begin(&state).unwrap().is_none());
             // Nested dispatch cannot discard recovery's original import identity.

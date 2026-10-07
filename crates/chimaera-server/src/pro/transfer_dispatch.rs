@@ -134,8 +134,8 @@ impl TransferScope {
         generation: u64,
     ) -> Result<Self> {
         let runtime = state
-            .daemon_extension
-            .clone()
+            .pro()
+            .runtime()
             .ok_or_else(|| anyhow::anyhow!("optional_runtime_unavailable"))?;
         let host =
             TransferHost::capture(state.clone(), workspace, source, cache, generation).await?;

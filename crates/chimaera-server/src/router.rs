@@ -30,7 +30,7 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
     let api = Router::new()
         .route("/health", get(api::health))
         // Whatever the workspace policy serves (nothing without an extension).
-        .merge(state.policy().routes())
+        .merge(state.policy().routes(&state))
         .route(
             "/workspaces",
             get(api::list_workspaces).post(api::create_workspace),
@@ -375,28 +375,12 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         // keep-alive health probe). The data plane rides /proxy below.
         .route("/proxy", get(proxy::list_proxies).post(proxy::create_proxy))
         .route("/proxy/{id}", delete(proxy::delete_proxy))
-        .route("/proxy/{id}/health", get(proxy::proxy_health))
-        .merge(
-            state
-                .daemon_extension
-                .as_ref()
-                .map_or_else(Router::new, |extension| {
-                    Router::new().nest_service(
-                        "/extensions",
-                        extension.workspace_routes(
-                            crate::workspace_maintenance::WorkspaceHost::new(state.clone()),
-                        ),
-                    )
-                }),
-        )
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            crate::session_proxy::api_proxy,
-        ))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            crate::workspace_scope::middleware,
-        ))
+        .route("/proxy/{id}/health", get(proxy::proxy_health));
+    // The policy's own request binding (a forwarded viewer's project scope)
+    // sits inside the bearer check.
+    let api = state
+        .policy()
+        .api_layers(&state, api)
         .route_layer(middleware::from_fn_with_state(state.clone(), api::auth))
         // Outermost: without the extension the `/pro/*` routes do not exist,
         // so they answer exactly as an unknown route did before.
@@ -431,15 +415,10 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/raw/{ticket}", get(fs::raw))
         // An HTML report's relative assets, confined to its folder.
         .route("/raw/{ticket}/{*rest}", get(fs::raw_asset))
-        .route("/download/{ticket}", get(download::download))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            crate::workspace_scope::ticket_middleware,
-        ))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            crate::session_proxy::ticket_proxy,
-        ))
+        .route("/download/{ticket}", get(download::download));
+    let ws = state
+        .policy()
+        .ticket_layers(&state, ws)
         // Three spellings because `{*path}` refuses an EMPTY tail: the bare
         // form redirects to the slashed form, the slashed form IS the app's
         // root document, and the wildcard carries everything deeper.
@@ -448,13 +427,15 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/proxy/{id}/{*path}", axum::routing::any(proxy::data_plane))
         .with_state(state.clone());
 
-    Router::new()
+    let app = Router::new()
         .nest("/api/v1", api)
         .merge(ws)
         // The fallback serves embedded UI assets, rescues absolute-path
         // requests from proxied apps (cookie/Referer), and applies the SPA
         // index.html rules — see proxy::fallback.
-        .fallback_service(axum::routing::any(proxy::fallback).with_state(state))
-        .layer(middleware::from_fn(crate::workspace_scope::reject_unbound))
+        .fallback_service(axum::routing::any(proxy::fallback).with_state(state.clone()));
+    state
+        .policy()
+        .outer_layers(app)
         .layer(TraceLayer::new_for_http())
 }

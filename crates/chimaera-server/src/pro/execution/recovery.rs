@@ -58,22 +58,22 @@ async fn run(
     );
     crate::pro::authority::workspace(state, &grant.workspace_id)?;
     let _job = state
-        .pro
+        .pro()
         .jobs
         .try_lock()
         .map_err(|_| anyhow::anyhow!("project transfer is active"))?;
     let generation;
     {
-        let _configuration = state.pro.configuration.lock().await;
-        generation = state.pro.generation.load(Ordering::Acquire);
-        if let Some(runtime) = lock(&state.pro.runtime).as_ref() {
+        let _configuration = state.pro().configuration.lock().await;
+        generation = state.pro().generation.load(Ordering::Acquire);
+        if let Some(runtime) = lock(&state.pro().runtime).as_ref() {
             ensure!(
                 runtime.account_id.as_deref() == Some(&request.account_id)
                     && runtime.endpoint == request.endpoint,
                 "account changed before recovery"
             );
         }
-        let mut preferences = lock(&state.pro.preferences);
+        let mut preferences = lock(&state.pro().preferences);
         let preference = preferences
             .get_mut(&grant.workspace_id)
             .context("managed project recovery identity unavailable")?;
@@ -102,7 +102,7 @@ async fn run(
     crate::pro::persist(state).await?;
     watchdog::stop(state, std::slice::from_ref(&grant.workspace_id)).await?;
     ensure!(
-        generation == state.pro.generation.load(Ordering::Acquire),
+        generation == state.pro().generation.load(Ordering::Acquire),
         "account changed during recovery"
     );
     crate::pro::transition::set_ownership(
@@ -134,7 +134,7 @@ async fn run(
     };
     engine::snapshot(state, &config, &grant.workspace_id, true).await?;
     ensure!(
-        generation == state.pro.generation.load(Ordering::Acquire),
+        generation == state.pro().generation.load(Ordering::Acquire),
         "account changed during recovery"
     );
     crate::pro::transition::set_ownership(
@@ -143,7 +143,7 @@ async fn run(
         Some(Ownership::AwaitingVerification { epoch: grant.epoch }),
         "recovery",
     );
-    lock(&state.pro.preferences)
+    lock(&state.pro().preferences)
         .get_mut(&grant.workspace_id)
         .context("recovery state unavailable")?
         .recovery_pending = false;

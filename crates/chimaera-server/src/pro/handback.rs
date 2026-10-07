@@ -21,8 +21,8 @@ pub(super) async fn prepare(
         force,
     )?;
     state
-        .daemon_extension
-        .as_ref()
+        .pro()
+        .runtime()
         .context("optional_runtime_unavailable")?
         .prepare_handback(owner)
         .await

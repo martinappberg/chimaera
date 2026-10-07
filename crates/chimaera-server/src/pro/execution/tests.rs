@@ -110,7 +110,7 @@ async fn strict_worker_polling_refuses_missing_runtime_without_granting_executio
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     config.endpoint = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-    lock(&state.pro.ownership).insert("w-a".into(), Ownership::Local { epoch: 1 });
+    lock(&state.pro().ownership).insert("w-a".into(), Ownership::Local { epoch: 1 });
     let error = super::super::engine::reconcile(&state, &config, "w-a")
         .await
         .unwrap_err();
@@ -119,7 +119,7 @@ async fn strict_worker_polling_refuses_missing_runtime_without_granting_executio
     assert!(crate::pro::may_execute(&state, "w-free"));
     assert_eq!(mutations.load(Ordering::SeqCst), 0);
     assert!(matches!(
-        lock(&state.pro.ownership).get("w-a"),
+        lock(&state.pro().ownership).get("w-a"),
         Some(Ownership::Local { epoch: 1 })
     ));
     assert!(!crate::pro::may_execute(&state, "w-a"));
@@ -136,7 +136,7 @@ async fn passive_observation_and_restart_never_install_execution_authority() {
         }
         let grant = baton();
         observe(&state, &config, &grant).unwrap();
-        lock(&state.pro.ownership).insert("w-a".into(), Ownership::Local { epoch: 2 });
+        lock(&state.pro().ownership).insert("w-a".into(), Ownership::Local { epoch: 2 });
         // A passive read never creates a lease: a worker cannot execute, and
         // a device publishes nothing, but keeps its own work (laptop first).
         assert_eq!(crate::pro::may_execute(&state, "w-a"), !strict);
@@ -146,9 +146,9 @@ async fn passive_observation_and_restart_never_install_execution_authority() {
         accept(&state, &config, &grant, 0, RequestStart::now()).unwrap();
         assert!(crate::pro::may_execute(&state, "w-a"));
         assert!(crate::pro::may_restore(&state, "w-a"));
-        crate::pro::ensure_root(&state.pro.root).await.unwrap();
+        crate::pro::ensure_root(&state.pro().root).await.unwrap();
         crate::pro::persist(&state).await.unwrap();
-        let restored = crate::pro::ProState::new(state.pro.root.clone());
+        let restored = crate::pro::ProState::new(state.pro().root.clone());
         assert!(restored.execution.proofs.lock().unwrap().is_empty());
         assert!(lock(&restored.preferences)["w-a"].continuity.is_some());
         assert_eq!(restored.worker.load(Ordering::Acquire), strict);
@@ -175,7 +175,7 @@ fn grant_replay_stale_generation_and_capability_downgrade_do_not_extend_deadline
     legacy.execution_lease = None;
     legacy.execution_capability = None;
     assert!(observe(&state, &config, &legacy).is_err());
-    assert_eq!(lock(&state.pro.execution.proofs)["w-a"].lease.sequence, 1);
+    assert_eq!(lock(&state.pro().execution.proofs)["w-a"].lease.sequence, 1);
     std::fs::remove_dir_all(root).unwrap();
 }
 /// A computer whose lease lapsed stops its own agents, like a cloud machine,
@@ -193,7 +193,7 @@ fn device_lease_expiry_fences_its_own_agents_whatever_the_account_answered() {
             crate::pro::reach::answered(&state, 503, from_account);
         }
         assert!(expire(&state, 0).is_empty(), "the deadline has not passed");
-        lock(&state.pro.execution.proofs)
+        lock(&state.pro().execution.proofs)
             .get_mut("w-a")
             .unwrap()
             .deadline = lease::Deadline::expired_fixture();
@@ -202,7 +202,7 @@ fn device_lease_expiry_fences_its_own_agents_whatever_the_account_answered() {
         assert!(!crate::pro::may_execute(&state, "w-a"));
         assert!(crate::pro::validate_execution_scope(&state, "w-a", 2).is_err());
         // Its own sessions stay resumable once it holds the project again.
-        assert!(!lock(&state.pro.preferences)["w-a"].execution_uncertain);
+        assert!(!lock(&state.pro().preferences)["w-a"].execution_uncertain);
         assert!(resume_allowed(&state, "w-a"));
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -216,7 +216,7 @@ fn a_thawed_computer_renews_first_only_while_nobody_could_have_taken_over() {
     // The fixture's lease was granted just now: a thaw right after its local
     // deadline is still inside the account's lease plus grace.
     {
-        let mut proofs = lock(&state.pro.execution.proofs);
+        let mut proofs = lock(&state.pro().execution.proofs);
         let proof = proofs.get_mut("w-a").unwrap();
         proof.deadline = lease::Deadline::lapsed_recently_fixture();
     }
@@ -226,7 +226,7 @@ fn a_thawed_computer_renews_first_only_while_nobody_could_have_taken_over() {
     assert!(crate::pro::may_execute(&state, "w-a"));
     // A deadline long past (anyone may hold the project now): no window.
     {
-        let mut proofs = lock(&state.pro.execution.proofs);
+        let mut proofs = lock(&state.pro().execution.proofs);
         let proof = proofs.get_mut("w-a").unwrap();
         proof.renew_until = None;
         proof.deadline = lease::Deadline::expired_fixture();
@@ -242,12 +242,12 @@ fn expiry_closes_ingress_and_marks_uncertain_without_a_network_round_trip() {
     worker_fixture(&state);
     crate::pro::install_execution_fixture(&state, "w-a", 2).unwrap();
     {
-        let mut proofs = lock(&state.pro.execution.proofs);
+        let mut proofs = lock(&state.pro().execution.proofs);
         proofs.get_mut("w-a").unwrap().deadline = lease::Deadline::expired_fixture();
     }
     assert!(!crate::pro::may_execute(&state, "w-a"));
     assert_eq!(expire(&state, 0), vec!["w-a"]);
-    assert!(lock(&state.pro.preferences)["w-a"].execution_uncertain);
+    assert!(lock(&state.pro().preferences)["w-a"].execution_uncertain);
     assert!(!resume_allowed(&state, "w-a"));
     assert!(crate::pro::validate_execution_scope(&state, "w-a", 2).is_err());
     std::fs::remove_dir_all(root).unwrap();
@@ -286,15 +286,25 @@ fn immutable_receipt_cannot_be_a_git_revision_expression() {
 async fn same_boot_crash_never_turns_empty_registry_into_stopped_evidence() {
     let (state, config, root) = fixture();
     accept(&state, &config, &baton(), 0, RequestStart::now()).unwrap();
-    lock(&state.pro.ownership).insert("w-a".into(), Ownership::Local { epoch: 2 });
-    crate::pro::ensure_root(&state.pro.root).await.unwrap();
+    lock(&state.pro().ownership).insert("w-a".into(), Ownership::Local { epoch: 2 });
+    crate::pro::ensure_root(&state.pro().root).await.unwrap();
     prepare_launch(&state, "w-a").await.unwrap();
     // No recorded process group: a worker cannot prove anything.
-    let restored = State::restore(&state.pro.root, &lock(&state.pro.preferences), true, false);
+    let restored = State::restore(
+        &state.pro().root,
+        &lock(&state.pro().preferences),
+        true,
+        false,
+    );
     assert!(lock(&restored.unclean).contains_key("w-a"));
     // A device can still work (D1), but incomplete durable launch evidence
     // cannot prove that every old process group stopped for publication.
-    let restored = State::restore(&state.pro.root, &lock(&state.pro.preferences), false, false);
+    let restored = State::restore(
+        &state.pro().root,
+        &lock(&state.pro().preferences),
+        false,
+        false,
+    );
     assert!(lock(&restored.unclean).contains_key("w-a"));
     // A recorded group that is still alive fences both until it exits.
     let mut child = std::process::Command::new("/bin/sleep")
@@ -302,20 +312,20 @@ async fn same_boot_crash_never_turns_empty_registry_into_stopped_evidence() {
         .process_group(0)
         .spawn()
         .unwrap();
-    let mut preferences = lock(&state.pro.preferences).clone();
+    let mut preferences = lock(&state.pro().preferences).clone();
     preferences.get_mut("w-a").unwrap().execution_launch_pending = false;
     let started = restart::leader_start(child.id() as i32).unwrap();
     preferences.get_mut("w-a").unwrap().execution_groups = vec![child.id()];
     preferences.get_mut("w-a").unwrap().execution_starts = vec![started];
     for worker in [false, true] {
-        let restored = State::restore(&state.pro.root, &preferences, worker, false);
+        let restored = State::restore(&state.pro().root, &preferences, worker, false);
         assert_eq!(lock(&restored.unclean)["w-a"], vec![(child.id(), started)]);
     }
     // The same id with another start time is a reused group, not old work.
     preferences.get_mut("w-a").unwrap().execution_starts = vec![started + 1];
-    let restored = State::restore(&state.pro.root, &preferences, false, false);
+    let restored = State::restore(&state.pro().root, &preferences, false, false);
     assert!(!lock(&restored.unclean).contains_key("w-a"));
-    lock(&state.pro.execution.unclean).insert("w-a".into(), vec![(child.id(), started)]);
+    lock(&state.pro().execution.unclean).insert("w-a".into(), vec![(child.id(), started)]);
     reprobe(&state);
     assert!(!quiescent(&state, "w-a"), "a live old group blocks handoff");
     child.kill().unwrap();
@@ -325,13 +335,13 @@ async fn same_boot_crash_never_turns_empty_registry_into_stopped_evidence() {
         quiescent(&state, "w-a"),
         "an exited group releases its fence"
     );
-    std::fs::write(state.pro.root.join("state.json"), b"{}").unwrap();
-    let damaged = crate::pro::ProState::new(state.pro.root.clone());
+    std::fs::write(state.pro().root.join("state.json"), b"{}").unwrap();
+    let damaged = crate::pro::ProState::new(state.pro().root.clone());
     assert!(lock(&damaged.execution.latched).contains("w-a"));
     assert!(damaged.execution.proofs.lock().unwrap().is_empty());
     // Unreadable ownership state fails closed and keeps the damaged copy.
     assert!(lock(&damaged.execution.uncertain).contains("w-a"));
-    assert!(state.pro.root.join("state.json.damaged").exists());
+    assert!(state.pro().root.join("state.json.damaged").exists());
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -353,14 +363,14 @@ fn lost_enrollment_records_make_only_those_projects_uncertain() {
     let (state, config, root) = fixture();
     observe(&state, &config, &baton()).unwrap();
     // The latch names w-a, but its policy record is gone; w-b never enrolled.
-    std::fs::create_dir_all(&state.pro.root).unwrap();
+    std::fs::create_dir_all(&state.pro().root).unwrap();
     std::fs::write(
-        state.pro.root.join("execution-authority.json"),
+        state.pro().root.join("execution-authority.json"),
         br#"{"version":1,"workspaces":["w-a"]}"#,
     )
     .unwrap();
     std::fs::write(
-        state.pro.root.join("state.json"),
+        state.pro().root.join("state.json"),
         br#"{"ownership":{},"preferences":{"w-b":{}}}"#,
     )
     .unwrap();
@@ -379,29 +389,33 @@ fn lost_enrollment_records_make_only_those_projects_uncertain() {
     // Nothing readable at all: a computer never makes an unenrolled project
     // managed (the account refuses an enrolled one's downgrade itself), and
     // an uncertain project still launches agents there.
-    std::fs::write(state.pro.root.join("state.json"), b"not json").unwrap();
-    std::fs::write(state.pro.root.join("execution-authority.json"), b"not json").unwrap();
-    std::fs::create_dir_all(state.pro.root.join("w-mirrored")).unwrap();
+    std::fs::write(state.pro().root.join("state.json"), b"not json").unwrap();
+    std::fs::write(
+        state.pro().root.join("execution-authority.json"),
+        b"not json",
+    )
+    .unwrap();
+    std::fs::create_dir_all(state.pro().root.join("w-mirrored")).unwrap();
     let restarted = restart(&root);
     assert!(!managed(&restarted, "w-mirrored"));
     assert!(lease_valid(&restarted, "w-never-mirrored"));
-    lock(&restarted.pro.execution.uncertain).insert("w-new".into());
-    lock(&restarted.pro.ownership).insert("w-new".into(), Ownership::Local { epoch: 1 });
+    lock(&restarted.pro().execution.uncertain).insert("w-new".into());
+    lock(&restarted.pro().ownership).insert("w-new".into(), Ownership::Local { epoch: 1 });
     assert!(crate::pro::may_execute(&restarted, "w-new"));
     drop(restarted);
     // A cloud machine cannot tell which of its projects were enrolled: each
     // one with local mirror data waits for the account.
     let empty = HashMap::new();
-    let worker = State::restore(&state.pro.root, &empty, true, true);
+    let worker = State::restore(&state.pro().root, &empty, true, true);
     assert!(lock(&worker.uncertain).contains("w-mirrored"));
     assert!(!lock(&worker.uncertain).contains("w-never-mirrored"));
     // A read error (here: the path is a directory) is not damage: the file
     // is not set aside and no unenrolled project becomes managed.
-    let _ = std::fs::remove_file(state.pro.root.join("state.json"));
-    let _ = std::fs::remove_file(state.pro.root.join("state.json.damaged"));
-    std::fs::create_dir_all(state.pro.root.join("state.json")).unwrap();
-    let unreadable = crate::pro::ProState::new(state.pro.root.clone());
-    assert!(!state.pro.root.join("state.json.damaged").exists());
+    let _ = std::fs::remove_file(state.pro().root.join("state.json"));
+    let _ = std::fs::remove_file(state.pro().root.join("state.json.damaged"));
+    std::fs::create_dir_all(state.pro().root.join("state.json")).unwrap();
+    let unreadable = crate::pro::ProState::new(state.pro().root.clone());
+    assert!(!state.pro().root.join("state.json.damaged").exists());
     assert!(!lock(&unreadable.execution.uncertain).contains("w-mirrored"));
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -414,16 +428,16 @@ fn device_shaped_grant_cannot_bypass_a_persisted_workers_restart_fence() {
         // persisted worker marker remains the execution boundary.
         worker_fixture(&state);
         if evidence == "unclean" {
-            lock(&state.pro.execution.unclean).insert("w-a".into(), Vec::new());
+            lock(&state.pro().execution.unclean).insert("w-a".into(), Vec::new());
         } else {
-            lock(&state.pro.execution.uncertain).insert("w-a".into());
+            lock(&state.pro().execution.uncertain).insert("w-a".into());
         }
         let error = accept(&state, &config, &baton(), 0, RequestStart::now()).unwrap_err();
         assert!(error.to_string().contains("previous managed processes"));
-        assert!(lock(&state.pro.execution.proofs).is_empty());
-        state.pro.worker.store(false, Ordering::Release);
+        assert!(lock(&state.pro().execution.proofs).is_empty());
+        state.pro().worker.store(false, Ordering::Release);
         accept(&state, &config, &baton(), 0, RequestStart::now()).unwrap();
-        assert!(lock(&state.pro.execution.proofs).contains_key("w-a"));
+        assert!(lock(&state.pro().execution.proofs).contains_key("w-a"));
         std::fs::remove_dir_all(root).unwrap();
     }
 }
@@ -440,9 +454,9 @@ fn canonical_recovery_has_a_distinct_exact_capability_and_keeps_expired_input_cl
     grant.execution_capability = Some(wire::ExecutionCapability::checkpoint_fork());
     grant.continuity.as_mut().unwrap().mode = "checkpoint_fork_v1".into();
     accept(&state, &config, &grant, 0, RequestStart::now()).unwrap();
-    lock(&state.pro.ownership).insert("w-a".into(), Ownership::Local { epoch: 2 });
+    lock(&state.pro().ownership).insert("w-a".into(), Ownership::Local { epoch: 2 });
     assert!(crate::pro::may_execute(&state, "w-a"));
-    lock(&state.pro.execution.proofs)
+    lock(&state.pro().execution.proofs)
         .get_mut("w-a")
         .unwrap()
         .deadline = lease::Deadline::expired_fixture();
@@ -467,7 +481,7 @@ fn canonical_recovery_has_a_distinct_exact_capability_and_keeps_expired_input_cl
         !crate::pro::may_execute(&state, "w-a"),
         "old ownership cannot use a new proof"
     );
-    lock(&state.pro.ownership).insert("w-a".into(), Ownership::Local { epoch: 3 });
+    lock(&state.pro().ownership).insert("w-a".into(), Ownership::Local { epoch: 3 });
     assert!(crate::pro::may_execute(&state, "w-a"));
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -530,8 +544,8 @@ async fn graceful_same_boot_restart_does_not_fence_but_a_crash_probes_survivors(
     let (state, config, root) = fixture();
     worker_fixture(&state);
     accept(&state, &config, &baton(), 0, RequestStart::now()).unwrap();
-    lock(&state.pro.ownership).insert("w-a".into(), Ownership::Local { epoch: 2 });
-    crate::pro::ensure_root(&state.pro.root).await.unwrap();
+    lock(&state.pro().ownership).insert("w-a".into(), Ownership::Local { epoch: 2 });
+    crate::pro::ensure_root(&state.pro().root).await.unwrap();
     let intent = prepare_launch(&state, "w-a").await.unwrap().unwrap();
     let agent = state
         .sessions
@@ -555,7 +569,7 @@ async fn graceful_same_boot_restart_does_not_fence_but_a_crash_probes_survivors(
     intent.registered(agent.id.clone());
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            let saved = std::fs::read(state.pro.root.join("state.json"))
+            let saved = std::fs::read(state.pro().root.join("state.json"))
                 .ok()
                 .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
             if saved.as_ref().is_some_and(|value| {
@@ -571,7 +585,7 @@ async fn graceful_same_boot_restart_does_not_fence_but_a_crash_probes_survivors(
     .await
     .unwrap();
     // A crash here leaves a live recorded group: a successor must wait for it.
-    let crashed = crate::pro::ProState::new(state.pro.root.clone());
+    let crashed = crate::pro::ProState::new(state.pro().root.clone());
     assert_eq!(
         lock(&crashed.execution.unclean)["w-a"]
             .iter()
@@ -582,7 +596,7 @@ async fn graceful_same_boot_restart_does_not_fence_but_a_crash_probes_survivors(
     // A graceful stop proves the agents exited and clears the evidence.
     shutdown(&state).await.unwrap();
     assert!(!state.sessions.get(&agent.id).is_some_and(|s| s.alive));
-    let restarted = crate::pro::ProState::new(state.pro.root.clone());
+    let restarted = crate::pro::ProState::new(state.pro().root.clone());
     assert!(lock(&restarted.execution.unclean).is_empty());
     assert!(!lock(&restarted.preferences)["w-a"].execution_active);
     std::fs::remove_dir_all(root).unwrap();
@@ -595,11 +609,11 @@ async fn graceful_same_boot_restart_does_not_fence_but_a_crash_probes_survivors(
 fn keeping_a_project_on_this_computer_never_fences_its_agents() {
     let (state, _config, root) = fixture();
     crate::pro::install_execution_fixture(&state, "w-a", 2).unwrap();
-    lock(&state.pro.preferences)
+    lock(&state.pro().preferences)
         .entry("w-a".into())
         .or_default()
         .never_mirror = true;
-    lock(&state.pro.execution.proofs)
+    lock(&state.pro().execution.proofs)
         .get_mut("w-a")
         .unwrap()
         .deadline = lease::Deadline::expired_fixture();
@@ -610,7 +624,7 @@ fn keeping_a_project_on_this_computer_never_fences_its_agents() {
     assert!(restorable(&state, "w-a"));
     // Switching it back puts it in the loop again; the next renewal installs
     // a fresh proof.
-    lock(&state.pro.preferences)
+    lock(&state.pro().preferences)
         .get_mut("w-a")
         .unwrap()
         .never_mirror = false;
@@ -619,12 +633,12 @@ fn keeping_a_project_on_this_computer_never_fences_its_agents() {
     // cloud could still take the project, so a lapse still fences.
     crate::pro::install_execution_fixture(&state, "w-a", 3).unwrap();
     {
-        let mut preferences = lock(&state.pro.preferences);
+        let mut preferences = lock(&state.pro().preferences);
         let preference = preferences.get_mut("w-a").unwrap();
         preference.never_mirror = true;
         preference.privacy_pending = true;
     }
-    lock(&state.pro.execution.proofs)
+    lock(&state.pro().execution.proofs)
         .get_mut("w-a")
         .unwrap()
         .deadline = lease::Deadline::expired_fixture();
@@ -649,7 +663,7 @@ async fn a_fenced_conversation_resumes_only_in_its_own_epoch() {
         .unwrap()
     };
     accept(&state, &config, &grant(2), 0, RequestStart::now()).unwrap();
-    lock(&state.pro.ownership).insert("w-a".into(), Ownership::Local { epoch: 2 });
+    lock(&state.pro().ownership).insert("w-a".into(), Ownership::Local { epoch: 2 });
     let entry = |id: &str, fence: Option<u64>, handoff: bool| crate::ledger::LedgerEntry {
         id: id.into(),
         suspended: true,
@@ -691,13 +705,13 @@ async fn a_fenced_conversation_resumes_only_in_its_own_epoch() {
     };
     assert!(current("s-stale"), "still this computer's epoch");
     // Its own lapsed epoch re-acquired, nobody in between: still its own.
-    lock(&state.pro.execution.proofs)
+    lock(&state.pro().execution.proofs)
         .get_mut("w-a")
         .unwrap()
         .stopped = true;
-    lock(&state.pro.execution.proofs).remove("w-a");
+    lock(&state.pro().execution.proofs).remove("w-a");
     accept(&state, &config, &grant(3), 0, RequestStart::now()).unwrap();
-    lock(&state.pro.ownership).insert("w-a".into(), Ownership::Local { epoch: 3 });
+    lock(&state.pro().ownership).insert("w-a".into(), Ownership::Local { epoch: 3 });
     assert_eq!(
         lock(&state.deferred_sessions)["s-stale"].fence_epoch,
         Some(3)
@@ -706,8 +720,8 @@ async fn a_fenced_conversation_resumes_only_in_its_own_epoch() {
     // Lapsed again; the cloud held epoch 4 and gave it back at 5. While
     // that return is still installing, nothing is settled yet: its own copy
     // may bring the conversation back (`finish_hydration` settles after).
-    lock(&state.pro.execution.proofs).remove("w-a");
-    lock(&state.pro.ownership).insert("w-a".into(), Ownership::Hydrating { epoch: 5 });
+    lock(&state.pro().execution.proofs).remove("w-a");
+    lock(&state.pro().ownership).insert("w-a".into(), Ownership::Hydrating { epoch: 5 });
     accept(&state, &config, &grant(5), 0, RequestStart::now()).unwrap();
     assert!(lock(&state.deferred_sessions).contains_key("s-stale"));
     super::super::settle_fenced_here(&state, "w-a", Some(5));
@@ -716,7 +730,7 @@ async fn a_fenced_conversation_resumes_only_in_its_own_epoch() {
     assert!(deferred.contains_key("s-imported"));
     assert!(deferred.contains_key("s-other"), "not fenced: left alone");
     drop(deferred);
-    assert_eq!(lock(&state.pro.settled).len(), 1, "on its way to Recents");
+    assert_eq!(lock(&state.pro().settled).len(), 1, "on its way to Recents");
     // A fenced entry whose epoch this computer does not hold never resumes.
     lock(&state.deferred_sessions).insert("s-late".into(), entry("s-late", Some(4), false));
     assert!(!current("s-late"));
@@ -735,7 +749,7 @@ async fn a_wake_fences_a_long_lapsed_lease_at_once() {
         Duration::from_millis(100),
         "a held lease"
     );
-    lock(&state.pro.execution.proofs)
+    lock(&state.pro().execution.proofs)
         .get_mut("w-a")
         .unwrap()
         .deadline = lease::Deadline::lapsed_recently_fixture();
@@ -743,7 +757,7 @@ async fn a_wake_fences_a_long_lapsed_lease_at_once() {
     assert!(!fenced(&state, "w-a"), "inside the window: renewal first");
     assert!(resuming(&state, "w-a"));
     {
-        let mut proofs = lock(&state.pro.execution.proofs);
+        let mut proofs = lock(&state.pro().execution.proofs);
         let proof = proofs.get_mut("w-a").unwrap();
         proof.renew_until = None;
         proof.deadline = lease::Deadline::expired_fixture();
@@ -751,7 +765,7 @@ async fn a_wake_fences_a_long_lapsed_lease_at_once() {
     crate::pro::routes::woke(&state).await;
     assert!(fenced(&state, "w-a"), "fenced by the wake itself");
     assert!(!crate::pro::may_execute(&state, "w-a"));
-    lock(&state.pro.execution.proofs).clear();
+    lock(&state.pro().execution.proofs).clear();
     assert_eq!(
         watchdog::tick(&state),
         Duration::from_secs(1),

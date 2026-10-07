@@ -80,7 +80,7 @@ impl MoveYieldOwner {
         epoch: u64,
         requested: u64,
     ) -> Self {
-        let generation = state.pro.generation.load(Ordering::Acquire);
+        let generation = state.pro().generation.load(Ordering::Acquire);
         Self {
             project: ProjectOwner::move_capture(state, config, workspace, generation),
             epoch,
@@ -91,13 +91,13 @@ impl MoveYieldOwner {
         self.requested
     }
     pub fn current(&self) -> bool {
-        let current = lock(&self.project.state.pro.moves.yielding)
+        let current = lock(&self.project.state.pro().moves.yielding)
             .get(self.project.id())
             .is_some_and(|(held, at, _)| *held == self.epoch && *at == self.requested);
         current && self.project.move_owned_epoch() == Some(self.epoch)
     }
     pub fn acted(&self) -> Option<u64> {
-        lock(&self.project.state.pro.moves.acted)
+        lock(&self.project.state.pro().moves.acted)
             .get(self.project.id())
             .copied()
     }
@@ -108,7 +108,7 @@ impl MoveYieldOwner {
         crate::pro::moves::claim(&self.project.config, self.project.id(), self.epoch).await
     }
     pub async fn hand_off(&self) -> bool {
-        lock(&self.project.state.pro.moves.leaving).insert(self.project.workspace.clone());
+        lock(&self.project.state.pro().moves.leaving).insert(self.project.workspace.clone());
         let handed = crate::pro::routes::hand_to_computer(
             &self.project.state,
             &self.project.config,
@@ -117,12 +117,12 @@ impl MoveYieldOwner {
         )
         .await;
         if !handed {
-            lock(&self.project.state.pro.moves.leaving).remove(self.project.id());
+            lock(&self.project.state.pro().moves.leaving).remove(self.project.id());
         }
         handed
     }
     pub(in crate::pro) fn finish(&self) {
-        let mut yielding = lock(&self.project.state.pro.moves.yielding);
+        let mut yielding = lock(&self.project.state.pro().moves.yielding);
         if yielding
             .get(self.project.id())
             .is_some_and(|(held, at, _)| *held == self.epoch && *at == self.requested)

@@ -30,7 +30,7 @@ impl Fixture {
         ));
         std::fs::create_dir_all(root.join("project")).unwrap();
         let root = root.canonicalize().unwrap();
-        let mut state = crate::daemon_extension::with_inert_for_tests(AppState::new(
+        let state = crate::daemon_extension::with_inert_for_tests(AppState::new(
             "fixture-token".into(),
             "fixture".into(),
             4242,
@@ -39,7 +39,9 @@ impl Fixture {
             root.join("config"),
         ));
         if runtime.is_some() {
-            state.daemon_extension = runtime;
+            if let Some(runtime) = runtime {
+                state.pro().set_runtime(runtime);
+            }
         }
         let state = Arc::new(state);
         state.stopping.store(true, Ordering::Release);
@@ -118,7 +120,7 @@ async fn distinct_route_rejects_legacy_downgrade_and_requires_worker_binding() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(!fixture.state.pro.root.exists());
+    assert!(!fixture.state.pro().root.exists());
     for (key, value) in [
         ("role", json!("device")),
         ("keeper_url", json!("http://127.0.0.1:9")),
@@ -198,7 +200,7 @@ async fn binding_latches_across_disconnect_restart_and_corrupt_marker() {
         active_status["workspace_configuration"]["workspace"]["workspace_id"],
         "w-a"
     );
-    let marker = fixture.state.pro.root.join("workspace-authority.json");
+    let marker = fixture.state.pro().root.join("workspace-authority.json");
     assert!(!std::fs::read_to_string(&marker)
         .unwrap()
         .contains("synthetic-delegation"));
@@ -213,8 +215,8 @@ async fn binding_latches_across_disconnect_restart_and_corrupt_marker() {
         .0,
         StatusCode::NO_CONTENT
     );
-    assert!(!fixture.state.pro.configured.load(Ordering::Acquire));
-    assert!(lock(&fixture.state.pro.authority).restricted());
+    assert!(!fixture.state.pro().configured.load(Ordering::Acquire));
+    assert!(lock(&fixture.state.pro().authority).restricted());
     assert!(!crate::pro::may_write(&fixture.state, "w-a"));
     let (_, status) = request(&fixture.state, Method::GET, "/api/v1/pro/status", None).await;
     assert_eq!(
@@ -252,15 +254,15 @@ async fn binding_latches_across_disconnect_restart_and_corrupt_marker() {
             StatusCode::BAD_REQUEST
         );
     }
-    let restored = Authority::load(&fixture.state.pro.root);
+    let restored = Authority::load(&fixture.state.pro().root);
     assert!(restored.allows("w-a"));
     assert!(!restored.allows("w-b"));
-    *lock(&fixture.state.pro.authority) = restored;
+    *lock(&fixture.state.pro().authority) = restored;
     assert!(prepare(&fixture.state, &config, fixture.project.clone())
         .await
         .is_ok());
     std::fs::write(&marker, b"{}").unwrap();
-    let corrupt = Authority::load(&fixture.state.pro.root);
+    let corrupt = Authority::load(&fixture.state.pro().root);
     assert!(corrupt.restricted());
     assert!(!corrupt.allows("w-a"));
 }
@@ -312,14 +314,14 @@ async fn foreign_workspace_fails_before_network_files_or_local_mutation() {
             .is_err());
     }
     let cache = fixture.root.join("forbidden-cache");
-    let cache_guard = Arc::new(fixture.state.pro.cache("w-b").unwrap().lock_owned().await);
+    let cache_guard = Arc::new(fixture.state.pro().cache("w-b").unwrap().lock_owned().await);
     assert!(engine::fetch_snapshot(
         &fixture.state,
         &config,
         "w-b",
         &cache,
         cache_guard,
-        fixture.state.pro.generation.load(Ordering::Acquire),
+        fixture.state.pro().generation.load(Ordering::Acquire),
     )
     .await
     .is_err());
@@ -347,8 +349,8 @@ async fn foreign_workspace_fails_before_network_files_or_local_mutation() {
         );
     }
     assert!(!fixture.root.join("forbidden").exists());
-    assert!(!lock(&fixture.state.pro.preferences).contains_key("w-b"));
-    assert!(!lock(&fixture.state.pro.ownership).contains_key("w-b"));
+    assert!(!lock(&fixture.state.pro().preferences).contains_key("w-b"));
+    assert!(!lock(&fixture.state.pro().ownership).contains_key("w-b"));
     assert!(engine::snapshot(&fixture.state, &config, "w-b", false)
         .await
         .is_err());
@@ -400,7 +402,7 @@ async fn registered_root_is_fixed_and_replacement_is_not_adopted() {
             .await
             .is_err()
     );
-    assert!(!fixture.state.pro.root.join("w-a").exists());
+    assert!(!fixture.state.pro().root.join("w-a").exists());
 }
 
 #[tokio::test]
@@ -411,7 +413,7 @@ async fn foreign_registered_workspace_remains_fenced() {
         .add(fixture.root.join("foreign"))
         .unwrap();
     lock(&fixture.state.session_workspaces).insert("s-other".into(), foreign.id.clone());
-    lock(&fixture.state.pro.ownership).insert(foreign.id.clone(), Ownership::Local { epoch: 2 });
+    lock(&fixture.state.pro().ownership).insert(foreign.id.clone(), Ownership::Local { epoch: 2 });
     assert!(!crate::pro::may_write(&fixture.state, &foreign.id));
     assert!(!crate::pro::may_import(&fixture.state, &foreign.id, 2));
     assert!(!engine::eligible(&fixture.state, &foreign));
@@ -482,7 +484,7 @@ fn renewal_never_widens_or_rebinds_authority() {
 async fn rejected_or_stale_renewal_does_not_count_as_a_refresh() {
     let fixture = Fixture::new();
     let config = fixture.bind().await;
-    let generation = fixture.state.pro.generation.load(Ordering::Acquire);
+    let generation = fixture.state.pro().generation.load(Ordering::Acquire);
     let previous = config.delegation;
     let mut next = previous.clone();
     next.access_token = "synthetic-rotated".into();
@@ -494,7 +496,7 @@ async fn rejected_or_stale_renewal_does_not_count_as_a_refresh() {
         next
     ));
     assert_eq!(
-        lock(&fixture.state.pro.runtime)
+        lock(&fixture.state.pro().runtime)
             .as_ref()
             .unwrap()
             .delegation
@@ -510,7 +512,7 @@ async fn rejected_or_stale_renewal_does_not_count_as_a_refresh() {
         next.clone()
     ));
     assert_eq!(
-        lock(&fixture.state.pro.runtime)
+        lock(&fixture.state.pro().runtime)
             .as_ref()
             .unwrap()
             .delegation
@@ -519,7 +521,7 @@ async fn rejected_or_stale_renewal_does_not_count_as_a_refresh() {
     );
     assert!(install_renewal(&fixture.state, generation, &previous, next));
     assert_eq!(
-        lock(&fixture.state.pro.runtime)
+        lock(&fixture.state.pro().runtime)
             .as_ref()
             .unwrap()
             .delegation
@@ -543,7 +545,7 @@ async fn supervised_revision_comparison_preserves_every_other_latched_identity()
         ),
     ));
     state.stopping.store(true, Ordering::Release);
-    let Authority::Bound(previous) = Authority::load(&state.pro.root) else {
+    let Authority::Bound(previous) = Authority::load(&state.pro().root) else {
         panic!("saved authority missing");
     };
     let mut incoming = previous.clone();
@@ -573,7 +575,7 @@ async fn supervised_revision_comparison_preserves_every_other_latched_identity()
     assert!(crate::pro::execution::supervisor::pending(&state));
     assert!(crate::pro::execution::supervisor::ack(&state).is_none());
     assert_eq!(
-        lock(&state.pro.authority)
+        lock(&state.pro().authority)
             .acknowledgment()
             .unwrap()
             .workspace
@@ -637,7 +639,7 @@ async fn initial_hydrate_retains_transfer_owner_after_read_admission() {
                 async move {
                     observed.fetch_add(1, Ordering::SeqCst);
                     if changed {
-                        owner.pro.generation.fetch_add(1, Ordering::AcqRel);
+                        owner.pro().generation.fetch_add(1, Ordering::AcqRel);
                     }
                     axum::Json(json!({"workspace_id":"w-a","repository_url":url,"working_tree_url":url,
                         "username":"fixture","password":"synthetic","read_only":true,
@@ -677,7 +679,7 @@ async fn initial_hydrate_retains_transfer_owner_after_read_admission() {
             assert_eq!(calls.load(Ordering::SeqCst), 1);
             assert_eq!(reply["error"], "fixture_initial_repository_admitted");
         }
-        assert!(!fixture.state.pro.root.join("w-a/incoming.git").exists());
+        assert!(!fixture.state.pro().root.join("w-a/incoming.git").exists());
         assert!(crate::lock(&fixture.state.workspaces).get("w-a").is_none());
         peer.abort();
         let _ = peer.await;

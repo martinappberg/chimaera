@@ -214,7 +214,7 @@ pub(crate) async fn apply_session_environment(
     env: &mut Vec<(String, String)>,
     remove: &mut Vec<String>,
 ) -> anyhow::Result<()> {
-    let Some(extension) = state.daemon_extension.as_ref() else {
+    let Some(extension) = state.pro().runtime() else {
         return Ok(());
     };
     // Below an active plan (and off a cloud worker) there is no account
@@ -266,14 +266,14 @@ fn validate_environment(
 /// Tests only: `state` composed with an inert Runtime, the official app's
 /// daemon before sign-in. Without one a daemon is free and has no `/pro/*`.
 #[cfg(test)]
-pub(crate) fn with_inert_for_tests(mut state: crate::AppState) -> crate::AppState {
+pub(crate) fn with_inert_for_tests(state: crate::AppState) -> crate::AppState {
     struct Inert;
     impl Runtime for Inert {
         fn coordinate(&self, _owner: CoordinatorOwner) -> RuntimeFuture {
             Box::pin(async {})
         }
     }
-    state.daemon_extension = Some(std::sync::Arc::new(Inert));
+    state.pro().set_runtime(std::sync::Arc::new(Inert));
     state
 }
 

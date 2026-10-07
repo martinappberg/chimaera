@@ -173,7 +173,9 @@ impl Harness {
             Ok::<_, anyhow::Error>((root, state))
         })
         .await??;
-        state.daemon_extension = runtime.or_else(|| factory.map(|factory| factory()));
+        if let Some(runtime) = runtime.or_else(|| factory.map(|factory| factory())) {
+            state.pro().set_runtime(runtime);
+        }
         Ok(Self {
             state: Arc::new(state),
             root,
@@ -191,7 +193,13 @@ impl Harness {
     pub async fn transfer_owner(
         &self,
     ) -> anyhow::Result<Arc<crate::pro::transfer_host::TransferHost>> {
-        let guard = Arc::new(self.state.pro.cache(&self.transfer_key)?.lock_owned().await);
+        let guard = Arc::new(
+            self.state
+                .pro()
+                .cache(&self.transfer_key)?
+                .lock_owned()
+                .await,
+        );
         crate::pro::transfer_host::TransferHost::capture_fixture(
             self.state.clone(),
             self.root.clone(),
@@ -206,10 +214,10 @@ impl Harness {
             crate::pro::valid_id(workspace),
             "invalid fixture cache identity"
         );
-        self.state.pro.cache(workspace)
+        self.state.pro().cache(workspace)
     }
     pub fn configuration(&self) -> Arc<tokio::sync::Mutex<()>> {
-        self.state.pro.configuration.clone()
+        self.state.pro().configuration.clone()
     }
     pub async fn transfer_owner_with_cache(
         &self,
@@ -230,7 +238,12 @@ impl Harness {
         .await
     }
     pub async fn settle_transfer(&self) -> anyhow::Result<()> {
-        let _original = self.state.pro.cache(&self.transfer_key)?.lock_owned().await;
+        let _original = self
+            .state
+            .pro()
+            .cache(&self.transfer_key)?
+            .lock_owned()
+            .await;
         crate::pro::transport::cache_quiescent(&self.transfer_key)
     }
     pub async fn configure(&self, request: serde_json::Value) -> anyhow::Result<Reply> {
@@ -266,7 +279,7 @@ impl Harness {
     pub async fn close(&self) -> anyhow::Result<()> {
         self.state.stopping.store(true, Ordering::Release);
         {
-            let _configuration = self.state.pro.configuration.lock().await;
+            let _configuration = self.state.pro().configuration.lock().await;
             crate::pro::routes::stop_tasks(&self.state).await?;
         }
         let result = crate::pro::drain(

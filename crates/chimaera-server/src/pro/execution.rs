@@ -110,18 +110,18 @@ pub(super) fn validate_configuration(config: &Configure) -> Result<()> {
 /// transfer stops it, through the ownership fences in `may_write`.
 pub(super) fn worker(state: &AppState) -> bool {
     crate::cloud::enabled()
-        || state.pro.worker.load(Ordering::Acquire)
-        || lock(&state.pro.runtime)
+        || state.pro().worker.load(Ordering::Acquire)
+        || lock(&state.pro().runtime)
             .as_ref()
             .is_some_and(|config| config.role == Role::Worker)
 }
 
 /// This project's enrollment record was lost; see `State::uncertain`.
 pub(super) fn uncertain(state: &AppState, workspace: &str) -> bool {
-    lock(&state.pro.execution.uncertain).contains(workspace)
+    lock(&state.pro().execution.uncertain).contains(workspace)
 }
 pub(super) fn any_uncertain(state: &AppState) -> bool {
-    !lock(&state.pro.execution.uncertain).is_empty()
+    !lock(&state.pro().execution.uncertain).is_empty()
 }
 
 /// The account refused a legacy release of this project because it is
@@ -133,7 +133,7 @@ pub(super) fn any_uncertain(state: &AppState) -> bool {
 /// one. Returns whether it was newly latched, so the one log line is not
 /// repeated.
 pub(super) fn require_v2(state: &AppState, workspace: &str) -> bool {
-    let mut latched = lock(&state.pro.execution.latched);
+    let mut latched = lock(&state.pro().execution.latched);
     // The persisted latch holds at most 128 projects; more would make every
     // state write fail.
     if !super::valid_id(workspace) || latched.len() >= 128 || !latched.insert(workspace.to_owned())
@@ -153,16 +153,16 @@ pub(super) fn require_v2(state: &AppState, workspace: &str) -> bool {
 /// switch is still unacknowledged (`privacy_pending`) the cloud could still
 /// take the project, so it keeps renewing like any other.
 pub(super) fn kept_here(state: &AppState, workspace: &str) -> bool {
-    lock(&state.pro.preferences)
+    lock(&state.pro().preferences)
         .get(workspace)
         .is_some_and(|p| p.never_mirror && !p.privacy_pending)
 }
 
 pub(super) fn managed(state: &AppState, workspace: &str) -> bool {
-    let latched = lock(&state.pro.execution.latched).contains(workspace);
+    let latched = lock(&state.pro().execution.latched).contains(workspace);
     uncertain(state, workspace)
         || latched
-        || lock(&state.pro.preferences)
+        || lock(&state.pro().preferences)
             .get(workspace)
             .is_some_and(|p| p.continuity.is_some())
 }
@@ -181,7 +181,7 @@ pub(super) fn effective(
     if !managed {
         result.execution = None;
     } else {
-        let policy = lock(&state.pro.preferences)
+        let policy = lock(&state.pro().preferences)
             .get(workspace)
             .and_then(|p| p.continuity.clone())
             .context("continuity policy unavailable")?;
@@ -222,9 +222,9 @@ pub(super) fn observe(state: &AppState, config: &Configure, baton: &Baton) -> Re
         super::valid_id(&baton.workspace_id),
         "invalid continuity workspace"
     );
-    let latched = lock(&state.pro.execution.latched).contains(&baton.workspace_id);
+    let latched = lock(&state.pro().execution.latched).contains(&baton.workspace_id);
     let lost = uncertain(state, &baton.workspace_id);
-    let mut preferences = lock(&state.pro.preferences);
+    let mut preferences = lock(&state.pro().preferences);
     let previous = preferences
         .get(&baton.workspace_id)
         .and_then(|p| p.continuity.as_ref());
@@ -277,9 +277,9 @@ pub(super) fn observe(state: &AppState, config: &Configure, baton: &Baton) -> Re
         .or_default()
         .continuity = Some(policy.clone());
     drop(preferences);
-    lock(&state.pro.execution.latched).insert(baton.workspace_id.clone());
+    lock(&state.pro().execution.latched).insert(baton.workspace_id.clone());
     // The account restored this project's policy: its lost record is resolved.
-    lock(&state.pro.execution.uncertain).remove(&baton.workspace_id);
+    lock(&state.pro().execution.uncertain).remove(&baton.workspace_id);
     Ok(())
 }
 
@@ -298,7 +298,7 @@ pub(super) fn expired(baton: &Baton) -> bool {
 /// (every acquisition advances the epoch). Its own processes and files are the
 /// newest state, so re-acquiring needs no hydration and no fork.
 pub(super) fn held_here(state: &AppState, config: &Configure, baton: &Baton) -> bool {
-    lock(&state.pro.preferences)
+    lock(&state.pro().preferences)
         .get(&baton.workspace_id)
         .and_then(|p| p.execution_identity.as_ref())
         .is_some_and(|identity| {
@@ -319,12 +319,12 @@ pub(super) fn held_here(state: &AppState, config: &Configure, baton: &Baton) -> 
 pub(super) fn shells_allowed(state: &AppState, workspace: &str) -> bool {
     !worker(state)
         && !supervisor::pending(state)
-        && !lock(&state.pro.preferences)
+        && !lock(&state.pro().preferences)
             .get(workspace)
             .is_some_and(|p| p.recovery_pending)
 }
 pub(super) fn fenced(state: &AppState, workspace: &str) -> bool {
-    lock(&state.pro.execution.proofs)
+    lock(&state.pro().execution.proofs)
         .get(workspace)
         .is_some_and(|proof| proof.stopped)
 }
@@ -351,7 +351,7 @@ pub(super) fn accept(
     start: RequestStart,
 ) -> Result<()> {
     ensure!(
-        generation == state.pro.generation.load(Ordering::Acquire),
+        generation == state.pro().generation.load(Ordering::Acquire),
         "stale execution generation"
     );
     ensure!(
@@ -368,13 +368,13 @@ pub(super) fn accept(
     );
     observe(state, config, baton)?;
     ensure!(
-        !lock(&state.pro.preferences)
+        !lock(&state.pro().preferences)
             .get(&baton.workspace_id)
             .is_some_and(|p| p.recovery_pending),
         "project recovery is pending"
     );
     if config.execution.is_none() {
-        lock(&state.pro.opened_here).remove(&baton.workspace_id);
+        lock(&state.pro().opened_here).remove(&baton.workspace_id);
         return Ok(());
     }
     ensure!(
@@ -383,7 +383,7 @@ pub(super) fn accept(
                 == baton.execution_capability.as_ref()
             && baton.holder_id.as_deref() == Some(&config.delegation.device_id)
             && !baton.mirror_disabled
-            && generation == state.pro.generation.load(Ordering::Acquire),
+            && generation == state.pro().generation.load(Ordering::Acquire),
         "execution ownership changed"
     );
     let lease = baton
@@ -407,7 +407,7 @@ pub(super) fn accept(
         .context("expired execution lease")?;
     let deadline = lease::Deadline::from_response(start, remaining)
         .context("execution lease arrived too late")?;
-    let mut proofs = lock(&state.pro.execution.proofs);
+    let mut proofs = lock(&state.pro().execution.proofs);
     // A canceled HTTP future does not cancel a blocking filesystem commit.
     // Replacing its epoch must wait for that owned reservation to be dropped.
     ensure!(
@@ -451,7 +451,7 @@ pub(super) fn accept(
     // nobody in between (the same epoch renewed, or its own re-acquired: every
     // acquisition advances the epoch by one): what a fence preserved stays
     // resumable. Any other grant settles those entries (review R4 S1).
-    let continued = lock(&state.pro.preferences)
+    let continued = lock(&state.pro().preferences)
         .get(&baton.workspace_id)
         .and_then(|p| p.execution_identity.as_ref())
         .filter(|identity| {
@@ -467,7 +467,7 @@ pub(super) fn accept(
         // (`finish_hydration`), so a conversation it brings back is never
         // also sent to Recents.
         None if !matches!(
-            lock(&state.pro.ownership).get(&baton.workspace_id),
+            lock(&state.pro().ownership).get(&baton.workspace_id),
             Some(Ownership::Hydrating { .. } | Ownership::SettingUp { .. })
         ) =>
         {
@@ -475,7 +475,7 @@ pub(super) fn accept(
         }
         None => {}
     }
-    lock(&state.pro.preferences)
+    lock(&state.pro().preferences)
         .entry(baton.workspace_id.clone())
         .or_default()
         .execution_identity = Some(wire::Identity {
@@ -505,8 +505,8 @@ pub(super) fn accept(
     );
     drop(proofs);
     // This device holds the project now: nothing is left to pull home.
-    lock(&state.pro.opened_here).remove(&baton.workspace_id);
-    state.pro.execution.changed.notify_waiters();
+    lock(&state.pro().opened_here).remove(&baton.workspace_id);
+    state.pro().execution.changed.notify_waiters();
     Ok(())
 }
 /// Local execution admission. Ownership transitions (another verified owner,
@@ -518,7 +518,7 @@ pub(super) fn allows(state: &AppState, workspace: &str) -> bool {
     if !managed(state, workspace) {
         return !supervisor::supervised(state);
     }
-    if lock(&state.pro.preferences)
+    if lock(&state.pro().preferences)
         .get(workspace)
         .is_some_and(|p| p.recovery_pending)
     {
@@ -541,7 +541,7 @@ pub(super) fn allows(state: &AppState, workspace: &str) -> bool {
         }
         let unverified = !super::signed_out(state)
             && matches!(
-                lock(&state.pro.ownership).get(workspace),
+                lock(&state.pro().ownership).get(workspace),
                 Some(super::Ownership::AwaitingVerification { .. })
             );
         return if unverified {
@@ -562,22 +562,22 @@ pub(super) fn allows(state: &AppState, workspace: &str) -> bool {
 /// renewal (`resumed`) and wakes the lease loop.
 pub(super) fn thawed(state: &AppState) -> bool {
     let stale =
-        lock(&state.pro.execution.tick).is_some_and(|tick| tick.elapsed() > watchdog::FREEZE);
-    if stale && resumed(state, state.pro.generation.load(Ordering::Acquire)) {
-        state.pro.renew_now.notify_one();
+        lock(&state.pro().execution.tick).is_some_and(|tick| tick.elapsed() > watchdog::FREEZE);
+    if stale && resumed(state, state.pro().generation.load(Ordering::Acquire)) {
+        state.pro().renew_now.notify_one();
     }
     stale
 }
 /// The watchdog ticked (see `thawed`).
 pub(super) fn ticked(state: &AppState, at: std::time::Instant) {
-    *lock(&state.pro.execution.tick) = Some(at);
+    *lock(&state.pro().execution.tick) = Some(at);
 }
 /// This process resumed from a freeze (see `resumed`) and is renewing its own
 /// epoch; the watchdog holds its fence until the renewal answers or the
 /// bounded window passes.
 pub(super) fn resuming(state: &AppState, workspace: &str) -> bool {
-    let generation = state.pro.generation.load(Ordering::Acquire);
-    lock(&state.pro.execution.proofs)
+    let generation = state.pro().generation.load(Ordering::Acquire);
+    lock(&state.pro().execution.proofs)
         .get(workspace)
         .is_some_and(|proof| {
             !proof.stopped
@@ -589,7 +589,7 @@ pub(super) fn resuming(state: &AppState, workspace: &str) -> bool {
 }
 /// The epoch of this project's current, unstopped execution proof.
 pub(super) fn proof_epoch(state: &AppState, workspace: &str) -> Option<u64> {
-    lock(&state.pro.execution.proofs)
+    lock(&state.pro().execution.proofs)
         .get(workspace)
         .filter(|proof| !proof.stopped)
         .map(|proof| proof.epoch)
@@ -608,7 +608,7 @@ pub(super) fn resumed(state: &AppState, generation: u64) -> bool {
     let now = std::time::Instant::now();
     let device = !worker(state);
     let mut due = false;
-    for proof in lock(&state.pro.execution.proofs).values_mut() {
+    for proof in lock(&state.pro().execution.proofs).values_mut() {
         if proof.generation == generation
             && !proof.stopped
             && proof.renew_until.is_none()
@@ -644,9 +644,9 @@ pub(super) fn lease_valid(state: &AppState, workspace: &str) -> bool {
     if !managed(state, workspace) {
         return true;
     }
-    let generation = state.pro.generation.load(Ordering::Acquire);
-    lock(&state.pro.execution.proofs).get(workspace).is_some_and(|proof| !proof.stopped && proof.generation==generation && proof.deadline.valid()
-        && matches!(lock(&state.pro.ownership).get(workspace),Some(Ownership::Local{epoch}|Ownership::SettingUp{epoch}|Ownership::Hydrating{epoch}|Ownership::Transferring{epoch}) if *epoch==proof.epoch))
+    let generation = state.pro().generation.load(Ordering::Acquire);
+    lock(&state.pro().execution.proofs).get(workspace).is_some_and(|proof| !proof.stopped && proof.generation==generation && proof.deadline.valid()
+        && matches!(lock(&state.pro().ownership).get(workspace),Some(Ownership::Local{epoch}|Ownership::SettingUp{epoch}|Ownership::Hydrating{epoch}|Ownership::Transferring{epoch}) if *epoch==proof.epoch))
 }
 pub(super) fn epoch(state: &AppState, workspace: &str) -> Option<u64> {
     if !allows(state, workspace) || !lease_valid(state, workspace) {
@@ -655,7 +655,7 @@ pub(super) fn epoch(state: &AppState, workspace: &str) -> Option<u64> {
     super::owned_epoch(state, workspace)
 }
 pub(super) fn preferred_here(state: &AppState, config: &Configure, workspace: &str) -> bool {
-    let policy = lock(&state.pro.preferences)
+    let policy = lock(&state.pro().preferences)
         .get(workspace)
         .and_then(|p| p.continuity.clone());
     match policy {
@@ -671,31 +671,31 @@ pub(super) fn preferred_here(state: &AppState, config: &Configure, workspace: &s
 /// (`super::note_opened`): it may come home to this computer even when the
 /// account's preferred installation is another one.
 pub(super) fn opened_here(state: &AppState, workspace: &str) -> bool {
-    lock(&state.pro.opened_here).contains(workspace)
+    lock(&state.pro().opened_here).contains(workspace)
 }
 pub(super) fn checkpoint_mode(state: &AppState, workspace: &str) -> bool {
-    lock(&state.pro.preferences)
+    lock(&state.pro().preferences)
         .get(workspace)
         .and_then(|p| p.continuity.as_ref())
         .is_some_and(|p| p.mode == "checkpoint_fork_v1")
 }
 pub(super) fn resume_allowed(state: &AppState, workspace: &str) -> bool {
     checkpoint_mode(state, workspace)
-        || !lock(&state.pro.preferences)
+        || !lock(&state.pro().preferences)
             .get(workspace)
             .is_some_and(|p| p.execution_uncertain)
 }
 pub(crate) fn recovery_context(state: &AppState, workspace: &str) -> bool {
     checkpoint_mode(state, workspace)
-        && lock(&state.pro.preferences)
+        && lock(&state.pro().preferences)
             .get(workspace)
             .is_some_and(|p| p.execution_uncertain)
 }
 pub(super) fn fence_workspace(state: &AppState, workspace: &str) {
-    if let Some(proof) = lock(&state.pro.execution.proofs).get_mut(workspace) {
+    if let Some(proof) = lock(&state.pro().execution.proofs).get_mut(workspace) {
         proof.stopped = true;
     }
-    state.pro.execution.changed.notify_waiters();
+    state.pro().execution.changed.notify_waiters();
 }
 
 /// How a wait for a resumed machine's own renewal ended.
@@ -729,16 +729,16 @@ pub(super) async fn await_renewal(
     epoch: u64,
     cap: Duration,
 ) -> Renewal {
-    let generation = state.pro.generation.load(Ordering::Acquire);
+    let generation = state.pro().generation.load(Ordering::Acquire);
     let started = tokio::time::Instant::now();
     loop {
         // Registered before the check, so a proof installed in between still
         // wakes this wait (notify_waiters keeps no permit for later waiters).
-        let changed = state.pro.execution.changed.notified();
+        let changed = state.pro().execution.changed.notified();
         tokio::pin!(changed);
         changed.as_mut().enable();
         let until = {
-            let proofs = lock(&state.pro.execution.proofs);
+            let proofs = lock(&state.pro().execution.proofs);
             let Some(proof) = proofs.get(workspace) else {
                 return Renewal::Refused;
             };
@@ -767,7 +767,7 @@ pub(super) async fn await_renewal(
 
 /// Processes from a previous daemon life that were not proven gone.
 pub(super) fn unclean(state: &AppState, workspace: &str) -> bool {
-    lock(&state.pro.execution.unclean).contains_key(workspace)
+    lock(&state.pro().execution.unclean).contains_key(workspace)
 }
 /// Agents are the managed workload. Plain shells are never managed: they are
 /// neither signalled by a fence nor awaited by a stop.
@@ -807,12 +807,12 @@ pub(super) fn quiescent(state: &AppState, workspace: &str) -> bool {
 /// from the requests that failed (review R4 B1). Shells keep running.
 pub(super) fn expire(state: &AppState, generation: u64) -> Vec<String> {
     let worker = worker(state);
-    let mut proofs = lock(&state.pro.execution.proofs);
+    let mut proofs = lock(&state.pro().execution.proofs);
     if !worker {
         // A project kept on this computer left the lease loop: nothing renews
         // its proof any more and nobody else may take it, so it holds none
         // and its agents are never fenced for it (`kept_here`).
-        let preferences = lock(&state.pro.preferences);
+        let preferences = lock(&state.pro().preferences);
         proofs.retain(|workspace, _| {
             !preferences
                 .get(workspace)
@@ -834,7 +834,7 @@ pub(super) fn expire(state: &AppState, generation: u64) -> Vec<String> {
             // signals its own and resumes them itself once it holds the
             // project again (`watchdog::preserve`).
             if worker {
-                lock(&state.pro.preferences)
+                lock(&state.pro().preferences)
                     .entry(workspace.clone())
                     .or_default()
                     .execution_uncertain = true;
@@ -844,30 +844,30 @@ pub(super) fn expire(state: &AppState, generation: u64) -> Vec<String> {
     }
     drop(proofs);
     if fenced {
-        state.pro.execution.changed.notify_waiters();
+        state.pro().execution.changed.notify_waiters();
     }
     expired
 }
 pub(super) fn invalidate(state: &AppState) -> Vec<String> {
-    let mut proofs = lock(&state.pro.execution.proofs);
+    let mut proofs = lock(&state.pro().execution.proofs);
     let mut workspaces = proofs.keys().cloned().collect::<Vec<_>>();
     for proof in proofs.values_mut() {
         proof.stopped = true;
     }
     drop(proofs);
-    for workspace in lock(&state.pro.execution.setups).keys() {
+    for workspace in lock(&state.pro().execution.setups).keys() {
         if !workspaces.contains(workspace) {
             workspaces.push(workspace.clone());
         }
     }
-    state.pro.execution.changed.notify_waiters();
+    state.pro().execution.changed.notify_waiters();
     workspaces
 }
 /// The leases this computer holds right now, as sign-out stands them down
 /// (`sign_out`): each project's current-generation proof and its epoch.
 pub(super) fn held(state: &AppState) -> Vec<(String, u64, HeldProof)> {
-    let generation = state.pro.generation.load(Ordering::Acquire);
-    lock(&state.pro.execution.proofs)
+    let generation = state.pro().generation.load(Ordering::Acquire);
+    lock(&state.pro().execution.proofs)
         .iter()
         .filter(|(_, proof)| proof.generation == generation)
         .map(|(workspace, proof)| (workspace.clone(), proof.epoch, HeldProof(proof.clone())))
@@ -883,42 +883,42 @@ pub(super) fn keep_held(state: &std::sync::Arc<AppState>, kept: Vec<(String, Hel
     if kept.is_empty() {
         return;
     }
-    let generation = state.pro.generation.load(Ordering::Acquire);
+    let generation = state.pro().generation.load(Ordering::Acquire);
     {
-        let mut proofs = lock(&state.pro.execution.proofs);
+        let mut proofs = lock(&state.pro().execution.proofs);
         for (workspace, HeldProof(mut proof)) in kept {
             proof.generation = generation;
             proof.renew_until = None;
             proofs.insert(workspace, proof);
         }
     }
-    state.pro.execution.changed.notify_waiters();
+    state.pro().execution.changed.notify_waiters();
     start(state);
 }
 /// The account acknowledged that a signed-out computer stood a project down:
 /// nobody takes it on this computer's behalf, so its proof goes and its
 /// agents are no longer fenced for it.
 pub(super) fn drop_held(state: &AppState, workspace: &str) {
-    lock(&state.pro.execution.proofs).remove(workspace);
-    state.pro.execution.changed.notify_waiters();
+    lock(&state.pro().execution.proofs).remove(workspace);
+    state.pro().execution.changed.notify_waiters();
 }
 /// A kept proof that `expire` has not fenced yet (see `keep_held`).
 pub(super) fn held_alive(state: &AppState, workspace: &str) -> bool {
-    lock(&state.pro.execution.proofs)
+    lock(&state.pro().execution.proofs)
         .get(workspace)
         .is_some_and(|proof| !proof.stopped && proof.deadline.valid())
 }
 pub(super) fn clear_stopped(state: &AppState) {
-    lock(&state.pro.execution.proofs).clear();
-    state.pro.execution.changed.notify_waiters();
+    lock(&state.pro().execution.proofs).clear();
+    state.pro().execution.changed.notify_waiters();
 }
 
 pub(super) fn valid_grant(state: &AppState, workspace: &str, epoch: u64) -> bool {
     if !managed(state, workspace) {
         return true;
     }
-    let generation = state.pro.generation.load(Ordering::Acquire);
-    lock(&state.pro.execution.proofs)
+    let generation = state.pro().generation.load(Ordering::Acquire);
+    lock(&state.pro().execution.proofs)
         .get(workspace)
         .is_some_and(|proof| {
             !proof.stopped
@@ -949,13 +949,13 @@ pub(super) fn adopt_running(state: &AppState, workspace: &str) {
     if !live {
         return;
     }
-    let mut preferences = lock(&state.pro.preferences);
+    let mut preferences = lock(&state.pro().preferences);
     if preferences.len() >= 128 && !preferences.contains_key(workspace) {
         return;
     }
     let preference = preferences.entry(workspace.to_owned()).or_default();
     preference.execution_active = true;
-    preference.execution_boot = state.pro.execution.boot.clone();
+    preference.execution_boot = state.pro().execution.boot.clone();
 }
 
 /// Durable admission precedes spawning. On a crash, same-boot execution remains
@@ -971,12 +971,12 @@ pub(crate) async fn prepare_launch(
         // Configure/stop may already hold this lock while draining our
         // reservation. Do not wait on the operation that is waiting for us.
         state
-            .pro
+            .pro()
             .configuration
             .try_lock()
             .map_err(|_| mutation::Changed)?
     } else {
-        state.pro.configuration.lock().await
+        state.pro().configuration.lock().await
     };
     ensure!(
         crate::pro::may_execute(state, workspace),
@@ -984,7 +984,7 @@ pub(crate) async fn prepare_launch(
     );
     let intent = launch::Intent::begin(state, workspace)?;
     {
-        let mut preferences = lock(&state.pro.preferences);
+        let mut preferences = lock(&state.pro().preferences);
         // An uncertain project (its record was lost) may have no preference
         // row yet; its launch still records evidence rather than failing.
         ensure!(
@@ -993,7 +993,7 @@ pub(crate) async fn prepare_launch(
         );
         let preference = preferences.entry(workspace.to_owned()).or_default();
         preference.execution_active = true;
-        preference.execution_boot = state.pro.execution.boot.clone();
+        preference.execution_boot = state.pro().execution.boot.clone();
         preference.execution_launch_pending = true;
     }
     crate::pro::persist(state).await?;
@@ -1008,14 +1008,14 @@ pub(crate) async fn prepare_launch(
 /// and no renewal arrived. Returns what the watchdog would fence.
 #[cfg(test)]
 pub(crate) fn expired_lease_fixture(state: &AppState, workspace: &str) -> Vec<String> {
-    if let Some(proof) = lock(&state.pro.execution.proofs).get_mut(workspace) {
+    if let Some(proof) = lock(&state.pro().execution.proofs).get_mut(workspace) {
         proof.deadline = lease::Deadline::expired_fixture();
     }
-    expire(state, state.pro.generation.load(Ordering::Acquire))
+    expire(state, state.pro().generation.load(Ordering::Acquire))
 }
 #[cfg(test)]
 pub(crate) fn lapse_fixture(state: &AppState, workspace: &str) {
-    if let Some(proof) = lock(&state.pro.execution.proofs).get_mut(workspace) {
+    if let Some(proof) = lock(&state.pro().execution.proofs).get_mut(workspace) {
         proof.deadline = lease::Deadline::expired_fixture();
     }
 }
@@ -1023,10 +1023,10 @@ pub(crate) fn lapse_fixture(state: &AppState, workspace: &str) {
 /// watchdog's freeze detection sees it. Returns what the watchdog would fence.
 #[cfg(any(test, feature = "daemon-extension-fixture"))]
 pub(crate) fn resumed_fixture(state: &AppState, workspace: &str) -> Vec<String> {
-    if let Some(proof) = lock(&state.pro.execution.proofs).get_mut(workspace) {
+    if let Some(proof) = lock(&state.pro().execution.proofs).get_mut(workspace) {
         proof.deadline = lease::Deadline::expired_fixture();
     }
-    let generation = state.pro.generation.load(Ordering::Acquire);
+    let generation = state.pro().generation.load(Ordering::Acquire);
     resumed(state, generation);
     expire(state, generation)
 }
@@ -1034,7 +1034,7 @@ pub(crate) fn resumed_fixture(state: &AppState, workspace: &str) -> Vec<String> 
 /// frozen and its watchdog has not ticked since.
 #[cfg(any(test, feature = "daemon-extension-fixture"))]
 pub(crate) fn thawed_fixture(state: &AppState, workspace: &str) {
-    if let Some(proof) = lock(&state.pro.execution.proofs).get_mut(workspace) {
+    if let Some(proof) = lock(&state.pro().execution.proofs).get_mut(workspace) {
         proof.deadline = lease::Deadline::expired_fixture();
     }
     ticked(
@@ -1045,7 +1045,7 @@ pub(crate) fn thawed_fixture(state: &AppState, workspace: &str) {
 /// A verified other owner, as an authenticated baton read records it.
 #[cfg(test)]
 pub(crate) fn remote_owner_fixture(state: &AppState, workspace: &str, epoch: u64) {
-    lock(&state.pro.ownership).insert(
+    lock(&state.pro().ownership).insert(
         workspace.into(),
         Ownership::Remote {
             epoch,
@@ -1056,21 +1056,21 @@ pub(crate) fn remote_owner_fixture(state: &AppState, workspace: &str, epoch: u64
 /// Strict worker semantics for fixtures that exercise lease fencing.
 #[cfg(test)]
 pub(crate) fn worker_fixture(state: &AppState) {
-    state.pro.worker.store(true, Ordering::Release);
+    state.pro().worker.store(true, Ordering::Release);
 }
 /// Shared HTTP/scope fixtures install a normally validated synthetic grant;
 /// production validation has no test-only permissive branch.
 #[cfg(any(test, feature = "daemon-extension-fixture"))]
 pub(crate) fn install_fixture(state: &AppState, workspace: &str, epoch: u64) -> Result<()> {
     grant_fixture(state, workspace, epoch, 1)?;
-    lock(&state.pro.ownership).insert(workspace.into(), Ownership::Local { epoch });
+    lock(&state.pro().ownership).insert(workspace.into(), Ownership::Local { epoch });
     Ok(())
 }
 /// The account answered a resumed machine's renewal of its own epoch: the
 /// lease loop accepts the same lease's next sequence (see `install_fixture`).
 #[cfg(test)]
 pub(crate) fn renewed_fixture(state: &AppState, workspace: &str, epoch: u64) -> Result<()> {
-    let sequence = lock(&state.pro.execution.proofs)
+    let sequence = lock(&state.pro().execution.proofs)
         .get(workspace)
         .context("no execution proof to renew")?
         .lease
@@ -1101,7 +1101,7 @@ fn grant_fixture(state: &AppState, workspace: &str, epoch: u64, sequence: u64) -
         state,
         &config,
         &grant,
-        state.pro.generation.load(Ordering::Acquire),
+        state.pro().generation.load(Ordering::Acquire),
         RequestStart::now(),
     )
 }
@@ -1109,5 +1109,5 @@ fn grant_fixture(state: &AppState, workspace: &str, epoch: u64, sequence: u64) -
 /// An admitted installer holds a Pro setup reservation for its project; a
 /// free local install holds none and keeps its unmanaged lifecycle.
 pub(crate) fn installer_guarded(state: &AppState, workspace: &str) -> bool {
-    lock(&state.pro.execution.setups).contains_key(workspace)
+    lock(&state.pro().execution.setups).contains_key(workspace)
 }

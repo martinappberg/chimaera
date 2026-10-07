@@ -67,7 +67,7 @@ async fn register_request(
         .body(Body::from(body_value.to_string()))
         .unwrap();
     let router = app(state.clone());
-    let response = if state.daemon_extension.is_none() {
+    let response = if state.pro().runtime().is_none() {
         // The legacy scenario: a viewing daemon without the extension, which
         // has no `/pro/*` routes, holding a placement it was given directly.
         let registration = serde_json::from_value(body_value).unwrap();
@@ -419,11 +419,15 @@ pub async fn routed_remote(
     factory: Option<fn() -> Arc<dyn crate::daemon_extension::Runtime>>,
 ) -> SleepingChat {
     // Both machines of a routed project run the composed daemon.
-    let mut remote = fixture_state();
-    remote.daemon_extension = factory.map(|factory| factory());
+    let remote = fixture_state();
+    if let Some(runtime) = factory.map(|factory| factory()) {
+        remote.pro().set_runtime(runtime);
+    }
     let remote = Arc::new(remote);
-    let mut local = fixture_state();
-    local.daemon_extension = factory.map(|factory| factory());
+    let local = fixture_state();
+    if let Some(runtime) = factory.map(|factory| factory()) {
+        local.pro().set_runtime(runtime);
+    }
     let local = Arc::new(local);
     let workspace = lock(&remote.workspaces)
         .add(test_dir(&format!("{label}-remote")).canonicalize().unwrap())

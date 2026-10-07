@@ -102,7 +102,7 @@ pub(super) fn set_ownership(
 ) {
     apply(
         state,
-        &mut lock(&state.pro.ownership),
+        &mut lock(&state.pro().ownership),
         workspace,
         new,
         reason,

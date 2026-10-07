@@ -63,7 +63,7 @@ fn guard_override(dev: bool, value: Option<&str>) -> u64 {
 /// header (before 7.84) must still see its successes.
 pub(super) fn answered(state: &AppState, status: u16, from_account: bool) {
     if (200..300).contains(&status) || status == 409 {
-        let _ = state.pro.reachable_since.compare_exchange(
+        let _ = state.pro().reachable_since.compare_exchange(
             0,
             super::now().max(1),
             Ordering::AcqRel,
@@ -83,11 +83,11 @@ pub(super) fn answered(state: &AppState, status: u16, from_account: bool) {
 /// The account could not be reached, or this computer slept or froze: the
 /// guard starts over.
 pub(super) fn unreachable(state: &AppState) {
-    state.pro.reachable_since.store(0, Ordering::Release);
+    state.pro().reachable_since.store(0, Ordering::Release);
 }
 /// Reached without a gap for the guard.
 pub(super) fn settled(state: &AppState) -> bool {
-    let since = state.pro.reachable_since.load(Ordering::Acquire);
+    let since = state.pro().reachable_since.load(Ordering::Acquire);
     since != 0 && super::now().saturating_sub(since) >= guard_seconds()
 }
 
@@ -111,13 +111,13 @@ struct Target {
     alias: String,
 }
 fn target(state: &AppState) -> Option<Target> {
-    if state.daemon_extension.is_none()
-        || !state.pro.configured.load(Ordering::Acquire)
+    if state.pro().runtime().is_none()
+        || !state.pro().configured.load(Ordering::Acquire)
         || super::execution::worker(state)
     {
         return None;
     }
-    let config = lock(&state.pro.runtime).clone()?;
+    let config = lock(&state.pro().runtime).clone()?;
     if config.role != super::protocol::Role::Device
         || config.delegation.workspace.is_some()
         || !config
@@ -163,29 +163,29 @@ pub(super) fn start(state: &Arc<AppState>) {
     if target(state).is_none() {
         return;
     }
-    let generation = state.pro.generation.load(Ordering::Acquire);
+    let generation = state.pro().generation.load(Ordering::Acquire);
     let weak = Arc::downgrade(state);
     let task = tokio::spawn(async move { run(weak, generation).await });
-    *lock(&state.pro.link) = Some(task);
+    *lock(&state.pro().link) = Some(task);
 }
 /// Ends the reverse link and every stream it carries (sign-out, a new
 /// configuration, shutdown).
 pub(super) fn stop(state: &AppState) {
-    if let Some(task) = lock(&state.pro.link).take() {
+    if let Some(task) = lock(&state.pro().link).take() {
         task.abort();
     }
 }
 /// Whether the reverse link task is running (tests and status).
 #[cfg(test)]
 pub(super) fn running(state: &AppState) -> bool {
-    lock(&state.pro.link)
+    lock(&state.pro().link)
         .as_ref()
         .is_some_and(|task| !task.is_finished())
 }
 
 fn current(state: &AppState, generation: u64) -> bool {
     !state.stopping.load(Ordering::Acquire)
-        && state.pro.generation.load(Ordering::Acquire) == generation
+        && state.pro().generation.load(Ordering::Acquire) == generation
 }
 
 async fn run(weak: std::sync::Weak<AppState>, generation: u64) {
@@ -480,7 +480,7 @@ mod tests {
         assert!(!running(&state));
         assert!(target(&state).is_none());
         // Configured, but no Runtime composed in: still nothing.
-        *lock(&state.pro.runtime) = Some(
+        *lock(&state.pro().runtime) = Some(
             serde_json::from_value(serde_json::json!({
                 "role":"device","endpoint":"https://account.example","keeper_url":"https://keeper.example",
                 "delegation":{"access_token":"synthetic","expires_at":"2099-01-01T00:00:00Z",
@@ -488,7 +488,7 @@ mod tests {
             }))
             .unwrap(),
         );
-        state.pro.configured.store(true, Ordering::Release);
+        state.pro().configured.store(true, Ordering::Release);
         start(&state);
         assert!(!running(&state));
         assert!(!settled(&state));
@@ -511,29 +511,29 @@ mod tests {
             root.join("config"),
         );
         answered(&state, 200, true);
-        let since = state.pro.reachable_since.load(Ordering::Acquire);
+        let since = state.pro().reachable_since.load(Ordering::Acquire);
         assert!(since > 0);
         answered(&state, 409, true);
-        assert_eq!(state.pro.reachable_since.load(Ordering::Acquire), since);
+        assert_eq!(state.pro().reachable_since.load(Ordering::Acquire), since);
         // A proxy's or captive portal's 5xx (no account marker) proves
         // nothing: not reachable.
         answered(&state, 502, false);
-        assert_eq!(state.pro.reachable_since.load(Ordering::Acquire), 0);
+        assert_eq!(state.pro().reachable_since.load(Ordering::Acquire), 0);
         // A refused credential is not reachable either.
         answered(&state, 200, true);
         answered(&state, 401, true);
-        assert_eq!(state.pro.reachable_since.load(Ordering::Acquire), 0);
+        assert_eq!(state.pro().reachable_since.load(Ordering::Acquire), 0);
         // A success needs no marker (an old curl cannot report one).
         answered(&state, 200, false);
-        assert!(state.pro.reachable_since.load(Ordering::Acquire) > 0);
+        assert!(state.pro().reachable_since.load(Ordering::Acquire) > 0);
         // The account's own server error is not reachable either (review
         // R4 B1).
         answered(&state, 503, true);
-        assert_eq!(state.pro.reachable_since.load(Ordering::Acquire), 0);
+        assert_eq!(state.pro().reachable_since.load(Ordering::Acquire), 0);
         answered(&state, 200, true);
         unreachable(&state);
-        assert_eq!(state.pro.reachable_since.load(Ordering::Acquire), 0);
-        state.pro.reachable_since.store(1, Ordering::Release);
+        assert_eq!(state.pro().reachable_since.load(Ordering::Acquire), 0);
+        state.pro().reachable_since.store(1, Ordering::Release);
         assert!(settled(&state));
         let _ = std::fs::remove_dir_all(root);
     }
@@ -621,7 +621,7 @@ mod tests {
             chimaera_core::generate_token()
         ));
         std::fs::create_dir_all(&root).unwrap();
-        let mut state = AppState::new(
+        let state = AppState::new(
             "fixture".into(),
             "fixture".into(),
             4242,
@@ -629,9 +629,9 @@ mod tests {
             root.clone(),
             root.join("config"),
         );
-        state.daemon_extension = Some(Arc::new(Composed));
+        state.pro().set_runtime(Arc::new(Composed));
         let state = Arc::new(state);
-        *lock(&state.pro.runtime) = Some(
+        *lock(&state.pro().runtime) = Some(
             serde_json::from_value(serde_json::json!({
                 "role":"device","endpoint":"http://127.0.0.1:1",
                 "keeper_url": format!("http://127.0.0.1:{port}"),
@@ -640,7 +640,7 @@ mod tests {
             }))
             .unwrap(),
         );
-        state.pro.configured.store(true, Ordering::Release);
+        state.pro().configured.store(true, Ordering::Release);
         (state, root)
     }
 

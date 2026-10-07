@@ -131,7 +131,7 @@ impl ProjectOwner {
         &self.workspace
     }
     pub fn generation_current(&self) -> bool {
-        self.generation == self.state.pro.generation.load(Ordering::Acquire)
+        self.generation == self.state.pro().generation.load(Ordering::Acquire)
     }
     pub fn role(&self) -> ProjectRole {
         if self.config.role == Role::Worker {
@@ -153,10 +153,10 @@ impl ProjectOwner {
         super::super::moves::pulling(&self.state, &self.workspace)
     }
     pub fn release_pending(&self) -> bool {
-        lock(&self.state.pro.release_pending).contains(&self.workspace)
+        lock(&self.state.pro().release_pending).contains(&self.workspace)
     }
     pub fn ownership(&self) -> Option<Ownership> {
-        lock(&self.state.pro.ownership)
+        lock(&self.state.pro().ownership)
             .get(&self.workspace)
             .cloned()
     }
@@ -167,7 +167,7 @@ impl ProjectOwner {
         crate::pro::transition::set_ownership(&self.state, &self.workspace, value, "lease");
     }
     pub fn copy_epoch(&self, epoch: u64) {
-        if let Some(copy) = lock(&self.state.pro.preferences)
+        if let Some(copy) = lock(&self.state.pro().preferences)
             .get_mut(&self.workspace)
             .and_then(|p| p.copy.as_mut())
         {
@@ -175,25 +175,25 @@ impl ProjectOwner {
         }
     }
     pub fn takeover_requested(&self) -> bool {
-        lock(&self.state.pro.preferences)
+        lock(&self.state.pro().preferences)
             .get(&self.workspace)
             .and_then(|p| p.copy.as_ref())
             .is_some_and(|copy| copy.takeover_requested)
     }
     pub fn privacy_disabled(&self) {
-        let mut entries = lock(&self.state.pro.preferences);
+        let mut entries = lock(&self.state.pro().preferences);
         let preference = entries.entry(self.workspace.clone()).or_default();
         preference.never_mirror = true;
         preference.privacy_pending = false;
     }
     pub fn answered(&self) {
-        let mut entries = lock(&self.state.pro.answered);
+        let mut entries = lock(&self.state.pro().answered);
         if entries.len() < 128 || entries.contains(&self.workspace) {
             entries.insert(self.workspace.clone());
         }
     }
     pub async fn configuration(&self) -> tokio::sync::OwnedMutexGuard<()> {
-        self.state.pro.configuration.clone().lock_owned().await
+        self.state.pro().configuration.clone().lock_owned().await
     }
     pub async fn persist(&self) -> Result<()> {
         super::super::persist(&self.state).await
@@ -372,15 +372,15 @@ impl ProjectOwner {
         previous: &Option<Ownership>,
         epoch: u64,
     ) -> Result<Option<IdleWorker>> {
-        let Ok(job) = self.state.pro.jobs.clone().try_lock_owned() else {
+        let Ok(job) = self.state.pro().jobs.clone().try_lock_owned() else {
             return Ok(None);
         };
-        let _configuration = self.state.pro.configuration.lock().await;
+        let _configuration = self.state.pro().configuration.lock().await;
         ensure!(
             self.generation_current(),
             "Account changed during project transfer"
         );
-        let mut ownership = lock(&self.state.pro.ownership);
+        let mut ownership = lock(&self.state.pro().ownership);
         let fenced = ownership.get(&self.workspace) == previous.as_ref()
             && !matches!(
                 previous,
@@ -403,13 +403,13 @@ impl ProjectOwner {
     }
     /// Jobs admission, immediate fence and original detached task stay public.
     pub async fn schedule_install(&self, epoch: u64) -> Result<bool> {
-        let Ok(job) = self.state.pro.jobs.clone().try_lock_owned() else {
+        let Ok(job) = self.state.pro().jobs.clone().try_lock_owned() else {
             return Ok(false);
         };
-        lock(&self.state.pro.installing).insert(self.workspace.clone());
+        lock(&self.state.pro().installing).insert(self.workspace.clone());
         self.set_ownership(Some(Ownership::AwaitingVerification { epoch }));
         if let Err(error) = self.persist().await {
-            lock(&self.state.pro.installing).remove(&self.workspace);
+            lock(&self.state.pro().installing).remove(&self.workspace);
             return Err(error);
         }
         let owner = self.state.clone();
@@ -426,7 +426,7 @@ impl ProjectOwner {
                     let _job = job;
                     let result =
                         super::install_owned(owner.clone(), config, key.clone(), epoch).await;
-                    lock(&owner.pro.installing).remove(&key);
+                    lock(&owner.pro().installing).remove(&key);
                     if let Err(error) = result {
                         super::record_error(&owner, &key, &error);
                         return super::super::detached::Outcome::refused(
@@ -507,7 +507,7 @@ impl SnapshotOwner {
     pub fn cache_root(&self) -> Result<PathBuf> {
         self.transfer
             .host
-            .captured_path(&self.project.state.pro.root.join(self.project.id()))
+            .captured_path(&self.project.state.pro().root.join(self.project.id()))
     }
     pub async fn clear_interrupted(&self) -> Result<()> {
         let owner = self.transfer.host.clone();
@@ -623,7 +623,7 @@ impl SnapshotOwner {
         super::super::projects::catalog::metadata(self.name(), self.visible())
     }
     pub async fn describe_repository(&self) -> Result<super::super::repository::Described> {
-        super::super::repository::describe(&self.project.state.pro, self.project.id(), self.root())
+        super::super::repository::describe(self.project.state.pro(), self.project.id(), self.root())
             .await
     }
     pub async fn publish_policy(&self, has_agents: bool) -> Result<()> {
@@ -654,7 +654,7 @@ impl SnapshotOwner {
         let state = &self.project.state;
         let workspace = self.project.id();
         {
-            let mut entries = lock(&state.pro.preferences);
+            let mut entries = lock(&state.pro().preferences);
             let preference = entries.entry(workspace.into()).or_default();
             preference.missing_environment = missing_environment;
             preference.published_tree = Some(tree);
@@ -663,7 +663,7 @@ impl SnapshotOwner {
             }
         }
         {
-            let mut statuses = lock(&state.pro.status);
+            let mut statuses = lock(&state.pro().status);
             let previous = statuses.remove(workspace).unwrap_or_default();
             statuses.insert(
                 workspace.into(),
@@ -686,8 +686,8 @@ impl SnapshotOwner {
     pub async fn release(&self, budget: Duration) -> Result<()> {
         self.project
             .state
-            .daemon_extension
-            .as_ref()
+            .pro()
+            .runtime()
             .context("optional_runtime_unavailable")?
             .release(self.release_owner(), budget)
             .await
@@ -699,15 +699,15 @@ impl SnapshotOwner {
         execution::require_v2(&self.project.state, self.project.id());
     }
     pub fn release_pending(&self) {
-        lock(&self.project.state.pro.release_pending).insert(self.project.workspace.clone());
+        lock(&self.project.state.pro().release_pending).insert(self.project.workspace.clone());
     }
     pub fn unpark(&self) {
         super::super::unpark(&self.project.state, self.project.id());
     }
     pub async fn recover_failed_publication(&self, must_upgrade: bool) -> Result<()> {
         let recover = {
-            let _configuration = self.project.state.pro.configuration.lock().await;
-            let mut ownership = lock(&self.project.state.pro.ownership);
+            let _configuration = self.project.state.pro().configuration.lock().await;
+            let mut ownership = lock(&self.project.state.pro().ownership);
             if self.project.generation_current()
                 && matches!(ownership.get(self.project.id()), Some(Ownership::Transferring{epoch}) if *epoch==self.epoch)
             {

@@ -105,21 +105,21 @@ pub(super) async fn stand_down_all(
 
 /// Signed out without the account acknowledging this project's stand-down.
 pub(super) fn unreleased(state: &AppState, workspace: &str) -> bool {
-    super::signed_out(state) && lock(&state.pro.unreleased).contains(workspace)
+    super::signed_out(state) && lock(&state.pro().unreleased).contains(workspace)
 }
 /// Signed out, and the account acknowledged the stand-down (or this computer
 /// held no lease for the project): nobody continues it elsewhere, so the
 /// computer's own work goes on without the account.
 pub(super) fn released(state: &AppState, workspace: &str) -> bool {
-    super::signed_out(state) && !lock(&state.pro.unreleased).contains(workspace)
+    super::signed_out(state) && !lock(&state.pro().unreleased).contains(workspace)
 }
 /// A new configuration (sign-in) ends sign-out's bookkeeping: the lease loop
 /// decides from here.
 pub(super) fn forget(state: &AppState) {
-    if let Some(task) = lock(&state.pro.stand_down).take() {
+    if let Some(task) = lock(&state.pro().stand_down).take() {
         task.abort();
     }
-    lock(&state.pro.unreleased).clear();
+    lock(&state.pro().unreleased).clear();
 }
 
 /// Asks again, in the background, for the owed stand-downs, backing off to
@@ -127,7 +127,7 @@ pub(super) fn forget(state: &AppState) {
 /// release lets the project's agents run on (its kept proof goes) and resumes
 /// what its fence stopped; a refusal leaves it fenced.
 pub(super) fn retry(state: &Arc<AppState>, config: Configure, mut owed: Vec<(String, u64)>) {
-    if let Some(task) = lock(&state.pro.stand_down).take() {
+    if let Some(task) = lock(&state.pro().stand_down).take() {
         task.abort();
     }
     if owed.is_empty() {
@@ -155,7 +155,7 @@ pub(super) fn retry(state: &Arc<AppState>, config: Configure, mut owed: Vec<(Str
                 }
                 owed.retain(|(id, _)| *id != workspace);
                 if answer == Answer::Released {
-                    lock(&state.pro.unreleased).remove(&workspace);
+                    lock(&state.pro().unreleased).remove(&workspace);
                     super::execution::drop_held(&state, &workspace);
                     changed.push((workspace, epoch));
                 } else {
@@ -175,7 +175,7 @@ pub(super) fn retry(state: &Arc<AppState>, config: Configure, mut owed: Vec<(Str
             }
         }
     });
-    *lock(&state.pro.stand_down) = Some(task);
+    *lock(&state.pro().stand_down) = Some(task);
 }
 
 /// The project is this computer's alone again: what a fence stopped at the
@@ -274,7 +274,7 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let endpoint = format!("http://{}", listener.local_addr().unwrap());
             let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-            *lock(&state.pro.runtime) = Some(
+            *lock(&state.pro().runtime) = Some(
                 serde_json::from_value(json!({
                     "account_id":"a-fixture","role":"device","endpoint":endpoint,
                     "keeper_url":"","hours_exhausted":false,
@@ -306,7 +306,7 @@ mod tests {
             } else {
                 assert!(unreleased(&state, "w-a"));
                 assert!(!released(&state, "w-a"));
-                let saved = std::fs::read_to_string(state.pro.root.join("state.json")).unwrap();
+                let saved = std::fs::read_to_string(state.pro().root.join("state.json")).unwrap();
                 assert!(saved.contains(r#""unreleased":["w-a"]"#), "{saved}");
                 // Fail closed: fenced at the kept lease's deadline.
                 assert_eq!(

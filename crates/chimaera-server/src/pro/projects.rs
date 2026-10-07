@@ -97,25 +97,25 @@ pub(crate) struct Open {
 }
 
 pub(super) fn adoption_pending(state: &AppState, workspace: &str) -> bool {
-    if lock(&state.pro.preferences)
+    if lock(&state.pro().preferences)
         .get(workspace)
         .is_some_and(super::project_copy::ready)
     {
         return false;
     }
-    lock(&state.pro.legacy_pending).contains(workspace)
-        || lock(&state.pro.adoptions)
+    lock(&state.pro().legacy_pending).contains(workspace)
+        || lock(&state.pro().adoptions)
             .get(workspace)
             .is_some_and(|entry| !entry.complete)
 }
 pub(in crate::pro) fn local_root(state: &AppState, workspace: &str) -> Option<PathBuf> {
-    if (lock(&state.pro.legacy_pending).contains(workspace)
-        && !lock(&state.pro.preferences)
+    if (lock(&state.pro().legacy_pending).contains(workspace)
+        && !lock(&state.pro().preferences)
             .get(workspace)
             .is_some_and(super::project_copy::ready))
         || !account_matches(state, workspace)
-        || (!lock(&state.pro.adoptions).contains_key(workspace)
-            && lock(&state.pro.preferences)
+        || (!lock(&state.pro().adoptions).contains_key(workspace)
+            && lock(&state.pro().preferences)
                 .get(workspace)
                 .is_none_or(|entry| entry.account.is_none()))
     {
@@ -125,7 +125,7 @@ pub(in crate::pro) fn local_root(state: &AppState, workspace: &str) -> Option<Pa
         .get(workspace)
         .map(|entry| entry.root)
         .or_else(|| {
-            lock(&state.pro.adoptions)
+            lock(&state.pro().adoptions)
                 .get(workspace)
                 .filter(|entry| entry.started || entry.complete)
                 .map(|entry| entry.root.clone())
@@ -140,18 +140,18 @@ fn account_scope(config: &Configure) -> Option<String> {
         .map(|id| format!("{}/{}", config.endpoint.trim_end_matches('/'), id))
 }
 pub(super) fn account_matches(state: &AppState, workspace: &str) -> bool {
-    let saved = lock(&state.pro.adoptions)
+    let saved = lock(&state.pro().adoptions)
         .get(workspace)
         .map(|entry| entry.account.clone());
     let saved = saved.unwrap_or_else(|| {
-        lock(&state.pro.preferences)
+        lock(&state.pro().preferences)
             .get(workspace)
             .and_then(|entry| entry.account.clone())
     });
     let Some(saved) = saved else {
-        return !lock(&state.pro.adoptions).contains_key(workspace);
+        return !lock(&state.pro().adoptions).contains_key(workspace);
     };
-    lock(&state.pro.runtime)
+    lock(&state.pro().runtime)
         .as_ref()
         .and_then(account_scope)
         .as_ref()
@@ -168,7 +168,7 @@ pub(super) fn bind_workspace_account(
     let Some(account) = account_scope(config) else {
         return Ok(());
     };
-    let mut preferences = lock(&state.pro.preferences);
+    let mut preferences = lock(&state.pro().preferences);
     ensure!(
         preferences.len() < MAX_PROJECTS || preferences.contains_key(workspace),
         refuse("limit_reached", "Local project limit reached")
@@ -244,7 +244,7 @@ async fn discover(state: &Arc<AppState>, config: &Configure) -> Result<Vec<Proje
         let rows = match rows {
             Ok(rows) => rows,
             Err(_) => {
-                let previous = lock(&state.pro.project_cache).projects.clone();
+                let previous = lock(&state.pro().project_cache).projects.clone();
                 for mut project in previous
                     .into_iter()
                     .filter(|project| project.host_id.as_deref() == Some(host.id.as_str()))
@@ -258,7 +258,7 @@ async fn discover(state: &Arc<AppState>, config: &Configure) -> Result<Vec<Proje
                             Some("Cloud project list is temporarily unavailable".into());
                         project.local_root = local_root(state, &project.workspace_id);
                         project.destination_saved = account_matches(state, &project.workspace_id)
-                            && lock(&state.pro.adoptions).contains_key(&project.workspace_id);
+                            && lock(&state.pro().adoptions).contains_key(&project.workspace_id);
                         projects.push(project);
                     }
                 }
@@ -275,7 +275,7 @@ async fn discover(state: &Arc<AppState>, config: &Configure) -> Result<Vec<Proje
             projects.push(Project {
                 local_root: local_root(state, &row.id),
                 destination_saved: account_matches(state, &row.id)
-                    && lock(&state.pro.adoptions).contains_key(&row.id),
+                    && lock(&state.pro().adoptions).contains_key(&row.id),
                 workspace_id: row.id,
                 name: row
                     .name
@@ -301,10 +301,10 @@ async fn discover(state: &Arc<AppState>, config: &Configure) -> Result<Vec<Proje
 async fn configuration(state: &AppState) -> (Option<Configure>, u64) {
     // stop_tasks changes generation before replacing the runtime. Snapshot the
     // pair under the same lock so a queued request cannot mix two accounts.
-    let _guard = state.pro.configuration.lock().await;
+    let _guard = state.pro().configuration.lock().await;
     (
-        lock(&state.pro.runtime).clone(),
-        state.pro.generation.load(Ordering::Acquire),
+        lock(&state.pro().runtime).clone(),
+        state.pro().generation.load(Ordering::Acquire),
     )
 }
 pub(in crate::pro) async fn list(state: &Arc<AppState>) -> Cache {
@@ -312,17 +312,17 @@ pub(in crate::pro) async fn list(state: &Arc<AppState>) -> Cache {
     let Some(config) = config.filter(|config| config.role == Role::Device) else {
         return Cache::default();
     };
-    let _guard = state.pro.discovery.lock().await;
-    if generation != state.pro.generation.load(Ordering::Acquire) {
+    let _guard = state.pro().discovery.lock().await;
+    if generation != state.pro().generation.load(Ordering::Acquire) {
         return Cache::default();
     }
     let now = super::now();
-    let cached = lock(&state.pro.project_cache).clone();
+    let cached = lock(&state.pro().project_cache).clone();
     if cached.checked_at != 0 && now.saturating_sub(cached.checked_at) < 30 {
         return cached;
     }
     let result = tokio::time::timeout(Duration::from_secs(10), discover(state, &config)).await;
-    if generation != state.pro.generation.load(Ordering::Acquire) {
+    if generation != state.pro().generation.load(Ordering::Acquire) {
         return Cache::default();
     }
     let next = match result {
@@ -345,7 +345,7 @@ pub(in crate::pro) async fn list(state: &Arc<AppState>) -> Cache {
             checked_at: now,
         },
     };
-    *lock(&state.pro.project_cache) = next.clone();
+    *lock(&state.pro().project_cache) = next.clone();
     next
 }
 pub(crate) async fn project_list(State(state): State<Arc<AppState>>) -> Response {
@@ -476,7 +476,7 @@ fn verify(destination: &Destination, require_empty: bool) -> Result<()> {
 }
 
 pub(super) fn check_copy_destination(state: &AppState, workspace: &str, root: &Path) -> Result<()> {
-    let destination = lock(&state.pro.adoptions)
+    let destination = lock(&state.pro().adoptions)
         .get(workspace)
         .cloned()
         .context("local copy destination is unavailable")?;
@@ -489,7 +489,7 @@ pub(super) fn check_copy_destination(state: &AppState, workspace: &str, root: &P
 /// Recheck immediately before filesystem installation, after potentially slow
 /// downloads. A durable marker makes partial imports retryable only at this path.
 pub(super) async fn begin_install(state: &AppState, workspace: &str, root: &Path) -> Result<()> {
-    let Some(destination) = lock(&state.pro.adoptions).get(workspace).cloned() else {
+    let Some(destination) = lock(&state.pro().adoptions).get(workspace).cloned() else {
         return Ok(());
     };
     ensure!(
@@ -511,13 +511,13 @@ pub(super) async fn begin_install(state: &AppState, workspace: &str, root: &Path
     let check = destination.clone();
     tokio::task::spawn_blocking(move || verify(&check, !check.started)).await??;
     let legacy = !super::project_copy::copy_only(state, workspace)
-        && lock(&state.pro.legacy_pending).remove(workspace);
+        && lock(&state.pro().legacy_pending).remove(workspace);
     if !destination.started || legacy {
-        if let Some(entry) = lock(&state.pro.adoptions).get_mut(workspace) {
+        if let Some(entry) = lock(&state.pro().adoptions).get_mut(workspace) {
             entry.started = true;
         }
         super::persist(state).await?;
-        lock(&state.pro.project_cache).checked_at = 0;
+        lock(&state.pro().project_cache).checked_at = 0;
     }
     Ok(())
 }
@@ -527,7 +527,7 @@ pub(in crate::pro) async fn copy(
     request: Open,
 ) -> Result<serde_json::Value> {
     anyhow::ensure!(
-        !crate::lock(&state.pro.authority).restricted(),
+        !crate::lock(&state.pro().authority).restricted(),
         refuse("unavailable", "workspace destination is fixed")
     );
     ensure!(
@@ -557,12 +557,12 @@ pub(in crate::pro) async fn copy(
         refuse("account_changed", "Account changed; open the project again")
     );
 
-    let _jobs = state.pro.jobs.lock().await;
+    let _jobs = state.pro().jobs.lock().await;
     ensure!(
-        generation == state.pro.generation.load(Ordering::Acquire),
+        generation == state.pro().generation.load(Ordering::Acquire),
         refuse("account_changed", "Account changed; open the project again")
     );
-    let explicit_unbound_recovery = lock(&state.pro.adoptions)
+    let explicit_unbound_recovery = lock(&state.pro().adoptions)
         .get(&request.workspace_id)
         .is_some_and(|entry| {
             entry.account.is_none() && request.destination_root.as_ref() == Some(&entry.root)
@@ -575,7 +575,7 @@ pub(in crate::pro) async fn copy(
         )
     );
     let existing = lock(&state.workspaces).get(&request.workspace_id);
-    let saved = lock(&state.pro.adoptions)
+    let saved = lock(&state.pro().adoptions)
         .get(&request.workspace_id)
         .filter(|entry| entry.started || entry.complete || request.destination_root.is_none())
         .cloned();
@@ -596,7 +596,7 @@ pub(in crate::pro) async fn copy(
                 )
             );
             saved.account = Some(account.clone());
-            lock(&state.pro.adoptions).insert(request.workspace_id.clone(), saved.clone());
+            lock(&state.pro().adoptions).insert(request.workspace_id.clone(), saved.clone());
             super::persist(state).await?;
         }
         ensure!(
@@ -623,8 +623,8 @@ pub(in crate::pro) async fn copy(
                 "This project already has a saved local folder"
             )
         );
-        let legacy = lock(&state.pro.legacy_pending).contains(&request.workspace_id)
-            || lock(&state.pro.preferences)
+        let legacy = lock(&state.pro().legacy_pending).contains(&request.workspace_id)
+            || lock(&state.pro().preferences)
                 .get(&request.workspace_id)
                 .is_none_or(|entry| entry.account.is_none());
         ensure!(
@@ -638,7 +638,7 @@ pub(in crate::pro) async fn copy(
         let (root, device, inode) =
             tokio::task::spawn_blocking(move || check_directory(&root)).await??;
         if legacy || !super::may_write(state, &request.workspace_id) {
-            lock(&state.pro.adoptions).insert(
+            lock(&state.pro().adoptions).insert(
                 request.workspace_id.clone(),
                 Destination {
                     root: root.clone(),
@@ -675,7 +675,7 @@ pub(in crate::pro) async fn copy(
         );
         let grant = engine::credentials(&config, &request.workspace_id, None).await?;
         ensure!(
-            grant.read_only && generation == state.pro.generation.load(Ordering::Acquire),
+            grant.read_only && generation == state.pro().generation.load(Ordering::Acquire),
             "Account changed before copy folder enrollment"
         );
         let root = request.destination_root.context(Refused {
@@ -683,7 +683,7 @@ pub(in crate::pro) async fn copy(
             message: "Choose where to save this project first",
         })?;
         let workspaces = lock(&state.workspaces).list();
-        let other_roots = lock(&state.pro.adoptions)
+        let other_roots = lock(&state.pro().adoptions)
             .iter()
             .filter(|(id, _)| *id != &request.workspace_id)
             .map(|(_, entry)| entry.root.clone())
@@ -697,9 +697,9 @@ pub(in crate::pro) async fn copy(
                 .await??;
         destination.account = Some(account.clone());
         let root = destination.root.clone();
-        lock(&state.pro.adoptions).insert(request.workspace_id.clone(), destination);
+        lock(&state.pro().adoptions).insert(request.workspace_id.clone(), destination);
         super::persist(state).await?;
-        lock(&state.pro.project_cache).checked_at = 0;
+        lock(&state.pro().project_cache).checked_at = 0;
         root
     };
     if let Some(existing) = existing.filter(|_| {
@@ -770,7 +770,7 @@ pub(super) async fn begin_copy_install(
     workspace: &str,
     root: &Path,
 ) -> Result<()> {
-    let destination = lock(&state.pro.adoptions)
+    let destination = lock(&state.pro().adoptions)
         .get(workspace)
         .cloned()
         .context("local copy destination is unavailable")?;
@@ -787,7 +787,7 @@ pub(super) async fn begin_copy_install(
     let check = destination.clone();
     tokio::task::spawn_blocking(move || verify(&check, !check.started)).await??;
     if !destination.started {
-        lock(&state.pro.adoptions)
+        lock(&state.pro().adoptions)
             .get_mut(workspace)
             .context("local copy destination disappeared")?
             .started = true;
@@ -797,10 +797,10 @@ pub(super) async fn begin_copy_install(
 }
 
 pub(super) fn complete_copy(state: &AppState, workspace: &str) {
-    if let Some(entry) = lock(&state.pro.adoptions).get_mut(workspace) {
+    if let Some(entry) = lock(&state.pro().adoptions).get_mut(workspace) {
         entry.complete = true;
     }
-    lock(&state.pro.project_cache).checked_at = 0;
+    lock(&state.pro().project_cache).checked_at = 0;
 }
 
 #[cfg(test)]
@@ -841,21 +841,22 @@ async fn takeover(state: &Arc<AppState>, request: TakeoverRequest) -> Result<ser
     }
     let mut intent = String::new();
     let prepared = async {
-        let _configuration = state.pro.configuration.lock().await;
+        let _configuration = state.pro().configuration.lock().await;
         ensure!(
-            generation == state.pro.generation.load(Ordering::Acquire),
+            generation == state.pro().generation.load(Ordering::Acquire),
             "Account changed before Take over"
         );
         let (owner, id, root) = (state.clone(), workspace.id.clone(), workspace.root.clone());
         tokio::task::spawn_blocking(move || check_copy_destination(&owner, &id, &root)).await??;
         let pending_install =
-            tokio::fs::try_exists(state.pro.root.join(&workspace.id).join("copy-install")).await?;
+            tokio::fs::try_exists(state.pro().root.join(&workspace.id).join("copy-install"))
+                .await?;
         ensure!(
             !pending_install,
             "Finish the interrupted local copy before Take over"
         );
         {
-            let mut preferences = lock(&state.pro.preferences);
+            let mut preferences = lock(&state.pro().preferences);
             let copy = preferences
                 .get_mut(&workspace.id)
                 .and_then(|p| p.copy.as_mut())

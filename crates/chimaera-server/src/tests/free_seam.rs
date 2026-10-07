@@ -13,14 +13,14 @@ fn free_state(data: PathBuf) -> Arc<AppState> {
 }
 
 fn untouched(state: &AppState, data: &std::path::Path) {
-    assert!(!state.pro.initialized(), "Pro state was read");
-    assert!(
-        !state.bundle_imports.initialized(),
-        "import record was read"
-    );
+    assert!(state.extension.get().is_none(), "Pro state was read");
+    assert!(state.extension.get().is_none(), "import record was read");
     assert!(!data.join("pro").exists(), "Pro state was written");
     assert!(!data.join("bundles").exists(), "import record was written");
-    assert!(!state.session_proxy.polling(), "a placement poll started");
+    assert!(
+        state.extension.get().is_none(),
+        "the extension state was built"
+    );
 }
 
 #[tokio::test]
@@ -205,7 +205,7 @@ async fn a_free_daemon_keeps_the_fence_an_earlier_composed_daemon_left() {
         .is_err());
     assert!(policy.allows(&state, "w-local", crate::policy::Need::Execute));
     // The fence was read, never Pro's live state.
-    assert!(!state.pro.initialized());
+    assert!(state.extension.get().is_none());
     std::fs::remove_dir_all(data).ok();
 }
 

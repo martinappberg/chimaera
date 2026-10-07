@@ -241,7 +241,7 @@ pub(crate) async fn terminal_input(
         .map(|record| record.key.clone());
     // Without the extension nothing admits or watches input (the pause
     // evidence below is Pro's idle proof), so a keystroke is a plain send.
-    if scope.is_none() && (key.is_none() || state.daemon_extension.is_none()) {
+    if scope.is_none() && (key.is_none() || !state.policy().composed(state)) {
         return input
             .send(bytes)
             .await
@@ -1889,7 +1889,7 @@ enum LocalWatch {
 struct ProjectView {
     /// The window's watched project and its mounted/listed paths.
     watched: Option<(String, Vec<String>, Vec<String>)>,
-    feed: Option<crate::session_proxy::Feed>,
+    feed: Option<Box<dyn crate::policy::ProjectFeed>>,
     /// Local git/fs watching is parked because the project is routed.
     remote: bool,
     retry_at: Option<tokio::time::Instant>,
@@ -1919,7 +1919,7 @@ impl ProjectView {
     /// A new watch registration from the window.
     fn watch(&mut self, workspace: Option<&str>, files: &[String], dirs: &[String]) {
         match (&self.feed, workspace) {
-            (Some(feed), Some(workspace)) if feed.workspace == workspace => {
+            (Some(feed), Some(workspace)) if feed.workspace() == workspace => {
                 feed.watch(files.to_vec(), dirs.to_vec());
             }
             (Some(_), _) => self.stop_feed(),
@@ -1935,7 +1935,7 @@ impl ProjectView {
             self.remote = false;
             return None;
         };
-        if !state.session_proxy.routed(workspace) {
+        if !state.policy().routed(state, workspace) {
             if !self.remote {
                 return None;
             }
@@ -1947,8 +1947,8 @@ impl ProjectView {
         let parked = !std::mem::replace(&mut self.remote, true);
         let park = parked.then(|| {
             LocalWatch::Park(
-                state.session_proxy.outside_project(workspace, files),
-                state.session_proxy.outside_project(workspace, dirs),
+                state.policy().outside_project(state, workspace, files),
+                state.policy().outside_project(state, workspace, dirs),
             )
         });
         if self.feed.is_none()
@@ -1957,16 +1957,13 @@ impl ProjectView {
                 .is_none_or(|at| tokio::time::Instant::now() >= at)
         {
             self.retry_at = None;
-            self.feed = Some(crate::session_proxy::Feed::start(
-                Arc::clone(state),
-                workspace.clone(),
-                files.clone(),
-                dirs.clone(),
-            ));
+            self.feed = state
+                .policy()
+                .project_feed(state, workspace, files.clone(), dirs.clone());
         }
         park
     }
-    async fn next(&mut self) -> Option<crate::session_proxy::FeedFrame> {
+    async fn next(&mut self) -> Option<crate::policy::ProjectFrame> {
         match self.feed.as_mut() {
             Some(feed) => feed.next().await,
             None => std::future::pending().await,
@@ -2122,17 +2119,17 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
             }
             // The watched project's frames from where it runs now.
             frame = project.next() => match frame {
-                Some(crate::session_proxy::FeedFrame::Fs(value)) => {
+                Some(crate::policy::ProjectFrame::Fs(value)) => {
                     project.backoff = FEED_RETRY_MIN;
                     if send_json(&mut socket, &value).await.is_err() {
                         return;
                     }
                 }
-                Some(crate::session_proxy::FeedFrame::Git(epoch)) => {
+                Some(crate::policy::ProjectFrame::Git(epoch)) => {
                     project.backoff = FEED_RETRY_MIN;
                     project.git = project.watched.as_ref().map(|(w, ..)| (w.clone(), epoch));
                 }
-                Some(crate::session_proxy::FeedFrame::Timeline(epoch)) => {
+                Some(crate::policy::ProjectFrame::Timeline(epoch)) => {
                     project.backoff = FEED_RETRY_MIN;
                     project.timeline = project.watched.as_ref().map(|(w, ..)| (w.clone(), epoch));
                 }
@@ -2148,7 +2145,7 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
                         project.watch(workspace_id.as_deref(), &files, &dirs);
                         let routed = workspace_id
                             .as_deref()
-                            .is_some_and(|w| state.session_proxy.routed(w));
+                            .is_some_and(|w| state.policy().routed(&state, w));
                         if routed {
                             // The owner's feed replaces local watching of a
                             // project that runs elsewhere; this computer's own
@@ -2157,8 +2154,8 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
                             let _ = project.reconcile(&state);
                             watch.set(None);
                             let workspace = workspace_id.as_deref().unwrap_or_default();
-                            let outside_files = state.session_proxy.outside_project(workspace, &files);
-                            let outside_dirs = state.session_proxy.outside_project(workspace, &dirs);
+                            let outside_files = state.policy().outside_project(&state, workspace, &files);
+                            let outside_dirs = state.policy().outside_project(&state, workspace, &dirs);
                             if fs_watch.set(outside_files, outside_dirs) {
                                 let changes = fs_watch.poll(false).await;
                                 if send_fs_changes(&mut socket, changes).await.is_err() {

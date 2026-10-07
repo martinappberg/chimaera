@@ -33,7 +33,7 @@ pub(in crate::pro) struct CopyGuard {
 }
 impl CopyGuard {
     pub(in crate::pro) fn check(&self, state: &AppState) -> anyhow::Result<()> {
-        let matching = lock(&state.pro.preferences)
+        let matching = lock(&state.pro().preferences)
             .get(&self.workspace)
             .filter(|preference| {
                 !preference.never_mirror
@@ -72,10 +72,10 @@ pub(in crate::pro) async fn begin_copy(
     checkpoint: super::wire::Checkpoint,
     root: std::path::PathBuf,
 ) -> anyhow::Result<CopyGuard> {
-    let configuration = state.pro.configuration.clone().lock_owned().await;
+    let configuration = state.pro().configuration.clone().lock_owned().await;
     super::receipt::validate(&checkpoint)?;
     let commit = {
-        let mut commits = lock(&state.pro.execution.commits.0);
+        let mut commits = lock(&state.pro().execution.commits.0);
         if commits.workspace_maintenance.contains(workspace)
             || commits.counts.get(workspace).copied().unwrap_or(0) > 0
             || commits.counts.values().sum::<usize>() >= 64
@@ -84,7 +84,7 @@ pub(in crate::pro) async fn begin_copy(
         }
         *commits.counts.entry(workspace.to_owned()).or_default() += 1;
         Guard {
-            commits: state.pro.execution.commits.0.clone(),
+            commits: state.pro().execution.commits.0.clone(),
             workspace: workspace.to_owned(),
         }
     };
@@ -139,8 +139,8 @@ impl ImportGuard {
             return Err(Changed.into());
         }
         let managed = super::managed(state, &self.workspace);
-        let proofs = lock(&state.pro.execution.proofs);
-        let mut ownership = lock(&state.pro.ownership);
+        let proofs = lock(&state.pro().execution.proofs);
+        let mut ownership = lock(&state.pro().ownership);
         if self.generation != generation(state)
             || !matches!(ownership.get(&self.workspace), Some(Ownership::Hydrating { epoch }) if *epoch == self.epoch)
             || (managed
@@ -167,8 +167,8 @@ impl ImportGuard {
     /// that exact transition without admitting new filesystem or execution work.
     pub(in crate::pro) fn check_setting_up(&self, state: &AppState) -> anyhow::Result<()> {
         let managed = super::managed(state, &self.workspace);
-        let proofs = lock(&state.pro.execution.proofs);
-        let ownership = lock(&state.pro.ownership);
+        let proofs = lock(&state.pro().execution.proofs);
+        let ownership = lock(&state.pro().ownership);
         if self.generation != generation(state)
             || !matches!(ownership.get(&self.workspace),Some(Ownership::SettingUp {epoch}) if *epoch==self.epoch)
             || (managed
@@ -201,15 +201,15 @@ pub(crate) async fn begin_import(
     epoch: u64,
     generation: u64,
 ) -> anyhow::Result<ImportGuard> {
-    let configuration = state.pro.configuration.clone().lock_owned().await;
+    let configuration = state.pro().configuration.clone().lock_owned().await;
     if generation != self::generation(state) || !crate::pro::may_import(state, workspace, epoch) {
         return Err(Changed.into());
     }
     let managed = super::managed(state, workspace);
     // Match the ordinary admission's proof -> ownership -> commits order.
     // Holding these locks makes reservation atomic against fence/epoch change.
-    let proofs = lock(&state.pro.execution.proofs);
-    let ownership = lock(&state.pro.ownership);
+    let proofs = lock(&state.pro().execution.proofs);
+    let ownership = lock(&state.pro().ownership);
     if managed
         && !(proofs.get(workspace).is_some_and(|proof| {
             !proof.stopped
@@ -223,7 +223,7 @@ pub(crate) async fn begin_import(
     if generation != self::generation(state) {
         return Err(Changed.into());
     }
-    let mut commits = lock(&state.pro.execution.commits.0);
+    let mut commits = lock(&state.pro().execution.commits.0);
     if commits.workspace_maintenance.contains(workspace)
         || commits.counts.values().sum::<usize>() >= 64
     {
@@ -232,7 +232,7 @@ pub(crate) async fn begin_import(
     *commits.counts.entry(workspace.to_owned()).or_default() += 1;
     Ok(ImportGuard {
         _commit: Guard {
-            commits: state.pro.execution.commits.0.clone(),
+            commits: state.pro().execution.commits.0.clone(),
             workspace: workspace.to_owned(),
         },
         _configuration: configuration,
@@ -328,7 +328,7 @@ impl Drop for Guard {
 
 #[cfg(test)]
 pub(crate) fn local_dispatch_owner_fixture(state: &AppState, workspace: &str, epoch: u64) {
-    lock(&state.pro.ownership).insert(workspace.to_owned(), Ownership::Local { epoch });
+    lock(&state.pro().ownership).insert(workspace.to_owned(), Ownership::Local { epoch });
 }
 
 /// An asynchronous daemon send retains this project's original account participation
@@ -364,7 +364,7 @@ impl Dispatch {
     }
     pub(crate) fn capture(state: &AppState, workspace: &str) -> anyhow::Result<Self> {
         let generation = generation(state);
-        let ownership = lock(&state.pro.ownership).get(workspace).cloned();
+        let ownership = lock(&state.pro().ownership).get(workspace).cloned();
         let captured = Self {
             workspace: workspace.to_owned(),
             generation: account_bound(state, workspace, &ownership).then_some(generation),
@@ -374,7 +374,7 @@ impl Dispatch {
         Ok(captured)
     }
     pub(crate) fn check(&self, state: &AppState) -> anyhow::Result<()> {
-        let ownership = lock(&state.pro.ownership).get(&self.workspace).cloned();
+        let ownership = lock(&state.pro().ownership).get(&self.workspace).cloned();
         if self
             .generation
             .is_some_and(|captured| captured != generation(state))
@@ -405,24 +405,24 @@ impl Dispatch {
 fn account_bound(state: &AppState, workspace: &str, ownership: &Option<Ownership>) -> bool {
     ownership.is_some()
         || super::managed(state, workspace)
-        || lock(&state.pro.preferences)
+        || lock(&state.pro().preferences)
             .get(workspace)
             .is_some_and(|preference| preference.account.is_some())
-        || lock(&state.pro.adoptions).contains_key(workspace)
+        || lock(&state.pro().adoptions).contains_key(workspace)
         || {
-            let authority = lock(&state.pro.authority);
+            let authority = lock(&state.pro().authority);
             authority.restricted() && authority.allows(workspace)
         }
 }
 
 fn tracked(state: &AppState, workspace: &str) -> bool {
     super::managed(state, workspace)
-        || (lock(&state.pro.runtime).is_some()
-            && (lock(&state.pro.preferences)
+        || (lock(&state.pro().runtime).is_some()
+            && (lock(&state.pro().preferences)
                 .get(workspace)
                 .is_some_and(|p| p.account.is_some())
-                || lock(&state.pro.adoptions).contains_key(workspace)
-                || lock(&state.pro.opened_here).contains(workspace)))
+                || lock(&state.pro().adoptions).contains_key(workspace)
+                || lock(&state.pro().opened_here).contains(workspace)))
 }
 
 pub(crate) fn maintenance_worker(state: &AppState) -> bool {
@@ -431,11 +431,11 @@ pub(crate) fn maintenance_worker(state: &AppState) -> bool {
 
 fn ordinary_worker(state: &AppState, workspace: &str, tracked: bool) -> bool {
     maintenance_worker(state)
-        && state.daemon_extension.is_some()
+        && state.pro().runtime().is_some()
         && !tracked
         && lock(&state.workspaces).get(workspace).is_some()
         && !account_bound(state, workspace, &None)
-        && !lock(&state.pro.authority).restricted()
+        && !lock(&state.pro().authority).restricted()
 }
 
 /// Count the final synchronous spawn/registration window so a clean transfer
@@ -474,9 +474,9 @@ fn begin_launch_admission(
     let tracked = tracked(state, workspace);
     let worker = super::worker(state);
     let ordinary_worker = ordinary_worker(state, workspace, tracked);
-    let installing = lock(&state.pro.installing).contains(workspace);
-    let proofs = lock(&state.pro.execution.proofs);
-    let ownership = lock(&state.pro.ownership);
+    let installing = lock(&state.pro().installing).contains(workspace);
+    let proofs = lock(&state.pro().execution.proofs);
+    let ownership = lock(&state.pro().ownership);
     if generation != self::generation(state) {
         return Err(Changed.into());
     }
@@ -502,7 +502,7 @@ fn begin_launch_admission(
             return Err(Changed.into());
         }
     }
-    let mut commits = lock(&state.pro.execution.commits.0);
+    let mut commits = lock(&state.pro().execution.commits.0);
     if commits.workspace_maintenance.contains(workspace)
         || commits.counts.values().sum::<usize>() >= 64
     {
@@ -510,14 +510,14 @@ fn begin_launch_admission(
     }
     *commits.counts.entry(workspace.to_owned()).or_default() += 1;
     Ok(Some(Guard {
-        commits: state.pro.execution.commits.0.clone(),
+        commits: state.pro().execution.commits.0.clone(),
         workspace: workspace.to_owned(),
     }))
 }
 pub(crate) use crate::policy::Changed;
 
 pub(crate) fn generation(state: &AppState) -> u64 {
-    state.pro.generation.load(Ordering::Acquire)
+    state.pro().generation.load(Ordering::Acquire)
 }
 pub(crate) fn capture(state: &AppState, workspace: &str) -> anyhow::Result<Option<(u64, u64)>> {
     if crate::pro::project_copy::copy_only(state, workspace) {
@@ -529,13 +529,13 @@ pub(crate) fn capture(state: &AppState, workspace: &str) -> anyhow::Result<Optio
         return Ok(None);
     }
     let generation = generation(state);
-    match lock(&state.pro.ownership).get(workspace) {
+    match lock(&state.pro().ownership).get(workspace) {
         Some(Ownership::Local { epoch }) => Ok(Some((*epoch, generation))),
         _ => Err(Changed.into()),
     }
 }
 pub(super) fn idle(state: &AppState, workspace: &str) -> bool {
-    lock(&state.pro.execution.commits.0)
+    lock(&state.pro().execution.commits.0)
         .counts
         .get(workspace)
         .copied()
@@ -553,8 +553,8 @@ pub(crate) fn begin(
     }
     // Proof -> ownership is the same order as lease validation. Holding both
     // through the reservation orders admission against stop and epoch changes.
-    let proofs = lock(&state.pro.execution.proofs);
-    let ownership = lock(&state.pro.ownership);
+    let proofs = lock(&state.pro().execution.proofs);
+    let ownership = lock(&state.pro().ownership);
     let allowed = proofs.get(workspace).is_some_and(|proof| {
         !proof.stopped
             && proof.generation == generation
@@ -565,7 +565,7 @@ pub(crate) fn begin(
     if !allowed {
         return Err(Changed.into());
     }
-    let mut commits = lock(&state.pro.execution.commits.0);
+    let mut commits = lock(&state.pro().execution.commits.0);
     // At most 64 irreversible operations can be outstanding, even if a shared
     // filesystem stalls. No mutex or reactor thread waits for their I/O.
     if commits.workspace_maintenance.contains(workspace)
@@ -575,7 +575,7 @@ pub(crate) fn begin(
     }
     *commits.counts.entry(workspace.to_owned()).or_default() += 1;
     Ok(Guard {
-        commits: state.pro.execution.commits.0.clone(),
+        commits: state.pro().execution.commits.0.clone(),
         workspace: workspace.to_owned(),
     })
 }
@@ -603,7 +603,7 @@ impl Drop for WorkspaceMutation {
     }
 }
 pub(crate) fn workspace_closed(state: &AppState, workspace: &str) -> bool {
-    lock(&state.pro.execution.commits.0)
+    lock(&state.pro().execution.commits.0)
         .workspace_maintenance
         .contains(workspace)
 }
@@ -614,13 +614,13 @@ pub(crate) fn begin_workspace_maintenance(
     // Ordinary shared workers have no managed lease. Only their selected
     // extension may reserve an unbound project; managed ownership stays strict.
     let ordinary_worker = ordinary_worker(state, workspace, tracked(state, workspace));
-    let ownership = lock(&state.pro.ownership);
+    let ownership = lock(&state.pro().ownership);
     match ownership.get(workspace) {
         None if ordinary_worker => {}
         Some(Ownership::Local { .. }) => {}
         _ => return Err(Changed.into()),
     }
-    let mut commits = lock(&state.pro.execution.commits.0);
+    let mut commits = lock(&state.pro().execution.commits.0);
     if commits.workspace_maintenance.contains(workspace)
         || commits.counts.get(workspace).copied().unwrap_or(0) != 0
         || commits.counts.values().sum::<usize>() >= 64
@@ -631,7 +631,7 @@ pub(crate) fn begin_workspace_maintenance(
     commits.counts.insert(workspace.to_owned(), 1);
     Ok(WorkspaceMutation {
         guard: Guard {
-            commits: state.pro.execution.commits.0.clone(),
+            commits: state.pro().execution.commits.0.clone(),
             workspace: workspace.to_owned(),
         },
     })

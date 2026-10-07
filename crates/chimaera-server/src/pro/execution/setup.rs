@@ -21,7 +21,7 @@ fn alive(group: (u32, u64)) -> bool {
     !restart::surviving(&[group]).is_empty()
 }
 pub(in crate::pro) fn signal(state: &AppState, workspace: &str) {
-    if let Some(group) = lock(&state.pro.execution.setups)
+    if let Some(group) = lock(&state.pro().execution.setups)
         .get(workspace)
         .and_then(|entry| entry.group)
     {
@@ -36,7 +36,7 @@ pub(in crate::pro) fn signal(state: &AppState, workspace: &str) {
     }
 }
 pub(in crate::pro) fn active(state: &AppState, workspace: &str) -> bool {
-    let mut setups = lock(&state.pro.execution.setups);
+    let mut setups = lock(&state.pro().execution.setups);
     match setups.get(workspace) {
         Some(entry) if entry.group.is_some_and(|group| !alive(group)) => {
             if !entry.held {
@@ -54,14 +54,14 @@ impl Guard {
         workspace: &str,
         captured: mutation::Dispatch,
     ) -> Result<Option<Self>> {
-        let _configuration = state.pro.configuration.lock().await;
+        let _configuration = state.pro().configuration.lock().await;
         let commit = captured.begin(state)?;
         // Free local installs do not create enrollment or durable Pro state.
         let Some(commit) = commit else {
             return Ok(None);
         };
         {
-            let mut setups = lock(&state.pro.execution.setups);
+            let mut setups = lock(&state.pro().execution.setups);
             ensure!(
                 setups.len() < 64 && !setups.contains_key(workspace),
                 "previous project setup is still stopping"
@@ -83,14 +83,14 @@ impl Guard {
         };
         guard.check()?;
         {
-            let mut preferences = lock(&state.pro.preferences);
+            let mut preferences = lock(&state.pro().preferences);
             ensure!(
                 preferences.len() < 128 || preferences.contains_key(workspace),
                 "project setup identity limit"
             );
             let preference = preferences.entry(workspace.to_owned()).or_default();
             preference.execution_active = true;
-            preference.execution_boot = state.pro.execution.boot.clone();
+            preference.execution_boot = state.pro().execution.boot.clone();
             preference.execution_launch_pending = true;
         }
         crate::pro::persist(state).await?;
@@ -106,13 +106,13 @@ impl Guard {
             .ok()
             .and_then(restart::leader_start)
             .unwrap_or(0);
-        lock(&self.state.pro.execution.setups)
+        lock(&self.state.pro().execution.setups)
             .get_mut(&self.workspace)
             .expect("setup reservation remains held")
             .group = Some((group, start));
     }
     pub(super) fn no_process(&self) {
-        let mut setups = lock(&self.state.pro.execution.setups);
+        let mut setups = lock(&self.state.pro().execution.setups);
         if setups
             .get(&self.workspace)
             .is_some_and(|entry| entry.group.is_none())
@@ -135,12 +135,12 @@ impl Guard {
         if self.generation == mutation::generation(&self.state)
             && super::launch::settled(&self.state, &self.workspace)
         {
-            lock(&self.state.pro.preferences)
+            lock(&self.state.pro().preferences)
                 .entry(self.workspace.clone())
                 .or_default()
                 .execution_launch_pending = false;
             if let Err(error) = crate::pro::persist(&self.state).await {
-                lock(&self.state.pro.preferences)
+                lock(&self.state.pro().preferences)
                     .entry(self.workspace.clone())
                     .or_default()
                     .execution_launch_pending = true;
@@ -153,7 +153,7 @@ impl Guard {
 impl Drop for Guard {
     fn drop(&mut self) {
         self.kill();
-        let mut setups = lock(&self.state.pro.execution.setups);
+        let mut setups = lock(&self.state.pro().execution.setups);
         if let Some(entry) = setups.get_mut(&self.workspace) {
             entry.held = false;
         }

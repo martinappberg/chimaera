@@ -42,7 +42,7 @@ impl Fixture {
             root.join("config"),
         ));
         let trash = with_trash.then(|| crate::pro::trash::fixture_home_trash(&root));
-        state.pro.trash = trash.clone();
+        state.pro_mut().trash = trash.clone();
         let state = Arc::new(state);
         state.stopping.store(true, Ordering::Release);
         let project = root.join("project");
@@ -113,7 +113,7 @@ impl Fixture {
         .await
     }
     fn open(&self) -> Option<usize> {
-        crate::lock(&self.state.pro.status)
+        crate::lock(&self.state.pro().status)
             .get(&self.workspace)
             .and_then(|status| status.kept_both)
     }
@@ -297,7 +297,7 @@ async fn owned_choices_hold_drainage_after_cancellation_and_refuse_changed_autho
         fx.write("a.txt", "cloud");
         fx.write(&kept("a.txt"), "mine");
         fx.keep(1, &[&kept("a.txt")]);
-        crate::lock(&fx.state.pro.ownership)
+        crate::lock(&fx.state.pro().ownership)
             .insert(fx.workspace.clone(), Ownership::Local { epoch: 3 });
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (resume_tx, resume_rx) = std::sync::mpsc::channel();
@@ -322,9 +322,9 @@ async fn owned_choices_hold_drainage_after_cancellation_and_refuse_changed_autho
         });
         entered_rx.await.unwrap();
         assert!(!crate::pro::execution::quiescent(&fx.state, &fx.workspace));
-        let cache = fx.state.pro.cache(&fx.workspace).unwrap();
+        let cache = fx.state.pro().cache(&fx.workspace).unwrap();
         assert!(cache.try_lock().is_err());
-        assert!(fx.state.pro.configuration.try_lock().is_err());
+        assert!(fx.state.pro().configuration.try_lock().is_err());
         match case {
             0 => {
                 task.abort();
@@ -332,16 +332,18 @@ async fn owned_choices_hold_drainage_after_cancellation_and_refuse_changed_autho
                 assert!(!crate::pro::execution::quiescent(&fx.state, &fx.workspace));
                 assert!(cache.try_lock().is_err());
                 resume_tx.send(()).unwrap();
-                let _configuration =
-                    tokio::time::timeout(Duration::from_secs(5), fx.state.pro.configuration.lock())
-                        .await
-                        .unwrap();
+                let _configuration = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    fx.state.pro().configuration.lock(),
+                )
+                .await
+                .unwrap();
                 assert_eq!(fx.read("a.txt").as_deref(), Some("mine"));
                 assert_eq!(fx.open(), None);
             }
             _ => {
                 if case == 1 {
-                    crate::lock(&fx.state.pro.ownership).insert(
+                    crate::lock(&fx.state.pro().ownership).insert(
                         fx.workspace.clone(),
                         Ownership::Remote {
                             epoch: 4,
@@ -349,7 +351,7 @@ async fn owned_choices_hold_drainage_after_cancellation_and_refuse_changed_autho
                         },
                     );
                 } else {
-                    fx.state.pro.generation.fetch_add(1, Ordering::AcqRel);
+                    fx.state.pro().generation.fetch_add(1, Ordering::AcqRel);
                 }
                 resume_tx.send(()).unwrap();
                 assert!(matches!(task.await.unwrap(), Err(Refusal::NotHere)));
@@ -369,7 +371,7 @@ async fn listing_waits_for_return_replacement_and_refuses_an_account_change() {
         // The old report's sibling is absent. Scanning it without the return
         // reservation would settle a new report that reuses the same name.
         fx.keep(1, &[&kept("a.txt")]);
-        let cache = fx.state.pro.cache(&fx.workspace).unwrap();
+        let cache = fx.state.pro().cache(&fx.workspace).unwrap();
         let held = cache.lock().await;
         let owner = fx.state.clone();
         let workspace = fx.workspace.clone();
@@ -380,12 +382,12 @@ async fn listing_waits_for_return_replacement_and_refuses_an_account_change() {
         assert!(!task.is_finished(), "listing must wait for the return");
         assert_eq!(fx.open(), Some(1));
         {
-            let _configuration = fx.state.pro.configuration.lock().await;
+            let _configuration = fx.state.pro().configuration.lock().await;
             fx.write("a.txt", "new cloud");
             fx.write(&kept("a.txt"), "new mine");
             fx.keep(1, &[&kept("a.txt")]);
             if changed_account {
-                fx.state.pro.generation.fetch_add(1, Ordering::AcqRel);
+                fx.state.pro().generation.fetch_add(1, Ordering::AcqRel);
             }
         }
         drop(held);
@@ -707,7 +709,7 @@ async fn choices_wait_for_the_project_to_be_here() {
     fx.write("a.txt", "cloud");
     fx.write(&kept("a.txt"), "mine");
     fx.keep(1, &[&kept("a.txt")]);
-    crate::lock(&fx.state.pro.ownership).insert(
+    crate::lock(&fx.state.pro().ownership).insert(
         fx.workspace.clone(),
         Ownership::Remote {
             epoch: 3,
@@ -829,7 +831,7 @@ async fn the_clouds_branches_are_read_live_from_the_projects_refs() {
     }
     // Only a project whose return kept branches runs Git for the listing.
     assert_eq!(fx.list().await["branches"], json!([]));
-    crate::lock(&fx.state.pro.preferences)
+    crate::lock(&fx.state.pro().preferences)
         .entry(fx.workspace.clone())
         .or_default()
         .git_branches = vec!["main@cloud-0123456789ab".into()];

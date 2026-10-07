@@ -35,7 +35,7 @@ pub(crate) fn compose(state: &AppState) {
     // installation Pro never enrolled a project on has nothing it could
     // name, so ordinary work goes on.
     if !super::any_enrolled(state) {
-        state.bundle_imports.release_unknown_fence();
+        state.pro().bundle_imports.release_unknown_fence();
     }
 }
 
@@ -162,11 +162,17 @@ impl WorkspacePolicy for ProPolicy {
         Ok(if read {
             Hold::new(
                 state
+                    .pro()
                     .bundle_imports
                     .read_admission(workspace, session, native)?,
             )
         } else {
-            Hold::new(state.bundle_imports.admit(workspace, session, native)?)
+            Hold::new(
+                state
+                    .pro()
+                    .bundle_imports
+                    .admit(workspace, session, native)?,
+            )
         })
     }
     fn check_import(
@@ -175,7 +181,7 @@ impl WorkspacePolicy for ProPolicy {
         session: &str,
         native: Option<&str>,
     ) -> anyhow::Result<()> {
-        state.bundle_imports.check_session(session, native)
+        state.pro().bundle_imports.check_session(session, native)
     }
     fn capture(&self, state: &AppState, workspace: &str) -> anyhow::Result<Admission> {
         let dispatch = mutation::Dispatch::capture(state, workspace)?;
@@ -248,7 +254,7 @@ impl WorkspacePolicy for ProPolicy {
                     row["at_pause"] = json!(paused);
                     // Additive: a deadline brought it home before the cloud
                     // finished its turn; gone once the user acts here.
-                    if crate::lock(&state.pro.unfinished).contains_key(&id) {
+                    if crate::lock(&state.pro().unfinished).contains_key(&id) {
                         row["unfinished_in"] = json!("cloud");
                     }
                 }
@@ -283,7 +289,7 @@ impl WorkspacePolicy for ProPolicy {
                 rows.push((entry.created_at, row));
             }
         }
-        state.session_proxy.rows()
+        state.pro().session_proxy.rows()
     }
     fn decorate_workspace(&self, state: &AppState, workspace: &str, value: &mut serde_json::Value) {
         if let Some(copy) = super::local_copy_view(state, workspace) {
@@ -338,12 +344,12 @@ impl WorkspacePolicy for ProPolicy {
     fn health(&self, state: &AppState, body: &mut serde_json::Value) {
         // Assembly presence is independent of SDK build compatibility; a
         // daemon without the extension answers exactly as before.
-        if state.daemon_extension.is_some() {
+        if state.pro().runtime().is_some() {
             body["daemon_extension"] = json!(true);
         }
         if let Some(identity) = state
-            .daemon_extension
-            .as_ref()
+            .pro()
+            .runtime()
             .and_then(|runtime| runtime.assembly_identity())
         {
             body["daemon_assembly"] = json!(identity);
@@ -417,7 +423,80 @@ impl WorkspacePolicy for ProPolicy {
         // crash.
         Box::pin(super::shutdown(state))
     }
-    fn routes(&self) -> axum::Router<Arc<AppState>> {
-        super::routes::router()
+    fn routed(&self, state: &AppState, workspace: &str) -> bool {
+        state.pro().session_proxy.routed(workspace)
+    }
+    fn outside_project(&self, state: &AppState, workspace: &str, paths: &[String]) -> Vec<String> {
+        state.pro().session_proxy.outside_project(workspace, paths)
+    }
+    fn project_feed(
+        &self,
+        state: &Arc<AppState>,
+        workspace: &str,
+        files: Vec<String>,
+        dirs: Vec<String>,
+    ) -> Option<Box<dyn crate::policy::ProjectFeed>> {
+        Some(Box::new(crate::session_proxy::Feed::start(
+            state.clone(),
+            workspace.to_owned(),
+            files,
+            dirs,
+        )))
+    }
+    fn workspace_resuming(&self, state: &AppState, workspace: &str) {
+        state.pro().session_proxy.clear_workspace(workspace);
+    }
+    fn routed_decisions(&self, state: &AppState) -> Vec<(String, String)> {
+        state.pro().session_proxy.awaiting_decision()
+    }
+    fn routes(&self, state: &Arc<AppState>) -> axum::Router<Arc<AppState>> {
+        let extension = state
+            .pro()
+            .runtime()
+            .map_or_else(axum::Router::new, |runtime| {
+                axum::Router::new().nest_service(
+                    "/extensions",
+                    runtime.workspace_routes(crate::workspace_maintenance::WorkspaceHost::new(
+                        state.clone(),
+                    )),
+                )
+            });
+        super::routes::router().merge(extension)
+    }
+    fn api_layers(
+        &self,
+        state: &Arc<AppState>,
+        api: axum::Router<Arc<AppState>>,
+    ) -> axum::Router<Arc<AppState>> {
+        use axum::middleware::from_fn_with_state;
+        api.route_layer(from_fn_with_state(
+            state.clone(),
+            crate::session_proxy::api_proxy,
+        ))
+        .route_layer(from_fn_with_state(
+            state.clone(),
+            crate::workspace_scope::middleware,
+        ))
+    }
+    fn ticket_layers(
+        &self,
+        state: &Arc<AppState>,
+        routes: axum::Router<Arc<AppState>>,
+    ) -> axum::Router<Arc<AppState>> {
+        use axum::middleware::from_fn_with_state;
+        routes
+            .route_layer(from_fn_with_state(
+                state.clone(),
+                crate::workspace_scope::ticket_middleware,
+            ))
+            .route_layer(from_fn_with_state(
+                state.clone(),
+                crate::session_proxy::ticket_proxy,
+            ))
+    }
+    fn outer_layers(&self, app: axum::Router) -> axum::Router {
+        app.layer(axum::middleware::from_fn(
+            crate::workspace_scope::reject_unbound,
+        ))
     }
 }

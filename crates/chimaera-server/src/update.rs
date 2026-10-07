@@ -129,7 +129,7 @@ impl UpdateStatus {
 /// This daemon's update status as every surface reads it.
 pub(crate) fn status_json(state: &AppState) -> serde_json::Value {
     let managed = state.policy().updates_managed(state);
-    if !managed && state.daemon_extension.is_some() {
+    if !managed && state.policy().composed(state) {
         // The official app's daemon is updated with the app (its signed
         // updater, or a reconnect for a remote one), never from the public
         // release feed, so it never checks. That is not a failed check: say
@@ -221,7 +221,7 @@ pub(crate) async fn run_checker(state: Arc<AppState>) {
 ///
 /// The account's cloud never asks: the service updates its daemon.
 pub(crate) async fn check_now(state: &Arc<AppState>) {
-    if state.policy().updates_managed(state) || state.daemon_extension.is_some() {
+    if state.policy().updates_managed(state) || state.policy().composed(state) {
         return;
     }
     // Every finished check moves the epoch (below, before the lock drops),

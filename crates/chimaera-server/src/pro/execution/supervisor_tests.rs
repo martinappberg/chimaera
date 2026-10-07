@@ -39,7 +39,7 @@ fn ordinary_startup_keeps_cleanup_metadata_without_process_hardening_or_duplicat
     stage_startup(&state, Some(startup)).unwrap();
     assert!(stage_startup(&state, Some(own_startup(f.receipt(&state, 2, 1)).unwrap())).is_err());
     assert_eq!(
-        lock(&state.pro.execution.supervisor_pending)
+        lock(&state.pro().execution.supervisor_pending)
             .as_ref()
             .unwrap()
             .launch_generation,
@@ -82,11 +82,11 @@ impl Fixture {
     }
     fn receipt(&self, state: &AppState, generation: u64, previous: u64) -> CleanupReceipt {
         let meta = std::fs::metadata(&self.project).unwrap();
-        decode(&serde_json::to_vec(&json!({"version":1,"workspace_id":"w-a","account_id":"a-fixture","root_identity":{"device":meta.dev(),"inode":meta.ino()},"registration_revision":7,"launch_generation":generation,"previous_generation":previous,"os_boot_id":state.pro.execution.boot.clone().unwrap()})).unwrap()).unwrap()
+        decode(&serde_json::to_vec(&json!({"version":1,"workspace_id":"w-a","account_id":"a-fixture","root_identity":{"device":meta.dev(),"inode":meta.ino()},"registration_revision":7,"launch_generation":generation,"previous_generation":previous,"os_boot_id":state.pro().execution.boot.clone().unwrap()})).unwrap()).unwrap()
     }
     async fn previously_bound(&self) -> Arc<AppState> {
         let state = self.state();
-        crate::pro::ensure_root(&state.pro.root).await.unwrap();
+        crate::pro::ensure_root(&state.pro().root).await.unwrap();
         let config: Configure = serde_json::from_value(self.config()).unwrap();
         let accepted = crate::pro::authority::prepare(&state, &config, self.project.clone())
             .await
@@ -94,7 +94,7 @@ impl Fixture {
         crate::pro::authority::save(&state, &accepted)
             .await
             .unwrap();
-        lock(&state.pro.preferences)
+        lock(&state.pro().preferences)
             .entry("w-a".into())
             .or_default()
             .supervisor_generation = Some(1);
@@ -112,11 +112,11 @@ impl Fixture {
     async fn dirty(&self) -> Arc<AppState> {
         let state = self.state();
         crate::pro::install_execution_fixture(&state, "w-a", 2).unwrap();
-        crate::pro::ensure_root(&state.pro.root).await.unwrap();
+        crate::pro::ensure_root(&state.pro().root).await.unwrap();
         prepare_launch(&state, "w-a").await.unwrap();
         drop(state);
         let restored = self.state();
-        assert!(lock(&restored.pro.execution.unclean).contains_key("w-a"));
+        assert!(lock(&restored.pro().execution.unclean).contains_key("w-a"));
         restored
     }
 }
@@ -172,9 +172,10 @@ async fn exact_cleanup_is_persisted_before_ack_but_never_grants_execution() {
     );
     assert!(quiescent(&state, "w-a"));
     assert!(!crate::pro::may_execute(&state, "w-a"));
-    assert!(lock(&state.pro.execution.proofs).is_empty());
+    assert!(lock(&state.pro().execution.proofs).is_empty());
     let saved: Value =
-        serde_json::from_slice(&std::fs::read(state.pro.root.join("state.json")).unwrap()).unwrap();
+        serde_json::from_slice(&std::fs::read(state.pro().root.join("state.json")).unwrap())
+            .unwrap();
     assert_eq!(saved["preferences"]["w-a"]["supervisor_generation"], 2);
     assert_eq!(saved["preferences"]["w-a"]["execution_active"], false);
     drop(state);
@@ -209,7 +210,7 @@ async fn exact_cleanup_is_persisted_before_ack_but_never_grants_execution() {
 async fn wrong_binding_boot_or_generation_preserves_crash_fence_and_pending_receipt() {
     let fixture = Fixture::new();
     let state = fixture.dirty().await;
-    lock(&state.pro.preferences)
+    lock(&state.pro().preferences)
         .get_mut("w-a")
         .unwrap()
         .supervisor_generation = Some(2);
@@ -241,7 +242,7 @@ async fn wrong_binding_boot_or_generation_preserves_crash_fence_and_pending_rece
         assert!(pending(&state));
         assert!(ack(&state).is_none());
         assert!(!quiescent(&state, "w-a"));
-        assert!(lock(&state.pro.preferences)["w-a"].execution_active);
+        assert!(lock(&state.pro().preferences)["w-a"].execution_active);
     }
 }
 #[tokio::test]
@@ -269,7 +270,7 @@ async fn broad_configuration_and_failed_persistence_cannot_clear_a_pending_gate(
             .0,
         StatusCode::BAD_REQUEST
     );
-    let path = state.pro.root.join("state.json");
+    let path = state.pro().root.join("state.json");
     std::fs::remove_file(&path).unwrap();
     std::fs::create_dir(&path).unwrap();
     assert_eq!(
@@ -285,8 +286,8 @@ async fn broad_configuration_and_failed_persistence_cannot_clear_a_pending_gate(
     assert!(pending(&state));
     assert!(ack(&state).is_none());
     assert!(!quiescent(&state, "w-a"));
-    assert!(lock(&state.pro.preferences)["w-a"].execution_active);
-    assert!(lock(&state.pro.preferences)["w-a"]
+    assert!(lock(&state.pro().preferences)["w-a"].execution_active);
+    assert!(lock(&state.pro().preferences)["w-a"]
         .supervisor_generation
         .is_none());
 }
@@ -366,7 +367,7 @@ async fn first_supervised_launch_still_requires_a_negotiated_account_lease() {
     );
     assert!(ack(&state).is_some());
     assert!(!crate::pro::may_execute(&state, "w-a"));
-    assert!(lock(&state.pro.execution.proofs).is_empty());
+    assert!(lock(&state.pro().execution.proofs).is_empty());
     let mut config: Configure = serde_json::from_value(fixture.config()).unwrap();
     config.execution = None;
     let grant:Baton=serde_json::from_value(json!({"workspace_id":"w-a","holder_id":"worker-fixture","epoch":1,"requires_fork":false,"server_now":"2026-09-28T00:00:00Z","expires_at":"2026-09-28T00:01:30Z"})).unwrap();
@@ -374,7 +375,7 @@ async fn first_supervised_launch_still_requires_a_negotiated_account_lease() {
         &state,
         &config,
         &grant,
-        state.pro.generation.load(Ordering::Acquire),
+        state.pro().generation.load(Ordering::Acquire),
         RequestStart::now()
     )
     .is_err());
@@ -385,13 +386,13 @@ async fn cleanup_clears_only_launch_evidence_and_preserves_missing_policy_fence(
     let fixture = Fixture::new();
     let state = fixture.dirty().await;
     {
-        let mut preferences = lock(&state.pro.preferences);
+        let mut preferences = lock(&state.pro().preferences);
         let row = preferences.get_mut("w-a").unwrap();
         row.execution_groups_overflow = true;
         row.execution_launch_pending = true;
         row.continuity = None;
     }
-    lock(&state.pro.execution.uncertain).insert("w-a".into());
+    lock(&state.pro().execution.uncertain).insert("w-a".into());
     stage(&state, Some(fixture.receipt(&state, 2, 1)));
     assert_eq!(
         request(
@@ -407,7 +408,7 @@ async fn cleanup_clears_only_launch_evidence_and_preserves_missing_policy_fence(
     assert!(uncertain(&state, "w-a"));
     assert!(!unclean(&state, "w-a"));
     assert!(!crate::pro::may_execute(&state, "w-a"));
-    let preference = lock(&state.pro.preferences)["w-a"].clone();
+    let preference = lock(&state.pro().preferences)["w-a"].clone();
     assert!(
         !preference.execution_active
             && !preference.execution_launch_pending
@@ -415,7 +416,8 @@ async fn cleanup_clears_only_launch_evidence_and_preserves_missing_policy_fence(
     );
     assert!(preference.execution_groups.is_empty() && preference.execution_starts.is_empty());
     let saved: Value =
-        serde_json::from_slice(&std::fs::read(state.pro.root.join("state.json")).unwrap()).unwrap();
+        serde_json::from_slice(&std::fs::read(state.pro().root.join("state.json")).unwrap())
+            .unwrap();
     assert_eq!(saved["worker"], true);
     assert_eq!(saved["preferences"]["w-a"]["supervisor_generation"], 2);
 }
@@ -424,8 +426,12 @@ async fn cleanup_clears_only_launch_evidence_and_preserves_missing_policy_fence(
 async fn unreadable_state_cannot_be_repaired_by_process_cleanup() {
     let fixture = Fixture::new();
     let state = fixture.state();
-    crate::pro::ensure_root(&state.pro.root).await.unwrap();
-    std::fs::write(state.pro.root.join("state.json"), b"not a persisted state").unwrap();
+    crate::pro::ensure_root(&state.pro().root).await.unwrap();
+    std::fs::write(
+        state.pro().root.join("state.json"),
+        b"not a persisted state",
+    )
+    .unwrap();
     drop(state);
     let state = fixture.state();
     stage(&state, Some(fixture.receipt(&state, 2, 1)));
@@ -456,7 +462,7 @@ async fn fresh_supervised_restart_advances_only_revision_and_persists_before_ack
     assert_eq!(ack(&state).unwrap().launch_generation, 2);
     assert!(!crate::pro::may_execute(&state, "w-a"));
     let authority: Value = serde_json::from_slice(
-        &std::fs::read(state.pro.root.join("workspace-authority.json")).unwrap(),
+        &std::fs::read(state.pro().root.join("workspace-authority.json")).unwrap(),
     )
     .unwrap();
     assert_eq!(authority["workspace"]["revision"], 8);
@@ -464,7 +470,7 @@ async fn fresh_supervised_restart_advances_only_revision_and_persists_before_ack
     drop(state);
     let restored = fixture.state();
     assert_eq!(
-        lock(&restored.pro.authority)
+        lock(&restored.pro().authority)
             .acknowledgment()
             .unwrap()
             .workspace
@@ -472,7 +478,7 @@ async fn fresh_supervised_restart_advances_only_revision_and_persists_before_ack
         8
     );
     assert_eq!(
-        lock(&restored.pro.preferences)["w-a"].supervisor_generation,
+        lock(&restored.pro().preferences)["w-a"].supervisor_generation,
         Some(2)
     );
 }
@@ -519,7 +525,7 @@ async fn revision_advance_rejects_missing_replayed_wrong_or_ordinary_configurati
         assert!(pending(&state));
         assert!(ack(&state).is_none());
         assert_eq!(
-            lock(&state.pro.authority)
+            lock(&state.pro().authority)
                 .acknowledgment()
                 .unwrap()
                 .workspace
@@ -527,7 +533,7 @@ async fn revision_advance_rejects_missing_replayed_wrong_or_ordinary_configurati
             7
         );
         assert_eq!(
-            lock(&state.pro.preferences)["w-a"].supervisor_generation,
+            lock(&state.pro().preferences)["w-a"].supervisor_generation,
             Some(1)
         );
     }
@@ -591,7 +597,7 @@ async fn revision_advance_rejects_changed_identity_and_replaced_root_before_pers
         StatusCode::BAD_REQUEST
     );
     assert_eq!(
-        lock(&state.pro.preferences)["w-a"].supervisor_generation,
+        lock(&state.pro().preferences)["w-a"].supervisor_generation,
         Some(1)
     );
 }
@@ -629,7 +635,7 @@ async fn revision_advance_rejects_live_unmapped_pty_and_rechecks_before_apply() 
     assert!(pending(&state));
     assert!(ack(&state).is_none());
     assert_eq!(
-        lock(&state.pro.preferences)["w-a"].supervisor_generation,
+        lock(&state.pro().preferences)["w-a"].supervisor_generation,
         Some(1)
     );
     state.sessions.kill(&session.id).unwrap();

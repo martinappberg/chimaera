@@ -40,7 +40,7 @@ struct Request {
 
 /// Whether new transfer work must be refused right now.
 pub(super) fn draining(state: &AppState) -> bool {
-    let mut drain = lock(&state.pro.drain);
+    let mut drain = lock(&state.pro().drain);
     if drain.as_ref().is_some_and(|drain| {
         SystemTime::now()
             .duration_since(drain.since)
@@ -56,8 +56,8 @@ pub(super) fn refusal() -> detached::Outcome {
 
 fn quiet(state: &AppState) -> bool {
     detached::running(state) == 0
-        && lock(&state.pro.sleeping).is_empty()
-        && lock(&state.pro.caches)
+        && lock(&state.pro().sleeping).is_empty()
+        && lock(&state.pro().caches)
             .values()
             .all(|cache| cache.strong_count() == 0)
         && transport::helpers_idle()
@@ -83,30 +83,31 @@ pub(crate) async fn start(State(state): State<Arc<AppState>>, body: axum::body::
         );
     // One drain at a time: a second request waits for the first and then
     // shares its token (or starts afresh if the first gave up).
-    let Ok(_gate) = tokio::time::timeout_at(deadline, state.pro.drain_gate.lock()).await else {
+    let Ok(_gate) = tokio::time::timeout_at(deadline, state.pro().drain_gate.lock()).await else {
         return busy();
     };
     if draining(&state) {
-        let token = lock(&state.pro.drain)
+        let token = lock(&state.pro().drain)
             .as_ref()
             .map(|drain| drain.token.clone());
         return Json(json!({"token":token})).into_response();
     }
     // The periodic pass and every transfer hold this reservation; taking it
     // both waits for them and keeps new ones from starting.
-    let jobs = match tokio::time::timeout_at(deadline, state.pro.jobs.clone().lock_owned()).await {
+    let jobs = match tokio::time::timeout_at(deadline, state.pro().jobs.clone().lock_owned()).await
+    {
         Ok(jobs) => jobs,
         Err(_) => return busy(),
     };
     let token = chimaera_core::generate_token()[..24].to_owned();
-    *lock(&state.pro.drain) = Some(Drain {
+    *lock(&state.pro().drain) = Some(Drain {
         token: token.clone(),
         since: SystemTime::now(),
         _jobs: jobs,
     });
     // A transfer admitted just before this drain, still waiting for the
     // reservation, now refuses itself instead of holding the drain open.
-    state.pro.drain_started.notify_waiters();
+    state.pro().drain_started.notify_waiters();
     // A caller that gives up (its request dropped) must not leave this
     // daemon draining: only a completed drain stays in place.
     let mut pending = Pending {
@@ -141,7 +142,7 @@ struct Pending<'a> {
 impl Drop for Pending<'_> {
     fn drop(&mut self) {
         if self.armed {
-            *lock(&self.state.pro.drain) = None;
+            *lock(&self.state.pro().drain) = None;
             self.state.changes.notify_waiters();
         }
     }
@@ -151,14 +152,14 @@ impl Drop for Pending<'_> {
 /// then the transfer refuses itself (`None`) rather than wait behind the drain
 /// that is waiting for it.
 pub(super) async fn reserve(state: &AppState) -> Option<tokio::sync::MutexGuard<'_, ()>> {
-    let started = state.pro.drain_started.notified();
+    let started = state.pro().drain_started.notified();
     tokio::pin!(started);
     started.as_mut().enable();
     if draining(state) {
         return None;
     }
     tokio::select! {
-        guard = state.pro.jobs.lock() => Some(guard),
+        guard = state.pro().jobs.lock() => Some(guard),
         () = started => None,
     }
 }
@@ -168,7 +169,7 @@ fn busy() -> Response {
 
 /// `DELETE /api/v1/pro/drain` → 204: normal work resumes.
 pub(crate) async fn cancel(State(state): State<Arc<AppState>>) -> Response {
-    *lock(&state.pro.drain) = None;
+    *lock(&state.pro().drain) = None;
     state.changes.notify_waiters();
     StatusCode::NO_CONTENT.into_response()
 }

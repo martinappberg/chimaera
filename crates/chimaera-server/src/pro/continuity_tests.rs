@@ -234,7 +234,7 @@ pub(super) fn project(
     let grant: Baton =
         serde_json::from_value(owned(&workspace.id, "d-home", epoch, "lease-fixture", 1)).unwrap();
     execution::accept(state, config, &grant, 0, execution::RequestStart::now()).unwrap();
-    lock(&state.pro.ownership).insert(workspace.id.clone(), Ownership::Local { epoch });
+    lock(&state.pro().ownership).insert(workspace.id.clone(), Ownership::Local { epoch });
     workspace
 }
 
@@ -286,7 +286,7 @@ async fn plain_shells_come_back_at_boot_while_agents_wait() {
     let account = FakeAccount::start(json!({})).await;
     let config = device(&account.endpoint);
     let workspace = project(&state, &root, &config, 4);
-    lock(&state.pro.ownership).insert(
+    lock(&state.pro().ownership).insert(
         workspace.id.clone(),
         Ownership::AwaitingVerification { epoch: 4 },
     );
@@ -329,8 +329,8 @@ async fn sign_out_never_keeps_this_computers_own_return_fenced() {
     let account = FakeAccount::start(json!({})).await;
     let config = device(&account.endpoint);
     let workspace = project(&state, &root, &config, 4);
-    *lock(&state.pro.runtime) = Some(config);
-    lock(&state.pro.ownership).insert(workspace.id.clone(), Ownership::Hydrating { epoch: 5 });
+    *lock(&state.pro().runtime) = Some(config);
+    lock(&state.pro().ownership).insert(workspace.id.clone(), Ownership::Hydrating { epoch: 5 });
     assert!(!crate::pro::may_write(&state, &workspace.id));
     assert_eq!(
         delete(&state, "/api/v1/pro/configure").await,
@@ -365,11 +365,11 @@ async fn a_drain_waits_for_running_work_then_refuses_new_transfers_until_release
     let mut config = device(&account.endpoint);
     config.role = Role::Worker;
     config.execution.as_mut().unwrap().installation_id = None;
-    *lock(&state.pro.runtime) = Some(config);
+    *lock(&state.pro().runtime) = Some(config);
     // A transfer still holds the job reservation (held until released, not
     // for a guessed time): the deadline passes first, and the drain releases
     // itself rather than wedging the machine.
-    let jobs = state.pro.jobs.clone();
+    let jobs = state.pro().jobs.clone();
     let (held, holding) = tokio::sync::oneshot::channel();
     let (release, released) = tokio::sync::oneshot::channel::<()>();
     let running = tokio::spawn(async move {
@@ -435,7 +435,7 @@ async fn a_drain_waits_for_running_work_then_refuses_new_transfers_until_release
     );
     assert!(!super::super::drain::draining(&state));
     assert!(
-        state.pro.jobs.try_lock().is_ok(),
+        state.pro().jobs.try_lock().is_ok(),
         "releasing the drain frees the reservation"
     );
 
@@ -444,7 +444,7 @@ async fn a_drain_waits_for_running_work_then_refuses_new_transfers_until_release
     // hold the drain open until its deadline).
     // (This test's runtime is single-threaded, so the order below is exact:
     // a spawned task runs until it waits whenever this one yields.)
-    let holder = state.pro.jobs.clone().lock_owned().await;
+    let holder = state.pro().jobs.clone().lock_owned().await;
     let draining = {
         let state = state.clone();
         tokio::spawn(
@@ -452,7 +452,7 @@ async fn a_drain_waits_for_running_work_then_refuses_new_transfers_until_release
         )
     };
     // Once the drain holds its gate it is queued for the reservation.
-    while state.pro.drain_gate.try_lock().is_ok() {
+    while state.pro().drain_gate.try_lock().is_ok() {
         tokio::task::yield_now().await;
     }
     let waiting = {
@@ -474,7 +474,7 @@ async fn a_drain_waits_for_running_work_then_refuses_new_transfers_until_release
     );
     // A drain request whose caller gives up does not leave the daemon
     // draining: only a completed drain stays in place.
-    let cache = state.pro.cache("w-busy").unwrap();
+    let cache = state.pro().cache("w-busy").unwrap();
     let abandoned = {
         let state = state.clone();
         tokio::spawn(
@@ -574,7 +574,7 @@ async fn the_request_that_wakes_a_cloud_machine_is_admitted_before_its_watchdog_
     config.role = Role::Worker;
     config.execution.as_mut().unwrap().installation_id = None;
     let workspace = project(&state, &root, &config, 4);
-    *lock(&state.pro.runtime) = Some(config);
+    *lock(&state.pro().runtime) = Some(config);
     execution::thawed_fixture(&state, &workspace.id);
     execution::ticked(&state, std::time::Instant::now());
     assert!(
@@ -587,10 +587,13 @@ async fn the_request_that_wakes_a_cloud_machine_is_admitted_before_its_watchdog_
     // Noticing the thaw wakes the lease loop then and there (the watchdog
     // does the same on its own tick): the renewal a viewer is waiting on
     // starts at once, not at the loop's next five-second tick.
-    tokio::time::timeout(StdDuration::from_millis(50), state.pro.renew_now.notified())
-        .await
-        .expect("the thaw woke the lease loop");
-    let generation = state.pro.generation.load(Ordering::Acquire);
+    tokio::time::timeout(
+        StdDuration::from_millis(50),
+        state.pro().renew_now.notified(),
+    )
+    .await
+    .expect("the thaw woke the lease loop");
+    let generation = state.pro().generation.load(Ordering::Acquire);
     assert!(
         execution::expire(&state, generation).is_empty(),
         "nothing is fenced while the renewal is out"

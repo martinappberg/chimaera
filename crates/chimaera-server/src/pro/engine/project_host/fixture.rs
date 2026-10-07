@@ -390,7 +390,7 @@ impl Harness {
         Ok(value)
     }
     pub fn configuration_value(&self) -> Result<Value> {
-        let config = lock(&self.state.pro.runtime)
+        let config = lock(&self.state.pro().runtime)
             .clone()
             .context("fixture configuration missing")?;
         ensure!(
@@ -406,7 +406,7 @@ impl Harness {
             root.starts_with(self.fixture_root()) && root != self.fixture_root(),
             "fixture legacy root outside anchor"
         );
-        *lock(&self.state.pro.projects_root) = Some(root);
+        *lock(&self.state.pro().projects_root) = Some(root);
         Ok(())
     }
     pub fn chats_empty(&self) -> bool {
@@ -420,16 +420,16 @@ impl Harness {
     }
     pub async fn periodic_pass(&self) -> Result<()> {
         ensure!(
-            lock(&self.state.pro.mirror_task).is_none(),
+            lock(&self.state.pro().mirror_task).is_none(),
             "fixture pass already present"
         );
-        let jobs = self.state.pro.jobs.clone();
+        let jobs = self.state.pro().jobs.clone();
         let task = tokio::spawn(async move {
             let _guard = jobs.lock_owned().await;
             tokio::time::sleep(Duration::from_secs(3600)).await;
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
-        *lock(&self.state.pro.mirror_task) = Some(task);
+        *lock(&self.state.pro().mirror_task) = Some(task);
         Ok(())
     }
     pub async fn serve_loopback(&self) -> Result<LoopbackServer> {
@@ -465,7 +465,7 @@ impl Harness {
         })
     }
     pub async fn jobs_reservation(&self) -> Reservation {
-        Reservation(self.state.pro.jobs.clone().lock_owned().await)
+        Reservation(self.state.pro().jobs.clone().lock_owned().await)
     }
     pub fn detached_running(&self) -> usize {
         crate::pro::detached::running(&self.state)
@@ -487,14 +487,14 @@ impl Harness {
         configured: bool,
     ) -> Result<()> {
         let config = configuration(&value)?;
-        *lock(&self.state.pro.runtime) = Some(config);
+        *lock(&self.state.pro().runtime) = Some(config);
         self.state
-            .pro
+            .pro()
             .generation
             .store(generation, Ordering::Release);
-        self.state.pro.worker.store(worker, Ordering::Release);
+        self.state.pro().worker.store(worker, Ordering::Release);
         self.state
-            .pro
+            .pro()
             .configured
             .store(configured, Ordering::Release);
         Ok(())
@@ -550,7 +550,7 @@ impl Harness {
         ensure!(crate::pro::valid_id(workspace), "invalid fixture project");
         ensure!(
             lock(&self.state.workspaces).get(workspace).is_some()
-                || lock(&self.state.pro.adoptions).contains_key(workspace),
+                || lock(&self.state.pro().adoptions).contains_key(workspace),
             "fixture project is not captured"
         );
         Ok(Scenario {
@@ -640,7 +640,7 @@ impl Scenario {
     pub fn advance_generation(&self) -> u64 {
         self.harness
             .state
-            .pro
+            .pro()
             .generation
             .fetch_add(1, Ordering::AcqRel)
             + 1
@@ -659,13 +659,13 @@ impl Scenario {
                 configured,
             } => {
                 let config = configuration(&value)?;
-                *lock(&state.pro.runtime) = Some(config);
-                state.pro.generation.store(generation, Ordering::Release);
-                state.pro.worker.store(worker, Ordering::Release);
-                state.pro.configured.store(configured, Ordering::Release);
+                *lock(&state.pro().runtime) = Some(config);
+                state.pro().generation.store(generation, Ordering::Release);
+                state.pro().worker.store(worker, Ordering::Release);
+                state.pro().configured.store(configured, Ordering::Release);
             }
             Seed::Ownership(value) => {
-                let mut ownership = lock(&state.pro.ownership);
+                let mut ownership = lock(&state.pro().ownership);
                 match value {
                     Some(value) => {
                         ownership.insert(key.clone(), value);
@@ -679,13 +679,13 @@ impl Scenario {
                 bounded(&value)?;
                 let preference: crate::pro::Preference = serde_json::from_value(value)?;
                 crate::pro::policy::validate_missing_environment(&preference.missing_environment)?;
-                lock(&state.pro.preferences).insert(key.clone(), preference);
+                lock(&state.pro().preferences).insert(key.clone(), preference);
             }
             Seed::ExecutionObservation { baton, accept } => {
                 bounded(&baton)?;
                 let baton: Baton = serde_json::from_value(baton)?;
                 ensure!(&baton.workspace_id == key, "fixture grant project changed");
-                let config = lock(&state.pro.runtime)
+                let config = lock(&state.pro().runtime)
                     .clone()
                     .context("fixture configuration missing")?;
                 if accept {
@@ -693,7 +693,7 @@ impl Scenario {
                         state,
                         &config,
                         &baton,
-                        state.pro.generation.load(Ordering::Acquire),
+                        state.pro().generation.load(Ordering::Acquire),
                         execution::RequestStart::now(),
                     )?;
                 } else {
@@ -709,18 +709,18 @@ impl Scenario {
                 backoff,
             } => {
                 state
-                    .pro
+                    .pro()
                     .sleep_generation
                     .store(sleep_generation, Ordering::Release);
                 // The fixture's computer has reached the account since then (0: long ago).
                 state
-                    .pro
+                    .pro()
                     .reachable_since
                     .store(reachable_since.max(1), Ordering::Release);
                 for (record, value) in [
-                    (&state.pro.sleeping, sleeping),
-                    (&state.pro.parked, parked),
-                    (&state.pro.release_pending, release_pending),
+                    (&state.pro().sleeping, sleeping),
+                    (&state.pro().parked, parked),
+                    (&state.pro().release_pending, release_pending),
                 ] {
                     if value {
                         lock(record).insert(key.clone());
@@ -728,7 +728,7 @@ impl Scenario {
                         lock(record).remove(key);
                     }
                 }
-                let mut records = lock(&state.pro.return_backoff);
+                let mut records = lock(&state.pro().return_backoff);
                 if let Some(backoff) = backoff {
                     records.insert(key.clone(), backoff);
                 } else {
@@ -754,21 +754,21 @@ impl Scenario {
     pub fn project(&self) -> Result<ProjectObservation> {
         let state = &self.harness.state;
         let key = &self.key;
-        let preference = serde_json::to_value(lock(&state.pro.preferences).get(key))?;
-        let status = serde_json::to_value(lock(&state.pro.status).get(key))?;
+        let preference = serde_json::to_value(lock(&state.pro().preferences).get(key))?;
+        let status = serde_json::to_value(lock(&state.pro().status).get(key))?;
         ensure!(
             serde_json::to_vec(&preference)?.len() <= 1024 * 1024
                 && serde_json::to_vec(&status)?.len() <= 1024 * 1024,
             "fixture observation exceeds bound"
         );
-        let ownership = lock(&state.pro.ownership).get(key).cloned();
-        let answered = lock(&state.pro.answered).contains(key);
-        let installing = lock(&state.pro.installing).contains(key);
-        let parked = lock(&state.pro.parked).contains(key);
-        let release_pending = lock(&state.pro.release_pending).contains(key);
-        let opened = lock(&state.pro.opened_here).contains(key);
-        let return_backoff = lock(&state.pro.return_backoff).get(key).copied();
-        let sleeping = lock(&state.pro.sleeping).contains(key);
+        let ownership = lock(&state.pro().ownership).get(key).cloned();
+        let answered = lock(&state.pro().answered).contains(key);
+        let installing = lock(&state.pro().installing).contains(key);
+        let parked = lock(&state.pro().parked).contains(key);
+        let release_pending = lock(&state.pro().release_pending).contains(key);
+        let opened = lock(&state.pro().opened_here).contains(key);
+        let return_backoff = lock(&state.pro().return_backoff).get(key).copied();
+        let sleeping = lock(&state.pro().sleeping).contains(key);
         Ok(ProjectObservation {
             ownership,
             preference,
@@ -793,7 +793,7 @@ impl Scenario {
     pub fn shadow_path(&self) -> PathBuf {
         self.harness
             .state
-            .pro
+            .pro()
             .root
             .join(&self.key)
             .join("working-tree.git")
@@ -813,14 +813,14 @@ impl Scenario {
     pub fn adoption(&self) -> Result<AdoptionObservation> {
         let state = &self.harness.state;
         let workspace = lock(&state.workspaces).get(&self.key);
-        let preference = serde_json::to_value(lock(&state.pro.preferences).get(&self.key))?;
+        let preference = serde_json::to_value(lock(&state.pro().preferences).get(&self.key))?;
         bounded(&preference)?;
-        let adoptions_empty = lock(&state.pro.adoptions).is_empty();
+        let adoptions_empty = lock(&state.pro().adoptions).is_empty();
         Ok(AdoptionObservation {
             local_root: crate::pro::projects::local_root(state, &self.key),
             account_matches: crate::pro::projects::account_matches(state, &self.key),
             adoption_pending: crate::pro::projects::adoption_pending(state, &self.key),
-            legacy_pending: lock(&state.pro.legacy_pending).contains(&self.key),
+            legacy_pending: lock(&state.pro().legacy_pending).contains(&self.key),
             eligible: workspace
                 .as_ref()
                 .is_some_and(|workspace| super::super::eligible(state, workspace)),
@@ -832,11 +832,11 @@ impl Scenario {
     pub fn host(&self) -> HostObservation {
         let state = &self.harness.state;
         HostObservation {
-            generation: state.pro.generation.load(Ordering::Acquire),
-            configured: state.pro.configured.load(Ordering::Acquire),
-            worker: state.pro.worker.load(Ordering::Acquire),
-            sleep_generation: state.pro.sleep_generation.load(Ordering::Acquire),
-            jobs_busy: state.pro.jobs.try_lock().is_err(),
+            generation: state.pro().generation.load(Ordering::Acquire),
+            configured: state.pro().configured.load(Ordering::Acquire),
+            worker: state.pro().worker.load(Ordering::Acquire),
+            sleep_generation: state.pro().sleep_generation.load(Ordering::Acquire),
+            jobs_busy: state.pro().jobs.try_lock().is_err(),
         }
     }
     pub fn defer_boot_session(&self, id: &str) -> Result<()> {
@@ -867,7 +867,7 @@ impl Scenario {
     }
     /// Read only: the final wake assertion must not cause the write it verifies.
     pub async fn restarted(&self) -> Result<RestartObservation> {
-        let root = self.harness.state.pro.root.clone();
+        let root = self.harness.state.pro().root.clone();
         let key = self.key.clone();
         tokio::task::spawn_blocking(move || {
             let restarted = crate::pro::ProState::new(root);
@@ -1340,15 +1340,15 @@ impl Scenario {
     }
     pub async fn renew_delegation(&self) -> Result<bool> {
         let state = &self.harness.state;
-        let config = lock(&state.pro.runtime)
+        let config = lock(&state.pro().runtime)
             .clone()
             .context("fixture configuration missing")?;
-        let generation = state.pro.generation.load(Ordering::Acquire);
+        let generation = state.pro().generation.load(Ordering::Acquire);
         Ok(super::super::renew_delegation(state, &config, generation).await)
     }
     pub async fn run(&self, operation: Operation) -> Result<Option<u64>> {
         let state = &self.harness.state;
-        let config = lock(&state.pro.runtime)
+        let config = lock(&state.pro().runtime)
             .clone()
             .context("fixture configuration missing")?;
         self.run_captured(config, operation).await
@@ -1361,7 +1361,7 @@ impl Scenario {
                     state,
                     &config,
                     &self.key,
-                    state.pro.generation.load(Ordering::Acquire),
+                    state.pro().generation.load(Ordering::Acquire),
                 )
                 .await
             }

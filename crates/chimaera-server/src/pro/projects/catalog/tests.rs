@@ -79,10 +79,10 @@ async fn published_catalog_is_passive_and_transient_failure_preserves_destinatio
     let (state, service, task, root) = fixture().await;
     let chosen = root.join("chosen");
     std::fs::create_dir(&chosen).unwrap();
-    let config = lock(&state.pro.runtime).clone().unwrap();
+    let config = lock(&state.pro().runtime).clone().unwrap();
     let mut destination = super::super::reserve(&chosen, &[], &[]).unwrap();
     destination.account = account_scope(&config);
-    lock(&state.pro.adoptions).insert("w-copy".into(), destination);
+    lock(&state.pro().adoptions).insert("w-copy".into(), destination);
     let result = super::super::list(&state).await;
     assert!(result.error.is_none());
     assert_eq!(result.projects.len(), 1);
@@ -90,24 +90,24 @@ async fn published_catalog_is_passive_and_transient_failure_preserves_destinatio
     assert!(result.projects[0].host_id.is_none());
     assert!(result.projects[0].destination_saved);
     assert!(result.projects[0].local_root.is_none());
-    assert!(lock(&state.pro.ownership).is_empty());
+    assert!(lock(&state.pro().ownership).is_empty());
     assert!(lock(&service.requests)
         .iter()
         .all(|request| request.starts_with("GET /v2/")));
     service.mode.store(1, Ordering::Release);
-    lock(&state.pro.project_cache).checked_at = 0;
+    lock(&state.pro().project_cache).checked_at = 0;
     let retained = super::super::list(&state).await;
     assert!(retained.error.is_some());
     assert_eq!(retained.projects[0].workspace_id, "w-copy");
     assert!(retained.projects[0].destination_saved);
     assert!(!retained.projects[0].available);
     assert_eq!(
-        lock(&state.pro.adoptions).get("w-copy").unwrap().root,
+        lock(&state.pro().adoptions).get("w-copy").unwrap().root,
         chosen
     );
     // Negotiated empty means no visible account projects, never stale worker fallback.
     service.mode.store(7, Ordering::Release);
-    lock(&state.pro.project_cache).checked_at = 0;
+    lock(&state.pro().project_cache).checked_at = 0;
     assert!(super::super::list(&state).await.projects.is_empty());
     assert!(lock(&service.requests)
         .iter()
@@ -120,7 +120,7 @@ async fn published_catalog_is_passive_and_transient_failure_preserves_destinatio
 #[tokio::test]
 async fn older_services_fall_back_but_malformed_negotiated_pages_fail_closed() {
     let (state, service, task, root) = fixture().await;
-    let config = lock(&state.pro.runtime).clone().unwrap();
+    let config = lock(&state.pro().runtime).clone().unwrap();
     for mode in [4, 5, 6] {
         service.mode.store(mode, Ordering::Release);
         assert!(list(&state, &config).await.unwrap().is_none());

@@ -126,6 +126,7 @@ impl<'a> ViewerAdmission<'a> {
         match self
             .link
             .state
+            .pro()
             .session_proxy
             .change(&self.link.route, &self.link.workspace)
         {
@@ -144,7 +145,7 @@ impl<'a> ViewerAdmission<'a> {
     pub async fn scope(&self) -> std::result::Result<ViewerScope, ()> {
         self.current().map_err(|_| ())?;
         let reach = verify_scope(
-            &self.link.state.session_proxy,
+            &self.link.state.pro().session_proxy,
             &self.link.route,
             &self.link.workspace,
         )
@@ -187,12 +188,14 @@ impl<'a> ViewerAdmission<'a> {
             && !self
                 .link
                 .state
+                .pro()
                 .session_proxy
                 .passive_refused(&self.link.route)
     }
     pub fn note_passive_refused(&self) {
         self.link
             .state
+            .pro()
             .session_proxy
             .note_passive_refused(&self.link.route);
     }

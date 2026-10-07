@@ -66,16 +66,16 @@ pub(super) async fn handle(state: Weak<AppState>, event: Event, acknowledge: imp
 /// Signed in with Pro and the Runtime composed in: the only state in which a
 /// power notice does anything (the watcher outlives a sign-out).
 fn active(state: &AppState) -> bool {
-    state.daemon_extension.is_some()
+    state.pro().runtime().is_some()
         && state
-            .pro
+            .pro()
             .configured
             .load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Starts the watcher for this process if this daemon may hand work over.
 pub(super) fn start(state: &Arc<AppState>) {
-    if state.daemon_extension.is_none() {
+    if state.pro().runtime().is_none() {
         return;
     }
     #[cfg(target_os = "macos")]
@@ -230,7 +230,7 @@ mod tests {
         ));
         start(&state);
         let generation = state
-            .pro
+            .pro()
             .sleep_generation
             .load(std::sync::atomic::Ordering::Acquire);
         for event in [Event::WillSleep, Event::PoweredOn] {
@@ -244,12 +244,12 @@ mod tests {
         }
         assert_eq!(
             state
-                .pro
+                .pro()
                 .sleep_generation
                 .load(std::sync::atomic::Ordering::Acquire),
             generation
         );
-        assert!(!state.pro.root.join("state.json").exists());
+        assert!(!state.pro().root.join("state.json").exists());
         drop(state);
         std::fs::remove_dir_all(root).unwrap();
     }

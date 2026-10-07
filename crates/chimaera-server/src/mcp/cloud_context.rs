@@ -191,7 +191,7 @@ pub(crate) async fn record_arrival(
     left_out: Option<&[PathBuf]>,
     [os, arch]: [Option<&str>; 2],
 ) {
-    if state.daemon_extension.is_none() {
+    if state.pro().runtime().is_none() {
         return;
     }
     let Some(path) = project_file(state, workspace, "arrival.json") else {
@@ -237,7 +237,7 @@ pub(crate) async fn read_arrival(state: &AppState, workspace: &str) -> Option<Ar
 
 /// The facts for a synced project on a daemon with the Runtime, else None.
 async fn facts(state: &AppState, workspace: &str) -> Option<Facts> {
-    state.daemon_extension.as_ref()?;
+    state.pro().runtime()?;
     let kept = crate::pro::synced(state, workspace)?;
     let missing_environment = crate::pro::missing_environment(state, workspace);
     let root = crate::lock(&state.workspaces).get(workspace)?.root;
@@ -329,7 +329,7 @@ fn fit(text: &str) -> Option<String> {
 /// Delivery goes through [`pending`]; this answers what it would say.
 #[cfg(test)]
 pub(crate) async fn note(state: &AppState, workspace: &str) -> Option<String> {
-    let runtime = state.daemon_extension.as_ref()?;
+    let runtime = state.pro().runtime()?;
     let facts = facts(state, workspace).await?;
     fit(&runtime.placement_note(&facts)?)
 }
@@ -375,7 +375,7 @@ pub(crate) struct Pending {
 /// and no kept-both pair it was not told of. A changed sign-in or setup
 /// command alone is not repeated (`where_am_i` answers those).
 pub(crate) async fn pending(state: &AppState, workspace: &str, session: &str) -> Option<Pending> {
-    let runtime = state.daemon_extension.as_ref()?;
+    let runtime = state.pro().runtime()?;
     if !safe_id(session) {
         return None;
     }
@@ -422,7 +422,7 @@ pub(crate) async fn pending(state: &AppState, workspace: &str, session: &str) ->
 /// [`pending`] for one agent session's project. One Option check on a daemon
 /// without the Runtime.
 pub(crate) async fn pending_for_session(state: &AppState, session: &str) -> Option<Pending> {
-    state.daemon_extension.as_ref()?;
+    state.pro().runtime()?;
     let workspace = crate::lock(&state.session_workspaces)
         .get(session)
         .cloned()?;
@@ -471,7 +471,7 @@ pub(crate) async fn told(state: &AppState, pending: &Pending) {
 /// `told.json`): the project stopped being synced. Nothing on a daemon
 /// without the Runtime.
 pub(crate) async fn forget(state: &AppState, workspace: &str) {
-    if state.daemon_extension.is_none() || !safe_id(workspace) {
+    if state.pro().runtime().is_none() || !safe_id(workspace) {
         return;
     }
     let dir = crate::pro::storage(state).join(workspace);
@@ -481,7 +481,7 @@ pub(crate) async fn forget(state: &AppState, workspace: &str) {
 /// [`forget`] for every project: the user signed out, so no file names of
 /// their projects stay behind for the next account.
 pub(crate) async fn forget_all(state: &AppState) {
-    if state.daemon_extension.is_none() {
+    if state.pro().runtime().is_none() {
         return;
     }
     let root = crate::pro::storage(state).to_path_buf();
@@ -509,18 +509,18 @@ fn remove_records(dir: &Path) {
 
 /// Whether this project's agents get the note and the lookup tool.
 pub(crate) fn available_in(state: &AppState, workspace: &str) -> bool {
-    state.daemon_extension.is_some() && crate::pro::synced(state, workspace).is_some()
+    state.pro().runtime().is_some() && crate::pro::synced(state, workspace).is_some()
 }
 
 pub(super) fn available(state: &AppState, session: &str) -> bool {
-    state.daemon_extension.is_some()
+    state.pro().runtime().is_some()
         && super::workspace_of(state, session).is_some_and(|w| available_in(state, &w.id))
 }
 
 pub(super) fn definitions(state: &AppState) -> Vec<Value> {
     state
-        .daemon_extension
-        .as_ref()
+        .pro()
+        .runtime()
         .map_or_else(Vec::new, |runtime| runtime.guidance_definitions())
 }
 
@@ -533,7 +533,7 @@ fn environment_name(name: &str) -> bool {
 }
 /// `where_am_i`, the only tool in [`NAMES`].
 pub(super) async fn call(state: &Arc<AppState>, session: &str, args: &Value) -> Value {
-    let Some(runtime) = state.daemon_extension.as_ref() else {
+    let Some(runtime) = state.pro().runtime() else {
         return super::tool_error("This project does not move between machines".into());
     };
     let result = async {
@@ -665,7 +665,7 @@ mod tests {
             // As on a daemon before Pro: a plugin may offer a tool of this name.
             assert!(!super::super::is_core_tool(name));
         }
-        assert!(!state.cloud_providers.initialized());
+        assert!(!state.pro().cloud_providers.initialized());
         drop(state);
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -37,7 +37,7 @@ pub(super) fn preserve(state: &AppState, workspaces: &[String]) {
     // The epoch each fence stopped its project at: what it preserves resumes
     // or travels only while this computer still holds it (review R4 S1).
     let epochs: std::collections::HashMap<String, u64> = {
-        let proofs = lock(&state.pro.execution.proofs);
+        let proofs = lock(&state.pro().execution.proofs);
         workspaces
             .iter()
             .filter_map(|workspace| Some((workspace.clone(), proofs.get(workspace)?.epoch)))
@@ -72,7 +72,7 @@ pub(super) fn preserve(state: &AppState, workspaces: &[String]) {
 const BUSY_TICK: Duration = Duration::from_millis(100);
 const IDLE_TICK: Duration = Duration::from_secs(1);
 pub(super) fn tick(state: &AppState) -> Duration {
-    if super::worker(state) || !lock(&state.pro.execution.proofs).is_empty() {
+    if super::worker(state) || !lock(&state.pro().execution.proofs).is_empty() {
         BUSY_TICK
     } else {
         IDLE_TICK
@@ -83,9 +83,9 @@ pub(super) fn tick(state: &AppState) -> Duration {
 /// takeover fences now, before thawed agents run on, and one still inside
 /// that window gets its one renewal first (`resumed`), as a tick would.
 pub(in crate::pro) fn check_now(state: &AppState) {
-    let generation = state.pro.generation.load(Ordering::Acquire);
+    let generation = state.pro().generation.load(Ordering::Acquire);
     if super::resumed(state, generation) {
-        state.pro.renew_now.notify_one();
+        state.pro().renew_now.notify_one();
     }
     for workspace in super::expire(state, generation) {
         signal(state, &workspace);
@@ -106,7 +106,7 @@ fn newly_fenced(recorded: &mut HashSet<String>, expired: Vec<String>) -> Vec<Str
 pub(in crate::pro) fn start(state: &Arc<AppState>) {
     let weak = Arc::downgrade(state);
     let runtime = tokio::runtime::Handle::current();
-    let generation = state.pro.generation.load(Ordering::Acquire);
+    let generation = state.pro().generation.load(Ordering::Acquire);
     std::thread::spawn(move || {
         let mut recorded = HashSet::new();
         let mut last = (std::time::Instant::now(), std::time::SystemTime::now());
@@ -117,7 +117,7 @@ pub(in crate::pro) fn start(state: &Arc<AppState>) {
                 return;
             };
             if state.stopping.load(Ordering::Acquire)
-                || state.pro.generation.load(Ordering::Acquire) != generation
+                || state.pro().generation.load(Ordering::Acquire) != generation
             {
                 return;
             }
@@ -138,7 +138,7 @@ pub(in crate::pro) fn start(state: &Arc<AppState>) {
                 // work home starts over.
                 super::super::reach::unreachable(&state);
                 if super::resumed(&state, generation) {
-                    state.pro.renew_now.notify_one();
+                    state.pro().renew_now.notify_one();
                 }
             }
             super::ticked(&state, now.0);
@@ -192,7 +192,7 @@ pub(in crate::pro) async fn stop(
     .await
     .map_err(|_| anyhow::anyhow!("previous execution is still stopping"))?;
     {
-        let mut preferences = lock(&state.pro.preferences);
+        let mut preferences = lock(&state.pro().preferences);
         for workspace in workspaces {
             if let Some(preference) = preferences.get_mut(workspace) {
                 preference.execution_active = false;

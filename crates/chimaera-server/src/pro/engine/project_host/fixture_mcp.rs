@@ -267,7 +267,7 @@ impl Scenario {
     /// Enrolls the project as its first copy or a hydrate would: only an
     /// enrolled project's agents hear where they run (`pro::synced`).
     pub fn enroll_fixture(&self) {
-        lock(&self.harness.state.pro.ownership)
+        lock(&self.harness.state.pro().ownership)
             .entry(self.key.clone())
             .or_insert(crate::pro::Ownership::Local { epoch: 1 });
     }
@@ -289,7 +289,7 @@ impl Scenario {
     }
     /// Seeds what the last move's configuration export left out.
     pub fn seed_fixture_environment(&self, names: &[&str]) -> Result<()> {
-        let mut preferences = lock(&self.harness.state.pro.preferences);
+        let mut preferences = lock(&self.harness.state.pro().preferences);
         let names: Vec<String> = names.iter().take(32).map(|n| n.to_string()).collect();
         crate::pro::policy::validate_missing_environment(&names)?;
         preferences

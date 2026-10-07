@@ -65,19 +65,19 @@ impl CoordinatorProject {
     }
     pub fn awaiting_verification(&self) -> bool {
         matches!(
-            lock(&self.state.pro.ownership).get(&self.id),
+            lock(&self.state.pro().ownership).get(&self.id),
             Some(Ownership::AwaitingVerification { .. })
         )
     }
 }
 impl CoordinatorOwner {
     pub(super) fn capture(state: Arc<AppState>) -> Self {
-        let generation = state.pro.generation.load(Ordering::Acquire);
+        let generation = state.pro().generation.load(Ordering::Acquire);
         Self { state, generation }
     }
     pub fn current(&self) -> bool {
         !self.state.stopping.load(Ordering::Relaxed)
-            && self.generation == self.state.pro.generation.load(Ordering::Acquire)
+            && self.generation == self.state.pro().generation.load(Ordering::Acquire)
     }
     pub fn now(&self) -> u64 {
         super::super::now()
@@ -86,7 +86,7 @@ impl CoordinatorOwner {
         if !self.current() {
             return None;
         }
-        let config = lock(&self.state.pro.runtime).clone()?;
+        let config = lock(&self.state.pro().runtime).clone()?;
         Some(CoordinatorTick {
             state: self.state.clone(),
             config,
@@ -96,14 +96,14 @@ impl CoordinatorOwner {
     pub async fn wait_tick(&self) {
         tokio::select! {
             () = tokio::time::sleep(Duration::from_secs(5)) => {}
-            () = self.state.pro.renew_now.notified() => {}
+            () = self.state.pro().renew_now.notified() => {}
         }
     }
 }
 impl CoordinatorTick {
     pub fn generation_current(&self) -> bool {
         !self.state.stopping.load(Ordering::Relaxed)
-            && self.generation == self.state.pro.generation.load(Ordering::Acquire)
+            && self.generation == self.state.pro().generation.load(Ordering::Acquire)
     }
     pub async fn renew_delegation(&self) -> bool {
         if !self.generation_current() {
@@ -131,7 +131,7 @@ impl CoordinatorTick {
         let mut unauthorized = false;
         if self.generation_current() && project.generation == self.generation {
             let task = {
-                let mut running = lock(&self.state.pro.reconciling);
+                let mut running = lock(&self.state.pro().reconciling);
                 if running
                     .get(&project.id)
                     .is_some_and(|task| !task.is_finished())
@@ -157,7 +157,7 @@ impl CoordinatorTick {
                         // stopped waiting for this one (review R4 N3).
                         if unauthorized {
                             state
-                                .pro
+                                .pro()
                                 .late_unauthorized
                                 .store(true, std::sync::atomic::Ordering::Release);
                         }
@@ -174,7 +174,7 @@ impl CoordinatorTick {
             // A refusal a pass that already stopped waiting never heard.
             unauthorized |= self
                 .state
-                .pro
+                .pro()
                 .late_unauthorized
                 .swap(false, std::sync::atomic::Ordering::AcqRel);
         }
@@ -187,7 +187,7 @@ impl CoordinatorTick {
     pub fn can_mirror(&self) -> bool {
         self.generation_current()
             && !super::super::drain::draining(&self.state)
-            && lock(&self.state.pro.mirror_task)
+            && lock(&self.state.pro().mirror_task)
                 .as_ref()
                 .is_none_or(|task| task.is_finished())
     }
@@ -203,7 +203,7 @@ impl CoordinatorTick {
         let config = self.config.clone();
         let generation = self.generation;
         let task = tokio::spawn(async move {
-            let _guard = owner.pro.jobs.lock().await;
+            let _guard = owner.pro().jobs.lock().await;
             if only.is_none() {
                 if let Err(error) = lazy_handback(&owner, &config).await {
                     tracing::warn!(phase="locate_return", error=%error, "Could not locate returning projects");
@@ -216,12 +216,12 @@ impl CoordinatorTick {
                 .filter(|workspace| only.as_ref().is_none_or(|ids| ids.contains(&workspace.id)))
                 .take(128)
             {
-                if generation != owner.pro.generation.load(Ordering::Acquire) {
+                if generation != owner.pro().generation.load(Ordering::Acquire) {
                     return;
                 }
                 if super::super::owned_epoch(&owner, &workspace.id).is_none()
                     || !execution::lease_valid(&owner, &workspace.id)
-                    || lock(&owner.pro.preferences)
+                    || lock(&owner.pro().preferences)
                         .get(&workspace.id)
                         .is_some_and(|p| p.never_mirror)
                 {
@@ -232,7 +232,7 @@ impl CoordinatorTick {
                 }
             }
         });
-        *lock(&self.state.pro.mirror_task) = Some(task);
+        *lock(&self.state.pro().mirror_task) = Some(task);
         true
     }
     /// A pass that only brings work home (`lazy_handback`), between the copy
@@ -248,37 +248,38 @@ impl CoordinatorTick {
         }
         // A project brought back through its own epoch (the lease loop) is
         // no longer returning once it is held here again.
-        let reclaim: Vec<String> = lock(&self.state.pro.reclaim).iter().cloned().collect();
+        let reclaim: Vec<String> = lock(&self.state.pro().reclaim).iter().cloned().collect();
         let home: Vec<String> = reclaim
             .into_iter()
             .filter(|id| super::super::owned_epoch(&self.state, id).is_some())
             .collect();
         if !home.is_empty() {
-            lock(&self.state.pro.reclaim).retain(|id| !home.contains(id));
+            lock(&self.state.pro().reclaim).retain(|id| !home.contains(id));
         }
-        let wanted = !lock(&self.state.pro.reclaim).is_empty()
+        let wanted = !lock(&self.state.pro().reclaim).is_empty()
             || (super::super::reach::settled(&self.state)
-                && lock(&self.state.pro.ownership).values().any(|owner| {
+                && lock(&self.state.pro().ownership).values().any(|owner| {
                     matches!(
                         owner,
                         Ownership::Remote { .. } | Ownership::Hydrating { .. }
                     )
                 }));
         let now = super::super::now();
-        if !wanted || now.saturating_sub(self.state.pro.return_pass.load(Ordering::Acquire)) < EVERY
+        if !wanted
+            || now.saturating_sub(self.state.pro().return_pass.load(Ordering::Acquire)) < EVERY
         {
             return false;
         }
-        self.state.pro.return_pass.store(now, Ordering::Release);
+        self.state.pro().return_pass.store(now, Ordering::Release);
         let owner = self.state.clone();
         let config = self.config.clone();
         let task = tokio::spawn(async move {
-            let _guard = owner.pro.jobs.lock().await;
+            let _guard = owner.pro().jobs.lock().await;
             if let Err(error) = lazy_handback(&owner, &config).await {
                 tracing::warn!(phase="locate_return", error=%error, "Could not locate returning projects");
             }
         });
-        *lock(&self.state.pro.mirror_task) = Some(task);
+        *lock(&self.state.pro().mirror_task) = Some(task);
         true
     }
 }
@@ -299,7 +300,7 @@ mod tests {
         std::fs::create_dir_all(&free_root).unwrap();
         let managed = lock(&state.workspaces).add(managed_root).unwrap();
         let free = lock(&state.workspaces).add(free_root).unwrap();
-        lock(&state.pro.ownership).insert(
+        lock(&state.pro().ownership).insert(
             managed.id.clone(),
             Ownership::Remote {
                 epoch: 7,
@@ -334,7 +335,7 @@ mod tests {
         assert!(!super::super::super::may_write(&state, &managed.id));
         assert!(super::super::super::may_write(&state, &free.id));
         assert!(super::super::super::may_execute(&state, &free.id));
-        assert!(lock(&state.pro.task).is_none());
+        assert!(lock(&state.pro().task).is_none());
         assert!(
             lock(&account.requests).is_empty(),
             "None does not start account policy"

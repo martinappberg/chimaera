@@ -59,7 +59,7 @@ impl Scenario {
     }
     pub fn restored_provider_status(&self) -> Result<Value> {
         // AppState::new uses this exact original ProState constructor/path.
-        let restored = crate::pro::ProState::new(self.harness.state.pro.root.clone());
+        let restored = crate::pro::ProState::new(self.harness.state.pro().root.clone());
         let statuses = lock(&restored.status);
         let status = statuses
             .get(&self.key)

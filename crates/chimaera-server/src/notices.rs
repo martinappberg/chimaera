@@ -926,7 +926,7 @@ fn attention(state: &AppState) -> Vec<Attention> {
     // rows. It also keeps a relayed permission alert up until it is answered
     // (on either machine) — consumers take back a blocking alert whose
     // session leaves this set.
-    let routed = state.session_proxy.awaiting_decision();
+    let routed = state.policy().routed_decisions(state);
     if ids.is_empty() && routed.is_empty() {
         return Vec::new();
     }

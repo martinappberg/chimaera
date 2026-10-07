@@ -145,12 +145,12 @@ impl TransferHost {
         tokio::task::spawn_blocking(move || {
             ensure!(pro::valid_id(&workspace), "invalid transfer workspace");
             ensure!(
-                generation == state.pro.generation.load(Ordering::Acquire),
+                generation == state.pro().generation.load(Ordering::Acquire),
                 "Account changed during transfer capture"
             );
             transport::cache_quiescent(&workspace)?;
             let source = source.map(Root::capture).transpose()?;
-            let cache_description = state.pro.root.clone();
+            let cache_description = state.pro().root.clone();
             let cache = Root::capture_cache(&cache_description)?;
             let project_cache = cache.path.join(&workspace);
             let owner = Arc::new(Self {
@@ -179,7 +179,7 @@ impl TransferHost {
     ) -> Result<Arc<Self>> {
         tokio::task::spawn_blocking(move || {
             let source = Root::capture(root.clone())?;
-            let generation = state.pro.generation.load(Ordering::Acquire);
+            let generation = state.pro().generation.load(Ordering::Acquire);
             let host = Arc::new(Self {
                 state,
                 workspace,
@@ -250,7 +250,7 @@ impl TransferHost {
         .await?
     }
     pub(crate) fn belongs_to(&self, pro: &pro::ProState, workspace: &str) -> bool {
-        self.workspace == workspace && std::ptr::eq(pro, &*self.state.pro)
+        self.workspace == workspace && std::ptr::eq(pro, self.state.pro())
     }
     pub fn cache(&self) -> &Path {
         &self.project_cache
@@ -263,7 +263,7 @@ impl TransferHost {
     }
     pub fn current(&self) -> Result<()> {
         ensure!(
-            self.generation == self.state.pro.generation.load(Ordering::Acquire),
+            self.generation == self.state.pro().generation.load(Ordering::Acquire),
             "Account changed during the original transfer"
         );
         transport::cache_quiescent(&self.workspace)?;
@@ -495,12 +495,12 @@ impl TransferHost {
     /// Read at the original post-shadow-baseline cutpoint, from this same
     /// project's preferences; no cache or configuration is selected anew.
     pub fn published_tree(&self) -> Option<String> {
-        lock(&self.state.pro.preferences)
+        lock(&self.state.pro().preferences)
             .get(&self.workspace)
             .and_then(|preference| preference.published_tree.clone())
     }
     pub fn observe_plain_folder(&self, repository: bool) -> bool {
-        let mut plain = lock(&self.state.pro.plain_folders);
+        let mut plain = lock(&self.state.pro().plain_folders);
         if repository {
             plain.remove(&self.workspace);
             false
@@ -925,7 +925,7 @@ mod cache_anchor_tests {
             data.clone(),
             root.join("config"),
         ));
-        let cache = Arc::new(state.pro.cache("w-first").unwrap().lock_owned().await);
+        let cache = Arc::new(state.pro().cache("w-first").unwrap().lock_owned().await);
         assert!(!data.join("pro").exists());
         let owner = TransferHost::capture(state, "w-first", Some(&source), cache, 0)
             .await

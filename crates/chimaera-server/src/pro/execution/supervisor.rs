@@ -163,23 +163,23 @@ pub(crate) fn stage_startup(state: &AppState, startup: Option<Startup>) -> Resul
     let Some(startup) = startup else {
         return Ok(());
     };
-    let mut pending = lock(&state.pro.execution.supervisor_pending);
+    let mut pending = lock(&state.pro().execution.supervisor_pending);
     ensure!(pending.is_none(), "supervisor startup already staged");
     *pending = Some(startup.receipt);
     Ok(())
 }
 #[cfg(test)]
 pub(crate) fn stage(state: &AppState, receipt: Option<CleanupReceipt>) {
-    *lock(&state.pro.execution.supervisor_pending) = receipt;
+    *lock(&state.pro().execution.supervisor_pending) = receipt;
 }
 pub(in crate::pro) fn pending(state: &AppState) -> bool {
-    lock(&state.pro.execution.supervisor_pending).is_some()
+    lock(&state.pro().execution.supervisor_pending).is_some()
 }
 pub(crate) fn ack(state: &AppState) -> Option<CleanupAck> {
-    lock(&state.pro.execution.supervisor_ack).clone()
+    lock(&state.pro().execution.supervisor_ack).clone()
 }
 pub(super) fn supervised(state: &AppState) -> bool {
-    lock(&state.pro.execution.supervisor_ack).is_some()
+    lock(&state.pro().execution.supervisor_ack).is_some()
 }
 /// Compare the accepted provider launch; this is not a process census.
 /// Shared startup admission. It has no effects and does not consume the pipe
@@ -188,7 +188,7 @@ pub(in crate::pro) fn validate(
     state: &AppState,
     accepted: &crate::pro::authority::Accepted,
 ) -> Result<()> {
-    let receipt = lock(&state.pro.execution.supervisor_pending)
+    let receipt = lock(&state.pro().execution.supervisor_pending)
         .clone()
         .context("supervisor cleanup receipt required")?;
     validate_receipt(state, accepted, &receipt)
@@ -199,9 +199,9 @@ fn validate_receipt(
     receipt: &CleanupReceipt,
 ) -> Result<()> {
     ensure!(
-        !state.pro.configured.load(Ordering::Acquire)
-            && lock(&state.pro.runtime).is_none()
-            && lock(&state.pro.execution.proofs).is_empty(),
+        !state.pro().configured.load(Ordering::Acquire)
+            && lock(&state.pro().runtime).is_none()
+            && lock(&state.pro().execution.proofs).is_empty(),
         "supervisor cleanup is startup-only"
     );
     ensure!(
@@ -214,11 +214,11 @@ fn validate_receipt(
         "supervisor cleanup identity mismatch"
     );
     ensure!(
-        state.pro.execution.boot.as_deref() == Some(&receipt.os_boot_id),
+        state.pro().execution.boot.as_deref() == Some(&receipt.os_boot_id),
         "supervisor cleanup boot mismatch"
     );
     ensure!(
-        !state.pro.execution.supervisor_state_invalid,
+        !state.pro().execution.supervisor_state_invalid,
         "managed state requires recovery"
     );
     ensure!(
@@ -228,7 +228,7 @@ fn validate_receipt(
             && !state.sessions.list().iter().any(|session| session.alive),
         "supervisor cleanup cannot replace live local work"
     );
-    let preferences = lock(&state.pro.preferences);
+    let preferences = lock(&state.pro().preferences);
     ensure!(
         preferences.len() < 128 || preferences.contains_key(&receipt.workspace_id),
         "supervisor workspace limit"
@@ -247,13 +247,13 @@ pub(in crate::pro) async fn apply(
     state: &AppState,
     accepted: Option<&crate::pro::authority::Accepted>,
 ) -> Result<()> {
-    let Some(receipt) = lock(&state.pro.execution.supervisor_pending).clone() else {
+    let Some(receipt) = lock(&state.pro().execution.supervisor_pending).clone() else {
         return Ok(());
     };
     let accepted = accepted.context("supervisor cleanup requires workspace-bound configuration")?;
     validate_receipt(state, accepted, &receipt)?;
     let previous = {
-        let mut preferences = lock(&state.pro.preferences);
+        let mut preferences = lock(&state.pro().preferences);
         ensure!(
             preferences.len() < 128 || preferences.contains_key(&receipt.workspace_id),
             "supervisor workspace limit"
@@ -275,10 +275,10 @@ pub(in crate::pro) async fn apply(
     };
     // The strict worker role, generation and cleared evidence share one write.
     // A later failure configuring authority cannot turn this into a free daemon.
-    let previous_worker = state.pro.worker.swap(true, Ordering::AcqRel);
+    let previous_worker = state.pro().worker.swap(true, Ordering::AcqRel);
     if let Err(error) = crate::pro::persist(state).await {
-        state.pro.worker.store(previous_worker, Ordering::Release);
-        let mut preferences = lock(&state.pro.preferences);
+        state.pro().worker.store(previous_worker, Ordering::Release);
+        let mut preferences = lock(&state.pro().preferences);
         if let Some(previous) = previous {
             preferences.insert(receipt.workspace_id.clone(), previous);
         } else {
@@ -288,19 +288,19 @@ pub(in crate::pro) async fn apply(
     }
     // The supervisor proved the complete UID tree dead. Do not weaken missing
     // enrollment policy; only an authoritative account observation repairs it.
-    lock(&state.pro.execution.unclean).remove(&receipt.workspace_id);
-    *lock(&state.pro.execution.supervisor_ack) = Some(CleanupAck {
+    lock(&state.pro().execution.unclean).remove(&receipt.workspace_id);
+    *lock(&state.pro().execution.supervisor_ack) = Some(CleanupAck {
         execution_cleanup: 1,
         workspace_id: receipt.workspace_id,
         registration_revision: receipt.registration_revision,
         launch_generation: receipt.launch_generation,
     });
-    *lock(&state.pro.execution.supervisor_pending) = None;
+    *lock(&state.pro().execution.supervisor_pending) = None;
     Ok(())
 }
 #[cfg(test)]
 pub(in crate::pro) fn fixture_boot(state: &AppState) -> Option<String> {
-    state.pro.execution.boot.clone()
+    state.pro().execution.boot.clone()
 }
 #[cfg(test)]
 #[path = "supervisor_tests.rs"]

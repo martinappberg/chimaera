@@ -110,7 +110,7 @@ pub(crate) async fn run_exec_scoped(
     };
     // Without the extension nothing can take a project's execution away
     // mid-dispatch, so the command is written as it always was.
-    let outcome = if state.daemon_extension.is_none() && admission.is_none() {
+    let outcome = if !state.policy().composed(state) && admission.is_none() {
         state.sessions.exec(id, opts).await
     } else {
         state

@@ -135,7 +135,7 @@ pub(super) fn observed(state: &Arc<AppState>, config: &Configure, baton: &super:
     }
     let workspace = &baton.workspace_id;
     {
-        let mut holders = lock(&state.pro.holders);
+        let mut holders = lock(&state.pro().holders);
         match baton.holder_kind.as_deref() {
             Some(kind @ ("computer" | "cloud"))
                 if holders.len() < 128 || holders.contains_key(workspace) =>
@@ -155,9 +155,9 @@ pub(super) fn observed(state: &Arc<AppState>, config: &Configure, baton: &super:
     }
     let reason = baton.reason.as_deref().and_then(Reason::parse);
     match reason {
-        Some(reason) => state.pro.reasons.set(workspace, reason, true),
+        Some(reason) => state.pro().reasons.set(workspace, reason, true),
         None => {
-            lock(&state.pro.reasons.0).retain(|id, (_, account)| id != workspace || !*account);
+            lock(&state.pro().reasons.0).retain(|id, (_, account)| id != workspace || !*account);
         }
     }
     let elsewhere = baton
@@ -187,10 +187,10 @@ pub(super) fn observed(state: &Arc<AppState>, config: &Configure, baton: &super:
 /// not synced. Local evidence only; the holder's kind comes from the last
 /// ownership read.
 pub(super) fn place(state: &AppState, workspace: &str) -> serde_json::Value {
-    let ownership = lock(&state.pro.ownership).get(workspace).cloned();
+    let ownership = lock(&state.pro().ownership).get(workspace).cloned();
     match ownership {
         None => serde_json::Value::Null,
-        Some(Ownership::Remote { .. }) => match lock(&state.pro.holders).get(workspace) {
+        Some(Ownership::Remote { .. }) => match lock(&state.pro().holders).get(workspace) {
             Some((kind, name)) if kind == "computer" => {
                 json!({"where": "computer", "computer": name})
             }
@@ -207,11 +207,11 @@ pub(super) fn moving(state: &AppState, workspace: &str) -> serde_json::Value {
     let Some(since_ms) = super::moving::started(state, workspace) else {
         return serde_json::Value::Null;
     };
-    let ownership = lock(&state.pro.ownership).get(workspace).cloned();
+    let ownership = lock(&state.pro().ownership).get(workspace).cloned();
     let (direction, step) = match ownership {
         Some(Ownership::Transferring { .. } | Ownership::Local { .. }) => (
             "cloud",
-            if lock(&state.pro.sleeping).contains(workspace) {
+            if lock(&state.pro().sleeping).contains(workspace) {
                 "saving_here"
             } else {
                 "starting_in_cloud"
@@ -241,7 +241,7 @@ pub(super) fn bring_back(state: &AppState, workspace: &str) -> bool {
     super::moving::begin(state, workspace);
     super::unpark(state, workspace);
     {
-        let mut ownership = lock(&state.pro.ownership);
+        let mut ownership = lock(&state.pro().ownership);
         if let Some(Ownership::Transferring { epoch }) = ownership.get(workspace).cloned() {
             super::transition::apply(
                 state,
@@ -252,14 +252,14 @@ pub(super) fn bring_back(state: &AppState, workspace: &str) -> bool {
             );
         }
     }
-    let mut reclaim = lock(&state.pro.reclaim);
+    let mut reclaim = lock(&state.pro().reclaim);
     if reclaim.len() < 128 || reclaim.contains(workspace) {
         reclaim.insert(workspace.to_owned());
     }
     drop(reclaim);
     // The next lease tick runs a return pass for it at once.
-    state.pro.return_pass.store(0, Ordering::Release);
-    lock(&state.pro.release_pending).remove(workspace)
+    state.pro().return_pass.store(0, Ordering::Release);
+    lock(&state.pro().release_pending).remove(workspace)
 }
 
 fn personal(config: Option<&Configure>) -> bool {
@@ -273,19 +273,19 @@ fn personal(config: Option<&Configure>) -> bool {
 /// work in the cloud or on its way there.
 pub(super) fn may_run_here(state: &AppState, config: Option<&Configure>, workspace: &str) -> bool {
     personal(config)
-        && state.daemon_extension.is_some()
+        && state.pro().runtime().is_some()
         && lock(&state.workspaces).get(workspace).is_some()
-        && lock(&state.pro.authority).allows(workspace)
+        && lock(&state.pro().authority).allows(workspace)
         && !super::project_copy::copy_only(state, workspace)
-        && !lock(&state.pro.preferences)
+        && !lock(&state.pro().preferences)
             .get(workspace)
             .is_some_and(|p| p.never_mirror)
-        && !lock(&state.pro.reclaim).contains(workspace)
+        && !lock(&state.pro().reclaim).contains(workspace)
         && matches!(
-            lock(&state.pro.ownership).get(workspace),
+            lock(&state.pro().ownership).get(workspace),
             Some(Ownership::Remote { .. } | Ownership::Transferring { .. })
         )
-        && !lock(&state.pro.sleeping).contains(workspace)
+        && !lock(&state.pro().sleeping).contains(workspace)
 }
 
 /// `POST /pro/projects/{id}/here` ("Run here"): the project comes back at its
@@ -300,9 +300,9 @@ pub(crate) async fn run_here(
     if !super::valid_id(&workspace) || lock(&state.workspaces).get(&workspace).is_none() {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let config = lock(&state.pro.runtime).clone();
+    let config = lock(&state.pro().runtime).clone();
     if !may_run_here(&state, config.as_ref(), &workspace) {
-        return if lock(&state.pro.reclaim).contains(&workspace) {
+        return if lock(&state.pro().reclaim).contains(&workspace) {
             (StatusCode::ACCEPTED, Json(json!({"returning": true}))).into_response()
         } else {
             (
@@ -317,13 +317,13 @@ pub(crate) async fn run_here(
         "a project was asked back to this computer"
     );
     // The latest computer the user ran it on is the one it returns to.
-    lock(&state.pro.opened_here).insert(workspace.clone());
-    lock(&state.pro.reasons.0).remove(&workspace);
+    lock(&state.pro().opened_here).insert(workspace.clone());
+    lock(&state.pro().reasons.0).remove(&workspace);
     let resume_now = bring_back(&state, &workspace);
     if let Err(error) = super::persist(&state).await {
         tracing::warn!(%error, "Could not save that a project comes back here");
     }
-    state.pro.renew_now.notify_waiters();
+    state.pro().renew_now.notify_waiters();
     if resume_now {
         let owner = state.clone();
         tokio::spawn(async move {
@@ -346,15 +346,15 @@ pub(super) fn may_run_in_cloud(
 ) -> bool {
     personal(config)
         && config.is_some_and(|config| !config.hours_exhausted)
-        && state.daemon_extension.is_some()
-        && state.pro.configured.load(Ordering::Acquire)
+        && state.pro().runtime().is_some()
+        && state.pro().configured.load(Ordering::Acquire)
         && !super::delegation_lapsed(state)
         && !super::execution::worker(state)
         && !super::drain::draining(state)
         && routes::flushable(state, workspace)
         && super::execution::lease_valid(state, workspace)
         && !super::parked(state, workspace)
-        && !lock(&state.pro.sleeping).contains(workspace)
+        && !lock(&state.pro().sleeping).contains(workspace)
 }
 
 /// `POST /pro/projects/{id}/cloud` ("Run in the cloud"): the project is handed
@@ -371,7 +371,7 @@ pub(crate) async fn run_in_cloud(
     if !super::valid_id(&workspace) || lock(&state.workspaces).get(&workspace).is_none() {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let config = lock(&state.pro.runtime).clone();
+    let config = lock(&state.pro().runtime).clone();
     if personal(config.as_ref()) && config.as_ref().is_some_and(|config| config.hours_exhausted) {
         return (
             StatusCode::CONFLICT,
@@ -387,14 +387,14 @@ pub(crate) async fn run_in_cloud(
     };
     // Claimed before answering, so a second request (or a sleep flush) sees
     // the project already on its way and nothing hands it over twice.
-    if !lock(&state.pro.sleeping).insert(workspace.clone()) {
+    if !lock(&state.pro().sleeping).insert(workspace.clone()) {
         return (StatusCode::CONFLICT, Json(json!({"error": "not_here"}))).into_response();
     }
     tracing::info!(
         target: "chimaera_server::pro::place",
         "a project was asked to run in the cloud"
     );
-    lock(&state.pro.reasons.0).remove(&workspace);
+    lock(&state.pro().reasons.0).remove(&workspace);
     let handover = routes::Handover {
         deadline: tokio::time::Instant::now() + BUDGET,
         park: true,
@@ -421,9 +421,9 @@ pub(crate) async fn run_in_cloud(
                 }
             }
         };
-        lock(&owner.pro.sleeping).remove(&workspace);
+        lock(&owner.pro().sleeping).remove(&workspace);
         if let Some(reason) = failure {
-            owner.pro.reasons.set(&workspace, reason, false);
+            owner.pro().reasons.set(&workspace, reason, false);
             tracing::info!(
                 target: "chimaera_server::pro::place",
                 reason = ?reason,
@@ -443,7 +443,7 @@ pub(super) fn arrived(state: &AppState, workspace: &str, blocked: bool) {
     if !super::is_worker(state) {
         return;
     }
-    let Some(config) = lock(&state.pro.runtime)
+    let Some(config) = lock(&state.pro().runtime)
         .clone()
         .filter(|config| config.execution.is_some())
     else {
@@ -515,7 +515,7 @@ mod tests {
             chimaera_core::generate_token()
         ));
         std::fs::create_dir_all(&root).unwrap();
-        let mut state = crate::daemon_extension::with_inert_for_tests(AppState::new(
+        let state = crate::daemon_extension::with_inert_for_tests(AppState::new(
             "fixture".into(),
             "fixture".into(),
             4242,
@@ -523,13 +523,13 @@ mod tests {
             root.clone(),
             root.join("config"),
         ));
-        state.daemon_extension = Some(Arc::new(Composed));
+        state.pro().set_runtime(Arc::new(Composed));
         let state = Arc::new(state);
         let workspace = lock(&state.workspaces).add(root.clone()).unwrap().id;
         crate::pro::install_execution_fixture(&state, &workspace, 3).unwrap();
-        *lock(&state.pro.runtime) = Some(device());
-        state.pro.configured.store(true, Ordering::Release);
-        let generation = state.pro.sleep_generation.load(Ordering::Acquire);
+        *lock(&state.pro().runtime) = Some(device());
+        state.pro().configured.store(true, Ordering::Release);
+        let generation = state.pro().sleep_generation.load(Ordering::Acquire);
         // Nothing yields between the two requests: the first's task has not
         // run, so only its synchronous claim can refuse the second.
         let first = run_in_cloud(State(state.clone()), Path(workspace.clone())).await;
@@ -539,15 +539,15 @@ mod tests {
         // The handover ends (here: it cannot reach the cloud) and releases
         // its claim.
         for _ in 0..200 {
-            if lock(&state.pro.sleeping).is_empty() {
+            if lock(&state.pro().sleeping).is_empty() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(lock(&state.pro.sleeping).is_empty());
+        assert!(lock(&state.pro().sleeping).is_empty());
         // A sleep starting while a project is claimed leaves it to that
         // handover and advances nothing.
-        lock(&state.pro.sleeping).insert(workspace.clone());
+        lock(&state.pro().sleeping).insert(workspace.clone());
         let handover = routes::Handover {
             deadline: tokio::time::Instant::now() + Duration::from_secs(5),
             park: false,
@@ -562,7 +562,7 @@ mod tests {
             "{flushed:?}"
         );
         assert_eq!(
-            state.pro.sleep_generation.load(Ordering::Acquire),
+            state.pro().sleep_generation.load(Ordering::Acquire),
             generation
         );
         drop(state);
@@ -586,10 +586,10 @@ mod tests {
                 .status(),
             StatusCode::NOT_FOUND
         );
-        assert!(lock(&state.pro.parked).is_empty());
-        assert!(lock(&state.pro.reclaim).is_empty());
+        assert!(lock(&state.pro().parked).is_empty());
+        assert!(lock(&state.pro().reclaim).is_empty());
         assert_eq!(place(&state, &workspace), serde_json::Value::Null);
-        assert!(!state.pro.root.join("state.json").exists());
+        assert!(!state.pro().root.join("state.json").exists());
         drop(state);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -646,7 +646,7 @@ mod tests {
     #[tokio::test]
     async fn nothing_the_app_sends_can_cancel_a_sleep_handover() {
         let (state, root) = fixture("app");
-        let before = state.pro.sleep_generation.load(Ordering::Acquire);
+        let before = state.pro().sleep_generation.load(Ordering::Acquire);
         for (method, path) in [
             ("PUT", "/api/v1/pro/power"),
             ("POST", "/api/v1/pro/wake"),
@@ -662,7 +662,7 @@ mod tests {
             call(&state, "GET", "/api/v1/pro/status").await,
             StatusCode::OK
         );
-        assert_eq!(state.pro.sleep_generation.load(Ordering::Acquire), before);
+        assert_eq!(state.pro().sleep_generation.load(Ordering::Acquire), before);
         drop(state);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -687,8 +687,8 @@ mod tests {
     async fn opening_a_project_elsewhere_never_stops_work_here() {
         let (state, root) = fixture("open");
         let config = device();
-        lock(&state.pro.ownership).insert("w-a".into(), Ownership::Local { epoch: 3 });
-        let generation = state.pro.sleep_generation.load(Ordering::Acquire);
+        lock(&state.pro().ownership).insert("w-a".into(), Ownership::Local { epoch: 3 });
+        let generation = state.pro().sleep_generation.load(Ordering::Acquire);
         observed(
             &state,
             &config,
@@ -698,13 +698,13 @@ mod tests {
             ),
         );
         assert!(matches!(
-            lock(&state.pro.ownership).get("w-a"),
+            lock(&state.pro().ownership).get("w-a"),
             Some(Ownership::Local { epoch: 3 })
         ));
-        assert!(lock(&state.pro.sleeping).is_empty());
-        assert!(lock(&state.pro.parked).is_empty());
+        assert!(lock(&state.pro().sleeping).is_empty());
+        assert!(lock(&state.pro().parked).is_empty());
         assert_eq!(
-            state.pro.sleep_generation.load(Ordering::Acquire),
+            state.pro().sleep_generation.load(Ordering::Acquire),
             generation
         );
         assert_eq!(place(&state, "w-a"), json!({"where": "here"}));
@@ -718,14 +718,14 @@ mod tests {
     async fn the_cloud_refusing_a_parked_project_unparks_it_and_says_why() {
         let (state, root) = fixture("refused");
         let config = device();
-        lock(&state.pro.ownership).insert(
+        lock(&state.pro().ownership).insert(
             "w-a".into(),
             Ownership::Remote {
                 epoch: 4,
                 holder: "m-cloud".into(),
             },
         );
-        lock(&state.pro.parked).insert("w-a".into());
+        lock(&state.pro().parked).insert("w-a".into());
         observed(
             &state,
             &config,
@@ -734,9 +734,9 @@ mod tests {
                 "requires_fork":false,"holder_kind":"cloud","reason":"agent_not_connected_in_cloud"}),
             ),
         );
-        assert!(lock(&state.pro.parked).is_empty());
+        assert!(lock(&state.pro().parked).is_empty());
         assert_eq!(
-            state.pro.reasons.get("w-a"),
+            state.pro().reasons.get("w-a"),
             Some(Reason::AgentNotConnectedInCloud)
         );
         assert_eq!(place(&state, "w-a"), json!({"where": "cloud"}));
@@ -749,7 +749,7 @@ mod tests {
                 "requires_fork":false,"holder_kind":"computer","holder_name":"Studio"}),
             ),
         );
-        assert_eq!(state.pro.reasons.get("w-a"), None);
+        assert_eq!(state.pro().reasons.get("w-a"), None);
         assert_eq!(
             place(&state, "w-a"),
             json!({"where": "computer", "computer": "Studio"})
@@ -765,7 +765,7 @@ mod tests {
     async fn moving_follows_the_transfer_from_trigger_to_settled() {
         let (state, root) = fixture("moving");
         assert_eq!(moving(&state, "w-a"), serde_json::Value::Null);
-        lock(&state.pro.ownership).insert("w-a".into(), Ownership::Transferring { epoch: 3 });
+        lock(&state.pro().ownership).insert("w-a".into(), Ownership::Transferring { epoch: 3 });
         assert!(crate::pro::moving::begin(&state, "w-a"));
         assert!(
             !crate::pro::moving::begin(&state, "w-a"),
@@ -775,9 +775,9 @@ mod tests {
         assert_eq!(row["direction"], "cloud");
         assert_eq!(row["step"], "starting_in_cloud");
         assert!(row["since_ms"].as_u64().is_some());
-        lock(&state.pro.sleeping).insert("w-a".into());
+        lock(&state.pro().sleeping).insert("w-a".into());
         assert_eq!(moving(&state, "w-a")["step"], "saving_here");
-        lock(&state.pro.sleeping).remove("w-a");
+        lock(&state.pro().sleeping).remove("w-a");
         // The cloud took it: the hand-over settled, nothing is moving.
         crate::pro::transition::set_ownership(
             &state,
@@ -828,17 +828,17 @@ mod tests {
         let (state, root) = fixture("woke");
         crate::pro::install_execution_fixture(&state, "w-a", 3).unwrap();
         crate::pro::lapse_execution_fixture(&state, "w-a");
-        lock(&state.pro.ownership).insert("w-a".into(), Ownership::Transferring { epoch: 3 });
-        lock(&state.pro.release_pending).insert("w-a".into());
-        state.pro.reachable_since.store(1, Ordering::Release);
-        let generation = state.pro.sleep_generation.load(Ordering::Acquire);
+        lock(&state.pro().ownership).insert("w-a".into(), Ownership::Transferring { epoch: 3 });
+        lock(&state.pro().release_pending).insert("w-a".into());
+        state.pro().reachable_since.store(1, Ordering::Release);
+        let generation = state.pro().sleep_generation.load(Ordering::Acquire);
         routes::woke(&state).await;
         assert!(matches!(
-            lock(&state.pro.ownership).get("w-a"),
+            lock(&state.pro().ownership).get("w-a"),
             Some(Ownership::AwaitingVerification { epoch: 3 })
         ));
-        assert!(lock(&state.pro.release_pending).is_empty());
-        assert!(state.pro.sleep_generation.load(Ordering::Acquire) > generation);
+        assert!(lock(&state.pro().release_pending).is_empty());
+        assert!(state.pro().sleep_generation.load(Ordering::Acquire) > generation);
         // The guard for bringing work home starts over.
         assert!(!super::super::reach::settled(&state));
         // Review R3 B3: no agent starts or resumes before the lease loop
@@ -855,7 +855,7 @@ mod tests {
     #[tokio::test]
     async fn signing_out_is_remembered_across_a_restart() {
         let (state, root) = fixture("signed-out");
-        assert!(!state.pro.signed_out.load(Ordering::Acquire));
+        assert!(!state.pro().signed_out.load(Ordering::Acquire));
         assert_eq!(
             call(&state, "DELETE", "/api/v1/pro/configure").await,
             StatusCode::NO_CONTENT
@@ -871,7 +871,7 @@ mod tests {
                 root.join("config"),
             ),
         ));
-        assert!(restarted.pro.signed_out.load(Ordering::Acquire));
+        assert!(restarted.pro().signed_out.load(Ordering::Acquire));
         drop(restarted);
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -60,7 +60,7 @@ fn destination_rejects_nonempty_git_nested_symlink_and_replaced_folders() {
 }
 
 fn configure(state: &AppState, origin: &str) {
-    *lock(&state.pro.runtime) = Some(Configure {
+    *lock(&state.pro().runtime) = Some(Configure {
         recovery: false,
         execution: None,
         account_id: Some("account-fixture".into()),
@@ -112,7 +112,7 @@ async fn copy_requires_a_negotiated_checkpoint_without_legacy_fallback() {
     .unwrap_err();
     assert_eq!(open_error_code(&error), "checkpoint_pending");
     assert_eq!(&*lock(&requests), &["/v2/baton/w-cloud"]);
-    assert!(lock(&laptop.pro.adoptions).is_empty());
+    assert!(lock(&laptop.pro().adoptions).is_empty());
     assert!(lock(&laptop.workspaces).list().is_empty());
     assert!(std::fs::read_dir(&chosen).unwrap().next().is_none());
     server.abort();
@@ -229,13 +229,13 @@ async fn configuration_snapshot_waits_for_account_transition() {
     let root = temp();
     let state = state(&root);
     configure(&state, "http://127.0.0.1:1");
-    let gate = state.pro.configuration.lock().await;
-    state.pro.generation.store(8, Ordering::Release);
+    let gate = state.pro().configuration.lock().await;
+    state.pro().generation.store(8, Ordering::Release);
     let owner = state.clone();
     let pending = tokio::spawn(async move { configuration(&owner).await });
     tokio::task::yield_now().await;
     assert!(!pending.is_finished());
-    lock(&state.pro.runtime).as_mut().unwrap().account_id = Some("replacement".into());
+    lock(&state.pro().runtime).as_mut().unwrap().account_id = Some("replacement".into());
     drop(gate);
     let (config, generation) = pending.await.unwrap();
     assert_eq!(generation, 8);
@@ -267,15 +267,15 @@ async fn original_laptop_root_is_bound_to_its_account_before_automatic_return() 
         .import_exact(workspace.clone())
         .unwrap();
     assert!(local_root(&state, "w-cloud").is_none());
-    let config = lock(&state.pro.runtime).clone().unwrap();
+    let config = lock(&state.pro().runtime).clone().unwrap();
     bind_workspace_account(&state, &config, "w-cloud").unwrap();
     assert_eq!(local_root(&state, "w-cloud"), Some(project.clone()));
     super::super::persist(&state).await.unwrap();
-    lock(&state.pro.runtime).as_mut().unwrap().account_id = Some("other-account".into());
+    lock(&state.pro().runtime).as_mut().unwrap().account_id = Some("other-account".into());
     assert!(!account_matches(&state, "w-cloud"));
     assert!(!engine::eligible(&state, &workspace));
     assert!(local_root(&state, "w-cloud").is_none());
-    lock(&state.pro.project_cache).checked_at = super::super::now();
+    lock(&state.pro().project_cache).checked_at = super::super::now();
     let result = copy(
         &state,
         Open {
@@ -300,9 +300,9 @@ async fn cache_wait_cannot_admit_an_old_account_configuration() {
     let root = temp();
     let owner = state(&root);
     configure(&owner, "http://127.0.0.1:1");
-    let config = lock(&owner.pro.runtime).clone().unwrap();
+    let config = lock(&owner.pro().runtime).clone().unwrap();
     for snapshot in [false, true] {
-        let cache = owner.pro.cache("w-generation").unwrap();
+        let cache = owner.pro().cache("w-generation").unwrap();
         let guard = cache.lock_owned().await;
         let future = async {
             if snapshot {
@@ -315,13 +315,13 @@ async fn cache_wait_cannot_admit_an_old_account_configuration() {
         assert!(tokio::time::timeout(Duration::from_millis(20), &mut future)
             .await
             .is_err());
-        owner.pro.generation.fetch_add(1, Ordering::AcqRel);
+        owner.pro().generation.fetch_add(1, Ordering::AcqRel);
         drop(guard);
         assert_eq!(
             future.await.unwrap_err().to_string(),
             "Account changed while waiting for project cache"
         );
-        assert!(!owner.pro.root.join("w-generation").exists());
+        assert!(!owner.pro().root.join("w-generation").exists());
     }
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -345,13 +345,13 @@ async fn copying_a_project_this_computer_owns_is_inert() {
         hidden: false,
     };
     lock(&laptop.workspaces).import_exact(workspace).unwrap();
-    let config = lock(&laptop.pro.runtime).clone().unwrap();
+    let config = lock(&laptop.pro().runtime).clone().unwrap();
     bind_workspace_account(&laptop, &config, "w-cloud").unwrap();
-    lock(&laptop.pro.ownership).insert(
+    lock(&laptop.pro().ownership).insert(
         "w-cloud".into(),
         super::super::Ownership::Local { epoch: 9 },
     );
-    lock(&laptop.pro.project_cache).checked_at = super::super::now();
+    lock(&laptop.pro().project_cache).checked_at = super::super::now();
     let request = || Open {
         workspace_id: "w-cloud".into(),
         destination_root: None,
@@ -361,12 +361,12 @@ async fn copying_a_project_this_computer_owns_is_inert() {
     let ack = copy(&laptop, request()).await.unwrap();
     assert_eq!(ack["state"], "owned_local");
     assert!(super::super::may_execute(&laptop, "w-cloud"));
-    assert!(lock(&laptop.pro.preferences)
+    assert!(lock(&laptop.pro().preferences)
         .get("w-cloud")
         .unwrap()
         .copy
         .is_none());
-    assert!(!laptop.pro.root.join("copy-authority.json").exists());
+    assert!(!laptop.pro().root.join("copy-authority.json").exists());
     assert_eq!(
         std::fs::read_to_string(chosen.join("keep.txt")).unwrap(),
         "owned local work"
@@ -381,14 +381,14 @@ async fn refused_takeover_start_retires_its_saved_intent_and_keeps_copy_reopenab
         let root = temp();
         let laptop = state(&root.join("daemon"));
         configure(&laptop, "http://127.0.0.1:1");
-        lock(&laptop.pro.runtime).as_mut().unwrap().execution=Some(serde_json::from_value(json!({"version":1,"installation_id":"i-fixture","capability":super::super::execution::wire::ExecutionCapability::checkpoint_fork()})).unwrap());
+        lock(&laptop.pro().runtime).as_mut().unwrap().execution=Some(serde_json::from_value(json!({"version":1,"installation_id":"i-fixture","capability":super::super::execution::wire::ExecutionCapability::checkpoint_fork()})).unwrap());
         let chosen = root.join("chosen");
         std::fs::create_dir(&chosen).unwrap();
         let mut destination = reserve(&chosen, &[], &[]).unwrap();
-        destination.account = account_scope(&lock(&laptop.pro.runtime).clone().unwrap());
+        destination.account = account_scope(&lock(&laptop.pro().runtime).clone().unwrap());
         destination.started = true;
         destination.complete = true;
-        lock(&laptop.pro.adoptions).insert("w-cloud".into(), destination);
+        lock(&laptop.pro().adoptions).insert("w-cloud".into(), destination);
         lock(&laptop.workspaces)
             .import_exact(crate::workspaces::Workspace {
                 id: "w-cloud".into(),
@@ -401,7 +401,7 @@ async fn refused_takeover_start_retires_its_saved_intent_and_keeps_copy_reopenab
                 hidden: false,
             })
             .unwrap();
-        lock(&laptop.pro.preferences)
+        lock(&laptop.pro().preferences)
             .entry("w-cloud".into())
             .or_default()
             .copy = Some(super::super::project_copy::CopyState {
@@ -415,7 +415,7 @@ async fn refused_takeover_start_retires_its_saved_intent_and_keeps_copy_reopenab
         if limited {
             super::super::moves::fill_requests_fixture(&laptop);
         } else {
-            lock(&laptop.pro.parked).insert("w-cloud".into());
+            lock(&laptop.pro().parked).insert("w-cloud".into());
         }
         assert!(takeover(
             &laptop,
@@ -428,7 +428,7 @@ async fn refused_takeover_start_retires_its_saved_intent_and_keeps_copy_reopenab
         )
         .await
         .is_err());
-        let copy = lock(&laptop.pro.preferences)
+        let copy = lock(&laptop.pro().preferences)
             .get("w-cloud")
             .unwrap()
             .copy

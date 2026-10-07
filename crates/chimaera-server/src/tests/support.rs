@@ -65,8 +65,8 @@ pub(super) fn test_state_with_runtime(
     data_dir: PathBuf,
     runtime: Arc<dyn crate::daemon_extension::Runtime>,
 ) -> Arc<AppState> {
-    let mut state = fixture_state(0, data_dir);
-    state.daemon_extension = Some(runtime);
+    let state = fixture_state(0, data_dir);
+    state.pro().set_runtime(runtime);
     Arc::new(state)
 }
 

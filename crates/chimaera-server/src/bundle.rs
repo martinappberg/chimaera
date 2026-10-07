@@ -330,7 +330,7 @@ async fn export_inner(
     if !valid_id(id) {
         bail!("invalid session ID");
     }
-    state.bundle_imports.check_session(id, None)?;
+    state.pro().bundle_imports.check_session(id, None)?;
     let _guard = crate::chat::ChatSwitchGuard::acquire(&state, id, "transfer")
         .context("session lifecycle operation already in progress")?;
     let mut entry = crate::ledger::snapshot(&state)
@@ -339,9 +339,14 @@ async fn export_inner(
         .find(|e| e.id == id)
         .context("unknown session")?;
     state
+        .pro()
         .bundle_imports
         .check_session(id, entry.agent.as_ref().and_then(|a| a.resume.as_deref()))?;
-    if state.bundle_imports.blocks_workspace(&entry.workspace_id) {
+    if state
+        .pro()
+        .bundle_imports
+        .blocks_workspace(&entry.workspace_id)
+    {
         return Err(pending::PendingError.into());
     }
     entry.suspended = false;
@@ -446,7 +451,7 @@ fn write_archive(
     mode: ExportMode,
     path: &Path,
 ) -> Result<()> {
-    let _read = state.bundle_imports.read_admission(
+    let _read = state.pro().bundle_imports.read_admission(
         &workspace.id,
         &entry.id,
         entry.agent.as_ref().and_then(|a| a.resume.as_deref()),

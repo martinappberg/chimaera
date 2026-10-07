@@ -124,7 +124,6 @@ async fn typing_on_a_free_daemon_changes_no_session_row() {
     let row = rows.iter().find(|row| row["id"] == sid.as_str()).unwrap();
     assert_eq!(row["last_input_ms"], serde_json::Value::Null);
     assert!(crate::activity::last_change(&state).is_none());
-    assert!(!state.session_proxy.polling(), "no roster timer");
     request(
         &state,
         Method::DELETE,

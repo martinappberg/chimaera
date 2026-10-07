@@ -24,7 +24,7 @@ fn fixture() -> (Arc<AppState>, PathBuf, String, String) {
     let b = lock(&state.workspaces).add(root.join("b")).unwrap().id;
     super::super::install_fixture(&state, &a, 4).unwrap();
     super::super::install_fixture(&state, &b, 4).unwrap();
-    *lock(&state.pro.runtime) = Some(serde_json::from_value(serde_json::json!({
+    *lock(&state.pro().runtime) = Some(serde_json::from_value(serde_json::json!({
         "role":"worker", "account_id":"a-fixture", "endpoint":"http://127.0.0.1:1", "keeper_url":"",
         "delegation":{"access_token":"synthetic", "expires_at":"2099-01-01T00:00:00Z", "scope":["baton","mirror"],"device_id":"d-home"}
     })).unwrap());
@@ -164,7 +164,7 @@ async fn stale_deadline_and_non_worker_cannot_publish_a_workspace_reservation() 
     let (state, root, a, _) = fixture();
     let host = WorkspaceHost::new(state.clone());
     assert!(host.prepare(&a, false, Instant::now()).await.is_err());
-    *lock(&state.pro.runtime) = None;
+    *lock(&state.pro().runtime) = None;
     assert!(host
         .prepare(&a, false, Instant::now() + Duration::from_secs(5))
         .await
@@ -299,7 +299,7 @@ fn ordinary_fixture(
     ));
     std::fs::create_dir_all(root.join("a")).unwrap();
     std::fs::create_dir_all(root.join("b")).unwrap();
-    let mut state = AppState::new(
+    let state = AppState::new(
         "fixture".into(),
         "fixture".into(),
         4242,
@@ -307,7 +307,9 @@ fn ordinary_fixture(
         root.clone(),
         root.join("config"),
     );
-    state.daemon_extension = extension;
+    if let Some(runtime) = extension {
+        state.pro().set_runtime(runtime);
+    }
     let state = Arc::new(state);
     let a = lock(&state.workspaces).add(root.join("a")).unwrap().id;
     let b = lock(&state.workspaces).add(root.join("b")).unwrap().id;
@@ -317,12 +319,12 @@ fn ordinary_fixture(
 #[tokio::test]
 async fn ordinary_selected_worker_maintenance_preserves_sibling_and_original_generation() {
     let (state, root, a, b) = ordinary_fixture(Some(Arc::new(SelectedRuntime)));
-    state.pro.worker.store(true, Ordering::Release);
+    state.pro().worker.store(true, Ordering::Release);
     let sibling = terminal(&state, &b, root.join("b"));
     let worker = state.clone();
     let result = tokio::spawn(async move {
-        assert!(lock(&worker.pro.runtime).is_none());
-        assert!(lock(&worker.pro.ownership).is_empty());
+        assert!(lock(&worker.pro().runtime).is_none());
+        assert!(lock(&worker.pro().ownership).is_empty());
         let mut prepared = WorkspaceHost::new(worker.clone())
             .prepare(&a, false, Instant::now() + Duration::from_secs(5))
             .await
@@ -333,9 +335,9 @@ async fn ordinary_selected_worker_maintenance_preserves_sibling_and_original_gen
         assert!(begin_launch(&worker, &b).unwrap().is_some());
         prepared.stop().await.unwrap();
         assert!(worker.sessions.get(&sibling).unwrap().alive);
-        assert!(lock(&worker.pro.runtime).is_none());
-        assert!(lock(&worker.pro.ownership).is_empty());
-        worker.pro.generation.fetch_add(1, Ordering::AcqRel);
+        assert!(lock(&worker.pro().runtime).is_none());
+        assert!(lock(&worker.pro().ownership).is_empty());
+        worker.pro().generation.fetch_add(1, Ordering::AcqRel);
         assert!(prepared.current().is_err());
         drop(prepared);
         assert!(begin_launch(&worker, &a).unwrap().is_some());
@@ -382,7 +384,7 @@ async fn ordinary_worker_launch_blocks_maintenance_through_actual_environment_wa
         release: release.clone(),
         worker: observed_worker.clone(),
     })));
-    state.pro.worker.store(true, Ordering::Release);
+    state.pro().worker.store(true, Ordering::Release);
     let sibling = terminal(&state, &b, root.join("b"));
     let worker = state.clone();
     let result = tokio::spawn(async move {
@@ -456,7 +458,7 @@ async fn ordinary_worker_launch_blocks_maintenance_through_actual_environment_wa
 async fn ordinary_maintenance_does_not_admit_absent_extension_or_account_bound_projects() {
     let (state, root, a, _) = ordinary_fixture(None);
     assert!(begin_launch(&state, &a).unwrap().is_none());
-    state.pro.worker.store(true, Ordering::Release);
+    state.pro().worker.store(true, Ordering::Release);
     assert!(begin_launch(&state, &a).unwrap().is_none());
     assert!(WorkspaceHost::new(state.clone())
         .prepare(&a, false, Instant::now() + Duration::from_secs(5))
@@ -471,8 +473,8 @@ async fn ordinary_maintenance_does_not_admit_absent_extension_or_account_bound_p
         .prepare(&a, false, Instant::now() + Duration::from_secs(5))
         .await
         .is_err());
-    state.pro.worker.store(true, Ordering::Release);
-    lock(&state.pro.preferences)
+    state.pro().worker.store(true, Ordering::Release);
+    lock(&state.pro().preferences)
         .entry(a.clone())
         .or_default()
         .account = Some("a-foreign".into());

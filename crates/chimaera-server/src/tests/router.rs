@@ -216,10 +216,8 @@ async fn health_assembly_metadata_is_authenticated_optional_and_stateless() {
             Some("2.0.0@fixture"),
         ),
     ] {
-        let mut state = test_state();
-        std::sync::Arc::get_mut(&mut state)
-            .unwrap()
-            .daemon_extension = Some(runtime);
+        let state = test_state();
+        state.pro().set_runtime(runtime);
         let router = app(state);
         let unauthorized = router
             .clone()

@@ -63,6 +63,14 @@ use tokio::sync::Mutex as AsyncMutex;
 
 pub(crate) struct ProState {
     root: PathBuf,
+    /// The composed runtime (the private half), set once at startup; tests
+    /// and fixtures set their own.
+    extension: Mutex<Option<Arc<dyn crate::daemon_extension::Runtime>>>,
+    /// Stable session identities routed to another daemon (`session_proxy`).
+    pub(crate) session_proxy: crate::session_proxy::Store,
+    /// Durable public imports gate execution before boot ledger restoration.
+    pub(crate) bundle_imports: crate::state::Lazy<crate::bundle::PendingImports>,
+    pub(crate) cloud_providers: crate::cloud::providers::ProviderSlot,
     configured: AtomicBool,
     /// `state.json` existed but could not be read at boot, so which projects
     /// Pro took on is unknown: every project is treated as enrolled
@@ -381,7 +389,38 @@ fn persisted_kept(statuses: &HashMap<String, WorkspaceStatus>) -> HashMap<String
         })
         .collect()
 }
+impl crate::AppState {
+    /// Pro's state, built from disk the first time the Pro policy needs it:
+    /// a daemon without the extension never calls this.
+    pub(crate) fn pro(&self) -> &ProState {
+        self.extension
+            .get_or_init(|| Box::new(ProState::new(self.data_dir.join("pro"))))
+            .downcast_ref()
+            .expect("the extension slot holds Pro's state")
+    }
+}
+
+#[cfg(test)]
+impl crate::AppState {
+    /// Tests replace parts of Pro's state on a state they own outright.
+    pub(crate) fn pro_mut(&mut self) -> &mut ProState {
+        let _ = self.pro();
+        self.extension
+            .get_mut()
+            .and_then(|value| value.downcast_mut())
+            .expect("the extension slot holds Pro's state")
+    }
+}
+
 impl ProState {
+    /// The composed runtime (the private half), when one was set.
+    pub(crate) fn runtime(&self) -> Option<Arc<dyn crate::daemon_extension::Runtime>> {
+        crate::lock(&self.extension).clone()
+    }
+    /// Set the composed runtime: once at startup; a fixture may replace it.
+    pub(crate) fn set_runtime(&self, runtime: Arc<dyn crate::daemon_extension::Runtime>) {
+        *crate::lock(&self.extension) = Some(runtime);
+    }
     fn cache(&self, workspace: &str) -> anyhow::Result<Arc<AsyncMutex<()>>> {
         anyhow::ensure!(valid_id(workspace), "invalid workspace cache identity");
         let mut caches = crate::lock(&self.caches);
@@ -548,6 +587,11 @@ impl ProState {
             unknown,
         );
         let copies = project_copy::Enrollment::load(&root);
+        // Public imports are recorded beside Pro's root, under the data dir.
+        let data_dir = root
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
         Self {
             root,
             configured: AtomicBool::new(false),
@@ -591,6 +635,12 @@ impl ProState {
             #[cfg(test)]
             persistence_pause: Mutex::new(None),
             configuration: Arc::new(AsyncMutex::new(())),
+            extension: Mutex::new(None),
+            session_proxy: Default::default(),
+            bundle_imports: crate::state::Lazy::new(move || {
+                crate::bundle::PendingImports::load(&data_dir)
+            }),
+            cloud_providers: Default::default(),
             caches: Mutex::new(HashMap::new()),
             boot_deferred: Mutex::new(Default::default()),
             installing: Mutex::new(Default::default()),
@@ -634,13 +684,13 @@ pub(crate) enum Tier {
 }
 pub(crate) fn tier(state: &crate::AppState) -> Tier {
     if state
-        .pro
+        .pro()
         .configured
         .load(std::sync::atomic::Ordering::Acquire)
         || crate::cloud::enabled()
     {
         Tier::Active
-    } else if state.daemon_extension.is_some() {
+    } else if state.pro().runtime().is_some() {
         Tier::Offered
     } else {
         Tier::Free
@@ -653,7 +703,7 @@ pub(crate) fn tier(state: &crate::AppState) -> Tier {
 /// Pro's own files; while `state.json` itself is unreadable every project
 /// counts, so a damaged record never lifts a real fence.
 pub(crate) fn enrolled(state: &crate::AppState, workspace: &str) -> bool {
-    let pro = &state.pro;
+    let pro = &state.pro();
     pro.records_unknown
         || crate::lock(&pro.ownership).contains_key(workspace)
         || crate::lock(&pro.preferences)
@@ -672,7 +722,7 @@ pub(crate) fn marks_folder(state: &crate::AppState, workspace: &str) -> bool {
 /// Whether this daemon holds any Pro project record at all (see
 /// [`enrolled`]). A never-enrolled installation has none.
 pub(crate) fn any_enrolled(state: &crate::AppState) -> bool {
-    let pro = &state.pro;
+    let pro = &state.pro();
     pro.records_unknown
         || !crate::lock(&pro.ownership).is_empty()
         || crate::lock(&pro.preferences)
@@ -698,25 +748,25 @@ pub(crate) fn note_opened(state: &crate::AppState, workspace: &str) {
         return;
     }
     if matches!(
-        crate::lock(&state.pro.ownership).get(workspace),
+        crate::lock(&state.pro().ownership).get(workspace),
         Some(Ownership::Local { .. })
     ) {
         return;
     }
-    let mut opened = crate::lock(&state.pro.opened_here);
+    let mut opened = crate::lock(&state.pro().opened_here);
     if opened.len() < 128 || opened.contains(workspace) {
         opened.insert(workspace.to_owned());
     }
 }
 #[cfg(test)]
 pub(crate) fn opened_here(state: &crate::AppState, workspace: &str) -> bool {
-    crate::lock(&state.pro.opened_here).contains(workspace)
+    crate::lock(&state.pro().opened_here).contains(workspace)
 }
 /// Tests only: an account configured this daemon ([`Tier::Active`]).
 #[cfg(test)]
 pub(crate) fn activate_fixture(state: &crate::AppState) {
     state
-        .pro
+        .pro()
         .configured
         .store(true, std::sync::atomic::Ordering::Release);
 }
@@ -724,7 +774,7 @@ pub(crate) fn activate_fixture(state: &crate::AppState) {
 /// without an account: it counts as enrolled and its folder gets its marker.
 #[cfg(test)]
 pub(crate) fn enroll_fixture(state: &crate::AppState, workspace: &str) {
-    crate::lock(&state.pro.preferences)
+    crate::lock(&state.pro().preferences)
         .entry(workspace.into())
         .or_default()
         .account = Some("acct-fixture".into());
@@ -744,23 +794,23 @@ pub(crate) fn local_copy_view(
 pub(crate) fn may_write(state: &crate::AppState, workspace: &str) -> bool {
     if execution::supervisor::pending(state)
         || project_copy::copy_only(state, workspace)
-        || state.bundle_imports.blocks_workspace(workspace)
+        || state.pro().bundle_imports.blocks_workspace(workspace)
     {
         return false;
     }
     if authority::workspace(state, workspace).is_err()
-        || (crate::lock(&state.pro.authority).restricted()
+        || (crate::lock(&state.pro().authority).restricted()
             && !state
-                .pro
+                .pro()
                 .configured
                 .load(std::sync::atomic::Ordering::Acquire))
     {
         return false;
     }
-    if crate::lock(&state.pro.legacy_pending).contains(workspace) {
+    if crate::lock(&state.pro().legacy_pending).contains(workspace) {
         return false;
     }
-    match crate::lock(&state.pro.ownership).get(workspace) {
+    match crate::lock(&state.pro().ownership).get(workspace) {
         Some(
             Ownership::Remote { .. }
             | Ownership::PrivacyDisabled { .. }
@@ -774,7 +824,7 @@ pub(crate) fn may_write(state: &crate::AppState, workspace: &str) -> bool {
         // (before its own fence). Its agents wait for that verification
         // (`execution::allows`).
         Some(Ownership::AwaitingVerification { .. }) => {
-            !execution::worker(state) && !crate::lock(&state.pro.installing).contains(workspace)
+            !execution::worker(state) && !crate::lock(&state.pro().installing).contains(workspace)
         }
         _ => true,
     }
@@ -806,7 +856,7 @@ pub(crate) fn account_failing_fixture(state: &crate::AppState) {
 #[cfg(test)]
 pub(crate) fn signed_out_fixture(state: &crate::AppState) {
     state
-        .pro
+        .pro()
         .signed_out
         .store(true, std::sync::atomic::Ordering::Release);
 }
@@ -823,13 +873,13 @@ pub(crate) fn managed_execution(state: &crate::AppState, workspace: &str) -> boo
 /// expired without a renewal. Only meaningful while configured.
 pub(super) fn delegation_lapsed(state: &crate::AppState) -> bool {
     if state
-        .pro
+        .pro()
         .delegation_refused
         .load(std::sync::atomic::Ordering::Acquire)
     {
         return true;
     }
-    crate::lock(&state.pro.runtime)
+    crate::lock(&state.pro().runtime)
         .as_ref()
         .and_then(|config| {
             time::OffsetDateTime::parse(
@@ -878,7 +928,7 @@ pub(crate) enum Phase {
     Arriving,
 }
 pub(crate) fn ownership_phase(state: &crate::AppState, workspace: &str) -> Phase {
-    match crate::lock(&state.pro.ownership).get(workspace) {
+    match crate::lock(&state.pro().ownership).get(workspace) {
         None | Some(Ownership::Local { .. } | Ownership::PrivacyDisabled { .. }) => Phase::Here,
         Some(Ownership::AwaitingVerification { .. }) => Phase::Verifying,
         Some(Ownership::Transferring { .. }) => Phase::Leaving,
@@ -900,7 +950,7 @@ pub(crate) fn interrupted_return(
     entry.handoff.is_some()
         && !execution::worker(state)
         && matches!(
-            crate::lock(&state.pro.ownership).get(&entry.workspace_id),
+            crate::lock(&state.pro().ownership).get(&entry.workspace_id),
             None | Some(Ownership::Local { .. } | Ownership::AwaitingVerification { .. })
         )
         && may_execute(state, &entry.workspace_id)
@@ -924,15 +974,15 @@ pub(crate) fn owner_kind(state: &crate::AppState, workspace: &str) -> Option<&'s
 }
 /// Whether this session waits at boot for this life's ownership proof.
 pub(crate) fn restart_deferred(state: &crate::AppState, session_id: &str) -> bool {
-    crate::lock(&state.pro.boot_deferred).contains(session_id)
+    crate::lock(&state.pro().boot_deferred).contains(session_id)
 }
 /// Whether boot deferred any session to this life's ownership proof; only
 /// then does the one-minute device fallback have anything to resume.
 pub(crate) fn any_restart_deferred(state: &crate::AppState) -> bool {
-    !crate::lock(&state.pro.boot_deferred).is_empty()
+    !crate::lock(&state.pro().boot_deferred).is_empty()
 }
 pub(crate) fn defer_boot_session(state: &crate::AppState, session: &str) {
-    let mut deferred = crate::lock(&state.pro.boot_deferred);
+    let mut deferred = crate::lock(&state.pro().boot_deferred);
     if deferred.len() < 512 {
         deferred.insert(session.to_owned());
     }
@@ -954,7 +1004,7 @@ pub(crate) async fn resume_unverified(state: &std::sync::Arc<crate::AppState>) {
         return;
     }
     // Re-run the fallback once the recorded groups exit (bounded to 10 min).
-    crate::lock(&state.pro.boot_deferred).extend(waiting);
+    crate::lock(&state.pro().boot_deferred).extend(waiting);
     let owner = state.clone();
     tokio::spawn(async move {
         for _ in 0..120 {
@@ -963,7 +1013,7 @@ pub(crate) async fn resume_unverified(state: &std::sync::Arc<crate::AppState>) {
                 return;
             }
             execution::reprobe(&owner);
-            let cleared = crate::lock(&owner.pro.boot_deferred).iter().any(|id| {
+            let cleared = crate::lock(&owner.pro().boot_deferred).iter().any(|id| {
                 crate::lock(&owner.deferred_sessions)
                     .get(id)
                     .is_some_and(|entry| !execution::unclean(&owner, &entry.workspace_id))
@@ -973,14 +1023,14 @@ pub(crate) async fn resume_unverified(state: &std::sync::Arc<crate::AppState>) {
                 if left.is_empty() {
                     return;
                 }
-                crate::lock(&owner.pro.boot_deferred).extend(left);
+                crate::lock(&owner.pro().boot_deferred).extend(left);
             }
         }
     });
 }
 /// One fallback pass; returns the sessions still waiting on old processes.
 async fn resume_unverified_once(state: &std::sync::Arc<crate::AppState>) -> Vec<String> {
-    let pending: Vec<String> = crate::lock(&state.pro.boot_deferred).drain().collect();
+    let pending: Vec<String> = crate::lock(&state.pro().boot_deferred).drain().collect();
     let mut workspaces: HashMap<String, Vec<String>> = HashMap::new();
     for id in pending {
         let workspace = crate::lock(&state.deferred_sessions)
@@ -994,8 +1044,8 @@ async fn resume_unverified_once(state: &std::sync::Arc<crate::AppState>) -> Vec<
     for (workspace, ids) in workspaces {
         // The account answered for this project (the verified path decides),
         // or a checkpoint install is replacing its files: not ours to resume.
-        if crate::lock(&state.pro.answered).contains(&workspace)
-            || crate::lock(&state.pro.installing).contains(&workspace)
+        if crate::lock(&state.pro().answered).contains(&workspace)
+            || crate::lock(&state.pro().installing).contains(&workspace)
         {
             continue;
         }
@@ -1014,7 +1064,7 @@ async fn resume_unverified_once(state: &std::sync::Arc<crate::AppState>) -> Vec<
             && !execution::kept_here(state, &workspace)
         {
             // Still waiting for the verified path (or a later fallback).
-            crate::lock(&state.pro.boot_deferred).extend(ids);
+            crate::lock(&state.pro().boot_deferred).extend(ids);
             continue;
         }
         if let Err(error) = crate::ledger::resume_deferred_sessions(state, &workspace, &ids).await {
@@ -1061,22 +1111,22 @@ pub(crate) fn owned_epoch(state: &crate::AppState, workspace: &str) -> Option<u6
     if project_copy::copy_only(state, workspace) {
         return None;
     }
-    match crate::lock(&state.pro.ownership).get(workspace) {
+    match crate::lock(&state.pro().ownership).get(workspace) {
         Some(Ownership::Local { epoch }) => Some(*epoch),
         _ => None,
     }
 }
 /// The user chose to run this project in the cloud ("Run in the cloud").
 fn parked(state: &crate::AppState, workspace: &str) -> bool {
-    crate::lock(&state.pro.parked).contains(workspace)
+    crate::lock(&state.pro().parked).contains(workspace)
 }
 /// Marks a "Run in the cloud" handover as it starts, unless another sleep or
 /// wake advanced the generation since it began (`generation` is the
 /// handover's): the newer one decides. The caller persists.
 fn park(state: &crate::AppState, workspace: &str, generation: u64) -> bool {
-    let mut parked = crate::lock(&state.pro.parked);
+    let mut parked = crate::lock(&state.pro().parked);
     if state
-        .pro
+        .pro()
         .sleep_generation
         .load(std::sync::atomic::Ordering::Acquire)
         != generation
@@ -1092,7 +1142,7 @@ fn park(state: &crate::AppState, workspace: &str, generation: u64) -> bool {
 /// (persisted across restarts).
 pub(crate) fn signed_out(state: &crate::AppState) -> bool {
     state
-        .pro
+        .pro()
         .signed_out
         .load(std::sync::atomic::Ordering::Acquire)
 }
@@ -1133,7 +1183,7 @@ pub(super) fn settle_fenced_here(state: &crate::AppState, workspace: &str, verif
         count = stale.len(),
         "Conversations a lapse stopped here ran elsewhere since; they move to Recents"
     );
-    let mut settled = crate::lock(&state.pro.settled);
+    let mut settled = crate::lock(&state.pro().settled);
     let room = 64usize.saturating_sub(settled.len());
     settled.extend(stale.into_iter().take(room));
     drop(settled);
@@ -1142,7 +1192,7 @@ pub(super) fn settle_fenced_here(state: &crate::AppState, workspace: &str, verif
 /// Puts the conversations [`settle_fenced_here`] took out of the deferred set
 /// in Recents, off the caller.
 pub(crate) fn retire_settled(state: &std::sync::Arc<crate::AppState>) {
-    let settled = std::mem::take(&mut *crate::lock(&state.pro.settled));
+    let settled = std::mem::take(&mut *crate::lock(&state.pro().settled));
     if settled.is_empty() {
         return;
     }
@@ -1181,7 +1231,7 @@ pub(crate) fn fence_current(state: &crate::AppState, entry: &crate::ledger::Ledg
 /// No longer kept in the cloud: "Run here", a handover that did not
 /// complete, or the cloud saying it cannot run the project.
 fn unpark(state: &crate::AppState, workspace: &str) {
-    crate::lock(&state.pro.parked).remove(workspace);
+    crate::lock(&state.pro().parked).remove(workspace);
 }
 fn valid_id(value: &str) -> bool {
     !value.is_empty()
@@ -1203,18 +1253,18 @@ struct PersistencePause {
 }
 
 async fn persist(state: &crate::AppState) -> anyhow::Result<()> {
-    let mut written = state.pro.persistence.clone().lock_owned().await;
-    ensure_root(&state.pro.root).await?;
+    let mut written = state.pro().persistence.clone().lock_owned().await;
+    ensure_root(&state.pro().root).await?;
     project_copy::persist_latch(state).await?;
     execution::record_groups(state);
-    let ownership = crate::lock(&state.pro.ownership).clone();
-    let preferences = crate::lock(&state.pro.preferences).clone();
-    let projects_root = crate::lock(&state.pro.projects_root).clone();
-    let adoptions = crate::lock(&state.pro.adoptions).clone();
-    let legacy_pending = crate::lock(&state.pro.legacy_pending).clone();
-    let parked = crate::lock(&state.pro.parked).iter().cloned().collect();
+    let ownership = crate::lock(&state.pro().ownership).clone();
+    let preferences = crate::lock(&state.pro().preferences).clone();
+    let projects_root = crate::lock(&state.pro().projects_root).clone();
+    let adoptions = crate::lock(&state.pro().adoptions).clone();
+    let legacy_pending = crate::lock(&state.pro().legacy_pending).clone();
+    let parked = crate::lock(&state.pro().parked).iter().cloned().collect();
     let (provider_blocks, kept_both) = {
-        let statuses = crate::lock(&state.pro.status);
+        let statuses = crate::lock(&state.pro().status);
         let blocks = statuses
             .iter()
             .filter(|(_, status)| !status.blocked_providers.is_empty())
@@ -1230,13 +1280,16 @@ async fn persist(state: &crate::AppState) -> anyhow::Result<()> {
         import_roots: HashMap::new(),
         adoptions,
         projects_root,
-        worker: state.pro.worker.load(std::sync::atomic::Ordering::Acquire),
+        worker: state
+            .pro()
+            .worker
+            .load(std::sync::atomic::Ordering::Acquire),
         ownership,
         preferences,
         parked,
         signed_out: signed_out(state),
-        unreleased: crate::lock(&state.pro.unreleased).clone(),
-        moving: crate::lock(&state.pro.moving)
+        unreleased: crate::lock(&state.pro().unreleased).clone(),
+        moving: crate::lock(&state.pro().moving)
             .iter()
             .map(|(id, at)| (id.clone(), *at))
             .collect(),
@@ -1248,10 +1301,10 @@ async fn persist(state: &crate::AppState) -> anyhow::Result<()> {
     if written.as_deref() == Some(bytes.as_slice()) {
         return Ok(());
     }
-    let path = state.pro.root.join("state.json");
+    let path = state.pro().root.join("state.json");
     let copy = bytes.clone();
     #[cfg(test)]
-    let pause = crate::lock(&state.pro.persistence_pause).take();
+    let pause = crate::lock(&state.pro().persistence_pause).take();
     // Aborting a coordinator/request cannot release this writer while its
     // blocking rename/fsync still owns state.json.tmp. Return the SAME guard
     // after settlement and retain it through the original state→latch order.
@@ -1281,7 +1334,7 @@ pub(crate) fn bundle_install_binding(
     digest: String,
 ) -> anyhow::Result<install::Binding> {
     authority::workspace(state, workspace)?;
-    let config = crate::lock(&state.pro.runtime);
+    let config = crate::lock(&state.pro().runtime);
     Ok(install::Binding {
         endpoint: config
             .as_ref()
@@ -1296,7 +1349,7 @@ pub(crate) fn bundle_install_binding(
 
 pub(crate) fn may_import(state: &crate::AppState, workspace: &str, epoch: u64) -> bool {
     if project_copy::copy_only(state, workspace)
-        && !crate::lock(&state.pro.preferences)
+        && !crate::lock(&state.pro().preferences)
             .get(workspace)
             .and_then(|p| p.copy.as_ref())
             .is_some_and(|copy| copy.takeover_requested)
@@ -1304,20 +1357,20 @@ pub(crate) fn may_import(state: &crate::AppState, workspace: &str, epoch: u64) -
         return false;
     }
     if authority::workspace(state, workspace).is_err()
-        || (crate::lock(&state.pro.authority).restricted()
+        || (crate::lock(&state.pro().authority).restricted()
             && !state
-                .pro
+                .pro()
                 .configured
                 .load(std::sync::atomic::Ordering::Acquire))
     {
         return false;
     }
-    match crate::lock(&state.pro.ownership).get(workspace) {
+    match crate::lock(&state.pro().ownership).get(workspace) {
         Some(Ownership::Local { epoch: current } | Ownership::Hydrating { epoch: current }) => {
             *current == epoch
         }
         None => !state
-            .pro
+            .pro()
             .configured
             .load(std::sync::atomic::Ordering::Acquire),
         _ => false,
@@ -1334,7 +1387,7 @@ pub(crate) fn sweep_leftovers(state: &std::sync::Arc<crate::AppState>) {
     }
     let owner = state.clone();
     tokio::spawn(async move {
-        let root = owner.pro.root.clone();
+        let root = owner.pro().root.clone();
         let projects = tokio::task::spawn_blocking(move || {
             std::fs::read_dir(root)
                 .map(|entries| {
@@ -1351,14 +1404,14 @@ pub(crate) fn sweep_leftovers(state: &std::sync::Arc<crate::AppState>) {
         .await
         .unwrap_or_default();
         for workspace in projects {
-            let Ok(cache) = owner.pro.cache(&workspace) else {
+            let Ok(cache) = owner.pro().cache(&workspace) else {
                 continue;
             };
             let _guard = cache.lock().await;
             if transport::cache_quiescent(&workspace).is_err() {
                 continue;
             }
-            let directory = owner.pro.root.join(&workspace);
+            let directory = owner.pro().root.join(&workspace);
             let _ =
                 tokio::task::spawn_blocking(move || mirror::clear_interrupted(&directory)).await;
         }
@@ -1419,7 +1472,7 @@ pub(super) fn report_return(
 ) {
     let (files, paths) = kept;
     {
-        let mut statuses = crate::lock(&state.pro.status);
+        let mut statuses = crate::lock(&state.pro().status);
         let status = statuses.entry(workspace.into()).or_default();
         status.kept_both = (files > 0).then_some(files);
         status.kept_paths = paths.clone();
@@ -1441,10 +1494,10 @@ pub(crate) fn active_operations(state: &crate::AppState) -> usize {
 
 fn project_operations(state: &crate::AppState) -> usize {
     let draining = drain::draining(state);
-    usize::from(!draining && state.pro.jobs.try_lock().is_err())
+    usize::from(!draining && state.pro().jobs.try_lock().is_err())
         + detached::running(state)
-        + crate::lock(&state.pro.sleeping).len()
-        + crate::lock(&state.pro.caches)
+        + crate::lock(&state.pro().sleeping).len()
+        + crate::lock(&state.pro().caches)
             .values()
             .filter(|cache| cache.strong_count() > 0)
             .count()
@@ -1470,26 +1523,26 @@ pub(crate) async fn ensure_root(root: &std::path::Path) -> anyhow::Result<()> {
 
 /// The same serialized configuration boundary used by imports and parking.
 pub(crate) fn manual_resume_configuration(state: &crate::AppState) -> Arc<AsyncMutex<()>> {
-    state.pro.configuration.clone()
+    state.pro().configuration.clone()
 }
 
 pub(crate) fn manual_resume_storage(state: &crate::AppState) -> &std::path::Path {
-    &state.pro.root
+    &state.pro().root
 }
 /// Where per-project transfer state lives (`<data>/pro`), outside every project.
 pub(crate) fn storage(state: &crate::AppState) -> &std::path::Path {
-    &state.pro.root
+    &state.pro().root
 }
 
 fn projects_root(state: &crate::AppState) -> PathBuf {
-    crate::lock(&state.pro.projects_root)
+    crate::lock(&state.pro().projects_root)
         .clone()
         .unwrap_or_else(|| {
             state
                 .claude_settings_path
                 .parent()
                 .and_then(std::path::Path::parent)
-                .unwrap_or(&state.pro.root)
+                .unwrap_or(&state.pro().root)
                 .join("chimaera")
         })
 }
@@ -1497,7 +1550,7 @@ fn projects_root(state: &crate::AppState) -> PathBuf {
 /// Whether the native app configured this daemon for Pro at all.
 pub(crate) fn configured(state: &crate::AppState) -> bool {
     state
-        .pro
+        .pro()
         .configured
         .load(std::sync::atomic::Ordering::Acquire)
 }
@@ -1508,7 +1561,7 @@ pub(crate) fn updates_managed(state: &crate::AppState) -> bool {
     execution::worker(state)
 }
 pub(crate) fn is_worker(state: &crate::AppState) -> bool {
-    crate::lock(&state.pro.runtime)
+    crate::lock(&state.pro().runtime)
         .as_ref()
         .is_some_and(|config| config.role == protocol::Role::Worker)
 }
@@ -1517,7 +1570,7 @@ pub(crate) fn is_worker(state: &crate::AppState) -> bool {
 pub(crate) fn workspace_in_scope(state: &crate::AppState, workspace: &str) -> bool {
     authority::workspace(state, workspace).is_ok()
         && state
-            .pro
+            .pro()
             .configured
             .load(std::sync::atomic::Ordering::Acquire)
         && projects::account_matches(state, workspace)
@@ -1536,15 +1589,15 @@ pub(crate) fn synced(state: &crate::AppState, workspace: &str) -> Option<Vec<(Pa
     // enrolled project of an account that did not sign out is still synced
     // meanwhile, so a conversation started then hears where it runs (review
     // R3, harness cause 3). Once configured, the account must match.
-    let restarting = crate::lock(&state.pro.runtime).is_none()
+    let restarting = crate::lock(&state.pro().runtime).is_none()
         && !signed_out(state)
         && authority::workspace(state, workspace).is_ok()
-        && crate::lock(&state.pro.preferences)
+        && crate::lock(&state.pro().preferences)
             .get(workspace)
             .is_some_and(|p| p.account.is_some());
     if !(workspace_in_scope(state, workspace) || restarting)
-        || !crate::lock(&state.pro.ownership).contains_key(workspace)
-        || crate::lock(&state.pro.preferences)
+        || !crate::lock(&state.pro().ownership).contains_key(workspace)
+        || crate::lock(&state.pro().preferences)
             .get(workspace)
             .is_some_and(|p| p.never_mirror)
         || crate::lock(&state.workspaces)
@@ -1553,7 +1606,7 @@ pub(crate) fn synced(state: &crate::AppState, workspace: &str) -> Option<Vec<(Pa
     {
         return None;
     }
-    let kept = crate::lock(&state.pro.status)
+    let kept = crate::lock(&state.pro().status)
         .get(workspace)
         .map(|status| status.kept_paths.clone())
         .unwrap_or_default()
@@ -1568,7 +1621,7 @@ pub(crate) fn synced(state: &crate::AppState, workspace: &str) -> Option<Vec<(Pa
 }
 /// The environment variable names the last move into this project left out.
 pub(crate) fn missing_environment(state: &crate::AppState, workspace: &str) -> Vec<String> {
-    crate::lock(&state.pro.preferences)
+    crate::lock(&state.pro().preferences)
         .get(workspace)
         .map(|entry| entry.missing_environment.clone())
         .unwrap_or_default()
@@ -1577,7 +1630,7 @@ pub(crate) fn missing_environment(state: &crate::AppState, workspace: &str) -> V
 /// projects get.
 #[cfg(test)]
 pub(crate) fn enroll_for_tests(state: &crate::AppState, workspace: &str) {
-    crate::lock(&state.pro.ownership).insert(workspace.into(), Ownership::Local { epoch: 1 });
+    crate::lock(&state.pro().ownership).insert(workspace.into(), Ownership::Local { epoch: 1 });
 }
 #[cfg(test)]
 mod tests {
@@ -1610,7 +1663,7 @@ mod tests {
         ));
         let project = root.join("project");
         std::fs::create_dir_all(&project).unwrap();
-        let mut state = crate::AppState::new(
+        let state = crate::AppState::new(
             "local-test".into(),
             "test-host".into(),
             4242,
@@ -1618,16 +1671,16 @@ mod tests {
             root.clone(),
             root.join("config"),
         );
-        state.daemon_extension = Some(Arc::new(Noting));
+        state.pro().set_runtime(Arc::new(Noting));
         let state = Arc::new(state);
         let workspace = crate::lock(&state.workspaces).add(project).unwrap().id;
         // Enrolled for an account in an earlier life; not configured yet.
         enroll_for_tests(&state, &workspace);
-        crate::lock(&state.pro.preferences)
+        crate::lock(&state.pro().preferences)
             .entry(workspace.clone())
             .or_default()
             .account = Some("a-fixture".into());
-        assert!(crate::lock(&state.pro.runtime).is_none());
+        assert!(crate::lock(&state.pro().runtime).is_none());
         assert_eq!(
             crate::mcp::cloud_context::note(&state, &workspace)
                 .await
@@ -1661,11 +1714,11 @@ mod tests {
         ));
         let state = state(&root);
         let workspace = "p-writer";
-        crate::lock(&state.pro.ownership).insert(workspace.into(), Ownership::Local { epoch: 1 });
-        crate::lock(&state.pro.execution.latched).insert(workspace.into());
+        crate::lock(&state.pro().ownership).insert(workspace.into(), Ownership::Local { epoch: 1 });
+        crate::lock(&state.pro().execution.latched).insert(workspace.into());
         let (entered, reached) = tokio::sync::oneshot::channel();
         let (release, resume) = std::sync::mpsc::channel();
-        *crate::lock(&state.pro.persistence_pause) = Some(PersistencePause {
+        *crate::lock(&state.pro().persistence_pause) = Some(PersistencePause {
             entered,
             release: resume,
         });
@@ -1677,12 +1730,12 @@ mod tests {
             // Publication changed while the ORIGINAL blocking writer remains
             // held. Losing its coordinator observer must not authorize a new
             // writer to rename the same temporary file or overtake this write.
-            crate::lock(&state.pro.ownership).insert(workspace.into(), Ownership::Remote {
+            crate::lock(&state.pro().ownership).insert(workspace.into(), Ownership::Remote {
                 epoch: 2, holder: "d-other".into()
             });
             first.abort();
             while !first.is_finished() { tokio::task::yield_now().await; }
-            anyhow::ensure!(state.pro.persistence.try_lock().is_err(), "original blocking writer was released");
+            anyhow::ensure!(state.pro().persistence.try_lock().is_err(), "original blocking writer was released");
             let successor = state.clone();
             second = Some(tokio::spawn(async move { persist(&successor).await }));
             anyhow::ensure!(
@@ -1696,7 +1749,7 @@ mod tests {
             anyhow::ensure!(matches!(disk.ownership.get(workspace), Some(Ownership::Remote { epoch: 2, holder }) if holder == "d-other"), "durable successor state was lost");
             let latch: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("pro/execution-authority.json"))?)?;
             anyhow::ensure!(latch["workspaces"] == serde_json::json!([workspace]), "original execution latch was not settled");
-            anyhow::ensure!(state.pro.persistence.lock().await.as_deref() == Some(bytes.as_slice()), "cached write precedes durable settlement");
+            anyhow::ensure!(state.pro().persistence.lock().await.as_deref() == Some(bytes.as_slice()), "cached write precedes durable settlement");
             Ok(())
         }.await;
         // Always unblock the test-owned worker and settle observers on failure.
@@ -1764,18 +1817,18 @@ mod tests {
         std::fs::create_dir_all(root.join("pro")).unwrap();
         std::fs::write(root.join("pro/state.json"), bytes).unwrap();
         let restored = state(&root);
-        assert_eq!(crate::lock(&restored.pro.ownership).len(), 258);
-        assert_eq!(crate::lock(&restored.pro.preferences).len(), 129);
-        assert_eq!(crate::lock(&restored.pro.adoptions).len(), 129);
-        assert_eq!(crate::lock(&restored.pro.legacy_pending).len(), 129);
-        assert_eq!(crate::lock(&restored.pro.parked).len(), 129);
-        crate::lock(&restored.pro.legacy_pending).clear();
+        assert_eq!(crate::lock(&restored.pro().ownership).len(), 258);
+        assert_eq!(crate::lock(&restored.pro().preferences).len(), 129);
+        assert_eq!(crate::lock(&restored.pro().adoptions).len(), 129);
+        assert_eq!(crate::lock(&restored.pro().legacy_pending).len(), 129);
+        assert_eq!(crate::lock(&restored.pro().parked).len(), 129);
+        crate::lock(&restored.pro().legacy_pending).clear();
         for index in 0..129 {
             let id = format!("w-parked-{index}");
             assert!(!may_write(&restored, &id));
             assert!(!may_write(&restored, &format!("w-fenced-{index}")));
             assert!(execution::unclean(&restored, &id));
-            let preferences = crate::lock(&restored.pro.preferences);
+            let preferences = crate::lock(&restored.pro().preferences);
             let preference = &preferences[&id];
             assert!(preference.never_mirror && preference.privacy_pending);
             assert_eq!(preference.account.as_deref(), Some("saved-account"));
@@ -1808,10 +1861,10 @@ mod tests {
             (Ownership::Hydrating { epoch: 1 }, Phase::Arriving),
             (Ownership::SettingUp { epoch: 1 }, Phase::Arriving),
         ] {
-            crate::lock(&state.pro.ownership).insert("w-a".into(), owner);
+            crate::lock(&state.pro().ownership).insert("w-a".into(), owner);
             assert_eq!(ownership_phase(&state, "w-a"), phase);
         }
-        crate::lock(&state.pro.ownership).insert(
+        crate::lock(&state.pro().ownership).insert(
             "w-a".into(),
             Ownership::Remote {
                 epoch: 2,
@@ -1824,7 +1877,7 @@ mod tests {
             Some("computer"),
             "runs here"
         );
-        crate::lock(&state.pro.ownership).insert("w-a".into(), Ownership::Hydrating { epoch: 3 });
+        crate::lock(&state.pro().ownership).insert("w-a".into(), Ownership::Hydrating { epoch: 3 });
         assert_eq!(owner_kind(&state, "w-a"), Some("computer"), "arriving here");
         execution::worker_fixture(&state);
         assert_eq!(
@@ -1832,7 +1885,7 @@ mod tests {
             Some("cloud"),
             "a cloud machine's own"
         );
-        crate::lock(&state.pro.ownership).insert(
+        crate::lock(&state.pro().ownership).insert(
             "w-a".into(),
             Ownership::Remote {
                 epoch: 4,
@@ -1877,10 +1930,10 @@ mod tests {
         ));
         let old = state(&root);
         assert!(may_write(&old, "w-new"));
-        crate::lock(&old.pro.ownership).insert("w-owned".into(), Ownership::Local { epoch: 7 });
-        crate::lock(&old.pro.ownership)
+        crate::lock(&old.pro().ownership).insert("w-owned".into(), Ownership::Local { epoch: 7 });
+        crate::lock(&old.pro().ownership)
             .insert("w-loading".into(), Ownership::Hydrating { epoch: 8 });
-        crate::lock(&old.pro.runtime).replace(protocol::Configure {
+        crate::lock(&old.pro().runtime).replace(protocol::Configure {
             recovery: false,
             execution: None,
             account_id: None,
@@ -1908,7 +1961,7 @@ mod tests {
         assert!(!may_import(&restored, "w-owned", 7));
         assert!(may_import(&restored, "w-loading", 8));
         assert!(!may_import(&restored, "w-loading", 7));
-        crate::lock(&restored.pro.ownership)
+        crate::lock(&restored.pro().ownership)
             .insert("w-owned".into(), Ownership::Local { epoch: 9 });
         assert!(may_write(&restored, "w-owned"));
         assert_eq!(owned_epoch(&restored, "w-owned"), Some(9));
@@ -1968,7 +2021,7 @@ mod tests {
         persist(&old).await.unwrap();
         let restored = state(&root);
         {
-            let statuses = crate::lock(&restored.pro.status);
+            let statuses = crate::lock(&restored.pro().status);
             let status = statuses.get(&workspace.id).expect("report restored");
             assert_eq!(status.kept_both, Some(3));
             assert_eq!(status.kept_paths, kept);
@@ -1982,7 +2035,7 @@ mod tests {
         assert!(old.notices.since(head).is_empty());
         persist(&old).await.unwrap();
         let restored = state(&root);
-        assert!(crate::lock(&restored.pro.status)
+        assert!(crate::lock(&restored.pro().status)
             .get(&workspace.id)
             .is_none_or(|status| status.kept_both.is_none()));
 
@@ -2037,10 +2090,10 @@ mod tests {
             chimaera_core::generate_token()
         ));
         let old = state(&root);
-        crate::lock(&old.pro.ownership).insert("w-owned".into(), Ownership::Local { epoch: 7 });
-        crate::lock(&old.pro.ownership)
+        crate::lock(&old.pro().ownership).insert("w-owned".into(), Ownership::Local { epoch: 7 });
+        crate::lock(&old.pro().ownership)
             .insert("w-flushing".into(), Ownership::Transferring { epoch: 3 });
-        crate::lock(&old.pro.ownership).insert(
+        crate::lock(&old.pro().ownership).insert(
             "w-cloud".into(),
             Ownership::Remote {
                 epoch: 4,

@@ -131,7 +131,7 @@ mod tests {
                 hidden: false,
             })
             .unwrap();
-        lock(&state.pro.ownership).insert("w-diagnostic".into(), Ownership::Local { epoch: 3 });
+        lock(&state.pro().ownership).insert("w-diagnostic".into(), Ownership::Local { epoch: 3 });
         let requests = Arc::new(AtomicUsize::new(0));
         let observed = requests.clone();
         let app = Router::new().route(
@@ -173,10 +173,10 @@ mod tests {
         assert_eq!(error.to_string(), "service request returned HTTP 403");
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         assert!(matches!(
-            lock(&state.pro.ownership).get("w-diagnostic"),
+            lock(&state.pro().ownership).get("w-diagnostic"),
             Some(Ownership::Local { epoch: 3 })
         ));
-        assert!(lock(&state.pro.status).get("w-diagnostic").is_none());
+        assert!(lock(&state.pro().status).get("w-diagnostic").is_none());
         server.abort();
         drop(state);
         std::fs::remove_dir_all(root).unwrap();

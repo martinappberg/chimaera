@@ -164,7 +164,9 @@ async fn run_selected(
         chimaera_core::data_dir(),
         chimaera_core::config_dir(),
     );
-    state.daemon_extension = runtime;
+    if let Some(runtime) = runtime {
+        state.pro().set_runtime(runtime);
+    }
     state.install_policy(pro, &chimaera_core::data_dir());
     let managed_root = chimaera_core::managed_agents_dir();
     if state.managed_root != managed_root {

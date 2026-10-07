@@ -54,7 +54,7 @@ pub(super) fn now_ms() -> u64 {
 /// Records a transfer's trigger; an earlier trigger for the same transfer
 /// stands. Returns whether this started one. The caller persists.
 pub(super) fn begin(state: &AppState, workspace: &str) -> bool {
-    let mut moving = lock(&state.pro.moving);
+    let mut moving = lock(&state.pro().moving);
     if moving.contains_key(workspace) || moving.len() >= 128 {
         return false;
     }
@@ -63,12 +63,12 @@ pub(super) fn begin(state: &AppState, workspace: &str) -> bool {
 }
 
 pub(super) fn started(state: &AppState, workspace: &str) -> Option<u64> {
-    lock(&state.pro.moving).get(workspace).copied()
+    lock(&state.pro().moving).get(workspace).copied()
 }
 
 pub(super) fn end(state: &AppState, workspace: &str) {
-    lock(&state.pro.moving).remove(workspace);
-    lock(&state.pro.return_backoff).remove(workspace);
+    lock(&state.pro().moving).remove(workspace);
+    lock(&state.pro().return_backoff).remove(workspace);
 }
 
 /// Where an automatic return stands between passes. Hot state: a restart
@@ -94,14 +94,14 @@ impl Retry {
 }
 
 pub(super) fn retry(state: &AppState, workspace: &str) -> Retry {
-    lock(&state.pro.return_backoff)
+    lock(&state.pro().return_backoff)
         .get(workspace)
         .copied()
         .unwrap_or_default()
 }
 
 pub(super) fn set_retry(state: &AppState, workspace: &str, retry: Retry) {
-    let mut backoff = lock(&state.pro.return_backoff);
+    let mut backoff = lock(&state.pro().return_backoff);
     if backoff.len() >= 128 && !backoff.contains_key(workspace) {
         backoff.clear();
     }

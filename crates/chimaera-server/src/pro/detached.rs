@@ -85,7 +85,7 @@ where
 {
     let key: Key = (kind, workspace.to_owned(), epoch);
     let task = {
-        let mut entries = lock(&state.pro.operations.entries);
+        let mut entries = lock(&state.pro().operations.entries);
         entries.retain(|_, entry| {
             !entry.done.load(Ordering::Acquire) || entry.started.elapsed() < RETAIN_SUCCESS
         });
@@ -113,7 +113,7 @@ where
                 finished.store(true, Ordering::Release);
                 if !(retain && outcome.succeeded()) {
                     if let Some(state) = owner.upgrade() {
-                        lock(&state.pro.operations.entries).remove(&forget);
+                        lock(&state.pro().operations.entries).remove(&forget);
                     }
                 }
                 outcome
@@ -144,7 +144,7 @@ where
 
 /// Transfers still running, for the idle/drain accounting.
 pub(super) fn running(state: &AppState) -> usize {
-    lock(&state.pro.operations.entries)
+    lock(&state.pro().operations.entries)
         .values()
         .filter(|entry| !entry.done.load(Ordering::Acquire))
         .count()

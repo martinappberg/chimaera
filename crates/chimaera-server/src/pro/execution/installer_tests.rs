@@ -26,10 +26,10 @@ async fn installer_keeps_original_authority_through_configuration_wait() {
     let (state, root) = fixture();
     install_fixture(&state, "project", 4).unwrap();
     let captured = mutation::Dispatch::capture(&state, "project").unwrap();
-    let configuration = state.pro.configuration.clone().lock_owned().await;
+    let configuration = state.pro().configuration.clone().lock_owned().await;
     let owned = state.clone();
     let task = tokio::spawn(async move { Running::begin(&owned, "project", captured).await });
-    lock(&state.pro.ownership).insert(
+    lock(&state.pro().ownership).insert(
         "project".into(),
         Ownership::Remote {
             holder: "other".into(),
@@ -38,7 +38,7 @@ async fn installer_keeps_original_authority_through_configuration_wait() {
     );
     drop(configuration);
     assert!(task.await.unwrap().is_err());
-    assert!(lock(&state.pro.execution.setups).is_empty());
+    assert!(lock(&state.pro().execution.setups).is_empty());
     assert!(mutation::idle(&state, "project"));
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -55,9 +55,13 @@ async fn abandoned_installer_cleans_actual_group_and_durable_pending_marker() {
         .unwrap();
     running.attach(child.id());
     assert!(!quiescent(&state, "project"));
-    assert!(lock(&state.pro.preferences)["project"].execution_launch_pending);
-    let restored =
-        super::super::State::restore(&state.pro.root, &lock(&state.pro.preferences), true, false);
+    assert!(lock(&state.pro().preferences)["project"].execution_launch_pending);
+    let restored = super::super::State::restore(
+        &state.pro().root,
+        &lock(&state.pro().preferences),
+        true,
+        false,
+    );
     assert!(lock(&restored.unclean).contains_key("project"));
     drop(running);
     tokio::task::spawn_blocking(move || child.wait())
@@ -71,7 +75,7 @@ async fn abandoned_installer_cleans_actual_group_and_durable_pending_marker() {
     })
     .await
     .unwrap();
-    assert!(!lock(&state.pro.preferences)["project"].execution_launch_pending);
+    assert!(!lock(&state.pro().preferences)["project"].execution_launch_pending);
     std::fs::remove_dir_all(root).unwrap();
 }
 #[tokio::test]
@@ -85,8 +89,8 @@ async fn free_installer_does_not_create_pro_state_and_unspawned_managed_cleans_p
     .await
     .unwrap();
     free.finish().await.unwrap();
-    assert!(lock(&state.pro.preferences).is_empty());
-    assert!(lock(&state.pro.execution.setups).is_empty());
+    assert!(lock(&state.pro().preferences).is_empty());
+    assert!(lock(&state.pro().execution.setups).is_empty());
     install_fixture(&state, "project", 4).unwrap();
     let managed = Running::begin(
         &state,
@@ -95,9 +99,9 @@ async fn free_installer_does_not_create_pro_state_and_unspawned_managed_cleans_p
     )
     .await
     .unwrap();
-    assert!(lock(&state.pro.preferences)["project"].execution_launch_pending);
+    assert!(lock(&state.pro().preferences)["project"].execution_launch_pending);
     managed.finish().await.unwrap();
-    assert!(!lock(&state.pro.preferences)["project"].execution_launch_pending);
+    assert!(!lock(&state.pro().preferences)["project"].execution_launch_pending);
     assert!(mutation::idle(&state, "project"));
     std::fs::remove_dir_all(root).unwrap();
 }

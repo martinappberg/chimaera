@@ -542,7 +542,7 @@ pub(crate) async fn start_install(
     action: &str,
     script: String,
 ) -> Result<String, Box<Response>> {
-    if state.daemon_extension.is_none() {
+    if !state.policy().composed(state) {
         return start_install_unmanaged(state, kind, workspace, action, script).await;
     }
     let captured = state
@@ -568,7 +568,7 @@ async fn start_install_captured(
     script: String,
     captured: crate::policy::Admission,
 ) -> Result<String, Box<Response>> {
-    if state.daemon_extension.is_none() {
+    if !state.policy().composed(state) {
         return start_install_unmanaged(state, kind, workspace, action, script).await;
     }
     let state = state.clone();

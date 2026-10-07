@@ -166,9 +166,9 @@ async fn configure_inner(
     mut config: Configure,
     root: Option<std::path::PathBuf>,
 ) -> Response {
-    let _configuration = state.pro.configuration.lock().await;
+    let _configuration = state.pro().configuration.lock().await;
     if root.is_none()
-        && (config.delegation.workspace.is_some() || lock(&state.pro.authority).restricted())
+        && (config.delegation.workspace.is_some() || lock(&state.pro().authority).restricted())
     {
         return failure(anyhow::anyhow!(
             "workspace authority requires scoped configuration"
@@ -176,12 +176,12 @@ async fn configure_inner(
     }
     let validation = (|| -> anyhow::Result<()> {
         execution::validate_configuration(&config)?;
-        let enrolled = !lock(&state.pro.execution.latched).is_empty();
+        let enrolled = !lock(&state.pro().execution.latched).is_empty();
         anyhow::ensure!(
             config.execution.is_some()
                 || (!execution::any_uncertain(&state)
                     && !enrolled
-                    && !lock(&state.pro.preferences)
+                    && !lock(&state.pro().preferences)
                         .values()
                         .any(|p| p.continuity.is_some())),
             "continuity upgrade required"
@@ -223,7 +223,7 @@ async fn configure_inner(
     } else {
         None
     };
-    if let Err(error) = super::ensure_root(&state.pro.root).await {
+    if let Err(error) = super::ensure_root(&state.pro().root).await {
         return failure(error);
     }
     if execution::supervisor::pending(&state) && config.execution.is_none() {
@@ -238,7 +238,7 @@ async fn configure_inner(
     }
     // Refreshing the same negotiated identity only replaces the credential;
     // it must not interrupt running work or reset the local lease deadline.
-    let same = lock(&state.pro.runtime).as_ref().is_some_and(|old| {
+    let same = lock(&state.pro().runtime).as_ref().is_some_and(|old| {
         old.endpoint == config.endpoint
             && old.account_id == config.account_id
             && old.role == config.role
@@ -249,15 +249,18 @@ async fn configure_inner(
             && old.delegation.scope == config.delegation.scope
             && config.execution.is_some()
     });
-    if same && state.pro.configured.load(Ordering::Acquire) {
+    if same && state.pro().configured.load(Ordering::Acquire) {
         let response = configure_ack(&config, accepted.as_ref().map(|v| v.ack()));
         // A new delegation or name: the reverse link reconnects with it.
-        let relink = lock(&state.pro.runtime).as_ref().is_some_and(|old| {
+        let relink = lock(&state.pro().runtime).as_ref().is_some_and(|old| {
             old.delegation.access_token != config.delegation.access_token
                 || old.alias != config.alias
         });
-        *lock(&state.pro.runtime) = Some(config);
-        state.pro.delegation_refused.store(false, Ordering::Release);
+        *lock(&state.pro().runtime) = Some(config);
+        state
+            .pro()
+            .delegation_refused
+            .store(false, Ordering::Release);
         if relink {
             super::reach::start(&state);
         }
@@ -266,20 +269,20 @@ async fn configure_inner(
     if let Err(error) = stop_tasks(&state).await {
         return failure(error);
     }
-    *lock(&state.pro.runtime) = None;
-    state.pro.configured.store(false, Ordering::Release);
+    *lock(&state.pro().runtime) = None;
+    state.pro().configured.store(false, Ordering::Release);
     if let Some(value) = &accepted {
-        *lock(&state.pro.authority) = authority::Authority::Invalid;
+        *lock(&state.pro().authority) = authority::Authority::Invalid;
         if let Err(error) = authority::save(&state, value).await {
             return failure(error);
         }
-        *lock(&state.pro.authority) = authority::Authority::Bound(value.clone());
+        *lock(&state.pro().authority) = authority::Authority::Bound(value.clone());
     }
-    *lock(&state.pro.project_cache) = Default::default();
+    *lock(&state.pro().project_cache) = Default::default();
     let response = configure_ack(&config, accepted.as_ref().map(|v| v.ack()));
     let managed = config.execution.is_some();
     if config.role == super::protocol::Role::Worker
-        && !state.pro.worker.swap(true, Ordering::AcqRel)
+        && !state.pro().worker.swap(true, Ordering::AcqRel)
     {
         if let Err(error) = super::persist(&state).await {
             return failure(error);
@@ -287,15 +290,18 @@ async fn configure_inner(
         // Its updates are the service's from now on; tell attached windows.
         crate::update::became_managed(&state);
     }
-    *lock(&state.pro.runtime) = Some(config);
-    state.pro.delegation_refused.store(false, Ordering::Release);
+    *lock(&state.pro().runtime) = Some(config);
+    state
+        .pro()
+        .delegation_refused
+        .store(false, Ordering::Release);
     super::sign_out::forget(&state);
-    if state.pro.signed_out.swap(false, Ordering::AcqRel) {
+    if state.pro().signed_out.swap(false, Ordering::AcqRel) {
         if let Err(error) = super::persist(&state).await {
             return failure(error);
         }
     }
-    state.pro.configured.store(true, Ordering::Release);
+    state.pro().configured.store(true, Ordering::Release);
     engine::start(state.clone());
     // Every managed host is fenced by lease expiry: a computer whose lease
     // lapsed stops its own agents so the cloud continues exactly once.
@@ -307,7 +313,7 @@ async fn configure_inner(
     // `sleep_watch`).
     super::reach::start(&state);
     if !execution::worker(&state)
-        && lock(&state.pro.runtime)
+        && lock(&state.pro().runtime)
             .as_ref()
             .is_some_and(|config| config.delegation.workspace.is_none())
     {
@@ -321,17 +327,17 @@ pub(super) async fn stop_tasks(state: &Arc<AppState>) -> anyhow::Result<()> {
     let worker = execution::worker(state);
     super::reach::stop(state);
     let stopping = execution::invalidate(state);
-    state.pro.configured.store(false, Ordering::Release);
-    state.pro.generation.fetch_add(1, Ordering::AcqRel);
-    let lease_task = lock(&state.pro.task).take();
-    let mirror_task = lock(&state.pro.mirror_task).take();
+    state.pro().configured.store(false, Ordering::Release);
+    state.pro().generation.fetch_add(1, Ordering::AcqRel);
+    let lease_task = lock(&state.pro().task).take();
+    let mirror_task = lock(&state.pro().mirror_task).take();
     for task in [&lease_task, &mirror_task].into_iter().flatten() {
         task.abort();
     }
     for task in [lease_task, mirror_task].into_iter().flatten() {
         let _ = task.await;
     }
-    for (_, task) in lock(&state.pro.reconciling).drain() {
+    for (_, task) in lock(&state.pro().reconciling).drain() {
         task.abort();
     }
     if worker {
@@ -341,11 +347,11 @@ pub(super) async fn stop_tasks(state: &Arc<AppState>) -> anyhow::Result<()> {
     Ok(())
 }
 pub(crate) async fn disconnect(State(state): State<Arc<AppState>>) -> Response {
-    let _configuration = state.pro.configuration.lock().await;
+    let _configuration = state.pro().configuration.lock().await;
     let device = !execution::worker(&state);
     // Captured before the lease loop stops: the leases this computer holds,
     // and the credential that stands them down (`sign_out`).
-    let config = lock(&state.pro.runtime).clone();
+    let config = lock(&state.pro().runtime).clone();
     let held = if device {
         execution::held(&state)
     } else {
@@ -377,10 +383,10 @@ pub(crate) async fn disconnect(State(state): State<Arc<AppState>>) -> Response {
         .filter(|(_, _, answer)| *answer == super::sign_out::Answer::Owed)
         .map(|(workspace, epoch, _)| (workspace.clone(), *epoch))
         .collect();
-    *lock(&state.pro.unreleased) = unreleased.clone();
-    *lock(&state.pro.project_cache) = Default::default();
-    *lock(&state.pro.runtime) = None;
-    state.pro.configured.store(false, Ordering::Release);
+    *lock(&state.pro().unreleased) = unreleased.clone();
+    *lock(&state.pro().project_cache) = Default::default();
+    *lock(&state.pro().runtime) = None;
+    state.pro().configured.store(false, Ordering::Release);
     // Known remote ownership remains fenced across sign-out and restart. A
     // local or interrupted local transfer becomes ordinary local work: signing
     // out publishes nothing more, but never stops this computer's agents. On a
@@ -389,22 +395,22 @@ pub(crate) async fn disconnect(State(state): State<Arc<AppState>>) -> Response {
     // stay fenced. Sessions a transfer stopped continue here. A project the
     // account did not acknowledge standing down is the exception: it stays
     // fenced at its lease's deadline and nothing resumes it (`sign_out`).
-    lock(&state.pro.release_pending).clear();
-    lock(&state.pro.opened_here).clear();
+    lock(&state.pro().release_pending).clear();
+    lock(&state.pro().opened_here).clear();
     super::moves::forget(&state);
     // No account is left to keep anything in the cloud or to reach this
     // computer through: the reverse link ends with the configuration.
     super::reach::stop(&state);
-    lock(&state.pro.parked).clear();
-    lock(&state.pro.reclaim).clear();
-    lock(&state.pro.holders).clear();
-    state.pro.reasons.clear();
+    lock(&state.pro().parked).clear();
+    lock(&state.pro().reclaim).clear();
+    lock(&state.pro().holders).clear();
+    state.pro().reasons.clear();
     // Recorded before the state write below, so a restart remembers that the
     // computer's interrupted work is its own again (`resume_unverified`).
-    state.pro.signed_out.store(true, Ordering::Release);
+    state.pro().signed_out.store(true, Ordering::Release);
     let mut dropped = Vec::new();
     let mut returned: Vec<String> = {
-        let mut ownership = lock(&state.pro.ownership);
+        let mut ownership = lock(&state.pro().ownership);
         let mut returned = Vec::new();
         for (id, owner) in ownership.clone() {
             let next = match owner {
@@ -474,7 +480,7 @@ pub(crate) async fn disconnect(State(state): State<Arc<AppState>>) -> Response {
     StatusCode::NO_CONTENT.into_response()
 }
 pub(crate) async fn status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let authority = lock(&state.pro.authority).clone();
+    let authority = lock(&state.pro().authority).clone();
     let sessions: Vec<_> = crate::session_view::sessions_json(&state)
         .into_iter()
         .filter(|row| {
@@ -485,10 +491,10 @@ pub(crate) async fn status(State(state): State<Arc<AppState>>) -> Json<serde_jso
         })
         .collect();
     let workspaces = lock(&state.workspaces).list();
-    let preferences = lock(&state.pro.preferences).clone();
-    let ownership = lock(&state.pro.ownership).clone();
-    let mut statuses = lock(&state.pro.status).clone();
-    if state.daemon_extension.is_none() && state.pro.configured.load(Ordering::Acquire) {
+    let preferences = lock(&state.pro().preferences).clone();
+    let ownership = lock(&state.pro().ownership).clone();
+    let mut statuses = lock(&state.pro().status).clone();
+    if state.pro().runtime().is_none() && state.pro().configured.load(Ordering::Acquire) {
         for workspace in &workspaces {
             if ownership.contains_key(&workspace.id)
                 || preferences
@@ -509,20 +515,20 @@ pub(crate) async fn status(State(state): State<Arc<AppState>>) -> Json<serde_jso
     // nothing: report the daemon as not configured (and why, additively) so
     // the native app mints a fresh one instead of trusting its cached stamp.
     let renewal_failed = super::delegation_lapsed(&state);
-    let config = lock(&state.pro.runtime).clone();
+    let config = lock(&state.pro().runtime).clone();
     // Additive per row: `place` (where its work runs: here, the cloud, or
     // another computer by name), `reason` (why the cloud is not running work
     // that needed it, or why "Run in the cloud" could not start), and the
     // two choices that apply now, `run_here` and `run_in_cloud`.
     Json(
-        json!({"configured":state.pro.configured.load(Ordering::Acquire) && !renewal_failed,"renewal_failed":renewal_failed,"workspace_configuration":authority.acknowledgment(),"projects_root":super::projects_root(&state),"projects_root_confirmed":lock(&state.pro.projects_root).is_some(),"sessions":sessions,"workspaces":workspaces.into_iter().filter(|workspace| authority.allows(&workspace.id)).take(128).map(|workspace|json!({"workspace_id":workspace.id,"name":workspace.name,"root":workspace.root,"never_mirror":preferences.get(&workspace.id).is_some_and(|p|p.never_mirror),"privacy_pending":preferences.get(&workspace.id).is_some_and(|p|p.privacy_pending),"ownership":ownership.get(&workspace.id),"continuity":preferences.get(&workspace.id).and_then(|p|p.continuity.as_ref()),"local_copy":super::local_copy_view(&state,&workspace.id),"git_staging":preferences.get(&workspace.id).and_then(|p|p.git_staging.as_ref()),"execution_allowed":super::may_execute(&state,&workspace.id),"bundle_import":state.bundle_imports.view(&workspace.id),"execution_uncertain":preferences.get(&workspace.id).is_some_and(|p|p.execution_uncertain),"mirror":statuses.get(&workspace.id),"blocked_providers":statuses.get(&workspace.id).map(|status|status.blocked_providers.clone()).unwrap_or_default(),"git_branches":preferences.get(&workspace.id).map(|p|&p.git_branches),"place":super::place::place(&state,&workspace.id),"reason":state.pro.reasons.get(&workspace.id),"run_here":super::place::may_run_here(&state,config.as_ref(),&workspace.id),"run_in_cloud":!renewal_failed && super::place::may_run_in_cloud(&state,config.as_ref(),&workspace.id),"moving":super::place::moving(&state,&workspace.id)})).collect::<Vec<_>>(),"now_ms":super::moving::now_ms()}),
+        json!({"configured":state.pro().configured.load(Ordering::Acquire) && !renewal_failed,"renewal_failed":renewal_failed,"workspace_configuration":authority.acknowledgment(),"projects_root":super::projects_root(&state),"projects_root_confirmed":lock(&state.pro().projects_root).is_some(),"sessions":sessions,"workspaces":workspaces.into_iter().filter(|workspace| authority.allows(&workspace.id)).take(128).map(|workspace|json!({"workspace_id":workspace.id,"name":workspace.name,"root":workspace.root,"never_mirror":preferences.get(&workspace.id).is_some_and(|p|p.never_mirror),"privacy_pending":preferences.get(&workspace.id).is_some_and(|p|p.privacy_pending),"ownership":ownership.get(&workspace.id),"continuity":preferences.get(&workspace.id).and_then(|p|p.continuity.as_ref()),"local_copy":super::local_copy_view(&state,&workspace.id),"git_staging":preferences.get(&workspace.id).and_then(|p|p.git_staging.as_ref()),"execution_allowed":super::may_execute(&state,&workspace.id),"bundle_import":state.pro().bundle_imports.view(&workspace.id),"execution_uncertain":preferences.get(&workspace.id).is_some_and(|p|p.execution_uncertain),"mirror":statuses.get(&workspace.id),"blocked_providers":statuses.get(&workspace.id).map(|status|status.blocked_providers.clone()).unwrap_or_default(),"git_branches":preferences.get(&workspace.id).map(|p|&p.git_branches),"place":super::place::place(&state,&workspace.id),"reason":state.pro().reasons.get(&workspace.id),"run_here":super::place::may_run_here(&state,config.as_ref(),&workspace.id),"run_in_cloud":!renewal_failed && super::place::may_run_in_cloud(&state,config.as_ref(),&workspace.id),"moving":super::place::moving(&state,&workspace.id)})).collect::<Vec<_>>(),"now_ms":super::moving::now_ms()}),
     )
 }
 /// A project a sleep flush or "Run in the cloud" may hand over: this computer owns it, the
 /// workspace is in scope and copying it is allowed.
 pub(super) fn flushable(state: &AppState, workspace: &str) -> bool {
-    lock(&state.pro.authority).allows(workspace)
-        && !lock(&state.pro.preferences)
+    lock(&state.pro().authority).allows(workspace)
+        && !lock(&state.pro().preferences)
             .get(workspace)
             .is_some_and(|p| p.never_mirror)
         && super::owned_epoch(state, workspace).is_some()
@@ -542,9 +548,9 @@ pub(crate) async fn privacy(
     if super::drain::draining(&state) {
         return super::drain::refusal().into_response();
     }
-    let _guard = state.pro.jobs.lock().await;
+    let _guard = state.pro().jobs.lock().await;
     {
-        let mut preferences = lock(&state.pro.preferences);
+        let mut preferences = lock(&state.pro().preferences);
         if preferences.len() >= 128 && !preferences.contains_key(&request.workspace_id) {
             return StatusCode::INSUFFICIENT_STORAGE.into_response();
         }
@@ -553,7 +559,7 @@ pub(crate) async fn privacy(
         preference.privacy_pending = request.never_mirror && !request.confirmed;
     }
     if request.never_mirror && request.confirmed {
-        let mut ownership = lock(&state.pro.ownership);
+        let mut ownership = lock(&state.pro().ownership);
         // An acknowledged account privacy fence prevents a cloud takeover.
         // Leave remote and unverified writers fenced; a verified local writer
         // can thereafter restart without needing the optional cloud account.
@@ -603,7 +609,7 @@ pub(crate) async fn sleep(State(state): State<Arc<AppState>>, body: axum::body::
             Err(_) => return StatusCode::BAD_REQUEST.into_response(),
         }
     };
-    if lock(&state.pro.runtime).is_none() {
+    if lock(&state.pro().runtime).is_none() {
         return StatusCode::NO_CONTENT.into_response();
     }
     let budget = std::time::Duration::from_millis(
@@ -626,7 +632,7 @@ pub(super) async fn sleeping(
     state: &Arc<AppState>,
     budget: std::time::Duration,
 ) -> serde_json::Value {
-    let Some(config) = lock(&state.pro.runtime).clone() else {
+    let Some(config) = lock(&state.pro().runtime).clone() else {
         return json!({"handoff":false,"reason":"not_configured","failed":[]});
     };
     // Asleep is not reachable: the guard for bringing work home starts over.
@@ -668,7 +674,7 @@ pub(super) async fn sleeping(
         }
         Err(_) => {
             // Still publishing: the flushes finish or recover on their own.
-            let pending: Vec<_> = lock(&state.pro.sleeping).iter().cloned().collect();
+            let pending: Vec<_> = lock(&state.pro().sleeping).iter().cloned().collect();
             json!({"handoff":false,"reason":"deadline","pending":pending,"failed":failed(Vec::new())})
         }
     }
@@ -697,7 +703,7 @@ pub(super) async fn hand_over(
     let Handover { deadline, park } = handover;
     // Only a wake advances this: a sleep flush and "Run in the cloud" running
     // at once never cancel each other (review R3 S1).
-    let generation = state.pro.sleep_generation.load(Ordering::Acquire);
+    let generation = state.pro().sleep_generation.load(Ordering::Acquire);
     let sleep = engine::Sleep {
         generation,
         deadline,
@@ -706,7 +712,7 @@ pub(super) async fn hand_over(
     // The periodic pass holds the job reservation across every project; a
     // sleep preempts it rather than queueing behind a long push. Anything it
     // leaves half-done recovers on the next pass (locks, fences, returns).
-    let jobs = state.pro.jobs.clone();
+    let jobs = state.pro().jobs.clone();
     let guard = match tokio::time::timeout(
         std::time::Duration::from_millis(500),
         jobs.clone().lock_owned(),
@@ -715,7 +721,7 @@ pub(super) async fn hand_over(
     {
         Ok(guard) => guard,
         Err(_) => {
-            let pass = lock(&state.pro.mirror_task).take();
+            let pass = lock(&state.pro().mirror_task).take();
             if let Some(pass) = pass {
                 pass.abort();
                 let _ = pass.await;
@@ -735,7 +741,7 @@ pub(super) async fn hand_over(
             || !flushable(state, &workspace.id)
             // Already being handed over (a "Run in the cloud" claim, or an
             // earlier flush still running): never flushed twice at once.
-            || (!park && lock(&state.pro.sleeping).contains(&workspace.id))
+            || (!park && lock(&state.pro().sleeping).contains(&workspace.id))
         {
             continue;
         }
@@ -778,7 +784,7 @@ pub(super) async fn hand_over(
                         tracing::warn!(%error, "Could not save that a project moved to the cloud");
                     }
                 }
-                lock(&owner.pro.sleeping).insert(workspace.clone());
+                lock(&owner.pro().sleeping).insert(workspace.clone());
                 // Owned: the deadline returning early never cancels a flush.
                 let task = tokio::spawn({
                     let owner = owner.clone();
@@ -795,7 +801,7 @@ pub(super) async fn hand_over(
                         tracing::warn!(%error, "Could not save that a project stays here");
                     }
                 }
-                lock(&owner.pro.sleeping).remove(&workspace);
+                lock(&owner.pro().sleeping).remove(&workspace);
                 (workspace, result)
             }
         };
@@ -824,13 +830,13 @@ pub(super) async fn hand_over(
 /// computer slept, so nothing resumes here on sight. The guard for bringing
 /// work home starts over (a lid opened for a moment pulls nothing home).
 pub(super) async fn woke(state: &Arc<AppState>) {
-    state.pro.sleep_generation.fetch_add(1, Ordering::AcqRel);
+    state.pro().sleep_generation.fetch_add(1, Ordering::AcqRel);
     super::reach::unreachable(state);
     // Thawed agents must not run on until the watchdog's next tick.
     execution::check_now(state);
-    lock(&state.pro.release_pending).clear();
+    lock(&state.pro().release_pending).clear();
     {
-        let mut ownership = lock(&state.pro.ownership);
+        let mut ownership = lock(&state.pro().ownership);
         for (id, owner) in ownership.clone() {
             if let Ownership::Transferring { epoch } = owner {
                 let verifying = Some(Ownership::AwaitingVerification { epoch });
@@ -841,7 +847,7 @@ pub(super) async fn woke(state: &Arc<AppState>) {
     if let Err(error) = super::persist(state).await {
         tracing::warn!(%error, "Could not save project ownership after waking");
     }
-    state.pro.renew_now.notify_waiters()
+    state.pro().renew_now.notify_waiters()
 }
 pub(crate) async fn hydrate(
     State(state): State<Arc<AppState>>,
@@ -873,11 +879,11 @@ async fn hydrate_owned(state: Arc<AppState>, mut request: Hydrate) -> detached::
         return super::drain::refusal();
     };
     let (config, generation) = {
-        let _configuration = state.pro.configuration.lock().await;
-        let Some(config) = lock(&state.pro.runtime).clone() else {
+        let _configuration = state.pro().configuration.lock().await;
+        let Some(config) = lock(&state.pro().runtime).clone() else {
             return detached::Outcome::refused(StatusCode::PRECONDITION_FAILED, None);
         };
-        (config, state.pro.generation.load(Ordering::Acquire))
+        (config, state.pro().generation.load(Ordering::Acquire))
     };
     request.destination_root = match authority::destination(
         &state,
@@ -894,15 +900,15 @@ async fn hydrate_owned(state: Arc<AppState>, mut request: Hydrate) -> detached::
     // resume the ready ones; nothing is fetched or reinstalled.
     if config.role == super::protocol::Role::Worker
         && lock(&state.workspaces).get(&request.workspace_id).is_some()
-        && matches!(lock(&state.pro.ownership).get(&request.workspace_id),Some(Ownership::Local{epoch}) if *epoch==request.expected_epoch)
-        && lock(&state.pro.status)
+        && matches!(lock(&state.pro().ownership).get(&request.workspace_id),Some(Ownership::Local{epoch}) if *epoch==request.expected_epoch)
+        && lock(&state.pro().status)
             .get(&request.workspace_id)
             .is_some_and(|status| !status.blocked_providers.is_empty())
     {
         return result(super::provider_gate::resume_ready(&state, &request.workspace_id).await);
     }
     if lock(&state.workspaces).get(&request.workspace_id).is_some()
-        && matches!(lock(&state.pro.ownership).get(&request.workspace_id),Some(Ownership::SettingUp{epoch}) if *epoch==request.expected_epoch)
+        && matches!(lock(&state.pro().ownership).get(&request.workspace_id),Some(Ownership::SettingUp{epoch}) if *epoch==request.expected_epoch)
     {
         return result(
             engine::hydrate(
@@ -918,7 +924,7 @@ async fn hydrate_owned(state: Arc<AppState>, mut request: Hydrate) -> detached::
     }
     if config.role == super::protocol::Role::Worker
         && lock(&state.workspaces).get(&request.workspace_id).is_some()
-        && matches!(lock(&state.pro.ownership).get(&request.workspace_id),Some(Ownership::Local{epoch}|Ownership::AwaitingVerification{epoch}) if *epoch==request.expected_epoch)
+        && matches!(lock(&state.pro().ownership).get(&request.workspace_id),Some(Ownership::Local{epoch}|Ownership::AwaitingVerification{epoch}) if *epoch==request.expected_epoch)
     {
         // Only the verified hydration path can prove a same-owner restart.
         // Reconciliation may legitimately do nothing while this route holds
@@ -936,16 +942,16 @@ async fn hydrate_owned(state: Arc<AppState>, mut request: Hydrate) -> detached::
         );
     }
     let cache = state
-        .pro
+        .pro()
         .root
         .join(&request.workspace_id)
         .join("incoming.git");
-    let cache_mutex = match state.pro.cache(&request.workspace_id) {
+    let cache_mutex = match state.pro().cache(&request.workspace_id) {
         Ok(cache) => cache,
         Err(error) => return outcome(error),
     };
     let cache_guard = Arc::new(cache_mutex.lock_owned().await);
-    if generation != state.pro.generation.load(Ordering::Acquire) {
+    if generation != state.pro().generation.load(Ordering::Acquire) {
         return outcome(anyhow::anyhow!(
             "Account changed while waiting for project cache"
         ));
@@ -1011,7 +1017,7 @@ async fn hydrate_owned(state: Arc<AppState>, mut request: Hydrate) -> detached::
             ),
         );
     }
-    if generation != state.pro.generation.load(Ordering::Acquire) {
+    if generation != state.pro().generation.load(Ordering::Acquire) {
         return outcome(anyhow::anyhow!("Account changed during project transfer"));
     }
     result(
@@ -1048,7 +1054,7 @@ pub(crate) async fn handoff(
     if let Err(error) = authority::workspace(&state, &request.workspace_id) {
         return failure(error);
     }
-    let Some(config) = lock(&state.pro.runtime).clone() else {
+    let Some(config) = lock(&state.pro().runtime).clone() else {
         return StatusCode::PRECONDITION_FAILED.into_response();
     };
     let workspace = request.workspace_id.clone();
@@ -1155,7 +1161,7 @@ pub(crate) async fn projects(
     State(state): State<Arc<AppState>>,
     Json(request): Json<Projects>,
 ) -> Response {
-    if lock(&state.pro.authority).restricted() {
+    if lock(&state.pro().authority).restricted() {
         return failure(anyhow::anyhow!("workspace destination is fixed"));
     }
     if !request.root.is_absolute()
@@ -1174,7 +1180,7 @@ pub(crate) async fn projects(
     })
     .await;
     match checked {
-        Ok(Ok(root)) => *lock(&state.pro.projects_root) = Some(root),
+        Ok(Ok(root)) => *lock(&state.pro().projects_root) = Some(root),
         Ok(Err(error)) => return failure(error),
         Err(error) => return failure(error.into()),
     };

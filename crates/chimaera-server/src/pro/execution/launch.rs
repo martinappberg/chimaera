@@ -12,12 +12,12 @@ pub(crate) struct Intent {
     settled: bool,
 }
 pub(super) fn settled(state: &AppState, workspace: &str) -> bool {
-    lock(&state.pro.execution.launches)
+    lock(&state.pro().execution.launches)
         .get(workspace)
         .is_none_or(|(count, abandoned, _)| *count == 0 && !abandoned)
 }
 pub(super) fn stopped(state: &AppState, workspace: &str) {
-    let mut launches = lock(&state.pro.execution.launches);
+    let mut launches = lock(&state.pro().execution.launches);
     // No old intent can exist without an entry. Stop must not enroll identities
     // for workspaces that have never used this bounded registry.
     let exhausted = launches.get_mut(workspace).is_some_and(|entry| {
@@ -30,14 +30,14 @@ pub(super) fn stopped(state: &AppState, workspace: &str) {
         entry.1
     });
     drop(launches);
-    if let Some(preference) = lock(&state.pro.preferences).get_mut(workspace) {
+    if let Some(preference) = lock(&state.pro().preferences).get_mut(workspace) {
         preference.execution_launch_pending = exhausted;
     }
 }
 impl Intent {
     pub(super) fn begin(state: &Arc<AppState>, workspace: &str) -> Result<Self> {
-        let ownership = lock(&state.pro.ownership).get(workspace).cloned();
-        let mut launches = lock(&state.pro.execution.launches);
+        let ownership = lock(&state.pro().ownership).get(workspace).cloned();
+        let mut launches = lock(&state.pro().execution.launches);
         ensure!(
             launches.len() < 128 || launches.contains_key(workspace),
             "managed launch identity limit"
@@ -59,10 +59,10 @@ impl Intent {
         })
     }
     pub(crate) fn check(&self) -> Result<()> {
-        let ownership = lock(&self.state.pro.ownership)
+        let ownership = lock(&self.state.pro().ownership)
             .get(&self.workspace)
             .cloned();
-        let current_revision = lock(&self.state.pro.execution.launches)
+        let current_revision = lock(&self.state.pro().execution.launches)
             .get(&self.workspace)
             .map(|entry| entry.2);
         ensure!(
@@ -99,7 +99,7 @@ impl Intent {
                         .get(&id)
                         .is_some_and(|session| !session.alive);
                 if group.is_some() || dead {
-                    let _configuration = self.state.pro.configuration.clone().lock_owned().await;
+                    let _configuration = self.state.pro().configuration.clone().lock_owned().await;
                     if self.check().is_err() {
                         return;
                     }
@@ -113,7 +113,7 @@ impl Intent {
                         return;
                     }
                     {
-                        let mut launches = lock(&self.state.pro.execution.launches);
+                        let mut launches = lock(&self.state.pro().execution.launches);
                         if let Some((count, _, revision)) = launches.get_mut(&self.workspace) {
                             if *revision != self.revision {
                                 return;
@@ -125,17 +125,17 @@ impl Intent {
                     if settled(&self.state, &self.workspace)
                         && !setup::active(&self.state, &self.workspace)
                     {
-                        lock(&self.state.pro.preferences)
+                        lock(&self.state.pro().preferences)
                             .entry(self.workspace.clone())
                             .or_default()
                             .execution_launch_pending = false;
                     }
                     if crate::pro::persist(&self.state).await.is_err() {
-                        lock(&self.state.pro.preferences)
+                        lock(&self.state.pro().preferences)
                             .entry(self.workspace.clone())
                             .or_default()
                             .execution_launch_pending = true;
-                        lock(&self.state.pro.execution.launches)
+                        lock(&self.state.pro().execution.launches)
                             .entry(self.workspace.clone())
                             .or_default()
                             .1 = true;
@@ -150,7 +150,7 @@ impl Intent {
 impl Drop for Intent {
     fn drop(&mut self) {
         if !self.settled {
-            let mut launches = lock(&self.state.pro.execution.launches);
+            let mut launches = lock(&self.state.pro().execution.launches);
             let Some((count, abandoned, revision)) = launches.get_mut(&self.workspace) else {
                 return;
             };
@@ -185,15 +185,15 @@ mod tests {
         let cancelled = prepare_launch(&state, "w-project").await.unwrap().unwrap();
         // Older evidence can contain groups that are all already gone. It
         // cannot establish completeness for this new unregistered launch.
-        lock(&state.pro.preferences)
+        lock(&state.pro().preferences)
             .get_mut("w-project")
             .unwrap()
             .execution_groups = vec![u32::MAX];
         crate::pro::persist(&state).await.unwrap();
         for worker in [false, true] {
             let restored = State::restore(
-                &state.pro.root,
-                &lock(&state.pro.preferences),
+                &state.pro().root,
+                &lock(&state.pro().preferences),
                 worker,
                 false,
             );
@@ -225,16 +225,16 @@ mod tests {
         lock(&state.session_workspaces).insert(session.id.clone(), "w-project".into());
         later.registered(session.id.clone());
         tokio::time::timeout(Duration::from_secs(3), async {
-            while lock(&state.pro.execution.launches)["w-project"].0 != 0 {
+            while lock(&state.pro().execution.launches)["w-project"].0 != 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .unwrap();
-        assert!(lock(&state.pro.preferences)["w-project"].execution_launch_pending);
+        assert!(lock(&state.pro().preferences)["w-project"].execution_launch_pending);
         state.sessions.fence(&session.id).unwrap();
         stop(&state, &["w-project".into()]).await.unwrap();
-        assert!(!lock(&state.pro.preferences)["w-project"].execution_launch_pending);
+        assert!(!lock(&state.pro().preferences)["w-project"].execution_launch_pending);
         std::fs::remove_dir_all(root).unwrap();
     }
     #[tokio::test]
@@ -277,11 +277,11 @@ mod tests {
         // poison it as abandoned when its task drops the stale intent.
         old.registered(session.id.clone());
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(lock(&state.pro.execution.launches)["w-project"].0, 1);
-        assert!(!lock(&state.pro.execution.launches)["w-project"].1);
-        assert!(lock(&state.pro.preferences)["w-project"].execution_launch_pending);
+        assert_eq!(lock(&state.pro().execution.launches)["w-project"].0, 1);
+        assert!(!lock(&state.pro().execution.launches)["w-project"].1);
+        assert!(lock(&state.pro().preferences)["w-project"].execution_launch_pending);
         // Epoch replacement also invalidates an intent without a stop/reset.
-        lock(&state.pro.ownership).insert("w-project".into(), Ownership::Local { epoch: 5 });
+        lock(&state.pro().ownership).insert("w-project".into(), Ownership::Local { epoch: 5 });
         assert!(mutation::begin_launch(&state, "w-project").is_ok());
         assert!(current.check().is_err());
         drop(current);

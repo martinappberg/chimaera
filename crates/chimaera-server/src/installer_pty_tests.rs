@@ -14,8 +14,8 @@ fn fixture() -> (Arc<AppState>, crate::workspaces::Workspace, PathBuf) {
         }
     }
     let (state, workspace, root) = free_fixture();
-    let mut state = Arc::into_inner(state).unwrap();
-    state.daemon_extension = Some(Arc::new(Inert));
+    let state = Arc::into_inner(state).unwrap();
+    state.pro().set_runtime(Arc::new(Inert));
     (Arc::new(state), workspace, root)
 }
 /// A daemon without the extension: main's plain install session.

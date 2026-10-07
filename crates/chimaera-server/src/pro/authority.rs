@@ -167,13 +167,13 @@ pub(super) fn install_renewal(
     if renewal(previous, &next).is_err() {
         return false;
     }
-    let mut runtime = lock(&state.pro.runtime);
+    let mut runtime = lock(&state.pro().runtime);
     let Some(runtime) = runtime.as_mut() else {
         return false;
     };
     if generation
         != state
-            .pro
+            .pro()
             .generation
             .load(std::sync::atomic::Ordering::Acquire)
         || renewal(&runtime.delegation, &next).is_err()
@@ -198,7 +198,7 @@ pub(super) fn config_workspace(config: &Configure, workspace: &str) -> Result<()
 }
 pub(super) fn workspace(state: &AppState, workspace: &str) -> Result<()> {
     ensure!(
-        super::valid_id(workspace) && lock(&state.pro.authority).allows(workspace),
+        super::valid_id(workspace) && lock(&state.pro().authority).allows(workspace),
         "workspace authority denied"
     );
     Ok(())
@@ -210,7 +210,7 @@ pub(super) fn config_matches(
 ) -> Result<()> {
     config_workspace(config, workspace_id)?;
     workspace(state, workspace_id)?;
-    match &*lock(&state.pro.authority) {
+    match &*lock(&state.pro().authority) {
         Authority::Bound(value) => ensure!(
             config.delegation.workspace.as_ref() == Some(&value.workspace)
                 && config.account_id.as_ref() == Some(&value.account_id)
@@ -283,7 +283,7 @@ pub(super) async fn prepare(
         "invalid workspace root"
     );
     // Reject changed authority before even probing a caller-supplied path.
-    match &*lock(&state.pro.authority) {
+    match &*lock(&state.pro().authority) {
         Authority::Bound(previous) => {
             ensure!(
                 config.account_id.as_ref() == Some(&previous.account_id)
@@ -305,7 +305,7 @@ pub(super) async fn prepare(
         }
         Authority::Invalid => anyhow::bail!("workspace authority record needs recovery"),
         Authority::Unbound => ensure!(
-            lock(&state.pro.runtime).is_none(),
+            lock(&state.pro().runtime).is_none(),
             "workspace authority needs a fresh daemon"
         ),
     }
@@ -340,7 +340,7 @@ pub(super) async fn prepare(
             "workspace authority needs a dedicated daemon"
         );
     }
-    match &*lock(&state.pro.authority) {
+    match &*lock(&state.pro().authority) {
         Authority::Bound(previous) => {
             if previous != &value {
                 ensure!(
@@ -352,14 +352,14 @@ pub(super) async fn prepare(
         }
         Authority::Invalid => anyhow::bail!("workspace authority record needs recovery"),
         Authority::Unbound => ensure!(
-            lock(&state.pro.runtime).is_none(),
+            lock(&state.pro().runtime).is_none(),
             "workspace authority needs a fresh daemon"
         ),
     }
     Ok(value)
 }
 pub(super) async fn save(state: &AppState, value: &Accepted) -> Result<()> {
-    let path = state.pro.root.join("workspace-authority.json");
+    let path = state.pro().root.join("workspace-authority.json");
     let bytes = serde_json::to_vec(value)?;
     ensure!(
         bytes.len() <= 16 * 1024,
@@ -376,7 +376,7 @@ pub(super) async fn destination(
     requested: Option<&Path>,
 ) -> Result<Option<PathBuf>> {
     config_matches(state, config, workspace_id)?;
-    let value = match &*lock(&state.pro.authority) {
+    let value = match &*lock(&state.pro().authority) {
         Authority::Bound(value) => Some(value.clone()),
         _ => None,
     };
@@ -399,7 +399,7 @@ pub(super) async fn destination(
 /// verifies the pinned directory identity before a transfer touches that root.
 pub(super) fn registered_root(state: &AppState, workspace_id: &str, root: &Path) -> Result<()> {
     workspace(state, workspace_id)?;
-    if let Authority::Bound(value) = &*lock(&state.pro.authority) {
+    if let Authority::Bound(value) = &*lock(&state.pro().authority) {
         ensure!(root == value.root, "workspace destination is fixed");
     }
     Ok(())

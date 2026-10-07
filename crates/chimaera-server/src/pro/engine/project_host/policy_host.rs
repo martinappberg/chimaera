@@ -134,7 +134,7 @@ impl HandbackOwner {
             host.worker_holder() == Some(holder.as_str()),
             "Project connection changed"
         );
-        let generation = state.pro.generation.load(Ordering::Acquire);
+        let generation = state.pro().generation.load(Ordering::Acquire);
         Ok(Self {
             project: ProjectOwner {
                 state,
@@ -160,7 +160,7 @@ impl HandbackOwner {
     pub fn current(&self) -> bool {
         self.project.generation_current()
             && self.project.account_matches()
-            && !lock(&self.project.state.pro.preferences)
+            && !lock(&self.project.state.pro().preferences)
                 .get(self.workspace())
                 .is_some_and(|p| p.never_mirror)
     }
@@ -184,7 +184,7 @@ impl HandbackOwner {
         execution::observe(&self.project.state, &self.project.config, observation)
     }
     pub async fn persist_remote(&self, epoch: u64) -> Result<()> {
-        let _configuration = self.project.state.pro.configuration.lock().await;
+        let _configuration = self.project.state.pro().configuration.lock().await;
         ensure!(self.current(), "Account or project changed during return");
         self.project.set_ownership(Some(Ownership::Remote {
             epoch,

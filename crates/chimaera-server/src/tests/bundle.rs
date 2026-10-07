@@ -575,6 +575,7 @@ async fn public_bundle_failed_metadata_is_fenced_across_restart_and_exact_retry(
     assert_eq!(row["bundle_import"]["state"], "recovery_needed");
     assert!(!crate::pro::may_execute(&state, "w-public"));
     assert!(state
+        .pro()
         .bundle_imports
         .check_session("s-public", None)
         .is_err());
@@ -630,8 +631,15 @@ async fn malformed_pending_import_record_blocks_restoration_and_new_workspace_la
     .unwrap();
     let state = test_state_with_extension_in(data);
     assert!(!crate::pro::may_execute(&state, "unrelated-free-project"));
-    assert!(state.bundle_imports.admit("w-new", "s-new", None).is_err());
-    assert_eq!(state.bundle_imports.view("w-new").unwrap()["damaged"], true);
+    assert!(state
+        .pro()
+        .bundle_imports
+        .admit("w-new", "s-new", None)
+        .is_err());
+    assert_eq!(
+        state.pro().bundle_imports.view("w-new").unwrap()["damaged"],
+        true
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -659,7 +667,7 @@ async fn public_bundle_caller_cancellation_retains_config_and_pending_until_owne
     );
     release.send(()).unwrap();
     assert!(disable.await.unwrap().0.is_success());
-    assert!(!state.bundle_imports.blocks_workspace("w-public"));
+    assert!(!state.pro().bundle_imports.blocks_workspace("w-public"));
     assert!(lock(&state.deferred_sessions).contains_key("s-public"));
     assert!(state.chat.get("s-public").is_none());
 }

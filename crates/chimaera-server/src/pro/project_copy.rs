@@ -69,10 +69,10 @@ impl Enrollment {
 }
 
 pub(super) fn copy_only(state: &AppState, workspace: &str) -> bool {
-    if lock(&state.pro.copies.ids).contains(workspace) {
+    if lock(&state.pro().copies.ids).contains(workspace) {
         return true;
     }
-    let preferences = lock(&state.pro.preferences);
+    let preferences = lock(&state.pro().preferences);
     let known = preferences.get(workspace);
     if known.is_some_and(|entry| entry.copy.is_some()) {
         return true;
@@ -83,11 +83,11 @@ pub(super) fn copy_only(state: &AppState, workspace: &str) -> bool {
     // read-only. Only when Pro's own records are unreadable too can a copy
     // hide among ordinary projects, and only then is every registered one
     // fenced; a project Pro never enrolled is otherwise never touched.
-    state.pro.copies.unknown
+    state.pro().copies.unknown
         && (known_account
-            || lock(&state.pro.adoptions).contains_key(workspace)
+            || lock(&state.pro().adoptions).contains_key(workspace)
             || super::execution::managed(state, workspace)
-            || state.pro.records_unknown
+            || state.pro().records_unknown
                 && state
                     .workspaces
                     .try_lock()
@@ -97,16 +97,16 @@ pub(super) fn copy_only(state: &AppState, workspace: &str) -> bool {
 /// State corruption cannot discard an enrolled copy's execution restriction.
 /// The owned I/O gate remains in the blocking writer if its caller disappears.
 pub(super) async fn persist_latch(state: &AppState) -> Result<()> {
-    let mut written = state.pro.copies.written.clone().lock_owned().await;
+    let mut written = state.pro().copies.written.clone().lock_owned().await;
     let bytes = {
-        let mut ids = lock(&state.pro.copies.ids);
+        let mut ids = lock(&state.pro().copies.ids);
         ids.extend(
-            lock(&state.pro.preferences)
+            lock(&state.pro().preferences)
                 .iter()
                 .filter(|(_, entry)| entry.copy.is_some())
                 .map(|(id, _)| id.clone()),
         );
-        ensure!(!state.pro.copies.unknown, "copy enrollment is unreadable");
+        ensure!(!state.pro().copies.unknown, "copy enrollment is unreadable");
         if ids.is_empty() && written.is_none() {
             return Ok(());
         }
@@ -120,7 +120,7 @@ pub(super) async fn persist_latch(state: &AppState) -> Result<()> {
     if written.as_deref() == Some(bytes.as_slice()) {
         return Ok(());
     }
-    let path = state.pro.root.join("copy-authority.json");
+    let path = state.pro().root.join("copy-authority.json");
     tokio::task::spawn_blocking(move || -> Result<()> {
         crate::persist::atomic_write_json_durable(&path, bytes.clone())?;
         *written = Some(bytes);
@@ -153,7 +153,7 @@ pub(super) fn carry_kept(
     if !copy_only(state, workspace) {
         return kept;
     }
-    let statuses = lock(&state.pro.status);
+    let statuses = lock(&state.pro().status);
     let Some(previous) = statuses
         .get(workspace)
         .filter(|status| status.kept_both.is_some())
@@ -202,7 +202,7 @@ pub(super) async fn sync(
         epoch,
     } = selection;
     execution::receipt::validate(&latest)?;
-    let cache_guard = Arc::new(state.pro.cache(workspace)?.lock_owned().await);
+    let cache_guard = Arc::new(state.pro().cache(workspace)?.lock_owned().await);
     transport::cache_quiescent(workspace)?;
     let transfer = super::transfer_dispatch::TransferScope::capture(
         state,
@@ -214,14 +214,14 @@ pub(super) async fn sync(
     .await?;
     let original_transfer = transfer.host.clone();
     transport::cache_scope(workspace, cache_guard, super::transfer_dispatch::scope(transfer, async {
-        let existing_transaction=tokio::fs::try_exists(state.pro.root.join(workspace).join("copy-install")).await?;
+        let existing_transaction=tokio::fs::try_exists(state.pro().root.join(workspace).join("copy-install")).await?;
         let selected = {
-            let _configuration = state.pro.configuration.lock().await;
-            ensure!(generation == state.pro.generation.load(Ordering::Acquire), "Account changed during copy selection");
+            let _configuration = state.pro().configuration.lock().await;
+            ensure!(generation == state.pro().generation.load(Ordering::Acquire), "Account changed during copy selection");
             ensure!(super::projects::account_matches(state, workspace), "Account changed during copy selection");
             ensure!(!live_processes(state,workspace), "A live local project process prevents copy installation");
             let selected = {
-                let mut preferences = lock(&state.pro.preferences);
+                let mut preferences = lock(&state.pro().preferences);
                 let preference = preferences.entry(workspace.to_owned()).or_default();
                 ensure!(!preference.copy.as_ref().is_some_and(|copy|copy.takeover_requested), "Take over is already in progress");
                 preference.account = config.account_id.as_ref().map(|account|format!("{}/{}",config.endpoint.trim_end_matches('/'),account));
@@ -237,23 +237,23 @@ pub(super) async fn sync(
             }
             // Older daemons understand this fence even though they do not know
             // the additive copy role. Never clear it during a copy import.
-            lock(&state.pro.legacy_pending).insert(workspace.to_owned());
+            lock(&state.pro().legacy_pending).insert(workspace.to_owned());
             super::persist(state).await?;
             selected
         };
         let current = || -> Result<()> {
-            ensure!(generation == state.pro.generation.load(Ordering::Acquire)
+            ensure!(generation == state.pro().generation.load(Ordering::Acquire)
                 && super::projects::account_matches(state, workspace)
-                && lock(&state.pro.preferences).get(workspace).and_then(|p|p.copy.as_ref()).is_some_and(|copy|!copy.takeover_requested && copy.pending.as_ref()==Some(&selected)), "Local copy authority changed");
+                && lock(&state.pro().preferences).get(workspace).and_then(|p|p.copy.as_ref()).is_some_and(|copy|!copy.takeover_requested && copy.pending.as_ref()==Some(&selected)), "Local copy authority changed");
             Ok(())
         };
         current()?;
-        let cache = state.pro.root.join(workspace).join("copy-incoming.git");
+        let cache = state.pro().root.join(workspace).join("copy-incoming.git");
         let manifest = engine::fetch_snapshot_at(config, workspace, &cache, Some(&selected)).await?;
         let grant = engine::credentials(config, workspace, None).await?;
         ensure!(grant.read_only, "Local copy requires a read-only grant");
-        let stage = state.pro.root.join(workspace).join("copy-stage");
-        let transaction_root = state.pro.root.join(workspace).join("copy-install");
+        let stage = state.pro().root.join(workspace).join("copy-stage");
+        let transaction_root = state.pro().root.join(workspace).join("copy-install");
         let binding = install::Binding {endpoint:config.endpoint.clone(),account:config.account_id.clone(),workspace:workspace.to_owned(),epoch:selected.source_epoch,receipt:Some(selected.id.clone())};
         let (path, bound) = (transaction_root.clone(), binding.clone());
         let mut transaction = tokio::task::spawn_blocking(move ||install::Transaction::open(&path,&bound)).await??;
@@ -282,7 +282,7 @@ pub(super) async fn sync(
                 install::snapshot(&root,&before,&|path|super::policy::allowed_path(path)||path.file_name().and_then(|name|name.to_str()).is_some_and(super::canonical::kept_copy_name),budget)?;
                 install::snapshot(&before,&checkout,&|_|true,budget)
             }).await??;
-            let baseline = lock(&state.pro.preferences).get(workspace).and_then(|p|p.copy.as_ref()).and_then(|copy|copy.checkpoint.clone());
+            let baseline = lock(&state.pro().preferences).get(workspace).and_then(|p|p.copy.as_ref()).and_then(|copy|copy.checkpoint.clone());
             let mut baseline_snapshot=None;
             if let Some(baseline)=&baseline {
                 let old_manifest=engine::fetch_snapshot_at(config,workspace,&cache,Some(baseline)).await?;
@@ -292,7 +292,7 @@ pub(super) async fn sync(
             }
             current()?;
             let prepared=repository::prepare_receive(&destination,&stage.join("checkout"),&stage.join("repository"),repository::Incoming {
-                cache:&state.pro.root.join(workspace).join("copy-repository.git"),credentials:&grant,branch:manifest.branch.as_deref(),origin:manifest.repository_origin.as_deref(),snapshot:manifest.repository.as_ref(),
+                cache:&state.pro().root.join(workspace).join("copy-repository.git"),credentials:&grant,branch:manifest.branch.as_deref(),origin:manifest.repository_origin.as_deref(),snapshot:manifest.repository.as_ref(),
                 staging:Some(repository::StagingIncoming {handoff:&stage.join("handoff"),baseline:baseline_snapshot.as_ref().map(|descriptor|(stage.join("baseline-handoff"),descriptor)).as_ref().map(|(path,descriptor)|(path.as_path(),*descriptor))}),
             },&current).await?;
             let (tree,checkout,base,left_out)=(stage.join("tree"),stage.join("checkout"),baseline.as_ref().map(|_|stage.join("baseline")),manifest.left_out);
@@ -355,7 +355,7 @@ pub(super) async fn sync(
                 Ok(guard)
             }).await??;
             {
-                let mut preferences=lock(&owner.pro.preferences);
+                let mut preferences=lock(&owner.pro().preferences);
                 let preference=preferences.get_mut(&id).context("copy receipt disappeared")?;
                 preference.copy=Some(CopyState {checkpoint:Some(selected.clone()),pending:None,ready:true,takeover_requested:false,takeover_request:None,owner_epoch:Some(epoch)});
                 preference.git_staging=Some(report.staging.clone());
@@ -418,7 +418,7 @@ pub(super) async fn promote(
 ) -> Result<()> {
     use anyhow::Context;
     guard.check(state)?;
-    let previous = lock(&state.pro.preferences)
+    let previous = lock(&state.pro().preferences)
         .get(workspace)
         .and_then(|p| p.copy.clone());
     if previous.is_none() {
@@ -435,21 +435,21 @@ pub(super) async fn promote(
         "Explicit Take over is required"
     );
     guard.setting_up(state)?;
-    lock(&state.pro.preferences)
+    lock(&state.pro().preferences)
         .get_mut(workspace)
         .context("copy authority disappeared")?
         .copy = None;
-    lock(&state.pro.legacy_pending).remove(workspace);
+    lock(&state.pro().legacy_pending).remove(workspace);
     // The independent enrollment stays in place until the new role/SettingUp
     // record is durable. A crash in this window is recovery-needed, never an
     // unguarded legacy fallback after ordinary state damage.
     let finish = async {
         super::persist(state).await?;
         guard.check_setting_up(state)?;
-        let mut written = state.pro.copies.written.clone().lock_owned().await;
+        let mut written = state.pro().copies.written.clone().lock_owned().await;
         let ids = {
-            ensure!(!state.pro.copies.unknown, "copy enrollment is unreadable");
-            let mut ids = lock(&state.pro.copies.ids).clone();
+            ensure!(!state.pro().copies.unknown, "copy enrollment is unreadable");
+            let mut ids = lock(&state.pro().copies.ids).clone();
             ids.remove(workspace);
             ids
         };
@@ -457,27 +457,27 @@ pub(super) async fn promote(
             version: 1,
             workspaces: ids.iter().cloned().collect(),
         })?;
-        let path = state.pro.root.join("copy-authority.json");
+        let path = state.pro().root.join("copy-authority.json");
         tokio::task::spawn_blocking(move || -> Result<()> {
             crate::persist::atomic_write_json_durable(&path, bytes.clone())?;
             *written = Some(bytes);
             Ok(())
         })
         .await??;
-        *lock(&state.pro.copies.ids) = ids;
+        *lock(&state.pro().copies.ids) = ids;
         Ok::<_, anyhow::Error>(())
     }
     .await;
     if let Err(error) = finish {
-        lock(&state.pro.preferences)
+        lock(&state.pro().preferences)
             .entry(workspace.to_owned())
             .or_default()
             .copy = previous;
-        lock(&state.pro.legacy_pending).insert(workspace.to_owned());
-        lock(&state.pro.copies.ids).insert(workspace.to_owned());
-        let ownership = lock(&state.pro.ownership).get(workspace).cloned();
+        lock(&state.pro().legacy_pending).insert(workspace.to_owned());
+        lock(&state.pro().copies.ids).insert(workspace.to_owned());
+        let ownership = lock(&state.pro().ownership).get(workspace).cloned();
         if let Some(super::Ownership::SettingUp { epoch }) = ownership {
-            lock(&state.pro.ownership)
+            lock(&state.pro().ownership)
                 .insert(workspace.to_owned(), super::Ownership::Hydrating { epoch });
         }
         let _ = persist_latch(state).await;
@@ -490,7 +490,7 @@ pub(super) fn view(state: &AppState, workspace: &str) -> Option<serde_json::Valu
     if !copy_only(state, workspace) {
         return None;
     }
-    let copy = lock(&state.pro.preferences)
+    let copy = lock(&state.pro().preferences)
         .get(workspace)
         .and_then(|p| p.copy.clone());
     Some(match copy {
@@ -533,17 +533,17 @@ async fn retire_takeover(
     request: &str,
     only_idle: bool,
 ) -> Result<()> {
-    let _configuration = state.pro.configuration.lock().await;
+    let _configuration = state.pro().configuration.lock().await;
     if generation
         != state
-            .pro
+            .pro()
             .generation
             .load(std::sync::atomic::Ordering::Acquire)
     {
         return Ok(());
     }
     let retire = || {
-        let mut preferences = lock(&state.pro.preferences);
+        let mut preferences = lock(&state.pro().preferences);
         if let Some(copy) = preferences
             .get_mut(workspace)
             .and_then(|p| p.copy.as_mut())

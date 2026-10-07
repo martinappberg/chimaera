@@ -26,7 +26,7 @@ fn fixture(root: &Path) -> Arc<AppState> {
             hidden: false,
         })
         .unwrap();
-    lock(&state.pro.ownership).insert("w-project".into(), Ownership::Hydrating { epoch: 3 });
+    lock(&state.pro().ownership).insert("w-project".into(), Ownership::Hydrating { epoch: 3 });
     state
 }
 fn entry(kind: AgentKind) -> crate::ledger::LedgerEntry {
@@ -122,8 +122,8 @@ async fn provider_checks_cannot_grant_after_cancellation_account_or_owner_change
     ));
     let state = fixture(&root);
     for case in 0..3 {
-        let generation = state.pro.generation.load(Ordering::Acquire);
-        lock(&state.pro.ownership).insert("w-project".into(), Ownership::Hydrating { epoch: 3 });
+        let generation = state.pro().generation.load(Ordering::Acquire);
+        lock(&state.pro().ownership).insert("w-project".into(), Ownership::Hydrating { epoch: 3 });
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
         let task_state = state.clone();
@@ -147,12 +147,12 @@ async fn provider_checks_cannot_grant_after_cancellation_account_or_owner_change
                 assert!(task.await.unwrap_err().is_cancelled());
             }
             1 => {
-                state.pro.generation.fetch_add(1, Ordering::AcqRel);
+                state.pro().generation.fetch_add(1, Ordering::AcqRel);
                 release.notify_one();
                 assert!(task.await.unwrap().is_err());
             }
             _ => {
-                lock(&state.pro.ownership).insert(
+                lock(&state.pro().ownership).insert(
                     "w-project".into(),
                     Ownership::Remote {
                         epoch: 4,

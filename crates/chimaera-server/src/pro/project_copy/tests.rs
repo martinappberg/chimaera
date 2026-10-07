@@ -31,7 +31,7 @@ fn checkpoint() -> Checkpoint {
     }
 }
 fn enroll(state: &AppState) {
-    lock(&state.pro.preferences)
+    lock(&state.pro().preferences)
         .entry("w-copy".into())
         .or_default()
         .copy = Some(CopyState {
@@ -42,7 +42,7 @@ fn enroll(state: &AppState) {
         takeover_request: None,
         owner_epoch: Some(4),
     });
-    lock(&state.pro.legacy_pending).insert("w-copy".into());
+    lock(&state.pro().legacy_pending).insert("w-copy".into());
 }
 
 #[tokio::test]
@@ -73,8 +73,8 @@ async fn copy_conflict_report_survives_restart_and_transaction_replay() {
         super::super::report_return(&restored, "w-copy", staged.clone(), &[]);
         super::super::persist(&restored).await.unwrap();
     }
-    assert_eq!(lock(&restored.pro.status)["w-copy"].kept_both, Some(2));
-    assert_eq!(lock(&restored.pro.status)["w-copy"].kept_paths, staged.1);
+    assert_eq!(lock(&restored.pro().status)["w-copy"].kept_both, Some(2));
+    assert_eq!(lock(&restored.pro().status)["w-copy"].kept_paths, staged.1);
     let many = carry_kept(
         &restored,
         "w-copy",
@@ -98,7 +98,7 @@ async fn copy_conflict_report_survives_restart_and_transaction_replay() {
 async fn copy_fence_survives_signout_and_ordinary_state_corruption() {
     let (state, root) = fixture();
     enroll(&state);
-    lock(&state.pro.ownership).insert("w-copy".into(), Ownership::Local { epoch: 4 });
+    lock(&state.pro().ownership).insert("w-copy".into(), Ownership::Local { epoch: 4 });
     super::super::persist(&state).await.unwrap();
     assert!(!super::super::may_write(&state, "w-copy"));
     assert!(!super::super::may_execute(&state, "w-copy"));
@@ -107,8 +107,8 @@ async fn copy_fence_survives_signout_and_ordinary_state_corruption() {
     assert!(mutation::begin_launch(&state, "w-copy").is_err());
     assert!(!super::super::may_import(&state, "w-copy", 4));
     assert!(super::super::may_write(&state, "w-free"));
-    *lock(&state.pro.runtime) = None;
-    let role_path = state.pro.root.join("state.json");
+    *lock(&state.pro().runtime) = None;
+    let role_path = state.pro().root.join("state.json");
     std::fs::write(&role_path, b"not valid json").unwrap();
     drop(state);
     let reloaded = Arc::new(AppState::new(
@@ -150,7 +150,7 @@ async fn copy_admission_is_counted_exact_and_excludes_existing_commits() {
         copy.check_files(&state).is_err(),
         "no selected inode means no file admission"
     );
-    lock(&state.pro.preferences)
+    lock(&state.pro().preferences)
         .get_mut("w-copy")
         .unwrap()
         .copy
@@ -161,7 +161,7 @@ async fn copy_admission_is_counted_exact_and_excludes_existing_commits() {
         .unwrap()
         .sequence = 2;
     assert!(copy.check(&state).is_err());
-    lock(&state.pro.preferences)
+    lock(&state.pro().preferences)
         .get_mut("w-copy")
         .unwrap()
         .copy
@@ -169,7 +169,7 @@ async fn copy_admission_is_counted_exact_and_excludes_existing_commits() {
         .unwrap()
         .pending = Some(checkpoint());
     state
-        .pro
+        .pro()
         .generation
         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     assert!(copy.check(&state).is_err());
@@ -183,12 +183,12 @@ async fn promotion_requires_explicit_intent_and_retires_both_copy_fences() {
     let (state, root) = fixture();
     execution::install_fixture(&state, "w-copy", 4).unwrap();
     enroll(&state);
-    lock(&state.pro.ownership).insert("w-copy".into(), Ownership::Hydrating { epoch: 4 });
+    lock(&state.pro().ownership).insert("w-copy".into(), Ownership::Hydrating { epoch: 4 });
     super::super::persist(&state).await.unwrap();
     assert!(mutation::begin_import(&state, "w-copy", 4, 0)
         .await
         .is_err());
-    lock(&state.pro.preferences)
+    lock(&state.pro().preferences)
         .get_mut("w-copy")
         .unwrap()
         .copy
@@ -201,9 +201,9 @@ async fn promotion_requires_explicit_intent_and_retires_both_copy_fences() {
     assert!(!execution::quiescent(&state, "w-copy"));
     promote(&state, "w-copy", &guard).await.unwrap();
     assert!(!copy_only(&state, "w-copy"));
-    assert!(!lock(&state.pro.legacy_pending).contains("w-copy"));
+    assert!(!lock(&state.pro().legacy_pending).contains("w-copy"));
     assert!(matches!(
-        lock(&state.pro.ownership).get("w-copy"),
+        lock(&state.pro().ownership).get("w-copy"),
         Some(Ownership::SettingUp { epoch: 4 })
     ));
     assert!(
@@ -230,16 +230,16 @@ async fn failed_role_persistence_restores_copy_fence_before_releasing_admission(
     let (state, root) = fixture();
     execution::install_fixture(&state, "w-copy", 4).unwrap();
     enroll(&state);
-    lock(&state.pro.preferences)
+    lock(&state.pro().preferences)
         .get_mut("w-copy")
         .unwrap()
         .copy
         .as_mut()
         .unwrap()
         .takeover_requested = true;
-    lock(&state.pro.ownership).insert("w-copy".into(), Ownership::Hydrating { epoch: 4 });
+    lock(&state.pro().ownership).insert("w-copy".into(), Ownership::Hydrating { epoch: 4 });
     super::super::persist(&state).await.unwrap();
-    let state_file = state.pro.root.join("state.json");
+    let state_file = state.pro().root.join("state.json");
     std::fs::remove_file(&state_file).unwrap();
     std::fs::create_dir(&state_file).unwrap();
     let guard = mutation::begin_import(&state, "w-copy", 4, 0)
@@ -247,9 +247,9 @@ async fn failed_role_persistence_restores_copy_fence_before_releasing_admission(
         .unwrap();
     assert!(promote(&state, "w-copy", &guard).await.is_err());
     assert!(copy_only(&state, "w-copy"));
-    assert!(lock(&state.pro.legacy_pending).contains("w-copy"));
+    assert!(lock(&state.pro().legacy_pending).contains("w-copy"));
     assert!(matches!(
-        lock(&state.pro.ownership).get("w-copy"),
+        lock(&state.pro().ownership).get("w-copy"),
         Some(Ownership::Hydrating { epoch: 4 })
     ));
     assert!(!super::super::may_execute(&state, "w-copy"));
@@ -275,7 +275,7 @@ async fn failed_old_takeover_completion_cannot_clear_a_new_intent() {
     let (state, root) = fixture();
     enroll(&state);
     {
-        let mut preferences = lock(&state.pro.preferences);
+        let mut preferences = lock(&state.pro().preferences);
         let copy = preferences
             .get_mut("w-copy")
             .unwrap()
@@ -289,7 +289,7 @@ async fn failed_old_takeover_completion_cannot_clear_a_new_intent() {
         .await
         .unwrap();
     assert!(
-        lock(&state.pro.preferences)
+        lock(&state.pro().preferences)
             .get("w-copy")
             .unwrap()
             .copy
@@ -301,7 +301,7 @@ async fn failed_old_takeover_completion_cannot_clear_a_new_intent() {
         .await
         .unwrap();
     assert!(
-        !lock(&state.pro.preferences)
+        !lock(&state.pro().preferences)
             .get("w-copy")
             .unwrap()
             .copy
@@ -319,7 +319,7 @@ async fn pre_start_cleanup_preserves_an_already_active_same_intent() {
     let (state, root) = fixture();
     enroll(&state);
     {
-        let mut preferences = lock(&state.pro.preferences);
+        let mut preferences = lock(&state.pro().preferences);
         let copy = preferences
             .get_mut("w-copy")
             .unwrap()
@@ -334,7 +334,7 @@ async fn pre_start_cleanup_preserves_an_already_active_same_intent() {
         .await
         .unwrap();
     assert_eq!(
-        lock(&state.pro.preferences)
+        lock(&state.pro().preferences)
             .get("w-copy")
             .unwrap()
             .copy
@@ -349,7 +349,7 @@ async fn pre_start_cleanup_preserves_an_already_active_same_intent() {
         .await
         .unwrap();
     assert!(
-        !lock(&state.pro.preferences)
+        !lock(&state.pro().preferences)
             .get("w-copy")
             .unwrap()
             .copy
@@ -399,7 +399,7 @@ async fn completed_old_launch_cannot_hide_a_live_process_from_final_copy_admissi
     let guard = mutation::begin_copy(&state, "w-copy", 0, checkpoint(), root.clone())
         .await
         .unwrap();
-    lock(&state.pro.preferences)
+    lock(&state.pro().preferences)
         .get_mut("w-copy")
         .unwrap()
         .execution_launch_pending = true;

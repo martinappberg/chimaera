@@ -179,7 +179,7 @@ pub(in crate::pro) fn leader_start(pid: i32) -> Option<u64> {
 /// Re-probe previous-life evidence; a workspace is released as soon as none
 /// of its recorded groups remains. Unprovable (empty) records stay.
 pub(in crate::pro) fn reprobe(state: &AppState) {
-    lock(&state.pro.execution.unclean).retain(|_, groups| {
+    lock(&state.pro().execution.unclean).retain(|_, groups| {
         if groups.is_empty() {
             return true;
         }
@@ -207,7 +207,7 @@ pub(in crate::pro) fn record_groups(state: &AppState) {
             by_workspace.entry(workspace).or_default().record(group);
         }
     }
-    for (workspace, entry) in lock(&state.pro.execution.setups).iter() {
+    for (workspace, entry) in lock(&state.pro().execution.setups).iter() {
         if let Some((group, _)) = entry.group {
             by_workspace
                 .entry(workspace.clone())
@@ -215,12 +215,12 @@ pub(in crate::pro) fn record_groups(state: &AppState) {
                 .record(group);
         }
     }
-    let unknown: HashSet<_> = lock(&state.pro.execution.unclean)
+    let unknown: HashSet<_> = lock(&state.pro().execution.unclean)
         .iter()
         .filter(|(_, groups)| groups.is_empty())
         .map(|(workspace, _)| workspace.clone())
         .collect();
-    let mut preferences = lock(&state.pro.preferences);
+    let mut preferences = lock(&state.pro().preferences);
     for (workspace, preference) in preferences.iter_mut() {
         if preference.execution_active {
             let mut evidence = by_workspace.remove(workspace).unwrap_or_default();
@@ -259,7 +259,7 @@ impl GroupEvidence {
 /// clear the evidence so a same-boot successor starts clean. Anything still
 /// running keeps its recorded groups for the successor's probe.
 pub(in crate::pro) async fn shutdown(state: &std::sync::Arc<AppState>) -> Result<()> {
-    let workspaces: Vec<String> = lock(&state.pro.preferences)
+    let workspaces: Vec<String> = lock(&state.pro().preferences)
         .iter()
         .filter(|(_, p)| p.execution_active)
         .map(|(id, _)| id.clone())
@@ -303,7 +303,7 @@ pub(in crate::pro) async fn shutdown(state: &std::sync::Arc<AppState>) -> Result
         .cloned()
         .collect();
     {
-        let mut preferences = lock(&state.pro.preferences);
+        let mut preferences = lock(&state.pro().preferences);
         for workspace in &workspaces {
             if let Some(preference) = preferences.get_mut(workspace) {
                 if !running.contains(workspace) && !unproven.contains(workspace) {
@@ -320,7 +320,10 @@ pub(in crate::pro) async fn persist_latch(
     state: &AppState,
     writer: tokio::sync::OwnedMutexGuard<Option<Vec<u8>>>,
 ) -> Result<tokio::sync::OwnedMutexGuard<Option<Vec<u8>>>> {
-    let mut workspaces: Vec<_> = lock(&state.pro.execution.latched).iter().cloned().collect();
+    let mut workspaces: Vec<_> = lock(&state.pro().execution.latched)
+        .iter()
+        .cloned()
+        .collect();
     if workspaces.is_empty() {
         return Ok(writer);
     }
@@ -330,7 +333,7 @@ pub(in crate::pro) async fn persist_latch(
         version: 1,
         workspaces,
     })?;
-    let path = state.pro.root.join("execution-authority.json");
+    let path = state.pro().root.join("execution-authority.json");
     // The state writer also excludes this latch's original blocking write.
     // Keep its custody if the async observer is cancelled before settlement.
     tokio::task::spawn_blocking(move || {
@@ -425,29 +428,29 @@ mod tests {
         );
         super::super::install_fixture(&state, "w-a", 4).unwrap();
         {
-            let mut preferences = lock(&state.pro.preferences);
+            let mut preferences = lock(&state.pro().preferences);
             let preference = preferences.get_mut("w-a").unwrap();
             preference.execution_active = true;
-            preference.execution_boot = state.pro.execution.boot.clone();
+            preference.execution_boot = state.pro().execution.boot.clone();
             preference.execution_groups = evidence.groups.iter().map(|(group, _)| *group).collect();
             preference.execution_starts = evidence.groups.iter().map(|(_, start)| *start).collect();
             preference.execution_groups_overflow = evidence.overflow;
         }
-        let disk = serde_json::to_vec(&*lock(&state.pro.preferences)).unwrap();
+        let disk = serde_json::to_vec(&*lock(&state.pro().preferences)).unwrap();
         let preferences = serde_json::from_slice(&disk).unwrap();
-        state.pro.execution = State::restore(&root, &preferences, true, false);
-        state.pro.worker.store(true, Ordering::Release);
-        assert!(lock(&state.pro.execution.unclean)["w-a"].is_empty());
+        state.pro_mut().execution = State::restore(&root, &preferences, true, false);
+        state.pro().worker.store(true, Ordering::Release);
+        assert!(lock(&state.pro().execution.unclean)["w-a"].is_empty());
         reprobe(&state);
         assert!(!super::super::quiescent(&state, "w-a"));
         assert!(!super::super::allows(&state, "w-a"));
         // An ordinary state flush must not erase the overflow just because
         // this successor's process registry has no old child in it.
         record_groups(&state);
-        assert!(lock(&state.pro.preferences)["w-a"].execution_groups_overflow);
-        let disk = serde_json::to_vec(&*lock(&state.pro.preferences)).unwrap();
+        assert!(lock(&state.pro().preferences)["w-a"].execution_groups_overflow);
+        let disk = serde_json::to_vec(&*lock(&state.pro().preferences)).unwrap();
         let preferences = serde_json::from_slice(&disk).unwrap();
-        state.pro.execution = State::restore(&root, &preferences, true, false);
+        state.pro_mut().execution = State::restore(&root, &preferences, true, false);
         reprobe(&state);
         assert!(!super::super::quiescent(&state, "w-a"));
         child.kill().unwrap();
@@ -459,22 +462,22 @@ mod tests {
         );
         // Laptop execution remains available; publication still requires
         // proving the previous workload stopped.
-        state.pro.worker.store(false, Ordering::Release);
+        state.pro().worker.store(false, Ordering::Release);
         assert!(super::super::allows(&state, "w-a"));
         assert!(!super::super::quiescent(&state, "w-a"));
-        if state.pro.execution.boot.is_some() {
-            lock(&state.pro.preferences)
+        if state.pro().execution.boot.is_some() {
+            lock(&state.pro().preferences)
                 .get_mut("w-a")
                 .unwrap()
                 .execution_boot = Some("different-previous-boot".into());
-            let preferences = lock(&state.pro.preferences).clone();
-            state.pro.execution = State::restore(&root, &preferences, true, false);
+            let preferences = lock(&state.pro().preferences).clone();
+            state.pro_mut().execution = State::restore(&root, &preferences, true, false);
             assert!(
                 super::super::quiescent(&state, "w-a"),
                 "a cold boot proves old groups cannot survive"
             );
             record_groups(&state);
-            assert!(!lock(&state.pro.preferences)["w-a"].execution_groups_overflow);
+            assert!(!lock(&state.pro().preferences)["w-a"].execution_groups_overflow);
         }
         std::fs::remove_dir_all(root).unwrap();
     }

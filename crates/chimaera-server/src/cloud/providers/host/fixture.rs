@@ -40,6 +40,7 @@ impl Harness {
         factory: impl FnOnce(ProviderHost) -> Option<Arc<dyn WorkerProviders>>,
     ) -> Option<Arc<dyn WorkerProviders>> {
         self.state
+            .pro()
             .cloud_providers
             .resolve(|| factory(self.host()))
             .cloned()
@@ -48,7 +49,7 @@ impl Harness {
         super::super::cached_observations(&self.state)
     }
     pub fn initialized(&self) -> bool {
-        self.state.cloud_providers.0.get().is_some()
+        self.state.pro().cloud_providers.0.get().is_some()
     }
     pub fn root(&self) -> &std::path::Path {
         &self.root

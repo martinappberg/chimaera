@@ -23,10 +23,10 @@ pub(crate) fn active_operations() -> usize {
     host::active()
 }
 fn controller(state: &Arc<AppState>) -> Option<&Arc<dyn WorkerProviders>> {
-    state.cloud_providers.admit(state)
+    state.pro().cloud_providers.admit(state)
 }
 pub(crate) fn cached_observations(state: &AppState) -> Vec<ProviderStatus> {
-    state.cloud_providers.current().map_or_else(
+    state.pro().cloud_providers.current().map_or_else(
         || {
             PROVIDERS
                 .iter()
@@ -70,6 +70,7 @@ pub(crate) async fn list(State(state): State<Arc<AppState>>) -> Response {
     // Reopening the UI or losing the mutation's HTTP response must not strand a
     // running logout with no job ID. This is an observation, never a new action.
     if let Some(connection) = state
+        .pro()
         .cloud_providers
         .current()
         .and_then(|p| p.pending_disconnect())
@@ -148,7 +149,7 @@ pub(crate) async fn submit(
     if !super::enabled() {
         return unavailable();
     }
-    let Some(owner) = state.cloud_providers.current() else {
+    let Some(owner) = state.pro().cloud_providers.current() else {
         return unavailable();
     };
     match owner.submit(&id, input.code) {
@@ -168,7 +169,7 @@ async fn connection_response(state: &Arc<AppState>, id: &str, cancel: bool) -> R
     if !super::enabled() {
         return unavailable();
     }
-    let Some(owner) = state.cloud_providers.current() else {
+    let Some(owner) = state.pro().cloud_providers.current() else {
         return unavailable();
     };
     let connection = if cancel {

@@ -175,7 +175,7 @@ fn report(state: &AppState, workspace: &str) -> Result<Report, Refusal> {
         .get(workspace)
         .map(|w| w.root)
         .ok_or(Refusal::UnknownProject)?;
-    let recorded = crate::lock(&state.pro.status)
+    let recorded = crate::lock(&state.pro().status)
         .get(workspace)
         .filter(|status| status.kept_both.is_some())
         .map(|status| status.kept_paths.clone())
@@ -394,7 +394,7 @@ fn side(dir: &File, name: &str) -> Result<Value, Refusal> {
 /// for a choice; kept copies past the listed ones (a return names up to 32)
 /// keep the count up until `resolve_all` settles the rest (`everything`).
 fn settle(state: &AppState, workspace: &str, settled: &[PathBuf], everything: bool) {
-    let mut statuses = crate::lock(&state.pro.status);
+    let mut statuses = crate::lock(&state.pro().status);
     let Some(status) = statuses.get_mut(workspace) else {
         return;
     };
@@ -427,11 +427,11 @@ fn settle(state: &AppState, workspace: &str, settled: &[PathBuf], everything: bo
 /// deleted).
 async fn listing(state: &Arc<AppState>, workspace: &str) -> Result<Value, Refusal> {
     let generation = super::mutation::generation(state);
-    let cache = state.pro.cache(workspace).map_err(|_| Refusal::Busy)?;
+    let cache = state.pro().cache(workspace).map_err(|_| Refusal::Busy)?;
     let held = tokio::time::timeout(LOCK_WAIT, cache.lock_owned())
         .await
         .map_err(|_| Refusal::Busy)?;
-    let configuration = state.pro.configuration.clone().lock_owned().await;
+    let configuration = state.pro().configuration.clone().lock_owned().await;
     if generation != super::mutation::generation(state) {
         return Err(Refusal::NotHere);
     }
@@ -451,7 +451,7 @@ async fn listing(state: &Arc<AppState>, workspace: &str) -> Result<Value, Refusa
 async fn listing_reserved(state: &Arc<AppState>, workspace: &str) -> Result<Value, Refusal> {
     let Report { root, recorded } = report(state, workspace)?;
     let scan_root = root.clone();
-    let home = state.pro.trash.clone();
+    let home = state.pro().trash.clone();
     let (pairs, settled, to_trash) = tokio::task::spawn_blocking(move || {
         let mut pairs = Vec::new();
         let mut settled = Vec::new();
@@ -476,10 +476,10 @@ async fn listing_reserved(state: &Arc<AppState>, workspace: &str) -> Result<Valu
     // Git runs only for a project that has something from the cloud to
     // show: a report, or branches its last return kept (then read live, so
     // one merged and deleted since drops off).
-    let kept_branches = crate::lock(&state.pro.preferences)
+    let kept_branches = crate::lock(&state.pro().preferences)
         .get(workspace)
         .is_some_and(|preference| !preference.git_branches.is_empty());
-    let open = crate::lock(&state.pro.status)
+    let open = crate::lock(&state.pro().status)
         .get(workspace)
         .is_some_and(|status| status.kept_both.is_some());
     let branches = if kept_branches || open {
@@ -487,7 +487,7 @@ async fn listing_reserved(state: &Arc<AppState>, workspace: &str) -> Result<Valu
     } else {
         Vec::new()
     };
-    let (files, total, at) = crate::lock(&state.pro.status)
+    let (files, total, at) = crate::lock(&state.pro().status)
         .get(workspace)
         .map(|status| {
             (
@@ -603,13 +603,13 @@ async fn choose(
     if !super::may_write(state, workspace) {
         return Err(Refusal::NotHere);
     }
-    let cache = state.pro.cache(workspace).map_err(|_| Refusal::Busy)?;
+    let cache = state.pro().cache(workspace).map_err(|_| Refusal::Busy)?;
     let held = tokio::time::timeout(LOCK_WAIT, cache.lock_owned())
         .await
         .map_err(|_| Refusal::Busy)?;
     // Again under the lock: a return may have replaced the report, or taken
     // the project away, while this waited.
-    let configuration = state.pro.configuration.clone().lock_owned().await;
+    let configuration = state.pro().configuration.clone().lock_owned().await;
     let Report { root, recorded } = report(state, workspace)?;
     if generation != super::mutation::generation(state) || !super::may_write(state, workspace) {
         return Err(Refusal::NotHere);
@@ -618,7 +618,7 @@ async fn choose(
     // requires a live worker proof; free/unconfigured local work stays inert.
     let reservation =
         super::mutation::begin_launch(state, workspace).map_err(|_| Refusal::NotHere)?;
-    let ownership = crate::lock(&state.pro.ownership).get(workspace).cloned();
+    let ownership = crate::lock(&state.pro().ownership).get(workspace).cloned();
     let folder = root.clone();
     let identity = tokio::task::spawn_blocking(move || {
         use std::os::unix::fs::MetadataExt;
@@ -640,7 +640,7 @@ async fn choose(
         let worker_state = owner.clone();
         let worker_workspace = workspace.to_owned();
         let expected_ownership = ownership.clone();
-        let home = state.pro.trash.clone();
+        let home = state.pro().trash.clone();
         let Outcome {
             settled,
             failures,
@@ -651,7 +651,7 @@ async fn choose(
                 use std::os::unix::fs::MetadataExt;
                 if generation != super::mutation::generation(&worker_state)
                     || !super::may_write(&worker_state, &worker_workspace)
-                    || crate::lock(&worker_state.pro.ownership)
+                    || crate::lock(&worker_state.pro().ownership)
                         .get(&worker_workspace)
                         .cloned()
                         != ownership
@@ -672,7 +672,7 @@ async fn choose(
         .map_err(failed)??;
         if generation != super::mutation::generation(state)
             || !super::may_write(state, workspace)
-            || crate::lock(&state.pro.ownership).get(workspace).cloned() != expected_ownership
+            || crate::lock(&state.pro().ownership).get(workspace).cloned() != expected_ownership
         {
             return Err(Refusal::NotHere);
         }

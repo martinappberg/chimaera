@@ -731,7 +731,7 @@ pub(super) async fn import_public(
                 Ok(std::fs::canonicalize(data)?.join("bundles"))
             })
             .await??;
-            let recovering = state.bundle_imports.matching(&pending)?;
+            let recovering = state.pro().bundle_imports.matching(&pending)?;
             let receipt_path = bundles
                 .clone()
                 .join("imports")
@@ -809,7 +809,7 @@ pub(super) async fn import_public(
                     let check = admission.clone();
                     tokio::task::spawn_blocking(move || {
                         check.check(&finish_state)?;
-                        finish_state.bundle_imports.finish(&finish_pending)
+                        finish_state.pro().bundle_imports.finish(&finish_pending)
                     })
                     .await??;
                 }
@@ -858,7 +858,7 @@ pub(super) async fn import_public(
             let transaction =
                 tokio::task::spawn_blocking(move || -> Result<install::Transaction> {
                     check.check(&install_state)?;
-                    install_state.bundle_imports.begin(marker.clone())?;
+                    install_state.pro().bundle_imports.begin(marker.clone())?;
                     // Publication serialized against final free/local spawn registration.
                     // Recheck after enrollment so an earlier admitted launch cannot hide.
                     let entry = LedgerEntry::from_json(&prepared_entry)
@@ -899,7 +899,7 @@ pub(super) async fn import_public(
                         pending: marker.clone(),
                     })?,
                 )?;
-                final_state.bundle_imports.finish(&marker)?;
+                final_state.pro().bundle_imports.finish(&marker)?;
                 // Cleanup never authorizes another write. Edited recovery artifacts
                 // remain retained; the committed receipt still prevents replay.
                 if transaction.cleanup().is_ok() {
@@ -915,6 +915,7 @@ pub(super) async fn import_public(
         match result {
             Err(_)
                 if recovery_state
+                    .pro()
                     .bundle_imports
                     .check_session(&recovery_id, None)
                     .is_err() =>
@@ -960,7 +961,10 @@ async fn finish_public(
             )
             .await?;
             crate::lock(&state.deferred_sessions).remove(&entry.id);
-            state.session_proxy.clear_workspace(&entry.workspace_id);
+            state
+                .pro()
+                .session_proxy
+                .clear_workspace(&entry.workspace_id);
             flush_ledger(&state, true).await
         })
         .await?;

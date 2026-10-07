@@ -112,8 +112,9 @@ pub async fn staging_baseline(
     validate_baseline_paths(owner.clone(), shadow.to_owned(), stage.to_owned()).await?;
     let runtime = owner
         .state
-        .daemon_extension
-        .clone()
+        .pro()
+        .runtime()
+        .cloned()
         .context("optional_runtime_unavailable")?;
     super::super::transfer_dispatch::scope(
         super::super::transfer_dispatch::TransferScope {
@@ -134,8 +135,9 @@ pub async fn copy_baseline(
     validate_baseline_paths(owner.clone(), shadow.to_owned(), stage.to_owned()).await?;
     let runtime = owner
         .state
-        .daemon_extension
-        .clone()
+        .pro()
+        .runtime()
+        .cloned()
         .context("optional_runtime_unavailable")?;
     super::super::transfer_dispatch::scope(
         super::super::transfer_dispatch::TransferScope {

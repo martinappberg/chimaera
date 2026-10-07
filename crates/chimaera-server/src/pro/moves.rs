@@ -71,32 +71,26 @@ fn now_ms() -> u64 {
 /// the account's own clock (`server_now` minus the request time), taken back
 /// from now. Two clocks are never compared directly.
 pub(super) fn requested_here(state: &AppState, baton: &Baton, now_ms: u64) -> Option<u64> {
-    state
-        .daemon_extension
-        .as_ref()?
-        .move_requested_here(baton, now_ms)
+    state.pro().runtime()?.move_requested_here(baton, now_ms)
 }
 
 /// The last actor wins: this computer's user acting after the request keeps
 /// the work here; otherwise the holder yields at its next pause.
 pub(super) fn decide(state: &AppState, acted_ms: Option<u64>, requested_ms: u64) -> Decision {
-    state
-        .daemon_extension
-        .as_ref()
-        .map_or(Decision::Claim, |runtime| {
-            runtime.move_decision(acted_ms, requested_ms)
-        })
+    state.pro().runtime().map_or(Decision::Claim, |runtime| {
+        runtime.move_decision(acted_ms, requested_ms)
+    })
 }
 
 /// The user acted on this computer in `workspace` (a chat command or typing
 /// that arrived on this daemon's own sockets, not a forwarded viewer's).
 pub(crate) fn acted_here(state: &AppState, workspace: &str) {
-    if workspace.is_empty() || lock(&state.pro.runtime).is_none() {
+    if workspace.is_empty() || lock(&state.pro().runtime).is_none() {
         return;
     }
     // The user is working here again: nothing of it is unfinished elsewhere.
-    lock(&state.pro.unfinished).retain(|_, project| project != workspace);
-    let mut acted = lock(&state.pro.moves.acted);
+    lock(&state.pro().unfinished).retain(|_, project| project != workspace);
+    let mut acted = lock(&state.pro().moves.acted);
     if acted.len() >= 128 && !acted.contains_key(workspace) {
         acted.clear();
     }
@@ -106,7 +100,7 @@ pub(crate) fn acted_here(state: &AppState, workspace: &str) {
 /// This project's work left (or is leaving) this computer for another of the
 /// user's computers rather than the cloud.
 pub(crate) fn other_computer(state: &AppState, workspace: &str) -> bool {
-    lock(&state.pro.moves.leaving).contains(workspace)
+    lock(&state.pro().moves.leaving).contains(workspace)
 }
 
 /// Whether this computer may take `workspace` when the user acts on it here:
@@ -121,7 +115,7 @@ pub(in crate::pro) fn can_take(state: &AppState, config: &Configure, workspace: 
         && lock(&state.workspaces).get(workspace).is_some()
         && super::projects::account_matches(state, workspace)
         && !super::parked(state, workspace)
-        && !lock(&state.pro.preferences)
+        && !lock(&state.pro().preferences)
             .get(workspace)
             .is_some_and(|p| p.never_mirror)
 }
@@ -150,14 +144,14 @@ pub(crate) fn device_fixture(state: &AppState, endpoint: &str) {
         },
     }))
     .expect("device configuration fixture");
-    *lock(&state.pro.runtime) = Some(config);
+    *lock(&state.pro().runtime) = Some(config);
 }
 
 /// Ends the request under way to bring `workspace` here with `outcome`, for
 /// fixtures that need a move to settle without an account behind it.
 #[cfg(test)]
 pub(crate) fn settle_fixture(state: &AppState, workspace: &str, outcome: Outcome) {
-    if let Some(sender) = lock(&state.pro.moves.pulls).remove(workspace) {
+    if let Some(sender) = lock(&state.pro().moves.pulls).remove(workspace) {
         let _ = sender.send(outcome);
     }
 }
@@ -169,7 +163,7 @@ pub(super) fn answer(state: &Arc<AppState>, config: &Configure, workspace: &str,
     if !can_take(state, config, workspace)
         || pulling(state, workspace)
         || (super::project_copy::copy_only(state, workspace)
-            && !lock(&state.pro.preferences)
+            && !lock(&state.pro().preferences)
                 .get(workspace)
                 .and_then(|p| p.copy.as_ref())
                 .is_some_and(|copy| copy.takeover_requested))
@@ -178,7 +172,7 @@ pub(super) fn answer(state: &Arc<AppState>, config: &Configure, workspace: &str,
     }
     let request = baton.move_requested_at.clone().unwrap_or_default();
     {
-        let mut answered = lock(&state.pro.moves.answered);
+        let mut answered = lock(&state.pro().moves.answered);
         if answered.get(workspace) == Some(&request) {
             return;
         }
@@ -199,7 +193,7 @@ fn start(
     bound: Duration,
 ) -> Option<watch::Receiver<Outcome>> {
     super::moving::begin(state, workspace);
-    let mut pulls = lock(&state.pro.moves.pulls);
+    let mut pulls = lock(&state.pro().moves.pulls);
     if let Some(waiting) = pulls.get(workspace) {
         if *waiting.borrow() == Outcome::Waiting {
             return Some(waiting.subscribe());
@@ -211,7 +205,7 @@ fn start(
     }
     // Admission and idle-only intent retirement share this lock. A copy must
     // still have an explicit durable intent when its pull becomes active.
-    let copy_request = lock(&state.pro.preferences)
+    let copy_request = lock(&state.pro().preferences)
         .get(workspace)
         .and_then(|p| p.copy.as_ref())
         .filter(|copy| copy.takeover_requested)
@@ -223,7 +217,7 @@ fn start(
     pulls.insert(workspace.to_owned(), sender);
     drop(pulls);
     let generation = state
-        .pro
+        .pro()
         .generation
         .load(std::sync::atomic::Ordering::Acquire);
     let owner = state.clone();
@@ -236,7 +230,7 @@ fn start(
             workspace.clone(),
             generation,
         );
-        let result = match owner.daemon_extension.as_ref() {
+        let result = match owner.pro().runtime() {
             Some(runtime) => {
                 runtime
                     .pull_move(project, ask, expected_epoch, bound, &mut stage)
@@ -268,7 +262,7 @@ fn start(
                         .await;
             }
         }
-        if let Some(sender) = lock(&owner.pro.moves.pulls).remove(&workspace) {
+        if let Some(sender) = lock(&owner.pro().moves.pulls).remove(&workspace) {
             let _ = sender.send(outcome);
         }
     });
@@ -279,16 +273,16 @@ fn start(
 /// over to another account. A request under way ends on its own (its
 /// transfer checks the account generation).
 pub(super) fn forget(state: &AppState) {
-    lock(&state.pro.moves.answered).clear();
-    lock(&state.pro.moves.acted).clear();
-    lock(&state.pro.moves.yielding).clear();
-    lock(&state.pro.moves.leaving).clear();
+    lock(&state.pro().moves.answered).clear();
+    lock(&state.pro().moves.acted).clear();
+    lock(&state.pro().moves.yielding).clear();
+    lock(&state.pro().moves.leaving).clear();
 }
 
 /// Whether a request to bring this project here is under way (a return pass
 /// leaves it to that request).
 pub(super) fn pulling(state: &AppState, workspace: &str) -> bool {
-    lock(&state.pro.moves.pulls)
+    lock(&state.pro().moves.pulls)
         .get(workspace)
         .is_some_and(|sender| *sender.borrow() == Outcome::Waiting)
 }
@@ -300,7 +294,7 @@ pub(super) fn if_idle<T>(
     workspace: &str,
     retire: impl FnOnce() -> T,
 ) -> Option<T> {
-    let pulls = lock(&state.pro.moves.pulls);
+    let pulls = lock(&state.pro().moves.pulls);
     if pulls
         .get(workspace)
         .is_some_and(|sender| *sender.borrow() == Outcome::Waiting)
@@ -379,18 +373,18 @@ pub(super) fn consider(state: &Arc<AppState>, config: &Configure, workspace: &st
         .as_deref()
         .filter(|target| *target != me && super::valid_id(target));
     let Some(target) = target else {
-        lock(&state.pro.moves.yielding).remove(workspace);
-        lock(&state.pro.moves.leaving).remove(workspace);
+        lock(&state.pro().moves.yielding).remove(workspace);
+        lock(&state.pro().moves.leaving).remove(workspace);
         return;
     };
     let now = now_ms();
     let Some(requested) = requested_here(state, grant, now) else {
         return;
     };
-    let acted = lock(&state.pro.moves.acted).get(workspace).copied();
+    let acted = lock(&state.pro().moves.acted).get(workspace).copied();
     match decide(state, acted, requested) {
         Decision::Claim => {
-            lock(&state.pro.moves.yielding).remove(workspace);
+            lock(&state.pro().moves.yielding).remove(workspace);
             let config = config.clone();
             let workspace = workspace.to_owned();
             let epoch = grant.epoch;
@@ -406,7 +400,7 @@ pub(super) fn consider(state: &Arc<AppState>, config: &Configure, workspace: &st
         }
         Decision::Yield => {
             {
-                let mut yielding = lock(&state.pro.moves.yielding);
+                let mut yielding = lock(&state.pro().moves.yielding);
                 // The same request, placed again from the next renewal (its
                 // age on this clock moves with each round trip).
                 if yielding.get(workspace).is_some_and(|(epoch, at, holder)| {
@@ -437,7 +431,7 @@ pub(super) fn consider(state: &Arc<AppState>, config: &Configure, workspace: &st
             );
             tokio::spawn(async move {
                 let cleanup = admitted.clone();
-                if let Some(runtime) = owner.daemon_extension.as_ref() {
+                if let Some(runtime) = owner.pro().runtime() {
                     let _ = runtime.hand_over_move(admitted).await;
                 }
                 cleanup.finish();
@@ -459,7 +453,7 @@ pub(super) fn abandoned(state: &AppState, baton: &Baton, previous: Option<&Owner
 
 #[cfg(test)]
 pub(super) fn fill_requests_fixture(state: &AppState) {
-    let mut pulls = lock(&state.pro.moves.pulls);
+    let mut pulls = lock(&state.pro().moves.pulls);
     for index in 0..LIMIT {
         pulls.insert(
             format!("w-pending-{index}"),
@@ -470,12 +464,12 @@ pub(super) fn fill_requests_fixture(state: &AppState) {
 
 #[cfg(test)]
 pub(super) fn pending_fixture(state: &AppState, workspace: &str) {
-    lock(&state.pro.moves.pulls).insert(workspace.into(), watch::channel(Outcome::Waiting).0);
+    lock(&state.pro().moves.pulls).insert(workspace.into(), watch::channel(Outcome::Waiting).0);
 }
 
 #[cfg(all(unix, feature = "daemon-extension-fixture"))]
 pub(in crate::pro) fn seed_actor_fixture(state: &AppState, workspace: &str, acted_ms: Option<u64>) {
-    let mut records = lock(&state.pro.moves.acted);
+    let mut records = lock(&state.pro().moves.acted);
     if let Some(at) = acted_ms {
         records.insert(workspace.into(), at);
     } else {

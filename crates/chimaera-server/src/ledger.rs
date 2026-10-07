@@ -963,7 +963,7 @@ pub(crate) async fn resume_deferred_filtered(
         .filter(|entry| entry.workspace_id == workspace_id && resumable(entry))
         .map(|entry| entry.id.clone())
         .collect();
-    state.session_proxy.clear_workspace(workspace_id);
+    state.policy().workspace_resuming(state, workspace_id);
     let mut failure = None;
     for id in ids {
         if let Err(error) = resume_one(state, &workspace, &id, &resumable).await {

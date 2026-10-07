@@ -48,7 +48,9 @@ impl Harness {
             Ok::<_, anyhow::Error>((state, workspace))
         })
         .await??;
-        state.daemon_extension = factory.map(|factory| factory());
+        if let Some(runtime) = factory.map(|factory| factory()) {
+            state.pro().set_runtime(runtime);
+        }
         let state = Arc::new(state);
         let body = Registration {
             host_id: "worker-fixture".into(),
@@ -61,9 +63,9 @@ impl Harness {
             register(State(state.clone()), Json(body)).await.status() == StatusCode::NO_CONTENT,
             "fixture placement refused"
         );
-        poll_workspaces(&state.session_proxy, &state.changes).await;
+        poll_workspaces(&state.pro().session_proxy, &state.changes).await;
         ensure!(
-            state.session_proxy.for_session("s-fixture").is_some(),
+            state.pro().session_proxy.for_session("s-fixture").is_some(),
             "fixture roster missing"
         );
         let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -139,7 +141,10 @@ impl Harness {
         }
     }
     pub fn retire(&self) {
-        self.state.session_proxy.clear_workspace(&self.workspace);
+        self.state
+            .pro()
+            .session_proxy
+            .clear_workspace(&self.workspace);
     }
     /// Closing the client alone is not a cleanup receipt. Wait for the actual
     /// original upgrade task to finish before the caller may remove its root.

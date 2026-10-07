@@ -77,8 +77,6 @@ pub(crate) struct AppState {
     /// the moment the id is in neither registry — a vanishing row would make
     /// every window prune the session's tabs mid-toggle.
     pub(crate) chat_switching: Mutex<HashMap<String, String>>,
-    /// Durable public imports gate execution before boot ledger restoration.
-    pub(crate) bundle_imports: Lazy<crate::bundle::PendingImports>,
     /// Workspaces with a Mastermind PUT/DELETE in flight. The routes are
     /// multi-step (retire old → bind → spawn, with rollback); two racing
     /// callers would leak the loser's spawned session and could clobber the
@@ -95,18 +93,18 @@ pub(crate) struct AppState {
     /// session id -> workspace id.
     pub(crate) session_workspaces: Mutex<HashMap<String, String>>,
     pub(crate) activity: Mutex<crate::activity::Activity>,
-    /// Pro's state, read from disk only when the Pro policy first uses it:
-    /// a daemon without the extension never touches it.
-    pub(crate) pro: Lazy<crate::pro::ProState>,
+    /// The data directory the state was built from (`~/.chimaera/data`).
+    pub(crate) data_dir: PathBuf,
+    /// The composed extension's own state, opaque to shared code: the
+    /// installed policy reaches it by type (`extension::<T>()`). Empty, and
+    /// never built, on a daemon without an extension.
+    pub(crate) extension: std::sync::OnceLock<Box<dyn std::any::Any + Send + Sync>>,
     /// The workspace-admission hook (`policy`); the inert default unless a
     /// composition installs one at startup.
     pub(crate) policy: std::sync::OnceLock<Arc<dyn crate::policy::WorkspacePolicy>>,
-    pub(crate) daemon_extension: Option<Arc<dyn crate::daemon_extension::Runtime>>,
-    pub(crate) cloud_providers: crate::cloud::providers::ProviderSlot,
     pub(crate) deferred_sessions: Mutex<HashMap<String, crate::ledger::LedgerEntry>>,
     /// session id -> the turn its resumers take (`ledger::resume_one`).
     pub(crate) resuming: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    pub(crate) session_proxy: crate::session_proxy::Store,
     /// session id -> agent wrapper state (kind "agent" sessions only).
     pub(crate) agents: Mutex<HashMap<String, agents::AgentRecord>>,
     /// session id -> polled shell display name (naming rule zero); written
@@ -330,24 +328,14 @@ impl AppState {
             chat_signals: Mutex::new(Some(chat_signals_rx)),
             chat_recipes: Mutex::new(HashMap::new()),
             chat_switching: Mutex::new(HashMap::new()),
-            bundle_imports: Lazy::new({
-                let data_dir = data_dir.clone();
-                move || crate::bundle::PendingImports::load(&data_dir)
-            }),
             mastermind_switching: Mutex::new(std::collections::HashSet::new()),
             spawn_reservations: Mutex::new(HashMap::new()),
             session_workspaces: Mutex::new(HashMap::new()),
             activity: Mutex::new(crate::activity::Activity::default()),
-            pro: Lazy::new({
-                let root = data_dir.join("pro");
-                move || crate::pro::ProState::new(root)
-            }),
+            extension: std::sync::OnceLock::new(),
             policy: std::sync::OnceLock::new(),
-            daemon_extension: None,
-            cloud_providers: crate::cloud::providers::ProviderSlot::default(),
             deferred_sessions: Mutex::new(HashMap::new()),
             resuming: Mutex::new(HashMap::new()),
-            session_proxy: crate::session_proxy::Store::default(),
             agents: Mutex::new(HashMap::new()),
             display_names: Mutex::new(HashMap::new()),
             current_cwds: Mutex::new(HashMap::new()),
@@ -390,6 +378,7 @@ impl AppState {
             plugin_runtime: plugins::runtime::PluginRuntime::default(),
             plugin_state: Mutex::new(plugins::hostfns::PluginStates::default()),
             plugin_platform: plugins::platform::Platform::new(&data_dir),
+            data_dir: data_dir.clone(),
             tui_episodes: Mutex::new(episodes::TuiEpisodes::default()),
             episode_queue: episodes::EpisodeQueue::default(),
             timeline_jobs_started: std::sync::atomic::AtomicBool::new(false),
@@ -456,7 +445,7 @@ fn default_policy(state: &AppState) -> Arc<dyn crate::policy::WorkspacePolicy> {
 /// host when it carries an extension, as the composed daemon would.
 #[cfg(not(test))]
 fn default_policy(state: &AppState) -> Arc<dyn crate::policy::WorkspacePolicy> {
-    if state.daemon_extension.is_some() {
+    if state.extension.get().is_some() {
         crate::pro::compose(state);
         Arc::new(crate::pro::ProPolicy::default())
     } else {
@@ -475,11 +464,6 @@ impl<T> Lazy<T> {
             cell: std::sync::OnceLock::new(),
             init: Mutex::new(Some(Box::new(init))),
         }
-    }
-    /// Whether anything has used it yet.
-    #[cfg(test)]
-    pub(crate) fn initialized(&self) -> bool {
-        self.cell.get().is_some()
     }
 }
 impl<T> std::ops::Deref for Lazy<T> {

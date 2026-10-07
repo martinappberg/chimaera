@@ -236,6 +236,28 @@ pub(crate) struct LaunchContext {
     pub(crate) tools: bool,
 }
 
+/// A frame a project that runs on another daemon sends the window that
+/// watches it, in place of this daemon's own file, git and timeline
+/// watching.
+pub(crate) enum ProjectFrame {
+    /// A path-only invalidation, already in this window's paths.
+    Fs(serde_json::Value),
+    /// The project's Git epoch where it runs.
+    Git(u64),
+    /// The project's Timeline epoch where it runs.
+    Timeline(u64),
+}
+
+/// The live view of a routed project for one window (`routed`): ends when
+/// the project stops being served elsewhere or its owner refuses it.
+pub(crate) trait ProjectFeed: Send {
+    fn workspace(&self) -> &str;
+    /// The window's mounted previews and listed folders, in its own paths.
+    fn watch(&self, files: Vec<String>, dirs: Vec<String>);
+    /// `None` once the feed ended.
+    fn next(&mut self) -> BoxFuture<'_, Option<ProjectFrame>>;
+}
+
 /// The workspace-admission hook. Implementations are trusted in-process.
 /// Every method must be cheap and must not block: shared code calls them on
 /// the reactor and on hot paths.
@@ -359,8 +381,44 @@ pub(crate) trait WorkspacePolicy: Send + Sync + 'static {
     fn stopping(&self, state: &AppState);
     /// Daemon shutdown, after the live agents were stopped.
     fn shutdown<'a>(&'a self, state: &'a Arc<AppState>) -> BoxFuture<'a, ()>;
+    /// Whether `workspace`'s files are served by another daemon right now,
+    /// so a window watches its feed instead of this disk.
+    fn routed(&self, state: &AppState, workspace: &str) -> bool;
+    /// Of `paths`, the ones outside a routed project's root: this computer's
+    /// own files, still watched here.
+    fn outside_project(&self, state: &AppState, workspace: &str, paths: &[String]) -> Vec<String>;
+    /// Start the feed of a routed project for one window; `None` when the
+    /// policy serves no feeds.
+    fn project_feed(
+        &self,
+        state: &Arc<AppState>,
+        workspace: &str,
+        files: Vec<String>,
+        dirs: Vec<String>,
+    ) -> Option<Box<dyn ProjectFeed>>;
+    /// Deferred sessions of `workspace` are resuming here: rows another
+    /// daemon served for it are no longer current.
+    fn workspace_resuming(&self, state: &AppState, workspace: &str);
+    /// Sessions another daemon serves that wait on a permission decision
+    /// (`(session, workspace)`), so a relayed alert stays up until answered.
+    fn routed_decisions(&self, state: &AppState) -> Vec<(String, String)>;
     /// Routes served under `/api/v1`, behind the bearer check.
-    fn routes(&self) -> axum::Router<Arc<AppState>>;
+    fn routes(&self, state: &Arc<AppState>) -> axum::Router<Arc<AppState>>;
+    /// The policy's own middleware around the authenticated API routes
+    /// (inside the bearer check): identity without an extension.
+    fn api_layers(
+        &self,
+        state: &Arc<AppState>,
+        api: axum::Router<Arc<AppState>>,
+    ) -> axum::Router<Arc<AppState>>;
+    /// The same around the ticket and WebSocket routes (outside it).
+    fn ticket_layers(
+        &self,
+        state: &Arc<AppState>,
+        routes: axum::Router<Arc<AppState>>,
+    ) -> axum::Router<Arc<AppState>>;
+    /// The outermost layer over the whole app.
+    fn outer_layers(&self, app: axum::Router) -> axum::Router;
 }
 
 /// No extension: admit everything, record nothing, run nothing.
@@ -499,7 +557,43 @@ impl WorkspacePolicy for Inert {
     fn shutdown<'a>(&'a self, _: &'a Arc<AppState>) -> BoxFuture<'a, ()> {
         Box::pin(async {})
     }
-    fn routes(&self) -> axum::Router<Arc<AppState>> {
+    fn routed(&self, _: &AppState, _: &str) -> bool {
+        false
+    }
+    fn outside_project(&self, _: &AppState, _: &str, paths: &[String]) -> Vec<String> {
+        paths.to_vec()
+    }
+    fn project_feed(
+        &self,
+        _: &Arc<AppState>,
+        _: &str,
+        _: Vec<String>,
+        _: Vec<String>,
+    ) -> Option<Box<dyn ProjectFeed>> {
+        None
+    }
+    fn workspace_resuming(&self, _: &AppState, _: &str) {}
+    fn routed_decisions(&self, _: &AppState) -> Vec<(String, String)> {
+        Vec::new()
+    }
+    fn routes(&self, _: &Arc<AppState>) -> axum::Router<Arc<AppState>> {
         axum::Router::new()
+    }
+    fn api_layers(
+        &self,
+        _: &Arc<AppState>,
+        api: axum::Router<Arc<AppState>>,
+    ) -> axum::Router<Arc<AppState>> {
+        api
+    }
+    fn ticket_layers(
+        &self,
+        _: &Arc<AppState>,
+        routes: axum::Router<Arc<AppState>>,
+    ) -> axum::Router<Arc<AppState>> {
+        routes
+    }
+    fn outer_layers(&self, app: axum::Router) -> axum::Router {
+        app
     }
 }

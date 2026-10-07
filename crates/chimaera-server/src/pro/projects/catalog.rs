@@ -87,7 +87,7 @@ pub(super) async fn list(
                 projects.push(Project {
                     local_root: local_root(state, &row.workspace_id),
                     destination_saved: account_matches(state, &row.workspace_id)
-                        && lock(&state.pro.adoptions).contains_key(&row.workspace_id),
+                        && lock(&state.pro().adoptions).contains_key(&row.workspace_id),
                     workspace_id: row.workspace_id,
                     name: row.name,
                     host_id: None,

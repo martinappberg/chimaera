@@ -19,12 +19,12 @@ fn receipt_fixture() -> wire::Checkpoint {
 async fn cold_boot_proof_clears_only_orphan_process_uncertainty_not_execution_authority() {
     let (state, config, root) = fixture();
     accept(&state, &config, &baton(), 0, RequestStart::now()).unwrap();
-    lock(&state.pro.ownership).insert("w-a".into(), Ownership::Local { epoch: 2 });
-    crate::pro::ensure_root(&state.pro.root).await.unwrap();
+    lock(&state.pro().ownership).insert("w-a".into(), Ownership::Local { epoch: 2 });
+    crate::pro::ensure_root(&state.pro().root).await.unwrap();
     prepare_launch(&state, "w-a").await.unwrap();
-    let mut saved = lock(&state.pro.preferences).clone();
+    let mut saved = lock(&state.pro().preferences).clone();
     saved.get_mut("w-a").unwrap().execution_boot = Some("different-synthetic-kernel-boot".into());
-    let restored = State::restore(&state.pro.root, &saved, true, false);
+    let restored = State::restore(&state.pro().root, &saved, true, false);
     if restored.boot.is_some() {
         assert!(!lock(&restored.unclean).contains_key("w-a"));
     } else {
@@ -37,7 +37,7 @@ async fn cold_boot_proof_clears_only_orphan_process_uncertainty_not_execution_au
     assert!(restored.latched.lock().unwrap().contains("w-a"));
     saved.get_mut("w-a").unwrap().execution_boot = None;
     assert!(
-        lock(&State::restore(&state.pro.root, &saved, true, false).unclean).contains_key("w-a")
+        lock(&State::restore(&state.pro().root, &saved, true, false).unclean).contains_key("w-a")
     );
     std::fs::remove_dir_all(root).unwrap();
 }
