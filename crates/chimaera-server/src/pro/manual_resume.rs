@@ -33,11 +33,6 @@ pub(crate) async fn resume(
     Path(id): Path<String>,
     request: Request,
 ) -> Response {
-    // Only Pro parks a conversation for manual resume. A free daemon has
-    // nothing to resume and must take no lock or create no Pro state.
-    if crate::pro::tier(&state) == crate::pro::Tier::Free {
-        return refusal(StatusCode::NOT_FOUND, "manual_resume_missing");
-    }
     #[cfg(not(unix))]
     {
         let _ = (state, id, request);
@@ -67,7 +62,7 @@ pub(crate) async fn resume(
             return refusal(StatusCode::CONFLICT, "manual_resume_unqualified");
         };
         if agent.ui != chimaera_agent::model::SessionUi::Chat
-            || ledger::manual::Receipt::for_entry(&entry).is_err()
+            || crate::pro::manual_receipt::Receipt::for_entry(&entry).is_err()
         {
             return refusal(StatusCode::CONFLICT, "manual_resume_unqualified");
         }
@@ -147,10 +142,11 @@ async fn owned(
             .await
             .map_err(|_| failed("storage_root"))?;
         let storage = state.clone();
-        let mut receipts = tokio::task::spawn_blocking(move || ledger::manual::load(&storage))
-            .await
-            .map_err(|_| failed("receipt_worker"))?
-            .map_err(|_| failed("receipt_read"))?;
+        let mut receipts =
+            tokio::task::spawn_blocking(move || crate::pro::manual_receipt::load(&storage))
+                .await
+                .map_err(|_| failed("receipt_worker"))?
+                .map_err(|_| failed("receipt_read"))?;
         current()?;
         let deferred = crate::lock(&state.deferred_sessions)
             .get(&entry.id)
@@ -245,10 +241,12 @@ async fn owned(
                 .map_err(|_| ())?;
             current()?;
             let storage = state.clone();
-            tokio::task::spawn_blocking(move || ledger::manual::save(&storage, &receipts))
-                .await
-                .map_err(|_| ())?
-                .map_err(|_| ())?;
+            tokio::task::spawn_blocking(move || {
+                crate::pro::manual_receipt::save(&storage, &receipts)
+            })
+            .await
+            .map_err(|_| ())?
+            .map_err(|_| ())?;
             current()?;
             if crate::lock(&state.deferred_sessions).get(&entry.id) != Some(&entry) {
                 return Err(());

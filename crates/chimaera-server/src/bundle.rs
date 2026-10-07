@@ -46,20 +46,7 @@ pub(crate) enum ExportMode {
     Snapshot,
     Stop,
 }
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum Origin {
-    Moved,
-    Home,
-}
-impl Origin {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Moved => "moved",
-            Self::Home => "home",
-        }
-    }
-}
+pub(crate) use crate::ledger::{HandoffResume, Origin};
 #[derive(Clone, Deserialize)]
 pub(crate) struct ImportOptions {
     #[serde(default)]
@@ -70,12 +57,6 @@ pub(crate) struct ImportOptions {
     pub defer_start: bool,
     #[serde(default)]
     pub destination_root: Option<PathBuf>,
-}
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct HandoffResume {
-    pub fork: bool,
-    pub origin: Origin,
-    pub epoch: u64,
 }
 #[derive(Serialize)]
 pub(crate) struct ImportedSession {

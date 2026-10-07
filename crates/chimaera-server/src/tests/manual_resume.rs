@@ -175,7 +175,9 @@ async fn same_id_survives_observer_loss(managed: bool) {
     assert_eq!(state.chat.get(&entry.id).unwrap().created_at_ms, before);
     assert_eq!(state.chat.process_group(&entry.id), Some(process));
     assert_eq!(state.chat.attach(&entry.id, 0).unwrap().head_seq, head);
-    assert!(ledger::manual::load(&state).unwrap().contains(&entry));
+    assert!(crate::pro::manual_receipt::load(&state)
+        .unwrap()
+        .contains(&entry));
     assert!(lock(&state.ledger)
         .load_boot()
         .sessions
@@ -335,10 +337,12 @@ async fn manual_receipts_refuse_unknown_storage_and_bound_live_originals() {
     pro::ensure_root(pro::manual_resume_storage(&state))
         .await
         .unwrap();
-    let mut receipts = ledger::manual::load(&state).unwrap();
+    let mut receipts = crate::pro::manual_receipt::load(&state).unwrap();
     receipts.retain(&state, &entry).unwrap();
-    ledger::manual::save(&state, &receipts).unwrap();
-    assert!(ledger::manual::load(&state).unwrap().contains(&entry));
+    crate::pro::manual_receipt::save(&state, &receipts).unwrap();
+    assert!(crate::pro::manual_receipt::load(&state)
+        .unwrap()
+        .contains(&entry));
     for index in 1..64 {
         let mut next = entry.clone();
         next.id = format!("s-manual-{index}");
@@ -348,7 +352,7 @@ async fn manual_receipts_refuse_unknown_storage_and_bound_live_originals() {
     let mut overflow = entry.clone();
     overflow.id = "s-manual-overflow".into();
     assert!(receipts.retain(&state, &overflow).is_err());
-    ledger::manual::save(&state, &receipts).unwrap();
+    crate::pro::manual_receipt::save(&state, &receipts).unwrap();
     let path = pro::manual_resume_storage(&state).join("manual-resumes.json");
     for bytes in [
         b"{\"version\":1,\"entries\":[],\"unknown\":1}".as_slice(),
@@ -356,17 +360,17 @@ async fn manual_receipts_refuse_unknown_storage_and_bound_live_originals() {
         b"{\"version\":1,\"entries\":[]} trailing",
     ] {
         std::fs::write(&path, bytes).unwrap();
-        assert!(ledger::manual::load(&state).is_err());
+        assert!(crate::pro::manual_receipt::load(&state).is_err());
     }
     std::fs::write(&path, vec![b' '; 128 * 1024 + 1]).unwrap();
-    assert!(ledger::manual::load(&state).is_err());
+    assert!(crate::pro::manual_receipt::load(&state).is_err());
     std::fs::remove_file(&path).unwrap();
     std::os::unix::fs::symlink("absent", &path).unwrap();
-    assert!(ledger::manual::load(&state).is_err());
+    assert!(crate::pro::manual_receipt::load(&state).is_err());
     std::fs::remove_file(&path).unwrap();
     let fifo = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
     assert_eq!(unsafe { nix::libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
     let started = std::time::Instant::now();
-    assert!(ledger::manual::load(&state).is_err());
+    assert!(crate::pro::manual_receipt::load(&state).is_err());
     assert!(started.elapsed() < Duration::from_secs(1));
 }

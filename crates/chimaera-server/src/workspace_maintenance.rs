@@ -276,7 +276,7 @@ impl PreparedWorkspace {
                 .agent
                 .as_ref()
                 .is_some_and(|agent| agent.ui == chimaera_agent::model::SessionUi::Chat)
-                && ledger::manual::Receipt::for_entry(&entry).is_ok();
+                && crate::pro::manual_receipt::Receipt::for_entry(&entry).is_ok();
             #[cfg(not(unix))]
             let manual = false;
             if manual {

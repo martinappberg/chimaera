@@ -154,13 +154,7 @@ pub(crate) struct Remove {
     host_id: Option<String>,
     workspace_id: Option<String>,
 }
-#[derive(Clone, Default, Deserialize, Serialize)]
-pub(crate) struct SocketOptions {
-    #[serde(default)]
-    pub read_only: bool,
-    #[serde(default)]
-    pub wake: Option<String>,
-}
+pub(crate) use crate::ws::SocketOptions;
 /// Whether `path` names the project folder `root` or something in it.
 fn inside(root: &std::path::Path, path: &str) -> bool {
     std::path::Path::new(path).starts_with(root)

@@ -18,7 +18,7 @@ pub(crate) async fn list_workspaces(
     Json(
         workspaces
             .into_iter()
-            .filter(|workspace| !crate::cloud::is_onboarding_workspace(workspace))
+            .filter(|workspace| !workspace.cloud_internal)
             .map(|workspace| {
                 let mut value = json!(workspace);
                 state

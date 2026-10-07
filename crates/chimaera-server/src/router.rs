@@ -239,7 +239,6 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         // app drives it through the tunnel to shut a remote host down.
         .route("/shutdown", post(api::shutdown))
         .route("/sessions/{id}/exec", post(api::exec_session))
-        .route("/sessions/{id}/resume", post(api::resume_manual_session))
         // Streamed to disk with its own per-file/per-session caps (see
         // `upload`); the DefaultBodyLimit override only lifts axum's 2MB
         // buffered-body default out of the way of multi-MB screenshots.
@@ -382,12 +381,6 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .policy()
         .api_layers(&state, api)
         .route_layer(middleware::from_fn_with_state(state.clone(), api::auth))
-        // Outermost: without the extension the `/pro/*` routes do not exist,
-        // so they answer exactly as an unknown route did before.
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            api::pro_routes,
-        ))
         // Registered after route_layer, so hook ingestion is NOT behind bearer
         // auth: claude's hooks cannot know the daemon token, so the random
         // per-session key embedded in the hook URL authorizes them instead.

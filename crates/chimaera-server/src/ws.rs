@@ -531,24 +531,29 @@ pub(crate) fn session_writable(state: &AppState, id: &str) -> bool {
     })
 }
 
+/// A session socket's query options: watch only, and (for a session that
+/// runs on another machine) which wake the viewer asked for.
+#[derive(Clone, Default, serde::Deserialize, serde::Serialize)]
+pub(crate) struct SocketOptions {
+    #[serde(default)]
+    pub read_only: bool,
+    #[serde(default)]
+    pub wake: Option<String>,
+}
+
 /// GET /ws/sessions/{id}
 pub(crate) async fn session_ws(
     ws: WebSocketUpgrade,
     Path(id): Path<String>,
     State(state): State<Arc<AppState>>,
-    Query(options): Query<crate::session_proxy::SocketOptions>,
+    Query(options): Query<SocketOptions>,
 ) -> Response {
     ws.max_message_size(MAX_TERMINAL_INPUT_MESSAGE)
         .max_frame_size(MAX_TERMINAL_INPUT_MESSAGE)
         .on_upgrade(move |socket| handle(socket, id, state, options))
 }
 
-async fn handle(
-    mut socket: WebSocket,
-    id: String,
-    state: Arc<AppState>,
-    options: crate::session_proxy::SocketOptions,
-) {
+async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>, options: SocketOptions) {
     let auth = match authenticate(&mut socket, &state, true).await {
         Ok(auth) => auth,
         Err(denied) => {
@@ -566,7 +571,9 @@ async fn handle(
     }
     let remote_auth = json!({"type":"auth", "token":"", "cols":auth.dims.map(|d| d.0), "rows":auth.dims.map(|d| d.1), "parked":auth.parked});
     if scope.is_none()
-        && crate::session_proxy::socket(&state, &id, "sessions", &options, remote_auth, &mut socket)
+        && state
+            .policy()
+            .proxy_socket(&state, &id, "sessions", &options, remote_auth, &mut socket)
             .await
     {
         return;
@@ -1138,7 +1145,7 @@ pub(crate) async fn chat_ws(
     ws: WebSocketUpgrade,
     Path(id): Path<String>,
     State(state): State<Arc<AppState>>,
-    Query(options): Query<crate::session_proxy::SocketOptions>,
+    Query(options): Query<SocketOptions>,
 ) -> Response {
     ws.max_message_size(MAX_CHAT_COMMAND_MESSAGE)
         .max_frame_size(MAX_CHAT_COMMAND_MESSAGE)
@@ -1183,7 +1190,7 @@ async fn handle_chat(
     mut socket: WebSocket,
     id: String,
     state: Arc<AppState>,
-    options: crate::session_proxy::SocketOptions,
+    options: SocketOptions,
 ) {
     let (last_seq, scope) = match chat_authenticate(&mut socket, &state).await {
         Ok(auth) => auth,
@@ -1201,15 +1208,17 @@ async fn handle_chat(
         return;
     }
     if scope.is_none()
-        && crate::session_proxy::socket(
-            &state,
-            &id,
-            "chat",
-            &options,
-            json!({"type":"auth","token":"","last_seq":last_seq}),
-            &mut socket,
-        )
-        .await
+        && state
+            .policy()
+            .proxy_socket(
+                &state,
+                &id,
+                "chat",
+                &options,
+                json!({"type":"auth","token":"","last_seq":last_seq}),
+                &mut socket,
+            )
+            .await
     {
         return;
     }

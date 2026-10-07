@@ -1195,9 +1195,31 @@ pub(crate) use super::projects::{copy_project, project_list, takeover_project};
 
 /// Every route Pro serves under `/api/v1` (behind the bearer check), mounted
 /// only when the Pro policy is installed.
-pub(crate) fn router() -> axum::Router<std::sync::Arc<crate::AppState>> {
+/// Pro's routes exist only while Pro is composed (an extension, or the
+/// account's cloud): otherwise they answer exactly as an unknown route.
+async fn only_composed(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if !state.policy().composed(&state) {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
+    }
+    next.run(request).await
+}
+
+pub(crate) fn router(state: &Arc<AppState>) -> axum::Router<std::sync::Arc<crate::AppState>> {
+    routes().route_layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        only_composed,
+    ))
+}
+
+fn routes() -> axum::Router<std::sync::Arc<crate::AppState>> {
     use axum::routing::{get, post, put};
     axum::Router::new()
+        // Explicit same-conversation restoration of a parked conversation.
+        .route("/sessions/{id}/resume", post(super::manual_resume::resume))
         .route(
             "/pro/configure",
             post(super::configure).delete(super::disconnect),

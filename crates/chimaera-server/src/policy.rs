@@ -408,6 +408,18 @@ pub(crate) trait WorkspacePolicy: Send + Sync + 'static {
         files: Vec<String>,
         dirs: Vec<String>,
     ) -> Option<Box<dyn ProjectFeed>>;
+    /// Serve a session socket from the daemon that owns the session, when
+    /// the policy routes it there: `true` once the relay ran to its end,
+    /// `false` when the session is this daemon's own.
+    fn proxy_socket<'a>(
+        &'a self,
+        state: &'a Arc<AppState>,
+        session: &'a str,
+        kind: &'a str,
+        options: &'a crate::ws::SocketOptions,
+        auth: serde_json::Value,
+        socket: &'a mut axum::extract::ws::WebSocket,
+    ) -> BoxFuture<'a, bool>;
     /// Deferred sessions of `workspace` are resuming here: rows another
     /// daemon served for it are no longer current.
     fn workspace_resuming(&self, state: &AppState, workspace: &str);
@@ -593,6 +605,17 @@ impl WorkspacePolicy for Inert {
         _: Vec<String>,
     ) -> Option<Box<dyn ProjectFeed>> {
         None
+    }
+    fn proxy_socket<'a>(
+        &'a self,
+        _: &'a Arc<AppState>,
+        _: &'a str,
+        _: &'a str,
+        _: &'a crate::ws::SocketOptions,
+        _: serde_json::Value,
+        _: &'a mut axum::extract::ws::WebSocket,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(async { false })
     }
     fn workspace_resuming(&self, _: &AppState, _: &str) {}
     fn routed_decisions(&self, _: &AppState) -> Vec<(String, String)> {

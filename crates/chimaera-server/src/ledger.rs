@@ -27,11 +27,32 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 
-#[cfg(unix)]
-#[path = "ledger_manual.rs"]
-pub(crate) mod manual;
-
 use crate::agents::AgentKind;
+
+/// Where a conversation that arrived by handoff came from: moved here from
+/// the machine that ran it, or home again after running elsewhere.
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Origin {
+    Moved,
+    Home,
+}
+impl Origin {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Moved => "moved",
+            Self::Home => "home",
+        }
+    }
+}
+/// A conversation's handoff provenance, kept on its ledger entry.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct HandoffResume {
+    pub fork: bool,
+    pub origin: Origin,
+    pub epoch: u64,
+}
+
 use crate::AppState;
 use chimaera_agent::model::SessionUi;
 
@@ -49,7 +70,7 @@ pub(crate) struct LedgerEntry {
     /// epoch, or one it acquired straight from it with nobody in between;
     /// otherwise another machine may have finished its turn (review R4 S1).
     pub(crate) fence_epoch: Option<u64>,
-    pub(crate) handoff: Option<crate::bundle::HandoffResume>,
+    pub(crate) handoff: Option<HandoffResume>,
     pub(crate) workspace_id: String,
     /// Last polled cwd (shells) or spawn cwd (agents).
     pub(crate) cwd: PathBuf,
@@ -956,7 +977,7 @@ pub(crate) async fn resume_deferred_filtered(
                 && entry
                     .handoff
                     .as_ref()
-                    .is_some_and(|handoff| handoff.origin == crate::bundle::Origin::Moved))
+                    .is_some_and(|handoff| handoff.origin == Origin::Moved))
     };
     let ids: Vec<_> = crate::lock(&state.deferred_sessions)
         .values()

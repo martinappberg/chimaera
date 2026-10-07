@@ -171,15 +171,8 @@ impl WorkspaceStore {
                 Vec::new()
             }
         };
-        let mut migrated = false;
         let mut dropped = false;
         for workspace in &mut items {
-            // Older workers recorded only this daemon-reserved absolute path.
-            // Persist the purpose once so ordinary names never drive filtering.
-            if !workspace.cloud_internal && crate::cloud::is_onboarding_workspace(workspace) {
-                workspace.cloud_internal = true;
-                migrated = true;
-            }
             let before = workspace.plugins_on.len();
             workspace
                 .plugins_on
@@ -192,7 +185,7 @@ impl WorkspaceStore {
             generation: 0,
             written: Arc::new(Mutex::new(0)),
         };
-        if migrated || dropped {
+        if dropped {
             // Kept in memory either way: the next save carries it.
             if let Err(error) = store.save() {
                 tracing::warn!(%error, "could not persist the workspace registry's load-time changes");
@@ -351,6 +344,22 @@ impl WorkspaceStore {
         Ok(workspace)
     }
 
+    /// Mark `ids` internal (never listed, never offered); the snapshot to
+    /// write when any changed.
+    pub(crate) fn mark_internal(&mut self, ids: &[String]) -> anyhow::Result<Option<Snapshot>> {
+        let mut changed = false;
+        for workspace in self.items.iter_mut() {
+            if !workspace.cloud_internal && ids.contains(&workspace.id) {
+                workspace.cloud_internal = true;
+                changed = true;
+            }
+        }
+        if changed {
+            self.snapshot().map(Some)
+        } else {
+            Ok(None)
+        }
+    }
     pub(crate) fn add_internal(&mut self, root: PathBuf) -> anyhow::Result<Workspace> {
         let added = self.add(root)?;
         let entry = self.items.iter_mut().find(|w| w.id == added.id).unwrap();

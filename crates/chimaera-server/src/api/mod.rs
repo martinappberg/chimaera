@@ -11,7 +11,6 @@ use crate::AppState;
 
 mod env;
 mod exec;
-mod manual_resume;
 mod sessions;
 mod shutdown;
 mod workspaces;
@@ -21,7 +20,6 @@ pub(crate) use env::{launcher_context_env, session_env, spawn_env_remove};
 #[cfg(test)]
 pub(crate) use env::spawn_path;
 pub(crate) use exec::{exec_session, session_journal};
-pub(crate) use manual_resume::resume as resume_manual_session;
 pub(crate) use sessions::{create_session, delete_session, list_sessions, rename_session};
 pub(crate) use shutdown::{delete_all_sessions, shutdown};
 pub(crate) use workspaces::{
@@ -51,25 +49,6 @@ pub(crate) async fn auth(State(state): State<Arc<AppState>>, req: Request, next:
         )
             .into_response()
     }
-}
-
-/// `/pro/*` exists only on a daemon with the extension (or the account's
-/// cloud): a daemon without it answers those paths as any unknown route.
-pub(crate) async fn pro_routes(
-    State(state): State<Arc<AppState>>,
-    req: Request,
-    next: Next,
-) -> Response {
-    let path = req.uri().path();
-    let path = path.strip_prefix("/api/v1").unwrap_or(path);
-    // Manual resume is Pro's too (`api/manual_resume.rs`).
-    let manual_resume = path
-        .strip_prefix("/sessions/")
-        .is_some_and(|rest| rest.split('/').nth(1) == Some("resume"));
-    if (path.starts_with("/pro/") || manual_resume) && !state.policy().composed(&state) {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
-    }
-    next.run(req).await
 }
 
 /// GET /api/v1/health

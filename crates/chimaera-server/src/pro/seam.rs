@@ -421,6 +421,27 @@ impl WorkspacePolicy for ProPolicy {
     }
     fn started(&self, state: &Arc<AppState>) -> anyhow::Result<()> {
         self.stage(state)?;
+        // Older workers recorded their setup terminal's folder only by its
+        // reserved path; mark it internal once so names never drive listing.
+        let snapshot = {
+            let mut store = crate::lock(&state.workspaces);
+            let setup: Vec<String> = store
+                .list()
+                .iter()
+                .filter(|w| !w.cloud_internal && crate::cloud::is_onboarding_workspace(w))
+                .map(|w| w.id.clone())
+                .collect();
+            store.mark_internal(&setup)
+        };
+        match snapshot {
+            Ok(Some(snapshot)) => {
+                if let Err(error) = snapshot.write() {
+                    tracing::warn!(%error, "could not persist the setup workspace's purpose");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, "could not mark the setup workspace"),
+        }
         // Transfer leftovers (staging copies, Git locks, temporary archives)
         // from a previous daemon life that never finished them.
         super::sweep_leftovers(state);
@@ -455,6 +476,19 @@ impl WorkspacePolicy for ProPolicy {
             dirs,
         )))
     }
+    fn proxy_socket<'a>(
+        &'a self,
+        state: &'a Arc<AppState>,
+        session: &'a str,
+        kind: &'a str,
+        options: &'a crate::ws::SocketOptions,
+        auth: serde_json::Value,
+        socket: &'a mut axum::extract::ws::WebSocket,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(crate::session_proxy::socket(
+            state, session, kind, options, auth, socket,
+        ))
+    }
     fn workspace_resuming(&self, state: &AppState, workspace: &str) {
         state.pro().session_proxy.clear_workspace(workspace);
     }
@@ -473,7 +507,7 @@ impl WorkspacePolicy for ProPolicy {
                     )),
                 )
             });
-        super::routes::router().merge(extension)
+        super::routes::router(state).merge(extension)
     }
     fn api_layers(
         &self,

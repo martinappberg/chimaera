@@ -13,6 +13,8 @@ pub(crate) mod engine;
 pub(crate) mod execution;
 pub(crate) mod install;
 mod kept;
+pub(crate) mod manual_receipt;
+mod manual_resume;
 pub(crate) mod mirror;
 pub(crate) mod moves;
 mod moving;
