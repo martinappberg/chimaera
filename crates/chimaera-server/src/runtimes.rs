@@ -2391,7 +2391,3 @@ esac
         assert!(!is_managed(Path::new("/home/u/.local/bin/claude"), &root));
     }
 }
-
-#[cfg(test)]
-#[path = "installer_pty_tests.rs"]
-mod installer_pty_tests;

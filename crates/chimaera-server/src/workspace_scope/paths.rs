@@ -4,7 +4,7 @@ use base64::Engine;
 use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
 
-pub(super) const HEADER: &str = "x-chimaera-viewer-root";
+pub const HEADER: &str = "x-chimaera-viewer-root";
 #[derive(Clone, Debug)]
 pub(crate) struct Alias {
     pub root: PathBuf,

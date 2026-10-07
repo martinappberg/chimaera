@@ -491,6 +491,3 @@ mod tests {
         std::fs::remove_dir_all(base).unwrap();
     }
 }
-
-#[cfg(test)]
-mod consumer_tests;

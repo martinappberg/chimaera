@@ -162,7 +162,7 @@ fn try_write(root: &Path, id: &str) -> std::io::Result<bool> {
 
 /// Write the marker only when the folder has none (a stat): existing users
 /// gain an identity over time without ever rewriting one. Blocking.
-pub(crate) fn backfill(root: &Path, id: &str) -> bool {
+pub fn backfill(root: &Path, id: &str) -> bool {
     let missing = matches!(
         std::fs::symlink_metadata(marker_path(root)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound

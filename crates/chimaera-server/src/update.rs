@@ -60,7 +60,7 @@ pub struct UpdateStatus {
     pub(crate) error: Option<String>,
     /// Tests only: this state's releases endpoint (a local fake), in place of
     /// the process-wide `CHIMAERA_RELEASES_API`.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "daemon-extension-fixture"))]
     pub(crate) api_override: Option<String>,
 }
 
@@ -231,7 +231,7 @@ pub(crate) async fn check_now(state: &Arc<AppState>) {
     if state.update_epoch.load(Ordering::Relaxed) != seen {
         return;
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "daemon-extension-fixture"))]
     let url = crate::lock(&state.update)
         .api_override
         .clone()
@@ -349,8 +349,8 @@ pub(crate) async fn get_update(
 }
 
 /// Tests only: point this state's own release check at `url`.
-#[cfg(test)]
-pub(crate) fn set_api_for_tests(state: &AppState, url: &str) {
+#[cfg(feature = "daemon-extension-fixture")]
+pub fn set_api_for_tests(state: &AppState, url: &str) {
     crate::lock(&state.update).api_override = Some(url.to_string());
 }
 

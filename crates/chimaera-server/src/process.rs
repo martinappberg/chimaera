@@ -74,7 +74,7 @@ impl Drop for Child {
         let _ = self.child.start_kill();
     }
 }
-pub(crate) fn command(bin: &Path, args: &[&str], cwd: &Path) -> tokio::process::Command {
+pub fn command(bin: &Path, args: &[&str], cwd: &Path) -> tokio::process::Command {
     let argv = crate::launcher::wrap_login_shell(
         &crate::launcher::login_shell(),
         std::iter::once(bin.to_string_lossy().into_owned())

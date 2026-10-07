@@ -55,7 +55,7 @@ pub(super) async fn upload(
     .await
 }
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn upload_with_limits(
+pub async fn upload_with_limits(
     state: Arc<AppState>,
     filesystem: Files,
     mutation: Option<Extension<crate::workspace_scope::Mutation>>,

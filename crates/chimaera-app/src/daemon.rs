@@ -45,7 +45,7 @@ pub fn run_headless() {
 
 /// Build-selected, stateless daemon runtime; the free executable supplies none.
 #[cfg(unix)]
-pub type RuntimeFactory = fn() -> std::sync::Arc<dyn chimaera_server::daemon_extension::Runtime>;
+pub type RuntimeFactory = chimaera_server::PolicyFactory;
 
 /// Private assemblies reuse the original headless runtime and fixed server configuration.
 #[cfg(unix)]
@@ -80,7 +80,7 @@ fn run_headless_with_runtime(factory: Option<RuntimeFactory>) {
             routable_bind: false,
         };
         match factory {
-            Some(factory) => chimaera_server::run_with_extension(config, factory()).await,
+            Some(factory) => chimaera_server::run_with_policy(config, factory).await,
             None => chimaera_server::run(config).await,
         }
     }) {

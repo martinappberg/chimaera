@@ -43,7 +43,6 @@ use axum::Json;
 use serde_json::{json, Value};
 
 use crate::AppState;
-pub mod cloud_context;
 
 /// Protocol version offered when the client's is unknown to us.
 const PROTOCOL_FALLBACK: &str = "2025-06-18";
@@ -305,7 +304,7 @@ pub(crate) async fn mcp(
 }
 
 /// Resolve the session's workspace (via `session_workspaces`), if any.
-fn workspace_of(state: &AppState, agent_id: &str) -> Option<crate::workspaces::Workspace> {
+pub fn workspace_of(state: &AppState, agent_id: &str) -> Option<crate::workspaces::Workspace> {
     // Sequential locks, never nested — the workspace store must not nest
     // inside the row locks (see `session_view::sessions_json`).
     let ws_id = crate::lock(&state.session_workspaces)
@@ -707,12 +706,12 @@ async fn open_browser(state: &AppState, agent_id: &str, args: &Value) -> Value {
 }
 
 /// Result content for a successful tool call.
-fn tool_text(text: String) -> Value {
+pub fn tool_text(text: String) -> Value {
     json!({ "content": [{ "type": "text", "text": text }] })
 }
 
 /// Result content for a failed tool call (isError; the model sees the text).
-fn tool_error(text: String) -> Value {
+pub fn tool_error(text: String) -> Value {
     json!({ "content": [{ "type": "text", "text": text }], "isError": true })
 }
 

@@ -18,11 +18,11 @@ use std::{
     sync::Arc,
 };
 
-pub(crate) const WORKSPACE_HEADER: &str = "x-chimaera-workspace";
-pub(crate) const EPOCH_HEADER: &str = "x-chimaera-epoch";
+pub const WORKSPACE_HEADER: &str = "x-chimaera-workspace";
+pub const EPOCH_HEADER: &str = "x-chimaera-epoch";
 mod commands;
-pub(crate) mod files;
-pub(crate) mod paths;
+pub mod files;
+pub mod paths;
 const MAX_JSON: usize = 1024 * 1024;
 
 /// A scoped request's admission, captured at admission and consumed only at
@@ -99,13 +99,13 @@ pub(crate) fn mutation_failure(error: &anyhow::Error) -> Option<Response> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Scope {
+pub struct Scope {
     pub workspace_id: String,
     pub epoch: u64,
     pub viewer_root: Option<String>,
 }
 #[derive(Default, Deserialize)]
-pub(crate) struct Fields {
+pub struct Fields {
     pub workspace_id: Option<String>,
     pub epoch: Option<u64>,
     pub viewer_root: Option<String>,
@@ -132,7 +132,7 @@ fn valid_id(value: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
 }
-pub(crate) fn from_headers(headers: &HeaderMap) -> Result<Option<Scope>> {
+pub fn from_headers(headers: &HeaderMap) -> Result<Option<Scope>> {
     let one = |name| -> Result<Option<&str>> {
         let values = headers.get_all(name);
         ensure!(values.iter().count() <= 1, "ambiguous workspace scope");
@@ -358,7 +358,7 @@ fn same(scope: &Scope, value: Option<&str>) -> Result<()> {
 
 /// Applied after bearer authentication and before the local placement proxy.
 /// Unknown forwarded routes fail closed; ordinary direct requests are unchanged.
-pub(crate) async fn reject_unbound(request: Request<Body>, next: Next) -> Response {
+pub async fn reject_unbound(request: Request<Body>, next: Next) -> Response {
     let path = request.uri().path();
     if (path.starts_with("/api/v1/mcp/")
         || path.starts_with("/api/v1/agent-events/")
@@ -371,7 +371,7 @@ pub(crate) async fn reject_unbound(request: Request<Body>, next: Next) -> Respon
     }
     next.run(request).await
 }
-pub(crate) async fn middleware(
+pub async fn middleware(
     State(state): State<Arc<AppState>>,
     request: Request<Body>,
     next: Next,
@@ -977,7 +977,7 @@ async fn keep_readable_candidates(
     }
     Ok(())
 }
-pub(crate) fn sessions(state: &AppState, scope: &Scope) -> Vec<Value> {
+pub fn sessions(state: &AppState, scope: &Scope) -> Vec<Value> {
     let alias = scope.alias(state).ok().flatten();
     crate::session_view::sessions_json(state)
         .into_iter()
@@ -991,7 +991,7 @@ pub(crate) fn sessions(state: &AppState, scope: &Scope) -> Vec<Value> {
         .collect()
 }
 
-pub(crate) fn links(state: &AppState, scope: &Scope) -> Vec<Value> {
+pub fn links(state: &AppState, scope: &Scope) -> Vec<Value> {
     crate::links::links_json(state)
         .into_iter()
         .filter(|row| {
@@ -1007,7 +1007,7 @@ pub(crate) fn links(state: &AppState, scope: &Scope) -> Vec<Value> {
 
 /// Ticket routes authenticate through their unguessable ticket, then bind its
 /// actual filesystem resource; scope headers alone never mint file authority.
-pub(crate) async fn ticket_middleware(
+pub async fn ticket_middleware(
     State(state): State<Arc<AppState>>,
     request: Request<Body>,
     next: Next,

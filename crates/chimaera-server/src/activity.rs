@@ -19,10 +19,7 @@ impl Activity {
                 .or_insert(at);
         }
     }
-    pub(crate) fn snapshot<'a>(
-        &mut self,
-        live: impl Iterator<Item = &'a str>,
-    ) -> HashMap<String, u64> {
+    pub fn snapshot<'a>(&mut self, live: impl Iterator<Item = &'a str>) -> HashMap<String, u64> {
         let live: HashSet<_> = live.collect();
         self.input.retain(|id, _| live.contains(id.as_str()));
         self.input.clone()

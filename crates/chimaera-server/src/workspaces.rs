@@ -100,7 +100,7 @@ pub struct WorkspaceStore {
 /// The list as of one change, to write off the store's lock (a plugin
 /// switch: `workspaces.json` can live on NFS, and every route reads this
 /// store).
-pub(crate) struct Snapshot {
+pub struct Snapshot {
     path: PathBuf,
     bytes: Vec<u8>,
     generation: u64,
@@ -114,7 +114,7 @@ impl Snapshot {
     pub(crate) fn write(self) -> anyhow::Result<()> {
         self.write_inner(false)
     }
-    fn write_durable(self) -> anyhow::Result<()> {
+    pub fn write_durable(self) -> anyhow::Result<()> {
         self.write_inner(true)
     }
     fn write_inner(self, durable: bool) -> anyhow::Result<()> {
@@ -346,7 +346,7 @@ impl WorkspaceStore {
 
     /// Mark `ids` internal (never listed, never offered); the snapshot to
     /// write when any changed.
-    pub(crate) fn mark_internal(&mut self, ids: &[String]) -> anyhow::Result<Option<Snapshot>> {
+    pub fn mark_internal(&mut self, ids: &[String]) -> anyhow::Result<Option<Snapshot>> {
         let mut changed = false;
         for workspace in self.items.iter_mut() {
             if !workspace.cloud_internal && ids.contains(&workspace.id) {
@@ -360,7 +360,7 @@ impl WorkspaceStore {
             Ok(None)
         }
     }
-    pub(crate) fn add_internal(&mut self, root: PathBuf) -> anyhow::Result<Workspace> {
+    pub fn add_internal(&mut self, root: PathBuf) -> anyhow::Result<Workspace> {
         let added = self.add(root)?;
         let entry = self.items.iter_mut().find(|w| w.id == added.id).unwrap();
         entry.cloud_internal = true;
@@ -370,7 +370,7 @@ impl WorkspaceStore {
     }
 
     /// Transfer preserves IDs; a conflicting root/ID is never silently merged.
-    pub(crate) fn import_exact(&mut self, workspace: Workspace) -> anyhow::Result<()> {
+    pub fn import_exact(&mut self, workspace: Workspace) -> anyhow::Result<()> {
         if let Some(existing) = self
             .items
             .iter()
@@ -391,7 +391,7 @@ impl WorkspaceStore {
 
     /// Bundle receipts require the current registry, not just its rename, to
     /// survive a crash. Share the normal snapshot ordering gate.
-    pub(crate) fn import_exact_durable(&mut self, workspace: Workspace) -> anyhow::Result<()> {
+    pub fn import_exact_durable(&mut self, workspace: Workspace) -> anyhow::Result<()> {
         self.import_exact(workspace)?;
         self.snapshot()?.write_durable()
     }

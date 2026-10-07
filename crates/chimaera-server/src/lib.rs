@@ -12,16 +12,12 @@ pub mod agents;
 pub mod api;
 mod assets;
 mod browser_open;
-mod bundle;
 #[doc(hidden)]
 pub mod chat;
-mod cloud;
-mod codex_notify;
 #[doc(hidden)]
 pub mod codex_rollout;
 mod comms;
 mod compute;
-pub mod daemon_extension;
 #[doc(hidden)]
 pub mod doc_check;
 #[doc(hidden)]
@@ -62,7 +58,6 @@ pub mod persist;
 mod plugins;
 #[doc(hidden)]
 pub mod policy;
-mod pro;
 #[doc(hidden)]
 pub mod process;
 mod proxy;
@@ -75,7 +70,6 @@ pub mod router;
 mod runtime_retention;
 #[doc(hidden)]
 pub mod runtimes;
-mod session_proxy;
 #[doc(hidden)]
 pub mod session_view;
 #[doc(hidden)]
@@ -93,8 +87,8 @@ pub mod upload;
 mod view_state;
 #[doc(hidden)]
 pub mod voice;
-mod workspace_maintenance;
-mod workspace_scope;
+#[doc(hidden)]
+pub mod workspace_scope;
 #[doc(hidden)]
 pub mod workspaces;
 #[doc(hidden)]
@@ -114,7 +108,18 @@ pub struct ServerConfig {
 }
 
 pub use job_host::run as run_job_host;
-pub use lifecycle::{run, run_with_extension};
+pub use lifecycle::{run, run_with_policy};
+
+/// Builds the workspace policy a composed daemon runs with, called once in
+/// the daemon process before its state exists (a policy may consume a
+/// one-shot launcher handle there).
+pub type PolicyFactory = fn() -> std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = anyhow::Result<std::sync::Arc<dyn policy::WorkspacePolicy>>,
+            > + Send,
+    >,
+>;
 /// `chimaera plugin caps <plugin.toml>`: a manifest's tier, capability
 /// digest and Can list, as the lock and the card record them.
 pub use plugins::capabilities::describe_manifest as plugin_capabilities;

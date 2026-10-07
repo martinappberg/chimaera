@@ -98,33 +98,6 @@ async fn codex_notify_authenticates_and_only_records_verified_terminal_identity(
     state.sessions.kill(&id).unwrap();
 }
 
-/// A moved terminal agent carries whether its turn was in flight, read while
-/// it still runs; an idle one carries nothing (so it resumes with no turn).
-#[tokio::test]
-async fn a_terminal_agents_bundle_records_only_a_turn_in_flight() {
-    let state = test_state();
-    let id = inject_silent_agent(&state, "carry-key");
-    // Quiet terminal, no hook yet: idle.
-    tokio::time::sleep(std::time::Duration::from_millis(
-        crate::agent_state::TUI_QUIET_MS + 100,
-    ))
-    .await;
-    assert!(bundle::tui_carryover(&state, &id).is_none());
-    for busy in [
-        crate::agent_state::AgentState::Running,
-        crate::agent_state::AgentState::NeedsPermission,
-    ] {
-        lock(&state.agents).get_mut(&id).unwrap().state = busy;
-        assert!(
-            bundle::tui_carryover(&state, &id).is_some_and(|carry| carry.turn_in_flight),
-            "{busy:?}"
-        );
-    }
-    lock(&state.agents).get_mut(&id).unwrap().state = crate::agent_state::AgentState::IdlePrompt;
-    assert!(bundle::tui_carryover(&state, &id).is_none());
-    state.sessions.kill(&id).unwrap();
-}
-
 /// Startup failures stay visible even before the first prompt, so users can
 /// read missing-library, authentication and timeout diagnostics.
 #[tokio::test]
@@ -1936,41 +1909,4 @@ async fn real_claude_agent_session() {
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
-}
-
-/// The account's cloud never offers agent updates: its agents come with its
-/// image and are updated with it, so a known-newer release stays off its rows
-/// and `?check=true` probes nothing.
-#[tokio::test]
-async fn the_cloud_never_offers_agent_updates() {
-    let state = test_state();
-    crate::pro::worker_execution_fixture(&state);
-    preset_agent(
-        &state,
-        agents::AgentKind::Claude,
-        Ok(PathBuf::from("/bin/echo")),
-        Some("2.1.196 (Claude Code)"),
-    );
-    for kind in [
-        agents::AgentKind::Codex,
-        agents::AgentKind::Gemini,
-        agents::AgentKind::Antigravity,
-    ] {
-        preset_agent(&state, kind, Err("not found (test)".to_string()), None);
-    }
-    lock(&state.agent_updates).insert(
-        agents::AgentKind::Claude,
-        agent_updates::AgentLatest {
-            version: "2.1.207".to_string(),
-            checked_at: 1_000,
-            error: None,
-        },
-    );
-    let (status, list) = request(&state, Method::GET, "/api/v1/agents?check=true", None).await;
-    assert_eq!(status, StatusCode::OK);
-    let claude = &list.as_array().unwrap()[0];
-    assert_eq!(claude["installed"], true);
-    assert_eq!(claude["version"], "2.1.196 (Claude Code)");
-    assert!(!claude.as_object().unwrap().contains_key("latest_version"));
-    assert!(!claude.as_object().unwrap().contains_key("update_available"));
 }

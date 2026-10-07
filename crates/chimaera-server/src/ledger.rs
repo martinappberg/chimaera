@@ -311,7 +311,7 @@ impl LedgerStore {
     /// A handoff's ledger write (a suspended session, a stopped agent) must
     /// survive a power cut: it is what keeps two machines from resuming the
     /// same conversation.
-    pub(crate) fn write_durable(
+    pub fn write_durable(
         &mut self,
         entries: &[LedgerEntry],
         links: &HashMap<String, String>,
@@ -325,7 +325,7 @@ impl LedgerStore {
     /// Active maintenance needs positive rename durability. Unlike ordinary
     /// stores, unsupported directory fsync cannot be treated as idle proof.
     #[cfg(unix)]
-    pub(crate) fn write_maintenance_durable(
+    pub fn write_maintenance_durable(
         &mut self,
         entries: &[LedgerEntry],
         links: &HashMap<String, String>,
@@ -1406,10 +1406,7 @@ mod tests {
 // manual entry owns the original conversation. The exact same-ID restoration
 // path is separately authenticated and serialized by manual Resume.
 tokio::task_local! { static MANUAL_RESUME: String; }
-pub(crate) async fn manual_resumption<F: std::future::Future>(
-    id: String,
-    operation: F,
-) -> F::Output {
+pub async fn manual_resumption<F: std::future::Future>(id: String, operation: F) -> F::Output {
     MANUAL_RESUME.scope(id, operation).await
 }
 pub(crate) fn check_manual_native(

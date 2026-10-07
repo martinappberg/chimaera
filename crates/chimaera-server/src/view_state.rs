@@ -132,7 +132,7 @@ impl ViewStateStore {
     ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
         self.put_inner(key, value, false)
     }
-    pub(crate) fn put_durable(
+    pub fn put_durable(
         &mut self,
         key: String,
         value: serde_json::Value,

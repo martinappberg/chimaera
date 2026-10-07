@@ -306,15 +306,13 @@ pub fn run() -> anyhow::Result<()> {
     run_selected(Cli::parse(), None)
 }
 
-/// Compose a trusted optional daemon runtime. The factory is called only for
+/// Compose a trusted workspace policy. The factory is called only for
 /// `serve`, after daemonization and the read-only short command paths.
-pub fn run_with_extension(
-    factory: fn() -> std::sync::Arc<dyn chimaera_server::daemon_extension::Runtime>,
-) -> anyhow::Result<()> {
+pub fn run_with_policy(factory: chimaera_server::PolicyFactory) -> anyhow::Result<()> {
     run_selected(Cli::parse(), Some(factory))
 }
 
-type RuntimeFactory = fn() -> std::sync::Arc<dyn chimaera_server::daemon_extension::Runtime>;
+type RuntimeFactory = chimaera_server::PolicyFactory;
 
 /// A composed CLI deploys only an artifact the user named (`--binary`); with
 /// none it connects like the open build (the public release), so the
@@ -405,7 +403,7 @@ async fn dispatch(command: Command, extension: Option<RuntimeFactory>) -> anyhow
                 routable_bind: bind_routable,
             };
             match extension {
-                Some(factory) => chimaera_server::run_with_extension(config, factory()).await,
+                Some(factory) => chimaera_server::run_with_policy(config, factory).await,
                 None => chimaera_server::run(config).await,
             }
         }
@@ -528,8 +526,17 @@ async fn dispatch(command: Command, extension: Option<RuntimeFactory>) -> anyhow
 mod tests {
     #[test]
     fn selected_dispatch_requires_explicit_artifacts_without_creating_runtime() {
-        fn never_constructed() -> std::sync::Arc<dyn chimaera_server::daemon_extension::Runtime> {
-            panic!("deployment selection must not construct a runtime");
+        type Built = std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = anyhow::Result<
+                            std::sync::Arc<dyn chimaera_server::policy::WorkspacePolicy>,
+                        >,
+                    > + Send,
+            >,
+        >;
+        fn never_constructed() -> Built {
+            panic!("deployment selection must not construct a policy");
         }
         for binary in [false, true] {
             assert_eq!(

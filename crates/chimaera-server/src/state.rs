@@ -394,22 +394,19 @@ impl AppState {
         self.policy.get_or_init(|| default_policy(self)).as_ref()
     }
 
-    /// Install the policy this daemon runs with (once, at startup): the Pro
-    /// host when an extension is composed, otherwise the inert policy with
-    /// the durable fence read from `data_dir`.
-    pub(crate) fn install_policy(
+    /// Install the policy this daemon runs with (once, at startup): the
+    /// composed one, otherwise the inert policy with the durable fence read
+    /// from `data_dir`.
+    pub fn install_policy(
         &self,
-        composed: Option<crate::pro::ProPolicy>,
+        composed: Option<Arc<dyn crate::policy::WorkspacePolicy>>,
         data_dir: &std::path::Path,
     ) {
-        let policy: Arc<dyn crate::policy::WorkspacePolicy> = if let Some(pro) = composed {
-            crate::pro::compose(self);
-            Arc::new(pro)
-        } else {
+        let policy = composed.unwrap_or_else(|| {
             Arc::new(crate::policy::Inert::new(
                 crate::policy::fence::Fence::load(data_dir),
             ))
-        };
+        });
         let _ = self.policy.set(policy);
     }
 
@@ -434,23 +431,12 @@ impl AppState {
     }
 }
 
-/// Tests exercise the Pro host directly unless they install the inert
-/// policy; a real daemon chooses at startup (`lifecycle`).
-#[cfg(test)]
+/// A state nothing installed a policy on runs the inert one: a real daemon
+/// chooses at startup (`lifecycle`), a composed fixture installs its own.
 fn default_policy(state: &AppState) -> Arc<dyn crate::policy::WorkspacePolicy> {
-    crate::pro::compose(state);
-    Arc::new(crate::pro::ProPolicy::default())
-}
-/// A state built outside `lifecycle` (a nondefault fixture) runs the Pro
-/// host when it carries an extension, as the composed daemon would.
-#[cfg(not(test))]
-fn default_policy(state: &AppState) -> Arc<dyn crate::policy::WorkspacePolicy> {
-    if state.extension.get().is_some() {
-        crate::pro::compose(state);
-        Arc::new(crate::pro::ProPolicy::default())
-    } else {
-        Arc::new(crate::policy::Inert::new(Default::default()))
-    }
+    Arc::new(crate::policy::Inert::new(
+        crate::policy::fence::Fence::load(&state.data_dir),
+    ))
 }
 
 /// A value built on first use, then shared. Field access derefs through it.

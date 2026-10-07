@@ -21,8 +21,8 @@ use tokio::io::AsyncWriteExt;
 
 use crate::AppState;
 mod scoped;
-#[cfg(test)]
-pub(crate) use scoped::upload_with_limits;
+#[cfg(feature = "daemon-extension-fixture")]
+pub use scoped::upload_with_limits;
 
 /// A session upload lands under bounded daemon state, so one reference/drop
 /// stays comfortably below the session-wide quota.

@@ -221,7 +221,7 @@ struct CommsState {
     last_message: HashMap<String, u64>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "daemon-extension-fixture"))]
 type PreparationGate = (
     tokio::sync::oneshot::Sender<()>,
     tokio::sync::oneshot::Receiver<()>,
@@ -238,7 +238,7 @@ pub struct Comms {
     writer: tokio::sync::Mutex<()>,
     /// Detached enqueue tasks are bounded even while actors stop draining.
     dispatches: Arc<tokio::sync::Semaphore>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "daemon-extension-fixture"))]
     preparation_gate: Mutex<Option<PreparationGate>>,
     #[cfg(test)]
     dispatch_gate: Mutex<Option<PreparationGate>>,
@@ -251,7 +251,7 @@ impl Comms {
             root,
             writer: tokio::sync::Mutex::new(()),
             dispatches: Arc::new(tokio::sync::Semaphore::new(64)),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "daemon-extension-fixture"))]
             preparation_gate: Mutex::new(None),
             #[cfg(test)]
             dispatch_gate: Mutex::new(None),
@@ -263,8 +263,8 @@ impl Comms {
         self.dispatches.clone().try_acquire_many_owned(64).unwrap()
     }
 
-    #[cfg(test)]
-    pub(crate) fn pause_next_message(
+    #[cfg(feature = "daemon-extension-fixture")]
+    pub fn pause_next_message(
         &self,
     ) -> (
         tokio::sync::oneshot::Receiver<()>,
@@ -1126,7 +1126,7 @@ pub(crate) async fn message_agent(state: &Arc<AppState>, from_sid: &str, args: &
         .get("expect_reply")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    #[cfg(test)]
+    #[cfg(any(test, feature = "daemon-extension-fixture"))]
     {
         let gate = crate::lock(&state.comms.preparation_gate).take();
         if let Some((entered, paused)) = gate {
@@ -2504,95 +2504,6 @@ mod tests {
             delivery: Some("inbox".into()),
         });
         Arc::new(e)
-    }
-
-    #[tokio::test]
-    async fn cancelled_delivery_keeps_its_owned_claim_until_refusal_settles() {
-        cancelled_delivery(false).await;
-        cancelled_delivery(true).await;
-    }
-
-    /// Both tiers settle a cancelled caller's claim in the detached task;
-    /// only managed execution takes a bounded delivery permit.
-    async fn cancelled_delivery(managed: bool) {
-        let root = std::env::temp_dir().join(format!(
-            "chimaera-comms-cancel-{}",
-            chimaera_core::generate_token()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let state = Arc::new(AppState::new(
-            "fixture".into(),
-            "fixture".into(),
-            4242,
-            0,
-            root.clone(),
-            root.join("config"),
-        ));
-        let target = reader("s-b");
-        let message = note_entry(1, "s-a", Some("s-b"));
-        crate::lock(&state.session_workspaces).insert(target.sid.clone(), target.ws.clone());
-        if managed {
-            crate::pro::install_execution_fixture(&state, "w", 4).unwrap();
-        }
-        assert_eq!(crate::pro::managed_execution(&state, "w"), managed);
-        let idle = if managed { 63 } else { 64 };
-        crate::lock(&state.comms.inner).in_flight.insert(
-            "owned-claim".into(),
-            InFlight {
-                ws: target.ws.clone(),
-                reader: target.sid.clone(),
-                seqs: vec![1],
-            },
-        );
-        let admission = state.policy().capture(&state, "w").unwrap();
-        let (entered, ready) = tokio::sync::oneshot::channel();
-        let (resume, paused) = tokio::sync::oneshot::channel();
-        *crate::lock(&state.comms.dispatch_gate) = Some((entered, paused));
-        let owner = state.clone();
-        let recipient = target.clone();
-        let caller = tokio::spawn(async move {
-            send_guarded(
-                &owner,
-                &recipient,
-                &admission,
-                AgentCommand::Send {
-                    blocks: vec![ContentBlock::Text {
-                        text: "synthetic cancelled delivery".into(),
-                    }],
-                },
-                None,
-                Some(("owned-claim".into(), true)),
-            )
-            .await
-        });
-        ready.await.unwrap();
-        caller.abort();
-        assert!(caller.await.unwrap_err().is_cancelled());
-        assert_eq!(state.comms.dispatches.available_permits(), idle);
-        assert!(crate::lock(&state.comms.inner)
-            .unread(&target, std::slice::from_ref(&message))
-            .is_empty());
-        resume.send(()).unwrap();
-        // There is deliberately no actor. Its refusal must end the claim even
-        // though the original caller can no longer run finish().
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while state.comms.dispatches.available_permits() != 64
-                || crate::lock(&state.comms.inner)
-                    .in_flight
-                    .contains_key("owned-claim")
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(
-            crate::lock(&state.comms.inner)
-                .unread(&target, &[message])
-                .len(),
-            1
-        );
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// An unmanaged daemon has no delivery cap: a send is never refused as

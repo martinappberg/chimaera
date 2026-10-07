@@ -27,8 +27,8 @@ use crate::AppState;
 
 mod row_index;
 mod scoped;
-#[cfg(test)]
-pub(crate) fn scoped_rename_fixture(
+#[cfg(feature = "daemon-extension-fixture")]
+pub fn scoped_rename_fixture(
     scope: &crate::workspace_scope::files::Context,
     from: &str,
     to: &str,
@@ -39,8 +39,8 @@ pub(crate) fn scoped_rename_fixture(
         MutateOutcome::Done(_)
     ))
 }
-#[cfg(test)]
-pub(crate) fn scoped_cross_device_move_fixture(
+#[cfg(feature = "daemon-extension-fixture")]
+pub fn scoped_cross_device_move_fixture(
     scope: &crate::workspace_scope::files::Context,
     from: &str,
     to: &str,
@@ -4857,7 +4857,7 @@ impl TicketStore {
 
     /// The path bound to `ticket`, if it exists and has not expired.
     /// Shared with the download module — same store, same capability model.
-    pub(crate) fn lookup(&mut self, ticket: &str) -> Option<PathBuf> {
+    pub fn lookup(&mut self, ticket: &str) -> Option<PathBuf> {
         self.snapshot(ticket).map(|snapshot| snapshot.path)
     }
 

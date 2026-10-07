@@ -13,26 +13,24 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     run_selected(cfg, None).await
 }
 
-/// Trusted composed assembly. Optional policy is supplied after CLI daemonization;
-/// public startup restrictions and the actual task owners remain the same.
-pub async fn run_with_extension(
+/// Trusted composed assembly: the policy is built after CLI daemonization,
+/// before restore or any helper starts; public startup restrictions and the
+/// actual task owners remain the same.
+pub async fn run_with_policy(
     cfg: ServerConfig,
-    runtime: Arc<dyn crate::daemon_extension::Runtime>,
+    factory: crate::PolicyFactory,
 ) -> anyhow::Result<()> {
-    run_selected(cfg, Some(runtime)).await
+    run_selected(cfg, Some(factory)).await
 }
 
 async fn run_selected(
     cfg: ServerConfig,
-    runtime: Option<Arc<dyn crate::daemon_extension::Runtime>>,
+    factory: Option<crate::PolicyFactory>,
 ) -> anyhow::Result<()> {
-    // The composition point: an extension brings the Pro host as its
-    // workspace policy, prepared before restore or any helper starts.
-    // Without one the daemon runs the inert policy.
-    let pro = if runtime.is_some() {
-        Some(crate::pro::ProPolicy::prepare().await?)
-    } else {
-        None
+    // The composition point. Without a policy the daemon runs the inert one.
+    let policy = match factory {
+        Some(factory) => Some(factory().await?),
+        None => None,
     };
     // A cluster workspace job: its data dir is the workspace's folder on the
     // shared filesystem, and the manifest there is the workspace's lease. A
@@ -149,7 +147,7 @@ async fn run_selected(
         build: Some(chimaera_core::BUILD_ID.to_string()),
         slurm_job_id: own_job.clone(),
         runtime_leases: true,
-        daemon_extension: runtime.is_some(),
+        daemon_extension: policy.is_some(),
     };
     manifest.write().context("failed to write manifest")?;
 
@@ -164,10 +162,7 @@ async fn run_selected(
         chimaera_core::data_dir(),
         chimaera_core::config_dir(),
     );
-    if let Some(runtime) = runtime {
-        state.pro().set_runtime(runtime);
-    }
-    state.install_policy(pro, &chimaera_core::data_dir());
+    state.install_policy(policy, &chimaera_core::data_dir());
     let managed_root = chimaera_core::managed_agents_dir();
     if state.managed_root != managed_root {
         state.legacy_managed_root = Some(std::mem::replace(&mut state.managed_root, managed_root));
