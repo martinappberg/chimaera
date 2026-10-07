@@ -240,6 +240,13 @@ impl WorkspacePolicy for ProPolicy {
                 let at = row["id"].as_str().and_then(|id| activity.get(id)).copied();
                 row["last_input_ms"] = json!(at);
                 row["placement"] = json!("here");
+                // Additive: the one pause verdict transfers use, so a cloud
+                // machine's idle check never re-derives it from `agent_state`.
+                if let Some(id) = row["id"].as_str() {
+                    let paused =
+                        super::activity::session(state, id) != super::activity::Activity::Working;
+                    row["at_pause"] = json!(paused);
+                }
             }
         }
         let deferred: Vec<_> = crate::lock(&state.deferred_sessions)

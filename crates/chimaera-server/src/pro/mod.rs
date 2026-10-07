@@ -1,4 +1,5 @@
 //! Optional daemon-owned mirrors and workspace handoff. No credential is durable.
+mod activity;
 mod authority;
 mod canonical;
 mod companion;

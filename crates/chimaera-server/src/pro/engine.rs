@@ -1,3 +1,4 @@
+use super::activity;
 use super::{
     authority, config, execution, mirror,
     protocol::{Baton, Configure, MirrorCredentials, Role},
@@ -1627,88 +1628,16 @@ pub(super) fn install_tree(
     Ok(kept)
 }
 
-fn chat_at_pause(
-    chat: &chimaera_agent::ChatInfo,
-    carry: Option<&chimaera_agent::Carryover>,
-    queued_input: bool,
-    agent_state: Option<crate::agent_state::AgentState>,
-) -> bool {
-    let Some(carry) = carry else {
-        return false;
-    };
-    chat.background_running == 0
-        && carry.background.is_empty()
-        && !queued_input
-        && (chat.pending_permission
-            || chat.status_needs_action
-            || (!carry.turn_in_flight
-                && (chat.status_category.as_deref() == Some("idle")
-                    // A turn that ended in an error, or one the vendor
-                    // refused for its limit, is over: nothing is in flight
-                    // and nothing will be until the user sends again. A
-                    // project waiting on such a conversation would never
-                    // reach its pause otherwise (its return home, and
-                    // "Run here", hung after a usage-limit abort).
-                    || matches!(
-                        agent_state,
-                        Some(
-                            crate::agent_state::AgentState::Finished
-                                | crate::agent_state::AgentState::IdlePrompt
-                                | crate::agent_state::AgentState::Errored
-                                | crate::agent_state::AgentState::RateLimited
-                        )
-                    ))))
-}
-
+/// No session in this project is working: each one is paused or waiting on
+/// the user (`activity`). What a hand-back and a stop wait for.
 pub(super) fn at_pause(state: &AppState, workspace: &str) -> bool {
-    sessions(state, workspace).into_iter().all(|id| {
-        if let Some(chat) = state.chat.get(&id) {
-            let activity = state.chat.input_activity(&id);
-            let agent_state = lock(&state.agents).get(&id).map(|agent| agent.state);
-            chat_at_pause(
-                &chat,
-                activity.as_ref().map(|(carry, _)| carry),
-                activity.as_ref().is_none_or(|(_, pending)| *pending),
-                agent_state,
-            )
-        } else {
-            // Cloned first: the terminal registry has its own locks.
-            let Some(agent) = lock(&state.agents).get(&id).cloned() else {
-                return true;
-            };
-            let Some(info) = state.sessions.get(&id) else {
-                return true;
-            };
-            crate::agent_state::tui_at_pause(
-                &agent,
-                info.alive,
-                info.last_output_at,
-                info.pid,
-                state.sessions.foreground_pid(&id),
-                crate::session_view::now_ms(),
-            )
-        }
-    })
-}
-/// A chat running work right now: a turn in flight, input queued for the
-/// next one, or background work still going. A turn parked on a permission
-/// or a question waits on the user, which is not work.
-fn chat_working(
-    chat: &chimaera_agent::ChatInfo,
-    carry: Option<&chimaera_agent::Carryover>,
-    queued_input: bool,
-) -> bool {
-    chat.alive
-        && !chat.pending_permission
-        && (queued_input
-            || chat.background_running > 0
-            || carry.is_some_and(|carry| carry.turn_in_flight || !carry.background.is_empty()))
+    sessions(state, workspace)
+        .iter()
+        .all(|id| activity::session(state, id) != activity::Activity::Working)
 }
 
 /// The agents (`claude`, `codex`, ...) running work in this project right
-/// now, each named once (the coordinator's copy triggers). The inverse of
-/// `at_pause` per session, except that a session nothing is known about is
-/// not counted as working.
+/// now, each named once (the coordinator's copy triggers).
 pub(super) fn working_agents(state: &AppState, workspace: &str) -> Vec<String> {
     agents_at_work(state, workspace, false)
 }
@@ -1746,37 +1675,20 @@ fn sessions_at_work(
 ) -> Vec<(String, String)> {
     let mut found = Vec::new();
     for id in sessions(state, workspace) {
-        let (working, kind) = if let Some(chat) = state.chat.get(&id) {
-            let activity = state.chat.input_activity(&id);
-            let working = chat_working(
-                &chat,
-                activity.as_ref().map(|(carry, _)| carry),
-                activity.as_ref().is_some_and(|(_, pending)| *pending),
-            ) || (waiting_counts && chat.alive && chat.pending_permission);
-            let kind = lock(&state.agents)
-                .get(&id)
-                .map_or(chat.agent, |record| record.kind.as_str().to_owned());
-            (working, kind)
-        } else {
-            // Cloned first: the terminal registry has its own locks.
-            let record = lock(&state.agents).get(&id).cloned();
-            let (Some(record), Some(info)) = (record, state.sessions.get(&id)) else {
-                continue;
-            };
-            let working = info.alive
-                && ((waiting_counts
-                    && record.state == crate::agent_state::AgentState::NeedsPermission)
-                    || !crate::agent_state::tui_at_pause(
-                        &record,
-                        info.alive,
-                        info.last_output_at,
-                        info.pid,
-                        state.sessions.foreground_pid(&id),
-                        crate::session_view::now_ms(),
-                    ));
-            (working, record.kind.as_str().to_owned())
+        let working = match activity::session(state, &id) {
+            activity::Activity::Working => true,
+            activity::Activity::WaitingOnUser => waiting_counts,
+            activity::Activity::Paused => false,
         };
-        if working && !kind.is_empty() && kind.len() <= 32 {
+        if !working {
+            continue;
+        }
+        let kind = lock(&state.agents)
+            .get(&id)
+            .map(|record| record.kind.as_str().to_owned())
+            .or_else(|| state.chat.get(&id).map(|chat| chat.agent))
+            .unwrap_or_default();
+        if !kind.is_empty() && kind.len() <= 32 {
             found.push((id, kind));
         }
     }
@@ -2668,95 +2580,9 @@ mod return_tests {
     }
 }
 
-#[cfg(test)]
-mod pause_tests {
-    use super::*;
-    #[test]
-    fn completed_chat_needs_no_vendor_status_but_active_work_stays_blocked() {
-        let mut chat = chimaera_agent::ChatInfo {
-            id: "s-codex".into(),
-            agent: "codex".into(),
-            cwd: "/tmp".into(),
-            created_at_ms: 0,
-            alive: true,
-            exit_status: None,
-            native_session_id: None,
-            model: None,
-            current_mode: None,
-            pending_permission: false,
-            status_detail: None,
-            status_category: None,
-            status_needs_action: false,
-            remote_control_url: None,
-            background_running: 0,
-        };
-        let mut carry = chimaera_agent::Carryover::default();
-        let finished = Some(crate::agent_state::AgentState::Finished);
-        assert!(chat_at_pause(&chat, Some(&carry), false, finished));
-        assert!(!chat_at_pause(&chat, Some(&carry), true, finished));
-        carry.turn_in_flight = true;
-        assert!(!chat_at_pause(&chat, Some(&carry), false, finished));
-        carry.turn_in_flight = false;
-        chat.background_running = 1;
-        assert!(!chat_at_pause(&chat, Some(&carry), false, finished));
-        chat.background_running = 0;
-        assert!(!chat_at_pause(
-            &chat,
-            Some(&carry),
-            false,
-            Some(crate::agent_state::AgentState::Running)
-        ));
-        assert!(!chat_at_pause(&chat, None, false, finished));
-        chat.pending_permission = true;
-        carry.turn_in_flight = true;
-        assert!(chat_at_pause(
-            &chat,
-            Some(&carry),
-            false,
-            Some(crate::agent_state::AgentState::NeedsPermission)
-        ));
-        assert!(!chat_at_pause(&chat, Some(&carry), true, finished));
-    }
-
-    #[test]
-    fn an_aborted_or_rate_limited_turn_is_a_pause() {
-        let chat = chimaera_agent::ChatInfo {
-            id: "s-claude".into(),
-            agent: "claude".into(),
-            cwd: "/tmp".into(),
-            created_at_ms: 0,
-            alive: true,
-            exit_status: None,
-            native_session_id: None,
-            model: None,
-            current_mode: None,
-            pending_permission: false,
-            status_detail: None,
-            status_category: None,
-            status_needs_action: false,
-            remote_control_url: None,
-            background_running: 0,
-        };
-        let mut carry = chimaera_agent::Carryover::default();
-        for ended in [
-            crate::agent_state::AgentState::Errored,
-            crate::agent_state::AgentState::RateLimited,
-        ] {
-            assert!(chat_at_pause(&chat, Some(&carry), false, Some(ended)));
-            // Input queued behind the failure is not a pause: it runs next.
-            assert!(!chat_at_pause(&chat, Some(&carry), true, Some(ended)));
-        }
-        // An error mid-flight (the row is stale while a turn still runs) is not.
-        carry.turn_in_flight = true;
-        assert!(!chat_at_pause(
-            &chat,
-            Some(&carry),
-            false,
-            Some(crate::agent_state::AgentState::Errored)
-        ));
-    }
-}
-
+/// What a receipt says about the conversations a snapshot stopped: their
+/// stop records, judged by the same rule as a live session (`activity`).
+/// A conversation without one is uncertain.
 fn continuation(state: &AppState, workspace: &str) -> execution::wire::Continuation {
     use execution::wire::Continuation;
     let mut result = Continuation::Idle;
@@ -2768,7 +2594,7 @@ fn continuation(state: &AppState, workspace: &str) -> execution::wire::Continuat
     {
         match agent.carryover {
             None => return Continuation::Uncertain,
-            Some(carry) if carry.interrupted_work() => result = Continuation::Interrupted,
+            Some(carry) if activity::carried(&carry) => result = Continuation::Interrupted,
             _ => {}
         }
     }

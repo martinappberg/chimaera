@@ -1020,6 +1020,11 @@ async fn hydrate_owned(state: Arc<AppState>, mut request: Hydrate) -> detached::
 pub(crate) struct Handoff {
     workspace_id: String,
     expected_epoch: u64,
+    /// Additive: the account's request for this project is past its
+    /// deadline (`move_requested_at`), so the holder hands over now instead
+    /// of waiting for the pause: the running turn is exported where it is.
+    #[serde(default)]
+    force: bool,
 }
 /// The clean flush is an owned task: its caller (the keeper relay, a worker
 /// supervisor) may give up, and the flush still completes or recovers. A
@@ -1037,6 +1042,7 @@ pub(crate) async fn handoff(
     };
     let workspace = request.workspace_id.clone();
     let epoch = request.expected_epoch;
+    let force = request.force;
     // A machine this request just woke is still renewing its own lease: let
     // that answer first (bounded) instead of refusing the return it came for.
     let _ = tokio::time::timeout(std::time::Duration::from_secs(20), async {
@@ -1053,12 +1059,12 @@ pub(crate) async fn handoff(
         ("handoff", true),
         &key,
         epoch,
-        || handoff_refusal(&checked, &key, epoch),
+        || handoff_refusal(&checked, &key, epoch, force),
         move || async move {
             let Some(_guard) = super::drain::reserve(&owner).await else {
                 return super::drain::refusal();
             };
-            if let Some(refusal) = handoff_refusal(&owner, &workspace, epoch) {
+            if let Some(refusal) = handoff_refusal(&owner, &workspace, epoch, force) {
                 return refusal;
             }
             result(engine::snapshot(&owner, &config, &workspace, true).await)
@@ -1086,12 +1092,12 @@ pub(super) async fn hand_to_computer(
         ("handoff", true),
         workspace,
         epoch,
-        || handoff_refusal(state, workspace, epoch),
+        || handoff_refusal(state, workspace, epoch, false),
         move || async move {
             let Some(_guard) = super::drain::reserve(&owner).await else {
                 return super::drain::refusal();
             };
-            if let Some(refusal) = handoff_refusal(&owner, &key, epoch) {
+            if let Some(refusal) = handoff_refusal(&owner, &key, epoch, false) {
                 return refusal;
             }
             result(engine::snapshot(&owner, &config, &key, true).await)
@@ -1100,14 +1106,22 @@ pub(super) async fn hand_to_computer(
     .await
     .ok()
 }
-fn handoff_refusal(state: &AppState, workspace: &str, epoch: u64) -> Option<detached::Outcome> {
+/// Why the holder will not hand `workspace` over now. Only the pause can be
+/// overridden (`force`): the clean flush then exports the running turn, so
+/// the conversation continues from where it was last seen.
+fn handoff_refusal(
+    state: &AppState,
+    workspace: &str,
+    epoch: u64,
+    force: bool,
+) -> Option<detached::Outcome> {
     if super::drain::draining(state) {
         return Some(super::drain::refusal());
     }
     if super::owned_epoch(state, workspace) != Some(epoch) {
         return Some(detached::Outcome::refused(StatusCode::CONFLICT, None));
     }
-    if !engine::at_pause(state, workspace) {
+    if !force && !engine::at_pause(state, workspace) {
         return Some(detached::Outcome::refused(
             StatusCode::CONFLICT,
             Some(json!({"error":"workspace_busy"})),
