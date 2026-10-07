@@ -33,9 +33,10 @@ and in `App.svelte` the view reporting + `focusFromNotification`.
   consumer agrees).
 - **Where it lives.** `notices.rs` (`Notices` store, `run` watcher, `get_notices`,
   `frame_since`, `push_agent_notice`, `push_kept_both`, `relay`); the record fields
-  `AgentRecord.notice_note` / `reply_draft` (`agent_state.rs`); the routed feed in
-  `session_proxy.rs` (`Feed`, `Store::awaiting_decision`); the kept-both report in
-  `pro/mod.rs` (`report_return`).
+  `AgentRecord.notice_note` / `reply_draft` (`agent_state.rs`); a routed
+  session's feed and its waiting decisions come from the workspace policy
+  (`policy.rs`: `project_feed`, `routed_decisions`); the kept-both report is
+  the private host's.
 - **Key behaviors.**
   - **One detector, every surface.** Agent state is written by claude hooks, chat protocol
     events, and the transcript watcher (claude chats get two of them), so notices are NOT
