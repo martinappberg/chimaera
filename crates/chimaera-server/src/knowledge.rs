@@ -52,7 +52,7 @@ const NEW_FINDINGS_MAX: usize = 5;
 const MEMORY_NOTES_MAX: usize = 200;
 
 #[derive(Default)]
-pub(crate) struct KnowledgeState {
+pub struct KnowledgeState {
     cache: HashMap<String, Cached>,
     /// A snapshot the provider gave but that was refused (too big, not a
     /// JSON object), per workspace: its stamp is what the next ask hands

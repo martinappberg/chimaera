@@ -10,11 +10,11 @@ use std::path::Path;
 use anyhow::Context;
 
 /// Reserved siblings are incomplete daemon writes, never project snapshot data.
-pub(crate) const PROJECT_STAGING_PREFIX: &str = ".chimaera-staging-";
+pub const PROJECT_STAGING_PREFIX: &str = ".chimaera-staging-";
 
 /// Keep atomic renames on the destination filesystem without putting partial
 /// bytes into a mirror. Preserve UTF-8 boundaries and the usual NAME_MAX ceiling.
-pub(crate) fn project_temp_name(name: &std::ffi::OsStr) -> std::ffi::OsString {
+pub fn project_temp_name(name: &std::ffi::OsStr) -> std::ffi::OsString {
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     let nonce = &chimaera_core::generate_token()[..32];
     let budget = 255 - (PROJECT_STAGING_PREFIX.len() + 1 + nonce.len() + ".tmp".len());
@@ -69,10 +69,7 @@ pub(crate) fn is_project_staging(staging: bool, name: &str) -> bool {
 /// let two machines run the same work: Pro ownership and the session ledger's
 /// Pro transfer writes, including public session imports. Ordinary preference
 /// stores keep the cheaper write.
-pub(crate) fn atomic_write_json_durable(
-    path: &Path,
-    contents: impl AsRef<[u8]>,
-) -> anyhow::Result<()> {
+pub fn atomic_write_json_durable(path: &Path, contents: impl AsRef<[u8]>) -> anyhow::Result<()> {
     use std::io::Write;
     let parent = path.parent().context("durable state needs a parent")?;
     std::fs::create_dir_all(parent)

@@ -449,7 +449,7 @@ fn read_meta(file: &Path, id: &str) -> Option<DraftMeta> {
 /// client_updated_ms, writer, bytes}]}` newest first (by `updated_ms`),
 /// without text. Reads only the sidecars; a draft whose
 /// sidecar is missing or corrupt is skipped.
-pub(crate) async fn list_drafts(State(state): State<Arc<AppState>>) -> Response {
+pub async fn list_drafts(State(state): State<Arc<AppState>>) -> Response {
     let root = state.drafts_root.clone();
     blocking(move || {
         let mut drafts: Vec<DraftMeta> = Vec::new();

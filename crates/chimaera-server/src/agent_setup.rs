@@ -62,7 +62,7 @@ impl Progress {
     }
 }
 
-pub(crate) struct Operation {
+pub struct Operation {
     progress: Mutex<Progress>,
     cancel: watch::Sender<bool>,
 }

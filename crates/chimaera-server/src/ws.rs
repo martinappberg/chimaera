@@ -347,7 +347,7 @@ fn acted_here(state: &AppState, id: &str) {
 /// command: a refused frame may be one this daemon cannot parse, and a relay
 /// that only needs a frame's kind must not copy a send's pictures to learn it.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct CommandTag {
+pub struct CommandTag {
     /// Its `type` (`send`, `interrupt`, `permission`…); `None` for anything
     /// that is not a small command tag.
     pub(crate) kind: Option<String>,
@@ -433,7 +433,7 @@ impl Probe {
     }
 }
 
-pub(crate) fn command_tag(text: &str) -> CommandTag {
+pub fn command_tag(text: &str) -> CommandTag {
     // Every other field (a send's `blocks` above all) is skipped unread, and
     // each of these is read by itself: one of the wrong type is only absent.
     #[derive(Deserialize)]
@@ -474,7 +474,7 @@ const BAD_CLIENT_ID: &str = "client_id must be 8 to 64 characters of A-Z, a-z, 0
 /// for a command sent under a client's id, that id (additive `client_id`):
 /// a client hands text back to the composer only for a refused send, and
 /// with the id it hands back exactly the send that was refused.
-pub(crate) fn command_refusal(mut answer: serde_json::Value, text: &str) -> serde_json::Value {
+pub fn command_refusal(mut answer: serde_json::Value, text: &str) -> serde_json::Value {
     let tag = command_tag(text);
     if let Some(command) = tag.kind {
         answer["command"] = json!(command);
@@ -501,7 +501,7 @@ fn refusal(state: &AppState, id: &str, watching: bool) -> serde_json::Value {
 }
 
 /// Where the project of session `id` runs now, when known (otherwise null).
-pub(crate) fn session_owner(state: &AppState, id: &str) -> Option<&'static str> {
+pub fn session_owner(state: &AppState, id: &str) -> Option<&'static str> {
     let workspace = crate::lock(&state.session_workspaces)
         .get(id)
         .cloned()
@@ -509,7 +509,7 @@ pub(crate) fn session_owner(state: &AppState, id: &str) -> Option<&'static str> 
     state.policy().owner(state, &workspace)
 }
 
-pub(crate) fn session_writable(state: &AppState, id: &str) -> bool {
+pub fn session_writable(state: &AppState, id: &str) -> bool {
     if crate::lock(&state.deferred_sessions)
         .get(id)
         .is_some_and(|entry| entry.manual_resume_reason.is_some())
@@ -534,7 +534,7 @@ pub(crate) fn session_writable(state: &AppState, id: &str) -> bool {
 /// A session socket's query options: watch only, and (for a session that
 /// runs on another machine) which wake the viewer asked for.
 #[derive(Clone, Default, serde::Deserialize, serde::Serialize)]
-pub(crate) struct SocketOptions {
+pub struct SocketOptions {
     #[serde(default)]
     pub read_only: bool,
     #[serde(default)]
@@ -1141,7 +1141,7 @@ async fn repaint(
 /// sibling of /ws/sessions/{id}; deliberately a separate endpoint — none of
 /// the PTY channel's byte-pipe semantics (binary frames, dims, resync)
 /// apply here.
-pub(crate) async fn chat_ws(
+pub async fn chat_ws(
     ws: WebSocketUpgrade,
     Path(id): Path<String>,
     State(state): State<Arc<AppState>>,

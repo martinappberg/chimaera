@@ -382,7 +382,7 @@ swap grok "$version"
 // --- POST /api/v1/agents/{id}/install ----------------------------------------
 
 #[derive(Deserialize)]
-pub(crate) struct InstallBody {
+pub struct InstallBody {
     workspace_id: String,
 }
 
@@ -399,7 +399,7 @@ pub(crate) const INSTALL_RESERVATION_GRACE: std::time::Duration =
 /// 404 unknown agent id or workspace; 409 while an install session for the
 /// same agent is still running; 400 for agents with no curated install
 /// (gemini, phase 2).
-pub(crate) async fn install_agent(
+pub async fn install_agent(
     State(state): State<Arc<AppState>>,
     UrlPath(id): UrlPath<String>,
     Json(body): Json<InstallBody>,
@@ -901,7 +901,7 @@ fn install_lock_error(root: &Path, kind: AgentKind, error: std::io::Error) -> Bo
 }
 
 #[derive(Clone, serde::Serialize)]
-pub(crate) struct InstallResult {
+pub struct InstallResult {
     session_id: String,
     exit_status: Option<i32>,
 }

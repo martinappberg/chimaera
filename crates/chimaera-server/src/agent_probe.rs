@@ -72,7 +72,7 @@ const SKILLS_PER_DIR: usize = 200;
 const HOOKS_JSON_MAX: u64 = 256 * 1024;
 
 #[derive(Default)]
-pub(crate) struct ProbeState {
+pub struct ProbeState {
     cache: Mutex<HashMap<String, (Instant, Value)>>,
     generation: AtomicU64,
     changed_epoch: AtomicU64,

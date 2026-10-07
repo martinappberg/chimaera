@@ -20,11 +20,12 @@ pub(crate) use env::{launcher_context_env, session_env, spawn_env_remove};
 #[cfg(test)]
 pub(crate) use env::spawn_path;
 pub(crate) use exec::{exec_session, session_journal};
-pub(crate) use sessions::{create_session, delete_session, list_sessions, rename_session};
+pub use sessions::delete_session;
+pub(crate) use sessions::{create_session, list_sessions, rename_session};
 pub(crate) use shutdown::{delete_all_sessions, shutdown};
+pub use workspaces::create_workspace;
 pub(crate) use workspaces::{
-    create_workspace, delete_mastermind, delete_workspace, list_workspaces, open_workspace,
-    put_mastermind,
+    delete_mastermind, delete_workspace, list_workspaces, open_workspace, put_mastermind,
 };
 
 /// Require `Authorization: Bearer {token}` on /api/v1 routes.

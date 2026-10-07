@@ -146,10 +146,7 @@ const PIPE_CAPACITY: usize = 64 * 1024;
 /// flight finishes on whatever it can still read. Entry mtimes ride into the
 /// zip as DOS datetimes in UTC (zip carries no timezone; without them every
 /// extracted file would read as 1980, the DOS epoch).
-pub(crate) async fn download(
-    State(state): State<Arc<AppState>>,
-    Path(ticket): Path<String>,
-) -> Response {
+pub async fn download(State(state): State<Arc<AppState>>, Path(ticket): Path<String>) -> Response {
     let not_found = || (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
     let Some(crate::fs::TicketSnapshot { path, bound, .. }) =
         crate::lock(&state.tickets).snapshot(&ticket)
@@ -426,7 +423,7 @@ async fn open_zip_entry(
 /// Open `relative` by walking from an already-open root descriptor. Every
 /// intermediate and final component is `O_NOFOLLOW`; no path lookup is ever
 /// restarted from the process cwd after the root is anchored.
-pub(crate) fn open_beneath(
+pub fn open_beneath(
     root: &File,
     relative: &FsPath,
     final_flags: rustix::fs::OFlags,

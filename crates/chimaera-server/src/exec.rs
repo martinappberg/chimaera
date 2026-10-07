@@ -29,7 +29,7 @@ const SENTINEL_FOREGROUNDS: &[&str] = &[
 /// friends), and the stage (queued/executing) mirrored into session
 /// snapshots for the UI's linked-terminal chips. Shared by the REST
 /// endpoint and the MCP `run_in_terminal` tool.
-pub(crate) async fn run_exec(
+pub async fn run_exec(
     state: &Arc<AppState>,
     id: &str,
     command: String,

@@ -121,7 +121,7 @@ impl RecentEntry {
 
 /// workspace id -> ended conversations, newest first; backed by a single
 /// JSON file (save-on-change), load-tolerant like the other stores.
-pub(crate) struct RecentsStore {
+pub struct RecentsStore {
     path: PathBuf,
     items: HashMap<String, Vec<RecentEntry>>,
 }
@@ -243,7 +243,7 @@ pub(crate) fn ancestors(state: &AppState, workspace_id: &str) -> HashMap<String,
 /// seen while the session was alive, `ui` the surface it last ran on (so the
 /// recents row reopens in the same mode). Broadcasts a change when anything
 /// moved.
-pub(crate) fn retire(
+pub fn retire(
     state: &Arc<AppState>,
     session_id: &str,
     pinned: Option<&str>,

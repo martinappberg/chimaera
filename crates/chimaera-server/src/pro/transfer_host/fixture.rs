@@ -114,7 +114,6 @@ pub async fn staging_baseline(
         .state
         .pro()
         .runtime()
-        .cloned()
         .context("optional_runtime_unavailable")?;
     super::super::transfer_dispatch::scope(
         super::super::transfer_dispatch::TransferScope {
@@ -137,7 +136,6 @@ pub async fn copy_baseline(
         .state
         .pro()
         .runtime()
-        .cloned()
         .context("optional_runtime_unavailable")?;
     super::super::transfer_dispatch::scope(
         super::super::transfer_dispatch::TransferScope {

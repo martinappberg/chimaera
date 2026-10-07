@@ -58,7 +58,7 @@ fn slot_prefix(ws_id: &str) -> String {
 
 /// The read-only git service: discovery cache, per-workspace nudge epochs, and
 /// the concurrency permit shared by every invocation.
-pub(crate) struct GitService {
+pub struct GitService {
     /// workspace id -> discovered repo (`None` = not a repo). A repo root is
     /// stable so a `Some` is cached for the daemon's life; a `None` is re-probed
     /// on demand, so `git init` in an already-open workspace eventually surfaces.
@@ -1023,7 +1023,7 @@ impl Drop for WatchGuard {
 /// Bump the epoch of every workspace whose root contains `path`, then wake the
 /// events bus. Called from the file-save and agent-write paths — the moment a
 /// tracked path changes, the client is nudged to refetch (zero polling).
-pub(crate) async fn mark_path_dirty(state: &AppState, path: &str) {
+pub async fn mark_path_dirty(state: &AppState, path: &str) {
     let expanded = expand_tilde(path);
     // Canonicalize before the prefix check. Workspace roots are stored
     // canonical (the create handler canonicalizes), so a `path` carrying `..`,

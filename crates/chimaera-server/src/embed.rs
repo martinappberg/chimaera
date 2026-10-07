@@ -153,7 +153,7 @@ pub(crate) async fn resolve_targets(
 
 /// The file part of a link or embed target, decoded; `None` when it names
 /// nothing on this host (a web URL, an empty or in-page `#anchor`).
-pub(crate) fn target_path(raw: &str) -> Option<String> {
+pub fn target_path(raw: &str) -> Option<String> {
     let t = raw.trim();
     if t.is_empty() || t.len() > MAX_TARGET_BYTES {
         return None;

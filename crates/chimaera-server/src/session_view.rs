@@ -23,7 +23,7 @@ const STALL_QUIET: Duration = Duration::from_secs(180);
 
 /// Milliseconds since the Unix epoch (0 if the clock reads before it) —
 /// the same clock the PTY reader stamps `last_output_at` with.
-pub(crate) fn now_ms() -> u64 {
+pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -189,7 +189,7 @@ fn chat_row(
 /// Lock order: workspaces (taken and dropped first, for the mastermind
 /// bindings) -> session_workspaces -> agents -> display_names ->
 /// current_cwds -> exec_status.
-pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
+pub fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
     // The git session tracker's facts, taken (and its lock dropped) before
     // any row lock below.
     let git_rows = state.git.sessions.rows();
@@ -365,7 +365,7 @@ const EVENTS_SNAPSHOT_REUSE: Duration = crate::ws::EVENTS_THROTTLE;
 /// client still keeps its own last-sent compare, and per-client state
 /// (fs_watch, git epochs, settings sends) stays per-client. No wire change:
 /// the frame bytes are exactly what each client built before.
-pub(crate) struct SnapshotCache {
+pub struct SnapshotCache {
     /// Serializes builds — the single-flight. Async, so a client waiting on
     /// an in-progress build YIELDS its reactor worker instead of parking it
     /// (with clients ≥ workers, sync waiting on one change could park every

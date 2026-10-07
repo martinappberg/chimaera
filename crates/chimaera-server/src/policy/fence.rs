@@ -22,12 +22,12 @@ const MAX_FENCED: usize = 512;
 /// The projects a previous composed daemon recorded as running elsewhere,
 /// moving, or as read-only copies.
 #[derive(Default)]
-pub(crate) struct Fence {
+pub struct Fence {
     fenced: HashSet<String>,
 }
 
 impl Fence {
-    pub(crate) fn fenced(&self, workspace: &str) -> bool {
+    pub fn fenced(&self, workspace: &str) -> bool {
         !self.fenced.is_empty() && self.fenced.contains(workspace)
     }
 
@@ -38,7 +38,7 @@ impl Fence {
 
     /// `<data>/pro/state.json` and `<data>/pro/copy-authority.json`, the
     /// records a composed daemon writes. Absent files are the ordinary case.
-    pub(crate) fn load(data_dir: &Path) -> Self {
+    pub fn load(data_dir: &Path) -> Self {
         let root = data_dir.join("pro");
         let mut fenced = HashSet::new();
         match read_bounded(&root.join("state.json"), MAX_STATE) {

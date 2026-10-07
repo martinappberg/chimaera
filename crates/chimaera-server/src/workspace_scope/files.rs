@@ -173,7 +173,7 @@ impl Authority {
 }
 /// Captured once at scoped HTTP admission; ordinary daemon requests omit it.
 #[derive(Clone)]
-pub(crate) struct Context {
+pub struct Context {
     project: Arc<Root>,
     uploads: Option<Arc<Root>>,
     authority: Authority,

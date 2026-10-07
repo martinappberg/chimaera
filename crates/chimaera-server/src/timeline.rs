@@ -239,7 +239,7 @@ enum WriteOp {
     Remove { dir: PathBuf },
 }
 
-pub(crate) struct TimelineService {
+pub struct TimelineService {
     root: PathBuf,
     inner: Mutex<HashMap<String, WsTimeline>>,
     /// Per workspace: the head seq at the last append. Durable (seq survives

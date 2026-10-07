@@ -33,7 +33,7 @@ const INITIAL_DELAY: Duration = Duration::from_secs(90);
 
 /// The newest known upstream release of one agent CLI.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct AgentLatest {
+pub struct AgentLatest {
     /// Bare version ("0.146.0") — prefix-stripped and charset-gated, safe
     /// for the wire and the UI.
     pub(crate) version: String,

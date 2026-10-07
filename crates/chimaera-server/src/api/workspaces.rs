@@ -31,7 +31,7 @@ pub(crate) async fn list_workspaces(
 }
 
 #[derive(Deserialize)]
-pub(crate) struct CreateWorkspace {
+pub struct CreateWorkspace {
     root: String,
     /// The native app's own internal workspace (`Workspace::hidden`).
     #[serde(default)]
@@ -44,7 +44,7 @@ pub(crate) struct CreateWorkspace {
 /// computer reopens the same project; a local duplicate gets a fresh id and
 /// a moved folder keeps its own (the table on
 /// `WorkspaceStore::add_identified`).
-pub(crate) async fn create_workspace(
+pub async fn create_workspace(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateWorkspace>,
 ) -> Response {

@@ -1,6 +1,6 @@
 //! Persistent workspace registry: `{id, root, name}` records stored as JSON.
 
-pub(crate) mod identity;
+pub mod identity;
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -39,7 +39,7 @@ pub(crate) struct MastermindCfg {
 
 /// A registered workspace: a canonicalized directory the user opened.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct Workspace {
+pub struct Workspace {
     pub(crate) id: String,
     pub(crate) root: PathBuf,
     pub(crate) name: String,
@@ -88,7 +88,7 @@ pub(crate) struct Registered {
 }
 
 /// In-memory workspace list backed by a JSON file (save-on-change).
-pub(crate) struct WorkspaceStore {
+pub struct WorkspaceStore {
     path: PathBuf,
     items: Vec<Workspace>,
     /// Bumped per snapshot: what `written` compares.

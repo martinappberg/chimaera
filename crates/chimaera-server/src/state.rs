@@ -15,271 +15,271 @@ use crate::{
 const RESTORE_WAIT_CAP: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Shared state for request handlers.
-pub(crate) struct AppState {
-    pub(crate) token: String,
-    pub(crate) started: Instant,
-    pub(crate) hostname: String,
-    pub(crate) pid: u32,
+pub struct AppState {
+    pub token: String,
+    pub started: Instant,
+    pub hostname: String,
+    pub pid: u32,
     /// Port the daemon listens on; embedded in generated agent hook URLs.
-    pub(crate) port: u16,
+    pub port: u16,
     /// Registered workspaces, persisted to `workspaces.json` on change.
-    pub(crate) workspaces: Mutex<workspaces::WorkspaceStore>,
+    pub workspaces: Mutex<workspaces::WorkspaceStore>,
     /// Per-window view state (layout trees etc.), persisted to
     /// `view-state.json` on change.
-    pub(crate) view_state: Mutex<view_state::ViewStateStore>,
+    pub view_state: Mutex<view_state::ViewStateStore>,
     /// Ended agent conversations per workspace (the rail's Recents section),
     /// persisted to `recents.json` on change.
-    pub(crate) recents: Mutex<recents::RecentsStore>,
+    pub recents: Mutex<recents::RecentsStore>,
     /// Conversations the user archived out of Recents, per workspace
     /// (`recents-archive.json`; see `recents_archive`). Hidden, never deleted.
-    pub(crate) recents_archive: Mutex<crate::recents_archive::ArchiveStore>,
+    pub recents_archive: Mutex<crate::recents_archive::ArchiveStore>,
     /// Serializes the archive's file writes (each snapshots under it).
-    pub(crate) recents_archive_write: tokio::sync::Mutex<()>,
+    pub recents_archive_write: tokio::sync::Mutex<()>,
     /// Bumped whenever the recents store changes; `/ws/events` pushes a
     /// `recents` frame so the rail refetches instead of guessing at timing.
-    pub(crate) recents_epoch: std::sync::atomic::AtomicU64,
+    pub recents_epoch: std::sync::atomic::AtomicU64,
     /// Durable session ledger (`sessions.json`): reconciled from live state,
     /// consumed at boot to resurrect sessions across restarts. See `ledger`.
-    pub(crate) ledger: Mutex<ledger::LedgerStore>,
+    pub ledger: Mutex<ledger::LedgerStore>,
     /// session id -> the scheme ("light"/"dark") it was spawned/themed for;
     /// resurrection re-themes successors with it. Pruned by the reconciler.
-    pub(crate) session_themes: Mutex<HashMap<String, String>>,
+    pub session_themes: Mutex<HashMap<String, String>>,
     /// What the daemon knows about newer releases (see `update`).
-    pub(crate) update: Mutex<update::UpdateStatus>,
+    pub update: Mutex<update::UpdateStatus>,
     /// The newest known upstream release per agent CLI (see `agent_updates`):
     /// filled by its slow checker and Settings' inline `?check=true`, read by
     /// the GET /agents row builder. Bounded: one entry per known agent.
-    pub(crate) agent_updates: Mutex<HashMap<agents::AgentKind, agent_updates::AgentLatest>>,
+    pub agent_updates: Mutex<HashMap<agents::AgentKind, agent_updates::AgentLatest>>,
     /// Bumped when the update status changes; drives the `update` ws frame.
-    pub(crate) update_epoch: std::sync::atomic::AtomicU64,
+    pub update_epoch: std::sync::atomic::AtomicU64,
     /// Serializes release checks (the periodic one and any "check now"), so
     /// concurrent asks share one fetch — see `update::check_now`.
-    pub(crate) update_check: tokio::sync::Mutex<()>,
+    pub update_check: tokio::sync::Mutex<()>,
     /// User settings (the settings.json ground truth), stored in the config
     /// dir; mtime-checked on read so hand-edits surface without a restart.
-    pub(crate) settings: Mutex<settings::SettingsStore>,
+    pub settings: Mutex<settings::SettingsStore>,
     /// Environment preludes (`env-profiles.json`, config dir): startup
     /// commands concatenated host ⊕ workspace ⊕ launch into each spawn's
     /// `CHIMAERA_PRELUDE` file. Same hand-edit story as settings.
-    pub(crate) env_preludes: Mutex<environment::EnvPreludeStore>,
+    pub env_preludes: Mutex<environment::EnvPreludeStore>,
     /// Owner of all PTY sessions; outlives any client connection.
-    pub(crate) sessions: Arc<chimaera_pty::SessionManager>,
+    pub sessions: Arc<chimaera_pty::SessionManager>,
     /// Owner of all structured chat sessions (Tier B agent drivers).
-    pub(crate) chat: Arc<chimaera_agent::ChatManager>,
+    pub chat: Arc<chimaera_agent::ChatManager>,
     /// The chat manager's hook signals; `chat::spawn_signal_task` (called
     /// from `app()`) takes and consumes this for the daemon's lifetime.
-    pub(crate) chat_signals: Mutex<Option<tokio::sync::mpsc::Receiver<chat::ChatSignal>>>,
+    pub chat_signals: Mutex<Option<tokio::sync::mpsc::Receiver<chat::ChatSignal>>>,
     /// Respawn ingredients per chat session, for the degrade-to-PTY path.
-    pub(crate) chat_recipes: Mutex<HashMap<String, chat::ChatRecipe>>,
+    pub chat_recipes: Mutex<HashMap<String, chat::ChatRecipe>>,
     /// Sessions mid view-switch (id -> target ui "chat"|"term"): their
     /// intentional process deaths must not retire records or trigger the
     /// degrade path, and `sessions_json` synthesizes a placeholder row for
     /// the moment the id is in neither registry — a vanishing row would make
     /// every window prune the session's tabs mid-toggle.
-    pub(crate) chat_switching: Mutex<HashMap<String, String>>,
+    pub chat_switching: Mutex<HashMap<String, String>>,
     /// Workspaces with a Mastermind PUT/DELETE in flight. The routes are
     /// multi-step (retire old → bind → spawn, with rollback); two racing
     /// callers would leak the loser's spawned session and could clobber the
     /// winner's binding on rollback — so per workspace, one change at a time
     /// (the `chat_switching` idiom).
-    pub(crate) mastermind_switching: Mutex<std::collections::HashSet<String>>,
+    pub mastermind_switching: Mutex<std::collections::HashSet<String>>,
     /// workspace id -> Mastermind spawns in flight (reserved but not yet in a
     /// registry). The spawn ceiling is check-then-act across real awaits
     /// (detect + file IO + process spawn), so parallel tool calls must
     /// count-and-reserve under one lock or they all pass the check — the
     /// wall would be advisory exactly for the runaway fan-out it exists to
     /// stop (`mcp::SpawnReservation`).
-    pub(crate) spawn_reservations: Mutex<HashMap<String, usize>>,
+    pub spawn_reservations: Mutex<HashMap<String, usize>>,
     /// session id -> workspace id.
-    pub(crate) session_workspaces: Mutex<HashMap<String, String>>,
-    pub(crate) activity: Mutex<crate::activity::Activity>,
+    pub session_workspaces: Mutex<HashMap<String, String>>,
+    pub activity: Mutex<crate::activity::Activity>,
     /// The data directory the state was built from (`~/.chimaera/data`).
-    pub(crate) data_dir: PathBuf,
+    pub data_dir: PathBuf,
     /// The composed extension's own state, opaque to shared code: the
     /// installed policy reaches it by type (`extension::<T>()`). Empty, and
     /// never built, on a daemon without an extension.
-    pub(crate) extension: std::sync::OnceLock<Box<dyn std::any::Any + Send + Sync>>,
+    pub extension: std::sync::OnceLock<Box<dyn std::any::Any + Send + Sync>>,
     /// The workspace-admission hook (`policy`); the inert default unless a
     /// composition installs one at startup.
-    pub(crate) policy: std::sync::OnceLock<Arc<dyn crate::policy::WorkspacePolicy>>,
-    pub(crate) deferred_sessions: Mutex<HashMap<String, crate::ledger::LedgerEntry>>,
+    pub policy: std::sync::OnceLock<Arc<dyn crate::policy::WorkspacePolicy>>,
+    pub deferred_sessions: Mutex<HashMap<String, crate::ledger::LedgerEntry>>,
     /// session id -> the turn its resumers take (`ledger::resume_one`).
-    pub(crate) resuming: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    pub resuming: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// session id -> agent wrapper state (kind "agent" sessions only).
-    pub(crate) agents: Mutex<HashMap<String, agents::AgentRecord>>,
+    pub agents: Mutex<HashMap<String, agents::AgentRecord>>,
     /// session id -> polled shell display name (naming rule zero); written
     /// by the per-session watcher in `naming`, read by `session_json`.
-    pub(crate) display_names: Mutex<HashMap<String, String>>,
+    pub display_names: Mutex<HashMap<String, String>>,
     /// session id -> polled current working directory (shell sessions only);
     /// written by the same watcher, surfaced as `cwd_current` on session JSON
     /// (agents and never-polled shells fall back to the spawn cwd).
-    pub(crate) current_cwds: Mutex<HashMap<String, PathBuf>>,
+    pub current_cwds: Mutex<HashMap<String, PathBuf>>,
     /// session id -> stage of a currently in-flight agent exec (queued /
     /// executing); drives the linked-terminal chips in the UI.
-    pub(crate) exec_status: Mutex<HashMap<String, chimaera_pty::ExecStage>>,
+    pub exec_status: Mutex<HashMap<String, chimaera_pty::ExecStage>>,
     /// terminal session id -> agent session id: the linked-terminal edges
     /// (one agent per terminal; see the `links` module).
-    pub(crate) links: Mutex<HashMap<String, String>>,
+    pub links: Mutex<HashMap<String, String>>,
     /// Short-lived raw-access tickets for /raw/{ticket} (in-memory only).
-    pub(crate) tickets: Mutex<fs::TicketStore>,
+    pub tickets: Mutex<fs::TicketStore>,
     /// Browser-pane proxy sessions (/proxy/{id} targets; in-memory only —
     /// panes re-mint transparently after a restart). See `proxy`.
-    pub(crate) proxies: Mutex<proxy::ProxyStore>,
+    pub proxies: Mutex<proxy::ProxyStore>,
     /// Per-workspace quick-open index: served stale-while-revalidating,
     /// single-flighted per workspace, dropped when idle or deleted. See
     /// `quickopen`.
-    pub(crate) quickopen: Mutex<quickopen::QuickOpenCache>,
+    pub quickopen: Mutex<quickopen::QuickOpenCache>,
     /// Read-only git service (status/diff): discovery cache, per-workspace nudge
     /// epochs, and a bounded pool for `git` child processes. Never persisted.
-    pub(crate) git: git::GitService,
+    pub git: git::GitService,
     /// Compute-scheduler awareness (Slurm detection + the user's queue),
     /// cached + single-flight; empty-tagged on a laptop. Never persisted.
-    pub(crate) compute: compute::ComputeService,
+    pub compute: compute::ComputeService,
     /// Signalled whenever the session list / agent state / titles change;
     /// wakes /ws/events subscribers (a 1s tick catches anything missed).
     /// Every wake stamps a change generation — the shared sessions-snapshot
     /// cache's key, so N connected windows cost one snapshot build per
     /// change instead of one each.
-    pub(crate) changes: ChangeBus,
+    pub changes: ChangeBus,
     /// The `/ws/events` sessions-frame cache (see `session_view`): built once
     /// per change generation and fanned out to every connected window.
-    pub(crate) sessions_snapshot: crate::session_view::SnapshotCache,
+    pub sessions_snapshot: crate::session_view::SnapshotCache,
     /// False while the boot ledger is being consumed (sessions resurrected /
     /// retired). Sessions snapshots wait for it: serving starts concurrently
     /// with resurrection, and a snapshot taken mid-restore reads as "those
     /// sessions are gone" — the UI would prune their tabs out of restored
     /// layouts. Defaults true (no restore pending); `run` flips it false
     /// before the listener accepts, `ledger::run` back once restore is done.
-    pub(crate) restored: tokio::sync::watch::Sender<bool>,
+    pub restored: tokio::sync::watch::Sender<bool>,
     /// Signalled by `POST /shutdown` to trigger graceful exit in-band (the
     /// only non-signal way to stop the daemon). Awaited alongside SIGINT/
     /// SIGTERM by the server's graceful-shutdown future.
-    pub(crate) shutdown: tokio::sync::Notify,
+    pub shutdown: tokio::sync::Notify,
     /// Set once the shutdown signal has fired (any source), so long-held
     /// requests — the notices long-poll — return instead of stalling the
     /// graceful drain.
-    pub(crate) stopping: std::sync::atomic::AtomicBool,
+    pub stopping: std::sync::atomic::AtomicBool,
     /// The notice feed (agent finished / needs you / agent `notify`).
-    pub(crate) notices: crate::notices::Notices,
+    pub notices: crate::notices::Notices,
     /// Agent `open_browser` requests on their way to the windows, plus how
     /// many `/ws/events` consumers are connected (see `browser_open`).
-    pub(crate) browser_opens: crate::browser_open::BrowserOpens,
+    pub browser_opens: crate::browser_open::BrowserOpens,
     /// Agent binaries resolved via the login shell (with `--version`),
     /// cached per agent for the daemon's lifetime;
     /// `GET /api/v1/agents?refresh=true` bypasses and refills it.
-    pub(crate) agent_bins: Mutex<HashMap<agents::AgentKind, launcher::AgentDetection>>,
+    pub agent_bins: Mutex<HashMap<agents::AgentKind, launcher::AgentDetection>>,
     /// Root of Claude Code's per-project transcript store, normally
     /// `~/.claude/projects`; tests point it at a fixture dir.
-    pub(crate) claude_projects_dir: PathBuf,
+    pub claude_projects_dir: PathBuf,
     /// Managed-runtime prefix (`~/.chimaera/agents`): curated installs land
     /// in `<agent>/<version>/bin/` here, activated via per-agent symlinks
     /// in `bin/`. Shared by cluster workspaces; explicit/dev homes stay isolated.
-    pub(crate) managed_root: PathBuf,
+    pub managed_root: PathBuf,
     /// Read fallback for installs made by older workspace-scoped daemons.
-    pub(crate) legacy_managed_root: Option<PathBuf>,
+    pub legacy_managed_root: Option<PathBuf>,
     /// Managed-worktree prefix (`~/.chimaera/worktrees/<repo>/<branch>`).
     /// Chimaera creates worktrees ONLY here, and removes ONLY what is under
     /// here — the containment check is what keeps `worktree remove` from ever
     /// touching the user's own checkouts. Derived from the data dir, so an
     /// isolated `CHIMAERA_HOME` (and every test) is sandboxed for free.
-    pub(crate) worktrees_root: PathBuf,
+    pub worktrees_root: PathBuf,
     /// Theming-shim dir (`~/.chimaera/shims`), prepended to every session's
     /// PATH via spawn env only — user dotfiles are never touched.
-    pub(crate) shims_dir: PathBuf,
+    pub shims_dir: PathBuf,
     /// Per-session upload landing pad (`~/.chimaera/uploads/<session-id>/`):
     /// OS-desktop drops and pasted screenshots stream here so their PATHS can
     /// be referenced in prompts/shells. Under the data dir (not runtime_dir):
     /// uploads must live as long as their session, and runtime tmp gets
     /// night-scrubbed on HPC. Size-capped per file and per session (`upload`),
     /// pruned when the session ends and at boot.
-    pub(crate) uploads_root: PathBuf,
+    pub uploads_root: PathBuf,
     /// Draft mirror (`~/.chimaera/drafts/`): unsaved editor text mirrored by
     /// the client so a window on another origin can recover it. Capped and
     /// evicted in `drafts`.
-    pub(crate) drafts_root: PathBuf,
+    pub drafts_root: PathBuf,
     /// Paths an agent or a save just wrote (`git::mark_path_dirty`). Every
     /// `/ws/events` client subscribes and re-stats the ones it watches right
     /// away instead of on its next poll. Bounded; a lagging receiver just
     /// falls back to that poll. See `fs_watch::TOUCHED_CAPACITY`.
-    pub(crate) fs_touched: tokio::sync::broadcast::Sender<crate::fs_watch::Touched>,
+    pub fs_touched: tokio::sync::broadcast::Sender<crate::fs_watch::Touched>,
     /// Live install sessions, one per agent (POST /agents/{id}/install
     /// answers 409 while one runs): session id + reservation time. The id
     /// registers in `SessionManager` only after spawn, so a reservation
     /// younger than `runtimes::INSTALL_RESERVATION_GRACE` is busy even with
     /// no visible session. Cleaned up by the install watcher.
-    pub(crate) installs: Mutex<HashMap<agents::AgentKind, (String, Instant)>>,
+    pub installs: Mutex<HashMap<agents::AgentKind, (String, Instant)>>,
     /// Exact live owner through preparation and cleanup, bounded by the agent
     /// catalog. A grace timer cannot reclaim an owner whose child is not visible.
-    pub(crate) install_owners: Mutex<HashMap<agents::AgentKind, String>>,
+    pub install_owners: Mutex<HashMap<agents::AgentKind, String>>,
     /// Latest installer result per built-in agent; bounded by the catalog.
-    pub(crate) install_results: Mutex<HashMap<agents::AgentKind, crate::runtimes::InstallResult>>,
-    pub(crate) agent_setup: Mutex<HashMap<agents::AgentKind, Arc<crate::agent_setup::Operation>>>,
+    pub install_results: Mutex<HashMap<agents::AgentKind, crate::runtimes::InstallResult>>,
+    pub agent_setup: Mutex<HashMap<agents::AgentKind, Arc<crate::agent_setup::Operation>>>,
     /// The user's own Claude Code settings file (`~/.claude/settings.json`);
     /// an explicit theme there suppresses chimaera's theme injection. Tests
     /// point it at a fixture.
-    pub(crate) claude_settings_path: PathBuf,
+    pub claude_settings_path: PathBuf,
     /// The user's codex config (`$CODEX_HOME/config.toml`, default
     /// `~/.codex`); same respect rule.
-    pub(crate) codex_config_path: PathBuf,
+    pub codex_config_path: PathBuf,
     /// The per-workspace Timeline (`<data_dir>/workspace/<ws>/timeline.jsonl`):
     /// what happened, written from signals the daemon already receives. Its
     /// per-workspace epochs drive the `/ws/events` timeline frame.
-    pub(crate) timeline: timeline::TimelineService,
+    pub timeline: timeline::TimelineService,
     /// Session history (`<data_dir>/workspace/<ws>/sessions.jsonl`): one
     /// record per agent session, opened at start and closed at end; only
     /// the open ones live here. See `history`.
-    pub(crate) history: crate::history::HistoryService,
+    pub history: crate::history::HistoryService,
     /// The plugin catalog (see `plugins::Catalog`): the embedded plugins
     /// merged with the installed copies under `<data_dir>/plugins`, reloaded
     /// after every install, update, rollback or remove.
-    pub(crate) plugin_catalog: plugins::Catalog,
+    pub plugin_catalog: plugins::Catalog,
     /// Who approved what each plugin can do, the admin policy and the kill
     /// switch (see `plugins::trust`, `plugins::revoke`).
-    pub(crate) plugin_guard: plugins::trust::Guard,
+    pub plugin_guard: plugins::trust::Guard,
     /// Plugin release knowledge (see `plugins::releases`): the newer
     /// versions a check found, and the one-change-at-a-time lock. Hot state.
-    pub(crate) plugin_releases: plugins::releases::Releases,
+    pub plugin_releases: plugins::releases::Releases,
     /// Per-workspace plugin footprint detection (see `plugins`): refreshed
     /// off the reactor, read-only on the MCP hot path.
-    pub(crate) plugin_detect: Mutex<plugins::DetectCache>,
+    pub plugin_detect: Mutex<plugins::DetectCache>,
     /// The plugin host's per-daemon half (see `plugins::runtime`): live
     /// WASM instances (≤ 64, idle-evicted), fault counts, what each plugin
     /// offers, the `emit` ring. Hot state; nothing persisted.
-    pub(crate) plugin_runtime: plugins::runtime::PluginRuntime,
+    pub plugin_runtime: plugins::runtime::PluginRuntime,
     /// What plugins keep per workspace through the host (`state-put`):
     /// 64 KiB per (plugin, workspace), in memory.
-    pub(crate) plugin_state: Mutex<plugins::hostfns::PluginStates>,
+    pub plugin_state: Mutex<plugins::hostfns::PluginStates>,
     /// The plugin platform (see `plugins::platform::Platform`): output
     /// folders, durable plugin data, surfaces, screens, file events.
-    pub(crate) plugin_platform: plugins::platform::Platform,
+    pub plugin_platform: plugins::platform::Platform,
     /// Hook-driven turns of claude TUIs in flight (the Timeline's hooks
     /// tier; see `episodes`). Bounded by live sessions.
-    pub(crate) tui_episodes: Mutex<episodes::TuiEpisodes>,
+    pub tui_episodes: Mutex<episodes::TuiEpisodes>,
     /// Turn starts and ends waiting on their workspace's Knowledge check,
     /// one FIFO per workspace (see `episodes`).
-    pub(crate) episode_queue: episodes::EpisodeQueue,
+    pub episode_queue: episodes::EpisodeQueue,
     /// The Timeline's Slurm job task is running (idempotent start: tests
     /// build several routers over one state).
-    pub(crate) timeline_jobs_started: std::sync::atomic::AtomicBool,
+    pub timeline_jobs_started: std::sync::atomic::AtomicBool,
     /// Cached answers from the agents' own CLIs (plugins, skills, hooks) —
     /// see `agent_probe`.
-    pub(crate) probes: agent_probe::ProbeState,
+    pub probes: agent_probe::ProbeState,
     /// Live claude chat sessions' slash/skill catalogs (from their handshake
     /// Init), for the Skills view's "built into the agent" group. Bounded by
     /// live sessions; dropped on exit.
-    pub(crate) chat_catalogs: Mutex<HashMap<String, Vec<(String, String)>>>,
+    pub chat_catalogs: Mutex<HashMap<String, Vec<(String, String)>>>,
     /// Agent communication (see `comms`): post rate windows (shared with
     /// plugins' Timeline appends), wake caps and requests, steers in flight
     /// (memory), and each workspace's read state (`comms.json`). Messages
     /// themselves live on the Timeline.
-    pub(crate) comms: comms::Comms,
+    pub comms: comms::Comms,
     /// Knowledge-provider cache, the Timeline's diff baseline, and who
     /// recorded what (see `knowledge`). Hot state; rebuilt from the files.
-    pub(crate) knowledge: Mutex<knowledge::KnowledgeState>,
+    pub knowledge: Mutex<knowledge::KnowledgeState>,
 }
 
 impl AppState {
-    pub(crate) fn new(
+    pub fn new(
         token: String,
         hostname: String,
         pid: u32,
@@ -454,12 +454,12 @@ fn default_policy(state: &AppState) -> Arc<dyn crate::policy::WorkspacePolicy> {
 }
 
 /// A value built on first use, then shared. Field access derefs through it.
-pub(crate) struct Lazy<T> {
+pub struct Lazy<T> {
     cell: std::sync::OnceLock<T>,
     init: Mutex<Option<Box<dyn FnOnce() -> T + Send>>>,
 }
 impl<T> Lazy<T> {
-    pub(crate) fn new(init: impl FnOnce() -> T + Send + 'static) -> Self {
+    pub fn new(init: impl FnOnce() -> T + Send + 'static) -> Self {
         Self {
             cell: std::sync::OnceLock::new(),
             init: Mutex::new(Some(Box::new(init))),
@@ -491,13 +491,14 @@ impl<T> std::ops::DerefMut for Lazy<T> {
 /// tick and each keeps its own last-sent compare; the generation only lets
 /// the sessions-snapshot build run once per change instead of once per
 /// connected window (see `session_view::SnapshotCache`).
-pub(crate) struct ChangeBus {
+pub struct ChangeBus {
     notify: tokio::sync::Notify,
     generation: std::sync::atomic::AtomicU64,
 }
 
 impl ChangeBus {
-    pub(crate) fn new() -> Self {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
         ChangeBus {
             notify: tokio::sync::Notify::new(),
             generation: std::sync::atomic::AtomicU64::new(0),
@@ -534,7 +535,7 @@ impl ChangeBus {
 
 /// Lock a mutex, recovering from poisoning (our critical sections cannot leave
 /// the data in a broken state, so a poisoned lock is still usable).
-pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())

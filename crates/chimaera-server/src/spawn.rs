@@ -15,7 +15,7 @@ use crate::workspaces::Workspace;
 use crate::AppState;
 
 /// What to run in the session.
-pub(crate) enum SpawnKind {
+pub enum SpawnKind {
     /// The user's interactive shell, with shell integration when available.
     Shell,
     /// An agent TUI. `resume` is a Claude conversation id or Codex thread id.
@@ -27,7 +27,7 @@ pub(crate) enum SpawnKind {
 }
 
 /// A validated spawn request.
-pub(crate) struct SpawnSpec {
+pub struct SpawnSpec {
     pub(crate) workspace: Workspace,
     /// Session id to (re)use. `None` mints a fresh one; resurrection passes
     /// the dead session's id so every layout tab referencing it rebinds.
@@ -61,7 +61,7 @@ pub(crate) struct SpawnSpec {
 }
 
 /// Why a spawn could not happen.
-pub(crate) enum SpawnFailure {
+pub enum SpawnFailure {
     /// The agent binary is missing/broken; the message is the detection
     /// error shown to the user (HTTP 409).
     AgentUnavailable(String),
@@ -71,7 +71,7 @@ pub(crate) enum SpawnFailure {
 
 /// Spawn a session per `spec` and register all its server-side state.
 /// Returns the same session JSON `GET /sessions` would list it with.
-pub(crate) async fn spawn_session(
+pub async fn spawn_session(
     state: &Arc<AppState>,
     spec: SpawnSpec,
 ) -> Result<serde_json::Value, SpawnFailure> {

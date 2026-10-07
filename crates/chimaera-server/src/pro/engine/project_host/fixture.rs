@@ -599,12 +599,14 @@ impl Scenario {
         let project = self.original_owner(value, original_generation)?;
         Ok(policy_host::ReleaseOwner::fixture(project, epoch, current))
     }
+    /// `force`: the return is past its deadline, the cloud yields at once.
     pub fn handback_owner(
         &self,
         value: Value,
         host: Value,
         holder: String,
         epoch: u64,
+        force: bool,
     ) -> Result<policy_host::HandbackOwner> {
         bounded(&host)?;
         policy_host::HandbackOwner::capture(
@@ -614,6 +616,7 @@ impl Scenario {
             serde_json::from_value(host)?,
             holder,
             epoch,
+            force,
         )
     }
     pub fn move_request_owner(
@@ -728,9 +731,18 @@ impl Scenario {
                         lock(record).remove(key);
                     }
                 }
+                // The fixture's `(next, tries)` pair is the retry record's
+                // two observable fields.
                 let mut records = lock(&state.pro().return_backoff);
-                if let Some(backoff) = backoff {
-                    records.insert(key.clone(), backoff);
+                if let Some((next, tries)) = backoff {
+                    records.insert(
+                        key.clone(),
+                        crate::pro::moving::Retry {
+                            next,
+                            tries: tries.min(u8::MAX as u64) as u8,
+                            ..Default::default()
+                        },
+                    );
                 } else {
                     records.remove(key);
                 }
@@ -767,7 +779,9 @@ impl Scenario {
         let parked = lock(&state.pro().parked).contains(key);
         let release_pending = lock(&state.pro().release_pending).contains(key);
         let opened = lock(&state.pro().opened_here).contains(key);
-        let return_backoff = lock(&state.pro().return_backoff).get(key).copied();
+        let return_backoff = lock(&state.pro().return_backoff)
+            .get(key)
+            .map(|retry| (retry.next, retry.tries as u64));
         let sleeping = lock(&state.pro().sleeping).contains(key);
         Ok(ProjectObservation {
             ownership,

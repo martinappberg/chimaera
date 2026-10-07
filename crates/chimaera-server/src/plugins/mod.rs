@@ -732,7 +732,7 @@ fn extras() -> Vec<Arc<Manifest>> {
 /// rollback or remove, so a change takes effect without a restart. The
 /// first-party plugins nothing is installed for are not in it: they have no
 /// component to load, and the wire lists them as `available` (`listing`).
-pub(crate) struct Catalog {
+pub struct Catalog {
     /// `<data dir>/plugins`.
     pub(crate) root: PathBuf,
     /// The daemon version the gates compare against (tests pin another).
@@ -983,7 +983,7 @@ pub(crate) mod test_catalog {
 
 /// Per-workspace detect results: plugin ids whose footprint is present.
 #[derive(Default)]
-pub(crate) struct DetectCache {
+pub struct DetectCache {
     entries: HashMap<String, (Instant, BTreeSet<String>)>,
 }
 

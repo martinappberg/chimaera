@@ -75,7 +75,7 @@ impl Harness {
         factory: Option<fn() -> Arc<dyn Runtime>>,
         runtime: Option<Arc<dyn Runtime>>,
     ) -> anyhow::Result<Self> {
-        let (root, mut state) = tokio::task::spawn_blocking(move || {
+        let (root, state) = tokio::task::spawn_blocking(move || {
             use std::os::unix::fs::{DirBuilderExt, MetadataExt};
             ensure!(
                 root.is_absolute() && root.as_os_str().len() <= 4096,

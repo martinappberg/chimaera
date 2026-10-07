@@ -43,7 +43,7 @@ use axum::Json;
 use serde_json::{json, Value};
 
 use crate::AppState;
-pub(crate) mod cloud_context;
+pub mod cloud_context;
 
 /// Protocol version offered when the client's is unknown to us.
 const PROTOCOL_FALLBACK: &str = "2025-06-18";

@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 const MAX_SESSIONS: usize = 4096;
 #[derive(Default)]
-pub(crate) struct Activity {
+pub struct Activity {
     input: HashMap<String, u64>,
     /// The last authenticated user mutation that is not a session input: a
     /// file save or upload, a Git operation, a session created or closed.
@@ -70,7 +70,7 @@ pub(crate) fn touch(state: &crate::AppState) {
     }
     crate::lock(&state.activity).changed = crate::session_view::now_ms();
 }
-pub(crate) fn last_change(state: &crate::AppState) -> Option<u64> {
+pub fn last_change(state: &crate::AppState) -> Option<u64> {
     let changed = crate::lock(&state.activity).changed;
     (changed > 0).then_some(changed)
 }
@@ -115,7 +115,7 @@ pub(crate) fn is_interaction(command: &chimaera_agent::model::AgentCommand) -> b
 /// What a chat frame is to whoever holds input for an owner that has not
 /// answered (this daemon's relay; a keeper sorts the same way).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ChatFrame {
+pub enum ChatFrame {
     /// The user acting: exactly [`is_interaction`]. Held in order, and a
     /// reason to wake the current owner, never an implicit takeover.
     Acting,
@@ -131,7 +131,7 @@ pub(crate) enum ChatFrame {
 /// relay need not build the command, a send's pictures included, to sort it.
 /// `Acting` is [`is_interaction`], which the tests hold it to for every
 /// command.
-pub(crate) fn chat_frame(kind: &str, dry_run: bool) -> ChatFrame {
+pub fn chat_frame(kind: &str, dry_run: bool) -> ChatFrame {
     match kind {
         "send" | "send_after_turn" | "permission" | "answer" | "elicitation" | "interrupt"
         | "compact" | "background_tool" | "stop_task" => ChatFrame::Acting,

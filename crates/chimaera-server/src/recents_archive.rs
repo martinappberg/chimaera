@@ -61,7 +61,7 @@ pub(crate) fn key_of(resume: Option<&str>, kind: &str, title: &str) -> String {
     }
 }
 
-pub(crate) struct ArchiveStore {
+pub struct ArchiveStore {
     path: PathBuf,
     /// workspace id -> archived, oldest first.
     items: HashMap<String, Vec<Archived>>,

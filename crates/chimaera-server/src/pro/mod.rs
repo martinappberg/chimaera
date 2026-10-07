@@ -17,7 +17,7 @@ pub(crate) mod manual_receipt;
 mod manual_resume;
 pub(crate) mod mirror;
 pub(crate) mod moves;
-mod moving;
+pub(crate) mod moving;
 pub(crate) mod pause;
 mod seam;
 pub(crate) use seam::{compose, ProPolicy};

@@ -16,7 +16,7 @@ use std::path::PathBuf;
 /// Antigravity CLI (binary `agy`). Gemini stays readable in old session
 /// records; new launches offer Antigravity, alongside Claude, Codex and Grok.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum AgentKind {
+pub enum AgentKind {
     Claude,
     Codex,
     Gemini,
@@ -94,7 +94,7 @@ impl AgentKind {
 
 /// Attention state of an agent session, derived from Claude Code hook events.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AgentState {
+pub enum AgentState {
     Running,
     NeedsPermission,
     IdlePrompt,
@@ -132,7 +132,7 @@ const TURN_SETTLE_MS: u64 = 2_000;
 /// output followed, or once its terminal has been quiet for a while with the
 /// agent itself in the foreground (no program it launched took the terminal).
 /// `now`, `last_output_at` are the PTY output clock (ms).
-pub(crate) fn tui_at_pause(
+pub fn tui_at_pause(
     record: &AgentRecord,
     alive: bool,
     last_output_at: u64,
@@ -222,7 +222,7 @@ impl AgentUsage {
 
 /// Server-side wrapper state for one agent session.
 #[derive(Clone, Debug)]
-pub(crate) struct AgentRecord {
+pub struct AgentRecord {
     /// Per-session secret embedded in the hook URL; authorizes ingestion.
     pub(crate) key: String,
     /// Which agent CLI this session runs (the UI glyphs sessions by it).
@@ -353,7 +353,7 @@ impl AgentRecord {
             .then(|| self.native_cwd.clone())
             .flatten()
     }
-    pub(crate) fn new(key: String, kind: AgentKind) -> Self {
+    pub fn new(key: String, kind: AgentKind) -> Self {
         AgentRecord {
             key,
             kind,

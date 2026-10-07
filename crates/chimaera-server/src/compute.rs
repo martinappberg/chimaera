@@ -224,7 +224,7 @@ const DET_UNKNOWN: u8 = 0;
 const DET_NONE: u8 = 1;
 const DET_SLURM: u8 = 2;
 
-pub(crate) struct ComputeService {
+pub struct ComputeService {
     /// One async lock covers detection + the snapshot cache: refreshes are
     /// single-flight (concurrent GETs await the first refresher and then
     /// read its cache), and nothing here is hot enough to shard.

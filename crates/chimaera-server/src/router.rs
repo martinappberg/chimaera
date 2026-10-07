@@ -12,7 +12,7 @@ use crate::{
 };
 
 /// Build the axum router (factored out so tests can drive it with `oneshot`).
-pub(crate) fn app(state: Arc<AppState>) -> Router {
+pub fn app(state: Arc<AppState>) -> Router {
     // Consumes the chat manager's hook signals for the daemon's lifetime
     // (no-op when already running — tests may build several routers).
     chat::spawn_signal_task(state.clone());

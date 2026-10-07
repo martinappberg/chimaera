@@ -262,7 +262,7 @@ fn close(turn: &mut TurnAcc, ts: u64, end: &'static str, duration: Option<u64>) 
 
 /// Hook-driven turns for claude TUIs (PTY sessions only).
 #[derive(Default)]
-pub(crate) struct TuiEpisodes {
+pub struct TuiEpisodes {
     open: HashMap<String, TurnAcc>,
 }
 
@@ -338,7 +338,7 @@ enum Job {
 /// The per-workspace FIFOs; a workspace's worker task runs while its queue
 /// is in the map (it removes it, under the same lock, when it runs dry).
 #[derive(Default)]
-pub(crate) struct EpisodeQueue {
+pub struct EpisodeQueue {
     queues: Mutex<HashMap<String, VecDeque<Job>>>,
 }
 

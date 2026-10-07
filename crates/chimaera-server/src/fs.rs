@@ -119,7 +119,7 @@ const MAX_TICKETS: usize = 4096;
 /// blocking pool can grow very large under a request burst; on NFS/Lustre that
 /// turns one stalled mount into host-wide thread and syscall pressure. Queued
 /// requests remain asynchronous, so terminals/chat/health stay responsive.
-pub(crate) static FILESYSTEM_WORK: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
+pub static FILESYSTEM_WORK: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
 
 /// The daemon user's home directory (`$HOME`).
 fn home_dir() -> anyhow::Result<PathBuf> {
@@ -130,7 +130,7 @@ fn home_dir() -> anyhow::Result<PathBuf> {
 }
 
 /// Expand a leading `~` to the user's home directory; other paths pass through.
-pub(crate) fn expand_tilde(raw: &str) -> anyhow::Result<PathBuf> {
+pub fn expand_tilde(raw: &str) -> anyhow::Result<PathBuf> {
     if raw == "~" {
         return home_dir();
     }
@@ -230,7 +230,7 @@ impl FileSource {
 /// writer shows up — holding a blocking worker and whatever limiter permit
 /// the caller took — and a device (`/dev/zero`) would stream without end.
 /// `O_NONBLOCK` changes nothing for a regular file's reads.
-pub(crate) fn open_regular(path: &Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+pub fn open_regular(path: &Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
     use rustix::fs::{Mode, OFlags};
     let fd = rustix::fs::open(
         path,
@@ -368,7 +368,7 @@ pub(crate) async fn home() -> Response {
 }
 
 #[derive(Deserialize)]
-pub(crate) struct DirsQuery {
+pub struct DirsQuery {
     path: String,
     #[serde(default)]
     hidden: bool,
@@ -382,7 +382,7 @@ struct DirEntry {
 }
 
 /// GET /api/v1/fs/dirs?path=<path>&hidden=<bool>
-pub(crate) async fn dirs(
+pub async fn dirs(
     State(state): State<Arc<AppState>>,
     filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
     Query(query): Query<DirsQuery>,
@@ -556,7 +556,7 @@ struct FsEntry {
 
 /// GET /api/v1/fs/list?path=<path>&hidden=<bool> — full directory listing
 /// (dirs and files) for the file tree.
-pub(crate) async fn list(
+pub async fn list(
     State(state): State<Arc<AppState>>,
     filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
     Query(query): Query<DirsQuery>,
@@ -780,7 +780,7 @@ fn list_entries(
 }
 
 #[derive(Deserialize)]
-pub(crate) struct FileQuery {
+pub struct FileQuery {
     path: String,
     #[serde(default)]
     offset: u64,
@@ -801,7 +801,7 @@ pub(crate) struct FileQuery {
 /// address DECOMPRESSED bytes (sequential decode, capped), the Content-Type
 /// comes from the inner name, and `X-File-Size` is only present once the
 /// total decompressed size is known (i.e. this slice reached EOF).
-pub(crate) async fn file(
+pub async fn file(
     filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
     Query(query): Query<FileQuery>,
 ) -> Response {
@@ -1038,7 +1038,7 @@ fn read_gz_slice_source(
 }
 
 #[derive(Deserialize)]
-pub(crate) struct PutFileQuery {
+pub struct PutFileQuery {
     path: String,
     #[serde(default)]
     expect_mtime: Option<String>,
@@ -1095,7 +1095,7 @@ enum WriteOutcome {
 ///   without writing, so a retry after a lost reply is a no-op, not a 409
 ///   against our own write. A missing file is a 409.
 /// - `expect_mtime` (a previous `X-Mtime`): the metadata token must match.
-pub(crate) async fn put_file(
+pub async fn put_file(
     State(state): State<Arc<AppState>>,
     filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
     mutation: Option<Extension<crate::workspace_scope::Mutation>>,
@@ -1652,7 +1652,7 @@ mod write_tests {
 }
 
 #[derive(Deserialize)]
-pub(crate) struct MarkdownQuery {
+pub struct MarkdownQuery {
     path: String,
 }
 
@@ -1660,7 +1660,7 @@ pub(crate) struct MarkdownQuery {
 /// as sanitized GFM HTML (see [`markdown_to_html`] for what it carries), and
 /// the raw text of a leading YAML frontmatter block (see [`frontmatter`];
 /// delimiter lines excluded) or null.
-pub(crate) async fn markdown(
+pub async fn markdown(
     filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
     Query(query): Query<MarkdownQuery>,
 ) -> Response {
@@ -3110,7 +3110,7 @@ mod markdown_parity_tests {
 }
 
 #[derive(Deserialize)]
-pub(crate) struct TableQuery {
+pub struct TableQuery {
     path: String,
     #[serde(default)]
     offset_rows: usize,
@@ -3226,7 +3226,7 @@ impl TableOpts {
 /// answers `scan_limited` with how far it got (`scanned_to`) — asking again
 /// resumes from there. The response also carries `total_rows` once a scan has
 /// reached the end, else `est_rows` (a byte-rate estimate, plain files only).
-pub(crate) async fn table(
+pub async fn table(
     filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
     Query(query): Query<TableQuery>,
 ) -> Response {
@@ -3634,7 +3634,7 @@ mod table_tests {
     }
 }
 #[derive(Deserialize)]
-pub(crate) struct XlsxQuery {
+pub struct XlsxQuery {
     path: String,
     #[serde(default)]
     sheet: Option<String>,
@@ -3650,7 +3650,7 @@ pub(crate) struct XlsxQuery {
 /// resolved `sheet`, so the UI can offer a sheet picker and reuse the CSV grid.
 /// The first row is the header (parity with the CSV viewer). Runs on a blocking
 /// worker (calamine parses the whole file) after a source-size gate.
-pub(crate) async fn xlsx(
+pub async fn xlsx(
     filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
     Query(query): Query<XlsxQuery>,
 ) -> Response {
@@ -4170,7 +4170,7 @@ pub(crate) async fn validate(
 }
 
 #[derive(Deserialize)]
-pub(crate) struct MkdirRequest {
+pub struct MkdirRequest {
     path: String,
 }
 
@@ -4180,7 +4180,7 @@ pub(crate) struct MkdirRequest {
 /// as writing a file via PUT /fs/file. Idempotent: an already-existing
 /// directory is a success. Backs the folder picker's "create folder" action,
 /// so a workspace can be opened on a path that does not exist yet.
-pub(crate) async fn mkdir(
+pub async fn mkdir(
     State(state): State<Arc<AppState>>,
     filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
     mutation: Option<Extension<crate::workspace_scope::Mutation>>,
@@ -4289,7 +4289,7 @@ enum CreateKind {
 }
 
 #[derive(Deserialize)]
-pub(crate) struct CreateRequest {
+pub struct CreateRequest {
     path: String,
     kind: CreateKind,
 }
@@ -4300,7 +4300,7 @@ pub(crate) struct CreateRequest {
 /// user "New File/Folder", so an already-existing target is a 409 conflict,
 /// never a silent success. Returns the canonical created path. Same trust
 /// model as PUT /fs/file: the daemon runs as the user.
-pub(crate) async fn create(
+pub async fn create(
     State(state): State<Arc<AppState>>,
     filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
     mutation: Option<Extension<crate::workspace_scope::Mutation>>,
@@ -4360,7 +4360,7 @@ pub(crate) async fn create(
 }
 
 #[derive(Deserialize)]
-pub(crate) struct RenameRequest {
+pub struct RenameRequest {
     from: String,
     to: String,
 }
@@ -4372,7 +4372,7 @@ pub(crate) struct RenameRequest {
 /// never their targets. Cross-filesystem moves are refused with a friendly
 /// error rather than silently degrading to copy+delete. Returns the canonical
 /// new path.
-pub(crate) async fn rename(
+pub async fn rename(
     State(state): State<Arc<AppState>>,
     filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
     mutation: Option<Extension<crate::workspace_scope::Mutation>>,
@@ -4426,7 +4426,7 @@ pub(crate) async fn rename(
 }
 
 #[derive(Deserialize)]
-pub(crate) struct DeleteRequest {
+pub struct DeleteRequest {
     path: String,
 }
 
@@ -4435,7 +4435,7 @@ pub(crate) struct DeleteRequest {
 /// server-side trash; the UI fronts this with an explicit confirmation.
 /// Refuses `/` (structurally: it has no file name) and the user's home
 /// directory. 204 on success.
-pub(crate) async fn delete(
+pub async fn delete(
     State(state): State<Arc<AppState>>,
     filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
     mutation: Option<Extension<crate::workspace_scope::Mutation>>,
@@ -4562,7 +4562,7 @@ fn is_within(child: &Path, ancestor: &Path) -> bool {
 }
 
 #[derive(Deserialize)]
-pub(crate) struct CopyRequest {
+pub struct CopyRequest {
     from: String,
     to: String,
     #[serde(default)]
@@ -4573,7 +4573,7 @@ pub(crate) struct CopyRequest {
 /// link), or directory (recursively) to `to`. `on_conflict:"unique"` picks a
 /// free "name copy" sibling instead of 409-ing. Refuses copying a directory
 /// into itself or a descendant. Returns the canonical new path.
-pub(crate) async fn copy(
+pub async fn copy(
     State(state): State<Arc<AppState>>,
     filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
     mutation: Option<Extension<crate::workspace_scope::Mutation>>,
@@ -4627,7 +4627,7 @@ pub(crate) async fn copy(
 }
 
 #[derive(Deserialize)]
-pub(crate) struct MoveRequest {
+pub struct MoveRequest {
     from: String,
     to: String,
 }
@@ -4637,7 +4637,7 @@ pub(crate) struct MoveRequest {
 /// recursive copy then deletes the source (only after the copy fully
 /// succeeds). Refuses moving the home directory or a directory into itself.
 /// 409 if `to` already exists. Returns the canonical new path.
-pub(crate) async fn move_(
+pub async fn move_(
     State(state): State<Arc<AppState>>,
     filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
     mutation: Option<Extension<crate::workspace_scope::Mutation>>,
@@ -4724,7 +4724,7 @@ pub(crate) async fn move_(
 /// file that changed. A renewal is a bearer-authed request for a capability
 /// the caller could mint fresh anyway.
 #[derive(Default)]
-pub(crate) struct TicketStore {
+pub struct TicketStore {
     tickets: HashMap<String, Ticket>,
     /// (path, version) -> the live ticket minted for it.
     by_version: HashMap<(PathBuf, String), String>,
@@ -4936,7 +4936,7 @@ mod ticket_store_tests {
 }
 
 #[derive(Deserialize)]
-pub(crate) struct TicketRequest {
+pub struct TicketRequest {
     path: String,
 }
 
@@ -4952,7 +4952,7 @@ pub(crate) struct TicketRequest {
 /// the ticket is bound to, which a symlink (`latest.html -> runs/42/…`) or
 /// `~` can hide from the caller — an HTML frame addresses its page as
 /// `/raw/{ticket}/{name}` (see [`raw_asset`]).
-pub(crate) async fn create_ticket(
+pub async fn create_ticket(
     State(state): State<Arc<AppState>>,
     filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
     Json(body): Json<TicketRequest>,
@@ -5035,7 +5035,7 @@ fn parse_byte_range(value: &str, total: u64) -> Option<Result<(u64, u64), ()>> {
 /// or expired tickets, and on files that vanished since the ticket was minted.
 /// Cacheable for the ticket's remaining life, revalidated by `ETag` (see
 /// [`serve_raw`]).
-pub(crate) async fn raw(
+pub async fn raw(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(ticket): axum::extract::Path<String>,
     headers: HeaderMap,
@@ -5100,7 +5100,7 @@ pub(crate) async fn raw(
 /// can LOAD these files (script, style, image, media tags) but never READ
 /// them with fetch/XHR — no CORS header is sent on purpose: a report must
 /// not be able to read out its neighbors.
-pub(crate) async fn raw_asset(
+pub async fn raw_asset(
     State(state): State<Arc<AppState>>,
     axum::extract::Path((ticket, rest)): axum::extract::Path<(String, String)>,
     headers: HeaderMap,

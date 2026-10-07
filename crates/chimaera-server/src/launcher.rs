@@ -167,7 +167,7 @@ pub(crate) fn is_outdated(kind: AgentKind, version: Option<&str>) -> bool {
 /// resolved binary is a chimaera-managed install (lives under
 /// `~/.chimaera/agents`).
 #[derive(Clone, Debug)]
-pub(crate) struct AgentDetection {
+pub struct AgentDetection {
     pub(crate) path: Result<PathBuf, String>,
     pub(crate) version: Option<String>,
     pub(crate) managed: bool,
@@ -216,7 +216,7 @@ fn validate_cache_hit(hit: &AgentDetection) -> CacheHit {
 /// a managed install the moment it lands. Cache hits are stat-validated so
 /// an update that replaced or moved the binary is noticed at the next spawn
 /// (without re-running the 6s login-shell probe the cache exists to avoid).
-pub(crate) async fn detect(state: &AppState, kind: AgentKind, refresh: bool) -> AgentDetection {
+pub async fn detect(state: &AppState, kind: AgentKind, refresh: bool) -> AgentDetection {
     if !refresh {
         let hit = crate::lock(&state.agent_bins).get(&kind).cloned();
         if let Some(hit) = hit {
@@ -1017,7 +1017,7 @@ pub(crate) fn build_codex_chat_command(
 }
 
 /// An argv-only config override; the per-session secret stays inside the shim.
-pub(crate) fn codex_notify_args(path: &Path) -> Vec<String> {
+pub fn codex_notify_args(path: &Path) -> Vec<String> {
     vec![
         "-c".into(),
         format!(
@@ -1111,7 +1111,7 @@ pub(crate) fn login_shell() -> String {
 /// machine: `/Users/x/dev/chimaera` -> `-Users-x-dev-chimaera`, and a
 /// `.claude-worktrees` component encodes as `--claude-worktrees` (the dot
 /// becomes a dash too).
-pub(crate) fn encode_cwd(cwd: &Path) -> String {
+pub fn encode_cwd(cwd: &Path) -> String {
     cwd.to_string_lossy()
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
@@ -1159,7 +1159,7 @@ pub(crate) async fn claude_resumables(
 /// error. Transcripts with nothing user-visible to title them (warmups,
 /// empty boots) are skipped rather than listed as "untitled".
 /// (Shared with GET /recents, which merges this history into the rail.)
-pub(crate) fn scan_resumables(dir: &Path, exclude: &[PathBuf]) -> Vec<serde_json::Value> {
+pub fn scan_resumables(dir: &Path, exclude: &[PathBuf]) -> Vec<serde_json::Value> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };

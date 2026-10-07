@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub(crate) struct Confined {
+pub struct Confined {
     pub(super) root: PathBuf,
     directory: File,
 }

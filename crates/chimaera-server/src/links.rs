@@ -21,7 +21,7 @@ use crate::AppState;
 
 /// The live link list as JSON, pruning edges whose sessions are gone.
 /// Stable terminal-id order so /ws/events snapshot dedup doesn't flap.
-pub(crate) fn links_json(state: &AppState) -> Vec<serde_json::Value> {
+pub fn links_json(state: &AppState) -> Vec<serde_json::Value> {
     let mut links = crate::lock(&state.links);
     links.retain(|terminal, agent| {
         state.sessions.get(terminal).is_some() && crate::chat::session_alive(state, agent)

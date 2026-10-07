@@ -26,14 +26,15 @@ use serde_json::json;
 
 use crate::AppState;
 
-pub(crate) use crate::agent_state::{apply_title_line, truncate_prompt, AgentKind, AgentRecord};
+pub(crate) use crate::agent_state::{apply_title_line, truncate_prompt};
 use crate::agent_state::{
     cleared_by_output, map_event, now_line_update, statusline_usage, subagent_identity,
     touched_file, AgentState,
 };
+pub use crate::agent_state::{AgentKind, AgentRecord};
 
 /// Fresh session id in the same format the PTY engine generates.
-pub(crate) fn fresh_session_id() -> String {
+pub fn fresh_session_id() -> String {
     format!("s-{}", &chimaera_core::generate_token()[..8])
 }
 

@@ -297,7 +297,7 @@ pub(crate) async fn upload(
 }
 
 #[derive(Deserialize)]
-pub(crate) struct DirUploadQuery {
+pub struct DirUploadQuery {
     /// Absolute destination directory on the daemon's filesystem.
     dir: String,
     /// Suggested filename; sanitized to a strict basename server-side.
@@ -313,7 +313,7 @@ pub(crate) struct DirUploadQuery {
 /// bounds one gesture. Collisions get a " copy" sibling rather than clobbering.
 /// Answers `{path, name, size}`. Bearer-authed; 400 for a bad name or a
 /// non-directory `dir`, 413 past the per-file cap.
-pub(crate) async fn upload_to_dir(
+pub async fn upload_to_dir(
     State(state): State<Arc<AppState>>,
     filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
     mutation: Option<Extension<crate::workspace_scope::Mutation>>,

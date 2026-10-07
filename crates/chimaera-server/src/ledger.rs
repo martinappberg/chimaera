@@ -58,7 +58,7 @@ use chimaera_agent::model::SessionUi;
 
 /// One live session, as much of it as can be rebuilt after a restart.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct LedgerEntry {
+pub struct LedgerEntry {
     pub(crate) id: String,
     /// A handoff or unverified owner retains identity without resurrecting.
     pub(crate) suspended: bool,
@@ -90,7 +90,7 @@ pub(crate) struct LedgerEntry {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct LedgerAgent {
+pub struct LedgerAgent {
     pub(crate) kind: AgentKind,
     /// Claude conversation id or Codex thread id, when known. A recorded id
     /// is a CLAIM, not a promise: claude 2.1.204 interactive sessions do
@@ -124,7 +124,7 @@ pub(crate) struct LedgerAgent {
 
 /// What the previous daemon left behind.
 #[derive(Debug, Default)]
-pub(crate) struct BootLedger {
+pub struct BootLedger {
     pub(crate) sessions: Vec<LedgerEntry>,
     /// terminal session id -> agent session id (linked terminals).
     pub(crate) links: HashMap<String, String>,
@@ -134,7 +134,7 @@ pub(crate) struct BootLedger {
 }
 
 impl LedgerEntry {
-    pub(crate) fn to_json(&self) -> serde_json::Value {
+    pub fn to_json(&self) -> serde_json::Value {
         let mut value = json!({
             "id": self.id,
             "workspace_id": self.workspace_id,
@@ -174,7 +174,7 @@ impl LedgerEntry {
         value
     }
 
-    pub(crate) fn from_json(value: &serde_json::Value) -> Option<LedgerEntry> {
+    pub fn from_json(value: &serde_json::Value) -> Option<LedgerEntry> {
         let agent = match value.get("agent") {
             None | Some(serde_json::Value::Null) => None,
             Some(a) => Some(LedgerAgent {
@@ -243,14 +243,14 @@ impl LedgerEntry {
 /// The on-disk ledger. One writer (the reconcile loop); writes are atomic
 /// (tmp + rename) and skipped when nothing changed, so an idle daemon costs
 /// zero I/O.
-pub(crate) struct LedgerStore {
+pub struct LedgerStore {
     path: PathBuf,
     /// Serialized body of the last write, for change detection.
     last_written: Option<String>,
 }
 
 impl LedgerStore {
-    pub(crate) fn new(path: PathBuf) -> Self {
+    pub fn new(path: PathBuf) -> Self {
         LedgerStore {
             path,
             last_written: None,
@@ -421,7 +421,7 @@ pub(crate) async fn run(state: Arc<AppState>) {
 /// qualify: install sessions (runtimes) are transient by design, and a
 /// session without a workspace mapping could not be respawned anywhere.
 /// Also called once at graceful shutdown for the final flush.
-pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, String>) {
+pub fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, String>) {
     let infos = state.sessions.list();
     // Chat-mode sessions live in a SEPARATE registry (`state.chat`), not the PTY
     // roster above. Snapshot them too — otherwise a restart resurrects terminals
@@ -622,7 +622,7 @@ pub(crate) async fn consume_boot(state: &Arc<AppState>, boot: BootLedger) {
 /// Act on what the previous daemon left: resurrect what can come back
 /// faithfully, retire the rest into Recents. Never silent — the log says
 /// what happened to every entry.
-pub(crate) async fn restore(state: &Arc<AppState>, boot: BootLedger) {
+pub async fn restore(state: &Arc<AppState>, boot: BootLedger) {
     if boot.sessions.is_empty() {
         return;
     }
@@ -800,7 +800,7 @@ pub(crate) async fn respawn(
     respawn_transfer(state, entry, workspace, fork, origin).await
 }
 
-pub(crate) async fn respawn_transfer(
+pub async fn respawn_transfer(
     state: &Arc<AppState>,
     entry: &LedgerEntry,
     workspace: crate::workspaces::Workspace,
@@ -887,7 +887,7 @@ pub(crate) async fn respawn_transfer(
 /// A conversation a lapse fenced here that another machine ran since
 /// (the workspace policy settles it): it goes to Recents instead of resuming, so
 /// reopening it continues the conversation without re-running its turn.
-pub(crate) async fn retire_stale(state: &Arc<AppState>, entry: &LedgerEntry) {
+pub async fn retire_stale(state: &Arc<AppState>, entry: &LedgerEntry) {
     retire_to_recents(state, entry, unix_now()).await;
     state.changes.notify_waiters();
 }
@@ -944,7 +944,7 @@ async fn retire_to_recents(state: &Arc<AppState>, entry: &LedgerEntry, last_acti
 }
 
 /// A verified local grant is the only path that resumes restart-deferred work.
-pub(crate) async fn resume_deferred_workspace(
+pub async fn resume_deferred_workspace(
     state: &Arc<AppState>,
     workspace_id: &str,
 ) -> anyhow::Result<()> {
@@ -955,7 +955,7 @@ pub(crate) async fn resume_deferred_workspace(
 /// provider still signing in holds only its own sessions back). One session
 /// that fails to resume does not stop the others; the first error is
 /// returned after every session was tried.
-pub(crate) async fn resume_deferred_filtered(
+pub async fn resume_deferred_filtered(
     state: &Arc<AppState>,
     workspace_id: &str,
     keep: impl Fn(&LedgerEntry) -> bool,
@@ -997,7 +997,7 @@ pub(crate) async fn resume_deferred_filtered(
 }
 
 /// Resume only the named restart-deferred sessions of one workspace.
-pub(crate) async fn resume_deferred_sessions(
+pub async fn resume_deferred_sessions(
     state: &Arc<AppState>,
     workspace_id: &str,
     ids: &[String],
@@ -1107,7 +1107,7 @@ impl Drop for ResumeTurn<'_> {
 }
 
 /// Imported/remote histories are bounded just like the live session roster.
-pub(crate) fn defer(state: &AppState, entry: LedgerEntry) -> anyhow::Result<()> {
+pub fn defer(state: &AppState, entry: LedgerEntry) -> anyhow::Result<()> {
     let mut deferred = crate::lock(&state.deferred_sessions);
     if !deferred.contains_key(&entry.id) && deferred.len() >= 512 {
         anyhow::bail!("suspended session limit reached");

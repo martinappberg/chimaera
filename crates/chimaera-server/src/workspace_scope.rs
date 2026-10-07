@@ -29,7 +29,7 @@ const MAX_JSON: usize = 1024 * 1024;
 /// the actual mutation commit: a body or queue wait cannot silently adopt a
 /// replacement account generation or epoch.
 #[derive(Clone)]
-pub(crate) struct Mutation {
+pub struct Mutation {
     scope: Scope,
     admission: crate::policy::Admission,
 }

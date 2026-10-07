@@ -35,7 +35,7 @@ const MAX_BYTES: u64 = 4096;
 
 /// What a folder says about itself.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Marker {
+pub struct Marker {
     /// The workspace id the folder was registered under.
     pub id: String,
     /// Unix seconds; informational.
@@ -46,7 +46,7 @@ pub(crate) struct Marker {
 /// The marker's path for `root`. Nothing is followed through a `.git`
 /// symlink: only a real `.git` directory, or a `.git` file naming a real git
 /// directory, hosts it.
-pub(crate) fn marker_path(root: &Path) -> PathBuf {
+pub fn marker_path(root: &Path) -> PathBuf {
     let git = root.join(".git");
     match std::fs::symlink_metadata(&git) {
         Ok(meta) if meta.is_dir() => return git.join(IN_GIT),
@@ -83,7 +83,7 @@ fn linked_git_dir(root: &Path, file: &Path) -> Option<PathBuf> {
 
 /// Same rule as the ids the account accepts (`pro::valid_id`): a marker
 /// naming anything else is treated as absent.
-pub(crate) fn valid_id(value: &str) -> bool {
+pub fn valid_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
         && value
@@ -94,7 +94,7 @@ pub(crate) fn valid_id(value: &str) -> bool {
 /// The folder's marker; `None` when it is missing, not a regular file,
 /// over 4 KiB, not parseable, or names an id that is not well formed.
 /// Blocking filesystem work: call off the reactor.
-pub(crate) fn read(root: &Path) -> Option<Marker> {
+pub fn read(root: &Path) -> Option<Marker> {
     // `open_regular` never parks on a FIFO swapped in for the marker and
     // refuses devices.
     let (file, meta) = crate::fs::open_regular(&marker_path(root)).ok()?;
@@ -115,7 +115,7 @@ pub(crate) fn read(root: &Path) -> Option<Marker> {
 /// level and reported as `false`, never raised. Returns whether the folder
 /// now carries this id. A marker that already names it is left alone (no
 /// rewrite per open). Blocking filesystem work.
-pub(crate) fn write(root: &Path, id: &str) -> bool {
+pub fn write(root: &Path, id: &str) -> bool {
     match try_write(root, id) {
         Ok(now_carries) => now_carries,
         Err(error) => {

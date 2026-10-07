@@ -15,7 +15,7 @@ pub(crate) static ROLLOUT_WORK: tokio::sync::Semaphore = tokio::sync::Semaphore:
 /// start through the user's login shell, which may export `CODEX_HOME`
 /// (common on HPC) where the daemon's own environment does not; that is
 /// probed once per daemon life, bounded, reading only that one variable.
-pub(crate) async fn codex_home(state: &crate::AppState) -> PathBuf {
+pub async fn codex_home(state: &crate::AppState) -> PathBuf {
     static LOGIN: tokio::sync::OnceCell<Option<PathBuf>> = tokio::sync::OnceCell::const_new();
     // Unit tests never run the developer's login shell.
     let login = if cfg!(test) {
@@ -73,7 +73,7 @@ async fn bounded_output(
     Ok((out.success, out.stdout))
 }
 
-pub(crate) fn valid_thread_id(id: &str) -> bool {
+pub fn valid_thread_id(id: &str) -> bool {
     id.len() == 36
         && id.bytes().enumerate().all(|(i, b)| {
             if matches!(i, 8 | 13 | 18 | 23) {
@@ -113,7 +113,7 @@ pub(crate) fn verify_rollout(path: &Path, id: &str, cwd: &Path) -> bool {
 
 /// Codex's dated rollout store has exactly three directory levels. Bound both
 /// metadata work and wall time; never recurse into arbitrary user directories.
-pub(crate) fn find_rollout(home: &Path, id: &str, cwd: &Path) -> Option<PathBuf> {
+pub fn find_rollout(home: &Path, id: &str, cwd: &Path) -> Option<PathBuf> {
     if !valid_thread_id(id) {
         return None;
     }

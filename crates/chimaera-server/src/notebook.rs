@@ -61,7 +61,7 @@ fn object<const N: usize>(fields: [(&str, Value); N]) -> Value {
 }
 
 #[derive(Deserialize)]
-pub(crate) struct NotebookQuery {
+pub struct NotebookQuery {
     path: String,
     #[serde(default)]
     offset: usize,
@@ -76,7 +76,7 @@ pub(crate) struct NotebookQuery {
 /// joined) and capped — an oversize payload is listed under `omitted` with
 /// its byte size instead. A page may hold fewer than `limit` cells when its
 /// payload budget fills; the next page starts at `offset + cells.len()`.
-pub(crate) async fn notebook(
+pub async fn notebook(
     filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
     Query(query): Query<NotebookQuery>,
 ) -> Response {

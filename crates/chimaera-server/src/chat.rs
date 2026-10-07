@@ -30,7 +30,7 @@ use crate::agent_state::{AgentKind, AgentState};
 use crate::AppState;
 
 /// What the ChatManager hooks emit; consumed by the signal task.
-pub(crate) enum ChatSignal {
+pub enum ChatSignal {
     Event(String, Arc<SeqEvent>),
     Exit(String, DriverExit),
 }
@@ -38,7 +38,7 @@ pub(crate) enum ChatSignal {
 /// Everything needed to respawn a chat session as a PTY TUI (the
 /// view toggle and lifecycle recovery).
 #[derive(Clone)]
-pub(crate) struct ChatRecipe {
+pub struct ChatRecipe {
     pub(crate) workspace_root: PathBuf,
     /// Workspace id, for the environment-prelude lookup (host ⊕ workspace ⊕
     /// launch): every respawn through this recipe re-materializes the
@@ -1146,14 +1146,14 @@ const STOP_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 /// and a chat driver alive under the same id, or let two rewinds race the same
 /// journal rewrite. Drop-based cleanup keeps every early-return/error path from
 /// stranding the session in a permanent "switching" state.
-pub(crate) struct ChatSwitchGuard {
+pub struct ChatSwitchGuard {
     state: Arc<AppState>,
     id: String,
     target: String,
 }
 
 impl ChatSwitchGuard {
-    pub(crate) fn acquire(state: &Arc<AppState>, id: &str, target: &str) -> Option<Self> {
+    pub fn acquire(state: &Arc<AppState>, id: &str, target: &str) -> Option<Self> {
         use std::collections::hash_map::Entry;
 
         let mut switching = crate::lock(&state.chat_switching);

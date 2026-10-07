@@ -138,13 +138,13 @@ pub(crate) async fn check_document(Query(query): Query<CheckQuery>) -> Response 
 }
 
 /// Pin the project before the viewer's separate asynchronous path proof.
-pub(crate) async fn pin_project(project: PathBuf) -> anyhow::Result<Confined> {
+pub async fn pin_project(project: PathBuf) -> anyhow::Result<Confined> {
     run_blocking(move || Ok(Confined::new(&project)?)).await
 }
 
 /// Check the viewer's document and targets beneath its already pinned project.
 /// A path proof made before this worker ran cannot authorize a replacement.
-pub(crate) async fn check_within(path: String, project: Confined) -> Response {
+pub async fn check_within(path: String, project: Confined) -> Response {
     let result = run_blocking(move || {
         let path = expand_tilde(&path);
         if !path.is_absolute() {
@@ -1525,7 +1525,7 @@ impl Checker<'_> {
 /// `fstat`), so a FIFO or device swapped in after that stat can neither
 /// block this worker (and its `FILESYSTEM_WORK` permit) nor stream without
 /// end, and `take` bounds a file that grew.
-pub(crate) fn read_regular(path: &Path, cap: u64) -> std::io::Result<Option<Vec<u8>>> {
+pub fn read_regular(path: &Path, cap: u64) -> std::io::Result<Option<Vec<u8>>> {
     let (file, _) = crate::fs::open_regular(path)?;
     read_opened(file, cap)
 }

@@ -11,13 +11,13 @@ use std::{any::Any, future::Future, pin::Pin, sync::Arc};
 
 use crate::AppState;
 
-pub(crate) mod fence;
+pub mod fence;
 
-pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// What a caller wants to do in a workspace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Need {
+pub enum Need {
     /// Start or drive an agent.
     Execute,
     /// Start or type into a plain shell.
@@ -28,7 +28,7 @@ pub(crate) enum Need {
 
 /// The kind of process a launch starts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LaunchKind {
+pub enum LaunchKind {
     Agent,
     Shell,
 }
@@ -36,7 +36,7 @@ pub(crate) enum LaunchKind {
 /// The admission changed between capture and use. The one error type
 /// callers match on (`err.is::<Changed>()`).
 #[derive(Debug)]
-pub(crate) struct Changed;
+pub struct Changed;
 impl std::fmt::Display for Changed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("workspace execution authority changed")
@@ -46,11 +46,11 @@ impl std::error::Error for Changed {}
 
 /// A counted reservation held until a commit or child registration is
 /// done; dropping it releases. Opaque to shared code.
-pub(crate) struct Reservation {
+pub struct Reservation {
     _held: Box<dyn Any + Send + Sync>,
 }
 impl Reservation {
-    pub(crate) fn new(inner: impl Any + Send + Sync) -> Self {
+    pub fn new(inner: impl Any + Send + Sync) -> Self {
         Self {
             _held: Box::new(inner),
         }
@@ -59,16 +59,16 @@ impl Reservation {
 
 /// A short synchronous hold (it may own a lock guard) kept until a child is
 /// registered or a read finished; never held across an await.
-pub(crate) struct Hold<'a> {
+pub struct Hold<'a> {
     _held: Option<Box<dyn Held + 'a>>,
 }
-pub(crate) trait Held {}
+pub trait Held {}
 impl<T> Held for T {}
 impl<'a> Hold<'a> {
-    pub(crate) fn none() -> Self {
+    pub fn none() -> Self {
         Self { _held: None }
     }
-    pub(crate) fn new(inner: impl Held + 'a) -> Self {
+    pub fn new(inner: impl Held + 'a) -> Self {
         Self {
             _held: Some(Box::new(inner)),
         }
@@ -79,11 +79,11 @@ impl<'a> Hold<'a> {
 /// final commit. `None` inside is the inert admission: it only re-asks
 /// [`Need::Execute`].
 #[derive(Clone)]
-pub(crate) struct Admission {
+pub struct Admission {
     workspace: String,
     token: Option<Arc<dyn AdmissionToken>>,
 }
-pub(crate) trait AdmissionToken: Send + Sync {
+pub trait AdmissionToken: Send + Sync {
     fn check(&self, state: &AppState) -> anyhow::Result<()>;
     /// The admission generation this was captured at: two admissions of the
     /// same workspace and generation are the same authority.
@@ -98,42 +98,42 @@ pub(crate) trait AdmissionToken: Send + Sync {
     ) -> BoxFuture<'a, anyhow::Result<Installer>>;
 }
 impl Admission {
-    pub(crate) fn inert(workspace: &str) -> Self {
+    pub fn inert(workspace: &str) -> Self {
         Self {
             workspace: workspace.to_owned(),
             token: None,
         }
     }
-    pub(crate) fn with(workspace: &str, token: Arc<dyn AdmissionToken>) -> Self {
+    pub fn with(workspace: &str, token: Arc<dyn AdmissionToken>) -> Self {
         Self {
             workspace: workspace.to_owned(),
             token: Some(token),
         }
     }
-    pub(crate) fn check(&self, state: &AppState) -> anyhow::Result<()> {
+    pub fn check(&self, state: &AppState) -> anyhow::Result<()> {
         match &self.token {
             Some(token) => token.check(state),
             None if state.policy().allows(state, &self.workspace, Need::Execute) => Ok(()),
             None => Err(Changed.into()),
         }
     }
-    pub(crate) fn managed(&self, state: &AppState) -> bool {
+    pub fn managed(&self, state: &AppState) -> bool {
         self.token
             .as_ref()
             .is_some_and(|token| token.managed(state))
     }
-    pub(crate) fn generation(&self) -> u64 {
+    pub fn generation(&self) -> u64 {
         self.token.as_ref().map_or(0, |token| token.generation())
     }
     /// Check, then reserve the final dispatch.
-    pub(crate) fn begin(&self, state: &AppState) -> anyhow::Result<Option<Reservation>> {
+    pub fn begin(&self, state: &AppState) -> anyhow::Result<Option<Reservation>> {
         match &self.token {
             Some(token) => token.begin(state),
             None => self.check(state).map(|()| None),
         }
     }
     /// Admit an installer child under this admission.
-    pub(crate) async fn installer(
+    pub async fn installer(
         &self,
         state: &Arc<AppState>,
         workspace: &str,
@@ -153,12 +153,12 @@ impl Admission {
 }
 
 /// An admitted installer process; its cleanup stays counted until finished.
-pub(crate) struct Installer {
+pub struct Installer {
     admission: Admission,
     state: Arc<AppState>,
     token: Option<Box<dyn InstallerToken>>,
 }
-pub(crate) trait InstallerToken: Send + Sync {
+pub trait InstallerToken: Send + Sync {
     /// Attach the spawned process group synchronously after spawn.
     fn attach(&mut self, group: u32);
     fn finish(self: Box<Self>) -> BoxFuture<'static, anyhow::Result<()>>;
@@ -167,7 +167,7 @@ pub(crate) trait InstallerToken: Send + Sync {
     fn guarded(&self) -> bool;
 }
 impl Installer {
-    pub(crate) fn with(
+    pub fn with(
         admission: Admission,
         state: Arc<AppState>,
         token: Box<dyn InstallerToken>,
@@ -178,21 +178,21 @@ impl Installer {
             token: Some(token),
         }
     }
-    pub(crate) fn captured(&self) -> Admission {
+    pub fn captured(&self) -> Admission {
         self.admission.clone()
     }
-    pub(crate) fn check(&self) -> anyhow::Result<()> {
+    pub fn check(&self) -> anyhow::Result<()> {
         self.admission.check(&self.state)
     }
-    pub(crate) fn guarded(&self) -> bool {
+    pub fn guarded(&self) -> bool {
         self.token.as_ref().is_some_and(|token| token.guarded())
     }
-    pub(crate) fn attach(&mut self, group: u32) {
+    pub fn attach(&mut self, group: u32) {
         if let Some(token) = &mut self.token {
             token.attach(group);
         }
     }
-    pub(crate) async fn finish(mut self) -> anyhow::Result<()> {
+    pub async fn finish(mut self) -> anyhow::Result<()> {
         match self.token.take() {
             Some(token) => token.finish().await,
             None => Ok(()),
@@ -201,10 +201,10 @@ impl Installer {
 }
 
 /// One admitted launch, held until its child is registered.
-pub(crate) struct Launch {
+pub struct Launch {
     token: Option<Box<dyn LaunchToken>>,
 }
-pub(crate) trait LaunchToken: Send + Sync {
+pub trait LaunchToken: Send + Sync {
     /// The child runs under the policy's process ownership (a fenceable,
     /// counted process group).
     fn managed(&self) -> bool;
@@ -212,19 +212,19 @@ pub(crate) trait LaunchToken: Send + Sync {
     fn registered(self: Box<Self>, id: String);
 }
 impl Launch {
-    pub(crate) fn inert() -> Self {
+    pub fn inert() -> Self {
         Self { token: None }
     }
-    pub(crate) fn with(token: Box<dyn LaunchToken>) -> Self {
+    pub fn with(token: Box<dyn LaunchToken>) -> Self {
         Self { token: Some(token) }
     }
-    pub(crate) fn managed(&self) -> bool {
+    pub fn managed(&self) -> bool {
         self.token.as_ref().is_some_and(|token| token.managed())
     }
-    pub(crate) fn check(&self) -> anyhow::Result<()> {
+    pub fn check(&self) -> anyhow::Result<()> {
         self.token.as_ref().map_or(Ok(()), |token| token.check())
     }
-    pub(crate) fn registered(self, id: String) {
+    pub fn registered(self, id: String) {
         if let Some(token) = self.token {
             token.registered(id);
         }
@@ -233,19 +233,19 @@ impl Launch {
 
 /// What a launch adds to an agent's start, beyond its environment.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct LaunchContext {
+pub struct LaunchContext {
     /// The agent continues work an interrupted earlier run left: its pick-up
     /// says to check the files first.
-    pub(crate) recovery: bool,
+    pub recovery: bool,
     /// The project's agents get the daemon's tools even in a terminal agent
     /// that otherwise has none.
-    pub(crate) tools: bool,
+    pub tools: bool,
 }
 
 /// A frame a project that runs on another daemon sends the window that
 /// watches it, in place of this daemon's own file, git and timeline
 /// watching.
-pub(crate) enum ProjectFrame {
+pub enum ProjectFrame {
     /// A path-only invalidation, already in this window's paths.
     Fs(serde_json::Value),
     /// The project's Git epoch where it runs.
@@ -256,7 +256,7 @@ pub(crate) enum ProjectFrame {
 
 /// The live view of a routed project for one window (`routed`): ends when
 /// the project stops being served elsewhere or its owner refuses it.
-pub(crate) trait ProjectFeed: Send {
+pub trait ProjectFeed: Send {
     fn workspace(&self) -> &str;
     /// The window's mounted previews and listed folders, in its own paths.
     fn watch(&self, files: Vec<String>, dirs: Vec<String>);
@@ -266,19 +266,19 @@ pub(crate) trait ProjectFeed: Send {
 
 /// A note an agent is told as it starts (once per change of machine), and
 /// what the policy remembers once it has been delivered.
-pub(crate) struct StartNote {
-    pub(crate) text: String,
+pub struct StartNote {
+    pub text: String,
     /// Identifies the note's substance within one agent process, so two
     /// carriers racing at one start deliver it once.
-    pub(crate) digest: u64,
+    pub digest: u64,
     /// The policy's own record of it, handed back in `note_told`.
-    pub(crate) record: Box<dyn Any + Send + Sync>,
+    pub record: Box<dyn Any + Send + Sync>,
 }
 
 /// The workspace-admission hook. Implementations are trusted in-process.
 /// Every method must be cheap and must not block: shared code calls them on
 /// the reactor and on hot paths.
-pub(crate) trait WorkspacePolicy: Send + Sync + 'static {
+pub trait WorkspacePolicy: Send + Sync + 'static {
     /// Whether an extension is composed here at all: only then does the
     /// daemon serve extension routes or add extension fields and frames.
     fn composed(&self, state: &AppState) -> bool;
@@ -526,11 +526,11 @@ pub(crate) trait WorkspacePolicy: Send + Sync + 'static {
 }
 
 /// No extension: admit everything, record nothing, run nothing.
-pub(crate) struct Inert {
+pub struct Inert {
     fence: fence::Fence,
 }
 impl Inert {
-    pub(crate) fn new(fence: fence::Fence) -> Self {
+    pub fn new(fence: fence::Fence) -> Self {
         Self { fence }
     }
 }

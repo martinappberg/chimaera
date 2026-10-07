@@ -24,7 +24,7 @@ impl Harness {
             peer.ip() == std::net::Ipv4Addr::LOCALHOST && peer.port() != 0,
             "fixture peer refused"
         );
-        let (mut state, workspace) = tokio::task::spawn_blocking(move || {
+        let (state, workspace) = tokio::task::spawn_blocking(move || {
             use std::os::unix::fs::MetadataExt;
             let root = root.canonicalize()?;
             let meta = std::fs::symlink_metadata(&root)?;

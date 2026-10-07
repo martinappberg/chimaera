@@ -29,7 +29,7 @@ const MAX_KEYS: usize = 128;
 /// (save-on-change). Values are opaque to the server and shared behind an
 /// `Arc`: the persist snapshot is 128 pointer bumps, not a deep copy of up
 /// to 8 MiB of JSON trees on a reactor worker.
-pub(crate) struct ViewStateStore {
+pub struct ViewStateStore {
     path: PathBuf,
     items: BTreeMap<String, Arc<serde_json::Value>>,
     /// Keys oldest-first by last write, for eviction. Load seeds it in the

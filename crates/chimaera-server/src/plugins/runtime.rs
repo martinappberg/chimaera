@@ -619,7 +619,7 @@ type BuildKey = (String, Arc<str>);
 
 /// The per-daemon half of the runtime (on `AppState`).
 #[derive(Default)]
-pub(crate) struct PluginRuntime {
+pub struct PluginRuntime {
     instances: InstanceBudget,
     slots: Mutex<HashMap<Key, Arc<Slot>>>,
     faults: Mutex<HashMap<Key, Faults>>,

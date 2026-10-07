@@ -50,7 +50,7 @@ pub(crate) struct Release {
 /// last good answer (`latest`, `succeeded_at`) and records why it failed, so
 /// "couldn't check" never reads as "up to date".
 #[derive(Debug, Default)]
-pub(crate) struct UpdateStatus {
+pub struct UpdateStatus {
     /// The most recent attempt, successful or not.
     pub(crate) checked_at: Option<u64>,
     /// The most recent attempt that got an answer from the releases feed.
@@ -144,7 +144,7 @@ pub(crate) fn status_json(state: &AppState) -> serde_json::Value {
 /// This daemon just became the account's cloud: move the epoch so windows
 /// already attached hear "managed" without waiting for a check that no
 /// longer runs.
-pub(crate) fn became_managed(state: &AppState) {
+pub fn became_managed(state: &AppState) {
     state.update_epoch.fetch_add(1, Ordering::Relaxed);
     state.changes.notify_waiters();
 }

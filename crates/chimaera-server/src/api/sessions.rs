@@ -585,7 +585,7 @@ pub(crate) async fn rename_session(
 }
 
 /// DELETE /api/v1/sessions/{id}
-pub(crate) async fn delete_session(
+pub async fn delete_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {

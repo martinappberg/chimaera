@@ -228,7 +228,7 @@ type PreparationGate = (
 );
 
 /// Agent communication's daemon-wide half (on `AppState.comms`).
-pub(crate) struct Comms {
+pub struct Comms {
     inner: Mutex<CommsState>,
     /// `<data_dir>/workspace` — the Timeline's root; `comms.json` sits
     /// beside each workspace's `timeline.jsonl`.

@@ -49,7 +49,7 @@ const ACCEPT_GITHUB: &str = "Accept: application/vnd.github+json";
 
 /// The daemon's plugin-release knowledge (on `AppState`). Hot state.
 #[derive(Default)]
-pub(crate) struct Releases {
+pub struct Releases {
     /// plugin id → the newer, gate-passing release a check found.
     offers: Mutex<HashMap<String, Offer>>,
     /// Tests only: the API and download bases (the env knobs are

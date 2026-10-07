@@ -166,7 +166,7 @@ impl NoticeKind {
 /// same event the same way; the structured fields let a consumer route a
 /// click (session + workspace) and re-compose for its platform.
 #[derive(Clone, Debug)]
-pub(crate) struct Notice {
+pub struct Notice {
     pub(crate) id: u64,
     pub(crate) kind: NoticeKind,
     pub(crate) session_id: String,
@@ -224,7 +224,7 @@ impl Notice {
 /// The feed store. `boot` distinguishes this daemon process from its
 /// predecessor (ids restart at 1 after a restart, and the port + token
 /// survive a handoff, so a consumer needs something that doesn't).
-pub(crate) struct Notices {
+pub struct Notices {
     boot: String,
     inner: Mutex<Inner>,
 }
@@ -497,7 +497,7 @@ pub(crate) fn push_agent_notice(
 /// `files`); `branches` the other machine's diverged branches kept beside the
 /// user's. Words say what happened and where the user's version is; the
 /// structured `kept` lets the UI list or open them.
-pub(crate) fn push_kept_both(
+pub fn push_kept_both(
     state: &AppState,
     workspace_id: &str,
     files: usize,
@@ -620,7 +620,7 @@ pub(crate) fn push_kept_both(
 ///
 /// Words are the owner's, bounded; the subtitle is recomposed with this
 /// computer's project name. Returns whether it was taken.
-pub(crate) fn relay(state: &AppState, workspace_id: &str, row: &Value) -> bool {
+pub fn relay(state: &AppState, workspace_id: &str, row: &Value) -> bool {
     let Some(kind) = row["kind"].as_str().and_then(NoticeKind::relayed) else {
         return false;
     };
