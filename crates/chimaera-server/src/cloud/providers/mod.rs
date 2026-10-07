@@ -1,6 +1,6 @@
 //! Authenticated fixed provider routes; optional private policy owns its one cache and attempts.
 pub(crate) mod host;
-pub(crate) mod process;
+pub(crate) use crate::process;
 use crate::AppState;
 use axum::{
     extract::{Path, State},
@@ -13,12 +13,6 @@ use host::{Operation, WorkerProviders, PROVIDERS};
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
-pub(crate) async fn bounded_process_output(
-    command: &mut tokio::process::Command,
-) -> Result<(bool, Vec<u8>), &'static str> {
-    let out = process::output(command).await?;
-    Ok((out.success, out.stdout))
-}
 pub(crate) fn active_operations() -> usize {
     host::active()
 }

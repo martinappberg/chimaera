@@ -878,7 +878,10 @@ async fn switch_to_pty(
             .get(id)
             .map(|record| record.key.clone());
         if let Some(key) = key {
-            let notify = crate::codex_notify::args(state, id, &key).await;
+            let notify = state
+                .policy()
+                .codex_notify_args(state, &recipe.workspace_id, id, &key)
+                .await;
             // The rollout identity only serves the notify shim; without it a
             // Codex TUI carries no transcript, as before the shim existed.
             let identity = !notify.is_empty();
@@ -898,7 +901,7 @@ async fn switch_to_pty(
                         .unwrap_or_else(|| recipe.workspace_root.clone());
                     let sought = thread.clone();
                     let rollout = tokio::task::spawn_blocking(move || {
-                        crate::codex_notify::find_rollout(&home, &sought, &cwd)
+                        crate::codex_rollout::find_rollout(&home, &sought, &cwd)
                     })
                     .await
                     .ok()
@@ -4253,7 +4256,7 @@ mod tests {
         )
         .unwrap();
         // The scan would find it: only the missing shim keeps it off the record.
-        assert!(crate::codex_notify::find_rollout(&home, thread, &project).is_some());
+        assert!(crate::codex_rollout::find_rollout(&home, thread, &project).is_some());
         let id = "s-free-codex-switch";
         crate::lock(&state.agents).insert(
             id.into(),

@@ -20,7 +20,7 @@ fn plant_rollout(state: &Arc<AppState>, cwd: &std::path::Path) -> PathBuf {
         ),
     )
     .unwrap();
-    assert!(codex_notify::find_rollout(&home, THREAD, cwd).is_some());
+    assert!(codex_rollout::find_rollout(&home, THREAD, cwd).is_some());
     path
 }
 

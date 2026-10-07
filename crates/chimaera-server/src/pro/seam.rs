@@ -207,6 +207,18 @@ impl WorkspacePolicy for ProPolicy {
     fn updates_managed(&self, state: &AppState) -> bool {
         super::updates_managed(state)
     }
+    fn codex_notify_args<'a>(
+        &'a self,
+        state: &'a AppState,
+        workspace: &'a str,
+        session: &'a str,
+        key: &'a str,
+    ) -> BoxFuture<'a, Vec<String>> {
+        Box::pin(crate::codex_notify::args_in(state, workspace, session, key))
+    }
+    fn session_retired(&self, state: &AppState, session: &str) {
+        crate::codex_notify::remove_shim(state, session);
+    }
     fn session_pause(
         &self,
         state: &AppState,

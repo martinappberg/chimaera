@@ -180,7 +180,7 @@ pub(crate) fn native_path(state: &AppState, entry: &LedgerEntry) -> Result<Optio
         .resume
         .as_deref()
         .context("native conversation is not ready to export")?;
-    if !crate::codex_notify::valid_thread_id(id) {
+    if !crate::codex_rollout::valid_thread_id(id) {
         bail!("invalid native conversation ID");
     }
     match agent.kind {
@@ -196,7 +196,7 @@ pub(crate) fn native_path(state: &AppState, entry: &LedgerEntry) -> Result<Optio
             }
         }
         crate::agents::AgentKind::Codex => Ok(Some(
-            crate::codex_notify::find_rollout(
+            crate::codex_rollout::find_rollout(
                 state.codex_config_path.parent().context("Codex home")?,
                 id,
                 agent.native_cwd.as_deref().unwrap_or(&entry.cwd),
@@ -705,7 +705,7 @@ fn open_archive(path: &Path) -> Result<Opened> {
             .resume
             .as_deref()
             .context("missing native conversation ID")?;
-        if !crate::codex_notify::valid_thread_id(native) {
+        if !crate::codex_rollout::valid_thread_id(native) {
             bail!("invalid native conversation ID");
         }
         if agent.kind == crate::agents::AgentKind::Codex {
@@ -751,7 +751,7 @@ fn native_destination(state: &AppState, entry: &LedgerEntry) -> Result<Option<Pa
         .resume
         .as_deref()
         .context("missing native conversation")?;
-    if !crate::codex_notify::valid_thread_id(id) {
+    if !crate::codex_rollout::valid_thread_id(id) {
         bail!("invalid native conversation ID");
     }
     match agent.kind {
@@ -766,7 +766,7 @@ fn native_destination(state: &AppState, entry: &LedgerEntry) -> Result<Option<Pa
             // Exact existing path wins; the bounded dated directory fallback
             // also works without a private Codex metadata database.
             Ok(Some(
-                crate::codex_notify::find_rollout(
+                crate::codex_rollout::find_rollout(
                     home,
                     id,
                     agent.native_cwd.as_deref().unwrap_or(&entry.cwd),

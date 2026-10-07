@@ -72,7 +72,7 @@ fn valid(entry: &Pending) -> bool {
         && entry
             .native
             .as_deref()
-            .is_none_or(crate::codex_notify::valid_thread_id)
+            .is_none_or(crate::codex_rollout::valid_thread_id)
 }
 impl PendingImports {
     pub(crate) fn load(data: &Path) -> Self {

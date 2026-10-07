@@ -39,7 +39,7 @@ pub(super) fn unstarted(state: &AppState, entry: &LedgerEntry) -> bool {
         || agent
             .resume
             .as_deref()
-            .is_some_and(|id| !crate::codex_notify::valid_thread_id(id))
+            .is_some_and(|id| !crate::codex_rollout::valid_thread_id(id))
         || state.chat.has_submitted_input(&entry.id)
     {
         return false;

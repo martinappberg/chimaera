@@ -489,7 +489,7 @@ pub(crate) async fn ingest(
         let Some(thread) = payload
             .get("thread-id")
             .and_then(|value| value.as_str())
-            .filter(|id| crate::codex_notify::valid_thread_id(id))
+            .filter(|id| crate::codex_rollout::valid_thread_id(id))
         else {
             return Json(json!({})).into_response();
         };
@@ -514,7 +514,7 @@ pub(crate) async fn ingest(
         {
             record.turn_complete_at = Some(crate::session_view::now_ms());
         }
-        let home = crate::codex_notify::codex_home(&state).await;
+        let home = crate::codex_rollout::codex_home(&state).await;
         let (known, native_cwd) = crate::lock(&state.agents)
             .get(&id)
             .map(|record| {
@@ -525,15 +525,15 @@ pub(crate) async fn ingest(
             })
             .unwrap_or_default();
         let cwd = native_cwd.unwrap_or(cwd);
-        let Ok(_permit) = crate::codex_notify::ROLLOUT_WORK.try_acquire() else {
+        let Ok(_permit) = crate::codex_rollout::ROLLOUT_WORK.try_acquire() else {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         };
         let thread = thread.to_string();
         let sought = thread.clone();
         let rollout = tokio::task::spawn_blocking(move || {
             known
-                .filter(|path| crate::codex_notify::verify_rollout(path, &sought, &cwd))
-                .or_else(|| crate::codex_notify::find_rollout(&home, &sought, &cwd))
+                .filter(|path| crate::codex_rollout::verify_rollout(path, &sought, &cwd))
+                .or_else(|| crate::codex_rollout::find_rollout(&home, &sought, &cwd))
         })
         .await
         .ok()

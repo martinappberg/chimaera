@@ -305,7 +305,7 @@ fn retire_inner(
     // but tidy is tidy).
     crate::environment::remove_prelude_file(session_id);
     crate::agents::remove_fork_context(session_id);
-    crate::codex_notify::remove_shim(state, session_id);
+    state.policy().session_retired(state, session_id);
 
     // A dead Mastermind must not stay bound (the dock would show a ghost),
     // and it never lands in Recents: it is the observer, not a roster

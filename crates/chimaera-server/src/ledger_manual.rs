@@ -42,7 +42,7 @@ impl Receipt {
         ensure!(
             crate::workspaces::identity::valid_id(&self.session_id)
                 && crate::workspaces::identity::valid_id(&self.workspace_id)
-                && crate::codex_notify::valid_thread_id(&self.native_id)
+                && crate::codex_rollout::valid_thread_id(&self.native_id)
                 && matches!(
                     AgentKind::parse(&self.kind),
                     Some(AgentKind::Claude | AgentKind::Codex)

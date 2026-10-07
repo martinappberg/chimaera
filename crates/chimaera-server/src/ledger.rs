@@ -747,7 +747,7 @@ fn resolve_resume(claude_projects_dir: &std::path::Path, entry: &LedgerEntry) ->
             .transcript
             .as_deref()
             .filter(|path| {
-                crate::codex_notify::verify_rollout(
+                crate::codex_rollout::verify_rollout(
                     path,
                     id,
                     agent.native_cwd.as_deref().unwrap_or(&entry.cwd),

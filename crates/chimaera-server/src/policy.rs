@@ -320,6 +320,18 @@ pub(crate) trait WorkspacePolicy: Send + Sync + 'static {
     /// Agent CLIs here are updated with the machine's image, not by
     /// themselves or by the daemon.
     fn updates_managed(&self, state: &AppState) -> bool;
+    /// Extra argv for a Codex TUI in `workspace` (the policy's own notify
+    /// chain, so it hears the turn end); empty leaves the user's argv alone.
+    fn codex_notify_args<'a>(
+        &'a self,
+        state: &'a AppState,
+        workspace: &'a str,
+        session: &'a str,
+        key: &'a str,
+    ) -> BoxFuture<'a, Vec<String>>;
+    /// A session's record is gone for good: whatever the policy wrote for
+    /// it may go too.
+    fn session_retired(&self, state: &AppState, session: &str);
 
     // Presentation.
     /// Why session `id` has no process here (a frame for its socket and its
@@ -500,6 +512,16 @@ impl WorkspacePolicy for Inert {
     fn updates_managed(&self, _: &AppState) -> bool {
         false
     }
+    fn codex_notify_args<'a>(
+        &'a self,
+        _: &'a AppState,
+        _: &'a str,
+        _: &'a str,
+        _: &'a str,
+    ) -> BoxFuture<'a, Vec<String>> {
+        Box::pin(async { Vec::new() })
+    }
+    fn session_retired(&self, _: &AppState, _: &str) {}
     fn session_pause(
         &self,
         _: &AppState,

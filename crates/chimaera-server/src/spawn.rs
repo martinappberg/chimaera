@@ -271,7 +271,10 @@ pub(crate) async fn spawn_session(
             }
             let mut codex_identity = false;
             if agent_kind == AgentKind::Codex {
-                let notify = crate::codex_notify::args_in(state, &workspace.id, &id, &key).await;
+                let notify = state
+                    .policy()
+                    .codex_notify_args(state, &workspace.id, &id, &key)
+                    .await;
                 // The rollout identity only serves the notify shim; without
                 // it a Codex TUI carries no transcript.
                 codex_identity = !notify.is_empty();
@@ -345,7 +348,7 @@ pub(crate) async fn spawn_session(
                             .unwrap_or_else(|| opts.cwd.clone());
                         let sought = thread.clone();
                         let path = tokio::task::spawn_blocking(move || {
-                            crate::codex_notify::find_rollout(&home, &sought, &cwd)
+                            crate::codex_rollout::find_rollout(&home, &sought, &cwd)
                         })
                         .await
                         .ok()
