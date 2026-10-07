@@ -108,7 +108,7 @@ impl ViewStateStore {
     /// A read counts as use: a window that boots or switches workspace
     /// reads its blob, and that must keep it out of the eviction queue's
     /// front even when it never edits its layout afterwards.
-    pub(crate) fn get(&mut self, key: &str) -> Option<Arc<serde_json::Value>> {
+    pub fn get(&mut self, key: &str) -> Option<Arc<serde_json::Value>> {
         let value = self.items.get(key).cloned()?;
         self.touch(key);
         Some(value)

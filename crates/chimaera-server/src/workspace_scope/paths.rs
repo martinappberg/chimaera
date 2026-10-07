@@ -6,7 +6,7 @@ use std::path::{Component, Path, PathBuf};
 
 pub const HEADER: &str = "x-chimaera-viewer-root";
 #[derive(Clone, Debug)]
-pub(crate) struct Alias {
+pub struct Alias {
     pub root: PathBuf,
     pub viewer: PathBuf,
 }
@@ -191,7 +191,7 @@ fn replace(raw: &str, from: &Path, to: &Path) -> String {
         })
         .unwrap_or_else(|_| raw.to_owned())
 }
-pub(crate) fn encode_query(values: &[(String, String)]) -> String {
+pub fn encode_query(values: &[(String, String)]) -> String {
     fn encode(value: &str) -> String {
         let mut result = String::new();
         for b in value.bytes() {

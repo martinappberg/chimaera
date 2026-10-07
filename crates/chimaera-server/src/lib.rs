@@ -5,7 +5,8 @@ mod agent_probe;
 mod agent_setup;
 #[doc(hidden)]
 pub mod agent_state;
-mod agent_updates;
+#[doc(hidden)]
+pub mod agent_updates;
 #[doc(hidden)]
 pub mod agents;
 #[doc(hidden)]
@@ -55,7 +56,8 @@ pub mod notebook;
 pub mod notices;
 #[doc(hidden)]
 pub mod persist;
-mod plugins;
+#[doc(hidden)]
+pub mod plugins;
 #[doc(hidden)]
 pub mod policy;
 #[doc(hidden)]
@@ -126,5 +128,11 @@ pub use plugins::capabilities::describe_manifest as plugin_capabilities;
 pub use router::app;
 pub use state::{lock, AppState};
 
+/// The test support an out-of-tree host's tests build on (the fixture feature).
+#[cfg(all(not(test), feature = "daemon-extension-fixture"))]
+#[path = "tests/support.rs"]
+pub mod test_support;
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, feature = "daemon-extension-fixture"))]
+pub use tests::support as test_support;

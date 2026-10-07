@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 /// pre-allows the whole chimaera server.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum MastermindMode {
+pub enum MastermindMode {
     Ask,
     Auto,
 }
@@ -25,66 +25,66 @@ pub(crate) enum MastermindMode {
 /// answer to. Persisted on the Workspace so a daemon restart resurrects the
 /// session with the same mode.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct MastermindCfg {
-    pub(crate) session_id: String,
-    pub(crate) mode: MastermindMode,
+pub struct MastermindCfg {
+    pub session_id: String,
+    pub mode: MastermindMode,
     /// The agent CLI behind the binding ("claude"/"codex"). Additive (empty
     /// for pre-upgrade records): the UI's mode-switch re-PUT must know the
     /// bound vendor even when the roster row is momentarily absent — the
     /// gone state, a restart gap — or a fallback guess would silently
     /// rotate a codex Mastermind into a claude one.
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub(crate) agent: String,
+    pub agent: String,
 }
 
 /// A registered workspace: a canonicalized directory the user opened.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Workspace {
-    pub(crate) id: String,
-    pub(crate) root: PathBuf,
-    pub(crate) name: String,
+    pub id: String,
+    pub root: PathBuf,
+    pub name: String,
     /// Unix seconds of the last open/activity; 0 for pre-upgrade records.
     #[serde(default)]
-    pub(crate) last_opened_at: u64,
+    pub last_opened_at: u64,
     /// The bound Mastermind, if the user appointed one. Additive wire field:
     /// absent for unbound workspaces (and for every pre-upgrade record).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) mastermind: Option<MastermindCfg>,
+    pub mastermind: Option<MastermindCfg>,
     /// Workbench plugins the user switched on for THIS workspace (`plugins`)
     /// — the per-workspace Plugins page is where the switch lives, so the
     /// switch is per workspace. Additive wire field: absent when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) plugins_on: Vec<String>,
+    pub plugins_on: Vec<String>,
     /// Daemon-owned setup, never a user project or a mirror/adoption candidate.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub(crate) cloud_internal: bool,
+    pub cloud_internal: bool,
     /// An internal workspace the native app keeps for its own windows (a
     /// cluster's login-node terminal): never listed (`GET /workspaces`), and
     /// its sessions never enter the ledger. Absent for every user workspace.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub(crate) hidden: bool,
+    pub hidden: bool,
 }
 
 /// What the caller learned from the folder (off the store's lock) for
 /// [`WorkspaceStore::add_identified`].
-pub(crate) struct FolderIdentity<'a> {
+pub struct FolderIdentity<'a> {
     /// The folder's own marker, if it has a well-formed one.
-    pub(crate) marker: Option<&'a identity::Marker>,
+    pub marker: Option<&'a identity::Marker>,
     /// The root the registry holds under the marker's id, when the caller
     /// found it missing on disk: the only evidence that a folder was MOVED
     /// rather than duplicated.
-    pub(crate) gone_root: Option<&'a Path>,
+    pub gone_root: Option<&'a Path>,
 }
 
 /// The outcome of [`WorkspaceStore::add_identified`].
-pub(crate) struct Registered {
-    pub(crate) workspace: Workspace,
+pub struct Registered {
+    pub workspace: Workspace,
     /// The folder does not yet say this id: write its marker, off the lock.
-    pub(crate) write_marker: bool,
+    pub write_marker: bool,
     /// The folder is a project that already existed (an entry of this
     /// registry, the id its marker names, or a moved entry), not a freshly
     /// minted id: opening it is the user picking that project up here.
-    pub(crate) known: bool,
+    pub known: bool,
 }
 
 /// In-memory workspace list backed by a JSON file (save-on-change).
@@ -111,7 +111,7 @@ impl Snapshot {
     /// Write it — unless a later snapshot already reached the disk (it holds
     /// this change too): a slow write must never put an older list back.
     /// One write at a time; they share the temp file.
-    pub(crate) fn write(self) -> anyhow::Result<()> {
+    pub fn write(self) -> anyhow::Result<()> {
         self.write_inner(false)
     }
     pub fn write_durable(self) -> anyhow::Result<()> {
@@ -138,15 +138,15 @@ impl Snapshot {
 
 /// A plugin switch applied in memory, with the snapshot that makes it
 /// durable; `undo_plugin_on(.., undo)` takes it back if that write fails.
-pub(crate) struct PluginSwitch {
-    pub(crate) workspace: Workspace,
-    pub(crate) snapshot: Snapshot,
-    pub(crate) undo: SwitchUndo,
+pub struct PluginSwitch {
+    pub workspace: Workspace,
+    pub snapshot: Snapshot,
+    pub undo: SwitchUndo,
 }
 
 /// What taking a staged switch back needs.
 #[derive(Clone, Copy)]
-pub(crate) struct SwitchUndo {
+pub struct SwitchUndo {
     on: bool,
     was_on: bool,
     generation: u64,
@@ -156,7 +156,7 @@ impl WorkspaceStore {
     /// Load the store from `path`. A missing or corrupt file yields an empty
     /// store (with a warning for the corrupt case). A retired plugin's
     /// switch is dropped everywhere, and the list saved once if any was on.
-    pub(crate) fn load(path: PathBuf) -> Self {
+    pub fn load(path: PathBuf) -> Self {
         let mut items: Vec<Workspace> = match std::fs::read_to_string(&path) {
             Ok(contents) => match serde_json::from_str(&contents) {
                 Ok(items) => items,
@@ -194,17 +194,17 @@ impl WorkspaceStore {
         store
     }
 
-    pub(crate) fn list(&self) -> Vec<Workspace> {
+    pub fn list(&self) -> Vec<Workspace> {
         self.items.clone()
     }
 
     /// The workspaces a user sees: every one but the app's hidden ones.
-    pub(crate) fn listed(&self) -> Vec<Workspace> {
+    pub fn listed(&self) -> Vec<Workspace> {
         self.items.iter().filter(|w| !w.hidden).cloned().collect()
     }
 
     /// Ids of the hidden workspaces (their sessions stay out of the ledger).
-    pub(crate) fn hidden_ids(&self) -> std::collections::HashSet<String> {
+    pub fn hidden_ids(&self) -> std::collections::HashSet<String> {
         self.items
             .iter()
             .filter(|w| w.hidden)
@@ -214,7 +214,7 @@ impl WorkspaceStore {
 
     /// Register `root` (canonical) as a hidden workspace, idempotent per
     /// root like [`Self::add`]; an existing record for it becomes hidden.
-    pub(crate) fn add_hidden(&mut self, root: PathBuf) -> anyhow::Result<Workspace> {
+    pub fn add_hidden(&mut self, root: PathBuf) -> anyhow::Result<Workspace> {
         let mut workspace = self.add(root)?;
         if !workspace.hidden {
             workspace.hidden = true;
@@ -226,7 +226,7 @@ impl WorkspaceStore {
         Ok(workspace)
     }
 
-    pub(crate) fn get(&self, id: &str) -> Option<Workspace> {
+    pub fn get(&self, id: &str) -> Option<Workspace> {
         self.items.iter().find(|w| w.id == id).cloned()
     }
 
@@ -234,7 +234,7 @@ impl WorkspaceStore {
     /// root; re-registering stamps the existing entry as freshly opened. Mints
     /// a new id and reads no folder identity — the route registers through
     /// [`Self::add_identified`].
-    pub(crate) fn add(&mut self, root: PathBuf) -> anyhow::Result<Workspace> {
+    pub fn add(&mut self, root: PathBuf) -> anyhow::Result<Workspace> {
         if let Some(existing) = self.items.iter_mut().find(|w| w.root == root) {
             existing.last_opened_at = unix_now();
             let workspace = existing.clone();
@@ -264,7 +264,7 @@ impl WorkspaceStore {
     /// the store never makes under its own lock. Anything short of a
     /// confirmed missing root reads as a duplicate, which never disturbs the
     /// other entry. The caller writes the marker AFTER releasing the lock.
-    pub(crate) fn add_identified(
+    pub fn add_identified(
         &mut self,
         root: PathBuf,
         folder: FolderIdentity<'_>,
@@ -404,7 +404,7 @@ impl WorkspaceStore {
     /// FIRST, so a later [`Self::add`] of the same root lands on it even if
     /// an older record for that root exists. `root` must already be
     /// canonical. Returns whether it was inserted.
-    pub(crate) fn seed(&mut self, id: &str, name: &str, root: PathBuf) -> anyhow::Result<bool> {
+    pub fn seed(&mut self, id: &str, name: &str, root: PathBuf) -> anyhow::Result<bool> {
         if self.items.iter().any(|w| w.id == id) {
             return Ok(false);
         }
@@ -431,7 +431,7 @@ impl WorkspaceStore {
 
     /// Stamp `id` as freshly opened. Returns the workspace, or None if
     /// unknown.
-    pub(crate) fn touch(&mut self, id: &str) -> Option<Workspace> {
+    pub fn touch(&mut self, id: &str) -> Option<Workspace> {
         let entry = self.items.iter_mut().find(|w| w.id == id)?;
         entry.last_opened_at = unix_now();
         let workspace = entry.clone();
@@ -449,7 +449,7 @@ impl WorkspaceStore {
     /// one) — so callers changing privilege MUST surface the error and roll
     /// the memory back, not report success (unlike `touch`, whose lost
     /// timestamp is cosmetic).
-    pub(crate) fn set_mastermind(
+    pub fn set_mastermind(
         &mut self,
         id: &str,
         cfg: Option<MastermindCfg>,
@@ -468,7 +468,7 @@ impl WorkspaceStore {
     /// [`Self::undo_plugin_on`] — same durability contract as
     /// [`Self::set_mastermind`]: an agent-visible toggle the next restart
     /// forgets is worse than a refused one. `Ok(None)` = unknown workspace.
-    pub(crate) fn stage_plugin_on(
+    pub fn stage_plugin_on(
         &mut self,
         id: &str,
         pid: &str,
@@ -504,7 +504,7 @@ impl WorkspaceStore {
     /// Take back a staged switch whose write failed — unless the list
     /// changed since: a later snapshot carries this switch as it is now,
     /// and whether that one lands is its writer's to say.
-    pub(crate) fn undo_plugin_on(&mut self, id: &str, pid: &str, undo: SwitchUndo) {
+    pub fn undo_plugin_on(&mut self, id: &str, pid: &str, undo: SwitchUndo) {
         if self.generation == undo.generation && undo.on != undo.was_on {
             self.put_switch(id, pid, undo.was_on);
         }
@@ -524,7 +524,7 @@ impl WorkspaceStore {
     /// Switch `pid` on or off and write it, under this lock. Tests only:
     /// the route writes off the lock.
     #[cfg(test)]
-    pub(crate) fn set_plugin_on(
+    pub fn set_plugin_on(
         &mut self,
         id: &str,
         pid: &str,
@@ -544,7 +544,7 @@ impl WorkspaceStore {
     /// under an id another publisher's plugin had: its switch must not bind
     /// whatever is installed under that id next. The snapshot to write, or
     /// None when no workspace had it on.
-    pub(crate) fn clear_plugin(&mut self, pid: &str) -> anyhow::Result<Option<Snapshot>> {
+    pub fn clear_plugin(&mut self, pid: &str) -> anyhow::Result<Option<Snapshot>> {
         let mut changed = false;
         for w in &mut self.items {
             let before = w.plugins_on.len();
@@ -562,7 +562,7 @@ impl WorkspaceStore {
     /// whether it did. Best-effort persistence: this runs on self-exit
     /// cleanup (`recents::retire`) where the session is already gone, so a
     /// failed write is logged, not propagated — there is no caller to abort.
-    pub(crate) fn clear_mastermind_if(&mut self, workspace_id: &str, session_id: &str) -> bool {
+    pub fn clear_mastermind_if(&mut self, workspace_id: &str, session_id: &str) -> bool {
         let bound = self.items.iter().any(|w| {
             w.id == workspace_id
                 && w.mastermind
@@ -580,7 +580,7 @@ impl WorkspaceStore {
     /// workspace id -> bound Mastermind session id, for the roster snapshot
     /// (the additive `mastermind` wire flag is computed per snapshot, so it
     /// can never disagree with the store).
-    pub(crate) fn mastermind_bindings(&self) -> std::collections::HashMap<String, String> {
+    pub fn mastermind_bindings(&self) -> std::collections::HashMap<String, String> {
         self.items
             .iter()
             .filter_map(|w| {
@@ -593,7 +593,7 @@ impl WorkspaceStore {
 
     /// Unregister `id` (never touches the directory). Returns whether it
     /// existed.
-    pub(crate) fn remove(&mut self, id: &str) -> anyhow::Result<bool> {
+    pub fn remove(&mut self, id: &str) -> anyhow::Result<bool> {
         let before = self.items.len();
         self.items.retain(|w| w.id != id);
         let removed = self.items.len() != before;
@@ -628,7 +628,7 @@ impl WorkspaceStore {
 /// still serves; the app can open the folder by path). Blocking (reads and
 /// canonicalizes on a shared filesystem): run it off the reactor, before
 /// the ledger resurrects sessions into the workspace.
-pub(crate) fn seed_cluster_workspace(state: &crate::AppState) {
+pub fn seed_cluster_workspace(state: &crate::AppState) {
     let Some(seed_path) = std::env::var_os(chimaera_core::cluster::ENV_CLUSTER_WORKSPACE)
         .filter(|p| !p.is_empty())
         .map(PathBuf::from)
@@ -699,7 +699,7 @@ fn unix_now() -> u64 {
 /// Mastermind (`None` otherwise). The one binding lookup every respawn path
 /// shares — the mode (not just the flag) because the codex spawn carries it
 /// in argv.
-pub(crate) fn workspace_mastermind_mode(
+pub fn workspace_mastermind_mode(
     state: &crate::AppState,
     workspace_id: &str,
     session_id: &str,

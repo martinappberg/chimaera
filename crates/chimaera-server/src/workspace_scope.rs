@@ -30,11 +30,11 @@ const MAX_JSON: usize = 1024 * 1024;
 /// replacement account generation or epoch.
 #[derive(Clone)]
 pub struct Mutation {
-    scope: Scope,
+    pub scope: Scope,
     admission: crate::policy::Admission,
 }
 impl Mutation {
-    pub(crate) fn for_scope(state: &AppState, scope: Scope) -> Result<Self> {
+    pub fn for_scope(state: &AppState, scope: Scope) -> Result<Self> {
         scope.alias(state)?;
         let admission = state
             .policy()
@@ -43,7 +43,7 @@ impl Mutation {
     }
     /// Reads prove the captured identity without consuming mutation capacity.
     /// Writes still call begin() at commit/dispatch for atomic reservation.
-    pub(crate) fn validate(&self, state: &AppState) -> Result<()> {
+    pub fn validate(&self, state: &AppState) -> Result<()> {
         self.admission.check(state)
     }
     pub(crate) fn session(&self, state: &AppState, session: &str) -> Result<()> {
@@ -69,7 +69,7 @@ impl Mutation {
                 admission,
             }))
     }
-    pub(crate) fn begin(&self, state: &AppState) -> Result<crate::policy::Reservation> {
+    pub fn begin(&self, state: &AppState) -> Result<crate::policy::Reservation> {
         Ok(self
             .admission
             .begin(state)?
@@ -261,7 +261,7 @@ impl Scope {
         })
         .await?
     }
-    async fn read(&self, state: &AppState, path: String) -> Result<()> {
+    pub async fn read(&self, state: &AppState, path: String) -> Result<()> {
         if self.readable(state, vec![path.clone()]).await?.first() == Some(&true) {
             return Ok(());
         }

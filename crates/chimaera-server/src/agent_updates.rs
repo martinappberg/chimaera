@@ -36,10 +36,10 @@ const INITIAL_DELAY: Duration = Duration::from_secs(90);
 pub struct AgentLatest {
     /// Bare version ("0.146.0") — prefix-stripped and charset-gated, safe
     /// for the wire and the UI.
-    pub(crate) version: String,
+    pub version: String,
     /// When the most recent attempt ran, unix seconds.
-    pub(crate) checked_at: u64,
-    pub(crate) error: Option<String>,
+    pub checked_at: u64,
+    pub error: Option<String>,
 }
 
 /// Periodic checker. Gated by the same `update.autoCheck` setting as the

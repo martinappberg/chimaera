@@ -258,8 +258,8 @@ impl Comms {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn block_dispatches(&self) -> tokio::sync::OwnedSemaphorePermit {
+    #[cfg(any(test, feature = "daemon-extension-fixture"))]
+    pub fn block_dispatches(&self) -> tokio::sync::OwnedSemaphorePermit {
         self.dispatches.clone().try_acquire_many_owned(64).unwrap()
     }
 

@@ -39,67 +39,67 @@ pub enum ChatSignal {
 /// view toggle and lifecycle recovery).
 #[derive(Clone)]
 pub struct ChatRecipe {
-    pub(crate) workspace_root: PathBuf,
+    pub workspace_root: PathBuf,
     /// Workspace id, for the environment-prelude lookup (host ⊕ workspace ⊕
     /// launch): every respawn through this recipe re-materializes the
     /// prelude, so view-switch/rewind all regenerate identically.
-    pub(crate) workspace_id: String,
-    pub(crate) kind: AgentKind,
-    pub(crate) bin: PathBuf,
+    pub workspace_id: String,
+    pub kind: AgentKind,
+    pub bin: PathBuf,
     /// The `--version` line the launcher probed for `bin` at resolution
     /// (`None` = probe failed). Threaded into the driver's `SpawnSpec` so the
     /// harness can journal it on `Init` and emit the non-fatal drift notice
     /// when it differs from the driver's `TESTED_*_VERSION`. Carried on the
     /// recipe so a view-switch/rewind respawn keeps the same provenance.
-    pub(crate) version: Option<String>,
-    pub(crate) settings: Option<PathBuf>,
-    pub(crate) mcp_config: Option<PathBuf>,
-    pub(crate) model: Option<String>,
-    pub(crate) resume: Option<String>,
+    pub version: Option<String>,
+    pub settings: Option<PathBuf>,
+    pub mcp_config: Option<PathBuf>,
+    pub model: Option<String>,
+    pub resume: Option<String>,
     /// Native fork point: Claude passes it to
     /// `--fork-session --resume-session-at`; Codex passes it as
     /// `thread/fork.lastTurnId`. Rewind and non-destructive branch both use it.
-    pub(crate) fork_at: Option<String>,
-    pub(crate) fork_head: bool,
+    pub fork_at: Option<String>,
+    pub fork_head: bool,
     /// Rewind rollback count: respawn resumes the thread and drops this many
     /// trailing turns via `thread/rollback` (codex only — its thread id
     /// survives, so the conversation truncates in place instead of forking).
     /// The fallback for app-servers without `thread/revert`.
-    pub(crate) rollback_turns: Option<u32>,
+    pub rollback_turns: Option<u32>,
     /// Rewind cut for `thread/revert {beforeTurnId}` (codex 0.153+): the
     /// native id of the first dropped turn. Preferred over the count —
     /// paginated threads refuse the deprecated rollback.
-    pub(crate) revert_before_turn: Option<String>,
+    pub revert_before_turn: Option<String>,
     /// Whether this spawn turns claude's Remote Control bridge on.
-    pub(crate) remote_control: RemoteControlAtStart,
+    pub remote_control: RemoteControlAtStart,
     /// Resurrection only: claude's session-scoped ultracode was on.
-    pub(crate) carry_ultracode: bool,
-    pub(crate) theme: String,
+    pub carry_ultracode: bool,
+    pub theme: String,
     /// Launch-scope prelude text (see `environment`). Carried on the recipe
     /// so a view-switch/rewind respawn keeps the launch scope; not
     /// in the ledger, so resurrection re-runs the durable scopes only.
-    pub(crate) prelude: Option<String>,
+    pub prelude: Option<String>,
     /// This session is its workspace's bound Mastermind, carrying the mode:
     /// the claude spawn appends the role prompt (the mode itself rides the
     /// settings file), the codex spawn needs the mode in argv (approval
     /// config + role prompt). Respawn paths (view switch, rewind,
     /// resurrection) resolve it from the workspace store at recipe build —
     /// the binding, not the recipe, is the source of truth.
-    pub(crate) mastermind: Option<crate::workspaces::MastermindMode>,
+    pub mastermind: Option<crate::workspaces::MastermindMode>,
     /// Vendor-neutral transcript context inherited by a portable branch.
     /// Claude reads it from a generated system-prompt file; Codex receives it
     /// on thread open as developer instructions. It never becomes a user turn.
-    pub(crate) portable_context: Option<String>,
+    pub portable_context: Option<String>,
     /// Original creation time (epoch ms) for a RESURRECTED session, so its age
     /// survives a daemon restart instead of resetting to "now". `None` on a
     /// fresh create / view-switch / rewind — the spawn stamps now.
-    pub(crate) created_at_ms: Option<u64>,
+    pub created_at_ms: Option<u64>,
 }
 
 /// Whether a chat spawn turns claude's Remote Control bridge on after the
 /// handshake. Codex's bridge lives on its app-server daemon: nothing to set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RemoteControlAtStart {
+pub enum RemoteControlAtStart {
     /// Respawning a live session (view switch, rewind): the new process
     /// starts without a bridge, so one the user turned off stays off.
     No,
@@ -3704,7 +3704,7 @@ pub(crate) async fn spawn_chat_session(
 /// where-you-run note when this conversation has not heard it for this
 /// machine (`cloud_context::pending`, remembered once the spawn succeeds).
 /// Codex chats have no hook carrier. Other agents get nothing here.
-pub(crate) async fn codex_developer_note(
+pub async fn codex_developer_note(
     state: &AppState,
     recipe: &ChatRecipe,
     id: &str,

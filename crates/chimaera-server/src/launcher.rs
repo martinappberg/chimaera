@@ -168,17 +168,17 @@ pub(crate) fn is_outdated(kind: AgentKind, version: Option<&str>) -> bool {
 /// `~/.chimaera/agents`).
 #[derive(Clone, Debug)]
 pub struct AgentDetection {
-    pub(crate) path: Result<PathBuf, String>,
-    pub(crate) version: Option<String>,
-    pub(crate) managed: bool,
+    pub path: Result<PathBuf, String>,
+    pub version: Option<String>,
+    pub managed: bool,
     /// The resolved binary is the user's explicit `agents.<kind>.path` setting
     /// (a runnable one) — surfaced so the launcher can label provenance as the
     /// path you set, distinct from "yours" (PATH) or "chimaera" (managed).
-    pub(crate) explicit: bool,
+    pub explicit: bool,
     /// The binary's mtime when it was detected — the cache-staleness stamp
     /// (see [`validate_cache_hit`]). `None` = stat failed at detection time
     /// (or a test preset): the entry is trusted as before.
-    pub(crate) mtime: Option<std::time::SystemTime>,
+    pub mtime: Option<std::time::SystemTime>,
 }
 
 /// Cache-hit staleness verdict (see [`detect`]).

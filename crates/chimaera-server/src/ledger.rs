@@ -33,12 +33,12 @@ use crate::agents::AgentKind;
 /// the machine that ran it, or home again after running elsewhere.
 #[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum Origin {
+pub enum Origin {
     Moved,
     Home,
 }
 impl Origin {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Moved => "moved",
             Self::Home => "home",
@@ -47,7 +47,7 @@ impl Origin {
 }
 /// A conversation's handoff provenance, kept on its ledger entry.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct HandoffResume {
+pub struct HandoffResume {
     pub fork: bool,
     pub origin: Origin,
     pub epoch: u64,
@@ -59,78 +59,78 @@ use chimaera_agent::model::SessionUi;
 /// One live session, as much of it as can be rebuilt after a restart.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LedgerEntry {
-    pub(crate) id: String,
+    pub id: String,
     /// A handoff or unverified owner retains identity without resurrecting.
-    pub(crate) suspended: bool,
+    pub suspended: bool,
     /// Fixed manual parking reason. Unknown persisted reasons stay manual;
     /// automatic ownership/provider recovery never clears this fence.
-    pub(crate) manual_resume_reason: Option<String>,
+    pub manual_resume_reason: Option<String>,
     /// The lease epoch a lapse fenced this conversation at (`pro`'s watchdog
     /// `preserve`). It resumes or travels only while this computer holds that
     /// epoch, or one it acquired straight from it with nobody in between;
     /// otherwise another machine may have finished its turn (review R4 S1).
-    pub(crate) fence_epoch: Option<u64>,
-    pub(crate) handoff: Option<HandoffResume>,
-    pub(crate) workspace_id: String,
+    pub fence_epoch: Option<u64>,
+    pub handoff: Option<HandoffResume>,
+    pub workspace_id: String,
     /// Last polled cwd (shells) or spawn cwd (agents).
-    pub(crate) cwd: PathBuf,
+    pub cwd: PathBuf,
     /// User-pinned display name (`SessionInfo::renamed`), when set.
-    pub(crate) pinned_name: Option<String>,
-    pub(crate) cols: u16,
-    pub(crate) rows: u16,
+    pub pinned_name: Option<String>,
+    pub cols: u16,
+    pub rows: u16,
     /// The scheme the session was themed for at spawn.
-    pub(crate) theme: String,
+    pub theme: String,
     /// Original creation time (unix secs), so a resurrected session keeps its
     /// age across a restart instead of resetting to "now". 0 = unknown (an
     /// older ledger, or a session that predates the field) — the resurrection
     /// path then lets the fresh spawn stamp now, as before.
-    pub(crate) created_at: u64,
+    pub created_at: u64,
     /// `None` = plain shell.
-    pub(crate) agent: Option<LedgerAgent>,
+    pub agent: Option<LedgerAgent>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct LedgerAgent {
-    pub(crate) kind: AgentKind,
+    pub kind: AgentKind,
     /// Claude conversation id or Codex thread id, when known. A recorded id
     /// is a CLAIM, not a promise: claude 2.1.204 interactive sessions do
     /// not persist their transcripts (verified 2026-07-07 — print mode
     /// does; 2.1.19x did), and `--resume` against a conversation with no
     /// transcript dies with "No conversation found". Restore verifies the
     /// transcript on disk before resuming.
-    pub(crate) resume: Option<String>,
+    pub resume: Option<String>,
     /// The transcript path claude's hooks reported, when any — the exact
     /// file `--resume` needs to exist.
-    pub(crate) transcript: Option<PathBuf>,
+    pub transcript: Option<PathBuf>,
     /// Header provenance; launch cwd may move while native bytes stay intact.
-    pub(crate) native_cwd: Option<PathBuf>,
+    pub native_cwd: Option<PathBuf>,
     /// Current display title — carried onto the successor session (or a
     /// Recents row) so the conversation stays recognizable either way.
-    pub(crate) title: String,
+    pub title: String,
     /// Which surface the session last ran as: `Term` = a PTY TUI, `Chat` = the
     /// structured chat driver. Chat sessions resurrect as chat (and retire into
     /// Recents as chat); TUI agents as a PTY. Additive — an older ledger without
     /// the field defaults to `Term`, matching the pre-chat-resurrection behavior.
-    pub(crate) ui: SessionUi,
+    pub ui: SessionUi,
     /// The chat model in use, so a resurrected chat re-selects it. `None` for a
     /// TUI agent (the model is the CLI's own concern there).
-    pub(crate) model: Option<String>,
+    pub model: Option<String>,
     /// What the chat's live process held that dies with it — the bridge,
     /// ultracode, background work, a running turn — so resurrection can
     /// re-establish or report it. `None` for a TUI agent and for an older
     /// ledger (resurrection then falls back to the at-start settings).
-    pub(crate) carryover: Option<chimaera_agent::Carryover>,
+    pub carryover: Option<chimaera_agent::Carryover>,
 }
 
 /// What the previous daemon left behind.
 #[derive(Debug, Default)]
 pub struct BootLedger {
-    pub(crate) sessions: Vec<LedgerEntry>,
+    pub sessions: Vec<LedgerEntry>,
     /// terminal session id -> agent session id (linked terminals).
-    pub(crate) links: HashMap<String, String>,
+    pub links: HashMap<String, String>,
     /// Unix seconds of the last reconcile — the honest `last_active` for
     /// entries that retire into Recents at boot.
-    pub(crate) written_at: u64,
+    pub written_at: u64,
 }
 
 impl LedgerEntry {
@@ -259,7 +259,7 @@ impl LedgerStore {
 
     /// Read what the previous daemon left. Load-tolerant like every store:
     /// a missing or corrupt file is an empty ledger, never an error.
-    pub(crate) fn load_boot(&self) -> BootLedger {
+    pub fn load_boot(&self) -> BootLedger {
         let contents = match std::fs::read_to_string(&self.path) {
             Ok(c) => c,
             Err(err) if err.kind() == ErrorKind::NotFound => return BootLedger::default(),
@@ -299,11 +299,7 @@ impl LedgerStore {
     /// Persist the snapshot if it differs from the last write. `written_at`
     /// is excluded from the comparison (it would make every snapshot
     /// "changed") and stamped only when a real write happens.
-    pub(crate) fn write_if_changed(
-        &mut self,
-        entries: &[LedgerEntry],
-        links: &HashMap<String, String>,
-    ) {
+    pub fn write_if_changed(&mut self, entries: &[LedgerEntry], links: &HashMap<String, String>) {
         if let Err(error) = self.write_checked(entries, links) {
             tracing::error!(%error, "failed to persist session ledger");
         }
@@ -347,7 +343,7 @@ impl LedgerStore {
         })
         .to_string()
     }
-    pub(crate) fn write_checked(
+    pub fn write_checked(
         &mut self,
         entries: &[LedgerEntry],
         links: &HashMap<String, String>,
@@ -392,7 +388,7 @@ const WRITE_DEBOUNCE: Duration = Duration::from_secs(2);
 /// Own the ledger for the daemon's lifetime: consume what the previous
 /// daemon left (resurrect / retire), then keep `sessions.json` reconciled
 /// with live truth until shutdown.
-pub(crate) async fn run(state: Arc<AppState>) {
+pub async fn run(state: Arc<AppState>) {
     // Boot data must be read (and acted on) before the reconcile loop's
     // first write replaces it with the current — initially empty — truth.
     let boot = crate::lock(&state.ledger).load_boot();
@@ -610,7 +606,7 @@ pub fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, String>)
 /// sessions snapshots, and the chat-journal budget, which cannot run earlier —
 /// until a ledgered chat respawns it is live nowhere, yet its journal is what
 /// it resumes from.
-pub(crate) async fn consume_boot(state: &Arc<AppState>, boot: BootLedger) {
+pub async fn consume_boot(state: &Arc<AppState>, boot: BootLedger) {
     restore(state, boot).await;
     state.policy().restored(state);
     // Serving started concurrently; sessions snapshots held back by
@@ -788,7 +784,7 @@ fn resolve_resume(claude_projects_dir: &std::path::Path, entry: &LedgerEntry) ->
     (recorded || derived).then(|| id.to_string())
 }
 
-pub(crate) async fn respawn(
+pub async fn respawn(
     state: &Arc<AppState>,
     entry: &LedgerEntry,
     workspace: crate::workspaces::Workspace,
@@ -1062,14 +1058,14 @@ async fn resume_one(
 
 /// One resumer's place in a session's turn (`AppState::resuming`). Dropping
 /// it, also on cancellation, forgets the turn once nobody else holds it.
-pub(crate) struct ResumeTurn<'a> {
+pub struct ResumeTurn<'a> {
     state: &'a AppState,
     id: String,
     turn: Option<Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl<'a> ResumeTurn<'a> {
-    pub(crate) fn take(state: &'a AppState, id: &str) -> Self {
+    pub fn take(state: &'a AppState, id: &str) -> Self {
         let turn = Arc::clone(
             crate::lock(&state.resuming)
                 .entry(id.to_owned())
@@ -1082,7 +1078,7 @@ impl<'a> ResumeTurn<'a> {
         }
     }
 
-    pub(crate) async fn wait(&self) -> tokio::sync::MutexGuard<'_, ()> {
+    pub async fn wait(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.turn
             .as_ref()
             .expect("turn held until drop")
@@ -1409,7 +1405,7 @@ tokio::task_local! { static MANUAL_RESUME: String; }
 pub async fn manual_resumption<F: std::future::Future>(id: String, operation: F) -> F::Output {
     MANUAL_RESUME.scope(id, operation).await
 }
-pub(crate) fn check_manual_native(
+pub fn check_manual_native(
     state: &AppState,
     session: Option<&str>,
     kind: crate::agents::AgentKind,

@@ -390,7 +390,7 @@ impl AppState {
     }
 
     /// The installed workspace policy, or the inert one.
-    pub(crate) fn policy(&self) -> &dyn crate::policy::WorkspacePolicy {
+    pub fn policy(&self) -> &dyn crate::policy::WorkspacePolicy {
         self.policy.get_or_init(|| default_policy(self)).as_ref()
     }
 
@@ -412,7 +412,7 @@ impl AppState {
 
     /// Tests: run this state with the inert policy (no extension).
     #[cfg(test)]
-    pub(crate) fn use_inert_policy(&self, fence: crate::policy::fence::Fence) {
+    pub fn use_inert_policy(&self, fence: crate::policy::fence::Fence) {
         assert!(
             self.policy
                 .set(Arc::new(crate::policy::Inert::new(fence)))
@@ -425,7 +425,7 @@ impl AppState {
     /// consumed. Every surface that reports the session list calls this
     /// first, so a client connecting during resurrection never sees — and
     /// acts on — a half-restored roster.
-    pub(crate) async fn wait_restored(&self) {
+    pub async fn wait_restored(&self) {
         let mut rx = self.restored.subscribe();
         let _ = tokio::time::timeout(RESTORE_WAIT_CAP, rx.wait_for(|done| *done)).await;
     }
@@ -494,7 +494,7 @@ impl ChangeBus {
     /// Announce a change: bump the generation, then wake every waiter. The
     /// bump comes first so a woken client that reads the generation always
     /// sees a value at least as new as the change that woke it.
-    pub(crate) fn notify_waiters(&self) {
+    pub fn notify_waiters(&self) {
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         self.notify.notify_waiters();
@@ -503,18 +503,18 @@ impl ChangeBus {
     /// Wait for the next `notify_waiters` (same semantics as
     /// `Notify::notified`: only waiters registered at wake time are woken —
     /// the 1s events tick remains the backstop for missed edges).
-    pub(crate) async fn notified(&self) {
+    pub async fn notified(&self) {
         self.notify.notified().await
     }
 
-    pub(crate) fn generation(&self) -> u64 {
+    pub fn generation(&self) -> u64 {
         self.generation.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The raw wake future, for a loop that must `enable()` it BEFORE
     /// reading [`Self::generation`] so no change between the two is missed
     /// (the git session tracker).
-    pub(crate) fn subscribe(&self) -> tokio::sync::futures::Notified<'_> {
+    pub fn subscribe(&self) -> tokio::sync::futures::Notified<'_> {
         self.notify.notified()
     }
 }

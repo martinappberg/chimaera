@@ -69,11 +69,11 @@ pub(crate) struct TicketIdentity {
     captured_root: (u64, u64),
 }
 #[derive(Clone)]
-pub(crate) struct Resolved {
+pub struct Resolved {
     root: Arc<Root>,
     pub(crate) canonical: PathBuf,
     relative: PathBuf,
-    authority: Option<Authority>,
+    pub authority: Option<Authority>,
 }
 impl Resolved {
     /// In-memory identity for exact scoped ticket renewal; no filesystem work
@@ -89,7 +89,7 @@ impl Resolved {
         })
     }
 
-    pub(crate) fn open(&self, directory: bool) -> io::Result<File> {
+    pub fn open(&self, directory: bool) -> io::Result<File> {
         let file = self.open_any()?;
         if !(if directory {
             file.metadata()?.is_dir()
@@ -148,13 +148,13 @@ impl Resolved {
 }
 
 #[derive(Clone)]
-struct Authority {
+pub struct Authority {
     state: std::sync::Weak<crate::AppState>,
-    admission: super::Mutation,
+    pub admission: super::Mutation,
     root: PathBuf,
 }
 impl Authority {
-    fn check(&self) -> io::Result<()> {
+    pub fn check(&self) -> io::Result<()> {
         let state = self.state.upgrade().ok_or_else(|| {
             io::Error::new(io::ErrorKind::PermissionDenied, crate::policy::Changed)
         })?;
@@ -176,13 +176,10 @@ impl Authority {
 pub struct Context {
     project: Arc<Root>,
     uploads: Option<Arc<Root>>,
-    authority: Authority,
+    pub authority: Authority,
 }
 impl Context {
-    pub(super) fn pin(
-        state: &Arc<crate::AppState>,
-        admission: super::Mutation,
-    ) -> io::Result<Self> {
+    pub fn pin(state: &Arc<crate::AppState>, admission: super::Mutation) -> io::Result<Self> {
         let root = crate::lock(&state.workspaces)
             .get(&admission.scope.workspace_id)
             .ok_or(io::ErrorKind::PermissionDenied)?
@@ -298,7 +295,7 @@ impl Context {
         })
     }
 
-    pub(crate) fn read(&self, raw: &str) -> io::Result<Resolved> {
+    pub fn read(&self, raw: &str) -> io::Result<Resolved> {
         self.authority.check()?;
         self.project.check()?;
         let path = crate::fs::expand_tilde(raw).map_err(|_| io::ErrorKind::InvalidInput)?;

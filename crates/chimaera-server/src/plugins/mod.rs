@@ -85,10 +85,11 @@ pub(crate) const SERVED_APIS: &[&str] = &["0.1", API];
 /// The test-only plugins (the host's fixture, and the first-party releases
 /// the lock pins, which tests install by path): embedded by test builds
 /// only, laid out by `scripts/build-plugins.sh`.
-#[cfg(test)]
+#[cfg(any(test, feature = "daemon-extension-fixture"))]
+#[allow(dead_code)]
 #[derive(rust_embed::RustEmbed)]
 #[folder = "../../plugins/dist-test"]
-pub(crate) struct DistTest;
+pub struct DistTest;
 
 /// `plugins/plugins.lock`: the first-party plugins, the release of each this
 /// daemon installs, and that release's checksums. The only plugin data this
@@ -189,7 +190,7 @@ pub(crate) fn lock_entry(id: &str) -> Option<&'static Locked> {
 
 #[derive(Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Manifest {
+pub struct Manifest {
     pub(crate) id: String,
     pub(crate) name: String,
     /// The plugin's own version, `MAJOR.MINOR.PATCH` (`validate`).
@@ -899,19 +900,20 @@ pub(crate) fn entry_json(state: &AppState, id: &str) -> Option<Value> {
 /// installed (every `Catalog` sees them; an installed copy of the same id
 /// shadows one). They have no directory, so Remove and Use previous don't
 /// apply to them.
-#[cfg(test)]
-pub(crate) mod test_catalog {
+#[cfg(any(test, feature = "daemon-extension-fixture"))]
+#[allow(dead_code)]
+pub mod test_catalog {
     use super::*;
 
     static EXTRA: std::sync::Mutex<Vec<Arc<Manifest>>> = std::sync::Mutex::new(Vec::new());
 
-    pub(crate) fn extra() -> Vec<Arc<Manifest>> {
+    pub fn extra() -> Vec<Arc<Manifest>> {
         crate::lock(&EXTRA).clone()
     }
 
     /// Add a WASM plugin (its manifest text + component bytes); idempotent
     /// by id — the first registration wins.
-    pub(crate) fn add(manifest: &str, wasm: Vec<u8>) -> Arc<Manifest> {
+    pub fn add(manifest: &str, wasm: Vec<u8>) -> Arc<Manifest> {
         let mut extra = crate::lock(&EXTRA);
         let mut m = parse_manifest(manifest).expect("test manifest parses");
         if let Some(existing) = extra.iter().find(|e| e.id == m.id) {
@@ -925,7 +927,7 @@ pub(crate) mod test_catalog {
 
     /// The host's fixture plugin (`plugins/test-fixture`, built into
     /// `plugins/dist-test`), added to the catalog.
-    pub(crate) fn fixture() -> Arc<Manifest> {
+    pub fn fixture() -> Arc<Manifest> {
         add(&fixture_manifest(), fixture_wasm())
     }
 
@@ -1092,7 +1094,7 @@ pub(crate) async fn active_for_session(state: &AppState, sid: &str) -> Vec<Arc<M
 /// plugin active there, plus agent communication's while it is on (empty —
 /// and so no settings change at all, nor a codex terminal's MCP injection —
 /// when neither).
-pub(crate) async fn spawn_allow(state: &AppState, ws: &str) -> Vec<String> {
+pub async fn spawn_allow(state: &AppState, ws: &str) -> Vec<String> {
     // A build the host refused or faulted here offers nothing, so nothing of
     // it is pre-allowed.
     let mut tools: Vec<String> = active(state, ws)

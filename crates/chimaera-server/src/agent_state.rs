@@ -26,7 +26,7 @@ pub enum AgentKind {
 
 impl AgentKind {
     /// The launcher catalog: what the popover offers and detection probes.
-    pub(crate) const ALL: [AgentKind; 4] = [
+    pub const ALL: [AgentKind; 4] = [
         AgentKind::Claude,
         AgentKind::Codex,
         AgentKind::Antigravity,
@@ -34,7 +34,7 @@ impl AgentKind {
     ];
 
     /// Stable id — also the binary name (`claude`, `codex`, `agy`, `gemini`).
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
@@ -45,7 +45,7 @@ impl AgentKind {
     }
 
     /// Human product name for launcher rows and error messages.
-    pub(crate) fn product_name(self) -> &'static str {
+    pub fn product_name(self) -> &'static str {
         match self {
             AgentKind::Claude => "Claude Code",
             AgentKind::Codex => "Codex",
@@ -55,7 +55,7 @@ impl AgentKind {
         }
     }
 
-    pub(crate) fn parse(s: &str) -> Option<AgentKind> {
+    pub fn parse(s: &str) -> Option<AgentKind> {
         // Existing sessions/recents retain their identity after retirement
         // from the new-agent catalog.
         if s == "gemini" {
@@ -71,17 +71,17 @@ impl AgentKind {
     /// `matches!` edits. (The client-facing `AgentInfo.chatCapable` the
     /// launcher computes is this AND path-ok AND !outdated — a composite the
     /// UI consumes; this is just the protocol-capability half.)
-    pub(crate) fn chat_capable(self) -> bool {
+    pub fn chat_capable(self) -> bool {
         self.chat_adapter().is_some()
     }
 
-    pub(crate) fn native_chat_controls(self) -> bool {
+    pub fn native_chat_controls(self) -> bool {
         matches!(self, Self::Claude | Self::Codex)
     }
 
     /// Explicit registration: a new identity must never fall through to the
     /// Codex adapter. The protocol choice does not reach the picker UI.
-    pub(crate) fn chat_adapter(self) -> Option<&'static dyn chimaera_agent::driver::AgentAdapter> {
+    pub fn chat_adapter(self) -> Option<&'static dyn chimaera_agent::driver::AgentAdapter> {
         match self {
             Self::Claude => Some(&chimaera_agent::claude::ClaudeAdapter),
             Self::Codex => Some(&chimaera_agent::codex::CodexAdapter),
@@ -106,7 +106,7 @@ pub enum AgentState {
 }
 
 impl AgentState {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             AgentState::Running => "running",
             AgentState::NeedsPermission => "needs_permission",
@@ -122,7 +122,7 @@ impl AgentState {
 /// Quiet this long, a terminal agent with no reliable hook state is idle: a
 /// working Claude or Codex TUI repaints its spinner and elapsed time at least
 /// once a second, including while it waits on the model or a tool.
-pub(crate) const TUI_QUIET_MS: u64 = if cfg!(test) { 300 } else { 10_000 };
+pub const TUI_QUIET_MS: u64 = if cfg!(test) { 300 } else { 10_000 };
 /// Output this close after a turn-complete notify is that turn's last render.
 const TURN_SETTLE_MS: u64 = 2_000;
 
@@ -185,33 +185,33 @@ const SMALL_STRING_MAX: usize = 80;
 /// payloads. Serialized straight onto the session row (`subagents[]`) —
 /// additive wire shape, don't rename fields.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
-pub(crate) struct SubagentInfo {
-    pub(crate) id: String,
-    pub(crate) label: String,
+pub struct SubagentInfo {
+    pub id: String,
+    pub label: String,
     /// ms since the Unix epoch, stamped at ingest (same clock as the PTY's
     /// `last_output_at`).
-    pub(crate) started_at: u64,
+    pub started_at: u64,
 }
 
 /// Statusline-heartbeat telemetry for a claude TUI session. Values are
 /// quantized at ingest (whole percent, whole cents) so micro-changes between
 /// heartbeats don't defeat the events-bus snapshot dedupe.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct AgentUsage {
-    pub(crate) model: Option<String>,
+pub struct AgentUsage {
+    pub model: Option<String>,
     /// Context-window use, whole percent 0–100.
-    pub(crate) context_pct: Option<u8>,
+    pub context_pct: Option<u8>,
     /// Session cost, whole US cents (serialized as dollars).
-    pub(crate) cost_cents: Option<u64>,
+    pub cost_cents: Option<u64>,
 }
 
 impl AgentUsage {
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.model.is_none() && self.context_pct.is_none() && self.cost_cents.is_none()
     }
 
     /// The wire shape: `{model, context_pct, cost_usd}`, every field optional.
-    pub(crate) fn to_json(&self) -> serde_json::Value {
+    pub fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "model": self.model,
             "context_pct": self.context_pct,
@@ -224,99 +224,99 @@ impl AgentUsage {
 #[derive(Clone, Debug)]
 pub struct AgentRecord {
     /// Per-session secret embedded in the hook URL; authorizes ingestion.
-    pub(crate) key: String,
+    pub key: String,
     /// Which agent CLI this session runs (the UI glyphs sessions by it).
-    pub(crate) kind: AgentKind,
-    pub(crate) state: AgentState,
+    pub kind: AgentKind,
+    pub state: AgentState,
     /// Latest transcript path reported by any hook payload.
-    pub(crate) transcript_path: Option<PathBuf>,
+    pub transcript_path: Option<PathBuf>,
     /// Original immutable native header cwd after an authenticated path remap.
-    pub(crate) native_cwd: Option<PathBuf>,
+    pub native_cwd: Option<PathBuf>,
     /// Codex notify's thread-id, captured only after its rollout is verified.
-    pub(crate) codex_thread_id: Option<String>,
+    pub codex_thread_id: Option<String>,
     /// When an authenticated Codex `agent-turn-complete` notify arrived (ms,
     /// the PTY output clock). A Codex TUI has no hook state; this, with the
     /// PTY's own output recency, tells whether it sits at a safe pause.
-    pub(crate) turn_complete_at: Option<u64>,
+    pub turn_complete_at: Option<u64>,
     /// Nonempty input admitted by the PTY writer, never a refused viewer frame.
     /// A new turn must not inherit the previous notify's safe-pause evidence.
-    pub(crate) terminal_input_at: Option<u64>,
+    pub terminal_input_at: Option<u64>,
     /// Latest `customTitle` transcript record (wins over `ai_title`).
-    pub(crate) custom_title: Option<String>,
+    pub custom_title: Option<String>,
     /// Latest `{"type":"ai-title"}` transcript record.
-    pub(crate) ai_title: Option<String>,
+    pub ai_title: Option<String>,
     /// First prompt seen in a `UserPromptSubmit` hook payload; provisional
     /// display name until a real title exists.
-    pub(crate) first_prompt: Option<String>,
+    pub first_prompt: Option<String>,
     /// Native conversation id this session resumed, when it did. Older Claude
     /// CLIs forked a NEW session id on resume (2.1.283 keeps it), while Codex
     /// continues the same thread id; Recents needs the ancestor to recognize
     /// the live continuation.
-    pub(crate) resumed_from: Option<String>,
+    pub resumed_from: Option<String>,
     /// Files this session has written (PostToolUse hooks for file-writing
     /// tools): ordered, de-duplicated, most recently touched last, capped at
     /// [`FILES_TOUCHED_CAP`]. Never cleared — the list lives as long as the
     /// session.
-    pub(crate) files_touched: Vec<String>,
+    pub files_touched: Vec<String>,
     /// Whether the cluster context (`compute::agent_context`: in a Slurm job,
     /// or on a login node) has been delivered to this session via a hook
     /// response. Once per record:
     /// the context lands in the conversation itself, so later hooks — and a
     /// view switch, which respawns the process but keeps the record and the
     /// conversation — must not repeat it. Never true off-cluster.
-    pub(crate) compute_ctx_delivered: bool,
+    pub compute_ctx_delivered: bool,
     /// The substance digest of the where-you-run note (`mcp::cloud_context`)
     /// this session's agent last received through a hook, so two hooks racing
     /// at one start carry it once. Across processes `cloud_context`'s
     /// `told.json` decides. Never set outside a synced project.
-    pub(crate) placement_delivered: Option<u64>,
+    pub placement_delivered: Option<u64>,
     /// Live subagents (SubagentStart/Stop hooks), capped at
     /// [`SUBAGENTS_CAP`]; cleared when the turn ends (Stop) or the session
     /// exits (the record dies with it).
-    pub(crate) subagents: Vec<SubagentInfo>,
+    pub subagents: Vec<SubagentInfo>,
     /// One-line "what it's doing now" from the most recent hook event
     /// (claude TUIs only — chat rows derive richer state from the journal);
     /// replaced per event, cleared on Stop/exit.
-    pub(crate) now_line: Option<String>,
+    pub now_line: Option<String>,
     /// Latest statusline-heartbeat telemetry (claude TUIs only), quantized
     /// at ingest.
-    pub(crate) usage: Option<AgentUsage>,
+    pub usage: Option<AgentUsage>,
     /// What the session's latest attention edge was about — the opening of
     /// its final reply, a permission or question title, an error line — for
     /// the notice feed (`notices`), which consumes it. Never on the wire.
-    pub(crate) notice_note: Option<NoticeNote>,
+    pub notice_note: Option<NoticeNote>,
     /// The opening of the current turn's latest prose segment (chat only),
     /// capped at [`NOTICE_TEXT_MAX`] chars. A tool call starts a new segment,
     /// so at turn end this holds the start of the reply the turn ended on.
-    pub(crate) reply_draft: String,
+    pub reply_draft: String,
     /// The state the latest change only corrected a stale reading to (a
     /// resumed idle chat's Init after its SessionStart hook read Running).
     /// The notice feed (`notices`) takes it as a baseline, not an edge, and
     /// clears it — but only while the record still reads that state: a
     /// change since (a failed process, a permission asked by a queued turn)
     /// is news as usual.
-    pub(crate) state_corrected: Option<AgentState>,
+    pub state_corrected: Option<AgentState>,
 }
 
 /// The descriptive half of an attention edge, stashed by whichever surface
 /// saw it (protocol event or hook) for the notice feed to read at the edge.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct NoticeNote {
-    pub(crate) text: String,
+pub struct NoticeNote {
+    pub text: String,
     /// A structured question (claude AskUserQuestion / codex
     /// requestUserInput) rather than a tool permission — both put the
     /// session in `NeedsPermission`, but the notification words differ.
-    pub(crate) question: bool,
+    pub question: bool,
 }
 
 /// Cap on notice text (a reply opening, a permission line): notifications
 /// show two or three lines at most, and the record must stay small.
-pub(crate) const NOTICE_TEXT_MAX: usize = 240;
+pub const NOTICE_TEXT_MAX: usize = 240;
 
 /// Collapse `text` to one trimmed line of at most [`NOTICE_TEXT_MAX`] chars
 /// (an ellipsis marks a cut). Markdown emphasis/heading markers are dropped —
 /// an OS notification renders them literally.
-pub(crate) fn notice_line(text: &str) -> String {
+pub fn notice_line(text: &str) -> String {
     let mut out = String::new();
     let mut count = 0;
     for word in text.split_whitespace() {
@@ -348,7 +348,7 @@ pub(crate) fn notice_line(text: &str) -> String {
 }
 
 impl AgentRecord {
-    pub(crate) fn native_cwd_for(&self, native_id: &str) -> Option<PathBuf> {
+    pub fn native_cwd_for(&self, native_id: &str) -> Option<PathBuf> {
         (self.resumed_from.as_deref() == Some(native_id))
             .then(|| self.native_cwd.clone())
             .flatten()
@@ -382,14 +382,14 @@ impl AgentRecord {
     /// Stash the descriptive half of an attention edge (see [`NoticeNote`]).
     /// Blank text clears it — a note that says nothing must not outlive the
     /// edge it was meant for.
-    pub(crate) fn set_notice_note(&mut self, text: &str, question: bool) {
+    pub fn set_notice_note(&mut self, text: &str, question: bool) {
         let text = notice_line(text);
         self.notice_note = (!text.is_empty()).then_some(NoticeNote { text, question });
     }
 
     /// Append streamed prose to the reply draft, keeping only its opening:
     /// a notification quotes how the reply starts, never the whole thing.
-    pub(crate) fn append_reply(&mut self, chunk: &str) {
+    pub fn append_reply(&mut self, chunk: &str) {
         // Byte-cheap guard first; the char count below is bounded by it.
         if self.reply_draft.len() >= NOTICE_TEXT_MAX * 4 {
             return;
@@ -401,7 +401,7 @@ impl AgentRecord {
     /// Record a subagent start: an already-known id refreshes its label in
     /// place; past the cap the OLDEST entry falls off (a stuck stale row
     /// must never block the live one). Returns whether anything changed.
-    pub(crate) fn subagent_started(&mut self, id: &str, label: &str, started_at: u64) -> bool {
+    pub fn subagent_started(&mut self, id: &str, label: &str, started_at: u64) -> bool {
         let label: String = label.chars().take(SMALL_STRING_MAX).collect();
         if let Some(existing) = self.subagents.iter_mut().find(|s| s.id == id) {
             if existing.label == label {
@@ -422,7 +422,7 @@ impl AgentRecord {
     }
 
     /// Drop a subagent by id; returns whether it was present.
-    pub(crate) fn subagent_stopped(&mut self, id: &str) -> bool {
+    pub fn subagent_stopped(&mut self, id: &str) -> bool {
         let before = self.subagents.len();
         self.subagents.retain(|s| s.id != id);
         self.subagents.len() != before
@@ -431,7 +431,7 @@ impl AgentRecord {
     /// Record a file write: a re-touched path moves to the end (newest last),
     /// a new one appends, and the oldest entries fall off past the cap.
     /// Returns whether the list changed (re-touching the newest is a no-op).
-    pub(crate) fn touch_file(&mut self, path: &str) -> bool {
+    pub fn touch_file(&mut self, path: &str) -> bool {
         if self.files_touched.last().is_some_and(|last| last == path) {
             return false;
         }
@@ -446,7 +446,7 @@ impl AgentRecord {
     }
 
     /// Display title: latest customTitle wins over latest aiTitle.
-    pub(crate) fn title(&self) -> Option<&str> {
+    pub fn title(&self) -> Option<&str> {
         self.custom_title.as_deref().or(self.ai_title.as_deref())
     }
 
@@ -457,7 +457,7 @@ impl AgentRecord {
     /// instantly without depending on semi-documented transcript records —
     /// found in the field when a `/rename git` left the row on its
     /// first-prompt name while the subtitle already showed "✳ git".
-    pub(crate) fn display_name(&self, osc_title: Option<&str>) -> String {
+    pub fn display_name(&self, osc_title: Option<&str>) -> String {
         self.custom_title
             .clone()
             .or_else(|| osc_title.and_then(cleaned_osc_title))
@@ -468,7 +468,7 @@ impl AgentRecord {
 
     /// The session id `claude --resume` accepts: the transcript filename stem
     /// (hooks report the transcript as `<store>/<cwd-key>/<session-id>.jsonl`).
-    pub(crate) fn resume_id(&self) -> Option<String> {
+    pub fn resume_id(&self) -> Option<String> {
         if self.kind == AgentKind::Codex {
             return self.codex_thread_id.clone();
         }
@@ -499,7 +499,7 @@ const PROMPT_TITLE_MAX: usize = 60;
 /// Collapse whitespace and truncate to ~60 chars at a word boundary,
 /// appending an ellipsis when anything was cut. Shared with the launcher's
 /// resumable-session titles so both surfaces truncate identically.
-pub(crate) fn truncate_prompt(prompt: &str) -> String {
+pub fn truncate_prompt(prompt: &str) -> String {
     let flat = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() <= PROMPT_TITLE_MAX {
         return flat;
@@ -527,7 +527,7 @@ pub(crate) fn truncate_prompt(prompt: &str) -> String {
 /// Field names verified against real hook payloads: Write/Edit (and
 /// MultiEdit, same tool family) carry `tool_input.file_path`; NotebookEdit
 /// carries `tool_input.notebook_path`.
-pub(crate) fn touched_file(payload: &serde_json::Value) -> Option<&str> {
+pub fn touched_file(payload: &serde_json::Value) -> Option<&str> {
     let field = match payload.get("tool_name")?.as_str()? {
         "Write" | "Edit" | "MultiEdit" => "file_path",
         "NotebookEdit" => "notebook_path",
@@ -544,7 +544,7 @@ pub(crate) fn touched_file(payload: &serde_json::Value) -> Option<&str> {
 /// Verified shape (claude 2.1.20x): `agent_id` + `agent_type`; parsed
 /// liberally (camelCase accepted, label optional) — `None` means an unknown
 /// shape the caller logs and drops.
-pub(crate) fn subagent_identity(payload: &serde_json::Value) -> Option<(&str, &str)> {
+pub fn subagent_identity(payload: &serde_json::Value) -> Option<(&str, &str)> {
     let id = payload
         .get("agent_id")
         .or_else(|| payload.get("agentId"))
@@ -563,7 +563,7 @@ pub(crate) fn subagent_identity(payload: &serde_json::Value) -> Option<(&str, &s
 /// it, `Some(None)` clears it (a turn boundary — the old line is stale),
 /// `None` keeps the current one. Tool events yield the task's one-line
 /// answer to "what is it doing": "edited foo.rs" beats "ran Edit".
-pub(crate) fn now_line_update(event: &str, payload: &serde_json::Value) -> Option<Option<String>> {
+pub fn now_line_update(event: &str, payload: &serde_json::Value) -> Option<Option<String>> {
     let tool = || {
         payload
             .get("tool_name")
@@ -602,7 +602,7 @@ fn file_basename(path: &str) -> Option<String> {
 /// caller drops. Field names per the claude statusline stdin JSON
 /// (`model.display_name`, `context_window.used_percentage`,
 /// `cost.total_cost_usd`), with a tokens-ratio fallback for the percentage.
-pub(crate) fn statusline_usage(payload: &serde_json::Value) -> AgentUsage {
+pub fn statusline_usage(payload: &serde_json::Value) -> AgentUsage {
     let model = payload
         .get("model")
         .and_then(|m| {
@@ -643,7 +643,7 @@ pub(crate) fn statusline_usage(payload: &serde_json::Value) -> AgentUsage {
 /// Map a hook event to the agent state it implies, if any. `SessionEnd`
 /// intentionally maps to `None`: the last state is kept, and the PTY exit
 /// still reaps the whole session (a closed claude TUI vanishes).
-pub(crate) fn map_event(event: &str, payload: &serde_json::Value) -> Option<AgentState> {
+pub fn map_event(event: &str, payload: &serde_json::Value) -> Option<AgentState> {
     match event {
         "SessionStart" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse"
         | "PostToolUseFailure" | "PostToolBatch" | "SubagentStart" | "SubagentStop"
@@ -691,7 +691,7 @@ pub(crate) fn map_event(event: &str, payload: &serde_json::Value) -> Option<Agen
 /// `NeedsPermission` and `Finished` are deliberately excluded: a pending
 /// permission appends nothing to the transcript while it blocks, and a
 /// finished run is meant to sit silently until its own next-turn hook.
-pub(crate) fn cleared_by_output(state: AgentState) -> Option<AgentState> {
+pub fn cleared_by_output(state: AgentState) -> Option<AgentState> {
     matches!(state, AgentState::IdlePrompt | AgentState::Errored).then_some(AgentState::Running)
 }
 
@@ -699,7 +699,7 @@ pub(crate) fn cleared_by_output(state: AgentState) -> Option<AgentState> {
 /// shared by the live transcript tail and the launcher's resume scan — one
 /// predicate, so the two can never drift. A superset by design: the real
 /// parse in `apply_title_line` decides.
-pub(crate) fn is_title_line(line: &str) -> bool {
+pub fn is_title_line(line: &str) -> bool {
     line.contains("\"customTitle\"") || line.contains("\"ai-title\"")
 }
 
@@ -708,7 +708,7 @@ pub(crate) fn is_title_line(line: &str) -> bool {
 /// records and any record carrying a top-level `customTitle` (string sets it,
 /// null clears it). Shared with the launcher's resumable-session scan so the
 /// live tail and the resume list resolve titles identically.
-pub(crate) fn apply_title_line(line: &str, record: &mut AgentRecord) -> bool {
+pub fn apply_title_line(line: &str, record: &mut AgentRecord) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
         return false;
     };

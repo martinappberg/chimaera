@@ -220,7 +220,7 @@ pub(crate) async fn run_checker(state: Arc<AppState>) {
 /// waits for it and reuses its answer instead of fetching twice.
 ///
 /// The account's cloud never asks: the service updates its daemon.
-pub(crate) async fn check_now(state: &Arc<AppState>) {
+pub async fn check_now(state: &Arc<AppState>) {
     if state.policy().updates_managed(state) || state.policy().composed(state) {
         return;
     }
@@ -236,7 +236,7 @@ pub(crate) async fn check_now(state: &Arc<AppState>) {
         .api_override
         .clone()
         .or_else(releases_api_url);
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "daemon-extension-fixture")))]
     let url = releases_api_url();
     let result = fetch_latest(url).await;
     let now = unix_now();

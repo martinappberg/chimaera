@@ -28,36 +28,36 @@ pub enum SpawnKind {
 
 /// A validated spawn request.
 pub struct SpawnSpec {
-    pub(crate) workspace: Workspace,
+    pub workspace: Workspace,
     /// Session id to (re)use. `None` mints a fresh one; resurrection passes
     /// the dead session's id so every layout tab referencing it rebinds.
-    pub(crate) id: Option<String>,
+    pub id: Option<String>,
     /// Pins the display name (`SessionInfo::renamed`); resurrection carries
     /// a user rename across the restart this way.
-    pub(crate) name: Option<String>,
+    pub name: Option<String>,
     /// Working directory override; `None` spawns at the workspace root.
     /// Resurrection passes the last polled cwd so shells come back where
     /// they were, not where they started.
-    pub(crate) cwd: Option<PathBuf>,
-    pub(crate) cols: Option<u16>,
-    pub(crate) rows: Option<u16>,
+    pub cwd: Option<PathBuf>,
+    pub cols: Option<u16>,
+    pub rows: Option<u16>,
     /// "light" | "dark" (validated by the caller).
-    pub(crate) theme: String,
+    pub theme: String,
     /// Provisional display title for agent sessions (resurrection carries
     /// the dead session's title so the rail row stays recognizable until
     /// the agent re-titles itself). Ignored for shells.
-    pub(crate) title_hint: Option<String>,
+    pub title_hint: Option<String>,
     /// Launch-scope prelude text (concatenated after the host + workspace
     /// preludes — see `environment`). Not persisted in the ledger, so
     /// resurrection passes None: a resurrected session re-runs the durable
     /// scopes only.
-    pub(crate) prelude: Option<String>,
-    pub(crate) kind: SpawnKind,
-    pub(crate) fork_head: bool,
-    pub(crate) native_cwd: Option<PathBuf>,
+    pub prelude: Option<String>,
+    pub kind: SpawnKind,
+    pub fork_head: bool,
+    pub native_cwd: Option<PathBuf>,
     /// Who started it, for an agent session's history record (shells keep
     /// none).
-    pub(crate) started_by: crate::history::StartedBy,
+    pub started_by: crate::history::StartedBy,
 }
 
 /// Why a spawn could not happen.

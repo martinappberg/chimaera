@@ -4738,10 +4738,10 @@ pub struct TicketStore {
     >,
 }
 
-pub(crate) struct TicketSnapshot {
-    pub(crate) path: PathBuf,
-    pub(crate) bound: Option<crate::workspace_scope::files::Resolved>,
-    pub(crate) fresh_for: Duration,
+pub struct TicketSnapshot {
+    pub path: PathBuf,
+    pub bound: Option<crate::workspace_scope::files::Resolved>,
+    pub fresh_for: Duration,
 }
 
 struct Ticket {
@@ -4754,11 +4754,11 @@ struct Ticket {
 impl TicketStore {
     /// Mint (or renew) a ticket for `path` at `version`, valid for
     /// [`TICKET_TTL`]. `None` (the version could not be read) always mints.
-    pub(crate) fn mint(&mut self, path: PathBuf, version: Option<String>) -> String {
+    pub fn mint(&mut self, path: PathBuf, version: Option<String>) -> String {
         self.create(path, version, TICKET_TTL)
     }
 
-    pub(crate) fn mint_bound(
+    pub fn mint_bound(
         &mut self,
         bound: crate::workspace_scope::files::Resolved,
         version: Option<String>,
@@ -4789,7 +4789,7 @@ impl TicketStore {
     }
     /// Snapshot path and optional scoped authority under one lookup. Missing
     /// or evicted tickets never degrade to an unrestricted path capability.
-    pub(crate) fn snapshot(&mut self, ticket: &str) -> Option<TicketSnapshot> {
+    pub fn snapshot(&mut self, ticket: &str) -> Option<TicketSnapshot> {
         self.purge();
         let now = Instant::now();
         self.tickets.get(ticket).map(|entry| TicketSnapshot {
@@ -4882,8 +4882,8 @@ impl TicketStore {
     }
 
     /// Force a ticket to be already expired (test hook for the expiry path).
-    #[cfg(test)]
-    pub(crate) fn expire(&mut self, ticket: &str) {
+    #[cfg(any(test, feature = "daemon-extension-fixture"))]
+    pub fn expire(&mut self, ticket: &str) {
         if let Some(t) = self.tickets.get_mut(ticket) {
             t.expires = Instant::now() - Duration::from_secs(1);
         }

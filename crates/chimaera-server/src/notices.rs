@@ -85,7 +85,7 @@ const KEPT_NAMED: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum NoticeKind {
+pub enum NoticeKind {
     /// The turn ended and the agent handed back the floor.
     Done,
     /// The turn ended with the agent explicitly waiting on the user.
@@ -167,21 +167,21 @@ impl NoticeKind {
 /// click (session + workspace) and re-compose for its platform.
 #[derive(Clone, Debug)]
 pub struct Notice {
-    pub(crate) id: u64,
-    pub(crate) kind: NoticeKind,
-    pub(crate) session_id: String,
-    pub(crate) workspace_id: Option<String>,
-    pub(crate) workspace: Option<String>,
-    pub(crate) agent: Option<String>,
+    pub id: u64,
+    pub kind: NoticeKind,
+    pub session_id: String,
+    pub workspace_id: Option<String>,
+    pub workspace: Option<String>,
+    pub agent: Option<String>,
     /// The session's display name (what the rail calls it).
-    pub(crate) name: String,
-    pub(crate) title: String,
-    pub(crate) subtitle: String,
-    pub(crate) body: String,
-    pub(crate) at_ms: u64,
+    pub name: String,
+    pub title: String,
+    pub subtitle: String,
+    pub body: String,
+    pub at_ms: u64,
     /// `kept_both` only: what the return kept (the additive `kept` field).
-    pub(crate) kept: Option<Kept>,
-    created: Instant,
+    pub kept: Option<Kept>,
+    pub created: Instant,
 }
 
 /// What a return kept in both versions: `files` counted, `paths` naming up
@@ -189,7 +189,7 @@ pub struct Notice {
 /// `kept_paths`), and the other machine's diverged Git branches kept beside
 /// the user's (`<branch>@cloud-<commit>`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
-pub(crate) struct Kept {
+pub struct Kept {
     pub(crate) files: usize,
     pub(crate) paths: Vec<String>,
     pub(crate) branches: Vec<String>,
@@ -198,7 +198,7 @@ pub(crate) struct Kept {
 impl Notice {
     /// Wire shape. `age_ms` is measured on THIS daemon's clock, so a
     /// consumer on another machine can judge freshness without clock sync.
-    pub(crate) fn to_json(&self, now: Instant) -> Value {
+    pub fn to_json(&self, now: Instant) -> Value {
         let mut value = json!({
             "id": self.id,
             "kind": self.kind,
@@ -255,7 +255,7 @@ impl Notices {
         &self.boot
     }
 
-    pub(crate) fn head(&self) -> u64 {
+    pub fn head(&self) -> u64 {
         crate::lock(&self.inner).head
     }
 
@@ -272,7 +272,7 @@ impl Notices {
     }
 
     /// Notices after `after` that are still fresh enough to replay.
-    pub(crate) fn since(&self, after: u64) -> Vec<Arc<Notice>> {
+    pub fn since(&self, after: u64) -> Vec<Arc<Notice>> {
         let inner = crate::lock(&self.inner);
         inner
             .ring
@@ -435,7 +435,7 @@ fn emit_edge(
 
 /// The MCP `notify` tool's entry point: validate, rate-limit, store. The
 /// `Ok` text is what the agent sees.
-pub(crate) fn push_agent_notice(
+pub fn push_agent_notice(
     state: &AppState,
     session_id: &str,
     title: Option<&str>,
@@ -747,7 +747,7 @@ struct Pending {
 /// The edge detector. Runs for the daemon's lifetime; wakes on every change
 /// (plus a 1s backstop — `notify_waiters` only reaches registered waiters,
 /// and a level diff catches up on whatever a missed wake hid).
-pub(crate) async fn run(state: Arc<AppState>) {
+pub async fn run(state: Arc<AppState>) {
     let mut seen: HashMap<String, AgentState> = HashMap::new();
     let mut pending: HashMap<String, Pending> = HashMap::new();
     loop {

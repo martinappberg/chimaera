@@ -92,7 +92,7 @@ pub struct GitService {
     /// module-loaded git in the user's dotfiles), so it must not happen per
     /// invocation — every git call reads the cached path.
     resolved_git: Mutex<Option<(Option<String>, Arc<GitBinary>)>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "daemon-extension-fixture"))]
     fixture_git: Option<String>,
     /// Bounds concurrent `git` processes across the whole daemon.
     pub(super) procs: Arc<Semaphore>,
@@ -306,7 +306,7 @@ impl GitService {
             watchers: Mutex::new(HashMap::new()),
             hashes: Mutex::new(HashMap::new()),
             resolved_git: Mutex::new(None),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "daemon-extension-fixture"))]
             fixture_git: None,
             procs: Arc::new(Semaphore::new(MAX_CONCURRENT_GIT)),
             status_share: StatusShare::new(),
@@ -318,7 +318,7 @@ impl GitService {
 
     /// Route fixtures use a captured PATH binary without reading the host's rc.
     /// An explicit setting still overrides it; production resolution is unchanged.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "daemon-extension-fixture"))]
     pub(crate) fn with_fixture_git(path: PathBuf) -> Self {
         Self {
             fixture_git: Some(path.to_string_lossy().into_owned()),
@@ -340,7 +340,7 @@ impl GitService {
             }
         }
         let resolver_input = configured.clone();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "daemon-extension-fixture"))]
         let resolver_input = resolver_input.or_else(|| self.fixture_git.clone());
         let bin = Arc::new(resolve_git_binary(resolver_input).await);
         *crate::lock(&self.resolved_git) = Some((configured, bin.clone()));

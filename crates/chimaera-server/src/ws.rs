@@ -170,7 +170,7 @@ enum ClientMessage {
 /// The first authenticated frame fixes both project scope and account generation.
 /// A later account with an equal workspace/epoch cannot revive this connection.
 #[derive(Clone)]
-pub(crate) struct SocketScope {
+pub struct SocketScope {
     scope: crate::workspace_scope::Scope,
     admission: crate::workspace_scope::Mutation,
 }
@@ -229,7 +229,7 @@ impl SocketScope {
     }
 }
 
-pub(crate) async fn terminal_input(
+pub async fn terminal_input(
     state: &Arc<AppState>,
     id: &str,
     input: &chimaera_pty::InputSender,
@@ -350,16 +350,16 @@ fn acted_here(state: &AppState, id: &str) {
 pub struct CommandTag {
     /// Its `type` (`send`, `interrupt`, `permission`…); `None` for anything
     /// that is not a small command tag.
-    pub(crate) kind: Option<String>,
+    pub kind: Option<String>,
     /// The id its client minted for it (`client_id`), when well formed
     /// (`chimaera_agent::model::valid_client_id`).
-    pub(crate) client_id: Option<String>,
+    pub client_id: Option<String>,
     /// It carries a `client_id` that is not well formed.
-    pub(crate) bad_client_id: bool,
+    pub bad_client_id: bool,
     /// A `rewind` that only asks what it would do.
-    pub(crate) dry_run: bool,
+    pub dry_run: bool,
     /// The `server` an MCP setting names, when it is short enough to be one.
-    pub(crate) server: Option<String>,
+    pub server: Option<String>,
 }
 
 /// One of a frame's tag fields, whatever JSON it turned out to be: a field

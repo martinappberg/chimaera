@@ -490,7 +490,7 @@ fn tool_defs(comms_on: bool, mastermind: bool, plugin_tools: Vec<Value>) -> Valu
 }
 
 /// Plugin manifests cannot claim a core name, including tools gated by role.
-pub(crate) fn is_core_tool(name: &str) -> bool {
+pub fn is_core_tool(name: &str) -> bool {
     static NAMES: std::sync::LazyLock<std::collections::HashSet<String>> =
         std::sync::LazyLock::new(|| {
             tool_defs(true, true, Vec::new())

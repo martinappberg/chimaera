@@ -279,7 +279,7 @@ impl ComputeService {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "daemon-extension-fixture"))]
     pub(crate) fn with_bindir(dir: PathBuf) -> Self {
         ComputeService {
             inner: tokio::sync::Mutex::new(Inner::default()),
