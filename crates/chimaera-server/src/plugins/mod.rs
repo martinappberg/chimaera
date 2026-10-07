@@ -85,8 +85,7 @@ pub(crate) const SERVED_APIS: &[&str] = &["0.1", API];
 /// The test-only plugins (the host's fixture, and the first-party releases
 /// the lock pins, which tests install by path): embedded by test builds
 /// only, laid out by `scripts/build-plugins.sh`.
-#[cfg(any(test, feature = "daemon-extension-fixture"))]
-#[allow(dead_code)]
+#[cfg(test)]
 #[derive(rust_embed::RustEmbed)]
 #[folder = "../../plugins/dist-test"]
 pub struct DistTest;
@@ -900,8 +899,7 @@ pub(crate) fn entry_json(state: &AppState, id: &str) -> Option<Value> {
 /// installed (every `Catalog` sees them; an installed copy of the same id
 /// shadows one). They have no directory, so Remove and Use previous don't
 /// apply to them.
-#[cfg(any(test, feature = "daemon-extension-fixture"))]
-#[allow(dead_code)]
+#[cfg(test)]
 pub mod test_catalog {
     use super::*;
 

@@ -229,6 +229,7 @@ pub async fn session_entry(state: &Arc<AppState>, id: &str) -> serde_json::Value
         .unwrap_or_else(|| panic!("session {id} not listed in {list}"))
 }
 
+#[cfg(test)]
 /// Install a first-party plugin as `chimaera plugin add --path` would: the
 /// release the lock pins, which `scripts/build-plugins.sh` laid out in
 /// `plugins/dist-test/<id>` (its SHA256SUMS included, so the copy is
