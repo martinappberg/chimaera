@@ -311,6 +311,59 @@ impl WorkspacePolicy for ProPolicy {
                 .insert("local_copy".into(), copy);
         }
     }
+    fn tools(&self, state: &AppState, session: &str) -> Vec<serde_json::Value> {
+        use crate::mcp::cloud_context;
+        if cloud_context::available(state, session) {
+            cloud_context::definitions(state)
+        } else {
+            Vec::new()
+        }
+    }
+    fn call_tool<'a>(
+        &'a self,
+        state: &'a Arc<AppState>,
+        session: &'a str,
+        name: &'a str,
+        args: &'a serde_json::Value,
+    ) -> Option<BoxFuture<'a, serde_json::Value>> {
+        use crate::mcp::cloud_context;
+        (cloud_context::NAMES.contains(&name) && cloud_context::available(state, session))
+            .then(|| Box::pin(cloud_context::call(state, session, args)) as BoxFuture<'a, _>)
+    }
+    fn auto_tools(&self, state: &AppState, workspace: &str) -> Vec<String> {
+        use crate::mcp::cloud_context;
+        if cloud_context::available_in(state, workspace) {
+            vec![cloud_context::LOOKUP.to_string()]
+        } else {
+            Vec::new()
+        }
+    }
+    fn start_note<'a>(
+        &'a self,
+        state: &'a AppState,
+        workspace: &'a str,
+        session: &'a str,
+    ) -> BoxFuture<'a, Option<crate::policy::StartNote>> {
+        Box::pin(async move {
+            let pending = crate::mcp::cloud_context::pending(state, workspace, session).await?;
+            Some(crate::policy::StartNote {
+                text: pending.text.clone(),
+                digest: pending.digest,
+                record: Box::new(pending),
+            })
+        })
+    }
+    fn note_told<'a>(
+        &'a self,
+        state: &'a AppState,
+        note: &'a crate::policy::StartNote,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if let Some(pending) = note.record.downcast_ref() {
+                crate::mcp::cloud_context::told(state, pending).await;
+            }
+        })
+    }
     fn reads_folder_identity(&self, state: &AppState) -> bool {
         super::tier(state) != Tier::Free
     }

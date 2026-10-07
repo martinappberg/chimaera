@@ -387,7 +387,7 @@ async fn a_synced_projects_agents_hear_where_they_run_once_per_change() {
     let codex = recipe(&workspace.id, &root, AgentKind::Codex);
     let (note, placement) = crate::chat::codex_developer_note(&state, &codex, "s-codex").await;
     assert_eq!(note.as_deref(), Some("PLACE cloud=true from=None kept=0"));
-    crate::mcp::cloud_context::told(&state, &placement.unwrap()).await;
+    state.policy().note_told(&state, &placement.unwrap()).await;
     let (note, placement) = crate::chat::codex_developer_note(&state, &codex, "s-codex").await;
     assert_eq!((note, placement.is_none()), (None, true));
     let claude = recipe(&workspace.id, &root, AgentKind::Claude);

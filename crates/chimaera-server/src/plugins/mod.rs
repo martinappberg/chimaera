@@ -1108,11 +1108,9 @@ pub(crate) async fn spawn_allow(state: &AppState, ws: &str) -> Vec<String> {
     if crate::comms::enabled(state) {
         tools.extend(crate::comms::TOOLS.iter().map(|t| t.to_string()));
     }
-    // A synced project's read-only "where am I" lookup: a permission prompt
-    // would stall a cloud run while the user is away.
-    if crate::mcp::cloud_context::available_in(state, ws) {
-        tools.push(crate::mcp::cloud_context::LOOKUP.to_string());
-    }
+    // The policy's own tools (a permission prompt would stall a run while
+    // the user is away).
+    tools.extend(state.policy().auto_tools(state, ws));
     tools
 }
 

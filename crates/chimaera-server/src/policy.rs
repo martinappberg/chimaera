@@ -258,6 +258,17 @@ pub(crate) trait ProjectFeed: Send {
     fn next(&mut self) -> BoxFuture<'_, Option<ProjectFrame>>;
 }
 
+/// A note an agent is told as it starts (once per change of machine), and
+/// what the policy remembers once it has been delivered.
+pub(crate) struct StartNote {
+    pub(crate) text: String,
+    /// Identifies the note's substance within one agent process, so two
+    /// carriers racing at one start deliver it once.
+    pub(crate) digest: u64,
+    /// The policy's own record of it, handed back in `note_told`.
+    pub(crate) record: Box<dyn Any + Send + Sync>,
+}
+
 /// The workspace-admission hook. Implementations are trusted in-process.
 /// Every method must be cheap and must not block: shared code calls them on
 /// the reactor and on hot paths.
@@ -359,6 +370,32 @@ pub(crate) trait WorkspacePolicy: Send + Sync + 'static {
     fn decorate_workspace(&self, state: &AppState, workspace: &str, value: &mut serde_json::Value);
     /// Additive `/health` fields.
     fn health(&self, state: &AppState, body: &mut serde_json::Value);
+
+    // What a project's agents are told and offered.
+    /// Tools the policy offers `session`'s agent; each replaces a plugin
+    /// tool of the same name.
+    fn tools(&self, state: &AppState, session: &str) -> Vec<serde_json::Value>;
+    /// Answer a call to one of [`Self::tools`]; `None` when `name` is not
+    /// the policy's.
+    fn call_tool<'a>(
+        &'a self,
+        state: &'a Arc<AppState>,
+        session: &'a str,
+        name: &'a str,
+        args: &'a serde_json::Value,
+    ) -> Option<BoxFuture<'a, serde_json::Value>>;
+    /// The policy's tools `workspace`'s agents use without asking.
+    fn auto_tools(&self, state: &AppState, workspace: &str) -> Vec<String>;
+    /// The note `session` (in `workspace`) carries as it starts, when it
+    /// has not heard it yet.
+    fn start_note<'a>(
+        &'a self,
+        state: &'a AppState,
+        workspace: &'a str,
+        session: &'a str,
+    ) -> BoxFuture<'a, Option<StartNote>>;
+    /// The note was delivered.
+    fn note_told<'a>(&'a self, state: &'a AppState, note: &'a StartNote) -> BoxFuture<'a, ()>;
 
     // Workspaces.
     /// Whether registering a folder reads its identity marker.
@@ -564,6 +601,32 @@ impl WorkspacePolicy for Inert {
     }
     fn decorate_workspace(&self, _: &AppState, _: &str, _: &mut serde_json::Value) {}
     fn health(&self, _: &AppState, _: &mut serde_json::Value) {}
+    fn tools(&self, _: &AppState, _: &str) -> Vec<serde_json::Value> {
+        Vec::new()
+    }
+    fn call_tool<'a>(
+        &'a self,
+        _: &'a Arc<AppState>,
+        _: &'a str,
+        _: &'a str,
+        _: &'a serde_json::Value,
+    ) -> Option<BoxFuture<'a, serde_json::Value>> {
+        None
+    }
+    fn auto_tools(&self, _: &AppState, _: &str) -> Vec<String> {
+        Vec::new()
+    }
+    fn start_note<'a>(
+        &'a self,
+        _: &'a AppState,
+        _: &'a str,
+        _: &'a str,
+    ) -> BoxFuture<'a, Option<StartNote>> {
+        Box::pin(async { None })
+    }
+    fn note_told<'a>(&'a self, _: &'a AppState, _: &'a StartNote) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
     fn reads_folder_identity(&self, _: &AppState) -> bool {
         false
     }

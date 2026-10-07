@@ -826,7 +826,12 @@ pub(crate) async fn ingest(
     // start from both carrying it. Without the optional Runtime this is one
     // Option check.
     if starting && own_hook {
-        if let Some(pending) = crate::mcp::cloud_context::pending_for_session(&state, &id).await {
+        let workspace = crate::lock(&state.session_workspaces).get(&id).cloned();
+        let pending = match workspace {
+            Some(workspace) => state.policy().start_note(&state, &workspace, &id).await,
+            None => None,
+        };
+        if let Some(pending) = pending {
             let fresh = {
                 let mut agents = crate::lock(&state.agents);
                 agents.get_mut(&id).is_some_and(|record| {
@@ -836,7 +841,7 @@ pub(crate) async fn ingest(
                 })
             };
             if fresh {
-                crate::mcp::cloud_context::told(&state, &pending).await;
+                state.policy().note_told(&state, &pending).await;
                 context.push(pending.text);
             }
         }

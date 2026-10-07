@@ -3691,7 +3691,7 @@ pub(crate) async fn spawn_chat_session(
             anyhow::bail!("project execution authority changed during launch");
         }
         if let Some(placement) = &placement {
-            crate::mcp::cloud_context::told(state, placement).await;
+            state.policy().note_told(state, placement).await;
         }
         launch.registered(id);
     }
@@ -3708,11 +3708,14 @@ pub(crate) async fn codex_developer_note(
     state: &AppState,
     recipe: &ChatRecipe,
     id: &str,
-) -> (Option<String>, Option<crate::mcp::cloud_context::Pending>) {
+) -> (Option<String>, Option<crate::policy::StartNote>) {
     if recipe.kind != AgentKind::Codex {
         return (None, None);
     }
-    let placement = crate::mcp::cloud_context::pending(state, &recipe.workspace_id, id).await;
+    let placement = state
+        .policy()
+        .start_note(state, &recipe.workspace_id, id)
+        .await;
     let notes: Vec<String> = [
         state.compute.agent_context().await,
         placement.as_ref().map(|pending| pending.text.clone()),

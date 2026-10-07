@@ -277,14 +277,13 @@ pub(crate) async fn mcp(
         "ping" => Ok(json!({})),
         "tools/list" => {
             let mut tools = tool_defs(comms_on, mastermind, plugin_tools);
-            if cloud_context::available(&state, &agent_id) {
-                // Where they are offered, these win over a plugin tool of
-                // the same name (plugins may use the names elsewhere).
+            // Where the policy offers tools, they win over a plugin tool of
+            // the same name (plugins may use the names elsewhere).
+            let own = state.policy().tools(&state, &agent_id);
+            if !own.is_empty() {
                 let tools = tools.as_array_mut().unwrap();
-                tools.retain(|tool| {
-                    !cloud_context::NAMES.contains(&tool["name"].as_str().unwrap_or_default())
-                });
-                tools.extend(cloud_context::definitions(&state));
+                tools.retain(|tool| !own.iter().any(|mine| mine["name"] == tool["name"]));
+                tools.extend(own);
             }
             Ok(json!({"tools":tools}))
         }
@@ -747,10 +746,10 @@ async fn tools_call(
             ),
         ));
     }
-    // A synced project's own tools, where they are offered, before any
-    // plugin's of the same name (`cloud_context::NAMES` are not reserved).
-    if cloud_context::NAMES.contains(&name) && cloud_context::available(state, agent_id) {
-        return Ok(cloud_context::call(state, agent_id, &args).await);
+    // The policy's own tools, where they are offered, before any plugin's
+    // of the same name.
+    if let Some(call) = state.policy().call_tool(state, agent_id, name, &args) {
+        return Ok(call.await);
     }
     // Plugin tools: offered only where their plugin is active; the same
     // gate on call (a caller can name a tool it was never offered).

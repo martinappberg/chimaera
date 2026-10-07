@@ -46,7 +46,7 @@ pub(crate) const LOOKUP: &str = "where_am_i";
 /// The tools a synced project's agents get. Not reserved from plugins: a
 /// plugin tool of the same name keeps working everywhere these are not
 /// offered (every project of a daemon without the Runtime).
-pub(super) const NAMES: &[&str] = &[LOOKUP];
+pub(crate) const NAMES: &[&str] = &[LOOKUP];
 
 /// The last move into this machine, kept beside the project's other transfer
 /// state (`<data>/pro/<workspace>/arrival.json`), never in the project folder.
@@ -419,16 +419,6 @@ pub(crate) async fn pending(state: &AppState, workspace: &str, session: &str) ->
     })
 }
 
-/// [`pending`] for one agent session's project. One Option check on a daemon
-/// without the Runtime.
-pub(crate) async fn pending_for_session(state: &AppState, session: &str) -> Option<Pending> {
-    state.pro().runtime()?;
-    let workspace = crate::lock(&state.session_workspaces)
-        .get(session)
-        .cloned()?;
-    pending(state, &workspace, session).await
-}
-
 /// Serializes `told.json`'s read-modify-write across sessions.
 static TOLD_WRITES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -512,12 +502,12 @@ pub(crate) fn available_in(state: &AppState, workspace: &str) -> bool {
     state.pro().runtime().is_some() && crate::pro::synced(state, workspace).is_some()
 }
 
-pub(super) fn available(state: &AppState, session: &str) -> bool {
+pub(crate) fn available(state: &AppState, session: &str) -> bool {
     state.pro().runtime().is_some()
         && super::workspace_of(state, session).is_some_and(|w| available_in(state, &w.id))
 }
 
-pub(super) fn definitions(state: &AppState) -> Vec<Value> {
+pub(crate) fn definitions(state: &AppState) -> Vec<Value> {
     state
         .pro()
         .runtime()
@@ -532,7 +522,7 @@ fn environment_name(name: &str) -> bool {
         })
 }
 /// `where_am_i`, the only tool in [`NAMES`].
-pub(super) async fn call(state: &Arc<AppState>, session: &str, args: &Value) -> Value {
+pub(crate) async fn call(state: &Arc<AppState>, session: &str, args: &Value) -> Value {
     let Some(runtime) = state.pro().runtime() else {
         return super::tool_error("This project does not move between machines".into());
     };
@@ -646,7 +636,7 @@ mod tests {
         assert!(definitions(&state).is_empty());
         assert!(!available(&state, "missing-session"));
         assert!(note(&state, "missing-workspace").await.is_none());
-        assert!(pending_for_session(&state, "missing-session")
+        assert!(pending(&state, "missing-workspace", "missing-session")
             .await
             .is_none());
         record_arrival(
