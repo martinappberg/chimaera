@@ -262,3 +262,14 @@ describe("captured logical route identity", () => {
     await expect(pending).rejects.toThrow(); expect(get(placementOwner)).toBeNull();
   });
 });
+
+describe("a transfer under way", () => {
+  it("reads the additive moving field and nothing else", async () => {
+    const { parseMoving } = await import("./placement");
+    expect(parseMoving({})).toBeNull();
+    expect(parseMoving({ moving: null })).toBeNull();
+    expect(parseMoving({ moving: { direction: "up", step: "x", since_ms: 1 } })).toBeNull();
+    expect(parseMoving({ moving: { direction: "cloud", step: "saving_here", since_ms: 1 } })).toEqual({ direction: "cloud", step: "saving_here", since_ms: 1 });
+    expect(parseMoving({ moving: { direction: "here", step: "restoring_here", since_ms: 2 } })).toEqual({ direction: "here", step: "restoring_here", since_ms: 2 });
+  });
+});

@@ -39,6 +39,8 @@ The window's host label (the connection dot and "local" at the foot of the rail,
 - The label reads the project's `/pro/status` row: `place` here is "This Mac" (or "This computer" off a Mac), cloud is "In the cloud", computer is "On <name>" ("On another computer" when the account has no name for it). A project with no `place` (not synced, or kept on this computer only) keeps the host's own label.
 - Clicking it opens a small menu: one sentence ("Running on this Mac", "Running in your cloud", "Running on Studio"), at most one note, and only the entries that apply. The note is one plain sentence for the row's `reason` (an agent not signed in in the cloud, with one **Connect** action; cloud time or storage used up; the cloud unavailable; a conversation too large or not saved; the project not synced yet; any other value reads as "This project couldn't move just now."), else the project's own problem (a sync problem, staged Git changes kept apart, branches to merge).
 - **Run here** shows only when the row's `run_here` is true and calls `POST /pro/projects/{id}/here`; **Run in the cloud** shows only when `run_in_cloud` is true and calls `POST /pro/projects/{id}/cloud` (`web-ui/src/lib/extensions/placeHost.ts`). After a 202 the label shows that action's own progress ("Moving here…", "Moving…") until a status read shows the project arrived, a reason, or the entry offered again after the daemon had withdrawn it; a 409 is one sentence in the menu.
+- **Run here** and **Run in the cloud** are meant for testing: they show only while the **Developer Tools** setting is on (`developer.tools`; `PlaceMount.developer`). The automatic hand-over (a closed lid, a wake) and switching between computers are the ordinary flows.
+- While a project moves (either direction) the whole workspace is covered and takes no input (`web-ui/src/lib/extensions/TransferSlot.svelte`, the extension's cover; the host makes the body inert). The cover names the direction, the step and how long it has been running, from the row's `moving`. A browser view of a project that moved to another machine reloads once to follow it; a host view asked to open a project another machine runs shows one card with one **Open** link to the project view (`web-ui/src/lib/workspace/ElsewhereNotice.svelte`) instead of that host's stale copy.
 - The status is read every 15 s while the window is visible, every 3 s while a move runs, and on the account's change event; nothing else polls. Per-conversation and per-terminal labels name a place only while the project's sessions run in more than one place (`net/placement.ts` `placesSplit`).
 
 The presentation and its words live in the private package (`account/ProjectPlace.svelte`, `account/place.ts`).
@@ -65,18 +67,23 @@ All routes are authenticated with the daemon's bearer like every other route. On
 | `POST /api/v1/pro/sleep {deadline_ms?}` | The hand-over the sleep watcher runs, for tests and hosts that learn of sleep another way. |
 | `GET /api/v1/pro/projects/{id}/kept`, `…/kept/file`, `POST …/kept/resolve`, `…/kept/resolve_all` | The review of files kept in both versions. |
 
-Each `/pro/status` project row carries, besides its ownership and copy fields, four additive fields:
+Each `/pro/status` project row carries, besides its ownership and copy fields, five additive fields, and the body carries the daemon's clock (`now_ms`) so a cover can show elapsed time without trusting the window's:
 
 ```json
 {
   "place": {"where": "here"},
   "reason": null,
   "run_here": false,
-  "run_in_cloud": true
+  "run_in_cloud": true,
+  "moving": {"direction": "cloud", "step": "starting_in_cloud", "since_ms": 1791329861000}
 }
 ```
 
-`place` is `{"where":"here"}`, `{"where":"cloud"}`, `{"where":"computer","computer":"<name>"}` (`computer` absent when the account has no name for it), or null for a project that is not synced. `reason` is null or one closed code: `agent_not_connected_in_cloud`, `cloud_time_used_up`, `cloud_storage_full`, `cloud_unavailable` (from the account), or `conversation_too_large`, `conversation_not_saved`, `not_synced_yet` (a Run in the cloud that could not start). `run_here` and `run_in_cloud` say whether each choice applies now.
+`moving` is null unless a transfer is under way; `direction` is `cloud` or `here`; `step` is one of `saving_here`, `starting_in_cloud`, `waiting_for_reply`, `saving_in_cloud`, `restoring_here` (derived from ownership, not a state of its own); `since_ms` is when the transfer was triggered (a sleep flush, Run in the cloud, Run here, a wake's first live return attempt, a move between computers). Session rows carry the additive `at_pause` (the one pause verdict transfers use) and, after a deadline brought a conversation home before the cloud finished its turn, `unfinished_in: "cloud"` until the user acts in that project.
+
+**One deadline instead of patience.** Every transfer runs on one rule (`pro/moving.rs`): a hand-over to the cloud that nobody took within 3 minutes of its trigger comes back here and resumes, with the reason `could_not_move_to_cloud`; a return the cloud still holds 3 minutes after its conversation's pause is asked for at once (the cloud yields with the turn exported as it stands, `force` on `/pro/handoff`) or, failing that, taken with the last copy when its lease lapses; a restore that fails three times, 20 s apart, gives up: the project runs here with the files it has, the cloud's latest changes stay fetched for the kept review, reason `cloud_changes_kept`. A pause is any conversation with no turn in flight and nothing queued: finished, waiting on the user, interrupted, failed or refused by the vendor alike (`pro/activity.rs`). Every change of a project's ownership, each deadline hit and each refused hand-back is one info line under the `chimaera_server::pro::transition` target.
+
+`place` is `{"where":"here"}`, `{"where":"cloud"}`, `{"where":"computer","computer":"<name>"}` (`computer` absent when the account has no name for it), or null for a project that is not synced. `reason` is null or one closed code: `agent_not_connected_in_cloud`, `cloud_time_used_up`, `cloud_storage_full`, `cloud_unavailable` (from the account), `conversation_too_large`, `conversation_not_saved`, `not_synced_yet` (a Run in the cloud that could not start), or `could_not_move_to_cloud`, `cloud_changes_kept` (a deadline decided here). `run_here` and `run_in_cloud` say whether each choice applies now.
 
 The account's ownership read carries the additive `reason`, `holder_kind` (`computer`, `cloud` or null) and `holder_name`; the lease, grace and reverse-serve contracts are in [HANDOFF](../../crates/chimaera-link/HANDOFF.md#one-handoff-mechanism) and [PROTOCOL](../../crates/chimaera-link/PROTOCOL.md#reverse-serve).
 

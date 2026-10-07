@@ -7,6 +7,8 @@ repo-root [AGENTS.md](../../../../AGENTS.md). The chat surface next door is
 
 ## The rule that governs this directory
 
+**Developer Tools (`developer.tools`).** One generic client-side boolean, off by default, for actions meant for testing and debugging; the extension reads it through `PlaceMount.developer` to show its testing entries. It names nothing Pro.
+
 **`schema.ts` is the single source of truth.** Every setting — its key, type,
 default, label, and grouping — is declared there once; the form (`SettingRow`,
 `AgentsSettings`) and the raw editor (`SettingsJson`) both derive from it. Add a

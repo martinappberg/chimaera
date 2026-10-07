@@ -143,6 +143,7 @@ export type SettingsMap = {
   "chat.voiceLanguage": string;
   "update.autoCheck": boolean;
   "plugins.allowUnverified": boolean;
+  "developer.tools": boolean;
   "plugins.toolsDir": string;
   "keys.modifier": "auto" | "cmd" | "ctrl-shift" | "alt";
 } & Record<KeyBindingId, string>;
@@ -878,6 +879,17 @@ const DEFS = {
     type: "boolean",
     default: true,
     scope: "daemon",
+  },
+
+  // --- Developer ---------------------------------------------------------------
+  "developer.tools": {
+    title: "Developer Tools",
+    category: "Developer",
+    description:
+      "Show actions meant for testing and debugging Chimaera. Off: the ordinary menus only.",
+    type: "boolean",
+    default: false,
+    scope: "client",
   },
 
   // --- Extensions --------------------------------------------------------------

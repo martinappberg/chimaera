@@ -28,6 +28,12 @@ describe("a build without the extension", () => {
     expect(get(proTier)).toBe("free");
   });
 
+  it("never covers a workspace and never asks where a project runs", () => {
+    // The transfer cover is the extension's; the host renders nothing of its
+    // own and the slot's gate reads the extension's hook, absent here.
+    expect(selectedApplication?.mountTransfer).toBeUndefined();
+  });
+
   it("keeps main's socket semantics (App sets keepers from the tier)", () => {
     expect(socketKeepers()).toBe(false);
   });

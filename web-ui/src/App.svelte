@@ -6,7 +6,7 @@
   import { loadApplicationEntry } from "virtual:chimaera-application-entry";
   import { selectedApplication } from "./lib/extensions/selected";
   import { paidPlan, proTier } from "./lib/net/plan";
-  import { isBrowserGateway, gatewayWorkspace } from "./lib/net/base";
+  import { isBrowserGateway, gatewayPrefix, gatewayWorkspace } from "./lib/net/base";
   import AgentSetupDialog from "./lib/workspace/AgentSetupDialog.svelte";
   import { agentSetup, openAgentSetup } from "./lib/workspace/agentSetup";
   import { agentCatalog } from "./lib/workspace/launcher";
@@ -284,6 +284,9 @@
   import { transferBlock, transferInto, type FileSource } from "./lib/workspace/fileTransfer";
   import ComputeStrip from "./lib/workspace/ComputeStrip.svelte";
   import PlaceSlot from "./lib/extensions/PlaceSlot.svelte";
+  import TransferSlot from "./lib/extensions/TransferSlot.svelte";
+  import ElsewhereNotice from "./lib/workspace/ElsewhereNotice.svelte";
+  import { elsewhere as projectElsewhere } from "./lib/net/placement";
   import type JobWindowNotices from "./lib/workspace/JobWindowNotices.svelte";
   import type JobClusterHome from "./lib/workspace/JobClusterHome.svelte";
   import {
@@ -510,6 +513,18 @@
    *  round trip to whichever machine that is means nothing to the person
    *  reading it. */
   const projectView = gatewayWorkspace() !== null;
+  /** A transfer of this window's project is under way: the extension's
+   *  cover is up and nothing underneath accepts input (`TransferSlot`). */
+  let transferBlocked = $state(false);
+  /** A host view asked to open a project another machine runs now: the
+   *  project view's link that follows it (`placement.elsewhere`), or null. */
+  let elsewhereHref = $state<string | null>(null);
+  {
+    const asked = isBrowserGateway() && !projectView ? new URLSearchParams(location.hash.slice(1)).get("ws") : null;
+    if (asked !== null) {
+      void projectElsewhere(asked, gatewayPrefix().replace(/^\/app\//, "") || null).then((href) => { elsewhereHref = href; });
+    }
+  }
   const stripHost = $derived(projectView ? projectWhereLabel($projectWhere) : hostAlias);
   /** Set when this window sits on a compute-node daemon (Mode 2 job). */
   const jobCtx = getJobContext();
@@ -5616,7 +5631,7 @@
       </div>
     {/if}
   {:else}
-  <div class="body" bind:clientWidth={bodyWidth}>
+  <div class="body" bind:clientWidth={bodyWidth} inert={transferBlocked || elsewhereHref !== null}>
     <aside
       class="rail"
       class:collapsed={layout.focusMode}
@@ -6644,6 +6659,15 @@
       </svelte:boundary>
     {/key}
   {/await}
+{/if}
+
+<!-- The cover over a project that is moving (to the cloud or back): the
+     extension's, nothing without it; the body is inert while it stands. -->
+<TransferSlot workspaceId={placeWorkspaceId} source={projectView ? "placement" : "daemon"} onblock={(blocked) => { transferBlocked = blocked; }} />
+{#if elsewhereHref !== null}
+  <!-- This host's copy of a project another machine runs: covered, with
+       the project view as the one way forward. -->
+  <ElsewhereNotice href={elsewhereHref} />
 {/if}
 
 <!-- Blocking re-auth overlay: the daemon rejected this window's token

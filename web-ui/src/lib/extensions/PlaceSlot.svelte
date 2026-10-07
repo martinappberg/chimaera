@@ -16,6 +16,7 @@
   import { paidPlan } from "../net/plan";
   import { pageVisible } from "../shared/visibility";
   import { cloudOnboarding } from "../pro/onboarding.svelte";
+  import { getSetting, onSettingsChange } from "../settings/store.svelte";
   import type { Session } from "../workspace/sessions";
   import type { PlaceSession } from "./application";
 
@@ -39,6 +40,9 @@
   // One store per slot; the extension subscribes and sees each new list.
   const placeSessions = writable<readonly PlaceSession[]>([]);
   $effect(() => { placeSessions.set(toPlace(sessions)); });
+  // The "Developer Tools" setting, for the actions meant for testing.
+  const developer = writable<boolean>(getSetting("developer.tools") === true);
+  $effect(() => onSettingsChange(() => developer.set(getSetting("developer.tools") === true)));
 
   $effect(() => {
     const host = target;
@@ -59,6 +63,7 @@
         },
         runHere: () => signal.aborted ? Promise.resolve({ started: false, error: "unavailable" }) : runHere(id),
         runInCloud: () => signal.aborted ? Promise.resolve({ started: false, error: "unavailable" }) : runInCloud(id),
+        developer,
       });
     }).then((mounted) => {
       if (signal.aborted) mounted.dispose(); else owner = mounted;

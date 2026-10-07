@@ -73,8 +73,33 @@ export interface PlaceMount {
   runHere(): Promise<PlaceMoveResult>;
   /** "Run in the cloud": `POST /pro/projects/{id}/cloud` on the window's daemon. */
   runInCloud(): Promise<PlaceMoveResult>;
+  /** The "Developer Tools" setting: actions meant for testing show only
+   *  while it is on. Absent on an older host. */
+  developer?: Observable<boolean>;
 }
 export interface PlaceOwner { dispose(): void }
+/** A transfer of the window's project in progress (to the cloud or back):
+ *  the extension draws over the whole workspace and the host makes what is
+ *  underneath inert while `block(true)` stands. The extension reads the
+ *  status itself from the window's daemon (`source: "daemon"`), or from the
+ *  browser view's placement read (`source: "placement"`). */
+export interface TransferMount {
+  version: 1;
+  workspaceId: string;
+  signal: AbortSignal;
+  visibility: Observable<boolean>;
+  /** true: nothing underneath accepts input; false: the workspace is usable. */
+  block(blocked: boolean): void;
+  source: "daemon" | "placement";
+  /** The browser view's latest `moving` field (null: nothing moving). */
+  moving?: Observable<ProjectMoving | null>;
+}
+/** The daemon's additive status field for a transfer under way. */
+export interface ProjectMoving {
+  direction: "cloud" | "here";
+  step: string;
+  since_ms: number;
+}
 /** One remote machine row on Home, by its SSH alias. */
 export interface HostMount {
   version: 1;
@@ -90,6 +115,8 @@ export interface ApplicationExtension {
   bindAccountBranding?(scope: AccountBrandingSubscription): Promise<() => void>;
   /** Optional: an extension without it leaves the host indicator alone. */
   mountPlace?(target: HTMLElement, mount: PlaceMount): Promise<PlaceOwner>;
+  /** Optional: an extension without it never covers a workspace. */
+  mountTransfer?(target: HTMLElement, mount: TransferMount): Promise<PlaceOwner>;
   /** Optional: one quiet line under a remote machine's Home row. */
   mountHost?(target: HTMLElement, mount: HostMount): Promise<PlaceOwner>;
 }

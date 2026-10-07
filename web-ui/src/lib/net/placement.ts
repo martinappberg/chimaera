@@ -1,3 +1,4 @@
+import type { ProjectMoving } from "../extensions/application";
 import { writable, type Readable } from "svelte/store";
 import { gatewayPrefix, gatewayWorkspace } from "./base";
 import { ownerAwake } from "./reconnect";
@@ -177,8 +178,18 @@ export function invalidatePlacementOwner(): void {
 function samePlacement(a: Pick<PlacementOwner, "workspace_id" | "epoch" | "holder_id" | "route_host_id">, b: WorkspacePlacement): boolean {
   return a.workspace_id === b.workspace_id && a.epoch === b.epoch && a.holder_id === b.holder_id && a.route_host_id === b.route_host_id;
 }
+let reloading = false;
 function admitPlacement(row: WorkspacePlacement): void {
   if (currentPlacement !== null && samePlacement(currentPlacement, row)) return;
+  // The project moved to another machine while this view was open: what
+  // the view shows belongs to the old host. One reload follows the owner
+  // (never re-armed: a second read never reloads again).
+  if (currentPlacement !== null && currentPlacement.route_host_id !== null && row.route_host_id !== null
+    && currentPlacement.route_host_id !== row.route_host_id && !reloading
+    && typeof location !== "undefined" && typeof location.reload === "function") {
+    reloading = true;
+    location.reload();
+  }
   const context = placementContext;
   const original: PlacementOwner = Object.freeze({ workspace_id: row.workspace_id, epoch: row.epoch,
     holder_id: row.holder_id, route_host_id: row.route_host_id,
@@ -207,6 +218,37 @@ function noteProjectWhere(placement: WorkspacePlacement): void {
   lastSuspended = asleep;
   // The owner answers again: sockets parked while it slept dial once.
   if (!asleep) ownerAwake();
+}
+
+/** The additive `moving` field of a placement or status row: a transfer
+ *  under way, with its direction, step and start. Absent → null. */
+export function parseMoving(row: unknown): ProjectMoving | null {
+  if (typeof row !== "object" || row === null) return null;
+  const moving = (row as { moving?: unknown }).moving;
+  if (typeof moving !== "object" || moving === null) return null;
+  const { direction, step, since_ms } = moving as { direction?: unknown; step?: unknown; since_ms?: unknown };
+  if ((direction !== "cloud" && direction !== "here") || typeof step !== "string" || typeof since_ms !== "number") return null;
+  return { direction, step, since_ms };
+}
+/** The browser view's project while it moves (null otherwise); from every
+ *  placement read, so the transfer overlay can follow it. */
+const projectMovingStore = writable<ProjectMoving | null>(null);
+export const projectMoving: Readable<ProjectMoving | null> = { subscribe: projectMovingStore.subscribe };
+
+/** For a host view asked to open a project: where that project runs now,
+ *  if it is on another machine than the one serving this page. Returns the
+ *  project view's link to follow it, or null when this host runs it, the
+ *  project is not enrolled (404/409) or nothing can be said. One read. */
+export async function elsewhere(workspaceId: string, hostId: string | null): Promise<string | null> {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(workspaceId)) return null;
+  try {
+    const response = await fetch(`/workspace/${workspaceId}/placement`, { cache: "no-store", redirect: "error", signal: AbortSignal.timeout(2500) });
+    if (!response.ok) { try { await response.body?.cancel(); } catch { /* nothing to keep */ } return null; }
+    const row = parsePlacement(await response.json(), workspaceId);
+    if (row.availability !== "owned" && row.availability !== "suspended") return null;
+    if (row.route_host_id === null || row.route_host_id === hostId) return null;
+    return `/workspace/${workspaceId}/`;
+  } catch { return null; }
 }
 
 /** The latest placement read of this project view said its owner is asleep
@@ -271,8 +313,10 @@ export function readPlacement(): Promise<WorkspacePlacement> {
     for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
     if (placementContext !== context) throw new PlacementError(409);
     let placement: WorkspacePlacement;
-    try { placement = parsePlacement(JSON.parse(new TextDecoder().decode(bytes)), workspace); }
+    let raw: unknown;
+    try { raw = JSON.parse(new TextDecoder().decode(bytes)); placement = parsePlacement(raw, workspace); }
     catch (error) { currentPlacement = null; placementOwnerStore.set(null); throw error; }
+    projectMovingStore.set(parseMoving(raw));
     // A sleeping owner is routed like an awake one; the transport wakes it
     // for a request or socket that carries wake intent, never for a read.
     if (placement.availability !== "owned" && placement.availability !== "suspended") {
