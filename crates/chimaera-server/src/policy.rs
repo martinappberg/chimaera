@@ -85,6 +85,9 @@ pub(crate) struct Admission {
 }
 pub(crate) trait AdmissionToken: Send + Sync {
     fn check(&self, state: &AppState) -> anyhow::Result<()>;
+    /// The admission generation this was captured at: two admissions of the
+    /// same workspace and generation are the same authority.
+    fn generation(&self) -> u64;
     fn begin(&self, state: &AppState) -> anyhow::Result<Option<Reservation>>;
     /// The workspace's agents run under the policy's process ownership.
     fn managed(&self, state: &AppState) -> bool;
@@ -118,6 +121,9 @@ impl Admission {
         self.token
             .as_ref()
             .is_some_and(|token| token.managed(state))
+    }
+    pub(crate) fn generation(&self) -> u64 {
+        self.token.as_ref().map_or(0, |token| token.generation())
     }
     /// Check, then reserve the final dispatch.
     pub(crate) fn begin(&self, state: &AppState) -> anyhow::Result<Option<Reservation>> {
@@ -371,6 +377,43 @@ pub(crate) trait WorkspacePolicy: Send + Sync + 'static {
     /// Additive `/health` fields.
     fn health(&self, state: &AppState, body: &mut serde_json::Value);
 
+    // A forwarded viewer's project scope.
+    /// Admit a viewer bound to `workspace` at `epoch`: the admission its
+    /// reads prove and its writes reserve under.
+    fn scope_admission(
+        &self,
+        state: &AppState,
+        workspace: &str,
+        epoch: u64,
+    ) -> anyhow::Result<Admission>;
+    /// Whether `workspace` is served to a viewer at `epoch` right now.
+    fn scope_check(&self, state: &AppState, workspace: &str, epoch: u64) -> anyhow::Result<()>;
+    /// A scope this machine cannot admit yet only because its own renewal of
+    /// exactly `epoch` is still out.
+    fn scope_renewing(&self, state: &AppState, workspace: &str, epoch: u64) -> bool;
+    /// Wait for that renewal (bounded); `true` once a fresh proof exists. The
+    /// caller checks the scope again.
+    fn await_scope_renewal<'a>(
+        &'a self,
+        state: &'a AppState,
+        workspace: &'a str,
+        epoch: u64,
+    ) -> BoxFuture<'a, bool>;
+    /// The admission a local command in `workspace` commits under, when the
+    /// policy ties commands to a live lease; `None` admits by ownership alone.
+    fn capture_command(
+        &self,
+        state: &AppState,
+        workspace: &str,
+    ) -> anyhow::Result<Option<Admission>>;
+    /// Run a reserved request to its end under its reservation: a
+    /// disconnected observer never cancels it.
+    fn run_reserved<'a>(
+        &'a self,
+        reservation: Reservation,
+        operation: BoxFuture<'a, axum::response::Response>,
+    ) -> BoxFuture<'a, axum::response::Response>;
+
     // What a project's agents are told and offered.
     /// Tools the policy offers `session`'s agent; each replaces a plugin
     /// tool of the same name.
@@ -601,6 +644,36 @@ impl WorkspacePolicy for Inert {
     }
     fn decorate_workspace(&self, _: &AppState, _: &str, _: &mut serde_json::Value) {}
     fn health(&self, _: &AppState, _: &mut serde_json::Value) {}
+    fn scope_admission(&self, _: &AppState, _: &str, _: u64) -> anyhow::Result<Admission> {
+        Err(Changed.into())
+    }
+    fn scope_check(&self, _: &AppState, _: &str, _: u64) -> anyhow::Result<()> {
+        Err(Changed.into())
+    }
+    fn scope_renewing(&self, _: &AppState, _: &str, _: u64) -> bool {
+        false
+    }
+    fn await_scope_renewal<'a>(
+        &'a self,
+        _: &'a AppState,
+        _: &'a str,
+        _: u64,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(async { false })
+    }
+    fn capture_command(&self, _: &AppState, _: &str) -> anyhow::Result<Option<Admission>> {
+        Ok(None)
+    }
+    fn run_reserved<'a>(
+        &'a self,
+        reservation: Reservation,
+        operation: BoxFuture<'a, axum::response::Response>,
+    ) -> BoxFuture<'a, axum::response::Response> {
+        Box::pin(async move {
+            let _reservation = reservation;
+            operation.await
+        })
+    }
     fn tools(&self, _: &AppState, _: &str) -> Vec<serde_json::Value> {
         Vec::new()
     }

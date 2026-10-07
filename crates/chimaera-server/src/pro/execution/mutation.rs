@@ -362,6 +362,10 @@ impl Dispatch {
     pub(crate) fn workspace(&self) -> &str {
         &self.workspace
     }
+    /// The account generation this dispatch is bound to (0 when unbound).
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.unwrap_or(0)
+    }
     pub(crate) fn capture(state: &AppState, workspace: &str) -> anyhow::Result<Self> {
         let generation = generation(state);
         let ownership = lock(&state.pro().ownership).get(workspace).cloned();

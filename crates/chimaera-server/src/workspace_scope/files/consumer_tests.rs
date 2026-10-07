@@ -35,7 +35,11 @@ fn fixture() -> (Arc<crate::AppState>, Context, PathBuf) {
         epoch: 4,
         viewer_root: None,
     };
-    let context = Context::pin(&state, scope, crate::pro::mutation::generation(&state)).unwrap();
+    let context = Context::pin(
+        &state,
+        super::super::Mutation::for_scope(&state, scope).unwrap(),
+    )
+    .unwrap();
     (state, context, base)
 }
 fn router(state: Arc<crate::AppState>, scope: Context) -> Router {
@@ -424,12 +428,15 @@ async fn saved_images_accept_a_state_root_alias_but_never_a_replaced_session_par
     .unwrap();
     let scope = Context::pin(
         &state,
-        super::super::Scope {
-            workspace_id: workspace.id,
-            epoch: 4,
-            viewer_root: None,
-        },
-        crate::pro::mutation::generation(&state),
+        super::super::Mutation::for_scope(
+            &state,
+            super::super::Scope {
+                workspace_id: workspace.id,
+                epoch: 4,
+                viewer_root: None,
+            },
+        )
+        .unwrap(),
     )
     .unwrap();
     let image = state.uploads_root.join("s-own/picture.png");
@@ -736,12 +743,15 @@ async fn preview_tickets_renew_only_within_the_exact_scoped_identity_and_version
     crate::pro::install_execution_fixture(&state, &workspace, 4).unwrap();
     let replacement = Context::pin(
         &state,
-        super::super::Scope {
-            workspace_id: workspace,
-            epoch: 4,
-            viewer_root: None,
-        },
-        crate::pro::mutation::generation(&state),
+        super::super::Mutation::for_scope(
+            &state,
+            super::super::Scope {
+                workspace_id: workspace,
+                epoch: 4,
+                viewer_root: None,
+            },
+        )
+        .unwrap(),
     )
     .unwrap();
     let newer = crate::lock(&state.tickets).mint_bound(

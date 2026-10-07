@@ -25,67 +25,55 @@ pub(crate) mod files;
 pub(crate) mod paths;
 const MAX_JSON: usize = 1024 * 1024;
 
-/// Captured at request admission, consumed only at the actual mutation commit.
-/// A body/queue wait cannot silently adopt a replacement account generation.
+/// A scoped request's admission, captured at admission and consumed only at
+/// the actual mutation commit: a body or queue wait cannot silently adopt a
+/// replacement account generation or epoch.
 #[derive(Clone)]
 pub(crate) struct Mutation {
     scope: Scope,
-    generation: u64,
+    admission: crate::policy::Admission,
 }
 impl Mutation {
     pub(crate) fn for_scope(state: &AppState, scope: Scope) -> Result<Self> {
-        let admission = Self {
-            scope,
-            generation: crate::pro::mutation::generation(state),
-        };
-        // Prove the captured generation as well as the supplied epoch before
-        // exposing it to a long-lived socket; neither may refresh implicitly.
-        admission.validate(state)?;
-        Ok(admission)
+        scope.alias(state)?;
+        let admission = state
+            .policy()
+            .scope_admission(state, &scope.workspace_id, scope.epoch)?;
+        Ok(Self { scope, admission })
     }
     /// Reads prove the captured identity without consuming mutation capacity.
     /// Writes still call begin() at commit/dispatch for atomic reservation.
     pub(crate) fn validate(&self, state: &AppState) -> Result<()> {
-        if self.generation != crate::pro::mutation::generation(state) {
-            return Err(crate::pro::mutation::Changed.into());
-        }
-        self.scope
-            .validate(state)
-            .map_err(|_| crate::pro::mutation::Changed)?;
-        if self.generation != crate::pro::mutation::generation(state) {
-            return Err(crate::pro::mutation::Changed.into());
-        }
-        Ok(())
+        self.admission.check(state)
     }
     pub(crate) fn session(&self, state: &AppState, session: &str) -> Result<()> {
         self.scope
             .session(state, session)
-            .map_err(|_| crate::pro::mutation::Changed.into())
+            .map_err(|_| crate::policy::Changed.into())
     }
+    fn generation(&self) -> u64 {
+        self.admission.generation()
+    }
+    /// A local command's admission in `workspace`, when the policy ties
+    /// commands to a live lease.
     pub(crate) fn capture(state: &AppState, workspace: &str) -> Result<Option<Self>> {
-        let Some((epoch, generation)) = crate::pro::mutation::capture(state, workspace)? else {
-            return Ok(None);
-        };
-        Ok(Some(Self {
-            scope: Scope {
-                workspace_id: workspace.into(),
-                epoch,
-                viewer_root: None,
-            },
-            generation,
-        }))
+        Ok(state
+            .policy()
+            .capture_command(state, workspace)?
+            .map(|admission| Self {
+                scope: Scope {
+                    workspace_id: workspace.into(),
+                    epoch: 0,
+                    viewer_root: None,
+                },
+                admission,
+            }))
     }
     pub(crate) fn begin(&self, state: &AppState) -> Result<crate::policy::Reservation> {
-        self.scope
-            .validate(state)
-            .map_err(|_| crate::pro::mutation::Changed)?;
-        crate::pro::mutation::begin(
-            state,
-            &self.scope.workspace_id,
-            self.scope.epoch,
-            self.generation,
-        )
-        .map(crate::policy::Reservation::new)
+        Ok(self
+            .admission
+            .begin(state)?
+            .unwrap_or_else(|| crate::policy::Reservation::new(())))
     }
 }
 pub(crate) fn begin_mutation(
@@ -101,11 +89,11 @@ pub(crate) fn mutation_failure(error: &anyhow::Error) -> Option<Response> {
     error
         .chain()
         .any(|cause| {
-            cause.is::<crate::pro::mutation::Changed>()
+            cause.is::<crate::policy::Changed>()
                 || cause
                     .downcast_ref::<std::io::Error>()
                     .and_then(std::io::Error::get_ref)
-                    .is_some_and(|inner| inner.is::<crate::pro::mutation::Changed>())
+                    .is_some_and(|inner| inner.is::<crate::policy::Changed>())
         })
         .then(|| denied(StatusCode::CONFLICT))
 }
@@ -190,18 +178,25 @@ impl Scope {
             "unknown workspace"
         );
         self.alias(state)?;
-        crate::pro::validate_execution_scope(state, &self.workspace_id, self.epoch)
+        state
+            .policy()
+            .scope_check(state, &self.workspace_id, self.epoch)
     }
     /// A scope this machine cannot admit yet only because it just thawed and
     /// its own renewal of exactly this epoch is still out (see
     /// `pro::scope_renewing`): wait for that renewal rather than refusing.
     pub(crate) fn renewing(&self, state: &AppState) -> bool {
-        crate::pro::scope_renewing(state, &self.workspace_id, self.epoch)
+        state
+            .policy()
+            .scope_renewing(state, &self.workspace_id, self.epoch)
     }
     /// Waits (bounded by the resume window) for that renewal; `true` once a
     /// fresh proof exists. Admits nothing: the caller validates again.
     pub(crate) async fn await_renewal(&self, state: &AppState) -> bool {
-        crate::pro::await_scope_renewal(state, &self.workspace_id, self.epoch).await
+        state
+            .policy()
+            .await_scope_renewal(state, &self.workspace_id, self.epoch)
+            .await
     }
     pub(crate) fn session(&self, state: &AppState, session: &str) -> Result<()> {
         ensure!(
@@ -404,18 +399,21 @@ async fn scoped_request(
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    let mut generation = crate::pro::mutation::generation(&state);
-    if scope.validate(&state).is_err() {
-        // The request that woke a suspended owner (or any reaching it while
-        // it renews its own epoch) is answered after that renewal, not 409.
-        if !(scope.renewing(&state) && scope.await_renewal(&state).await) {
-            return denied(StatusCode::CONFLICT);
+    let admission = match Mutation::for_scope(&state, scope.clone()) {
+        Ok(admission) => admission,
+        Err(_) => {
+            // The request that woke a suspended owner (or any reaching it
+            // while it renews its own epoch) is answered after that renewal,
+            // not 409.
+            if !(scope.renewing(&state) && scope.await_renewal(&state).await) {
+                return denied(StatusCode::CONFLICT);
+            }
+            match Mutation::for_scope(&state, scope.clone()) {
+                Ok(admission) => admission,
+                Err(_) => return denied(StatusCode::CONFLICT),
+            }
         }
-        generation = crate::pro::mutation::generation(&state);
-        if scope.validate(&state).is_err() {
-            return denied(StatusCode::CONFLICT);
-        }
-    }
+    };
     let path = request
         .uri()
         .path()
@@ -430,9 +428,9 @@ async fn scoped_request(
     };
     let filesystem = if path.starts_with("/fs/") || path.starts_with("/git/") {
         let owner = state.clone();
-        let binding = scope.clone();
+        let binding = admission.clone();
         match blocking_paths(&crate::fs::FILESYSTEM_WORK, move || {
-            files::Context::pin(&owner, binding, generation)
+            files::Context::pin(&owner, binding)
         })
         .await
         {
@@ -537,7 +535,6 @@ async fn scoped_request(
         let Some(document) = query.get("path").cloned() else {
             return denied(StatusCode::BAD_REQUEST);
         };
-        let generation = crate::pro::mutation::generation(&state);
         let Some(root) = crate::lock(&state.workspaces)
             .get(&scope.workspace_id)
             .map(|workspace| workspace.root)
@@ -551,16 +548,13 @@ async fn scoped_request(
             Err(_) => return denied(StatusCode::CONFLICT),
         };
         if let Err(error) = scope.read(&state, document.clone()).await {
-            if generation != crate::pro::mutation::generation(&state)
-                || scope.validate(&state).is_err()
-            {
+            if admission.validate(&state).is_err() {
                 return denied(StatusCode::CONFLICT);
             }
             return outside_read(error);
         }
         let response = crate::doc_check::check_within(document, pinned).await;
-        if generation != crate::pro::mutation::generation(&state)
-            || scope.validate(&state).is_err()
+        if admission.validate(&state).is_err()
             || crate::lock(&state.workspaces)
                 .get(&scope.workspace_id)
                 .is_none_or(|workspace| workspace.root != root)
@@ -637,13 +631,10 @@ async fn scoped_request(
         }
     };
     // Recheck after filesystem/JSON work; a lease may have changed while awaiting.
-    if scope.validate(&state).is_err() {
+    if admission.validate(&state).is_err() {
         return denied(StatusCode::CONFLICT);
     }
-    request.extensions_mut().insert(Mutation {
-        scope: scope.clone(),
-        generation,
-    });
+    request.extensions_mut().insert(admission);
     request.extensions_mut().insert(scope);
     if let Some(filesystem) = filesystem {
         request.extensions_mut().insert(filesystem);

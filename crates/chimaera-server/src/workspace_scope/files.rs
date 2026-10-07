@@ -83,7 +83,7 @@ impl Resolved {
         Some(TicketIdentity {
             workspace: authority.admission.scope.workspace_id.clone(),
             epoch: authority.admission.scope.epoch,
-            generation: authority.admission.generation,
+            generation: authority.admission.generation(),
             registered_root: authority.root.clone(),
             captured_root: self.root.identity,
         })
@@ -156,10 +156,7 @@ struct Authority {
 impl Authority {
     fn check(&self) -> io::Result<()> {
         let state = self.state.upgrade().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                crate::pro::mutation::Changed,
-            )
+            io::Error::new(io::ErrorKind::PermissionDenied, crate::policy::Changed)
         })?;
         if self.admission.validate(&state).is_err()
             || crate::lock(&state.workspaces)
@@ -168,7 +165,7 @@ impl Authority {
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                crate::pro::mutation::Changed,
+                crate::policy::Changed,
             ));
         }
         Ok(())
@@ -184,19 +181,15 @@ pub(crate) struct Context {
 impl Context {
     pub(super) fn pin(
         state: &Arc<crate::AppState>,
-        scope: super::Scope,
-        generation: u64,
+        admission: super::Mutation,
     ) -> io::Result<Self> {
         let root = crate::lock(&state.workspaces)
-            .get(&scope.workspace_id)
+            .get(&admission.scope.workspace_id)
             .ok_or(io::ErrorKind::PermissionDenied)?
             .root;
         let authority = Authority {
             state: Arc::downgrade(state),
-            admission: super::Mutation {
-                scope: scope.clone(),
-                generation,
-            },
+            admission,
             root: root.clone(),
         };
         authority.check()?;
@@ -223,7 +216,7 @@ impl Context {
             .authority
             .state
             .upgrade()
-            .ok_or(crate::pro::mutation::Changed)?;
+            .ok_or(crate::policy::Changed)?;
         self.authority.admission.validate(&state)
     }
     pub(crate) fn key(&self, raw: &str) -> io::Result<()> {

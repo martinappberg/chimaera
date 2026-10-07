@@ -46,10 +46,64 @@ impl ProPolicy {
     }
 }
 
+/// A viewer's, or a worker command's, admission at one lease epoch: void
+/// once the account generation or the project's epoch moves.
+struct Epoch {
+    workspace: String,
+    epoch: u64,
+    generation: u64,
+}
+impl Epoch {
+    fn capture(state: &AppState, workspace: &str, epoch: u64) -> anyhow::Result<Admission> {
+        let token = Self {
+            workspace: workspace.to_owned(),
+            epoch,
+            generation: mutation::generation(state),
+        };
+        token.check(state)?;
+        Ok(Admission::with(workspace, Arc::new(token)))
+    }
+}
+impl AdmissionToken for Epoch {
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+    fn check(&self, state: &AppState) -> anyhow::Result<()> {
+        if self.generation != mutation::generation(state) {
+            return Err(crate::policy::Changed.into());
+        }
+        super::validate_execution_scope(state, &self.workspace, self.epoch)
+            .map_err(|_| crate::policy::Changed)?;
+        if self.generation != mutation::generation(state) {
+            return Err(crate::policy::Changed.into());
+        }
+        Ok(())
+    }
+    fn begin(&self, state: &AppState) -> anyhow::Result<Option<Reservation>> {
+        self.check(state)?;
+        mutation::begin(state, &self.workspace, self.epoch, self.generation)
+            .map(|guard| Some(Reservation::new(guard)))
+    }
+    fn managed(&self, _: &AppState) -> bool {
+        true
+    }
+    fn installer<'a>(
+        &'a self,
+        _: &'a Arc<AppState>,
+        _: &'a str,
+    ) -> BoxFuture<'a, anyhow::Result<Installer>> {
+        // A viewer never starts an installer.
+        Box::pin(async { Err(crate::policy::Changed.into()) })
+    }
+}
+
 struct Dispatched(mutation::Dispatch);
 impl AdmissionToken for Dispatched {
     fn check(&self, state: &AppState) -> anyhow::Result<()> {
         self.0.check(state)
+    }
+    fn generation(&self) -> u64 {
+        self.0.generation()
     }
     fn begin(&self, state: &AppState) -> anyhow::Result<Option<Reservation>> {
         Ok(self.0.begin(state)?.map(Reservation::new))
@@ -310,6 +364,50 @@ impl WorkspacePolicy for ProPolicy {
                 .expect("workspace object")
                 .insert("local_copy".into(), copy);
         }
+    }
+    fn scope_admission(
+        &self,
+        state: &AppState,
+        workspace: &str,
+        epoch: u64,
+    ) -> anyhow::Result<Admission> {
+        Epoch::capture(state, workspace, epoch)
+    }
+    fn scope_check(&self, state: &AppState, workspace: &str, epoch: u64) -> anyhow::Result<()> {
+        super::validate_execution_scope(state, workspace, epoch)
+    }
+    fn scope_renewing(&self, state: &AppState, workspace: &str, epoch: u64) -> bool {
+        super::scope_renewing(state, workspace, epoch)
+    }
+    fn await_scope_renewal<'a>(
+        &'a self,
+        state: &'a AppState,
+        workspace: &'a str,
+        epoch: u64,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(super::await_scope_renewal(state, workspace, epoch))
+    }
+    fn capture_command(
+        &self,
+        state: &AppState,
+        workspace: &str,
+    ) -> anyhow::Result<Option<Admission>> {
+        let Some((epoch, generation)) = mutation::capture(state, workspace)? else {
+            return Ok(None);
+        };
+        let token = Epoch {
+            workspace: workspace.to_owned(),
+            epoch,
+            generation,
+        };
+        Ok(Some(Admission::with(workspace, Arc::new(token))))
+    }
+    fn run_reserved<'a>(
+        &'a self,
+        reservation: Reservation,
+        operation: BoxFuture<'a, axum::response::Response>,
+    ) -> BoxFuture<'a, axum::response::Response> {
+        Box::pin(mutation::reserved_request(reservation, operation))
     }
     fn tools(&self, state: &AppState, session: &str) -> Vec<serde_json::Value> {
         use crate::mcp::cloud_context;

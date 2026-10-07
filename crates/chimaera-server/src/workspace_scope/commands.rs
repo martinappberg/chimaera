@@ -69,7 +69,10 @@ pub(super) async fn run(state: Arc<AppState>, request: Request<Body>, next: Next
     let operation = tokio::spawn(async move {
         let _permit = permit;
         if let Some(guard) = guard {
-            crate::pro::mutation::reserved_request(guard, next.run(request)).await
+            state
+                .policy()
+                .run_reserved(guard, Box::pin(next.run(request)))
+                .await
         } else {
             next.run(request).await
         }
