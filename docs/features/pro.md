@@ -93,7 +93,7 @@ The account's ownership read carries the additive `reason`, `holder_kind` (`comp
 
 | Area | Entry points |
 | --- | --- |
-| The hook the host implements | `crates/chimaera-server/src/policy.rs`, `policy/fence.rs` (inert fence); `run_with_policy` in `lifecycle.rs`, passed through `crates/chimaera/src/lib.rs` and `crates/chimaera-app/src/daemon.rs`; map: [chimaera-server](../../crates/chimaera-server/AGENTS.md) |
+| The hook the host implements | `crates/chimaera-server/src/policy.rs` (the trait, in nine groups), `policy/admission.rs` (its handles), `policy/inert.rs`, `policy/fence.rs` (inert fence); `run_with_policy` in `lifecycle.rs`, passed through `crates/chimaera/src/lib.rs` and `crates/chimaera-app/src/daemon.rs`; map: [chimaera-server](../../crates/chimaera-server/AGENTS.md) |
 | The host: mechanism, routes, account, agents' where-you-run note | private crate, not in this repository |
 | Test support for an out-of-tree host | `test_support` behind the `daemon-extension-fixture` feature |
 | Web UI | `web-ui/src/lib/pro/`, `web-ui/src/lib/extensions/` (the host indicator slot: `PlaceSlot.svelte`, `placeHost.ts`) |
