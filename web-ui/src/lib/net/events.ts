@@ -2,6 +2,7 @@ import { sendSocketAuth } from "./placement";
 import { daemonSocketUrl, gatewayWorkspace, isBrowserGateway } from "./base";
 import { getToken } from "./api";
 import { nudgeReconnectors, ownerAwake, retryDelayMs } from "./reconnect";
+import { noteServed } from "./projectMoving";
 import type { Link } from "../workspace/agentLinks";
 import type { Session } from "../workspace/sessions";
 import type { Notice } from "../workspace/notices";
@@ -378,7 +379,9 @@ export class EventsSocket {
       if (up) nudgeReconnectors();
       // In a project view this socket reaches the project's owner itself:
       // it answering means a sleeping owner woke, so parked sockets dial.
-      if (up && gatewayWorkspace() !== null) ownerAwake();
+      // It answering is also the project's machine serving it: a move it
+      // was on has arrived.
+      if (up && gatewayWorkspace() !== null) { ownerAwake(); noteServed(); }
     }
   }
 

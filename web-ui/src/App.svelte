@@ -286,6 +286,7 @@
   import PlaceSlot from "./lib/extensions/PlaceSlot.svelte";
   import { filesLoading } from "./lib/extensions/loading";
   import ElsewhereNotice from "./lib/workspace/ElsewhereNotice.svelte";
+  import MovingOverlay from "./lib/workspace/MovingOverlay.svelte";
   import { elsewhere as projectElsewhere } from "./lib/net/placement";
   import type JobWindowNotices from "./lib/workspace/JobWindowNotices.svelte";
   import type JobClusterHome from "./lib/workspace/JobClusterHome.svelte";
@@ -6679,6 +6680,12 @@
   <!-- This host's copy of a project another machine runs: covered, with
        the project view as the one way forward. -->
   <ElsewhereNotice href={elsewhereHref} />
+{/if}
+
+{#if projectView}
+  <!-- A project view while its project moves between the computer and the
+       cloud: nothing underneath answers until the new machine serves it. -->
+  <MovingOverlay />
 {/if}
 
 <!-- Blocking re-auth overlay: the daemon rejected this window's token
