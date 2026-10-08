@@ -2,6 +2,7 @@ import { writable, type Readable } from "svelte/store";
 import { gatewayPrefix, gatewayWorkspace } from "./base";
 import { ownerAwake } from "./reconnect";
 import { providerLabel } from "../pro/providers";
+import { carryMoving, noteMovingRead } from "./projectMoving";
 
 export interface WorkspacePlacement {
   workspace_id: string;
@@ -187,6 +188,7 @@ function admitPlacement(row: WorkspacePlacement): void {
     && currentPlacement.route_host_id !== row.route_host_id && !reloading
     && typeof location !== "undefined" && typeof location.reload === "function") {
     reloading = true;
+    carryMoving();
     location.reload();
   }
   const context = placementContext;
@@ -210,9 +212,13 @@ export interface ProjectWhere {
 const projectWhereStore = writable<ProjectWhere | null>(null);
 export const projectWhere: Readable<ProjectWhere | null> = { subscribe: projectWhereStore.subscribe };
 let lastSuspended = false;
+/** Where the latest routed read put the project; kept across reads that find
+ *  nobody holding it, so a move can be told from where it left. */
+let lastWhere: ProjectWhere["where"] | null = null;
 function noteProjectWhere(placement: WorkspacePlacement): void {
   const asleep = placement.availability === "suspended";
   const where = placement.route_host_id?.startsWith("worker-") ? "cloud" : "computer";
+  lastWhere = where;
   projectWhereStore.update((now) => (now?.where === where && now.asleep === asleep ? now : { where, asleep }));
   lastSuspended = asleep;
   // The owner answers again: sockets parked while it slept dial once.
@@ -299,6 +305,8 @@ export function readPlacement(): Promise<WorkspacePlacement> {
     let placement: WorkspacePlacement;
     try { placement = parsePlacement(JSON.parse(new TextDecoder().decode(bytes)), workspace); }
     catch (error) { currentPlacement = null; placementOwnerStore.set(null); throw error; }
+    // Before `projectWhere` takes this read: the move is told from the change.
+    noteMovingRead(lastWhere, placement);
     // A sleeping owner is routed like an awake one; the transport wakes it
     // for a request or socket that carries wake intent, never for a read.
     if (placement.availability !== "owned" && placement.availability !== "suspended") {

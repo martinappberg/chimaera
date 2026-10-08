@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ASLEEP_NOTE, plainError, runningElsewhere } from "../net/api";
+import { movingSentence } from "../net/projectMoving";
 import { PlacementError, pauseLabel, placementLabel, projectWhereLabel, refusalWords } from "../net/placement";
 import { refusalText, statusText } from "../terminal/refusals.svelte";
 import { parseOwnershipHints } from "../workspace/placementHints";
@@ -17,6 +18,8 @@ const sources = Object.fromEntries(Object.entries(import.meta.glob<string>([
   "/src/lib/extensions/**/*.{svelte,ts}",
   "/src/lib/workspace/placementHints.ts",
   "/src/lib/net/placement.ts",
+  "/src/lib/net/projectMoving.ts",
+  "/src/lib/workspace/MovingOverlay.svelte",
   "/src/lib/terminal/refusals.svelte.ts",
   "/src/lib/net/native.ts",
 ], { query: "?raw", import: "default", eager: true })).filter(([file]) => !file.endsWith(".test.ts")));
@@ -123,6 +126,7 @@ describe("Chimaera Pro vocabulary", () => {
     // A relay's own machinery words never reach the chat for these reasons.
     for (const reason of ["waking", "bringing", "reconnecting"]) said.push(refusalWords("Still waking the cloud machine. That was not sent.", reason));
     for (const code of ["project_busy", "project_copy_update_required", "project_checkpoint_pending", "project_unavailable", "anything"]) said.push(projectCopyError(code));
+    for (const to of ["cloud", "computer"] as const) for (const arriving of [false, true]) said.push(movingSentence({ to, arriving, since: 0 }));
     expect(said.filter(sentence => BANNED.test(sentence))).toEqual([]);
   });
 });

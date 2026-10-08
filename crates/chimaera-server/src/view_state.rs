@@ -105,6 +105,36 @@ impl ViewStateStore {
             .collect()
     }
 
+    /// The conversations and terminals the last-active window on workspace
+    /// `ws` shows (its `ws_<ws>` mirror's `surfaces`, tree order): the one
+    /// in its focused tab, if a session is focused, and every one, at most
+    /// `cap`. None when no window has shown the workspace. Does not touch
+    /// recency, like [`Self::surfaces_for`].
+    pub fn shown_sessions(&self, ws: &str, cap: usize) -> Option<(Option<String>, Vec<String>)> {
+        let surfaces = self
+            .items
+            .get(&format!("ws_{ws}"))?
+            .get("surfaces")?
+            .as_array()?;
+        let mut focused = None;
+        let mut open: Vec<String> = Vec::new();
+        for entry in surfaces {
+            if entry.get("surface").and_then(|s| s.as_str()) != Some("session") {
+                continue;
+            }
+            let Some(sid) = entry.get("sid").and_then(|s| s.as_str()) else {
+                continue;
+            };
+            if entry.get("focused").and_then(|f| f.as_bool()) == Some(true) {
+                focused = Some(sid.to_owned());
+            }
+            if open.len() < cap && !open.iter().any(|known| known == sid) {
+                open.push(sid.to_owned());
+            }
+        }
+        Some((focused, open))
+    }
+
     /// A read counts as use: a window that boots or switches workspace
     /// reads its blob, and that must keep it out of the eviction queue's
     /// front even when it never edits its layout afterwards.
@@ -291,6 +321,41 @@ pub(crate) async fn put_view_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shown_sessions_reads_the_workspace_mirror_only() {
+        let mut store = temp_store("shown");
+        assert_eq!(store.shown_sessions("w1", 64), None);
+        let surfaces = json!([
+            {"surface": "file", "path": "a.md"},
+            {"surface": "session", "sid": "s-1"},
+            {"surface": "session", "sid": "s-2", "focused": true},
+            {"surface": "session", "sid": "s-1"},
+            {"surface": "changes", "sid": "s-3"},
+            {"surface": "session"},
+        ]);
+        drop(store.put(
+            "win_w1".into(),
+            json!({"surfaces": [{"surface": "session", "sid": "other"}]}),
+        ));
+        drop(store.put(
+            "ws_w1".into(),
+            json!({"v": 1, "ws": "w1", "surfaces": surfaces}),
+        ));
+        assert_eq!(
+            store.shown_sessions("w1", 64),
+            Some((Some("s-2".into()), vec!["s-1".into(), "s-2".into()]))
+        );
+        assert_eq!(
+            store.shown_sessions("w1", 1),
+            Some((Some("s-2".into()), vec!["s-1".into()]))
+        );
+        drop(store.put(
+            "ws_w2".into(),
+            json!({"surfaces": [{"surface": "file", "path": "b", "focused": true}]}),
+        ));
+        assert_eq!(store.shown_sessions("w2", 64), Some((None, vec![])));
+    }
 
     fn got(store: &mut ViewStateStore, key: &str) -> Option<serde_json::Value> {
         store.get(key).map(|value| (*value).clone())
