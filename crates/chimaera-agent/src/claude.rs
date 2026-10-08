@@ -50,6 +50,11 @@ use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
 /// full chat-smoke 23/23; PROTOCOL.md Pass 33).
 pub const TESTED_CLAUDE_VERSION: &str = "2.1.289";
 
+/// Whether a chat argv resumes an existing conversation ([`chat_args`]).
+fn resumes(argv: &[String]) -> bool {
+    argv.iter().any(|arg| arg == "--resume")
+}
+
 /// Arguments for a structured chat session, before server-side extras
 /// (`--settings`, `--mcp-config`, `--session-id`) and login-shell wrapping.
 pub fn chat_args(model: Option<&str>, resume: Option<&str>) -> Vec<String> {
@@ -499,6 +504,10 @@ impl Driver for ClaudeDriver {
             spec.agent_version.clone(),
             &commands_catalog,
         );
+        // A resumed conversation already has its name, carried by the daemon:
+        // naming it off this process's first message would rename it after a
+        // restart's or a move's pick-up text, or after whatever came next.
+        mapper.title_requested = resumes(&spec.argv);
         // The argv model is the session's model from the first frame on —
         // `system/init` (which reports the RESOLVED id) only arrives with the
         // first turn, and the header chip must not claim the catalog default
@@ -5470,6 +5479,30 @@ pub(crate) mod tests {
             None,
             &json!({ "commands": [{ "name": "compact", "description": "Compact history" }] }),
         )
+    }
+
+    /// A resumed conversation keeps the name it already has: its first send
+    /// in a new process (a restart's or a move's pick-up, or the user's next
+    /// message) asks for no new title.
+    #[test]
+    fn a_resumed_conversation_is_not_renamed_by_its_next_message() {
+        assert!(resumes(&chat_args(None, Some("native-1"))));
+        assert!(!resumes(&chat_args(None, None)));
+        let mut m = mapper();
+        m.title_requested = resumes(&chat_args(None, Some("native-1")));
+        let step = m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "The Chimaera daemon hosting this session restarted".into(),
+            }],
+        });
+        assert!(
+            !step
+                .outbound
+                .iter()
+                .any(|frame| frame["request"]["subtype"] == "generate_session_title"),
+            "{:?}",
+            step.outbound
+        );
     }
 
     #[test]
