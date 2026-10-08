@@ -1377,6 +1377,12 @@ impl ChatManager {
         })
     }
 
+    /// Live events from now on, without a replay: for the daemon watching
+    /// what a command of its own starts.
+    pub fn subscribe(&self, id: &str) -> Result<broadcast::Receiver<Arc<SeqEvent>>> {
+        Ok(self.get_session(id)?.events_tx.subscribe())
+    }
+
     pub async fn command(&self, id: &str, cmd: AgentCommand) -> Result<()> {
         self.command_as(id, cmd, None).await
     }

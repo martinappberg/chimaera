@@ -123,7 +123,9 @@ conversation. All four chat providers retain their native resume handle through 
   two seconds later kills every process group of the agents and their descendants, detached shells
   included; and the next daemon on that host stops any agent it recorded that still runs before
   anything resumes. The ledger's last reconcile (≤ 5 s old) still carries what the process held. A
-  permission prompt the restart cut off is named in the pick-up as not run. TUI sessions are out of scope —
+  permission prompt the restart cut off is named in the pick-up as not run, and a pick-up turn that
+  fails at once with a known transient agent error (a sign-in refresh race), or whose process exits
+  before answering, is tried once more after 5 s. TUI sessions are out of scope —
   claude resumes there with `--resume`, but nothing types into a PTY on the user's behalf.
 
 ## Graceful shutdown & close-all

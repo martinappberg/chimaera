@@ -690,6 +690,7 @@ async fn handle_chat_exit(state: &Arc<AppState>, id: &str, exit: DriverExit) {
     if state.stopping.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
+    let pickup = take_unanswered_pickup(state, id);
     // Startup cleanup and deliberate view switches must own the lifecycle
     // exclusively. A closing socket must report exit, never a successor
     // that the user did not request.
@@ -732,6 +733,24 @@ async fn handle_chat_exit(state: &Arc<AppState>, id: &str, exit: DriverExit) {
         return;
     }
     let recipe = crate::lock(&state.chat_recipes).remove(id);
+    if let (Some(pickup), Some(recipe), DriverExit::Clean(_) | DriverExit::ProtocolError(_)) =
+        (pickup, &recipe, &exit)
+    {
+        // The process died before the pick-up turn produced anything: start
+        // the conversation again once, a moment later, keeping its record.
+        // The dead entry stays registered meanwhile, so the agent watcher
+        // does not take the gap for the session's end.
+        let native = state.chat.get(id).and_then(|info| info.native_session_id);
+        tracing::warn!(%id, "the agent exited before answering its pick-up; starting it again");
+        tokio::spawn(retry_exited_pickup(
+            state.clone(),
+            id.to_string(),
+            recipe.clone(),
+            native,
+            pickup,
+        ));
+        return;
+    }
     match exit {
         DriverExit::HandshakeFailed {
             reason,
@@ -3941,13 +3960,7 @@ pub(crate) async fn resurrect_chat_transfer(
                 .map(|text| (text, chimaera_agent::model::ORIGIN_RESTART))
             };
             if let Some((text, tag)) = pick_up {
-                let send = chimaera_agent::model::AgentCommand::Send {
-                    blocks: vec![chimaera_agent::model::ContentBlock::Text { text }],
-                };
-                if let Err(err) = state.chat.command_as(&entry.id, send, Some(tag)).await {
-                    tracing::warn!(session = %entry.id, %err,
-                        "could not send the restart pick-up message");
-                }
+                send_pickup(state, &entry.id, text, tag, true).await;
             }
             Ok(())
         }
@@ -3992,6 +4005,171 @@ fn codex_mcp_auto_approve(
             Some(crate::workspaces::MastermindMode::Auto) => None,
             None => Some(always.collect()),
         },
+    }
+}
+
+/// Texts of an agent failure that a second try moments later gets past: the
+/// turn never reached the model. Matched as substrings; the one list.
+const TRANSIENT_AGENT_ERRORS: &[&str] = &[
+    // Claude Code, when another of its processes refreshes the same OAuth
+    // token at the same moment (a resumed chat and a status probe).
+    "another Claude Code process is refreshing",
+    "Failed to refresh OAuth token",
+];
+/// A pick-up turn counts as failing at once only within this window.
+const PICKUP_FAILURE_WINDOW: std::time::Duration = std::time::Duration::from_secs(20);
+/// The pause before the one retry, long enough for the race to settle.
+const PICKUP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn take_unanswered_pickup(state: &AppState, id: &str) -> Option<(String, &'static str)> {
+    crate::lock(&state.unanswered_pickups).remove(id)
+}
+
+fn is_transient_agent_error(text: &str) -> bool {
+    TRANSIENT_AGENT_ERRORS
+        .iter()
+        .any(|known| text.contains(known))
+}
+
+/// Send the daemon's pick-up message. With `retry`, a turn that fails at once
+/// (within [`PICKUP_FAILURE_WINDOW`], before any output) with a known
+/// transient error, or whose process exits first, is tried once more after
+/// [`PICKUP_RETRY_DELAY`]. A turn that produced anything is never repeated.
+async fn send_pickup(
+    state: &Arc<AppState>,
+    id: &str,
+    text: String,
+    tag: &'static str,
+    retry: bool,
+) {
+    let live = retry.then(|| state.chat.subscribe(id).ok()).flatten();
+    if live.is_some() {
+        crate::lock(&state.unanswered_pickups).insert(id.to_string(), (text.clone(), tag));
+    }
+    if let Err(err) = state
+        .chat
+        .command_as(id, pickup_send(text), Some(tag))
+        .await
+    {
+        tracing::warn!(session = %id, %err, "could not send the pick-up message");
+        take_unanswered_pickup(state, id);
+        return;
+    }
+    let Some(live) = live else {
+        return;
+    };
+    let (state, id) = (state.clone(), id.to_string());
+    tokio::spawn(async move {
+        let failed = failed_at_once(live).await;
+        // An exit is the exit hook's to settle (it takes the entry).
+        let Some(failed) = failed else {
+            return;
+        };
+        let Some((text, tag)) = take_unanswered_pickup(&state, &id).filter(|_| failed) else {
+            return;
+        };
+        tracing::warn!(session = %id, "the pick-up turn failed at once; sending it again shortly");
+        tokio::time::sleep(PICKUP_RETRY_DELAY).await;
+        if !state.stopping.load(std::sync::atomic::Ordering::Relaxed)
+            && state.chat.get(&id).is_some_and(|c| c.alive)
+        {
+            if let Err(err) = state
+                .chat
+                .command_as(&id, pickup_send(text), Some(tag))
+                .await
+            {
+                tracing::warn!(session = %id, %err, "could not send the pick-up message again");
+            }
+        }
+    });
+}
+
+fn pickup_send(text: String) -> chimaera_agent::model::AgentCommand {
+    chimaera_agent::model::AgentCommand::Send {
+        blocks: vec![chimaera_agent::model::ContentBlock::Text { text }],
+    }
+}
+
+/// How the turn a pick-up started went: `Some(true)` when it ended within
+/// the window as a transient failure with no output, `Some(false)` when it
+/// produced output, ended otherwise, or outlived the window, and `None` when
+/// the process exited first.
+async fn failed_at_once(mut live: tokio::sync::broadcast::Receiver<Arc<SeqEvent>>) -> Option<bool> {
+    let deadline = tokio::time::Instant::now() + PICKUP_FAILURE_WINDOW;
+    let mut transient = false;
+    loop {
+        let Ok(Ok(entry)) = tokio::time::timeout_at(deadline, live.recv()).await else {
+            return Some(false);
+        };
+        match &entry.ev {
+            AgentEvent::MessageChunk { text, .. } | AgentEvent::Error { message: text, .. }
+                if is_transient_agent_error(text) =>
+            {
+                transient = true;
+            }
+            AgentEvent::TurnAborted {
+                reason,
+                interrupted: false,
+                ..
+            } => return Some(transient || is_transient_agent_error(reason)),
+            AgentEvent::Exited { .. } => return None,
+            AgentEvent::MessageChunk { .. }
+            | AgentEvent::ThoughtChunk { .. }
+            | AgentEvent::ToolCall { .. }
+            | AgentEvent::ToolCallUpdate { .. }
+            | AgentEvent::Plan { .. }
+            | AgentEvent::PermissionRequest { .. }
+            | AgentEvent::QuestionRequest { .. }
+            | AgentEvent::ElicitationRequest { .. }
+            | AgentEvent::TurnCompleted { .. }
+            | AgentEvent::TurnAborted { .. } => return Some(false),
+            _ => {}
+        }
+    }
+}
+
+/// The exit hook's half of [`send_pickup`]'s retry: start the conversation
+/// again from its recipe and send the pick-up once more, or, when that fails,
+/// retire it as the exit would have.
+async fn retry_exited_pickup(
+    state: Arc<AppState>,
+    id: String,
+    recipe: ChatRecipe,
+    native: Option<String>,
+    (text, tag): (String, &'static str),
+) {
+    tokio::time::sleep(PICKUP_RETRY_DELAY).await;
+    // A stopping daemon's ledger resurrects it; another lifecycle operation
+    // on the session settles it itself.
+    if state.stopping.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let Some(guard) = ChatSwitchGuard::acquire(&state, &id, "pickup") else {
+        return;
+    };
+    if state.chat.get(&id).is_some_and(|c| c.alive) {
+        return;
+    }
+    state.chat.remove(&id);
+    // Closed by the user meanwhile: nothing left to start.
+    if !crate::lock(&state.agents).contains_key(&id) {
+        return;
+    }
+    let started = spawn_chat_session(&state, id.clone(), recipe, None).await;
+    drop(guard);
+    match started {
+        Ok(_) => send_pickup(&state, &id, text, tag, false).await,
+        Err(err) => {
+            tracing::warn!(%id, %err, "the agent could not start again for its pick-up");
+            crate::recents::retire_with_resume(
+                &state,
+                &id,
+                None,
+                None,
+                chimaera_agent::model::SessionUi::Chat,
+                native,
+            );
+        }
     }
 }
 
@@ -5930,6 +6108,66 @@ mod tests {
         let recovered = handoff_message("home", Some(&both), true, true).expect("recovery");
         assert!(recovered.contains("back to the user's computer because"));
         assert!(recovered.contains("Background task: Watch CI for PR 158"));
+    }
+
+    /// Only a pick-up turn that failed at once with a known transient error,
+    /// before any output, is sent again; a process that exits first is the
+    /// exit hook's to retry; anything the agent produced, a user's stop, or
+    /// another failure is left alone.
+    #[tokio::test]
+    async fn a_pickup_is_retried_only_after_a_transient_failure_with_no_output() {
+        async fn verdict(events: Vec<AgentEvent>) -> Option<bool> {
+            let (tx, rx) = tokio::sync::broadcast::channel(64);
+            for (seq, ev) in events.into_iter().enumerate() {
+                tx.send(Arc::new(SeqEvent {
+                    seq: seq as u64 + 1,
+                    ts: 0,
+                    ev,
+                }))
+                .unwrap();
+            }
+            failed_at_once(rx).await
+        }
+        let started = || AgentEvent::TurnStarted {
+            turn_id: "t".into(),
+        };
+        let said = |text: &str| AgentEvent::MessageChunk {
+            turn_id: "t".into(),
+            text: text.into(),
+        };
+        let aborted = |reason: &str, interrupted: bool| AgentEvent::TurnAborted {
+            turn_id: "t".into(),
+            reason: reason.into(),
+            interrupted,
+        };
+        let race = "Failed to refresh OAuth token: another Claude Code process is refreshing it \
+                    or exited mid-refresh";
+        assert_eq!(
+            verdict(vec![started(), said(race), aborted("turn failed", false)]).await,
+            Some(true)
+        );
+        assert_eq!(
+            verdict(vec![started(), aborted(race, false)]).await,
+            Some(true)
+        );
+        assert_eq!(
+            verdict(vec![started(), said("Picking up."), aborted(race, false)]).await,
+            Some(false),
+            "a turn that produced output is never repeated"
+        );
+        assert_eq!(
+            verdict(vec![started(), aborted(race, true)]).await,
+            Some(false),
+            "a user's stop"
+        );
+        assert_eq!(
+            verdict(vec![started(), aborted("Prompt is too long", false)]).await,
+            Some(false)
+        );
+        assert_eq!(
+            verdict(vec![started(), AgentEvent::Exited { status: Some(1) }]).await,
+            None
+        );
     }
 
     /// A permission prompt the move or restart cut off is named, with its
