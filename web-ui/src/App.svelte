@@ -284,7 +284,7 @@
   import { transferBlock, transferInto, type FileSource } from "./lib/workspace/fileTransfer";
   import ComputeStrip from "./lib/workspace/ComputeStrip.svelte";
   import PlaceSlot from "./lib/extensions/PlaceSlot.svelte";
-  import TransferSlot from "./lib/extensions/TransferSlot.svelte";
+  import { filesLoading } from "./lib/extensions/loading";
   import ElsewhereNotice from "./lib/workspace/ElsewhereNotice.svelte";
   import { elsewhere as projectElsewhere } from "./lib/net/placement";
   import type JobWindowNotices from "./lib/workspace/JobWindowNotices.svelte";
@@ -513,9 +513,6 @@
    *  round trip to whichever machine that is means nothing to the person
    *  reading it. */
   const projectView = gatewayWorkspace() !== null;
-  /** A transfer of this window's project is under way: the extension's
-   *  cover is up and nothing underneath accepts input (`TransferSlot`). */
-  let transferBlocked = $state(false);
   /** A host view asked to open a project another machine runs now: the
    *  project view's link that follows it (`placement.elsewhere`), or null. */
   let elsewhereHref = $state<string | null>(null);
@@ -5631,7 +5628,7 @@
       </div>
     {/if}
   {:else}
-  <div class="body" bind:clientWidth={bodyWidth} inert={transferBlocked || elsewhereHref !== null}>
+  <div class="body" bind:clientWidth={bodyWidth} inert={elsewhereHref !== null}>
     <aside
       class="rail"
       class:collapsed={layout.focusMode}
@@ -6149,6 +6146,7 @@
                 onDragStart={onTreeEntryDown}
                 dropAction={dropSpot?.kind === "fileOp" ? dropSpot.operation : "upload"}
                 activePath={focusedFilePath}
+                arriving={$filesLoading.has(workspace.id)}
                 reveal={treeReveal}
                 createRequest={treeCreate}
                 dropDir={(dropSpot?.kind === "uploadDir" || (dropSpot?.kind === "fileOp" && dropSpot.blocked === null)) && dropSpot.paneId === null ? dropSpot.dir : null}
@@ -6661,9 +6659,6 @@
   {/await}
 {/if}
 
-<!-- The cover over a project that is moving (to the cloud or back): the
-     extension's, nothing without it; the body is inert while it stands. -->
-<TransferSlot workspaceId={placeWorkspaceId} source={projectView ? "placement" : "daemon"} onblock={(blocked) => { transferBlocked = blocked; }} />
 {#if elsewhereHref !== null}
   <!-- This host's copy of a project another machine runs: covered, with
        the project view as the one way forward. -->

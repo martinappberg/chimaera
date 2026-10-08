@@ -19,6 +19,8 @@
   import { getSetting, onSettingsChange } from "../settings/store.svelte";
   import type { Session } from "../workspace/sessions";
   import type { PlaceSession } from "./application";
+  import { sessionPause } from "../net/placement";
+  import { loadingOwner, sessionTransfer } from "./loading";
 
   let { workspaceId, sessions, label }: {
     /** The local project this window shows, or null (Home, a remote window,
@@ -36,6 +38,8 @@
     id: row.id,
     agentKind: row.kind === "agent" ? row.agent_kind ?? "claude" : null,
     remote: typeof row.placement === "object" && row.placement !== null && typeof row.placement.remote === "string" ? row.placement.remote : null,
+    paused: row.suspended === true || sessionPause(row) !== null,
+    transfer: sessionTransfer(row),
   })));
   // One store per slot; the extension subscribes and sees each new list.
   const placeSessions = writable<readonly PlaceSession[]>([]);
@@ -51,6 +55,7 @@
     const controller = new AbortController();
     const signal = controller.signal;
     let owner: { dispose(): void } | null = null;
+    const loading = loadingOwner(id);
     void import("./placeHost").then(({ runHere, runInCloud }) => {
       if (signal.aborted) throw new Error("Place retired");
       return selectedApplication!.mountPlace!(host, {
@@ -64,16 +69,19 @@
         runHere: () => signal.aborted ? Promise.resolve({ started: false, error: "unavailable" }) : runHere(id),
         runInCloud: () => signal.aborted ? Promise.resolve({ started: false, error: "unavailable" }) : runInCloud(id),
         developer,
+        filesLoading: (value) => loading.files(value === true),
+        sessionState: (sessionId, state) => loading.session(sessionId, state),
       });
     }).then((mounted) => {
       if (signal.aborted) mounted.dispose(); else owner = mounted;
     }).catch(() => {
       // An extension that cannot mount leaves the host's label as it was.
-      if (!signal.aborted) claimed = false;
+      if (!signal.aborted) { claimed = false; loading.dispose(); }
     });
     return () => {
       controller.abort();
       claimed = false;
+      loading.dispose();
       try { owner?.dispose(); } catch { /* The host label is already back. */ }
       owner = null;
     };

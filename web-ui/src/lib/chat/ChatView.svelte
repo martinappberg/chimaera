@@ -128,6 +128,8 @@
   import { activeTheme, getSetting, setSetting } from "../settings/store.svelte";
   import { hostCanDictate, voiceProblem } from "./voice.svelte";
   import { keyHint } from "../shared/keybindings";
+  import LoadingRows from "../shared/LoadingRows.svelte";
+  import { sessionStates } from "../extensions/loading";
 
   interface Props {
     session: Session;
@@ -2259,6 +2261,11 @@
       { signedOut: $accountSignedOut },
     ).status,
   );
+  /** What an optional extension says about this conversation not being here
+   *  yet (`extensions/loading.ts`): a placeholder over the transcript while
+   *  it arrives, or one quiet line. Never set without the extension. */
+  const arrival = $derived($sessionStates.get(session.id) ?? null);
+  const arriving = $derived(arrival?.kind === "loading");
   /** The agent sign-in this paused conversation waits for on the cloud (the
    *  row's additive `blocked_provider`); null otherwise. */
   const connect = $derived(canOpenOnboarding() ? pausedConnect(session) : null);
@@ -2921,8 +2928,10 @@
   <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
   <div
     class="transcript"
+    class:arriving
     role="log"
     aria-label="conversation"
+    aria-busy={arriving}
     tabindex="0"
     bind:this={transcriptEl}
     onscroll={onScroll}
@@ -2933,6 +2942,11 @@
     <!-- Room for earlier history ahead of the rendered window: it absorbs
          every height change above a scrolled-up reader (see "reading
          position" in the script). Height is written directly, never bound. -->
+    {#if arriving}
+      <!-- Pinned to the top of the scroller, painted over the hidden
+           transcript, which stays mounted and fills in under it. -->
+      <div class="arriving-rows"><LoadingRows rows={9} variant="transcript" label="conversation" /></div>
+    {/if}
     <div class="history-spacer" bind:this={spacerEl} aria-hidden="true"></div>
     <!-- One real reading column (the Claude Desktop measure): agent prose
          fills it from the left, user bubbles right-align inside it. -->
@@ -3638,7 +3652,11 @@
     </div>
   {/if}
 
-  {#if continuing}
+  {#if arrival?.kind === "note"}
+    <div class="connection-status" role="status">{arrival.text}</div>
+  {:else if arriving}
+    <!-- The placeholder says it; the window's status bar says where. -->
+  {:else if continuing}
     <div class="connection-status"><span role="status">{continuingLabel}</span>{#if connect !== null}<button type="button" class="connect" onclick={() => cloudOnboarding.request({ providerIds: [connect.providerId], workspaceId: connect.workspaceId })}>Connect {connect.label} to continue</button>{/if}</div>
   {:else if store.bringing}
     <!-- Acting here is bringing the work over; the send waits for it. -->
@@ -3747,6 +3765,27 @@
   /* The pane clips at its padding box and the transcript fills it edge to
      edge — the global outside ring (app.css) would be cut on three sides, so
      paint it inside. */
+  /* An arriving conversation: the placeholder in the column's place, and no
+     scrolling through the transcript hidden under it. Opacity, not
+     visibility: the transcript under it stays as it is (rules/web-ui.md). */
+  .transcript.arriving {
+    overflow-y: hidden;
+  }
+  .transcript.arriving > :not(.arriving-rows) {
+    opacity: 0;
+  }
+  .arriving-rows {
+    position: sticky;
+    top: 0;
+    height: 0;
+    overflow: visible;
+    z-index: 1;
+  }
+  .arriving-rows > :global(.loading-rows) {
+    width: var(--chat-column);
+    max-width: 100%;
+    margin: 0 auto;
+  }
   .transcript:focus-visible {
     outline-offset: -2px;
   }

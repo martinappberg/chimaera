@@ -501,7 +501,12 @@ Pro to bring it back." — "Picking up where you left off…",
 "Waiting for Claude Code in the cloud", "Opening…"; a row naming the
 agent in `blocked_provider` adds **Connect <agent> to continue**, `pro/providers.ts`
 `pausedConnect`), and retries at once
-(`ChatSocket.retrySoon`) when its row stops being paused or changes owner. The connection row appears only for a viewed project (routed row or
+(`ChatSocket.retrySoon`) when its row stops being paused or changes owner. An optional extension can also say a conversation is not here yet
+(`extensions/loading.ts` `sessionStates`, keyed by session id): `loading` puts
+`shared/LoadingRows.svelte` over the transcript (pinned to the scroller's top;
+the transcript stays mounted at opacity 0 under it, no scrolling, and the
+connection line stays quiet), `note` replaces the connection line with the
+extension's one sentence. Never set without the extension. The connection row appears only for a viewed project (routed row or
 browser view) after a 2 s grace; while it says "Reconnecting…" the header does
 not repeat it. Browser sockets use `net/base` to preserve gateway prefixes. The
 daemon's transfer pick-up (a user message with origin `moved`, `home` or `recovered`) renders

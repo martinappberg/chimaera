@@ -48,7 +48,15 @@ export interface SurfaceOwner { update(presentation: Readonly<SurfacePresentatio
 /** One conversation or terminal of the project, as the window lists it:
  *  `remote` is the host a routed session runs on (`worker-…` / `device-…`),
  *  null for one on this computer. */
-export interface PlaceSession { readonly id: string; readonly agentKind: string | null; readonly remote: string | null }
+export interface PlaceSession {
+  readonly id: string; readonly agentKind: string | null; readonly remote: string | null;
+  /** The row says it has no process here and that is not an exit (its
+   *  additive `pause` field, or `suspended`). Absent on an older host. */
+  readonly paused?: boolean;
+  /** The row's additive `transfer` field as sent (`state` and `reason`
+   *  codes), null when absent. Absent on an older host. */
+  readonly transfer?: { readonly state: string; readonly reason: string | null } | null;
+}
 /** The daemon's answer to "Run here" or "Run in the cloud": started (202:
  *  the status row's `place` says when it has arrived), or refused with the
  *  daemon's own fixed code (`not_here`, `not_elsewhere`,
@@ -76,30 +84,17 @@ export interface PlaceMount {
   /** The "Developer Tools" setting: actions meant for testing show only
    *  while it is on. Absent on an older host. */
   developer?: Observable<boolean>;
+  /** The project's files are still arriving: the file tree shows
+   *  placeholder rows until this says false (or the mount retires). Absent
+   *  on an older host. */
+  filesLoading?(loading: boolean): void;
+  /** One conversation is not here yet: `{kind: "loading"}` puts a
+   *  placeholder over its transcript, `{kind: "note", text}` one quiet line;
+   *  null clears it. Retirement clears every state this mount set. Absent on
+   *  an older host. */
+  sessionState?(sessionId: string, state: { kind: "loading" } | { kind: "note"; text: string } | null): void;
 }
 export interface PlaceOwner { dispose(): void }
-/** A transfer of the window's project in progress (to the cloud or back):
- *  the extension draws over the whole workspace and the host makes what is
- *  underneath inert while `block(true)` stands. The extension reads the
- *  status itself from the window's daemon (`source: "daemon"`), or from the
- *  browser view's placement read (`source: "placement"`). */
-export interface TransferMount {
-  version: 1;
-  workspaceId: string;
-  signal: AbortSignal;
-  visibility: Observable<boolean>;
-  /** true: nothing underneath accepts input; false: the workspace is usable. */
-  block(blocked: boolean): void;
-  source: "daemon" | "placement";
-  /** The browser view's latest `moving` field (null: nothing moving). */
-  moving?: Observable<ProjectMoving | null>;
-}
-/** The daemon's additive status field for a transfer under way. */
-export interface ProjectMoving {
-  direction: "cloud" | "here";
-  step: string;
-  since_ms: number;
-}
 /** One remote machine row on Home, by its SSH alias. */
 export interface HostMount {
   version: 1;
@@ -115,8 +110,6 @@ export interface ApplicationExtension {
   bindAccountBranding?(scope: AccountBrandingSubscription): Promise<() => void>;
   /** Optional: an extension without it leaves the host indicator alone. */
   mountPlace?(target: HTMLElement, mount: PlaceMount): Promise<PlaceOwner>;
-  /** Optional: an extension without it never covers a workspace. */
-  mountTransfer?(target: HTMLElement, mount: TransferMount): Promise<PlaceOwner>;
   /** Optional: one quiet line under a remote machine's Home row. */
   mountHost?(target: HTMLElement, mount: HostMount): Promise<PlaceOwner>;
 }

@@ -37,6 +37,7 @@
   import FileIcon from "../shared/FileIcon.svelte";
   import FolderIcon from "../shared/FolderIcon.svelte";
   import Spinner from "../previews/Spinner.svelte";
+  import LoadingRows from "../shared/LoadingRows.svelte";
   /** Who a kept copy's version belongs to, in the tree's badge. */
   const keptHere = hereName();
 
@@ -81,6 +82,10 @@
      *  under a symlink AND its target, so the highlight resolves by position
      *  when it can, by path only for the fallbacks. */
     dropKey?: string | null;
+    /** The workspace's files are still arriving (an extension says so,
+     *  `extensions/loading.ts`): placeholder rows stand in for the entries
+     *  until it clears. Never set without the extension. */
+    arriving?: boolean;
   }
 
   let {
@@ -94,6 +99,7 @@
     dropDir = null,
     dropAction = "upload",
     dropKey = null,
+    arriving = false,
   }: Props = $props();
 
   /** A row's own left padding (CSS `--row-pad`): the sticky probe lands
@@ -1069,7 +1075,7 @@
          and never moves the content. During an OS file drag it names the drop
          destination instead of the ancestors — one message at a time. -->
     <div class="tree-overlay">
-      {#if sticky.length > 0}
+      {#if sticky.length > 0 && !arriving}
         <div class="sticky-rows">
           {#each sticky as s (s.key)}
             <!-- A pinned ancestor is a drop target like its real row
@@ -1138,6 +1144,9 @@
         ...(hasLocalFiles() ? ["separator" as const, ...revealEntries(root)] : []),
       ])}
   >
+  {#if arriving}
+    <LoadingRows rows={10} variant="tree" label="files" />
+  {:else}
   {#if rootError !== null}
     <div class="tree-error">{rootError}</div>
   {:else if listings.get(root) === undefined}
@@ -1350,6 +1359,7 @@
     <div class="tree-limit" role="status" title={[...truncatedDirs].join("\n")}>
       Some large folders are partially shown
     </div>
+  {/if}
   {/if}
   </div>
   </div>

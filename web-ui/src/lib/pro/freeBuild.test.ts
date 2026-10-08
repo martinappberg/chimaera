@@ -7,6 +7,7 @@ import { get } from "svelte/store";
 vi.mock("virtual:chimaera-application-entry", () => ({ loadApplicationEntry: null }));
 
 import { selectedApplication } from "../extensions/selected";
+import { filesLoading, sessionStates } from "../extensions/loading";
 import { proTier } from "../net/plan";
 import { socketKeepers } from "../net/reconnect";
 import { pickupNote } from "../chat/transfer";
@@ -28,10 +29,14 @@ describe("a build without the extension", () => {
     expect(get(proTier)).toBe("free");
   });
 
-  it("never covers a workspace and never asks where a project runs", () => {
-    // The transfer cover is the extension's; the host renders nothing of its
-    // own and the slot's gate reads the extension's hook, absent here.
-    expect(selectedApplication?.mountTransfer).toBeUndefined();
+  it("never shows a loading placeholder or a place sentence", () => {
+    // The only writers of the loading signals are the place mount's hooks,
+    // and the place slot mounts nothing without an extension: the file tree
+    // and every conversation read "nothing loading", and the host's own
+    // label is the status bar's only word.
+    expect(selectedApplication?.mountPlace).toBeUndefined();
+    expect(get(filesLoading).size).toBe(0);
+    expect(get(sessionStates).size).toBe(0);
   });
 
   it("keeps main's socket semantics (App sets keepers from the tier)", () => {
