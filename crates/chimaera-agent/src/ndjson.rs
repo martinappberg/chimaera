@@ -190,6 +190,10 @@ impl JsonlChild {
             }
         });
 
+        let pid = child.id();
+        if let Some(pid) = pid {
+            crate::reaper::register(pid);
+        }
         let child = Arc::new(Mutex::new(child));
         if let Some(control) = control {
             control.attach(&child);
@@ -201,6 +205,7 @@ impl JsonlChild {
             },
             guard: ChildGuard {
                 managed_execution: control.is_some(),
+                pid,
                 child,
                 stderr_tail,
                 stderr_task,
@@ -321,6 +326,9 @@ const STDERR_SETTLE: Duration = Duration::from_secs(1);
 /// Owns the child for lifecycle: bounded shutdown, kill, stderr diagnostics.
 pub struct ChildGuard {
     managed_execution: bool,
+    /// The leader's pid as spawned, kept past the reap so the agent can be
+    /// taken off the daemon's cleanup list (`reaper`) when the guard goes.
+    pid: Option<u32>,
     child: Arc<Mutex<Child>>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
     stderr_task: tokio::task::JoinHandle<()>,
@@ -581,6 +589,9 @@ impl Drop for ChildGuard {
                 nix::unistd::Pid::from_raw(pid as i32),
                 nix::sys::signal::Signal::SIGKILL,
             );
+        }
+        if let Some(pid) = self.pid {
+            crate::reaper::unregister(pid);
         }
     }
 }

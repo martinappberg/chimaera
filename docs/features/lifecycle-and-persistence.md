@@ -117,8 +117,12 @@ conversation. All four chat providers retain their native resume handle through 
   `stopping` set: the ledger reconciler stops writing, and the chat exit path and the agent watcher
   retire nothing, so the deliberately ended chats stay in the ledger and never land in Recents.
   Measured: 0.19 s to stop with two chats (fake agents), 0.84 s with a real Claude 2.1.283 chat whose
-  background `sleep` ended with it; after the restart that chat's agent restarted the command itself. A crash still leaves whatever the process
-  held; the ledger's last reconcile (≤ 5 s old) still carries it. TUI sessions are out of scope —
+  background `sleep` ended with it; after the restart that chat's agent restarted the command itself. A
+  daemon killed outright (SIGKILL, a crash) no longer leaves its agents running: a small watcher
+  process (`chimaera-agent` `reaper.rs`) notices the daemon's pipe close, SIGTERMs each chat agent and
+  two seconds later kills every process group of the agents and their descendants, detached shells
+  included; and the next daemon on that host stops any agent it recorded that still runs before
+  anything resumes. The ledger's last reconcile (≤ 5 s old) still carries what the process held. TUI sessions are out of scope —
   claude resumes there with `--resume`, but nothing types into a PTY on the user's behalf.
 
 ## Graceful shutdown & close-all

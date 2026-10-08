@@ -29,6 +29,7 @@ pub mod managed_process;
 pub mod model;
 pub mod native_ui;
 pub mod ndjson;
+pub mod reaper;
 mod send_state;
 pub mod subagent;
 pub mod transcript;

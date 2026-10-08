@@ -151,6 +151,15 @@ async fn run_selected(
     };
     manifest.write().context("failed to write manifest")?;
 
+    // Agents never outlive this daemon, however it ends; ones a killed
+    // predecessor on this host left running stop here, before anything
+    // resumes. Per host: a home shared across nodes holds other hosts' ids.
+    let record = chimaera_core::data_dir().join(format!(
+        "agent-processes-{}",
+        hostname.replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "_")
+    ));
+    let _ = tokio::task::spawn_blocking(move || chimaera_agent::reaper::install(record)).await;
+
     println!("chimaera daemon listening on 127.0.0.1:{port}");
     println!("http://127.0.0.1:{port}/#token={token}");
 
