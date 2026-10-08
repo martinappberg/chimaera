@@ -4093,7 +4093,9 @@ fn pickup_send(text: String) -> chimaera_agent::model::AgentCommand {
 /// How the turn a pick-up started went: `Some(true)` when it ended within
 /// the window as a transient failure with no output, `Some(false)` when it
 /// produced output, ended otherwise, or outlived the window, and `None` when
-/// the process exited first.
+/// the process exited first. A turn that completes at once with nothing said
+/// settles nothing: claude answers a pick-up it could not start with an empty
+/// completion and reports the failure as the next turn, moments later.
 async fn failed_at_once(mut live: tokio::sync::broadcast::Receiver<Arc<SeqEvent>>) -> Option<bool> {
     let deadline = tokio::time::Instant::now() + PICKUP_FAILURE_WINDOW;
     let mut transient = false;
@@ -4113,6 +4115,7 @@ async fn failed_at_once(mut live: tokio::sync::broadcast::Receiver<Arc<SeqEvent>
                 ..
             } => return Some(transient || is_transient_agent_error(reason)),
             AgentEvent::Exited { .. } => return None,
+            AgentEvent::TurnCompleted { .. } if !transient => {}
             AgentEvent::MessageChunk { .. }
             | AgentEvent::ThoughtChunk { .. }
             | AgentEvent::ToolCall { .. }
@@ -6163,6 +6166,29 @@ mod tests {
         assert_eq!(
             verdict(vec![started(), aborted("Prompt is too long", false)]).await,
             Some(false)
+        );
+        // Seen on a cloud machine: the pick-up's own turn completes at once
+        // with nothing said, then the failure arrives as the next turn.
+        let completed = || AgentEvent::TurnCompleted {
+            turn_id: "t".into(),
+            usage: Default::default(),
+        };
+        assert_eq!(
+            verdict(vec![
+                started(),
+                completed(),
+                started(),
+                said(race),
+                aborted(race, false)
+            ])
+            .await,
+            Some(true),
+            "an empty completion settles nothing"
+        );
+        assert_eq!(
+            verdict(vec![started(), said("Picking up."), completed()]).await,
+            Some(false),
+            "a completion after output is the turn's end"
         );
         assert_eq!(
             verdict(vec![started(), AgentEvent::Exited { status: Some(1) }]).await,
