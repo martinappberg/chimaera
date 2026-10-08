@@ -100,9 +100,41 @@
    *  the compatibility path below to open Home and retire itself. */
   const showBackToHome = $derived(native && ownAlias !== null);
 
+  /** Needs-you first, then running, then by recency: what is happening sits
+   *  at the top of the scroll area. */
   const sorted = $derived(
-    [...workspaces].sort((a, b) => (b.last_opened_at ?? 0) - (a.last_opened_at ?? 0)),
+    [...workspaces].sort((a, b) => {
+      const rank = (w: Workspace) => {
+        const l = liveByWs.get(w.id);
+        return l && l.attn > 0 ? 2 : l && l.live > 0 ? 1 : 0;
+      };
+      return rank(b) - rank(a) || (b.last_opened_at ?? 0) - (a.last_opened_at ?? 0);
+    }),
   );
+
+  /** Past this many workspaces the list scrolls in place (so the remote
+   *  machines below stay on screen) and a filter appears. */
+  const FILTER_THRESHOLD = 5;
+  let filter = $state("");
+  const shownWorkspaces = $derived.by(() => {
+    // The filter input only exists past the threshold: a stale query must not
+    // keep hiding rows once removals shrink the list below it.
+    const q = sorted.length > FILTER_THRESHOLD ? filter.trim().toLowerCase() : "";
+    if (q === "") return sorted;
+    // Short queries match names only: every path under ~ shares letters, so
+    // one or two characters would match everything.
+    return sorted.filter(
+      (w) => w.name.toLowerCase().includes(q) || (q.length >= 3 && w.root.toLowerCase().includes(q)),
+    );
+  });
+  /** Names that appear twice keep their path visible: it is the only thing
+   *  telling those rows apart. */
+  const dupNames = $derived.by(() => {
+    const seen = new Set<string>();
+    const dup = new Set<string>();
+    for (const w of workspaces) (seen.has(w.name) ? dup : seen).add(w.name);
+    return dup;
+  });
 
   /** Live rollup per workspace: total live sessions + how many need you. */
   const liveByWs = $derived.by(() => {
@@ -849,6 +881,27 @@
     <section class="workspaces" aria-label="Workspaces on this machine">
       <div class="sec-head">
         <h2 class="sec-title">{ownAlias === null ? (native && isMac ? "This Mac" : "This computer") : "On this machine"}</h2>
+        {#if sorted.length > FILTER_THRESHOLD}
+          <input
+            class="add-input filter"
+            bind:value={filter}
+            placeholder="Filter workspaces"
+            aria-label="Filter workspaces"
+            spellcheck="false"
+            autocomplete="off"
+            onkeydown={(e) => {
+              if (e.key === "Escape" && filter !== "") {
+                e.preventDefault();
+                e.stopPropagation();
+                filter = "";
+              } else if (e.key === "Enter" && shownWorkspaces.length > 0) {
+                e.preventDefault();
+                if ((e.metaKey || e.ctrlKey) && !jobScoped) void openWindow(ownAlias, shownWorkspaces[0].id, true);
+                else onOpen(shownWorkspaces[0]);
+              }
+            }}
+          />
+        {/if}
         <div class="where" title={health?.hostname}>
           {#if health !== null}<span class="hostname">{health.hostname}</span>{/if}
           <span class="remote-status" class:online={daemonReachable} role="status">
@@ -867,17 +920,21 @@
           <button class="cta" onclick={onOpenFolder}>Open folder</button>
         </div>
       {:else}
-        <div class="rows">
-          {#each sorted as w (w.id)}
+        <div class="rows" class:scroll={sorted.length > FILTER_THRESHOLD}>
+          {#if shownWorkspaces.length === 0}
+            <p class="no-match">No workspace matches “{filter.trim()}”.</p>
+          {/if}
+          {#each shownWorkspaces as w (w.id)}
             {@const live = liveByWs.get(w.id)}
             {@const placeHint = placeHints.get(w.id)}
             {@const wsState = !daemonReachable ? "" : live && live.attn > 0 ? "attn" : live && live.live > 0 ? "alive" : ""}
             {#if confirmStopId === w.id}
-              <div class="row confirm" role="alertdialog" aria-label="end sessions?">
+              <div class="row confirm" role="alertdialog" aria-label="End sessions?">
                 <span class="name">{w.name}</span>
                 <span class="confirm-label"
-                  >end {live?.live} running session{live?.live === 1 ? "" : "s"}?</span
+                  >End {live?.live} running session{live?.live === 1 ? "" : "s"}? The workspace stays in your list.</span
                 >
+                <button class="confirm-no" onclick={() => (confirmStopId = null)}>Cancel</button>
                 <button
                   class="confirm-yes"
                   onclick={() => {
@@ -885,20 +942,24 @@
                     onStop(w);
                   }}>End sessions</button
                 >
-                <button class="confirm-no" onclick={() => (confirmStopId = null)}>cancel</button>
               </div>
             {:else if confirmRemoveId === w.id}
-              <div class="row confirm" role="alertdialog" aria-label="remove workspace?">
+              {@const running = live?.live ?? 0}
+              <div class="row confirm" class:strong={running > 0} role="alertdialog" aria-label="Remove workspace?">
                 <span class="name">{w.name}</span>
-                <span class="confirm-label">remove from this list?</span>
+                <span class="confirm-label"
+                  >{running > 0
+                    ? `Remove from your list and end its ${running === 1 ? "running session" : `${running} running sessions`}? Your folder is untouched.`
+                    : "Remove from your list? Your folder is untouched."}</span
+                >
+                <button class="confirm-no" onclick={() => (confirmRemoveId = null)}>Cancel</button>
                 <button
                   class="confirm-yes"
                   onclick={() => {
                     confirmRemoveId = null;
                     onRemove(w);
-                  }}>remove</button
+                  }}>{running > 0 ? "End & remove" : "Remove"}</button
                 >
-                <button class="confirm-no" onclick={() => (confirmRemoveId = null)}>cancel</button>
               </div>
             {:else}
               <div class="rowwrap workspace-row" role="presentation" class:live={wsState === "alive"} class:attn={wsState === "attn"}>
@@ -911,7 +972,7 @@
                         ? `${live?.live} live session${live?.live === 1 ? "" : "s"}`
                         : "no live sessions"}
                   ></span>
-                  <span class="workspace-label"><span class="name">{w.name}</span><span class="path">{tildify(w.root)}</span></span>
+                  <span class="workspace-label" class:dup={dupNames.has(w.name)}><span class="name">{w.name}</span><span class="path">{tildify(w.root)}</span></span>
                 </button>
                 <!-- The meta sits beside the row button (not inside it: a button
                      cannot nest a button) so the live count can turn into the
@@ -920,16 +981,16 @@
                   {#if live !== undefined && live.attn > 0}
                     <span class="session-state" class:attention={daemonReachable} class:stale={!daemonReachable}>{live.attn} {daemonReachable ? "awaiting approval" : `approval${live.attn === 1 ? "" : "s"} last seen`}</span>
                   {:else if live !== undefined && live.live > 0}
-                    <span class="session-state" class:stale={!daemonReachable}>{live.live} {daemonReachable ? "live " : ""}session{live.live === 1 ? "" : "s"}{daemonReachable ? "" : " last seen"}</span>
-                  {/if}
-                  {#if live !== undefined && live.live > 0}
-                    <button
-                      class="side stop"
-                      title="end this workspace's {live.live} running session{live.live === 1
-                        ? ''
-                        : 's'}"
-                      onclick={() => (confirmStopId = w.id)}>End sessions</button
-                    >
+                    <span class="live-slot">
+                      <span class="session-state" class:stale={!daemonReachable}>{live.live} {daemonReachable ? "live " : ""}session{live.live === 1 ? "" : "s"}{daemonReachable ? "" : " last seen"}</span>
+                      <button
+                        class="side stop"
+                        title="end this workspace's {live.live} running session{live.live === 1
+                          ? ''
+                          : 's'}"
+                        onclick={() => (confirmStopId = w.id)}>End sessions</button
+                      >
+                    </span>
                   {/if}
                   <span class="when">{#if placeHint !== undefined}{placeHint} · {/if}{ago(w.last_opened_at)}</span>
                 </span>
@@ -1231,11 +1292,6 @@
                         </button>
                       </div>
                     </div>
-                  {:else if cluster}
-                    <!-- The login-node override is on, so the row connects to
-                         the login daemon as before; the cluster page (jobs)
-                         stays one click away. -->
-                    <div class="remote-ws">{@render jobsRow(h.alias)}</div>
                   {/if}
                 {/if}
                 </div>
@@ -1916,8 +1972,9 @@
 
   .workspaces .rows { border: 1px solid var(--edge); border-radius: 10px; padding: 5px; }
   .workspace-row, .host-row { padding-right: 8px; }
-  .workspace-row .row, .host-row .row { padding: 14px 12px; gap: 14px; }
-  .workspace-label { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 5px; }
+  .workspace-row .row, .host-row .row { padding: 9px 12px; gap: 14px; }
+  .workspace-row:hover, .host-row:hover { background: color-mix(in srgb, var(--row-hover) 45%, transparent); }
+  .workspace-label { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
   .workspace-label .name { max-width: none; font-family: inherit; font-weight: 550; font-size: var(--text-md); }
   .workspace-label .path, .workspace-label .phase { flex: none; font-size: var(--text-xs); }
   /* One quiet line ("1 live session · 2m ago"), vertically centred with the
@@ -1931,15 +1988,39 @@
   .session-state.stale { color: var(--muted); }
   .session-state { font-size: var(--text-xs); color: var(--accent); }
   .workspace-meta .when { font-family: inherit; font-size: var(--text-xs); margin-left: 0; }
+  .live-slot { display: inline-grid; align-items: center; justify-items: end; }
+  .live-slot > * { grid-area: 1 / 1; }
+  /* End sessions replaces the live count in place: same size and type, no
+     chrome — it reads as the count turning into an action. The count must not
+     catch the pointer (an opacity:0 sibling would paint over the button). */
+  .live-slot .session-state { pointer-events: none; }
   .workspace-meta .side.stop {
-    display: none; visibility: visible; min-height: 0; height: 24px; padding: 0 8px; margin: -4px 0;
-    border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent); border-radius: 6px;
-    color: var(--warn); font-size: var(--text-xs); line-height: 1;
+    display: inline-flex; visibility: visible; opacity: 0; min-height: 0; padding: 0; margin: 0;
+    border: none; background: none; font-size: var(--text-xs); line-height: inherit; color: var(--warn);
+    text-decoration: underline; text-decoration-color: color-mix(in srgb, var(--warn) 40%, transparent); text-underline-offset: 3px;
+    white-space: nowrap;
   }
-  .workspace-row:hover .workspace-meta .session-state:not(.attention) { display: none; }
-  .workspace-row:hover .workspace-meta .side.stop { display: inline-flex; align-items: center; }
-  .workspace-row:hover .workspace-meta .session-state.attention + .side.stop { display: none; }
-  .workspace-meta .side.stop:hover { color: var(--err); border-color: color-mix(in srgb, var(--err) 55%, transparent); background: var(--row-active); }
+  .live-slot:hover .session-state, .live-slot:focus-within .session-state { opacity: 0; }
+  .live-slot:hover .side.stop, .live-slot:focus-within .side.stop { opacity: 1; }
+  /* One line per workspace: the path shows on hover/focus (or always when two
+     workspaces share a name). Opacity, not display, so rows never reflow. */
+  .workspace-row .workspace-label { flex-direction: row; align-items: baseline; gap: 12px; }
+  .workspace-row .workspace-label .name { flex: none; max-width: 60%; }
+  .workspace-row .workspace-label .path { flex: 1; opacity: 0; transition: opacity 0.12s ease; }
+  .workspace-row:hover .workspace-label .path, .workspace-row:focus-within .workspace-label .path, .workspace-label.dup .path { opacity: 1; }
+  /* Past the threshold the list scrolls in place, ending on a half row so the
+     scroll is visible; the remote machines stay below it. */
+  .workspaces .rows.scroll { max-height: 268px; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
+  .no-match { margin: 0; padding: 14px 12px; color: var(--muted); font-size: var(--text-sm); }
+  /* Same field as the Add-machine input, just narrower and quieter. */
+  .add-input.filter { flex: 0 1 180px; margin-left: auto; padding: 3px 9px; font-size: var(--text-xs); }
+  /* No hover on touch: the End sessions control replaces the count outright. */
+  @media (hover: none) {
+    .live-slot .session-state { opacity: 0; }
+    .live-slot .side.stop { opacity: 1; }
+    .workspace-row .workspace-label .path { opacity: 1; }
+  }
+  .workspace-meta .side.stop:hover { color: var(--err); text-decoration-color: currentColor; }
   .host-card { border: 1px solid var(--edge); border-radius: 10px; padding: 5px; }
   .remotes .rows { gap: 10px; }
   .host-name { display: flex; align-items: center; gap: 9px; min-width: 0; }
@@ -1947,7 +2028,7 @@
   .host-open { flex: none; font-size: var(--text-sm); color: var(--muted); }
   .host-open span { margin-left: 4px; }
   .host-row.connected, .workspace-row.live { background: transparent; }
-  .host-row.connected:hover, .workspace-row.live:hover { background: var(--row-hover); }
+  .host-row.connected:hover, .workspace-row.live:hover { background: color-mix(in srgb, var(--row-hover) 45%, transparent); }
   .remote-ws { margin: 0 9px 7px 26px; padding: 6px 0 0 12px; border-color: var(--edge); }
   .remote-ws .name { font-family: inherit; font-size: var(--text-sm); }
   .remote-ws .path, .remote-ws .when { font-size: var(--text-xs); }
@@ -1959,6 +2040,10 @@
   .offline-note { margin: 0 0 8px; font-size: var(--text-sm); line-height: 1.5; color: var(--muted); }
   .confirm { flex-wrap: wrap; min-height: 58px; }
   .confirm-label { min-width: 120px; line-height: 1.5; }
+  /* In the workspace list the confirm takes the row's own height, so asking
+     doesn't make the list jump. */
+  .workspaces .confirm { min-height: 0; padding: 9px 12px; }
+  .workspaces .confirm-yes, .workspaces .confirm-no { padding-block: 1px; }
   .add { padding: 10px 0; flex-wrap: wrap; }
   .add-input { min-width: 160px; min-height: 34px; }
   .side { min-height: 30px; }

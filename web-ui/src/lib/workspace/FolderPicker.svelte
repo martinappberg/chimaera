@@ -20,11 +20,16 @@
     /** A workspace was opened in THIS window. */
     onOpened: (w: Workspace) => void;
     onClose: () => void;
+    /** Present inside a workspace: adds a "Home" row that returns to the
+     *  workspace launcher (the caller decides how — it must not close this
+     *  window's workspace out from under the user). */
+    onHome?: () => void;
   }
 
-  let { recents, onOpened, onClose }: Props = $props();
+  let { recents, onOpened, onClose, onHome }: Props = $props();
 
   type Row =
+    | { kind: "home" }
     | { kind: "recent"; ws: Workspace }
     | { kind: "here"; path: string }
     | { kind: "dir"; dir: DirEntry }
@@ -42,6 +47,9 @@
   let busy = false;
 
   const showRecents = $derived(!navigated && input === "" && recents.length > 0);
+  /** The Home row leads the list until the user starts filtering or browsing. */
+  const showHome = $derived(onHome !== undefined && !navigated && input === "");
+  const homeOffset = $derived(showHome ? 1 : 0);
   /** An absolute (or ~) path typed into the filter: the "open this folder"
    *  row acts on IT, not on the breadcrumb directory. */
   const typedPath = $derived.by((): string | null => {
@@ -116,6 +124,7 @@
 
   const rows = $derived.by((): Row[] => {
     const out: Row[] = [];
+    if (showHome) out.push({ kind: "home" });
     if (showRecents) {
       for (const ws of recents) out.push({ kind: "recent", ws });
     }
@@ -129,7 +138,7 @@
     }
     return out;
   });
-  const browseOffset = $derived(showRecents ? recents.length : 0);
+  const browseOffset = $derived(homeOffset + (showRecents ? recents.length : 0));
   const crumbs = $derived.by((): { name: string; path: string }[] => {
     if (listing === null) return [];
     const out: { name: string; path: string }[] = [];
@@ -145,6 +154,8 @@
   function rowPath(row: Row | undefined): string | null {
     if (row === undefined) return listing?.path ?? null;
     switch (row.kind) {
+      case "home":
+        return null; // not a folder — Enter goes Home
       case "recent":
         return row.ws.root;
       case "here":
@@ -158,7 +169,7 @@
 
   function resetHighlight(): void {
     if (showRecents) {
-      highlight = 0;
+      highlight = homeOffset; // the first recent, not Home: a stray Enter keeps its old meaning
       return;
     }
     // When completing a path, prefer an exact match of the typed segment so
@@ -179,7 +190,8 @@
     // Else the first subdirectory (Enter descends); fall back to "open this
     // folder" when nothing matches.
     const firstDir = rows.findIndex((r) => r.kind === "dir");
-    highlight = firstDir >= 0 ? firstDir : 0;
+    // Never default onto the Home row: a stray Enter keeps its old meaning.
+    highlight = firstDir >= 0 ? firstDir : homeOffset;
   }
 
   async function browse(path: string): Promise<boolean> {
@@ -329,6 +341,10 @@
     } else if (e.key === "Enter") {
       e.preventDefault();
       const row = rows[highlight];
+      if (row?.kind === "home") {
+        onHome?.();
+        return;
+      }
       // The tail row is a mode switch, with or without modifiers.
       if (row?.kind === "newfolder") {
         startCreate();
@@ -488,15 +504,33 @@
       {#if error !== null}
         <div class="error">{error}</div>
       {/if}
+      {#if showHome}
+        <div
+          class="rowwrap home-row"
+          role="presentation"
+          class:hl={highlight === 0}
+          data-idx={0}
+          onmouseenter={() => (highlight = 0)}
+        >
+          <button class="row" tabindex="-1" onmousedown={keepFocus} onclick={() => onHome?.()}>
+            <svg class="home-ico" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+              <path d="M2.5 7.5 8 3l5.5 4.5M4 6.7V13h3v-3.5h2V13h3V6.7" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+            <span class="name here-label">Home</span>
+            <span class="home-hint">all workspaces</span>
+          </button>
+        </div>
+      {/if}
       {#if showRecents}
         <div class="section">recent</div>
         {#each recents as ws, i (ws.id)}
+          {@const ri = i + homeOffset}
           <div
             class="rowwrap"
             role="presentation"
-            class:hl={highlight === i}
-            data-idx={i}
-            onmouseenter={() => (highlight = i)}
+            class:hl={highlight === ri}
+            data-idx={ri}
+            onmouseenter={() => (highlight = ri)}
           >
             <button
               class="row"
@@ -839,4 +873,8 @@
   .rowwrap.hl .side {
     display: block;
   }
+
+  .home-ico { flex: none; color: var(--muted); }
+  .home-row.hl .home-ico { color: var(--fg); }
+  .home-hint { margin-left: auto; font-size: var(--text-xs); color: var(--muted); }
 </style>

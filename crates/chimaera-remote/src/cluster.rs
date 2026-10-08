@@ -1735,8 +1735,7 @@ fn spawn_attached_inner(
 /// why. Reads both pipes to their end (a full pipe would stall srun); `echo`
 /// also passes each line to this process's stderr (the CLI's terminal).
 pub fn attached_output(child: &mut Child, echo: bool) -> Arc<Mutex<VecDeque<String>>> {
-    const KEEP: usize = 8;
-    let tail = Arc::new(Mutex::new(VecDeque::with_capacity(KEEP)));
+    let tail = Arc::new(Mutex::new(VecDeque::with_capacity(ATTACHED_TAIL_LINES)));
     let pipes: [Option<Box<dyn tokio::io::AsyncRead + Unpin + Send>>; 2] = [
         child.stdout.take().map(|p| Box::new(p) as _),
         child.stderr.take().map(|p| Box::new(p) as _),
@@ -1748,15 +1747,26 @@ pub fn attached_output(child: &mut Child, echo: bool) -> Arc<Mutex<VecDeque<Stri
     tail
 }
 
-/// An attached process may never print a newline, or print invalid UTF-8.
-/// Keep a bounded prefix of each line while still draining its entire stream.
+/// How many of an attached job's last lines `attached_output` keeps.
+const ATTACHED_TAIL_LINES: usize = 8;
+/// The most of one line that is kept; the rest of it is still drained.
 const ATTACHED_LINE_BYTES: usize = 4096;
+
+/// Read `pipe` to its end, keeping its last `ATTACHED_TAIL_LINES` lines in
+/// `tail`. An attached process may never print a newline, may print invalid
+/// UTF-8, or may redraw one line with carriage returns, so this reads raw
+/// blocks rather than `lines()`: a line keeps at most `ATTACHED_LINE_BYTES`,
+/// bytes decode lossily, and `\r` ends a line like `\n` does (so the last
+/// redraw is the one kept, and a pty's `\r\n` still yields one line). Nothing
+/// here may panic or return while the pipe is open: an unread pipe fills and
+/// stalls srun.
 async fn drain_attached<R>(mut pipe: R, tail: Arc<Mutex<VecDeque<String>>>, echo: bool)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
+    use std::io::Write as _;
     use tokio::io::AsyncReadExt;
-    let mut block = [0; 4096];
+    let mut block = [0; ATTACHED_LINE_BYTES];
     let mut line = Vec::with_capacity(ATTACHED_LINE_BYTES);
     let emit = |line: &[u8]| {
         let text = plain_line(&String::from_utf8_lossy(line));
@@ -1764,31 +1774,36 @@ where
             return;
         }
         if echo {
-            eprintln!("{text}");
+            // Not `eprintln!`: with stderr's reader gone (`2>&1 | head`) it
+            // panics, which would end this task and leave the pipe unread.
+            let _ = writeln!(std::io::stderr().lock(), "{text}");
         }
         let mut tail = tail.lock().unwrap_or_else(|p| p.into_inner());
-        if tail.len() == 8 {
+        if tail.len() >= ATTACHED_TAIL_LINES {
             tail.pop_front();
         }
         tail.push_back(text.chars().take(300).collect());
     };
     loop {
-        match pipe.read(&mut block).await {
-            Ok(0) | Err(_) => {
-                if !line.is_empty() {
-                    emit(&line);
-                }
-                return;
+        let count = match pipe.read(&mut block).await {
+            Ok(count) => count,
+            Err(err) => {
+                tracing::debug!(%err, "an attached job's output pipe failed before its end");
+                0
             }
-            Ok(count) => {
-                for byte in &block[..count] {
-                    if *byte == b'\n' {
-                        emit(&line);
-                        line.clear();
-                    } else if line.len() < ATTACHED_LINE_BYTES {
-                        line.push(*byte);
-                    }
-                }
+        };
+        if count == 0 {
+            if !line.is_empty() {
+                emit(&line);
+            }
+            return;
+        }
+        for byte in &block[..count] {
+            if matches!(byte, b'\n' | b'\r') {
+                emit(&line);
+                line.clear();
+            } else if line.len() < ATTACHED_LINE_BYTES {
+                line.push(*byte);
             }
         }
     }
@@ -3851,6 +3866,22 @@ mod tests {
         assert_eq!(tail[0], "x".repeat(300));
         assert_eq!(tail[1], "\u{fffd} malformed");
         assert_eq!(tail[2], "next line");
+    }
+
+    #[tokio::test]
+    async fn attached_output_keeps_the_last_redraw_of_a_carriage_return_line() {
+        let tail = Arc::new(Mutex::new(VecDeque::new()));
+        drain_attached(
+            &b"srun: job 7 queued\r\n 10%\r 50%\r100%\r\nsrun: error: x\r\n"[..],
+            tail.clone(),
+            false,
+        )
+        .await;
+        let tail = tail.lock().unwrap();
+        assert_eq!(
+            tail.iter().cloned().collect::<Vec<_>>(),
+            ["srun: job 7 queued", "10%", "50%", "100%", "srun: error: x"]
+        );
     }
 
     #[test]

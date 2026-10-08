@@ -106,7 +106,7 @@
     </span>
     <span class="title">{title}</span>
     {#if block.stats !== null}
-      <span class="stats">{block.stats}</span>
+      <span class="stats" title={block.stats}>{block.stats}</span>
     {/if}
     {#if expandable}
       <Chevron {open} />
@@ -203,8 +203,13 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  /* The CLI's close sentence can quote a whole command line; it gives way
+     (ellipsis) well before the title does. */
   .stats {
-    flex: none;
+    flex: 0 100 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
     color: color-mix(in srgb, var(--muted) 75%, transparent);
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
