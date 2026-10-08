@@ -21,13 +21,14 @@ describe("transfer pick-up notes", () => {
     expect(pickUp).toMatchObject({ kind: "user", origin: "moved", text: MOVED, sentAtMs: 5_000 });
     expect(recovered).toMatchObject({ kind: "user", origin: "recovered", sentAtMs: 9_000 });
     // Only the daemon's own transfer rows become notes.
-    for (const origin of ["moved", "home", "recovered"]) expect(isTransferOrigin(origin)).toBe(true);
+    for (const origin of ["moved", "home", "recovered", "returning"]) expect(isTransferOrigin(origin)).toBe(true);
     for (const origin of ["remote", "restart", "worker", null]) expect(isTransferOrigin(origin)).toBe(false);
   });
 
   it("says where the conversation went, keyed by its origin tag", () => {
     expect(transferNote("moved", MOVED)).toBe("Continued in the cloud");
     expect(transferNote("home", MOVED)).toBe("Back on your computer");
+    expect(transferNote("returning", "Chimaera is moving this conversation back to the user's computer now.")).toBe("Going back to your computer");
     // A recovery is its own tag now: the text no longer decides it.
     expect(transferNote("moved", RECOVERED)).toBe("Continued in the cloud");
     expect(transferNote("recovered", RECOVERED)).toBe("Continued in the cloud after this computer stopped responding");

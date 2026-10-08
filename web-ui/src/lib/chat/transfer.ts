@@ -2,19 +2,20 @@
  * The daemon's transfer pick-up: when a conversation arrives on another
  * machine with work cut off, the receiving daemon sends the agent a message
  * it wrote itself, tagged by origin — `moved` (into the cloud), `home` (back
- * on this computer), or `recovered` (either direction, when the other
- * machine stopped responding and the conversation continues from its last
- * saved point). Its text is for the agent — where it runs now, what to
+ * on this computer), `recovered` (either direction, when the other machine
+ * stopped responding and the conversation continues from its last saved
+ * point), or `returning` (the one sentence the cloud sends a conversation it
+ * is about to stop, before it goes back to the computer). Its text is for the agent — where it runs now, what to
  * re-check — so the transcript shows a one-line note of what happened and
  * keeps the text behind a disclosure. A surface that holds only the text (the
  * Timeline records a turn's prompt, not the message's origin tag) recognises
  * the pick-up from its opening words with {@link pickupNote}.
  */
 
-export type TransferOrigin = "moved" | "home" | "recovered";
+export type TransferOrigin = "moved" | "home" | "recovered" | "returning";
 
 export function isTransferOrigin(origin: string | null): origin is TransferOrigin {
-  return origin === "moved" || origin === "home" || origin === "recovered";
+  return origin === "moved" || origin === "home" || origin === "recovered" || origin === "returning";
 }
 
 /** The origin tag carries no direction for a recovery; the daemon's own
@@ -30,6 +31,7 @@ const HOMEWARD = "back to the user's computer";
 export function transferNote(origin: TransferOrigin, text: string, viewer = false): string {
   if (origin === "home") return "Back on your computer";
   if (origin === "moved") return "Continued in the cloud";
+  if (origin === "returning") return "Going back to your computer";
   if (text.includes(HOMEWARD)) return "Back on your computer after the cloud stopped responding";
   return `Continued in the cloud after ${viewer ? "your" : "this"} computer stopped responding`;
 }
