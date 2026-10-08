@@ -122,7 +122,10 @@ conversation. All four chat providers retain their native resume handle through 
   process (`chimaera-agent` `reaper.rs`) notices the daemon's pipe close, SIGTERMs each chat agent and
   two seconds later kills every process group of the agents and their descendants, detached shells
   included; and the next daemon on that host stops any agent it recorded that still runs before
-  anything resumes. The ledger's last reconcile (≤ 5 s old) still carries what the process held. A
+  anything resumes. Measured with Claude Code 2.1.294 running a background `while true` loop: after
+  `kill -9` of the daemon the loop stopped within 0.6 s and claude within 2.4 s (before this change
+  both kept running, reparented to launchd); with the watcher killed too, the next daemon stopped them
+  2.6 s after it started, before the chat resumed. The ledger's last reconcile (≤ 5 s old) still carries what the process held. A
   permission prompt the restart cut off is named in the pick-up as not run, and a pick-up turn that
   fails at once with a known transient agent error (a sign-in refresh race), or whose process exits
   before answering, is tried once more after 5 s. TUI sessions are out of scope —
