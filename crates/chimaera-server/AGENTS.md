@@ -375,7 +375,9 @@ the lifecycle, keep them consistent:
   off and the conversation resumed, one `origin: "restart"` message to the
   agent (`pickup_message`: gated by `chat.resumeAfterRestart`, never to a
   Mastermind, never in a cluster workspace job (jobs resume idle), and withheld within 10 min of the chat's last pick-up so a
-  crash loop can't bill a turn per crash).
+  crash loop can't bill a turn per crash). A permission the turn was parked on
+  (`Carryover.awaiting_approval`) is named in the pick-up as not run, so the
+  agent makes the call again (`approval_note`).
   Transfer restore similarly sends a `moved`/`home` pickup (`recovered`, either
   way, when it continues from the last saved point after the other machine
   stopped responding; `chat::transfer_origin`) only for captured

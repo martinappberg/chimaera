@@ -4081,9 +4081,9 @@ fn restart_message(carry: &chimaera_agent::Carryover) -> Option<String> {
          was resumed in a new agent process.",
     );
     if carry.background.is_empty() {
-        text.push_str(
-            " Your last turn was cut off before it finished. Continue where you left off.",
-        );
+        text.push_str(" Your last turn was cut off before it finished.");
+        text.push_str(&approval_note(carry));
+        text.push_str(" Continue where you left off.");
         return Some(text);
     }
     text.push_str(" Background work the previous process was running stopped with it:\n");
@@ -4112,8 +4112,10 @@ fn restart_message(carry: &chimaera_agent::Carryover) -> Option<String> {
     // Restoring is the default: offered a free choice ("whichever you still
     // need"), a live Haiku just acknowledged and restarted nothing.
     if carry.turn_in_flight {
+        text.push_str("\n\nYour last turn was also cut off before it finished.");
+        text.push_str(&approval_note(carry));
         text.push_str(
-            "\n\nYour last turn was also cut off before it finished.\n\nRestart each of \
+            "\n\nRestart each of \
              these the same way you started it, unless it is clearly no longer needed (say \
              which you skipped), then continue where you left off.",
         );
@@ -4124,6 +4126,29 @@ fn restart_message(carry: &chimaera_agent::Carryover) -> Option<String> {
         );
     }
     Some(text)
+}
+
+/// A permission the restart or move cut off: the call never ran, so the agent
+/// makes it again if it still needs it, and the user is asked again whenever
+/// its permissions require that. Empty when no permission was open.
+fn approval_note(carry: &chimaera_agent::Carryover) -> String {
+    let Some(waiting) = &carry.awaiting_approval else {
+        return String::new();
+    };
+    let title = waiting
+        .title
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let call = waiting
+        .tool_call_id
+        .as_deref()
+        .map(|id| format!(" (tool call {id})"))
+        .unwrap_or_default();
+    format!(
+        " The interrupted turn was waiting for the user's permission to run {title}{call}, and \
+         that call was not run: if it is still needed, make the call again."
+    )
 }
 
 /// Only interrupted work needs a transfer pick-up turn. Idle conversations keep
@@ -4209,6 +4234,7 @@ fn transfer_context(
                 " Your previous process and its background work stopped during the move: \
                  continue the interrupted task, and restart background work that is still needed.",
             );
+            text.push_str(&approval_note(carry));
         }
         for task in carry.background.iter().take(32) {
             text.push_str(&format!("\nBackground task: {}", task.description));
@@ -5904,6 +5930,37 @@ mod tests {
         let recovered = handoff_message("home", Some(&both), true, true).expect("recovery");
         assert!(recovered.contains("back to the user's computer because"));
         assert!(recovered.contains("Background task: Watch CI for PR 158"));
+    }
+
+    /// A permission prompt the move or restart cut off is named, with its
+    /// tool call, as not run; the agent asks again rather than guessing. A
+    /// recovery from a saved point cannot know whether it was answered, so
+    /// it says nothing of it.
+    #[test]
+    fn pickups_say_an_open_permission_was_not_run() {
+        let carry: chimaera_agent::Carryover = serde_json::from_value(serde_json::json!({
+            "turn_in_flight": true,
+            "awaiting_approval": {"title": "Bash", "tool_call_id": "toolu_9"}
+        }))
+        .unwrap();
+        let said = "permission to run Bash (tool call toolu_9), and that call was not run";
+        for origin in ["moved", "home"] {
+            let text = handoff_message(origin, Some(&carry), false, false).unwrap();
+            assert!(text.contains(said), "{text}");
+            let recovered = handoff_message(origin, Some(&carry), true, false).unwrap();
+            assert!(!recovered.contains("was not run"), "{recovered}");
+        }
+        let restarted = restart_message(&carry).unwrap();
+        assert!(restarted.contains(said), "{restarted}");
+        assert!(
+            restarted.ends_with("Continue where you left off."),
+            "{restarted}"
+        );
+        let idle = chimaera_agent::Carryover {
+            turn_in_flight: true,
+            ..Default::default()
+        };
+        assert!(!restart_message(&idle).unwrap().contains("was not run"));
     }
 
     /// The tag the UI keys its divider on: the direction, and whether the

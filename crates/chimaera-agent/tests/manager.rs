@@ -307,6 +307,12 @@ async fn full_turn_with_permission_allow_and_gap_replay() {
         fx.manager.get("s-1").unwrap().pending_permission,
         "info tracks the outstanding permission"
     );
+    let waiting = fx.manager.carryover("s-1").unwrap().awaiting_approval;
+    assert_eq!(
+        waiting.map(|w| (w.title, w.tool_call_id)),
+        Some(("Bash".to_string(), Some("tu-1".to_string()))),
+        "a stop now carries the open permission to the successor"
+    );
 
     fx.manager
         .command(
@@ -328,6 +334,12 @@ async fn full_turn_with_permission_allow_and_gap_replay() {
         matches!(ev, AgentEvent::PermissionResolved { .. })
     })
     .await;
+    assert!(fx
+        .manager
+        .carryover("s-1")
+        .unwrap()
+        .awaiting_approval
+        .is_none());
     wait_for(&mut rx, &mut seen, "ToolCallUpdate completed", |ev| {
         matches!(
             ev,

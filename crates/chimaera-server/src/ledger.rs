@@ -1335,6 +1335,7 @@ mod tests {
                 monitor: true,
             }],
             pickup_at_ms: 1_790_000_000_000,
+            awaiting_approval: None,
         });
         let entries = vec![
             shell_entry(),

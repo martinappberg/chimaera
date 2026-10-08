@@ -550,6 +550,22 @@ pub struct Carryover {
     /// LOOP from a series of updates, since each pick-up starts a billed turn.
     #[serde(default, skip_serializing_if = "is_zero_ms")]
     pub pickup_at_ms: u64,
+    /// The tool call the turn was parked on, waiting for the user's
+    /// permission: it never ran. A successor tells the agent so, and the
+    /// agent asks again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub awaiting_approval: Option<CarriedApproval>,
+}
+
+/// A permission request still open: its title as the card showed it (the
+/// tool's name for claude) and the tool call it gates.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CarriedApproval {
+    #[serde(skip)]
+    request_id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 fn is_zero_ms(ms: &u64) -> bool {
@@ -594,6 +610,29 @@ impl Carryover {
             AgentEvent::TurnStarted { .. } => self.turn_in_flight = true,
             AgentEvent::TurnCompleted { .. } | AgentEvent::TurnAborted { .. } => {
                 self.turn_in_flight = false;
+                self.awaiting_approval = None;
+            }
+            AgentEvent::PermissionRequest {
+                request_id,
+                tool_call_id,
+                title,
+                ..
+            } => {
+                self.awaiting_approval = Some(CarriedApproval {
+                    request_id: request_id.clone(),
+                    title: model::truncate_label(title, model::BG_LABEL_MAX),
+                    tool_call_id: tool_call_id
+                        .as_deref()
+                        .map(|id| model::truncate_label(id, model::BG_LABEL_MAX)),
+                });
+            }
+            AgentEvent::PermissionResolved { request_id, .. }
+                if self
+                    .awaiting_approval
+                    .as_ref()
+                    .is_some_and(|a| &a.request_id == request_id) =>
+            {
+                self.awaiting_approval = None;
             }
             AgentEvent::BackgroundTasks { tasks, .. } => {
                 self.background = tasks
@@ -2705,6 +2744,62 @@ mod tests {
 
         carry.observe(&AgentEvent::Exited { status: Some(0) });
         assert_eq!(carry, Carryover::default(), "nothing outlives the process");
+    }
+
+    /// A permission still open is carried (title and tool call, never the
+    /// request id, which means nothing to another process); answering it or
+    /// ending the turn clears it.
+    #[test]
+    fn carryover_records_the_approval_a_turn_is_waiting_on() {
+        let ask = |request: &str| AgentEvent::PermissionRequest {
+            request_id: request.into(),
+            tool_call_id: Some("toolu_1".into()),
+            title: "Bash".into(),
+            options: Vec::new(),
+            input_preview: serde_json::json!({"command": "make"}),
+            plan: None,
+        };
+        let mut carry = Carryover::default();
+        carry.observe(&AgentEvent::TurnStarted {
+            turn_id: "t1".into(),
+        });
+        carry.observe(&ask("r1"));
+        let waiting = carry.awaiting_approval.clone().expect("open permission");
+        assert_eq!(
+            (waiting.title.as_str(), waiting.tool_call_id.as_deref()),
+            ("Bash", Some("toolu_1"))
+        );
+        let wire = serde_json::to_value(&carry).unwrap();
+        assert_eq!(
+            wire["awaiting_approval"],
+            serde_json::json!({"title": "Bash", "tool_call_id": "toolu_1"})
+        );
+        let back: Carryover = serde_json::from_value(wire).unwrap();
+        assert_eq!(back.awaiting_approval.unwrap().title, "Bash");
+
+        carry.observe(&AgentEvent::PermissionResolved {
+            request_id: "other".into(),
+            option_id: "allow".into(),
+        });
+        assert!(carry.awaiting_approval.is_some(), "another answer keeps it");
+        carry.observe(&AgentEvent::PermissionResolved {
+            request_id: "r1".into(),
+            option_id: "allow".into(),
+        });
+        assert!(carry.awaiting_approval.is_none());
+
+        carry.observe(&ask("r2"));
+        carry.observe(&AgentEvent::TurnAborted {
+            turn_id: "t1".into(),
+            reason: "interrupted".into(),
+            interrupted: true,
+        });
+        assert!(carry.awaiting_approval.is_none(), "a turn end clears it");
+        assert_eq!(
+            serde_json::to_value(Carryover::default()).unwrap(),
+            serde_json::json!({}),
+            "an idle carryover serializes as before"
+        );
     }
 
     /// Every daemon pick-up (restart, move, return, and the recovery after
