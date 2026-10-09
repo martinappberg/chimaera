@@ -75,6 +75,10 @@
     onHostsChanged: () => void;
     /** Connection placement and recovery, available from the local Home hub. */
     onConnectionSettings?: () => void;
+    /** A job window's Start again: open the start sheet for this workspace,
+     *  set up like the job (by Slurm id) that ended, once the page has read
+     *  the cluster. */
+    startAgain?: { workspace: string; slurmJobId: string } | null;
   }
 
   let {
@@ -86,6 +90,7 @@
     onHere,
     onHostsChanged,
     onConnectionSettings,
+    startAgain = null,
   }: Props = $props();
 
   const entry = $derived(clusterOverviews.entry(alias));
@@ -266,6 +271,15 @@
   function startSheet(preselect: string[], spec: LaunchSpec | null = null): void {
     sheet = { kind: "start", preselect, spec };
   }
+
+  // Start again from a job window: once, when the overview first lands.
+  let startedAgain = false;
+  $effect(() => {
+    if (startAgain === null || overview === null || startedAgain) return;
+    startedAgain = true;
+    const from = overview.jobs.find((j) => j.slurm_job_id === startAgain.slurmJobId);
+    untrack(() => startSheet([startAgain.workspace], from?.spec ?? null));
+  });
 
   /** Open: where it's open (this window's own workspace: back to it here).
    *  Anywhere else is your pick — a running job, when a waiting one starts,

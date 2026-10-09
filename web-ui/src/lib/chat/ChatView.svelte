@@ -23,6 +23,8 @@
   import { canOpenOnboarding, cloudOnboarding } from "../pro/onboarding.svelte";
   import BranchChip from "../shared/BranchChip.svelte";
   import { openBranchChanges } from "../workspace/git";
+  import { windowJobEnd } from "../workspace/jobEnd";
+  import { endedScreenWords } from "../workspace/cluster";
   import {
     acquireChat,
     releaseChat,
@@ -3407,8 +3409,14 @@
     {#if store.degraded}
       <div class="notice">continued in terminal — this pane will switch</div>
     {:else if store.exited !== null && !continuing}
+      <!-- In a cluster job window whose job ended, the agent stopped because
+           the job did: say that, not an agent exit status. -->
       <div class="notice">
-        agent exited{store.exited.status !== null ? ` (status ${store.exited.status})` : ""}
+        {#if $windowJobEnd !== null}
+          {endedScreenWords($windowJobEnd.reason)}
+        {:else}
+          agent exited{store.exited.status !== null ? ` (status ${store.exited.status})` : ""}
+        {/if}
       </div>
     {/if}
 
