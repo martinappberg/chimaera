@@ -1734,7 +1734,10 @@ async fn scoped_events(mut socket: WebSocket, state: Arc<AppState>, scope: Socke
     state.wait_restored().await;
     let alias = match scope.alias(&state) {
         Ok(alias) => alias,
-        Err(_) => return,
+        Err(_) => {
+            scope_changed(&mut socket).await;
+            return;
+        }
     };
     let mut watch = crate::git::WatchGuard::new(state.clone());
     watch.set(Some(scope.workspace_id.clone()));
@@ -1821,14 +1824,19 @@ async fn scoped_events(mut socket: WebSocket, state: Arc<AppState>, scope: Socke
             message = socket.recv() => match message {
                 Some(Ok(Message::Text(text))) => {
                     if let Ok(ClientMessage::Watch {workspace_id, files: mut wanted_files, mut dirs, git_repos: _}) = serde_json::from_str(&text) {
-                        if workspace_id.as_deref().is_some_and(|id| id != scope.workspace_id) { return; }
+                        if workspace_id.as_deref().is_some_and(|id| id != scope.workspace_id) {
+                            let _ = socket.send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                                code: axum::extract::ws::close_code::POLICY,
+                                reason: "workspace_mismatch".into(),
+                            }))).await;
+                            return;
+                        }
                         if let Some(alias)=&alias { for path in wanted_files.iter_mut().chain(dirs.iter_mut()) { *path=alias.input(path); } }
                         // A path this viewer may not read is dropped, never a
                         // reason to close: its window watches that one itself.
                         let (wanted_files, dirs) = readable_watch(&state, &scope, wanted_files, dirs).await;
                         if scope.validate(&state).is_err() { scope_changed(&mut socket).await; return; }
                         files.set(wanted_files,dirs);
-                        tokio::time::sleep(EVENTS_THROTTLE).await;
                     }
                 },
                 Some(Ok(Message::Ping(payload))) => { if socket.send(Message::Pong(payload)).await.is_err() { return; } },
@@ -1836,6 +1844,9 @@ async fn scoped_events(mut socket: WebSocket, state: Arc<AppState>, scope: Socke
                 _ => {},
             },
         }
+        // Every client frame wakes a full pass; a burst of them must not
+        // turn into back-to-back passes (the unscoped loop throttles alike).
+        tokio::time::sleep(EVENTS_THROTTLE).await;
     }
 }
 
