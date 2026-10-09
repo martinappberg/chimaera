@@ -531,7 +531,14 @@ pub(crate) async fn detect_tools(bindir: Option<&Path>) -> Option<Detection> {
         return Some(Detection::None);
     }
     let shell = chimaera_core::login_shell();
-    let out = run_capped(&shell, &["-lc".into(), "printf %s \"$PATH\"".into()]).await;
+    let mut cmd = tokio::process::Command::new(&shell);
+    cmd.args(["-lc", "printf %s \"$PATH\""]);
+    // A login shell's own process group, killed whole: rc helpers must not
+    // outlive the probe (see `launcher::probe_output`).
+    let out = crate::launcher::probe_output(&mut cmd, CMD_TIMEOUT)
+        .await
+        .filter(|out| out.success)
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned());
     let Some(path) = out else {
         tracing::warn!("login-shell PATH probe failed; scheduler detection will retry");
         return None;

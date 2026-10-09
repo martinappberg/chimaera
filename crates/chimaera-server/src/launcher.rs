@@ -343,6 +343,27 @@ fn well_known_agent_paths(bin: &str, home: Option<&Path>) -> Vec<PathBuf> {
     out
 }
 
+/// One short probe (a login shell's `command -v`, a CLI's `--version`) run to
+/// completion or `limit`, `None` on any failure. The probe gets its own
+/// process group, killed whole when its leader exits or when this future is
+/// dropped (timeout, daemon shutdown): an interactive rc (nvm, prompt
+/// frameworks) or a node-backed CLI leaves helpers behind that `kill_on_drop`
+/// (the leader alone) never reaches, and they'd outlive the daemon in its
+/// own process group. [`crate::process::Child`] keeps the leader unreaped
+/// until the group is signalled, so the group id can't have been reused.
+pub(crate) async fn probe_output(
+    cmd: &mut tokio::process::Command,
+    limit: Duration,
+) -> Option<crate::process::Output> {
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    tokio::time::timeout(limit, crate::process::output(cmd))
+        .await
+        .ok()?
+        .ok()
+}
+
 /// Timeout for the login-shell resolution probe. An interactive rc can be
 /// slow (completion init, prompt frameworks) or, pathologically, block on
 /// input; the well-known-path and managed fallbacks backstop a timeout, so
@@ -357,17 +378,10 @@ const SHELL_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
 /// tolerated (last non-empty stdout line is the path); stdin is `/dev/null`
 /// and a timeout backstops a slow or input-reading rc.
 async fn resolve_via_login_shell(shell: &str, bin: &str) -> Option<PathBuf> {
-    let output = tokio::process::Command::new(shell)
-        .arg("-ilc")
-        .arg(format!("command -v {bin}"))
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .output();
-    let out = tokio::time::timeout(SHELL_PROBE_TIMEOUT, output)
-        .await
-        .ok()?
-        .ok()?;
-    if !out.status.success() {
+    let mut cmd = tokio::process::Command::new(shell);
+    cmd.arg("-ilc").arg(format!("command -v {bin}"));
+    let out = probe_output(&mut cmd, SHELL_PROBE_TIMEOUT).await?;
+    if !out.success {
         return None;
     }
     let path = String::from_utf8_lossy(&out.stdout)
@@ -475,16 +489,10 @@ const VERSION_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// First non-empty line of `<bin> --version`, or `None` on any failure.
 pub(crate) async fn probe_version(bin: &Path) -> Option<String> {
-    let output = tokio::process::Command::new(bin)
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .output();
-    let out = tokio::time::timeout(VERSION_TIMEOUT, output)
-        .await
-        .ok()?
-        .ok()?;
-    if !out.status.success() {
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.arg("--version");
+    let out = probe_output(&mut cmd, VERSION_TIMEOUT).await?;
+    if !out.success {
         return None;
     }
     String::from_utf8_lossy(&out.stdout)
@@ -2262,5 +2270,85 @@ mod tests {
         assert!(install_command(AgentKind::Claude).starts_with("curl "));
         assert!(install_command(AgentKind::Codex).contains("npm install -g @openai/codex"));
         assert!(install_command(AgentKind::Gemini).contains("npm install -g @google/gemini-cli"));
+    }
+
+    /// A stand-in login shell: backgrounds a sleeping helper the way a slow
+    /// rc does, records the helper's pid, then runs `tail` (print a path and
+    /// exit, or hang).
+    #[cfg(unix)]
+    fn fake_login_shell(name: &str, tail: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("chim-probe-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("helper");
+        let script = dir.join("sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nsleep 30 &\necho $! > '{}'\n{tail}\n",
+                pidfile.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (script, pidfile)
+    }
+
+    /// The rc's helper must be gone within ~2 s (killed, then reaped by
+    /// init once orphaned): nothing the probe started outlives it.
+    #[cfg(unix)]
+    async fn assert_helper_gone(pidfile: &Path) {
+        let pid: i32 = std::fs::read_to_string(pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let pid = nix::unistd::Pid::from_raw(pid);
+        for _ in 0..40 {
+            if nix::sys::signal::kill(pid, None) == Err(nix::errno::Errno::ESRCH) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+        panic!("the probe's helper {pid} outlived it");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_login_shell_probe_leaves_no_helper_behind() {
+        let (shell, pidfile) = fake_login_shell("done", "echo /bin/sh");
+        let found = tokio::time::timeout(
+            Duration::from_secs(3),
+            resolve_via_login_shell(shell.to_str().unwrap(), "sh"),
+        )
+        .await
+        .expect("a backgrounded helper holding stdout must not stall the probe");
+        assert_eq!(found, Some(PathBuf::from("/bin/sh")));
+        assert_helper_gone(&pidfile).await;
+        let _ = std::fs::remove_dir_all(shell.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_abandoned_login_shell_probe_kills_its_whole_group() {
+        let (shell, pidfile) = fake_login_shell("hang", "sleep 30");
+        // Dropping the probe mid-flight, once its rc has started the helper,
+        // is what daemon shutdown does.
+        let mut probe = Box::pin(resolve_via_login_shell(shell.to_str().unwrap(), "sh"));
+        let started = async {
+            while !std::fs::read_to_string(&pidfile).is_ok_and(|s| s.ends_with('\n')) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::select! {
+            _ = &mut probe => panic!("a hanging login shell must not answer"),
+            started = tokio::time::timeout(Duration::from_secs(5), started) => {
+                started.expect("the fake rc never started its helper");
+            }
+        }
+        drop(probe);
+        assert_helper_gone(&pidfile).await;
+        let _ = std::fs::remove_dir_all(shell.parent().unwrap());
     }
 }

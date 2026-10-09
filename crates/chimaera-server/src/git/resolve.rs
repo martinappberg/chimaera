@@ -1,5 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 
 use serde_json::json;
@@ -102,17 +101,12 @@ pub(super) async fn resolve_git_binary(configured: Option<String>) -> GitBinary 
 /// GUI-launched daemon resolves git the same way a terminal would.
 async fn login_shell_git() -> Option<PathBuf> {
     let shell = chimaera_core::login_shell();
-    let output = tokio::process::Command::new(&shell)
-        .arg("-ilc")
-        .arg("command -v git")
-        .stdin(Stdio::null())
-        .kill_on_drop(true)
-        .output();
-    let out = tokio::time::timeout(Duration::from_secs(5), output)
-        .await
-        .ok()?
-        .ok()?;
-    if !out.status.success() {
+    let mut cmd = tokio::process::Command::new(&shell);
+    cmd.arg("-ilc").arg("command -v git");
+    // Its own process group, killed whole: an rc's helpers must not outlive
+    // the probe (see `launcher::probe_output`).
+    let out = crate::launcher::probe_output(&mut cmd, Duration::from_secs(5)).await?;
+    if !out.success {
         return None;
     }
     // Login shells may print banners; the path is the last non-empty line.
@@ -127,16 +121,10 @@ async fn login_shell_git() -> Option<PathBuf> {
 
 /// First non-empty line of `<bin> --version`, or `None` if it cannot run.
 async fn probe_git_version(bin: &Path) -> Option<String> {
-    let output = tokio::process::Command::new(bin)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .kill_on_drop(true)
-        .output();
-    let out = tokio::time::timeout(Duration::from_secs(2), output)
-        .await
-        .ok()?
-        .ok()?;
-    if !out.status.success() {
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.arg("--version");
+    let out = crate::launcher::probe_output(&mut cmd, Duration::from_secs(2)).await?;
+    if !out.success {
         return None;
     }
     String::from_utf8_lossy(&out.stdout)
