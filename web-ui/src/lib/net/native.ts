@@ -550,6 +550,9 @@ export interface ClusterOverview {
   config: ClusterConfig;
   /** Startup commands: the cluster's, and each workspace's (by id). */
   startup: { cluster: string; workspaces: Record<string, string> };
+  /** The account's cloud holds this cluster's jobs, attached ones included,
+   *  while this app is away; absent on a cluster this app reaches itself. */
+  kept?: boolean;
 }
 
 export interface PartitionChoice {

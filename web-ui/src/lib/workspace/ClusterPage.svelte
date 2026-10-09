@@ -741,7 +741,7 @@
                 <span class="dot {jobDot(j)}" title={stopping ? "stopping" : j.state}></span>
                 <span class="job-label">
                   <span class="job-name" title={j.slurm_job_id ? `Slurm job ${j.slurm_job_id}` : j.name}>{j.name}</span>
-                  <span class="job-line">{busy === "stopping" || busy === "cancelling" ? "Waiting for Slurm to finish…" : jobStatusLine(j, clusterTime)}</span>
+                  <span class="job-line">{busy === "stopping" || busy === "cancelling" ? "Waiting for Slurm to finish…" : jobStatusLine(j, clusterTime, undefined, overview?.kept === true)}</span>
                 </span>
                 <span class="acts">
                   {#if busy === "stopping"}

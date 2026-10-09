@@ -246,8 +246,9 @@ export function shortHost(host: string): string {
   return host.split(".")[0] || host;
 }
 
-/** A job card's one status line (plan §4.2). */
-export function jobStatusLine(j: ClusterJob, nowMs: number, locale?: string): string {
+/** A job card's one status line (plan §4.2). `kept`: the account's cloud
+ *  holds the cluster's jobs, so an attached one outlives this app. */
+export function jobStatusLine(j: ClusterJob, nowMs: number, locale?: string, kept = false): string {
   if (isJobStopping(j)) return j.node ? `Stopping on ${j.node}…` : "Stopping…";
   let line: string;
   switch (j.state) {
@@ -276,7 +277,7 @@ export function jobStatusLine(j: ClusterJob, nowMs: number, locale?: string): st
     case "ended":
       return endedLine(j, nowMs, locale);
   }
-  if (j.attached) line += " · stops if this app disconnects";
+  if (j.attached) line += kept ? " · held by your cloud while you're away" : " · stops if this app disconnects";
   return line;
 }
 

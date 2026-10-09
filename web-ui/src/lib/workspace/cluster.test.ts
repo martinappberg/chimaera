@@ -298,6 +298,11 @@ describe("jobs in words", () => {
     expect(jobStatusLine(job({ state: "waiting", attached: true, submitted_ms: NOW }), NOW)).toBe(
       "Waiting for a node · stops if this app disconnects",
     );
+    // On a kept cluster the account's cloud holds an attached job.
+    expect(jobStatusLine(job({ state: "waiting", attached: true, submitted_ms: NOW }), NOW, undefined, true)).toBe(
+      "Waiting for a node · held by your cloud while you're away",
+    );
+    expect(jobStatusLine(job({ state: "waiting", submitted_ms: NOW }), NOW, undefined, true)).toBe("Waiting for a node");
   });
 
   it("keeps a cancelled or completing job stopping and out of workspace destinations", () => {

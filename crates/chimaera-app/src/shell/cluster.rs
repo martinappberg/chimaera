@@ -764,6 +764,15 @@ async fn page_overview(
             .insert(slurm, (Instant::now(), est));
     }
     let mut v = serde_json::to_value(&ov).map_err(|e| e.to_string())?;
+    // A kept cluster's jobs, attached ones too, are held by the account's
+    // cloud while this app is away; the page words them so.
+    if shell
+        .pro
+        .owner()
+        .is_some_and(|owner| owner.cluster_selected(alias))
+    {
+        v["kept"] = json!(true);
+    }
     if let Some(list) = v.get_mut("jobs").and_then(|w| w.as_array_mut()) {
         for j in list {
             let est = j
