@@ -257,6 +257,31 @@
     }
   }
 
+  /** "Clear all": dismiss the ended jobs one at a time (each is its own
+   *  short command on the cluster — never a burst), then read once. */
+  let clearing = $state(false);
+  async function clearEnded(): Promise<void> {
+    if (clearing) return;
+    clearing = true;
+    try {
+      for (const j of ended) {
+        if (jobBusy[j.id] !== undefined) continue;
+        jobError = setIn(jobError, j.id, null);
+        jobBusy = setIn(jobBusy, j.id, "dismissing");
+        try {
+          await clusterDismissJob(alias, j.id);
+        } catch (e) {
+          jobError = setIn(jobError, j.id, errText(e));
+        } finally {
+          jobBusy = setIn(jobBusy, j.id, null);
+        }
+      }
+    } finally {
+      clearing = false;
+      refresh();
+    }
+  }
+
   function openIn(w: ClusterWorkspaceView, jobId: string | null): void {
     const target = jobs.find((j) => j.id === (jobId ?? w.job));
     if (target !== undefined && isJobStopping(target)) return;
@@ -502,9 +527,19 @@
   {@const activity = workspaceActivity(w, clusterTime, undefined, stopping)}
   <div class="ws" class:live={w.state === "open" && !stopping}>
     <div class="ws-main">
-      <span class="name" title={w.name}>{w.name}</span>
-      <span class="path" title={w.path}>{tildePath(w.path, overview?.home)}</span>
+      <span class="ws-label">
+        <span class="name" title={w.name}>{w.name}</span>
+        <span class="path" title={w.path}>{tildePath(w.path, overview?.home)}</span>
+      </span>
       {#if w.id === here}<span class="here-tag">this window</span>{/if}
+      {#if activity !== ""}
+        <span
+          class="meta"
+          class:warn={!stopping && w.failed !== undefined}
+          class:working={!stopping && w.state === "open" && (w.working ?? 0) > 0}
+          title={!stopping ? w.failed || undefined : undefined}>{activity}</span
+        >
+      {/if}
       {#if !stopping}
         <span class="acts">
           {#if busy !== undefined}
@@ -542,31 +577,42 @@
         </span>
       {/if}
     </div>
-    {#if activity !== ""}
-      <div class="detail" class:warn={!stopping && w.failed !== undefined} title={!stopping ? w.failed || undefined : undefined}>{activity}</div>
-    {/if}
     {#if !stopping && wsError[w.id] !== undefined}
-      <div class="detail row-err">{wsError[w.id]}</div>
+      <div class="row-err">{wsError[w.id]}</div>
     {/if}
   </div>
 {/snippet}
 
 <div class="inner">
   <header class="masthead">
-    <div class="topline">
-      <button class="back-home" aria-label="Back to {backLabel}" title="Back to {backLabel}" onclick={onBack}>
-        <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
-          <path
-            d="M10.5 3.5 6 8l4.5 4.5M6.5 8H14"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.4"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-          />
-        </svg>
-        <span>{backLabel}</span>
-      </button>
+    <button class="back-home" aria-label="Back to {backLabel}" title="Back to {backLabel}" onclick={onBack}>
+      <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+        <path
+          d="M10.5 3.5 6 8l4.5 4.5M6.5 8H14"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.4"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        />
+      </svg>
+      <span>{backLabel}</span>
+    </button>
+    <div class="title-row">
+      <div class="title">
+        <h1>{alias}</h1>
+        <div class="kind">
+          <span>Slurm cluster</span>
+          {#if overview !== null && overview.login_node !== ""}
+            <span title="Connected through {overview.login_node}"
+              >· via <span class="mono">{shortHost(overview.login_node)}</span></span
+            >
+          {/if}
+          {#if loginServe}
+            <span class="pill-warn" title="Allowed on the login node (from the … menu)">login node</span>
+          {/if}
+        </div>
+      </div>
       <div class="mast-acts">
         <button class="mast-btn" title="A terminal on {alias}'s login node" onclick={() => void openTerminal()}>
           <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
@@ -595,33 +641,21 @@
         </button>
       </div>
     </div>
-    <h1>{alias}</h1>
-    <div class="kind">
-      <span class="sched">Slurm cluster</span>
-      {#if overview !== null && overview.login_node !== ""}
-        <span title="Connected through {overview.login_node}"
-          >· via <span class="mono">{shortHost(overview.login_node)}</span></span
-        >
-      {/if}
-      {#if loginServe}
-        <span class="pill-warn" title="Allowed on the login node (from the … menu)">login node</span>
-      {/if}
-    </div>
     {#if mastError !== null}
       <div class="err-line">{mastError}</div>
     {:else if mastNote !== null}
       <div class="note-line">{mastNote}</div>
     {/if}
+    {#if jobsAlive && (notify === "denied" || notify === "not_determined")}
+      <!-- A fact with a way to change it — a caption, not an alarm. -->
+      <p class="note-line" role="note">
+        Notifications are off, so you won't hear when a job starts or is about to end.
+        <button class="inline-act" onclick={() => void turnOnNotifications()}>
+          {notify === "denied" ? "Open settings" : "Turn on"}
+        </button>
+      </p>
+    {/if}
   </header>
-
-  {#if jobsAlive && (notify === "denied" || notify === "not_determined")}
-    <div class="notice" role="note">
-      <p>Notifications are off, so you won't hear when a job starts or is about to end.</p>
-      <button class="notice-act" onclick={() => void turnOnNotifications()}>
-        {notify === "denied" ? "Open settings" : "Turn on"}
-      </button>
-    </div>
-  {/if}
 
   {#if loginDaemon !== null}
     <div class="notice" role="note">
@@ -658,144 +692,170 @@
       </div>
     </div>
   {:else}
-    {#if overview.degraded}
-      <div class="degraded" role="status">
-        The queue didn't answer; showing the last read{overview.queue_at_ms > 0
-          ? ` (${agoWords(overview.queue_at_ms, clusterTime)})`
-          : ""}.
-      </div>
-    {/if}
-    {#if entry !== undefined && entry.error !== null}
-      <div class="err-line quiet">
-        Couldn't refresh: {entry.error}
-        <button class="inline-act" onclick={refresh}>Try again</button>
+    {#if overview.degraded || (entry !== undefined && entry.error !== null)}
+      <div class="status-lines">
+        {#if overview.degraded}
+          <div class="degraded" role="status">
+            The queue didn't answer; showing the last read{overview.queue_at_ms > 0
+              ? ` (${agoWords(overview.queue_at_ms, clusterTime)})`
+              : ""}.
+          </div>
+        {/if}
+        {#if entry !== undefined && entry.error !== null}
+          <div class="err-line quiet">
+            Couldn't refresh: {entry.error}
+            <button class="inline-act" onclick={refresh}>Try again</button>
+          </div>
+        {/if}
       </div>
     {/if}
 
     {#if jobs.length > 0}
-      <section class="jobs" aria-label="Jobs">
+      <section aria-label="Jobs">
         <div class="sec-head">
-          <span class="sec-title">jobs</span>
+          <h2 class="sec-title">Jobs</h2>
           {@render refreshButton()}
         </div>
-        {#each jobs as j (j.id)}
-          {@const busy = jobBusy[j.id] ?? (isJobStopping(j) ? "stopping" : undefined)}
-          {@const stopping = isJobStopping(j)}
-          {@const inside = wsIn(j)}
-          {@const next = continuation(j)}
-          <div class="job" class:running={j.state === "running" && !stopping}>
-            <div class="job-head">
-              <span class="dot {jobDot(j)}" title={stopping ? "stopping" : j.state}></span>
-              <span class="job-name" title={j.slurm_job_id ? `Slurm job ${j.slurm_job_id}` : j.name}>{j.name}</span>
-              <span class="acts">
-                {#if busy === "stopping"}
-                  <span class="busy-word">Stopping…</span>
-                {:else if busy === "cancelling"}
-                  <span class="busy-word">Cancelling…</span>
-                {:else if j.state === "waiting"}
-                  <button
-                    class="act"
-                    onclick={() => void jobAction(j, "cancelling", () => clusterStopJob(alias, j.id))}
-                    >Cancel</button
-                  >
-                {:else}
-                  {#if j.state === "running" && !j.attached && next === undefined}
-                    <button class="act" onclick={() => (sheet = { kind: "continue", job: j })}
-                      >Continue in a new job…</button
+        <div class="surface">
+          {#each jobs as j (j.id)}
+            {@const busy = jobBusy[j.id] ?? (isJobStopping(j) ? "stopping" : undefined)}
+            {@const stopping = isJobStopping(j)}
+            {@const inside = wsIn(j)}
+            {@const next = continuation(j)}
+            <div class="job">
+              <div class="job-head">
+                <span class="dot {jobDot(j)}" title={stopping ? "stopping" : j.state}></span>
+                <span class="job-label">
+                  <span class="job-name" title={j.slurm_job_id ? `Slurm job ${j.slurm_job_id}` : j.name}>{j.name}</span>
+                  <span class="job-line">{busy === "stopping" || busy === "cancelling" ? "Waiting for Slurm to finish…" : jobStatusLine(j, clusterTime)}</span>
+                </span>
+                <span class="acts">
+                  {#if busy === "stopping"}
+                    <span class="busy-word">Stopping…</span>
+                  {:else if busy === "cancelling"}
+                    <span class="busy-word">Cancelling…</span>
+                  {:else if j.state === "waiting"}
+                    <button
+                      class="act"
+                      onclick={() => void jobAction(j, "cancelling", () => clusterStopJob(alias, j.id))}
+                      >Cancel</button
+                    >
+                  {:else}
+                    {#if j.state === "running" && !j.attached && next === undefined}
+                      <button class="act" onclick={() => (sheet = { kind: "continue", job: j })}
+                        >Continue in a new job…</button
+                      >
+                    {/if}
+                    <button
+                      class="act"
+                      onclick={() => (confirmStop = j)}>Stop</button
                     >
                   {/if}
-                  <button
-                    class="act"
-                    onclick={() => (confirmStop = j)}>Stop</button
-                  >
-                {/if}
-              </span>
+                </span>
+              </div>
+              {#if !stopping && j.replaces !== undefined}
+                <div class="job-note">
+                  Continues {jobName(j.replaces)} — its workspaces move here when this one starts.
+                </div>
+              {/if}
+              {#if !stopping && next !== undefined}
+                <div class="job-note">Continuing in a new job — waiting for a node.</div>
+              {/if}
+              {#if j.state === "running" && j.egress === false}
+                <div class="job-note warn">Agents can't reach the internet from this node.</div>
+              {/if}
+              {#if jobError[j.id] !== undefined}
+                <div class="job-note row-err">{jobError[j.id]}</div>
+              {/if}
+              {#if inside.length > 0 || j.state === "running"}
+                <div class="job-ws">
+                  {#each inside as w (w.id)}
+                    {@render wsRow(w, stopping)}
+                  {/each}
+                  {#if j.state === "running" && busy === undefined}
+                    <button class="add-row" onclick={(e) => openHereMenu(e, j)}>
+                      <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+                        <path d="M8 3v10M3 8h10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+                      </svg>
+                      Open a workspace here
+                    </button>
+                  {/if}
+                </div>
+              {/if}
             </div>
-            <div class="job-line">{busy === "stopping" || busy === "cancelling" ? "Waiting for Slurm to finish…" : jobStatusLine(j, clusterTime)}</div>
-            {#if !stopping && j.replaces !== undefined}
-              <div class="job-line note">
-                Continues {jobName(j.replaces)} — its workspaces move here when this one starts.
-              </div>
-            {/if}
-            {#if !stopping && next !== undefined}
-              <div class="job-line note">Continuing in a new job — waiting for a node.</div>
-            {/if}
-            {#if j.state === "running" && j.egress === false}
-              <div class="job-line warn">Agents can't reach the internet from this node.</div>
-            {/if}
-            {#if jobError[j.id] !== undefined}
-              <div class="job-line row-err">{jobError[j.id]}</div>
-            {/if}
-            {#if inside.length > 0 || j.state === "running"}
-              <div class="job-ws">
-                {#each inside as w (w.id)}
-                  {@render wsRow(w, stopping)}
-                {/each}
-                {#if j.state === "running" && busy === undefined}
-                  <button class="open-here" onclick={(e) => openHereMenu(e, j)}>
-                    <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
-                      <path d="M8 3v10M3 8h10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
-                    </svg>
-                    Open a workspace here
-                  </button>
-                {/if}
-              </div>
-            {/if}
-          </div>
-        {/each}
+          {/each}
+        </div>
       </section>
     {/if}
 
-    {#each ended as j (j.id)}
-      <div class="ended">
-        <span class="ended-text">{endedLine(j, clusterTime)}</span>
-        <button
-          class="act"
-          onclick={() =>
-            startSheet(
-              j.open.filter((id) => closedWs.some((w) => w.id === id)),
-              j.spec,
-            )}>Start again</button
-        >
-        <button
-          class="act icon"
-          aria-label="Dismiss"
-          title="Dismiss"
-          disabled={jobBusy[j.id] !== undefined}
-          onclick={() => void jobAction(j, "dismissing", () => clusterDismissJob(alias, j.id))}
-        >
-          <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
-            <path d="M4 4l8 8M12 4l-8 8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
-          </svg>
-        </button>
-      </div>
-    {/each}
-
-    <section aria-label="Not open">
-      {#if closedWs.length > 0}
+    {#if ended.length > 0}
+      <section aria-label="Ended jobs">
         <div class="sec-head">
-          <span class="sec-title">{closedWs.length < (overview.workspaces.length ?? 0)
-              ? "other workspaces"
-              : "workspaces"}</span>
-          {#if jobs.length === 0}{@render refreshButton()}{/if}
+          <h2 class="sec-title">Ended</h2>
+          {#if ended.length > 1}
+            <button class="ghost" disabled={clearing} onclick={() => void clearEnded()}
+              >{clearing ? "Clearing…" : "Clear all"}</button
+            >
+          {/if}
         </div>
-        <div class="rows">
-          {#each closedWs as w (w.id)}
-            {@render wsRow(w)}
+        <div class="surface quiet">
+          {#each ended as j (j.id)}
+            <div class="ended">
+              <div class="ended-main">
+                <span class="ended-text">{endedLine(j, clusterTime)}</span>
+                <span class="acts">
+                  <button
+                    class="act"
+                    onclick={() =>
+                      startSheet(
+                        j.open.filter((id) => closedWs.some((w) => w.id === id)),
+                        j.spec,
+                      )}>Start again</button
+                  >
+                  <button
+                    class="act icon"
+                    aria-label="Dismiss"
+                    title="Dismiss"
+                    disabled={jobBusy[j.id] !== undefined}
+                    onclick={() => void jobAction(j, "dismissing", () => clusterDismissJob(alias, j.id))}
+                  >
+                    <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+                      <path d="M4 4l8 8M12 4l-8 8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+                    </svg>
+                  </button>
+                </span>
+              </div>
+              {#if jobError[j.id] !== undefined}
+                <div class="row-err">{jobError[j.id]}</div>
+              {/if}
+            </div>
           {/each}
         </div>
-      {/if}
-      <button class="add-ws" onclick={() => (picker = { job: null })}>
-        <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
-          <path d="M8 3v10M3 8h10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
-        </svg>
-        Add a workspace…
-      </button>
-    </section>
-
-    {#if otherJobsWords(overview.other_jobs) !== ""}
-      <div class="other-jobs">{otherJobsWords(overview.other_jobs)}</div>
+      </section>
     {/if}
+
+    <section aria-label="Not open">
+      <div class="sec-head">
+        <h2 class="sec-title">{closedWs.length > 0 && closedWs.length < (overview.workspaces.length ?? 0)
+            ? "Other workspaces"
+            : "Workspaces"}</h2>
+        {#if jobs.length === 0}{@render refreshButton()}{/if}
+      </div>
+      <div class="surface">
+        {#each closedWs as w (w.id)}
+          {@render wsRow(w)}
+        {/each}
+        <button class="add-row" onclick={() => (picker = { job: null })}>
+          <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+            <path d="M8 3v10M3 8h10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+          </svg>
+          Add a workspace…
+        </button>
+      </div>
+      {#if otherJobsWords(overview.other_jobs) !== ""}
+        <p class="caption">{otherJobsWords(overview.other_jobs)}</p>
+      {/if}
+    </section>
   {/if}
 </div>
 
@@ -883,27 +943,28 @@
 {/if}
 
 <style>
+  /* The Home screen's layout language (HomeScreen.svelte): the same column,
+     section titles, one bordered surface per section with compact rows (name,
+     a muted status, actions at the right end) and the same type scale. The
+     values mirror HomeScreen's scoped rules; keep the two in step. */
   .inner {
-    max-width: 640px;
+    container: cluster-page / inline-size;
+    box-sizing: border-box;
+    width: 100%;
+    max-width: calc(860px + 2 * clamp(24px, 4vw, 64px));
     margin: 0 auto;
     /* The top stays clear of the native window's 32px drag strip. */
-    padding: clamp(40px, 8vh, 72px) 24px 64px;
+    padding: 56px clamp(24px, 4vw, 64px) 40px;
     display: flex;
     flex-direction: column;
-    gap: 30px;
+    gap: 32px;
   }
 
   .masthead {
     display: flex;
     flex-direction: column;
-    gap: 4px;
-  }
-
-  .topline {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 10px;
+    align-items: flex-start;
+    gap: 14px;
   }
 
   .back-home {
@@ -931,47 +992,28 @@
     background: var(--row-hover);
   }
 
-  .mast-acts {
+  .title-row {
+    align-self: stretch;
     display: flex;
     align-items: center;
-    gap: 6px;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px 20px;
   }
 
-  .mast-btn {
-    appearance: none;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    border: 1px solid var(--edge);
-    background: var(--overlay-bg);
-    color: var(--fg);
-    font: inherit;
-    font-size: var(--text-sm);
-    padding: 4px 10px;
-    border-radius: 6px;
-    cursor: pointer;
-    transition: border-color 0.12s ease;
-  }
-
-  .mast-btn:hover {
-    border-color: color-mix(in srgb, var(--accent) 60%, var(--edge));
-  }
-
-  .mast-btn.icon {
-    padding: 4px 6px;
-    color: var(--muted);
-  }
-
-  .mast-btn.icon:hover {
-    color: var(--fg);
+  .title {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
   }
 
   h1 {
     margin: 0;
-    font-family: var(--mono);
     font-size: calc(var(--text-lg) + 4px);
-    font-weight: 600;
-    letter-spacing: 0.01em;
+    font-weight: 550;
+    letter-spacing: -0.02em;
+    color: var(--fg);
     overflow-wrap: anywhere;
   }
 
@@ -982,10 +1024,6 @@
     gap: 5px;
     font-size: var(--text-sm);
     color: var(--muted);
-  }
-
-  .sched {
-    color: var(--accent);
   }
 
   .pill-warn {
@@ -1002,9 +1040,80 @@
     font-family: var(--mono);
   }
 
-  .note-line {
-    font-size: var(--text-xs);
+  .mast-acts {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .mast-btn {
+    appearance: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    border: 1px solid var(--edge);
+    background: var(--overlay-bg);
+    color: var(--fg);
+    font: inherit;
+    font-size: var(--text-sm);
+    padding: 5px 11px;
+    border-radius: 6px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: border-color 0.12s ease;
+  }
+
+  .mast-btn:hover:enabled {
+    border-color: color-mix(in srgb, var(--accent) 60%, var(--edge));
+  }
+
+  .mast-btn.icon {
+    padding: 5px 7px;
     color: var(--muted);
+  }
+
+  .mast-btn.icon:hover {
+    color: var(--fg);
+  }
+
+  .mast-btn.primary {
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
+    background: color-mix(in srgb, var(--accent) 12%, var(--overlay-bg));
+  }
+
+  .mast-btn.primary:hover:enabled {
+    background: color-mix(in srgb, var(--accent) 20%, var(--overlay-bg));
+  }
+
+  .mast-btn:disabled {
+    opacity: 0.55;
+    cursor: default;
+  }
+
+  /* Masthead captions: the partitions note, and notifications being off. */
+  .note-line {
+    margin: 0;
+    font-size: var(--text-xs);
+    line-height: 1.5;
+    color: var(--muted);
+  }
+
+  .inline-act {
+    appearance: none;
+    border: none;
+    background: none;
+    font: inherit;
+    color: var(--fg);
+    text-decoration: underline;
+    text-decoration-color: color-mix(in srgb, var(--fg) 35%, transparent);
+    text-underline-offset: 3px;
+    cursor: pointer;
+    padding: 0 2px;
+  }
+
+  .inline-act:hover {
+    color: var(--accent);
+    text-decoration-color: currentColor;
   }
 
   /* The found-from-before login daemon: calm, one fact, one action. */
@@ -1014,14 +1123,14 @@
     align-items: center;
     gap: 8px 14px;
     padding: 11px 14px;
-    border-radius: 8px;
-    background: color-mix(in srgb, var(--warn) 10%, transparent);
+    border-radius: 10px;
+    background: color-mix(in srgb, var(--warn) 8%, transparent);
     border: 1px solid color-mix(in srgb, var(--warn) 28%, var(--edge));
   }
 
   .notice p {
     flex: 1;
-    min-width: 240px;
+    min-width: 220px;
     margin: 0;
     font-size: var(--text-sm);
     line-height: 1.5;
@@ -1066,20 +1175,26 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 0 8px 4px;
+    gap: 16px;
+    padding: 0 0 4px;
   }
 
   .sec-title {
-    font-size: var(--text-xs);
-    color: var(--muted);
-    text-transform: lowercase;
-    letter-spacing: 0.04em;
+    margin: 0;
+    font-size: var(--text-md);
+    font-weight: 550;
+    color: var(--fg);
+    letter-spacing: -0.01em;
   }
 
-  .sec-acts {
+  /* One surface per section, as Home's workspace list. */
+  .surface {
     display: flex;
-    align-items: center;
+    flex-direction: column;
     gap: 2px;
+    border: 1px solid var(--edge);
+    border-radius: 10px;
+    padding: 5px;
   }
 
   .ghost {
@@ -1098,6 +1213,10 @@
     color: var(--fg);
   }
 
+  .ghost:disabled {
+    cursor: default;
+  }
+
   .ghost.refresh {
     display: flex;
     align-items: center;
@@ -1113,61 +1232,74 @@
     }
   }
 
-  .add {
+  .status-lines {
     display: flex;
     flex-direction: column;
-    gap: 4px;
-    padding: 2px 10px 10px;
+    gap: 2px;
+    margin-bottom: -16px;
   }
 
-  .add-row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-
-  .add-input {
-    min-width: 0;
-    border: 1px solid var(--edge);
-    border-radius: 6px;
-    background: var(--overlay-bg);
-    color: var(--fg);
-    font-family: var(--mono);
-    font-size: var(--text-sm);
-    padding: 6px 10px;
-    outline: none;
-  }
-
-  .add-input.path-field {
-    flex: 2;
-  }
-
-  .add-input.name-field {
-    flex: 1;
-  }
-
-  .add-input.bad {
-    border-color: color-mix(in srgb, var(--err) 60%, var(--edge));
-  }
-
-  .add-input:focus {
-    border-color: var(--focus-ring);
-  }
-
-  .add-input::placeholder {
-    color: var(--muted);
-    opacity: 0.7;
-  }
-
-  .field-err {
+  .degraded {
     font-size: var(--text-xs);
+    color: var(--warn);
+  }
+
+  .reading {
+    font-size: var(--text-sm);
+    color: var(--muted);
+    animation: breathe 1.4s ease-in-out infinite;
+  }
+
+  @keyframes breathe {
+    50% {
+      opacity: 0.45;
+    }
+  }
+
+  .err-line {
+    font-size: var(--text-sm);
     color: var(--err);
     white-space: pre-wrap;
   }
 
-  .field-hint {
+  .err-line.quiet {
     font-size: var(--text-xs);
+  }
+
+  /* First visit: one invitation, two ways in (Home's empty state). */
+  .welcome {
+    border: 1px solid var(--edge);
+    border-radius: 10px;
+    padding: 40px 24px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    gap: 12px;
+  }
+
+  .welcome h2 {
+    margin: 0;
+    font-size: var(--text-lg);
+    font-weight: 500;
+    letter-spacing: -0.02em;
+    color: var(--fg);
+  }
+
+  .welcome p {
+    margin: 0;
+    max-width: 46ch;
+    font-size: var(--text-md);
+    line-height: 1.6;
     color: var(--muted);
+  }
+
+  .welcome-acts {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 8px;
+    margin-top: 6px;
   }
 
   .cta {
@@ -1187,80 +1319,127 @@
     border-color: var(--accent);
   }
 
-  .cta:disabled {
-    opacity: 0.55;
-    cursor: default;
+  .cta.primary {
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
+    background: color-mix(in srgb, var(--accent) 12%, var(--overlay-bg));
   }
 
-  .cta.small {
-    flex: none;
-    padding: 5px 12px;
-    font-size: var(--text-sm);
+  /* A job: its row, then the workspaces open in it hanging under it the way
+     Home hangs a host's workspaces under the host. */
+  .job {
+    display: flex;
+    flex-direction: column;
+    padding: 4px 0 2px;
   }
 
-  .degraded {
-    padding: 0 10px 2px;
-    font-size: var(--text-xs);
-    color: var(--warn);
+  .job + .job {
+    border-top: 1px solid color-mix(in srgb, var(--edge) 70%, transparent);
+    margin-top: 3px;
+    padding-top: 7px;
   }
 
-  .reading {
-    padding: 4px 10px;
-    font-size: var(--text-sm);
-    color: var(--muted);
-    animation: breathe 1.4s ease-in-out infinite;
+  .job-head {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-width: 0;
+    padding: 5px 8px 5px 12px;
   }
 
-  @keyframes breathe {
-    50% {
-      opacity: 0.45;
-    }
+  /* The dot sits beside the job's name, not the middle of a wrapped line. */
+  .job-head > .dot {
+    align-self: flex-start;
+    margin-top: 7px;
   }
 
-
-  .rows {
+  .job-label {
+    flex: 1;
+    min-width: 0;
     display: flex;
     flex-direction: column;
     gap: 2px;
   }
 
-  .ws {
+  .job-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: var(--text-md);
+    font-weight: 550;
+    color: var(--fg);
+  }
+
+  .job-line {
+    font-size: var(--text-xs);
+    color: var(--muted);
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+  }
+
+  .job-note {
+    padding: 0 12px 2px 31px;
+    font-size: var(--text-xs);
+    color: var(--muted);
+    line-height: 1.5;
+  }
+
+  .job-note.warn {
+    color: var(--warn);
+  }
+
+  .job-note.row-err {
+    color: var(--err);
+    white-space: pre-wrap;
+  }
+
+  .job-ws {
+    margin: 4px 8px 4px 26px;
+    padding-left: 8px;
+    border-left: 1px solid var(--edge);
     display: flex;
     flex-direction: column;
     gap: 1px;
-    padding: 8px 10px 9px;
+  }
+
+  /* A workspace row: Home's one-line row — name and path, a muted status,
+     actions at the right end. */
+  .ws {
+    display: flex;
+    flex-direction: column;
+    padding: 6px 8px 6px 12px;
     border-radius: 6px;
     transition: background-color 0.12s ease;
   }
 
   .ws:hover {
-    background: var(--row-hover);
-  }
-
-  /* A running workspace carries the home's faint accent wash. */
-  .ws.live {
-    background: color-mix(in srgb, var(--accent) 6%, transparent);
-  }
-
-  .ws.live:hover {
-    background: var(--row-hover);
+    background: color-mix(in srgb, var(--row-hover) 45%, transparent);
   }
 
   .ws-main {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 12px;
     min-width: 0;
+    min-height: 26px;
+  }
+
+  .ws-label {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
   }
 
   .name {
     flex: none;
-    max-width: 40%;
+    max-width: 60%;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-family: var(--mono);
     font-size: var(--text-md);
+    font-weight: 550;
+    color: var(--fg);
   }
 
   .ws.live .name {
@@ -1274,8 +1453,26 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     font-family: var(--mono);
-    font-size: var(--text-sm);
+    font-size: var(--text-xs);
     color: var(--muted);
+  }
+
+  .meta {
+    flex: none;
+    max-width: 40%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: var(--text-xs);
+    color: var(--muted);
+  }
+
+  .meta.working {
+    color: var(--accent);
+  }
+
+  .meta.warn {
+    color: var(--warn);
   }
 
   .here-tag {
@@ -1307,6 +1504,7 @@
     padding: 2px 9px;
     border-radius: 5px;
     cursor: pointer;
+    white-space: nowrap;
     transition:
       color 0.12s ease,
       border-color 0.12s ease;
@@ -1335,39 +1533,92 @@
     cursor: default;
   }
 
+  .chev-down {
+    margin-left: 4px;
+  }
+
   .busy-word {
     font-size: var(--text-xs);
     color: var(--warn);
   }
 
-  .detail {
-    padding-left: 17px;
-    font-family: var(--mono);
+  .row-err {
+    padding-top: 2px;
     font-size: var(--text-xs);
-    color: var(--muted);
+    color: var(--err);
     line-height: 1.5;
+    white-space: pre-wrap;
     overflow-wrap: anywhere;
   }
 
-  .detail.note {
-    opacity: 0.9;
+  /* "+ Open a workspace here" / "+ Add a workspace…": Home's quiet browse
+     row, waking on hover. */
+  .add-row {
+    appearance: none;
+    align-self: stretch;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    border: none;
+    background: none;
+    color: var(--muted);
+    font: inherit;
+    font-size: var(--text-sm);
+    text-align: left;
+    padding: 6px 12px;
+    border-radius: 6px;
+    cursor: pointer;
   }
 
-  .detail.warn {
-    color: var(--warn);
-    opacity: 1;
+  .add-row:hover {
+    color: var(--fg);
+    background: color-mix(in srgb, var(--row-hover) 45%, transparent);
   }
 
-  .detail.row-err {
-    color: var(--err);
-    white-space: pre-wrap;
+  /* Ended jobs: one quiet list, one row each, until dismissed. */
+  .ended {
+    display: flex;
+    flex-direction: column;
+    padding: 5px 8px 5px 12px;
+    border-radius: 6px;
   }
 
-  .other-jobs {
-    padding: 8px 10px 0;
+  .ended:hover {
+    background: color-mix(in srgb, var(--row-hover) 45%, transparent);
+  }
+
+  .ended-main {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-width: 0;
+  }
+
+  .ended-text {
+    flex: 1;
+    min-width: 0;
+    font-size: var(--text-sm);
+    line-height: 1.5;
+    color: var(--muted);
+  }
+
+  /* The quiet surface's row actions stay muted until the row is hovered. */
+  .surface.quiet .act {
+    border-color: transparent;
+    background: none;
+  }
+
+  .surface.quiet .ended:hover .act,
+  .surface.quiet .act:focus-visible {
+    border-color: var(--edge);
+    background: var(--overlay-bg);
+  }
+
+  .caption {
+    margin: 4px 0 0;
+    padding: 0 2px;
     font-size: var(--text-xs);
     color: var(--muted);
-    opacity: 0.85;
   }
 
   /* State dots — the home screen's language: dormant muted, running in the
@@ -1424,194 +1675,61 @@
     animation-play-state: paused;
   }
 
-  .err-line {
-    padding: 2px 10px 6px;
-    font-size: var(--text-sm);
-    color: var(--err);
-    white-space: pre-wrap;
+  button:focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: 2px;
   }
 
-  .err-line.quiet {
-    font-size: var(--text-xs);
-    padding-top: 0;
+  /* A narrow pane (the page can sit in ~600 px): rows wrap their status and
+     actions under the name instead of squeezing it. */
+  @container cluster-page (max-width: 560px) {
+    .ws-main,
+    .ended-main {
+      flex-wrap: wrap;
+      row-gap: 4px;
+    }
+
+    .ws-label {
+      flex-basis: 100%;
+    }
+
+    .meta {
+      flex: 1;
+      max-width: none;
+    }
+
+    .ended-text {
+      flex: 1 1 240px;
+    }
+
+    .ended-main .acts {
+      margin-left: auto;
+    }
+
+    .job-head {
+      flex-wrap: wrap;
+      row-gap: 6px;
+    }
+
+    .job-head .acts {
+      margin-left: 19px;
+    }
+
+    .job-ws {
+      margin-left: 14px;
+    }
   }
 
-  .inline-act {
-    appearance: none;
-    border: none;
-    background: none;
-    font: inherit;
-    color: var(--fg);
-    text-decoration: underline;
-    cursor: pointer;
-    padding: 0 4px;
-  }
-  .mast-btn.primary {
-    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
-    background: color-mix(in srgb, var(--accent) 12%, var(--overlay-bg));
+  @media (max-width: 700px) {
+    .inner {
+      padding: 24px 20px 20px;
+      gap: 28px;
+    }
   }
 
-  .mast-btn.primary:hover:enabled {
-    background: color-mix(in srgb, var(--accent) 20%, var(--overlay-bg));
-  }
-
-  .mast-btn:disabled {
-    opacity: 0.55;
-    cursor: default;
-  }
-
-  /* First visit: one invitation, two ways in. */
-  .welcome {
-    border: 1px dashed var(--edge);
-    border-radius: 10px;
-    padding: 28px 24px;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    text-align: center;
-    gap: 10px;
-  }
-
-  .welcome h2 {
-    margin: 0;
-    font-size: var(--text-lg);
-    font-weight: 600;
-    color: var(--fg);
-  }
-
-  .welcome p {
-    margin: 0;
-    max-width: 46ch;
-    font-size: var(--text-md);
-    line-height: 1.55;
-    color: var(--muted);
-  }
-
-  .welcome-acts {
-    display: flex;
-    gap: 8px;
-    margin-top: 6px;
-  }
-
-  .cta.primary {
-    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
-    background: color-mix(in srgb, var(--accent) 12%, var(--overlay-bg));
-  }
-
-  /* A job: a card holding the workspaces open in it. */
-  .jobs {
-    gap: 10px;
-  }
-
-  .job {
-    border: 1px solid var(--edge);
-    border-radius: 10px;
-    padding: 10px 12px 8px;
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    background: var(--overlay-bg);
-  }
-
-  .job.running {
-    border-color: color-mix(in srgb, var(--accent) 30%, var(--edge));
-  }
-
-  .job-head {
-    display: flex;
-    align-items: center;
-    gap: 9px;
-    min-width: 0;
-  }
-
-  .job-name {
-    flex: 1;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-size: var(--text-md);
-    font-weight: 600;
-    color: var(--fg);
-  }
-
-  .job-line {
-    padding-left: 16px;
-    font-size: var(--text-sm);
-    color: var(--muted);
-    line-height: 1.5;
-    overflow-wrap: anywhere;
-  }
-
-  .job-line.note {
-    font-size: var(--text-xs);
-  }
-
-  .job-line.warn {
-    font-size: var(--text-xs);
-    color: var(--warn);
-  }
-
-  .job-line.row-err {
-    font-size: var(--text-xs);
-    color: var(--err);
-    white-space: pre-wrap;
-  }
-
-  .job-ws {
-    margin-top: 6px;
-    padding-top: 4px;
-    border-top: 1px solid color-mix(in srgb, var(--edge) 70%, transparent);
-    display: flex;
-    flex-direction: column;
-    gap: 1px;
-  }
-
-  .open-here,
-  .add-ws {
-    appearance: none;
-    align-self: flex-start;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    border: none;
-    background: none;
-    color: var(--muted);
-    font: inherit;
-    font-size: var(--text-sm);
-    padding: 5px 10px;
-    border-radius: 5px;
-    cursor: pointer;
-  }
-
-  .open-here:hover,
-  .add-ws:hover {
-    color: var(--fg);
-    background: var(--row-hover);
-  }
-
-  .add-ws {
-    margin-top: 2px;
-  }
-
-  .chev-down {
-    margin-left: 4px;
-  }
-
-  /* An ended job: one line, until dismissed. */
-  .ended {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 6px 10px;
-    border-radius: 6px;
-    background: color-mix(in srgb, var(--fg) 3%, transparent);
-  }
-
-  .ended-text {
-    flex: 1;
-    min-width: 0;
-    font-size: var(--text-sm);
-    color: var(--muted);
+  @media (prefers-reduced-motion: reduce) {
+    .dot {
+      animation: none;
+    }
   }
 </style>
