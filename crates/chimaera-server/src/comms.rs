@@ -1446,6 +1446,11 @@ async fn execute(
 /// Dispatch after all asynchronous preparation, under the originally captured
 /// authority. The bounded owned enqueue retains the reservation and settles its
 /// inbox claim even when the caller disconnects during the actor queue wait.
+///
+/// These guards hold on a free daemon too: the inert admission still refuses a
+/// fenced project, a session rebound to another workspace is refused, and
+/// delivery runs on a detached task (as do `message_agent`'s capture and
+/// `post_wake`'s same-workspace check); only the cap and deadline are managed-only.
 async fn send_guarded(
     state: &Arc<AppState>,
     target: &Reader,
@@ -1521,11 +1526,17 @@ async fn deliver_all(
     origin: &'static str,
     admission: Option<&crate::policy::Admission>,
 ) -> Result<usize, String> {
-    let captured = state
-        .policy()
-        .capture(state, &reader.ws)
-        .map_err(|_| "workspace execution authority changed".to_string())?;
-    let admission = admission.unwrap_or(&captured);
+    let captured;
+    let admission = match admission {
+        Some(admission) => admission,
+        None => {
+            captured = state
+                .policy()
+                .capture(state, &reader.ws)
+                .map_err(|_| "workspace execution authority changed".to_string())?;
+            &captured
+        }
+    };
     if !reader.chat || !state.chat.get(&reader.sid).is_some_and(|c| c.alive) {
         return Err("not a running chat session".into());
     }
