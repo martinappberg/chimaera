@@ -672,10 +672,11 @@ async fn watch_overview(app: &AppHandle, alias: &str) -> Result<ClusterOverview,
 }
 
 /// The overview a job action decides on: the cluster's records as they are,
-/// without the job-hosts' live word.
+/// without the job-hosts' live word. Never a page's cached read: a
+/// workspace another device opened a moment ago must not start twice.
 async fn job_overview(app: &AppHandle, alias: &str) -> Result<ClusterOverview, String> {
     if let Some(selected) = kept::select(&app.state::<Shell>(), alias).await? {
-        return selected.overview(&app.state::<Shell>(), false).await;
+        return selected.current_overview().await;
     }
     cluster::overview(alias, home()).await.map_err(err)
 }

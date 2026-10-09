@@ -57,6 +57,9 @@ impl Selected {
     ) -> Result<ClusterOverview, String> {
         self.0.overview(refresh).await
     }
+    pub(super) async fn current_overview(&self) -> Result<ClusterOverview, String> {
+        self.0.current_overview().await
+    }
     pub(super) async fn port(
         &self,
         _shell: &Shell,

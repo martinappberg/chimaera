@@ -232,6 +232,13 @@ pub trait DelegatedCluster: Send + Sync {
         &self,
         refresh: bool,
     ) -> Task<Result<chimaera_remote::cluster::ClusterOverview, String>>;
+    /// The overview a job action decides on. `overview(false)` may answer
+    /// from a page's recent read; this one asks the keeper (a read already
+    /// in flight may be shared). Defaults to `overview(false)` for delegates
+    /// that keep no page cache.
+    fn current_overview(&self) -> Task<Result<chimaera_remote::cluster::ClusterOverview, String>> {
+        self.overview(false)
+    }
     fn port(
         &self,
         alias: String,
