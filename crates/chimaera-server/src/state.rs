@@ -412,7 +412,12 @@ impl AppState {
                 crate::policy::fence::Fence::load(data_dir),
             ))
         });
-        let _ = self.policy.set(policy);
+        // A second install, or one after `policy()` already defaulted to the
+        // inert policy, would silently run the daemon under the wrong policy.
+        assert!(
+            self.policy.set(policy).is_ok(),
+            "workspace policy installed twice, or after first use"
+        );
     }
 
     /// Tests: run this state with the inert policy (no extension).

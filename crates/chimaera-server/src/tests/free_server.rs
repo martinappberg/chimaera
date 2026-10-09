@@ -222,3 +222,13 @@ async fn free_restore_does_not_strand_a_suspended_conversation() {
         state.sessions.kill(id).ok();
     }
 }
+
+/// The policy is chosen once: installing after `policy()` defaulted fails
+/// loudly instead of silently keeping the inert policy.
+#[test]
+#[should_panic(expected = "workspace policy installed twice")]
+fn install_policy_after_first_use_panics() {
+    let state = test_state();
+    let _ = state.policy().composed(&state);
+    state.install_policy(None, &state.data_dir.clone());
+}
