@@ -84,7 +84,7 @@ app-build` (never the root `cargo`).
   `open_shell_window`, which refuses the cloud's alias, and a connect to the cloud is refused before
   anything reaches it (`shell/connect.rs` `run_flight`, `shell/tunnel.rs` `app_host`). A window on it
   saved by an older build is not restored; launch logs it and drops the record. Cloud projects open in
-  local windows after their folder is synced; execution stays with its current owner until a separate
+  local windows once their folder is copied here; execution stays with its current owner until a separate
   takeover ([pro.md](pro.md#what-the-user-sees-and-does)).
 
 ## Home launcher

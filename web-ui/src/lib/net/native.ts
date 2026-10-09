@@ -1500,6 +1500,6 @@ export interface MirrorStatus {
   sessions: { id: string; workspace_id: string; display_name?: string; name: string }[];
 }
 export async function proMirrorStatus(expectedAccountLifetime?: string): Promise<MirrorStatus> {
-  const t = tauri(); if (t === null) throw new Error("Open the desktop app to see your synced projects.");
+  const t = tauri(); if (t === null) throw new Error("Open the desktop app to see the projects in your cloud.");
   return t.core.invoke<MirrorStatus>("pro_mirror_status", { ...accountGuard(expectedAccountLifetime) });
 }
