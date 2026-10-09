@@ -611,7 +611,9 @@ or a copy, files installed and may differ, re-check tools and paths). Its
 `UserMessage.origin` is a stable tag clients key on: `moved` (a clean move, now
 in the cloud), `home` (a clean return, back on the user's computer) and
 `recovered` (either direction, continuing from the last saved point because
-the other machine stopped responding). A terminal agent gets one neutral
+the other machine stopped responding; when the daemon knows how old that
+saved point was when the other machine was last heard from, the message says
+so, since files written after it stayed on that machine). A terminal agent gets one neutral
 positional prompt instead, and only for a turn that was cut off.
 
 Lease expiry fences execution on every managed host ([One handoff

@@ -384,7 +384,9 @@ the lifecycle, keep them consistent:
   (`retry_exited_pickup`, which retires it as before if that start fails).
   Transfer restore similarly sends a `moved`/`home` pickup (`recovered`, either
   way, when it continues from the last saved point after the other machine
-  stopped responding; `chat::transfer_origin`) only for captured
+  stopped responding; `chat::transfer_origin`; its words say how old that
+  saved point is when the policy's `LaunchContext.saved_point_age_ms` knows,
+  so a missing file is not read as never written) only for captured
   interrupted work (a terminal agent: one neutral positional prompt, only when
   its bundle recorded a turn in flight). Finished conversations remain idle; a composed
   daemon may add a start note through the policy, without starting a model turn.
