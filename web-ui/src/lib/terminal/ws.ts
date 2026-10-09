@@ -1,7 +1,7 @@
 import { ownerSuspended, sendSocketAuth } from "../net/placement";
 import { daemonSocketUrl, isBrowserGateway } from "../net/base";
 import { getToken } from "../net/api";
-import { ownerAwake, parkUntilAwake, QUIET_OPEN_MS, Reconnector, socketKeepers, UNKNOWN_SESSION_RETRIES } from "../net/reconnect";
+import { OwnerWait, ownerAwake, QUIET_OPEN_MS, Reconnector, UNKNOWN_SESSION_RETRIES } from "../net/reconnect";
 
 export interface SessionSocketHandlers {
   readOnly?(): boolean;
@@ -120,15 +120,14 @@ export class SessionSocket {
    *  socket's: it outlives a dropped connection (a gateway may close after
    *  saying so) and ends with a wake, a move or the next `ready`. */
   private asleep = false;
-  /** Set while this socket is down because its owner is asleep: no retry
-   *  timer runs; a keystroke (with wake intent) or a sign the owner answers
-   *  again dials it. Calling it leaves the waiting set. */
-  private leaveSleepWait: (() => void) | null = null;
+  /** Parked while the owner is asleep (no retry timer: a user action with
+   *  wake intent or a sign the owner answers again dials it), and the quiet
+   *  wait after authenticating. */
+  private readonly wait = new OwnerWait();
   /** This connection was answered (`ready`) or stayed open quietly
    *  ({@link QUIET_OPEN_MS}): its owner's side keeps it. One that closes
    *  before either was refused. */
   private kept = false;
-  private quietTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly recon = new Reconnector(() => this.connect());
   private readonly encoder = new TextEncoder();
 
@@ -143,7 +142,7 @@ export class SessionSocket {
 
   private connect(interaction = false): void {
     if (this.closed) return;
-    this.stopSleepWait();
+    this.wait.stopPark();
     this.setKept(false);
     const readOnly = this.handlers.readOnly?.() ?? false;
     const query = readOnly ? "?read_only=true" : interaction && !this.handlers.parked?.() ? "?wake=interaction" : "";
@@ -208,16 +207,9 @@ export class SessionSocket {
   private waitForOwner(): void {
     this.recon.cancel();
     this.recon.clear();
-    this.stopSleepWait();
-    this.leaveSleepWait = parkUntilAwake(() => {
-      this.leaveSleepWait = null;
+    this.wait.park(() => {
       if (!this.closed && !this.fatal && !this.exited && this.ws === null) this.connect();
     });
-  }
-
-  private stopSleepWait(): void {
-    this.leaveSleepWait?.();
-    this.leaveSleepWait = null;
   }
 
   /** Authenticated: if nothing is heard for {@link QUIET_OPEN_MS} the socket
@@ -225,24 +217,16 @@ export class SessionSocket {
    *  leaves the reconnecting indicator (keeping its backoff, which a later
    *  drop continues). */
   private awaitQuiet(ws: WebSocket): void {
-    this.stopQuiet();
-    if (!socketKeepers()) return;
-    this.quietTimer = setTimeout(() => {
-      this.quietTimer = null;
+    this.wait.awaitQuiet(() => {
       if (this.ws !== ws || this.closed) return;
       this.recon.clear();
       this.setKept(true);
-    }, QUIET_OPEN_MS);
-  }
-
-  private stopQuiet(): void {
-    if (this.quietTimer !== null) clearTimeout(this.quietTimer);
-    this.quietTimer = null;
+    });
   }
 
   /** Settles the quiet wait either way; tells the pane only on a change. */
   private setKept(kept: boolean): void {
-    this.stopQuiet();
+    this.wait.stopQuiet();
     if (this.kept === kept) return;
     this.kept = kept;
     this.handlers.onKept?.(kept);
@@ -250,7 +234,7 @@ export class SessionSocket {
 
   /** Waiting for a sleeping owner (no socket, no retry timer). */
   get waitingForOwner(): boolean {
-    return this.leaveSleepWait !== null;
+    return this.wait.parked;
   }
 
   /** Its row says the owner may answer again (reachable, or a new owner):
@@ -258,7 +242,7 @@ export class SessionSocket {
    *  backoff retries at once. */
   retrySoon(): void {
     if (this.closed || this.fatal || this.exited) return;
-    if (this.leaveSleepWait !== null) this.connect();
+    if (this.wait.parked) this.connect();
     else this.recon.nudge(0);
   }
 
@@ -271,7 +255,7 @@ export class SessionSocket {
    * owner wakes.
    */
   private wakeOnInput(): void {
-    if (!(isBrowserGateway() || this.leaveSleepWait !== null) || this.closed || this.fatal || this.exited || this.waking) return;
+    if (!(isBrowserGateway() || this.wait.parked) || this.closed || this.fatal || this.exited || this.waking) return;
     if (this.handlers.readOnly?.() ?? false) return;
     this.waking = true;
     this.asleep = false;
@@ -289,7 +273,7 @@ export class SessionSocket {
       return;
     }
     // Any frame ends the quiet wait: the owner's side spoke.
-    this.stopQuiet();
+    this.wait.stopQuiet();
     switch (msg.type) {
       case "ready": {
         this.recon.succeeded();
@@ -490,7 +474,7 @@ export class SessionSocket {
     if (this.handlers.readOnly?.()) return;
     if (this.ws?.readyState === WebSocket.OPEN && this.authenticatedSocket === this.ws) {
       this.ws.send(this.encoder.encode(data));
-    } else if (isBrowserGateway() || this.leaveSleepWait !== null) {
+    } else if (isBrowserGateway() || this.wait.parked) {
       // A browser view's socket is down, or it waits for a sleeping owner:
       // the keystroke is dropped (never queued) and a wake-carrying
       // reconnect starts; say so over the pane.
@@ -562,7 +546,7 @@ export class SessionSocket {
   /** Permanently close the socket (no reconnect). */
   close(): void {
     this.closed = true;
-    this.stopSleepWait();
+    this.wait.stopPark();
     this.setKept(false);
     this.recon.cancel();
     this.recon.clear();
