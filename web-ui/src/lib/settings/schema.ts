@@ -61,6 +61,9 @@ export interface SettingDef {
   placeholder?: string;
   /** Where the value is consumed; "daemon" values act on the server side. */
   scope: "client" | "daemon";
+  /** Shown only in a development build of the native app (the shell's
+   *  `dev_build`): a setting for testing Chimaera, never offered to users. */
+  devOnly?: boolean;
   /** Extra caveat rendered small in the UI ("Applies to new sessions."). */
   note?: string;
   /** Control override: "theme-cards" renders enum options as mini theme
@@ -890,6 +893,7 @@ const DEFS = {
     type: "boolean",
     default: false,
     scope: "client",
+    devOnly: true,
   },
 
   // --- Extensions --------------------------------------------------------------
@@ -1032,4 +1036,11 @@ export function expectedType(def: SettingDef): string {
     case "keybinding":
       return 'chord like "Mod+e" or "Meta+Shift+d" (or "" to disable)';
   }
+}
+
+/** Whether a setting is listed at all: a `devOnly` one only in a development
+ *  build of the native app. The product decides where work runs; the moves
+ *  behind "Developer Tools" exist for testing and are never offered to users. */
+export function listed(def: SettingDef, devBuild: boolean): boolean {
+  return !def.devOnly || devBuild;
 }

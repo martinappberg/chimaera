@@ -137,7 +137,7 @@ wakes row always shows.
 | File | What it owns |
 |---|---|
 | `SettingsView.svelte` | The surface itself, loaded lazily (`layout/lazyViews.ts`). Mounted in two places: a singleton layout tab in a workspace, and a full page over Home (`App.svelte` `homeSettingsOpen`) where no workspace is open, so it must not assume one. |
-| `schema.ts` | The settings schema: keys, types, defaults, labels, groups. Ground truth. |
+| `schema.ts` | The settings schema: keys, types, defaults, labels, groups. Ground truth. A `devOnly` entry ("Developer Tools") is listed only when the native shell reports a development build (`listed`). |
 | `store.svelte.ts` | The reactive settings store: load/patch/persist against `/api/v1/settings`, sparse-map semantics, the `dirtySince` echo-guard, and document-wide theme/interface/editor CSS variables. |
 | `themes.ts` | The curated light/dark theme definitions + `applyAppearance`. |
 | `AgentsSettings.svelte` | Installed-agent cards; Advanced paths and removal. Opens the shared `../workspace/AgentSetupDialog.svelte` through `agentSetup.ts` for install/update/reinstall and recoverable progress/results; the compact dialog keeps technical output under Details and separates Sign in from Open chat. Polls only while visible and preserves unfinished edits. |

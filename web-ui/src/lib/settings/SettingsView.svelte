@@ -6,7 +6,7 @@
    * itself. Keybindings are ordinary rows (the keys.* settings); the few
    * spec-pinned chords render read-only at the end of the Keyboard section.
    */
-  import { CATEGORIES, SETTINGS, type SettingDef } from "./schema";
+  import { CATEGORIES, SETTINGS, listed, type SettingDef } from "./schema";
   import { isModified, settingsLoaded } from "./store.svelte";
   import SettingRow from "./SettingRow.svelte";
   import SettingsJson from "./SettingsJson.svelte";
@@ -16,7 +16,7 @@
   import { loadApplicationEntry } from "virtual:chimaera-application-entry";
   const accountExtensionSelected = loadApplicationEntry !== null;
   import { isBrowserGateway } from "../net/base";
-  import { isNativeShell } from "../net/native";
+  import { isNativeShell, localDaemonState } from "../net/native";
   import BrandMark from "../shared/BrandMark.svelte";
   import { accountPlan, proTier } from "../net/plan";
   import { legacyCloudRequest } from "../extensions/accountDaemon";
@@ -106,7 +106,16 @@
     );
   }
 
-  const visible = $derived(SETTINGS.filter(matches));
+  /** A development build of the native app lists the testing settings too. */
+  let devBuild = $state(false);
+  $effect(() => {
+    if (!isNativeShell()) return;
+    void localDaemonState().then((s) => {
+      devBuild = s?.dev_build === true;
+    });
+  });
+
+  const visible = $derived(SETTINGS.filter((d) => listed(d, devBuild) && matches(d)));
   const modifiedCount = $derived(SETTINGS.filter((d) => isModified(d.id)).length);
 
   /**
