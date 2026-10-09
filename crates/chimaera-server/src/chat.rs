@@ -3940,14 +3940,18 @@ pub(crate) async fn resurrect_chat_transfer(
             {
                 None
             } else if let Some(origin) = origin {
-                let recovery = state
-                    .policy()
-                    .launch_context(state, &entry.workspace_id)
-                    .recovery;
+                let context = state.policy().launch_context(state, &entry.workspace_id);
+                let recovery = context.recovery;
                 // Where it runs now arrives separately, at the process start
                 // (`cloud_context`); the pick-up only says what to continue.
-                handoff_message(origin, carry.as_ref(), recovery, fork_head)
-                    .map(|text| (text, transfer_origin(origin, recovery)))
+                handoff_message(
+                    origin,
+                    carry.as_ref(),
+                    recovery,
+                    fork_head,
+                    context.saved_point_age_ms,
+                )
+                .map(|text| (text, transfer_origin(origin, recovery)))
             } else {
                 pickup_message(
                     &entry.id,
@@ -4362,11 +4366,18 @@ fn handoff_message(
     carry: Option<&chimaera_agent::Carryover>,
     recovery: bool,
     forked: bool,
+    saved_age_ms: Option<u64>,
 ) -> Option<String> {
     if carry.is_some_and(|c| !c.interrupted_work()) || (carry.is_none() && !recovery) {
         return None;
     }
-    Some(transfer_context(origin, carry, recovery, forked))
+    Some(transfer_context(
+        origin,
+        carry,
+        recovery,
+        forked,
+        saved_age_ms,
+    ))
 }
 
 /// The `UserMessage.origin` a transfer pick-up carries. The UI folds these
@@ -4392,12 +4403,15 @@ fn transfer_origin(origin: &str, recovery: bool) -> &'static str {
 /// that the project files were installed and may differ, and to re-check
 /// tools and paths. A recovery also carries the rules for work of uncertain
 /// state: neither redo nor claim it blindly, and don't stop to ask merely
-/// because the recovery happened.
+/// because the recovery happened. `saved_age_ms` is how old the saved point
+/// was when the other machine was last heard from: an agent that finds a file
+/// missing must not read that as "it was never written".
 fn transfer_context(
     origin: &str,
     carry: Option<&chimaera_agent::Carryover>,
     recovery: bool,
     forked: bool,
+    saved_age_ms: Option<u64>,
 ) -> String {
     let (moved, runs) = if origin == "home" {
         ("back to the user's computer", "on the user's computer")
@@ -4417,6 +4431,12 @@ fn transfer_context(
     } else {
         ", in the same conversation."
     });
+    if let Some(age) = saved_age_ms.filter(|_| recovery).and_then(saved_point_age) {
+        text.push_str(&format!(
+            " That saved point is from {age} before the other machine stopped responding, so \
+             files written after it are on that machine, not here."
+        ));
+    }
     text.push_str(
         " The project files were installed here and may differ from what you last saw. \
          Re-check tools and paths before relying on anything from the previous machine.",
@@ -4444,6 +4464,20 @@ fn transfer_context(
         }
     }
     text
+}
+
+/// A saved point's age in plain words: seconds, or minutes above two
+/// minutes. None under two seconds, where the difference says nothing.
+fn saved_point_age(ms: u64) -> Option<String> {
+    if ms < 2_000 {
+        return None;
+    }
+    let seconds = (ms + 500) / 1_000;
+    Some(if seconds > 120 {
+        format!("{} minutes", (seconds + 30) / 60)
+    } else {
+        format!("{seconds} seconds")
+    })
 }
 
 #[cfg(test)]
@@ -6041,12 +6075,12 @@ mod tests {
 
         for origin in ["moved", "home"] {
             assert_eq!(
-                handoff_message(origin, None, false, false),
+                handoff_message(origin, None, false, false, None),
                 None,
                 "older ledger"
             );
             assert_eq!(
-                handoff_message(origin, Some(&Carryover::default()), false, false),
+                handoff_message(origin, Some(&Carryover::default()), false, false, None),
                 None
             );
             let idle = Carryover {
@@ -6056,7 +6090,7 @@ mod tests {
                 ..Carryover::default()
             };
             assert_eq!(
-                handoff_message(origin, Some(&idle), false, false),
+                handoff_message(origin, Some(&idle), false, false, None),
                 None,
                 "settings and an earlier pickup are not unfinished work"
             );
@@ -6065,7 +6099,7 @@ mod tests {
 
     #[test]
     fn automatic_checkpoint_recovery_inspects_uncertainty_without_waking_known_idle_work() {
-        let text = handoff_message("moved", None, true, true)
+        let text = handoff_message("moved", None, true, true, None)
             .expect("unknown saved work is inspected automatically");
         assert!(text.contains("because the other machine stopped responding"));
         assert!(text.contains("continuing from the last saved point in a copy"));
@@ -6077,10 +6111,53 @@ mod tests {
                 "moved",
                 Some(&chimaera_agent::Carryover::default()),
                 true,
-                true
+                true,
+                None
             ),
             None
         );
+    }
+
+    /// A recovery says how old its saved point is, so an agent that finds a
+    /// file missing knows it may still be on the other machine; a move, an
+    /// unknown age or one under two seconds adds nothing.
+    #[test]
+    fn recovery_pickup_says_how_old_the_saved_point_is() {
+        let sentence = |age| {
+            let text = handoff_message("moved", None, true, true, age).expect("recovery");
+            text.split(". ")
+                .find(|s| s.starts_with("That saved point"))
+                .map(str::to_owned)
+        };
+        assert_eq!(
+            sentence(Some(12_400)).as_deref(),
+            Some(
+                "That saved point is from 12 seconds before the other machine stopped \
+                 responding, so files written after it are on that machine, not here"
+            )
+        );
+        assert!(sentence(Some(120_000))
+            .unwrap()
+            .contains("from 120 seconds before"));
+        assert!(sentence(Some(300_000))
+            .unwrap()
+            .contains("from 5 minutes before"));
+        assert!(sentence(Some(2_000))
+            .unwrap()
+            .contains("from 2 seconds before"));
+        assert_eq!(sentence(Some(1_999)), None);
+        assert_eq!(sentence(None), None);
+        let home = handoff_message("home", None, true, false, Some(30_000)).unwrap();
+        assert!(home.contains(
+            "continuing from the last saved point, in the same conversation. That saved point \
+             is from 30 seconds before"
+        ));
+        let carry = chimaera_agent::Carryover {
+            turn_in_flight: true,
+            ..Default::default()
+        };
+        let moved = handoff_message("moved", Some(&carry), false, false, Some(30_000)).unwrap();
+        assert!(!moved.contains("saved point"), "{moved}");
     }
 
     /// The pick-up names where the agent runs now in the UI's words, says
@@ -6113,8 +6190,8 @@ mod tests {
             ("home", "You now run on the user's computer"),
         ] {
             for carry in [&turn, &background, &both] {
-                let text =
-                    handoff_message(origin, Some(carry), false, false).expect("interrupted work");
+                let text = handoff_message(origin, Some(carry), false, false, None)
+                    .expect("interrupted work");
                 assert!(text.contains(place), "{text}");
                 assert!(text.contains("in the same conversation"), "{text}");
                 assert!(text.contains("installed here and may differ"), "{text}");
@@ -6130,7 +6207,7 @@ mod tests {
                 );
             }
         }
-        let recovered = handoff_message("home", Some(&both), true, true).expect("recovery");
+        let recovered = handoff_message("home", Some(&both), true, true, None).expect("recovery");
         assert!(recovered.contains("back to the user's computer because"));
         assert!(recovered.contains("Background task: Watch CI for PR 158"));
     }
@@ -6256,9 +6333,9 @@ mod tests {
         .unwrap();
         let said = "permission to run Bash (tool call toolu_9), and that call was not run";
         for origin in ["moved", "home"] {
-            let text = handoff_message(origin, Some(&carry), false, false).unwrap();
+            let text = handoff_message(origin, Some(&carry), false, false, None).unwrap();
             assert!(text.contains(said), "{text}");
-            let recovered = handoff_message(origin, Some(&carry), true, false).unwrap();
+            let recovered = handoff_message(origin, Some(&carry), true, false, None).unwrap();
             assert!(!recovered.contains("was not run"), "{recovered}");
         }
         let restarted = restart_message(&carry).unwrap();

@@ -218,6 +218,10 @@ pub struct LaunchContext {
     /// The agent continues work an interrupted earlier run left: its pick-up
     /// says to check the files first.
     pub recovery: bool,
+    /// With `recovery`: how long before the other machine stopped responding
+    /// the saved point it continues from was made (ms), when known. The
+    /// pick-up says so, because files written after it stay on that machine.
+    pub saved_point_age_ms: Option<u64>,
     /// The project's agents get the daemon's tools even in a terminal agent
     /// that otherwise has none.
     pub tools: bool,
