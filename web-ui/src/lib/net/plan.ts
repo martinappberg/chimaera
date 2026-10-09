@@ -25,8 +25,10 @@ interface AccountState {
  *  composed, and the window is this computer's own native window or the
  *  account gateway. A build without the extension, a native window on
  *  another host's daemon and an ordinary browser never can. Synchronous and
- *  static for the process: deciding it asks nothing of anyone. */
-function proPossible(): boolean {
+ *  static for the process: deciding it asks nothing of anyone, so it is the
+ *  one free/not-free test (boot, listeners, Pro entry points). `proTier`
+ *  adds offered vs active on top of it. */
+export function proPossible(): boolean {
   if (selectedApplication === null) return false;
   if (isBrowserGateway() || isAccountHome()) return true;
   return isNativeShell() && getHostLabel() === "local";

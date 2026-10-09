@@ -3,9 +3,8 @@
   import { cloudOnboarding } from "./lib/pro/onboarding.svelte";
   import { KEPT_NOTICE_PREFIX, keptNoticeWorkspace } from "./lib/pro/kept";
   import { onMount, tick, untrack } from "svelte";
-  import { loadApplicationEntry } from "virtual:chimaera-application-entry";
   import { selectedApplication } from "./lib/extensions/selected";
-  import { paidPlan, proTier } from "./lib/net/plan";
+  import { paidPlan, proPossible, proTier } from "./lib/net/plan";
   import { isBrowserGateway, gatewayPrefix, gatewayWorkspace } from "./lib/net/base";
   import AgentSetupDialog from "./lib/workspace/AgentSetupDialog.svelte";
   import { agentSetup, openAgentSetup } from "./lib/workspace/agentSetup";
@@ -31,6 +30,7 @@
     pollHealth,
     reclaimHomeHub,
     setActiveWorkspaceId,
+    setViewerWorkspaceHeader,
     unauthorized,
     type Health,
   } from "./lib/net/api";
@@ -508,7 +508,8 @@
   /** This window's host alias ("local" for the local daemon). */
   // Only a window that can have Pro has keepers that hold its sockets open
   // for a sleeping owner (`net/reconnect.ts`); set before any socket dials.
-  setSocketKeepers(get(proTier) !== "free");
+  setSocketKeepers(proPossible());
+  setViewerWorkspaceHeader(proPossible());
   const hostAlias = getHostLabel();
   const isRemoteWindow = hostAlias !== "local";
   /** A browser view of a project (`/workspace/{id}/`) follows the project
@@ -1884,7 +1885,7 @@
       onNotices: (list) => {
         // A return that kept both versions: the chat's line and an open
         // review read the project's answer again (native or browser).
-        if (get(proTier) !== "free") for (const n of list) {
+        if (proPossible()) for (const n of list) {
           if (n.kind === "kept_both" && n.workspace_id !== null) void import("./lib/pro/keptReviews.svelte").then(({ keptReviews }) => keptReviews.refresh(n.workspace_id!)).catch(() => { /* A visible review retains its own explicit Refresh recovery. */ });
         }
         if (isNativeShell()) return;
@@ -1929,8 +1930,8 @@
     // closes the focused VIEW (a home window just closes), reclaiming the
     // chords a browser reserves for tabs.
     let proReturnLive = true;
-    const stopProReturn = loadApplicationEntry !== null && isNativeShell() ? asyncDisposer(import("./lib/net/proReturn").then(({ listenForProReturn }) =>
-      proReturnLive ? listenForProReturn(() => { if (proReturnLive) pendingProReturn = true; }) : () => {})) : () => {};
+    const stopProReturn = proPossible() && isNativeShell() ? asyncDisposer(import("./lib/net/proReturn").then(({ listenForProReturn }) =>
+      proReturnLive ? listenForProReturn(() => { if (proReturnLive) proReturnRequests += 1; }) : () => {})) : () => {};
     let unlistenMenu: (() => void) | null = null;
     let unlistenDaemonMoved: (() => void) | null = null;
     let unlistenHostStatus: (() => void) | null = null;
@@ -2048,7 +2049,7 @@
       else openDashboardSurface();
     };
     // Pro's own requests: a window that can never have Pro listens for none.
-    const proListeners: [string, (event: Event) => void][] = get(proTier) === "free" ? [] : [
+    const proListeners: [string, (event: Event) => void][] = !proPossible() ? [] : [
       ["chimaera:providers-ready", providersReady],
       ["chimaera:connect-providers", connectProviders],
       ["chimaera:open-pro", openProSurface],
@@ -2467,7 +2468,7 @@
    * restored yet has nothing to anchor on; the frame is not queued.
    */
   function onAgentBrowserOpen(open: AgentBrowserOpen): void {
-    if (!layoutReady || !admitsAgentBrowserOpen(open, sessionsById.get(open.sessionId), projectView, get(proTier) === "free")) return;
+    if (!layoutReady || !admitsAgentBrowserOpen(open, sessionsById.get(open.sessionId), projectView, !proPossible())) return;
     const view = {
       layout,
       workspaceId: activeWsId,
@@ -3758,10 +3759,13 @@
    *  stays mounted underneath, parked (hidden + inert): the cluster page, an
    *  open Add-machine form and a connect's progress line are still there on
    *  return, and Home's mount-time fetches don't run again. */
-  let pendingProReturn = $state(false);
+  // A request counter the effect only reads, plus a plain count of the ones
+  // it has handled: the effect never writes the state it depends on.
+  let proReturnRequests = $state(0);
+  let proReturnsHandled = 0;
   $effect(() => {
-    if (pendingProReturn && (activeWsId === null || layoutReady)) {
-      pendingProReturn = false;
+    if (proReturnRequests > proReturnsHandled && (activeWsId === null || layoutReady)) {
+      proReturnsHandled = proReturnRequests;
       untrack(openProSurface);
     }
   });
@@ -3798,7 +3802,7 @@
 
   function openProSurface(): void {
     // A build or window that can never offer Pro has no Pro page to open.
-    if (get(proTier) === "free") return;
+    if (!proPossible()) return;
     if (activeWsId === null) {
       homeSurface = "pro";
       homeSettingsLoad = loadPaneView("pro");
@@ -3824,10 +3828,14 @@
    * that project first (the notification-reveal path), then opens once its
    * layout has booted.
    */
-  let pendingKeptReview = $state<string | null>(null);
+  // Each request is a fresh object the effect only reads; the plain
+  // `keptReviewHandled` marks the one it has opened, so the effect never
+  // writes the state it depends on.
+  let pendingKeptReview = $state<{ id: string } | null>(null);
+  let keptReviewHandled: { id: string } | null = null;
   async function openKeptReviewFor(workspaceId: string): Promise<void> {
     // Only a window that can have Pro has returns to review.
-    if (get(proTier) === "free") return;
+    if (!proPossible()) return;
     if (workspaceId !== activeWsId) {
       let target = workspaces.find((w) => w.id === workspaceId);
       if (target === undefined) {
@@ -3838,22 +3846,22 @@
         }
       }
       if (target === undefined) return;
-      pendingKeptReview = workspaceId;
+      pendingKeptReview = { id: workspaceId };
       void activateWorkspace(target);
       return;
     }
     if (!layoutReady) {
-      pendingKeptReview = workspaceId;
+      pendingKeptReview = { id: workspaceId };
       return;
     }
     layout = openKeptReview(layout);
     void import("./lib/pro/keptReviews.svelte").then(({ keptReviews }) => keptReviews.refresh(workspaceId)).catch(() => { /* The review has explicit Refresh recovery. */ });
   }
   $effect(() => {
-    const id = pendingKeptReview;
-    if (id === null || !layoutReady || activeWsId !== id) return;
-    pendingKeptReview = null;
-    untrack(() => void openKeptReviewFor(id));
+    const request = pendingKeptReview;
+    if (request === null || request === keptReviewHandled || !layoutReady || activeWsId !== request.id) return;
+    keptReviewHandled = request;
+    untrack(() => void openKeptReviewFor(request.id));
   });
 
   /** Open/focus All sessions (the Recents header, the dashboard's usage
@@ -5595,7 +5603,7 @@
             />
             {#snippet failed(_error, reset)}
               <div class="home-settings-shell">
-                <HomeNavigation active="workspaces" plan={$paidPlan} showPro={$proTier !== "free"}
+                <HomeNavigation active="workspaces" plan={$paidPlan} showPro={proPossible()}
                   onHome={reset} onPro={openProSurface} onSettings={openSettingsSurface} />
                 <div class="home-settings-content home-surface-failed">
                   <p role="alert">Home hit an error and stopped.</p>
@@ -5609,7 +5617,7 @@
       {:catch error}
         {#if !homeSettingsOpen}
           <div class="home-settings-shell">
-            <HomeNavigation active="workspaces" plan={$paidPlan} showPro={$proTier !== "free"}
+            <HomeNavigation active="workspaces" plan={$paidPlan} showPro={proPossible()}
               onHome={() => (homeLoad = retryPaneView("home", error))} onPro={openProSurface} onSettings={openSettingsSurface} />
             <div class="home-settings-content home-surface-failed">
               <p role="alert">Couldn't open Home.</p>
@@ -5622,7 +5630,7 @@
     {/if}
     {#if homeSettingsOpen}
       <div class="home-settings-shell">
-        <HomeNavigation active={homeSurface} plan={$paidPlan} showPro={$proTier !== "free"}
+        <HomeNavigation active={homeSurface} plan={$paidPlan} showPro={proPossible()}
           onHome={() => (homeSettingsOpen = false)} onPro={openProSurface} onSettings={openSettingsSurface} />
       <div class="home-settings-surface">
         <nav class="home-surface-nav" aria-label="Home navigation">
@@ -6217,7 +6225,9 @@
         <!-- Inside an allocation the label carries the node ("cluster ›
              n042") so a compute-node window never poses as its login
              node — derived from the daemon's self block, hash-independent. -->
-        <PlaceSlot workspaceId={placeWorkspaceId} sessions={wsSessions}>
+        <!-- The collapsed rail stays mounted in focus mode; the strip's slot
+             then mounts the place extension instead, so it runs once. -->
+        <PlaceSlot workspaceId={layout.focusMode ? null : placeWorkspaceId} sessions={wsSessions}>
           {#snippet label()}<span class="daemon-host" class:remote={isRemoteWindow} title={health?.hostname}
             >{$computeStatus?.self
               ? `${getHostLabel()} › ${$computeStatus.self.node}`

@@ -431,6 +431,15 @@ export class ApiError extends Error {
   }
 }
 
+/** Whether `api()` names the window's active project to its daemon
+ *  (`X-Chimaera-Viewer-Workspace`, crates/chimaera-link/PROTOCOL.md). Only a
+ *  window that can have Pro sends it (App sets it from `proPossible` at
+ *  boot); the free daemon ignores it, so a free window never adds it. */
+let viewerWorkspaceHeader = false;
+export function setViewerWorkspaceHeader(on: boolean): void {
+  viewerWorkspaceHeader = on;
+}
+
 /** Fetch wrapper for /api/v1 that attaches the Bearer token. */
 export async function api(path: string, init: RequestInit = {}, guard?: ApiGuard): Promise<Response> {
   const owner = currentOwner;
@@ -441,9 +450,9 @@ export async function api(path: string, init: RequestInit = {}, guard?: ApiGuard
     headers.set("Authorization", `Bearer ${token}`);
   }
   if (isBrowserGateway()) headers.set("X-Chimaera-Browser", "1");
-  if (!isBrowserGateway()) {
-    const workspace=getActiveWorkspaceId();
-    if (workspace !== null && /^[A-Za-z0-9_-]{1,128}$/.test(workspace)) headers.set("X-Chimaera-Viewer-Workspace",workspace);
+  if (viewerWorkspaceHeader && !isBrowserGateway()) {
+    const workspace = getActiveWorkspaceId();
+    if (workspace !== null && /^[A-Za-z0-9_-]{1,128}$/.test(workspace)) headers.set("X-Chimaera-Viewer-Workspace", workspace);
   }
   try { await workspaceHeaders(headers, guard?.placement); }
   catch (error) { if (error instanceof PlacementError && error.status === 401 && owner === currentOwner) notifyUnauthorized(); throw error; }
