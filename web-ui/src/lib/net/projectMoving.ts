@@ -1,7 +1,7 @@
 /**
  * A browser view of a project while the project moves between the user's
- * computer and their cloud. Nothing in the view is usable then (whatever
- * would answer is on its way), so the view says so once, over everything,
+ * computer and their cloud. None of its panes is usable then (whatever
+ * would answer is on its way), so the view says so once, over the panes,
  * and clears as soon as the machine that holds the project serves it.
  *
  * Driven only by the view's own placement reads (every action and socket
@@ -29,7 +29,7 @@ type Place = "cloud" | "computer";
  *  minutes, so past this the view shows its ordinary connection state. */
 export const MOVING_MAX_MS = 5 * 60_000;
 
-/** The one sentence the view shows over everything while its project moves. */
+/** The one sentence the view shows over its panes while its project moves. */
 export function movingSentence(moving: ProjectMoving): string {
   if (moving.to === "computer") return "Coming back to your computer…";
   return moving.arriving ? "Starting in your cloud…" : "Moving to your cloud…";

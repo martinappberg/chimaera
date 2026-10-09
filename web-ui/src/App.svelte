@@ -6455,6 +6455,13 @@
           </div>
         {/if}
       {/if}
+      {#if projectView}
+        <!-- A project view while its project moves between the computer and
+             the cloud: no pane answers until the new machine serves it, so
+             the panes are covered; the sidebar (Home, the project list) is
+             not, since it does not depend on the moving project. -->
+        <MovingOverlay />
+      {/if}
     </main>
     {#if mastermindPanel.open && MastermindPanelView !== null && layoutReady && activeWsId !== null}
       <MastermindPanelView
@@ -6680,12 +6687,6 @@
   <!-- This host's copy of a project another machine runs: covered, with
        the project view as the one way forward. -->
   <ElsewhereNotice href={elsewhereHref} />
-{/if}
-
-{#if projectView}
-  <!-- A project view while its project moves between the computer and the
-       cloud: nothing underneath answers until the new machine serves it. -->
-  <MovingOverlay />
 {/if}
 
 <!-- Blocking re-auth overlay: the daemon rejected this window's token
