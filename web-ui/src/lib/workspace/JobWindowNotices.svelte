@@ -7,8 +7,9 @@
    *   setup, and when it starts this job's workspaces move over and this
    *   window follows (the shell opens it there);
    * - once the shell reports the job ended, or this workspace was closed
-   *   (`host-status` "ended" on this window's key): a calm overlay — the work
-   *   is gone, the chats aren't.
+   *   (`host-status` "ended" on this window's key, or the cluster's overview
+   *   after a reconnect failed): a calm overlay — the work is gone, the chats
+   *   aren't — with Start again (a new job for this workspace) and Close.
    * A person starts every job (plan §2.4): nothing here queues anything
    * without a click.
    */
@@ -37,9 +38,23 @@
     ended: { reason: string | null } | null;
     /** The reconnect strip holds the top edge right now — sit below it. */
     stacked?: boolean;
+    /** The cluster page is over this window: the ended panel waits under it. */
+    covered?: boolean;
+    /** Start a new job for this workspace (the cluster page's start sheet,
+     *  set up like the job that ended). */
+    onStartAgain?: () => void;
   }
 
-  let { alias, cws, self: alloc, receivedAt, ended, stacked = false }: Props = $props();
+  let {
+    alias,
+    cws,
+    self: alloc,
+    receivedAt,
+    ended,
+    stacked = false,
+    covered = false,
+    onStartAgain,
+  }: Props = $props();
 
   const nativeJob = $derived(isNativeShell() && cws !== null);
   /** An attached job (held by the app) can't continue: its reminder only
@@ -114,6 +129,11 @@
 
   /** On its way to another job: the shell reopens this window there. */
   const moving = $derived(ended !== null && ended.reason === "moving");
+  /** The job itself ended (not just this workspace closing or stopping in a
+   *  job that still runs): a new job is what brings the workspace back. */
+  const jobGone = $derived(
+    ended !== null && !moving && ended.reason !== "closed" && ended.reason !== "workspace-failed",
+  );
 
   let leaving = $state(false);
   let leaveError = $state<string | null>(null);
@@ -135,7 +155,7 @@
 </script>
 
 {#if ended !== null}
-  <div class="ended-overlay">
+  {#if !covered}<div class="ended-overlay">
     <div
       class="ended-panel"
       role="alertdialog"
@@ -151,8 +171,10 @@
       {#if leaveError !== null}<p class="ended-err">{leaveError}</p>{/if}
       <div class="ended-acts">
         {#if isNativeShell()}
-          <button class="quiet" onclick={closeThisWindow}>Close window</button>
-          {#if !moving}
+          <button class="quiet" onclick={closeThisWindow}>Close</button>
+          {#if jobGone && cws !== null && onStartAgain !== undefined}
+            <button class="primary" use:focusOnMount onclick={onStartAgain}>Start again</button>
+          {:else if !moving}
             <button class="primary" disabled={leaving} use:focusOnMount onclick={() => void backToHost()}
               >Back to {alias}</button
             >
@@ -160,7 +182,7 @@
         {/if}
       </div>
     </div>
-  </div>
+  </div>{/if}
 {:else if showBanner}
   <div class="job-banner" class:stacked role="status" aria-live="polite">
     {#if phase === "waiting"}

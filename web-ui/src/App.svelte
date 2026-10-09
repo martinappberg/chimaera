@@ -98,6 +98,7 @@
   } from "./lib/workspace/agentLinks";
   import { typeIntoDetachedSession } from "./lib/terminal/ws";
   import { reconnectingSockets, setSocketKeepers } from "./lib/net/reconnect";
+  import { endJobWindow, jobWindowEnd, windowJobEnd } from "./lib/workspace/jobEnd";
   import {
     createReconnectListenerGate,
     selectRemoteReconnectSurface,
@@ -337,6 +338,7 @@
     askpassActive,
     closeThisWindow,
     clusterOpen,
+    clusterOverview,
     connectHost,
     isNativeShell,
     onAppUpdate,
@@ -554,9 +556,10 @@
   let reconnecting = $state(false);
   /** Last reconnect failure, surfaced with a Retry. */
   let reconnectError = $state<string | null>(null);
-  /** A job window's job left the queue (the shell's `ended` on its key);
-   *  `reason` is Slurm's state, or "stopped" for a stop from the app. */
-  let jobEnded = $state<{ reason: string | null } | null>(null);
+  /** A job window's job left the queue (the shell's `ended` on its key, or
+   *  the cluster's overview after a reconnect failed); `reason` is Slurm's
+   *  state, or "stopped" for a stop from the app. */
+  const jobEnded = $derived($windowJobEnd);
   /** The job window's notices — their own chunk, loaded only in job windows. */
   let JobNoticesView = $state<typeof JobWindowNotices | null>(null);
   if (jobCtx !== null) {
@@ -573,8 +576,12 @@
   const clusterWs = isNativeShell() ? (jobCtx?.cws ?? null) : null;
   let clusterHomeOpen = $state(false);
   let ClusterHomeView = $state<typeof JobClusterHome | null>(null);
+  /** The cluster page opened from the ended panel's Start again: it opens
+   *  its start sheet for this workspace, set up like the ended job. */
+  let clusterStartAgain = $state(false);
 
-  function openClusterHome(): void {
+  function openClusterHome(startAgain = false): void {
+    clusterStartAgain = startAgain;
     clusterHomeOpen = true;
     if (ClusterHomeView !== null) return;
     import("./lib/workspace/JobClusterHome.svelte").then(
@@ -626,9 +633,32 @@
       // Every successful shell connect republishes `host-status: connected`,
       // which clears the overlay and re-homes this window when needed.
     } catch (e) {
-      reconnectError = e instanceof Error ? e.message : String(e);
+      // A job window that can't get back may simply have nothing left to
+      // reach: its job ended (the shell's `ended` can come late, or never
+      // when its overview took the end first). Ask the cluster before
+      // offering a Retry that cannot help.
+      const end = jobCtx !== null ? await jobEndFromOverview(jobCtx.jobId, jobCtx.cws) : null;
+      if (end !== null) {
+        endJobWindow(end);
+        finishReconnect();
+      } else {
+        reconnectError = e instanceof Error ? e.message : String(e);
+      }
     } finally {
       reconnecting = false;
+    }
+  }
+
+  /** The cluster overview's word on this job window's end; null when it
+   *  still runs there, or when the overview can't be read either. */
+  async function jobEndFromOverview(
+    slurmJobId: string,
+    cws: string | null,
+  ): Promise<{ reason: string | null } | null> {
+    try {
+      return jobWindowEnd(await clusterOverview(hostAlias), slurmJobId, cws);
+    } catch {
+      return null;
     }
   }
 
@@ -661,7 +691,7 @@
       // Only a job window's composite key ends; a "down" without it is still
       // just a connection blip (the reconnect below).
       if (jobCtx === null) return;
-      jobEnded = { reason: e.reason ?? null };
+      endJobWindow({ reason: e.reason ?? null });
       finishReconnect();
       return;
     }
@@ -6813,6 +6843,7 @@
     alias={hostAlias}
     here={clusterWs}
     hereName={workspace?.name ?? "workspace"}
+    startAgainFrom={clusterStartAgain ? (jobCtx?.jobId ?? null) : null}
     onClose={() => (clusterHomeOpen = false)}
   />
 {/if}
@@ -6827,6 +6858,8 @@
     receivedAt={$computeStatus?.received_at_ms ?? 0}
     ended={jobEnded}
     stacked={reconnectSurface !== "hidden" && !$askpassActive}
+    covered={clusterHomeOpen}
+    onStartAgain={clusterWs !== null ? () => openClusterHome(true) : undefined}
   />
 {/if}
 

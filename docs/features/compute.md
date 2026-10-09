@@ -173,6 +173,15 @@ Nothing site-specific is ever coded.
   person starts every job. An attached job can't continue (the app holds it); its window
   says when it ends without offering to (job-host sets `CHIMAERA_JOB_ATTACHED` on its
   workspaces' chimaeras, and their `/compute` `self` block carries `attached`).
+- **A job window when its job ends.** The window says so in the cluster page's words
+  ("This job ended — it hit its time limit. Your chats are saved.") and offers **Start
+  again** (the cluster page's start sheet for this workspace, set up like the job that
+  ended) and **Close**; a closed or stopped workspace in a job that still runs offers
+  **Back to** the cluster instead. It learns the end from the shell's `host-status`
+  `ended`, or — when a reconnect fails first — from the cluster's overview
+  (`web-ui/src/lib/workspace/jobEnd.ts`), so a dead endpoint never gets a Retry. Its
+  sockets stop retrying, and a chat whose agent stopped with the job says the job ended
+  instead of "agent exited".
 - **Notifications** (native app, even when looking elsewhere; windows never open by
   themselves): ready, an hour left, ten minutes left (only for a job longer than the mark,
   worded with the time actually left; the watcher wakes at those marks), stopped, and

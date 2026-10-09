@@ -196,6 +196,26 @@ export function ownerAwake(rand: () => number = Math.random): void {
   }
 }
 
+/** This window's daemon is gone for good (its cluster job ended): no socket
+ *  retries again — each attempt would only meet a dead endpoint. A new
+ *  daemon means a new page load, which starts this module fresh. */
+let halted = false;
+
+/** Stop every socket's retries for the rest of this page's life and drop
+ *  their reconnecting-indicator count: the window says why itself. */
+export function haltReconnects(): void {
+  halted = true;
+  for (const r of [...down]) {
+    r.cancel();
+    r.clear();
+  }
+}
+
+/** Whether {@link haltReconnects} ran. */
+export function reconnectsHalted(): boolean {
+  return halted;
+}
+
 /**
  * One document-lifetime listener, armed lazily on the first schedule():
  * module-scoped (not component-scoped) on purpose — the sockets it serves
@@ -237,6 +257,7 @@ export class Reconnector {
    * for the attempt after.
    */
   schedule(): void {
+    if (halted) return;
     armVisibilityRetry();
     if (!this.reconnecting) {
       this.reconnecting = true;
@@ -261,6 +282,7 @@ export class Reconnector {
    * so the failure path retries immediately. No-op on a healthy socket.
    */
   nudge(delayMs: number): void {
+    if (halted) return;
     if (this.timer !== null) {
       clearTimeout(this.timer);
       this.timer = setTimeout(() => {
