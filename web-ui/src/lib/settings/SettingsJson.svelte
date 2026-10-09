@@ -26,11 +26,14 @@
     type CompletionResult,
   } from "@codemirror/autocomplete";
   import { tags as t } from "@lezer/highlight";
-  import { expectedType, sanitize, settingDef, SETTINGS } from "./schema";
+  import { completableSettings, expectedType, sanitize, settingDef } from "./schema";
   import { getSetting, rawUserSettings, replaceSettings } from "./store.svelte";
   import { isMac } from "../shared/keys";
 
   const SAVE_HINT = isMac ? "⌘S to save" : "Ctrl+S to save";
+
+  /** A development build of the native app also completes testing settings. */
+  let { devBuild = false }: { devBuild?: boolean } = $props();
 
   let host = $state<HTMLDivElement | null>(null);
   let view: EditorView | null = null;
@@ -96,7 +99,7 @@
   ): CompletionResult | Promise<CompletionResult | null> | null {
     const word = ctx.matchBefore(/"[\w.]*$/);
     if (word === null && !ctx.explicit) return null;
-    const options: Completion[] = SETTINGS.map((def) => ({
+    const options: Completion[] = completableSettings(devBuild).map((def) => ({
       label: `"${def.id}"`,
       type: "property",
       detail: def.type,

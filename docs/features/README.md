@@ -60,7 +60,7 @@ core; an addition can change when there's a clear improvement. Don't be too stri
 | [git.md](git.md) | Source-control panel (status/diff), several repositories per workspace, history (log, commits, file history, changes on a branch), sessions' branches, worktree create/remove/lock, the session-scoped changes view, git-binary remediation |
 | [linked-terminals.md](linked-terminals.md) | Granting an agent access to specific terminals (the "leash") and the daemon's MCP server (`list_terminals` / `run_in_terminal` / `read_terminal`; `notify` lives in [notifications.md](notifications.md)) |
 | [remote-connect.md](remote-connect.md) | `chimaera connect` — SSH orchestration, daemon auto-deploy, tunnels, in-app SSH/2FA auth, remote host management |
-| [pro.md](pro.md) | Optional account sign-in, project sync and explicit takeover, cloud continuity, kept host connections, remote viewing and device controls |
+| [pro.md](pro.md) | Optional account sign-in, project copies and explicit takeover, cloud continuity, kept host connections, remote viewing and device controls |
 | [notifications.md](notifications.md) | The notice feed (agent finished / awaiting approval / error / agent `notify`), native OS + browser notifications with click-to-session, the approval-only counts and the unread mark |
 | [native-app.md](native-app.md) | The Tauri shell: real OS windows, window restore, the signed app+daemon self-updater, the update toast |
 | [lifecycle-and-persistence.md](lifecycle-and-persistence.md) | Daemon-owned session lifetime, live reconnect, conversation resume and shell respawn after restart, graceful shutdown, update awareness |

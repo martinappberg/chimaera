@@ -75,7 +75,7 @@ writes and must not silently resume the old cloud agent.
 
 Omitting `epoch` requests read-only credentials. Supplying it requests write
 credentials and must match the caller's current, unexpired baton holder and
-epoch. Response:
+epoch. Response (example values; limits are synthetic, not any plan's allowance):
 
 ```json
 {
@@ -86,7 +86,7 @@ epoch. Response:
   "password": "opaque-short-lived-secret",
   "expires_at": "2026-09-27T01:15:00Z",
   "read_only": false,
-  "storage_limit_bytes": 21474836480,
+  "storage_limit_bytes": 1073741824,
   "max_file_bytes": 100000000
 }
 ```

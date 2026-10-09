@@ -43,7 +43,7 @@ impl Alias {
             }
         }
         for key in ["bases", "candidates"] {
-            if let Some(values) = body[key].as_array_mut() {
+            if let Some(values) = body.get_mut(key).and_then(Value::as_array_mut) {
                 for value in values {
                     map_string(value, |p| self.input(p));
                 }
@@ -257,6 +257,16 @@ mod tests {
             "/Users/å/project/my plot#x.png"
         );
         assert_eq!(response["results"][original]["ticket"], "opaque");
+    }
+    #[test]
+    fn request_mapping_adds_no_fields_to_a_forwarded_body() {
+        let alias = alias();
+        let mut body = serde_json::json!({"path":"/Users/å/project/file"});
+        alias.request_body(&mut body);
+        assert_eq!(body, serde_json::json!({"path":"/cloud/project/file"}));
+        let mut body = serde_json::json!({"candidates":["/Users/å/project/a"]});
+        alias.request_body(&mut body);
+        assert_eq!(body, serde_json::json!({"candidates":["/cloud/project/a"]}));
     }
     #[test]
     fn alias_rejects_encoded_traversal_controls_and_noncanonical_encoding() {

@@ -828,7 +828,7 @@
                   >
                   <button
                     class="act icon"
-                    aria-label="Dismiss"
+                    aria-label="Dismiss {j.name}"
                     title="Dismiss"
                     disabled={jobBusy[j.id] !== undefined}
                     onclick={() => void jobAction(j, "dismissing", () => clusterDismissJob(alias, j.id))}
@@ -1694,8 +1694,8 @@
     outline-offset: 2px;
   }
 
-  /* A narrow pane (the page can sit in ~600 px): rows wrap their status and
-     actions under the name instead of squeezing it. */
+  /* A narrow page (560 px or less, e.g. in a split pane): rows wrap their
+     status and actions under the name instead of squeezing it. */
   @container cluster-page (max-width: 560px) {
     .ws-main,
     .ended-main {
@@ -1734,6 +1734,8 @@
     }
   }
 
+  /* The page's own padding follows the window, as Home's does: `.inner` is
+     the size container, and a container cannot query itself. */
   @media (max-width: 700px) {
     .inner {
       padding: 24px 20px 20px;

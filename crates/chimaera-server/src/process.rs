@@ -1,11 +1,13 @@
-//! Auth subprocesses never forward their output to logs or HTTP errors.
+//! Bounded subprocesses: auth helpers (whose output never reaches logs or
+//! HTTP errors) and short detection probes (login-shell `command -v`,
+//! `--version`). Each runs in its own process group, killed whole.
 use std::{path::Path, process::Stdio, time::Duration};
 use tokio::io::AsyncReadExt;
 
 pub const LIMIT: usize = 64 * 1024;
 pub const TIMEOUT: Duration = Duration::from_secs(8);
 pub struct Child {
-    pub child: tokio::process::Child,
+    child: tokio::process::Child,
     #[cfg(unix)]
     group: Option<rustix::process::Pid>,
 }
@@ -13,6 +15,30 @@ impl Child {
     pub fn spawn(command: &mut tokio::process::Command) -> Result<Self, &'static str> {
         #[cfg(unix)]
         command.process_group(0);
+        Self::start(command)
+    }
+
+    /// Like [`Child::spawn`], but in a new session with no controlling
+    /// terminal. An interactive (`-i`) shell opens `/dev/tty` and starts job
+    /// control: outside the terminal's foreground group bash stops itself
+    /// with SIGTTIN until the timeout, and zsh may take the terminal away
+    /// from a daemon running in the foreground. A session leader's group id
+    /// is its pid, so the group kill below is unchanged.
+    pub fn spawn_session(command: &mut tokio::process::Command) -> Result<Self, &'static str> {
+        #[cfg(unix)]
+        // SAFETY: setsid is a single async-signal-safe syscall; nothing is
+        // allocated or locked between fork and exec.
+        unsafe {
+            command.pre_exec(|| {
+                rustix::process::setsid()
+                    .map(|_| ())
+                    .map_err(std::io::Error::from)
+            });
+        }
+        Self::start(command)
+    }
+
+    fn start(command: &mut tokio::process::Command) -> Result<Self, &'static str> {
         let child = command
             .kill_on_drop(true)
             .spawn()
@@ -58,6 +84,18 @@ impl Child {
             }
         }
         self.child.wait().await
+    }
+
+    pub fn id(&self) -> Option<u32> {
+        self.child.id()
+    }
+
+    pub fn take_stdout(&mut self) -> Option<tokio::process::ChildStdout> {
+        self.child.stdout.take()
+    }
+
+    pub fn take_stderr(&mut self) -> Option<tokio::process::ChildStderr> {
+        self.child.stderr.take()
     }
 
     #[cfg(unix)]
@@ -115,19 +153,43 @@ pub async fn output_tracked(
     cmd: &mut tokio::process::Command,
     started: impl FnOnce(u32),
 ) -> Result<Output, &'static str> {
-    let mut child = Child::spawn(cmd)?;
-    if let Some(pid) = child.child.id() {
+    let child = Child::spawn(cmd)?;
+    if let Some(pid) = child.id() {
         started(pid);
     }
-    let stdout = child.child.stdout.take().ok_or("start_failed")?;
-    let stderr = child.child.stderr.take().ok_or("start_failed")?;
+    collect(child).await
+}
+
+/// One short probe (a login shell's `command -v`, a CLI's `--version`) run to
+/// completion or `limit`, `None` on any failure. It runs in a new session
+/// ([`Child::spawn_session`]), killed whole when its leader exits or when
+/// this future is dropped (timeout, daemon shutdown): an interactive rc (nvm,
+/// prompt frameworks) or a node-backed CLI leaves helpers behind that
+/// `kill_on_drop` (the leader alone) never reaches. stderr is discarded:
+/// nothing reads it, and a chatty rc must not fail detection on the cap.
+pub async fn probe_output(cmd: &mut tokio::process::Command, limit: Duration) -> Option<Output> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let child = Child::spawn_session(cmd).ok()?;
+    tokio::time::timeout(limit, collect(child)).await.ok()?.ok()
+}
+
+async fn collect(mut child: Child) -> Result<Output, &'static str> {
+    let stdout = child.take_stdout().ok_or("start_failed")?;
+    let stderr = child.take_stderr();
     let work = async {
         let mut out = Vec::new();
         let mut err = Vec::new();
         let mut stdout = stdout.take((LIMIT + 1) as u64);
-        let mut stderr = stderr.take((LIMIT + 1) as u64);
         let drain = async {
-            let (a, b) = tokio::join!(stdout.read_to_end(&mut out), stderr.read_to_end(&mut err));
+            let read_err = async {
+                match stderr {
+                    Some(stderr) => stderr.take((LIMIT + 1) as u64).read_to_end(&mut err).await,
+                    None => Ok(0),
+                }
+            };
+            let (a, b) = tokio::join!(stdout.read_to_end(&mut out), read_err);
             a.map_err(|_| "probe_failed")?;
             b.map_err(|_| "probe_failed")?;
             if out.len() > LIMIT || err.len() > LIMIT {
@@ -205,5 +267,48 @@ mod tests {
         );
         assert!(child.child.id().is_none());
         assert_eq!(child.wait().await.unwrap().code(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn a_probe_runs_in_its_own_session_without_a_controlling_terminal() {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 5"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = Child::spawn_session(&mut command).unwrap();
+        let pid = rustix::process::Pid::from_raw(child.id().unwrap() as i32).unwrap();
+        let own = rustix::process::getsid(None).unwrap();
+        let probe = rustix::process::getsid(Some(pid)).unwrap();
+        assert_ne!(probe, own, "a probe must not share the daemon's session");
+        assert_eq!(probe, pid, "the probe leads its own session");
+        assert_eq!(rustix::process::getpgid(Some(pid)).unwrap(), pid);
+        drop(child);
+
+        // Whether or not this test runs under a terminal, a probe cannot open
+        // one: an interactive rc has no terminal to fight the daemon for.
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "if (: </dev/tty) 2>/dev/null; then echo tty; else echo none; fi",
+        ]);
+        let out = probe_output(&mut command, Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "none");
+    }
+
+    #[tokio::test]
+    async fn a_probe_ignores_stderr_past_the_output_cap() {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "i=0; while [ $i -lt 4096 ]; do printf '%0100d\\n' 0 >&2; i=$((i+1)); done; echo /bin/found",
+        ]);
+        let out = probe_output(&mut command, Duration::from_secs(5))
+            .await
+            .expect("a noisy rc on stderr must not fail the probe");
+        assert!(out.success);
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "/bin/found");
     }
 }

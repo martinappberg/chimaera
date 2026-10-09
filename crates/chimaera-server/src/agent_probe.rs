@@ -199,7 +199,7 @@ fn base_command(
 /// Run a CLI to completion: stdout capped (over the cap is an error, never a
 /// silently truncated JSON), stderr tail kept for the error message. The CLI
 /// runs in its own process group, killed whole once the login shell exits or
-/// the probe is abandoned (see `launcher::probe_output`).
+/// the probe is abandoned (see `process::probe_output`).
 async fn run_bounded(
     argv: &[String],
     cwd: Option<&Path>,
@@ -207,8 +207,8 @@ async fn run_bounded(
 ) -> Result<String, String> {
     let mut child = crate::process::Child::spawn(&mut base_command(argv, cwd, prelude))
         .map_err(|_| format!("could not start {}", argv[0]))?;
-    let mut stdout = child.child.stdout.take().ok_or("no stdout")?;
-    let mut stderr = child.child.stderr.take().ok_or("no stderr")?;
+    let mut stdout = child.take_stdout().ok_or("no stdout")?;
+    let mut stderr = child.take_stderr().ok_or("no stderr")?;
     let work = async {
         // Both pipes at once: a CLI that fills stderr before closing stdout
         // would otherwise block on its write while we wait for stdout's EOF.

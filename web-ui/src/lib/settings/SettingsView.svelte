@@ -285,7 +285,7 @@
     {:else}
     <p class="subtitle">
       Ground truth: <code>~/.config/chimaera/settings.json</code> on the daemon host — hand-edits
-      and other windows sync here live.
+      and changes from other windows appear here live.
       {#if modifiedCount > 0}
         <span class="mod-count">{modifiedCount} modified</span>
       {/if}
@@ -350,7 +350,7 @@
                 <span class="pro-copy">
                   {#if paid}
                     <strong>Your Chimaera {$accountPlan === "max" ? "Max" : "Pro"}</strong>
-                    <span>Your plan, cloud agents and project sync.</span>
+                    <span>Your plan, cloud agents and project copies.</span>
                   {:else}
                     <strong>Chimaera Pro</strong>
                     <span>Optional: agents keep working in the cloud while you're away, and your work opens on another device.</span>
@@ -495,7 +495,7 @@
     </div>
   {:else}
     <div class="json-body">
-      <SettingsJson />
+      <SettingsJson {devBuild} />
     </div>
   {/if}
 </div>
