@@ -3947,9 +3947,11 @@ pub(crate) async fn resurrect_chat_transfer(
                 handoff_message(
                     origin,
                     carry.as_ref(),
-                    recovery,
-                    fork_head,
-                    context.saved_point_age_ms,
+                    Arrival {
+                        recovery,
+                        forked: fork_head,
+                        saved_age_ms: context.saved_point_age_ms,
+                    },
                 )
                 .map(|text| (text, transfer_origin(origin, recovery)))
             } else {
@@ -4068,11 +4070,15 @@ async fn send_pickup(
             let (state, id) = (state.clone(), id.clone());
             move || take_unanswered_pickup(&state, &id)
         };
-        let Some((text, tag)) = failed_at_once(live, take).await else {
+        let mut live = live;
+        let Some((text, tag)) = failed_at_once(&mut live, take).await else {
             return;
         };
         tracing::warn!(session = %id, "the pick-up turn failed at once; sending it again shortly");
-        tokio::time::sleep(PICKUP_RETRY_DELAY).await;
+        if !idle_for(&mut live, PICKUP_RETRY_DELAY).await {
+            tracing::info!(session = %id, "the conversation went on; the pick-up is not sent again");
+            return;
+        }
         if !state.stopping.load(std::sync::atomic::Ordering::Relaxed)
             && state.chat.get(&id).is_some_and(|c| c.alive)
         {
@@ -4093,62 +4099,122 @@ fn pickup_send(text: String) -> chimaera_agent::model::AgentCommand {
     }
 }
 
+type Pickup = (String, &'static str);
+
+/// Where the watch of a pick-up's turn stands (see [`failed_at_once`]).
+enum PickupTurn {
+    /// Nothing said yet.
+    Quiet,
+    /// The turn completed at once with nothing said. The entry is settled
+    /// (an exit now is the turn's end, not a dead pick-up) and kept here:
+    /// claude answers a pick-up it could not start with an empty completion
+    /// and reports the failure as the next turn, moments later.
+    CompletedEmpty(Option<Pickup>),
+    /// Only a known transient failure text so far, after an empty completion
+    /// when one came first.
+    Transient(Option<Pickup>),
+}
+
 /// How the turn a pick-up started went, watched within [`PICKUP_FAILURE_WINDOW`]:
 /// the pick-up to send again when the turn ended as a transient failure with
-/// no output; nothing otherwise. `take` settles the unanswered entry (the
-/// exit hook's signal): it is taken when the turn produced output, ended
-/// otherwise, or outlived the window, and left in place when the process
-/// exited first, for the exit hook. A turn that completes at once with
-/// nothing said settles the entry too (an exit after it is the turn's end,
-/// not a dead pick-up), but the watch goes on: claude answers a pick-up it
-/// could not start with an empty completion and reports the failure as the
-/// next turn, moments later.
+/// no output (aborted, or completed having said only the failure); nothing
+/// otherwise. `take` settles the unanswered entry (the exit hook's signal):
+/// it is taken when the turn produced output, ended otherwise, or outlived
+/// the window, and left in place when the process exited first, for the exit
+/// hook. A message from anyone but the daemon's pick-up (the user, Remote
+/// Control, another agent) means the conversation moved on: the watch
+/// settles without a retry, so a user's own failing turn never re-sends it.
 async fn failed_at_once(
-    mut live: tokio::sync::broadcast::Receiver<Arc<SeqEvent>>,
-    mut take: impl FnMut() -> Option<(String, &'static str)>,
-) -> Option<(String, &'static str)> {
+    live: &mut tokio::sync::broadcast::Receiver<Arc<SeqEvent>>,
+    mut take: impl FnMut() -> Option<Pickup>,
+) -> Option<Pickup> {
+    use PickupTurn::*;
     let deadline = tokio::time::Instant::now() + PICKUP_FAILURE_WINDOW;
-    let mut transient = false;
-    let mut kept: Option<(String, &'static str)> = None;
+    let mut turn = Quiet;
     loop {
         let Ok(Ok(entry)) = tokio::time::timeout_at(deadline, live.recv()).await else {
             take();
             return None;
         };
-        match &entry.ev {
-            AgentEvent::MessageChunk { text, .. } | AgentEvent::Error { message: text, .. }
-                if is_transient_agent_error(text) =>
+        turn = match (turn, &entry.ev) {
+            (_, AgentEvent::UserMessage { origin, .. })
+                if !origin
+                    .as_deref()
+                    .is_some_and(chimaera_agent::model::is_pickup_origin) =>
             {
-                transient = true;
-            }
-            AgentEvent::TurnAborted {
-                reason,
-                interrupted: false,
-                ..
-            } => {
-                let pickup = kept.take().or_else(&mut take);
-                return pickup.filter(|_| transient || is_transient_agent_error(reason));
-            }
-            AgentEvent::Exited { .. } => return None,
-            AgentEvent::TurnCompleted { .. } if !transient => {
-                if kept.is_none() {
-                    kept = take();
-                }
-            }
-            AgentEvent::MessageChunk { .. }
-            | AgentEvent::ThoughtChunk { .. }
-            | AgentEvent::ToolCall { .. }
-            | AgentEvent::ToolCallUpdate { .. }
-            | AgentEvent::Plan { .. }
-            | AgentEvent::PermissionRequest { .. }
-            | AgentEvent::QuestionRequest { .. }
-            | AgentEvent::ElicitationRequest { .. }
-            | AgentEvent::TurnCompleted { .. }
-            | AgentEvent::TurnAborted { .. } => {
                 take();
                 return None;
             }
-            _ => {}
+            (
+                turn,
+                AgentEvent::MessageChunk { text, .. } | AgentEvent::Error { message: text, .. },
+            ) if is_transient_agent_error(text) => match turn {
+                Quiet => Transient(None),
+                CompletedEmpty(kept) | Transient(kept) => Transient(kept),
+            },
+            (
+                turn,
+                AgentEvent::TurnAborted {
+                    reason,
+                    interrupted: false,
+                    ..
+                },
+            ) => {
+                return match turn {
+                    Transient(kept) => kept.or_else(&mut take),
+                    CompletedEmpty(kept) => kept
+                        .or_else(&mut take)
+                        .filter(|_| is_transient_agent_error(reason)),
+                    Quiet => take().filter(|_| is_transient_agent_error(reason)),
+                };
+            }
+            (_, AgentEvent::Exited { .. }) => return None,
+            // The failure reported as text, then a completed turn: the turn
+            // never reached the model, as with an abort.
+            (Transient(kept), AgentEvent::TurnCompleted { .. }) => {
+                return kept.or_else(&mut take);
+            }
+            (Quiet, AgentEvent::TurnCompleted { .. }) => CompletedEmpty(take()),
+            (CompletedEmpty(kept), AgentEvent::TurnCompleted { .. }) => CompletedEmpty(kept),
+            (
+                _,
+                AgentEvent::MessageChunk { .. }
+                | AgentEvent::ThoughtChunk { .. }
+                | AgentEvent::ToolCall { .. }
+                | AgentEvent::ToolCallUpdate { .. }
+                | AgentEvent::Plan { .. }
+                | AgentEvent::PermissionRequest { .. }
+                | AgentEvent::QuestionRequest { .. }
+                | AgentEvent::ElicitationRequest { .. }
+                | AgentEvent::TurnAborted { .. },
+            ) => {
+                take();
+                return None;
+            }
+            (turn, _) => turn,
+        };
+    }
+}
+
+/// Whether the conversation stays idle for `delay` before a pick-up is sent
+/// again: a turn starting or a message arriving meanwhile (the user went on)
+/// means no retry, so the pick-up never lands on top of a running turn.
+async fn idle_for(
+    live: &mut tokio::sync::broadcast::Receiver<Arc<SeqEvent>>,
+    delay: std::time::Duration,
+) -> bool {
+    let until = tokio::time::Instant::now() + delay;
+    loop {
+        match tokio::time::timeout_at(until, live.recv()).await {
+            Err(_) => return true,
+            // Lagged is a burst of activity; closed is a session gone.
+            Ok(Err(_)) => return false,
+            Ok(Ok(entry)) => match entry.ev {
+                AgentEvent::TurnStarted { .. }
+                | AgentEvent::UserMessage { .. }
+                | AgentEvent::Exited { .. } => return false,
+                _ => {}
+            },
         }
     }
 }
@@ -4358,26 +4424,30 @@ fn approval_note(carry: &chimaera_agent::Carryover) -> String {
     )
 }
 
+/// How a transferred conversation arrived, for its pick-up's words.
+#[derive(Clone, Copy)]
+struct Arrival {
+    /// The other machine stopped responding: it continues from the last
+    /// saved point.
+    recovery: bool,
+    /// It continues in a copy of the conversation, not the same one.
+    forked: bool,
+    /// How old that saved point was when the other machine was last heard.
+    saved_age_ms: Option<u64>,
+}
+
 /// Only interrupted work needs a transfer pick-up turn. Idle conversations keep
 /// their history without asking the model to do more work; in a synced project
 /// the new process's start note (`mcp::cloud_context`) says where it runs now.
 fn handoff_message(
     origin: &str,
     carry: Option<&chimaera_agent::Carryover>,
-    recovery: bool,
-    forked: bool,
-    saved_age_ms: Option<u64>,
+    arrival: Arrival,
 ) -> Option<String> {
-    if carry.is_some_and(|c| !c.interrupted_work()) || (carry.is_none() && !recovery) {
+    if carry.is_some_and(|c| !c.interrupted_work()) || (carry.is_none() && !arrival.recovery) {
         return None;
     }
-    Some(transfer_context(
-        origin,
-        carry,
-        recovery,
-        forked,
-        saved_age_ms,
-    ))
+    Some(transfer_context(origin, carry, arrival))
 }
 
 /// The `UserMessage.origin` a transfer pick-up carries. The UI folds these
@@ -4409,9 +4479,11 @@ fn transfer_origin(origin: &str, recovery: bool) -> &'static str {
 fn transfer_context(
     origin: &str,
     carry: Option<&chimaera_agent::Carryover>,
-    recovery: bool,
-    forked: bool,
-    saved_age_ms: Option<u64>,
+    Arrival {
+        recovery,
+        forked,
+        saved_age_ms,
+    }: Arrival,
 ) -> String {
     let (moved, runs) = if origin == "home" {
         ("back to the user's computer", "on the user's computer")
@@ -6075,12 +6147,16 @@ mod tests {
 
         for origin in ["moved", "home"] {
             assert_eq!(
-                handoff_message(origin, None, false, false, None),
+                handoff_message(origin, None, arrival(false, false, None)),
                 None,
                 "older ledger"
             );
             assert_eq!(
-                handoff_message(origin, Some(&Carryover::default()), false, false, None),
+                handoff_message(
+                    origin,
+                    Some(&Carryover::default()),
+                    arrival(false, false, None)
+                ),
                 None
             );
             let idle = Carryover {
@@ -6090,7 +6166,7 @@ mod tests {
                 ..Carryover::default()
             };
             assert_eq!(
-                handoff_message(origin, Some(&idle), false, false, None),
+                handoff_message(origin, Some(&idle), arrival(false, false, None)),
                 None,
                 "settings and an earlier pickup are not unfinished work"
             );
@@ -6099,7 +6175,7 @@ mod tests {
 
     #[test]
     fn automatic_checkpoint_recovery_inspects_uncertainty_without_waking_known_idle_work() {
-        let text = handoff_message("moved", None, true, true, None)
+        let text = handoff_message("moved", None, arrival(true, true, None))
             .expect("unknown saved work is inspected automatically");
         assert!(text.contains("because the other machine stopped responding"));
         assert!(text.contains("continuing from the last saved point in a copy"));
@@ -6110,9 +6186,7 @@ mod tests {
             handoff_message(
                 "moved",
                 Some(&chimaera_agent::Carryover::default()),
-                true,
-                true,
-                None
+                arrival(true, true, None)
             ),
             None
         );
@@ -6124,7 +6198,7 @@ mod tests {
     #[test]
     fn recovery_pickup_says_how_old_the_saved_point_is() {
         let sentence = |age| {
-            let text = handoff_message("moved", None, true, true, age).expect("recovery");
+            let text = handoff_message("moved", None, arrival(true, true, age)).expect("recovery");
             text.split(". ")
                 .find(|s| s.starts_with("That saved point"))
                 .map(str::to_owned)
@@ -6147,7 +6221,7 @@ mod tests {
             .contains("from 2 seconds before"));
         assert_eq!(sentence(Some(1_999)), None);
         assert_eq!(sentence(None), None);
-        let home = handoff_message("home", None, true, false, Some(30_000)).unwrap();
+        let home = handoff_message("home", None, arrival(true, false, Some(30_000))).unwrap();
         assert!(home.contains(
             "continuing from the last saved point, in the same conversation. That saved point \
              is from 30 seconds before"
@@ -6156,7 +6230,8 @@ mod tests {
             turn_in_flight: true,
             ..Default::default()
         };
-        let moved = handoff_message("moved", Some(&carry), false, false, Some(30_000)).unwrap();
+        let moved =
+            handoff_message("moved", Some(&carry), arrival(false, false, Some(30_000))).unwrap();
         assert!(!moved.contains("saved point"), "{moved}");
     }
 
@@ -6190,7 +6265,7 @@ mod tests {
             ("home", "You now run on the user's computer"),
         ] {
             for carry in [&turn, &background, &both] {
-                let text = handoff_message(origin, Some(carry), false, false, None)
+                let text = handoff_message(origin, Some(carry), arrival(false, false, None))
                     .expect("interrupted work");
                 assert!(text.contains(place), "{text}");
                 assert!(text.contains("in the same conversation"), "{text}");
@@ -6207,7 +6282,8 @@ mod tests {
                 );
             }
         }
-        let recovered = handoff_message("home", Some(&both), true, true, None).expect("recovery");
+        let recovered =
+            handoff_message("home", Some(&both), arrival(true, true, None)).expect("recovery");
         assert!(recovered.contains("back to the user's computer because"));
         assert!(recovered.contains("Background task: Watch CI for PR 158"));
     }
@@ -6232,7 +6308,8 @@ mod tests {
             }
             let taken = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let flag = taken.clone();
-            let again = failed_at_once(rx, move || {
+            let mut rx = rx;
+            let again = failed_at_once(&mut rx, move || {
                 flag.store(true, std::sync::atomic::Ordering::Relaxed);
                 Some((String::from("pick up"), "moved"))
             })
@@ -6318,6 +6395,88 @@ mod tests {
             verdict(vec![started(), AgentEvent::Exited { status: Some(1) }]).await,
             None
         );
+        // The failure reported as text, then a completed turn: the turn never
+        // reached the model, as with an abort.
+        assert_eq!(
+            verdict(vec![started(), said(race), completed()]).await,
+            Some(true),
+            "transient text then a completion"
+        );
+        assert_eq!(
+            verdict(vec![
+                started(),
+                completed(),
+                started(),
+                said(race),
+                completed()
+            ])
+            .await,
+            Some(true),
+            "an empty completion, then the failure reported as a completed turn"
+        );
+        // The pick-up's own echo is not the user going on.
+        assert_eq!(
+            verdict(vec![
+                user_message(Some("moved")),
+                started(),
+                aborted(race, false)
+            ])
+            .await,
+            Some(true)
+        );
+        // After an empty completion the user sends a message whose own turn
+        // fails with the transient text: that turn is theirs, not the
+        // pick-up's, so the pick-up is not sent on top of it.
+        assert_eq!(
+            verdict(vec![
+                started(),
+                completed(),
+                user_message(None),
+                started(),
+                said(race),
+                aborted(race, false)
+            ])
+            .await,
+            Some(false),
+            "a user's turn is never taken for the pick-up's"
+        );
+    }
+
+    fn arrival(recovery: bool, forked: bool, saved_age_ms: Option<u64>) -> Arrival {
+        Arrival {
+            recovery,
+            forked,
+            saved_age_ms,
+        }
+    }
+
+    fn user_message(origin: Option<&str>) -> AgentEvent {
+        serde_json::from_value(serde_json::json!({
+            "type": "user_message",
+            "text": "hello",
+            "origin": origin,
+        }))
+        .unwrap()
+    }
+
+    /// The retry waits for a quiet conversation: a turn or message arriving
+    /// during the pause means the user went on, and the pick-up is not sent
+    /// on top of it.
+    #[tokio::test]
+    async fn a_pickup_retry_waits_for_an_idle_conversation() {
+        let delay = std::time::Duration::from_millis(20);
+        let entry = |ev| Arc::new(SeqEvent { seq: 1, ts: 0, ev });
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        assert!(idle_for(&mut rx, delay).await, "nothing happened");
+        tx.send(entry(AgentEvent::TurnStarted {
+            turn_id: "u".into(),
+        }))
+        .unwrap();
+        assert!(!idle_for(&mut rx, delay).await, "a turn is running");
+        tx.send(entry(user_message(None))).unwrap();
+        assert!(!idle_for(&mut rx, delay).await, "the user sent a message");
+        drop(tx);
+        assert!(!idle_for(&mut rx, delay).await, "the session is gone");
     }
 
     /// A permission prompt the move or restart cut off is named, with its
@@ -6333,9 +6492,10 @@ mod tests {
         .unwrap();
         let said = "permission to run Bash (tool call toolu_9), and that call was not run";
         for origin in ["moved", "home"] {
-            let text = handoff_message(origin, Some(&carry), false, false, None).unwrap();
+            let text = handoff_message(origin, Some(&carry), arrival(false, false, None)).unwrap();
             assert!(text.contains(said), "{text}");
-            let recovered = handoff_message(origin, Some(&carry), true, false, None).unwrap();
+            let recovered =
+                handoff_message(origin, Some(&carry), arrival(true, false, None)).unwrap();
             assert!(!recovered.contains("was not run"), "{recovered}");
         }
         let restarted = restart_message(&carry).unwrap();
