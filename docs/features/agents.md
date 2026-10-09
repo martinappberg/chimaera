@@ -46,7 +46,9 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   `safe_arg`).
 - **Key behaviors.** The binary is resolved through the interactive **login** shell (`-ilc`, not
   `-lc` — the claude installer's PATH line lives in `.zshrc`, and `claude` isn't on the
-  non-interactive ssh PATH on HPC nodes), then well-known prefixes, then the managed bin dir; a
+  non-interactive ssh PATH on HPC nodes; the probe runs in its own session with stderr
+  discarded, `process::probe_output`, so an interactive rc can't fight a foreground daemon for the
+  terminal or fail detection by being chatty), then well-known prefixes, then the managed bin dir; a
   hit is cached for the daemon's life, a miss left uncached to self-heal. `model`/`resume` are
   charset-validated (`safe_arg` refuses flag-shaped/control-byte values). The launcher env scrubs
   the daemon's own `CLAUDE_CODE_*`/`CLAUDE_AGENT_*` markers so a spawned claude doesn't think it's
@@ -250,9 +252,11 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   row → **Archive**, or the header → **Archive all** (with an Undo), hides conversations from the
   rail without deleting anything; a quiet **All sessions** link ends the list
   ([session-history.md](session-history.md#archiving-recents)).
-- **Codex terminal capture (Pro-configured projects).** `codex_notify.rs` injects an argv `notify`
-  wrapper for terminal launches and chat-to-terminal switches in projects with a Pro cloud profile;
-  elsewhere a Codex TUI's argv and notify stay exactly the user's. It posts to the existing
+- **Codex terminal capture (Pro-configured projects).** The workspace policy
+  (`WorkspacePolicy::codex_notify_args`, asked by `spawn.rs` and `chat.rs`; the argv shape is
+  `launcher::codex_notify_args`) injects an argv `notify` wrapper for terminal launches and
+  chat-to-terminal switches in projects with a Pro cloud profile. The free daemon's inert policy
+  adds nothing, so elsewhere a Codex TUI's argv and notify stay exactly the user's. It posts to the existing
   per-session-key hook route and then runs the user's notify argv unchanged: the one Codex itself
   would run (the project's own `.codex/config.toml` over its Codex home, where a `CODEX_HOME`
   exported by the login shell counts; probed once per daemon life). The wrapper lives under the

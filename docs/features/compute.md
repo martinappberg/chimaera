@@ -77,14 +77,17 @@ The direct behavior described below remains the fallback the user selects.
 
 - **What & how.** The local home shows a cluster row ("Slurm cluster" and a one-line
   summary: "1 job running · ends in 5d 22h", "1 job waiting for a node", …). Clicking it
-  connects (nothing starts) and opens the cluster page in place: one card per job —
-  **running** (node · resources · time left), **starting**, or **waiting for a node**
-  (Slurm's start estimate and its reason when not plain priority) — listing the
-  workspaces open in it (open · opening · closing, and what their chats are doing);
-  ended jobs as one quiet list, one line each with Start again and dismiss, plus Clear all when
-  there are several (why: time limit, cancelled, failed, preempted, its node
-  failed, out of memory — asked of `sacct` once and kept); the workspaces not open
-  anywhere; one quiet count of the user's other Slurm jobs. Masthead: Home, Terminal (a
+  connects (nothing starts) and opens the cluster page in place, in three sections that
+  are each one surface of rows. **Jobs**: one row per job — **running** (node · resources
+  · time left), **starting**, or **waiting for a node** (Slurm's start estimate and its
+  reason when not plain priority) — with the workspaces open in it beneath (open ·
+  opening · closing, and what their chats are doing) and "Open a workspace here" on a
+  running job. **Ended**: one quiet list, one line each with Start again and dismiss,
+  plus Clear all when there are several (why: time limit, cancelled, failed, preempted,
+  its node failed, out of memory — asked of `sacct` once and kept). **Workspaces** (or
+  "Other workspaces" when some are open): the ones not open anywhere, then "Add a
+  workspace…", and one quiet count of the user's other Slurm jobs. A first visit with
+  nothing added yet shows a short welcome instead (Add a workspace…, Start a job). Masthead: Home, Terminal (a
   terminal-only window, "<host> · login node", running `ssh <host>` over the app's
   ControlMaster — never listed as a workspace, never restored, its session ends when the
   window closes), ⋯ (startup commands, rules for agents, refresh partitions, connection settings) and **Start a job**. The app's own binary install on the

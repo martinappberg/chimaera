@@ -275,7 +275,7 @@ and cluster-only connections). Replacement resolution precedes any daemon stop.
   `~/.chimaera`. Neither can reach the other's home.
 - **How it's used.** Nothing to opt into: run a dev build (`just app-dev-isolated`, or the bare
   CLI) and `connect <host>` / `status <host>` operate on the dev homes; every host row in a dev
-  app wears the amber `dev` pill. See the [develop skill](../../.claude/skills/develop/SKILL.md).
+  app carries the amber word `dev` in its status line. See the [develop skill](../../.claude/skills/develop/SKILL.md).
 - **Where it lives.** `chimaera-remote/src/lib.rs` (`RemoteHome::current` — every remote
   path/command derives from it), `chimaera-core::is_dev_build` + `state_home` (the local
   default).
@@ -305,11 +305,17 @@ and cluster-only connections). Replacement resolution precedes any daemon stop.
   a later New Window opens a fresh Home without replacing it. The explicit new-window action opens
   another workbench directly.
 - **How it's used.** Connected host rows enter the host page; the row's "…" menu offers **End sessions**
-  (kill everything on the host; the daemon + tunnel stay up), **Disconnect** (tunnel down; sessions +
+  (only while the host has live sessions; kill everything on the host; the daemon + tunnel stay up), **Disconnect** (tunnel down; sessions +
   daemon keep running), **Shut down** (end sessions *and* stop the daemon, then drop the tunnel — the
-  real off switch), **Forget machine**, and **Connection settings**. A connected row says
-  **Connected** with its login node, loopback port, and live-session count (including an
-  active Mastermind); the remote detail masthead repeats that daemon reachability as an explicit
+  real off switch), **Forget machine**, and **Connection settings**. Each row's status line is
+  one muted register of words in the UI font (what used to be pills): **Connected** with its
+  login node, loopback port, and live-session count (including an active Mastermind),
+  **Connecting…** or the connect phase, or **Not connected · Last connected …**; a cluster row
+  reads its scheduler label, then the phase or job summary. A failed connect is a quiet one-line
+  note under the row (the error, ellipsized, full text on hover) with **Try again**, never a
+  banner. In the official app an extension may add one more quiet line under the row
+  (`web-ui/src/lib/extensions/HostSlot.svelte`, which sets `--mono` to the UI font so that line
+  matches the status line); the free app renders nothing there. The remote detail masthead repeats that daemon reachability as an explicit
   online/offline badge. An outdated remote daemon offers an inline "update" that reconnects with
   `updateDaemon=true`.
 - **Where it lives.** `crates/chimaera-app/src/shell/commands.rs` (`navigate_home`,

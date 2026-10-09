@@ -10,7 +10,6 @@ wake or acquire execution.
 | `commands.rs` | Body admission and owned lifecycle dispatch. The original captured reservation survives cancellation; a delayed body cannot adopt a new epoch. |
 | `paths.rs` | Explicit viewer-to-owner path aliases and metadata response mapping. File bytes and arbitrary JSON/text contents are never rewritten. |
 | `files.rs` | Literal no-follow project-root pinning, single resolution of intentional internal links, descriptor-relative file/parent capabilities, and authority rechecks. This project's saved session uploads remain beneath a captured daemon-state root and require the current exact session association. |
-| `files/consumer_tests.rs` | Real HTTP consumer regressions: parent replacement cannot read or mutate another project, internal links and nested mutations still work, scoped tickets retain their original authority; saved-image aliases remain readable and upload cancellation drains its own temporary. |
 
 Filesystem proof is attached to descriptors, not a canonical path string passed
 to a later absolute-path open. Every ancestor of the registered root is opened

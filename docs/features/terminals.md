@@ -274,6 +274,7 @@ reconnects with wake intent and says so over the pane (see [Pro: continuing and 
 Typing the daemon refuses (watching, busy, running in the cloud or on your
 computer) is said in a short note over the pane, never in the scrollback; a
 project idle in the cloud is said there too ("Idle in your cloud. Press a key to
-continue.") until a keystroke continues it. A terminal whose session
+continue."; a pane that is just watching reads "Idle in your cloud. Choose Type here, then
+press a key to continue.") until a keystroke continues it. A terminal whose session
 moves to another machine keeps its screen and reconnects; it does not show as
 exited.
