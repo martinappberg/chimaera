@@ -19,10 +19,7 @@ pub fn project_temp_name(name: &std::ffi::OsStr) -> std::ffi::OsString {
     let nonce = &chimaera_core::generate_token()[..32];
     let budget = 255 - (PROJECT_STAGING_PREFIX.len() + 1 + nonce.len() + ".tmp".len());
     let bytes = name.as_bytes();
-    let mut cut = bytes.len().min(budget);
-    while cut > 0 && cut < bytes.len() && (bytes[cut] & 0b1100_0000) == 0b1000_0000 {
-        cut -= 1;
-    }
+    let cut = utf8_cut(bytes, budget);
     let mut out = Vec::with_capacity(255);
     out.extend_from_slice(PROJECT_STAGING_PREFIX.as_bytes());
     out.extend_from_slice(&bytes[..cut]);
@@ -30,6 +27,16 @@ pub fn project_temp_name(name: &std::ffi::OsStr) -> std::ffi::OsString {
     out.extend_from_slice(nonce.as_bytes());
     out.extend_from_slice(b".tmp");
     std::ffi::OsString::from_vec(out)
+}
+
+/// The longest prefix of `bytes` within `budget` that does not split a UTF-8
+/// sequence (names that are not UTF-8 are cut at the budget).
+fn utf8_cut(bytes: &[u8], budget: usize) -> usize {
+    let mut cut = bytes.len().min(budget);
+    while cut > 0 && cut < bytes.len() && (bytes[cut] & 0b1100_0000) == 0b1000_0000 {
+        cut -= 1;
+    }
+    cut
 }
 
 /// The hidden temp sibling for a write into a project. `staging` (a daemon
@@ -44,10 +51,7 @@ pub(crate) fn project_temp_sibling(staging: bool, name: &std::ffi::OsStr) -> std
     let nonce = &chimaera_core::generate_token()[..8];
     let budget = 255 - (".".len() + ".".len() + nonce.len() + ".tmp".len());
     let bytes = name.as_bytes();
-    let mut cut = bytes.len().min(budget);
-    while cut > 0 && cut < bytes.len() && (bytes[cut] & 0b1100_0000) == 0b1000_0000 {
-        cut -= 1;
-    }
+    let cut = utf8_cut(bytes, budget);
     let mut out = Vec::with_capacity(cut + 14);
     out.push(b'.');
     out.extend_from_slice(&bytes[..cut]);

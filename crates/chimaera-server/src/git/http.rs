@@ -158,12 +158,13 @@ pub(crate) async fn repos(
     scope: Option<Extension<crate::workspace_scope::Scope>>,
     Query(q): Query<ReposQuery>,
 ) -> Response {
+    let scope = scope.as_ref().map(|s| &s.0);
     let Some(ws) = crate::lock(&state.workspaces).get(&q.workspace_id) else {
         return (
             StatusCode::NOT_FOUND,
             view_json(
                 &state,
-                scope.as_ref().map(|s| &s.0),
+                scope,
                 "/git/repos",
                 json!({"error": format!("unknown workspace {}", q.workspace_id)}),
             ),
@@ -174,7 +175,7 @@ pub(crate) async fn repos(
     if !git.adequate {
         return view_json(
             &state,
-            scope.as_ref().map(|s| &s.0),
+            scope,
             "/git/repos",
             json!({
                 "workspace_id": q.workspace_id,
@@ -269,7 +270,7 @@ pub(crate) async fn repos(
         .collect();
     view_json(
         &state,
-        scope.as_ref().map(|s| &s.0),
+        scope,
         "/git/repos",
         json!({
             "workspace_id": q.workspace_id,
@@ -293,12 +294,13 @@ pub(crate) async fn status(
     scope: Option<Extension<crate::workspace_scope::Scope>>,
     Query(q): Query<StatusQuery>,
 ) -> Response {
+    let scope = scope.as_ref().map(|s| &s.0);
     let Some(ws) = crate::lock(&state.workspaces).get(&q.workspace_id) else {
         return (
             StatusCode::NOT_FOUND,
             view_json(
                 &state,
-                scope.as_ref().map(|s| &s.0),
+                scope,
                 "/git/status",
                 json!({"error": format!("unknown workspace {}", q.workspace_id)}),
             ),
@@ -313,7 +315,7 @@ pub(crate) async fn status(
         let epoch = state.git.epoch(&q.workspace_id);
         return view_json(
             &state,
-            scope.as_ref().map(|s| &s.0),
+            scope,
             "/git/status",
             json!({
                 "repo": false,
@@ -325,15 +327,7 @@ pub(crate) async fn status(
         )
         .into_response();
     }
-    let picked = match pick_repo(
-        &state,
-        &git.path,
-        &ws,
-        q.repo.as_deref(),
-        scope.as_ref().map(|s| &s.0),
-    )
-    .await
-    {
+    let picked = match pick_repo(&state, &git.path, &ws, q.repo.as_deref(), scope).await {
         Ok(outcome) => outcome,
         Err(refusal) => return refusal,
     };
@@ -346,7 +340,7 @@ pub(crate) async fn status(
             let epoch = state.git.epoch(&q.workspace_id);
             return view_json(
                 &state,
-                scope.as_ref().map(|s| &s.0),
+                scope,
                 "/git/status",
                 json!({
                     "repo": false,
@@ -402,7 +396,7 @@ pub(crate) async fn status(
             body["git_ok"] = json!(true);
             body["git"] = git.json();
             body["repo_epoch"] = json!(state.git.repo_epoch(&q.workspace_id, &repo.toplevel));
-            view_json(&state, scope.as_ref().map(|s| &s.0), "/git/status", body).into_response()
+            view_json(&state, scope, "/git/status", body).into_response()
         }
         Err(err) => {
             tracing::warn!(%err, workspace = %q.workspace_id, "git status failed");
@@ -415,7 +409,7 @@ pub(crate) async fn status(
             body["git_ok"] = json!(true);
             body["git"] = git.json();
             body["repo_epoch"] = json!(state.git.repo_epoch(&q.workspace_id, &repo.toplevel));
-            view_json(&state, scope.as_ref().map(|s| &s.0), "/git/status", body).into_response()
+            view_json(&state, scope, "/git/status", body).into_response()
         }
     }
 }
@@ -428,12 +422,13 @@ pub(crate) async fn worktrees(
     scope: Option<Extension<crate::workspace_scope::Scope>>,
     Query(q): Query<StatusQuery>,
 ) -> Response {
+    let scope = scope.as_ref().map(|s| &s.0);
     let Some(ws) = crate::lock(&state.workspaces).get(&q.workspace_id) else {
         return (
             StatusCode::NOT_FOUND,
             view_json(
                 &state,
-                scope.as_ref().map(|s| &s.0),
+                scope,
                 "/git/worktrees",
                 json!({"error": "unknown workspace"}),
             ),
@@ -445,28 +440,20 @@ pub(crate) async fn worktrees(
         // Too old to list worktrees; the status endpoint carries the diagnostic.
         return view_json(
             &state,
-            scope.as_ref().map(|s| &s.0),
+            scope,
             "/git/worktrees",
             json!({"repo": false, "worktrees": []}),
         )
         .into_response();
     }
-    let picked = match pick_repo(
-        &state,
-        &git.path,
-        &ws,
-        q.repo.as_deref(),
-        scope.as_ref().map(|s| &s.0),
-    )
-    .await
-    {
+    let picked = match pick_repo(&state, &git.path, &ws, q.repo.as_deref(), scope).await {
         Ok(outcome) => outcome,
         Err(refusal) => return refusal,
     };
     let Some(repo) = picked.into_repo() else {
         return view_json(
             &state,
-            scope.as_ref().map(|s| &s.0),
+            scope,
             "/git/worktrees",
             json!({"repo": false, "worktrees": []}),
         )
@@ -601,7 +588,7 @@ pub(crate) async fn worktrees(
                 .collect();
             view_json(
                 &state,
-                scope.as_ref().map(|s| &s.0),
+                scope,
                 "/git/worktrees",
                 json!({"repo": true, "worktrees": items}),
             )
@@ -611,7 +598,7 @@ pub(crate) async fn worktrees(
             tracing::warn!(%err, workspace = %q.workspace_id, "git worktree list failed");
             view_json(
                 &state,
-                scope.as_ref().map(|s| &s.0),
+                scope,
                 "/git/worktrees",
                 json!({"repo": true, "worktrees": [], "error": err.to_string()}),
             )
@@ -676,12 +663,13 @@ pub(crate) async fn diff(
     scope: Option<Extension<crate::workspace_scope::Scope>>,
     Query(q): Query<DiffQuery>,
 ) -> Response {
+    let scope = scope.as_ref().map(|s| &s.0);
     let Some(ws) = crate::lock(&state.workspaces).get(&q.workspace_id) else {
         return (
             StatusCode::NOT_FOUND,
             view_json(
                 &state,
-                scope.as_ref().map(|s| &s.0),
+                scope,
                 "/git/diff",
                 json!({"error": "unknown workspace"}),
             ),
@@ -692,15 +680,7 @@ pub(crate) async fn diff(
     if !git.adequate {
         return git_too_old(&git);
     }
-    let picked = match pick_repo(
-        &state,
-        &git.path,
-        &ws,
-        q.repo.as_deref(),
-        scope.as_ref().map(|s| &s.0),
-    )
-    .await
-    {
+    let picked = match pick_repo(&state, &git.path, &ws, q.repo.as_deref(), scope).await {
         Ok(outcome) => outcome,
         Err(refusal) => return refusal,
     };
@@ -718,7 +698,7 @@ pub(crate) async fn diff(
             StatusCode::BAD_REQUEST,
             view_json(
                 &state,
-                scope.as_ref().map(|s| &s.0),
+                scope,
                 "/git/diff",
                 json!({"error": "not a git repository"}),
             ),
@@ -730,7 +710,7 @@ pub(crate) async fn diff(
             StatusCode::BAD_REQUEST,
             view_json(
                 &state,
-                scope.as_ref().map(|s| &s.0),
+                scope,
                 "/git/diff",
                 json!({"error": "path is not inside the repository"}),
             ),
@@ -835,7 +815,7 @@ pub(crate) async fn diff(
         (Err(e), _) | (_, Err(e)) => {
             return view_json(
                 &state,
-                scope.as_ref().map(|s| &s.0),
+                scope,
                 "/git/diff",
                 json!({"error": e, "too_large": e == "too_large"}),
             )
@@ -848,7 +828,7 @@ pub(crate) async fn diff(
     {
         return view_json(
             &state,
-            scope.as_ref().map(|s| &s.0),
+            scope,
             "/git/diff",
             json!({"path": q.path, "rel": rel, "mode": mode, "binary": true}),
         )
@@ -859,7 +839,7 @@ pub(crate) async fn diff(
     let b_text = to_text(b);
     view_json(
         &state,
-        scope.as_ref().map(|s| &s.0),
+        scope,
         "/git/diff",
         json!({
             "path": q.path,
@@ -1142,12 +1122,13 @@ pub(crate) async fn branches(
     scope: Option<Extension<crate::workspace_scope::Scope>>,
     Query(q): Query<BranchesQuery>,
 ) -> Response {
+    let scope = scope.as_ref().map(|s| &s.0);
     let Some(ws) = crate::lock(&state.workspaces).get(&q.workspace_id) else {
         return (
             StatusCode::NOT_FOUND,
             view_json(
                 &state,
-                scope.as_ref().map(|s| &s.0),
+                scope,
                 "/git/branches",
                 json!({"error": "unknown workspace"}),
             ),
@@ -1158,28 +1139,20 @@ pub(crate) async fn branches(
     if !git.adequate {
         return view_json(
             &state,
-            scope.as_ref().map(|s| &s.0),
+            scope,
             "/git/branches",
             json!({"repo": false, "branches": []}),
         )
         .into_response();
     }
-    let picked = match pick_repo(
-        &state,
-        &git.path,
-        &ws,
-        q.repo.as_deref(),
-        scope.as_ref().map(|s| &s.0),
-    )
-    .await
-    {
+    let picked = match pick_repo(&state, &git.path, &ws, q.repo.as_deref(), scope).await {
         Ok(outcome) => outcome,
         Err(refusal) => return refusal,
     };
     let Some(repo) = picked.into_repo() else {
         return view_json(
             &state,
-            scope.as_ref().map(|s| &s.0),
+            scope,
             "/git/branches",
             json!({"repo": false, "branches": []}),
         )
@@ -1203,11 +1176,11 @@ pub(crate) async fn branches(
     {
         Ok(out) if out.success => out,
         Ok(out) => {
-            return view_json(&state, scope.as_ref().map(|s| &s.0), "/git/branches", json!({"repo": true, "branches": [], "error": out.stderr}))
+            return view_json(&state, scope, "/git/branches", json!({"repo": true, "branches": [], "error": out.stderr}))
                 .into_response()
         }
         Err(err) => {
-            return view_json(&state, scope.as_ref().map(|s| &s.0), "/git/branches", json!({"repo": true, "branches": [], "error": err.to_string()}))
+            return view_json(&state, scope, "/git/branches", json!({"repo": true, "branches": [], "error": err.to_string()}))
                 .into_response()
         }
     };
@@ -1230,7 +1203,7 @@ pub(crate) async fn branches(
         .collect();
     view_json(
         &state,
-        scope.as_ref().map(|s| &s.0),
+        scope,
         "/git/branches",
         json!({"repo": true, "branches": items, "truncated": truncated}),
     )

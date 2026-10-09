@@ -562,10 +562,7 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>, options
         }
     };
     let scope = auth.scope.clone();
-    if scope
-        .as_ref()
-        .is_some_and(|scope| scope.session(&state, &id).is_err())
-    {
+    if scope_lost(&scope, &state, &id) {
         scope_changed(&mut socket).await;
         return;
     }
@@ -608,13 +605,15 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>, options
     let mut attachment = match attach_res {
         // A stopped process still registered for a moment after a transfer
         // stop is not an exit to replay: the viewer follows the session.
-        Ok(attachment) if !attachment.info.alive && pause_frame(&state, &id).is_some() => {
-            if let Some(frame) = pause_frame(&state, &id) {
-                let _ = send_json(&mut socket, &frame).await;
+        Ok(attachment) => {
+            if !attachment.info.alive {
+                if let Some(frame) = pause_frame(&state, &id) {
+                    let _ = send_json(&mut socket, &frame).await;
+                    return;
+                }
             }
-            return;
+            attachment
         }
-        Ok(attachment) => attachment,
         Err(err) => {
             // Paused for a transfer: not an exit, and its last screen is not
             // its last words. The viewer follows it to its new owner.
@@ -755,7 +754,7 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>, options
     loop {
         tokio::select! {
             _ = scope_tick.tick(), if scope.is_some() => {
-                if scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) { scope_changed(&mut socket).await; return; }
+                if scope_lost(&scope, &state, &id) { scope_changed(&mut socket).await; return; }
             },
             _ = &mut resync_sleep, if resync_at.is_some() => {
                 resync_at = None;
@@ -845,7 +844,7 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>, options
                     // project connection changed hears that first: it must
                     // re-read where the project runs before following it.
                     if matches!(event, chimaera_pty::SessionEvent::Exited { .. }) {
-                        if scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) {
+                        if scope_lost(&scope, &state, &id) {
                             scope_changed(&mut socket).await;
                             return;
                         }
@@ -900,16 +899,16 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>, options
             },
             msg = socket.recv() => match msg {
                 Some(Ok(Message::Binary(bytes))) => {
-                    if scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) { scope_changed(&mut socket).await; return; }
+                    if scope_lost(&scope, &state, &id) { scope_changed(&mut socket).await; return; }
                     if options.read_only || !session_writable(&state, &id) {
                         let _ = send_ordered_json(&mut socket, &mut batch, &refusal(&state, &id, options.read_only)).await;
                         continue;
                     }
                     let mut interacted = false;
                     for chunk in bytes.chunks(TERMINAL_INPUT_CHUNK) {
-                        if !session_writable(&state, &id) || scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) { scope_changed(&mut socket).await; return; }
+                        if !session_writable(&state, &id) || scope_lost(&scope, &state, &id) { scope_changed(&mut socket).await; return; }
                         if let Err(error) = terminal_input(&state, &id, &attachment.input, Bytes::copy_from_slice(chunk), scope.as_ref()).await {
-                            if scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) {
+                            if scope_lost(&scope, &state, &id) {
                                 scope_changed(&mut socket).await;
                                 return;
                             }
@@ -934,7 +933,7 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>, options
                     }
                 }
                 Some(Ok(Message::Text(text))) => {
-                    if scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) { scope_changed(&mut socket).await; return; }
+                    if scope_lost(&scope, &state, &id) { scope_changed(&mut socket).await; return; }
                     match serde_json::from_str::<ClientMessage>(&text) {
                         Ok(ClientMessage::Resize { cols, rows }) => {
                             if options.read_only || !session_writable(&state, &id) { continue; }
@@ -1200,10 +1199,7 @@ async fn handle_chat(
         }
     };
 
-    if scope
-        .as_ref()
-        .is_some_and(|s| s.session(&state, &id).is_err())
-    {
+    if scope_lost(&scope, &state, &id) {
         scope_changed(&mut socket).await;
         return;
     }
@@ -1302,7 +1298,7 @@ async fn handle_chat(
     loop {
         tokio::select! {
             _ = scope_tick.tick(), if scope.is_some() => {
-                if scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) { scope_changed(&mut socket).await; return; }
+                if scope_lost(&scope, &state, &id) { scope_changed(&mut socket).await; return; }
             },
             event = native_ui.recv(), if native_ui_open => {
                 let frame = match event {
@@ -1358,7 +1354,7 @@ async fn handle_chat(
                     // - stopped for a transfer: it moved, it did not exit
                     //   (a scoped viewer whose connection changed hears that
                     //   first, to re-read where the project runs).
-                    if scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) {
+                    if scope_lost(&scope, &state, &id) {
                         scope_changed(&mut socket).await;
                         return;
                     }
@@ -1378,7 +1374,7 @@ async fn handle_chat(
             },
             msg = socket.recv() => match msg {
                 Some(Ok(Message::Text(text))) => {
-                    if scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) { scope_changed(&mut socket).await; return; }
+                    if scope_lost(&scope, &state, &id) { scope_changed(&mut socket).await; return; }
                     let tag = command_tag(&text);
                     let tag = if send_ids { tag } else { CommandTag { client_id: None, bad_client_id: false, ..tag } };
                     if send_ids && tag.kind.as_deref() == Some("cancel_send") {
@@ -1487,7 +1483,7 @@ async fn handle_chat(
                             // A send's images get a saved copy the echoed
                             // message can show after replay.
                             let saved = crate::upload::save_send_images(&state, &id, &mut cmd).await;
-                            if !session_writable(&state, &id) || scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) {
+                            if !session_writable(&state, &id) || scope_lost(&scope, &state, &id) {
                                 crate::upload::discard_saved_images(saved);
                                 scope_changed(&mut socket).await;
                                 return;
@@ -1708,6 +1704,14 @@ pub(crate) async fn events_ws(
     ws.max_message_size(MAX_EVENTS_INPUT_MESSAGE)
         .max_frame_size(MAX_EVENTS_INPUT_MESSAGE)
         .on_upgrade(move |socket| handle_events(socket, state))
+}
+
+/// Whether a scoped socket's session left its project (an unscoped socket
+/// never loses one).
+fn scope_lost(scope: &Option<SocketScope>, state: &AppState, id: &str) -> bool {
+    scope
+        .as_ref()
+        .is_some_and(|scope| scope.session(state, id).is_err())
 }
 
 /// The retryable project-scope refusal. Every caller returns right after, so
