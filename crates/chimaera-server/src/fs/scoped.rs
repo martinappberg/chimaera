@@ -46,14 +46,23 @@ pub(super) fn write(
         return Ok(outcome);
     }
     let _commit = commit()?;
+    // Read-only for the metadata: a replace needs no write access to the old
+    // file (a user's 0444 file is replaced like the unscoped write does).
     let existing = if entry.stat()?.is_some() {
-        Some(entry.open(OFlags::RDWR)?)
+        Some(entry.open(OFlags::RDONLY)?)
     } else {
         None
     };
     let meta = existing.as_ref().map(|file| file.metadata()).transpose()?;
-    if meta.as_ref().is_some_and(|meta| meta.nlink() > 1) {
-        let mut file = existing.expect("existing hard link");
+    if let Some(linked) = meta.as_ref().filter(|meta| meta.nlink() > 1) {
+        // Only the in-place rewrite of a hard-linked file writes through it.
+        let mut file = entry.open(OFlags::RDWR)?;
+        let current = file.metadata()?;
+        anyhow::ensure!(
+            (current.dev(), current.ino()) == (linked.dev(), linked.ino()),
+            "{} changed while saving",
+            entry.name.to_string_lossy()
+        );
         if let Err(outcome) = judge(pre, Some(file_version(&mut file)?), &hash) {
             return Ok(outcome);
         }
@@ -541,5 +550,47 @@ pub(super) fn move_entry(scope: &Files, from: &str, to: &str) -> anyhow::Result<
             cross_device_move(scope, from, to, || {})
         }
         result => result,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::support::*;
+
+    #[tokio::test]
+    async fn a_read_only_file_is_replaced_like_an_unscoped_write() {
+        let state = test_state();
+        use_test_policy(
+            &state,
+            TestPolicy {
+                admit_scopes: true,
+                ..Default::default()
+            },
+        );
+        let ws = make_workspace(&state, "scoped-read-only").await;
+        let root = crate::lock(&state.workspaces).get(&ws).unwrap().root;
+        let path = root.join("read-only.txt");
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let scope = crate::workspace_scope::Scope {
+            workspace_id: ws,
+            epoch: 0,
+            viewer_root: None,
+        };
+        let mutation = crate::workspace_scope::Mutation::for_scope(&state, scope).unwrap();
+        let files = Files::pin(&state, mutation).unwrap();
+        let outcome = write(
+            &files,
+            path.to_str().unwrap(),
+            b"new",
+            Precondition::None,
+            || Ok(None),
+        )
+        .unwrap();
+        assert!(matches!(outcome, WriteOutcome::Written { .. }));
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o444, "the replacement keeps the file's mode");
     }
 }
