@@ -232,3 +232,23 @@ fn install_policy_after_first_use_panics() {
     let _ = state.policy().composed(&state);
     state.install_policy(None, &state.data_dir.clone());
 }
+
+/// Every Codex rollout lookup goes through one capture (the Codex home a
+/// terminal sees, the shared lookup limit); a known path must still verify.
+#[tokio::test]
+async fn codex_rollout_capture_verifies_and_finds() {
+    let state = test_state();
+    let ws = make_workspace(&state, "free-codex-capture").await;
+    let cwd = lock(&state.workspaces).get(&ws).unwrap().root;
+    let rollout = plant_rollout(&state, &cwd);
+    assert_eq!(
+        codex_rollout::capture(&state, THREAD, cwd.clone(), None).await,
+        Some(rollout.clone())
+    );
+    let elsewhere = test_dir("free-codex-capture-other");
+    assert_eq!(
+        codex_rollout::capture(&state, THREAD, elsewhere, Some(rollout.clone())).await,
+        None,
+        "a known path must still verify against the cwd"
+    );
+}

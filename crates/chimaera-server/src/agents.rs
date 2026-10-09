@@ -515,7 +515,6 @@ pub(crate) async fn ingest(
         {
             record.turn_complete_at = Some(crate::session_view::now_ms());
         }
-        let home = crate::codex_rollout::codex_home(&state).await;
         let (known, native_cwd) = crate::lock(&state.agents)
             .get(&id)
             .map(|record| {
@@ -526,19 +525,11 @@ pub(crate) async fn ingest(
             })
             .unwrap_or_default();
         let cwd = native_cwd.unwrap_or(cwd);
-        let Ok(_permit) = crate::codex_rollout::ROLLOUT_WORK.try_acquire() else {
+        let Ok(rollout) = crate::codex_rollout::try_capture(&state, thread, cwd, known).await
+        else {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         };
         let thread = thread.to_string();
-        let sought = thread.clone();
-        let rollout = tokio::task::spawn_blocking(move || {
-            known
-                .filter(|path| crate::codex_rollout::verify_rollout(path, &sought, &cwd))
-                .or_else(|| crate::codex_rollout::find_rollout(&home, &sought, &cwd))
-        })
-        .await
-        .ok()
-        .flatten();
         if let Some(path) = rollout {
             let mut agents = crate::lock(&state.agents);
             // The session may have switched/retired while the filesystem was busy.

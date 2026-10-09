@@ -909,30 +909,17 @@ async fn switch_to_pty(
             // first TUI turn. Carry its already-existing rollout now rather
             // than relying on a notify that may never arrive.
             if let Some(thread) = recipe.resume.clone().filter(|_| identity) {
-                if let Some(home) = state
-                    .codex_config_path
-                    .parent()
-                    .map(std::path::Path::to_path_buf)
-                {
-                    let cwd = crate::lock(&state.agents)
-                        .get(id)
-                        .and_then(|r| r.native_cwd_for(&thread))
-                        .unwrap_or_else(|| recipe.workspace_root.clone());
-                    let sought = thread.clone();
-                    let rollout = tokio::task::spawn_blocking(move || {
-                        crate::codex_rollout::find_rollout(&home, &sought, &cwd)
-                    })
-                    .await
-                    .ok()
-                    .flatten();
-                    if let Some(path) = rollout {
-                        if let Some(record) = crate::lock(&state.agents)
-                            .get_mut(id)
-                            .filter(|record| record.key == key)
-                        {
-                            record.codex_thread_id = Some(thread);
-                            record.transcript_path = Some(path);
-                        }
+                let cwd = crate::lock(&state.agents)
+                    .get(id)
+                    .and_then(|r| r.native_cwd_for(&thread))
+                    .unwrap_or_else(|| recipe.workspace_root.clone());
+                if let Some(path) = crate::codex_rollout::capture(state, &thread, cwd, None).await {
+                    if let Some(record) = crate::lock(&state.agents)
+                        .get_mut(id)
+                        .filter(|record| record.key == key)
+                    {
+                        record.codex_thread_id = Some(thread);
+                        record.transcript_path = Some(path);
                     }
                 }
             }

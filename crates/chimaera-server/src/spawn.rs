@@ -338,25 +338,14 @@ pub async fn spawn_session(
             record.native_cwd = spec.native_cwd.clone();
             if codex_identity {
                 if let Some(thread) = resume.clone() {
-                    if let Some(home) = state
-                        .codex_config_path
-                        .parent()
-                        .map(std::path::Path::to_path_buf)
+                    let cwd = record
+                        .native_cwd_for(&thread)
+                        .unwrap_or_else(|| opts.cwd.clone());
+                    if let Some(path) =
+                        crate::codex_rollout::capture(state, &thread, cwd, None).await
                     {
-                        let cwd = record
-                            .native_cwd_for(&thread)
-                            .unwrap_or_else(|| opts.cwd.clone());
-                        let sought = thread.clone();
-                        let path = tokio::task::spawn_blocking(move || {
-                            crate::codex_rollout::find_rollout(&home, &sought, &cwd)
-                        })
-                        .await
-                        .ok()
-                        .flatten();
-                        if let Some(path) = path {
-                            record.codex_thread_id = Some(thread);
-                            record.transcript_path = Some(path);
-                        }
+                        record.codex_thread_id = Some(thread);
+                        record.transcript_path = Some(path);
                     }
                 }
             }

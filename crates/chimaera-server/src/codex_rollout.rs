@@ -11,6 +11,52 @@ const SCAN_CAP: usize = 32_768;
 /// Rollout lookups walk a dated tree; two at a time, never a pile-up.
 pub(crate) static ROLLOUT_WORK: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
+/// The rollout of `thread` for `cwd` under the Codex home a terminal sees:
+/// the `known` path while it still verifies, else a scan of the dated tree.
+/// Waits for its turn in [`ROLLOUT_WORK`]; [`try_capture`] does not wait.
+pub async fn capture(
+    state: &crate::AppState,
+    thread: &str,
+    cwd: PathBuf,
+    known: Option<PathBuf>,
+) -> Option<PathBuf> {
+    let home = codex_home(state).await;
+    let _permit = ROLLOUT_WORK.acquire().await.ok()?;
+    lookup(home, thread, cwd, known).await
+}
+
+/// All lookup slots are taken; the caller should come back later.
+pub struct Busy;
+
+/// [`capture`] for a caller that must not queue behind other lookups.
+pub async fn try_capture(
+    state: &crate::AppState,
+    thread: &str,
+    cwd: PathBuf,
+    known: Option<PathBuf>,
+) -> Result<Option<PathBuf>, Busy> {
+    let home = codex_home(state).await;
+    let _permit = ROLLOUT_WORK.try_acquire().map_err(|_| Busy)?;
+    Ok(lookup(home, thread, cwd, known).await)
+}
+
+async fn lookup(
+    home: PathBuf,
+    thread: &str,
+    cwd: PathBuf,
+    known: Option<PathBuf>,
+) -> Option<PathBuf> {
+    let sought = thread.to_string();
+    tokio::task::spawn_blocking(move || {
+        known
+            .filter(|path| verify_rollout(path, &sought, &cwd))
+            .or_else(|| find_rollout(&home, &sought, &cwd))
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 /// Codex's own config home as a terminal session sees it. Terminal agents
 /// start through the user's login shell, which may export `CODEX_HOME`
 /// (common on HPC) where the daemon's own environment does not; that is
