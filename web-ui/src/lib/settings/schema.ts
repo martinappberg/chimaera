@@ -1044,3 +1044,9 @@ export function expectedType(def: SettingDef): string {
 export function listed(def: SettingDef, devBuild: boolean): boolean {
   return !def.devOnly || devBuild;
 }
+
+/** The settings the JSON editor completes: the listed ones only, so a
+ *  release build never offers a testing setting there either. */
+export function completableSettings(devBuild: boolean): SettingDef[] {
+  return SETTINGS.filter((def) => listed(def, devBuild));
+}

@@ -495,7 +495,7 @@
     </div>
   {:else}
     <div class="json-body">
-      <SettingsJson />
+      <SettingsJson {devBuild} />
     </div>
   {/if}
 </div>

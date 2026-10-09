@@ -17,6 +17,7 @@
   import { pageVisible } from "../shared/visibility";
   import { cloudOnboarding } from "../pro/onboarding.svelte";
   import { getSetting, onSettingsChange } from "../settings/store.svelte";
+  import { localDaemonState } from "../net/native";
   import type { Session } from "../workspace/sessions";
   import type { PlaceSession } from "./application";
   import { sessionPause } from "../net/placement";
@@ -44,9 +45,23 @@
   // One store per slot; the extension subscribes and sees each new list.
   const placeSessions = writable<readonly PlaceSession[]>([]);
   $effect(() => { placeSessions.set(toPlace(sessions)); });
-  // The "Developer Tools" setting, for the actions meant for testing.
-  const developer = writable<boolean>(getSetting("developer.tools") === true);
-  $effect(() => onSettingsChange(() => developer.set(getSetting("developer.tools") === true)));
+  // The "Developer Tools" setting, for the actions meant for testing: only
+  // in a development build. In a release build the product decides where
+  // work runs, whatever a hand-edited settings file says.
+  let devBuild = false;
+  const developer = writable<boolean>(false);
+  const readDeveloper = () => developer.set(devBuild && getSetting("developer.tools") === true);
+  $effect(() => {
+    if (!active) return;
+    let live = true;
+    void localDaemonState().then((s) => {
+      if (!live) return;
+      devBuild = s?.dev_build === true;
+      readDeveloper();
+    }, () => {});
+    return () => { live = false; };
+  });
+  $effect(() => onSettingsChange(readDeveloper));
 
   $effect(() => {
     const host = target;
