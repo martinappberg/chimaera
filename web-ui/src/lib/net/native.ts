@@ -175,6 +175,14 @@ export async function removeHost(alias: string): Promise<void> {
   await tauri()?.core.invoke<void>("remove_host", { alias });
 }
 
+/** Turn keep-connected off for a host the account keeps (Pro). The shell
+ *  answers with a sentence naming the reason when it can't. */
+export async function unkeepHost(alias: string): Promise<void> {
+  const t = tauri();
+  if (t === null) throw new Error("Open the desktop app to change this host.");
+  await t.core.invoke<void>("pro_set_host_kept", { alias, kept: false });
+}
+
 /**
  * Connect to a saved host (probe, auto-install, start, tunnel). Resolves to
  * the connected state; rejects with the shell's error message on failure.

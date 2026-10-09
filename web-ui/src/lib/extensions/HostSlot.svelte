@@ -15,11 +15,14 @@
   import { pageVisible } from "../shared/visibility";
 
   let { alias }: { alias: string } = $props();
+  // The prop reads through the parent's host row, which every host-list
+  // refresh replaces; a derived string changes only when the alias does, so
+  // a refresh never retires and remounts the line (it popped out and back).
+  const name = $derived(alias);
   const active = $derived(mountable && isNativeShell() && $paidPlan !== null);
   let target = $state<HTMLDivElement>();
   $effect(() => {
     const host = target;
-    const name = alias;
     if (!active || host === undefined || selectedApplication?.mountHost === undefined) return;
     const controller = new AbortController();
     let owner: { dispose(): void } | null = null;
@@ -38,8 +41,9 @@
 
 <style>
   /* The mounted line takes the host row's status register: the UI font at
-     the status size. `display: contents` adds no box, but custom properties
-     still inherit through it, so content that asks for `var(--mono)` gets the
-     UI font here without the extension changing. */
+     the status size, set by the row's line stack this slot sits in.
+     `display: contents` adds no box, so the mounted lines are items of that
+     stack; custom properties still inherit through it, so content that asks
+     for `var(--mono)` gets the UI font. */
   .host-slot { display: contents; --mono: var(--ui-font); }
 </style>

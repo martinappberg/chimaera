@@ -34,6 +34,7 @@
     setHostDirectSsh,
     clusterSetLoginServe,
     shutdownHost,
+    unkeepHost,
     updateLocalDaemon,
     type ConnectProgress,
     type HostState,
@@ -48,6 +49,7 @@
   import { asyncDisposer } from "../shared/asyncDisposer";
   import { fetchOwnershipHints, readsOwnership } from "./placementHints";
   import { relativeAge } from "./launcher";
+  import { forgetFailure, forgetPlan } from "./hostForget";
   import { APP_UPDATES, checkForUpdates, MANAGED_UPDATES, updateState } from "./update.svelte";
 
   interface Props {
@@ -200,6 +202,9 @@
   let addError = $state<string | null>(null);
   let remoteSettings = $state<{ alias: string; firstSetup: boolean } | null>(null);
   let confirmForget = $state<string | null>(null);
+  /** Why the last forget of a kept host stopped short (shown in its confirm). */
+  let forgetError = $state<{ alias: string; text: string } | null>(null);
+  let forgetting = $state<string | null>(null);
   /** Host pending a "end all sessions" / "shut down" confirm (alias). */
   let confirmEnd = $state<string | null>(null);
   let confirmShutdown = $state<string | null>(null);
@@ -531,8 +536,25 @@
     }
   }
 
-  async function forget(alias: string): Promise<void> {
+  async function forget(host: HostState): Promise<void> {
+    const alias = host.alias;
+    if (forgetting !== null) return;
+    forgetError = null;
+    if (forgetPlan(host).turnOffKeep) {
+      // Turned off first: a host the keeper still holds comes back at the
+      // next host list. The confirm stays up with the reason if it can't.
+      forgetting = alias;
+      try {
+        await unkeepHost(alias);
+      } catch (reason) {
+        forgetError = { alias, text: forgetFailure(reason) };
+        return;
+      } finally {
+        forgetting = null;
+      }
+    }
     confirmForget = null;
+    hostErrors = mapWithout(hostErrors, alias);
     await removeHost(alias);
     remoteWs = mapWithout(remoteWs, alias);
     clusterOverviews.forget(alias);
@@ -678,6 +700,20 @@
     return new Date(unixSecs * 1000).toISOString().slice(0, 10);
   }
 
+  /** A host row's state, as the status line's parts: the state word first
+   *  (the row puts "via Pro" right after it), then its details. */
+  function hostStateParts(h: HostState, phase: string | undefined): string[] {
+    if (phase !== undefined) return [phase];
+    if (h.status === "connecting") return ["Connecting…"];
+    if (h.status !== "connected") return h.last_connected_at ? ["Not connected", `Last connected ${ago(h.last_connected_at)}`] : ["Not connected"];
+    const parts = ["Connected"];
+    if (h.node) parts.push(shortNode(h.node));
+    if (h.local_port !== null) parts.push(`127.0.0.1:${h.local_port}`);
+    const live = h.live_sessions ?? 0;
+    if (live > 0) parts.push(`${live} live session${live === 1 ? "" : "s"}`);
+    return parts;
+  }
+
   /** A login node's first label — "login-a" for "login-a.cluster.example". */
   function shortNode(node: string): string {
     return node.split(".")[0] || node;
@@ -760,11 +796,11 @@
      then says it is about keeping it connected. The words are the shell's. -->
 {#snippet hostNote(h: HostState, err: string)}
   {@const live = h.status === "connected" || (isCluster(h) && clusterRunning(h.alias))}
-  <p class="host-note" role="status">
+  <div class="host-note" role="status">
     {#if live && h.kept === true}<span class="host-note-label">Keep connected:</span>{/if}
     <span class="host-note-text" title={err}>{err}</span>
     <button class="host-note-act" disabled={h.status === "connecting"} onclick={() => void connect(h.alias)}>Try again</button>
-  </p>
+  </div>
 {/snippet}
 
 {#snippet jobsRow(alias: string)}
@@ -1109,6 +1145,8 @@
                 {@const ws = remoteWs.get(h.alias)}
                 {@const cluster = isCluster(h)}
                 {@const loginServe = h.cluster?.login_serve === true}
+                {@const plainCluster = cluster && !loginServe}
+                {@const confirming = confirmShutdown === h.alias || confirmEnd === h.alias || confirmForget === h.alias}
                 <div class="host-card">
                 {#if confirmShutdown === h.alias}
                   <div class="row confirm strong" role="alertdialog" aria-label="shut down host?">
@@ -1136,13 +1174,14 @@
                     <button class="confirm-no" onclick={() => (confirmEnd = null)}>cancel</button>
                   </div>
                 {:else if confirmForget === h.alias}
+                  {@const failed = forgetError?.alias === h.alias ? forgetError.text : null}
                   <div class="row confirm" role="alertdialog" aria-label="forget host?">
                     <span class="name">{h.alias}</span>
-                    <span class="confirm-label">forget this host?</span>
-                    <button class="confirm-yes" onclick={() => void forget(h.alias)}>forget</button>
-                    <button class="confirm-no" onclick={() => (confirmForget = null)}>cancel</button>
+                    <span class="confirm-label" class:failed={failed !== null} role={failed !== null ? "status" : undefined}>{failed ?? forgetPlan(h).question}</span>
+                    <button class="confirm-yes" disabled={forgetting === h.alias} onclick={() => void forget(h)}>{forgetting === h.alias ? "turning off…" : "forget"}</button>
+                    <button class="confirm-no" onclick={() => { confirmForget = null; forgetError = null; }}>cancel</button>
                   </div>
-                {:else if cluster && !loginServe}
+                {:else if plainCluster}
                   <!-- A cluster: chimaera never runs on its login node, so
                        there is nothing to tunnel to — the row reads the
                        cluster's workspaces and opens its page in place. -->
@@ -1164,7 +1203,7 @@
                             : "no job running"}
                       ></span>
                       <span class="workspace-label">
-                        <span class="host-name"><span class="name">{h.alias}</span>{#if h.via_pro}<span class="via-pro" title="Connected through Chimaera Pro">via Pro</span>{/if}</span>
+                        <span class="name">{h.alias}</span>
                         <span class="phase quiet">
                           <span title="{h.alias} has a batch scheduler: Chimaera runs inside jobs you start there, never on the login node"
                             >{schedulerLabel(h.cluster?.scheduler)}</span
@@ -1172,7 +1211,7 @@
                               class="dev-word"
                               title="dev build — every connection targets this machine's own build in ~/.chimaera-dev on {h.alias}; the real daemon there is untouched"
                               >dev</span
-                            >{/if}<span class="sep" aria-hidden="true">·</span>{#if phase !== undefined}{phase === PHASE_LABEL.probing ? "connecting…" : phase}{:else if line !== null}{line}{:else}{ago(h.last_connected_at)}{/if}
+                            >{/if}<span class="sep" aria-hidden="true">·</span>{#if phase !== undefined}{phase === PHASE_LABEL.probing ? "connecting…" : phase}{:else if line !== null}{line}{:else}{ago(h.last_connected_at)}{/if}{#if h.via_pro}<span class="sep" aria-hidden="true">·</span><span title="Connected through Chimaera Pro">via Pro</span>{/if}
                         </span>
                       </span>
                     </button>
@@ -1182,15 +1221,8 @@
                       {@render directPreference(h)}
                     </HomeActions>
                   </div>
-                  {#if err !== undefined}{@render hostNote(h, err)}{/if}
-                  <HostSlot alias={h.alias} />
-                  {#if h.cluster !== null && h.cluster.login_daemon !== null && phase === undefined}
-                    <div class="note-line warn">
-                      a chimaera server from before is still running on {shortNode(h.cluster.login_daemon.node)} —
-                      <button class="update-act" onclick={() => void connect(h.alias)}>open to shut it down</button>
-                    </div>
-                  {/if}
                 {:else}
+                  {@const parts = hostStateParts(h, phase)}
                   <div class="rowwrap host-row" role="presentation" class:connected={h.status === "connected"}>
                     <button
                       class="row"
@@ -1216,7 +1248,7 @@
                             : "not connected"}
                       ></span>
                       <span class="workspace-label">
-                        <span class="host-name"><span class="name">{h.alias}</span>{#if h.via_pro}<span class="via-pro" title="Connected through Chimaera Pro">via Pro</span>{/if}</span>
+                        <span class="name">{h.alias}</span>
                         <span
                           class="phase quiet"
                           title={phase === undefined && h.status === "connected" && h.node
@@ -1227,13 +1259,12 @@
                             class="dev-word"
                             title="dev build — every connection targets this machine's own build in ~/.chimaera-dev on {h.alias}; the real daemon there is untouched"
                             >dev</span
-                          ><span class="sep" aria-hidden="true">·</span>{/if}{#if phase !== undefined}{phase}
-                          {:else if h.status === "connected"}Connected{#if h.node}{" · "}{shortNode(h.node)}{/if}{#if h.local_port !== null}{" · "}127.0.0.1:{h.local_port}{/if}{#if (h.live_sessions ?? 0) > 0}{" · "}{h.live_sessions} live session{h.live_sessions === 1 ? "" : "s"}{/if}
-                          {:else if h.status === "connecting"}Connecting…
-                          {:else}Not connected{#if h.last_connected_at} · Last connected {ago(h.last_connected_at)}{/if}{/if}
+                          ><span class="sep" aria-hidden="true">·</span>{/if}{parts[0]}{#if h.via_pro}<span class="sep" aria-hidden="true">·</span><span title="Connected through Chimaera Pro">via Pro</span>{/if}{#each parts.slice(1) as part, i (i)}<span class="sep" aria-hidden="true">·</span>{part}{/each}
                         </span>
                       </span>
-                      <span class="host-open">{h.status === "connected" ? "Open" : h.status === "connecting" ? "" : "Connect"}<span aria-hidden="true"> →</span></span>
+                      <!-- Hidden, not emptied, while connecting: the label keeps
+                           its width and nothing beside it moves. -->
+                      <span class="host-open" class:idle={h.status === "connecting"}>{h.status === "connected" ? "Open" : "Connect"}<span aria-hidden="true"> →</span></span>
                     </button>
                     <HomeActions label={`Actions for ${h.alias}`}>
                       {#if h.status === "connected"}
@@ -1262,9 +1293,21 @@
                       {@render directPreference(h)}
                     </HomeActions>
                   </div>
-                  {#if err !== undefined}{@render hostNote(h, err)}{/if}
+                {/if}
+                <!-- The row's further status lines, in its status register and
+                     aligned under the name. Outside the branches above, so the
+                     extension's line is never retired by a status change or a
+                     confirm; the lines come and go only with what they say. -->
+                <div class="host-lines">
+                  {#if err !== undefined && !confirming}{@render hostNote(h, err)}{/if}
                   <HostSlot alias={h.alias} />
-                  {#if h.status === "connected" && h.outdated && phase === undefined}
+                  {#if !confirming && plainCluster && h.cluster !== null && h.cluster.login_daemon !== null && phase === undefined}
+                    <div class="note-line warn">
+                      a chimaera server from before is still running on {shortNode(h.cluster.login_daemon.node)} —
+                      <button class="update-act" onclick={() => void connect(h.alias)}>open to shut it down</button>
+                    </div>
+                  {/if}
+                  {#if !confirming && !plainCluster && h.status === "connected" && h.outdated && phase === undefined}
                     <div class="note-line" title={buildNote(h.remote_build)}>
                       daemon is an older build —
                       <button class="update-act" onclick={() => void connect(h.alias, true)}>
@@ -1272,29 +1315,29 @@
                       </button>
                     </div>
                   {/if}
-                  {#if h.status === "connected" && ws !== undefined}
-                    <div class="remote-ws">
-                      {#each ws as rw (rw.id)}
-                        <div class="rowwrap" role="presentation">
-                          <button
-                            class="row sub"
-                            title={rw.root}
-                            onclick={() => void navigateHost(h.alias, rw.id)}
-                          >
-                            <span class="name">{rw.name}</span>
-                            <span class="path">{tildify(rw.root)}</span>
-                            <span class="when">{ago(rw.last_opened_at)}</span>
-                          </button>
-                        </div>
-                      {/each}
-                      {#if cluster}{@render jobsRow(h.alias)}{/if}
+                </div>
+                {#if !confirming && !plainCluster && h.status === "connected" && ws !== undefined}
+                  <div class="remote-ws">
+                    {#each ws as rw (rw.id)}
                       <div class="rowwrap" role="presentation">
-                        <button class="row sub browse" onclick={() => void navigateHost(h.alias)}>
-                          <span class="name">Open {h.alias}</span><span aria-hidden="true">→</span>
+                        <button
+                          class="row sub"
+                          title={rw.root}
+                          onclick={() => void navigateHost(h.alias, rw.id)}
+                        >
+                          <span class="name">{rw.name}</span>
+                          <span class="path">{tildify(rw.root)}</span>
+                          <span class="when">{ago(rw.last_opened_at)}</span>
                         </button>
                       </div>
+                    {/each}
+                    {#if cluster}{@render jobsRow(h.alias)}{/if}
+                    <div class="rowwrap" role="presentation">
+                      <button class="row sub browse" onclick={() => void navigateHost(h.alias)}>
+                        <span class="name">Open {h.alias}</span><span aria-hidden="true">→</span>
+                      </button>
                     </div>
-                  {/if}
+                  </div>
                 {/if}
                 </div>
               {/each}
@@ -1324,12 +1367,6 @@
   .host-advanced label { display: flex; align-items: flex-start; gap: 8px; margin-top: 10px; }
   .host-advanced input { margin-top: 3px; flex: none; }
   .host-advanced p { white-space: normal; color: var(--muted); font-size: var(--text-xs); line-height: 1.5; margin: 8px 0 0; }
-  .via-pro {
-    flex: none;
-    font-size: var(--text-xs);
-    color: var(--muted);
-    white-space: nowrap;
-  }
 
   .home { position: absolute; inset: 0; display: flex; overflow: hidden; background: var(--bg); }
   .cluster-surface { flex: 1; min-width: 0; min-height: 0; overflow-y: auto; }
@@ -1999,9 +2036,10 @@
     .workspace-row .workspace-label .path { opacity: 1; }
   }
   .workspace-meta .side.stop:hover { color: var(--err); text-decoration-color: currentColor; }
-  .host-card { border: 1px solid var(--edge); border-radius: 10px; padding: 5px; }
-  .remotes .rows { gap: 10px; }
-  .host-name { display: flex; align-items: center; gap: 9px; min-width: 0; }
+  /* Remote machines read like This Mac's list: one bordered list, rows in
+     the same rhythm, each machine's lines grouped under its name. */
+  .remotes .rows { border: 1px solid var(--edge); border-radius: 10px; padding: 5px; gap: 5px; }
+  .host-card + .host-card { border-top: 1px solid color-mix(in srgb, var(--edge) 70%, transparent); padding-top: 5px; }
   /* A host row's status line is one register — UI font, status size, muted —
      and carries what used to be pills ("Slurm cluster", "login node", "dev")
      as words; the optional extension's line under it matches (HostSlot). */
@@ -2010,14 +2048,21 @@
   /* Dev-build language stays amber: a dev build talks only to isolated
      ~/.chimaera-dev daemons, and its rows must never read like a release's. */
   .dev-word { color: var(--warn); }
-  .host-note { margin: 0; padding: 0 10px 6px 33px; display: flex; align-items: baseline; gap: 0.45em; min-width: 0; font-size: var(--text-xs); line-height: 1.5; color: var(--muted); }
+  /* Lines under a host row continue its status line: same size, colour and
+     line height, the same 2px apart, aligned under the name (row padding 12 +
+     dot 7 + gap 14). The pull-up meets the row's bottom padding, so a row
+     with lines and one without keep the same rhythm. */
+  .host-lines { display: flex; flex-direction: column; gap: 2px; min-width: 0; margin-top: -7px; padding: 0 20px 9px 33px; font-size: var(--text-xs); line-height: 1.5; color: var(--muted); }
+  .host-lines .note-line { padding: 0; font-family: inherit; }
+  .host-note { display: flex; align-items: baseline; gap: 0.45em; min-width: 0; }
   .host-note-label { flex: none; }
   .host-note-text { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: color-mix(in srgb, var(--err) 70%, var(--muted)); }
   .host-note-act { flex: none; appearance: none; border: none; background: none; padding: 0; font: inherit; color: var(--muted); text-decoration: underline; text-decoration-color: var(--edge); text-underline-offset: 3px; cursor: pointer; white-space: nowrap; }
   .host-note-act:hover:enabled { color: var(--fg); text-decoration-color: currentColor; }
   .host-note-act:disabled { opacity: 0.6; cursor: default; }
-  .host-name > .name { flex: 1 1 auto; min-width: 0; }
+  .host-row .workspace-label .name { overflow: hidden; text-overflow: ellipsis; }
   .host-open { flex: none; font-size: var(--text-sm); color: var(--muted); }
+  .host-open.idle { visibility: hidden; }
   .host-open span { margin-left: 4px; }
   .host-row.connected, .workspace-row.live { background: transparent; }
   .host-row.connected:hover, .workspace-row.live:hover { background: color-mix(in srgb, var(--row-hover) 45%, transparent); }
@@ -2032,6 +2077,7 @@
   .offline-note { margin: 0 0 8px; font-size: var(--text-sm); line-height: 1.5; color: var(--muted); }
   .confirm { flex-wrap: wrap; min-height: 58px; }
   .confirm-label { min-width: 120px; line-height: 1.5; }
+  .confirm-label.failed { color: color-mix(in srgb, var(--err) 70%, var(--muted)); }
   /* In the workspace list the confirm takes the row's own height, so asking
      doesn't make the list jump. */
   .workspaces .confirm { min-height: 0; padding: 9px 12px; }
@@ -2056,7 +2102,7 @@
     .open-folder kbd { display: none; }
     .host-row .row { padding: 12px 9px; gap: 10px; }
     .host-open { font-size: var(--text-xs); }
-    .host-note { padding-left: 26px; }
+    .host-lines { margin-top: -10px; padding: 0 12px 12px 26px; }
     .remote-ws { margin-left: 13px; padding-left: 9px; }
     .remote-ws .row.sub { flex-wrap: wrap; gap: 5px 10px; }
     .remote-ws .row.sub .name { max-width: 100%; }

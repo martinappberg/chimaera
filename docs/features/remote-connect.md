@@ -307,15 +307,21 @@ and cluster-only connections). Replacement resolution precedes any daemon stop.
 - **How it's used.** Connected host rows enter the host page; the row's "…" menu offers **End sessions**
   (only while the host has live sessions; kill everything on the host; the daemon + tunnel stay up), **Disconnect** (tunnel down; sessions +
   daemon keep running), **Shut down** (end sessions *and* stop the daemon, then drop the tunnel — the
-  real off switch), **Forget machine**, and **Connection settings**. Each row's status line is
+  real off switch), **Forget machine**, and **Connection settings**. **Forget machine** is never
+  disabled; for a host kept connected through Pro its confirm says keep connected turns off too,
+  and it turns that off before forgetting (the keeper would otherwise list the host again); if
+  that fails the confirm stays up with the reason (`workspace/hostForget.ts`). Remote machines are
+  one bordered list in This Mac's rhythm. Each row's status line is
   one muted register of words in the UI font (what used to be pills): **Connected** with its
   login node, loopback port, and live-session count (including an active Mastermind),
-  **Connecting…** or the connect phase, or **Not connected · Last connected …**; a cluster row
-  reads its scheduler label, then the phase or job summary. A failed connect is a quiet one-line
-  note under the row (the error, ellipsized, full text on hover) with **Try again**, never a
-  banner. In the official app an extension may add one more quiet line under the row
-  (`web-ui/src/lib/extensions/HostSlot.svelte`, which sets `--mono` to the UI font so that line
-  matches the status line); the free app renders nothing there. The remote detail masthead repeats that daemon reachability as an explicit
+  **Connecting…** or the connect phase, or **Not connected · Last connected …**, with **via Pro**
+  after the state when the route goes through the keeper; a cluster row
+  reads its scheduler label, then the phase or job summary. Further lines continue that status
+  line under the name, same size and colour: a failed connect (the error in muted red,
+  ellipsized, full text on hover, with **Try again**, never a banner), then in the official app
+  one line an extension may add (`web-ui/src/lib/extensions/HostSlot.svelte`, rendered outside the
+  row's state branches and keyed on the alias string, so a host-list refresh or a confirm never
+  remounts it); the free app renders nothing there. The remote detail masthead repeats that daemon reachability as an explicit
   online/offline badge. An outdated remote daemon offers an inline "update" that reconnects with
   `updateDaemon=true`.
 - **Where it lives.** `crates/chimaera-app/src/shell/commands.rs` (`navigate_home`,
