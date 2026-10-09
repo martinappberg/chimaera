@@ -103,9 +103,9 @@ async fn login_shell_git() -> Option<PathBuf> {
     let shell = chimaera_core::login_shell();
     let mut cmd = tokio::process::Command::new(&shell);
     cmd.arg("-ilc").arg("command -v git");
-    // Its own process group, killed whole: an rc's helpers must not outlive
-    // the probe (see `launcher::probe_output`).
-    let out = crate::launcher::probe_output(&mut cmd, Duration::from_secs(5)).await?;
+    // Its own session, killed whole: an rc's helpers must not outlive
+    // the probe (see `process::probe_output`).
+    let out = crate::process::probe_output(&mut cmd, Duration::from_secs(5)).await?;
     if !out.success {
         return None;
     }
@@ -123,7 +123,7 @@ async fn login_shell_git() -> Option<PathBuf> {
 async fn probe_git_version(bin: &Path) -> Option<String> {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.arg("--version");
-    let out = crate::launcher::probe_output(&mut cmd, Duration::from_secs(2)).await?;
+    let out = crate::process::probe_output(&mut cmd, Duration::from_secs(2)).await?;
     if !out.success {
         return None;
     }

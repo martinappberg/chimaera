@@ -343,27 +343,6 @@ fn well_known_agent_paths(bin: &str, home: Option<&Path>) -> Vec<PathBuf> {
     out
 }
 
-/// One short probe (a login shell's `command -v`, a CLI's `--version`) run to
-/// completion or `limit`, `None` on any failure. The probe gets its own
-/// process group, killed whole when its leader exits or when this future is
-/// dropped (timeout, daemon shutdown): an interactive rc (nvm, prompt
-/// frameworks) or a node-backed CLI leaves helpers behind that `kill_on_drop`
-/// (the leader alone) never reaches, and they'd outlive the daemon in its
-/// own process group. [`crate::process::Child`] keeps the leader unreaped
-/// until the group is signalled, so the group id can't have been reused.
-pub(crate) async fn probe_output(
-    cmd: &mut tokio::process::Command,
-    limit: Duration,
-) -> Option<crate::process::Output> {
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    tokio::time::timeout(limit, crate::process::output(cmd))
-        .await
-        .ok()?
-        .ok()
-}
-
 /// Timeout for the login-shell resolution probe. An interactive rc can be
 /// slow (completion init, prompt frameworks) or, pathologically, block on
 /// input; the well-known-path and managed fallbacks backstop a timeout, so
@@ -380,7 +359,7 @@ const SHELL_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
 async fn resolve_via_login_shell(shell: &str, bin: &str) -> Option<PathBuf> {
     let mut cmd = tokio::process::Command::new(shell);
     cmd.arg("-ilc").arg(format!("command -v {bin}"));
-    let out = probe_output(&mut cmd, SHELL_PROBE_TIMEOUT).await?;
+    let out = crate::process::probe_output(&mut cmd, SHELL_PROBE_TIMEOUT).await?;
     if !out.success {
         return None;
     }
@@ -491,7 +470,7 @@ const VERSION_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) async fn probe_version(bin: &Path) -> Option<String> {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.arg("--version");
-    let out = probe_output(&mut cmd, VERSION_TIMEOUT).await?;
+    let out = crate::process::probe_output(&mut cmd, VERSION_TIMEOUT).await?;
     if !out.success {
         return None;
     }
