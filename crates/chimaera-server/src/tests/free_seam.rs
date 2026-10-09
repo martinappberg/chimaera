@@ -98,14 +98,16 @@ async fn a_free_daemon_serves_the_free_product_and_nothing_else() {
         let (status, _) = request(&state, Method::GET, route, None).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{route}");
     }
-    let (status, _) = request(
-        &state,
-        Method::POST,
+    // The place menu's "Run in the cloud" / "Run here": a release build
+    // refuses both, whatever the project.
+    for route in [
         "/api/v1/pro/configure",
-        Some(serde_json::json!({})),
-    )
-    .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+        "/api/v1/pro/projects/w-example/cloud",
+        "/api/v1/pro/projects/w-example/here",
+    ] {
+        let (status, _) = request(&state, Method::POST, route, Some(serde_json::json!({}))).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{route}");
+    }
 
     untouched(&state, &data);
     std::fs::remove_dir_all(root).ok();
