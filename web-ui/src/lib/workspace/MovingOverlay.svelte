@@ -1,10 +1,11 @@
 <script lang="ts">
   /**
-   * Over a project view while its project moves between the user's computer
-   * and their cloud: nothing underneath can be used until the machine that
-   * takes it serves it, so the whole view shimmers with one sentence saying
-   * what is going on. Self-gating on `projectMoving`, which only a project
-   * view's placement reads ever set.
+   * Over a project view's panes while its project moves between the user's
+   * computer and their cloud: no pane can be used until the machine that
+   * takes it serves it, so the pane area shimmers with one sentence saying
+   * what is going on. Mounted inside the stage (`App.svelte`), so the sidebar
+   * stays usable. Self-gating on `projectMoving`, which only a project view's
+   * placement reads ever set.
    */
   import { movingSentence, projectMoving } from "../net/projectMoving";
   import LoadingRows from "../shared/LoadingRows.svelte";
@@ -21,24 +22,26 @@
 
 <style>
   .moving {
-    position: fixed;
+    /* Fills the stage (its positioned parent), not the window. */
+    position: absolute;
     inset: 0;
-    /* Under the elsewhere card (190) and the auth overlay (200): those
-       still say what they say over a moving project. */
-    z-index: 189;
+    /* Over pane content (up to 40), under the context menu (90), pickers
+       (100), dialogs (110), the elsewhere card (190) and the auth overlay
+       (200), so a menu opened from the sidebar still shows over it. */
+    z-index: 85;
     display: flex;
     align-items: center;
     justify-content: center;
     background: color-mix(in srgb, var(--bg) 95%, transparent);
   }
-  /* The shimmer stands for the whole view: a centred column of rows. */
+  /* The shimmer stands for the panes: a centred column of rows. */
   .rows {
     position: absolute;
     inset: 0;
     display: flex;
     flex-direction: column;
     justify-content: center;
-    padding: 0 max(24px, calc((100vw - 720px) / 2));
+    padding: 0 max(24px, calc((100% - 720px) / 2));
     overflow: hidden;
   }
   .sentence {
