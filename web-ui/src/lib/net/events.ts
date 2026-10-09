@@ -1,7 +1,7 @@
 import { sendSocketAuth } from "./placement";
 import { daemonSocketUrl, gatewayWorkspace, isBrowserGateway } from "./base";
 import { getToken } from "./api";
-import { nudgeReconnectors, ownerAwake, retryDelayMs } from "./reconnect";
+import { nudgeReconnectors, ownerAwake, reconnectsHalted, retryDelayMs } from "./reconnect";
 import { noteServed } from "./projectMoving";
 import type { Link } from "../workspace/agentLinks";
 import type { Session } from "../workspace/sessions";
@@ -242,7 +242,10 @@ export class EventsSocket {
   }
 
   private connect(): void {
-    if (this.closed) return;
+    // A halted page (its cluster job ended) has no daemon left to answer: a
+    // retry already pending when the halt came, or a visibility or health
+    // nudge, must not dial it either.
+    if (this.closed || reconnectsHalted()) return;
     const ws = new WebSocket(daemonSocketUrl("/ws/events"));
     this.ws = ws;
 
@@ -386,6 +389,7 @@ export class EventsSocket {
   }
 
   private scheduleReconnect(): void {
+    if (reconnectsHalted()) return;
     // Jitter + the hidden slow tier (shared with the per-session sockets):
     // a resumed laptop with a dead tunnel must not probe 12x/min per window
     // forever while nobody is even looking. The first two retries keep the
