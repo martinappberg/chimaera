@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ASLEEP_NOTE, ApiError, isHomeHub, leaveHomeHub, ownerElsewhere, plainError, projectStateNote, reclaimHomeHub } from "./api";
+import { ASLEEP_NOTE, ApiError, api, isHomeHub, leaveHomeHub, ownerElsewhere, plainError, projectStateNote, reclaimHomeHub, setActiveWorkspaceId, setViewerWorkspaceHeader } from "./api";
 import { placementLabel } from "./placement";
 
 describe("daemon connection codes", () => {
@@ -91,5 +91,26 @@ describe("native Home hub identity", () => {
 
     reclaimHomeHub();
     expect(isHomeHub()).toBe(true);
+  });
+});
+
+describe("the viewer-workspace header", () => {
+  afterEach(() => { vi.unstubAllGlobals(); setViewerWorkspaceHeader(false); setActiveWorkspaceId(null); });
+
+  async function sentHeader(): Promise<string | null> {
+    const fetchMock = vi.fn(async (_path: string, _init: RequestInit) => new Response("{}"));
+    vi.stubGlobal("fetch", fetchMock);
+    setActiveWorkspaceId("w-one");
+    await api("/health");
+    return new Headers(fetchMock.mock.calls[0][1].headers).get("X-Chimaera-Viewer-Workspace");
+  }
+
+  it("is never sent by a window that can never have Pro", async () => {
+    expect(await sentHeader()).toBeNull();
+  });
+
+  it("names the active project once the window can have Pro", async () => {
+    setViewerWorkspaceHeader(true);
+    expect(await sentHeader()).toBe("w-one");
   });
 });

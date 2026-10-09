@@ -1,7 +1,7 @@
 import { daemonSocketUrl, isBrowserGateway } from "../net/base";
 import { movedTo, ownerSuspended, parsePause, sendSocketAuth, type MovedTo, type SessionPause } from "../net/placement";
 import { getToken } from "../net/api";
-import { ownerAwake, parkUntilAwake, QUIET_OPEN_MS, Reconnector, socketKeepers, UNKNOWN_SESSION_RETRIES } from "../net/reconnect";
+import { OwnerWait, ownerAwake, QUIET_OPEN_MS, Reconnector, UNKNOWN_SESSION_RETRIES } from "../net/reconnect";
 import { CooperativeQueue } from "./cooperativeQueue";
 import { NativeUiTransport, isNativeUiAction } from "./nativeUi";
 
@@ -152,15 +152,14 @@ export class ChatSocket {
   /** The owner said it is asleep (`worker_asleep`) and nothing has woken it
    *  since (a `ready`, `waking`, a move or a pause ends it). */
   private asleep = false;
-  /** Set while this socket is down because its owner is asleep: no retry
-   *  timer runs; a send (with wake intent) or a sign the owner answers again
-   *  dials it. Calling it leaves the waiting set. */
-  private leaveSleepWait: (() => void) | null = null;
+  /** Parked while the owner is asleep (no retry timer: a user action with
+   *  wake intent or a sign the owner answers again dials it), and the quiet
+   *  wait after authenticating. */
+  private readonly wait = new OwnerWait();
   /** This connection was answered (`ready`) or stayed open quietly
    *  ({@link QUIET_OPEN_MS}): its owner's side keeps it. One that closes
    *  before either was refused. */
   private kept = false;
-  private quietTimer: ReturnType<typeof setTimeout> | null = null;
   private unknownRetries = 0;
   private readonly recon = new Reconnector(() => this.connect());
   /** Replay, live events, and terminal frames share one cooperative FIFO.
@@ -244,8 +243,8 @@ export class ChatSocket {
    *  a paused project's owner to wake. */
   private connect(interaction = false): void {
     if (this.closed) return;
-    this.stopSleepWait();
-    this.stopQuiet();
+    this.wait.stopPark();
+    this.wait.stopQuiet();
     this.kept = false;
     const ws = new WebSocket(daemonSocketUrl(`/ws/chat/${this.sessionId}${interaction ? "?wake=interaction" : ""}`));
     this.ws = ws;
@@ -270,7 +269,7 @@ export class ChatSocket {
         return;
       }
       // Any frame ends the quiet wait: the owner's side spoke.
-      this.stopQuiet();
+      this.wait.stopQuiet();
       switch (msg.type) {
         case "native_ui":
           this.nativeUi.receive(msg.event);
@@ -443,7 +442,7 @@ export class ChatSocket {
       this.waking = false;
       const kept = this.kept;
       this.kept = false;
-      this.stopQuiet();
+      this.wait.stopQuiet();
       if (this.closed || this.fatal || this.ended) {
         this.recon.clear();
         return;
@@ -475,16 +474,9 @@ export class ChatSocket {
   private waitForOwner(): void {
     this.recon.cancel();
     this.recon.clear();
-    this.stopSleepWait();
-    this.leaveSleepWait = parkUntilAwake(() => {
-      this.leaveSleepWait = null;
+    this.wait.park(() => {
       if (!this.closed && !this.fatal && !this.ended && this.ws === null) this.connect();
     });
-  }
-
-  private stopSleepWait(): void {
-    this.leaveSleepWait?.();
-    this.leaveSleepWait = null;
   }
 
   /** Authenticated: if nothing is heard for {@link QUIET_OPEN_MS} the socket
@@ -492,25 +484,17 @@ export class ChatSocket {
    *  leaves the reconnecting indicator (keeping its backoff, which a later
    *  drop continues) and the view stops counting it as down. */
   private awaitQuiet(ws: WebSocket): void {
-    this.stopQuiet();
-    if (!socketKeepers()) return;
-    this.quietTimer = setTimeout(() => {
-      this.quietTimer = null;
+    this.wait.awaitQuiet(() => {
       if (this.ws !== ws || this.closed) return;
       this.kept = true;
       this.recon.clear();
       this.deliveries.push({ kind: "held" });
-    }, QUIET_OPEN_MS);
-  }
-
-  private stopQuiet(): void {
-    if (this.quietTimer !== null) clearTimeout(this.quietTimer);
-    this.quietTimer = null;
+    });
   }
 
   /** Waiting for a sleeping owner (no socket, no retry timer). */
   get waitingForOwner(): boolean {
-    return this.leaveSleepWait !== null;
+    return this.wait.parked;
   }
 
   /**
@@ -556,7 +540,7 @@ export class ChatSocket {
    * owner wakes.
    */
   private wakeOnInput(): void {
-    if (!(isBrowserGateway() || this.leaveSleepWait !== null) || this.closed || this.fatal || this.ended || this.waking) return;
+    if (!(isBrowserGateway() || this.wait.parked) || this.closed || this.fatal || this.ended || this.waking) return;
     this.waking = true;
     this.resetNativeUi();
     this.recon.cancel();
@@ -577,14 +561,14 @@ export class ChatSocket {
   retrySoon(): void {
     if (this.closed || this.fatal || this.ended) return;
     // Waiting for a sleeping owner: dial once, passively (a send wakes it).
-    if (this.leaveSleepWait !== null) this.connect();
+    if (this.wait.parked) this.connect();
     else this.recon.nudge(0);
   }
 
   close(): void {
     this.closed = true;
-    this.stopSleepWait();
-    this.stopQuiet();
+    this.wait.stopPark();
+    this.wait.stopQuiet();
     this.resetNativeUi();
     this.recon.cancel();
     this.recon.clear();

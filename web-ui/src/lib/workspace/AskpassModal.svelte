@@ -35,11 +35,11 @@
 
 {#if askpass !== null}
   <!-- This original focus owner survives every queued prompt. -->
-  <div class="loader" use:modalFocus={{ priority: 1 }}>
+  <div class="focus-owner" use:modalFocus={{ priority: 1 }}>
     <AskpassDialog prompt={askpass} onAnswer={answer} />
   </div>
 {/if}
 
 <style>
-  .loader { display: contents; }
+  .focus-owner { display: contents; }
 </style>

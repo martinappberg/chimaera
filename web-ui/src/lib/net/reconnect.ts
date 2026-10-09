@@ -64,7 +64,7 @@ export const UNKNOWN_SESSION_RETRIES = 12;
 export const QUIET_OPEN_MS = 1500;
 
 /** Whether a keeper may hold this window's sockets for a sleeping owner: only
- *  a window that can have Pro (App sets it once from `proTier`). Without one
+ *  a window that can have Pro (App sets it once from `proPossible`). Without one
  *  a socket means what it always did: open and quiet is still reconnecting
  *  ({@link QUIET_OPEN_MS} never applies), and open is live. */
 let keepersPossible = false;
@@ -136,6 +136,50 @@ export function parkUntilAwake(retry: () => void): () => void {
   return () => {
     parked.delete(retry);
   };
+}
+
+/** The two waits a chat or terminal socket keeps for an owner that has not
+ *  answered: parked with no timer while the owner is asleep
+ *  ({@link parkUntilAwake}), and the {@link QUIET_OPEN_MS} silence after
+ *  authenticating that marks a socket a keeper holds open. */
+export class OwnerWait {
+  private unpark: (() => void) | null = null;
+  private quietTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** Down because the owner is asleep: no retry timer runs. */
+  get parked(): boolean {
+    return this.unpark !== null;
+  }
+
+  /** Park until the owner answers again; `dial` runs once when it does. */
+  park(dial: () => void): void {
+    this.stopPark();
+    this.unpark = parkUntilAwake(() => {
+      this.unpark = null;
+      dial();
+    });
+  }
+
+  stopPark(): void {
+    this.unpark?.();
+    this.unpark = null;
+  }
+
+  /** `kept` runs after {@link QUIET_OPEN_MS} of silence, only in a window
+   *  whose sockets a keeper may hold ({@link socketKeepers}). */
+  awaitQuiet(kept: () => void): void {
+    this.stopQuiet();
+    if (!socketKeepers()) return;
+    this.quietTimer = setTimeout(() => {
+      this.quietTimer = null;
+      kept();
+    }, QUIET_OPEN_MS);
+  }
+
+  stopQuiet(): void {
+    if (this.quietTimer !== null) clearTimeout(this.quietTimer);
+    this.quietTimer = null;
+  }
 }
 
 /** Re-read a surface (the file tree, the Timeline) once its project answers

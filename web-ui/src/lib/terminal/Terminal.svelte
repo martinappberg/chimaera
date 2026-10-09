@@ -141,11 +141,11 @@
 </script>
 
 {#if showAccess}
-  <div class="terminal-access" role="toolbar" aria-label="Terminal access">
+  <div class="terminal-access">
     <!-- The window names one shared place once; a split project labels each. -->
     {#if placement !== null && $placesSplit}<span class="where">{placement}</span>{/if}
     {#if watching}<span>Just watching</span>{/if}
-    <button type="button" aria-pressed={!watching} onclick={toggleAccess}>{watching ? "Type here" : "Just watch"}</button>
+    <button type="button" onclick={toggleAccess}>{watching ? "Type here" : "Just watch"}</button>
   </div>
 {/if}
 <div class="term-view" class:watching class:with-access={showAccess} use:findTarget={find}>

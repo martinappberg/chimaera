@@ -707,3 +707,14 @@ authorization. `POST /v2/installations/bind` accepts optional `display_name`
 authenticated binding may update that device's label. The native app reads macOS
 ComputerName instead of a network-assigned hostname. Older sign-ins remain
 individually revocable; displaying them never revokes or merges credentials.
+
+### Viewer workspace header
+
+`X-Chimaera-Viewer-Workspace: <workspace id>` (1 to 128 ASCII letters, digits,
+`_` or `-`) names the project a window is showing. The web UI adds it to its
+ordinary `/api/v1` requests only in a window that can have Pro (the official
+app's own native window on this computer), and only while the window has an
+active project; account-gateway browser views never send it, because their URL
+already carries the project. A host that keeps sessions reads it to know which
+project the request comes from and strips it before forwarding. The free daemon
+ignores it, and no request needs it: without it a request behaves as before.

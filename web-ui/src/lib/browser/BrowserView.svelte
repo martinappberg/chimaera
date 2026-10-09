@@ -279,7 +279,7 @@
   // daemon expiring the proxy session, and a hidden window must come back to
   // a working app, not an expired ticket. 1 request/min is the accepted cost.
   $effect(() => {
-    if (!visible || phase.kind !== "ready") return;
+    if (!visible || !$pageVisible || phase.kind !== "ready") return;
     const t = setInterval(() => {
       const id = proxyId;
       if (id === null) return;
@@ -300,10 +300,12 @@
   });
 
   // Refresh the HttpOnly preview cookie without navigating the app. The keeper
-  // answers this POST with 204. Leases stay short if the pane closes; live
-  // sockets independently revalidate parent device revocation.
+  // answers this POST with 204. Leases stay short if the pane closes or the
+  // page is hidden (nobody is using the app then); the effect's re-run on
+  // return renews at once. Live sockets independently revalidate parent
+  // device revocation.
   $effect(() => {
-    if (!browserGateway || !visible || phase.kind !== "ready") return;
+    if (!browserGateway || !visible || !$pageVisible || phase.kind !== "ready") return;
     let pending = false;
     let cancelled = false;
     const renew = async () => {
@@ -640,7 +642,7 @@
       </div>
     {/if}
     {#if browserGateway && phase.kind === "ready"}
-      <div class="isolated-note">Preview runs in an isolated origin. If this browser blocks it, <button onclick={openExternal}>open in a separate tab</button>.</div>
+      <div class="isolated-note">This preview opens separately for safety. If it stays blank, <button onclick={openExternal}>open it in a separate tab</button>.</div>
     {/if}
     {#if iframeSrc !== null && (phase.kind === "ready" || phase.kind === "connecting")}
       <iframe

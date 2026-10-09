@@ -7,8 +7,8 @@
   import type { DropSpot, LayoutCtrl } from "./dnd";
   import { registerPane, unregisterPane, zoneWord } from "./dnd";
   import { dirLabel } from "../previews/files";
-  import { pauseLabel, placementLabel, sessionPause } from "../net/placement";
-  import { accountSignedOut } from "../net/plan";
+  import { pauseLabel, placementLabel, sessionPause, shellPauseLabel } from "../net/placement";
+  import { accountSignedOut, proPossible } from "../net/plan";
   import { terminalKept, terminalStatus } from "../terminal/refusals.svelte";
   import { pausedConnect } from "../pro/providers";
   import { canOpenOnboarding, cloudOnboarding } from "../pro/onboarding.svelte";
@@ -392,12 +392,9 @@
            additive `pause` says which). A paused chat stays mounted below:
            its transcript and scroll survive and it follows the conversation. -->
       {@const pause = sessionPause(s)}
-      {@const paused = pauseLabel(
-        s.kind === "shell" && !(pause?.type === "paused" && pause.reason === "restarting")
-          ? { type: "paused", reason: "stays_on_computer", provider: null }
-          : pause,
-        { signedOut: $accountSignedOut },
-      )}
+      {@const paused = s.kind === "shell"
+        ? shellPauseLabel(pause, { places: proPossible() })
+        : pauseLabel(pause, { signedOut: $accountSignedOut })}
       <!-- Waiting for an agent sign-in on the cloud (the row's additive
            `blocked_provider`): offer the one thing that unblocks it. -->
       {@const connect = canOpenOnboarding() ? pausedConnect(s) : null}
@@ -654,6 +651,8 @@
         onClose={() => { const index = node.tabs.findIndex(candidate => candidate === tab); if (index >= 0) ctrl.closeTab(node.id, index); }} />
     {:else if viewErrors.pro}
       {@render loadFailure("pro", "Chimaera Pro")}
+    {:else}
+      <Spinner />
     {/if}
   {:else if tab.surface === "settings"}
     {@const SettingsView = views.settings}

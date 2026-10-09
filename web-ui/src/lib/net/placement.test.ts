@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { get } from "svelte/store";
-import { notePlaces, ownerSuspended, parsePause, parsePlacement, pauseLabel, placementLabel, placesSplit, projectWhere, projectWhereLabel, sessionPause } from "./placement";
+import { notePlaces, ownerSuspended, parsePause, parsePlacement, pauseLabel, placementLabel, placesSplit, projectWhere, projectWhereLabel, sessionPause, shellPauseLabel } from "./placement";
 const live = { workspace_id: "w-one", holder_id: "d-home", route_host_id: "device-d-home", epoch: 4, policy_revision: 1, availability: "owned", server_now: "2026-09-28T19:00:00Z", expires_at: "2026-09-28T19:01:30Z" };
 describe("workspace routing authority", () => {
   it("accepts exact current owner without choosing a home or worker", () => {
@@ -101,6 +101,14 @@ describe("paused sessions", () => {
     expect(new Set(statuses).size).toBe(statuses.length);
     expect(reasons[1].detail).not.toBeNull();
     expect(reasons[0].detail).toBeNull();
+  });
+  it("names a paused terminal's computer only in a window that can have Pro", () => {
+    const free = shellPauseLabel(null, { places: false });
+    expect(free).toEqual({ status: "This terminal is paused", detail: null });
+    expect(free.status).not.toMatch(/computer|cloud/i);
+    expect(shellPauseLabel(null, { places: true }).status).toBe("This terminal stays on your computer");
+    const restart = { type: "paused", reason: "restarting", provider: null } as const;
+    for (const places of [false, true]) expect(shellPauseLabel(restart, { places }).status).toBe("Picking up where you left off…");
   });
   it("names any restart by what happens next, not by an update", () => {
     const restart = pauseLabel({ type: "paused", reason: "restarting", provider: null }).status;

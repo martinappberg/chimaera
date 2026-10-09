@@ -9,10 +9,13 @@ import {
   Reconnector,
   reconnectingSockets,
   nudgeReconnectors,
+  OwnerWait,
   ownerAwake,
+  QUIET_OPEN_MS,
   parkUntilAwake,
   refetchWhenOwnerAwake,
   retryDelayMs,
+  setSocketKeepers,
 } from "./reconnect";
 
 /**
@@ -310,5 +313,43 @@ describe("a surface re-read after its owner slept", () => {
     ownerAwake(() => 0);
     vi.advanceTimersByTime(1_000);
     expect(cancelled).not.toHaveBeenCalled();
+  });
+});
+
+describe("OwnerWait", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => { vi.useRealTimers(); setSocketKeepers(false); });
+
+  it("dials once when the owner answers, and never after it stops waiting", () => {
+    const wait = new OwnerWait();
+    const dial = vi.fn();
+    wait.park(dial);
+    expect(wait.parked).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+    ownerAwake(() => 0);
+    vi.advanceTimersByTime(0);
+    expect(dial).toHaveBeenCalledOnce();
+    expect(wait.parked).toBe(false);
+    const late = vi.fn();
+    wait.park(late);
+    wait.stopPark();
+    ownerAwake(() => 0);
+    vi.advanceTimersByTime(0);
+    expect(late).not.toHaveBeenCalled();
+  });
+
+  it("counts a quiet socket as kept only where a keeper may hold it", () => {
+    const wait = new OwnerWait();
+    const kept = vi.fn();
+    wait.awaitQuiet(kept);
+    expect(vi.getTimerCount()).toBe(0);
+    setSocketKeepers(true);
+    wait.awaitQuiet(kept);
+    vi.advanceTimersByTime(QUIET_OPEN_MS);
+    expect(kept).toHaveBeenCalledOnce();
+    wait.awaitQuiet(kept);
+    wait.stopQuiet();
+    vi.advanceTimersByTime(QUIET_OPEN_MS);
+    expect(kept).toHaveBeenCalledOnce();
   });
 });

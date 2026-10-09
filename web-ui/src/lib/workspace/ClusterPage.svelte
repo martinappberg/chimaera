@@ -971,7 +971,15 @@
     padding: 56px clamp(24px, 4vw, 64px) 40px;
     display: flex;
     flex-direction: column;
-    gap: 32px;
+    --block-gap: 32px;
+  }
+  /* The status lines belong to the block after them, so they sit 16px
+     closer to it than blocks sit to each other. */
+  .inner > * + * {
+    margin-top: var(--block-gap);
+  }
+  .inner > .status-lines + * {
+    margin-top: calc(var(--block-gap) - 16px);
   }
 
   .masthead {
@@ -1250,7 +1258,6 @@
     display: flex;
     flex-direction: column;
     gap: 2px;
-    margin-bottom: -16px;
   }
 
   .degraded {
@@ -1739,7 +1746,7 @@
   @media (max-width: 700px) {
     .inner {
       padding: 24px 20px 20px;
-      gap: 28px;
+      --block-gap: 28px;
     }
   }
 

@@ -5,7 +5,7 @@
   import HomeActions from "./HomeActions.svelte";
   import HostSlot from "../extensions/HostSlot.svelte";
   import { isMac } from "../shared/keys";
-  import { paidPlan, proTier } from "../net/plan";
+  import { paidPlan, proPossible, proTier } from "../net/plan";
   import { gatewayWorkspace, isBrowserGateway } from "../net/base";
   import { projectWhere, projectWhereLabel } from "../net/placement";
   import type ClusterPage from "./ClusterPage.svelte";
@@ -370,7 +370,8 @@
       void checkAppUpdate().then((v) => (appUpdate = v));
     }
     // A Pro sign-in or plan change can add or drop hosts reached through it.
-    const unlisteners: Array<() => void> = [asyncDisposer(onProChanged(() => { if (document.visibilityState === "visible") void refreshHosts(); }))];
+    // A window that can never have Pro registers nothing.
+    const unlisteners: Array<() => void> = proPossible() ? [asyncDisposer(onProChanged(() => { if (document.visibilityState === "visible") void refreshHosts(); }))] : [];
     // A cluster's workspaces changed (a start, stop, or handoff — from this
     // window or another): refresh its row. The cluster page, when open,
     // listens for itself and shares the same cache.
@@ -803,7 +804,7 @@
         >{/if}
     </button>
   {/if}
-  <HomeNavigation active="workspaces" plan={$paidPlan} showPro={$proTier !== "free"}
+  <HomeNavigation active="workspaces" plan={$paidPlan} showPro={proPossible()}
     onHome={() => {
       // The cluster page's own back route: a cluster workspace's window has
       // local Home behind its page; any other Home returns to its own list —

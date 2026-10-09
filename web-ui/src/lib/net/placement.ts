@@ -152,6 +152,15 @@ export function pauseLabel(pause: SessionPause | null, { signedOut = false }: { 
   }
 }
 
+/** A paused terminal stays on the computer it started on; only a restart
+ *  says what happens next. Only a window that can have Pro (`places`) moves
+ *  projects between computers, so a free one names no place. */
+export function shellPauseLabel(pause: SessionPause | null, { places }: { places: boolean }): { status: string; detail: string | null } {
+  if (pause?.type === "paused" && pause.reason === "restarting") return pauseLabel(pause);
+  if (!places) return { status: "This terminal is paused", detail: null };
+  return pauseLabel({ type: "paused", reason: "stays_on_computer", provider: null });
+}
+
 function elsewherePause(signedOut: boolean): { status: string; detail: null } {
   return { status: signedOut ? "This conversation is elsewhere. Sign in to Chimaera Pro to view it." : "Continuing elsewhere…", detail: null };
 }

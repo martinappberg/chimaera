@@ -13,11 +13,12 @@
     href: string;
     sentence?: string;
   } = $props();
+  const sentenceId = $props.id();
 </script>
 
 <div class="elsewhere">
-  <div class="panel" role="alertdialog" aria-modal="true" aria-label="project elsewhere" tabindex="-1" use:modalFocus>
-    <p class="sentence">{sentence}</p>
+  <div class="panel" role="alertdialog" aria-modal="true" aria-labelledby={sentenceId} tabindex="-1" use:modalFocus>
+    <p class="sentence" id={sentenceId}>{sentence}</p>
     <a class="open" {href}>Open</a>
   </div>
 </div>
@@ -39,7 +40,7 @@
     background: var(--overlay-bg);
     border: 1px solid var(--edge);
     border-radius: 8px;
-    box-shadow: 0 12px 36px rgba(0, 0, 0, 0.22);
+    box-shadow: 0 12px 36px var(--scrim);
   }
   .sentence {
     margin: 0 0 12px;
@@ -57,5 +58,9 @@
   }
   .open:hover {
     background: var(--row-hover);
+  }
+  .open:focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: 2px;
   }
 </style>
