@@ -81,7 +81,8 @@ The direct behavior described below remains the fallback the user selects.
   **running** (node · resources · time left), **starting**, or **waiting for a node**
   (Slurm's start estimate and its reason when not plain priority) — listing the
   workspaces open in it (open · opening · closing, and what their chats are doing);
-  ended jobs as one line each (why: time limit, cancelled, failed, preempted, its node
+  ended jobs as one quiet list, one line each with Start again and dismiss, plus Clear all when
+  there are several (why: time limit, cancelled, failed, preempted, its node
   failed, out of memory — asked of `sacct` once and kept); the workspaces not open
   anywhere; one quiet count of the user's other Slurm jobs. Masthead: Home, Terminal (a
   terminal-only window, "<host> · login node", running `ssh <host>` over the app's

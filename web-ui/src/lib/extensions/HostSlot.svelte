@@ -37,5 +37,9 @@
 {#if active}<div class="host-slot" bind:this={target}></div>{/if}
 
 <style>
-  .host-slot { display: contents; }
+  /* The mounted line takes the host row's status register: the UI font at
+     the status size. `display: contents` adds no box, but custom properties
+     still inherit through it, so content that asks for `var(--mono)` gets the
+     UI font here without the extension changing. */
+  .host-slot { display: contents; --mono: var(--ui-font); }
 </style>

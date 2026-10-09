@@ -753,6 +753,19 @@
   {/if}
 {/snippet}
 
+<!-- A host's last error: a quiet note under its row with the way to retry,
+     never a full-width block. A host that is up (connected, or a cluster
+     with a job running) and kept connected keeps its green dot; the note
+     then says it is about keeping it connected. The words are the shell's. -->
+{#snippet hostNote(h: HostState, err: string)}
+  {@const live = h.status === "connected" || (isCluster(h) && clusterRunning(h.alias))}
+  <p class="host-note" role="status">
+    {#if live && h.kept === true}<span class="host-note-label">Keep connected:</span>{/if}
+    <span class="host-note-text" title={err}>{err}</span>
+    <button class="host-note-act" disabled={h.status === "connecting"} onclick={() => void connect(h.alias)}>Try again</button>
+  </p>
+{/snippet}
+
 {#snippet jobsRow(alias: string)}
   <div class="rowwrap" role="presentation">
     <button
@@ -1134,7 +1147,7 @@
                        cluster's workspaces and opens its page in place. -->
                   {@const line = clusterReadable(h) ? clusterLine(h) : null}
                   {@const running = clusterRunning(h.alias)}
-                  <div class="rowwrap" role="presentation" class:connected={running}>
+                  <div class="rowwrap host-row" role="presentation" class:connected={running}>
                     <button
                       class="row"
                       title="{h.alias}'s jobs and workspaces"
@@ -1149,26 +1162,18 @@
                             ? "a job is running"
                             : "no job running"}
                       ></span>
-                      <span class="name">{h.alias}</span>
-                      <span
-                        class="pill-sched"
-                        title="{h.alias} has a batch scheduler: Chimaera runs inside jobs you start there, never on the login node"
-                        >{schedulerLabel(h.cluster?.scheduler)}</span
-                      >
-                      {#if localState?.dev_build}
-                        <span
-                          class="pill-dev"
-                          title="dev build — every connection targets this machine's own build in ~/.chimaera-dev on {h.alias}; the real daemon there is untouched"
-                          >dev</span
-                        >
-                      {/if}
-                      {#if phase !== undefined}
-                        <span class="phase">{phase === PHASE_LABEL.probing ? "connecting…" : phase}</span>
-                      {:else if line !== null}
-                        <span class="phase quiet">{line}</span>
-                      {:else}
-                        <span class="when">{ago(h.last_connected_at)}</span>
-                      {/if}
+                      <span class="workspace-label">
+                        <span class="host-name"><span class="name">{h.alias}</span>{#if h.via_pro}<span class="via-pro" title="Connected through Chimaera Pro">via Pro</span>{/if}</span>
+                        <span class="phase quiet">
+                          <span title="{h.alias} has a batch scheduler: Chimaera runs inside jobs you start there, never on the login node"
+                            >{schedulerLabel(h.cluster?.scheduler)}</span
+                          >{#if localState?.dev_build}<span class="sep" aria-hidden="true">·</span><span
+                              class="dev-word"
+                              title="dev build — every connection targets this machine's own build in ~/.chimaera-dev on {h.alias}; the real daemon there is untouched"
+                              >dev</span
+                            >{/if}<span class="sep" aria-hidden="true">·</span>{#if phase !== undefined}{phase === PHASE_LABEL.probing ? "connecting…" : phase}{:else if line !== null}{line}{:else}{ago(h.last_connected_at)}{/if}
+                        </span>
+                      </span>
                     </button>
                     <HomeActions label={`Actions for ${h.alias}`}>
                       <button class="side" disabled={h.status === "connecting"} onclick={() => (remoteSettings = { alias: h.alias, firstSetup: false })}>Connection settings</button>
@@ -1176,9 +1181,7 @@
                       {@render directPreference(h)}
                     </HomeActions>
                   </div>
-                  {#if err !== undefined}
-                    <div class="err-line">{err}</div>
-                  {/if}
+                  {#if err !== undefined}{@render hostNote(h, err)}{/if}
                   <HostSlot alias={h.alias} />
                   {#if h.cluster !== null && h.cluster.login_daemon !== null && phase === undefined}
                     <div class="note-line warn">
@@ -1212,19 +1215,19 @@
                             : "not connected"}
                       ></span>
                       <span class="workspace-label">
-                        <span class="host-name"><span class="name">{h.alias}</span>{#if h.via_pro}<span class="via-pro" title="Connected through Chimaera Pro">via Pro</span>{/if}{#if cluster}<span class="pill-sched">{schedulerLabel(h.cluster?.scheduler)}</span><span class="pill-dev" title="chimaera runs on {h.alias}'s login node (scheduled jobs are off in connection settings)">login node</span>{/if}{#if localState?.dev_build}<span
-                          class="pill-dev"
-                          title="dev build — every connection targets this machine's own build in ~/.chimaera-dev on {h.alias}; the real daemon there is untouched"
-                          >dev</span
-                        >{/if}</span>
+                        <span class="host-name"><span class="name">{h.alias}</span>{#if h.via_pro}<span class="via-pro" title="Connected through Chimaera Pro">via Pro</span>{/if}</span>
                         <span
                           class="phase quiet"
                           title={phase === undefined && h.status === "connected" && h.node
                             ? `${h.alias} spans several login nodes; its daemon runs on ${h.node}, so this connection is pinned there`
                             : undefined}
                         >
-                          {#if phase !== undefined}{phase}
-                          {:else if h.status === "connected"}Connected{#if h.node} · {shortNode(h.node)}{/if}{#if h.local_port !== null} · 127.0.0.1:{h.local_port}{/if}{#if (h.live_sessions ?? 0) > 0} · {h.live_sessions} live session{h.live_sessions === 1 ? "" : "s"}{/if}
+                          {#if cluster}<span>{schedulerLabel(h.cluster?.scheduler)}</span><span class="sep" aria-hidden="true">·</span><span title="chimaera runs on {h.alias}'s login node (scheduled jobs are off in connection settings)">login node</span><span class="sep" aria-hidden="true">·</span>{/if}{#if localState?.dev_build}<span
+                            class="dev-word"
+                            title="dev build — every connection targets this machine's own build in ~/.chimaera-dev on {h.alias}; the real daemon there is untouched"
+                            >dev</span
+                          ><span class="sep" aria-hidden="true">·</span>{/if}{#if phase !== undefined}{phase}
+                          {:else if h.status === "connected"}Connected{#if h.node}{" · "}{shortNode(h.node)}{/if}{#if h.local_port !== null}{" · "}127.0.0.1:{h.local_port}{/if}{#if (h.live_sessions ?? 0) > 0}{" · "}{h.live_sessions} live session{h.live_sessions === 1 ? "" : "s"}{/if}
                           {:else if h.status === "connecting"}Connecting…
                           {:else}Not connected{#if h.last_connected_at} · Last connected {ago(h.last_connected_at)}{/if}{/if}
                         </span>
@@ -1258,9 +1261,7 @@
                       {@render directPreference(h)}
                     </HomeActions>
                   </div>
-                  {#if err !== undefined}
-                    <div class="err-line">{err}</div>
-                  {/if}
+                  {#if err !== undefined}{@render hostNote(h, err)}{/if}
                   <HostSlot alias={h.alias} />
                   {#if h.status === "connected" && h.outdated && phase === undefined}
                     <div class="note-line" title={buildNote(h.remote_build)}>
@@ -1837,17 +1838,6 @@
     color: var(--fg);
   }
 
-  /* The scheduler tag on a cluster row — a fact, quietly stated. */
-  .pill-sched {
-    flex: none;
-    font-size: var(--text-xs);
-    color: var(--muted);
-    border: 1px solid var(--edge);
-    border-radius: 999px;
-    padding: 1px 7px;
-    white-space: nowrap;
-  }
-
   .note-line.warn {
     color: var(--warn);
   }
@@ -1950,19 +1940,6 @@
     opacity: 0.7;
   }
 
-  /* Dev-build language: amber, the "this is special" register — a dev build
-     talks only to isolated ~/.chimaera-dev daemons, and its host rows must
-     never read like a release's. */
-  .pill-dev {
-    flex: none;
-    font-family: var(--mono);
-    font-size: var(--text-xs);
-    color: var(--warn);
-    border: 1px solid color-mix(in srgb, var(--warn) 40%, transparent);
-    border-radius: 999px;
-    padding: 1px 7px;
-  }
-
   .err-line {
     padding: 2px 10px 6px;
     font-size: var(--text-sm);
@@ -2024,6 +2001,20 @@
   .host-card { border: 1px solid var(--edge); border-radius: 10px; padding: 5px; }
   .remotes .rows { gap: 10px; }
   .host-name { display: flex; align-items: center; gap: 9px; min-width: 0; }
+  /* A host row's status line is one register — UI font, status size, muted —
+     and carries what used to be pills ("Slurm cluster", "login node", "dev")
+     as words; the optional extension's line under it matches (HostSlot). */
+  .host-row .workspace-label .phase.quiet { font-family: inherit; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sep { margin: 0 0.45em; opacity: 0.6; }
+  /* Dev-build language stays amber: a dev build talks only to isolated
+     ~/.chimaera-dev daemons, and its rows must never read like a release's. */
+  .dev-word { color: var(--warn); }
+  .host-note { margin: 0; padding: 0 10px 6px 33px; display: flex; align-items: baseline; gap: 0.45em; min-width: 0; font-size: var(--text-xs); line-height: 1.5; color: var(--muted); }
+  .host-note-label { flex: none; }
+  .host-note-text { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: color-mix(in srgb, var(--err) 70%, var(--muted)); }
+  .host-note-act { flex: none; appearance: none; border: none; background: none; padding: 0; font: inherit; color: var(--muted); text-decoration: underline; text-decoration-color: var(--edge); text-underline-offset: 3px; cursor: pointer; white-space: nowrap; }
+  .host-note-act:hover:enabled { color: var(--fg); text-decoration-color: currentColor; }
+  .host-note-act:disabled { opacity: 0.6; cursor: default; }
   .host-name > .name { flex: 1 1 auto; min-width: 0; }
   .host-open { flex: none; font-size: var(--text-sm); color: var(--muted); }
   .host-open span { margin-left: 4px; }
@@ -2064,6 +2055,7 @@
     .open-folder kbd { display: none; }
     .host-row .row { padding: 12px 9px; gap: 10px; }
     .host-open { font-size: var(--text-xs); }
+    .host-note { padding-left: 26px; }
     .remote-ws { margin-left: 13px; padding-left: 9px; }
     .remote-ws .row.sub { flex-wrap: wrap; gap: 5px 10px; }
     .remote-ws .row.sub .name { max-width: 100%; }
