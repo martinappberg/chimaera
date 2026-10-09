@@ -153,7 +153,7 @@ requested plan; portal return refreshes account state. A callback alone never
 grants access. Cancel/expiry/error remain recoverable and do not silently reopen
 checkout. No account token, Stripe session URL, or callback nonce enters UI state.
 
-Account example (limits are supplied by the account, never hardcoded by clients):
+Account example (limits are supplied by the account, never hardcoded by clients; the values here are synthetic examples, not any plan's allowance):
 
 ```json
 {
@@ -163,8 +163,8 @@ Account example (limits are supplied by the account, never hardcoded by clients)
   "device_id": "d_example",
   "protocol": 0,
   "keeper_url": "https://keeper.example.invalid",
-  "limits": { "cloud_hours": 40, "storage_bytes": 4000000000 },
-  "usage": { "cloud_hours": 2.5, "storage_bytes": 1200000 },
+  "limits": { "cloud_hours": 1, "storage_bytes": 1073741824 },
+  "usage": { "cloud_hours": 0.5, "storage_bytes": 1200000 },
   "hours_exhausted": false
 }
 ```
