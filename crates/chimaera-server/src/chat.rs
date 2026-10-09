@@ -909,30 +909,17 @@ async fn switch_to_pty(
             // first TUI turn. Carry its already-existing rollout now rather
             // than relying on a notify that may never arrive.
             if let Some(thread) = recipe.resume.clone().filter(|_| identity) {
-                if let Some(home) = state
-                    .codex_config_path
-                    .parent()
-                    .map(std::path::Path::to_path_buf)
-                {
-                    let cwd = crate::lock(&state.agents)
-                        .get(id)
-                        .and_then(|r| r.native_cwd_for(&thread))
-                        .unwrap_or_else(|| recipe.workspace_root.clone());
-                    let sought = thread.clone();
-                    let rollout = tokio::task::spawn_blocking(move || {
-                        crate::codex_rollout::find_rollout(&home, &sought, &cwd)
-                    })
-                    .await
-                    .ok()
-                    .flatten();
-                    if let Some(path) = rollout {
-                        if let Some(record) = crate::lock(&state.agents)
-                            .get_mut(id)
-                            .filter(|record| record.key == key)
-                        {
-                            record.codex_thread_id = Some(thread);
-                            record.transcript_path = Some(path);
-                        }
+                let cwd = crate::lock(&state.agents)
+                    .get(id)
+                    .and_then(|r| r.native_cwd_for(&thread))
+                    .unwrap_or_else(|| recipe.workspace_root.clone());
+                if let Some(path) = crate::codex_rollout::capture(state, &thread, cwd, None).await {
+                    if let Some(record) = crate::lock(&state.agents)
+                        .get_mut(id)
+                        .filter(|record| record.key == key)
+                    {
+                        record.codex_thread_id = Some(thread);
+                        record.transcript_path = Some(path);
                     }
                 }
             }
@@ -3684,18 +3671,24 @@ pub(crate) async fn spawn_chat_session(
             .is_some_and(|entry| {
                 entry.manual_resume_reason.as_deref() == Some("project_secrets_idle")
             });
-    crate::lock(&state.chat_recipes).insert(id.clone(), recipe.clone());
     let adapter = recipe
         .kind
         .chat_adapter()
         .ok_or_else(|| anyhow::anyhow!("no chat adapter registered"))?;
-    let import_admission = state.policy().hold_session(
+    crate::lock(&state.chat_recipes).insert(id.clone(), recipe.clone());
+    let import_admission = match state.policy().hold_session(
         state,
         &recipe.workspace_id,
         &id,
         recipe.resume.as_deref(),
         false,
-    )?;
+    ) {
+        Ok(admission) => admission,
+        Err(error) => {
+            crate::lock(&state.chat_recipes).remove(&id);
+            return Err(error);
+        }
+    };
     let info = state.chat.spawn(adapter, spec);
     drop(import_admission);
     if info.is_err() {
@@ -3706,7 +3699,9 @@ pub(crate) async fn spawn_chat_session(
             .policy()
             .allows(state, &recipe.workspace_id, crate::policy::Need::Execute)
         {
+            // The killed session's retention watch ends on its own.
             state.chat.fence(&id);
+            crate::lock(&state.chat_recipes).remove(&id);
             anyhow::bail!("project execution authority changed during launch");
         }
         if let Some(placement) = &placement {

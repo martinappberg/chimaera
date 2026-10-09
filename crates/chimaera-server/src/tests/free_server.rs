@@ -137,10 +137,118 @@ async fn free_manual_resume_is_missing_and_creates_no_pro_state() {
         None,
     )
     .await;
-    // The route does not exist without the extension (`api::pro_routes`);
-    // the handler's own guard answers `manual_resume_missing` behind it.
+    // Only an extension adds the route (`WorkspacePolicy::routes`); the
+    // inert policy adds none, so the generic fallback answers.
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert_eq!(body["error"], "not found");
     assert!(state.extension.get().is_none());
     assert!(!lock(&state.chat_switching).contains_key(&entry.id));
+}
+
+/// Nothing resumes a deferred entry without an extension, so a conversation
+/// an earlier composed daemon suspended for a manual resume is ordinary local
+/// work for a free daemon: it lands in Recents (restore is off here) instead
+/// of being stranded, and starting it again from there is not refused.
+#[tokio::test]
+async fn free_restore_does_not_strand_a_suspended_conversation() {
+    let state = test_state();
+    let ws = make_workspace(&state, "free-suspended-restore").await;
+    let cwd = lock(&state.workspaces).get(&ws).unwrap().root;
+    let (status, _) = request(
+        &state,
+        Method::PUT,
+        "/api/v1/settings",
+        Some(serde_json::json!({"daemon.restoreSessions": false})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let entry = ledger::LedgerEntry {
+        id: "s-free-suspended".into(),
+        suspended: true,
+        manual_resume_reason: Some("project_secrets_idle".into()),
+        fence_epoch: None,
+        handoff: None,
+        workspace_id: ws.clone(),
+        cwd,
+        pinned_name: None,
+        cols: 80,
+        rows: 24,
+        theme: "dark".into(),
+        created_at: 1,
+        agent: Some(ledger::LedgerAgent {
+            kind: agents::AgentKind::Codex,
+            resume: Some(THREAD.into()),
+            transcript: None,
+            native_cwd: None,
+            title: "suspended work".into(),
+            ui: chimaera_agent::model::SessionUi::Chat,
+            model: None,
+            carryover: None,
+        }),
+    };
+    let boot = ledger::BootLedger {
+        sessions: vec![entry.clone()],
+        links: Default::default(),
+        written_at: 1_750_000_000,
+    };
+    ledger::restore(&state, boot).await;
+
+    assert!(
+        lock(&state.deferred_sessions).is_empty(),
+        "nothing deferred"
+    );
+    let (live, _) = ledger::snapshot(&state);
+    assert!(live.is_empty(), "the ledger does not carry it forward");
+    let recents = lock(&state.recents).list(&ws);
+    assert_eq!(recents.len(), 1, "the conversation is findable in Recents");
+    assert_eq!(recents[0].resume.as_deref(), Some(THREAD));
+
+    // The Recents row starts again; the 409 manual-resume guard is inert.
+    ledger::check_manual_native(&state, None, agents::AgentKind::Codex, Some(THREAD))
+        .expect("a free daemon never requires a manual resume");
+    lock(&state.deferred_sessions).insert(entry.id.clone(), entry);
+    let (status, body) = request(
+        &state,
+        Method::POST,
+        "/api/v1/sessions",
+        Some(serde_json::json!({
+            "workspace_id": ws, "kind": "agent", "agent": "codex", "resume": THREAD,
+        })),
+    )
+    .await;
+    assert_ne!(status, StatusCode::CONFLICT, "{body}");
+    assert_ne!(body["error"], "manual_resume_required");
+    if let Some(id) = body["id"].as_str() {
+        state.sessions.kill(id).ok();
+    }
+}
+
+/// The policy is chosen once: installing after `policy()` defaulted fails
+/// loudly instead of silently keeping the inert policy.
+#[test]
+#[should_panic(expected = "workspace policy installed twice")]
+fn install_policy_after_first_use_panics() {
+    let state = test_state();
+    let _ = state.policy().composed(&state);
+    state.install_policy(None, &state.data_dir.clone());
+}
+
+/// Every Codex rollout lookup goes through one capture (the Codex home a
+/// terminal sees, the shared lookup limit); a known path must still verify.
+#[tokio::test]
+async fn codex_rollout_capture_verifies_and_finds() {
+    let state = test_state();
+    let ws = make_workspace(&state, "free-codex-capture").await;
+    let cwd = lock(&state.workspaces).get(&ws).unwrap().root;
+    let rollout = plant_rollout(&state, &cwd);
+    assert_eq!(
+        codex_rollout::capture(&state, THREAD, cwd.clone(), None).await,
+        Some(rollout.clone())
+    );
+    let elsewhere = test_dir("free-codex-capture-other");
+    assert_eq!(
+        codex_rollout::capture(&state, THREAD, elsewhere, Some(rollout.clone())).await,
+        None,
+        "a known path must still verify against the cwd"
+    );
 }

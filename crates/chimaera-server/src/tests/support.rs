@@ -601,3 +601,317 @@ pub fn age_file(path: &std::path::Path, secs: u64) {
     file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(secs))
         .unwrap();
 }
+
+/// The inert policy with the overrides a test needs: refuse the last hold
+/// before a launch spawns, and/or admit scoped (project-window) requests.
+/// Everything else is exactly the inert policy.
+pub struct TestPolicy {
+    pub inner: crate::policy::Inert,
+    pub refuse_hold: bool,
+    pub admit_scopes: bool,
+}
+
+impl Default for TestPolicy {
+    fn default() -> Self {
+        Self {
+            inner: crate::policy::Inert::new(Default::default()),
+            refuse_hold: false,
+            admit_scopes: false,
+        }
+    }
+}
+
+/// Run `state` under `policy` (before anything read the default one).
+pub fn use_test_policy(state: &Arc<AppState>, policy: TestPolicy) {
+    assert!(
+        state.policy.set(Arc::new(policy)).is_ok(),
+        "policy already chosen"
+    );
+}
+
+mod test_policy {
+    use super::TestPolicy;
+    use crate::policy::*;
+    use crate::AppState;
+    use std::sync::Arc;
+
+    impl WorkspacePolicy for TestPolicy {
+        fn hold_session<'a>(
+            &'a self,
+            state: &'a AppState,
+            workspace: &str,
+            session: &str,
+            native: Option<&str>,
+            read: bool,
+        ) -> anyhow::Result<Hold<'a>> {
+            anyhow::ensure!(read || !self.refuse_hold, "refused by the test policy");
+            self.inner
+                .hold_session(state, workspace, session, native, read)
+        }
+        fn scope_admission(
+            &self,
+            state: &AppState,
+            workspace: &str,
+            epoch: u64,
+        ) -> anyhow::Result<Admission> {
+            if self.admit_scopes {
+                Ok(Admission::inert(workspace))
+            } else {
+                self.inner.scope_admission(state, workspace, epoch)
+            }
+        }
+        fn scope_check(&self, state: &AppState, workspace: &str, epoch: u64) -> anyhow::Result<()> {
+            if self.admit_scopes {
+                Ok(())
+            } else {
+                self.inner.scope_check(state, workspace, epoch)
+            }
+        }
+        fn composed(&self, state: &AppState) -> bool {
+            self.inner.composed(state)
+        }
+        fn active(&self, state: &AppState) -> bool {
+            self.inner.active(state)
+        }
+        fn started(&self, state: &Arc<AppState>) -> anyhow::Result<()> {
+            self.inner.started(state)
+        }
+        fn stopping(&self, state: &AppState) {
+            self.inner.stopping(state)
+        }
+        fn shutdown<'a>(&'a self, state: &'a Arc<AppState>) -> BoxFuture<'a, ()> {
+            self.inner.shutdown(state)
+        }
+        fn health(&self, state: &AppState, body: &mut serde_json::Value) {
+            self.inner.health(state, body)
+        }
+        fn routes(&self, state: &Arc<AppState>) -> axum::Router<Arc<AppState>> {
+            self.inner.routes(state)
+        }
+        fn api_layers(
+            &self,
+            state: &Arc<AppState>,
+            api: axum::Router<Arc<AppState>>,
+        ) -> axum::Router<Arc<AppState>> {
+            self.inner.api_layers(state, api)
+        }
+        fn ticket_layers(
+            &self,
+            state: &Arc<AppState>,
+            routes: axum::Router<Arc<AppState>>,
+        ) -> axum::Router<Arc<AppState>> {
+            self.inner.ticket_layers(state, routes)
+        }
+        fn outer_layers(&self, app: axum::Router) -> axum::Router {
+            self.inner.outer_layers(app)
+        }
+        fn allows(&self, state: &AppState, workspace: &str, need: Need) -> bool {
+            self.inner.allows(state, workspace, need)
+        }
+        fn reserve(
+            &self,
+            state: &AppState,
+            workspace: &str,
+            kind: LaunchKind,
+        ) -> anyhow::Result<Option<Reservation>> {
+            self.inner.reserve(state, workspace, kind)
+        }
+        fn admit_launch<'a>(
+            &'a self,
+            state: &'a Arc<AppState>,
+            workspace: &'a str,
+            kind: LaunchKind,
+        ) -> BoxFuture<'a, anyhow::Result<(Launch, Option<Reservation>)>> {
+            self.inner.admit_launch(state, workspace, kind)
+        }
+        fn check_import(
+            &self,
+            state: &AppState,
+            session: &str,
+            native: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.inner.check_import(state, session, native)
+        }
+        fn capture(&self, state: &AppState, workspace: &str) -> anyhow::Result<Admission> {
+            self.inner.capture(state, workspace)
+        }
+        fn capture_command(
+            &self,
+            state: &AppState,
+            workspace: &str,
+        ) -> anyhow::Result<Option<Admission>> {
+            self.inner.capture_command(state, workspace)
+        }
+        fn run_reserved<'a>(
+            &'a self,
+            reservation: Reservation,
+            operation: BoxFuture<'a, axum::response::Response>,
+        ) -> BoxFuture<'a, axum::response::Response> {
+            self.inner.run_reserved(reservation, operation)
+        }
+        fn launch_context(&self, state: &AppState, workspace: &str) -> LaunchContext {
+            self.inner.launch_context(state, workspace)
+        }
+        fn launch_env<'a>(
+            &'a self,
+            state: &'a AppState,
+            workspace: &'a str,
+            env: &'a mut Vec<(String, String)>,
+            remove: &'a mut Vec<String>,
+        ) -> BoxFuture<'a, anyhow::Result<()>> {
+            self.inner.launch_env(state, workspace, env, remove)
+        }
+        fn updates_managed(&self, state: &AppState) -> bool {
+            self.inner.updates_managed(state)
+        }
+        fn codex_notify_args<'a>(
+            &'a self,
+            state: &'a AppState,
+            workspace: &'a str,
+            session: &'a str,
+            key: &'a str,
+        ) -> BoxFuture<'a, Vec<String>> {
+            self.inner.codex_notify_args(state, workspace, session, key)
+        }
+        fn session_retired(&self, state: &AppState, session: &str) {
+            self.inner.session_retired(state, session)
+        }
+        fn held_at_boot(&self, state: &AppState, entry: &crate::ledger::LedgerEntry) {
+            self.inner.held_at_boot(state, entry)
+        }
+        fn restored(&self, state: &Arc<AppState>) {
+            self.inner.restored(state)
+        }
+        fn may_resume(&self, state: &AppState, entry: &crate::ledger::LedgerEntry) -> bool {
+            self.inner.may_resume(state, entry)
+        }
+        fn resume_check(
+            &self,
+            state: &AppState,
+            entry: &crate::ledger::LedgerEntry,
+        ) -> anyhow::Result<()> {
+            self.inner.resume_check(state, entry)
+        }
+        fn workspace_resuming(&self, state: &AppState, workspace: &str) {
+            self.inner.workspace_resuming(state, workspace)
+        }
+        fn session_pause(
+            &self,
+            state: &AppState,
+            id: &str,
+            entry: Option<&crate::ledger::LedgerEntry>,
+        ) -> Option<serde_json::Value> {
+            self.inner.session_pause(state, id, entry)
+        }
+        fn owner(&self, state: &AppState, workspace: &str) -> Option<&'static str> {
+            self.inner.owner(state, workspace)
+        }
+        fn refusal(&self, state: &AppState, id: &str, watching: bool) -> serde_json::Value {
+            self.inner.refusal(state, id, watching)
+        }
+        fn acted(&self, state: &AppState, workspace: &str) {
+            self.inner.acted(state, workspace)
+        }
+        fn decorate_sessions(
+            &self,
+            state: &AppState,
+            rows: &mut Vec<(u64, serde_json::Value)>,
+        ) -> Vec<serde_json::Value> {
+            self.inner.decorate_sessions(state, rows)
+        }
+        fn decorate_workspace(
+            &self,
+            state: &AppState,
+            workspace: &str,
+            value: &mut serde_json::Value,
+        ) {
+            self.inner.decorate_workspace(state, workspace, value)
+        }
+        fn routed(&self, state: &AppState, workspace: &str) -> bool {
+            self.inner.routed(state, workspace)
+        }
+        fn outside_project(
+            &self,
+            state: &AppState,
+            workspace: &str,
+            paths: &[String],
+        ) -> Vec<String> {
+            self.inner.outside_project(state, workspace, paths)
+        }
+        fn project_feed(
+            &self,
+            state: &Arc<AppState>,
+            workspace: &str,
+            files: Vec<String>,
+            dirs: Vec<String>,
+        ) -> Option<Box<dyn ProjectFeed>> {
+            self.inner.project_feed(state, workspace, files, dirs)
+        }
+        fn proxy_socket<'a>(
+            &'a self,
+            state: &'a Arc<AppState>,
+            session: &'a str,
+            kind: &'a str,
+            options: &'a crate::ws::SocketOptions,
+            auth: serde_json::Value,
+            socket: &'a mut axum::extract::ws::WebSocket,
+        ) -> BoxFuture<'a, bool> {
+            self.inner
+                .proxy_socket(state, session, kind, options, auth, socket)
+        }
+        fn routed_decisions(&self, state: &AppState) -> Vec<(String, String)> {
+            self.inner.routed_decisions(state)
+        }
+        fn scope_renewing(&self, state: &AppState, workspace: &str, epoch: u64) -> bool {
+            self.inner.scope_renewing(state, workspace, epoch)
+        }
+        fn await_scope_renewal<'a>(
+            &'a self,
+            state: &'a AppState,
+            workspace: &'a str,
+            epoch: u64,
+        ) -> BoxFuture<'a, bool> {
+            self.inner.await_scope_renewal(state, workspace, epoch)
+        }
+        fn tools(&self, state: &AppState, session: &str) -> Vec<serde_json::Value> {
+            self.inner.tools(state, session)
+        }
+        fn call_tool<'a>(
+            &'a self,
+            state: &'a Arc<AppState>,
+            session: &'a str,
+            name: &'a str,
+            args: &'a serde_json::Value,
+        ) -> Option<BoxFuture<'a, serde_json::Value>> {
+            self.inner.call_tool(state, session, name, args)
+        }
+        fn auto_tools(&self, state: &AppState, workspace: &str) -> Vec<String> {
+            self.inner.auto_tools(state, workspace)
+        }
+        fn start_note<'a>(
+            &'a self,
+            state: &'a AppState,
+            workspace: &'a str,
+            session: &'a str,
+        ) -> BoxFuture<'a, Option<StartNote>> {
+            self.inner.start_note(state, workspace, session)
+        }
+        fn note_told<'a>(&'a self, state: &'a AppState, note: &'a StartNote) -> BoxFuture<'a, ()> {
+            self.inner.note_told(state, note)
+        }
+        fn reads_folder_identity(&self, state: &AppState) -> bool {
+            self.inner.reads_folder_identity(state)
+        }
+        fn workspace_known(&self, state: &AppState, workspace: &str) {
+            self.inner.workspace_known(state, workspace)
+        }
+        fn workspace_opened<'a>(
+            &'a self,
+            state: &'a Arc<AppState>,
+            workspace: &'a crate::workspaces::Workspace,
+            registered: Option<bool>,
+        ) -> BoxFuture<'a, ()> {
+            self.inner.workspace_opened(state, workspace, registered)
+        }
+    }
+}

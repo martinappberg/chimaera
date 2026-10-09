@@ -819,6 +819,19 @@ struct PrefsUpdate {
     mode: Option<String>,
 }
 
+/// Run blocking fs work from async code without stalling the reactor:
+/// `block_in_place` on a multi-thread runtime, inline elsewhere (a
+/// current-thread runtime cannot hand its worker off, and sync callers have
+/// no reactor to stall).
+fn off_reactor<T>(work: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(work)
+        }
+        _ => work(),
+    }
+}
+
 pub struct ChatManager {
     sessions: Mutex<HashMap<String, Arc<ChatSession>>>,
     journal_dir: PathBuf,
@@ -884,7 +897,6 @@ impl ChatManager {
             );
         }
 
-        let journal = Arc::new(Journal::open(&self.journal_dir, &id)?);
         // A new process of this session still refuses the sends its journal
         // already holds (a daemon restart, a respawn, a resume).
         // Durable receipts guard work that can move between machines; every
@@ -894,12 +906,18 @@ impl ChatManager {
         } else {
             send_state::Receipts::Memory
         };
-        let send_state = send_state::Store::open(
-            &self.journal_dir,
-            &id,
-            journal.client_evidence_at_open(),
-            receipts,
-        )?;
+        // Both opens touch the (possibly network) journal dir; callers are
+        // async handlers, so keep that fs work off the reactor.
+        let (journal, send_state) = off_reactor(|| -> Result<_> {
+            let journal = Arc::new(Journal::open(&self.journal_dir, &id)?);
+            let send_state = send_state::Store::open(
+                &self.journal_dir,
+                &id,
+                journal.client_evidence_at_open(),
+                receipts,
+            )?;
+            Ok((journal, send_state))
+        })?;
         let mut command_budget = CommandBudget::default();
         for client_id in journal.client_ids_at_open() {
             command_budget

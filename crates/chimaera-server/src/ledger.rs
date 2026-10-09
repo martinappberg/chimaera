@@ -625,6 +625,10 @@ pub async fn restore(state: &Arc<AppState>, boot: BootLedger) {
     // `daemon.restoreSessions` off = retire agents into Recents (their
     // conversations must still be findable) and let shells go.
     let restore = crate::lock(&state.settings).restore_sessions();
+    // Without an extension nothing ever resumes a deferred entry, so only the
+    // durable fence defers; work an earlier composed daemon suspended or held
+    // for a manual resume is ordinary local work again (`policy::fence`).
+    let composed = state.policy().composed(state);
     let mut respawned = 0usize;
     let mut retired = 0usize;
     for entry in &boot.sessions {
@@ -636,7 +640,7 @@ pub async fn restore(state: &Arc<AppState>, boot: BootLedger) {
             crate::policy::Need::Shell
         };
         let held = !state.policy().allows(state, &entry.workspace_id, need);
-        if entry.suspended || entry.manual_resume_reason.is_some() || held {
+        if held || (composed && (entry.suspended || entry.manual_resume_reason.is_some())) {
             let mut deferred = entry.clone();
             deferred.suspended = true;
             if let Err(error) = defer(state, deferred) {
@@ -646,6 +650,17 @@ pub async fn restore(state: &Arc<AppState>, boot: BootLedger) {
             }
             continue;
         }
+        let ordinary;
+        let entry = if entry.suspended || entry.manual_resume_reason.is_some() {
+            ordinary = LedgerEntry {
+                suspended: false,
+                manual_resume_reason: None,
+                ..entry.clone()
+            };
+            &ordinary
+        } else {
+            entry
+        };
         let workspace = crate::lock(&state.workspaces).get(&entry.workspace_id);
         let plan = plan_restore(entry, restore, workspace.is_some());
         match plan {
@@ -1412,6 +1427,11 @@ pub fn check_manual_native(
     kind: crate::agents::AgentKind,
     native: Option<&str>,
 ) -> anyhow::Result<()> {
+    // Only a composed daemon ever resumes a manual entry; without one the
+    // entries left deferred are fenced and never resume here.
+    if !state.policy().composed(state) {
+        return Ok(());
+    }
     let authorized = MANUAL_RESUME
         .try_with(|id| session == Some(id.as_str()))
         .unwrap_or(false);
