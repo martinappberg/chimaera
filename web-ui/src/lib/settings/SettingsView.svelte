@@ -350,7 +350,7 @@
                 <span class="pro-copy">
                   {#if paid}
                     <strong>Your Chimaera {$accountPlan === "max" ? "Max" : "Pro"}</strong>
-                    <span>Your plan, cloud agents and project copies.</span>
+                    <span>Your plan, cloud agents and your projects on every device.</span>
                   {:else}
                     <strong>Chimaera Pro</strong>
                     <span>Optional: agents keep working in the cloud while you're away, and your work opens on another device.</span>
