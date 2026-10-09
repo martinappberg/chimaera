@@ -11,7 +11,7 @@ import { projectCopyError } from "./projectCopy";
 // cloud", a computer is "this computer" or its name, and an action in
 // progress reads as that action's progress. The only sentences allowed to
 // say a machine are about the user's own SSH hosts.
-const BANNED = /\b(asleep|sleeping|waking|wake[sn]?|owners?|lease[sd]?|checkpoints?|epochs?|baton|workers?|keeper|mirror(?:s|ed|ing)?|cop(?:y|ies)|parked|pending|take over|takeover|take control|moving execution|execution|index snapshots?|copy-only)\b/i;
+const BANNED = /\b(asleep|sleeping|waking|wake[sn]?|owners?|lease[sd]?|checkpoints?|epochs?|baton|workers?|keeper|mirror(?:s|ed|ing)?|cop(?:y|ies)|parked|pending|take over|takeover|take control|moving execution|execution|index snapshots?|copy-only|sync(?:ed|ing)?)\b/i;
 
 const sources = Object.fromEntries(Object.entries(import.meta.glob<string>([
   "/src/lib/pro/**/*.{svelte,ts}",
@@ -32,6 +32,7 @@ const shared = Object.fromEntries(Object.entries(import.meta.glob<string>([
   "/src/lib/chat/ChatView.svelte",
   "/src/lib/chat/store.svelte.ts",
   "/src/lib/net/api.ts",
+  "/src/lib/settings/SettingsView.svelte",
   "/src/lib/terminal/Terminal.svelte",
   "/src/lib/workspace/HomeScreen.svelte",
 ], { query: "?raw", import: "default", eager: true })));
@@ -94,7 +95,7 @@ describe("Chimaera Pro vocabulary", () => {
     expect(hits(/waking up|is asleep|wakes it|going to sleep|starting up|still starting/gi)).toEqual([]);
   });
   it("names places, never the machinery, in every sentence of these sources", () => {
-    expect(Object.keys(shared)).toHaveLength(6);
+    expect(Object.keys(shared)).toHaveLength(7);
     const found = Object.entries({ ...sources, ...shared }).flatMap(([file, raw]) => sentences(file, raw)
       .filter(sentence => BANNED.test(sentence) && !FREE.some(free => free.test(sentence.trim())))
       .map(sentence => `${file}: ${sentence}`));
