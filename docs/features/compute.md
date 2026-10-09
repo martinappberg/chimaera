@@ -243,7 +243,7 @@ _Captured 2026-07-15 (from the maintainer; drafted from his design-session words
 
 - **Problem it solves:** the cluster should be visible in the workbench — detect Slurm,
   show your queue. First step of the placement axis toward owning a session on a compute
-  node, and toward the premium synced-workspace vision.
+  node, and toward the premium vision of one workspace on every device.
 - **How settled (intent grade: the invariants are core to this feature; the rest is
   addition):** promises — cluster behavior is **probed per cluster, never assumed**
   ("not all environments are the same"; "no shame in saying not supported"), and the
