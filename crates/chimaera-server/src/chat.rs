@@ -4060,12 +4060,11 @@ async fn send_pickup(
     };
     let (state, id) = (state.clone(), id.to_string());
     tokio::spawn(async move {
-        let failed = failed_at_once(live).await;
-        // An exit is the exit hook's to settle (it takes the entry).
-        let Some(failed) = failed else {
-            return;
+        let take = {
+            let (state, id) = (state.clone(), id.clone());
+            move || take_unanswered_pickup(&state, &id)
         };
-        let Some((text, tag)) = take_unanswered_pickup(&state, &id).filter(|_| failed) else {
+        let Some((text, tag)) = failed_at_once(live, take).await else {
             return;
         };
         tracing::warn!(session = %id, "the pick-up turn failed at once; sending it again shortly");
@@ -4090,18 +4089,27 @@ fn pickup_send(text: String) -> chimaera_agent::model::AgentCommand {
     }
 }
 
-/// How the turn a pick-up started went: `Some(true)` when it ended within
-/// the window as a transient failure with no output, `Some(false)` when it
-/// produced output, ended otherwise, or outlived the window, and `None` when
-/// the process exited first. A turn that completes at once with nothing said
-/// settles nothing: claude answers a pick-up it could not start with an empty
-/// completion and reports the failure as the next turn, moments later.
-async fn failed_at_once(mut live: tokio::sync::broadcast::Receiver<Arc<SeqEvent>>) -> Option<bool> {
+/// How the turn a pick-up started went, watched within [`PICKUP_FAILURE_WINDOW`]:
+/// the pick-up to send again when the turn ended as a transient failure with
+/// no output; nothing otherwise. `take` settles the unanswered entry (the
+/// exit hook's signal): it is taken when the turn produced output, ended
+/// otherwise, or outlived the window, and left in place when the process
+/// exited first, for the exit hook. A turn that completes at once with
+/// nothing said settles the entry too (an exit after it is the turn's end,
+/// not a dead pick-up), but the watch goes on: claude answers a pick-up it
+/// could not start with an empty completion and reports the failure as the
+/// next turn, moments later.
+async fn failed_at_once(
+    mut live: tokio::sync::broadcast::Receiver<Arc<SeqEvent>>,
+    mut take: impl FnMut() -> Option<(String, &'static str)>,
+) -> Option<(String, &'static str)> {
     let deadline = tokio::time::Instant::now() + PICKUP_FAILURE_WINDOW;
     let mut transient = false;
+    let mut kept: Option<(String, &'static str)> = None;
     loop {
         let Ok(Ok(entry)) = tokio::time::timeout_at(deadline, live.recv()).await else {
-            return Some(false);
+            take();
+            return None;
         };
         match &entry.ev {
             AgentEvent::MessageChunk { text, .. } | AgentEvent::Error { message: text, .. }
@@ -4113,9 +4121,16 @@ async fn failed_at_once(mut live: tokio::sync::broadcast::Receiver<Arc<SeqEvent>
                 reason,
                 interrupted: false,
                 ..
-            } => return Some(transient || is_transient_agent_error(reason)),
+            } => {
+                let pickup = kept.take().or_else(&mut take);
+                return pickup.filter(|_| transient || is_transient_agent_error(reason));
+            }
             AgentEvent::Exited { .. } => return None,
-            AgentEvent::TurnCompleted { .. } if !transient => {}
+            AgentEvent::TurnCompleted { .. } if !transient => {
+                if kept.is_none() {
+                    kept = take();
+                }
+            }
             AgentEvent::MessageChunk { .. }
             | AgentEvent::ThoughtChunk { .. }
             | AgentEvent::ToolCall { .. }
@@ -4125,7 +4140,10 @@ async fn failed_at_once(mut live: tokio::sync::broadcast::Receiver<Arc<SeqEvent>
             | AgentEvent::QuestionRequest { .. }
             | AgentEvent::ElicitationRequest { .. }
             | AgentEvent::TurnCompleted { .. }
-            | AgentEvent::TurnAborted { .. } => return Some(false),
+            | AgentEvent::TurnAborted { .. } => {
+                take();
+                return None;
+            }
             _ => {}
         }
     }
@@ -4153,11 +4171,15 @@ async fn retry_exited_pickup(
     if state.chat.get(&id).is_some_and(|c| c.alive) {
         return;
     }
-    state.chat.remove(&id);
-    // Closed by the user meanwhile: nothing left to start.
-    if !crate::lock(&state.agents).contains_key(&id) {
+    // Closed by the user meanwhile: nothing left to start. A session parked
+    // for a move (deferred) is not this daemon's to start either: its next
+    // arrival resumes it and sends its own pick-up.
+    if !crate::lock(&state.agents).contains_key(&id)
+        || crate::lock(&state.deferred_sessions).contains_key(&id)
+    {
         return;
     }
+    state.chat.remove(&id);
     let started = spawn_chat_session(&state, id.clone(), recipe, None).await;
     drop(guard);
     match started {
@@ -6119,6 +6141,8 @@ mod tests {
     /// another failure is left alone.
     #[tokio::test]
     async fn a_pickup_is_retried_only_after_a_transient_failure_with_no_output() {
+        /// `Some(true)`: sent again; `Some(false)`: settled without a retry;
+        /// `None`: left to the exit hook (the entry was never taken).
         async fn verdict(events: Vec<AgentEvent>) -> Option<bool> {
             let (tx, rx) = tokio::sync::broadcast::channel(64);
             for (seq, ev) in events.into_iter().enumerate() {
@@ -6129,7 +6153,20 @@ mod tests {
                 }))
                 .unwrap();
             }
-            failed_at_once(rx).await
+            let taken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = taken.clone();
+            let again = failed_at_once(rx, move || {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                Some((String::from("pick up"), "moved"))
+            })
+            .await;
+            if again.is_some() {
+                Some(true)
+            } else if taken.load(std::sync::atomic::Ordering::Relaxed) {
+                Some(false)
+            } else {
+                None
+            }
         }
         let started = || AgentEvent::TurnStarted {
             turn_id: "t".into(),
@@ -6189,6 +6226,16 @@ mod tests {
             verdict(vec![started(), said("Picking up."), completed()]).await,
             Some(false),
             "a completion after output is the turn's end"
+        );
+        assert_eq!(
+            verdict(vec![
+                started(),
+                completed(),
+                AgentEvent::Exited { status: Some(0) }
+            ])
+            .await,
+            Some(false),
+            "an exit after an empty completion is the turn's end, not a dead pick-up"
         );
         assert_eq!(
             verdict(vec![started(), AgentEvent::Exited { status: Some(1) }]).await,
