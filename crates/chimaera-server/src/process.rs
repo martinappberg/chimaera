@@ -7,7 +7,9 @@ use tokio::io::AsyncReadExt;
 pub const LIMIT: usize = 64 * 1024;
 pub const TIMEOUT: Duration = Duration::from_secs(8);
 pub struct Child {
-    child: tokio::process::Child,
+    /// The extension drives the inner child itself (stdin, wait, kill), so
+    /// this stays public: it is part of the contract the private side builds on.
+    pub child: tokio::process::Child,
     #[cfg(unix)]
     group: Option<rustix::process::Pid>,
 }
