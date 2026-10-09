@@ -368,6 +368,13 @@ pub async fn spawn_session(
             spawned_agent = Some(agent_kind);
         }
     }
+    // From here every refusal must forget the record (and its MCP/hook key).
+    let mut launched = Uncommitted {
+        state,
+        id: &id,
+        agent: spawned_agent.is_some(),
+        workspace: false,
+    };
 
     if !allowed(state, &workspace.id) {
         return Err(SpawnFailure::Internal(anyhow::anyhow!(
@@ -413,6 +420,7 @@ pub async fn spawn_session(
         Ok(info) => {
             crate::runtime_retention::watch(state.clone(), info.id.clone(), usage);
             crate::lock(&state.session_workspaces).insert(info.id.clone(), workspace.id.clone());
+            launched.workspace = true;
             if !allowed(state, &workspace.id) {
                 let _ = state.sessions.kill(&info.id);
                 return Err(SpawnFailure::Internal(anyhow::anyhow!(
@@ -420,6 +428,7 @@ pub async fn spawn_session(
                 )));
             }
             launch.registered(info.id.clone());
+            launched.commit();
             // Remember the spawn theme: resurrection re-themes the session's
             // successor with it (there is no other durable record of it).
             crate::lock(&state.session_themes).insert(info.id.clone(), spec.theme.clone());
@@ -451,9 +460,36 @@ pub async fn spawn_session(
             ))
         }
         Err(err) => {
-            crate::lock(&state.agents).remove(&id);
             tracing::error!(%err, "failed to spawn session");
             Err(SpawnFailure::Internal(err))
+        }
+    }
+}
+
+/// What a launch registered before the PTY is up and admitted: dropped
+/// uncommitted (any early return), it removes the agent record and the
+/// session's workspace binding so no refused launch keeps a live key.
+struct Uncommitted<'a> {
+    state: &'a AppState,
+    id: &'a str,
+    agent: bool,
+    workspace: bool,
+}
+
+impl Uncommitted<'_> {
+    fn commit(&mut self) {
+        self.agent = false;
+        self.workspace = false;
+    }
+}
+
+impl Drop for Uncommitted<'_> {
+    fn drop(&mut self) {
+        if self.agent {
+            crate::lock(&self.state.agents).remove(self.id);
+        }
+        if self.workspace {
+            crate::lock(&self.state.session_workspaces).remove(self.id);
         }
     }
 }

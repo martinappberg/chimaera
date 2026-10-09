@@ -3684,18 +3684,24 @@ pub(crate) async fn spawn_chat_session(
             .is_some_and(|entry| {
                 entry.manual_resume_reason.as_deref() == Some("project_secrets_idle")
             });
-    crate::lock(&state.chat_recipes).insert(id.clone(), recipe.clone());
     let adapter = recipe
         .kind
         .chat_adapter()
         .ok_or_else(|| anyhow::anyhow!("no chat adapter registered"))?;
-    let import_admission = state.policy().hold_session(
+    crate::lock(&state.chat_recipes).insert(id.clone(), recipe.clone());
+    let import_admission = match state.policy().hold_session(
         state,
         &recipe.workspace_id,
         &id,
         recipe.resume.as_deref(),
         false,
-    )?;
+    ) {
+        Ok(admission) => admission,
+        Err(error) => {
+            crate::lock(&state.chat_recipes).remove(&id);
+            return Err(error);
+        }
+    };
     let info = state.chat.spawn(adapter, spec);
     drop(import_admission);
     if info.is_err() {
@@ -3706,7 +3712,9 @@ pub(crate) async fn spawn_chat_session(
             .policy()
             .allows(state, &recipe.workspace_id, crate::policy::Need::Execute)
         {
+            // The killed session's retention watch ends on its own.
             state.chat.fence(&id);
+            crate::lock(&state.chat_recipes).remove(&id);
             anyhow::bail!("project execution authority changed during launch");
         }
         if let Some(placement) = &placement {
