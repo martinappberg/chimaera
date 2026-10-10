@@ -2,11 +2,13 @@
 
 The public UI runs directly on a daemon, inside the native shell, or beneath a browser gateway path. Read [the transport contract](../../../../crates/chimaera-link/PROTOCOL.md) before changing gateway behavior.
 
-A browser logical-project view (`/workspace/{id}/`) has a **Home** link in the
-existing rail header and focus-mode strip. It goes to the same-origin account
-root `/`, including when the sidebar is hidden on a phone. It carries no daemon
-path, host selection or wake intent; ordinary daemon and native windows have no
-account Home link.
+Every browser view the account serves (`/workspace/{id}/`, and `/app/{id}/`
+for a cloud machine or a kept cluster job's workspace) has a **Home** link in
+the existing rail header and focus-mode strip, and the daemon Home's brand mark
+(`workspace/HomeNavigation.svelte`) links there too. It goes to the
+same-origin account root `/`, including when the sidebar is hidden on a phone.
+It carries no daemon path, host selection or wake intent; ordinary daemon and
+native windows have no account Home link.
 
 | File | Responsibility |
 |---|---|

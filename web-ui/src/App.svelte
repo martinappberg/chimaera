@@ -518,6 +518,9 @@
    *  round trip to whichever machine that is means nothing to the person
    *  reading it. */
   const projectView = gatewayWorkspace() !== null;
+  /** Every view the account serves (a project, a cloud machine, a cluster
+   *  job's workspace) links back to the account's Home at `/`. */
+  const accountHomeLink = isBrowserGateway() && !isNativeShell();
   /** A host view asked to open a project another machine runs now: the
    *  project view's link that follows it (`placement.elsewhere`), or null. */
   let elsewhereHref = $state<string | null>(null);
@@ -5681,7 +5684,7 @@
       bind:this={railEl}
     >
       <div class="workspace">
-        {#if projectView && !isNativeShell()}
+        {#if accountHomeLink}
           <a class="account-home-link" href="/" aria-label="Back to account Home" title="Back to Home">Home</a>
         {/if}
         <button
@@ -6525,7 +6528,7 @@
     <!-- Deep native drag regions include the strip's padding and flex gaps;
          Tauri excludes interactive descendants, so its buttons still work. -->
     <footer class="strip" data-tauri-drag-region={nativeTitlebarOverlay ? "deep" : undefined}>
-      {#if projectView && !isNativeShell()}
+      {#if accountHomeLink}
         <a class="account-home-link" href="/" aria-label="Back to account Home" title="Back to Home">Home</a>
       {/if}
       {#if !detachedWindow}

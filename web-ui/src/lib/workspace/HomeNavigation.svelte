@@ -1,6 +1,8 @@
 <script lang="ts">
   import BrandMark from "../shared/BrandMark.svelte";
   import { keyHintSuffix } from "../shared/keybindings";
+  import { isBrowserGateway } from "../net/base";
+  import { isNativeShell } from "../net/native";
 
   let { active, plan, showPro, onHome, onPro, onSettings }: {
     active: "workspaces" | "pro" | "settings";
@@ -10,10 +12,12 @@
     onPro: () => void;
     onSettings: () => void;
   } = $props();
+  const accountHome = isBrowserGateway() && !isNativeShell();
 </script>
 
 <nav class="home-navigation" aria-label="Chimaera">
-  <div class="brand"><BrandMark size={23} title="Chimaera" /><span>chimaera</span>{#if plan !== null}{#await import("../shared/PlanBadge.svelte") then { default: PlanBadge }}<PlanBadge {plan} />{/await}{/if}</div>
+  <!-- A view the account serves: the brand goes back to the account's Home. -->
+  <svelte:element this={accountHome ? "a" : "div"} class="brand" href={accountHome ? "/" : undefined} aria-label={accountHome ? "Back to account Home" : undefined}><BrandMark size={23} title="Chimaera" /><span>chimaera</span>{#if plan !== null}{#await import("../shared/PlanBadge.svelte") then { default: PlanBadge }}<PlanBadge {plan} />{/await}{/if}</svelte:element>
   <button class="home-link" class:active={active === "workspaces"} aria-current={active === "workspaces" ? "page" : undefined} onclick={onHome}>
     <svg viewBox="0 0 18 18" width="17" height="17" aria-hidden="true"><rect x="2.5" y="3" width="13" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.3" /><path d="M2.5 7h13M7 7v8" fill="none" stroke="currentColor" stroke-width="1.3" /></svg>
     <span>Workspaces</span>
@@ -35,6 +39,9 @@
 <style>
   .home-navigation { width: 200px; flex: 0 0 200px; align-self: stretch; display: flex; flex-direction: column; gap: 30px; padding: 54px 12px 20px; box-sizing: border-box; border-right: 1px solid var(--edge); background: var(--rail-bg); }
   .brand { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 0 8px; color: var(--fg); }
+  a.brand { text-decoration: none; border-radius: 6px; }
+  a.brand:hover { background: var(--row-hover); }
+  a.brand:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
   .brand > span { font-size: 18px; letter-spacing: -.035em; font-weight: 550; }
   button { display: flex; align-items: center; gap: 10px; width: 100%; padding: 10px; border: 0; border-radius: 6px; background: transparent; color: var(--muted); font: inherit; font-size: var(--text-sm); text-align: left; cursor: pointer; white-space: nowrap; }
   button svg { flex: none; }
