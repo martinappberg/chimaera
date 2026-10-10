@@ -89,11 +89,42 @@ describe("a browser job view's watch", () => {
   const gone = () => new Response(JSON.stringify({ error: "host_unavailable" }), { status: 503 });
   const busy = () => new Response(JSON.stringify({ error: "temporarily_unavailable" }), { status: 503 });
 
-  it("reads only the account's host_unavailable as the route being gone", async () => {
-    expect(await routeGoneAnswer(gone())).toBe(true);
-    expect(await routeGoneAnswer(busy())).toBe(false);
-    expect(await routeGoneAnswer(new Response("bad gateway", { status: 503 }))).toBe(false);
-    expect(await routeGoneAnswer(new Response("{}", { status: 200 }))).toBe(false);
+  it("reads the account's words for a gone route, and nothing else", async () => {
+    expect(await routeGoneAnswer(gone())).toEqual({ reason: "gone" });
+    expect(await routeGoneAnswer(busy())).toBeNull();
+    expect(await routeGoneAnswer(new Response("bad gateway", { status: 503 }))).toBeNull();
+    expect(await routeGoneAnswer(new Response("{}", { status: 200 }))).toBeNull();
+    expect(await routeGoneAnswer(new Response(JSON.stringify({ error: "job_ended" }), { status: 409 }))).toBeNull();
+  });
+
+  it("says what happened for each of the account's words", async () => {
+    const said = async (error: string) => {
+      const end = await routeGoneAnswer(new Response(JSON.stringify({ error }), { status: 503 }));
+      return end === null ? null : endedScreenWords(end.reason);
+    };
+    expect(await said("job_ended")).toBe("This job ended. Your chats are saved.");
+    expect(await said("workspace_closed")).toBe("This workspace was closed. Its chats are saved.");
+    expect(await said("not_kept")).toBe("This host is no longer kept connected. Connect it again from your computer.");
+    expect(await said("host_unavailable")).toBe("This workspace's job has ended, or the workspace was closed. Its chats are saved.");
+    expect(await said("route_pending")).toBeNull();
+  });
+
+  it("ends with the latest answer's reason", async () => {
+    vi.useFakeTimers();
+    try {
+      windowJobEnd.set(null);
+      const answers = [gone, () => new Response(JSON.stringify({ error: "workspace_closed" }), { status: 503 })];
+      let asked = 0;
+      const watch = createGatewayJobWatch(async () => answers[asked++]());
+      watch.link(false);
+      await vi.advanceTimersByTimeAsync(4_000);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(asked).toBe(2);
+      expect(get(windowJobEnd)).toEqual({ reason: "closed" });
+      watch.stop();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("ends the view after two gone answers in a row, and not after one", async () => {

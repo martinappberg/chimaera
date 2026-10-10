@@ -619,6 +619,8 @@ export function endedScreenWords(reason: string | null | undefined): string {
       return "Moving to the new job — this window reopens there when it's ready. Your chats come with you.";
     case "GONE":
       return "This workspace's job has ended, or the workspace was closed. Its chats are saved.";
+    case "NOT-KEPT":
+      return "This host is no longer kept connected. Connect it again from your computer.";
   }
   const why = endedWords(reason, false);
   return why === ""

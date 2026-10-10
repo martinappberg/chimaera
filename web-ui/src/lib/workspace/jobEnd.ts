@@ -61,19 +61,30 @@ export function jobWindowEnd(
 }
 
 /**
- * Whether an account-gateway answer says this browser view's job route is
- * gone: `503 {"error":"host_unavailable"}`, which the account sends once the
- * keeper no longer lists the workspace in a running job, or the keeper says
- * the job's route is gone. A restarting keeper or a stalled link answers
- * `temporarily_unavailable` instead, which is only a connection problem.
+ * How an account-gateway answer says this browser view's job route is gone,
+ * as the end the view shows, or null when it does not. The account answers
+ * 503 with the keeper's own word: `job_ended` (the job ended: the plain
+ * ended sentence), `workspace_closed` (closed while its job runs on),
+ * `not_kept` (the cluster host is no longer kept connected) or
+ * `host_unavailable` (gone, but it cannot tell which). A restarting keeper
+ * or a stalled link answers `temporarily_unavailable` instead, which is only
+ * a connection problem.
  */
-export async function routeGoneAnswer(res: Response): Promise<boolean> {
-  if (res.status !== 503) return false;
+export async function routeGoneAnswer(res: Response): Promise<JobEnd | null> {
+  if (res.status !== 503) return null;
+  let error: unknown;
   try {
     const body = (await res.json()) as unknown;
-    return typeof body === "object" && body !== null && (body as { error?: unknown }).error === "host_unavailable";
+    error = typeof body === "object" && body !== null ? (body as { error?: unknown }).error : undefined;
   } catch {
-    return false;
+    return null;
+  }
+  switch (error) {
+    case "job_ended": return { reason: null };
+    case "workspace_closed": return { reason: "closed" };
+    case "not_kept": return { reason: "not-kept" };
+    case "host_unavailable": return { reason: "gone" };
+    default: return null;
   }
 }
 
@@ -126,17 +137,18 @@ export function createGatewayJobWatch(probe: () => Promise<Response>): {
 
   async function ask(): Promise<void> {
     if (!down) return;
-    let gone = false;
+    let gone: JobEnd | null = null;
     try {
       gone = await routeGoneAnswer(await probe());
     } catch {
-      gone = false;
+      gone = null;
     }
     if (!down) return;
-    strikes = gone ? strikes + 1 : 0;
-    if (strikes >= GONE_STRIKES) {
+    strikes = gone !== null ? strikes + 1 : 0;
+    if (gone !== null && strikes >= GONE_STRIKES) {
       down = false;
-      endJobWindow({ reason: "gone" });
+      // The latest answer says why.
+      endJobWindow(gone);
       return;
     }
     schedule(PROBE_MS);
