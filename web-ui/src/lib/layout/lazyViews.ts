@@ -16,8 +16,10 @@ export type PaneViewKind =
   | "plugins"
   | "plugin"
   | "sessions"
+  | "kept"
   | "browser"
-  | "settings";
+  | "settings"
+  | "pro";
 
 /** A view that is not a pane but still stays out of the always-loaded entry:
  *  Home loads only while it is visible. It shares the pane cache and asset
@@ -50,7 +52,9 @@ const loaders: Record<LazyViewKind, () => Promise<PaneViewModule>> = {
   plugins: () => import("../plugins/PluginsView.svelte"),
   plugin: () => import("../plugins/ui/PluginTab.svelte"),
   sessions: () => import("../workspace/SessionsView.svelte"),
+  kept: () => import("../extensions/KeptApplicationView.svelte"),
   browser: () => import("../browser/BrowserView.svelte"),
+  pro: () => import("../extensions/AccountApplicationView.svelte"),
   settings: () => import("../settings/SettingsView.svelte"),
   home: () => import("../workspace/HomeScreen.svelte"),
 };
@@ -72,8 +76,10 @@ const viewChunkPrefixes: Record<LazyViewKind, string> = {
   plugins: "PluginsView-",
   plugin: "PluginTab-",
   sessions: "SessionsView-",
+  kept: "KeptApplicationView-",
   browser: "BrowserView-",
   settings: "SettingsView-",
+  pro: "AccountApplicationView-",
   home: "HomeScreen-",
 };
 
@@ -100,7 +106,7 @@ export function failedAssetUrls(
       continue;
     }
     const wanted = extension === "css" ? url.pathname.endsWith(".css") : /\.m?js$/.test(url.pathname);
-    if (url.origin !== origin || !url.pathname.startsWith("/assets/") || !wanted) continue;
+    if (url.origin !== origin || !/^\/(?:(?:app|workspace)\/[A-Za-z0-9_-]{1,128}\/)?assets\//.test(url.pathname) || !wanted) continue;
     url.hash = "";
     if (seen.has(url.href)) continue;
     seen.add(url.href);

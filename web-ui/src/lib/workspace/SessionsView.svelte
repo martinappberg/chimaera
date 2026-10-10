@@ -195,10 +195,12 @@
   /** Its conversation can't be reopened (a Mastermind's is never, by design
    *  — not "gone"). */
   const gone = (r: HistoryRecord) =>
-    !r.live && r.mastermind !== true && (r.reopen?.resume ?? null) === null;
+    !r.live && !manual(r) && r.mastermind !== true && (r.reopen?.resume ?? null) === null;
+
+  const manual = (r: HistoryRecord) => sessions.get(r.id)?.manual_resume_reason != null;
 
   function activate(r: HistoryRecord): void {
-    if (r.live) {
+    if (r.live || manual(r)) {
       dash.onOpenSession(r.id);
       return;
     }
@@ -345,16 +347,18 @@
               {@const commits = commitCount(r)}
               {@const live = r.live ? sessions.get(r.id) : undefined}
               {@const isGone = gone(r)}
+              {@const isManual = manual(r)}
               {@const who = by(r)}
               <div class="rec" class:gone={isGone}>
                 <div class="row">
-                  <button class="main" onclick={() => activate(r)} title={isGone ? (r.reopen?.gone ?? "") : r.live ? "open this session" : "resume this conversation"}>
+                  <button class="main" onclick={() => activate(r)} title={isGone ? (r.reopen?.gone ?? "") : r.live || isManual ? "open this session" : "resume this conversation"}>
                     <SessionGlyph kind="agent" agentKind={r.agent} state={live !== undefined ? dotState(live) : ""} size={11} title={r.agent} />
                     <span class="text">
                       <span class="title">{recordTitle(r)}</span>
                       {#if isGone}<span class="sub">Conversation no longer available</span>{/if}
+                      {#if isManual}<span class="sub">Paused · resume from the conversation</span>{/if}
                     </span>
-                    {#if r.live || (r.reopen?.resume ?? null) !== null}<span class="hint">{r.live ? "Open" : "Resume"}</span>{/if}
+                    {#if r.live || isManual || (r.reopen?.resume ?? null) !== null}<span class="hint">{r.live || isManual ? "Open" : "Resume"}</span>{/if}
                   </button>
                   <span class="meta">
                     {#if who !== null}<span>{who}</span>{/if}

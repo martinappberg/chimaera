@@ -6,7 +6,10 @@ Claude Mods use `nativeUi.ts` (bounded socket RPC and tree validation),
 `ModClient.svelte`/`modClient.ts` (isolated surface modules), and
 `ModsWorkbench.svelte` (responsive dock/inline panes, tabs and status). Code
 elements share `../shared/ExtensionCode.svelte` with workbench plugins. Never journal a render tree or
-replay a press; reconnect creates fresh render handles. See
+replay a press; reconnect creates fresh render handles. Only `ui_press`,
+`ui_input`, `ui_select` and `ui_client_press` carry user intent. Automatic RPCs
+send quietly. Ownership/wake/pause notices immediately reject pending RPCs and
+invalidate handles; a queued old `ready` cannot restore them. See
 [Claude Mods](../../../../docs/features/claude-mods.md).
 
 Orientation for coding agents. This directory is the **front half of chat mode**:
@@ -50,7 +53,7 @@ hard-resets and rebuilds.
 |---|---|
 | `ModelPicker.svelte` / `modelPicker.ts` | Shared model menu and optional custom-ID form; catalog identity matching, exact-ID validation, and full unlisted current IDs. Custom entry requires the adapter's explicit capability. |
 | `store.svelte.ts` | `ChatStore` — the reducer + all reactive view state (`blocks`, `pending`, `pendingSends`, `questions`, model/mode, `pendingModel` (a sent selection until provider read-back or failure), activity, exited/degraded/connected/fatalError — the last cleared by a fresh `init`, a `forked` marker, or a journal reset; a SOCKET-origin fatal (a handshake failure via `onFatalError`) also clears on the next successful `ready`, while a journal `error{fatal}` outlives reconnects until the driver is genuinely relaunched), including initial replay hydration through the ready-frame `head`. **The single source of truth for the view.** Every block carries a monotonic per-store `uid` (the transcript's keyed-render key — never an array index). `blocks` is capped at ~2000 with hysteresis: it runs one 64-block slack past the cap, then one batch splice trims back to the cap behind a single "earlier history trimmed" notice (so the O(n) index rebuild runs once per batch, not per event at cap); `trimmedCount` counts the NET front shift (dropped − the replacing notice), making a block's virtual index (`trimmedCount + i`) invariant and `virtualTotal` (`blocks.length + trimmedCount`) monotonic at cap. `structuralVersion` counts insertions/removals (net lengths are a false proxy — a retracted-then-reappended tail cancels out) and `epoch` stamps the transcript generation (a journal reset restarts the trim numbering). `subagents` (a `SvelteMap` by tool row id) folds `subagent_info` — a subagent's agent handle, served model and kind, latest-wins per field, capped — which the trays, agent tool cards and finished rows read for the model chip and the open affordance; `activeAgents` is the reducer-maintained live-subagents set (same proxies as `blocks`, so tray rows update in place — no per-event full-blocks filter), and `tool_output_delta` accumulation is capped client-side (12 KiB head + rolling 4 KiB tail behind the server's own "[N bytes omitted]" marker; the authoritative result replaces it). Its reducer has a vitest test (`store.svelte.test.ts`) — one of the UI’s targeted Vitest suites. |
-| `chatWs.ts` / `cooperativeQueue.ts` | `ChatSocket` — connect/auth/reconnect(backoff)/gap-replay, then dispatch replay/live/control frames through one order-preserving cooperative queue so a cold history cannot starve browser input. Per-command refusals (`command_failed` / `invalid_command`) are visible but nonfatal. Shares reconnect accounting with `../terminal/ws.ts`. |
+| `chatWs.ts` / `cooperativeQueue.ts` | `ChatSocket` — connect/auth/reconnect(backoff)/gap-replay, then dispatch replay/live/control frames through one order-preserving cooperative queue so a cold history cannot starve browser input. Per-command refusals (`command_failed` / `invalid_command` / `read_only`) are visible but nonfatal and carry the refused command's `client_id`; a `ready` reports `send_ids` and whether it is a reattach (`ReadyAttach`), and `send_cancelled` answers the store's `cancel_send`. Shares reconnect accounting with `../terminal/ws.ts`. |
 | `nativeUi.ts` / `mods.svelte.ts` / `Mod*.svelte` / `modClient.ts` | Claude Mods' transient UI bridge. Native requests are bounded and fail on disconnect; trees and closure handles never enter the journal. One controller attaches per visible socket, renders at most four sites concurrently, refreshes mounted sites on invalidation, and routes panes, controls, focus, status, and composer callbacks. `ModNode` validates native elements and uses sanitized Markdown/SVG; `ModClient` loads supplied module graphs in a terminable worker inside an opaque CSP iframe (no workbench origin or network), caches four bundles, and caps active workers at sixteen. Hidden views unmount Clients. Circular module imports currently report an explicit fault. `nativeComposer.ts` holds bounded, grapheme-aware decoration ranges; `Composer` keeps native edits revision-fenced so a delayed hook cannot overwrite a newer draft. |
 | `chatPool.ts` / `chatPoolRegistry.ts` | Session-keyed warm reducer/transport + scroll/render-window/followed-revision cursor. The agent keeps folding while a tab's bounded DOM snapshot is hidden or its view is evicted; client-pool eviction never stops the daemon-owned process. The registry (the entries map + `disposeChat`/`syncChatSessions`/`disposeAllChats`) is what `App` imports — it rides the always-loaded entry bundle; acquiring (which constructs the store and sockets) lives in the chat chunk. A `sub:<parent>:<agent>` key (`subagentView.ts`) pools a subagent view, fed by the `SubagentSocket` the chat chunk registers (`provideSubagentTransport`) and disposed with its parent. |
 | `subagentView.ts` / `subagentSocket.svelte.ts` / `SubagentBanner.svelte` / `SubagentChip.svelte` | **Open a subagent as its own chat.** `subagentView.ts`: the pool key, `subagentRunning`/`subagentModel` over the parent store, and `advanceCursor` (incremental reads: `epoch`/`after`/`stamp`, own vitest). `SubagentSocket`: the read-only transport behind a `ChatView` in subagent mode — polls `GET /sessions/{id}/subagents/{agent}/transcript` every 2.5 s only while watched + visible and while the parent says the subagent is working (one closing read after; a resumed subagent restarts the window), feeds the store a synthetic `init` then the events, refuses every command. `SubagentBanner` replaces the chat header ("Subagent of ‹chat› · title · kind · model · working/finished · read-only"); `SubagentChip` is the clickable "agent" lane label both trays share; `ModelChip.svelte` is the one model chip (catalog label else the id verbatim; `pill` on the card and banner) the trays, the agent tool card and the banner all render. |
@@ -74,6 +77,7 @@ hard-resets and rebuilds.
 | `AgentMessageCards.svelte` / `agentMessages.ts` | Messages from other agents in the workspace (agent communication, [plan §12](../../../../docs/design/agent-communication-plan.md)): the `agent_message` block — a card per message with the sender's name beside its vendor mark (`SessionGlyph`; a vendor word with no mark — the daemon's "agent" — shows none rather than a wrong one), `#id`, "to you"/"to everyone", "re #N", a quiet accent edge for the Mastermind's direction, the body through `Markdown` (the plain card, when no header parsed, through `UserText`), and a send's leading why-line as a caption. Never a fork/rewind point. The pending tail reuses it for a Codex steer that hasn't been read ("next step") or missed its turn ("not delivered — it's in their inbox", ✕ dismisses). `agentMessages.ts` (pure, own vitest suite) parses the daemon's header format: a header is a line that starts `[message #` unquoted, so a peer's `> `-quoted body can't forge a second card; peer bodies lose their `> `, the Mastermind's stay verbatim (the daemon escapes a header-shaped line in it with `\`, which the parser removes). |
 | `HookRow.svelte` / `hookNotice.ts` | What a claude hook said: its notice arrives with every line prefixed alike (`Stop says: …`). `hookNotice` (pure, own vitest suite) reads the hook's name and lines; `HookRow` shows one quiet line (`<name> hook` + the first line, faded) that expands to the lines as written — the thought row's voice, never a block that outweighs the reply. A one-line notice counts only when the name has no space. All other notices render unchanged. |
 | `ThoughtRow.svelte` / `thoughtText.ts` | A reasoning line: "Thought"/"Thinking" + `thoughtPreview` (pure, own vitest suite) — the newest Codex `**section title**` (live or settled, so the row never jumps), else the first line, as plain text with code spans intact; the body renders through `Markdown.svelte` with the chat's prose wiring and mounts only while the row is open. |
+| `TransferNote.svelte` / `transfer.ts` / `KeptNote.svelte` | The quiet one-line dividers where the conversation changed machines (see the transfer paragraph below); `KeptNote` is the "Back on this Mac … both changed N files" line with its **Review** action. |
 | `FinishedRow.svelte` | The `finished` block: a subagent's end (`subagent_finished`, report on click), a background command's or monitor's close (the CLI's own sentence + output link). |
 | `AgentsTray.svelte` / `BackgroundTray.svelte` / `backgroundKinds.ts` | Two of the three pinned strips above the composer: live subagents (derived from in-flight Agent tool rows; a lone agent is named with its step) and live background tasks (the `background_tasks` level-set; the header names a Monitor watch and counts the rest per kind via `backgroundKinds.ts`, so it doubles as the between-turns "still waiting" signal), each with a stop affordance, a model chip (`BackgroundTask.model` / `store.subagents`, labelled through the model catalog, else the agent's own id) and — on the "agent" lane label (`SubagentChip`) — the opener for the subagent's own conversation. Chrome lives in the shared `../shared/WorkTray.svelte` + `WorkTrayRow.svelte` shell; elapsed/duration text uses `../shared/time.ts`. The **plan strip** is the third, rendered inline in `ChatView` on the same `WorkTray` shell (`pulse` off unless a step is in flight) — three orthogonal readings of the same session: what the agent *means* to do (plan), *who* is working (subagents), what is *detached* (background). |
 | `PermissionCard` / `QuestionCard` | The permission prompt and structured-question cards (their answers ride `socket.send`; `PermissionCard` also carries the deny-with-feedback field; `QuestionCard` presents Codex auto-resolution deadlines without owning the authoritative timeout). |
@@ -90,7 +94,7 @@ hard-resets and rebuilds.
 | `AttachmentStrip.svelte` / `ImagePreview.svelte` | A message's images as picture tiles (one row height, width from the picture's aspect via `images.ts::tileBox`, no hover effects): `drafts` in the composer (in-memory pixels, ✕ to remove, click → `ImagePreview`, a fixed overlay like the plan card's) and `paths` on sent/queued bubbles (the daemon's saved copies from `user_message.attachment_paths`, resolved near the viewport through `resolveFile`, click → open in a pane, a gone copy a dashed tile). A picture-only message puts the strip where the bubble would be. |
 | `paths.ts` | The chat half of path links: which candidates a code span / link target offers (parsing is `../shared/fileRef.ts`, shared with the terminal), and `PathResolver` — one per ChatView, batching every renderer's candidates into `fsValidate` calls grouped by base ladder (live cwd, spawn cwd, workspace root from App's `setChatLinkContext`), caching hits/ambiguous/misses keyed by candidate + base ladder + workspace (`resolveScope`; misses expire after 15 s and at every turn end, hits after 60 s; failures are never cached). A click re-checks before opening (`resolveNow` / `reopenResolution`), so a stale hit never opens a moved or deleted file. Opening goes through `../shared/openPath.ts` (reveal at the line, Cmd/Ctrl split); ambiguous names open a context-menu pick list. Own vitest suite (`paths.test.ts`). |
 | `voice.svelte.ts` / `voiceCapture.ts` / `VoiceMeter.svelte` / `voiceLanguages.ts` | Voice dictation — the composer's mic button (on by default; `/voice on` or `off`; the same in Claude and Codex chats). `Dictation` (one per composer) is a chain of `Phrase`s — one `/ws/voice` socket each, opened with the mic (audio captured before a socket is up is queued, never dropped). `PauseDetector` (pure, tested) ends a phrase at a pause: the service revises nothing until a stream is finalized, so the recording finalizes each phrase there and speaks on into a fresh one — opened only when speech resumes, with ~300 ms of pre-roll, so a recording that ends in silence opens none — and each phrase's corrected text arrives a moment later. The host check (`hostCanDictate`) re-asks on the window's next focus/visibility whenever the answer was no. `finals` is the leading run of finished phrases, `interim` everything after (a finishing phrase keeps its guess until its correction lands); keeps the last five levels for `VoiceMeter`'s waveform (beside the stop button), and owns `error` (the composer only reads it) — including the silence message naming the device when the loudest chunk stayed near zero; a generation counter fences late events from an ended recording. `hostCanDictate` / `recheckHost` cache the daemon's `GET /api/v1/voice` per window (re-asked after a login error), gating the mic; `voiceProblem` is `/voice on`'s check (that, then one mic permission request). `voiceCapture.ts`: `listMicrophones` (names are withheld until the page has the mic once), `startCapture(onChunk, microphone)` resolving a remembered NAME to this origin's device id, and an AudioWorklet (inlined as a Blob URL) box-filtering the device rate to 16 kHz mono PCM16 in 100 ms chunks with an RMS level; the mic is released after each recording. Keys stay the composer's: the Dictate chord (`keys.dictate`, matched only while the composer has focus — App's handler has no case for it, so it falls through), and while recording Esc restores the draft and Enter stops and sends; Space is never taken over. The words stream INTO the draft (`dictationParts` / `joinParts`: the text around the caret, settled words, forming words, spaced like typing), so the box grows like typing; the textarea goes read-only with transparent text and the composer's `.ghost` mirror (exact box, font, wrapping, scroll and scrollbar-width padding) draws it with the spoken part dimmed — keep their box and font properties identical. Pure helpers (`dictationParts`, `insertDictation`, `joinSpoken`) have a vitest suite (`voice.test.ts`). |
-| `composerBus.ts` | Cross-component channel to insert text/attachments into the active composer (e.g. `@term:` grants, references, dropped-file paths, a quoted transcript passage). An insert is `inline` (joins the draft after a space) or `block` (its own paragraph, so a quote's `>` starts a line); `composer.ts::draftWithInsert` is the pure join. An insert may name the mounting view's token (`view`): one chat can be mounted twice (the Mastermind dock and a pane), and a quote belongs in the composer under its selection. Own vitest suite (`composerBus.test.ts`). |
+| `composerBus.ts` | Cross-component channel to insert text/attachments into the active composer (e.g. `@term:` grants, references, dropped-file paths, a quoted transcript passage). An insert is `inline` (joins the draft after a space) or `block` (its own paragraph, so a quote's `>` starts a line); `composer.ts::draftWithInsert` is the pure join (its `above` is for the return channel). A message that did not arrive comes back through `registerComposerReturn` / `returnableCount` / `returnToComposer`: all or nothing (its pictures must fit), above the draft, and never taking focus; keyed by the mounting view's token like inserts, so a chat mounted twice keeps a target when one view unmounts. An insert may name the mounting view's token (`view`): one chat can be mounted twice (the Mastermind dock and a pane), and a quote belongs in the composer under its selection. Own vitest suite (`composerBus.test.ts`). |
 | `composerHeight.ts` | Pure height policy for content-fit growth plus manual resize baselines; covered by `composerHeight.test.ts`. |
 | `drafts.ts` | Per-session composer draft persistence (survives the per-session ChatView remount + a page reload) — text layers into sessionStorage, images stay in-memory; both bounded. It also publishes which drafts remain memory-only so an interface-build transition cannot silently reload over them. |
 | `images.ts` | Pasted/dropped image → downscale + base64 encode into an `ImageAttachment` (the canonical home of that type, with its encoded size); size-bounded. Also the tile geometry (`tileBox`) and draft `<img>` source (`attachmentSrc`); own vitest suite. |
@@ -350,6 +354,184 @@ per-chunk work proportional to the TRAILING OPEN SEGMENT, not the message:
   rewind dialog, `/mcp`, usage, effort) are already their own components — add new
   chrome the same way rather than inlining it into the host.
 
+Remote chats (Pro): attaching and reconnecting are passive; there is no wake
+button. A keeper may keep a sleeping cloud machine's sockets open (it marks them
+`X-Chimaera-Sockets: kept`; VIEWING.md, "A sleeping cloud machine's sockets").
+This is negotiated per connection; a native window's daemon then passes
+straight through to it. `ChatSocket.send` on an open socket is simply sent
+(never a wake redial). `QUIET_OPEN_MS` after authentication a socket that
+heard nothing is `store.held` (not live, so a send shows pending; not
+reconnecting, so no "Reconnecting…" row, no rail pulse and no "· reconnecting"
+in the header; before the first replay a viewed cloud conversation shows the
+wake hint, `waitsForCloud`). `{"type":"waking"}` shows unconfirmed sends as
+pending even when the socket still looked live, and a second `ready` on the
+same socket is a reattach: `onReady` resets nothing, `apply`'s seq guard drops
+what the store has, pending bubbles wait for their echoes (and go out again by
+id, below). `worker_asleep`
+ends `held`; so does `remote_unavailable`, which also ends `connected` and
+`waking`: with `reason:"reconnecting"` (a relay retrying) that lasts until the
+next frame, without it (a hand-back) the socket is still kept and `held`
+returns after the quiet window. A kept socket that drops is dialed again
+before the placement's "suspended" parks it.
+
+Sends (any keeper, relay or daemon): each composer send goes out under a
+`client_id` (`mintSendId`) and is kept in `store.unconfirmed` with its frame
+(`noteSent(id, frame, text, images)`); `store.sending` is the ones shown as
+"sending…" bubbles (several at once, also under the loading line). Only the id
+settles a send. The echo (`user_message`) that carries it confirms it. A
+refusal of a `send`/`send_after_turn` that carries it (`onCommandFailed`'s
+`clientId`) hands back exactly that text through `restoredDrafts` /
+`takeRestoredDrafts` (a queue; ChatView hands the oldest
+that fit to the composer through `composerBus`'s return channel,
+`returnableCount` + `returnToComposer`: texts above the draft in progress,
+pictures attached, no focus taken and a focused caret kept where it was; a
+send whose pictures do not fit waits in the queue, whole, until the composer
+reports room through `onReturnRoom`); a refusal naming an id the store no
+longer holds says nothing (unless it is one `noteSentOutside` recorded,
+below). At every `ready` whose daemon says
+`send_ids` (`ReadyAttach.sendIds`), once `lastSeq` reaches its `head`
+(`resendUnconfirmed`), each send still without an echo goes out again under
+the same id through the path `chatPool` bound with `bindSender`
+(`ChatSocket.sendQuietly`: never a redial, never a wake), while it is
+younger than `RESEND_FOR_MS` (two minutes): the daemon runs an id once, so
+that is right whether the first copy was lost, is queued in the daemon or is
+about to be delivered by a keeper. Copies of one send are paced (`resendDue`:
+at least `RESEND_GAP_MS` since it last went out, doubling to 30 s); one not
+due at the `ready` goes out from the store's own timer when it is, if the
+conversation is still live and its echo has not come (`onDisconnected` and
+`dispose` clear the timer). An older one is withdrawn with
+`cancel_send`; `send_cancelled` (`onSendCancelled`) with `cancelled:true`
+returns its text with the notice "not delivered", `false` leaves the bubble
+for an active holder's echo. A durable `send_confirmed` receipt keeps the text
+visible as delivered until its echo replaces it, without retries. A nonfatal
+`send_uncertain` error keeps it visible as unconfirmed delivery, stops retries
+and withdrawals, and never puts it back in the composer as unsent. Delayed
+refusals cannot reverse either receipt. Those two command frames are the only thing this client
+ever sends by itself; there is no queue of commands. A refused `cancel_send`
+is not shown and is asked again at the next `ready`.
+
+`ready.active_queued_ids` is a bounded snapshot of the current driver's keyed
+queue. After replay through `head`, older queued echoes absent from the snapshot
+remain visible as delivery unconfirmed and keep their ✕ (`cancel_queued`; a
+live process holding nothing under that id answers a `cancelled` tombstone) and,
+while a turn runs, Send now (`offersSendNow`), as queued rows always did.
+Post-head live echoes are untouched. A definitive `sent`, `cancelled` or `dropped`
+update resolves uncertainty; a driver exit marks remaining queued rows uncertain.
+
+A daemon without `send_ids` (no extension: main's daemon) gets main's plain
+`{type, blocks}` frame with no `client_id`, and nothing is tracked
+(`ChatStore.sendsWithIds`; before the first `ready` only a window whose
+`proTier` is not "free" sends under an id): no pending bubble, no hand-back, no
+"delivery unconfirmed". Queued rows turn uncertain only on a chat that has seen
+`send_ids`. A tracked send made against such a daemon (a window that can have
+Pro, before its first `ready`) is never sent anything twice and no `ready`
+decides anything there. Its echo has no id and confirms the oldest send with
+exactly that text (a send made against such a daemon keeps that rule after the
+daemon is replaced, `UnconfirmedSend.plain`); its refusal names no send and
+returns the newest. A refusal without an id behind a daemon that has them (a
+holder in between that predates ids) returns nothing, however many sends are
+unconfirmed: it may answer a second copy of a send that holder still
+delivers. They show as pending and the next `ready` sends or withdraws each. `waking`/`bringing` only change
+presentation (`showUnconfirmed`). A send on a live connection shows no bubble
+until it has waited `SHOW_UNCONFIRMED_AFTER_MS` for its echo (ChatView's timer
+calls `showOverdue`; ids daemons only). `onDisconnected` (the pool calls it
+too when it heals a dead socket) shows what is unconfirmed as pending; an exit
+or a fall back to the terminal retains it as uncertain instead of claiming it
+was unsent (its ✕ dismisses it locally, `dismissUnconfirmed`); a move forgets nothing.
+The Mastermind panel's one-click prompts go out under their own id and tell
+the store (`noteSentOutside`): nothing to confirm or return, but a refusal
+that names one is still said, and is never taken for the composer's send.
+
+Commands that are not the user acting (`set_thinking`, `get_usage`, `get_mcp`,
+`cancel_send`, a dry-run `rewind`) are dropped by a keeper or relay while
+nothing is attached, so nothing may wait on one forever: `/mcp` keeps the
+inventory it has and closes after 10 s without a first answer, a rewind's dry
+run closes after 30 s (both only for a viewed conversation). `thinkingPushed`
+is cleared by a new `init` and by a second `ready` on the same socket
+(`ReadyAttach.reattach`: its keeper dropped a push made while nothing was
+attached), never by a plain reconnect, where the process still has it and a
+second window's default would override another window's choice at every blip.
+A toggle made while not `connected` is marked pending (`toggleThinking`), so
+the next `ready` pushes it.
+The seven settings commands (`set_model`, `set_mode`, `set_effort`,
+`set_ultracode`, `set_remote_control`, `set_mcp_enabled`, `reconnect_mcp`) are
+held by a keeper and by this computer's relay while the owner is not attached.
+The relay delivers one only in front of this viewer's next acting command
+(never by itself at a `ready`) and refuses it by name after ten minutes, so
+the refusal's notice shows; they have no optimistic state, so the old value
+shows until the owner confirms.
+
+The rest of this paragraph applies when the connected keeper refuses or
+closes those sockets, and for another computer as owner. In a native window the daemon holds the first command while a paused
+owner wakes (the additive `{"type":"waking"}` → `store.waking`, shown as the send's own
+progress, "Sending…"), refuses further acting commands until it answers, and answers
+anything it cannot deliver with `command_failed`. Only acting commands (the
+daemon's `activity::is_interaction`) wake its current owner; the
+seven settings commands are held with them (above), everything else is
+dropped while the owner is away. Every refusal carries the additive `command`
+it answers and the `client_id` it was sent under; the store keeps each send
+with its pictures (`noteSent`) until its echo and hands it back
+(`restoredDrafts` → `composerBus`'s return channel) only for
+`command:"send"` / `"send_after_turn"` — never for a refused interrupt/permission
+answer, which could resurrect a delivered message. A send made while not
+live shows at once in `store.sending` ("sending…") until its echo. Ordinary chat input stays with its current owner, including from a copied-local
+project. Only explicit **Take over** moves execution to this computer. The
+additive `{"type":"bringing","to":"here"}` frame remains understood for older
+relays → `store.bringing` ("Bringing the work here…", the send shown pending); it ends with the next `ready`, a wake, a
+move, or a `command_failed` with `reason:"still_working"` (the other computer
+kept it; the send it names comes back to the composer). A move to another computer is
+`moved` with `other:true` → `store.moving = "other"` ("Continuing on your
+other computer…"). In a browser view, `send()` into a
+dropped socket reconnects once with `?wake=interaction` and returns false (the
+composer keeps the draft). Socket states that are not errors: `worker_asleep` →
+`store.asleep` (no status line: the composer stays ready, and the header says
+only "In the cloud", never "· reconnecting"; it survives a
+dropped socket and ends with an accepted send, `waking`, a move or `ready`; a
+socket that drops meanwhile waits with no retry timer until a send dials it with
+wake intent or `retrySoon` / `ownerAwake` dials it passively — `reachKey`
+includes the row's `placement_available`);
+the additive `{"type":"moved","to"}` → `store.moving` (only
+for a real transfer); and the additive `{"type":"paused","reason","provider"?}`
+→ `store.pausedFor` (restarting / needs_provider / importing): the chat is NOT
+ended, stays mounted (the pane keeps a paused chat row's ChatView), hides the
+replayed "agent exited", disables the composer with `net/placement.ts`
+`pauseLabel` ("Continuing in the cloud…" — or, signed out (`net/plan.ts`
+`accountSignedOut`), "This conversation is in the cloud. Sign in to Chimaera
+Pro to bring it back." — "Picking up where you left off…",
+"Waiting for Claude Code in the cloud", "Opening…"; a row naming the
+agent in `blocked_provider` adds **Connect <agent> to continue**, `pro/providers.ts`
+`pausedConnect`), and retries at once
+(`ChatSocket.retrySoon`) when its row stops being paused or changes owner. An optional extension can also say a conversation is not here yet
+(`extensions/loading.ts` `sessionStates`, keyed by session id): `loading` puts
+`shared/LoadingRows.svelte` over the transcript (pinned to the scroller's top;
+the transcript stays mounted at opacity 0 under it, no scrolling, and the
+connection line stays quiet), `note` replaces the connection line with the
+extension's one sentence. Never set without the extension. The connection row appears only for a viewed project (routed row or
+browser view) after a 2 s grace; while it says "Reconnecting…" the header does
+not repeat it. Browser sockets use `net/base` to preserve gateway prefixes. The
+daemon's transfer pick-up (a user message with origin `moved`, `home` or `recovered`) renders
+as `TransferNote.svelte`: one line ("Continued in the cloud · 5m ago", "Back on
+your computer", or "… after this computer stopped responding" when it
+is tagged `recovered`, its direction read from the daemon's sentence — `transfer.ts`) with the agent-facing
+text behind "Show what the agent was told". A surface that holds only the prompt's text, not the
+origin tag (the Timeline's "Since you left" rows), recognises the pick-up from its opening words
+with `pickupNote` and shows the same short line instead of quoting the agent-facing text.
+When the chat's project came back from the cloud with files both sides changed while apart
+(Pro's kept-both report, `pro/keptReviews.svelte.ts`, read once per project and again on a
+`kept_both` notice or a choice), `KeptNote.svelte` draws one more such line — "Back on this
+Mac. The cloud and this Mac both changed 3 files while apart." with **Review**, which opens the
+review of both versions through `extensions/KeptApplicationView.svelte` and the optional
+private presentation; without it, the same tab offers Close/Open project folder. It is not a block: ChatView places it by
+the report's `returned_at` before the first user/assistant row sent after the return (after the
+last row at the live edge when nothing followed), never in a chat that began after the return or
+whose return point is outside the mounted window; a `home` pick-up at that point carries the
+line itself (`TransferNote`'s `kept` prop) instead of a second divider. The line goes once
+nothing waits for a choice.
+`store.awaitingWake` (`hydrating && asleep`) replaces the loading line with one quiet sentence while
+the owner sleeps before the first replay; a wake (`waking`) hands back to the ordinary loading line.
+ChatView's `waitsForCloud` shows the same sentence for a kept, quiet socket (`held`) of a viewed
+conversation that runs on a cloud machine (`net/placement.ts` `ownerIsCloud`), never for a local chat.
+
 ## Session capabilities
 
 `capabilities.ts` consumes the driver’s additive `capabilities` event; unknown agents have no
@@ -363,3 +545,5 @@ Startup status is separate from transcript activity: `startup_progress` stores
 one latest phase until Init, fatal Error or Exited. A reconnect replays that same
 phase; a fresh progress event marks a respawn uninitialized even when history is
 already present. The composer can accept a queued message while startup runs.
+
+Automatic browser-open notices require a live direct-owner roster row; routed or scoped project views drop them until an owner-bound proxy is available. Home/Pro restore and lazy loading remain independent.

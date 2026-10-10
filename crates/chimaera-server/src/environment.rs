@@ -138,7 +138,7 @@ impl EnvPreludes {
 
 /// In-memory prelude store backed by `env-profiles.json`, mtime-checked on
 /// read so external edits (vim over SSH) surface without a daemon restart.
-pub(crate) struct EnvPreludeStore {
+pub struct EnvPreludeStore {
     path: PathBuf,
     data: EnvPreludes,
     /// mtime of the file the cached data was read from (None = no file).

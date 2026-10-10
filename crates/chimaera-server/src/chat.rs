@@ -30,7 +30,7 @@ use crate::agent_state::{AgentKind, AgentState};
 use crate::AppState;
 
 /// What the ChatManager hooks emit; consumed by the signal task.
-pub(crate) enum ChatSignal {
+pub enum ChatSignal {
     Event(String, Arc<SeqEvent>),
     Exit(String, DriverExit),
 }
@@ -38,67 +38,68 @@ pub(crate) enum ChatSignal {
 /// Everything needed to respawn a chat session as a PTY TUI (the
 /// view toggle and lifecycle recovery).
 #[derive(Clone)]
-pub(crate) struct ChatRecipe {
-    pub(crate) workspace_root: PathBuf,
+pub struct ChatRecipe {
+    pub workspace_root: PathBuf,
     /// Workspace id, for the environment-prelude lookup (host ⊕ workspace ⊕
     /// launch): every respawn through this recipe re-materializes the
     /// prelude, so view-switch/rewind all regenerate identically.
-    pub(crate) workspace_id: String,
-    pub(crate) kind: AgentKind,
-    pub(crate) bin: PathBuf,
+    pub workspace_id: String,
+    pub kind: AgentKind,
+    pub bin: PathBuf,
     /// The `--version` line the launcher probed for `bin` at resolution
     /// (`None` = probe failed). Threaded into the driver's `SpawnSpec` so the
     /// harness can journal it on `Init` and emit the non-fatal drift notice
     /// when it differs from the driver's `TESTED_*_VERSION`. Carried on the
     /// recipe so a view-switch/rewind respawn keeps the same provenance.
-    pub(crate) version: Option<String>,
-    pub(crate) settings: Option<PathBuf>,
-    pub(crate) mcp_config: Option<PathBuf>,
-    pub(crate) model: Option<String>,
-    pub(crate) resume: Option<String>,
+    pub version: Option<String>,
+    pub settings: Option<PathBuf>,
+    pub mcp_config: Option<PathBuf>,
+    pub model: Option<String>,
+    pub resume: Option<String>,
     /// Native fork point: Claude passes it to
     /// `--fork-session --resume-session-at`; Codex passes it as
     /// `thread/fork.lastTurnId`. Rewind and non-destructive branch both use it.
-    pub(crate) fork_at: Option<String>,
+    pub fork_at: Option<String>,
+    pub fork_head: bool,
     /// Rewind rollback count: respawn resumes the thread and drops this many
     /// trailing turns via `thread/rollback` (codex only — its thread id
     /// survives, so the conversation truncates in place instead of forking).
     /// The fallback for app-servers without `thread/revert`.
-    pub(crate) rollback_turns: Option<u32>,
+    pub rollback_turns: Option<u32>,
     /// Rewind cut for `thread/revert {beforeTurnId}` (codex 0.153+): the
     /// native id of the first dropped turn. Preferred over the count —
     /// paginated threads refuse the deprecated rollback.
-    pub(crate) revert_before_turn: Option<String>,
+    pub revert_before_turn: Option<String>,
     /// Whether this spawn turns claude's Remote Control bridge on.
-    pub(crate) remote_control: RemoteControlAtStart,
+    pub remote_control: RemoteControlAtStart,
     /// Resurrection only: claude's session-scoped ultracode was on.
-    pub(crate) carry_ultracode: bool,
-    pub(crate) theme: String,
+    pub carry_ultracode: bool,
+    pub theme: String,
     /// Launch-scope prelude text (see `environment`). Carried on the recipe
     /// so a view-switch/rewind respawn keeps the launch scope; not
     /// in the ledger, so resurrection re-runs the durable scopes only.
-    pub(crate) prelude: Option<String>,
+    pub prelude: Option<String>,
     /// This session is its workspace's bound Mastermind, carrying the mode:
     /// the claude spawn appends the role prompt (the mode itself rides the
     /// settings file), the codex spawn needs the mode in argv (approval
     /// config + role prompt). Respawn paths (view switch, rewind,
     /// resurrection) resolve it from the workspace store at recipe build —
     /// the binding, not the recipe, is the source of truth.
-    pub(crate) mastermind: Option<crate::workspaces::MastermindMode>,
+    pub mastermind: Option<crate::workspaces::MastermindMode>,
     /// Vendor-neutral transcript context inherited by a portable branch.
     /// Claude reads it from a generated system-prompt file; Codex receives it
     /// on thread open as developer instructions. It never becomes a user turn.
-    pub(crate) portable_context: Option<String>,
+    pub portable_context: Option<String>,
     /// Original creation time (epoch ms) for a RESURRECTED session, so its age
     /// survives a daemon restart instead of resetting to "now". `None` on a
     /// fresh create / view-switch / rewind — the spawn stamps now.
-    pub(crate) created_at_ms: Option<u64>,
+    pub created_at_ms: Option<u64>,
 }
 
 /// Whether a chat spawn turns claude's Remote Control bridge on after the
 /// handshake. Codex's bridge lives on its app-server daemon: nothing to set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RemoteControlAtStart {
+pub enum RemoteControlAtStart {
     /// Respawning a live session (view switch, rewind): the new process
     /// starts without a bridge, so one the user turned off stays off.
     No,
@@ -202,6 +203,7 @@ pub(crate) async fn prune_journals(state: &Arc<AppState>, spawning: Option<&str>
     }
     let mut keep: HashSet<String> = crate::lock(&state.agents).keys().cloned().collect();
     keep.extend(spawning.map(str::to_string));
+    keep.extend(crate::lock(&state.deferred_sessions).keys().cloned());
     // Stats every journal (and may unlink some) on a possibly-NFS dir.
     let manager = Arc::clone(&state.chat);
     if let Err(err) = tokio::task::spawn_blocking(move || manager.prune_journal_dir(keep)).await {
@@ -688,6 +690,7 @@ async fn handle_chat_exit(state: &Arc<AppState>, id: &str, exit: DriverExit) {
     if state.stopping.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
+    let pickup = take_unanswered_pickup(state, id);
     // Startup cleanup and deliberate view switches must own the lifecycle
     // exclusively. A closing socket must report exit, never a successor
     // that the user did not request.
@@ -730,6 +733,24 @@ async fn handle_chat_exit(state: &Arc<AppState>, id: &str, exit: DriverExit) {
         return;
     }
     let recipe = crate::lock(&state.chat_recipes).remove(id);
+    if let (Some(pickup), Some(recipe), DriverExit::Clean(_) | DriverExit::ProtocolError(_)) =
+        (pickup, &recipe, &exit)
+    {
+        // The process died before the pick-up turn produced anything: start
+        // the conversation again once, a moment later, keeping its record.
+        // The dead entry stays registered meanwhile, so the agent watcher
+        // does not take the gap for the session's end.
+        let native = state.chat.get(id).and_then(|info| info.native_session_id);
+        tracing::warn!(%id, "the agent exited before answering its pick-up; starting it again");
+        tokio::spawn(retry_exited_pickup(
+            state.clone(),
+            id.to_string(),
+            recipe.clone(),
+            native,
+            pickup,
+        ));
+        return;
+    }
     match exit {
         DriverExit::HandshakeFailed {
             reason,
@@ -860,7 +881,7 @@ async fn switch_to_pty(
     } else {
         None
     };
-    let argv = crate::launcher::build_agent_resume_command(
+    let mut argv = crate::launcher::build_agent_resume_command(
         recipe.kind,
         &bin,
         recipe.settings.as_deref(),
@@ -871,6 +892,39 @@ async fn switch_to_pty(
         codex_theme,
         fork_context_file.as_deref(),
     );
+    if recipe.kind == AgentKind::Codex {
+        let key = crate::lock(&state.agents)
+            .get(id)
+            .map(|record| record.key.clone());
+        if let Some(key) = key {
+            let notify = state
+                .policy()
+                .codex_notify_args(state, &recipe.workspace_id, id, &key)
+                .await;
+            // The rollout identity only serves the notify shim; without it a
+            // Codex TUI carries no transcript, as before the shim existed.
+            let identity = !notify.is_empty();
+            argv.extend(notify);
+            // A chat->terminal switch can be closed or restarted before its
+            // first TUI turn. Carry its already-existing rollout now rather
+            // than relying on a notify that may never arrive.
+            if let Some(thread) = recipe.resume.clone().filter(|_| identity) {
+                let cwd = crate::lock(&state.agents)
+                    .get(id)
+                    .and_then(|r| r.native_cwd_for(&thread))
+                    .unwrap_or_else(|| recipe.workspace_root.clone());
+                if let Some(path) = crate::codex_rollout::capture(state, &thread, cwd, None).await {
+                    if let Some(record) = crate::lock(&state.agents)
+                        .get_mut(id)
+                        .filter(|record| record.key == key)
+                    {
+                        record.codex_thread_id = Some(thread);
+                        record.transcript_path = Some(path);
+                    }
+                }
+            }
+        }
+    }
     // A view-switch respawn is a real spawn too — same prelude as the chat
     // process it replaces (the recipe carries the launch scope).
     let startup = crate::environment::job_startup().await;
@@ -883,7 +937,7 @@ async fn switch_to_pty(
     );
     let env = crate::api::session_env(state, id, &recipe.theme, prelude.as_deref());
     let env_remove = crate::api::spawn_env_remove(&env);
-    let opts = chimaera_pty::SpawnOpts {
+    let mut opts = chimaera_pty::SpawnOpts {
         cwd: recipe.workspace_root,
         // Carry the user's pinned name across the toggle so the PTY row keeps
         // it (and reports `renamed` truthfully); None leaves it deriving.
@@ -900,9 +954,63 @@ async fn switch_to_pty(
         env_remove,
         scrollback: crate::lock(&state.settings).scrollback_lines(),
     };
-    match state.sessions.spawn(opts) {
+    let policy = state.policy();
+    if !policy.allows(
+        state,
+        &successor_recipe.workspace_id,
+        crate::policy::Need::Execute,
+    ) {
+        return false;
+    }
+    let Ok((launch, _reservation)) = policy
+        .admit_launch(
+            state,
+            &successor_recipe.workspace_id,
+            crate::policy::LaunchKind::Agent,
+        )
+        .await
+    else {
+        return false;
+    };
+    if policy
+        .launch_env(
+            state,
+            &successor_recipe.workspace_id,
+            &mut opts.env,
+            &mut opts.env_remove,
+        )
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    let Ok(import_admission) = policy.hold_session(
+        state,
+        &successor_recipe.workspace_id,
+        id,
+        successor_recipe.resume.as_deref(),
+        false,
+    ) else {
+        return false;
+    };
+    let spawned = if launch.managed() {
+        state.sessions.spawn_managed(opts)
+    } else {
+        state.sessions.spawn(opts)
+    };
+    drop(import_admission);
+    match spawned {
         Ok(_) => {
             crate::runtime_retention::watch(state.clone(), id.to_string(), usage);
+            if !policy.allows(
+                state,
+                &successor_recipe.workspace_id,
+                crate::policy::Need::Execute,
+            ) {
+                let _ = state.sessions.fence(id);
+                return false;
+            }
+            launch.registered(id.to_owned());
             crate::lock(&state.chat_recipes).insert(id.to_string(), successor_recipe);
             tracing::info!(%id, "chat session switched to PTY TUI");
             true
@@ -1044,14 +1152,14 @@ const STOP_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 /// and a chat driver alive under the same id, or let two rewinds race the same
 /// journal rewrite. Drop-based cleanup keeps every early-return/error path from
 /// stranding the session in a permanent "switching" state.
-struct ChatSwitchGuard {
+pub struct ChatSwitchGuard {
     state: Arc<AppState>,
     id: String,
     target: String,
 }
 
 impl ChatSwitchGuard {
-    fn acquire(state: &Arc<AppState>, id: &str, target: &str) -> Option<Self> {
+    pub fn acquire(state: &Arc<AppState>, id: &str, target: &str) -> Option<Self> {
         use std::collections::hash_map::Entry;
 
         let mut switching = crate::lock(&state.chat_switching);
@@ -1595,6 +1703,7 @@ async fn perform_switch(
         model: None,
         resume,
         fork_at: None,
+        fork_head: false,
         rollback_turns: None,
         revert_before_turn: None,
         remote_control: RemoteControlAtStart::No,
@@ -1977,6 +2086,7 @@ pub(crate) async fn rewind_session(
             model: None,
             resume: Some(native),
             fork_at: (!is_codex).then(|| body.resume_at.clone()),
+            fork_head: false,
             rollback_turns: if is_codex {
                 dropped_turns.as_ref().map(|d| d.count)
             } else {
@@ -2084,6 +2194,7 @@ fn render_fork_context(events: &[AgentEvent]) -> Vec<ForkContextRow> {
                 queued: true,
                 after_turn: _,
                 origin: None,
+                client_id: _,
             } => {
                 assistant_turn = None;
                 if let Some(id) = id {
@@ -2764,7 +2875,7 @@ pub(crate) async fn fork_session(
                 return err(
                     StatusCode::CONFLICT,
                     "that user message no longer matches the selected branch point".to_string(),
-                )
+                );
             }
         },
         None => body.through_seq,
@@ -3103,6 +3214,7 @@ pub(crate) async fn spawn_fresh_chat_at(
         model: spec.model,
         resume: native_fork.as_ref().map(|(source, _)| source.clone()),
         fork_at: native_fork.as_ref().map(|(_, at)| at.clone()),
+        fork_head: false,
         rollback_turns: None,
         revert_before_turn: None,
         remote_control: RemoteControlAtStart::Setting,
@@ -3211,6 +3323,13 @@ pub(crate) async fn spawn_chat_session(
     recipe: ChatRecipe,
     pinned_override: Option<String>,
 ) -> anyhow::Result<ChatInfo> {
+    anyhow::ensure!(
+        state
+            .policy()
+            .allows(state, &recipe.workspace_id, crate::policy::Need::Execute),
+        "project execution authority unavailable"
+    );
+    crate::ledger::check_manual_native(state, Some(&id), recipe.kind, recipe.resume.as_deref())?;
     let chat_bin = crate::launcher::chat_executable(state, recipe.kind, &recipe.bin).await?;
     let (usage, binaries) = crate::runtime_retention::acquire(
         state,
@@ -3226,11 +3345,7 @@ pub(crate) async fn spawn_chat_session(
     // context it gets as a developer note once its thread opens (claude's
     // rides the hook carrier). Both are None off-cluster without any I/O.
     let startup = crate::environment::job_startup().await;
-    let codex_cluster_context = if recipe.kind == AgentKind::Codex {
-        state.compute.agent_context().await
-    } else {
-        None
-    };
+    let (codex_note, placement) = codex_developer_note(state, &recipe, &id).await;
     // Re-enforce the journal-dir budget as sessions are created: pruning only
     // at boot lets a weeks-long daemon accumulate one capped journal per
     // session past the documented ceiling.
@@ -3300,17 +3415,23 @@ pub(crate) async fn spawn_chat_session(
                 (None, None) => Some(fresh_native_uuid()),
             };
             (
-                crate::launcher::build_chat_command(
-                    spawn_bin,
-                    settings,
-                    mcp,
-                    model.as_deref(),
-                    recipe.resume.as_deref(),
-                    pinned.as_deref(),
-                    recipe.fork_at.as_deref(),
-                    fork_context_file.as_deref(),
-                    recipe.mastermind.is_some(),
-                ),
+                {
+                    let mut argv = crate::launcher::build_chat_command(
+                        spawn_bin,
+                        settings,
+                        mcp,
+                        model.as_deref(),
+                        recipe.resume.as_deref(),
+                        pinned.as_deref(),
+                        recipe.fork_at.as_deref(),
+                        fork_context_file.as_deref(),
+                        recipe.mastermind.is_some(),
+                    );
+                    if recipe.fork_head {
+                        crate::launcher::fork_native_head(recipe.kind, &mut argv)?;
+                    }
+                    argv
+                },
                 pinned,
             )
         }
@@ -3484,8 +3605,9 @@ pub(crate) async fn spawn_chat_session(
     // Same-agent native branch: Claude already receives this through argv;
     // Codex consumes it during the handshake as thread/fork lastTurnId.
     spec.fork_at = recipe.fork_at.clone();
+    spec.fork_head = recipe.fork_head;
     spec.portable_context = recipe.portable_context.clone();
-    spec.developer_note = codex_cluster_context;
+    spec.developer_note = codex_note;
     // Resurrection carries the original creation time so age survives the
     // restart; every other path leaves it None → the spawn stamps now.
     spec.created_at_ms = recipe.created_at_ms;
@@ -3502,7 +3624,15 @@ pub(crate) async fn spawn_chat_session(
         // Return value (whether history was seeded) matters only to the
         // create-from-recent path, which pre-seeds and inspects it there; here
         // (view-switch / rewind) the session always stays in chat.
+        let import_admission = state.policy().hold_session(
+            state,
+            &recipe.workspace_id,
+            &id,
+            recipe.resume.as_deref(),
+            true,
+        )?;
         let _ = tokio::task::block_in_place(|| seed_resumed_journal(state, &id, &recipe));
+        drop(import_admission);
     }
 
     if matches!(recipe.kind, AgentKind::Grok | AgentKind::Antigravity) {
@@ -3510,18 +3640,104 @@ pub(crate) async fn spawn_chat_session(
         // has a new Chimaera id, but seed_resumed_journal copied its marker.
         spec.portable_context = recover_portable_context_from_disk(state, &id, recipe.kind).await;
     }
-    crate::lock(&state.chat_recipes).insert(id.clone(), recipe.clone());
+    anyhow::ensure!(
+        state
+            .policy()
+            .allows(state, &recipe.workspace_id, crate::policy::Need::Execute),
+        "project execution authority changed during launch"
+    );
+    let (launch, _reservation) = state
+        .policy()
+        .admit_launch(
+            state,
+            &recipe.workspace_id,
+            crate::policy::LaunchKind::Agent,
+        )
+        .await?;
+    crate::ledger::check_manual_native(state, Some(&id), recipe.kind, recipe.resume.as_deref())?;
+    launch.check()?;
+    state
+        .policy()
+        .launch_env(
+            state,
+            &recipe.workspace_id,
+            &mut spec.env,
+            &mut spec.env_remove,
+        )
+        .await?;
+    spec.managed_execution = launch.managed()
+        || crate::lock(&state.deferred_sessions)
+            .get(&id)
+            .is_some_and(|entry| {
+                entry.manual_resume_reason.as_deref() == Some("project_secrets_idle")
+            });
     let adapter = recipe
         .kind
         .chat_adapter()
         .ok_or_else(|| anyhow::anyhow!("no chat adapter registered"))?;
+    crate::lock(&state.chat_recipes).insert(id.clone(), recipe.clone());
+    let import_admission = match state.policy().hold_session(
+        state,
+        &recipe.workspace_id,
+        &id,
+        recipe.resume.as_deref(),
+        false,
+    ) {
+        Ok(admission) => admission,
+        Err(error) => {
+            crate::lock(&state.chat_recipes).remove(&id);
+            return Err(error);
+        }
+    };
     let info = state.chat.spawn(adapter, spec);
+    drop(import_admission);
     if info.is_err() {
         crate::lock(&state.chat_recipes).remove(&id);
     } else {
-        crate::runtime_retention::watch(state.clone(), id, usage);
+        crate::runtime_retention::watch(state.clone(), id.clone(), usage);
+        if !state
+            .policy()
+            .allows(state, &recipe.workspace_id, crate::policy::Need::Execute)
+        {
+            // The killed session's retention watch ends on its own.
+            state.chat.fence(&id);
+            crate::lock(&state.chat_recipes).remove(&id);
+            anyhow::bail!("project execution authority changed during launch");
+        }
+        if let Some(placement) = &placement {
+            state.policy().note_told(state, placement).await;
+        }
+        launch.registered(id);
     }
     info
+}
+
+/// What a Codex chat is handed as its developer note when its thread opens
+/// (`SpawnSpec::developer_note`, PROTOCOL.md Pass 41): the cluster context in
+/// a cluster job, then, in a synced project with the optional Runtime, the
+/// where-you-run note when this conversation has not heard it for this
+/// machine (`cloud_context::pending`, remembered once the spawn succeeds).
+/// Codex chats have no hook carrier. Other agents get nothing here.
+pub async fn codex_developer_note(
+    state: &AppState,
+    recipe: &ChatRecipe,
+    id: &str,
+) -> (Option<String>, Option<crate::policy::StartNote>) {
+    if recipe.kind != AgentKind::Codex {
+        return (None, None);
+    }
+    let placement = state
+        .policy()
+        .start_note(state, &recipe.workspace_id, id)
+        .await;
+    let notes: Vec<String> = [
+        state.compute.agent_context().await,
+        placement.as_ref().map(|pending| pending.text.clone()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    ((!notes.is_empty()).then(|| notes.join("\n\n")), placement)
 }
 
 /// Resurrect a chat session from the ledger under its ORIGINAL id (the boot
@@ -3539,6 +3755,22 @@ pub(crate) async fn resurrect_chat(
     entry: &crate::ledger::LedgerEntry,
     workspace: crate::workspaces::Workspace,
 ) -> anyhow::Result<()> {
+    resurrect_chat_transfer(state, entry, workspace, false, None).await
+}
+
+pub(crate) async fn resurrect_chat_transfer(
+    state: &Arc<AppState>,
+    entry: &crate::ledger::LedgerEntry,
+    workspace: crate::workspaces::Workspace,
+    fork_head: bool,
+    origin: Option<&'static str>,
+) -> anyhow::Result<()> {
+    if !state
+        .policy()
+        .allows(state, &workspace.id, crate::policy::Need::Execute)
+    {
+        anyhow::bail!("workspace owned elsewhere");
+    }
     let agent = entry
         .agent
         .as_ref()
@@ -3610,6 +3842,12 @@ pub(crate) async fn resurrect_chat(
         other => other.clone(),
     };
 
+    if entry.manual_resume_reason.is_some() {
+        anyhow::ensure!(
+            resume == agent.resume && resume.is_some() && !fork_head,
+            "manual conversation cannot resume fresh or fork"
+        );
+    }
     // Seed the AgentRecord BEFORE the spawn. `apply_chat_event` only UPDATES an
     // existing record — on a fresh boot there is none, so a `get_mut` here would
     // no-op and the row would come back as a bare "claude". Mirror create_session:
@@ -3620,6 +3858,8 @@ pub(crate) async fn resurrect_chat(
     // chat is dropped from the following snapshot and lost on the NEXT restart.
     let mut record = crate::agents::AgentRecord::new(key, agent.kind);
     record.resumed_from = resume.clone();
+    record.native_cwd = agent.native_cwd.clone();
+    record.transcript_path = agent.transcript.clone();
     record.custom_title = entry.pinned_name.clone();
     if record.custom_title.is_none() && agent.title != agent.kind.as_str() {
         record.ai_title = Some(crate::agents::truncate_prompt(&agent.title));
@@ -3651,14 +3891,17 @@ pub(crate) async fn resurrect_chat(
         model: agent.model.clone(),
         resume,
         fork_at: None,
+        fork_head,
         rollback_turns: None,
         revert_before_turn: None,
         remote_control: match &carry {
+            _ if entry.manual_resume_reason.is_some() => RemoteControlAtStart::No,
             Some(c) if c.remote_control => RemoteControlAtStart::Yes,
             Some(_) => RemoteControlAtStart::No,
             None => RemoteControlAtStart::Setting,
         },
-        carry_ultracode: carry.as_ref().is_some_and(|c| c.ultracode),
+        carry_ultracode: entry.manual_resume_reason.is_none()
+            && carry.as_ref().is_some_and(|c| c.ultracode),
         theme: entry.theme.clone(),
         // The ledger doesn't persist launch text: a resurrected session
         // re-runs the durable scopes (host ⊕ workspace) only.
@@ -3685,31 +3928,40 @@ pub(crate) async fn resurrect_chat(
             // the background work, and neither agent restarts them on resume
             // (the conversation survives, its processes do not). Tell the
             // agent once, as a message it can act on (see `pickup_message`).
-            // Never in a cluster workspace job: a job may start hours after
-            // the click that queued it, with nobody there to watch the turn
-            // it would start — its chats come back idle and wait for the user.
-            let enabled = crate::lock(&state.settings).resume_after_restart()
-                && !state.compute.is_cluster_job();
-            let pick_up = pickup_message(
-                &entry.id,
-                carry.as_ref(),
-                resumed,
-                mastermind_mode.is_some(),
-                enabled,
-                crate::session_view::now_ms(),
-            );
-            if let Some(text) = pick_up {
-                let send = chimaera_agent::model::AgentCommand::Send {
-                    blocks: vec![chimaera_agent::model::ContentBlock::Text { text }],
-                };
-                if let Err(err) = state
-                    .chat
-                    .command_as(&entry.id, send, Some(chimaera_agent::model::ORIGIN_RESTART))
-                    .await
-                {
-                    tracing::warn!(session = %entry.id, %err,
-                        "could not send the restart pick-up message");
-                }
+            let enabled = crate::lock(&state.settings).resume_after_restart();
+            let pick_up = if entry.manual_resume_reason.is_some()
+                || mastermind_mode.is_some()
+                || state.compute.is_cluster_job()
+            {
+                None
+            } else if let Some(origin) = origin {
+                let context = state.policy().launch_context(state, &entry.workspace_id);
+                let recovery = context.recovery;
+                // Where it runs now arrives separately, at the process start
+                // (`cloud_context`); the pick-up only says what to continue.
+                handoff_message(
+                    origin,
+                    carry.as_ref(),
+                    Arrival {
+                        recovery,
+                        forked: fork_head,
+                        saved_age_ms: context.saved_point_age_ms,
+                    },
+                )
+                .map(|text| (text, transfer_origin(origin, recovery)))
+            } else {
+                pickup_message(
+                    &entry.id,
+                    carry.as_ref(),
+                    resumed,
+                    mastermind_mode.is_some(),
+                    enabled,
+                    crate::session_view::now_ms(),
+                )
+                .map(|text| (text, chimaera_agent::model::ORIGIN_RESTART))
+            };
+            if let Some((text, tag)) = pick_up {
+                send_pickup(state, &entry.id, text, tag, true).await;
             }
             Ok(())
         }
@@ -3754,6 +4006,260 @@ fn codex_mcp_auto_approve(
             Some(crate::workspaces::MastermindMode::Auto) => None,
             None => Some(always.collect()),
         },
+    }
+}
+
+/// Texts of an agent failure that a second try moments later gets past: the
+/// turn never reached the model. Matched as substrings; the one list.
+const TRANSIENT_AGENT_ERRORS: &[&str] = &[
+    // Claude Code, when another of its processes refreshes the same OAuth
+    // token at the same moment (a resumed chat and a status probe).
+    "another Claude Code process is refreshing",
+    "Failed to refresh OAuth token",
+];
+/// A pick-up turn counts as failing at once only within this window.
+const PICKUP_FAILURE_WINDOW: std::time::Duration = std::time::Duration::from_secs(20);
+/// The pause before the one retry, long enough for the race to settle.
+const PICKUP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn take_unanswered_pickup(state: &AppState, id: &str) -> Option<(String, &'static str)> {
+    crate::lock(&state.unanswered_pickups).remove(id)
+}
+
+fn is_transient_agent_error(text: &str) -> bool {
+    TRANSIENT_AGENT_ERRORS
+        .iter()
+        .any(|known| text.contains(known))
+}
+
+/// Send the daemon's pick-up message. With `retry`, a turn that fails at once
+/// (within [`PICKUP_FAILURE_WINDOW`], before any output) with a known
+/// transient error, or whose process exits first, is tried once more after
+/// [`PICKUP_RETRY_DELAY`]. A turn that produced anything is never repeated.
+async fn send_pickup(
+    state: &Arc<AppState>,
+    id: &str,
+    text: String,
+    tag: &'static str,
+    retry: bool,
+) {
+    let live = retry.then(|| state.chat.subscribe(id).ok()).flatten();
+    if live.is_some() {
+        crate::lock(&state.unanswered_pickups).insert(id.to_string(), (text.clone(), tag));
+    }
+    if let Err(err) = state
+        .chat
+        .command_as(id, pickup_send(text), Some(tag))
+        .await
+    {
+        tracing::warn!(session = %id, %err, "could not send the pick-up message");
+        take_unanswered_pickup(state, id);
+        return;
+    }
+    let Some(live) = live else {
+        return;
+    };
+    let (state, id) = (state.clone(), id.to_string());
+    tokio::spawn(async move {
+        let take = {
+            let (state, id) = (state.clone(), id.clone());
+            move || take_unanswered_pickup(&state, &id)
+        };
+        let mut live = live;
+        let Some((text, tag)) = failed_at_once(&mut live, take).await else {
+            return;
+        };
+        tracing::warn!(session = %id, "the pick-up turn failed at once; sending it again shortly");
+        if !idle_for(&mut live, PICKUP_RETRY_DELAY).await {
+            tracing::info!(session = %id, "the conversation went on; the pick-up is not sent again");
+            return;
+        }
+        if !state.stopping.load(std::sync::atomic::Ordering::Relaxed)
+            && state.chat.get(&id).is_some_and(|c| c.alive)
+        {
+            if let Err(err) = state
+                .chat
+                .command_as(&id, pickup_send(text), Some(tag))
+                .await
+            {
+                tracing::warn!(session = %id, %err, "could not send the pick-up message again");
+            }
+        }
+    });
+}
+
+fn pickup_send(text: String) -> chimaera_agent::model::AgentCommand {
+    chimaera_agent::model::AgentCommand::Send {
+        blocks: vec![chimaera_agent::model::ContentBlock::Text { text }],
+    }
+}
+
+type Pickup = (String, &'static str);
+
+/// Where the watch of a pick-up's turn stands (see [`failed_at_once`]).
+enum PickupTurn {
+    /// Nothing said yet.
+    Quiet,
+    /// The turn completed at once with nothing said. The entry is settled
+    /// (an exit now is the turn's end, not a dead pick-up) and kept here:
+    /// claude answers a pick-up it could not start with an empty completion
+    /// and reports the failure as the next turn, moments later.
+    CompletedEmpty(Option<Pickup>),
+    /// Only a known transient failure text so far, after an empty completion
+    /// when one came first.
+    Transient(Option<Pickup>),
+}
+
+/// How the turn a pick-up started went, watched within [`PICKUP_FAILURE_WINDOW`]:
+/// the pick-up to send again when the turn ended as a transient failure with
+/// no output (aborted, or completed having said only the failure); nothing
+/// otherwise. `take` settles the unanswered entry (the exit hook's signal):
+/// it is taken when the turn produced output, ended otherwise, or outlived
+/// the window, and left in place when the process exited first, for the exit
+/// hook. A message from anyone but the daemon's pick-up (the user, Remote
+/// Control, another agent) means the conversation moved on: the watch
+/// settles without a retry, so a user's own failing turn never re-sends it.
+async fn failed_at_once(
+    live: &mut tokio::sync::broadcast::Receiver<Arc<SeqEvent>>,
+    mut take: impl FnMut() -> Option<Pickup>,
+) -> Option<Pickup> {
+    use PickupTurn::*;
+    let deadline = tokio::time::Instant::now() + PICKUP_FAILURE_WINDOW;
+    let mut turn = Quiet;
+    loop {
+        let Ok(Ok(entry)) = tokio::time::timeout_at(deadline, live.recv()).await else {
+            take();
+            return None;
+        };
+        turn = match (turn, &entry.ev) {
+            (_, AgentEvent::UserMessage { origin, .. })
+                if !origin
+                    .as_deref()
+                    .is_some_and(chimaera_agent::model::is_pickup_origin) =>
+            {
+                take();
+                return None;
+            }
+            (
+                turn,
+                AgentEvent::MessageChunk { text, .. } | AgentEvent::Error { message: text, .. },
+            ) if is_transient_agent_error(text) => match turn {
+                Quiet => Transient(None),
+                CompletedEmpty(kept) | Transient(kept) => Transient(kept),
+            },
+            (
+                turn,
+                AgentEvent::TurnAborted {
+                    reason,
+                    interrupted: false,
+                    ..
+                },
+            ) => {
+                return match turn {
+                    Transient(kept) => kept.or_else(&mut take),
+                    CompletedEmpty(kept) => kept
+                        .or_else(&mut take)
+                        .filter(|_| is_transient_agent_error(reason)),
+                    Quiet => take().filter(|_| is_transient_agent_error(reason)),
+                };
+            }
+            (_, AgentEvent::Exited { .. }) => return None,
+            // The failure reported as text, then a completed turn: the turn
+            // never reached the model, as with an abort.
+            (Transient(kept), AgentEvent::TurnCompleted { .. }) => {
+                return kept.or_else(&mut take);
+            }
+            (Quiet, AgentEvent::TurnCompleted { .. }) => CompletedEmpty(take()),
+            (CompletedEmpty(kept), AgentEvent::TurnCompleted { .. }) => CompletedEmpty(kept),
+            (
+                _,
+                AgentEvent::MessageChunk { .. }
+                | AgentEvent::ThoughtChunk { .. }
+                | AgentEvent::ToolCall { .. }
+                | AgentEvent::ToolCallUpdate { .. }
+                | AgentEvent::Plan { .. }
+                | AgentEvent::PermissionRequest { .. }
+                | AgentEvent::QuestionRequest { .. }
+                | AgentEvent::ElicitationRequest { .. }
+                | AgentEvent::TurnAborted { .. },
+            ) => {
+                take();
+                return None;
+            }
+            (turn, _) => turn,
+        };
+    }
+}
+
+/// Whether the conversation stays idle for `delay` before a pick-up is sent
+/// again: a turn starting or a message arriving meanwhile (the user went on)
+/// means no retry, so the pick-up never lands on top of a running turn.
+async fn idle_for(
+    live: &mut tokio::sync::broadcast::Receiver<Arc<SeqEvent>>,
+    delay: std::time::Duration,
+) -> bool {
+    let until = tokio::time::Instant::now() + delay;
+    loop {
+        match tokio::time::timeout_at(until, live.recv()).await {
+            Err(_) => return true,
+            // Lagged is a burst of activity; closed is a session gone.
+            Ok(Err(_)) => return false,
+            Ok(Ok(entry)) => match entry.ev {
+                AgentEvent::TurnStarted { .. }
+                | AgentEvent::UserMessage { .. }
+                | AgentEvent::Exited { .. } => return false,
+                _ => {}
+            },
+        }
+    }
+}
+
+/// The exit hook's half of [`send_pickup`]'s retry: start the conversation
+/// again from its recipe and send the pick-up once more, or, when that fails,
+/// retire it as the exit would have.
+async fn retry_exited_pickup(
+    state: Arc<AppState>,
+    id: String,
+    recipe: ChatRecipe,
+    native: Option<String>,
+    (text, tag): (String, &'static str),
+) {
+    tokio::time::sleep(PICKUP_RETRY_DELAY).await;
+    // A stopping daemon's ledger resurrects it; another lifecycle operation
+    // on the session settles it itself.
+    if state.stopping.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let Some(guard) = ChatSwitchGuard::acquire(&state, &id, "pickup") else {
+        return;
+    };
+    if state.chat.get(&id).is_some_and(|c| c.alive) {
+        return;
+    }
+    // Closed by the user meanwhile: nothing left to start. A session parked
+    // for a move (deferred) is not this daemon's to start either: its next
+    // arrival resumes it and sends its own pick-up.
+    if !crate::lock(&state.agents).contains_key(&id)
+        || crate::lock(&state.deferred_sessions).contains_key(&id)
+    {
+        return;
+    }
+    state.chat.remove(&id);
+    let started = spawn_chat_session(&state, id.clone(), recipe, None).await;
+    drop(guard);
+    match started {
+        Ok(_) => send_pickup(&state, &id, text, tag, false).await,
+        Err(err) => {
+            tracing::warn!(%id, %err, "the agent could not start again for its pick-up");
+            crate::recents::retire_with_resume(
+                &state,
+                &id,
+                None,
+                None,
+                chimaera_agent::model::SessionUi::Chat,
+                native,
+            );
+        }
     }
 }
 
@@ -3843,9 +4349,9 @@ fn restart_message(carry: &chimaera_agent::Carryover) -> Option<String> {
          was resumed in a new agent process.",
     );
     if carry.background.is_empty() {
-        text.push_str(
-            " Your last turn was cut off before it finished. Continue where you left off.",
-        );
+        text.push_str(" Your last turn was cut off before it finished.");
+        text.push_str(&approval_note(carry));
+        text.push_str(" Continue where you left off.");
         return Some(text);
     }
     text.push_str(" Background work the previous process was running stopped with it:\n");
@@ -3874,8 +4380,10 @@ fn restart_message(carry: &chimaera_agent::Carryover) -> Option<String> {
     // Restoring is the default: offered a free choice ("whichever you still
     // need"), a live Haiku just acknowledged and restarted nothing.
     if carry.turn_in_flight {
+        text.push_str("\n\nYour last turn was also cut off before it finished.");
+        text.push_str(&approval_note(carry));
         text.push_str(
-            "\n\nYour last turn was also cut off before it finished.\n\nRestart each of \
+            "\n\nRestart each of \
              these the same way you started it, unless it is clearly no longer needed (say \
              which you skipped), then continue where you left off.",
         );
@@ -3888,9 +4396,238 @@ fn restart_message(carry: &chimaera_agent::Carryover) -> Option<String> {
     Some(text)
 }
 
+/// A permission the restart or move cut off: the call never ran, so the agent
+/// makes it again if it still needs it, and the user is asked again whenever
+/// its permissions require that. Empty when no permission was open.
+fn approval_note(carry: &chimaera_agent::Carryover) -> String {
+    let Some(waiting) = &carry.awaiting_approval else {
+        return String::new();
+    };
+    let title = waiting
+        .title
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let call = waiting
+        .tool_call_id
+        .as_deref()
+        .map(|id| format!(" (tool call {id})"))
+        .unwrap_or_default();
+    format!(
+        " The interrupted turn was waiting for the user's permission to run {title}{call}, and \
+         that call was not run: if it is still needed, make the call again."
+    )
+}
+
+/// How a transferred conversation arrived, for its pick-up's words.
+#[derive(Clone, Copy)]
+struct Arrival {
+    /// The other machine stopped responding: it continues from the last
+    /// saved point.
+    recovery: bool,
+    /// It continues in a copy of the conversation, not the same one.
+    forked: bool,
+    /// How old that saved point was when the other machine was last heard.
+    saved_age_ms: Option<u64>,
+}
+
+/// Only interrupted work needs a transfer pick-up turn. Idle conversations keep
+/// their history without asking the model to do more work; in a synced project
+/// the new process's start note (`mcp::cloud_context`) says where it runs now.
+fn handoff_message(
+    origin: &str,
+    carry: Option<&chimaera_agent::Carryover>,
+    arrival: Arrival,
+) -> Option<String> {
+    if carry.is_some_and(|c| !c.interrupted_work()) || (carry.is_none() && !arrival.recovery) {
+        return None;
+    }
+    Some(transfer_context(origin, carry, arrival))
+}
+
+/// The `UserMessage.origin` a transfer pick-up carries. The UI folds these
+/// messages into a divider keyed on the exact tag, so the recovered arrival
+/// (the other machine stopped responding; the conversation continues from
+/// the last saved point) gets its own, whichever way it went: its words
+/// differ, and so does what the user should be told. `origin` is the
+/// bundle's `moved` | `home`.
+fn transfer_origin(origin: &str, recovery: bool) -> &'static str {
+    use chimaera_agent::model::{ORIGIN_HOME, ORIGIN_MOVED, ORIGIN_RECOVERED};
+    match (origin == "home", recovery) {
+        (_, true) => ORIGIN_RECOVERED,
+        (true, false) => ORIGIN_HOME,
+        (false, false) => ORIGIN_MOVED,
+    }
+}
+
+/// The agent-facing pick-up after a move (`moved`: now in the cloud) or a
+/// return (`home`: back on the user's computer). Plain words, and short: the
+/// UI shows it folded behind a divider, but the agent reads every word of it
+/// in its context. It must still say where the agent runs now, whether this
+/// is the same conversation or a copy continuing from the last saved point,
+/// that the project files were installed and may differ, and to re-check
+/// tools and paths. A recovery also carries the rules for work of uncertain
+/// state: neither redo nor claim it blindly, and don't stop to ask merely
+/// because the recovery happened. `saved_age_ms` is how old the saved point
+/// was when the other machine was last heard from: an agent that finds a file
+/// missing must not read that as "it was never written".
+fn transfer_context(
+    origin: &str,
+    carry: Option<&chimaera_agent::Carryover>,
+    Arrival {
+        recovery,
+        forked,
+        saved_age_ms,
+    }: Arrival,
+) -> String {
+    let (moved, runs) = if origin == "home" {
+        ("back to the user's computer", "on the user's computer")
+    } else {
+        ("to the cloud", "in the cloud")
+    };
+    let mut text = if recovery {
+        format!(
+            "Chimaera moved this conversation {moved} because the other machine stopped \
+             responding. You now run {runs}, continuing from the last saved point"
+        )
+    } else {
+        format!("Chimaera moved this conversation {moved}. You now run {runs}")
+    };
+    text.push_str(if forked {
+        " in a copy of this conversation."
+    } else {
+        ", in the same conversation."
+    });
+    if let Some(age) = saved_age_ms.filter(|_| recovery).and_then(saved_point_age) {
+        text.push_str(&format!(
+            " That saved point is from {age} before the other machine stopped responding, so \
+             files written after it are on that machine, not here."
+        ));
+    }
+    text.push_str(
+        " The project files were installed here and may differ from what you last saw. \
+         Re-check tools and paths before relying on anything from the previous machine.",
+    );
+    if recovery {
+        text.push_str(
+            " Work after the saved point may or may not have happened: treat unfinished tool \
+             calls and background work in the history as uncertain, not failed or safe to \
+             repeat. Check the project and any external state before repeating a step, then \
+             continue the user's unfinished task with the permissions you already have. Don't \
+             ask the user to confirm just because of this move, don't claim an external action \
+             happened exactly once, and leave a finished task finished.",
+        );
+    }
+    if let Some(carry) = carry.filter(|c| c.interrupted_work()) {
+        if !recovery {
+            text.push_str(
+                " Your previous process and its background work stopped during the move: \
+                 continue the interrupted task, and restart background work that is still needed.",
+            );
+            text.push_str(&approval_note(carry));
+        }
+        for task in carry.background.iter().take(32) {
+            text.push_str(&format!("\nBackground task: {}", task.description));
+        }
+    }
+    text
+}
+
+/// A saved point's age in plain words: seconds, or minutes above two
+/// minutes. None under two seconds, where the difference says nothing.
+fn saved_point_age(ms: u64) -> Option<String> {
+    if ms < 2_000 {
+        return None;
+    }
+    let seconds = (ms + 500) / 1_000;
+    Some(if seconds > 120 {
+        format!("{} minutes", (seconds + 30) / 60)
+    } else {
+        format!("{seconds} seconds")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Without the Pro notify shim (a free daemon), a Codex chat->terminal
+    /// switch never scans the rollout store: the TUI record carries no
+    /// transcript or thread identity, as before the shim existed.
+    #[tokio::test]
+    async fn free_codex_terminal_switch_carries_no_rollout_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-free-codex-switch-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut state = AppState::new(
+            "test-token".into(),
+            "test-host".into(),
+            std::process::id(),
+            0,
+            root.join("data"),
+            root.join("config"),
+        );
+        state.codex_config_path = root.join("codex-home/config.toml");
+        state.managed_root = root.join("managed");
+        state.legacy_managed_root = None;
+        let state = Arc::new(state);
+        let thread = "0199a1b2-c3d4-4e5f-8a6b-7c8d9e0f1a2b";
+        let home = root.join("codex-home");
+        let day = home.join("sessions/2026/10/06");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(
+            day.join(format!("rollout-2026-10-06T00-00-00-{thread}.jsonl")),
+            format!(
+                "{}\n",
+                serde_json::json!({"type":"session_meta","payload":{"id":thread,"cwd":project}})
+            ),
+        )
+        .unwrap();
+        // The scan would find it: only the missing shim keeps it off the record.
+        assert!(crate::codex_rollout::find_rollout(&home, thread, &project).is_some());
+        let id = "s-free-codex-switch";
+        crate::lock(&state.agents).insert(
+            id.into(),
+            crate::agents::AgentRecord::new("k".into(), AgentKind::Codex),
+        );
+        crate::lock(&state.session_workspaces).insert(id.into(), "w-free".into());
+        let recipe = ChatRecipe {
+            workspace_root: project.clone(),
+            workspace_id: "w-free".into(),
+            kind: AgentKind::Codex,
+            bin: PathBuf::from("/bin/true"),
+            version: None,
+            settings: None,
+            mcp_config: None,
+            model: None,
+            resume: Some(thread.into()),
+            fork_at: None,
+            fork_head: false,
+            rollback_turns: None,
+            revert_before_turn: None,
+            remote_control: RemoteControlAtStart::No,
+            carry_ultracode: false,
+            theme: "dark".into(),
+            prelude: None,
+            mastermind: None,
+            portable_context: None,
+            created_at_ms: None,
+        };
+        assert!(switch_to_pty(&state, id, recipe, None).await);
+        {
+            let agents = crate::lock(&state.agents);
+            let record = agents.get(id).expect("the switched TUI keeps its record");
+            assert_eq!(record.transcript_path, None);
+            assert_eq!(record.codex_thread_id, None);
+        }
+        let _ = state.sessions.kill(id);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     /// A chat driver that never speaks: alive until killed, then one Exited.
     struct IdleAdapter;
@@ -3988,6 +4725,7 @@ mod tests {
                     queued: false,
                     after_turn: false,
                     origin: None,
+                    client_id: None,
                 },
             ),
             seq_event(
@@ -4083,6 +4821,7 @@ mod tests {
                     queued: false,
                     after_turn: false,
                     origin: None,
+                    client_id: None,
                 },
             ),
             seq_event(
@@ -4114,6 +4853,7 @@ mod tests {
                     queued: false,
                     after_turn: false,
                     origin: None,
+                    client_id: None,
                 },
             ),
             seq_event(
@@ -4141,6 +4881,7 @@ mod tests {
                     queued: true,
                     after_turn: false,
                     origin: None,
+                    client_id: None,
                 },
             ),
             seq_event(
@@ -4204,6 +4945,7 @@ mod tests {
                 queued: false,
                 after_turn: false,
                 origin: None,
+                client_id: None,
             },
             AgentEvent::MessageChunk {
                 turn_id: "t1".into(),
@@ -4256,6 +4998,7 @@ mod tests {
                     queued: false,
                     after_turn: false,
                     origin: None,
+                    client_id: None,
                 },
             ),
             seq_event(
@@ -4322,6 +5065,7 @@ mod tests {
                     queued: false,
                     after_turn: false,
                     origin: None,
+                    client_id: None,
                 },
             ),
             seq_event(
@@ -4362,6 +5106,7 @@ mod tests {
                     queued: false,
                     after_turn: false,
                     origin: None,
+                    client_id: None,
                 },
             ),
             seq_event(
@@ -4439,6 +5184,7 @@ mod tests {
                     queued: false,
                     after_turn: false,
                     origin: None,
+                    client_id: None,
                 },
             ),
             seq_event(
@@ -4517,6 +5263,7 @@ mod tests {
                     queued: false,
                     after_turn: false,
                     origin: None,
+                    client_id: None,
                 },
             ),
             seq_line(
@@ -4549,6 +5296,7 @@ mod tests {
                     queued: false,
                     after_turn: false,
                     origin: None,
+                    client_id: None,
                 },
             ),
             seq_line(
@@ -4636,6 +5384,7 @@ mod tests {
                     queued: false,
                     after_turn: false,
                     origin: None,
+                    client_id: None,
                 },
             ),
             seq_line(
@@ -4661,6 +5410,7 @@ mod tests {
                     queued: true,
                     after_turn: false,
                     origin: None,
+                    client_id: None,
                 },
             ),
             seq_line(
@@ -4753,6 +5503,7 @@ mod tests {
             queued,
             after_turn: false,
             origin: None,
+            client_id: None,
         };
         let update = |id: &str| AgentEvent::UserMessageUpdate {
             id: id.into(),
@@ -5192,6 +5943,7 @@ mod tests {
                 queued: false,
                 after_turn: false,
                 origin: None,
+                client_id: None,
             },
             AgentEvent::TurnStarted {
                 turn_id: "turn-1".into(),
@@ -5249,6 +6001,7 @@ mod tests {
             model: None,
             resume: Some(native_id.into()),
             fork_at: None,
+            fork_head: false,
             rollback_turns: None,
             revert_before_turn: None,
             remote_control: RemoteControlAtStart::No,
@@ -5381,6 +6134,391 @@ mod tests {
         let text = restart_message(&both).expect("both");
         assert!(text.contains("Your last turn was also cut off"), "{text}");
         assert!(text.contains("then continue where you left off"), "{text}");
+    }
+
+    #[test]
+    fn handoff_message_keeps_finished_conversations_idle_in_both_directions() {
+        use chimaera_agent::Carryover;
+
+        for origin in ["moved", "home"] {
+            assert_eq!(
+                handoff_message(origin, None, arrival(false, false, None)),
+                None,
+                "older ledger"
+            );
+            assert_eq!(
+                handoff_message(
+                    origin,
+                    Some(&Carryover::default()),
+                    arrival(false, false, None)
+                ),
+                None
+            );
+            let idle = Carryover {
+                remote_control: true,
+                ultracode: true,
+                pickup_at_ms: 1,
+                ..Carryover::default()
+            };
+            assert_eq!(
+                handoff_message(origin, Some(&idle), arrival(false, false, None)),
+                None,
+                "settings and an earlier pickup are not unfinished work"
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_checkpoint_recovery_inspects_uncertainty_without_waking_known_idle_work() {
+        let text = handoff_message("moved", None, arrival(true, true, None))
+            .expect("unknown saved work is inspected automatically");
+        assert!(text.contains("because the other machine stopped responding"));
+        assert!(text.contains("continuing from the last saved point in a copy"));
+        assert!(text.contains("Check the project and any external state"));
+        assert!(text.contains("Don't ask the user to confirm just because of this move"));
+        assert!(!text.contains("stopped during the move"));
+        assert_eq!(
+            handoff_message(
+                "moved",
+                Some(&chimaera_agent::Carryover::default()),
+                arrival(true, true, None)
+            ),
+            None
+        );
+    }
+
+    /// A recovery says how old its saved point is, so an agent that finds a
+    /// file missing knows it may still be on the other machine; a move, an
+    /// unknown age or one under two seconds adds nothing.
+    #[test]
+    fn recovery_pickup_says_how_old_the_saved_point_is() {
+        let sentence = |age| {
+            let text = handoff_message("moved", None, arrival(true, true, age)).expect("recovery");
+            text.split(". ")
+                .find(|s| s.starts_with("That saved point"))
+                .map(str::to_owned)
+        };
+        assert_eq!(
+            sentence(Some(12_400)).as_deref(),
+            Some(
+                "That saved point is from 12 seconds before the other machine stopped \
+                 responding, so files written after it are on that machine, not here"
+            )
+        );
+        assert!(sentence(Some(120_000))
+            .unwrap()
+            .contains("from 120 seconds before"));
+        assert!(sentence(Some(300_000))
+            .unwrap()
+            .contains("from 5 minutes before"));
+        assert!(sentence(Some(2_000))
+            .unwrap()
+            .contains("from 2 seconds before"));
+        assert_eq!(sentence(Some(1_999)), None);
+        assert_eq!(sentence(None), None);
+        let home = handoff_message("home", None, arrival(true, false, Some(30_000))).unwrap();
+        assert!(home.contains(
+            "continuing from the last saved point, in the same conversation. That saved point \
+             is from 30 seconds before"
+        ));
+        let carry = chimaera_agent::Carryover {
+            turn_in_flight: true,
+            ..Default::default()
+        };
+        let moved =
+            handoff_message("moved", Some(&carry), arrival(false, false, Some(30_000))).unwrap();
+        assert!(!moved.contains("saved point"), "{moved}");
+    }
+
+    /// The pick-up names where the agent runs now in the UI's words, says
+    /// whether the conversation is the same one or a copy, and keeps the
+    /// instructions the agent needs — without the old jargon.
+    #[test]
+    fn handoff_message_continues_interrupted_turns_and_background_work() {
+        use chimaera_agent::{CarriedTask, Carryover};
+
+        let turn = Carryover {
+            turn_in_flight: true,
+            ..Carryover::default()
+        };
+        let background = Carryover {
+            background: vec![CarriedTask {
+                id: "b-1".into(),
+                task_type: "local_bash".into(),
+                description: "Watch CI for PR 158".into(),
+                workflow_name: None,
+                monitor: true,
+            }],
+            ..Carryover::default()
+        };
+        let both = Carryover {
+            turn_in_flight: true,
+            ..background.clone()
+        };
+        for (origin, place) in [
+            ("moved", "You now run in the cloud"),
+            ("home", "You now run on the user's computer"),
+        ] {
+            for carry in [&turn, &background, &both] {
+                let text = handoff_message(origin, Some(carry), arrival(false, false, None))
+                    .expect("interrupted work");
+                assert!(text.contains(place), "{text}");
+                assert!(text.contains("in the same conversation"), "{text}");
+                assert!(text.contains("installed here and may differ"), "{text}");
+                assert!(text.contains("Re-check tools and paths"), "{text}");
+                assert!(text.contains("continue the interrupted task"), "{text}");
+                for jargon in ["host", "laptop", "checkpoint", "acknowledged", "native"] {
+                    assert!(!text.contains(jargon), "{jargon}: {text}");
+                }
+                assert_eq!(
+                    text.contains("Background task: Watch CI for PR 158"),
+                    !carry.background.is_empty(),
+                    "{text}"
+                );
+            }
+        }
+        let recovered =
+            handoff_message("home", Some(&both), arrival(true, true, None)).expect("recovery");
+        assert!(recovered.contains("back to the user's computer because"));
+        assert!(recovered.contains("Background task: Watch CI for PR 158"));
+    }
+
+    /// Only a pick-up turn that failed at once with a known transient error,
+    /// before any output, is sent again; a process that exits first is the
+    /// exit hook's to retry; anything the agent produced, a user's stop, or
+    /// another failure is left alone.
+    #[tokio::test]
+    async fn a_pickup_is_retried_only_after_a_transient_failure_with_no_output() {
+        /// `Some(true)`: sent again; `Some(false)`: settled without a retry;
+        /// `None`: left to the exit hook (the entry was never taken).
+        async fn verdict(events: Vec<AgentEvent>) -> Option<bool> {
+            let (tx, rx) = tokio::sync::broadcast::channel(64);
+            for (seq, ev) in events.into_iter().enumerate() {
+                tx.send(Arc::new(SeqEvent {
+                    seq: seq as u64 + 1,
+                    ts: 0,
+                    ev,
+                }))
+                .unwrap();
+            }
+            let taken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = taken.clone();
+            let mut rx = rx;
+            let again = failed_at_once(&mut rx, move || {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                Some((String::from("pick up"), "moved"))
+            })
+            .await;
+            if again.is_some() {
+                Some(true)
+            } else if taken.load(std::sync::atomic::Ordering::Relaxed) {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        let started = || AgentEvent::TurnStarted {
+            turn_id: "t".into(),
+        };
+        let said = |text: &str| AgentEvent::MessageChunk {
+            turn_id: "t".into(),
+            text: text.into(),
+        };
+        let aborted = |reason: &str, interrupted: bool| AgentEvent::TurnAborted {
+            turn_id: "t".into(),
+            reason: reason.into(),
+            interrupted,
+        };
+        let race = "Failed to refresh OAuth token: another Claude Code process is refreshing it \
+                    or exited mid-refresh";
+        assert_eq!(
+            verdict(vec![started(), said(race), aborted("turn failed", false)]).await,
+            Some(true)
+        );
+        assert_eq!(
+            verdict(vec![started(), aborted(race, false)]).await,
+            Some(true)
+        );
+        assert_eq!(
+            verdict(vec![started(), said("Picking up."), aborted(race, false)]).await,
+            Some(false),
+            "a turn that produced output is never repeated"
+        );
+        assert_eq!(
+            verdict(vec![started(), aborted(race, true)]).await,
+            Some(false),
+            "a user's stop"
+        );
+        assert_eq!(
+            verdict(vec![started(), aborted("Prompt is too long", false)]).await,
+            Some(false)
+        );
+        // Seen on a cloud machine: the pick-up's own turn completes at once
+        // with nothing said, then the failure arrives as the next turn.
+        let completed = || AgentEvent::TurnCompleted {
+            turn_id: "t".into(),
+            usage: Default::default(),
+        };
+        assert_eq!(
+            verdict(vec![
+                started(),
+                completed(),
+                started(),
+                said(race),
+                aborted(race, false)
+            ])
+            .await,
+            Some(true),
+            "an empty completion settles nothing"
+        );
+        assert_eq!(
+            verdict(vec![started(), said("Picking up."), completed()]).await,
+            Some(false),
+            "a completion after output is the turn's end"
+        );
+        assert_eq!(
+            verdict(vec![
+                started(),
+                completed(),
+                AgentEvent::Exited { status: Some(0) }
+            ])
+            .await,
+            Some(false),
+            "an exit after an empty completion is the turn's end, not a dead pick-up"
+        );
+        assert_eq!(
+            verdict(vec![started(), AgentEvent::Exited { status: Some(1) }]).await,
+            None
+        );
+        // The failure reported as text, then a completed turn: the turn never
+        // reached the model, as with an abort.
+        assert_eq!(
+            verdict(vec![started(), said(race), completed()]).await,
+            Some(true),
+            "transient text then a completion"
+        );
+        assert_eq!(
+            verdict(vec![
+                started(),
+                completed(),
+                started(),
+                said(race),
+                completed()
+            ])
+            .await,
+            Some(true),
+            "an empty completion, then the failure reported as a completed turn"
+        );
+        // The pick-up's own echo is not the user going on.
+        assert_eq!(
+            verdict(vec![
+                user_message(Some("moved")),
+                started(),
+                aborted(race, false)
+            ])
+            .await,
+            Some(true)
+        );
+        // After an empty completion the user sends a message whose own turn
+        // fails with the transient text: that turn is theirs, not the
+        // pick-up's, so the pick-up is not sent on top of it.
+        assert_eq!(
+            verdict(vec![
+                started(),
+                completed(),
+                user_message(None),
+                started(),
+                said(race),
+                aborted(race, false)
+            ])
+            .await,
+            Some(false),
+            "a user's turn is never taken for the pick-up's"
+        );
+    }
+
+    fn arrival(recovery: bool, forked: bool, saved_age_ms: Option<u64>) -> Arrival {
+        Arrival {
+            recovery,
+            forked,
+            saved_age_ms,
+        }
+    }
+
+    fn user_message(origin: Option<&str>) -> AgentEvent {
+        serde_json::from_value(serde_json::json!({
+            "type": "user_message",
+            "text": "hello",
+            "origin": origin,
+        }))
+        .unwrap()
+    }
+
+    /// The retry waits for a quiet conversation: a turn or message arriving
+    /// during the pause means the user went on, and the pick-up is not sent
+    /// on top of it.
+    #[tokio::test]
+    async fn a_pickup_retry_waits_for_an_idle_conversation() {
+        let delay = std::time::Duration::from_millis(20);
+        let entry = |ev| Arc::new(SeqEvent { seq: 1, ts: 0, ev });
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        assert!(idle_for(&mut rx, delay).await, "nothing happened");
+        tx.send(entry(AgentEvent::TurnStarted {
+            turn_id: "u".into(),
+        }))
+        .unwrap();
+        assert!(!idle_for(&mut rx, delay).await, "a turn is running");
+        tx.send(entry(user_message(None))).unwrap();
+        assert!(!idle_for(&mut rx, delay).await, "the user sent a message");
+        drop(tx);
+        assert!(!idle_for(&mut rx, delay).await, "the session is gone");
+    }
+
+    /// A permission prompt the move or restart cut off is named, with its
+    /// tool call, as not run; the agent asks again rather than guessing. A
+    /// recovery from a saved point cannot know whether it was answered, so
+    /// it says nothing of it.
+    #[test]
+    fn pickups_say_an_open_permission_was_not_run() {
+        let carry: chimaera_agent::Carryover = serde_json::from_value(serde_json::json!({
+            "turn_in_flight": true,
+            "awaiting_approval": {"title": "Bash", "tool_call_id": "toolu_9"}
+        }))
+        .unwrap();
+        let said = "permission to run Bash (tool call toolu_9), and that call was not run";
+        for origin in ["moved", "home"] {
+            let text = handoff_message(origin, Some(&carry), arrival(false, false, None)).unwrap();
+            assert!(text.contains(said), "{text}");
+            let recovered =
+                handoff_message(origin, Some(&carry), arrival(true, false, None)).unwrap();
+            assert!(!recovered.contains("was not run"), "{recovered}");
+        }
+        let restarted = restart_message(&carry).unwrap();
+        assert!(restarted.contains(said), "{restarted}");
+        assert!(
+            restarted.ends_with("Continue where you left off."),
+            "{restarted}"
+        );
+        let idle = chimaera_agent::Carryover {
+            turn_in_flight: true,
+            ..Default::default()
+        };
+        assert!(!restart_message(&idle).unwrap().contains("was not run"));
+    }
+
+    /// The tag the UI keys its divider on: the direction, and whether the
+    /// arrival is a recovery after the other machine stopped responding.
+    #[test]
+    fn transfer_pickups_carry_a_stable_origin_tag() {
+        use chimaera_agent::model::{is_pickup_origin, ORIGIN_RECOVERED};
+        assert_eq!(transfer_origin("moved", false), "moved");
+        assert_eq!(transfer_origin("home", false), "home");
+        assert_eq!(transfer_origin("moved", true), "recovered");
+        assert_eq!(transfer_origin("home", true), "recovered");
+        assert_eq!(ORIGIN_RECOVERED, "recovered");
+        for tag in [true, false].map(|r| transfer_origin("home", r)) {
+            assert!(is_pickup_origin(tag), "{tag} resets the pick-up clock");
+        }
     }
 
     /// Who gets a pick-up message: only a chat whose work was cut off, whose

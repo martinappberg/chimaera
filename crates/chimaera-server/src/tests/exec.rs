@@ -191,3 +191,80 @@ async fn exec_into_agent_session_is_409_and_journal_endpoint_reads() {
     state.sessions.kill(&agent_id).ok();
     state.sessions.kill(&id).ok();
 }
+
+/// Fedora-style prompt arrays must never donate an exec's correlation token to
+/// a prompt hook. Drive the real PTY and HTTP API: marks alone can be present
+/// even when the returned record has prompt output and no exit status.
+#[tokio::test]
+async fn exec_round_trip_with_prompt_array_preserves_exact_completion() {
+    let state = test_state();
+    let base = test_dir("exec-prompt-array-base");
+    let home = test_dir("exec-prompt-array-home");
+    std::fs::write(
+        home.join(".bashrc"),
+        "PS1='$ '\nPROMPT_COMMAND=([0]=\": first-hook # keep this comment\" [5]=\": second-hook\")\n",
+    )
+    .unwrap();
+    let launch = chimaera_core::shellint::shell_launch_for("/bin/bash", &base).unwrap();
+    let mut env = launch.env;
+    env.push(("HOME".into(), home.to_string_lossy().into_owned()));
+    let info = state
+        .sessions
+        .spawn(chimaera_pty::SpawnOpts {
+            cwd: home,
+            name: None,
+            cols: 80,
+            rows: 24,
+            command: Some(launch.argv),
+            id: None,
+            env,
+            env_remove: vec![
+                "CHIMAERA_INTEGRATION".into(),
+                "BASH_ENV".into(),
+                "PROMPT_COMMAND".into(),
+            ],
+            scrollback: None,
+        })
+        .unwrap();
+    let id = info.id;
+    let marks = state.sessions.marks(&id).unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while marks.phase() != chimaera_pty::ShellPhase::Ready {
+        assert!(tokio::time::Instant::now() < deadline, "shell never ready");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    for (command, output, exit) in [
+        ("printf 'array-zero-output\\n'", "array-zero-output", 0),
+        (
+            "printf 'array-seven-output\\n'; (exit 7)",
+            "array-seven-output",
+            7,
+        ),
+    ] {
+        let (status, reply) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            request(
+                &state,
+                Method::POST,
+                &format!("/api/v1/sessions/{id}/exec"),
+                Some(serde_json::json!({
+                    "command": command,
+                    "timeout_ms": 3000,
+                    "queue_timeout_ms": 5000,
+                })),
+            ),
+        )
+        .await
+        .expect("exec bounded by original request timeout");
+        assert_eq!(status, StatusCode::OK, "{reply}");
+        assert_eq!(reply["mode"], "integrated", "{reply}");
+        assert_eq!(reply["timed_out"], false, "{reply}");
+        assert_eq!(reply["record"]["command"], command, "{reply}");
+        assert_eq!(reply["record"]["source"], "agent", "{reply}");
+        assert_eq!(reply["record"]["running"], false, "{reply}");
+        assert_eq!(reply["record"]["exit_code"], exit, "{reply}");
+        assert_eq!(reply["record"]["output"].as_str(), Some(output), "{reply}");
+        assert_eq!(reply["record"]["truncated_bytes"], 0, "{reply}");
+    }
+    state.sessions.kill(&id).ok();
+}

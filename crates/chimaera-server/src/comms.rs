@@ -221,8 +221,14 @@ struct CommsState {
     last_message: HashMap<String, u64>,
 }
 
+#[cfg(any(test, feature = "daemon-extension-fixture"))]
+type PreparationGate = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
 /// Agent communication's daemon-wide half (on `AppState.comms`).
-pub(crate) struct Comms {
+pub struct Comms {
     inner: Mutex<CommsState>,
     /// `<data_dir>/workspace` — the Timeline's root; `comms.json` sits
     /// beside each workspace's `timeline.jsonl`.
@@ -230,6 +236,12 @@ pub(crate) struct Comms {
     /// Serializes read-state writes: each writes the state as it is when
     /// its turn comes, so an older snapshot never lands over a newer one.
     writer: tokio::sync::Mutex<()>,
+    /// Detached enqueue tasks are bounded even while actors stop draining.
+    dispatches: Arc<tokio::sync::Semaphore>,
+    #[cfg(any(test, feature = "daemon-extension-fixture"))]
+    preparation_gate: Mutex<Option<PreparationGate>>,
+    #[cfg(test)]
+    dispatch_gate: Mutex<Option<PreparationGate>>,
 }
 
 impl Comms {
@@ -238,7 +250,30 @@ impl Comms {
             inner: Mutex::new(CommsState::default()),
             root,
             writer: tokio::sync::Mutex::new(()),
+            dispatches: Arc::new(tokio::sync::Semaphore::new(64)),
+            #[cfg(any(test, feature = "daemon-extension-fixture"))]
+            preparation_gate: Mutex::new(None),
+            #[cfg(test)]
+            dispatch_gate: Mutex::new(None),
         }
+    }
+
+    #[cfg(any(test, feature = "daemon-extension-fixture"))]
+    pub fn block_dispatches(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.dispatches.clone().try_acquire_many_owned(64).unwrap()
+    }
+
+    #[cfg(feature = "daemon-extension-fixture")]
+    pub fn pause_next_message(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (resume, paused) = tokio::sync::oneshot::channel();
+        *crate::lock(&self.preparation_gate) = Some((entered, paused));
+        (ready, resume)
     }
 
     fn path(&self, ws: &str) -> PathBuf {
@@ -1067,6 +1102,12 @@ pub(crate) async fn message_agent(state: &Arc<AppState>, from_sid: &str, args: &
     let Some(from) = reader(state, from_sid) else {
         return error("this session has no workspace".into());
     };
+    // A project that runs elsewhere, or whose ownership is being verified,
+    // starts no turns here (the same fence every mutation passes).
+    let admission = match state.policy().capture(state, &from.ws) {
+        Ok(admission) => admission,
+        Err(_) => return error("Project execution is paused while ownership is verified".into()),
+    };
     let body = match arg_text(args) {
         Ok(body) => body,
         Err(e) => return error(e),
@@ -1085,6 +1126,14 @@ pub(crate) async fn message_agent(state: &Arc<AppState>, from_sid: &str, args: &
         .get("expect_reply")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    #[cfg(any(test, feature = "daemon-extension-fixture"))]
+    {
+        let gate = crate::lock(&state.comms.preparation_gate).take();
+        if let Some((entered, paused)) = gate {
+            let _ = entered.send(());
+            let _ = paused.await;
+        }
+    }
     ensure_loaded(state, &from.ws).await;
     let msgs = messages(state, &from.ws).await;
     // A reply joins its conversation (the root's seq); a reply to a
@@ -1200,7 +1249,15 @@ pub(crate) async fn message_agent(state: &Arc<AppState>, from_sid: &str, args: &
     }
     let mut outcome = String::new();
     for (target, plan) in targets.iter().zip(plans) {
-        let said = execute(state, &from, target, plan, &posted, thread_key.clone()).await;
+        let said = execute(
+            state,
+            &from,
+            target,
+            plan,
+            &posted,
+            (&admission, thread_key.clone()),
+        )
+        .await;
         if !broadcast {
             outcome = said;
         }
@@ -1239,8 +1296,9 @@ async fn execute(
     target: &Reader,
     plan: Plan,
     posted: &Arc<Entry>,
-    thread: Option<(String, u64)>,
+    execution: (&crate::policy::Admission, Option<(String, u64)>),
 ) -> String {
+    let (admission, thread) = execution;
     match plan {
         Plan::Carrier if target.busy => "it's working; it reads this at its next step".into(),
         Plan::Carrier => {
@@ -1273,14 +1331,15 @@ async fn execute(
                 id: id.clone(),
                 blocks: vec![ContentBlock::Text { text: body }],
             };
-            match state
-                .chat
-                .command_as(
-                    &target.sid,
-                    command,
-                    Some(chimaera_agent::model::ORIGIN_AGENT),
-                )
-                .await
+            match send_guarded(
+                state,
+                target,
+                admission,
+                command,
+                Some(chimaera_agent::model::ORIGIN_AGENT),
+                Some((id.clone(), false)),
+            )
+            .await
             {
                 Ok(()) => "it's working; it reads this at its next step".into(),
                 Err(err) => {
@@ -1297,6 +1356,7 @@ async fn execute(
                 target,
                 Some(&why),
                 chimaera_agent::model::ORIGIN_AGENT,
+                Some(admission),
             )
             .await
             {
@@ -1334,6 +1394,7 @@ async fn execute(
                 target,
                 None,
                 chimaera_agent::model::ORIGIN_MASTERMIND,
+                Some(admission),
             )
             .await
             {
@@ -1382,6 +1443,79 @@ async fn execute(
     }
 }
 
+/// Dispatch after all asynchronous preparation, under the originally captured
+/// authority. The bounded owned enqueue retains the reservation and settles its
+/// inbox claim even when the caller disconnects during the actor queue wait.
+///
+/// These guards hold on a free daemon too: the inert admission still refuses a
+/// fenced project, a session rebound to another workspace is refused, and
+/// delivery runs on a detached task (as do `message_agent`'s capture and
+/// `post_wake`'s same-workspace check); only the cap and deadline are managed-only.
+async fn send_guarded(
+    state: &Arc<AppState>,
+    target: &Reader,
+    admission: &crate::policy::Admission,
+    command: AgentCommand,
+    origin: Option<&'static str>,
+    claim: Option<(String, bool)>,
+) -> Result<(), String> {
+    // The delivery cap and enqueue deadline bound managed execution only; an
+    // unmanaged daemon waits on the actor queue as it always has.
+    let managed = admission.managed(state);
+    let permit = if managed {
+        match state.comms.dispatches.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                if let Some((key, _)) = &claim {
+                    finish(state, key, false);
+                }
+                return Err("agent delivery capacity exhausted".into());
+            }
+        }
+    } else {
+        None
+    };
+    let state = state.clone();
+    let sid = target.sid.clone();
+    let workspace = target.ws.clone();
+    let admission = admission.clone();
+    tokio::spawn(async move {
+        let _permit = permit;
+        #[cfg(test)]
+        {
+            let gate = crate::lock(&state.comms.dispatch_gate).take();
+            if let Some((entered, paused)) = gate {
+                let _ = entered.send(());
+                let _ = paused.await;
+            }
+        }
+        let enqueue = state.chat.command_as_checked(&sid, command, origin, || {
+            let guard = admission.begin(&state)?;
+            anyhow::ensure!(
+                crate::lock(&state.session_workspaces).get(&sid) == Some(&workspace),
+                "workspace execution authority changed"
+            );
+            Ok(guard)
+        });
+        let sent = if managed {
+            tokio::time::timeout(Duration::from_secs(5), enqueue)
+                .await
+                .map_err(|_| "agent command queue timed out".to_string())
+                .and_then(|result| result.map_err(|_| "agent command was refused".to_string()))
+        } else {
+            enqueue.await.map_err(|error| error.to_string())
+        };
+        if let Some((key, settle)) = claim {
+            if settle || sent.is_err() {
+                finish(&state, &key, settle && sent.is_ok());
+            }
+        }
+        sent
+    })
+    .await
+    .map_err(|_| "agent delivery task failed".to_string())?
+}
+
 /// Deliver every unread message to a live chat reader as ONE send (a
 /// turn when it's idle, its next step when it's working), and settle them.
 /// Err when nothing was sent.
@@ -1390,7 +1524,19 @@ async fn deliver_all(
     reader: &Reader,
     why: Option<&str>,
     origin: &'static str,
+    admission: Option<&crate::policy::Admission>,
 ) -> Result<usize, String> {
+    let captured;
+    let admission = match admission {
+        Some(admission) => admission,
+        None => {
+            captured = state
+                .policy()
+                .capture(state, &reader.ws)
+                .map_err(|_| "workspace execution authority changed".to_string())?;
+            &captured
+        }
+    };
     if !reader.chat || !state.chat.get(&reader.sid).is_some_and(|c| c.alive) {
         return Err("not a running chat session".into());
     }
@@ -1403,12 +1549,15 @@ async fn deliver_all(
     let command = AgentCommand::Send {
         blocks: vec![ContentBlock::Text { text: body }],
     };
-    let sent = state
-        .chat
-        .command_as(&reader.sid, command, Some(origin))
-        .await;
-    finish(state, &key, sent.is_ok());
-    sent.map_err(|e| e.to_string())?;
+    send_guarded(
+        state,
+        reader,
+        admission,
+        command,
+        Some(origin),
+        Some((key, true)),
+    )
+    .await?;
     Ok(unread.len())
 }
 
@@ -1535,6 +1684,9 @@ async fn idle_check(state: &Arc<AppState>, sid: &str) {
     if !reader.chat || !reader.alive || reader.busy {
         return;
     }
+    let Ok(admission) = state.policy().capture(state, &reader.ws) else {
+        return;
+    };
     let key = (reader.ws.clone(), reader.sid.clone());
     let awaiting = crate::lock(&state.comms.inner)
         .awaiting
@@ -1624,6 +1776,7 @@ async fn idle_check(state: &Arc<AppState>, sid: &str) {
                 &reader,
                 Some(&why),
                 chimaera_agent::model::ORIGIN_AGENT,
+                Some(&admission),
             )
             .await
             {
@@ -2088,7 +2241,7 @@ pub(crate) async fn post_wake(
     if !enabled(&state) {
         return fail(StatusCode::CONFLICT, OFF);
     }
-    let Some(target) = reader(&state, &req.to_sid) else {
+    let Some(target) = reader(&state, &req.to_sid).filter(|target| target.ws == id) else {
         return fail(StatusCode::CONFLICT, "that agent is gone");
     };
     // The user approved continuing: the conversation's wake count restarts.
@@ -2102,6 +2255,7 @@ pub(crate) async fn post_wake(
         &target,
         Some(why),
         chimaera_agent::model::ORIGIN_AGENT,
+        None,
     )
     .await
     {
@@ -2137,6 +2291,7 @@ pub(crate) async fn post_deliver(
         &target,
         Some(why),
         chimaera_agent::model::ORIGIN_AGENT,
+        None,
     )
     .await
     {
@@ -2167,9 +2322,26 @@ pub(crate) async fn post_deliver(
 pub(crate) async fn deliver(
     State(state): State<Arc<AppState>>,
     Path((id, seq)): Path<(String, u64)>,
+    mutation: Option<axum::Extension<crate::workspace_scope::Mutation>>,
 ) -> Response {
     let Some(workspace) = crate::lock(&state.workspaces).get(&id) else {
         return fail(StatusCode::NOT_FOUND, "unknown workspace");
+    };
+    // A project that runs elsewhere, or whose ownership is being verified,
+    // takes no new turns here (the Pro fence every mutation passes).
+    let _dispatch = match crate::workspace_scope::begin_mutation(&state, &mutation) {
+        Ok(guard)
+            if state
+                .policy()
+                .allows(&state, &id, crate::policy::Need::Execute) =>
+        {
+            guard
+        }
+        _ => return fail(StatusCode::CONFLICT, "workspace_scope_changed"),
+    };
+    let admission = match state.policy().capture(&state, &id) {
+        Ok(admission) => admission,
+        Err(_) => return fail(StatusCode::CONFLICT, "workspace_scope_changed"),
     };
     let (page, _) = state
         .timeline
@@ -2229,7 +2401,13 @@ pub(crate) async fn deliver(
         .delivery
         .is_some()
         .then_some(chimaera_agent::model::ORIGIN_AGENT);
-    match state.chat.command_as(&target, command, origin).await {
+    let Some(target_reader) = reader(&state, &target).filter(|reader| reader.ws == id) else {
+        return fail(
+            StatusCode::CONFLICT,
+            "the recipient is not in this workspace",
+        );
+    };
+    match send_guarded(&state, &target_reader, &admission, command, origin, None).await {
         Ok(()) => {
             tracing::info!(workspace = %id, note = seq, target = %target, "note delivered by the user");
             crate::history::act(
@@ -2337,6 +2515,48 @@ mod tests {
             delivery: Some("inbox".into()),
         });
         Arc::new(e)
+    }
+
+    /// An unmanaged daemon has no delivery cap: a send is never refused as
+    /// "capacity exhausted", it reaches the chat actor as before.
+    #[tokio::test]
+    async fn unmanaged_delivery_ignores_the_managed_capacity_cap() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-comms-free-cap-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let state = Arc::new(AppState::new(
+            "fixture".into(),
+            "fixture".into(),
+            4242,
+            0,
+            root.clone(),
+            root.join("config"),
+        ));
+        let target = reader("s-b");
+        crate::lock(&state.session_workspaces).insert(target.sid.clone(), target.ws.clone());
+        let admission = state.policy().capture(&state, "w").unwrap();
+        let occupied = state.comms.block_dispatches();
+        let error = send_guarded(
+            &state,
+            &target,
+            &admission,
+            AgentCommand::Send {
+                blocks: vec![ContentBlock::Text {
+                    text: "synthetic free delivery".into(),
+                }],
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        // No actor exists: the refusal is the chat manager's own, not a cap.
+        assert_ne!(error, "agent delivery capacity exhausted");
+        assert_ne!(error, "agent command was refused");
+        drop(occupied);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

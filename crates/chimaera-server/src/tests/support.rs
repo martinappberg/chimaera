@@ -1,22 +1,23 @@
 use crate::*;
 
-pub(super) use std::path::PathBuf;
-pub(super) use std::sync::Arc;
-pub(super) use tokio::net::TcpListener;
+pub use std::path::PathBuf;
+pub use std::sync::Arc;
+pub use tokio::net::TcpListener;
 
-pub(super) use axum::body::Body;
-pub(super) use axum::http::{header, Method, Request, StatusCode};
-pub(super) use http_body_util::BodyExt;
-pub(super) use tower::ServiceExt;
+pub use axum::body::Body;
+pub use axum::http::{header, Method, Request, StatusCode};
+pub use http_body_util::BodyExt;
+pub use tower::ServiceExt;
 
-/// Fresh temp directory, unique per call within this test process.
-pub(super) fn test_dir(label: &str) -> PathBuf {
+/// Fresh even when the OS reuses a PID from an earlier test run.
+pub fn test_dir(label: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(
-        "chimaera-server-test-{}-{label}-{}",
+        "chimaera-server-test-{}-{label}-{}-{}",
         std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
+        COUNTER.fetch_add(1, Ordering::Relaxed),
+        chimaera_core::generate_token(),
     ));
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -25,47 +26,66 @@ pub(super) fn test_dir(label: &str) -> PathBuf {
 /// Test state with its workspace registry persisted under a temp dir
 /// (equivalent to pointing data_dir at a temp HOME, without the global
 /// env-var mutation that races across parallel tests).
-pub(super) fn test_state() -> Arc<AppState> {
+pub fn test_state() -> Arc<AppState> {
     test_state_with_port(0)
 }
 
-pub(super) fn test_state_with_port(port: u16) -> Arc<AppState> {
+pub fn test_state_with_port(port: u16) -> Arc<AppState> {
     test_state_with_data_dir(port, test_dir("data"))
 }
 
-pub(super) fn test_state_with_data_dir(port: u16, data_dir: PathBuf) -> Arc<AppState> {
+pub fn test_state_with_data_dir(port: u16, data_dir: PathBuf) -> Arc<AppState> {
+    Arc::new(fixture_state(port, data_dir))
+}
+
+fn fixture_state(port: u16, data_dir: PathBuf) -> AppState {
     let config_dir = data_dir.join("config");
-    Arc::new(AppState::new(
+    let provider_home = data_dir.join("provider-home");
+    let managed_root = data_dir.join("managed-agents");
+    let scheduler_tools = data_dir.join("scheduler-tools");
+    std::fs::create_dir_all(&scheduler_tools).unwrap();
+    let mut state = AppState::new(
         "test-token".to_string(),
         "testhost".to_string(),
         4242,
         port,
         data_dir,
         config_dir,
-    ))
+    );
+    state.claude_projects_dir = provider_home.join(".claude/projects");
+    state.claude_settings_path = provider_home.join(".claude/settings.json");
+    state.codex_config_path = provider_home.join(".codex/config.toml");
+    // Spawns acquire runtime leases even for synthetic executables.
+    state.managed_root = managed_root;
+    state.legacy_managed_root = None;
+    // These API fixtures need real Git, not ambient login rc or cluster tools.
+    // Keep settings empty and leave dedicated resolver/compute tests unchanged.
+    let git_name = format!("git{}", std::env::consts::EXE_SUFFIX);
+    let git = std::env::split_paths(&std::env::var_os("PATH").expect("fixture PATH"))
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(&git_name))
+        .find(|path| crate::launcher::is_executable(path))
+        .expect("fixture Git must be installed")
+        .canonicalize()
+        .unwrap();
+    state.git = crate::git::GitService::with_fixture_git(git);
+    state.compute = crate::compute::ComputeService::with_bindir(scheduler_tools);
+    state
 }
 
 /// Test state with the Claude transcript store pointed at a fixture dir
 /// (equivalent to pointing HOME at a temp dir, without the global
 /// env-var mutation that races across parallel tests).
-pub(super) fn test_state_with_claude_store(store: PathBuf) -> Arc<AppState> {
+pub fn test_state_with_claude_store(store: PathBuf) -> Arc<AppState> {
     let data = test_dir("data");
-    let config = data.join("config");
-    let mut state = AppState::new(
-        "test-token".to_string(),
-        "testhost".to_string(),
-        4242,
-        0,
-        data,
-        config,
-    );
+    let mut state = fixture_state(0, data);
     state.claude_projects_dir = store;
     Arc::new(state)
 }
 
 /// `request`, answering a trust prompt as the user's Trust click would: a
 /// 409 carrying `trust` is sent again with the digest it asked about.
-pub(super) async fn request_trusting(
+pub async fn request_trusting(
     state: &Arc<AppState>,
     method: Method,
     uri: &str,
@@ -80,7 +100,7 @@ pub(super) async fn request_trusting(
     request(state, method, uri, Some(body)).await
 }
 
-pub(super) async fn request(
+pub async fn request(
     state: &Arc<AppState>,
     method: Method,
     uri: &str,
@@ -116,7 +136,7 @@ pub(super) async fn request(
 }
 
 /// Next frame from a tungstenite client stream, with a 10s timeout.
-pub(super) async fn next_ws_frame<S>(socket: &mut S) -> tokio_tungstenite::tungstenite::Message
+pub async fn next_ws_frame<S>(socket: &mut S) -> tokio_tungstenite::tungstenite::Message
 where
     S: futures::Stream<
             Item = Result<
@@ -135,7 +155,7 @@ where
 
 /// Spawn a real shell session tagged as an agent (synthetic record with a
 /// known hook key), without needing a claude binary.
-pub(super) fn inject_agent(state: &Arc<AppState>, key: &str) -> String {
+pub fn inject_agent(state: &Arc<AppState>, key: &str) -> String {
     inject_agent_running(state, key, None)
 }
 
@@ -144,7 +164,7 @@ pub(super) fn inject_agent(state: &Arc<AppState>, key: &str) -> String {
 /// shell's rc (Ubuntu's sets `user@host: dir` with every prompt) writes one
 /// whenever the shell gets there, so a test reading the name must not have
 /// a shell underneath.
-pub(super) fn inject_silent_agent(state: &Arc<AppState>, key: &str) -> String {
+pub fn inject_silent_agent(state: &Arc<AppState>, key: &str) -> String {
     inject_agent_running(state, key, Some(vec!["sleep".into(), "600".into()]))
 }
 
@@ -173,7 +193,7 @@ fn inject_agent_running(state: &Arc<AppState>, key: &str, command: Option<Vec<St
 /// Preset the launcher's detection cache for one agent, so tests never
 /// hit the real login shell (the same isolation idea as
 /// `test_state_with_data_dir`: no global env mutation).
-pub(super) fn preset_agent(
+pub fn preset_agent(
     state: &Arc<AppState>,
     kind: agents::AgentKind,
     path: Result<PathBuf, String>,
@@ -198,7 +218,7 @@ pub(super) fn preset_agent(
 }
 
 /// The session entry for `id` from GET /api/v1/sessions.
-pub(super) async fn session_entry(state: &Arc<AppState>, id: &str) -> serde_json::Value {
+pub async fn session_entry(state: &Arc<AppState>, id: &str) -> serde_json::Value {
     let (status, list) = request(state, Method::GET, "/api/v1/sessions", None).await;
     assert_eq!(status, StatusCode::OK);
     list.as_array()
@@ -209,12 +229,13 @@ pub(super) async fn session_entry(state: &Arc<AppState>, id: &str) -> serde_json
         .unwrap_or_else(|| panic!("session {id} not listed in {list}"))
 }
 
+#[cfg(test)]
 /// Install a first-party plugin as `chimaera plugin add --path` would: the
 /// release the lock pins, which `scripts/build-plugins.sh` laid out in
 /// `plugins/dist-test/<id>` (its SHA256SUMS included, so the copy is
 /// verified). The daemon carries no plugin of its own. Already installed:
 /// nothing to do.
-pub(super) async fn install_first_party(state: &Arc<AppState>, id: &str) {
+pub async fn install_first_party(state: &Arc<AppState>, id: &str) {
     if state.plugin_catalog.installed_copy(id).is_some() {
         return;
     }
@@ -230,7 +251,7 @@ pub(super) async fn install_first_party(state: &Arc<AppState>, id: &str) {
 }
 
 /// Register a workspace and return its id.
-pub(super) async fn make_workspace(state: &Arc<AppState>, label: &str) -> String {
+pub async fn make_workspace(state: &Arc<AppState>, label: &str) -> String {
     let root = test_dir(label);
     let (status, ws) = request(
         state,
@@ -246,7 +267,7 @@ pub(super) async fn make_workspace(state: &Arc<AppState>, label: &str) -> String
 /// Plant a dead-session-to-be agent record: the maps hold what the watch
 /// loop would see at the death tick (no live PTY needed — retire never
 /// touches the session manager).
-pub(super) fn plant_agent_record(
+pub fn plant_agent_record(
     state: &Arc<AppState>,
     session_id: &str,
     workspace_id: &str,
@@ -261,10 +282,7 @@ pub(super) fn plant_agent_record(
     lock(&state.session_workspaces).insert(session_id.to_string(), workspace_id.to_string());
 }
 
-pub(super) async fn recents_of(
-    state: &Arc<AppState>,
-    workspace_id: &str,
-) -> Vec<serde_json::Value> {
+pub async fn recents_of(state: &Arc<AppState>, workspace_id: &str) -> Vec<serde_json::Value> {
     let (status, body) = request(
         state,
         Method::GET,
@@ -277,7 +295,7 @@ pub(super) async fn recents_of(
 }
 
 /// Write one transcript fixture and backdate its mtime.
-pub(super) fn write_transcript(dir: &std::path::Path, name: &str, body: &str, secs_ago: u64) {
+pub fn write_transcript(dir: &std::path::Path, name: &str, body: &str, secs_ago: u64) {
     let path = dir.join(format!("{name}.jsonl"));
     std::fs::write(&path, body).unwrap();
     let mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(secs_ago);
@@ -287,7 +305,7 @@ pub(super) fn write_transcript(dir: &std::path::Path, name: &str, body: &str, se
 }
 
 /// POST a synthetic hook payload to the ingest endpoint.
-pub(super) async fn post_hook(
+pub async fn post_hook(
     state: &Arc<AppState>,
     id: &str,
     key: &str,
@@ -306,11 +324,7 @@ pub(super) async fn post_hook(
 /// Spawn a real bash (no rc files, so no OSC titles interfere) at `root`,
 /// map it to `workspace_id`, and start the naming watcher — the shell
 /// equivalent of `inject_agent`.
-pub(super) fn inject_shell(
-    state: &Arc<AppState>,
-    root: &std::path::Path,
-    workspace_id: &str,
-) -> String {
+pub fn inject_shell(state: &Arc<AppState>, root: &std::path::Path, workspace_id: &str) -> String {
     let info = state
         .sessions
         .spawn(chimaera_pty::SpawnOpts {
@@ -335,7 +349,7 @@ pub(super) fn inject_shell(
 }
 
 /// Poll GET /api/v1/sessions until the session's display_name matches.
-pub(super) async fn wait_display_name(state: &Arc<AppState>, id: &str, expected: &str) {
+pub async fn wait_display_name(state: &Arc<AppState>, id: &str, expected: &str) {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         let entry = session_entry(state, id).await;
@@ -352,7 +366,7 @@ pub(super) async fn wait_display_name(state: &Arc<AppState>, id: &str, expected:
 }
 
 /// Poll GET /api/v1/sessions until the session's cwd_current matches.
-pub(super) async fn wait_cwd_current(state: &Arc<AppState>, id: &str, expected: &std::path::Path) {
+pub async fn wait_cwd_current(state: &Arc<AppState>, id: &str, expected: &std::path::Path) {
     let expected = serde_json::json!(expected);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
@@ -370,7 +384,7 @@ pub(super) async fn wait_cwd_current(state: &Arc<AppState>, id: &str, expected: 
 }
 
 /// Spawn an integrated bash with a hermetic HOME and wait for `ready`.
-pub(super) async fn spawn_integrated_bash(state: &Arc<AppState>, label: &str) -> String {
+pub async fn spawn_integrated_bash(state: &Arc<AppState>, label: &str) -> String {
     let base = test_dir(&format!("{label}-base"));
     let home = test_dir(&format!("{label}-home"));
     let launch = chimaera_core::shellint::shell_launch_for("/bin/bash", &base).expect("launch");
@@ -407,7 +421,7 @@ pub(super) async fn spawn_integrated_bash(state: &Arc<AppState>, label: &str) ->
 /// stays alive swallowing stdin, so spawn-path route tests run hermetically.
 /// Protocol depth lives in chimaera-agent's scripted `fake-claude`; this is
 /// just enough for "the driver spawned and registered".
-pub(super) fn write_fake_claude(label: &str) -> PathBuf {
+pub fn write_fake_claude(label: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let path = test_dir(label).join("claude");
     std::fs::write(
@@ -422,7 +436,7 @@ pub(super) fn write_fake_claude(label: &str) -> PathBuf {
 }
 
 /// POST one JSON-RPC message to an agent's MCP endpoint.
-pub(super) async fn mcp_post(
+pub async fn mcp_post(
     state: &Arc<AppState>,
     agent_id: &str,
     key: &str,
@@ -438,7 +452,7 @@ pub(super) async fn mcp_post(
 }
 
 /// Call an MCP tool and return (isError, text content).
-pub(super) async fn mcp_tool_call(
+pub async fn mcp_tool_call(
     state: &Arc<AppState>,
     agent_id: &str,
     key: &str,
@@ -467,7 +481,7 @@ pub(super) async fn mcp_tool_call(
 
 /// Synthetic PostToolUse payload for a file-writing tool, shaped like
 /// the real hook payloads (top-level tool_name + tool_input).
-pub(super) fn touch_payload(tool: &str, field: &str, path: &str) -> serde_json::Value {
+pub fn touch_payload(tool: &str, field: &str, path: &str) -> serde_json::Value {
     serde_json::json!({
         "hook_event_name": "PostToolUse",
         "tool_name": tool,
@@ -476,7 +490,7 @@ pub(super) fn touch_payload(tool: &str, field: &str, path: &str) -> serde_json::
 }
 
 /// Create a temp repo with one commit; returns (repo dir, git runner).
-pub(super) fn init_temp_repo(label: &str) -> PathBuf {
+pub fn init_temp_repo(label: &str) -> PathBuf {
     let repo = test_dir(label);
     let git = |args: &[&str]| {
         let out = std::process::Command::new("git")
@@ -504,7 +518,7 @@ pub(super) fn init_temp_repo(label: &str) -> PathBuf {
 }
 
 /// Percent-encode a path for a query string (tests only).
-pub(super) fn urlencode(s: &str) -> String {
+pub fn urlencode(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
@@ -517,7 +531,7 @@ pub(super) fn urlencode(s: &str) -> String {
 
 /// Like `request`, but returns the raw response: status, headers, bytes.
 /// `token: None` sends no Authorization header (for /raw).
-pub(super) async fn request_bytes(
+pub async fn request_bytes(
     state: &Arc<AppState>,
     method: Method,
     uri: &str,
@@ -537,7 +551,7 @@ pub(super) async fn request_bytes(
     (status, headers, bytes)
 }
 
-pub(super) fn header_str<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> &'a str {
+pub fn header_str<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> &'a str {
     headers
         .get(name)
         .unwrap_or_else(|| panic!("missing header {name}"))
@@ -546,7 +560,7 @@ pub(super) fn header_str<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> 
 }
 
 /// Gzip `content`, optionally recording `fname` as the member's FNAME.
-pub(super) fn gzip_bytes(content: &[u8], fname: Option<&str>) -> Vec<u8> {
+pub fn gzip_bytes(content: &[u8], fname: Option<&str>) -> Vec<u8> {
     use std::io::Write;
     let mut builder = flate2::GzBuilder::new();
     if let Some(name) = fname {
@@ -558,7 +572,7 @@ pub(super) fn gzip_bytes(content: &[u8], fname: Option<&str>) -> Vec<u8> {
 }
 
 /// PUT raw bytes with the bearer token; returns status, headers, body.
-pub(super) async fn put_raw(
+pub async fn put_raw(
     state: &Arc<AppState>,
     uri: &str,
     body: Vec<u8>,
@@ -582,8 +596,322 @@ pub(super) async fn put_raw(
 
 /// Age a file's mtime by `secs` so second-resolution ranking tests do not
 /// have to sleep.
-pub(super) fn age_file(path: &std::path::Path, secs: u64) {
+pub fn age_file(path: &std::path::Path, secs: u64) {
     let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
     file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(secs))
         .unwrap();
+}
+
+/// The inert policy with the overrides a test needs: refuse the last hold
+/// before a launch spawns, and/or admit scoped (project-window) requests.
+/// Everything else is exactly the inert policy.
+pub struct TestPolicy {
+    pub inner: crate::policy::Inert,
+    pub refuse_hold: bool,
+    pub admit_scopes: bool,
+}
+
+impl Default for TestPolicy {
+    fn default() -> Self {
+        Self {
+            inner: crate::policy::Inert::new(Default::default()),
+            refuse_hold: false,
+            admit_scopes: false,
+        }
+    }
+}
+
+/// Run `state` under `policy` (before anything read the default one).
+pub fn use_test_policy(state: &Arc<AppState>, policy: TestPolicy) {
+    assert!(
+        state.policy.set(Arc::new(policy)).is_ok(),
+        "policy already chosen"
+    );
+}
+
+mod test_policy {
+    use super::TestPolicy;
+    use crate::policy::*;
+    use crate::AppState;
+    use std::sync::Arc;
+
+    impl WorkspacePolicy for TestPolicy {
+        fn hold_session<'a>(
+            &'a self,
+            state: &'a AppState,
+            workspace: &str,
+            session: &str,
+            native: Option<&str>,
+            read: bool,
+        ) -> anyhow::Result<Hold<'a>> {
+            anyhow::ensure!(read || !self.refuse_hold, "refused by the test policy");
+            self.inner
+                .hold_session(state, workspace, session, native, read)
+        }
+        fn scope_admission(
+            &self,
+            state: &AppState,
+            workspace: &str,
+            epoch: u64,
+        ) -> anyhow::Result<Admission> {
+            if self.admit_scopes {
+                Ok(Admission::inert(workspace))
+            } else {
+                self.inner.scope_admission(state, workspace, epoch)
+            }
+        }
+        fn scope_check(&self, state: &AppState, workspace: &str, epoch: u64) -> anyhow::Result<()> {
+            if self.admit_scopes {
+                Ok(())
+            } else {
+                self.inner.scope_check(state, workspace, epoch)
+            }
+        }
+        fn composed(&self, state: &AppState) -> bool {
+            self.inner.composed(state)
+        }
+        fn active(&self, state: &AppState) -> bool {
+            self.inner.active(state)
+        }
+        fn started(&self, state: &Arc<AppState>) -> anyhow::Result<()> {
+            self.inner.started(state)
+        }
+        fn stopping(&self, state: &AppState) {
+            self.inner.stopping(state)
+        }
+        fn shutdown<'a>(&'a self, state: &'a Arc<AppState>) -> BoxFuture<'a, ()> {
+            self.inner.shutdown(state)
+        }
+        fn health(&self, state: &AppState, body: &mut serde_json::Value) {
+            self.inner.health(state, body)
+        }
+        fn routes(&self, state: &Arc<AppState>) -> axum::Router<Arc<AppState>> {
+            self.inner.routes(state)
+        }
+        fn api_layers(
+            &self,
+            state: &Arc<AppState>,
+            api: axum::Router<Arc<AppState>>,
+        ) -> axum::Router<Arc<AppState>> {
+            self.inner.api_layers(state, api)
+        }
+        fn ticket_layers(
+            &self,
+            state: &Arc<AppState>,
+            routes: axum::Router<Arc<AppState>>,
+        ) -> axum::Router<Arc<AppState>> {
+            self.inner.ticket_layers(state, routes)
+        }
+        fn outer_layers(&self, app: axum::Router) -> axum::Router {
+            self.inner.outer_layers(app)
+        }
+        fn allows(&self, state: &AppState, workspace: &str, need: Need) -> bool {
+            self.inner.allows(state, workspace, need)
+        }
+        fn reserve(
+            &self,
+            state: &AppState,
+            workspace: &str,
+            kind: LaunchKind,
+        ) -> anyhow::Result<Option<Reservation>> {
+            self.inner.reserve(state, workspace, kind)
+        }
+        fn admit_launch<'a>(
+            &'a self,
+            state: &'a Arc<AppState>,
+            workspace: &'a str,
+            kind: LaunchKind,
+        ) -> BoxFuture<'a, anyhow::Result<(Launch, Option<Reservation>)>> {
+            self.inner.admit_launch(state, workspace, kind)
+        }
+        fn check_import(
+            &self,
+            state: &AppState,
+            session: &str,
+            native: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.inner.check_import(state, session, native)
+        }
+        fn capture(&self, state: &AppState, workspace: &str) -> anyhow::Result<Admission> {
+            self.inner.capture(state, workspace)
+        }
+        fn capture_command(
+            &self,
+            state: &AppState,
+            workspace: &str,
+        ) -> anyhow::Result<Option<Admission>> {
+            self.inner.capture_command(state, workspace)
+        }
+        fn run_reserved<'a>(
+            &'a self,
+            reservation: Reservation,
+            operation: BoxFuture<'a, axum::response::Response>,
+        ) -> BoxFuture<'a, axum::response::Response> {
+            self.inner.run_reserved(reservation, operation)
+        }
+        fn launch_context(&self, state: &AppState, workspace: &str) -> LaunchContext {
+            self.inner.launch_context(state, workspace)
+        }
+        fn launch_env<'a>(
+            &'a self,
+            state: &'a AppState,
+            workspace: &'a str,
+            env: &'a mut Vec<(String, String)>,
+            remove: &'a mut Vec<String>,
+        ) -> BoxFuture<'a, anyhow::Result<()>> {
+            self.inner.launch_env(state, workspace, env, remove)
+        }
+        fn updates_managed(&self, state: &AppState) -> bool {
+            self.inner.updates_managed(state)
+        }
+        fn codex_notify_args<'a>(
+            &'a self,
+            state: &'a AppState,
+            workspace: &'a str,
+            session: &'a str,
+            key: &'a str,
+        ) -> BoxFuture<'a, Vec<String>> {
+            self.inner.codex_notify_args(state, workspace, session, key)
+        }
+        fn session_retired(&self, state: &AppState, session: &str) {
+            self.inner.session_retired(state, session)
+        }
+        fn held_at_boot(&self, state: &AppState, entry: &crate::ledger::LedgerEntry) {
+            self.inner.held_at_boot(state, entry)
+        }
+        fn restored(&self, state: &Arc<AppState>) {
+            self.inner.restored(state)
+        }
+        fn may_resume(&self, state: &AppState, entry: &crate::ledger::LedgerEntry) -> bool {
+            self.inner.may_resume(state, entry)
+        }
+        fn resume_check(
+            &self,
+            state: &AppState,
+            entry: &crate::ledger::LedgerEntry,
+        ) -> anyhow::Result<()> {
+            self.inner.resume_check(state, entry)
+        }
+        fn workspace_resuming(&self, state: &AppState, workspace: &str) {
+            self.inner.workspace_resuming(state, workspace)
+        }
+        fn session_pause(
+            &self,
+            state: &AppState,
+            id: &str,
+            entry: Option<&crate::ledger::LedgerEntry>,
+        ) -> Option<serde_json::Value> {
+            self.inner.session_pause(state, id, entry)
+        }
+        fn owner(&self, state: &AppState, workspace: &str) -> Option<&'static str> {
+            self.inner.owner(state, workspace)
+        }
+        fn refusal(&self, state: &AppState, id: &str, watching: bool) -> serde_json::Value {
+            self.inner.refusal(state, id, watching)
+        }
+        fn acted(&self, state: &AppState, workspace: &str) {
+            self.inner.acted(state, workspace)
+        }
+        fn decorate_sessions(
+            &self,
+            state: &AppState,
+            rows: &mut Vec<(u64, serde_json::Value)>,
+        ) -> Vec<serde_json::Value> {
+            self.inner.decorate_sessions(state, rows)
+        }
+        fn decorate_workspace(
+            &self,
+            state: &AppState,
+            workspace: &str,
+            value: &mut serde_json::Value,
+        ) {
+            self.inner.decorate_workspace(state, workspace, value)
+        }
+        fn routed(&self, state: &AppState, workspace: &str) -> bool {
+            self.inner.routed(state, workspace)
+        }
+        fn outside_project(
+            &self,
+            state: &AppState,
+            workspace: &str,
+            paths: &[String],
+        ) -> Vec<String> {
+            self.inner.outside_project(state, workspace, paths)
+        }
+        fn project_feed(
+            &self,
+            state: &Arc<AppState>,
+            workspace: &str,
+            files: Vec<String>,
+            dirs: Vec<String>,
+        ) -> Option<Box<dyn ProjectFeed>> {
+            self.inner.project_feed(state, workspace, files, dirs)
+        }
+        fn proxy_socket<'a>(
+            &'a self,
+            state: &'a Arc<AppState>,
+            session: &'a str,
+            kind: &'a str,
+            options: &'a crate::ws::SocketOptions,
+            auth: serde_json::Value,
+            socket: &'a mut axum::extract::ws::WebSocket,
+        ) -> BoxFuture<'a, bool> {
+            self.inner
+                .proxy_socket(state, session, kind, options, auth, socket)
+        }
+        fn routed_decisions(&self, state: &AppState) -> Vec<(String, String)> {
+            self.inner.routed_decisions(state)
+        }
+        fn scope_renewing(&self, state: &AppState, workspace: &str, epoch: u64) -> bool {
+            self.inner.scope_renewing(state, workspace, epoch)
+        }
+        fn await_scope_renewal<'a>(
+            &'a self,
+            state: &'a AppState,
+            workspace: &'a str,
+            epoch: u64,
+        ) -> BoxFuture<'a, bool> {
+            self.inner.await_scope_renewal(state, workspace, epoch)
+        }
+        fn tools(&self, state: &AppState, session: &str) -> Vec<serde_json::Value> {
+            self.inner.tools(state, session)
+        }
+        fn call_tool<'a>(
+            &'a self,
+            state: &'a Arc<AppState>,
+            session: &'a str,
+            name: &'a str,
+            args: &'a serde_json::Value,
+        ) -> Option<BoxFuture<'a, serde_json::Value>> {
+            self.inner.call_tool(state, session, name, args)
+        }
+        fn auto_tools(&self, state: &AppState, workspace: &str) -> Vec<String> {
+            self.inner.auto_tools(state, workspace)
+        }
+        fn start_note<'a>(
+            &'a self,
+            state: &'a AppState,
+            workspace: &'a str,
+            session: &'a str,
+        ) -> BoxFuture<'a, Option<StartNote>> {
+            self.inner.start_note(state, workspace, session)
+        }
+        fn note_told<'a>(&'a self, state: &'a AppState, note: &'a StartNote) -> BoxFuture<'a, ()> {
+            self.inner.note_told(state, note)
+        }
+        fn reads_folder_identity(&self, state: &AppState) -> bool {
+            self.inner.reads_folder_identity(state)
+        }
+        fn workspace_known(&self, state: &AppState, workspace: &str) {
+            self.inner.workspace_known(state, workspace)
+        }
+        fn workspace_opened<'a>(
+            &'a self,
+            state: &'a Arc<AppState>,
+            workspace: &'a crate::workspaces::Workspace,
+            registered: Option<bool>,
+        ) -> BoxFuture<'a, ()> {
+            self.inner.workspace_opened(state, workspace, registered)
+        }
+    }
 }

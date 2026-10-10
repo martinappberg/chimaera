@@ -105,7 +105,7 @@ struct ProxyEntry {
 /// In-memory registry of proxy sessions. Bearer-authed routes mint and revoke
 /// entries; the unauthenticated data plane only ever looks ids up.
 #[derive(Default)]
-pub(crate) struct ProxyStore {
+pub struct ProxyStore {
     entries: HashMap<String, ProxyEntry>,
     tunnels: Arc<AtomicUsize>,
 }

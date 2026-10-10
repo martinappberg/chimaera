@@ -9,7 +9,13 @@ import {
   Reconnector,
   reconnectingSockets,
   nudgeReconnectors,
+  OwnerWait,
+  ownerAwake,
+  QUIET_OPEN_MS,
+  parkUntilAwake,
+  refetchWhenOwnerAwake,
   retryDelayMs,
+  setSocketKeepers,
 } from "./reconnect";
 
 /**
@@ -203,5 +209,147 @@ describe("Reconnector under a hidden document", () => {
     expect(retries).toBe(3);
     r.cancel();
     r.clear();
+  });
+});
+
+describe("sockets waiting on a sleeping owner", () => {
+  it("run no timer, dial once each when the owner answers, and a left wait is forgotten", () => {
+    vi.useFakeTimers();
+    try {
+      const first = vi.fn();
+      const left = vi.fn();
+      parkUntilAwake(first);
+      const leave = parkUntilAwake(left);
+      leave();
+      expect(vi.getTimerCount()).toBe(0);
+      ownerAwake(() => 0.5);
+      vi.advanceTimersByTime(1_000);
+      expect(first).toHaveBeenCalledOnce();
+      expect(left).not.toHaveBeenCalled();
+      // Dialed once: a second sign does not dial it again.
+      ownerAwake(() => 0);
+      vi.advanceTimersByTime(1_000);
+      expect(first).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("a surface re-read after its owner slept", () => {
+  let visibility: "visible" | "hidden";
+  let listeners: (() => void)[];
+  beforeEach(() => {
+    visibility = "visible";
+    listeners = [];
+    vi.useFakeTimers();
+    (globalThis as Record<string, unknown>).document = {
+      get visibilityState() {
+        return visibility;
+      },
+      addEventListener: (_type: string, fn: () => void) => {
+        listeners.push(fn);
+      },
+      removeEventListener: (_type: string, fn: () => void) => {
+        listeners = listeners.filter((l) => l !== fn);
+      },
+    };
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    delete (globalThis as Record<string, unknown>).document;
+  });
+
+  it("reads again once the owner answers, no timer while it sleeps, one read per park", () => {
+    const refetch = vi.fn();
+    refetchWhenOwnerAwake(refetch);
+    expect(vi.getTimerCount()).toBe(0);
+    ownerAwake(() => 0);
+    vi.advanceTimersByTime(1_000);
+    expect(refetch).toHaveBeenCalledOnce();
+    // A second sign does not read again: a read that finds it asleep parks anew.
+    ownerAwake(() => 0);
+    vi.advanceTimersByTime(1_000);
+    expect(refetch).toHaveBeenCalledOnce();
+  });
+
+  it("asks once more on its own only when told to, and only while the document is seen", () => {
+    const refetch = vi.fn();
+    refetchWhenOwnerAwake(refetch, { pollMs: 30_000 });
+    vi.advanceTimersByTime(29_999);
+    expect(refetch).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(refetch).toHaveBeenCalledOnce();
+    // The poll and the wake are one read, never two.
+    ownerAwake(() => 0);
+    vi.advanceTimersByTime(1_000);
+    expect(refetch).toHaveBeenCalledOnce();
+
+    const hidden = vi.fn();
+    refetchWhenOwnerAwake(hidden, { pollMs: 30_000 });
+    visibility = "hidden";
+    vi.advanceTimersByTime(60_000);
+    expect(hidden).not.toHaveBeenCalled();
+    visibility = "visible";
+    for (const l of [...listeners]) l();
+    expect(hidden).toHaveBeenCalledOnce();
+  });
+
+  it("waits for the document to be seen, and a cancelled wait never reads", () => {
+    const refetch = vi.fn();
+    refetchWhenOwnerAwake(refetch);
+    visibility = "hidden";
+    ownerAwake(() => 0);
+    vi.advanceTimersByTime(1_000);
+    expect(refetch).not.toHaveBeenCalled();
+    visibility = "visible";
+    for (const l of [...listeners]) l();
+    expect(refetch).toHaveBeenCalledOnce();
+    expect(listeners).toHaveLength(0);
+
+    const cancelled = vi.fn();
+    const cancel = refetchWhenOwnerAwake(cancelled);
+    cancel();
+    ownerAwake(() => 0);
+    vi.advanceTimersByTime(1_000);
+    expect(cancelled).not.toHaveBeenCalled();
+  });
+});
+
+describe("OwnerWait", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => { vi.useRealTimers(); setSocketKeepers(false); });
+
+  it("dials once when the owner answers, and never after it stops waiting", () => {
+    const wait = new OwnerWait();
+    const dial = vi.fn();
+    wait.park(dial);
+    expect(wait.parked).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+    ownerAwake(() => 0);
+    vi.advanceTimersByTime(0);
+    expect(dial).toHaveBeenCalledOnce();
+    expect(wait.parked).toBe(false);
+    const late = vi.fn();
+    wait.park(late);
+    wait.stopPark();
+    ownerAwake(() => 0);
+    vi.advanceTimersByTime(0);
+    expect(late).not.toHaveBeenCalled();
+  });
+
+  it("counts a quiet socket as kept only where a keeper may hold it", () => {
+    const wait = new OwnerWait();
+    const kept = vi.fn();
+    wait.awaitQuiet(kept);
+    expect(vi.getTimerCount()).toBe(0);
+    setSocketKeepers(true);
+    wait.awaitQuiet(kept);
+    vi.advanceTimersByTime(QUIET_OPEN_MS);
+    expect(kept).toHaveBeenCalledOnce();
+    wait.awaitQuiet(kept);
+    wait.stopQuiet();
+    vi.advanceTimersByTime(QUIET_OPEN_MS);
+    expect(kept).toHaveBeenCalledOnce();
   });
 });

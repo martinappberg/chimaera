@@ -193,6 +193,15 @@ plane `ANY /proxy/{id}[/{*path}]`; agent-opened panes add the MCP `open_browser`
   appears only when the URL is actually proxyable, so the menu never offers a pane that
   would just show "can't reach".
 
+## Routed project limitation
+
+Automatic `open_browser` works on a direct connection to the daemon that owns
+its calling session, including a direct SSH/Slurm daemon connection. A project
+view routed through another computer or an account workspace gateway does not
+yet have an owner-bound scoped proxy ticket route. These automatic notices are
+dropped, never replayed or interpreted as the laptop's `localhost`; passive
+events do not wake an owner. Direct local browser panes remain available.
+
 ## Key constraints
 
 - **Same-origin is deliberate, and for the real cases it costs nothing.** The proxied app

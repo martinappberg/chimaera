@@ -1,6 +1,6 @@
 # Clusters (HPC + Slurm)
 
-On a cluster — a host whose login shell reaches a batch scheduler — **nothing of
+With direct SSH, on a cluster — a host whose login shell reaches a batch scheduler — **nothing of
 Chimaera's keeps running on the login node**. You start Slurm **jobs**, and open
 **workspaces** inside them: each job runs `chimaera job-host` on its compute node, which
 runs one `chimaera serve` per open workspace. The app (or the CLI) starts, lists, opens and
@@ -19,6 +19,27 @@ notifications in `crates/chimaera-app/src/shell/cluster.rs`; the CLI in
 `crates/chimaera/src/compute.rs`; the UI's cluster page, start sheet and folder picker
 under `web-ui/src/lib/workspace/`; a workspace chimaera's side (its job, agent context,
 startup commands, the lease) in `crates/chimaera-server/src/{compute,lifecycle,environment}.rs`.
+
+## Kept cluster connections
+
+A capability-confirmed keeper uses the same Jobs page and job-host APIs through
+exact host/job/workspace Link routes. Its allocation hold and compute tunnel
+survive closing the Mac app, including interactive jobs. The native adapter keeps
+bearers outside page overviews, retires listeners on account changes or route
+replacement, and reconciles a lost mutation reply by its original operation ID.
+An uncertain Start is never replaced with another submission. A requested Stop
+stays pending until the keeper has positive scheduler evidence that the job ended.
+
+Regular polls and action reloads use cached keeper observations. The manual
+Refresh button may query an already established connection; it never authenticates
+SSH or wakes the cloud. A missing connection needs explicit Connect/Reconnect.
+Unsupported keepers refuse the kept flow; the advanced per-computer direct SSH
+choice remains explicit. Kept cluster capability remains disabled in the private
+startup until real SSH/Slurm and combined resource acceptance pass.
+
+The login-node terminal is still an explicit direct SSH session in the local
+PTY and ends with its native window. It is not a keeper-held job or terminal.
+The direct behavior described below remains the fallback the user selects.
 
 ## Detection and cluster mode
 
@@ -56,13 +77,17 @@ startup commands, the lease) in `crates/chimaera-server/src/{compute,lifecycle,e
 
 - **What & how.** The local home shows a cluster row ("Slurm cluster" and a one-line
   summary: "1 job running · ends in 5d 22h", "1 job waiting for a node", …). Clicking it
-  connects (nothing starts) and opens the cluster page in place: one card per job —
-  **running** (node · resources · time left), **starting**, or **waiting for a node**
-  (Slurm's start estimate and its reason when not plain priority) — listing the
-  workspaces open in it (open · opening · closing, and what their chats are doing);
-  ended jobs as one line each (why: time limit, cancelled, failed, preempted, its node
-  failed, out of memory — asked of `sacct` once and kept); the workspaces not open
-  anywhere; one quiet count of the user's other Slurm jobs. Masthead: Home, Terminal (a
+  connects (nothing starts) and opens the cluster page in place, in three sections that
+  are each one surface of rows. **Jobs**: one row per job — **running** (node · resources
+  · time left), **starting**, or **waiting for a node** (Slurm's start estimate and its
+  reason when not plain priority) — with the workspaces open in it beneath (open ·
+  opening · closing, and what their chats are doing) and "Open a workspace here" on a
+  running job. **Ended**: one quiet list, one line each with Start again and dismiss,
+  plus Clear all when there are several (why: time limit, cancelled, failed, preempted,
+  its node failed, out of memory — asked of `sacct` once and kept). **Workspaces** (or
+  "Other workspaces" when some are open): the ones not open anywhere, then "Add a
+  workspace…", and one quiet count of the user's other Slurm jobs. A first visit with
+  nothing added yet shows a short welcome instead (Add a workspace…, Start a job). Masthead: Home, Terminal (a
   terminal-only window, "<host> · login node", running `ssh <host>` over the app's
   ControlMaster — never listed as a workspace, never restored, its session ends when the
   window closes), ⋯ (startup commands, rules for agents, refresh partitions, connection settings) and **Start a job**. The app's own binary install on the
@@ -152,6 +177,15 @@ Nothing site-specific is ever coded.
   person starts every job. An attached job can't continue (the app holds it); its window
   says when it ends without offering to (job-host sets `CHIMAERA_JOB_ATTACHED` on its
   workspaces' chimaeras, and their `/compute` `self` block carries `attached`).
+- **A job window when its job ends.** The window says so in the cluster page's words
+  ("This job ended — it hit its time limit. Your chats are saved.") and offers **Start
+  again** (the cluster page's start sheet for this workspace, set up like the job that
+  ended) and **Close**; a closed or stopped workspace in a job that still runs offers
+  **Back to** the cluster instead. It learns the end from the shell's `host-status`
+  `ended`, or — when a reconnect fails first — from the cluster's overview
+  (`web-ui/src/lib/workspace/jobEnd.ts`), so a dead endpoint never gets a Retry. Its
+  sockets stop retrying, and a chat whose agent stopped with the job says the job ended
+  instead of "agent exited".
 - **Notifications** (native app, even when looking elsewhere; windows never open by
   themselves): ready, an hour left, ten minutes left (only for a job longer than the mark,
   worded with the time actually left; the watcher wakes at those marks), stopped, and
@@ -209,7 +243,7 @@ _Captured 2026-07-15 (from the maintainer; drafted from his design-session words
 
 - **Problem it solves:** the cluster should be visible in the workbench — detect Slurm,
   show your queue. First step of the placement axis toward owning a session on a compute
-  node, and toward the premium synced-workspace vision.
+  node, and toward the premium vision of one workspace on every device.
 - **How settled (intent grade: the invariants are core to this feature; the rest is
   addition):** promises — cluster behavior is **probed per cluster, never assumed**
   ("not all environments are the same"; "no shame in saying not supported"), and the

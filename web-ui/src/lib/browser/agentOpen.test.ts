@@ -21,7 +21,9 @@ import {
 import type { Session } from "../workspace/sessions";
 import {
   type AgentBrowserOpen,
+  admitsAgentBrowserOpen,
   browserOpener,
+  hasDirectBrowserOwner,
   parseAgentBrowserOpen,
   placeAgentBrowser,
   shouldActOnAgentBrowserOpen,
@@ -98,6 +100,43 @@ describe("parseAgentBrowserOpen", () => {
     expect(parse("/a/%2e%2e/b")).toBe("/b");
     expect(parse("//evil.example/x")).toBe("//evil.example/x");
     expect(parse("/a b")).toBe("/a%20b");
+  });
+});
+
+describe("hasDirectBrowserOwner", () => {
+  const session = (over: Partial<Session> = {}) => ({
+    id: "s-agent", workspace_id: "w-1", alive: true, ...over,
+  }) as Session;
+
+  it("keeps direct local and SSH-daemon sessions usable, including older rosters", () => {
+    expect(hasDirectBrowserOwner(frame(), session(), false)).toBe(true);
+    expect(hasDirectBrowserOwner(frame(), session({ placement: "here" }), false)).toBe(true);
+    expect(hasDirectBrowserOwner(frame({ workspaceId: null }), session(), false)).toBe(true);
+  });
+
+  it("never interprets a remote owner's localhost through the laptop proxy", () => {
+    expect(hasDirectBrowserOwner(frame(), session({ placement: { remote: "worker-1" } }), false)).toBe(false);
+    expect(hasDirectBrowserOwner(frame(), session(), true)).toBe(false);
+  });
+
+  it("drops missing, retired, suspended and wrong-project sessions rather than replaying later", () => {
+    expect(hasDirectBrowserOwner(frame(), undefined, false)).toBe(false);
+    for (const over of [{ id: "s-other" }, { alive: false }, { suspended: true },
+      { placement_available: false }, { workspace_id: "w-other" }]) {
+      expect(hasDirectBrowserOwner(frame(), session(over), false)).toBe(false);
+    }
+  });
+});
+
+describe("admitsAgentBrowserOpen", () => {
+  it("a window that can never have Pro opens every frame, as it always did", () => {
+    expect(admitsAgentBrowserOpen(frame(), undefined, false, true)).toBe(true);
+    expect(admitsAgentBrowserOpen(frame(), { id: "s-agent", alive: false } as Session, false, true)).toBe(true);
+  });
+
+  it("otherwise only a direct owner's frame", () => {
+    expect(admitsAgentBrowserOpen(frame(), undefined, false, false)).toBe(false);
+    expect(admitsAgentBrowserOpen(frame(), { id: "s-agent", workspace_id: "w-1", alive: true } as Session, false, false)).toBe(true);
   });
 });
 
@@ -285,6 +324,17 @@ describe("who opened a browser pane", () => {
     const back = deserializeLayout(JSON.parse(JSON.stringify(serializeLayout(l))));
     expect(back).not.toBeNull();
     expect(browserTabs(back!).map(({ tab }) => tab)).toEqual(browserTabs(l).map(({ tab }) => tab));
+  });
+
+  it("restores the browser opener beside existing Pro and settings tabs", () => {
+    let l = placeAgentBrowser(withAgent(), frame({ path: "/app" }));
+    l = openTab(l, { surface: "pro" });
+    l = openTab(l, { surface: "settings" });
+    const back = deserializeLayout(JSON.parse(JSON.stringify(serializeLayout(l))), true);
+    expect(back).not.toBeNull();
+    expect(browserTabs(back!).map(({ tab }) => tab)).toEqual(browserTabs(l).map(({ tab }) => tab));
+    expect(panes(back!.root).flatMap((p) => p.tabs).filter((t) => t.surface === "pro")).toHaveLength(1);
+    expect(panes(back!.root).flatMap((p) => p.tabs).filter((t) => t.surface === "settings")).toHaveLength(1);
   });
 
   it("restores an older layout without the field unchanged, and drops a garbage value", () => {

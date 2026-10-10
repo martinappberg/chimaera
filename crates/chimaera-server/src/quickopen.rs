@@ -99,7 +99,7 @@ pub(crate) struct IndexedFile {
 
 /// Per-workspace index slots. The map lock is held only to look up or
 /// evict a slot — never across a walk.
-pub(crate) struct QuickOpenCache {
+pub struct QuickOpenCache {
     slots: HashMap<String, Arc<Slot>>,
     /// The idle sweep runs at most once per [`IDLE_SWEEP`]: it locks every
     /// slot, and every link-validation burst would otherwise pay it.

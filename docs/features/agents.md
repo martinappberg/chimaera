@@ -46,7 +46,9 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   `safe_arg`).
 - **Key behaviors.** The binary is resolved through the interactive **login** shell (`-ilc`, not
   `-lc` — the claude installer's PATH line lives in `.zshrc`, and `claude` isn't on the
-  non-interactive ssh PATH on HPC nodes), then well-known prefixes, then the managed bin dir; a
+  non-interactive ssh PATH on HPC nodes; the probe runs in its own session with stderr
+  discarded, `process::probe_output`, so an interactive rc can't fight a foreground daemon for the
+  terminal or fail detection by being chatty), then well-known prefixes, then the managed bin dir; a
   hit is cached for the daemon's life, a miss left uncached to self-heal. `model`/`resume` are
   charset-validated (`safe_arg` refuses flag-shaped/control-byte values). The launcher env scrubs
   the daemon's own `CLAUDE_CODE_*`/`CLAUDE_AGENT_*` markers so a spawned claude doesn't think it's
@@ -186,7 +188,8 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   drops to "unk" (tooltip "agent says working — no output for a while") — the claim is likely
   stale and the dot says so without touching the record. Every COUNT — the home-screen amber
   rollup, the rail pill, the focus strip, and the window-title prefix — is `needsApproval`
-  (needs_permission only: a permission, plan approval, or question blocking the agent), alive-gated
+  (needs_permission only: a permission, plan approval, or question blocking the agent; a chat
+  row's additive `needs_permission` counts the same, `awaitsDecision`), alive-gated
   because a crashed chat driver stays registered (alive:false, errored) until deleted. Finished and
   waiting-for-input sessions are news, not a number: they wear the unread mark (bold name + accent
   dot, see [notifications.md](notifications.md)). The dashboard's attention lane stays the broader
@@ -249,6 +252,21 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   row → **Archive**, or the header → **Archive all** (with an Undo), hides conversations from the
   rail without deleting anything; a quiet **All sessions** link ends the list
   ([session-history.md](session-history.md#archiving-recents)).
+- **Codex terminal capture (Pro-configured projects).** The workspace policy
+  (`WorkspacePolicy::codex_notify_args`, asked by `spawn.rs` and `chat.rs`; the argv shape is
+  `launcher::codex_notify_args`) injects an argv `notify` wrapper for terminal launches and
+  chat-to-terminal switches in projects with a Pro cloud profile. The free daemon's inert policy
+  adds nothing, so elsewhere a Codex TUI's argv and notify stay exactly the user's. It posts to the existing
+  per-session-key hook route and then runs the user's notify argv unchanged: the one Codex itself
+  would run (the project's own `.codex/config.toml` over its Codex home, where a `CODEX_HOME`
+  exported by the login shell counts; probed once per daemon life). The wrapper lives under the
+  daemon's data directory, not the runtime directory HPC hosts scrub. Verified against Codex 0.157.1: the payload has
+  `type:"agent-turn-complete"`, `thread-id`, `turn-id`, `cwd`, `input-messages`, and
+  `last-assistant-message`; the rollout starts with a `session_meta` record carrying `payload.id`
+  and `payload.cwd`. Only matching on-disk rollouts mint terminal resume handles. Reads are capped
+  (64 KiB header; 32,768 directory entries / two-second discovery budget), and the hook key stays
+  in a private header file rather than process arguments. If user notify config cannot be read
+  faithfully, its hook stays in place and capture is skipped with a daemon warning.
 
 ## Documents: the portable dialect, `check_document` and the issues chip
 

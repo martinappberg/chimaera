@@ -24,14 +24,19 @@ and in `App.svelte` the view reporting + `focusFromNotification`.
   you), `permission`, `question`, `error`, `rate_limited`, and `agent` (the `notify` tool).
   Each carries the session's display name, its workspace, a state phrase, and a body quoting
   what it was about — how the final reply starts, the permission line ("Bash: rm -rf build"),
-  the question, the error.
+  the question, the error. One project event rides the same feed: `kept_both`, when a Chimaera
+  Pro return kept both versions of files changed on both machines (see
+  [pro.md](pro.md)).
 - **How it's used.** Consumers pull it: the native shell long-polls `GET /api/v1/notices`
   (bearer-authed) once per daemon it has open; browser tabs get `{"type":"notices"}` frames on
   `/ws/events`. Which kinds exist at all is the daemon's `notifications.*` settings (so every
   consumer agrees).
 - **Where it lives.** `notices.rs` (`Notices` store, `run` watcher, `get_notices`,
-  `frame_since`, `push_agent_notice`); the record fields `AgentRecord.notice_note` /
-  `reply_draft` (`agent_state.rs`).
+  `frame_since`, `push_agent_notice`, `push_kept_both`, `relay`); the record fields
+  `AgentRecord.notice_note` / `reply_draft` (`agent_state.rs`); a routed
+  session's feed and its waiting decisions come from the workspace policy
+  (`policy.rs`: `project_feed`, `routed_decisions`); the kept-both report is
+  the private host's.
 - **Key behaviors.**
   - **One detector, every surface.** Agent state is written by claude hooks, chat protocol
     events, and the transcript watcher (claude chats get two of them), so notices are NOT
@@ -59,7 +64,30 @@ and in `App.svelte` the view reporting + `focusFromNotification`.
     shutdown (`AppState.stopping`) so a held poll never stalls a graceful drain.
   - **The attention set** returned alongside is the live sessions blocked on an approval
     (`needs_permission` — permissions, plan approvals, questions), Mastermind excluded: what
-    the Dock badge and the tray count.
+    the Dock badge and the tray count. It includes the conversations of a project running on
+    another machine (Chimaera Pro) that are blocked the same way, from the routed rows the
+    in-app count already reads.
+  - **Work running on another machine.** For a Pro project whose work runs elsewhere, a
+    window's events feed from the owner carries the owner's notices about that project's
+    conversations; the daemon relays a finished turn (`done`/`input`), a permission, a question
+    and the agent's own `notify` message (which the owner lets replace its turn-end notice)
+    into its own feed (`relay`), so the app alerts as it would for local work; errors and
+    usage limits stay with the owner. Once
+    each: every window watching the project runs a feed, so a bounded set (256, ten minutes)
+    keyed by session, kind and the owner's timestamp keeps the first. Never for a session
+    that runs on this computer (its own watcher speaks), and only for kinds this computer's
+    settings allow. Answered on either machine, the conversation leaves the attention set and
+    the alert is taken back. Only while some window has that project open: a routed project
+    with no window has no feed.
+  - **Kept both versions** (`kept_both`, Pro). One notice per return that kept anything:
+    title "Kept both versions of N files", the project as subtitle, a body naming the saved
+    copies ("Your versions are saved beside them (notes.md.mine-20260929-1412, …)"), and an
+    additive `kept: {files, paths, branches}` (up to 32 project-relative copy paths; branches
+    kept as `<branch>@cloud-<commit>`). Not a session's: `session_id` is a per-project key
+    (`kept-both-<workspace_id>`), so a click raises the project's window and opens its review of
+    both versions ([pro.md](pro.md#the-model)); a window showing that
+    review counts as looking at the notice. A newer return replaces the project's older alert. Gated by `notifications.needsYou`; never blocking,
+    never counted.
 
 ## Agent-sent notifications (`notify` tool)
 
@@ -145,7 +173,9 @@ and in `App.svelte` the view reporting + `focusFromNotification`.
 - **Counts mean approvals.** Every number — the rail's workspace pill, the window title's
   `(N)`, the focus strip's "N awaiting approval", the Home screen's per-workspace badge, the
   Dock badge, the tray's per-window "— N awaiting approval" — counts only live sessions in
-  `needs_permission` (`needsApproval` in `workspace/sessions.ts`). Finished and
+  `needs_permission` (a Pro project's conversations running on another machine included),
+  or chat rows whose additive `needs_permission` is true
+  (`needsApproval` in `workspace/sessions.ts`). Finished and
   waiting-for-input sessions are news, not a number.
 - **Unread is the news cue.** A session whose turn finished (or ended waiting for input)
   while it wasn't focused wears a bold full-ink name plus a small accent dot — on the rail

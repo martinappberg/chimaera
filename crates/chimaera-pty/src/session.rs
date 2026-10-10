@@ -17,7 +17,7 @@ use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 use anyhow::Context;
 use bytes::Bytes;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 
 use crate::{
     lock_unpoisoned, marks::now_ms, marks::Marks, marks::ShellPhase, snapshot, validate_dimensions,
@@ -116,11 +116,12 @@ pub(crate) struct Session {
     /// OS pid of the direct child, captured at spawn.
     child_pid: Option<u32>,
     term: Arc<Mutex<Term<EventProxy>>>,
-    master: Mutex<Box<dyn MasterPty + Send>>,
+    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    managed: Option<Arc<crate::managed::Managed>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     state: Arc<Mutex<SessionState>>,
     title: Arc<Mutex<Option<String>>>,
-    input_tx: mpsc::Sender<Bytes>,
+    input_tx: crate::InputSender,
     output_tx: broadcast::Sender<Bytes>,
     events_tx: broadcast::Sender<SessionEvent>,
     /// Shell-integration marks: OSC 133 phase + command journal.
@@ -138,6 +139,7 @@ impl Session {
         id: SessionId,
         opts: &SpawnOpts,
         on_exit: Box<dyn FnOnce() + Send + 'static>,
+        managed: bool,
     ) -> anyhow::Result<Arc<Session>> {
         // openpty and the headless Term must never see an invalid or
         // allocation-hostile grid. `resize` shares this exact boundary.
@@ -184,6 +186,8 @@ impl Session {
             cmd.env(name, value);
         }
 
+        // A shell must not mistake its terminal stdin for daemon cleanup evidence.
+        cmd.env_remove("CHIMAERA_SUPERVISOR_CLEANUP_FD");
         let mut child = pty
             .slave
             .spawn_command(cmd)
@@ -199,10 +203,12 @@ impl Session {
         let mut writer = master.take_writer().context("failed to take pty writer")?;
         let killer = child.clone_killer();
         let child_pid = child.process_id();
+        let managed = managed.then(|| Arc::new(crate::managed::Managed::new(child_pid)));
+        let master = Arc::new(Mutex::new(master));
 
         let (output_tx, _) = broadcast::channel::<Bytes>(OUTPUT_CHANNEL_CAPACITY);
         let (events_tx, _) = broadcast::channel::<SessionEvent>(EVENT_CHANNEL_CAPACITY);
-        let (input_tx, mut input_rx) = mpsc::channel::<Bytes>(INPUT_CHANNEL_CAPACITY);
+        let (input_tx, mut input_rx) = crate::input::channel(INPUT_CHANNEL_CAPACITY);
 
         let title = Arc::new(Mutex::new(None));
         let proxy = EventProxy {
@@ -288,11 +294,20 @@ impl Session {
         // portable-pty writer is blocking, so this lives on its own thread.
         {
             let id = id.clone();
+            let managed = managed.clone();
             std::thread::Builder::new()
                 .name(format!("pty-write-{id}"))
                 .spawn(move || {
                     while let Some(data) = input_rx.blocking_recv() {
-                        if let Err(e) = writer.write_all(&data).and_then(|()| writer.flush()) {
+                        if managed
+                            .as_ref()
+                            .is_some_and(|managed| managed.closed.load(Ordering::Acquire))
+                        {
+                            break;
+                        }
+                        if let Err(e) = data
+                            .write(|bytes| writer.write_all(bytes).and_then(|()| writer.flush()))
+                        {
                             tracing::debug!(session = %id, error = %e, "pty writer stopped");
                             break;
                         }
@@ -308,10 +323,16 @@ impl Session {
             let state = Arc::clone(&state);
             let events_tx = events_tx.clone();
             let id = id.clone();
+            let managed = managed.clone();
+            let master = master.clone();
             std::thread::Builder::new()
                 .name(format!("pty-wait-{id}"))
                 .spawn(move || {
-                    let status = match child.wait() {
+                    let result = match managed {
+                        Some(managed) => managed.wait(&mut *child, &master),
+                        None => child.wait(),
+                    };
+                    let status = match result {
                         Ok(status) => {
                             if status.signal().is_some() {
                                 None
@@ -351,7 +372,8 @@ impl Session {
                 .unwrap_or(0),
             child_pid,
             term,
-            master: Mutex::new(master),
+            master,
+            managed,
             killer: Mutex::new(killer),
             state,
             title,
@@ -408,7 +430,7 @@ impl Session {
     }
 
     /// Queue bytes to the PTY without an attachment (exec engine path).
-    pub(crate) fn input(&self) -> mpsc::Sender<Bytes> {
+    pub(crate) fn input(&self) -> crate::InputSender {
         self.input_tx.clone()
     }
 
@@ -514,6 +536,15 @@ impl Session {
         Ok(())
     }
 
+    /// Fence the session: a managed session's owned process-group stop,
+    /// otherwise [`Self::kill`].
+    pub(crate) fn fence(&self) {
+        if let Some(managed) = &self.managed {
+            managed.fence(&self.master);
+        } else {
+            self.kill();
+        }
+    }
     /// Terminate the child: SIGHUP first (via portable-pty, so a shell can run
     /// its exit traps and vanish tmux-style), escalating to SIGKILL if it is
     /// still alive after a short grace period. The escalation matters — a child
@@ -523,6 +554,10 @@ impl Session {
     /// thread. Killing a session whose child already exited is a no-op. Reaping
     /// and state bookkeeping still happen on the wait thread.
     pub(crate) fn kill(&self) {
+        if let Some(managed) = &self.managed {
+            managed.fence(&self.master);
+            return;
+        }
         if !lock_unpoisoned(&self.state).alive {
             return;
         }

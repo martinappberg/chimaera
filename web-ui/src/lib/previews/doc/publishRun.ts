@@ -1,3 +1,4 @@
+import { daemonPath } from "../../net/base";
 /**
  * Publishing, the page half (the pure pieces are `publish.ts`). Loaded on
  * first use from the toolbar's publish menu, never with the view.
@@ -155,7 +156,7 @@ function dataUrl(blob: Blob, mime: string): Promise<string> {
  *  carries one, else a fresh one. */
 async function fileBlob(info: TargetInfo, cap: number): Promise<Blob> {
   if (info.ticket === undefined) return new Blob([await fetchRawBytes(info.path, cap)]);
-  const res = await fetch(`/raw/${info.ticket}`);
+  const res = await fetch(daemonPath(`/raw/${info.ticket}`));
   if (!res.ok) throw new Error(`couldn't read ${basename(info.path)} (${res.status})`);
   const blob = await res.blob();
   if (blob.size > cap) throw new TooLargeError(blob.size, cap);

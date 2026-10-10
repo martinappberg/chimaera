@@ -7,6 +7,11 @@
   import type { DropSpot, LayoutCtrl } from "./dnd";
   import { registerPane, unregisterPane, zoneWord } from "./dnd";
   import { dirLabel } from "../previews/files";
+  import { pauseLabel, placementLabel, sessionPause, shellPauseLabel } from "../net/placement";
+  import { accountSignedOut, proPossible } from "../net/plan";
+  import { terminalKept, terminalStatus } from "../terminal/refusals.svelte";
+  import { pausedConnect } from "../pro/providers";
+  import { canOpenOnboarding, cloudOnboarding } from "../pro/onboarding.svelte";
   import { agentHue, type LinkCtrl } from "../workspace/agentLinks";
   import { activeModLabel, keyHint, keyHintSuffix, paneFocusHint, paneMoveHint } from "../shared/keybindings";
   import PaneTabs from "./PaneTabs.svelte";
@@ -18,6 +23,7 @@
     requestAssetReload,
   } from "./assetTransition";
   import Spinner from "../previews/Spinner.svelte";
+  import { modalFocus } from "../shared/modalFocus";
   import { browserOpener } from "../browser/agentOpen";
   import { findTargetsChanged, targetIn } from "../shared/find";
   import type { DashCtx } from "../dashboard/dash";
@@ -380,6 +386,19 @@
       <!-- The session is gone (mid-teardown, before pruneSessions drops the
            tab): render nothing, never a fresh TerminalView against a dead id. -->
       <div class="hint"><span>closing…</span></div>
+    {:else if s.suspended && s.ui !== "chat"}
+      <!-- A paused terminal: its project runs elsewhere, or it waits for an
+           update, a sign-in on the cloud machine or its transfer (the row's
+           additive `pause` says which). A paused chat stays mounted below:
+           its transcript and scroll survive and it follows the conversation. -->
+      {@const pause = sessionPause(s)}
+      {@const paused = s.kind === "shell"
+        ? shellPauseLabel(pause, { places: proPossible() })
+        : pauseLabel(pause, { signedOut: $accountSignedOut })}
+      <!-- Waiting for an agent sign-in on the cloud (the row's additive
+           `blocked_provider`): offer the one thing that unblocks it. -->
+      {@const connect = canOpenOnboarding() ? pausedConnect(s) : null}
+      <div class="hint paused"><span role="status">{paused.status}</span>{#if connect !== null}<button type="button" onclick={() => cloudOnboarding.request({ providerIds: [connect.providerId], workspaceId: connect.workspaceId })}>Connect {connect.label} to continue</button>{:else if paused.detail !== null}<small>{paused.detail}</small>{/if}</div>
     {:else if s.ui === "chat"}
       {@const ChatView = views.chat}
       {#if ChatView !== undefined}
@@ -406,7 +425,13 @@
     {:else}
       {@const TerminalView = views.terminal}
       {#if TerminalView !== undefined}
-        <TerminalView sessionId={tab.sessionId} focused={focused && active} fontSize={node.fontSize} />
+        <TerminalView
+          sessionId={tab.sessionId}
+          focused={focused && active}
+          fontSize={node.fontSize}
+          placement={placementLabel(s.placement, s.placement_available, { owner: terminalStatus(s.id), reachable: terminalKept(s.id) })}
+          reach={`${typeof s.placement === "object" ? s.placement.remote : "here"}|${s.placement_available !== false}`}
+        />
       {:else if viewErrors.terminal}
         {@render loadFailure("terminal", "terminal view")}
       {:else}
@@ -572,6 +597,29 @@
     {:else}
       <Spinner />
     {/if}
+  {:else if tab.surface === "kept"}
+    {@const KeptApplicationView = views.kept}
+    {#if KeptApplicationView !== undefined}
+      <KeptApplicationView {wsId} {wsRoot} visible={active} {tab} paneId={node.id}
+        currentTab={(original: object, pane: string) => node.id === pane && node.tabs.some((candidate) => candidate === original)}
+        callbacks={{
+          openFile: (pane: string, path: string) => ctrl.openFileFrom(pane, path, false),
+          openFolder: (pane: string, path: string) => ctrl.openPathFrom(pane, path, "dir", false),
+          close: (original: object, pane: string) => {
+            if (node.id !== pane) return;
+            const index = node.tabs.findIndex((candidate) => candidate === original);
+            if (index >= 0) ctrl.closeTab(pane, index);
+          },
+          modal: (element: HTMLElement) => {
+            const handle = modalFocus(element);
+            return { destroy: () => handle?.destroy?.() };
+          },
+        }} />
+    {:else if viewErrors.kept}
+      {@render loadFailure("kept", "the review of both versions")}
+    {:else}
+      <Spinner />
+    {/if}
   {:else if tab.surface === "browser"}
     {@const BrowserView = views.browser}
     {#if BrowserView !== undefined}
@@ -592,6 +640,17 @@
       />
     {:else if viewErrors.browser}
       {@render loadFailure("browser", "browser pane")}
+    {:else}
+      <Spinner />
+    {/if}
+  {:else if tab.surface === "pro"}
+    {@const ProView = views.pro}
+    {#if ProView !== undefined}
+      <ProView visible={active} workspaceId={wsId} incarnation={tab}
+        current={() => node.tabs.some(candidate => candidate === tab)}
+        onClose={() => { const index = node.tabs.findIndex(candidate => candidate === tab); if (index >= 0) ctrl.closeTab(node.id, index); }} />
+    {:else if viewErrors.pro}
+      {@render loadFailure("pro", "Chimaera Pro")}
     {:else}
       <Spinner />
     {/if}
@@ -974,6 +1033,39 @@
     font-size: var(--text-sm);
     user-select: none;
   }
+
+  .hint.paused {
+    flex-direction: column;
+    padding: 0 16px;
+    text-align: center;
+  }
+  .hint.paused small {
+    font-size: var(--text-xs);
+  }
+  .hint.paused button {
+    margin-top: 0.35rem;
+    border: 1px solid var(--edge);
+    border-radius: 6px;
+    padding: 0.35rem 0.75rem;
+    color: var(--fg);
+    background: var(--bg);
+    font: inherit;
+    cursor: pointer;
+  }
+  .hint.paused button:hover {
+    background: var(--row-hover);
+  }
+  .hint.paused button:focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: 2px;
+  }
+  @media (pointer: coarse) {
+    .hint.paused button {
+      min-height: 40px;
+    }
+  }
+
+
 
   .hint-sep {
     opacity: 0.5;

@@ -1,7 +1,9 @@
 use std::path::Path;
 
 use anyhow::{bail, Context};
-use chimaera_remote::{connect, hosts::HostsStore, ClusterHost, ConnectOpts, Phase};
+use chimaera_remote::{
+    connect, hosts::HostsStore, ClusterHost, ConnectOpts, DeploymentSource, Phase,
+};
 
 pub async fn run(
     host: &str,
@@ -10,6 +12,7 @@ pub async fn run(
     no_open: bool,
     update_daemon: bool,
     login_node: bool,
+    deployment_source: DeploymentSource,
 ) -> anyhow::Result<()> {
     // Dev is dev: an unstamped build always targets ~/.chimaera-dev on the
     // host (and defaults its own state there) — say so, since the real
@@ -34,6 +37,7 @@ pub async fn run(
     let opts = ConnectOpts {
         local_port,
         binary: binary.map(Path::to_path_buf),
+        deployment_source,
         update_daemon,
         login_serve: login_node || saved,
         not_cluster,

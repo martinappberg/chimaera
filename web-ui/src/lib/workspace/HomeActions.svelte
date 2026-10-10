@@ -5,10 +5,10 @@
   let trigger: HTMLElement;
   let open = $state(false);
   function dismiss(event: MouseEvent): void {
-    if (event.target instanceof Node && !details.contains(event.target)) details.open = false;
+    if (details && event.target instanceof Node && !details.contains(event.target)) details.open = false;
   }
   function escape(event: KeyboardEvent): void {
-    if (event.key !== "Escape") return;
+    if (event.key !== "Escape" || !details) return;
     event.preventDefault(); event.stopPropagation(); details.open = false; trigger.focus();
   }
   // Outside-click and Escape listeners exist only while this menu is open: a
@@ -17,8 +17,11 @@
   // finished dispatching, so that click never dismisses its own menu.
   // The list is position:fixed so a scrolling ancestor (Home's workspace list)
   // cannot clip it; it is placed from the trigger on open, flips above the
-  // trigger when it would run off the bottom, and a scroll closes it rather
-  // than leaving it detached from its row.
+  // trigger when it would run off the bottom. A scroll of a box holding the
+  // row moves the list with its trigger, and closes it only once the trigger
+  // has left the window: a scroll that layout causes (a scroller clamping when
+  // a line elsewhere on Home comes or goes) must not take the menu away from
+  // under the pointer. Scrolls anywhere else (another list) leave it alone.
   let list: HTMLElement;
   function place(): void {
     const t = trigger.getBoundingClientRect();
@@ -29,26 +32,34 @@
     list.style.right = `${Math.max(8, window.innerWidth - t.right)}px`;
   }
   function close(): void {
-    details.open = false;
+    if (details) details.open = false;
+  }
+  function follow(event: Event): void {
+    if (!details?.open) return;
+    const source = event.target;
+    if (source !== document && !(source instanceof Node && source.contains(details))) return;
+    const t = trigger.getBoundingClientRect();
+    if (t.bottom < 0 || t.top > window.innerHeight) close();
+    else place();
   }
   $effect(() => {
     if (!open) return;
     place();
     window.addEventListener("click", dismiss);
     window.addEventListener("keydown", escape);
-    window.addEventListener("scroll", close, true);
+    window.addEventListener("scroll", follow, true);
     window.addEventListener("resize", close);
     return () => {
       window.removeEventListener("click", dismiss);
       window.removeEventListener("keydown", escape);
-      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("scroll", follow, true);
       window.removeEventListener("resize", close);
     };
   });
 </script>
 
-<details class="actions" bind:this={details} ontoggle={() => (open = details.open)} onfocusout={(event) => {
-  if (event.relatedTarget instanceof Node && !details.contains(event.relatedTarget)) details.open = false;
+<details class="actions" bind:this={details} ontoggle={() => (open = details?.open ?? false)} onfocusout={(event) => {
+  if (details && event.relatedTarget instanceof Node && !details.contains(event.relatedTarget)) details.open = false;
 }}>
   <summary bind:this={trigger} aria-label={label} title={label}>
     <svg viewBox="0 0 18 18" width="18" height="18" aria-hidden="true"><circle cx="4" cy="9" r="1.2" fill="currentColor" /><circle cx="9" cy="9" r="1.2" fill="currentColor" /><circle cx="14" cy="9" r="1.2" fill="currentColor" /></svg>
@@ -56,7 +67,7 @@
   <!-- Native buttons preserve ordinary tab navigation; this is a disclosure,
        not an ARIA menu with a second keyboard interaction model. -->
   <div class="action-list" bind:this={list} onclick={(event) => {
-    if (event.target instanceof Element && event.target.closest("button")) details.open = false;
+    if (details && event.target instanceof Element && event.target.closest("button")) details.open = false;
   }} role="presentation">{@render children()}</div>
 </details>
 

@@ -7,6 +7,10 @@
 //! an update stays with the clients that can do it (the app's signed
 //! updater, `chimaera connect --update-daemon`); the daemon only reports.
 //!
+//! The account's cloud never checks: the service updates that daemon, so it
+//! reports `state: "managed"` instead (`WorkspacePolicy::updates_managed`), with no release
+//! and nothing to offer, and makes no release request at all.
+//!
 //! The transport is a `curl` subprocess, deliberately: it is the one HTTP
 //! client every HPC site already ships, trusts, and routes through its
 //! proxies — the same reasoning as `chimaera-remote`'s release fetch. Every
@@ -46,7 +50,7 @@ pub(crate) struct Release {
 /// last good answer (`latest`, `succeeded_at`) and records why it failed, so
 /// "couldn't check" never reads as "up to date".
 #[derive(Debug, Default)]
-pub(crate) struct UpdateStatus {
+pub struct UpdateStatus {
     /// The most recent attempt, successful or not.
     pub(crate) checked_at: Option<u64>,
     /// The most recent attempt that got an answer from the releases feed.
@@ -54,6 +58,10 @@ pub(crate) struct UpdateStatus {
     pub(crate) latest: Option<Release>,
     /// Why the most recent attempt failed; cleared by the next success.
     pub(crate) error: Option<String>,
+    /// Tests only: this state's releases endpoint (a local fake), in place of
+    /// the process-wide `CHIMAERA_RELEASES_API`.
+    #[cfg(any(test, feature = "daemon-extension-fixture"))]
+    pub(crate) api_override: Option<String>,
 }
 
 impl UpdateStatus {
@@ -78,8 +86,27 @@ impl UpdateStatus {
         }
     }
 
-    pub(crate) fn to_json(&self) -> serde_json::Value {
+    /// The wire shape (`GET /update`, the `update` frame). `managed`: this
+    /// daemon is the account's cloud, updated by the service, so it says so
+    /// and reports no check, no release and nothing available, whatever an
+    /// earlier check (before it became the cloud) found.
+    pub(crate) fn to_json(&self, managed: bool) -> serde_json::Value {
         let current = current_version();
+        if managed {
+            return json!({
+                "current": current,
+                "build": chimaera_core::BUILD_ID,
+                "dev": chimaera_core::version_is_dev(&current),
+                "state": "managed",
+                "managed": true,
+                "checked_at": null,
+                "succeeded_at": null,
+                "error": null,
+                "interval_secs": CHECK_INTERVAL.as_secs(),
+                "available": false,
+                "latest": null,
+            });
+        }
         json!({
             "current": current,
             "build": chimaera_core::BUILD_ID,
@@ -97,6 +124,29 @@ impl UpdateStatus {
             })),
         })
     }
+}
+
+/// This daemon's update status as every surface reads it.
+pub(crate) fn status_json(state: &AppState) -> serde_json::Value {
+    let managed = state.policy().updates_managed(state);
+    if !managed && state.policy().composed(state) {
+        // The official app's daemon is updated with the app (its signed
+        // updater, or a reconnect for a remote one), never from the public
+        // release feed, so it never checks. That is not a failed check: say
+        // `with_app` (additive), with nothing checked and nothing offered.
+        let mut value = UpdateStatus::default().to_json(false);
+        value["with_app"] = json!(true);
+        return value;
+    }
+    crate::lock(&state.update).to_json(managed)
+}
+
+/// This daemon just became the account's cloud: move the epoch so windows
+/// already attached hear "managed" without waiting for a check that no
+/// longer runs.
+pub fn became_managed(state: &AppState) {
+    state.update_epoch.fetch_add(1, Ordering::Relaxed);
+    state.changes.notify_waiters();
 }
 
 /// The version updates are compared against (and reported as `current`).
@@ -125,7 +175,8 @@ fn releases_api_url() -> Option<String> {
 /// once after the same boot delay and then every
 /// `plugins::releases::CHECK_INTERVAL`. Dev builds stay silent (and off the
 /// network) for each unless its endpoint is explicitly overridden; users
-/// can turn all of it off with the `update.autoCheck` setting.
+/// can turn all of it off with the `update.autoCheck` setting. The account's
+/// cloud skips its own half (`check_now`) and keeps the plugins'.
 pub(crate) async fn run_checker(state: Arc<AppState>) {
     let dev = chimaera_core::VERSION == "0.0.1";
     let own = !dev || std::env::var("CHIMAERA_RELEASES_API").is_ok();
@@ -167,7 +218,12 @@ pub(crate) async fn run_checker(state: Arc<AppState>) {
 ///
 /// Checks are serialized: a "check now" landing while another check runs
 /// waits for it and reuses its answer instead of fetching twice.
-pub(crate) async fn check_now(state: &Arc<AppState>) {
+///
+/// The account's cloud never asks: the service updates its daemon.
+pub async fn check_now(state: &Arc<AppState>) {
+    if state.policy().updates_managed(state) || state.policy().composed(state) {
+        return;
+    }
     // Every finished check moves the epoch (below, before the lock drops),
     // so a moved epoch after the wait means a check completed after we asked.
     let seen = state.update_epoch.load(Ordering::Relaxed);
@@ -175,7 +231,14 @@ pub(crate) async fn check_now(state: &Arc<AppState>) {
     if state.update_epoch.load(Ordering::Relaxed) != seen {
         return;
     }
-    let result = fetch_latest().await;
+    #[cfg(any(test, feature = "daemon-extension-fixture"))]
+    let url = crate::lock(&state.update)
+        .api_override
+        .clone()
+        .or_else(releases_api_url);
+    #[cfg(not(any(test, feature = "daemon-extension-fixture")))]
+    let url = releases_api_url();
+    let result = fetch_latest(url).await;
     let now = unix_now();
     let mut status = crate::lock(&state.update);
     status.checked_at = Some(now);
@@ -228,8 +291,8 @@ fn describe_failure(err: &anyhow::Error) -> String {
 /// `parse_release`'s context for a body that isn't JSON at all.
 const BAD_RELEASE_JSON: &str = "bad release JSON";
 
-async fn fetch_latest() -> anyhow::Result<Release> {
-    let url = releases_api_url().context("no releases endpoint for this build")?;
+async fn fetch_latest(url: Option<String>) -> anyhow::Result<Release> {
+    let url = url.context("no releases endpoint for this build")?;
     // The shared bounded fetch (10s, 1MB, kill_on_drop) — one fence for
     // every phone-home the daemon makes.
     let body = crate::agent_updates::curl(&url, &["Accept: application/vnd.github+json"]).await?;
@@ -274,6 +337,7 @@ pub(crate) struct UpdateQuery {
 /// first (bounded by curl's own timeout) and returns the fresh truth — the
 /// UI's "check now". An explicit ask runs even with `update.autoCheck` off
 /// or on a dev build: the setting governs the daemon phoning home on its own.
+/// On the account's cloud it answers "managed" at once and asks nobody.
 pub(crate) async fn get_update(
     State(state): State<Arc<AppState>>,
     Query(query): Query<UpdateQuery>,
@@ -281,7 +345,13 @@ pub(crate) async fn get_update(
     if query.refresh == Some(true) {
         check_now(&state).await;
     }
-    Json(crate::lock(&state.update).to_json())
+    Json(status_json(&state))
+}
+
+/// Tests only: point this state's own release check at `url`.
+#[cfg(feature = "daemon-extension-fixture")]
+pub fn set_api_for_tests(state: &AppState, url: &str) {
+    crate::lock(&state.update).api_override = Some(url.to_string());
 }
 
 #[cfg(test)]
@@ -323,8 +393,9 @@ mod tests {
             succeeded_at: Some(1_000),
             latest: Some(release("99.0.0")),
             error: None,
+            ..UpdateStatus::default()
         };
-        let json = status.to_json();
+        let json = status.to_json(false);
         assert_eq!(json["current"], chimaera_core::VERSION);
         assert_eq!(json["latest"]["version"], "99.0.0");
         assert_eq!(json["succeeded_at"], 1_000);
@@ -336,8 +407,17 @@ mod tests {
         assert_eq!(json["available"], !dev);
         assert_eq!(json["dev"], dev);
         assert_eq!(json["state"], if dev { "current" } else { "available" });
+        assert!(json.get("managed").is_none(), "{json}");
+        // The account's cloud: managed for it, whatever an earlier check knew.
+        let managed = status.to_json(true);
+        assert_eq!(managed["state"], "managed");
+        assert_eq!(managed["managed"], true);
+        assert_eq!(managed["available"], false);
+        assert_eq!(managed["latest"], serde_json::Value::Null);
+        assert_eq!(managed["checked_at"], serde_json::Value::Null);
+        assert_eq!(managed["current"], chimaera_core::VERSION);
         // No check yet = empty status, honestly null.
-        let empty = UpdateStatus::default().to_json();
+        let empty = UpdateStatus::default().to_json(false);
         assert_eq!(empty["latest"], serde_json::Value::Null);
         assert_eq!(empty["available"], false);
         assert_eq!(empty["state"], "unchecked");
@@ -354,7 +434,7 @@ mod tests {
         };
         assert_eq!(never.state(), "failed");
         assert_eq!(
-            never.to_json()["error"],
+            never.to_json(false)["error"],
             "Could not resolve host: api.github.com"
         );
 
@@ -366,9 +446,10 @@ mod tests {
             succeeded_at: Some(1_000),
             latest: Some(release("0.0.1")),
             error: Some("timed out".into()),
+            ..UpdateStatus::default()
         };
         assert_eq!(stale.state(), "failed");
-        assert_eq!(stale.to_json()["succeeded_at"], 1_000);
+        assert_eq!(stale.to_json(false)["succeeded_at"], 1_000);
     }
 
     #[test]

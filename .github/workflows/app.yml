@@ -110,6 +110,10 @@ jobs:
       # beforeBuildCommand has created that directory on a clean runner.
       - run: cargo test
         working-directory: crates/chimaera-app
+      # Optional account/SSH-signing implementation and its fixtures live in
+      # the private client assembly. This job proves the standalone free host.
+      - run: cargo clippy --locked --all-targets -- -D warnings
+        working-directory: crates/chimaera-app
       # Plugin execution must also work inside the hardened, signed executable;
       # cargo test runs an ordinary test binary and cannot catch macOS kills.
       - name: Exercise plugins in the signed macOS bundle

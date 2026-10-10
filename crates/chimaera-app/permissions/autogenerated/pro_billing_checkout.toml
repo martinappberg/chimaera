@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pro-billing-checkout"
+description = "Enables the pro_billing_checkout command without any pre-configured scope."
+commands.allow = ["pro_billing_checkout"]
+
+[[permission]]
+identifier = "deny-pro-billing-checkout"
+description = "Denies the pro_billing_checkout command without any pre-configured scope."
+commands.deny = ["pro_billing_checkout"]

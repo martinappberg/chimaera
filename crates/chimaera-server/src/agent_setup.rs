@@ -62,7 +62,7 @@ impl Progress {
     }
 }
 
-pub(crate) struct Operation {
+pub struct Operation {
     progress: Mutex<Progress>,
     cancel: watch::Sender<bool>,
 }
@@ -130,6 +130,10 @@ pub(crate) async fn start(
             "Open a workspace on this host first.",
         );
     };
+    let captured = match state.policy().capture(&state, &body.workspace_id) {
+        Ok(captured) => captured,
+        Err(_) => return error(StatusCode::CONFLICT, "Project execution authority changed."),
+    };
     if !matches!(body.action, Action::Install)
         && !crate::launcher::detect(&state, kind, false).await.managed
     {
@@ -141,15 +145,30 @@ pub(crate) async fn start(
             "This agent has no managed installer.",
         );
     };
-    start_script(state, kind, workspace.root, body, script).await
+    start_captured(state, kind, workspace.root, body, script, captured).await
 }
 
+#[cfg(test)]
 async fn start_script(
     state: Arc<AppState>,
     kind: AgentKind,
     cwd: PathBuf,
     body: Request,
     script: String,
+) -> Response {
+    let captured = match state.policy().capture(&state, &body.workspace_id) {
+        Ok(captured) => captured,
+        Err(_) => return error(StatusCode::CONFLICT, "Project execution authority changed."),
+    };
+    start_captured(state, kind, cwd, body, script, captured).await
+}
+async fn start_captured(
+    state: Arc<AppState>,
+    kind: AgentKind,
+    cwd: PathBuf,
+    body: Request,
+    script: String,
+    captured: crate::policy::Admission,
 ) -> Response {
     let install_lock = match crate::runtimes::lock_install(&state.managed_root, kind).await {
         Ok(file) => file,
@@ -167,6 +186,10 @@ async fn start_script(
     if let Some(p) = snapshot(&state, kind).filter(|p| p.running() || p.id == body.request_id) {
         return Json(p).into_response();
     }
+    if captured.check(&state).is_err() {
+        return error(StatusCode::CONFLICT, "Project execution authority changed.");
+    }
+    let workspace = body.workspace_id.clone();
     let (cancel, receiver) = watch::channel(false);
     let progress = Progress {
         id: body.request_id,
@@ -185,18 +208,61 @@ async fn start_script(
     });
     lock(&state.agent_setup).insert(kind, operation.clone());
     tokio::spawn(async move {
+        let mut admitted = match captured.installer(&state, &workspace).await {
+            Ok(admitted) => admitted,
+            Err(_) => {
+                finish(
+                    &operation,
+                    Phase::Cancelled,
+                    None,
+                    "Project execution authority changed; installer was not started.",
+                );
+                state.changes.notify_waiters();
+                return;
+            }
+        };
         crate::runtimes::prune_install_versions(state.managed_root.clone(), kind).await;
-        let (phase, code, message) = run(&state, &operation, receiver, cwd, script).await;
-        if phase == Phase::Succeeded {
+        // Only a Pro setup reservation needs its group drained on success; a
+        // free install leaves its installer's background children running.
+        let guarded = admitted.guarded();
+        let (phase, code, message) = run(
+            &state,
+            &operation,
+            receiver,
+            cwd,
+            script,
+            &mut admitted,
+            guarded,
+        )
+        .await;
+        if phase == Phase::Succeeded && admitted.check().is_ok() {
             crate::runtimes::prune_install_versions(state.managed_root.clone(), kind).await;
         }
         lock(&operation.progress).message = "Refreshing the installed version…".into();
         // Keep the shared lock through detection; there must be no false
         // completion while a competing workspace changes the executable.
         crate::launcher::detect(&state, kind, true).await;
-        let update = state.clone();
-        let _ =
-            tokio::task::spawn_blocking(move || crate::runtimes::regenerate_shims(&update)).await;
+        if admitted.check().is_ok() {
+            let update = state.clone();
+            let captured = admitted.captured();
+            let _ = tokio::task::spawn_blocking(move || {
+                if captured.check(&update).is_ok() {
+                    crate::runtimes::regenerate_shims(&update);
+                }
+            })
+            .await;
+        }
+        // Include the actual process-group drain in the owned operation and
+        // shared install lock, even if its HTTP observer has disappeared.
+        if admitted.finish().await.is_err() {
+            finish(
+                &operation,
+                Phase::Failed,
+                code,
+                "Installer cleanup could not be confirmed. Project execution remains fenced.",
+            );
+            return;
+        }
         drop(install_lock);
         finish(&operation, phase, code, &message);
         state.changes.notify_waiters();
@@ -267,14 +333,46 @@ impl Drop for Group {
     }
 }
 
+fn exited_unreaped(pid: u32) -> std::io::Result<bool> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let mut info = std::mem::MaybeUninit::<nix::libc::siginfo_t>::zeroed();
+        // This child remains owned and unreaped until final group cleanup.
+        let result = unsafe {
+            nix::libc::waitid(
+                nix::libc::P_PID,
+                pid,
+                info.as_mut_ptr(),
+                nix::libc::WEXITED | nix::libc::WNOHANG | nix::libc::WNOWAIT,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let info = unsafe { info.assume_init() };
+        #[cfg(target_os = "macos")]
+        let observed = info.si_pid;
+        #[cfg(target_os = "linux")]
+        let observed = unsafe { info.si_pid() };
+        Ok(observed == pid as i32)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        Err(std::io::Error::other("installer lifecycle unsupported"))
+    }
+}
+
 async fn run(
     state: &AppState,
     op: &Operation,
     mut cancel: watch::Receiver<bool>,
     cwd: PathBuf,
     script: String,
+    admitted: &mut crate::policy::Installer,
+    guarded: bool,
 ) -> (Phase, Option<i32>, String) {
-    if *cancel.borrow() {
+    if *cancel.borrow() || admitted.check().is_err() {
         return (
             Phase::Cancelled,
             None,
@@ -295,6 +393,13 @@ async fn run(
     for name in remove {
         cmd.env_remove(name);
     }
+    if admitted.check().is_err() {
+        return (
+            Phase::Cancelled,
+            None,
+            "Project execution authority changed; installer was not started.".into(),
+        );
+    }
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
@@ -305,13 +410,101 @@ async fn run(
             );
         }
     };
-    let group = Group(nix::unistd::Pid::from_raw(child.id().unwrap() as i32));
+    let pid = child.id().unwrap();
+    let group = Group(nix::unistd::Pid::from_raw(pid as i32));
+    admitted.attach(pid);
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
     let reads = async {
         tokio::join!(drain(stdout, op), drain(stderr, op));
     };
     tokio::pin!(reads);
+    if !guarded {
+        return run_unguarded(op, cancel, child, group, reads).await;
+    }
+    // Cancellation also handles a request received before the process started.
+    let stopped = async {
+        if !*cancel.borrow() {
+            let _ = cancel.changed().await;
+        }
+    };
+    let mut logs_done = false;
+    let mut observation_failed = false;
+    let normal = {
+        let completion = async {
+            loop {
+                match exited_unreaped(pid) {
+                    Ok(true) => return true,
+                    Ok(false) => {}
+                    Err(_) => {
+                        observation_failed = true;
+                        return false;
+                    }
+                }
+                if admitted.check().is_err() {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        tokio::pin!(completion);
+        let logs_and_completion = async {
+            tokio::select! {
+                result = &mut completion => result,
+                _ = &mut reads => { logs_done = true; completion.await },
+            }
+        };
+        tokio::select! {
+            result = logs_and_completion => result,
+            _ = stopped => false,
+            _ = tokio::time::sleep(DEADLINE) => false,
+        }
+    };
+    let cancelled = *cancel.borrow() || admitted.check().is_err();
+    if !normal {
+        let _ = nix::sys::signal::killpg(group.0, nix::sys::signal::Signal::SIGTERM);
+        if !logs_done {
+            logs_done = tokio::time::timeout(Duration::from_secs(2), &mut reads)
+                .await
+                .is_ok();
+        }
+    }
+    // WNOWAIT retains the direct PID while signalling. Also drain background
+    // descendants on a successful shell exit, including ones that closed logs.
+    drop(group);
+    let code = child.wait().await.ok().and_then(|s| s.code());
+    if !logs_done {
+        let _ = tokio::time::timeout(Duration::from_secs(2), &mut reads).await;
+    }
+    if normal && code == Some(0) {
+        (
+            Phase::Succeeded,
+            code,
+            "Installation finished. Sign-in and chat have not been checked.".into(),
+        )
+    } else if normal {
+        (
+            Phase::Failed,
+            code,
+            failure_hint(&lock(&op.progress).output).into(),
+        )
+    } else {
+        (if cancelled { Phase::Cancelled } else { Phase::Failed }, code,
+            if cancelled { "Installation cancelled. Files may already have changed; check the installed version before retrying." }
+            else if observation_failed { "Installer process status could not be verified; it was stopped. Check the installed version before retrying." }
+            else { "The installer exceeded 15 minutes and was stopped. Check the output and connection, then retry." }.into())
+    }
+}
+/// A free install: success is log EOF plus the leader's exit, and the
+/// installer's surviving background children are left alone.
+async fn run_unguarded(
+    op: &Operation,
+    mut cancel: watch::Receiver<bool>,
+    mut child: tokio::process::Child,
+    group: Group,
+    reads: std::pin::Pin<&mut impl std::future::Future<Output = ()>>,
+) -> (Phase, Option<i32>, String) {
+    let mut reads = reads;
     // Cancellation also handles a request received before the process started.
     let stopped = async {
         if !*cancel.borrow() {

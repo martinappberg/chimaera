@@ -1,299 +1,45 @@
 <script lang="ts">
-  // The in-app SSH auth prompt (password / keyboard-interactive 2FA). ssh has
-  // no tty in the app, so its prompts arrive via SSH_ASKPASS as a host-scoped
-  // `ssh-askpass` event (see crates/chimaera-app/src/askpass.rs). The native
-  // command layer applies the same scope to pending-list and answer calls;
-  // this UI filter is defense in depth. The home window remains the fallback
-  // for startup restore and prompts raised before a remote window exists.
-  //
-  // Prompts queue rather than replace: ssh asks sequentially (password, then
-  // a Duo passcode), and clobbering an unanswered prompt would strand its ssh
-  // waiting on an answer that can no longer be given.
+  // The native queue stays mounted before any prompt arrives. The dialog is
+  // part of the entry, never a separately loaded chunk: the prompt is often
+  // the very step that restores the connection a chunk would load over.
   import { onMount } from "svelte";
-  import {
-    answerAskpass,
-    askpassActive,
-    listAskpass,
-    onAskpass,
-    onAskpassDone,
-    type AskpassPrompt,
-  } from "../net/native";
+  import { answerAskpass, askpassActive, listAskpass, onAskpass, onAskpassDone, type AskpassPrompt } from "../net/native";
   import { asyncDisposer } from "../shared/asyncDisposer";
   import { modalFocus } from "../shared/modalFocus";
+  import AskpassDialog from "./AskpassDialog.svelte";
   import { askpassBelongsToHost } from "./askpassScope";
 
-  interface Props {
-    /** Null on the local/home window, which is the fallback prompt surface. */
-    hostAlias: string | null;
-  }
-
-  let { hostAlias }: Props = $props();
-
-  /** Prompts awaiting an answer, oldest first; the head is on screen. */
+  let { hostAlias }: { hostAlias: string | null } = $props();
   let queue = $state<AskpassPrompt[]>([]);
   const askpass = $derived(queue[0] ?? null);
-  /** What the user has typed into the field. */
-  let secretValue = $state("");
-  /** Reveal the typed secret (a passcode is easier to check than a password). */
-  let revealSecret = $state(false);
+  $effect(() => { askpassActive.set(askpass !== null); });
 
-  // Tell the rest of the UI (the reconnect status/dialog) a prompt is on screen.
-  $effect(() => {
-    askpassActive.set(askpass !== null);
-  });
-
-  function enqueue(p: AskpassPrompt): void {
-    if (!askpassBelongsToHost(p, hostAlias)) return;
-    if (queue.some((q) => q.id === p.id)) return;
-    if (queue.length === 0) {
-      secretValue = "";
-      revealSecret = false;
-    }
-    queue = [...queue, p];
+  function enqueue(prompt: AskpassPrompt): void {
+    if (!askpassBelongsToHost(prompt, hostAlias) || queue.some((p) => p.id === prompt.id)) return;
+    queue = [...queue, prompt];
   }
-
   onMount(() => {
-    const unlisteners = [asyncDisposer(onAskpass(enqueue))];
-    // A prompt resolved elsewhere (another window answered, or ssh gave up
-    // waiting) must leave this window's queue too.
-    unlisteners.push(
-      asyncDisposer(
-        onAskpassDone((id) => {
-          queue = queue.filter((q) => q.id !== id);
-        }),
-      ),
-    );
-    // Pick up prompts raised before this window existed (startup restore
-    // connects before any webview loads; the emit-only path would lose them).
-    void listAskpass().then((pending) => pending.forEach(enqueue));
-    return () => unlisteners.forEach((u) => u());
+    let alive = true;
+    const unlisteners = [asyncDisposer(onAskpass(enqueue)), asyncDisposer(onAskpassDone((id) => {
+      queue = queue.filter((prompt) => prompt.id !== id);
+    }))];
+    void listAskpass().then((pending) => { if (alive) pending.forEach(enqueue); });
+    return () => { alive = false; unlisteners.forEach((stop) => stop()); askpassActive.set(false); };
   });
-
-  function advance(): void {
+  function answer(id: number, secret: string | null): void {
+    if (queue[0]?.id !== id) return;
+    void answerAskpass(id, secret);
     queue = queue.slice(1);
-    secretValue = "";
-    revealSecret = false;
-  }
-
-  function submit(): void {
-    const p = askpass;
-    if (p === null) return;
-    void answerAskpass(p.id, secretValue);
-    advance();
-  }
-
-  function cancel(): void {
-    const p = askpass;
-    if (p === null) return;
-    void answerAskpass(p.id, null);
-    advance();
-  }
-
-  /** Focus the field the moment the prompt appears. */
-  function focusOnShow(node: HTMLInputElement): void {
-    node.focus();
   }
 </script>
 
 {#if askpass !== null}
-  <!-- Only Escape or the cancel button cancels: a cancel ends the ssh attempt
-       (see askpass.rs), so a stray click on the backdrop — on the way to a
-       password manager or the Duo app — must not. -->
-  <div
-    class="askpass-backdrop"
-    role="presentation"
-    onkeydown={(e) => e.key === "Escape" && cancel()}
-  >
-    <div
-      class="askpass"
-      role="dialog"
-      aria-modal="true"
-      aria-label="SSH authentication"
-      tabindex="-1"
-      use:modalFocus={{ priority: 1 }}
-    >
-      <div class="askpass-head">
-        <span class="askpass-glyph" aria-hidden="true">&#128274;</span>
-        <span class="askpass-title">
-          authenticate{askpass.alias != null ? ` · ${askpass.alias}` : ""}
-        </span>
-      </div>
-      <pre class="askpass-prompt">{askpass.prompt}</pre>
-      <div class="askpass-field">
-        <input
-          class="askpass-input"
-          type={revealSecret ? "text" : "password"}
-          autocomplete="off"
-          autocapitalize="off"
-          autocorrect="off"
-          spellcheck="false"
-          bind:value={secretValue}
-          use:focusOnShow
-          onkeydown={(e) => {
-            if (e.key === "Enter") {
-              e.preventDefault();
-              submit();
-            } else if (e.key === "Escape") {
-              e.preventDefault();
-              cancel();
-            }
-          }}
-        />
-        <button
-          class="askpass-reveal"
-          type="button"
-          title={revealSecret ? "hide" : "show"}
-          onclick={() => (revealSecret = !revealSecret)}>{revealSecret ? "hide" : "show"}</button
-        >
-      </div>
-      <div class="askpass-actions">
-        <button class="askpass-cancel" onclick={cancel}>cancel</button>
-        <button class="askpass-go" onclick={submit}>authenticate</button>
-      </div>
-    </div>
+  <!-- This original focus owner survives every queued prompt. -->
+  <div class="focus-owner" use:modalFocus={{ priority: 1 }}>
+    <AskpassDialog prompt={askpass} onAnswer={answer} />
   </div>
 {/if}
 
 <style>
-  .askpass-backdrop {
-    position: fixed;
-    inset: 0;
-    /* SSH is synchronously blocked on this answer. Keep it above every
-       ordinary picker, confirm dialog, toast, and reconnect UI. */
-    z-index: 230;
-    display: grid;
-    place-items: center;
-    padding: 24px;
-    background: var(--scrim);
-    backdrop-filter: blur(2px);
-  }
-
-  .askpass {
-    width: min(440px, 100%);
-    display: flex;
-    flex-direction: column;
-    gap: 14px;
-    padding: 20px;
-    background: var(--bg);
-    border: 1px solid var(--edge);
-    border-radius: 10px;
-    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.35);
-  }
-
-  .askpass-head {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-
-  .askpass-glyph {
-    font-size: var(--text-md);
-  }
-
-  .askpass-title {
-    font-size: var(--text-md);
-    font-weight: 600;
-    letter-spacing: 0.02em;
-    color: var(--fg);
-  }
-
-  .askpass-prompt {
-    margin: 0;
-    max-height: 40vh;
-    overflow-y: auto;
-    padding: 10px 12px;
-    background: var(--row-hover);
-    border: 1px solid var(--edge);
-    border-radius: 6px;
-    font-family: var(--mono);
-    font-size: var(--text-sm);
-    line-height: 1.5;
-    color: var(--muted);
-    white-space: pre-wrap;
-    word-break: break-word;
-  }
-
-  .askpass-field {
-    display: flex;
-    align-items: stretch;
-    gap: 6px;
-  }
-
-  .askpass-input {
-    flex: 1;
-    min-width: 0;
-    background: var(--bg);
-    border: 1px solid var(--edge);
-    border-radius: 6px;
-    color: var(--fg);
-    font: inherit;
-    font-family: var(--mono);
-    padding: 8px 10px;
-    outline: none;
-  }
-
-  .askpass-input:focus {
-    border-color: var(--focus-ring);
-  }
-
-  .askpass-reveal {
-    appearance: none;
-    background: transparent;
-    border: 1px solid var(--edge);
-    border-radius: 6px;
-    color: var(--muted);
-    font: inherit;
-    font-size: var(--text-xs);
-    padding: 0 10px;
-    cursor: pointer;
-    transition:
-      border-color 0.12s ease,
-      color 0.12s ease;
-  }
-
-  .askpass-reveal:hover {
-    border-color: var(--accent);
-    color: var(--fg);
-  }
-
-  .askpass-actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: 8px;
-  }
-
-  .askpass-cancel,
-  .askpass-go {
-    appearance: none;
-    font: inherit;
-    font-size: var(--text-md);
-    padding: 7px 16px;
-    border-radius: 6px;
-    cursor: pointer;
-    border: 1px solid var(--edge);
-    transition:
-      border-color 0.12s ease,
-      background 0.12s ease;
-  }
-
-  .askpass-cancel {
-    background: transparent;
-    color: var(--muted);
-  }
-
-  .askpass-cancel:hover {
-    border-color: var(--accent);
-    color: var(--fg);
-  }
-
-  .askpass-go {
-    background: var(--accent);
-    border-color: var(--accent);
-    color: var(--bg);
-    font-weight: 600;
-  }
-
-  .askpass-go:hover {
-    filter: brightness(1.08);
-  }
+  .focus-owner { display: contents; }
 </style>

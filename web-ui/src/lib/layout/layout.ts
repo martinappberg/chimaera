@@ -43,6 +43,10 @@ export interface FileTab {
 export interface SettingsTab {
   surface: "settings";
 }
+/** Account view; distinct from daemon settings. */
+export interface ProTab {
+  surface: "pro";
+}
 /**
  * A Finder (Miller-columns file browser). Keyed by a stable `id` — NOT by
  * `path` — so several Finders can coexist and each navigates freely; `path` is
@@ -134,6 +138,14 @@ export interface PluginViewTab {
   view: string;
 }
 /**
+ * Both versions a Chimaera Pro return kept, for choosing between them
+ * (`extensions/KeptApplicationView.svelte`) — the workspace's own singleton
+ * tab; absent private presentation retains Close/folder recovery.
+ */
+export interface KeptTab {
+  surface: "kept";
+}
+/**
  * A review of the files ONE session changed — a session-scoped changes list
  * built on the same git status/diff APIs as the source-control panel. Keyed by
  * session so re-opening focuses the existing tab; it reads the session's live
@@ -184,6 +196,7 @@ export type Tab =
   | TerminalTab
   | FileTab
   | SettingsTab
+  | ProTab
   | FinderTab
   | DiffTab
   | GitDetailTab
@@ -196,6 +209,7 @@ export type Tab =
   | PluginsTab
   | PluginViewTab
   | SessionsTab
+  | KeptTab
   | BrowserTab;
 
 /** Identity key for the no-duplicates invariant (one tab per surface). */
@@ -221,9 +235,11 @@ export function tabKey(t: Tab): string {
   if (t.surface === "timeline") return "v:timeline";
   if (t.surface === "knowledge") return "v:knowledge";
   if (t.surface === "plugins") return "v:plugins";
+  if (t.surface === "pro") return "v:pro";
   // `x:` (extension) — a plugin's view, its own namespace.
   if (t.surface === "plugin") return `x:${t.plugin}/${t.view}`;
   if (t.surface === "sessions") return "v:sessions";
+  if (t.surface === "kept") return "v:kept";
   if (t.surface === "changes") return `changes:${t.sessionId}`;
   // The title is a label, not identity: one tab per subagent.
   if (t.surface === "subagent") return `sub:${t.sessionId}:${t.agentId}`;
@@ -378,6 +394,14 @@ export function visibleSessionIds(l: Layout): string[] {
     if (t !== undefined && t.surface === "terminal") out.push(t.sessionId);
   }
   return out;
+}
+
+/** Whether the review of both versions is on screen (a shown pane's active
+ *  tab), the way `visibleSessionIds` reads sessions. */
+export function keptReviewShown(l: Layout): boolean {
+  const zoomed = l.zoomedPaneId !== null ? findPane(l.root, l.zoomedPaneId) : null;
+  const shown = zoomed !== null ? [zoomed] : panes(l.root);
+  return shown.some((p) => p.tabs[p.active]?.surface === "kept");
 }
 
 /** Every file path shown anywhere in the tree. */
@@ -811,9 +835,18 @@ export function openSessionsList(l: Layout): Layout {
   return openTab(l, { surface: "sessions" });
 }
 
+/** Open (or focus) the review of both versions a return kept. */
+export function openKeptReview(l: Layout): Layout {
+  return openTab(l, { surface: "kept" });
+}
+
 /** Open (or focus) the session-scoped changes review. */
 export function openChanges(l: Layout, sessionId: string): Layout {
   return openTab(l, { surface: "changes", sessionId });
+}
+
+export function openPro(l: Layout): Layout {
+  return openTab(l, { surface: "pro" });
 }
 
 /** Open (or focus) a subagent's conversation. */
@@ -1644,8 +1677,10 @@ function serNode(node: LayoutNode): SNode {
         if (t.surface === "timeline") return { v: "timeline" };
         if (t.surface === "knowledge") return { v: "knowledge" };
         if (t.surface === "plugins") return { v: "plugins" };
+        if (t.surface === "pro") return { v: "pro" };
         if (t.surface === "plugin") return { pg: t.plugin, pgv: t.view };
         if (t.surface === "sessions") return { v: "sessions" };
+        if (t.surface === "kept") return { v: "kept" };
         if (t.surface === "changes") return { cs: t.sessionId };
         if (t.surface === "subagent") return { sa: t.sessionId, sg: t.agentId, st: t.title };
         if (t.surface === "browser") {
@@ -1689,6 +1724,7 @@ function deserNode(
   depth: number,
   ids: Set<string>,
   seenTabs: Set<string>,
+  proTabs: boolean,
 ): LayoutNode | null {
   if (!isRecord(raw) || depth > MAX_DEPTH) return null;
   if (typeof raw.id !== "string" || raw.id.length === 0 || raw.id.length > 64 || ids.has(raw.id)) {
@@ -1753,6 +1789,8 @@ function deserNode(
         tab = { surface: "plugin", plugin: t.pg, view: t.pgv };
       } else if (t.v === "sessions") {
         tab = { surface: "sessions" };
+      } else if (t.v === "kept" && proTabs) {
+        tab = { surface: "kept" };
       } else if (typeof t.cs === "string" && t.cs.length > 0) {
         tab = { surface: "changes", sessionId: t.cs };
       } else if (
@@ -1778,6 +1816,8 @@ function deserNode(
         // none); anything not shaped like an id is dropped, never fatal.
         if (typeof t.wb === "string" && SESSION_ID_RE.test(t.wb)) browser.openedBy = t.wb;
         tab = browser;
+      } else if (t.v === "pro" && proTabs) {
+        tab = { surface: "pro" };
       } else if (t.v === "settings") {
         tab = { surface: "settings" };
       } else {
@@ -1804,18 +1844,20 @@ function deserNode(
   if (raw.t === "s") {
     if (raw.dir !== "row" && raw.dir !== "col") return null;
     if (typeof raw.ratio !== "number") return null;
-    const a = deserNode(raw.a, depth + 1, ids, seenTabs);
-    const b = deserNode(raw.b, depth + 1, ids, seenTabs);
+    const a = deserNode(raw.a, depth + 1, ids, seenTabs, proTabs);
+    const b = deserNode(raw.b, depth + 1, ids, seenTabs, proTabs);
     if (a === null || b === null) return null;
     return { type: "split", id: raw.id, dir: raw.dir, ratio: clampRatio(raw.ratio), a, b };
   }
   return null;
 }
 
-/** Validate a persisted blob; anything malformed yields null (caller falls back to defaultLayout). */
-export function deserializeLayout(raw: unknown): Layout | null {
+/** Validate a persisted blob; anything malformed yields null (caller falls back to defaultLayout).
+ *  `proTabs`: this build has the optional extension. Without it a saved Pro
+ *  tab is skipped like any tab kind this build does not know. */
+export function deserializeLayout(raw: unknown, proTabs = false): Layout | null {
   if (!isRecord(raw) || raw.v !== 1) return null;
-  const root = deserNode(raw.root, 0, new Set(), new Set());
+  const root = deserNode(raw.root, 0, new Set(), new Set(), proTabs);
   if (root === null) return null;
   const focused = typeof raw.focused === "string" ? raw.focused : "";
   const zoom = typeof raw.zoom === "string" ? raw.zoom : null;

@@ -12,6 +12,7 @@ fn main() {
     let commands: &'static [&'static str] = Box::leak(
         command_manifest::DAEMON_UI_COMMANDS
             .iter()
+            .chain(command_manifest::LOCAL_ACCOUNT_COMMANDS)
             .chain(command_manifest::WSL_SETUP_COMMANDS)
             .copied()
             .collect::<Vec<_>>()

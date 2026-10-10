@@ -27,13 +27,19 @@
     isCutPending,
     pasteInto,
   } from "./fileClipboard.svelte";
-  import { isRemoteHost } from "../net/api";
+  import { getActiveWorkspaceId, isOwnerAsleep, isRemoteHost, projectStateNote } from "../net/api";
+  import { hereName, keptCopyHint, keptMark, requestKeptReview } from "../pro/kept";
+  import { proTier } from "../net/plan";
+  import { refetchWhenOwnerAwake } from "../net/reconnect";
   import { stemLength, validateEntryName } from "../shared/fsNames";
   import { contextMenu, type ContextMenuEntry } from "../shared/contextMenu.svelte";
   import { hasLocalFiles, revealEntries, writeClipboard } from "../net/native";
   import FileIcon from "../shared/FileIcon.svelte";
   import FolderIcon from "../shared/FolderIcon.svelte";
   import Spinner from "../previews/Spinner.svelte";
+  import LoadingRows from "../shared/LoadingRows.svelte";
+  /** Who a kept copy's version belongs to, in the tree's badge. */
+  const keptHere = hereName();
 
   /** Local-daemon windows hide Download (the file already lives here). */
   const remote = isRemoteHost();
@@ -76,6 +82,10 @@
      *  under a symlink AND its target, so the highlight resolves by position
      *  when it can, by path only for the fallbacks. */
     dropKey?: string | null;
+    /** The workspace's files are still arriving (an extension says so,
+     *  `extensions/loading.ts`): placeholder rows stand in for the entries
+     *  until it clears. Never set without the extension. */
+    arriving?: boolean;
   }
 
   let {
@@ -89,6 +99,7 @@
     dropDir = null,
     dropAction = "upload",
     dropKey = null,
+    arriving = false,
   }: Props = $props();
 
   /** A row's own left padding (CSS `--row-pad`): the sticky probe lands
@@ -488,6 +499,7 @@
       listings = new Map();
       truncatedDirs = new Set();
       rootError = null;
+      stopWaitingForOwner();
       lastGitEpoch = -1;
       prevGitEntries = new Map();
       relistDirs = new Set();
@@ -572,6 +584,30 @@
     });
   });
 
+  // The root's listing met a project whose owner sleeps (or is reconnecting):
+  // the note stands until the owner answers, then the tree is listed again —
+  // it never reads again on its own, so without this a woken project's tree
+  // kept saying "asleep".
+  let cancelOwnerWait: (() => void) | null = null;
+  function stopWaitingForOwner(): void {
+    cancelOwnerWait?.();
+    cancelOwnerWait = null;
+  }
+  function waitForOwner(asleep: boolean): void {
+    stopWaitingForOwner();
+    cancelOwnerWait = refetchWhenOwnerAwake(
+      () => {
+        cancelOwnerWait = null;
+        void load(root);
+      },
+      // A sleeping owner's wake is announced; a project routed elsewhere that
+      // came home is not (nothing on this computer says so), so it is asked
+      // again now and then while the note stands.
+      { pollMs: asleep ? undefined : 30_000 },
+    );
+  }
+  $effect(() => stopWaitingForOwner);
+
   async function load(dir: string): Promise<void> {
     loading = new Set(loading).add(dir);
     try {
@@ -583,13 +619,17 @@
       if (listing.truncated === true) truncated.add(dir);
       else truncated.delete(dir);
       truncatedDirs = truncated;
-      if (dir === root) rootError = null;
+      if (dir === root) {
+        rootError = null;
+        stopWaitingForOwner();
+      }
     } catch (e) {
       const truncated = new Set(truncatedDirs);
       truncated.delete(dir);
       truncatedDirs = truncated;
       if (dir === root) {
         rootError = e instanceof Error ? e.message : "failed to list files";
+        if (projectStateNote(e) !== null) waitForOwner(isOwnerAsleep(e));
       } else {
         // Collapse a dir that failed to list (deleted, permission denied).
         const n = new Set(expanded);
@@ -905,6 +945,18 @@
         ? [{ label: "Download", onSelect: () => void fsDownload(entry.path) } as ContextMenuEntry]
         : []),
       { label: "Copy Path", onSelect: () => void copyPath(entry.path) },
+      // This computer's version kept beside the cloud's (a Pro return).
+      ...(entry.kind === "file" && keptMark(entry.name, $proTier) && getActiveWorkspaceId() !== null
+        ? [
+            {
+              label: "Review both versions",
+              onSelect: () => {
+                const id = getActiveWorkspaceId();
+                if (id !== null) requestKeptReview(id);
+              },
+            } as ContextMenuEntry,
+          ]
+        : []),
       ...revealEntries(entry.path),
       // Only inside a repository: git is ambient, never an offer.
       ...(entry.kind === "file" && repoForPath($gitRepos, entry.path) !== null
@@ -1023,7 +1075,7 @@
          and never moves the content. During an OS file drag it names the drop
          destination instead of the ancestors — one message at a time. -->
     <div class="tree-overlay">
-      {#if sticky.length > 0}
+      {#if sticky.length > 0 && !arriving}
         <div class="sticky-rows">
           {#each sticky as s (s.key)}
             <!-- A pinned ancestor is a drop target like its real row
@@ -1092,6 +1144,9 @@
         ...(hasLocalFiles() ? ["separator" as const, ...revealEntries(root)] : []),
       ])}
   >
+  {#if arriving}
+    <LoadingRows rows={10} variant="tree" label="files" />
+  {:else}
   {#if rootError !== null}
     <div class="tree-error">{rootError}</div>
   {:else if listings.get(root) === undefined}
@@ -1246,6 +1301,11 @@
           class:symlink={entry.symlink}
           class:broken={entry.broken}
           style:color={entry.broken ? undefined : gDeco ? gDeco.color : undefined}>{entry.name}</span>
+        {#if entry.kind === "file" && !entry.symlink && keptMark(entry.name, $proTier)}
+          <!-- A Pro return's kept copy: the odd name explained where it
+               appears (right-click offers the review). -->
+          <span class="kept-mark" title={keptCopyHint(entry.name, keptHere)}>from {keptHere}</span>
+        {/if}
         {#if entry.kind === "dir" && $gitIndex.repoRoots.has(entry.path)}
           <!-- A repository of its own: a quiet mark (its changes are its own,
                in its own section of the Source Control panel). -->
@@ -1299,6 +1359,7 @@
     <div class="tree-limit" role="status" title={[...truncatedDirs].join("\n")}>
       Some large folders are partially shown
     </div>
+  {/if}
   {/if}
   </div>
   </div>
@@ -1829,6 +1890,18 @@
     font-weight: 600;
     font-variant-numeric: tabular-nums;
     line-height: 1;
+  }
+  /* A Pro return's kept copy: a small pill right after the name. */
+  .kept-mark {
+    flex: none;
+    margin-left: 0.4rem;
+    padding: 0 5px;
+    border: 1px solid var(--edge);
+    border-radius: 999px;
+    font-size: 10px;
+    line-height: 14px;
+    color: var(--muted);
+    white-space: nowrap;
   }
   .repo-mark {
     flex: none;

@@ -33,9 +33,8 @@ mod worktree;
 pub(crate) use history::{compare, log, show};
 pub(crate) use http::{branches, diff, repos, status, worktrees};
 pub(crate) use repos::note_listed_dir;
-pub(crate) use service::{
-    backstop_poll, git_facts, mark_path_dirty, usable_git_dir, GitService, WatchGuard,
-};
+pub use service::mark_path_dirty;
+pub(crate) use service::{backstop_poll, git_facts, usable_git_dir, GitService, WatchGuard};
 pub(crate) use session::{session_git, session_turn_end, track_sessions};
 pub(crate) use worktree::{
     allowed_session_cwd, create_worktree, ensure_branch_worktree, remove_worktree,

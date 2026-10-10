@@ -7,6 +7,13 @@
 //! the same `ssh -L` as the workspaces themselves); a workspace keeps its
 //! chats in its own folder, so it moves between jobs.
 //!
+//! The optional keeper uses the same helpers, owning job connections itself.
+//! `start_job_with_id` and `spawn_attached_once` add remote, non-expiring claims
+//! for its durable operation journal; uncertainties require reconciliation, never
+//! a second scheduler effect. A stable batch start checks Slurm --test-only once
+//! before actual submission; only a fresh distinct refusal phase proves that
+//! the real submit was never invoked. Direct app/CLI lifecycle is unchanged.
+//!
 //! Every exec is one bounded `ssh host sh -s` with the script on STDIN, never
 //! in argv: startup commands may carry secrets (an `export API_KEY=…` on an
 //! egress-limited cluster), and argv is visible to every user of a shared
@@ -277,6 +284,7 @@ pub struct HostEndpoint {
     pub node: String,
     pub port: u16,
     pub token: String,
+    pub build: String,
 }
 
 /// Where an open workspace's chimaera listens — kept by the client.
@@ -287,6 +295,7 @@ pub struct Endpoint {
     pub node: String,
     pub port: u16,
     pub token: String,
+    pub build: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -631,6 +640,7 @@ fn build(
                             },
                             port: m.port,
                             token: m.token.clone(),
+                            build: m.build.clone().unwrap_or_default(),
                         },
                     );
                     return v;
@@ -729,6 +739,7 @@ fn job_view(
         },
         port: h.port,
         token: h.token.clone(),
+        build: h.build.clone(),
     };
     match row {
         Some(job) if slurm::is_live_state(&job.state) => {
@@ -1271,7 +1282,8 @@ pub enum StartOutcome {
 
 /// The scheduler said no. `message` is its own text, cleaned; `kind` is
 /// what it seems to say (remembered so the next start doesn't fail the same
-/// way).
+/// way). A stable submission additionally requires an intact empty-ID refusal
+/// frame; any emitted allocation identity remains [`StartUncertain`].
 #[derive(Clone, Debug, Serialize)]
 pub struct StartRefused {
     pub message: String,
@@ -1315,6 +1327,44 @@ pub async fn start_job(
     config: &ClusterConfig,
     req: &JobStart<'_>,
 ) -> anyhow::Result<StartOutcome> {
+    start_job_inner(host, home, config, req, new_job_id(), false).await
+}
+
+/// Submit using a caller's durable identity. An existing remote claim is never
+/// submitted again, even when its reply or local keeper journal was lost.
+/// The caller reconciles records/queue/accounting; absence is not terminal proof.
+/// Claims cover process/SSH/reply loss. After storage loss, reconcile the exact
+/// deterministic scheduler name before any effect; mkdir alone proves no fsync.
+pub async fn start_job_with_id(
+    host: &str,
+    home: RemoteHome,
+    config: &ClusterConfig,
+    req: &JobStart<'_>,
+    job_id: &str,
+) -> anyhow::Result<StartOutcome> {
+    anyhow::ensure!(valid_job_id(job_id), "unknown job");
+    start_job_inner(host, home, config, req, job_id.to_owned(), true).await
+}
+
+#[derive(Debug)]
+pub struct StartUncertain {
+    pub job: String,
+}
+impl std::fmt::Display for StartUncertain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("job submission requires reconciliation; it was not repeated")
+    }
+}
+impl std::error::Error for StartUncertain {}
+
+async fn start_job_inner(
+    host: &str,
+    home: RemoteHome,
+    config: &ClusterConfig,
+    req: &JobStart<'_>,
+    jid: String,
+    stable: bool,
+) -> anyhow::Result<StartOutcome> {
     let spec = req.spec.clone().normalized();
     spec.validate().map_err(anyhow::Error::msg)?;
     for wid in req.open {
@@ -1330,15 +1380,14 @@ pub async fn start_job(
         req.run_startup.len() <= STARTUP_MAX,
         "Startup commands are limited to 32 KB"
     );
-    let jid = new_job_id();
     let name = req
         .name
         .map(str::trim)
         .filter(|n| !n.is_empty())
         .map(|n| n.chars().take(60).collect::<String>())
         .unwrap_or_else(|| job_display_name(&spec));
-    let token = &chimaera_core::generate_token()[..6];
-    let job_name = slurm::job_name(&name, token);
+    let token = chimaera_core::generate_token();
+    let job_name = slurm::job_name(&name, if stable { &jid[2..] } else { &token[..6] });
     let dir = job_dir(home, &jid);
     let record = JobRecord {
         id: jid.clone(),
@@ -1373,7 +1422,11 @@ pub async fn start_job(
 
     let mut s = String::from("umask 077\nunset SLURM_JOB_ID SLURM_JOBID\n");
     s.push_str(&path_line(host));
-    s.push_str(&format!("D=\"{dir}\"\nmkdir -p \"$D\" || exit 3\n"));
+    let receipt = stable.then(chimaera_core::generate_token);
+    if let Some(nonce) = &receipt {
+        s.push_str(&format!("printf '===begin {nonce}\\n'\n"));
+    }
+    s.push_str(&submission_claim(&dir, stable));
     s.push_str(&write_file_lines("$D/job.sh", &script_text));
     s.push_str(&write_file_lines("$D/startup.sh", req.run_startup));
     s.push_str(&write_file_lines(
@@ -1401,23 +1454,28 @@ pub async fn start_job(
                 }
             })
             .collect();
-        s.push_str(&format!(
-            "out=$(sbatch {} \"$D/job.sh\" 2>\"$D/.sbatch.err\"); rc=$?\n\
-             id=${{out%%;*}}\n\
-             case \"$id\" in ''|*[!0-9_]*) [ \"$rc\" -eq 0 ] && rc=97 ;; esac\n\
-             if [ \"$rc\" -eq 0 ]; then\n\
-             \x20 sed \"s/__CHIMAERA_JOB_ID__/$id/\" \"$D/job.pending\" > \"$D/job.json.tmp\" && mv -f \"$D/job.json.tmp\" \"$D/job.json\"\n\
-             fi\n\
-             rm -f \"$D/job.pending\"\n\
-             printf '===rc %s\\n===id %s\\n===err\\n' \"$rc\" \"$id\"; cat \"$D/.sbatch.err\" 2>/dev/null; rm -f \"$D/.sbatch.err\"\n\
-             [ \"$rc\" -eq 0 ] || rm -rf \"$D\"\n\
-             printf '===end\\n'\n",
-            args.join(" ")
-        ));
+        s.push_str(&submission_lines(&args.join(" "), stable));
     }
-    let out = run_script(host, &s, EXEC_SECS).await?;
+    let out = match run_script(host, &s, EXEC_SECS).await {
+        Ok(out) => out,
+        Err(_) if stable => return Err(StartUncertain { job: jid }.into()),
+        Err(error) => return Err(error),
+    };
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let secs = sections(&stdout);
+    let secs = if let Some(receipt) = &receipt {
+        match submission_receipt(&stdout, receipt, req.attached) {
+            Some(secs) => secs,
+            None => return Err(StartUncertain { job: jid }.into()),
+        }
+    } else {
+        sections(&stdout)
+    };
+    if stable
+        && (section(&secs, "end").is_none()
+            || matches!(marker_arg(&secs, "rc"), Some("96" | "97" | "98")))
+    {
+        return Err(StartUncertain { job: jid }.into());
+    }
     if section(&secs, "end").is_none() {
         bail!(
             "starting a job on {host} failed: {}",
@@ -1426,10 +1484,18 @@ pub async fn start_job(
     }
     invalidate_queue(host);
     if req.attached {
+        if stable && marker_arg(&secs, "rc") != Some("0") {
+            return Err(StartUncertain { job: jid }.into());
+        }
         return Ok(StartOutcome::Attached { job: jid, job_name });
     }
-    let rc = marker_arg(&secs, "rc").unwrap_or("1");
+    let rc = marker_arg(&secs, "rc")
+        .or_else(|| marker_arg(&secs, "preflight_rc"))
+        .unwrap_or("1");
     if rc != "0" {
+        if stable && !stable_batch_non_submission(&secs) {
+            return Err(StartUncertain { job: jid }.into());
+        }
         let message = clean_tool_stderr(section(&secs, "err").unwrap_or(""), "sbatch");
         return Err(StartRefused {
             kind: classify_refusal(&message),
@@ -1444,6 +1510,145 @@ pub async fn start_job(
     })
 }
 
+fn submission_receipt(stdout: &str, nonce: &str, attached: bool) -> Option<Vec<(String, String)>> {
+    let begin = format!("===begin {nonce}");
+    let mut lines = stdout.lines();
+    lines.find(|line| *line == begin)?;
+    let mut secs: Vec<(String, String)> = Vec::with_capacity(4);
+    for line in lines {
+        if let Some(key) = line.strip_prefix("===") {
+            if secs.len() >= 4 {
+                return None;
+            }
+            secs.push((key.trim_end().to_owned(), String::new()));
+        } else if let Some((key, body)) = secs.last_mut() {
+            if key != "err" && !line.trim().is_empty() {
+                return None;
+            }
+            if body.len().saturating_add(line.len() + 1) > STARTUP_MAX {
+                return None;
+            }
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    let preflight = !attached
+        && secs
+            .first()
+            .is_some_and(|(key, _)| key.starts_with("preflight_rc "));
+    let status = if preflight { "preflight_rc" } else { "rc" };
+    let expected = if attached {
+        vec!["rc", "end"]
+    } else {
+        vec![status, "id", "err", "end"]
+    };
+    // An existing claim's rc98 receipt has no batch id; it is uncertainty.
+    if secs.len() == 2 && secs[0].0 == "rc 98" && secs[1].0 == "end" {
+        return Some(secs);
+    }
+    if secs.len() != expected.len()
+        || secs
+            .iter()
+            .zip(expected)
+            .any(|((key, _), want)| key.split_whitespace().next() != Some(want))
+    {
+        return None;
+    }
+    let rc = marker_arg(&secs, status)?.parse::<u16>().ok()?;
+    if secs[0].0 != format!("{status} {rc}")
+        || secs.last()?.0 != "end"
+        || (preflight && (rc == 0 || rc > 255))
+    {
+        return None;
+    }
+    if !attached && rc == 0 {
+        let id = marker_arg(&secs, "id")?;
+        if !valid_slurm_job_id(id) || secs[1].0 != format!("id {id}") {
+            return None;
+        }
+    }
+    Some(secs)
+}
+
+/// A scheduler command can print an allocation ID and still fail afterward.
+/// Its nonzero exit then cannot prove that no job was accepted. Called only
+/// after the fresh nonce/exact frame parser succeeds, never on SSH diagnostics.
+/// Shell execution errors and signal termination are not scheduler refusals.
+fn stable_batch_non_submission(sections: &[(String, String)]) -> bool {
+    if marker_arg(sections, "preflight_rc").is_some() {
+        // The exact nonce phase is emitted only on the branch that exits before
+        // real submission. Classification is guidance, not stderr authority.
+        return sections.get(1).is_some_and(|(marker, _)| marker == "id");
+    }
+    let rejected = marker_arg(sections, "rc")
+        .and_then(|rc| rc.parse::<u8>().ok())
+        .is_some_and(|rc| (1..126).contains(&rc) && !matches!(rc, 96..=98));
+    rejected
+        && sections.get(1).is_some_and(|(marker, _)| marker == "id")
+        && positive_scheduler_refusal(section(sections, "err").unwrap_or(""))
+}
+
+fn positive_scheduler_refusal(stderr: &str) -> bool {
+    // SchedMD sbatch reports both controller rejection and send/receive failure
+    // through the same nonzero exit. Only exact known controller policy codes
+    // are evidence here; the broad UI classifier is deliberately not authority.
+    // See src/sbatch/sbatch.c, src/api/submit.c and src/common/slurm_errno.c.
+    let Some(reason) = stderr
+        .trim()
+        .strip_prefix("sbatch: error: Batch job submission failed: ")
+    else {
+        return false;
+    };
+    matches!(
+        reason,
+        "Invalid account or account/partition combination specified"
+            | "Invalid qos specification"
+            | "Invalid feature specification"
+    )
+}
+
+fn submission_claim(dir: &str, stable: bool) -> String {
+    if stable {
+        // mkdir is the remote, non-expiring claim, before any sbatch effect.
+        // Retain it on every uncertainty; never remove it merely to retry.
+        format!("D=\"{dir}\"\nmkdir -p \"${{D%/*}}\" || exit 3\nif ! mkdir \"$D\"; then printf '===rc 98\\n===end\\n'; exit 0; fi\nset -e\n")
+    } else {
+        format!("D=\"{dir}\"\nmkdir -p \"$D\" || exit 3\n")
+    }
+}
+fn submission_lines(args: &str, stable: bool) -> String {
+    let before = if stable { "set +e\n" } else { "" };
+    let after = if stable { "set -e\n" } else { "" };
+    let locale = if stable { "LC_ALL=C LANG=C " } else { "" };
+    let preflight = if stable {
+        format!("{before}test_out=$(LC_ALL=C LANG=C sbatch --test-only {args} \"$D/job.sh\" 2>\"$D/.sbatch.err\"); test_rc=$?\n\
+            if [ \"$test_rc\" -ne 0 ] || [ -n \"$test_out\" ]; then\n\
+             printf '===preflight_rc %s\\n===id %s\\n===err\\n' \"$test_rc\" \"$test_out\"; cat \"$D/.sbatch.err\" 2>/dev/null || true; rm -f \"$D/.sbatch.err\"\n\
+             printf '===end\\n'; exit 0\n\
+            fi\n")
+    } else {
+        String::new()
+    };
+    let remove = if stable {
+        ""
+    } else {
+        "rm -f \"$D/job.pending\"\n[ \"$rc\" -eq 0 ] || rm -rf \"$D\"\n"
+    };
+    // Only a stable submission turns a failed record write into its own
+    // outcome. An ordinary one keeps main's behaviour: the job was queued,
+    // so it is reported started and its folder (its job.sh) is never
+    // removed under it.
+    let record_failed = if stable { " || rc=96" } else { "" };
+    format!("{preflight}{before}out=$({locale}sbatch {args} \"$D/job.sh\" 2>\"$D/.sbatch.err\"); rc=$?\n{after}\
+             id=${{out%%;*}}\n\
+             case \"$id\" in ''|*[!0-9_]*) if [ \"$rc\" -eq 0 ]; then rc=97; fi ;; esac\n\
+             if [ \"$rc\" -eq 0 ]; then\n\
+              sed \"s/__CHIMAERA_JOB_ID__/$id/\" \"$D/job.pending\" > \"$D/job.json.tmp\" && mv -f \"$D/job.json.tmp\" \"$D/job.json\"{record_failed}\n\
+             fi\n\
+             printf '===rc %s\\n===id %s\\n===err\\n' \"$rc\" \"$id\"; cat \"$D/.sbatch.err\" 2>/dev/null || true; rm -f \"$D/.sbatch.err\"\n\
+             {remove}printf '===end\\n'\n")
+}
+
 /// Hold an attached job in the foreground: `ssh -tt host srun … job.sh`. The
 /// pty makes the login node hang the job up when this connection ends —
 /// app quit, laptop sleep, a dropped link — so nothing outlives the user's
@@ -1456,6 +1661,42 @@ pub fn spawn_attached(
     job_name: &str,
     gpu_flag: GpuFlag,
 ) -> anyhow::Result<Child> {
+    spawn_attached_inner(host, home, jid, spec, job_name, gpu_flag, false)
+}
+
+/// Keeper-owned interactive launch. A remote one-shot claim refuses a replay
+/// after lost SSH/restart; the caller retains its hold until terminal proof.
+pub fn spawn_attached_once(
+    host: &str,
+    home: RemoteHome,
+    jid: &str,
+    spec: &LaunchSpec,
+    job_name: &str,
+    gpu_flag: GpuFlag,
+) -> anyhow::Result<Child> {
+    anyhow::ensure!(valid_job_id(jid), "unknown job");
+    anyhow::ensure!(
+        job_name.ends_with(&format!("~{}", &jid[2..])),
+        "job identity does not match"
+    );
+    spec.validate()
+        .map_err(|_| anyhow::anyhow!("invalid launch specification"))?;
+    spawn_attached_inner(host, home, jid, spec, job_name, gpu_flag, true)
+}
+
+fn attached_claim(dir: &str) -> String {
+    format!("[ -f \"{dir}/job.json\" ] && mkdir \"{dir}/attached.started\" || exit 98; ")
+}
+
+fn spawn_attached_inner(
+    host: &str,
+    home: RemoteHome,
+    jid: &str,
+    spec: &LaunchSpec,
+    job_name: &str,
+    gpu_flag: GpuFlag,
+    once: bool,
+) -> anyhow::Result<Child> {
     anyhow::ensure!(valid_job_id(jid), "unknown job");
     let args: Vec<String> = spec
         .srun_args(job_name, gpu_flag)
@@ -1464,8 +1705,13 @@ pub fn spawn_attached(
         .collect();
     // One line, so each statement needs its `;`: the PATH line ends in a
     // newline, and a space there once made it `export PATH exec srun …`.
+    let claim = if once {
+        attached_claim(&job_dir(home, jid))
+    } else {
+        String::new()
+    };
     let script = format!(
-        "unset SLURM_JOB_ID SLURM_JOBID; {}exec srun {} /bin/bash \"{}/job.sh\"",
+        "unset SLURM_JOB_ID SLURM_JOBID; {claim}{}exec srun {} /bin/bash \"{}/job.sh\"",
         path_line(host).replace('\n', "; "),
         args.join(" "),
         job_dir(home, jid)
@@ -1700,6 +1946,260 @@ pub async fn record_end(host: &str, home: RemoteHome, record: &JobRecord) -> any
     ));
     run_script(host, &w, EXEC_SECS).await?;
     Ok(ended)
+}
+
+/// Positive scheduler evidence for one keeper-stable submission, independent
+/// of queue absence and the presentation-only `ENDED` fallback. Unknown,
+/// failed, malformed, mismatched or conflicting observations never prove idle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalEvidence {
+    pub job_id: String,
+    pub slurm_job_id: String,
+    pub state: &'static str,
+    pub source: TerminalSource,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalSource {
+    Accounting,
+    Controller,
+}
+
+/// Uses routed SSH, bounded output/deadline and exact stable scheduler name.
+/// `observed_id` is the last positively observed interactive allocation id;
+/// omission still permits exact-name accounting recovery, never name guessing.
+/// Call at the existing scheduler polling floor, never once per viewer.
+pub async fn terminal_evidence(
+    host: &str,
+    record: &JobRecord,
+    observed_id: Option<&str>,
+) -> anyhow::Result<Option<TerminalEvidence>> {
+    let expected = terminal_identity(record, observed_id)?;
+    let age = terminal_query_age(record.submitted_ms, now_ms());
+    if age.is_none() && expected.is_none() {
+        return Ok(None);
+    }
+    let nonce = chimaera_core::generate_token();
+    let script = format!(
+        "{}{}",
+        path_line(host),
+        terminal_script(&record.job_name, expected, age, &nonce)
+    );
+    let output = run_script(host, &script, EXEC_SECS).await?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    Ok(terminal_receipt(&output.stdout, &nonce, record, expected))
+}
+fn terminal_identity<'a>(
+    record: &'a JobRecord,
+    observed_id: Option<&'a str>,
+) -> anyhow::Result<Option<&'a str>> {
+    anyhow::ensure!(
+        valid_job_id(&record.id)
+            && record.job_name.starts_with("chimaera-")
+            && record.job_name.ends_with(&format!("~{}", &record.id[2..]))
+            && record.job_name.len() <= 128
+            && record
+                .job_name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-~".contains(&b)),
+        "invalid stable job identity"
+    );
+    if let (Some(a), Some(b)) = (record.slurm_job_id.as_deref(), observed_id) {
+        anyhow::ensure!(a == b, "scheduler job identity changed");
+    }
+    let id = record.slurm_job_id.as_deref().or(observed_id);
+    anyhow::ensure!(
+        id.is_none_or(|id| valid_slurm_job_id(id) && id.starts_with(|c: char| c.is_ascii_digit())),
+        "invalid scheduler job identity"
+    );
+    Ok(id)
+}
+// Ten minutes allows clock skew; a month bounds accounting history even for
+// a damaged/ancient journal. Older entries still permit exact controller proof.
+fn terminal_query_age(submitted_ms: u64, now: u64) -> Option<u64> {
+    const MONTH: u64 = 31 * 24 * 3600;
+    if submitted_ms == 0 || submitted_ms > now.saturating_add(600_000) {
+        return None;
+    }
+    let age = now.saturating_sub(submitted_ms) / 1000;
+    (age <= MONTH - 600).then_some(age + 600)
+}
+fn terminal_script(name: &str, id: Option<&str>, age: Option<u64>, nonce: &str) -> String {
+    let select = id
+        .map(|id| format!("-j {}", sh_quote(id)))
+        .unwrap_or_default();
+    let accounting = age.map(|age| format!("sacct -nPXD {select} -S now-{age}seconds --name={} -o JobID%64,JobName%128,State%64,UID 2>/dev/null; rc=$?", sh_quote(name))).unwrap_or_else(|| "rc=1".into());
+    let controller = id
+        .map(|id| format!("scontrol -o show job {} 2>/dev/null; rc=$?", sh_quote(id)))
+        .unwrap_or_else(|| "rc=1".into());
+    format!(
+        "printf '===begin {nonce}\n===sacct\n'\n\
+        {accounting}\n\
+        printf '\n===sacct_rc %s\n===scontrol\n' \"$rc\"\n\
+        {controller}\n\
+        printf '\n===scontrol_rc %s\n===uid %s\n===end\n' \"$rc\" \"$(id -u)\"\n"
+    )
+}
+#[derive(Clone, Debug)]
+enum TerminalObservation {
+    Unknown,
+    Live,
+    Terminal(TerminalEvidence),
+    Conflict,
+}
+fn terminal_receipt(
+    bytes: &[u8],
+    nonce: &str,
+    record: &JobRecord,
+    expected: Option<&str>,
+) -> Option<TerminalEvidence> {
+    if bytes.len() > 64 * 1024 {
+        return None;
+    }
+    let stdout = std::str::from_utf8(bytes).ok()?;
+    let begin = format!("===begin {nonce}\n");
+    let start = stdout.lines().position(|line| line == begin.trim_end())?;
+    let framed = stdout.lines().skip(start).collect::<Vec<_>>().join("\n");
+    let secs = sections(&framed);
+    if secs.len() != 7
+        || secs[0].0 != format!("begin {nonce}")
+        || secs[1].0 != "sacct"
+        || !secs[2].0.starts_with("sacct_rc ")
+        || secs[3].0 != "scontrol"
+        || !secs[4].0.starts_with("scontrol_rc ")
+        || !secs[5].0.starts_with("uid ")
+        || secs[6].0 != "end"
+        || secs
+            .iter()
+            .enumerate()
+            .any(|(i, (_, body))| i != 1 && i != 3 && !body.trim().is_empty())
+    {
+        return None;
+    }
+    let rc = |index: usize| secs[index].0.split_once(' ')?.1.parse::<u8>().ok();
+    let uid = secs[5].0.strip_prefix("uid ")?.parse::<u32>().ok()?;
+    let accounting = if rc(2)? == 0 {
+        terminal_accounting(&secs[1].1, record, expected, uid)
+    } else {
+        TerminalObservation::Unknown
+    };
+    let controller = if rc(4)? == 0 {
+        terminal_controller(&secs[3].1, record, expected, uid)
+    } else {
+        TerminalObservation::Unknown
+    };
+    match (accounting, controller) {
+        (TerminalObservation::Live | TerminalObservation::Conflict, _)
+        | (_, TerminalObservation::Live | TerminalObservation::Conflict) => None,
+        (TerminalObservation::Terminal(a), TerminalObservation::Terminal(b))
+            if a.slurm_job_id != b.slurm_job_id || a.state != b.state =>
+        {
+            None
+        }
+        (TerminalObservation::Terminal(a), _) => Some(a),
+        (_, TerminalObservation::Terminal(b)) => Some(b),
+        _ => None,
+    }
+}
+fn terminal_accounting(
+    body: &str,
+    record: &JobRecord,
+    expected: Option<&str>,
+    uid: u32,
+) -> TerminalObservation {
+    let mut evidence: Option<TerminalEvidence> = None;
+    for (n, line) in body.lines().filter(|l| !l.trim().is_empty()).enumerate() {
+        if n >= 1 {
+            return TerminalObservation::Conflict;
+        }
+        let fields: Vec<_> = line.split('|').map(str::trim).collect();
+        if fields.len() != 4
+            || !valid_slurm_job_id(fields[0])
+            || !fields[0].starts_with(|c: char| c.is_ascii_digit())
+            || expected.is_some_and(|id| id != fields[0])
+            || fields[1] != record.job_name
+            || fields[3].parse::<u32>().ok() != Some(uid)
+        {
+            return TerminalObservation::Conflict;
+        }
+        let Some(state) = exact_terminal_state(fields[2]) else {
+            return TerminalObservation::Live;
+        };
+        let next = TerminalEvidence {
+            job_id: record.id.clone(),
+            slurm_job_id: fields[0].into(),
+            state,
+            source: TerminalSource::Accounting,
+        };
+        if evidence
+            .as_ref()
+            .is_some_and(|e| e.slurm_job_id != next.slurm_job_id || e.state != next.state)
+        {
+            return TerminalObservation::Conflict;
+        }
+        evidence = Some(next);
+    }
+    evidence
+        .map(TerminalObservation::Terminal)
+        .unwrap_or(TerminalObservation::Unknown)
+}
+fn terminal_controller(
+    body: &str,
+    record: &JobRecord,
+    expected: Option<&str>,
+    uid: u32,
+) -> TerminalObservation {
+    let mut lines = body.lines().filter(|l| !l.trim().is_empty());
+    let Some(line) = lines.next() else {
+        return TerminalObservation::Unknown;
+    };
+    if lines.next().is_some() {
+        return TerminalObservation::Conflict;
+    }
+    let mut fields = std::collections::BTreeMap::new();
+    for part in line.split_whitespace() {
+        if let Some((key, value)) = part.split_once('=') {
+            if fields.insert(key, value).is_some() {
+                return TerminalObservation::Conflict;
+            }
+        }
+    }
+    let Some(id) = fields.get("JobId") else {
+        return TerminalObservation::Conflict;
+    };
+    let owner = fields
+        .get("UserId")
+        .and_then(|u| u.rsplit_once('('))
+        .and_then(|(_, n)| n.strip_suffix(')'))
+        .and_then(|n| n.parse::<u32>().ok());
+    if expected != Some(*id)
+        || fields.get("JobName").copied() != Some(record.job_name.as_str())
+        || owner != Some(uid)
+    {
+        return TerminalObservation::Conflict;
+    }
+    let Some(state) = fields.get("JobState").and_then(|s| exact_terminal_state(s)) else {
+        return TerminalObservation::Live;
+    };
+    TerminalObservation::Terminal(TerminalEvidence {
+        job_id: record.id.clone(),
+        slurm_job_id: (*id).into(),
+        state,
+        source: TerminalSource::Controller,
+    })
+}
+fn exact_terminal_state(state: &str) -> Option<&'static str> {
+    slurm::TERMINAL_STATES
+        .iter()
+        .find(|candidate| {
+            state == **candidate
+                || (**candidate == "CANCELLED"
+                    && state
+                        .strip_prefix("CANCELLED by ")
+                        .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())))
+        })
+        .copied()
 }
 
 /// Forget an ended job: remove its folder (its script and Slurm's output).
@@ -1952,6 +2452,7 @@ pub fn endpoint_from(status: &JobHostStatus, jid: &str, wid: &str) -> Option<End
         node: status.node.clone(),
         port: w.port?,
         token: w.token.clone()?,
+        build: w.build.clone().unwrap_or_default(),
     })
 }
 
@@ -2128,10 +2629,80 @@ mod tests {
             build: None,
             slurm_job_id: Some(slurm.into()),
             runtime_leases: false,
+            daemon_extension: false,
         }
     }
 
     const NOW: u64 = 1_000_000_000;
+    #[test]
+    fn original_records_and_job_host_preserve_each_endpoint_build() {
+        let config = ClusterConfig {
+            workspaces: vec![ClusterWorkspace {
+                id: "w-0000abcd".into(),
+                name: "fixture".into(),
+                path: "/fixture/project".into(),
+                created_ms: 0,
+            }],
+            ..Default::default()
+        };
+        let mut original_host = host("77");
+        original_host.build = "abcdef1.123".into();
+        let mut original_workspace = manifest("77");
+        original_workspace.build = Some("abcdef1.124".into());
+        let state = BrowseState {
+            config: config.clone(),
+            jobs: vec![JobFiles {
+                record: record("j-0000aaaa", Some("77"), NOW - 500_000),
+                host: Some(original_host),
+                egress: None,
+                hosting: None,
+            }],
+            manifests: [("w-0000abcd".into(), original_workspace)]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let queue = [queue_row("77", "RUNNING", "n042", "1:00:00", "None")];
+        let observed = build(&config, &state, &queue, true, NOW);
+        assert_eq!(observed.hosts["j-0000aaaa"].build, "abcdef1.123");
+        assert_eq!(observed.endpoints["w-0000abcd"].build, "abcdef1.124");
+        let mut live = JobHostStatus {
+            job: "j-0000aaaa".into(),
+            slurm_job_id: "77".into(),
+            node: "n042".into(),
+            workspaces: vec![HostedWorkspace {
+                id: "w-0000abcd".into(),
+                state: HostedState::Open,
+                port: Some(43000),
+                token: Some("successor-token".into()),
+                build: Some("abcdef1.125".into()),
+                ..Default::default()
+            }],
+        };
+        let mut overview = ClusterOverview {
+            jobs: observed.jobs,
+            workspaces: observed.workspaces,
+            endpoints: observed.endpoints,
+            ..Default::default()
+        };
+        apply_hosting(&mut overview, "j-0000aaaa", &live);
+        let endpoint = &overview.endpoints["w-0000abcd"];
+        assert_eq!(
+            (
+                endpoint.port,
+                endpoint.token.as_str(),
+                endpoint.build.as_str()
+            ),
+            (43000, "successor-token", "abcdef1.125")
+        );
+        live.workspaces[0].build = None;
+        assert_eq!(
+            endpoint_from(&live, "j-0000aaaa", "w-0000abcd")
+                .unwrap()
+                .build,
+            ""
+        );
+    }
 
     #[test]
     fn a_job_waits_starts_and_runs_with_the_queue_and_its_host_record() {
@@ -2547,6 +3118,7 @@ mod tests {
                 port,
                 working: 2,
                 token: port.map(|_| "tok".to_string()),
+                build: port.map(|_| "abcdef1.124".to_string()),
                 detail: detail.into(),
             };
         let status = JobHostStatus {
@@ -2613,6 +3185,574 @@ mod tests {
         assert!(f.get("workspaces").is_none(), "an empty scope goes away");
         set_scope(&mut f, None, " ");
         assert!(f.get("host").is_none());
+    }
+
+    #[test]
+    fn stable_receipts_require_fresh_begin_and_exact_positive_completion() {
+        let nonce = "fresh_attempt";
+        assert!(submission_receipt("===rc 0\n===end\n", nonce, true).is_none());
+        assert!(
+            submission_receipt("===rc 0\n===end\n===begin fresh_attempt\n", nonce, true).is_none()
+        );
+        assert!(submission_receipt("===begin fresh_attempt\n===end\n", nonce, true).is_none());
+        assert!(submission_receipt(
+            "===begin fresh_attempt\n===rc 0 extra\n===end\n",
+            nonce,
+            true
+        )
+        .is_none());
+        assert!(submission_receipt(
+            "===begin fresh_attempt\n===rc 0\n===end\n===end\n",
+            nonce,
+            true
+        )
+        .is_none());
+        assert!(submission_receipt(
+            "===begin fresh_attempt\n===rc 0\n===id bad\n===err\n===end\n",
+            nonce,
+            false
+        )
+        .is_none());
+        let attached = submission_receipt(
+            "===rc 9\n===end\n===begin fresh_attempt\n===rc 0\n===end\n",
+            nonce,
+            true,
+        )
+        .unwrap();
+        assert_eq!(marker_arg(&attached, "rc"), Some("0"));
+        let batch = submission_receipt(
+            "noise\n===begin fresh_attempt\n===rc 0\n===id 12345\n===err\n===end\n",
+            nonce,
+            false,
+        )
+        .unwrap();
+        assert_eq!(marker_arg(&batch, "id"), Some("12345"));
+    }
+
+    fn terminal_record() -> JobRecord {
+        JobRecord {
+            id: "j-1234abcd".into(),
+            job_name: "chimaera-fixture~1234abcd".into(),
+            slurm_job_id: Some("123".into()),
+            ..Default::default()
+        }
+    }
+    fn terminal_frame(accounting: &str, acct_rc: u8, controller: &str, control_rc: u8) -> Vec<u8> {
+        format!("noise\n===begin fresh\n===sacct\n{accounting}\n===sacct_rc {acct_rc}\n===scontrol\n{controller}\n===scontrol_rc {control_rc}\n===uid 1000\n===end\n").into_bytes()
+    }
+    #[test]
+    fn terminal_proof_requires_exact_name_id_uid_and_successful_fresh_complete_frame() {
+        let record = terminal_record();
+        let row = "123|chimaera-fixture~1234abcd|COMPLETED|1000";
+        let valid = terminal_frame(row, 0, "", 1);
+        let proof = terminal_receipt(&valid, "fresh", &record, Some("123")).unwrap();
+        assert_eq!(
+            (
+                proof.job_id.as_str(),
+                proof.slurm_job_id.as_str(),
+                proof.state,
+                proof.source
+            ),
+            ("j-1234abcd", "123", "COMPLETED", TerminalSource::Accounting)
+        );
+        for bad in [
+            "124|chimaera-fixture~1234abcd|COMPLETED|1000",
+            "123|chimaera-other~1234abcd|COMPLETED|1000",
+            "123|chimaera-fixture~1234abcd|COMPLETED|1001",
+            "123.batch|chimaera-fixture~1234abcd|COMPLETED|1000",
+            "123|chimaera-fixture~1234abcd|COMPLETED+|1000",
+            "123|chimaera-fixture~1234abcd|RUNNING|1000",
+            "123|chimaera-fixture~1234abcd|ENDED|1000",
+            "123|chimaera-fixture~1234abcd|CANCELLED_REQUEUED|1000",
+            "123|chimaera-fixture~1234abcd|COMPLETED|1000|extra",
+        ] {
+            assert!(terminal_receipt(
+                &terminal_frame(bad, 0, "", 1),
+                "fresh",
+                &record,
+                Some("123")
+            )
+            .is_none());
+        }
+        assert!(terminal_receipt(
+            &terminal_frame(row, 1, "", 1),
+            "fresh",
+            &record,
+            Some("123")
+        )
+        .is_none());
+        assert!(terminal_receipt(&valid, "different", &record, Some("123")).is_none());
+        for damaged in [
+            valid[..valid.len() - 8].to_vec(),
+            [valid.clone(), b"===end\n".to_vec()].concat(),
+            [valid.clone(), b"unexpected\n".to_vec()].concat(),
+            vec![b'x'; 65537],
+        ] {
+            assert!(terminal_receipt(&damaged, "fresh", &record, Some("123")).is_none());
+        }
+        let mut wrong = record.clone();
+        wrong.job_name = "chimaera-other~99999999".into();
+        assert!(terminal_identity(&wrong, None).is_err());
+        assert!(terminal_identity(&record, Some("124")).is_err());
+    }
+    #[test]
+    fn terminal_controller_fallback_refuses_live_conflicting_and_unknown_observations() {
+        let record = terminal_record();
+        let control =
+            "JobId=123 JobName=chimaera-fixture~1234abcd UserId=fixture(1000) JobState=CANCELLED";
+        let proof = terminal_receipt(
+            &terminal_frame("", 1, control, 0),
+            "fresh",
+            &record,
+            Some("123"),
+        )
+        .unwrap();
+        assert_eq!(
+            (proof.state, proof.source),
+            ("CANCELLED", TerminalSource::Controller)
+        );
+        for bad in [
+            control.replace("JobId=123", "JobId=124"),
+            control.replace("UserId=fixture(1000)", "UserId=fixture(1001)"),
+            control.replace("CANCELLED", "RUNNING"),
+            control.replace("CANCELLED", "UNKNOWN"),
+            format!("{control} JobId=123"),
+        ] {
+            assert!(terminal_receipt(
+                &terminal_frame("", 1, &bad, 0),
+                "fresh",
+                &record,
+                Some("123")
+            )
+            .is_none());
+        }
+        let completed = "123|chimaera-fixture~1234abcd|COMPLETED|1000";
+        for contradiction in [control.replace("CANCELLED", "RUNNING"), control.to_string()] {
+            assert!(terminal_receipt(
+                &terminal_frame(completed, 0, &contradiction, 0),
+                "fresh",
+                &record,
+                Some("123")
+            )
+            .is_none());
+        }
+        assert!(
+            terminal_receipt(&terminal_frame("", 0, "", 1), "fresh", &record, Some("123"))
+                .is_none()
+        );
+        assert!(
+            terminal_receipt(&terminal_frame("", 1, "", 1), "fresh", &record, Some("123"))
+                .is_none()
+        );
+        assert!(terminal_receipt(
+            &terminal_frame(
+                "123|chimaera-fixture~1234abcd|CANCELLED by 1000|1000",
+                0,
+                "",
+                1
+            ),
+            "fresh",
+            &record,
+            Some("123")
+        )
+        .is_some());
+        assert!(terminal_receipt(&terminal_frame("123|chimaera-fixture~1234abcd|COMPLETED|1000\n124|chimaera-fixture~1234abcd|COMPLETED|1000",0,"",1),"fresh",&record,None).is_none());
+    }
+    #[test]
+    fn terminal_accounting_window_is_bounded_by_submission_time_not_epoch_history() {
+        let now = 1_900_000_000_000u64;
+        assert_eq!(terminal_query_age(now - 5_000, now), Some(605));
+        assert_eq!(terminal_query_age(now + 5_000, now), Some(600));
+        assert!(terminal_query_age(0, now).is_none());
+        assert!(terminal_query_age(now + 600_001, now).is_none());
+        assert!(terminal_query_age(now - 31 * 24 * 3600 * 1000, now).is_none());
+        let script = terminal_script("chimaera-fixture~1234abcd", None, Some(605), "fresh");
+        assert!(script.contains("-S now-605seconds"));
+        assert!(script.contains("-nPXD"));
+        assert!(!script.contains("1970"));
+        let record = terminal_record();
+        let row = "123|chimaera-fixture~1234abcd|COMPLETED|1000";
+        assert!(terminal_receipt(
+            &terminal_frame(&format!("{row}\n{row}"), 0, "", 1),
+            "fresh",
+            &record,
+            Some("123")
+        )
+        .is_none());
+    }
+    #[test]
+    fn terminal_probe_real_shell_retains_status_and_controller_fallback_without_queue_guessing() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = SubmissionFixture::new("exit 0");
+        let record = terminal_record();
+        for (accounting,controller,source) in [
+            ("printf '123|chimaera-fixture~1234abcd|COMPLETED|%s\\n' \"$(id -u)\"","exit 1",Some(TerminalSource::Accounting)),
+            ("exit 1","printf 'JobId=123 JobName=chimaera-fixture~1234abcd UserId=fixture(%s) JobState=TIMEOUT\\n' \"$(id -u)\"",Some(TerminalSource::Controller)),
+            ("exit 1","exit 1",None),
+            ("printf '123|chimaera-fixture~1234abcd|RUNNING|%s\\n' \"$(id -u)\"","exit 1",None),
+        ] {
+            for (name,body) in [("sacct",accounting),("scontrol",controller)] {
+                let path=fixture.0.join("bin").join(name);std::fs::write(&path,format!("#!/bin/sh\n{body}\n")).unwrap();std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let output=fixture.run(&terminal_script(&record.job_name,Some("123"),Some(600),"fresh"));
+            assert!(output.status.success());
+            assert_eq!(terminal_receipt(&output.stdout,"fresh",&record,Some("123")).map(|p|p.source),source);
+        }
+    }
+
+    #[test]
+    fn terminal_old_or_missing_submission_still_allows_exact_controller_proof() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = SubmissionFixture::new("exit 0");
+        let control = fixture.0.join("bin/scontrol");
+        std::fs::write(&control,"#!/bin/sh\nprintf 'JobId=123 JobName=chimaera-fixture~1234abcd UserId=fixture(%s) JobState=COMPLETED\\n' \"$(id -u)\"\n").unwrap();
+        std::fs::set_permissions(control, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let record = terminal_record();
+        let now = 1_900_000_000_000u64;
+        for submitted in [0, now - 32 * 24 * 3600 * 1000, now + 600_001] {
+            let age = terminal_query_age(submitted, now);
+            assert!(age.is_none());
+            let script = terminal_script(&record.job_name, Some("123"), age, "fresh");
+            assert!(!script.contains("sacct -"));
+            let output = fixture.run(&script);
+            assert!(output.status.success());
+            let evidence = terminal_receipt(&output.stdout, "fresh", &record, Some("123")).unwrap();
+            assert_eq!(
+                (evidence.state, evidence.source),
+                ("COMPLETED", TerminalSource::Controller)
+            );
+        }
+    }
+
+    struct SubmissionFixture(std::path::PathBuf);
+    impl SubmissionFixture {
+        fn new(sbatch: &str) -> Self {
+            Self::with_preflight(sbatch, "exit 0")
+        }
+        fn with_preflight(sbatch: &str, preflight: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let root = std::env::temp_dir().join(format!(
+                "chimaera-submit-{}",
+                chimaera_core::generate_token()
+            ));
+            std::fs::create_dir_all(root.join("bin")).unwrap();
+            let path = root.join("bin/sbatch");
+            std::fs::write(
+                &path,
+                format!("#!/bin/sh\nif [ \"$1\" = --test-only ]; then\n printf 'called\\n' >> \"$HOME/preflight-calls\"\n {preflight}\nfi\nprintf 'called\\n' >> \"$HOME/calls\"\n{sbatch}\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            Self(root)
+        }
+        fn run(&self, script: &str) -> std::process::Output {
+            std::process::Command::new("sh")
+                .args(["-c", script])
+                .env("HOME", &self.0)
+                .env(
+                    "PATH",
+                    format!("{}:/usr/bin:/bin", self.0.join("bin").display()),
+                )
+                .output()
+                .unwrap()
+        }
+        fn submit_script(&self) -> String {
+            let mut script = String::from("umask 077\n");
+            script.push_str(&submission_claim("$HOME/cluster/j/j-1234abcd", true));
+            script.push_str(&write_file_lines(
+                "$D/job.pending",
+                "{\"slurm_job_id\":\"__CHIMAERA_JOB_ID__\"}",
+            ));
+            script.push_str(&write_file_lines("$D/job.sh", "exit 0"));
+            script.push_str(&submission_lines("--parsable", true));
+            script
+        }
+        fn calls(&self) -> usize {
+            std::fs::read_to_string(self.0.join("calls")).map_or(0, |s| s.lines().count())
+        }
+    }
+    impl Drop for SubmissionFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// An ordinary start whose record cannot be written (the folder is full
+    /// or read-only) still reports the job it queued, and never removes the
+    /// folder holding that job's script, as on main.
+    #[test]
+    fn ordinary_submission_keeps_a_queued_job_when_its_record_fails() {
+        let f =
+            SubmissionFixture::new("chmod 500 \"$HOME/cluster/j/j-1234abcd\"; printf '12345\\n'");
+        let mut script = String::from("umask 077\n");
+        script.push_str(&submission_claim("$HOME/cluster/j/j-1234abcd", false));
+        script.push_str(&write_file_lines("$D/job.pending", "{}"));
+        script.push_str(&write_file_lines("$D/job.sh", "exit 0"));
+        script.push_str(&submission_lines("--parsable", false));
+        let out = f.run(&script);
+        let dir = f.0.join("cluster/j/j-1234abcd");
+        let restore = || {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let kept = dir.join("job.sh").is_file();
+        restore();
+        assert!(
+            stdout.contains("===rc 0") && stdout.contains("===id 12345"),
+            "{stdout}"
+        );
+        assert!(kept, "the queued job's script stays");
+        assert!(!dir.join("job.json").exists());
+    }
+    #[test]
+    fn stable_submission_claim_prevents_duplicate_after_lost_reply() {
+        let f = SubmissionFixture::new("printf '12345;cluster\\n'");
+        let script = f.submit_script();
+        let first = f.run(&script);
+        assert!(first.status.success());
+        assert!(String::from_utf8_lossy(&first.stdout).contains("===id 12345"));
+        let record = std::fs::read_to_string(f.0.join("cluster/j/j-1234abcd/job.json")).unwrap();
+        assert!(record.contains("12345"));
+        // Forget the first reply; the remote claim remains and retry makes no effect.
+        let retry = f.run(&script);
+        assert!(String::from_utf8_lossy(&retry.stdout).contains("===rc 98"));
+        assert_eq!(f.calls(), 1);
+        assert_eq!(
+            std::fs::read_to_string(f.0.join("cluster/j/j-1234abcd/job.json")).unwrap(),
+            record
+        );
+    }
+    #[test]
+    fn stable_submission_preserves_refused_and_unparseable_evidence() {
+        for (sbatch, rc) in [
+            ("printf 'invalid partition\\n' >&2; exit 1", "===rc 1"),
+            ("printf 'invalid id\\n'", "===rc 97"),
+        ] {
+            let f = SubmissionFixture::new(sbatch);
+            let script = f.submit_script();
+            let first = f.run(&script);
+            assert!(
+                String::from_utf8_lossy(&first.stdout).contains(rc),
+                "{}",
+                String::from_utf8_lossy(&first.stdout)
+            );
+            assert!(f.0.join("cluster/j/j-1234abcd/job.pending").is_file());
+            f.run(&script);
+            assert_eq!(f.calls(), 1);
+        }
+    }
+    #[test]
+    fn stable_refusal_requires_nonzero_empty_id_frame_and_never_clears_claim() {
+        for (command, positive) in [
+            ("printf 'sbatch: error: Batch job submission failed: Socket timed out on send/recv operation\n' >&2; exit 1", false),
+            ("printf 'sbatch: error: Batch job submission failed: Message receive failure\n' >&2; exit 1", false),
+            ("printf 'account required but controller unavailable\n' >&2; exit 1", false),
+            ("printf 'Batch jobs not allowed here\n' >&2; exit 1", false),
+            ("printf 'sbatch: error: Batch job submission failed: Invalid qos specification\n' >&2; exit 1", true),
+            ("printf 'sbatch: error: Batch job submission failed: Invalid account or account/partition combination specified\n' >&2; exit 1", true),
+            ("printf 'sbatch: error: Batch job submission failed: Invalid feature specification\n' >&2; exit 1", true),
+            ("printf 'sbatch: error: Batch job submission failed: Invalid qos specification\nsbatch: error: Message receive failure\n' >&2; exit 1", false),
+            ("printf '12345\n'; printf 'sbatch: error: Batch job submission failed: Invalid qos specification\n' >&2; exit 1", false),
+            (
+                "printf '12345;cluster\n'; printf 'post-submit error\n' >&2; exit 1",
+                false,
+            ),
+            ("printf 'unrecognized scheduler output\n'; exit 1", false),
+            ("printf '12345\n'", false),
+        ] {
+            let fixture = SubmissionFixture::new(command);
+            let script = format!(
+                "printf '===begin refusal_probe\n'\n{}",
+                fixture.submit_script()
+            );
+            let output = fixture.run(&script);
+            assert!(output.status.success());
+            let sections = submission_receipt(
+                &String::from_utf8_lossy(&output.stdout),
+                "refusal_probe",
+                false,
+            )
+            .unwrap();
+            assert_eq!(stable_batch_non_submission(&sections), positive);
+            // Claim survives both the positive refusal and ambiguous ID/error.
+            // A later retry can't turn old evidence into another submission.
+            let retry = fixture.run(&script);
+            let sections = submission_receipt(
+                &String::from_utf8_lossy(&retry.stdout),
+                "refusal_probe",
+                false,
+            )
+            .unwrap();
+            assert!(!stable_batch_non_submission(&sections));
+            assert_eq!(fixture.calls(), 1);
+        }
+        for frame in [
+            "===begin refusal_probe\n===rc 256\n===id\n===err\n===end\n",
+            "===begin refusal_probe\n===rc 137\n===id\n===err\n===end\n",
+            "===begin refusal_probe\n===rc 126\n===id\n===err\n===end\n",
+            "===begin refusal_probe\n===rc 127\n===id\n===err\n===end\n",
+            "===begin refusal_probe\n===rc 96\n===id\n===err\n===end\n",
+            "===begin refusal_probe\n===rc 97\n===id\n===err\n===end\n",
+        ] {
+            let sections = submission_receipt(frame, "refusal_probe", false).unwrap();
+            assert!(!stable_batch_non_submission(&sections));
+        }
+    }
+    #[test]
+    fn stable_preflight_refusal_proves_zero_real_submission_and_never_replays() {
+        for (preflight, positive, kind) in [
+            (
+                "printf 'sbatch: error: Batch jobs not allowed; use interactive\n' >&2; exit 1",
+                true,
+                Refusal::BatchNotAllowed,
+            ),
+            (
+                "printf 'sbatch: error: Message receive failure\n' >&2; exit 1",
+                true,
+                Refusal::Other,
+            ),
+            (
+                "printf '12345\n'; printf 'site failure\n' >&2; exit 1",
+                false,
+                Refusal::Other,
+            ),
+        ] {
+            let fixture = SubmissionFixture::with_preflight("printf '12345\n'", preflight);
+            let script = format!(
+                "printf '===begin preflight_probe\n'\n{}",
+                fixture.submit_script()
+            );
+            let result = fixture.run(&script);
+            assert!(result.status.success());
+            let output = String::from_utf8_lossy(&result.stdout);
+            let sections = submission_receipt(&output, "preflight_probe", false).unwrap();
+            assert!(sections[0].0.starts_with("preflight_rc "));
+            assert_eq!(stable_batch_non_submission(&sections), positive);
+            assert_eq!(classify_refusal(section(&sections, "err").unwrap()), kind);
+            assert_eq!(fixture.calls(), 0);
+            assert_eq!(
+                std::fs::read_to_string(fixture.0.join("preflight-calls"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+            assert!(submission_receipt(&output, "stale_nonce", false).is_none());
+            assert!(
+                submission_receipt(&output.replace("===end", ""), "preflight_probe", false)
+                    .is_none()
+            );
+            assert!(submission_receipt(&output, "preflight_probe", true).is_none());
+            let retry = fixture.run(&script);
+            let retry = submission_receipt(
+                &String::from_utf8_lossy(&retry.stdout),
+                "preflight_probe",
+                false,
+            )
+            .unwrap();
+            assert!(!stable_batch_non_submission(&retry));
+            assert_eq!(fixture.calls(), 0);
+            assert_eq!(
+                std::fs::read_to_string(fixture.0.join("preflight-calls"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+        }
+    }
+    #[test]
+    fn stable_preflight_stdout_cannot_hide_a_nonconforming_submission_wrapper() {
+        let fixture =
+            SubmissionFixture::with_preflight("printf '54321\n'", "printf '12345\n'; exit 0");
+        let script = format!(
+            "printf '===begin preflight_probe\n'\n{}",
+            fixture.submit_script()
+        );
+        let result = fixture.run(&script);
+        let output = String::from_utf8_lossy(&result.stdout);
+        assert!(output.contains("===preflight_rc 0"));
+        assert!(submission_receipt(&output, "preflight_probe", false).is_none());
+        assert_eq!(fixture.calls(), 0);
+        fixture.run(&script);
+        assert_eq!(fixture.calls(), 0);
+        assert_eq!(
+            std::fs::read_to_string(fixture.0.join("preflight-calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+    #[test]
+    fn stable_preflight_uses_same_arguments_then_one_actual_submission() {
+        let fixture = SubmissionFixture::with_preflight(
+            "printf '%s\n' \"$*\" >> \"$HOME/args\"; printf '12345\n'",
+            "printf '%s\n' \"$*\" >> \"$HOME/args\"; exit 0",
+        );
+        let script = format!(
+            "printf '===begin preflight_probe\n'\n{}",
+            fixture.submit_script()
+        );
+        let result = fixture.run(&script);
+        let sections = submission_receipt(
+            &String::from_utf8_lossy(&result.stdout),
+            "preflight_probe",
+            false,
+        )
+        .unwrap();
+        assert_eq!(marker_arg(&sections, "rc"), Some("0"));
+        assert_eq!(marker_arg(&sections, "id"), Some("12345"));
+        let args = std::fs::read_to_string(fixture.0.join("args")).unwrap();
+        let args: Vec<_> = args.lines().collect();
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0].strip_prefix("--test-only "), Some(args[1]));
+        assert_eq!(fixture.calls(), 1);
+        fixture.run(&script);
+        assert_eq!(fixture.calls(), 1);
+        assert_eq!(
+            std::fs::read_to_string(fixture.0.join("args"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+        for frame in [
+            "===begin preflight_probe\n===preflight_rc 0\n===id\n===err\n===end\n",
+            "===begin preflight_probe\n===preflight_rc 256\n===id\n===err\n===end\n",
+        ] {
+            assert!(submission_receipt(frame, "preflight_probe", false).is_none());
+        }
+    }
+    #[test]
+    fn stable_submission_partial_prepare_never_resubmits() {
+        let f = SubmissionFixture::new("printf '12345\\n'");
+        assert!(f
+            .run(&submission_claim("$HOME/cluster/j/j-1234abcd", true))
+            .status
+            .success());
+        let retry = f.run(&f.submit_script());
+        assert!(String::from_utf8_lossy(&retry.stdout).contains("===rc 98"));
+        assert_eq!(f.calls(), 0);
+    }
+    #[test]
+    fn attached_remote_claim_allows_only_one_effect_even_after_exit() {
+        let f = SubmissionFixture::new("exit 0");
+        let dir = "$HOME/cluster/j/j-1234abcd";
+        let prepare = format!(
+            "{}{}",
+            submission_claim(dir, true),
+            write_file_lines("$D/job.json", "{}")
+        );
+        assert!(f.run(&prepare).status.success());
+        let script = format!(
+            "{}printf 'called\\n' >> \"$HOME/calls\"",
+            attached_claim(dir)
+        );
+        assert!(f.run(&script).status.success());
+        assert_eq!(f.run(&script).status.code(), Some(98));
+        assert_eq!(f.calls(), 1);
     }
 
     #[test]

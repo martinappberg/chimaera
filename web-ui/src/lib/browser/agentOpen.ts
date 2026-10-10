@@ -93,6 +93,34 @@ export function parseAgentBrowserOpen(raw: unknown): AgentBrowserOpen | null {
   };
 }
 
+/** Automatic targets use this window's daemon proxy. A routed session's
+ * localhost belongs to its owner, so it must never open on this computer.
+ * Project gateways do not yet expose a scoped proxy and fail closed here. */
+export function hasDirectBrowserOwner(
+  open: AgentBrowserOpen,
+  session: Session | undefined,
+  projectGateway: boolean,
+): boolean {
+  return !projectGateway && session !== undefined && session.id === open.sessionId &&
+    session.alive && !session.suspended && session.placement_available !== false &&
+    (session.placement === undefined || session.placement === "here") &&
+    (open.workspaceId === null || session.workspace_id === open.workspaceId);
+}
+
+/** Whether this window acts on an agent's open at all. A window that can
+ *  never have Pro (`free`: `proTier` "free") has no routed sessions, so it
+ *  opens every frame as it always did, even one from a session the roster
+ *  has not listed yet. Otherwise only a direct owner's ({@link
+ *  hasDirectBrowserOwner}). */
+export function admitsAgentBrowserOpen(
+  open: AgentBrowserOpen,
+  session: Session | undefined,
+  projectGateway: boolean,
+  free: boolean,
+): boolean {
+  return free || hasDirectBrowserOwner(open, session, projectGateway);
+}
+
 /** What a window knows about itself when a frame arrives. */
 export interface WindowView {
   layout: Layout;

@@ -727,7 +727,7 @@ pub(crate) fn wire(m: &Manifest) -> Value {
 /// The platform's per-daemon half (on `AppState`): output folders,
 /// durable data, surfaces, screens' invalidation and activity, and file
 /// events. Hot state except `pdata` and the output folders themselves.
-pub(crate) struct Platform {
+pub struct Platform {
     /// Where output folders live (`output::root_for`).
     pub(crate) output_root: std::path::PathBuf,
     pub(crate) usage: std::sync::Mutex<super::output::Usage>,

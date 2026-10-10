@@ -1,9 +1,13 @@
 <script lang="ts">
   import RemoteSettingsDialog from "./RemoteSettingsDialog.svelte";
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import HomeNavigation from "./HomeNavigation.svelte";
   import HomeActions from "./HomeActions.svelte";
+  import HostSlot from "../extensions/HostSlot.svelte";
   import { isMac } from "../shared/keys";
+  import { paidPlan, proPossible, proTier } from "../net/plan";
+  import { gatewayWorkspace, isBrowserGateway } from "../net/base";
+  import { projectWhere, projectWhereLabel } from "../net/placement";
   import type ClusterPage from "./ClusterPage.svelte";
   import { keyHint } from "../shared/keybindings";
   import { isBusy, needsApproval, type Session, type Workspace } from "./sessions";
@@ -22,11 +26,15 @@
     onClusterChanged,
     onConnectProgress,
     onHostStatus,
+    onProChanged,
     openWindow,
+    proOpenCloudProject,
     remoteWorkspaces,
     removeHost,
+    setHostDirectSsh,
     clusterSetLoginServe,
     shutdownHost,
+    unkeepHost,
     updateLocalDaemon,
     type ConnectProgress,
     type HostState,
@@ -39,8 +47,10 @@
   import { pageVisible } from "../shared/visibility";
   import { getJobContext, isHomeHub, type Health } from "../net/api";
   import { asyncDisposer } from "../shared/asyncDisposer";
+  import { fetchOwnershipHints, readsOwnership } from "./placementHints";
   import { relativeAge } from "./launcher";
-  import { checkForUpdates, updateState } from "./update.svelte";
+  import { forgetFailure, forgetPlan } from "./hostForget";
+  import { APP_UPDATES, checkForUpdates, MANAGED_UPDATES, updateState } from "./update.svelte";
 
   interface Props {
     workspaces: Workspace[];
@@ -59,6 +69,8 @@
     onOpenFolder: () => void;
     /** Open Settings as a full page over Home (Home's navigation, ⌘,). */
     onSettings: () => void;
+    /** Open the Pro page (only offered when an installed extension can). */
+    onPro: () => void;
   }
 
   let {
@@ -72,6 +84,7 @@
     onStop,
     onOpenFolder,
     onSettings,
+    onPro,
   }: Props = $props();
 
   const native = isNativeShell();
@@ -141,6 +154,35 @@
     return map;
   });
 
+  /** Where a project's work runs when that is not (only) here — "In the
+   *  cloud", "Coming back here…" — from this daemon's own Pro ownership answer. A
+   *  project the cloud holds otherwise looks idle here. Empty without Pro.
+   *  Read while the page shows (and re-read while Pro answers), never on a
+   *  remote host's Home or in a project view, which have no ownership here. */
+  let placeHints = $state(new Map<string, string>());
+  $effect(() => {
+    // Only an active plan has ownership to show: without one Home asks the
+    // daemon nothing about Pro (`proTier`).
+    if ($proTier !== "active" && untrack(() => placeHints.size) > 0) placeHints = new Map();
+    if (!readsOwnership({ tier: $proTier, remoteHome: ownAlias !== null, gateway: isBrowserGateway(), visible: $pageVisible })) return;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const read = async (): Promise<void> => {
+      const answer = await fetchOwnershipHints();
+      if (stopped) return;
+      // An unreadable answer keeps what was known (a blip drops no hint).
+      if (answer !== null) placeHints = answer.hints;
+      // A daemon without Pro has nothing to poll for; a return-to-visible
+      // re-runs this effect and asks once more.
+      if (answer === null || answer.configured) timer = setTimeout(() => void read(), answer === null ? 30_000 : 15_000);
+    };
+    void read();
+    return () => {
+      stopped = true;
+      if (timer !== null) clearTimeout(timer);
+    };
+  });
+
   /** Confirm target for workspace removal (one at a time, Escape cancels). */
   let confirmRemoveId = $state<string | null>(null);
   /** Confirm target for ending a workspace's live sessions. */
@@ -154,11 +196,15 @@
   /** Human line under a host while its connect flow runs. */
   let phases = $state<Map<string, string>>(new Map());
   let hostErrors = $state<Map<string, string>>(new Map());
+  let savingDirect = $state(new Set<string>());
   let addOpen = $state(false);
   let addAlias = $state("");
   let addError = $state<string | null>(null);
   let remoteSettings = $state<{ alias: string; firstSetup: boolean } | null>(null);
   let confirmForget = $state<string | null>(null);
+  /** Why the last forget of a kept host stopped short (shown in its confirm). */
+  let forgetError = $state<{ alias: string; text: string } | null>(null);
+  let forgetting = $state<string | null>(null);
   /** Host pending a "end all sessions" / "shut down" confirm (alias). */
   let confirmEnd = $state<string | null>(null);
   let confirmShutdown = $state<string | null>(null);
@@ -252,7 +298,10 @@
         : `daemon v${health?.version ?? "?"}`;
     const d = updateState.daemon;
     if (d === null) return `${v}. Click to check for updates.`;
+    // The account's cloud: nothing to check (a click shows the same line).
+    if (d.managed) return `${v}. ${MANAGED_UPDATES}`;
     if (d.dev) return `${v}: release updates don't apply. Click to check anyway.`;
+    if (d.withApp) return `${v}. ${APP_UPDATES}`;
     const checked = d.checked_at === null ? null : relativeAge(d.checked_at, stampNow);
     const when = checked === null ? "" : checked === "now" ? " (checked just now)" : ` (checked ${checked} ago)`;
     switch (d.state) {
@@ -264,6 +313,8 @@
         return `${v}: not checked for updates yet. Click to check.`;
       case "current":
         return `${v}: up to date${when}. Click to check again.`;
+      case "managed":
+        return `${v}. ${MANAGED_UPDATES}`;
     }
   });
 
@@ -323,7 +374,9 @@
     if (hostLabel === "local") {
       void checkAppUpdate().then((v) => (appUpdate = v));
     }
-    const unlisteners: Array<() => void> = [];
+    // A Pro sign-in or plan change can add or drop hosts reached through it.
+    // A window that can never have Pro registers nothing.
+    const unlisteners: Array<() => void> = proPossible() ? [asyncDisposer(onProChanged(() => { if (document.visibilityState === "visible") void refreshHosts(); }))] : [];
     // A cluster's workspaces changed (a start, stop, or handoff — from this
     // window or another): refresh its row. The cluster page, when open,
     // listens for itself and shares the same cache.
@@ -468,8 +521,40 @@
     void refreshHosts();
   }
 
-  async function forget(alias: string): Promise<void> {
+  async function setDirect(host: HostState, input: HTMLInputElement): Promise<void> {
+    if (savingDirect.has(host.alias)) return;
+    savingDirect = new Set(savingDirect).add(host.alias);
+    hostErrors = mapWithout(hostErrors, host.alias);
+    try {
+      const updated = await setHostDirectSsh(host.alias, input.checked);
+      hosts = hosts.map(row => row.alias === host.alias ? updated : row);
+    } catch {
+      input.checked = host.direct_ssh === true;
+      hostErrors = new Map(hostErrors).set(host.alias, "This connection preference couldn't be saved. Try again.");
+    } finally {
+      const pending = new Set(savingDirect); pending.delete(host.alias); savingDirect = pending;
+    }
+  }
+
+  async function forget(host: HostState): Promise<void> {
+    const alias = host.alias;
+    if (forgetting !== null) return;
+    forgetError = null;
+    if (forgetPlan(host).turnOffKeep) {
+      // Turned off first: a host the keeper still holds comes back at the
+      // next host list. The confirm stays up with the reason if it can't.
+      forgetting = alias;
+      try {
+        await unkeepHost(alias);
+      } catch (reason) {
+        forgetError = { alias, text: forgetFailure(reason) };
+        return;
+      } finally {
+        forgetting = null;
+      }
+    }
     confirmForget = null;
+    hostErrors = mapWithout(hostErrors, alias);
     await removeHost(alias);
     remoteWs = mapWithout(remoteWs, alias);
     clusterOverviews.forget(alias);
@@ -615,6 +700,20 @@
     return new Date(unixSecs * 1000).toISOString().slice(0, 10);
   }
 
+  /** A host row's state, as the status line's parts: the state word first
+   *  (the row puts "via Pro" right after it), then its details. */
+  function hostStateParts(h: HostState, phase: string | undefined): string[] {
+    if (phase !== undefined) return [phase];
+    if (h.status === "connecting") return ["Connecting…"];
+    if (h.status !== "connected") return h.last_connected_at ? ["Not connected", `Last connected ${ago(h.last_connected_at)}`] : ["Not connected"];
+    const parts = ["Connected"];
+    if (h.node) parts.push(shortNode(h.node));
+    if (h.local_port !== null) parts.push(`127.0.0.1:${h.local_port}`);
+    const live = h.live_sessions ?? 0;
+    if (live > 0) parts.push(`${live} live session${live === 1 ? "" : "s"}`);
+    return parts;
+  }
+
   /** A login node's first label — "login-a" for "login-a.cluster.example". */
   function shortNode(node: string): string {
     return node.split(".")[0] || node;
@@ -626,14 +725,31 @@
     return m ? `~${m[1] ?? ""}` : path;
   }
 
-  function openRow(e: MouseEvent, w: Workspace): void {
+  let copyingProject = $state<string | null>(null);
+  let copyError = $state<string | null>(null);
+  async function openRow(e: Pick<MouseEvent, "metaKey" | "ctrlKey">, w: Workspace): Promise<void> {
+    if (copyingProject !== null) return;
+    let target = w;
+    // Only a Pro cloud project carries `local_copy`; a free list never does.
+    if (w.local_copy !== undefined && ownAlias === null && native) {
+      copyingProject = w.id; copyError = null;
+      try {
+        const copied = await proOpenCloudProject(w.id);
+        if (copied === null) return;
+        target = { ...w, id: copied.workspace_id, root: copied.root, name: copied.name, local_copy: copied.local_copy };
+      } catch (reason) {
+        copyError = await import("../pro/projectCopy").then(({ projectCopyError }) => projectCopyError(reason), () => "This project couldn’t update here. Try Open again.");
+        return;
+      }
+      finally { copyingProject = null; }
+    }
     if ((e.metaKey || e.ctrlKey) && !jobScoped) {
       // Cmd/Ctrl-click is the explicit "give me another window" gesture — on
       // THIS screen's own daemon (see ownAlias). Job-scoped windows degrade
       // to the in-window open (see jobScoped).
-      void openWindow(ownAlias, w.id, true);
+      await openWindow(ownAlias, target.id, true);
     } else {
-      onOpen(w);
+      onOpen(target);
     }
   }
 
@@ -661,6 +777,31 @@
     }
   }
 </script>
+
+<!-- Offered only where Pro is in play (a paid plan, or a host Pro kept or
+     already set to connect directly); a free build never shows it. -->
+{#snippet directPreference(host: HostState)}
+  {#if host.direct_ssh !== undefined && ($paidPlan !== null || host.kept === true || host.direct_ssh === true)}
+    <details class="host-advanced">
+      <summary>Advanced</summary>
+      <label><input type="checkbox" checked={host.direct_ssh} disabled={savingDirect.has(host.alias)} onchange={event => void setDirect(host, event.currentTarget)} />Connect directly from this computer</label>
+      <p>Uses this computer’s SSH settings on the next connection. Existing connections stay as they are until you reconnect. Running jobs and other computers are unaffected.</p>
+    </details>
+  {/if}
+{/snippet}
+
+<!-- A host's last error: a quiet note under its row with the way to retry,
+     never a full-width block. A host that is up (connected, or a cluster
+     with a job running) and kept connected keeps its green dot; the note
+     then says it is about keeping it connected. The words are the shell's. -->
+{#snippet hostNote(h: HostState, err: string)}
+  {@const live = h.status === "connected" || (isCluster(h) && clusterRunning(h.alias))}
+  <div class="host-note" role="status">
+    {#if live && h.kept === true}<span class="host-note-label">Keep connected:</span>{/if}
+    <span class="host-note-text" title={err}>{err}</span>
+    <button class="host-note-act" disabled={h.status === "connecting"} onclick={() => void connect(h.alias)}>Try again</button>
+  </div>
+{/snippet}
 
 {#snippet jobsRow(alias: string)}
   <div class="rowwrap" role="presentation">
@@ -699,7 +840,7 @@
         >{/if}
     </button>
   {/if}
-  <HomeNavigation active="workspaces"
+  <HomeNavigation active="workspaces" plan={$paidPlan} showPro={proPossible()}
     onHome={() => {
       // The cluster page's own back route: a cluster workspace's window has
       // local Home behind its page; any other Home returns to its own list —
@@ -707,7 +848,7 @@
       // is a remote window's route to local Home.
       if (clusterWs !== null) void backToHome();
       else clusterView = null;
-    }} {onSettings} />
+    }} {onPro} {onSettings} />
   {#if clusterView !== null}
     {@const alias = clusterView}
     <div class="cluster-surface">
@@ -746,8 +887,11 @@
           </button>
         {/if}
         <div class="welcome">
-          <h1>{ownAlias === null ? "Workspaces" : hostLabel}</h1>
-          <p>{ownAlias === null ? "Pick up where you left off." : "Workspaces and sessions on this machine."}</p>
+          <!-- A project view follows its project: name where it runs now. -->
+          <h1>{ownAlias === null ? "Workspaces" : gatewayWorkspace() !== null ? projectWhereLabel($projectWhere) : hostLabel}</h1>
+          <!-- A machine's own Home: its name is the heading and its list
+               follows, so no line restates them. -->
+          {#if ownAlias === null}<p>Pick up where you left off.</p>{/if}
         </div>
       </div>
       <button class="cta open-folder" onclick={onOpenFolder}>
@@ -818,6 +962,8 @@
           </span>
         </div>
       </div>
+      {#if copyError}<p class="err-line" role="alert">{copyError}</p>{/if}
+      {#if copyingProject !== null}<p class="hint" role="status">Getting the project’s latest files…</p>{/if}
       {#if !daemonReachable}<p class="offline-note" role="status">Connection interrupted. Your workspaces will reconnect when this machine is available.</p>{/if}
       {#if sorted.length === 0}
         <div class="blank">
@@ -832,6 +978,7 @@
           {/if}
           {#each shownWorkspaces as w (w.id)}
             {@const live = liveByWs.get(w.id)}
+            {@const placeHint = placeHints.get(w.id)}
             {@const wsState = !daemonReachable ? "" : live && live.attn > 0 ? "attn" : live && live.live > 0 ? "alive" : ""}
             {#if confirmStopId === w.id}
               <div class="row confirm" role="alertdialog" aria-label="End sessions?">
@@ -868,7 +1015,7 @@
               </div>
             {:else}
               <div class="rowwrap workspace-row" role="presentation" class:live={wsState === "alive"} class:attn={wsState === "attn"}>
-                <button class="row" title={w.root} onclick={(e) => openRow(e, w)}>
+                <button class="row" title={w.root} disabled={copyingProject !== null} onclick={(e) => void openRow(e, w)}>
                   <span
                     class="dot {wsState}"
                     title={!daemonReachable ? "Last known session state — this machine is offline" : wsState === "attn"
@@ -897,7 +1044,7 @@
                       >
                     </span>
                   {/if}
-                  <span class="when">{ago(w.last_opened_at)}</span>
+                  <span class="when">{#if placeHint !== undefined}{placeHint} · {/if}{ago(w.last_opened_at)}</span>
                 </span>
                 <HomeActions label={`Actions for ${w.name}`}>
                   {#if live !== undefined && live.live > 0}
@@ -907,7 +1054,7 @@
                     <button
                       class="side"
                       title="open in a new window"
-                      onclick={() => void openWindow(ownAlias, w.id, true)}>Open in new window</button
+                      disabled={copyingProject !== null} onclick={() => void openRow({ metaKey: true, ctrlKey: false }, w)}>Open in new window</button
                     >
                   {/if}
                   <button
@@ -922,6 +1069,15 @@
         </div>
       {/if}
     </section>
+
+    {#if native && ownAlias === null && $proTier === "active"}
+      <!-- The cloud projects list (and the Pro presentation copy behind it)
+           loads only for a paid plan: it stays out of the always-loaded
+           entry, whose budget the shell is close to. -->
+      {#await import("../extensions/AccountApplicationView.svelte") then { default: CloudProjects }}
+        <CloudProjects kind="cloud-projects" onOpen={onOpen} knownIds={workspaces.map(workspace => workspace.id)} />
+      {/await}
+    {/if}
 
     {#if ownAlias === null}
       <section class="remotes" aria-label="Remote machines">
@@ -991,6 +1147,8 @@
                 {@const ws = remoteWs.get(h.alias)}
                 {@const cluster = isCluster(h)}
                 {@const loginServe = h.cluster?.login_serve === true}
+                {@const plainCluster = cluster && !loginServe}
+                {@const confirming = confirmShutdown === h.alias || confirmEnd === h.alias || confirmForget === h.alias}
                 <div class="host-card">
                 {#if confirmShutdown === h.alias}
                   <div class="row confirm strong" role="alertdialog" aria-label="shut down host?">
@@ -1018,19 +1176,20 @@
                     <button class="confirm-no" onclick={() => (confirmEnd = null)}>cancel</button>
                   </div>
                 {:else if confirmForget === h.alias}
+                  {@const failed = forgetError?.alias === h.alias ? forgetError.text : null}
                   <div class="row confirm" role="alertdialog" aria-label="forget host?">
                     <span class="name">{h.alias}</span>
-                    <span class="confirm-label">forget this host?</span>
-                    <button class="confirm-yes" onclick={() => void forget(h.alias)}>forget</button>
-                    <button class="confirm-no" onclick={() => (confirmForget = null)}>cancel</button>
+                    <span class="confirm-label" class:failed={failed !== null} role={failed !== null ? "status" : undefined}>{failed ?? forgetPlan(h).question}</span>
+                    <button class="confirm-yes" disabled={forgetting === h.alias} onclick={() => void forget(h)}>{forgetting === h.alias ? "turning off…" : "forget"}</button>
+                    <button class="confirm-no" onclick={() => { confirmForget = null; forgetError = null; }}>cancel</button>
                   </div>
-                {:else if cluster && !loginServe}
+                {:else if plainCluster}
                   <!-- A cluster: chimaera never runs on its login node, so
                        there is nothing to tunnel to — the row reads the
                        cluster's workspaces and opens its page in place. -->
                   {@const line = clusterReadable(h) ? clusterLine(h) : null}
                   {@const running = clusterRunning(h.alias)}
-                  <div class="rowwrap" role="presentation" class:connected={running}>
+                  <div class="rowwrap host-row" role="presentation" class:connected={running}>
                     <button
                       class="row"
                       title="{h.alias}'s jobs and workspaces"
@@ -1045,42 +1204,27 @@
                             ? "a job is running"
                             : "no job running"}
                       ></span>
-                      <span class="name">{h.alias}</span>
-                      <span
-                        class="pill-sched"
-                        title="{h.alias} has a batch scheduler: Chimaera runs inside jobs you start there, never on the login node"
-                        >{schedulerLabel(h.cluster?.scheduler)}</span
-                      >
-                      {#if localState?.dev_build}
-                        <span
-                          class="pill-dev"
-                          title="dev build — every connection targets this machine's own build in ~/.chimaera-dev on {h.alias}; the real daemon there is untouched"
-                          >dev</span
-                        >
-                      {/if}
-                      {#if phase !== undefined}
-                        <span class="phase">{phase === PHASE_LABEL.probing ? "connecting…" : phase}</span>
-                      {:else if line !== null}
-                        <span class="phase quiet">{line}</span>
-                      {:else}
-                        <span class="when">{ago(h.last_connected_at)}</span>
-                      {/if}
+                      <span class="workspace-label">
+                        <span class="name">{h.alias}</span>
+                        <span class="phase quiet">
+                          <span title="{h.alias} has a batch scheduler: Chimaera runs inside jobs you start there, never on the login node"
+                            >{schedulerLabel(h.cluster?.scheduler)}</span
+                          >{#if localState?.dev_build}<span class="sep" aria-hidden="true">·</span><span
+                              class="dev-word"
+                              title="dev build — every connection targets this machine's own build in ~/.chimaera-dev on {h.alias}; the real daemon there is untouched"
+                              >dev</span
+                            >{/if}<span class="sep" aria-hidden="true">·</span>{#if phase !== undefined}{phase === PHASE_LABEL.probing ? "connecting…" : phase}{:else if line !== null}{line}{:else}{ago(h.last_connected_at)}{/if}{#if h.via_pro}<span class="sep" aria-hidden="true">·</span><span title="Connected through Chimaera Pro">via Pro</span>{/if}
+                        </span>
+                      </span>
                     </button>
                     <HomeActions label={`Actions for ${h.alias}`}>
                       <button class="side" disabled={h.status === "connecting"} onclick={() => (remoteSettings = { alias: h.alias, firstSetup: false })}>Connection settings</button>
                       <button class="side x" title="forget host" onclick={() => (confirmForget = h.alias)}>Forget machine</button>
+                      {@render directPreference(h)}
                     </HomeActions>
                   </div>
-                  {#if err !== undefined}
-                    <div class="err-line">{err}</div>
-                  {/if}
-                  {#if h.cluster !== null && h.cluster.login_daemon !== null && phase === undefined}
-                    <div class="note-line warn">
-                      a chimaera server from before is still running on {shortNode(h.cluster.login_daemon.node)} —
-                      <button class="update-act" onclick={() => void connect(h.alias)}>open to shut it down</button>
-                    </div>
-                  {/if}
                 {:else}
+                  {@const parts = hostStateParts(h, phase)}
                   <div class="rowwrap host-row" role="presentation" class:connected={h.status === "connected"}>
                     <button
                       class="row"
@@ -1106,24 +1250,23 @@
                             : "not connected"}
                       ></span>
                       <span class="workspace-label">
-                        <span class="host-name"><span class="name">{h.alias}</span>{#if cluster}<span class="pill-sched">{schedulerLabel(h.cluster?.scheduler)}</span><span class="pill-dev" title="chimaera runs on {h.alias}'s login node (scheduled jobs are off in connection settings)">login node</span>{/if}{#if localState?.dev_build}<span
-                          class="pill-dev"
-                          title="dev build — every connection targets this machine's own build in ~/.chimaera-dev on {h.alias}; the real daemon there is untouched"
-                          >dev</span
-                        >{/if}</span>
+                        <span class="name">{h.alias}</span>
                         <span
                           class="phase quiet"
                           title={phase === undefined && h.status === "connected" && h.node
                             ? `${h.alias} spans several login nodes; its daemon runs on ${h.node}, so this connection is pinned there`
                             : undefined}
                         >
-                          {#if phase !== undefined}{phase}
-                          {:else if h.status === "connected"}Connected{#if h.node} · {shortNode(h.node)}{/if}{#if h.local_port !== null} · 127.0.0.1:{h.local_port}{/if}{#if (h.live_sessions ?? 0) > 0} · {h.live_sessions} live session{h.live_sessions === 1 ? "" : "s"}{/if}
-                          {:else if h.status === "connecting"}Connecting…
-                          {:else}Not connected{#if h.last_connected_at} · Last connected {ago(h.last_connected_at)}{/if}{/if}
+                          {#if cluster}<span>{schedulerLabel(h.cluster?.scheduler)}</span><span class="sep" aria-hidden="true">·</span><span title="chimaera runs on {h.alias}'s login node (scheduled jobs are off in connection settings)">login node</span><span class="sep" aria-hidden="true">·</span>{/if}{#if localState?.dev_build}<span
+                            class="dev-word"
+                            title="dev build — every connection targets this machine's own build in ~/.chimaera-dev on {h.alias}; the real daemon there is untouched"
+                            >dev</span
+                          ><span class="sep" aria-hidden="true">·</span>{/if}{parts[0]}{#if h.via_pro}<span class="sep" aria-hidden="true">·</span><span title="Connected through Chimaera Pro">via Pro</span>{/if}{#each parts.slice(1) as part, i (i)}<span class="sep" aria-hidden="true">·</span>{part}{/each}
                         </span>
                       </span>
-                      <span class="host-open">{h.status === "connected" ? "Open" : h.status === "connecting" ? "" : "Connect"}<span aria-hidden="true"> →</span></span>
+                      <!-- Hidden, not emptied, while connecting: the label keeps
+                           its width and nothing beside it moves. -->
+                      <span class="host-open" class:idle={h.status === "connecting"}>{h.status === "connected" ? "Open" : "Connect"}<span aria-hidden="true"> →</span></span>
                     </button>
                     <HomeActions label={`Actions for ${h.alias}`}>
                       {#if h.status === "connected"}
@@ -1149,12 +1292,24 @@
                         >Forget machine</button
                       >
                       <button class="side" disabled={h.status === "connecting"} onclick={() => (remoteSettings = { alias: h.alias, firstSetup: false })}>Connection settings</button>
+                      {@render directPreference(h)}
                     </HomeActions>
                   </div>
-                  {#if err !== undefined}
-                    <div class="err-line">{err}</div>
+                {/if}
+                <!-- The row's further status lines, in its status register and
+                     aligned under the name. Outside the branches above, so the
+                     extension's line is never retired by a status change or a
+                     confirm; the lines come and go only with what they say. -->
+                <div class="host-lines">
+                  {#if err !== undefined && !confirming}{@render hostNote(h, err)}{/if}
+                  <HostSlot alias={h.alias} />
+                  {#if !confirming && plainCluster && h.cluster !== null && h.cluster.login_daemon !== null && phase === undefined}
+                    <div class="note-line warn">
+                      a chimaera server from before is still running on {shortNode(h.cluster.login_daemon.node)} —
+                      <button class="update-act" onclick={() => void connect(h.alias)}>open to shut it down</button>
+                    </div>
                   {/if}
-                  {#if h.status === "connected" && h.outdated && phase === undefined}
+                  {#if !confirming && !plainCluster && h.status === "connected" && h.outdated && phase === undefined}
                     <div class="note-line" title={buildNote(h.remote_build)}>
                       daemon is an older build —
                       <button class="update-act" onclick={() => void connect(h.alias, true)}>
@@ -1162,29 +1317,29 @@
                       </button>
                     </div>
                   {/if}
-                  {#if h.status === "connected" && ws !== undefined}
-                    <div class="remote-ws">
-                      {#each ws as rw (rw.id)}
-                        <div class="rowwrap" role="presentation">
-                          <button
-                            class="row sub"
-                            title={rw.root}
-                            onclick={() => void navigateHost(h.alias, rw.id)}
-                          >
-                            <span class="name">{rw.name}</span>
-                            <span class="path">{tildify(rw.root)}</span>
-                            <span class="when">{ago(rw.last_opened_at)}</span>
-                          </button>
-                        </div>
-                      {/each}
-                      {#if cluster}{@render jobsRow(h.alias)}{/if}
+                </div>
+                {#if !confirming && !plainCluster && h.status === "connected" && ws !== undefined}
+                  <div class="remote-ws">
+                    {#each ws as rw (rw.id)}
                       <div class="rowwrap" role="presentation">
-                        <button class="row sub browse" onclick={() => void navigateHost(h.alias)}>
-                          <span class="name">Open {h.alias}</span><span aria-hidden="true">→</span>
+                        <button
+                          class="row sub"
+                          title={rw.root}
+                          onclick={() => void navigateHost(h.alias, rw.id)}
+                        >
+                          <span class="name">{rw.name}</span>
+                          <span class="path">{tildify(rw.root)}</span>
+                          <span class="when">{ago(rw.last_opened_at)}</span>
                         </button>
                       </div>
+                    {/each}
+                    {#if cluster}{@render jobsRow(h.alias)}{/if}
+                    <div class="rowwrap" role="presentation">
+                      <button class="row sub browse" onclick={() => void navigateHost(h.alias)}>
+                        <span class="name">Open {h.alias}</span><span aria-hidden="true">→</span>
+                      </button>
                     </div>
-                  {/if}
+                  </div>
                 {/if}
                 </div>
               {/each}
@@ -1209,6 +1364,11 @@
 {/if}
 
 <style>
+  .host-advanced { max-width: 320px; padding: 8px 10px; color: var(--fg); font-size: var(--text-sm); }
+  .host-advanced summary { cursor: pointer; color: var(--muted); }
+  .host-advanced label { display: flex; align-items: flex-start; gap: 8px; margin-top: 10px; }
+  .host-advanced input { margin-top: 3px; flex: none; }
+  .host-advanced p { white-space: normal; color: var(--muted); font-size: var(--text-xs); line-height: 1.5; margin: 8px 0 0; }
 
   .home { position: absolute; inset: 0; display: flex; overflow: hidden; background: var(--bg); }
   .cluster-surface { flex: 1; min-width: 0; min-height: 0; overflow-y: auto; }
@@ -1718,17 +1878,6 @@
     color: var(--fg);
   }
 
-  /* The scheduler tag on a cluster row — a fact, quietly stated. */
-  .pill-sched {
-    flex: none;
-    font-size: var(--text-xs);
-    color: var(--muted);
-    border: 1px solid var(--edge);
-    border-radius: 999px;
-    padding: 1px 7px;
-    white-space: nowrap;
-  }
-
   .note-line.warn {
     color: var(--warn);
   }
@@ -1831,19 +1980,6 @@
     opacity: 0.7;
   }
 
-  /* Dev-build language: amber, the "this is special" register — a dev build
-     talks only to isolated ~/.chimaera-dev daemons, and its host rows must
-     never read like a release's. */
-  .pill-dev {
-    flex: none;
-    font-family: var(--mono);
-    font-size: var(--text-xs);
-    color: var(--warn);
-    border: 1px solid color-mix(in srgb, var(--warn) 40%, transparent);
-    border-radius: 999px;
-    padding: 1px 7px;
-  }
-
   .err-line {
     padding: 2px 10px 6px;
     font-size: var(--text-sm);
@@ -1902,11 +2038,33 @@
     .workspace-row .workspace-label .path { opacity: 1; }
   }
   .workspace-meta .side.stop:hover { color: var(--err); text-decoration-color: currentColor; }
-  .host-card { border: 1px solid var(--edge); border-radius: 10px; padding: 5px; }
-  .remotes .rows { gap: 10px; }
-  .host-name { display: flex; align-items: center; gap: 9px; min-width: 0; }
-  .host-name > .name { flex: 1 1 auto; min-width: 0; }
+  /* Remote machines read like This Mac's list: one bordered list, rows in
+     the same rhythm, each machine's lines grouped under its name. */
+  .remotes .rows { border: 1px solid var(--edge); border-radius: 10px; padding: 5px; gap: 5px; }
+  .host-card + .host-card { border-top: 1px solid color-mix(in srgb, var(--edge) 70%, transparent); padding-top: 5px; }
+  /* A host row's status line is one register — UI font, status size, muted —
+     and carries what used to be pills ("Slurm cluster", "login node", "dev")
+     as words; the optional extension's line under it matches (HostSlot). */
+  .host-row .workspace-label .phase.quiet { font-family: inherit; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sep { margin: 0 0.45em; opacity: 0.6; }
+  /* Dev-build language stays amber: a dev build talks only to isolated
+     ~/.chimaera-dev daemons, and its rows must never read like a release's. */
+  .dev-word { color: var(--warn); }
+  /* Lines under a host row continue its status line: same size, colour and
+     line height, the same 2px apart, aligned under the name (row padding 12 +
+     dot 7 + gap 14). The pull-up meets the row's bottom padding, so a row
+     with lines and one without keep the same rhythm. */
+  .host-lines { display: flex; flex-direction: column; gap: 2px; min-width: 0; margin-top: -7px; padding: 0 20px 9px 33px; font-size: var(--text-xs); line-height: 1.5; color: var(--muted); }
+  .host-lines .note-line { padding: 0; font-family: inherit; }
+  .host-note { display: flex; align-items: baseline; gap: 0.45em; min-width: 0; }
+  .host-note-label { flex: none; }
+  .host-note-text { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: color-mix(in srgb, var(--err) 70%, var(--muted)); }
+  .host-note-act { flex: none; appearance: none; border: none; background: none; padding: 0; font: inherit; color: var(--muted); text-decoration: underline; text-decoration-color: var(--edge); text-underline-offset: 3px; cursor: pointer; white-space: nowrap; }
+  .host-note-act:hover:enabled { color: var(--fg); text-decoration-color: currentColor; }
+  .host-note-act:disabled { opacity: 0.6; cursor: default; }
+  .host-row .workspace-label .name { overflow: hidden; text-overflow: ellipsis; }
   .host-open { flex: none; font-size: var(--text-sm); color: var(--muted); }
+  .host-open.idle { visibility: hidden; }
   .host-open span { margin-left: 4px; }
   .host-row.connected, .workspace-row.live { background: transparent; }
   .host-row.connected:hover, .workspace-row.live:hover { background: color-mix(in srgb, var(--row-hover) 45%, transparent); }
@@ -1921,6 +2079,7 @@
   .offline-note { margin: 0 0 8px; font-size: var(--text-sm); line-height: 1.5; color: var(--muted); }
   .confirm { flex-wrap: wrap; min-height: 58px; }
   .confirm-label { min-width: 120px; line-height: 1.5; }
+  .confirm-label.failed { color: color-mix(in srgb, var(--err) 70%, var(--muted)); }
   /* In the workspace list the confirm takes the row's own height, so asking
      doesn't make the list jump. */
   .workspaces .confirm { min-height: 0; padding: 9px 12px; }
@@ -1945,6 +2104,7 @@
     .open-folder kbd { display: none; }
     .host-row .row { padding: 12px 9px; gap: 10px; }
     .host-open { font-size: var(--text-xs); }
+    .host-lines { margin-top: -10px; padding: 0 12px 12px 26px; }
     .remote-ws { margin-left: 13px; padding-left: 9px; }
     .remote-ws .row.sub { flex-wrap: wrap; gap: 5px 10px; }
     .remote-ws .row.sub .name { max-width: 100%; }

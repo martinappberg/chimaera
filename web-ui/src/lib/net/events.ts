@@ -1,5 +1,8 @@
+import { sendSocketAuth } from "./placement";
+import { daemonSocketUrl, gatewayWorkspace, isBrowserGateway } from "./base";
 import { getToken } from "./api";
-import { nudgeReconnectors, retryDelayMs } from "./reconnect";
+import { nudgeReconnectors, ownerAwake, reconnectsHalted, retryDelayMs } from "./reconnect";
+import { noteServed } from "./projectMoving";
 import type { Link } from "../workspace/agentLinks";
 import type { Session } from "../workspace/sessions";
 import type { Notice } from "../workspace/notices";
@@ -9,6 +12,9 @@ import { parseUpdateStatus, type UpdateStatus } from "../workspace/update.svelte
 
 const INITIAL_BACKOFF_MS = 500;
 const MAX_BACKOFF_MS = 10_000;
+/** Error codes that describe a project connection in motion, never a
+ *  rejected socket: reconnect instead of giving up. */
+const RECONNECTING_CODES = new Set(["remote_unavailable", "workspace_scope_changed", "worker_asleep"]);
 
 export interface EventsSocketHandlers {
   /**
@@ -109,6 +115,7 @@ interface ServerEventFrame {
   /** An `update` frame's discriminator; the rest is `parseUpdateStatus`'s. */
   available?: boolean;
   message?: string;
+  code?: string;
   files?: string[];
   removed?: string[];
   dirs?: string[];
@@ -122,9 +129,19 @@ interface ServerEventFrame {
  * full snapshots, re-sent whenever any session appears/disappears or changes
  * state/title/name. Replaces the sessions poll while connected; reconnects
  * forever with exponential backoff on unclean closes.
+ *
+ * An open socket that says nothing is healthy, however long: no timer watches
+ * for silence and nothing is retried. That matters in a browser view behind a
+ * keeper that keeps a sleeping cloud machine's sockets open (VIEWING.md, "A
+ * sleeping cloud machine's sockets") and attaches them again by itself once
+ * the machine wakes: the machine's first frames after each attach are the
+ * same full snapshots as after a connect, so state is fresh again, and the
+ * `settings` frame among them re-sends this window's registration (it lives
+ * on the daemon's side of one attach).
  */
 export class EventsSocket {
   private ws: WebSocket | null = null;
+  private authenticatedSocket: WebSocket | null = null;
   private closed = false;
   private fatal = false;
   /** A fatal socket has been revived by the health cross-nudge (once ever —
@@ -212,7 +229,7 @@ export class EventsSocket {
   }
 
   private sendWatch(): void {
-    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    if (this.ws?.readyState !== WebSocket.OPEN || this.authenticatedSocket !== this.ws) return;
     this.ws.send(
       JSON.stringify({
         type: "watch",
@@ -225,15 +242,20 @@ export class EventsSocket {
   }
 
   private connect(): void {
-    if (this.closed) return;
-    const proto = location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(`${proto}://${location.host}/ws/events`);
+    // A halted page (its cluster job ended) has no daemon left to answer: a
+    // retry already pending when the halt came, or a visibility or health
+    // nudge, must not dial it either.
+    if (this.closed || reconnectsHalted()) return;
+    const ws = new WebSocket(daemonSocketUrl("/ws/events"));
     this.ws = ws;
 
     ws.onopen = () => {
-      ws.send(JSON.stringify({ type: "auth", token: getToken() ?? "" }));
-      // Re-assert interest: a reconnect starts a fresh watcher registration.
-      this.sendWatch();
+      sendSocketAuth(ws, { type: "auth", token: getToken() ?? "" },
+        () => this.ws === ws && !this.closed, () => {
+          this.authenticatedSocket = ws;
+          // Re-assert interest only after the scoped authentication frame.
+          this.sendWatch();
+        });
     };
 
     ws.onmessage = (ev: MessageEvent) => {
@@ -258,6 +280,18 @@ export class EventsSocket {
       ) {
         this.backoffMs = INITIAL_BACKOFF_MS;
         this.handlers.onSettings?.(msg.settings);
+        // A daemon sends its settings once per attach (and when they change,
+        // which is rare), and a keeper that kept this socket open across
+        // its machine's sleep has just attached it afresh: register again.
+        // The first one after a connect repeats the registration sent with
+        // authentication, which may not have reached a sleeping machine;
+        // repeating an unchanged one changes nothing on the daemon. Only a
+        // gateway view's socket can be attached twice.
+        if (isBrowserGateway()) {
+          this.sendWatch();
+          // The project's owner answers: whatever waited for it reads again.
+          if (gatewayWorkspace() !== null) ownerAwake();
+        }
       } else if (
         msg.type === "git" &&
         typeof msg.epochs === "object" &&
@@ -314,6 +348,10 @@ export class EventsSocket {
         const open = parseAgentBrowserOpen(msg);
         if (open !== null) this.handlers.onBrowserOpen?.(open);
       } else if (msg.type === "error") {
+        // A project's connection changing (it moved, or its owner is
+        // unreachable) is not a rejection: the daemon closes this socket and
+        // the ordinary reconnect below picks up the new route.
+        if (msg.code !== undefined && RECONNECTING_CODES.has(msg.code)) return;
         // Bad auth or a server-side failure; give up and surface it (the
         // app shows the blocking re-auth overlay on "unauthorized").
         this.fatal = true;
@@ -342,10 +380,16 @@ export class EventsSocket {
       // message handler finishes applying the snapshot first and a
       // crash-looping daemon can't turn its flaps into connect herds.
       if (up) nudgeReconnectors();
+      // In a project view this socket reaches the project's owner itself:
+      // it answering means a sleeping owner woke, so parked sockets dial.
+      // It answering is also the project's machine serving it: a move it
+      // was on has arrived.
+      if (up && gatewayWorkspace() !== null) { ownerAwake(); noteServed(); }
     }
   }
 
   private scheduleReconnect(): void {
+    if (reconnectsHalted()) return;
     // Jitter + the hidden slow tier (shared with the per-session sockets):
     // a resumed laptop with a dead tunnel must not probe 12x/min per window
     // forever while nobody is even looking. The first two retries keep the

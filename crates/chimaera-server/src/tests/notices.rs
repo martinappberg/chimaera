@@ -233,3 +233,93 @@ async fn a_quickly_answered_permission_never_notifies() {
     assert_eq!(notices[0]["body"], "", "{notices:?}");
     state.sessions.kill(&id).ok();
 }
+
+/// A routed project's owner notice is taken once (every window's feed
+/// delivers it), only for the relayed kinds, only for that project, never
+/// for a session that runs here, and only while this computer's settings
+/// want that kind.
+#[tokio::test]
+async fn relayed_owner_notices_are_taken_once_and_never_for_local_sessions() {
+    let state = test_state();
+    let workspace = lock(&state.workspaces)
+        .add(test_dir("relay-notices"))
+        .unwrap();
+    let (boot, head) = fresh_boot(&state).await;
+    let row = |kind: &str, session: &str, at_ms: u64| {
+        serde_json::json!({
+            "id": 7, "kind": kind, "blocking": kind == "permission",
+            "session_id": session, "workspace_id": workspace.id,
+            "workspace": "owner's name", "agent": "claude",
+            "name": "fix the build", "title": "fix the build",
+            "subtitle": "Needs permission · owner's name",
+            "body": "Bash: rm -rf build", "at_ms": at_ms, "age_ms": 40,
+        })
+    };
+    let permission = row("permission", "s-remote", 1_000);
+    assert!(crate::notices::relay(&state, &workspace.id, &permission));
+    // The same notice from a second window's feed: already taken.
+    assert!(!crate::notices::relay(&state, &workspace.id, &permission));
+    // Not this project, not a relayed kind, stale: never taken.
+    assert!(!crate::notices::relay(&state, "w-other", &permission));
+    for kind in ["error", "rate_limited", "kept_both", "bogus"] {
+        assert!(
+            !crate::notices::relay(&state, &workspace.id, &row(kind, "s-remote", 2_000)),
+            "{kind}"
+        );
+    }
+    let mut stale = row("done", "s-remote", 3_000);
+    stale["age_ms"] = serde_json::json!(11 * 60 * 1000);
+    assert!(!crate::notices::relay(&state, &workspace.id, &stale));
+    // A session that runs here notifies through this daemon's own watcher.
+    let here = inject_agent(&state, "rk");
+    assert!(!crate::notices::relay(
+        &state,
+        &workspace.id,
+        &row("done", &here, 4_000)
+    ));
+    // The same session's next turn is new; so is the agent's own message.
+    assert!(crate::notices::relay(
+        &state,
+        &workspace.id,
+        &row("done", "s-remote", 5_000)
+    ));
+    assert!(crate::notices::relay(
+        &state,
+        &workspace.id,
+        &row("agent", "s-remote", 5_000)
+    ));
+
+    let notices = poll(&state, &boot, head).await["notices"]
+        .as_array()
+        .cloned()
+        .unwrap();
+    assert_eq!(notices.len(), 3, "{notices:?}");
+    let first = &notices[0];
+    assert_eq!(first["kind"], "permission");
+    assert_eq!(first["blocking"], true);
+    assert_eq!(first["session_id"], "s-remote");
+    assert_eq!(first["body"], "Bash: rm -rf build");
+    // Worded with this computer's name for the project.
+    assert_eq!(
+        first["subtitle"],
+        format!("Needs permission · {}", workspace.name).as_str()
+    );
+    assert_eq!(notices[1]["kind"], "done");
+    assert_eq!(notices[2]["kind"], "agent");
+
+    // This computer's settings decide which kinds alert at all.
+    let (status, _) = request(
+        &state,
+        Method::PUT,
+        "/api/v1/settings",
+        Some(serde_json::json!({"notifications.needsYou": false})),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    assert!(!crate::notices::relay(
+        &state,
+        &workspace.id,
+        &row("question", "s-remote", 6_000)
+    ));
+    state.sessions.kill(&here).ok();
+}

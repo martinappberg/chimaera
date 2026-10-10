@@ -42,6 +42,131 @@ const MAX_ENTRY_BYTES: usize = 256 * 1024;
 /// never has a hole; deep enough to ride out normal fs latency.
 const WRITE_QUEUE_DEPTH: usize = 256;
 
+/// Maximum versioned send-evidence payload accepted in a session bundle.
+pub const SEND_STATE_MAX_BYTES: usize = crate::send_state::MAX_BYTES;
+
+/// Export independent dispatch/withdrawal evidence for this logical session.
+/// Blocking I/O: callers must run this off the reactor. A pending/failed owned
+/// write refuses the snapshot rather than exporting stale delivery authority.
+pub fn export_send_state(dir: &Path, session_id: &str) -> Result<Vec<u8>> {
+    crate::send_state::export(dir, session_id, &legacy_send_evidence(dir, session_id)?)
+}
+
+/// Validate a bounded, exact-session send-evidence member before installation.
+pub fn validate_send_state(session_id: &str, bytes: &[u8]) -> Result<()> {
+    crate::send_state::validate(session_id, bytes)
+}
+
+/// Prepare the conservative union without writing or creating directories.
+/// Captures existing legacy receipts before an import replaces its journal.
+/// Blocking reads; incoming payloads retain the exact logical session binding.
+pub fn merge_send_state(dir: &Path, session_id: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+    crate::send_state::merge(
+        dir,
+        session_id,
+        bytes,
+        &legacy_send_evidence(dir, session_id)?,
+    )
+}
+
+/// Merge independent delivery evidence into a quiescent session durably.
+/// Blocking I/O. A legacy archive without a member must leave existing evidence
+/// alone; callers must not interpret absence as a request to clear this store.
+pub fn import_send_state(dir: &Path, session_id: &str, bytes: &[u8]) -> Result<()> {
+    crate::send_state::import(
+        dir,
+        session_id,
+        bytes,
+        &legacy_send_evidence(dir, session_id)?,
+    )
+}
+
+fn legacy_send_evidence(
+    dir: &Path,
+    session_id: &str,
+) -> Result<Vec<(String, crate::ClientIdState)>> {
+    use std::io::Read;
+    crate::send_state::paths(dir, session_id)?;
+    let file = match fs::File::open(dir.join(format!("{session_id}.jsonl"))) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).context("read legacy send evidence"),
+    };
+    let cap = FILE_CAP as usize + MAX_ENTRY_BYTES;
+    let mut bytes = Vec::new();
+    file.take(cap as u64 + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len() <= cap, "legacy send journal exceeds limit");
+    let mut receipts = LegacyReceipts::default();
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if let Ok(entry) = serde_json::from_slice::<SeqEvent>(line) {
+            receipts.observe(&entry.ev);
+        }
+    }
+    Ok(receipts.evidence())
+}
+
+/// Legacy queued echoes prove only driver ownership; only a matching Sent
+/// update or a nonqueued echo proves delivery. Bounded even across dead FIFOs.
+#[derive(Default)]
+struct LegacyReceipts(VecDeque<(Option<String>, String, crate::ClientIdState)>);
+impl LegacyReceipts {
+    fn observe(&mut self, event: &AgentEvent) {
+        match event {
+            AgentEvent::UserMessage {
+                id,
+                client_id: Some(client_id),
+                queued,
+                ..
+            } => {
+                self.0.retain(|(_, existing, _)| existing != client_id);
+                if self.0.len() == crate::model::CLIENT_IDS_REMEMBERED {
+                    self.0.pop_front();
+                }
+                self.0.push_back((
+                    id.clone(),
+                    client_id.clone(),
+                    if *queued {
+                        crate::ClientIdState::Uncertain
+                    } else {
+                        crate::ClientIdState::Confirmed
+                    },
+                ));
+            }
+            AgentEvent::UserMessageUpdate {
+                id,
+                state:
+                    crate::model::UserMessageState::Sent | crate::model::UserMessageState::Cancelled,
+            } => {
+                if let Some((_, _, confirmed)) = self
+                    .0
+                    .iter_mut()
+                    .rev()
+                    .find(|(driver_id, _, _)| driver_id.as_deref() == Some(id.as_str()))
+                {
+                    if matches!(
+                        event,
+                        AgentEvent::UserMessageUpdate {
+                            state: crate::model::UserMessageState::Sent,
+                            ..
+                        }
+                    ) {
+                        *confirmed = crate::ClientIdState::Confirmed;
+                    } else if *confirmed == crate::ClientIdState::Uncertain {
+                        *confirmed = crate::ClientIdState::Cancelled;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    fn evidence(&self) -> Vec<(String, crate::ClientIdState)> {
+        self.0
+            .iter()
+            .map(|(_, id, confirmed)| (id.clone(), *confirmed))
+            .collect()
+    }
+}
+
 /// Directory budgets, enforced by [`prune_dir`] once boot restore settles and
 /// again on every chat spawn.
 pub const DIR_MAX_BYTES: u64 = 100 * 1024 * 1024;
@@ -78,6 +203,7 @@ enum WriteOp {
     Line(Vec<u8>),
     /// Drain barrier: ack once everything before it hit the file.
     Sync(oneshot::Sender<()>),
+    Durable(oneshot::Sender<bool>),
 }
 
 struct RingState {
@@ -104,6 +230,10 @@ pub struct Journal {
     /// disk already refused).
     written_seq: Arc<AtomicU64>,
     caps: JournalCaps,
+    /// See [`Journal::client_ids_at_open`]. Read in the same pass that finds
+    /// the last seq, so it costs no second read of the file.
+    client_ids: Vec<String>,
+    client_evidence: Vec<(String, crate::ClientIdState)>,
 }
 
 impl Journal {
@@ -124,6 +254,7 @@ impl Journal {
         // next write starts on a clean boundary.
         let mut last_seq = 0u64;
         let mut size = 0u64;
+        let mut receipts = LegacyReceipts::default();
         if let Ok(bytes) = fs::read(&path) {
             size = bytes.len() as u64;
             let mut line_start = 0usize;
@@ -133,6 +264,7 @@ impl Journal {
                     if let Ok(entry) = serde_json::from_slice::<SeqEvent>(&bytes[line_start..i]) {
                         last_seq = last_seq.max(entry.seq);
                         good_end = (i + 1) as u64;
+                        receipts.observe(&entry.ev);
                     }
                     line_start = i + 1;
                 }
@@ -165,6 +297,7 @@ impl Journal {
             size,
             caps,
             written_seq: Arc::clone(&written_seq),
+            failed: false,
         };
         let handle = std::thread::Builder::new()
             .name(format!("journal-{session_id}"))
@@ -182,7 +315,20 @@ impl Journal {
             writer: Some(handle),
             written_seq,
             caps,
+            client_ids: receipts.0.iter().map(|(_, id, _)| id.clone()).collect(),
+            client_evidence: receipts.evidence(),
         })
+    }
+
+    /// The send ids of the newest messages this journal held when it was
+    /// opened, oldest first (at most [`crate::model::CLIENT_IDS_REMEMBERED`]):
+    /// what a new process of the session must still refuse to run again.
+    pub fn client_ids_at_open(&self) -> &[String] {
+        &self.client_ids
+    }
+
+    pub(crate) fn client_evidence_at_open(&self) -> &[(String, crate::ClientIdState)] {
+        &self.client_evidence
     }
 
     /// Assign the next seq, journal the event, and return it for broadcast.
@@ -346,6 +492,23 @@ impl Journal {
         }
     }
 
+    /// Maintenance proof must reject a lost line or failed stable-storage
+    /// barrier. Ordinary replay's cheaper flush semantics remain unchanged.
+    pub(crate) async fn sync_checked(&self) -> Result<()> {
+        let (ack, received) = oneshot::channel();
+        self.tx
+            .as_ref()
+            .context("journal writer unavailable")?
+            .send(WriteOp::Durable(ack))
+            .await
+            .context("journal writer unavailable")?;
+        anyhow::ensure!(
+            received.await.unwrap_or(false),
+            "journal durability unavailable"
+        );
+        Ok(())
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -369,6 +532,7 @@ struct WriterThread {
     size: u64,
     caps: JournalCaps,
     written_seq: Arc<AtomicU64>,
+    failed: bool,
 }
 
 impl WriterThread {
@@ -380,6 +544,7 @@ impl WriterThread {
                     match self.file.write_all(&line) {
                         Ok(()) => self.size += line.len() as u64,
                         Err(err) => {
+                            self.failed = true;
                             tracing::error!(%err, path = %self.path.display(), "journal write failed");
                             // Terminate any partial write with a newline so the
                             // next line can't glue onto a torn record.
@@ -396,6 +561,7 @@ impl WriterThread {
                     }
                     if self.size > self.caps.file_cap {
                         if let Err(err) = self.compact() {
+                            self.failed = true;
                             tracing::error!(%err, path = %self.path.display(), "journal compaction failed");
                         }
                     }
@@ -403,6 +569,11 @@ impl WriterThread {
                 WriteOp::Sync(ack) => {
                     let _ = self.file.flush();
                     let _ = ack.send(());
+                }
+                WriteOp::Durable(ack) => {
+                    let durable = self.file.flush().and_then(|_| self.file.sync_all()).is_ok();
+                    self.failed |= !durable;
+                    let _ = ack.send(!self.failed);
                 }
             }
         }
@@ -476,11 +647,11 @@ impl WriterThread {
 /// A user's message too long for one journal line, cut to fit instead of
 /// replaced. A send near the text limit, or a shorter one full of characters
 /// JSON escapes six to one, serializes past the line cap; an `Error` in its
-/// place would erase the user's own message from the transcript and drop its
-/// delivery id, so the later `UserMessageUpdate` for it resolves nothing.
-/// Every field but the text is kept (all small and bounded); the text keeps
-/// its head and tail around the marker tool output uses. `None` for any other
-/// event.
+/// place would drop the message's delivery id and its client's send id with
+/// it, so the client could never confirm the send, and the next process
+/// would run a resend of it a second time. Every field but the text is kept
+/// (they are all small and bounded), and the text keeps its head and tail
+/// around the marker tool output uses. `None` for any other event.
 fn shortened_user_message(ev: &AgentEvent, seq: u64, ts: u64) -> Option<(Arc<SeqEvent>, Vec<u8>)> {
     let AgentEvent::UserMessage { text, .. } = ev else {
         return None;
@@ -592,6 +763,18 @@ impl JournalIndex {
     /// Re-key the conversation's row at the tail (most recent last), carrying
     /// the settings it already held through `apply`. One atomic rewrite.
     fn upsert(&self, native_id: &str, session_id: &str, apply: impl FnOnce(&mut IndexEntry)) {
+        if let Err(err) = self.upsert_checked(native_id, session_id, apply, false) {
+            tracing::warn!(%err, "failed to save journal index");
+        }
+    }
+
+    fn upsert_checked(
+        &self,
+        native_id: &str,
+        session_id: &str,
+        apply: impl FnOnce(&mut IndexEntry),
+        durable: bool,
+    ) -> Result<()> {
         let _persist = self.persist_lock.lock().expect("index persist lock");
         let mut entries = self.entries.lock().expect("index lock");
         let previous = entries.iter().rev().find(|e| e.native_id == native_id);
@@ -612,8 +795,10 @@ impl JournalIndex {
         }
         let snapshot = entries.clone();
         drop(entries);
-        if let Err(err) = save_atomic(&self.path, &snapshot) {
-            tracing::warn!(%err, "failed to save journal index");
+        if durable {
+            crate::send_state::atomic_write(&self.path, &serde_json::to_vec(&snapshot)?)
+        } else {
+            save_atomic(&self.path, &snapshot)
         }
     }
 
@@ -626,20 +811,48 @@ impl JournalIndex {
         session_id: &str,
         apply: impl FnOnce(&mut ConversationSettings),
     ) {
-        self.upsert(native_id, session_id, |entry| {
-            let mut settings = ConversationSettings {
-                model: entry.model.take(),
-                effort: entry.effort.take(),
-                mode: entry.mode.take(),
-            };
-            apply(&mut settings);
-            let bounded = |value: Option<String>| {
-                value.filter(|v| !v.is_empty() && v.len() <= crate::model::COMMAND_SELECTOR_MAX)
-            };
-            entry.model = bounded(settings.model).filter(|m| crate::model::is_real_model(m));
-            entry.effort = bounded(settings.effort);
-            entry.mode = bounded(settings.mode);
-        });
+        if let Err(err) = self.record_settings_impl(native_id, session_id, apply, false) {
+            tracing::warn!(%err, "failed to save journal index");
+        }
+    }
+
+    /// Durable bundle-import variant. Uses the same mutation/persistence lock,
+    /// returns storage failure, and syncs both the index and its directory.
+    pub fn record_settings_checked(
+        &self,
+        native_id: &str,
+        session_id: &str,
+        apply: impl FnOnce(&mut ConversationSettings),
+    ) -> Result<()> {
+        self.record_settings_impl(native_id, session_id, apply, true)
+    }
+
+    fn record_settings_impl(
+        &self,
+        native_id: &str,
+        session_id: &str,
+        apply: impl FnOnce(&mut ConversationSettings),
+        durable: bool,
+    ) -> Result<()> {
+        self.upsert_checked(
+            native_id,
+            session_id,
+            |entry| {
+                let mut settings = ConversationSettings {
+                    model: entry.model.take(),
+                    effort: entry.effort.take(),
+                    mode: entry.mode.take(),
+                };
+                apply(&mut settings);
+                let bounded = |value: Option<String>| {
+                    value.filter(|v| !v.is_empty() && v.len() <= crate::model::COMMAND_SELECTOR_MAX)
+                };
+                entry.model = bounded(settings.model).filter(|m| crate::model::is_real_model(m));
+                entry.effort = bounded(settings.effort);
+                entry.mode = bounded(settings.mode);
+            },
+            durable,
+        )
     }
 
     /// The conversation's last known settings (all `None` for an unknown id).
@@ -956,43 +1169,75 @@ pub fn prune_dir(
     max_files: usize,
     keep: &HashSet<String>,
 ) -> Result<()> {
-    let mut files: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
+    // Count companion-only groups too: a partially failed cleanup and retained
+    // unknown deliveries must not disappear from the directory budget.
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(_) => return Ok(()),
     };
+    let mut groups = std::collections::HashMap::<String, (u64, SystemTime)>::new();
     for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_some_and(|e| e == "jsonl") {
-            if let Ok(meta) = entry.metadata() {
-                files.push((path, meta.len(), meta.modified().unwrap_or(UNIX_EPOCH)));
-            }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(id) = name
+            .strip_suffix(".send-state.json")
+            .or_else(|| name.strip_suffix(".send-state-required"))
+            .or_else(|| name.strip_suffix(".jsonl"))
+        else {
+            continue;
+        };
+        if let Ok(meta) = entry.metadata() {
+            let group = groups.entry(id.to_owned()).or_insert((0, UNIX_EPOCH));
+            group.0 = group.0.saturating_add(meta.len());
+            group.1 = group.1.max(meta.modified().unwrap_or(UNIX_EPOCH));
         }
     }
-    files.sort_by_key(|(_, _, mtime)| *mtime);
-
-    let mut total: u64 = files.iter().map(|(_, size, _)| size).sum();
-    let mut count = files.len();
-    for (path, size, _) in &files {
+    let mut groups: Vec<_> = groups.into_iter().collect();
+    groups.sort_by_key(|(_, (_, mtime))| *mtime);
+    let mut total: u64 = groups.iter().map(|(_, (size, _))| size).sum();
+    let mut count = groups.len();
+    for (id, (size, _)) in &groups {
         if total <= max_bytes && count <= max_files {
             break;
         }
-        let kept = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .is_some_and(|id| keep.contains(id));
-        if kept {
+        if keep.contains(id) {
             continue;
         }
-        match fs::remove_file(path) {
-            Ok(()) => {}
-            // A concurrent prune (every spawn runs one) already freed it;
-            // not counting it would evict an extra history journal.
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => continue,
+        let journal = dir.join(format!("{id}.jsonl"));
+        let state = dir.join(format!("{id}.send-state.json"));
+        let required = dir.join(format!("{id}.send-state-required"));
+        // Retiring history may discard prompts, never unknown delivery IDs.
+        // Corruption is also protected: cleanup must not erase the latch that
+        // makes a reopened conversation fail closed. A journal whose name is
+        // not a send-state session id is still pruned on its own.
+        let prune_evidence = crate::send_state::paths(dir, id).is_ok()
+            && crate::send_state::can_prune_evidence(dir, id).unwrap_or(false);
+        let removed_journal = match fs::remove_file(&journal) {
+            Ok(()) => true,
+            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        };
+        if removed_journal && prune_evidence {
+            match fs::remove_file(&state) {
+                Ok(()) => {
+                    let _ = fs::remove_file(&required);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let _ = fs::remove_file(&required);
+                }
+                Err(_) => {}
+            }
         }
-        total -= size;
-        count -= 1;
+        let remaining_files: Vec<_> = [&journal, &state, &required]
+            .iter()
+            .filter_map(|path| fs::metadata(path).ok())
+            .collect();
+        let remaining: u64 = remaining_files.iter().map(|metadata| metadata.len()).sum();
+        total = total.saturating_sub(size.saturating_sub(remaining));
+        if remaining_files.is_empty() {
+            count -= 1;
+        }
     }
     Ok(())
 }
@@ -1007,6 +1252,250 @@ mod tests {
             turn_id: "t1".into(),
             text: text.into(),
         }
+    }
+
+    #[cfg(unix)]
+    fn checked_writer_fixture(file: fs::File, path: PathBuf) -> Journal {
+        let caps = JournalCaps::default();
+        let written_seq = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = mpsc::channel(WRITE_QUEUE_DEPTH);
+        let writer = WriterThread {
+            file,
+            path: path.clone(),
+            size: 0,
+            caps,
+            written_seq: written_seq.clone(),
+            failed: false,
+        };
+        let writer = std::thread::spawn(move || writer.run(rx));
+        Journal {
+            path,
+            state: Mutex::new(RingState {
+                ring: VecDeque::new(),
+                ring_bytes: 0,
+                next_seq: 1,
+            }),
+            tx: Some(tx),
+            writer: Some(writer),
+            written_seq,
+            caps,
+            client_ids: Vec::new(),
+            client_evidence: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn checked_journal_keeps_lost_write_failure_through_later_durable_barriers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("readonly.jsonl");
+        fs::write(&path, b"").unwrap();
+        let file = fs::File::open(&path).unwrap();
+        // A read-only regular file can sync successfully, but rejects a write.
+        // Later successful fsync alone must not certify the discarded line.
+        file.sync_all().unwrap();
+        let journal = checked_writer_fixture(file, path);
+        journal.sync_checked().await.unwrap();
+        journal.append(msg("synthetic refused write")).await;
+        assert!(journal.sync_checked().await.is_err());
+        assert!(journal.sync_checked().await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn checked_journal_refuses_actual_fsync_failure_and_closed_writer() {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+        let dir = tempfile::tempdir().unwrap();
+        let (writer, _reader) = UnixStream::pair().unwrap();
+        let file = fs::File::from(OwnedFd::from(writer));
+        assert!(file.sync_all().is_err());
+        let mut journal = checked_writer_fixture(file, dir.path().join("synthetic-socket"));
+        journal.append(msg("synthetic successful pipe write")).await;
+        assert!(journal.sync_checked().await.is_err());
+        assert!(journal.sync_checked().await.is_err());
+        journal.tx.take();
+        journal.writer.take().unwrap().join().unwrap();
+        assert!(journal.sync_checked().await.is_err());
+        let (closed, receiver) = mpsc::channel(1);
+        drop(receiver);
+        journal.tx = Some(closed);
+        assert!(journal.sync_checked().await.is_err());
+    }
+
+    #[test]
+    fn preparation_merges_legacy_receipts_without_writes_or_mkdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("not-created");
+        let empty = serde_json::json!({"version":1,"session_id":"s-prepare","entries":[]});
+        let incoming = serde_json::to_vec(&empty).unwrap();
+        merge_send_state(&absent, "s-prepare", &incoming).unwrap();
+        assert!(!absent.exists());
+        let journal = SeqEvent {
+            seq: 1,
+            ts: 0,
+            ev: AgentEvent::UserMessage {
+                text: "existing".into(),
+                attachments: 0,
+                id: Some("u1".into()),
+                queued: false,
+                after_turn: false,
+                origin: None,
+                client_id: Some("client-legacy".into()),
+                attachment_paths: vec![],
+            },
+        };
+        let mut line = serde_json::to_vec(&journal).unwrap();
+        line.push(b'\n');
+        fs::write(dir.path().join("s-prepare.jsonl"), &line).unwrap();
+        let merged = merge_send_state(dir.path(), "s-prepare", &incoming).unwrap();
+        assert_eq!(fs::read(dir.path().join("s-prepare.jsonl")).unwrap(), line);
+        assert!(!dir.path().join("s-prepare.send-state.json").exists());
+        let parsed: serde_json::Value = serde_json::from_slice(&merged).unwrap();
+        assert_eq!(parsed["entries"][0]["id"], "client-legacy");
+        assert_eq!(parsed["entries"][0]["state"], "confirmed");
+        // Journal replacement cannot erase the receipts preparation captured.
+        fs::write(dir.path().join("s-prepare.jsonl"), b"").unwrap();
+        import_send_state(dir.path(), "s-prepare", &merged).unwrap();
+        let exported: serde_json::Value =
+            serde_json::from_slice(&export_send_state(dir.path(), "s-prepare").unwrap()).unwrap();
+        assert_eq!(exported["entries"][0]["id"], "client-legacy");
+    }
+
+    #[test]
+    fn queued_legacy_echo_never_promotes_unresolved_evidence_without_a_sent_update() {
+        for sent in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let queued = AgentEvent::UserMessage {
+                text: "queued".into(),
+                attachments: 0,
+                id: Some("driver-queued".into()),
+                queued: true,
+                after_turn: true,
+                origin: None,
+                client_id: Some("client-queued".into()),
+                attachment_paths: vec![],
+            };
+            let mut lines = serde_json::to_vec(&SeqEvent {
+                seq: 1,
+                ts: 0,
+                ev: queued,
+            })
+            .unwrap();
+            lines.push(b'\n');
+            if sent {
+                lines.extend(
+                    serde_json::to_vec(&SeqEvent {
+                        seq: 2,
+                        ts: 0,
+                        ev: AgentEvent::UserMessageUpdate {
+                            id: "driver-queued".into(),
+                            state: crate::model::UserMessageState::Sent,
+                        },
+                    })
+                    .unwrap(),
+                );
+                lines.push(b'\n');
+            }
+            fs::write(dir.path().join("s-queued.jsonl"), &lines).unwrap();
+            let evidence = br#"{"version":1,"session_id":"s-queued","entries":[{"id":"client-queued","state":"dispatching"}]}"#;
+            // Return finalization encounters the already-installed incoming
+            // journal. Its queued echo must not override the bundle evidence.
+            import_send_state(dir.path(), "s-queued", evidence).unwrap();
+            let journal = Journal::open(dir.path(), "s-queued").unwrap();
+            let store = crate::send_state::Store::open(
+                dir.path(),
+                "s-queued",
+                journal.client_evidence_at_open(),
+                crate::send_state::Receipts::Durable,
+            )
+            .unwrap();
+            assert_eq!(
+                store.state("client-queued").unwrap(),
+                Some(if sent {
+                    crate::ClientIdState::Confirmed
+                } else {
+                    crate::ClientIdState::Uncertain
+                })
+            );
+            let transfer = export_send_state(dir.path(), "s-queued").unwrap();
+            let destination = tempfile::tempdir().unwrap();
+            fs::write(destination.path().join("s-queued.jsonl"), &lines).unwrap();
+            import_send_state(destination.path(), "s-queued", &transfer).unwrap();
+            let exported: serde_json::Value =
+                serde_json::from_slice(&export_send_state(destination.path(), "s-queued").unwrap())
+                    .unwrap();
+            assert_eq!(
+                exported["entries"][0]["state"],
+                if sent { "confirmed" } else { "dispatching" }
+            );
+        }
+    }
+
+    #[test]
+    fn durable_index_import_reports_write_failure_and_preserves_selector_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = JournalIndex::load(dir.path());
+        index
+            .record_settings_checked("native-1", "s-index", |settings| {
+                settings.model = Some("selected".into());
+                settings.effort = Some("x".repeat(crate::model::COMMAND_SELECTOR_MAX + 1));
+            })
+            .unwrap();
+        let reloaded = JournalIndex::load(dir.path());
+        assert_eq!(
+            reloaded.settings("native-1").model.as_deref(),
+            Some("selected")
+        );
+        assert_eq!(reloaded.settings("native-1").effort, None);
+        fs::remove_file(dir.path().join("index.json")).unwrap();
+        fs::create_dir(dir.path().join("index.json")).unwrap();
+        assert!(index
+            .record_settings_checked("native-1", "s-index", |_| {})
+            .is_err());
+        assert!(dir.path().join("index.json").is_dir());
+    }
+
+    #[test]
+    fn pruning_counts_and_cleans_delivery_companions_but_keeps_protected_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        for id in ["s-retired", "s-protected"] {
+            fs::write(dir.path().join(format!("{id}.jsonl")), b"history").unwrap();
+            let payload = serde_json::to_vec(&serde_json::json!({"version":1,"session_id":id,"entries":[{"id":"client-settled","state":"withdrawn"}]})).unwrap();
+            import_send_state(dir.path(), id, &payload).unwrap();
+        }
+        let keep = HashSet::from(["s-protected".to_owned()]);
+        prune_dir(dir.path(), 0, 0, &keep).unwrap();
+        for extension in ["jsonl", "send-state.json", "send-state-required"] {
+            assert!(!dir.path().join(format!("s-retired.{extension}")).exists());
+            assert!(dir.path().join(format!("s-protected.{extension}")).exists());
+        }
+    }
+
+    #[test]
+    fn pruning_never_forgets_unresolved_or_damaged_companion_only_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = serde_json::to_vec(&serde_json::json!({"version":1,"session_id":"s-unknown","entries":[{"id":"client-unknown","state":"dispatching"}]})).unwrap();
+        import_send_state(dir.path(), "s-unknown", &payload).unwrap();
+        fs::write(dir.path().join("s-unknown.jsonl"), b"history").unwrap();
+        fs::write(dir.path().join("s-damaged.send-state.json"), b"").unwrap();
+        fs::write(dir.path().join("s-damaged.send-state-required"), b"1\n").unwrap();
+        fs::write(dir.path().join("s-history.jsonl"), b"history").unwrap();
+        prune_dir(dir.path(), 0, 0, &HashSet::new()).unwrap();
+        assert!(!dir.path().join("s-unknown.jsonl").exists());
+        assert!(!dir.path().join("s-history.jsonl").exists());
+        for id in ["s-unknown", "s-damaged"] {
+            for extension in ["send-state.json", "send-state-required"] {
+                assert!(dir.path().join(format!("{id}.{extension}")).exists());
+            }
+        }
+        // A repeated pruning pass counts orphan evidence and leaves the
+        // damaged latch intact rather than reopening it as an unused ID.
+        prune_dir(dir.path(), 0, 0, &HashSet::new()).unwrap();
+        assert!(export_send_state(dir.path(), "s-damaged").is_err());
+        let exported: serde_json::Value =
+            serde_json::from_slice(&export_send_state(dir.path(), "s-unknown").unwrap()).unwrap();
+        assert_eq!(exported["entries"][0]["state"], "dispatching");
     }
 
     /// `replay_from` may drain the writer via the blocking `sync()`, which
@@ -1062,9 +1551,49 @@ mod tests {
         }
     }
 
+    /// A reopened journal hands back the send ids of its newest messages, so
+    /// the session's next process refuses to run those sends again.
+    #[tokio::test]
+    async fn reopen_reads_back_the_newest_send_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let sent = |n: usize, client_id: Option<String>| AgentEvent::UserMessage {
+            text: format!("message {n}"),
+            attachments: 0,
+            attachment_paths: Vec::new(),
+            id: Some(format!("u{n}")),
+            queued: false,
+            after_turn: false,
+            origin: None,
+            client_id,
+        };
+        {
+            let journal = Journal::open(dir.path(), "s").unwrap();
+            assert!(journal.client_ids_at_open().is_empty());
+            journal.append(sent(0, None)).await;
+            for n in 1..=crate::model::CLIENT_IDS_REMEMBERED + 2 {
+                journal
+                    .append(sent(n, Some(format!("client-{n:04}"))))
+                    .await;
+            }
+            journal.sync_async().await;
+        }
+        let journal = Journal::open(dir.path(), "s").unwrap();
+        let ids = journal.client_ids_at_open();
+        assert_eq!(ids.len(), crate::model::CLIENT_IDS_REMEMBERED);
+        assert_eq!(ids.first().map(String::as_str), Some("client-0003"));
+        assert_eq!(
+            ids.last().cloned(),
+            Some(format!(
+                "client-{:04}",
+                crate::model::CLIENT_IDS_REMEMBERED + 2
+            ))
+        );
+    }
+
     /// A send at the text limit whose characters escape six to one serializes
-    /// to several times the line cap. Its echo must still be journaled as the
-    /// user's message, with its delivery id and every other field.
+    /// to several times the line cap. Its echo must still be journaled as a
+    /// user message with both ids: the client confirms by the id, and the
+    /// next process reads the id back so a resend does not run it again.
     #[tokio::test]
     async fn an_oversize_user_message_is_cut_not_replaced() {
         let dir = tempfile::tempdir().unwrap();
@@ -1083,6 +1612,7 @@ mod tests {
             queued: true,
             after_turn: true,
             origin: None,
+            client_id: Some("client-large-1".into()),
         };
         assert!(serde_json::to_vec(&sent).unwrap().len() > 2 * MAX_ENTRY_BYTES);
         {
@@ -1097,11 +1627,13 @@ mod tests {
                 queued,
                 after_turn,
                 origin,
+                client_id,
             } = &entry.ev
             else {
                 panic!("replaced by {:?}", entry.ev);
             };
             assert_eq!(id.as_deref(), Some("u-large"));
+            assert_eq!(client_id.as_deref(), Some("client-large-1"));
             assert_eq!((*attachments, attachment_paths.len()), (2, 2));
             assert!(*queued && *after_turn && origin.is_none());
             assert!(
@@ -1120,6 +1652,7 @@ mod tests {
                     queued: false,
                     after_turn: false,
                     origin: None,
+                    client_id: Some("client-plain-1".into()),
                 })
                 .await;
             assert!(
@@ -1127,8 +1660,12 @@ mod tests {
             );
             journal.sync_async().await;
         }
-        // The file holds the cut message, not an error, on replay.
+        // The file holds it, and the next process reads its id back.
         let journal = Journal::open(dir.path(), "s").unwrap();
+        assert_eq!(
+            journal.client_ids_at_open(),
+            ["client-large-1", "client-plain-1"]
+        );
         let events = blocking_replay(&journal, 0);
         assert!(matches!(
             &events[0].ev,
@@ -1260,6 +1797,7 @@ mod tests {
                 queued: false,
                 after_turn: false,
                 origin: None,
+                client_id: None,
             },
             AgentEvent::TurnStarted {
                 turn_id: "t1".into(),
@@ -1450,6 +1988,15 @@ mod tests {
         );
         let reloaded = JournalIndex::load(dir.path());
         assert_eq!(reloaded.effort("native-old").as_deref(), Some("xhigh"));
+    }
+
+    #[test]
+    fn prune_dir_prunes_a_journal_with_a_foreign_name() {
+        let dir = tempfile::tempdir().unwrap();
+        backdated(dir.path(), "not.an-id.jsonl", 1000, 600);
+        backdated(dir.path(), "s-new.jsonl", 1000, 60);
+        prune_dir(dir.path(), u64::MAX, 1, &HashSet::new()).unwrap();
+        assert_eq!(names(dir.path()), vec!["s-new.jsonl".to_string()]);
     }
 
     #[test]

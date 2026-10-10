@@ -86,6 +86,17 @@ and cluster-only connections). Replacement resolution precedes any daemon stop.
 
 ## Key behaviors & gotchas
 
+- **Direct SSH on this computer.** In a host's Home actions, expand **Advanced**
+  and choose **Connect directly from this computer** when its site forbids a
+  keeper connection, requires this computer's VPN, or needs local SSH settings.
+  The native `pro_set_host_direct_ssh` command saves additive `hosts.json`
+  `direct_ssh`; it overrides a known kept SSH route even while signed in.
+  Existing connections remain until reconnect, and running jobs and other
+  computers are unaffected. This does not change account-wide **Keep connected**.
+  Device connections have no SSH fallback and do not offer the preference.
+  The choice appears with an active Pro plan; a saved direct preference remains
+  visible while signed out so it can still be cleared.
+
 - **One ControlMaster per host.** Every ssh/scp call rides one chimaera-owned master
   (`ControlMaster=auto`, `ControlPersist=10m`, `Compression=yes`): the user authenticates **once**
   (password or 2FA/Duo, inherited from `~/.ssh/config` — the ssh client is never reimplemented),
@@ -217,6 +228,11 @@ and cluster-only connections). Replacement resolution precedes any daemon stop.
   control-plane output is collected concurrently under 8 MiB stdout / 1 MiB stderr and wall-clock
   limits; overflow or timeout kills and reaps the process. Fetched daemons are cached per
   triple-and-version.
+- **Attached job output stays bounded while it drains.** Each stdout/stderr reader keeps at most
+  a 4 KiB line prefix, discards an oversized line's remainder, and continues through invalid UTF-8.
+  The diagnostic tail retains eight sanitized lines of at most 300 characters each. Explicit
+  ControlMaster closure attempts both routed legs within bounded deadlines, including after its
+  caller is cancelled; it succeeds only on an acknowledged exit or a verified absent control socket.
 - **Tunnel teardown cannot hold the app hostage.** Tunnel objects are removed from shared maps
   before any process/network wait, so one dead host cannot block health checks or commands for
   another. Child reaping gets a two-second ceiling; ControlMaster forward cancellation is
@@ -259,7 +275,7 @@ and cluster-only connections). Replacement resolution precedes any daemon stop.
   `~/.chimaera`. Neither can reach the other's home.
 - **How it's used.** Nothing to opt into: run a dev build (`just app-dev-isolated`, or the bare
   CLI) and `connect <host>` / `status <host>` operate on the dev homes; every host row in a dev
-  app wears the amber `dev` pill. See the [develop skill](../../.claude/skills/develop/SKILL.md).
+  app carries the amber word `dev` in its status line. See the [develop skill](../../.claude/skills/develop/SKILL.md).
 - **Where it lives.** `chimaera-remote/src/lib.rs` (`RemoteHome::current` — every remote
   path/command derives from it), `chimaera-core::is_dev_build` + `state_home` (the local
   default).
@@ -289,11 +305,23 @@ and cluster-only connections). Replacement resolution precedes any daemon stop.
   a later New Window opens a fresh Home without replacing it. The explicit new-window action opens
   another workbench directly.
 - **How it's used.** Connected host rows enter the host page; the row's "…" menu offers **End sessions**
-  (kill everything on the host; the daemon + tunnel stay up), **Disconnect** (tunnel down; sessions +
+  (only while the host has live sessions; kill everything on the host; the daemon + tunnel stay up), **Disconnect** (tunnel down; sessions +
   daemon keep running), **Shut down** (end sessions *and* stop the daemon, then drop the tunnel — the
-  real off switch), **Forget machine**, and **Connection settings**. A connected row says
-  **Connected** with its login node, loopback port, and live-session count (including an
-  active Mastermind); the remote detail masthead repeats that daemon reachability as an explicit
+  real off switch), **Forget machine**, and **Connection settings**. **Forget machine** is never
+  disabled; for a host kept connected through Pro its confirm says keep connected turns off too,
+  and it turns that off before forgetting (the keeper would otherwise list the host again); if
+  that fails the confirm stays up with the reason (`workspace/hostForget.ts`). Remote machines are
+  one bordered list in This Mac's rhythm. Each row's status line is
+  one muted register of words in the UI font (what used to be pills): **Connected** with its
+  login node, loopback port, and live-session count (including an active Mastermind),
+  **Connecting…** or the connect phase, or **Not connected · Last connected …**, with **via Pro**
+  after the state when the route goes through the keeper; a cluster row
+  reads its scheduler label, then the phase or job summary. Further lines continue that status
+  line under the name, same size and colour: a failed connect (the error in muted red,
+  ellipsized, full text on hover, with **Try again**, never a banner), then in the official app
+  one line an extension may add (`web-ui/src/lib/extensions/HostSlot.svelte`, rendered outside the
+  row's state branches and keyed on the alias string, so a host-list refresh or a confirm never
+  remounts it); the free app renders nothing there. The remote detail masthead repeats that daemon reachability as an explicit
   online/offline badge. An outdated remote daemon offers an inline "update" that reconnects with
   `updateDaemon=true`.
 - **Where it lives.** `crates/chimaera-app/src/shell/commands.rs` (`navigate_home`,

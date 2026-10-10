@@ -246,8 +246,9 @@ export function shortHost(host: string): string {
   return host.split(".")[0] || host;
 }
 
-/** A job card's one status line (plan §4.2). */
-export function jobStatusLine(j: ClusterJob, nowMs: number, locale?: string): string {
+/** A job card's one status line (plan §4.2). `kept`: the account's cloud
+ *  holds the cluster's jobs, so an attached one outlives this app. */
+export function jobStatusLine(j: ClusterJob, nowMs: number, locale?: string, kept = false): string {
   if (isJobStopping(j)) return j.node ? `Stopping on ${j.node}…` : "Stopping…";
   let line: string;
   switch (j.state) {
@@ -276,7 +277,9 @@ export function jobStatusLine(j: ClusterJob, nowMs: number, locale?: string): st
     case "ended":
       return endedLine(j, nowMs, locale);
   }
-  if (j.attached) line += " · stops if this app disconnects";
+  // A job the account's cloud holds simply runs on: nothing to decide, so
+  // nothing said. One this app holds ends with it, which the user must know.
+  if (j.attached && !kept) line += " · stops if this app disconnects";
   return line;
 }
 
@@ -604,19 +607,68 @@ export function stopsInWords(remainingSecs: number): string {
  * The window's ended screen, from the shell's reason: Slurm's state,
  * "stopped" (stopped from the app), "closed" (this workspace was closed; its
  * job still runs), "workspace-failed" (its chimaera stopped on its own) or
- * "moving" (it is on its way to another job; the window follows).
+ * "moving" (it is on its way to another job; the window follows), or "gone"
+ * (a browser view's job route is no longer listed: the account cannot tell
+ * which of those two it was).
  */
 export function endedScreenWords(reason: string | null | undefined): string {
   switch (stateWord(reason)) {
     case "CLOSED":
       return "This workspace was closed. Its chats are saved.";
     case "WORKSPACE-FAILED":
-      return "This workspace stopped unexpectedly. Its chats are saved — open it again from the cluster page.";
+      return "This workspace stopped unexpectedly. Its chats are saved.";
     case "MOVING":
-      return "Moving to the new job — this window reopens there when it's ready. Your chats come with you.";
+      return "Moving to the new job…";
+    case "GONE":
+      return "This workspace ended. Your chats are saved.";
+    case "NOT-KEPT":
+      return "Turn on Keep connected for this host to open it here.";
   }
   const why = endedWords(reason, false);
   return why === ""
     ? "This job ended. Your chats are saved."
     : `This job ended — ${why}. Your chats are saved.`;
+}
+
+/**
+ * A cluster page's error line: a whole sentence from the shell stands alone
+ * (it already says what happened and what to do); a bare fragment ("unknown
+ * job", an ssh line) is introduced by what was being done.
+ */
+export function clusterErrorLine(doing: string, error: string): string {
+  const e = error.trim();
+  return /^[A-Z][^\n]*[.!?…]$/.test(e) ? e : `${doing}: ${e}`;
+}
+
+/** The quiet line under the login-node terminal action for a note code
+ *  the shell answered (an account extension's); null for none or unknown. */
+export function terminalNoteWords(code: string | undefined): string | null {
+  switch (code) {
+    case "login_needs_sign_in":
+      return "This terminal signs in to the login node on its own.";
+    default:
+      return null;
+  }
+}
+
+/** The row's quiet status for a transient Open outcome code; null for none
+ *  or an unknown one. */
+export function openPendingWords(code: string | undefined): string | null {
+  switch (code) {
+    case "opening":
+      return "Still opening…";
+    case "getting_ready":
+      return "Getting ready…";
+    case "not_answering":
+      return "Not answering yet…";
+    default:
+      return null;
+  }
+}
+
+/** The Terminal action's tooltip. On a kept cluster the terminal is this
+ *  computer's own sign-in to the login node, separate from the cloud's. */
+export function terminalTitle(alias: string, kept: boolean): string {
+  const base = `A terminal on ${alias}'s login node`;
+  return kept ? `${base}. ${terminalNoteWords("login_needs_sign_in")}` : base;
 }

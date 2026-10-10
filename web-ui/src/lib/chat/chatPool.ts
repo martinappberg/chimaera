@@ -14,8 +14,9 @@
  * carry reactivity; the pool map itself must never be $state.
  */
 
-import { ChatSocket, type ChatSessionInfo, type SeqEvent } from "./chatWs";
+import { ChatSocket, type ChatSessionInfo, type ReadyAttach, type SeqEvent } from "./chatWs";
 import { disposeChat, POOL_CAP, pool, tick, type ChatTransport } from "./chatPoolRegistry";
+import type { MovedTo } from "../net/placement";
 import { ChatStore } from "./store.svelte";
 import { parseSubagentChatId, type SubagentRef } from "./subagentView";
 
@@ -41,19 +42,35 @@ function makeSocket(sessionId: string, store: ChatStore): ChatTransport {
     if (subagentTransport === null) throw new Error("subagent view opened before the chat chunk loaded");
     return subagentTransport(subagent, store);
   }
-  return new ChatSocket(sessionId, {
-    onReady: (info: ChatSessionInfo, replayFrom: number, head: number | undefined) =>
-      store.onReady(info, replayFrom, head),
+  const socket = new ChatSocket(sessionId, {
+    onReady: (info: ChatSessionInfo, replayFrom: number, head: number | undefined, attach: ReadyAttach) =>
+      store.onReady(info, replayFrom, head, attach),
     onEvent: (entry: SeqEvent) => store.apply(entry),
     onDegraded: () => store.onDegraded(),
     onExited: (status: number | null) => store.onExited(status),
     onError: (message: string) => store.onFatalError(message),
     // A refused command is a notice, not a dead pane — the socket keeps
-    // reconnecting and the user keeps their transcript.
-    onCommandFailed: (message: string) => store.notice(message, "error"),
+    // reconnecting and the user keeps their transcript and their text.
+    onCommandFailed: (message: string, command: string | null, reason?: string | null, clientId?: string | null) =>
+      store.onCommandFailed(message, command, reason ?? null, clientId ?? null),
+    onSendCancelled: (clientId: string, cancelled: boolean) => store.onSendCancelled(clientId, cancelled),
+    onSendUncertain: (clientId: string, message: string) => store.onSendUncertain(clientId, message),
+    onSendConfirmed: (clientId: string) => store.onSendConfirmed(clientId),
+    onAsleep: () => store.onAsleep(),
+    onWaking: () => store.onWaking(),
+    onHeld: () => store.onHeld(),
+    onUnreachable: () => store.onUnreachable(),
+    onBringing: () => store.onBringing(),
+    onMoved: (to: MovedTo) => store.onMoved(to),
+    onPaused: (pause) => store.onPaused(pause),
     onDisconnected: () => store.onDisconnected(),
     lastSeq: () => store.lastSeq,
   });
+  // The store sends its own unconfirmed sends again (by id) on this socket,
+  // and nothing else: there is no queue of commands on this side. Quietly: a
+  // frame the store sends by itself never redials or asks for a wake.
+  store.bindSender((frame) => socket.sendQuietly(frame));
+  return socket;
 }
 
 /**
@@ -81,7 +98,11 @@ export function acquireChat(sessionId: string): { store: ChatStore; socket: Chat
     pool.set(sessionId, entry);
   } else if (!entry.socket.healthy) {
     // The socket died while parked; heal it without losing the transcript.
+    // The store never heard it end (a fatal or ended socket reports no
+    // drop): say so now, so sends it left unconfirmed show as pending until
+    // the new socket's `ready` sends them again.
     entry.socket.close();
+    entry.store.onDisconnected();
     entry.socket = makeSocket(sessionId, entry.store);
     entry.lastUsed = tick.next();
   } else {

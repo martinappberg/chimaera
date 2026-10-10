@@ -1,6 +1,9 @@
 import { api } from "../net/api";
 import { acquireChat, provideSubagentTransport, releaseChat } from "./chatPool";
-import type { ChatSessionInfo, ChatSocketHandlers, SeqEvent } from "./chatWs";
+import type { ChatSessionInfo, ChatSocketHandlers, ReadyAttach, SeqEvent } from "./chatWs";
+
+/** A read-only view sends nothing, so it never resends under client ids. */
+const READ_ONLY_ATTACH: ReadyAttach = { sendIds: false, reattach: false };
 import { CooperativeQueue } from "./cooperativeQueue";
 import { NativeUiTransport } from "./nativeUi";
 import {
@@ -211,8 +214,8 @@ export class SubagentSocket {
       };
       // A head below the store's own position is the chat protocol's
       // "journal was recreated" signal: the store drops what it rendered.
-      if (this.handlers.lastSeq() > 0) this.handlers.onReady(info, 0, 0);
-      this.handlers.onReady(info, 0, delivery.total + 1);
+      if (this.handlers.lastSeq() > 0) this.handlers.onReady(info, 0, 0, READ_ONLY_ATTACH);
+      this.handlers.onReady(info, 0, delivery.total + 1, READ_ONLY_ATTACH);
       this.handlers.onEvent({ seq: 1, ts: 0, ev: { type: "init", model: delivery.model } });
     } catch (error) {
       console.warn("subagent view: dropping an unapplyable event", error);
@@ -229,8 +232,8 @@ function makeSubagentSocket(ref: SubagentRef, store: ChatStore): SubagentSocket 
   const socket = new SubagentSocket(
     ref,
     {
-      onReady: (info: ChatSessionInfo, replayFrom: number, head: number | undefined) =>
-        store.onReady(info, replayFrom, head),
+      onReady: (info: ChatSessionInfo, replayFrom: number, head: number | undefined, attach: ReadyAttach) =>
+        store.onReady(info, replayFrom, head, attach),
       onEvent: (entry: SeqEvent) => store.apply(entry),
       onDegraded: () => {},
       onExited: () => {},

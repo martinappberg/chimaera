@@ -33,13 +33,13 @@ const INITIAL_DELAY: Duration = Duration::from_secs(90);
 
 /// The newest known upstream release of one agent CLI.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct AgentLatest {
+pub struct AgentLatest {
     /// Bare version ("0.146.0") — prefix-stripped and charset-gated, safe
     /// for the wire and the UI.
-    pub(crate) version: String,
+    pub version: String,
     /// When the most recent attempt ran, unix seconds.
-    pub(crate) checked_at: u64,
-    pub(crate) error: Option<String>,
+    pub checked_at: u64,
+    pub error: Option<String>,
 }
 
 /// Periodic checker. Gated by the same `update.autoCheck` setting as the
@@ -57,7 +57,13 @@ pub(crate) async fn run_checker(state: Arc<AppState>) {
 /// Probe every agent's latest release concurrently and store what landed.
 /// A failed probe keeps the previous entry (stale beats absent); any change
 /// wakes `/ws/events` subscribers so open surfaces can refetch.
+///
+/// The account's cloud never asks: its agents come with its image and are
+/// updated with it, so there is nothing a release would be offered for.
 pub(crate) async fn check_all(state: &Arc<AppState>) {
+    if state.policy().updates_managed(state) {
+        return;
+    }
     let results = futures::future::join_all(
         AgentKind::ALL
             .into_iter()

@@ -146,15 +146,14 @@ const PIPE_CAPACITY: usize = 64 * 1024;
 /// flight finishes on whatever it can still read. Entry mtimes ride into the
 /// zip as DOS datetimes in UTC (zip carries no timezone; without them every
 /// extracted file would read as 1980, the DOS epoch).
-pub(crate) async fn download(
-    State(state): State<Arc<AppState>>,
-    Path(ticket): Path<String>,
-) -> Response {
+pub async fn download(State(state): State<Arc<AppState>>, Path(ticket): Path<String>) -> Response {
     let not_found = || (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
-    let Some(path) = crate::lock(&state.tickets).lookup(&ticket) else {
+    let Some(crate::fs::TicketSnapshot { path, bound, .. }) =
+        crate::lock(&state.tickets).snapshot(&ticket)
+    else {
         return not_found();
     };
-    let Ok(target) = open_ticket_target(path.clone()).await else {
+    let Ok(target) = open_ticket_target_bound(path.clone(), bound).await else {
         tracing::warn!(path = %path.display(), "ticketed download path unstattable");
         return not_found();
     };
@@ -302,17 +301,24 @@ enum OpenedTicketTarget {
 /// Open and classify the ticket path once. Metadata and bytes now come from
 /// the same no-follow descriptor: a file swapped to a symlink cannot redirect
 /// a plain download, and a folder walk inherits this already-anchored root.
-async fn open_ticket_target(path: PathBuf) -> anyhow::Result<OpenedTicketTarget> {
+async fn open_ticket_target_bound(
+    path: PathBuf,
+    bound: Option<crate::workspace_scope::files::Resolved>,
+) -> anyhow::Result<OpenedTicketTarget> {
     tokio::task::spawn_blocking(move || {
-        let fd = rustix::fs::open(
-            &path,
-            rustix::fs::OFlags::RDONLY
-                | rustix::fs::OFlags::NOFOLLOW
-                | rustix::fs::OFlags::CLOEXEC
-                | rustix::fs::OFlags::NONBLOCK,
-            rustix::fs::Mode::empty(),
-        )?;
-        let file = File::from(fd);
+        let file = if let Some(bound) = bound {
+            bound.open_any()?
+        } else {
+            let fd = rustix::fs::open(
+                &path,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC
+                    | rustix::fs::OFlags::NONBLOCK,
+                rustix::fs::Mode::empty(),
+            )?;
+            File::from(fd)
+        };
         let metadata = file.metadata()?;
         if metadata.is_dir() {
             Ok(OpenedTicketTarget::Directory(Arc::new(file)))
@@ -417,7 +423,7 @@ async fn open_zip_entry(
 /// Open `relative` by walking from an already-open root descriptor. Every
 /// intermediate and final component is `O_NOFOLLOW`; no path lookup is ever
 /// restarted from the process cwd after the root is anchored.
-pub(crate) fn open_beneath(
+pub fn open_beneath(
     root: &File,
     relative: &FsPath,
     final_flags: rustix::fs::OFlags,

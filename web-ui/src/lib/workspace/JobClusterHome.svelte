@@ -17,10 +17,13 @@
     here: string;
     /** Its name, for the back button. */
     hereName: string;
+    /** Opened by the ended panel's Start again: the Slurm id of the job that
+     *  ended (the start sheet opens for `here`, set up like that job). */
+    startAgainFrom?: string | null;
     onClose: () => void;
   }
 
-  let { alias, here, hereName, onClose }: Props = $props();
+  let { alias, here, hereName, startAgainFrom = null, onClose }: Props = $props();
 
   let hosts = $state<HostState[]>([]);
 
@@ -44,6 +47,7 @@
     backLabel={hereName}
     {here}
     onHere={onClose}
+    startAgain={startAgainFrom === null ? null : { workspace: here, slurmJobId: startAgainFrom }}
     onHostsChanged={refreshHosts}
   />
 </div>

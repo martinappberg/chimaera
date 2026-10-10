@@ -8,42 +8,66 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::workspaces::Workspace;
 use crate::AppState;
 
-/// GET /api/v1/workspaces — every workspace but the app's hidden ones.
-pub(crate) async fn list_workspaces(State(state): State<Arc<AppState>>) -> Json<Vec<Workspace>> {
-    Json(crate::lock(&state.workspaces).listed())
+/// GET /api/v1/workspaces
+pub(crate) async fn list_workspaces(
+    State(state): State<Arc<AppState>>,
+) -> Json<Vec<serde_json::Value>> {
+    let workspaces = crate::lock(&state.workspaces).listed();
+    Json(
+        workspaces
+            .into_iter()
+            .filter(|workspace| !workspace.cloud_internal)
+            .map(|workspace| {
+                let mut value = json!(workspace);
+                state
+                    .policy()
+                    .decorate_workspace(&state, &workspace.id, &mut value);
+                value
+            })
+            .collect(),
+    )
 }
 
 #[derive(Deserialize)]
-pub(crate) struct CreateWorkspace {
+pub struct CreateWorkspace {
     root: String,
     /// The native app's own internal workspace (`Workspace::hidden`).
     #[serde(default)]
     hidden: bool,
 }
 
-/// POST /api/v1/workspaces — register a directory, idempotent per canonical root.
-pub(crate) async fn create_workspace(
+/// POST /api/v1/workspaces — register a directory, idempotent per canonical
+/// root. The folder carries its workspace id (`workspaces::identity`): the
+/// id it names is reused, so a reinstall, a second daemon or another
+/// computer reopens the same project; a local duplicate gets a fresh id and
+/// a moved folder keeps its own (the table on
+/// `WorkspaceStore::add_identified`).
+pub async fn create_workspace(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateWorkspace>,
 ) -> Response {
+    use crate::workspaces::identity;
     // `canonicalize` and `is_dir` are blocking fs syscalls on a user-supplied
     // path — a slow or dead NFS mount would otherwise stall the async reactor.
-    // Validate off the reactor; the error strings are unchanged.
+    // Validate off the reactor; the error strings are unchanged. The folder's
+    // marker is read in the same blocking step, and only where Pro can be:
+    // without the extension a folder registers exactly as it always did.
     let input = body.root.clone();
+    let read_marker = state.policy().reads_folder_identity(&state);
     let validated = tokio::task::spawn_blocking(move || {
         let root = std::fs::canonicalize(PathBuf::from(&input))
             .map_err(|err| format!("{input}: {err}"))?;
         if !root.is_dir() {
             return Err(format!("{} is not a directory", root.display()));
         }
-        Ok::<PathBuf, String>(root)
+        let marker = read_marker.then(|| identity::read(&root)).flatten();
+        Ok::<_, String>((root, marker))
     })
     .await;
-    let root = match validated {
-        Ok(Ok(root)) => root,
+    let (root, marker) = match validated {
+        Ok(Ok(found)) => found,
         Ok(Err(msg)) => {
             return (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
         }
@@ -56,16 +80,57 @@ pub(crate) async fn create_workspace(
                 .into_response();
         }
     };
-    let added = {
-        let mut store = crate::lock(&state.workspaces);
-        if body.hidden {
-            store.add_hidden(root)
-        } else {
-            store.add(root)
-        }
+    if body.hidden {
+        return match crate::lock(&state.workspaces).add_hidden(root) {
+            Ok(workspace) => Json(workspace).into_response(),
+            Err(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": err.to_string()})),
+            )
+                .into_response(),
+        };
+    }
+    // The registry holds the marker's id under another root: that root is
+    // stat'ed here, off the store's lock, to tell a moved folder (its old
+    // root is gone) from a local duplicate (it is still there).
+    let elsewhere = marker
+        .as_ref()
+        .and_then(|marker| crate::lock(&state.workspaces).get(&marker.id))
+        .map(|held| held.root)
+        .filter(|held| *held != root);
+    let gone_root = match elsewhere {
+        Some(held) => tokio::task::spawn_blocking(move || {
+            matches!(
+                std::fs::symlink_metadata(&held),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+            .then_some(held)
+        })
+        .await
+        .ok()
+        .flatten(),
+        None => None,
     };
-    match added {
-        Ok(workspace) => Json(workspace).into_response(),
+    let registered = crate::lock(&state.workspaces).add_identified(
+        root,
+        crate::workspaces::FolderIdentity {
+            marker: marker.as_ref(),
+            gone_root: gone_root.as_deref(),
+        },
+    );
+    match registered {
+        Ok(registered) => {
+            let workspace = registered.workspace;
+            if registered.known {
+                // The user opened this project here.
+                state.policy().workspace_known(&state, &workspace.id);
+            }
+            state
+                .policy()
+                .workspace_opened(&state, &workspace, Some(registered.write_marker))
+                .await;
+            Json(workspace).into_response()
+        }
         Err(err) => {
             tracing::error!(%err, "failed to persist workspace");
             (
@@ -78,13 +143,25 @@ pub(crate) async fn create_workspace(
 }
 
 /// POST /api/v1/workspaces/{id}/open — stamp a workspace as freshly opened
-/// (home-screen recency), returning it.
+/// (home-screen recency), returning it. Also gives an enrolled Pro project's
+/// folder that has no identity marker yet its own (one stat, best effort,
+/// never awaited); a project Pro never enrolled is left untouched.
 pub(crate) async fn open_workspace(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
-    match crate::lock(&state.workspaces).touch(&id) {
-        Some(workspace) => Json(workspace).into_response(),
+    let touched = crate::lock(&state.workspaces).touch(&id);
+    match touched {
+        Some(workspace) => {
+            if !workspace.cloud_internal && !workspace.hidden {
+                state.policy().workspace_known(&state, &workspace.id);
+                state
+                    .policy()
+                    .workspace_opened(&state, &workspace, None)
+                    .await;
+            }
+            Json(workspace).into_response()
+        }
         None => (
             StatusCode::NOT_FOUND,
             Json(json!({"error": "unknown workspace"})),

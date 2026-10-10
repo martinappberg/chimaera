@@ -54,7 +54,7 @@ const KINDS_MAX: usize = 16;
 /// are also written to disk (`pdata`) and read back on first use after a
 /// restart.
 #[derive(Default)]
-pub(crate) struct PluginStates {
+pub struct PluginStates {
     by_key: HashMap<(String, String), BTreeMap<String, Stored>>,
     /// Pairs whose durable keys were read back (`load`).
     loaded: HashSet<(String, String)>,

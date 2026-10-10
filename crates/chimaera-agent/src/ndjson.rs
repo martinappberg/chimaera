@@ -8,7 +8,7 @@
 use std::collections::VecDeque;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -121,6 +121,20 @@ impl JsonlChild {
         env: &[(String, String)],
         env_remove: &[String],
     ) -> Result<Self> {
+        Self::spawn_controlled(bin, args, cwd, env, env_remove, None)
+    }
+    pub(crate) fn spawn_controlled(
+        bin: &str,
+        args: &[String],
+        cwd: &Path,
+        env: &[(String, String)],
+        env_remove: &[String],
+        control: Option<&Arc<ProcessControl>>,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            control.is_none_or(|c| !c.fenced()),
+            "managed process was fenced before spawn"
+        );
         let mut cmd = Command::new(bin);
         // Its own process group: the executable can be a launcher (npm's
         // codex entry is a node script around the native binary), and
@@ -144,6 +158,8 @@ impl JsonlChild {
         for k in env_remove {
             cmd.env_remove(k);
         }
+        // Startup-only supervisor input is consumed by the daemon, never an agent.
+        cmd.env_remove("CHIMAERA_SUPERVISOR_CLEANUP_FD");
         let mut child = cmd
             .spawn()
             .with_context(|| format!("failed to spawn {bin}"))?;
@@ -174,12 +190,22 @@ impl JsonlChild {
             }
         });
 
+        let pid = child.id();
+        if let Some(pid) = pid {
+            crate::reaper::register(pid);
+        }
+        let child = Arc::new(Mutex::new(child));
+        if let Some(control) = control {
+            control.attach(&child);
+        }
         Ok(Self {
             sink: JsonlSink { stdin },
             stream: JsonlStream {
                 lines: CappedLines::new(stdout, MAX_STDOUT_LINE_BYTES),
             },
             guard: ChildGuard {
+                managed_execution: control.is_some(),
+                pid,
                 child,
                 stderr_tail,
                 stderr_task,
@@ -247,6 +273,30 @@ pub struct JsonlStream {
 }
 
 impl JsonlStream {
+    /// Called only after the trusted caller confirmed the exact leader stopped.
+    /// Incomplete lines survive canceled reads and refuse a false empty tail.
+    pub(crate) fn drained(&self) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let mut pending: nix::libc::c_int = 0;
+            self.lines.partial.is_empty()
+                && !self.lines.overflowed
+                && self.lines.reader.buffer().is_empty()
+                && unsafe {
+                    nix::libc::ioctl(
+                        self.lines.reader.get_ref().as_raw_fd(),
+                        nix::libc::FIONREAD,
+                        &mut pending,
+                    )
+                } == 0
+                && pending == 0
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
     /// Next JSON frame, no deadline — an idle agent is silent for as long as
     /// the user thinks. `Ok(None)` = EOF.
     pub async fn next(&mut self) -> Result<Option<Value>> {
@@ -275,7 +325,11 @@ const STDERR_SETTLE: Duration = Duration::from_secs(1);
 
 /// Owns the child for lifecycle: bounded shutdown, kill, stderr diagnostics.
 pub struct ChildGuard {
-    child: Child,
+    managed_execution: bool,
+    /// The leader's pid as spawned, kept past the reap so the agent can be
+    /// taken off the daemon's cleanup list (`reaper`) when the guard goes.
+    pid: Option<u32>,
+    child: Arc<Mutex<Child>>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
     stderr_task: tokio::task::JoinHandle<()>,
 }
@@ -291,7 +345,7 @@ impl ChildGuard {
     /// (PROTOCOL.md Pass 32). A no-op once the child has been reaped (tokio
     /// clears the pid then, so a recycled pid is never signalled).
     pub fn terminate(&self) {
-        if let Some(pid) = self.child.id() {
+        if let Some(pid) = self.child.lock().expect("child lifecycle lock").id() {
             let _ = nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(pid as i32),
                 nix::sys::signal::Signal::SIGTERM,
@@ -318,23 +372,76 @@ impl ChildGuard {
     /// and with it the group id, cannot be recycled before the group kill.
     pub async fn shutdown_with_stderr(mut self, grace: Duration) -> (Option<i32>, String) {
         let deadline = Instant::now() + grace;
-        #[cfg(unix)]
-        if let Some(pid) = self.child.id() {
-            while Instant::now() < deadline && !exited_unreaped(pid) {
+        if cfg!(unix) || self.managed_execution {
+            // Wait for the child to exit or the deadline, whichever comes
+            // first (a clean stop takes ~0.3 s; every stop, view switch and
+            // rewind used to wait the full two seconds), then end whatever
+            // else is left in its process group.
+            // The exit is observed without reaping (WNOWAIT), so the group id
+            // cannot be recycled before the group kill below.
+            let group_deadline = if self.managed_execution {
+                Instant::now() + grace.min(Duration::from_secs(2))
+            } else {
+                deadline
+            };
+            let pid = self.child.lock().expect("child lifecycle lock").id();
+            while Instant::now() < group_deadline && !pid.is_some_and(exited_unreaped) {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            let _ = nix::sys::signal::killpg(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGKILL,
-            );
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let status = match tokio::time::timeout(remaining, self.child.wait()).await {
-            Ok(Ok(status)) => status.code(),
-            _ => {
-                self.child.start_kill().ok();
-                self.child.wait().await.ok().and_then(|s| s.code())
+            let child = self.child.lock().expect("child lifecycle lock");
+            #[cfg(unix)]
+            if let Some(pid) = child.id() {
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(pid as i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
             }
+        }
+        // An ordinary child is owned by this guard alone (no execution
+        // control holds it), so it is reaped exactly as before managed
+        // execution existed: wait out the grace, then kill and wait.
+        if !self.managed_execution {
+            if let Some(child) = Arc::get_mut(&mut self.child).and_then(|c| c.get_mut().ok()) {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let status = match tokio::time::timeout(remaining, child.wait()).await {
+                    Ok(Ok(status)) => status.code(),
+                    _ => {
+                        child.start_kill().ok();
+                        child.wait().await.ok().and_then(|s| s.code())
+                    }
+                };
+                let _ = tokio::time::timeout(STDERR_SETTLE, &mut self.stderr_task).await;
+                let tail = self.stderr_tail();
+                return (status, tail);
+            }
+        }
+        // Keep the managed path's existing reap window; ordinary shutdown
+        // still kills at the original grace, without adding another grace.
+        let deadline = if self.managed_execution {
+            Instant::now() + grace
+        } else {
+            deadline
+        };
+        let status = loop {
+            let observed = self.child.lock().expect("child lifecycle lock").try_wait();
+            match observed {
+                Ok(Some(status)) => break status.code(),
+                Err(_) => break None,
+                Ok(None) => {}
+            }
+            if Instant::now() >= deadline {
+                let _ = self
+                    .child
+                    .lock()
+                    .expect("child lifecycle lock")
+                    .start_kill();
+            }
+            // Keep the synchronous control lock free while waiting. A lease
+            // watchdog can stop the owned handle during handshake or IO stalls.
+            if Instant::now() >= deadline + Duration::from_secs(5) {
+                break None;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         };
         let _ = tokio::time::timeout(STDERR_SETTLE, &mut self.stderr_task).await;
         let tail = self.stderr_tail();
@@ -344,24 +451,6 @@ impl ChildGuard {
     pub fn stderr_tail(&self) -> String {
         let tail = self.stderr_tail.lock().expect("stderr tail lock");
         tail.iter().cloned().collect::<Vec<_>>().join("\n")
-    }
-}
-
-impl Drop for ChildGuard {
-    /// A shutdown future dropped midway (its caller cancelled) or a guard
-    /// never shut down still ends the group and its stderr reader: a
-    /// descendant holding the stderr pipe would otherwise keep the reader
-    /// task alive, and the group running, after the session is gone. A no-op
-    /// for a reaped child (tokio clears its pid then).
-    fn drop(&mut self) {
-        self.stderr_task.abort();
-        #[cfg(unix)]
-        if let Some(pid) = self.child.id() {
-            let _ = nix::sys::signal::killpg(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGKILL,
-            );
-        }
     }
 }
 
@@ -395,7 +484,7 @@ fn exited_unreaped(pid: u32) -> bool {
     let observed = unsafe { info.si_pid() };
     observed == pid as i32
 }
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn exited_unreaped(_: u32) -> bool {
     false
 }
@@ -407,12 +496,112 @@ fn truncate(s: &str, max: usize) -> &str {
     }
 }
 
+/// Opt-in managed-process fence; ordinary CLI/probe shutdown retains its normal
+/// SIGTERM behavior. No cached PID is signalled after the Child was reaped.
+#[derive(Default)]
+pub struct ProcessControl {
+    state: Mutex<ControlState>,
+}
+#[derive(Default)]
+struct ControlState {
+    child: Weak<Mutex<Child>>,
+    fenced_at: Option<Instant>,
+}
+impl ProcessControl {
+    /// Run off-reactor. Pin while the unreaped owned Child lock excludes a
+    /// concurrent reap; a later numeric PID reuse cannot retarget the fd.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn pin_process(&self) -> Result<crate::managed_process::ManagedProcess> {
+        let state = self.state.lock().expect("process control lock");
+        anyhow::ensure!(state.fenced_at.is_none(), "managed child fenced");
+        let child = state.child.upgrade().context("managed child unavailable")?;
+        let child = child.lock().expect("child lifecycle lock");
+        crate::managed_process::ManagedProcess::pin(child.id().context("managed child exited")?)
+    }
+    fn fenced(&self) -> bool {
+        self.state
+            .lock()
+            .expect("process control lock")
+            .fenced_at
+            .is_some()
+    }
+    fn attach(&self, child: &Arc<Mutex<Child>>) {
+        let mut state = self.state.lock().expect("process control lock");
+        state.child = Arc::downgrade(child);
+        if state.fenced_at.is_some() {
+            Self::signal(&state);
+        }
+    }
+    /// The owned process group's id (the child's pid) while it is attached and
+    /// unreaped, so a daemon can record restart evidence for it.
+    pub fn process_group(&self) -> Option<u32> {
+        let child = self
+            .state
+            .lock()
+            .expect("process control lock")
+            .child
+            .upgrade()?;
+        let id = child.lock().expect("child lifecycle lock").id();
+        id
+    }
+    /// Called repeatedly during the bounded stop window. First SIGTERM lets
+    /// the official CLI stop detached helpers; the owned group gets SIGKILL
+    /// after two seconds. This is not containment of arbitrary setsid children.
+    pub fn fence(&self) {
+        let mut state = self.state.lock().expect("process control lock");
+        state.fenced_at.get_or_insert_with(Instant::now);
+        Self::signal(&state);
+    }
+    fn signal(state: &ControlState) {
+        let Some(child) = state.child.upgrade() else {
+            return;
+        };
+        let mut child = child.lock().expect("child lifecycle lock");
+        let Some(pid) = child.id() else {
+            return;
+        };
+        let force = state
+            .fenced_at
+            .is_some_and(|at| at.elapsed() >= Duration::from_secs(2));
+        #[cfg(unix)]
+        {
+            let signal = if force {
+                nix::sys::signal::Signal::SIGKILL
+            } else {
+                nix::sys::signal::Signal::SIGTERM
+            };
+            let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid as i32), signal);
+        }
+        if force {
+            let _ = child.start_kill();
+        }
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        // A detached descendant may retain stderr after the bounded drain.
+        // The reader belongs to this guard, including canceled shutdowns.
+        self.stderr_task.abort();
+        #[cfg(unix)]
+        if let Some(pid) = self.child.lock().expect("child lifecycle lock").id() {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        if let Some(pid) = self.pid {
+            crate::reaper::unregister(pid);
+        }
+    }
+}
+
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn partial_output_survives_canceled_line_reads() {
+    async fn maintenance_partial_output_survives_canceled_line_reads() {
         let (mut input, output) = tokio::io::duplex(256);
         let mut lines = CappedLines::new(output, 32);
         input.write_all(b"{\"proof\":").await.unwrap();
@@ -458,6 +647,39 @@ mod tests {
         assert!(tail.lines().count() <= STDERR_TAIL_LINES);
     }
 
+    /// An ordinary child is reaped with its status, and one that outlives
+    /// the grace is killed then and reaped at once.
+    #[tokio::test]
+    async fn an_ordinary_child_is_reaped_at_exit_or_killed_at_the_grace() {
+        let child = JsonlChild::spawn(
+            "/bin/sh",
+            &["-c".into(), "exit 3".into()],
+            Path::new("/"),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let (sink, _stream, guard) = child.split();
+        assert!(!guard.managed_execution);
+        drop(sink);
+        assert_eq!(guard.shutdown(Duration::from_secs(5)).await, Some(3));
+
+        let child = JsonlChild::spawn(
+            "/bin/sh",
+            &["-c".into(), "trap '' TERM; sleep 30".into()],
+            Path::new("/"),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let (sink, _stream, guard) = child.split();
+        guard.terminate();
+        drop(sink);
+        let started = Instant::now();
+        assert_eq!(guard.shutdown(Duration::from_millis(200)).await, None);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
     #[tokio::test]
     async fn an_oversize_stderr_line_is_kept_not_dropped() {
         let over_budget = STDERR_TAIL_BUDGET + 1024;
@@ -480,7 +702,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_a_guard_cancels_its_stderr_reader() {
+    async fn dropping_a_guard_cancels_its_owned_stderr_reader() {
         let child = JsonlChild::spawn(
             "/bin/sh",
             &["-c".into(), "read ignored".into()],
@@ -507,11 +729,10 @@ mod tests {
         .await
         .unwrap();
     }
-
-    // Model npm's codex entry: a launcher that forwards TERM to its native
-    // child, which ignores it. Both hold stdout until they exit; the native
-    // child would on its own exit only after 6 s.
-    async fn launcher_cleanup(cancel_shutdown: bool) {
+    // Model the npm entrypoint: one owned launcher forwards TERM, but its
+    // native child ignores it. Both retain stdout until their finite exit.
+    // No recorded PID/group is ever used to signal test cleanup.
+    async fn ordinary_launcher_cleanup(cancel_shutdown: bool) {
         let child = JsonlChild::spawn(
             "/bin/sh",
             &[
@@ -533,15 +754,17 @@ wait "$native"
         .unwrap();
         let (sink, mut stream, guard) = child.split();
         let owns_group = {
-            let pid = guard.child.id().unwrap() as i32;
-            // The unreaped child pins this pid while it is inspected.
+            let child = guard.child.lock().expect("child lifecycle lock");
+            let pid = child.id().unwrap() as i32;
+            // The unreaped direct Child pins this identity while inspected.
             unsafe { nix::libc::getpgid(pid) == pid && pid != nix::libc::getpgrp() }
         };
+        let ordinary = !guard.managed_execution;
         let ready = tokio::time::timeout(Duration::from_secs(1), stream.next()).await;
         guard.terminate();
         drop(sink);
         let stopped = if cancel_shutdown {
-            // Drop the shutdown future while its grace is still running.
+            // Drop the original shutdown future while its grace is waiting.
             tokio::time::timeout(
                 Duration::from_millis(20),
                 guard.shutdown(Duration::from_secs(3)),
@@ -554,8 +777,8 @@ wait "$native"
         };
         let eof = tokio::time::timeout(Duration::from_millis(500), stream.next()).await;
         let closed_promptly = matches!(eof, Ok(Ok(None)));
-        // Without the fix the native child outlives the launcher; let it end
-        // on its own before asserting, so a failing run leaves nothing behind.
+        // The pre-fix child may survive the launcher. Let the SAME finite
+        // child end naturally before any assertion, including negative runs.
         let settled = closed_promptly
             || matches!(
                 tokio::time::timeout(Duration::from_secs(8), stream.next()).await,
@@ -564,38 +787,50 @@ wait "$native"
         drop(stream);
         assert!(settled, "finite launcher/native pipe did not settle");
         assert!(matches!(ready, Ok(Ok(Some(ref frame))) if frame["ready"] == true));
+        assert!(
+            ordinary,
+            "ordinary launch must not acquire managed admission"
+        );
         assert!(stopped, "shutdown did not reach its intended cutpoint");
         assert!(
             closed_promptly,
             "native child survived launcher teardown (own group: {owns_group})"
         );
-        assert!(owns_group, "the launcher inherited the daemon's group");
+        assert!(owns_group, "ordinary launcher inherited the caller's group");
     }
 
     #[tokio::test]
-    async fn launcher_shutdown_ends_its_native_child() {
-        launcher_cleanup(false).await;
+    async fn ordinary_launcher_shutdown_ends_its_native_child() {
+        ordinary_launcher_cleanup(false).await;
     }
 
     #[tokio::test]
-    async fn canceled_launcher_shutdown_still_ends_its_native_child() {
-        launcher_cleanup(true).await;
+    async fn ordinary_launcher_canceled_shutdown_ends_its_native_child() {
+        ordinary_launcher_cleanup(true).await;
     }
 
-    /// A child that exits on its own is reaped as soon as it does, and what
-    /// it left running in its process group is still ended.
+    /// A managed child that exits on its own is reaped at once (a stop, view
+    /// switch or rewind no longer waits out a fixed two seconds), and what it
+    /// left running in its process group is still ended.
     #[tokio::test]
-    async fn an_exited_child_is_reaped_at_once_and_its_group_ended() {
-        let child = JsonlChild::spawn(
+    async fn a_managed_child_that_exits_is_reaped_at_once_and_its_group_ended() {
+        let control = Arc::new(ProcessControl::default());
+        let child = JsonlChild::spawn_controlled(
             "/bin/sh",
             &["-c".into(), "sleep 30 & exit 3".into()],
             Path::new("/"),
             &[],
             &[],
+            Some(&control),
         )
         .unwrap();
         let (_sink, _stream, guard) = child.split();
-        let group = guard.child.id().unwrap() as i32;
+        let group = guard
+            .child
+            .lock()
+            .expect("child lifecycle lock")
+            .id()
+            .unwrap() as i32;
         let started = Instant::now();
         let status = guard.shutdown(Duration::from_secs(10)).await;
         assert_eq!(status, Some(3));
@@ -609,5 +844,29 @@ wait "$native"
             assert!(Instant::now() < deadline, "the background sleep survived");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod supervisor_channel_tests {
+    use super::*;
+    #[tokio::test]
+    async fn startup_cleanup_marker_never_reaches_agent_child() {
+        let mut child = JsonlChild::spawn(
+            "/bin/sh",
+            &[
+                "-c".into(),
+                r#"printf '{"marker":"%s"}\n' "${CHIMAERA_SUPERVISOR_CLEANUP_FD-absent}""#.into(),
+            ],
+            &std::env::temp_dir(),
+            &[("CHIMAERA_SUPERVISOR_CLEANUP_FD".into(), "0".into())],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            child.recv(Duration::from_secs(5)).await.unwrap().unwrap()["marker"],
+            "absent"
+        );
+        child.shutdown(Duration::from_secs(1)).await.unwrap();
     }
 }

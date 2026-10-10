@@ -185,7 +185,7 @@ impl Policy {
 }
 
 /// The trust records, the policy file and the kill switch (on `AppState`).
-pub(crate) struct Guard {
+pub struct Guard {
     path: PathBuf,
     store: Mutex<TrustStore>,
     /// Trust writes, one at a time, each writing the store as it is then.

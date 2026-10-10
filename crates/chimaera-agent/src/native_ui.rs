@@ -7,6 +7,15 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+/// These request subtypes come only from an explicit control on the live tree.
+/// Rendering, focus, attachment and host replies never carry wake intent.
+pub fn is_user_action(subtype: &str) -> bool {
+    matches!(
+        subtype,
+        "ui_press" | "ui_input" | "ui_select" | "ui_client_press"
+    )
+}
+
 pub const UI_QUEUE: usize = 16;
 pub const UI_EVENT_QUEUE: usize = 4;
 pub const UI_REQUEST_BYTES: usize = 128 * 1024;
@@ -45,6 +54,31 @@ mod tests {
             json!({"subtype":"ui_render","props":{"text":"x".repeat(UI_REQUEST_BYTES)}})
         )
         .is_err());
+    }
+
+    #[test]
+    fn only_explicit_tree_controls_are_user_actions() {
+        for subtype in ["ui_press", "ui_input", "ui_select", "ui_client_press"] {
+            assert!(command("ours", subtype).is_user_action(), "{subtype}");
+        }
+        for subtype in [
+            "ui_attach",
+            "ui_detach",
+            "ui_render",
+            "ui_panes",
+            "ui_pane_show",
+            "ui_pane_focus",
+            "ui_close",
+            "ui_scroll",
+            "ui_focus",
+            "ui_client_module",
+            "ui_message",
+            "ui_prompt_edit",
+            "ui_host_response",
+        ] {
+            assert!(!command("ours", subtype).is_user_action(), "{subtype}");
+        }
+        assert!(!is_user_action("unknown"));
     }
 
     #[test]
@@ -134,6 +168,10 @@ mod tests {
 }
 
 impl NativeUiCommand {
+    pub fn is_user_action(&self) -> bool {
+        is_user_action(self.request["subtype"].as_str().unwrap_or_default())
+    }
+
     /// The authenticated transport assigns client_id. Never accept a browser's
     /// choice of another window's identity or arbitrary Claude control methods.
     pub fn new(client_id: &str, request_id: &str, mut request: Value) -> anyhow::Result<Self> {

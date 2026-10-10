@@ -9,6 +9,7 @@ import type {
   PartitionChoice,
 } from "../net/native";
 import {
+  clusterErrorLine,
   accountChoices,
   childPath,
   agoWords,
@@ -24,6 +25,9 @@ import {
   isInteractiveOnly,
   jobResources,
   jobStatusLine,
+  terminalNoteWords,
+  openPendingWords,
+  terminalTitle,
   limitWords,
   liveJobs,
   memWords,
@@ -298,6 +302,11 @@ describe("jobs in words", () => {
     expect(jobStatusLine(job({ state: "waiting", attached: true, submitted_ms: NOW }), NOW)).toBe(
       "Waiting for a node · stops if this app disconnects",
     );
+    // On a kept cluster the account's cloud holds an attached job: it just runs on.
+    expect(jobStatusLine(job({ state: "waiting", attached: true, submitted_ms: NOW }), NOW, undefined, true)).toBe(
+      "Waiting for a node",
+    );
+    expect(jobStatusLine(job({ state: "waiting", submitted_ms: NOW }), NOW, undefined, true)).toBe("Waiting for a node");
   });
 
   it("keeps a cancelled or completing job stopping and out of workspace destinations", () => {
@@ -326,10 +335,10 @@ describe("jobs in words", () => {
     );
     expect(endedScreenWords("closed")).toBe("This workspace was closed. Its chats are saved.");
     expect(endedScreenWords("moving")).toBe(
-      "Moving to the new job — this window reopens there when it's ready. Your chats come with you.",
+      "Moving to the new job…",
     );
     expect(endedScreenWords("workspace-failed")).toBe(
-      "This workspace stopped unexpectedly. Its chats are saved — open it again from the cluster page.",
+      "This workspace stopped unexpectedly. Its chats are saved.",
     );
     expect(endedScreenWords(null)).toBe("This job ended. Your chats are saved.");
   });
@@ -568,5 +577,47 @@ describe("the folder picker", () => {
     expect(parentPath("/scratch")).toBe("/");
     expect(parentPath("/")).toBeNull();
     expect(parentPath("~/x")).toBeNull();
+  });
+});
+
+describe("clusterErrorLine", () => {
+  it("lets a whole sentence stand alone and introduces a fragment", () => {
+    expect(clusterErrorLine("Couldn't refresh", "The cluster is busy. Try again in a moment.")).toBe(
+      "The cluster is busy. Try again in a moment.",
+    );
+    expect(clusterErrorLine("Couldn't refresh", "unknown job")).toBe("Couldn't refresh: unknown job");
+    expect(clusterErrorLine("Couldn't refresh", "Getting ready…")).toBe("Getting ready…");
+    expect(clusterErrorLine("Couldn't refresh", "ssh: connect to host x port 22: Connection refused")).toBe(
+      "Couldn't refresh: ssh: connect to host x port 22: Connection refused",
+    );
+  });
+});
+
+describe("terminalNoteWords", () => {
+  it("says why a kept cluster's terminal asks to sign in, and nothing otherwise", () => {
+    expect(terminalNoteWords("login_needs_sign_in")).toBe(
+      "This terminal signs in to the login node on its own.",
+    );
+    expect(terminalNoteWords(undefined)).toBeNull();
+    expect(terminalNoteWords("something_new")).toBeNull();
+  });
+});
+
+describe("openPendingWords", () => {
+  it("words a transient Open outcome and nothing else", () => {
+    expect(openPendingWords("opening")).toBe("Still opening…");
+    expect(openPendingWords("getting_ready")).toBe("Getting ready…");
+    expect(openPendingWords("not_answering")).toBe("Not answering yet…");
+    expect(openPendingWords(undefined)).toBeNull();
+    expect(openPendingWords("something_new")).toBeNull();
+  });
+});
+
+describe("terminalTitle", () => {
+  it("adds the sign-in note only on a kept cluster", () => {
+    expect(terminalTitle("hpc", false)).toBe("A terminal on hpc's login node");
+    expect(terminalTitle("hpc", true)).toBe(
+      "A terminal on hpc's login node. This terminal signs in to the login node on its own.",
+    );
   });
 });

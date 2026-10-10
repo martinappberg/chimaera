@@ -30,7 +30,7 @@ const MAX_SETTINGS_BYTES: usize = 256 * 1024;
 
 /// In-memory settings map backed by `settings.json`, mtime-checked on read
 /// so external edits (vim over SSH) surface without a daemon restart.
-pub(crate) struct SettingsStore {
+pub struct SettingsStore {
     path: PathBuf,
     map: serde_json::Map<String, serde_json::Value>,
     /// mtime of the file the cached map was read from (None = no file).
@@ -345,7 +345,7 @@ pub(crate) async fn get_settings(State(state): State<Arc<AppState>>) -> Response
 
 /// PUT /api/v1/settings — replace the whole map (a JSON object ≤ 256KB);
 /// 204 on success. Unknown keys are preserved verbatim (forward compat).
-pub(crate) async fn put_settings(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+pub async fn put_settings(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     if body.len() > MAX_SETTINGS_BYTES {
         return (
             StatusCode::PAYLOAD_TOO_LARGE,

@@ -15,9 +15,16 @@
   } from "./paths";
   import { listAgents } from "../workspace/launcher";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
+  import { insertIntoComposer, registerFollow, returnableCount, returnToComposer } from "./composerBus";
+  import { isBrowserGateway } from "../net/base";
+  import { ownerIsCloud, pauseLabel, placementLabel, placesSplit, projectWhere, sessionPause } from "../net/placement";
+  import { accountSignedOut, proTier } from "../net/plan";
+  import { pausedConnect } from "../pro/providers";
+  import { canOpenOnboarding, cloudOnboarding } from "../pro/onboarding.svelte";
   import BranchChip from "../shared/BranchChip.svelte";
   import { openBranchChanges } from "../workspace/git";
-  import { insertIntoComposer, registerFollow } from "./composerBus";
+  import { windowJobEnd } from "../workspace/jobEnd";
+  import { endedScreenWords } from "../workspace/cluster";
   import {
     acquireChat,
     releaseChat,
@@ -72,6 +79,10 @@
   import AttachmentStrip from "./AttachmentStrip.svelte";
   import ForkDialog from "./ForkDialog.svelte";
   import AgentMessageMeta from "./AgentMessageMeta.svelte";
+  import TransferNote from "./TransferNote.svelte";
+  import KeptNote from "./KeptNote.svelte";
+  import { isTransferOrigin } from "./transfer";
+  import { keptReviews, requestKeptReview, waitingReview } from "../pro/keptReviews.svelte";
   import Composer from "./Composer.svelte";
   import { hookNotice } from "./hookNotice";
   import HookRow from "./HookRow.svelte";
@@ -96,6 +107,7 @@
     PendingSend,
     PlanEntry,
   } from "./store.svelte";
+  import { mintSendId, offersSendNow, SHOW_UNCONFIRMED_AFTER_MS } from "./store.svelte";
   import {
     advanceTailWindow,
     autoPageEarlier,
@@ -118,6 +130,8 @@
   import { activeTheme, getSetting, setSetting } from "../settings/store.svelte";
   import { hostCanDictate, voiceProblem } from "./voice.svelte";
   import { keyHint } from "../shared/keybindings";
+  import LoadingRows from "../shared/LoadingRows.svelte";
+  import { sessionStates } from "../extensions/loading";
 
   interface Props {
     session: Session;
@@ -1494,7 +1508,17 @@
     for (const img of images) {
       blocks.push({ type: "image", media_type: img.media_type, data: img.data });
     }
-    return socket.send({ type: afterTurn ? "send_after_turn" : "send", blocks });
+    const type = afterTurn ? "send_after_turn" : "send";
+    // A daemon without send ids takes the plain frame and settles it with its
+    // own echo or refusal; nothing is tracked here.
+    if (!store.sendsWithIds($proTier === "free")) return socket.send({ type, blocks });
+    // The id this send goes out under: the daemon runs an id once, so the
+    // store may send the same frame again until its echo names it.
+    const id = mintSendId();
+    const frame = { type, blocks, client_id: id };
+    if (!socket.send(frame)) return false;
+    store.noteSent(id, frame, text, images);
+    return true;
   }
 
   // A send made outside the composer (the Mastermind panel's one-click
@@ -1520,6 +1544,47 @@
     }
     return accepted;
   }
+
+  // A send made on a live connection shows no pending bubble, because its
+  // echo follows at once. One still unconfirmed a moment later shows after
+  // all: a machine that froze as the message arrived says nothing.
+  $effect(() => {
+    const since = store.unshownSince;
+    if (since === null) return;
+    const timer = setTimeout(() => store.showOverdue(), Math.max(0, since + SHOW_UNCONFIRMED_AFTER_MS - Date.now()));
+    return () => clearTimeout(timer);
+  });
+
+  // An undelivered send goes back into this chat's composer, once, above
+  // whatever is being written there now (it was written first, and must not
+  // land under the caret), and without taking focus: nobody asked for it at
+  // this moment. Several can come back together (every send a wake was
+  // holding): each its own paragraph, in the order sent. A send comes back
+  // whole or not yet: while the composer has no room for its pictures it
+  // waits in the store, and `returnRoom` brings this back when it has.
+  let returnRoom = $state(0);
+  $effect(() => {
+    void returnRoom;
+    const drafts = store.restoredDrafts;
+    if (drafts.length === 0) return;
+    untrack(() => {
+      const count = returnableCount(session.id, drafts, quoteOwner);
+      if (count === 0) return;
+      const fitting = drafts.slice(0, count);
+      const returned = returnToComposer(
+        session.id,
+        {
+          text: fitting
+            .map((draft) => draft.text)
+            .filter((text) => text.length > 0)
+            .join("\n\n"),
+          images: fitting.flatMap((draft) => draft.images),
+        },
+        quoteOwner,
+      );
+      if (returned) store.takeRestoredDrafts(count);
+    });
+  });
 
   /** One never-lose-a-click path for every interactive AgentCommand. A closed
    *  socket cannot queue locally (replay would make that ambiguous), so keep
@@ -1695,7 +1760,10 @@
       case "mcp":
         if (supports("get_mcp")) {
           if (!sendCommand({ type: "get_mcp" }, "MCP request not sent")) return false;
-          store.mcpServers = null;
+          // A viewed conversation keeps the inventory already known up while
+          // this one is fetched: a read is not the user acting, so nobody
+          // answers it while a cloud machine sleeps (see `UNANSWERED_MS`).
+          if (!viewed) store.mcpServers = null;
           menu = "mcp";
           return true;
         }
@@ -1968,6 +2036,29 @@
       : null,
   );
 
+  /** A read is not the user acting (`get_mcp`, a rewind's dry run): a keeper
+   *  that keeps a sleeping cloud machine's socket neither holds it nor wakes
+   *  the machine for it, so no answer comes. A surface waiting on one closes
+   *  after this long instead of saying "loading…" for good; asking again
+   *  once the conversation answers works. Only a viewed conversation: a
+   *  local daemon always answers or refuses. */
+  const UNANSWERED_MS = { mcp: 10_000, rewind: 30_000 };
+  $effect(() => {
+    if (!viewed || menu !== "mcp" || store.mcpServers !== null) return;
+    const timer = setTimeout(() => {
+      if (menu === "mcp") menu = null;
+    }, UNANSWERED_MS.mcp);
+    return () => clearTimeout(timer);
+  });
+  $effect(() => {
+    const intent = rewindIntent;
+    if (!viewed || intent === null || intent.stage !== "dry" || rewindReport !== null) return;
+    const timer = setTimeout(() => {
+      if (rewindIntent === intent) rewindIntent = null;
+    }, UNANSWERED_MS.rewind);
+    return () => clearTimeout(timer);
+  });
+
   function askRewind(checkpoint: { id: string; preceding: string | null }) {
     store.rewind = null;
     if (conversationOnlyRewind) {
@@ -2102,11 +2193,13 @@
   function toggleThinking() {
     const next = !thinkingOn;
     store.setThinking(next);
-    if (!sendCommand({ type: "set_thinking", enabled: next }, "thinking change not sent")) {
-      // Keep the user's preference, but mark it unsynchronized so the existing
-      // connected-effect retries it on the next ready frame.
-      store.markThinkingPending();
-    }
+    // Keep the user's preference, but mark it unsynchronized whenever it may
+    // not have reached the driver, so the connected-effect below pushes it at
+    // the next `ready`: the socket refused the frame, or took it while the
+    // conversation is not live (whoever keeps a sleeping owner's socket drops
+    // a `set_thinking`, and a plain reconnect does not push it again).
+    const sent = sendCommand({ type: "set_thinking", enabled: next }, "thinking change not sent");
+    if (!sent || (viewed && !store.connected)) store.markThinkingPending();
   }
   // Push the effective preference to the live driver, once per driver process.
   // It pushes whatever the user's effective choice IS (never forces a value),
@@ -2150,6 +2243,94 @@
    *  "Counting files"), else the phase: starting → thinking / writing /
    *  running tools → working (between steps). */
   const agentBusy = $derived(store.running || store.compacting);
+  const RECONNECTING_GRACE_MS = 2000;
+  /** The conversation has no process where it is shown, and that is not an
+   *  exit: its row is paused, or its socket said it moved or is paused and it
+   *  has not been reached since. The transcript stays mounted. */
+  const rowPause = $derived(sessionPause(session));
+  // A row an older version left paused by hand (`manual_resume_reason`)
+  // stays paused, with the ordinary paused words.
+  const continuing = $derived(
+    session.manual_resume_reason != null || session.suspended === true || ((store.moving !== null || store.pausedFor !== null) && !store.connected),
+  );
+  const continuingLabel = $derived(
+    pauseLabel(
+      store.moving !== null && !store.connected
+        ? { type: "moved", to: store.moving }
+        : store.pausedFor !== null && !store.connected
+          ? store.pausedFor
+          : rowPause,
+      { signedOut: $accountSignedOut },
+    ).status,
+  );
+  /** What an optional extension says about this conversation not being here
+   *  yet (`extensions/loading.ts`): a placeholder over the transcript while
+   *  it arrives, or one quiet line. Never set without the extension. */
+  const arrival = $derived($sessionStates.get(session.id) ?? null);
+  const arriving = $derived(arrival?.kind === "loading");
+  /** The agent sign-in this paused conversation waits for on the cloud (the
+   *  row's additive `blocked_provider`); null otherwise. */
+  const connect = $derived(canOpenOnboarding() ? pausedConnect(session) : null);
+  /** A paused row coming back, the project changing where it runs, or its
+   *  owner becoming reachable (a sleeping cloud machine woke) means the
+   *  conversation is reachable now: reconnect at once instead of sitting out
+   *  a backoff — or, for a socket waiting on a sleeping owner, instead of
+   *  waiting for a send. */
+  const reachKey = $derived(
+    `${session.suspended === true}|${session.manual_resume_reason ?? ""}|${rowPause?.type ?? ""}|${typeof session.placement === "object" ? session.placement.remote : "here"}|${session.placement_available !== false}`,
+  );
+  let lastReachKey: string | null = null;
+  $effect(() => {
+    const key = reachKey;
+    if (lastReachKey !== null && lastReachKey !== key && !untrack(() => store.connected)) {
+      socket.retrySoon?.();
+    }
+    lastReachKey = key;
+  });
+  /** A project viewed from another device (a routed row, or a browser view of
+   *  a project). An ordinary local chat never grows connection chrome. */
+  const viewed = $derived(typeof session.placement === "object" || isBrowserGateway());
+  /** Nothing to load yet and no end to a loading line: the first replay
+   *  waits on a cloud machine that sleeps. Either its relay said so
+   *  (`awaitingWake`), or the socket is kept open for it and has heard
+   *  nothing (until a send goes out, which is what wakes it); only a viewed
+   *  conversation in the cloud, never a local one whose daemon is merely
+   *  slow to answer. */
+  const waitsForCloud = $derived(
+    store.awaitingWake ||
+      (store.hydrating &&
+        store.held &&
+        !store.waking &&
+        store.sending.length === 0 &&
+        viewed &&
+        ownerIsCloud(session.placement, $projectWhere)),
+  );
+  /** Name a dropped connection only after a short grace, so the first
+   *  handshake and a quick reconnect never flash a status row. A socket that
+   *  is open and kept for an owner that has not answered (`held`) is not
+   *  reconnecting. */
+  let reconnectingShown = $state(false);
+  $effect(() => {
+    if (!viewed || store.connected || store.held || store.exited !== null || store.degraded) {
+      reconnectingShown = false;
+      return;
+    }
+    const timer = setTimeout(() => (reconnectingShown = true), RECONNECTING_GRACE_MS);
+    return () => clearTimeout(timer);
+  });
+  /** "In the cloud" / "On another computer" for a routed conversation. A
+   *  sleeping owner fails the daemon's passive roster read like an
+   *  unreachable one, so what this socket heard (asleep, waking) or is
+   *  (answered, or kept open) wins over the row's "reconnecting"; and the
+   *  status line under the transcript says "Reconnecting…" itself when it is
+   *  showing, so the header does not. */
+  const runsElsewhere = $derived(
+    placementLabel(session.placement, session.placement_available, {
+      owner: store.asleep ? "asleep" : store.waking && !store.connected ? "waking" : null,
+      reconnectingShown: reconnectingShown && !continuing && !store.waking && !store.asleep,
+      reachable: store.connected || store.held,
+    }),
+  );
   const activityLabel = $derived.by(() => {
     if (store.compacting) return "Compacting context";
     if (store.activityLine !== null) return store.activityLine;
@@ -2483,6 +2664,47 @@
     return folded;
   });
 
+  // --- a Pro return that kept both versions ----------------------------------
+  // When this chat's project came back to this computer with files both sides
+  // changed while apart, one line marks where (`KeptNote`, or the `home`
+  // pick-up's own line when there is one) and offers the review. Placed by
+  // time: before the first row sent after the return; after the last row
+  // when nothing followed yet. A chat that began after the return, or whose
+  // return point is outside the mounted window, shows nothing.
+  // Only an active plan has returns to review: without one a chat asks the
+  // daemon nothing about Pro (`proTier`).
+  const keptWorkspace = $derived($proTier === "active" ? session.workspace_id ?? null : null);
+  $effect(() => {
+    const id = keptWorkspace;
+    if (id === null || !visible) return;
+    untrack(() => keptReviews.ensure(id));
+  });
+  const keptWaiting = $derived.by(() => {
+    const review = keptWorkspace === null ? undefined : keptReviews.byWorkspace[keptWorkspace];
+    return waitingReview(review) ? review : null;
+  });
+  type KeptAnchor = { key: string; merge: boolean } | "end";
+  const keptAnchor = $derived.by((): KeptAnchor | null => {
+    const at = keptWaiting?.returned_at ?? null;
+    if (at === null) return null;
+    let before = false;
+    for (const item of renderItems) {
+      if (item.t !== "single") continue;
+      const block = item.block;
+      if (block.kind !== "user" && block.kind !== "message") continue;
+      if (block.sentAtMs < at) {
+        before = true;
+        continue;
+      }
+      if (!before) return null;
+      return { key: item.key, merge: block.kind === "user" && block.origin === "home" };
+    }
+    return before && atLiveEdge ? "end" : null;
+  });
+  function reviewKept(): void {
+    if (keptWorkspace !== null) requestKeptReview(keptWorkspace);
+  }
+
   /** A finished turn's duration, kept out of the page (the live elapsed on
    *  the status line is the number that matters while it runs) and offered
    *  on the closing message's timestamp tooltip instead. Keyed by uid. */
@@ -2507,13 +2729,18 @@
     store.blocks.length > 0 ? store.blocks[store.blocks.length - 1].uid : -1,
   );
 
-  /** One precise wall-clock timer for every assistant timestamp in this view.
+  /** One precise wall-clock timer for every assistant timestamp (and each
+   *  transfer note's) in this view.
    *  Each row reports its next label boundary; scheduling the earliest avoids
    *  a timer per message and leaves old transcripts idle between midnights. */
   let messageTimeNowMs = $state(Date.now());
   const messageTimestamps = $derived(
     visible
-      ? renderBlocks.flatMap((block) => (block.kind === "message" ? [block.sentAtMs] : []))
+      ? renderBlocks.flatMap((block) =>
+          block.kind === "message" || (block.kind === "user" && isTransferOrigin(block.origin))
+            ? [block.sentAtMs]
+            : [],
+        )
       : [],
   );
   $effect(() => {
@@ -2647,6 +2874,11 @@
     keepOpenWithin: ".menu-host",
   }}
 >
+  {#if runsElsewhere !== null && $placesSplit}
+    <!-- Only when the project's sessions run in different places: otherwise
+         the window's indicator names the one place once. -->
+    <div class="placement-note">{runsElsewhere}</div>
+  {/if}
   {#if subagent !== undefined}
   <SubagentBanner
     {agentKind}
@@ -2698,8 +2930,10 @@
   <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
   <div
     class="transcript"
+    class:arriving
     role="log"
     aria-label="conversation"
+    aria-busy={arriving}
     tabindex="0"
     bind:this={transcriptEl}
     onscroll={onScroll}
@@ -2710,15 +2944,59 @@
     <!-- Room for earlier history ahead of the rendered window: it absorbs
          every height change above a scrolled-up reader (see "reading
          position" in the script). Height is written directly, never bound. -->
+    {#if arriving}
+      <!-- Pinned to the top of the scroller, painted over the hidden
+           transcript, which stays mounted and fills in under it. -->
+      <div class="arriving-rows"><LoadingRows rows={9} variant="transcript" label="conversation" /></div>
+    {/if}
     <div class="history-spacer" bind:this={spacerEl} aria-hidden="true"></div>
     <!-- One real reading column (the Claude Desktop measure): agent prose
          fills it from the left, user bubbles right-align inside it. -->
     <div class="column" bind:this={columnEl}>
-    {#if store.hydrating}
+    <!-- Sends made while the conversation is not live (paused, waking,
+         reconnecting): each shown at once, so nobody sends it twice. Its echo
+         replaces it; a send that was not delivered goes back to the composer. -->
+    {#snippet unconfirmedBubbles()}
+      {#if store.sending.length > 0}
+        <div class="pending" aria-live={visible ? "polite" : "off"}>
+          {#each store.sending as pending (pending.key)}
+            <div class="msg user pending-msg">
+              <div class="bubble-row">
+                <div class="bubble">
+                  <UserText text={pending.text} onOpenPath={openProsePath} resolvePaths={prosePaths} />
+                </div>
+                {#if pending.uncertain && !pending.confirmed}
+                  <button
+                    class="cancel-btn"
+                    title="dismiss (check the conversation before sending it again)"
+                    aria-label="dismiss unconfirmed message"
+                    onclick={() => store.dismissUnconfirmed(pending.key)}
+                  >✕</button>
+                {/if}
+              </div>
+              <span class="delivery">{pending.confirmed ? "delivered" : pending.uncertain ? "delivery unconfirmed · check the conversation before sending again" : "sending…"}</span>
+              {#if pending.images > 0}
+                <span class="attach">{pending.images} image{pending.images > 1 ? "s" : ""}</span>
+              {/if}
+            </div>
+          {/each}
+        </div>
+      {/if}
+    {/snippet}
+    {#if waitsForCloud}
+      <!-- Idle in the cloud before the first replay: nothing to load yet,
+           and no spinner for a wait that only a send ends. -->
+      <div class="empty asleep-note" role="status">
+        <span>This conversation shows here when you send a message.</span>
+      </div>
+    {:else if store.hydrating}
       <div class="empty hydrate" aria-live="polite">
         <SessionGlyph kind="agent" {agentKind} size={18} state="alive" />
         <span>loading recent conversation…</span>
       </div>
+      <!-- A send made before the first replay shows under the loading line
+           instead of vanishing from the composer. -->
+      {@render unconfirmedBubbles()}
     {:else}
     {#if readOnly}
       {#if store.blocks.length === 0}
@@ -2807,6 +3085,9 @@
       />
     {/snippet}
     {#each renderItems as item (item.key)}
+      {#if keptWaiting !== null && keptAnchor !== null && keptAnchor !== "end" && keptAnchor.key === item.key && !keptAnchor.merge}
+        <KeptNote total={keptWaiting.total} onReview={reviewKept} />
+      {/if}
       {#if item.t === "fold"}
         <ActivityFold
           tools={item.tools}
@@ -2836,6 +3117,18 @@
         </FinishedFold>
       {:else if isActivityRow(item)}
         {@render activityRow(item)}
+      {:else if item.block.kind === "user" && isTransferOrigin(item.block.origin)}
+        <TransferNote
+          origin={item.block.origin}
+          text={item.block.text}
+          sentAtMs={item.block.sentAtMs}
+          nowMs={messageTimeNowMs}
+          sourceIndex={item.index}
+          sourceUid={item.block.uid}
+          kept={keptWaiting !== null && keptAnchor !== null && keptAnchor !== "end" && keptAnchor.key === item.key && keptAnchor.merge
+            ? { total: keptWaiting.total, onReview: reviewKept }
+            : null}
+        />
       {:else if item.block.kind === "user"}
         {@const block = item.block}
         <!-- Only delivered (sent) user messages render inline; queued/dropped
@@ -3022,6 +3315,9 @@
         </div>
       {/if}
     {/each}
+    {#if keptWaiting !== null && keptAnchor === "end"}
+      <KeptNote total={keptWaiting.total} onReview={reviewKept} />
+    {/if}
 
     {#if !atLiveEdge}
       {#if canAutoLoadHistory}
@@ -3069,6 +3365,9 @@
       <ElicitationCard {request} {visible} onRespond={(action, content) => sendCommand({type: "elicitation", request_id: request.requestId, action, content}, "MCP response not sent")} />
     {/each}
 
+    <!-- A decision only the optional extension can take (a setup command
+         this agent proposed): nothing at all without it or without a plan. -->
+
     {#if agentBusy && pinnedPermissions.length === 0 && pinnedQuestions.length === 0 && pinnedElicitations.length === 0}
       <div class="status-row" aria-live={visible ? "polite" : "off"}>
         <span class="status-spark">
@@ -3109,9 +3408,15 @@
     {/if}
     {#if store.degraded}
       <div class="notice">continued in terminal — this pane will switch</div>
-    {:else if store.exited !== null}
+    {:else if store.exited !== null && !continuing}
+      <!-- In a cluster job window whose job ended, the agent stopped because
+           the job did: say that, not an agent exit status. -->
       <div class="notice">
-        agent exited{store.exited.status !== null ? ` (status ${store.exited.status})` : ""}
+        {#if $windowJobEnd !== null}
+          {endedScreenWords($windowJobEnd.reason)}
+        {:else}
+          agent exited{store.exited.status !== null ? ` (status ${store.exited.status})` : ""}
+        {/if}
       </div>
     {/if}
 
@@ -3144,7 +3449,7 @@
               caption={parsed.caption}
               text={send.text}
               mastermind={send.origin === "mastermind"}
-              state={send.state}
+              state={send.uncertain ? "uncertain" : send.state}
               onDismiss={() => cancelQueued(send.id)}
               {visible}
               onOpenPath={openProsePath}
@@ -3169,7 +3474,7 @@
                   />
                 </div>
               {/if}
-              {#if send.state === "queued" && store.running}
+              {#if offersSendNow(send, store.running)}
                 <button
                   class="send-now-btn"
                   title={waiting > 1
@@ -3193,7 +3498,7 @@
               </button>
             </div>
             <span class="delivery" class:dropped={send.state === "dropped"}>
-              {send.state === "dropped"
+              {send.uncertain ? "delivery unconfirmed · check the conversation before sending again" : send.state === "dropped"
                 ? "not delivered"
                 : send.afterTurn
                   ? "after this turn"
@@ -3207,6 +3512,7 @@
         {/each}
       </div>
     {/if}
+    {@render unconfirmedBubbles()}
     {/if}
 
     {#if hasDeferredActivity || !atBottom}
@@ -3354,6 +3660,25 @@
     </div>
   {/if}
 
+  {#if arrival?.kind === "note"}
+    <div class="connection-status" role="status">{arrival.text}</div>
+  {:else if arriving}
+    <!-- The placeholder says it; the window's status bar says where. -->
+  {:else if continuing}
+    <div class="connection-status"><span role="status">{continuingLabel}</span>{#if connect !== null}<button type="button" class="connect" onclick={() => cloudOnboarding.request({ providerIds: [connect.providerId], workspaceId: connect.workspaceId })}>Connect {connect.label} to continue</button>{/if}</div>
+  {:else if store.bringing}
+    <!-- Acting here is bringing the work over; the send waits for it. -->
+    <div class="connection-status" role="status">Moving this conversation here…</div>
+  {:else if store.waking && !store.connected}
+    <!-- The cloud starting for the user's own send: the send's progress, not
+         a state of the cloud. -->
+    <div class="connection-status" role="status">Sending…</div>
+  {:else if store.asleep}
+    <!-- Idle in the cloud is not this socket reconnecting: nothing to say,
+         and the composer stays ready (a send continues it). -->
+  {:else if reconnectingShown}
+    <div class="connection-status" role="status">Reconnecting…</div>
+  {/if}
   {#if !readOnly && (session.git || sameFile.notesFor(session.id).length > 0)}
     <!-- One quiet line just above the input. Left: the branch this
          conversation works on (only in a repository; hover names the
@@ -3381,7 +3706,8 @@
     imageInput={capabilities.image_input}
     view={quoteOwner}
     running={agentBusy}
-    disabled={composerDisabled}
+    disabled={continuing || composerDisabled}
+    disabledReason={continuing ? continuingLabel : undefined}
     slashCommands={composerCommands}
     workspaceId={session.workspace_id ?? null}
     {terminals}
@@ -3390,6 +3716,7 @@
     {onSubmit}
     {voiceTerms}
     onDraftState={(active) => (composerEngaged = active)}
+    onReturnRoom={() => (returnRoom += 1)}
     onInterrupt={interrupt}
     onCycleMode={cycleMode}
     {onSlash}
@@ -3398,6 +3725,12 @@
 </div>
 
 <style>
+  .placement-note { color: var(--accent); font-size: var(--text-xs); padding: 5px 12px; border-bottom: 1px solid var(--edge); }
+  .connection-status { padding: 8px 12px; color: var(--muted); font-size: var(--text-xs); text-align: center; }
+  .connection-status .connect { margin-left: 10px; border: 1px solid var(--edge); border-radius: 6px; padding: 3px 9px; color: var(--fg); background: var(--bg); font: inherit; cursor: pointer; }
+  .connection-status .connect:hover { background: var(--row-hover); }
+  .connection-status .connect:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+  @media (pointer: coarse) { .connection-status .connect { min-height: 40px; padding: 6px 12px; } }
   .chat {
     box-sizing: border-box;
     position: relative; /* anchors the rewind dialog + /mcp panel overlays */
@@ -3440,6 +3773,27 @@
   /* The pane clips at its padding box and the transcript fills it edge to
      edge — the global outside ring (app.css) would be cut on three sides, so
      paint it inside. */
+  /* An arriving conversation: the placeholder in the column's place, and no
+     scrolling through the transcript hidden under it. Opacity, not
+     visibility: the transcript under it stays as it is (rules/web-ui.md). */
+  .transcript.arriving {
+    overflow-y: hidden;
+  }
+  .transcript.arriving > :not(.arriving-rows) {
+    opacity: 0;
+  }
+  .arriving-rows {
+    position: sticky;
+    top: 0;
+    height: 0;
+    overflow: visible;
+    z-index: 1;
+  }
+  .arriving-rows > :global(.loading-rows) {
+    width: var(--chat-column);
+    max-width: 100%;
+    margin: 0 auto;
+  }
   .transcript:focus-visible {
     outline-offset: -2px;
   }
@@ -3520,6 +3874,11 @@
     flex-direction: column;
     align-items: center;
     gap: 8px;
+  }
+  .asleep-note {
+    max-width: 34ch;
+    text-align: center;
+    line-height: 1.5;
   }
   .history-more {
     align-self: center;

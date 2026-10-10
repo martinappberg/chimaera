@@ -1,0 +1,7 @@
+{
+  "providers": [
+    {"id": "claude", "label": "Claude Code", "category": "agent", "auth_origins": ["https://claude.com"]},
+    {"id": "codex", "label": "Codex", "category": "agent", "auth_origins": ["https://auth.openai.com"]},
+    {"id": "github", "label": "GitHub", "category": "repository", "auth_origins": ["https://github.com"]}
+  ]
+}

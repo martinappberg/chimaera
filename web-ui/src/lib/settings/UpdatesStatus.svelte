@@ -6,7 +6,9 @@
    * plainly whether a newer release exists, when that was last checked,
    * and — the part that used to be invisible — why a check failed if it
    * did. "check now" asks every source at once. The switch below it is the
-   * ordinary `update.autoCheck` schema row.
+   * ordinary `update.autoCheck` schema row. On the account's cloud (a daemon
+   * that says `managed`) the daemon line is one neutral sentence and neither
+   * "check now" nor the switch shows: its updates are the service's.
    */
   import { onMount } from "svelte";
   import {
@@ -24,7 +26,7 @@
     relativeAge,
     versionNumber,
   } from "../workspace/launcher";
-  import { applyAppStatus, checkForUpdates, updateState } from "../workspace/update.svelte";
+  import { APP_UPDATES, applyAppStatus, checkForUpdates, MANAGED_UPDATES, updateState } from "../workspace/update.svelte";
   import { agentUpdateStatus } from "./agentStatus";
   import { getSetting } from "./store.svelte";
 
@@ -162,6 +164,10 @@
       return { ...base, version: null, verdict: "asking…", tone: "idle", sub: "waiting for the daemon's answer" };
     }
     const version = d.dev ? `dev·${(d.build ?? "unknown").split(".")[0]}` : d.current;
+    // The account's cloud: nothing to check, offer or apply here.
+    if (d.managed) {
+      return { ...base, version, verdict: "managed", tone: "idle", sub: MANAGED_UPDATES };
+    }
     if (native && updateState.buildSkew) {
       return {
         ...base,
@@ -184,6 +190,8 @@
         sub: "release checks don't apply to a dev build",
       };
     }
+    // The official app's daemon never checks the feed itself.
+    if (d.withApp) return { ...base, version, verdict: "with the app", tone: "idle", sub: APP_UPDATES };
     const checked = ago(d.checked_at);
     const cadence = autoCheck ? `checks ${every(d.interval_secs)}` : "automatic checks are off";
     if (d.state === "available" && d.latest !== null) {
@@ -287,6 +295,7 @@
   const lines = $derived(
     [appLine, daemonLine, agentsLine].filter((l): l is Line => l !== null),
   );
+  const managed = $derived(updateState.daemon?.managed === true);
 
   async function checkNow(): Promise<void> {
     if (checking) return;
@@ -328,14 +337,16 @@
 
 <div class="cat-row">
   <h2 class="cat">Updates</h2>
-  <button
-    class="recheck"
-    title="ask GitHub (and the agents' release feeds) for the newest versions now"
-    onclick={() => void checkNow()}
-    disabled={checking}
-  >
-    {checking ? "checking…" : "check now"}
-  </button>
+  {#if !managed}
+    <button
+      class="recheck"
+      title="ask GitHub (and the agents' release feeds) for the newest versions now"
+      onclick={() => void checkNow()}
+      disabled={checking}
+    >
+      {checking ? "checking…" : "check now"}
+    </button>
+  {/if}
 </div>
 
 <div class="status" aria-live="polite">

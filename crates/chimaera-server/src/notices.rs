@@ -19,6 +19,13 @@
 //! the instant a turn ends, never flashes a notification, and a turn-end the
 //! agent immediately follows with "waiting on you" arrives as one notice.
 //!
+//! **Not only this computer's sessions.** Two more sources feed the same
+//! ring: a Pro return that kept both versions of changed files
+//! ([`push_kept_both`], a project event, not a session's), and a project that
+//! runs on another machine — its owner's notices about that project's
+//! conversations arrive on a window's events feed and are relayed here
+//! ([`relay`], de-duplicated, so they reach the OS once like local ones).
+//!
 //! Bounded by construction: a small ring of recent notices ([`RING_CAP`]),
 //! replayed to a reconnecting consumer only while fresh ([`REPLAY_MAX_AGE`]);
 //! a fresh consumer (new boot, first poll) starts at the head, so opening
@@ -63,10 +70,22 @@ const AGENT_HOURLY_CAP: usize = 20;
 const HOUR: Duration = Duration::from_secs(60 * 60);
 /// Caps on agent-authored text (the tool validates, this bounds the ring).
 pub(crate) const AGENT_TITLE_MAX: usize = 80;
+/// Relayed notices remembered for de-duplication (every window watching a
+/// routed project runs its own feed, so each owner notice arrives once per
+/// window). Entries also expire after [`REPLAY_MAX_AGE`]: an owner never
+/// replays older notices to a feed (a feed starts at its head).
+const RELAY_SEEN_CAP: usize = 256;
+/// Bounds on words this feed did not write itself (another daemon's, a
+/// project's name, a kept file's name) before they enter the ring.
+const WORDS_MAX: usize = 480;
+const NAME_MAX: usize = 200;
+/// Kept copies a `kept_both` notice names in its body; the full (bounded)
+/// list rides the additive `kept.paths`.
+const KEPT_NAMED: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum NoticeKind {
+pub enum NoticeKind {
     /// The turn ended and the agent handed back the floor.
     Done,
     /// The turn ended with the agent explicitly waiting on the user.
@@ -81,6 +100,10 @@ pub(crate) enum NoticeKind {
     RateLimited,
     /// The agent called the `notify` tool.
     Agent,
+    /// A Pro return kept both versions of files changed on both machines
+    /// (the user's own beside the incoming one), or of a Git branch. A
+    /// project event: `session_id` is a per-project key, not a session.
+    KeptBoth,
 }
 
 impl NoticeKind {
@@ -93,7 +116,8 @@ impl NoticeKind {
             | NoticeKind::Permission
             | NoticeKind::Question
             | NoticeKind::Error
-            | NoticeKind::RateLimited => "notifications.needsYou",
+            | NoticeKind::RateLimited
+            | NoticeKind::KeptBoth => "notifications.needsYou",
         }
     }
 
@@ -107,6 +131,25 @@ impl NoticeKind {
             NoticeKind::Error => "Stopped on an error",
             NoticeKind::RateLimited => "Hit a usage limit",
             NoticeKind::Agent => "Message",
+            NoticeKind::KeptBoth => "Kept both versions",
+        }
+    }
+
+    /// The owner's wire name, for the kinds a routed project relays: a turn
+    /// that ended (finished, or waiting for the user), a permission or a
+    /// question blocking it, and the agent's own `notify` — which the owner
+    /// lets replace its turn-end notice, so relaying `done` without it would
+    /// lose "ping me when it's done". Errors and usage limits stay with the
+    /// owner: a cloud machine stopping its agents for a hand-back must not
+    /// read as news here.
+    fn relayed(kind: &str) -> Option<Self> {
+        match kind {
+            "done" => Some(NoticeKind::Done),
+            "input" => Some(NoticeKind::Input),
+            "permission" => Some(NoticeKind::Permission),
+            "question" => Some(NoticeKind::Question),
+            "agent" => Some(NoticeKind::Agent),
+            _ => None,
         }
     }
 
@@ -123,27 +166,40 @@ impl NoticeKind {
 /// same event the same way; the structured fields let a consumer route a
 /// click (session + workspace) and re-compose for its platform.
 #[derive(Clone, Debug)]
-pub(crate) struct Notice {
-    pub(crate) id: u64,
-    pub(crate) kind: NoticeKind,
-    pub(crate) session_id: String,
-    pub(crate) workspace_id: Option<String>,
-    pub(crate) workspace: Option<String>,
-    pub(crate) agent: Option<String>,
+pub struct Notice {
+    pub id: u64,
+    pub kind: NoticeKind,
+    pub session_id: String,
+    pub workspace_id: Option<String>,
+    pub workspace: Option<String>,
+    pub agent: Option<String>,
     /// The session's display name (what the rail calls it).
-    pub(crate) name: String,
-    pub(crate) title: String,
-    pub(crate) subtitle: String,
-    pub(crate) body: String,
-    pub(crate) at_ms: u64,
-    created: Instant,
+    pub name: String,
+    pub title: String,
+    pub subtitle: String,
+    pub body: String,
+    pub at_ms: u64,
+    /// `kept_both` only: what the return kept (the additive `kept` field).
+    pub kept: Option<Kept>,
+    pub created: Instant,
+}
+
+/// What a return kept in both versions: `files` counted, `paths` naming up
+/// to 32 of the kept copies (project-relative, as the mirror row's
+/// `kept_paths`), and the other machine's diverged Git branches kept beside
+/// the user's (`<branch>@cloud-<commit>`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct Kept {
+    pub(crate) files: usize,
+    pub(crate) paths: Vec<String>,
+    pub(crate) branches: Vec<String>,
 }
 
 impl Notice {
     /// Wire shape. `age_ms` is measured on THIS daemon's clock, so a
     /// consumer on another machine can judge freshness without clock sync.
-    pub(crate) fn to_json(&self, now: Instant) -> Value {
-        json!({
+    pub fn to_json(&self, now: Instant) -> Value {
+        let mut value = json!({
             "id": self.id,
             "kind": self.kind,
             "blocking": self.kind.blocking(),
@@ -157,14 +213,18 @@ impl Notice {
             "body": self.body,
             "at_ms": self.at_ms,
             "age_ms": now.saturating_duration_since(self.created).as_millis() as u64,
-        })
+        });
+        if let Some(kept) = &self.kept {
+            value["kept"] = json!(kept);
+        }
+        value
     }
 }
 
 /// The feed store. `boot` distinguishes this daemon process from its
 /// predecessor (ids restart at 1 after a restart, and the port + token
 /// survive a handoff, so a consumer needs something that doesn't).
-pub(crate) struct Notices {
+pub struct Notices {
     boot: String,
     inner: Mutex<Inner>,
 }
@@ -175,7 +235,13 @@ struct Inner {
     ring: VecDeque<Arc<Notice>>,
     /// Per-session agent `notify` send times within the last hour.
     agent_sends: HashMap<String, VecDeque<Instant>>,
+    /// Relayed notices already taken (see [`relay`]), oldest first.
+    relayed: VecDeque<(RelayKey, Instant)>,
 }
+
+/// One owner notice's identity: its session, its kind, and the owner's
+/// timestamp for it (a turn's own). Two windows' feeds deliver the same key.
+type RelayKey = (String, NoticeKind, u64);
 
 impl Notices {
     pub(crate) fn new() -> Self {
@@ -189,7 +255,7 @@ impl Notices {
         &self.boot
     }
 
-    pub(crate) fn head(&self) -> u64 {
+    pub fn head(&self) -> u64 {
         crate::lock(&self.inner).head
     }
 
@@ -206,7 +272,7 @@ impl Notices {
     }
 
     /// Notices after `after` that are still fresh enough to replay.
-    pub(crate) fn since(&self, after: u64) -> Vec<Arc<Notice>> {
+    pub fn since(&self, after: u64) -> Vec<Arc<Notice>> {
         let inner = crate::lock(&self.inner);
         inner
             .ring
@@ -214,6 +280,27 @@ impl Notices {
             .filter(|n| n.id > after && n.created.elapsed() <= REPLAY_MAX_AGE)
             .cloned()
             .collect()
+    }
+
+    /// Whether a relayed notice is new here; remembers it if so. Bounded
+    /// both by count and by age.
+    fn first_relay(&self, key: RelayKey) -> bool {
+        let mut inner = crate::lock(&self.inner);
+        while inner
+            .relayed
+            .front()
+            .is_some_and(|(_, at)| at.elapsed() > REPLAY_MAX_AGE)
+        {
+            inner.relayed.pop_front();
+        }
+        if inner.relayed.iter().any(|(seen, _)| *seen == key) {
+            return false;
+        }
+        if inner.relayed.len() >= RELAY_SEEN_CAP {
+            inner.relayed.pop_front();
+        }
+        inner.relayed.push_back((key, Instant::now()));
+        true
     }
 
     /// When this session last had an agent-sent notice, if within `window`.
@@ -341,13 +428,14 @@ fn emit_edge(
         subtitle,
         body,
         at_ms: crate::session_view::now_ms(),
+        kept: None,
         created: Instant::now(),
     }))
 }
 
 /// The MCP `notify` tool's entry point: validate, rate-limit, store. The
 /// `Ok` text is what the agent sees.
-pub(crate) fn push_agent_notice(
+pub fn push_agent_notice(
     state: &AppState,
     session_id: &str,
     title: Option<&str>,
@@ -396,10 +484,211 @@ pub(crate) fn push_agent_notice(
         subtitle,
         body: message,
         at_ms: crate::session_view::now_ms(),
+        kept: None,
         created: Instant::now(),
     });
     state.changes.notify_waiters();
     Ok("Notification sent.".to_string())
+}
+
+/// A Pro return kept both versions of something (see `pro::report_return`):
+/// one notice for the whole return, never one per file. `paths` are the kept
+/// copies (`<name>.mine-<yyyymmdd-hhmm>`, project-relative, up to 32 of
+/// `files`); `branches` the other machine's diverged branches kept beside the
+/// user's. Words say what happened and where the user's version is; the
+/// structured `kept` lets the UI list or open them.
+pub fn push_kept_both(
+    state: &AppState,
+    workspace_id: &str,
+    files: usize,
+    paths: &[std::path::PathBuf],
+    branches: &[String],
+) -> Option<Arc<Notice>> {
+    if (files == 0 && branches.is_empty()) || !kind_enabled(state, NoticeKind::KeptBoth) {
+        return None;
+    }
+    let project = crate::lock(&state.workspaces)
+        .get(workspace_id)
+        .map(|w| w.name)
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "your project".to_string());
+    let project = clip(&project, NAME_MAX);
+    let paths: Vec<String> = paths
+        .iter()
+        .take(32)
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let branches: Vec<String> = branches.iter().take(32).cloned().collect();
+    let plural = |n: usize, one: &str, many: &str| {
+        if n == 1 {
+            format!("1 {one}")
+        } else {
+            format!("{n} {many}")
+        }
+    };
+    let what = match (files, branches.len()) {
+        (0, b) => plural(b, "branch", "branches"),
+        (f, 0) => plural(f, "file", "files"),
+        (f, b) => format!(
+            "{} and {}",
+            plural(f, "file", "files"),
+            plural(b, "branch", "branches")
+        ),
+    };
+    // Named by the kept copy's own file name: the one the user will find in
+    // the file tree right beside the incoming version.
+    let named = |items: Vec<&str>, total: usize| {
+        let mut list = items.join(", ");
+        if total > items.len() {
+            list.push_str(&format!(" and {} more", total - items.len()));
+        }
+        list
+    };
+    let mut body = Vec::new();
+    if files > 0 {
+        let names: Vec<&str> = paths
+            .iter()
+            .take(KEPT_NAMED)
+            .map(|p| {
+                std::path::Path::new(p)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(p)
+            })
+            .collect();
+        let list = named(names, files);
+        body.push(if files == 1 {
+            format!("Your version is saved beside it ({list}).")
+        } else {
+            format!("Your versions are saved beside them ({list}).")
+        });
+    }
+    if !branches.is_empty() {
+        let list = named(
+            branches
+                .iter()
+                .take(KEPT_NAMED)
+                .map(String::as_str)
+                .collect(),
+            branches.len(),
+        );
+        body.push(if branches.len() == 1 {
+            format!("The other machine's version is kept as branch {list}.")
+        } else {
+            format!("The other machine's versions are kept as branches {list}.")
+        });
+    }
+    let notice = state.notices.push(Notice {
+        id: 0,
+        kind: NoticeKind::KeptBoth,
+        // A per-project key where consumers expect a session id: a newer
+        // return's notice replaces this project's older one, never another
+        // project's; a click routes by `workspace_id`.
+        session_id: format!("kept-both-{workspace_id}"),
+        workspace_id: Some(workspace_id.to_string()),
+        workspace: Some(project.clone()),
+        agent: None,
+        name: project.clone(),
+        title: format!("Kept both versions of {what}"),
+        subtitle: project,
+        body: clip(&body.join(" "), WORDS_MAX),
+        at_ms: crate::session_view::now_ms(),
+        kept: Some(Kept {
+            files,
+            paths,
+            branches,
+        }),
+        created: Instant::now(),
+    });
+    state.changes.notify_waiters();
+    Some(notice)
+}
+
+/// A notice the owner of a routed project raised about one of that
+/// project's conversations, as a window's events feed received it
+/// (`session_proxy::Feed`). Taken into this daemon's own feed — so the
+/// native app and browser tabs alert about it like a local one — when:
+///
+/// - it is a relayed kind (a turn that ended; a permission or a question;
+///   the agent's own message), switched on in THIS computer's settings;
+/// - it names this project and a session that does not run here (a live
+///   local session notifies through this daemon's own watcher; relaying the
+///   owner's word too would alert twice);
+/// - it is fresh and new: every window watching the project runs its own
+///   feed, so the same notice arrives once per window, and only the first
+///   (by session, kind and the owner's timestamp) is kept.
+///
+/// Words are the owner's, bounded; the subtitle is recomposed with this
+/// computer's project name. Returns whether it was taken.
+pub fn relay(state: &AppState, workspace_id: &str, row: &Value) -> bool {
+    let Some(kind) = row["kind"].as_str().and_then(NoticeKind::relayed) else {
+        return false;
+    };
+    let (Some(session_id), Some(at_ms)) = (row["session_id"].as_str(), row["at_ms"].as_u64())
+    else {
+        return false;
+    };
+    let age = Duration::from_millis(row["age_ms"].as_u64().unwrap_or(0));
+    if session_id.is_empty()
+        || session_id.len() > 128
+        || row["workspace_id"].as_str() != Some(workspace_id)
+        || age > REPLAY_MAX_AGE
+        || !kind_enabled(state, kind)
+    {
+        return false;
+    }
+    let local = state.sessions.get(session_id).is_some_and(|s| s.alive)
+        || state.chat.get(session_id).is_some_and(|c| c.alive);
+    if local
+        || !state
+            .notices
+            .first_relay((session_id.to_string(), kind, at_ms))
+    {
+        return false;
+    }
+    let text = |key: &str, max: usize| clip(row[key].as_str().unwrap_or_default(), max);
+    let workspace = crate::lock(&state.workspaces)
+        .get(workspace_id)
+        .map(|w| w.name)
+        .or_else(|| row["workspace"].as_str().map(str::to_string))
+        .map(|name| clip(&name, NAME_MAX));
+    let name = text("name", NAME_MAX);
+    let title = Some(text("title", NAME_MAX))
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| name.clone());
+    let phrase = kind.phrase();
+    state.notices.push(Notice {
+        id: 0,
+        kind,
+        session_id: session_id.to_string(),
+        workspace_id: Some(workspace_id.to_string()),
+        subtitle: match &workspace {
+            Some(ws) => format!("{phrase} · {ws}"),
+            None => phrase.to_string(),
+        },
+        workspace,
+        agent: row["agent"].as_str().map(|a| clip(a, 32)),
+        name,
+        title,
+        body: text("body", WORDS_MAX),
+        // The owner's own time for it (what the de-duplication keys on);
+        // its age as the owner measured it carries over.
+        at_ms,
+        kept: None,
+        created: Instant::now().checked_sub(age).unwrap_or_else(Instant::now),
+    });
+    state.changes.notify_waiters();
+    true
+}
+
+/// `text` without control characters, at most `max` chars.
+fn clip(text: &str, max: usize) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(max)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 /// What an observed state change means for the feed.
@@ -446,7 +735,7 @@ fn still_true(kind: NoticeKind, state: AgentState) -> bool {
         NoticeKind::Permission | NoticeKind::Question => state == AgentState::NeedsPermission,
         NoticeKind::Error => state == AgentState::Errored,
         NoticeKind::RateLimited => state == AgentState::RateLimited,
-        NoticeKind::Agent => false,
+        NoticeKind::Agent | NoticeKind::KeptBoth => false,
     }
 }
 
@@ -458,7 +747,7 @@ struct Pending {
 /// The edge detector. Runs for the daemon's lifetime; wakes on every change
 /// (plus a 1s backstop — `notify_waiters` only reaches registered waiters,
 /// and a level diff catches up on whatever a missed wake hid).
-pub(crate) async fn run(state: Arc<AppState>) {
+pub async fn run(state: Arc<AppState>) {
     let mut seen: HashMap<String, AgentState> = HashMap::new();
     let mut pending: HashMap<String, Pending> = HashMap::new();
     loop {
@@ -632,7 +921,13 @@ fn attention(state: &AppState) -> Vec<Attention> {
         .filter(|(_, r)| r.state == AgentState::NeedsPermission)
         .map(|(id, _)| id.clone())
         .collect();
-    if ids.is_empty() {
+    // A project running on another machine: its conversations blocked on an
+    // approval count too, as the in-app count already does from the same
+    // rows. It also keeps a relayed permission alert up until it is answered
+    // (on either machine) — consumers take back a blocking alert whose
+    // session leaves this set.
+    let routed = state.policy().routed_decisions(state);
+    if ids.is_empty() && routed.is_empty() {
         return Vec::new();
     }
     ids.retain(|id| {
@@ -647,8 +942,16 @@ fn attention(state: &AppState) -> Vec<Attention> {
     let workspaces = crate::lock(&state.session_workspaces);
     let mut rows: Vec<Attention> = ids
         .into_iter()
-        .filter_map(|id| {
+        .map(|id| {
             let workspace_id = workspaces.get(&id).cloned();
+            (id, workspace_id)
+        })
+        .chain(
+            routed
+                .into_iter()
+                .map(|(id, workspace_id)| (id, Some(workspace_id))),
+        )
+        .filter_map(|(id, workspace_id)| {
             let mastermind = workspace_id
                 .as_ref()
                 .and_then(|ws| masterminds.get(ws))
@@ -661,6 +964,7 @@ fn attention(state: &AppState) -> Vec<Attention> {
         })
         .collect();
     rows.sort_by(|a, b| a.id.cmp(&b.id));
+    rows.dedup_by(|a, b| a.id == b.id);
     rows
 }
 
@@ -948,6 +1252,7 @@ mod tests {
             subtitle: "s".into(),
             body: "b".into(),
             at_ms: 0,
+            kept: None,
             created: Instant::now(),
         }
     }

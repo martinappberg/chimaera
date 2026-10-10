@@ -20,11 +20,12 @@ pub(crate) use env::{launcher_context_env, session_env, spawn_env_remove};
 #[cfg(test)]
 pub(crate) use env::spawn_path;
 pub(crate) use exec::{exec_session, session_journal};
-pub(crate) use sessions::{create_session, delete_session, list_sessions, rename_session};
+pub use sessions::delete_session;
+pub(crate) use sessions::{create_session, list_sessions, rename_session};
 pub(crate) use shutdown::{delete_all_sessions, shutdown};
+pub use workspaces::create_workspace;
 pub(crate) use workspaces::{
-    create_workspace, delete_mastermind, delete_workspace, list_workspaces, open_workspace,
-    put_mastermind,
+    delete_mastermind, delete_workspace, list_workspaces, open_workspace, put_mastermind,
 };
 
 /// Require `Authorization: Bearer {token}` on /api/v1 routes.
@@ -36,6 +37,11 @@ pub(crate) async fn auth(State(state): State<Arc<AppState>>, req: Request, next:
         .is_some_and(|v| v == format!("Bearer {}", state.token));
 
     if authorized {
+        if state.policy().active(&state)
+            && crate::activity::is_change(req.method(), req.uri().path())
+        {
+            crate::activity::touch(&state);
+        }
         next.run(req).await
     } else {
         (
@@ -48,7 +54,7 @@ pub(crate) async fn auth(State(state): State<Arc<AppState>>, req: Request, next:
 
 /// GET /api/v1/health
 pub(crate) async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    Json(json!({
+    let mut value = json!({
         "name": "chimaera",
         "version": chimaera_core::VERSION,
         // The build id lets clients spot daemon/client skew (semver is the
@@ -57,5 +63,8 @@ pub(crate) async fn health(State(state): State<Arc<AppState>>) -> Json<serde_jso
         "hostname": state.hostname,
         "pid": state.pid,
         "uptime_secs": state.started.elapsed().as_secs(),
-    }))
+    });
+    // Additive fields a composed extension serves (nothing without one).
+    state.policy().health(&state, &mut value);
+    Json(value)
 }

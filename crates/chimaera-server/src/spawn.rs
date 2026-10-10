@@ -15,11 +15,10 @@ use crate::workspaces::Workspace;
 use crate::AppState;
 
 /// What to run in the session.
-pub(crate) enum SpawnKind {
+pub enum SpawnKind {
     /// The user's interactive shell, with shell integration when available.
     Shell,
-    /// An agent TUI. `resume` is a claude conversation id (`--resume <id>`);
-    /// callers guarantee it is only set for [`AgentKind::Claude`].
+    /// An agent TUI. `resume` is a Claude conversation id or Codex thread id.
     Agent {
         kind: AgentKind,
         model: Option<String>,
@@ -28,39 +27,41 @@ pub(crate) enum SpawnKind {
 }
 
 /// A validated spawn request.
-pub(crate) struct SpawnSpec {
-    pub(crate) workspace: Workspace,
+pub struct SpawnSpec {
+    pub workspace: Workspace,
     /// Session id to (re)use. `None` mints a fresh one; resurrection passes
     /// the dead session's id so every layout tab referencing it rebinds.
-    pub(crate) id: Option<String>,
+    pub id: Option<String>,
     /// Pins the display name (`SessionInfo::renamed`); resurrection carries
     /// a user rename across the restart this way.
-    pub(crate) name: Option<String>,
+    pub name: Option<String>,
     /// Working directory override; `None` spawns at the workspace root.
     /// Resurrection passes the last polled cwd so shells come back where
     /// they were, not where they started.
-    pub(crate) cwd: Option<PathBuf>,
-    pub(crate) cols: Option<u16>,
-    pub(crate) rows: Option<u16>,
+    pub cwd: Option<PathBuf>,
+    pub cols: Option<u16>,
+    pub rows: Option<u16>,
     /// "light" | "dark" (validated by the caller).
-    pub(crate) theme: String,
+    pub theme: String,
     /// Provisional display title for agent sessions (resurrection carries
     /// the dead session's title so the rail row stays recognizable until
     /// the agent re-titles itself). Ignored for shells.
-    pub(crate) title_hint: Option<String>,
+    pub title_hint: Option<String>,
     /// Launch-scope prelude text (concatenated after the host + workspace
     /// preludes — see `environment`). Not persisted in the ledger, so
     /// resurrection passes None: a resurrected session re-runs the durable
     /// scopes only.
-    pub(crate) prelude: Option<String>,
-    pub(crate) kind: SpawnKind,
+    pub prelude: Option<String>,
+    pub kind: SpawnKind,
+    pub fork_head: bool,
+    pub native_cwd: Option<PathBuf>,
     /// Who started it, for an agent session's history record (shells keep
     /// none).
-    pub(crate) started_by: crate::history::StartedBy,
+    pub started_by: crate::history::StartedBy,
 }
 
 /// Why a spawn could not happen.
-pub(crate) enum SpawnFailure {
+pub enum SpawnFailure {
     /// The agent binary is missing/broken; the message is the detection
     /// error shown to the user (HTTP 409).
     AgentUnavailable(String),
@@ -70,11 +71,23 @@ pub(crate) enum SpawnFailure {
 
 /// Spawn a session per `spec` and register all its server-side state.
 /// Returns the same session JSON `GET /sessions` would list it with.
-pub(crate) async fn spawn_session(
+pub async fn spawn_session(
     state: &Arc<AppState>,
     spec: SpawnSpec,
 ) -> Result<serde_json::Value, SpawnFailure> {
     let workspace = spec.workspace;
+    let shell = matches!(spec.kind, SpawnKind::Shell);
+    let need = if shell {
+        crate::policy::Need::Shell
+    } else {
+        crate::policy::Need::Execute
+    };
+    let allowed = |state: &AppState, workspace: &str| state.policy().allows(state, workspace, need);
+    if !allowed(state, &workspace.id) {
+        return Err(SpawnFailure::Internal(anyhow::anyhow!(
+            "workspace owned elsewhere"
+        )));
+    }
     // Every session gets a pre-picked id: it rides in the spawn env as
     // CHIMAERA_SESSION (shells too — typed agents need their session
     // context) and, for claude, in the hook URL.
@@ -154,8 +167,8 @@ pub(crate) async fn spawn_session(
             usage = guard;
             let bin = binaries.remove(0);
             let key = crate::agents::fresh_agent_key();
-            // Hook injection is claude-only: other agents have no hook system
-            // to wire, so their sessions stay honestly "unknown". The scheme
+            // Claude's hooks drive attention state. Codex's notify below
+            // captures identity only; its attention stays "unknown". The scheme
             // theme rides in the same settings file — unless the user's own
             // settings already set one (respect the explicit choice).
             let settings = if agent_kind == AgentKind::Claude {
@@ -209,6 +222,9 @@ pub(crate) async fn spawn_session(
             // communication is on (default) or a plugin with tools is active
             // here (`spawn_allow`); with neither, the argv and env stay
             // exactly what they were.
+            // A workspace policy may give a project's terminal agents the
+            // daemon's tools too (`LaunchContext::tools`); otherwise that
+            // opt-in boundary stands.
             let codex_plugin_tools = if agent_kind == AgentKind::Codex {
                 crate::plugins::spawn_allow(state, &workspace.id).await
             } else {
@@ -239,11 +255,35 @@ pub(crate) async fn spawn_session(
                     codex_theme,
                 )
             };
+            if spec.fork_head {
+                if resume.is_none() {
+                    return Err(SpawnFailure::Internal(anyhow::anyhow!(
+                        "native fork requires resume"
+                    )));
+                }
+                if let Err(error) = crate::launcher::fork_native_head(agent_kind, &mut argv) {
+                    return Err(SpawnFailure::Internal(error));
+                }
+            }
             if let Some(mcp) = &mcp_config {
                 argv.push("--mcp-config".to_string());
                 argv.push(mcp.to_string_lossy().into_owned());
             }
-            if !codex_plugin_tools.is_empty() {
+            let mut codex_identity = false;
+            if agent_kind == AgentKind::Codex {
+                let notify = state
+                    .policy()
+                    .codex_notify_args(state, &workspace.id, &id, &key)
+                    .await;
+                // The rollout identity only serves the notify shim; without
+                // it a Codex TUI carries no transcript.
+                codex_identity = !notify.is_empty();
+                argv.extend(notify);
+            }
+            if !codex_plugin_tools.is_empty()
+                || (agent_kind == AgentKind::Codex
+                    && state.policy().launch_context(state, &workspace.id).tools)
+            {
                 // Pre-approved: the prompt-free tools every session gets
                 // (`notify`) plus the active plugins' own.
                 let approve: Vec<String> = crate::mcp::ALWAYS_ALLOWED_TOOLS
@@ -261,6 +301,27 @@ pub(crate) async fn spawn_session(
                 opts.env
                     .push((crate::launcher::CODEX_MCP_KEY_ENV.to_string(), key.clone()));
             }
+            if agent_kind == AgentKind::Claude && state.policy().updates_managed(state) {
+                // Agents that come with the machine's image are updated with
+                // it: claude's own updater could only fail there (the image
+                // prefix is not the daemon user's to write) and say so mid-turn.
+                opts.env
+                    .push(("DISABLE_AUTOUPDATER".to_string(), "1".to_string()));
+            }
+            let transferred = crate::lock(&state.deferred_sessions).get(&id).cloned();
+            if let Some(entry) = transferred.filter(|entry| entry.workspace_id == workspace.id) {
+                // A positional prompt starts a billed turn: only a terminal
+                // agent whose turn was cut off by the move gets one.
+                let pickup = entry.handoff.is_some().then(|| {
+                    tui_pickup(
+                        entry.agent.as_ref().and_then(|a| a.carryover.as_ref()),
+                        state.policy().launch_context(state, &workspace.id).recovery,
+                    )
+                });
+                if let Some(context) = pickup.flatten() {
+                    crate::launcher::append_transfer_prompt(&mut argv, &context);
+                }
+            }
             // Login-shell wrap: agents must see the user's terminal environment
             // (exported API keys, nvm PATHs) — the daemon's own env never
             // sourced their profile.
@@ -274,6 +335,20 @@ pub(crate) async fn spawn_session(
             // keeps it); remember the ancestor so recents can hide (and later
             // supersede) the old conversation either way.
             record.resumed_from = resume.clone();
+            record.native_cwd = spec.native_cwd.clone();
+            if codex_identity {
+                if let Some(thread) = resume.clone() {
+                    let cwd = record
+                        .native_cwd_for(&thread)
+                        .unwrap_or_else(|| opts.cwd.clone());
+                    if let Some(path) =
+                        crate::codex_rollout::capture(state, &thread, cwd, None).await
+                    {
+                        record.codex_thread_id = Some(thread);
+                        record.transcript_path = Some(path);
+                    }
+                }
+            }
             // A carried-over title slots in as the provisional first-prompt
             // name: it loses to any real title the agent produces, exactly
             // like a first prompt would.
@@ -282,11 +357,67 @@ pub(crate) async fn spawn_session(
             spawned_agent = Some(agent_kind);
         }
     }
+    // From here every refusal must forget the record (and its MCP/hook key).
+    let mut launched = Uncommitted {
+        state,
+        id: &id,
+        agent: spawned_agent.is_some(),
+        workspace: false,
+    };
 
-    match state.sessions.spawn(opts) {
+    if !allowed(state, &workspace.id) {
+        return Err(SpawnFailure::Internal(anyhow::anyhow!(
+            "project execution authority changed during launch"
+        )));
+    }
+    // Shells share the short launch/registration gate with agents.
+    let kind = if spawned_agent.is_some() {
+        crate::policy::LaunchKind::Agent
+    } else {
+        crate::policy::LaunchKind::Shell
+    };
+    let (launch, _reservation) = state
+        .policy()
+        .admit_launch(state, &workspace.id, kind)
+        .await
+        .map_err(SpawnFailure::Internal)?;
+    let managed = launch.managed();
+    state
+        .policy()
+        .launch_env(state, &workspace.id, &mut opts.env, &mut opts.env_remove)
+        .await
+        .map_err(SpawnFailure::Internal)?;
+    let native = match &spec.kind {
+        SpawnKind::Agent { resume, .. } => resume.as_deref(),
+        SpawnKind::Shell => None,
+    };
+    if let SpawnKind::Agent { kind, .. } = &spec.kind {
+        crate::ledger::check_manual_native(state, Some(&id), *kind, native)
+            .map_err(SpawnFailure::Internal)?;
+    }
+    let import_admission = state
+        .policy()
+        .hold_session(state, &workspace.id, &id, native, false)
+        .map_err(SpawnFailure::Internal)?;
+    let spawned = if managed {
+        state.sessions.spawn_managed(opts)
+    } else {
+        state.sessions.spawn(opts)
+    };
+    drop(import_admission);
+    match spawned {
         Ok(info) => {
             crate::runtime_retention::watch(state.clone(), info.id.clone(), usage);
             crate::lock(&state.session_workspaces).insert(info.id.clone(), workspace.id.clone());
+            launched.workspace = true;
+            if !allowed(state, &workspace.id) {
+                let _ = state.sessions.kill(&info.id);
+                return Err(SpawnFailure::Internal(anyhow::anyhow!(
+                    "project execution authority changed during launch"
+                )));
+            }
+            launch.registered(info.id.clone());
+            launched.commit();
             // Remember the spawn theme: resurrection re-themes the session's
             // successor with it (there is no other durable record of it).
             crate::lock(&state.session_themes).insert(info.id.clone(), spec.theme.clone());
@@ -318,9 +449,89 @@ pub(crate) async fn spawn_session(
             ))
         }
         Err(err) => {
-            crate::lock(&state.agents).remove(&id);
             tracing::error!(%err, "failed to spawn session");
             Err(SpawnFailure::Internal(err))
+        }
+    }
+}
+
+/// What a launch registered before the PTY is up and admitted: dropped
+/// uncommitted (any early return), it removes the agent record and the
+/// session's workspace binding so no refused launch keeps a live key.
+struct Uncommitted<'a> {
+    state: &'a AppState,
+    id: &'a str,
+    agent: bool,
+    workspace: bool,
+}
+
+impl Uncommitted<'_> {
+    fn commit(&mut self) {
+        self.agent = false;
+        self.workspace = false;
+    }
+}
+
+impl Drop for Uncommitted<'_> {
+    fn drop(&mut self) {
+        if self.agent {
+            crate::lock(&self.state.agents).remove(self.id);
+        }
+        if self.workspace {
+            crate::lock(&self.state.session_workspaces).remove(self.id);
+        }
+    }
+}
+
+/// The one message a moved terminal agent starts with, shown in its terminal
+/// as the user's own line: only when a turn was cut off by the move (idle
+/// conversations resume silently), in plain words that name no machines.
+/// After an abrupt loss (`recovery`) it also asks the agent to check what
+/// already happened before repeating anything.
+pub(crate) fn tui_pickup(
+    carry: Option<&chimaera_agent::Carryover>,
+    recovery: bool,
+) -> Option<String> {
+    let carry = carry.filter(|carry| carry.turn_in_flight || carry.interrupted_work())?;
+    let mut text = String::from(
+        "Continuing here. The previous run stopped while this task was underway; please continue it.",
+    );
+    if recovery {
+        text.push_str(
+            " Some of that work may have happened after the last saved point: check the project and any external effects before repeating a step.",
+        );
+    }
+    if !carry.background.is_empty() {
+        text.push_str(
+            " Background tasks that were running have stopped; restart the ones still needed.",
+        );
+    }
+    Some(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn only_a_cut_off_turn_gets_a_neutral_pickup_prompt() {
+        let idle = chimaera_agent::Carryover::default();
+        assert_eq!(
+            tui_pickup(None, false),
+            None,
+            "unknown means no billed turn"
+        );
+        assert_eq!(tui_pickup(None, true), None);
+        assert_eq!(tui_pickup(Some(&idle), true), None);
+        let busy = chimaera_agent::Carryover {
+            turn_in_flight: true,
+            ..Default::default()
+        };
+        for recovery in [false, true] {
+            let text = tui_pickup(Some(&busy), recovery).unwrap();
+            assert!(text.starts_with("Continuing here."));
+            for word in ["host", "transfer", "laptop", "cloud", "Chimaera"] {
+                assert!(!text.contains(word), "{word}: {text}");
+            }
         }
     }
 }

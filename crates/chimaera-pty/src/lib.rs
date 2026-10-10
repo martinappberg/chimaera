@@ -9,11 +9,14 @@
 //! xterm.js instance, plus live output/event receivers and an input sender.
 
 pub mod exec;
+mod input;
+mod managed;
 pub mod marks;
 mod session;
 mod snapshot;
 
 pub use exec::{ExecError, ExecMode, ExecOptions, ExecOutcome, ExecStage};
+pub use input::InputSender;
 pub use marks::{CommandMeta, CommandSource, CommandView, Marks, ShellPhase};
 pub use session::KILL_ESCALATION_GRACE;
 
@@ -133,7 +136,7 @@ pub struct Attachment {
     pub snapshot: Vec<u8>,
     pub output: tokio::sync::broadcast::Receiver<bytes::Bytes>,
     pub events: tokio::sync::broadcast::Receiver<SessionEvent>,
-    pub input: tokio::sync::mpsc::Sender<bytes::Bytes>,
+    pub input: InputSender,
 }
 
 /// The final screen of an exited session, kept briefly so late attachers (a
@@ -176,6 +179,21 @@ impl SessionManager {
     /// Spawn a new session and register it. Returns its initial info. The
     /// session unregisters itself when its child exits.
     pub fn spawn(self: &Arc<Self>, opts: SpawnOpts) -> anyhow::Result<SessionInfo> {
+        self.spawn_inner(opts, false)
+    }
+    /// Opt-in owned process-group shutdown for lease-managed work.
+    pub fn spawn_managed(self: &Arc<Self>, opts: SpawnOpts) -> anyhow::Result<SessionInfo> {
+        anyhow::ensure!(
+            cfg!(any(target_os = "linux", target_os = "macos")),
+            "managed execution unsupported on this platform"
+        );
+        self.spawn_inner(opts, true)
+    }
+    fn spawn_inner(
+        self: &Arc<Self>,
+        opts: SpawnOpts,
+        managed: bool,
+    ) -> anyhow::Result<SessionInfo> {
         let id = match &opts.id {
             Some(id) => {
                 if lock_unpoisoned(&self.sessions).contains_key(id) {
@@ -201,7 +219,7 @@ impl SessionManager {
                 lock_unpoisoned(&m.sessions).remove(&exit_id);
             }
         });
-        let session = session::Session::spawn(id.clone(), &opts, on_exit)
+        let session = session::Session::spawn(id.clone(), &opts, on_exit, managed)
             .with_context(|| format!("failed to spawn session in {}", opts.cwd.display()))?;
         let info = session.info();
         lock_unpoisoned(&self.sessions).insert(id, session);
@@ -290,6 +308,34 @@ impl SessionManager {
         exec::exec(session.marks(), session.input(), session.exec_lock(), opts).await
     }
 
+    /// Revalidate the caller's authority in the writer after all queue waits.
+    /// The returned guard is owned through the blocking PTY write and flush.
+    pub async fn exec_guarded<G: Send + 'static>(
+        &self,
+        id: &str,
+        opts: ExecOptions,
+        admission: impl FnOnce() -> Result<G, ExecError> + Send + 'static,
+    ) -> Result<ExecOutcome, ExecError> {
+        let session = self.session(id).ok_or(ExecError::SessionGone)?;
+        exec::exec_guarded(
+            session.marks(),
+            session.input(),
+            session.exec_lock(),
+            opts,
+            Box::new(move || admission().map(|guard| Box::new(guard) as Box<dyn Send>)),
+        )
+        .await
+    }
+
+    /// Fence a session: a managed session's owned process-group stop; a plain
+    /// session is killed. An unknown session is an error.
+    pub fn fence(&self, id: &str) -> anyhow::Result<()> {
+        let session = self
+            .session(id)
+            .ok_or_else(|| anyhow!("session not found"))?;
+        session.fence();
+        Ok(())
+    }
     /// Signal the session's child to terminate (SIGHUP); the wait thread
     /// reaps it and the session unregisters itself. Killing an unknown or
     /// already-exited session is a no-op, so deletes are idempotent.

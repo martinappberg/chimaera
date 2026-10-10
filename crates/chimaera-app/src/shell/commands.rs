@@ -1,5 +1,5 @@
 //! The IPC command surface the daemon-served UI calls
-//! (`web-ui/src/lib/native.ts` is the other half of this contract — change
+//! (`web-ui/src/lib/net/native.ts` is the other half of this contract — change
 //! command and event names in lockstep). Thin delegators over the connect
 //! flight state machine and the window/tunnel state.
 
@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use chimaera_link::{Host, HostKind};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -79,6 +80,17 @@ fn report_can_reclaim_local_home(alias: &Option<String>, ws: &Option<String>) ->
     alias.is_none() && ws.is_none()
 }
 
+// The physical device already has the local-workspaces section. Compare its
+// authenticated daemon identity, never a user-editable alias or an opaque id.
+fn visible_machine(host: &Host, local_token: &str) -> bool {
+    host.kind != HostKind::Worker
+        && !(host.kind == HostKind::Device
+            && host
+                .daemon
+                .as_ref()
+                .is_some_and(|daemon| daemon.token == local_token))
+}
+
 #[tauri::command]
 pub(super) async fn list_hosts(state: State<'_, Shell>) -> Result<Vec<HostState>, String> {
     tracing::debug!("ipc: list_hosts");
@@ -86,13 +98,34 @@ pub(super) async fn list_hosts(state: State<'_, Shell>) -> Result<Vec<HostState>
     let tunnels = state.tunnels.lock().await;
     let connecting: HashSet<String> = lock(&state.connecting).keys().cloned().collect();
     let unhealthy = lock(&state.unhealthy_tunnels).clone();
+    let keeper = state.pro.hosts();
+    let local_token = lock(&state.local).token.clone();
     let clusters: HashMap<String, super::cluster::ClusterInfo> = lock(&state.clusters)
         .iter()
         .filter_map(|(alias, c)| c.info.clone().map(|i| (alias.clone(), i)))
         .collect();
-    Ok(hosts
+    let mut out: Vec<_> = hosts
         .iter()
+        // Managed workers are placement infrastructure, never remote-machine
+        // choices. Keep the authoritative host map intact for automatic routing.
+        .filter(|h| {
+            !keeper
+                .iter()
+                .any(|host| host.alias == h.alias && !visible_machine(host, &local_token))
+        })
         .map(|h| {
+            if let Some(host) = keeper
+                .iter()
+                .find(|host| host.alias == h.alias && !h.direct_ssh)
+            {
+                return super::connect::keeper_state(
+                    host,
+                    tunnels
+                        .get(&h.alias)
+                        .filter(|_| !unhealthy.contains(&h.alias)),
+                )
+                .with_cluster(h, clusters.get(&h.alias));
+            }
             let live = clusters.get(&h.alias);
             let state = if connecting.contains(&h.alias) {
                 state_for(h, "connecting", None)
@@ -110,6 +143,24 @@ pub(super) async fn list_hosts(state: State<'_, Shell>) -> Result<Vec<HostState>
             };
             state.with_cluster(h, live)
         })
+        .collect();
+    for host in keeper
+        .iter()
+        .filter(|host| visible_machine(host, &local_token))
+    {
+        if !hosts.iter().any(|entry| entry.alias == host.alias) {
+            out.push(super::connect::keeper_state(
+                host,
+                tunnels
+                    .get(&host.alias)
+                    .filter(|_| !unhealthy.contains(&host.alias)),
+            ));
+        }
+    }
+    let owner = state.pro.owner().is_some();
+    Ok(out
+        .into_iter()
+        .map(|host| host.offer_direct_ssh(owner))
         .collect())
 }
 
@@ -124,6 +175,33 @@ pub(super) async fn add_host(alias: String) -> Result<HostState, String> {
     }
     let entry = with_hosts(move |hosts| hosts.add(&alias, None)).await?;
     Ok(state_for(&entry, "disconnected", None))
+}
+
+/// Changes only this computer's next SSH connection, never the kept login or
+/// current tunnels. A device alias cannot acquire an SSH fallback this way.
+/// Granted only to local-UI windows, and refused without an account owner:
+/// the choice means nothing when every host is direct.
+#[tauri::command]
+pub(super) async fn pro_set_host_direct_ssh(
+    state: State<'_, Shell>,
+    alias: String,
+    on: bool,
+) -> Result<HostState, String> {
+    if state.pro.owner().is_none() {
+        return Err(crate::account::ABSENT.into());
+    }
+    let alias =
+        chimaera_remote::hosts::normalize_alias(&alias).map_err(|error| error.to_string())?;
+    let device = state.pro.is_device(&alias) || lock(&state.registry).is_link_device(&alias);
+    super::pro::direct_ssh_bypass(true, device)?;
+    let saved_alias = alias.clone();
+    let entry = with_hosts(move |hosts| hosts.set_direct_ssh(&saved_alias, on)).await?;
+    lock(&state.host_entries).insert(alias.clone(), entry);
+    list_hosts(state)
+        .await?
+        .into_iter()
+        .find(|host| host.alias == alias)
+        .ok_or_else(|| "Host is unavailable".into())
 }
 
 #[tauri::command]
@@ -263,7 +341,7 @@ pub(super) async fn update_local_daemon(
     state: State<'_, Shell>,
 ) -> Result<(), String> {
     tracing::info!("ipc: update_local_daemon");
-    let fresh = crate::daemon::update_local_daemon()
+    let fresh = crate::daemon::update_local_daemon_for(super::runtime_requirement(&app))
         .await
         .map_err(|e| format!("{e:#}"))?;
     let moved = LocalDaemonMoved {
@@ -274,6 +352,11 @@ pub(super) async fn update_local_daemon(
     authorize_scope_origin(&app, None, fresh.port)
         .map_err(|e| format!("could not authorize the updated daemon origin: {e}"))?;
     *lock(&state.local) = fresh;
+    super::activate_account(&app);
+    // The replacement daemon starts without Pro setup; restore it now so
+    // project copying, viewing and its own reverse link do not pause until
+    // the next reconciliation.
+    super::pro::reconfigure(&app);
     let _ = app.emit("local-daemon-updated", moved);
     Ok(())
 }
@@ -1093,7 +1176,10 @@ pub(super) fn report_window_scope(
     super::notices::window_scoped(webview.app_handle(), webview.label(), &alias, &ws);
     if (!home_hub || reclaimed_home) && !stable_id.is_empty() {
         let mut registry = lock(&state.registry);
-        registry.set_scope(&stable_id, registered_alias, ws);
+        let link_device = registered_alias
+            .as_deref()
+            .is_some_and(|alias| state.pro.is_device(alias));
+        registry.set_scope(&stable_id, registered_alias, ws, link_device);
         // Detachedness follows into the record so the NEXT launch reopens
         // the window in the mode it actually ended up in.
         if detached_changed {
@@ -1412,7 +1498,7 @@ pub(super) async fn begin_update(app: AppHandle) -> Result<(), String> {
         n => {
             return Err(format!(
                 "{n} windows have unsaved edits — save or discard them, then update."
-            ))
+            ));
         }
     }
     let updater = app.updater().map_err(|e| e.to_string())?;

@@ -771,8 +771,10 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "arboard",
+ "axum",
  "block2",
  "chimaera-core",
+ "chimaera-link",
  "chimaera-remote",
  "chimaera-server",
  "nix 0.31.3",
@@ -793,6 +795,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "url",
  "urlencoding",
  "windows-sys 0.61.2",
  "winreg 0.56.0",
@@ -810,6 +813,23 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
+ "url",
+ "zeroize",
+]
+
+[[package]]
+name = "chimaera-link"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chimaera-core",
+ "rand 0.10.2",
+ "serde",
+ "serde_json",
+ "time",
+ "url",
+ "zeroize",
 ]
 
 [[package]]
@@ -875,8 +895,10 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "sha1 0.11.0",
  "sha2 0.11.0",
  "tar",
+ "time",
  "tokio",
  "tokio-tungstenite 0.30.0",
  "tokio-util",

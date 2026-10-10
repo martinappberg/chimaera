@@ -12,7 +12,7 @@ use crate::{
 };
 
 /// Build the axum router (factored out so tests can drive it with `oneshot`).
-pub(crate) fn app(state: Arc<AppState>) -> Router {
+pub fn app(state: Arc<AppState>) -> Router {
     // Consumes the chat manager's hook signals for the daemon's lifetime
     // (no-op when already running — tests may build several routers).
     chat::spawn_signal_task(state.clone());
@@ -29,6 +29,8 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
     }
     let api = Router::new()
         .route("/health", get(api::health))
+        // Whatever the workspace policy serves (nothing without an extension).
+        .merge(state.policy().routes(&state))
         .route(
             "/workspaces",
             get(api::list_workspaces).post(api::create_workspace),
@@ -372,7 +374,12 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         // keep-alive health probe). The data plane rides /proxy below.
         .route("/proxy", get(proxy::list_proxies).post(proxy::create_proxy))
         .route("/proxy/{id}", delete(proxy::delete_proxy))
-        .route("/proxy/{id}/health", get(proxy::proxy_health))
+        .route("/proxy/{id}/health", get(proxy::proxy_health));
+    // The policy's own request binding (a forwarded viewer's project scope)
+    // sits inside the bearer check.
+    let api = state
+        .policy()
+        .api_layers(&state, api)
         .route_layer(middleware::from_fn_with_state(state.clone(), api::auth))
         // Registered after route_layer, so hook ingestion is NOT behind bearer
         // auth: claude's hooks cannot know the daemon token, so the random
@@ -401,7 +408,10 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/raw/{ticket}", get(fs::raw))
         // An HTML report's relative assets, confined to its folder.
         .route("/raw/{ticket}/{*rest}", get(fs::raw_asset))
-        .route("/download/{ticket}", get(download::download))
+        .route("/download/{ticket}", get(download::download));
+    let ws = state
+        .policy()
+        .ticket_layers(&state, ws)
         // Three spellings because `{*path}` refuses an EMPTY tail: the bare
         // form redirects to the slashed form, the slashed form IS the app's
         // root document, and the wildcard carries everything deeper.
@@ -410,12 +420,15 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/proxy/{id}/{*path}", axum::routing::any(proxy::data_plane))
         .with_state(state.clone());
 
-    Router::new()
+    let app = Router::new()
         .nest("/api/v1", api)
         .merge(ws)
         // The fallback serves embedded UI assets, rescues absolute-path
         // requests from proxied apps (cookie/Referer), and applies the SPA
         // index.html rules — see proxy::fallback.
-        .fallback_service(axum::routing::any(proxy::fallback).with_state(state))
+        .fallback_service(axum::routing::any(proxy::fallback).with_state(state.clone()));
+    state
+        .policy()
+        .outer_layers(app)
         .layer(TraceLayer::new_for_http())
 }

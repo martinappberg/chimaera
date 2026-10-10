@@ -64,6 +64,10 @@ export interface ComputeSelf {
   /** Held by the app that started it (absent otherwise): it ends when that
    *  app disconnects, and can't continue in a new job. */
   attached?: boolean;
+  /** When the allocation ends (epoch ms, the daemon's clock), fixed when
+   *  squeue measured `time_left`; absent from older daemons and for
+   *  sentinels (UNLIMITED, …). */
+  ends_at_ms?: number;
 }
 
 export interface ComputeSnapshot {
@@ -127,7 +131,24 @@ function parseSelf(raw: unknown): ComputeSelf | null {
     cpus: typeof r.cpus === "string" ? r.cpus : "",
     mem: typeof r.mem === "string" ? r.mem : "",
     gres: typeof r.gres === "string" ? r.gres : "",
+    ...(r.attached === true ? { attached: true } : {}),
+    ...(typeof r.ends_at_ms === "number" && Number.isFinite(r.ends_at_ms) ? { ends_at_ms: r.ends_at_ms } : {}),
   };
+}
+
+/**
+ * Seconds left in this allocation at `now` (client clock); null when Slurm
+ * gave no duration (UNLIMITED, NOT_SET, …). Counts to the daemon's fixed
+ * end when it sent one, so every window into the same job agrees: the
+ * daemon's `time_left` is as old as its cached snapshot, and counting it
+ * down from this client's receive time is off by that age. Older daemons
+ * fall back to that receive-time countdown.
+ */
+export function secondsLeft(self: ComputeSelf, receivedAt: number, now: number): number | null {
+  if (self.ends_at_ms !== undefined) return Math.max(0, Math.floor((self.ends_at_ms - now) / 1000));
+  const base = parseSlurmTimeLeft(self.time_left);
+  if (base === null) return null;
+  return Math.max(0, base - Math.floor((now - receivedAt) / 1000));
 }
 
 /**
@@ -156,7 +177,7 @@ export function formatSlurmDuration(totalSecs: number): string {
   return mmss;
 }
 
-function parseSnapshot(body: unknown): ComputeSnapshot {
+export function parseSnapshot(body: unknown): ComputeSnapshot {
   const none: ComputeSnapshot = {
     scheduler: "none",
     jobs: [],

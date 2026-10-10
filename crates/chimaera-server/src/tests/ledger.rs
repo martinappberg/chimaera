@@ -53,6 +53,10 @@ async fn ledger_resurrects_sessions_across_restart() {
     let mut boot = lock(&state2.ledger).load_boot();
     assert_eq!(boot.sessions.len(), 1);
     boot.sessions.push(ledger::LedgerEntry {
+        suspended: false,
+        manual_resume_reason: None,
+        fence_epoch: None,
+        handoff: None,
         id: "s-dead-codex".to_string(),
         workspace_id: workspace_id.clone(),
         cwd: root.clone(),
@@ -65,6 +69,7 @@ async fn ledger_resurrects_sessions_across_restart() {
             kind: agents::AgentKind::Codex,
             resume: None,
             transcript: None,
+            native_cwd: None,
             title: "port the parser".to_string(),
             ui: chimaera_agent::model::SessionUi::Term,
             model: None,
@@ -142,6 +147,10 @@ async fn ledger_restore_disabled_still_lands_recents() {
     let boot = ledger::BootLedger {
         sessions: vec![
             ledger::LedgerEntry {
+                suspended: false,
+                manual_resume_reason: None,
+                fence_epoch: None,
+                handoff: None,
                 id: "s-shell".to_string(),
                 workspace_id: workspace_id.clone(),
                 cwd: root.clone(),
@@ -153,6 +162,10 @@ async fn ledger_restore_disabled_still_lands_recents() {
                 agent: None,
             },
             ledger::LedgerEntry {
+                suspended: false,
+                manual_resume_reason: None,
+                fence_epoch: None,
+                handoff: None,
                 id: "s-claude".to_string(),
                 workspace_id: workspace_id.clone(),
                 cwd: root.clone(),
@@ -165,6 +178,7 @@ async fn ledger_restore_disabled_still_lands_recents() {
                     kind: agents::AgentKind::Claude,
                     resume: Some("conv-1".to_string()),
                     transcript: Some(transcript),
+                    native_cwd: None,
                     title: "fix the flaky tests".to_string(),
                     ui: chimaera_agent::model::SessionUi::Term,
                     model: None,
@@ -249,6 +263,10 @@ async fn journal_budget_spares_chats_the_ledger_resurrects() {
         Some("9.9.9-fake"),
     );
     let chat_entry = |id: &str| ledger::LedgerEntry {
+        suspended: false,
+        manual_resume_reason: None,
+        fence_epoch: None,
+        handoff: None,
         id: id.to_string(),
         workspace_id: workspace_id.clone(),
         cwd: root.clone(),
@@ -261,6 +279,7 @@ async fn journal_budget_spares_chats_the_ledger_resurrects() {
             kind: agents::AgentKind::Claude,
             resume: None,
             transcript: None,
+            native_cwd: None,
             title: "claude".to_string(),
             ui: chimaera_agent::model::SessionUi::Chat,
             model: None,
@@ -292,6 +311,55 @@ async fn journal_budget_spares_chats_the_ledger_resurrects() {
 
     state.chat.kill("s-chat-a");
     state.chat.kill("s-chat-b");
+}
+
+/// A free daemon's boot defers nothing, so it starts no one-minute fallback
+/// timer: its chat comes back at boot like its shell.
+#[tokio::test]
+async fn a_free_boot_defers_nothing() {
+    let state = test_state_with_data_dir(0, test_dir("ledger-free-boot"));
+    let root = std::fs::canonicalize(test_dir("ledger-free-boot-root")).unwrap();
+    let workspace = lock(&state.workspaces).add(root.clone()).unwrap();
+    preset_agent(
+        &state,
+        agents::AgentKind::Claude,
+        Ok(write_fake_claude("ledger-free-boot-fake")),
+        Some("9.9.9-fake"),
+    );
+    let boot = ledger::BootLedger {
+        sessions: vec![ledger::LedgerEntry {
+            suspended: false,
+            manual_resume_reason: None,
+            handoff: None,
+            fence_epoch: None,
+            id: "s-free-chat".to_string(),
+            workspace_id: workspace.id.clone(),
+            cwd: root.clone(),
+            pinned_name: None,
+            cols: 80,
+            rows: 24,
+            theme: "dark".to_string(),
+            created_at: 0,
+            agent: Some(ledger::LedgerAgent {
+                kind: agents::AgentKind::Claude,
+                resume: None,
+                transcript: None,
+                native_cwd: None,
+                title: "claude".to_string(),
+                ui: chimaera_agent::model::SessionUi::Chat,
+                model: None,
+                carryover: None,
+            }),
+        }],
+        links: std::collections::HashMap::new(),
+        written_at: 1_750_000_000,
+    };
+    ledger::restore(&state, boot).await;
+    assert!(state.chat.contains("s-free-chat"), "comes back at boot");
+    state.chat.kill("s-free-chat");
+    state
+        .stopping
+        .store(true, std::sync::atomic::Ordering::Release);
 }
 
 /// The native app's hidden workspace (a cluster's login-node terminal):

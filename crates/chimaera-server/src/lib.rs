@@ -1,57 +1,100 @@
+#[doc(hidden)]
+pub mod activity;
 mod agent_docs;
 mod agent_probe;
 mod agent_setup;
-mod agent_state;
-mod agent_updates;
-mod agents;
-mod api;
+#[doc(hidden)]
+pub mod agent_state;
+#[doc(hidden)]
+pub mod agent_updates;
+#[doc(hidden)]
+pub mod agents;
+#[doc(hidden)]
+pub mod api;
 mod assets;
 mod browser_open;
-mod chat;
+#[doc(hidden)]
+pub mod chat;
+#[doc(hidden)]
+pub mod codex_rollout;
 mod comms;
 mod compute;
-mod doc_check;
-mod download;
-mod drafts;
-mod embed;
+#[doc(hidden)]
+pub mod doc_check;
+#[doc(hidden)]
+pub mod download;
+#[doc(hidden)]
+pub mod drafts;
+#[doc(hidden)]
+pub mod embed;
 mod environment;
 mod episodes;
-mod exec;
-mod fs;
+#[doc(hidden)]
+pub mod exec;
+#[doc(hidden)]
+pub mod fs;
 mod fs_watch;
-mod git;
-mod history;
+#[doc(hidden)]
+pub mod git;
+#[doc(hidden)]
+pub mod history;
 mod job_host;
 mod knowledge;
-mod launcher;
-mod ledger;
+#[doc(hidden)]
+pub mod launcher;
+#[doc(hidden)]
+pub mod ledger;
 mod lifecycle;
-mod links;
-mod mcp;
+#[doc(hidden)]
+pub mod links;
+#[doc(hidden)]
+pub mod mcp;
 mod naming;
-mod notebook;
-mod notices;
-mod persist;
-mod plugins;
+#[doc(hidden)]
+pub mod notebook;
+#[doc(hidden)]
+pub mod notices;
+#[doc(hidden)]
+pub mod persist;
+#[doc(hidden)]
+pub mod plugins;
+#[doc(hidden)]
+pub mod policy;
+#[doc(hidden)]
+pub mod process;
 mod proxy;
 mod quickopen;
-mod recents;
+#[doc(hidden)]
+pub mod recents;
 mod recents_archive;
-mod router;
+#[doc(hidden)]
+pub mod router;
 mod runtime_retention;
-mod runtimes;
-mod session_view;
-mod settings;
-mod spawn;
-mod state;
+#[doc(hidden)]
+pub mod runtimes;
+#[doc(hidden)]
+pub mod session_view;
+#[doc(hidden)]
+pub mod settings;
+#[doc(hidden)]
+pub mod spawn;
+#[doc(hidden)]
+pub mod state;
 mod subagents;
 mod timeline;
-mod update;
-mod upload;
+#[doc(hidden)]
+pub mod update;
+#[doc(hidden)]
+pub mod upload;
 mod view_state;
-mod voice;
-mod workspaces;
-mod ws;
+#[doc(hidden)]
+pub mod voice;
+#[doc(hidden)]
+pub mod workspace_scope;
+#[doc(hidden)]
+pub mod workspaces;
+#[doc(hidden)]
+pub mod ws;
 
 /// Configuration for the chimaera daemon.
 pub struct ServerConfig {
@@ -67,12 +110,29 @@ pub struct ServerConfig {
 }
 
 pub use job_host::run as run_job_host;
-pub use lifecycle::run;
+pub use lifecycle::{run, run_with_policy};
+
+/// Builds the workspace policy a composed daemon runs with, called once in
+/// the daemon process before its state exists (a policy may consume a
+/// one-shot launcher handle there).
+pub type PolicyFactory = fn() -> std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = anyhow::Result<std::sync::Arc<dyn policy::WorkspacePolicy>>,
+            > + Send,
+    >,
+>;
 /// `chimaera plugin caps <plugin.toml>`: a manifest's tier, capability
 /// digest and Can list, as the lock and the card record them.
 pub use plugins::capabilities::describe_manifest as plugin_capabilities;
-pub(crate) use router::app;
-pub(crate) use state::{lock, AppState};
+pub use router::app;
+pub use state::{lock, AppState};
 
+/// The test support an out-of-tree host's tests build on (the fixture feature).
+#[cfg(all(not(test), feature = "daemon-extension-fixture"))]
+#[path = "tests/support.rs"]
+pub mod test_support;
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, feature = "daemon-extension-fixture"))]
+pub use tests::support as test_support;

@@ -260,16 +260,32 @@ pub(crate) async fn mcp(
             _ => (Vec::new(), Vec::new()),
         };
     let result = match method {
-        "initialize" => Ok(initialize_result(
-            &params,
-            &agent_id,
-            comms_on,
-            mastermind,
-            mastermind_here,
-            &plugin_paragraphs,
-        )),
+        "initialize" => {
+            // Where the agent runs is not appended here: Claude Code cuts
+            // long server instructions short. It rides the hook/developer-note
+            // carriers instead (`cloud_context`).
+            Ok(initialize_result(
+                &params,
+                &agent_id,
+                comms_on,
+                mastermind,
+                mastermind_here,
+                &plugin_paragraphs,
+            ))
+        }
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({ "tools": tool_defs(comms_on, mastermind, plugin_tools) })),
+        "tools/list" => {
+            let mut tools = tool_defs(comms_on, mastermind, plugin_tools);
+            // Where the policy offers tools, they win over a plugin tool of
+            // the same name (plugins may use the names elsewhere).
+            let own = state.policy().tools(&state, &agent_id);
+            if !own.is_empty() {
+                let tools = tools.as_array_mut().unwrap();
+                tools.retain(|tool| !own.iter().any(|mine| mine["name"] == tool["name"]));
+                tools.extend(own);
+            }
+            Ok(json!({"tools":tools}))
+        }
         "tools/call" => {
             tools_call(&state, &agent_id, comms_on, mastermind, &plugins, &params).await
         }
@@ -288,7 +304,7 @@ pub(crate) async fn mcp(
 }
 
 /// Resolve the session's workspace (via `session_workspaces`), if any.
-fn workspace_of(state: &AppState, agent_id: &str) -> Option<crate::workspaces::Workspace> {
+pub fn workspace_of(state: &AppState, agent_id: &str) -> Option<crate::workspaces::Workspace> {
     // Sequential locks, never nested — the workspace store must not nest
     // inside the row locks (see `session_view::sessions_json`).
     let ws_id = crate::lock(&state.session_workspaces)
@@ -474,7 +490,7 @@ fn tool_defs(comms_on: bool, mastermind: bool, plugin_tools: Vec<Value>) -> Valu
 }
 
 /// Plugin manifests cannot claim a core name, including tools gated by role.
-pub(crate) fn is_core_tool(name: &str) -> bool {
+pub fn is_core_tool(name: &str) -> bool {
     static NAMES: std::sync::LazyLock<std::collections::HashSet<String>> =
         std::sync::LazyLock::new(|| {
             tool_defs(true, true, Vec::new())
@@ -690,12 +706,12 @@ async fn open_browser(state: &AppState, agent_id: &str, args: &Value) -> Value {
 }
 
 /// Result content for a successful tool call.
-fn tool_text(text: String) -> Value {
+pub fn tool_text(text: String) -> Value {
     json!({ "content": [{ "type": "text", "text": text }] })
 }
 
 /// Result content for a failed tool call (isError; the model sees the text).
-fn tool_error(text: String) -> Value {
+pub fn tool_error(text: String) -> Value {
     json!({ "content": [{ "type": "text", "text": text }], "isError": true })
 }
 
@@ -728,6 +744,11 @@ async fn tools_call(
                  dashboard, or to ask the Mastermind on your behalf."
             ),
         ));
+    }
+    // The policy's own tools, where they are offered, before any plugin's
+    // of the same name.
+    if let Some(call) = state.policy().call_tool(state, agent_id, name, &args) {
+        return Ok(call.await);
     }
     // Plugin tools: offered only where their plugin is active; the same
     // gate on call (a caller can name a tool it was never offered).
@@ -1635,6 +1656,8 @@ async fn spawn_terminal(
         "mastermind act: spawn_terminal");
     let workspace_id = workspace.id.clone();
     let spec = crate::spawn::SpawnSpec {
+        native_cwd: None,
+        fork_head: false,
         workspace,
         id: None,
         name,

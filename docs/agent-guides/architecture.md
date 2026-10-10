@@ -73,6 +73,19 @@ whole stack needs only SSH + `$HOME`.
   `ssh` / `claude` are on PATH. Site policies, quotas and outbound access require
   separate checks.
 
+### Composing an extension: one policy hook
+
+Shared daemon code asks one trait, `WorkspacePolicy` (`crates/chimaera-server/src/policy.rs`),
+about admission, launch, presentation and lifecycle, and never names an extension. A composed
+daemon lives outside this repository (the Pro host is a private crate): it implements the trait and
+passes a `PolicyFactory` to `chimaera_server::run_with_policy` (the CLI and the app pass it
+through); its own state sits in the one opaque `AppState.extension` slot. The modules a host needs
+are `#[doc(hidden)] pub mod` in `lib.rs`; its tests build on `test_support` (feature
+`daemon-extension-fixture`). With no extension the daemon runs the `Inert` policy: everything
+admitted, no extension route or wire field, and only the durable fence an earlier composed daemon
+left (`policy/fence.rs`) is honoured. The web UI holds the host's slots (`web-ui/src/lib/extensions/`),
+which render nothing without a host. See [Pro](../features/pro.md).
+
 ### Transport: SSH only, lossless reconnect
 
 Ordinary connections use SSH forwards to loopback TCP with a per-daemon bearer

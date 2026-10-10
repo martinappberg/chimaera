@@ -28,7 +28,7 @@ const MAX_PROXY_REPLY: usize = 16 * 1024;
 
 /// Why an upgrade failed, in the terms the relay reports.
 #[derive(Debug)]
-pub(crate) enum ConnectError {
+pub enum ConnectError {
     /// The service answered the upgrade with an HTTP status (401/403 = the
     /// login was refused).
     Rejected(u16),
@@ -49,7 +49,7 @@ impl std::fmt::Display for ConnectError {
 }
 
 /// Open the WebSocket at `url` (ws:// or wss://) with `headers`.
-pub(crate) async fn connect(
+pub async fn connect(
     url: &str,
     headers: &[(&'static str, String)],
 ) -> Result<Stream, ConnectError> {

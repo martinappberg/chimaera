@@ -66,6 +66,49 @@ describe("update awareness", () => {
     );
   });
 
+  it("reads the account's cloud as managed, never as an offer", async () => {
+    const { parseUpdateStatus } = await load();
+    const managed = daemonStatus({ state: "managed", managed: true, latest: null, checked_at: null, succeeded_at: null });
+    expect(parseUpdateStatus(managed)).toMatchObject({ state: "managed", managed: true, available: false });
+    // Either signal is enough, and a managed daemon never has anything available.
+    expect(parseUpdateStatus(daemonStatus({ managed: true, state: "available", available: true }))).toMatchObject({ state: "managed", available: false, latest: null });
+    expect(parseUpdateStatus(daemonStatus({ state: "managed" }))?.managed).toBe(true);
+    // Older daemons omit it.
+    expect(parseUpdateStatus(daemonStatus())?.managed).toBe(false);
+  });
+
+  it("answers an explicit check on the account's cloud with the managed line and asks nobody", async () => {
+    const store = await load();
+    expect(store.MANAGED_UPDATES).toBe("Updates for your cloud are managed for you.");
+    // The first answer comes from the daemon itself.
+    mocks.api.mockResolvedValue(respond(daemonStatus({ state: "managed", managed: true, latest: null })));
+    await store.checkForUpdates(true);
+    expect(store.currentNotice(null)).toEqual({ kind: "managed" });
+    store.dismissAnswer();
+    expect(store.currentNotice(null)).toBeNull();
+    // Once known, asking again answers at once without a request.
+    mocks.api.mockClear();
+    const asking = store.checkForUpdates(true);
+    expect(store.currentNotice(null)).toEqual({ kind: "managed" });
+    await asking;
+    await store.checkForUpdates(false);
+    expect(mocks.api).not.toHaveBeenCalled();
+    expect(store.currentOffer(null, true)).toBeNull();
+  });
+
+  it("reads the official app's daemon as updating with the app, never as a failed check", async () => {
+    const store = await load();
+    expect(store.APP_UPDATES).toBe("Updates arrive with the app.");
+    const status = store.parseUpdateStatus(daemonStatus({ state: "unchecked", with_app: true, latest: null, checked_at: null }));
+    expect(status).toMatchObject({ withApp: true, managed: false, available: false });
+    // Other daemons omit it.
+    expect(store.parseUpdateStatus(daemonStatus())?.withApp).toBe(false);
+    // Seen from a browser, an explicit check answers with the neutral line.
+    mocks.api.mockResolvedValue(respond(daemonStatus({ state: "unchecked", with_app: true, latest: null, checked_at: null })));
+    await store.checkForUpdates(true);
+    expect(store.currentNotice(null)).toEqual({ kind: "with-app" });
+  });
+
   it("stays silent until asked, then answers even when up to date", async () => {
     const store = await load();
     store.updateState.daemon = store.parseUpdateStatus(daemonStatus());

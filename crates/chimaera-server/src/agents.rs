@@ -26,14 +26,15 @@ use serde_json::json;
 
 use crate::AppState;
 
-pub(crate) use crate::agent_state::{apply_title_line, truncate_prompt, AgentKind, AgentRecord};
+pub(crate) use crate::agent_state::{apply_title_line, truncate_prompt};
 use crate::agent_state::{
     cleared_by_output, map_event, now_line_update, statusline_usage, subagent_identity,
     touched_file, AgentState,
 };
+pub use crate::agent_state::{AgentKind, AgentRecord};
 
 /// Fresh session id in the same format the PTY engine generates.
-pub(crate) fn fresh_session_id() -> String {
+pub fn fresh_session_id() -> String {
     format!("s-{}", &chimaera_core::generate_token()[..8])
 }
 
@@ -470,6 +471,89 @@ pub(crate) async fn ingest(
     } else {
         query.key.as_str()
     };
+    // Codex 0.157.1 notify: agent-turn-complete, thread-id, cwd, and
+    // input-messages. Authenticate before any disk work, and do not feed
+    // this partial hook into Claude's attention state machine.
+    if query.event.as_deref() == Some("codex-notify") {
+        {
+            let agents = crate::lock(&state.agents);
+            let Some(record) = agents.get(&id) else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
+            if record.key != presented_key {
+                return StatusCode::FORBIDDEN.into_response();
+            }
+            if record.kind != AgentKind::Codex {
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+        }
+        let Some(thread) = payload
+            .get("thread-id")
+            .and_then(|value| value.as_str())
+            .filter(|id| crate::codex_rollout::valid_thread_id(id))
+        else {
+            return Json(json!({})).into_response();
+        };
+        if payload["type"] != "agent-turn-complete" {
+            return Json(json!({})).into_response();
+        }
+        let Some(info) = state.sessions.get(&id) else {
+            return Json(json!({})).into_response();
+        };
+        let cwd = info.cwd;
+        if payload["cwd"]
+            .as_str()
+            .is_none_or(|value| std::path::Path::new(value) != cwd)
+        {
+            return Json(json!({})).into_response();
+        }
+        // The turn ended: with no output after it, this TUI is at a safe
+        // pause (see `agent_state::tui_at_pause`).
+        if let Some(record) = crate::lock(&state.agents)
+            .get_mut(&id)
+            .filter(|record| record.key == presented_key)
+        {
+            record.turn_complete_at = Some(crate::session_view::now_ms());
+        }
+        let (known, native_cwd) = crate::lock(&state.agents)
+            .get(&id)
+            .map(|record| {
+                (
+                    record.transcript_path.clone(),
+                    record.native_cwd_for(thread),
+                )
+            })
+            .unwrap_or_default();
+        let cwd = native_cwd.unwrap_or(cwd);
+        let Ok(rollout) = crate::codex_rollout::try_capture(&state, thread, cwd, known).await
+        else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        let thread = thread.to_string();
+        if let Some(path) = rollout {
+            let mut agents = crate::lock(&state.agents);
+            // The session may have switched/retired while the filesystem was busy.
+            if let Some(record) = agents
+                .get_mut(&id)
+                .filter(|record| record.key == presented_key)
+            {
+                let changed = record.codex_thread_id.as_ref() != Some(&thread);
+                record.codex_thread_id = Some(thread);
+                record.transcript_path = Some(path);
+                if record.first_prompt.is_none() {
+                    record.first_prompt = payload["input-messages"]
+                        .as_array()
+                        .and_then(|messages| messages.iter().find_map(|value| value.as_str()))
+                        .map(truncate_prompt);
+                }
+                if changed {
+                    tracing::info!(session = %id, "captured verified Codex terminal thread");
+                    state.changes.notify_waiters();
+                }
+            }
+        }
+        return Json(json!({})).into_response();
+    }
     // Statusline heartbeat (the generated wrapper posts the TUI's statusline
     // JSON with `?event=statusline`): quantized usage telemetry only — it
     // never touches the hook state machine. Liberal ingest: an unknown shape
@@ -711,6 +795,7 @@ pub(crate) async fn ingest(
     // (see the transcript_path note above). Off-cluster `agent_context` is
     // None after one Option check and one atomic load — response unchanged.
     let mut context: Vec<String> = Vec::new();
+    let starting = matches!(event, "SessionStart" | "UserPromptSubmit");
     if compute_ctx_pending {
         if let Some(ctx) = state.compute.agent_context().await {
             let mut agents = crate::lock(&state.agents);
@@ -721,6 +806,35 @@ pub(crate) async fn ingest(
                     record.compute_ctx_delivered = true;
                     context.push(ctx);
                 }
+            }
+        }
+    }
+
+    // Where a synced project's agent runs (the user's computer or their
+    // cloud machine) and what did not travel: the same carriers. It lands in
+    // the conversation's history, so a conversation hears it once per change
+    // of machine (`cloud_context::pending`, remembered across restarts and
+    // view switches) and the record's digest keeps two hooks racing at one
+    // start from both carrying it. Without the optional Runtime this is one
+    // Option check.
+    if starting && own_hook {
+        let workspace = crate::lock(&state.session_workspaces).get(&id).cloned();
+        let pending = match workspace {
+            Some(workspace) => state.policy().start_note(&state, &workspace, &id).await,
+            None => None,
+        };
+        if let Some(pending) = pending {
+            let fresh = {
+                let mut agents = crate::lock(&state.agents);
+                agents.get_mut(&id).is_some_and(|record| {
+                    let fresh = record.placement_delivered != Some(pending.digest);
+                    record.placement_delivered = Some(pending.digest);
+                    fresh
+                })
+            };
+            if fresh {
+                state.policy().note_told(&state, &pending).await;
+                context.push(pending.text);
             }
         }
     }
@@ -737,7 +851,7 @@ pub(crate) async fn ingest(
 
     // Active plugins: each may add one line on a carrier that already
     // fires — never a new turn. Nothing switched on returns before any work.
-    if matches!(event, "SessionStart" | "UserPromptSubmit") {
+    if starting {
         context.extend(crate::plugins::runtime::hook(&state, &id, event).await);
     }
 
@@ -845,7 +959,10 @@ pub(crate) fn spawn_agent_watch(
                 let Some(record) = agents.get(&session_id) else {
                     return; // record withdrawn elsewhere
                 };
-                record.transcript_path.clone()
+                // Codex's rollout is an identity proof, not a Claude title log.
+                (record.kind == AgentKind::Claude)
+                    .then(|| record.transcript_path.clone())
+                    .flatten()
             };
             let Some(path) = path else { continue };
             if tailed.as_ref() != Some(&path) {

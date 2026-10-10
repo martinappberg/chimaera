@@ -531,6 +531,7 @@ impl AcpMapper {
             queued,
             after_turn,
             origin: None,
+            client_id: None,
         }
     }
     fn start(&mut self, item: Queued, was_queued: bool, step: &mut DriverStep) {

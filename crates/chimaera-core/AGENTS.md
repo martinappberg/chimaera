@@ -22,10 +22,12 @@ versions). Run `cargo test` in the app workspace too when you touch core deps.
 
 | File | What it owns |
 |---|---|
-| `lib.rs` | `Manifest` + `Handoff` (the daemon's on-disk lifecycle records), `VERSION`/`REPOSITORY`/`BUILD_ID` + build-match helpers (`builds_match`, `build_ref`, `parse_version`, `release_is_newer`), `managed_agents_dir` (user-scoped, ignores `CHIMAERA_DATA_DIR`) + `data_dir`/`config_dir`/`runtime_dir` (honoring `CHIMAERA_HOME`, and `CHIMAERA_DATA_DIR`/`CHIMAERA_RUNTIME_DIR` for a cluster workspace job's daemon), `login_shell` (+ pure `resolve_login_shell`), `generate_token`. |
+| `lib.rs` | `Manifest` + `Handoff` (the daemon's on-disk lifecycle records), `VERSION`/`REPOSITORY`/`BUILD_ID` + build-match helpers (`builds_match`, `build_ref`, `parse_version`, `release_is_newer`), `managed_agents_dir`/`managed_companions_dir` (user-scoped, ignore `CHIMAERA_DATA_DIR`; companion path resolution creates/discovers nothing) + `data_dir`/`config_dir`/`runtime_dir` (honoring `CHIMAERA_HOME`, and `CHIMAERA_DATA_DIR`/`CHIMAERA_RUNTIME_DIR` for a cluster workspace job's daemon), `login_shell` (+ pure `resolve_login_shell`), `generate_token`. |
+| `cloud_providers.rs` + `cloud-providers.json` | Shared provider identities and exact browser authentication origins; adapters stay in the daemon. The UI imports the same JSON. A catalog entry alone does not enable a provider; the adapters and their extension checklist live with the private host. |
+| `personal_providers.rs` | Optional `personal-providers` pure closed catalog/attempt/command DTOs, exact parent/child identity and authentication-origin validation, zeroizing one-use code and fixed errors; no transport or runtime authority. |
 | `shellint.rs` + `shellint/` | The shell-integration subsystem: materialize OSC 133/633/7 scripts, compose per-shell launch argv/env, and the remote-install snippet. Bash folds an indexed `PROMPT_COMMAND` array into one newline-joined string, every entry in order, so the DEBUG re-arm always runs last. |
 | `slurm.rs` | The scheduler vocabulary, pure: `Scheduler`, the `squeue`/`sinfo` format strings + parsers (`Job`, `Partition`), Slurm's duration grammar, `clean_tool_stderr`, partition access from `sacctmgr` associations + `scontrol show partition` (`usable_partitions`), refusal classification, `LaunchSpec` (validation, `sbatch`/`srun` argv), job names. Shared by the daemon and every client; nothing site-specific, ever. |
-| `cluster.rs` | A cluster's own folder on its shared home (`cluster/`): `ClusterConfig` (`cluster.json`: workspaces, saved setups, the last setup, rules for agents, learned facts), `ClusterFacts`, a job's records (`j/<id>/`: `JobRecord` `job.json`, `HostRecord` `host.json`, `HostingRecord` `workspaces.json`), `WorkspaceSeed`, job-host's API types (`HostedState`/`HostedWorkspace`/`JobHostStatus`/`HeldElsewhere`), the job script (`job_script`: `exec`s `chimaera job-host`), `browse_state` / `browse_dir` (what `chimaera browse` prints — read-only, bounded), `expand_path` (no shell), id makers/validators, and the env names job-host gives each workspace chimaera (`CHIMAERA_DATA_DIR`, `CHIMAERA_RUNTIME_DIR`, `CHIMAERA_CLUSTER_WORKSPACE`, `CHIMAERA_HOST_PRELUDE_FILE`, `CHIMAERA_AGENT_RULES_FILE`, `CHIMAERA_CLUSTER_FACTS_FILE`). |
+| `cluster.rs` | A cluster's own folder on its shared home (`cluster/`): `ClusterConfig` (`cluster.json`: workspaces, saved setups, the last setup, rules for agents, learned facts), `ClusterFacts`, a job's records (`j/<id>/`: `JobRecord` `job.json`, `HostRecord` `host.json`, `HostingRecord` `workspaces.json`), `WorkspaceSeed`, job-host's API types (`HostedState`/`HostedWorkspace`/`JobHostStatus`/`HeldElsewhere`), including an optional legacy-defaulted workspace build captured with its token, the job script (`job_script`: `exec`s `chimaera job-host`), `browse_state` / `browse_dir` (what `chimaera browse` prints — read-only, bounded), `expand_path` (no shell), id makers/validators, and the env names job-host gives each workspace chimaera (`CHIMAERA_DATA_DIR`, `CHIMAERA_RUNTIME_DIR`, `CHIMAERA_CLUSTER_WORKSPACE`, `CHIMAERA_HOST_PRELUDE_FILE`, `CHIMAERA_AGENT_RULES_FILE`, `CHIMAERA_CLUSTER_FACTS_FILE`). |
 
 ## Invariants / gotchas
 
@@ -38,6 +40,10 @@ versions). Run `cargo test` in the app workspace too when you touch core deps.
   old manifest still parses.
   `Manifest.runtime_leases` defaults false: old daemons do not protect managed
   agent packages, so automatic package cleanup defers while their manifest is live.
+  `Manifest.daemon_extension` (default false, omitted when false, so a free
+  daemon's manifest is unchanged) marks a daemon composed with an extension:
+  `connect` probes composition before an automatic public-release replacement
+  only when it is set.
 - **A manifest's pid means something only on the node that wrote it.** HPC login
   nodes share `$HOME`, so every node reads the same file: check `written_here()`
   (`this_node()` vs `hostname`, via `same_node`) before trusting `is_alive()`, and

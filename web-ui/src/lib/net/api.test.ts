@@ -1,6 +1,83 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { isHomeHub, leaveHomeHub, reclaimHomeHub } from "./api";
+import { ASLEEP_NOTE, ApiError, api, isHomeHub, leaveHomeHub, ownerElsewhere, plainError, projectStateNote, reclaimHomeHub, setActiveWorkspaceId, setViewerWorkspaceHeader } from "./api";
+import { placementLabel } from "./placement";
+
+describe("daemon connection codes", () => {
+  it("never reach the screen as raw wire identifiers", () => {
+    for (const code of [
+      "project_unavailable",
+      "workspace_owned_elsewhere",
+      "remote_unavailable",
+      "workspace_scope_changed",
+      "read_only",
+      "worker_asleep",
+    ]) {
+      const error = new ApiError(409, code);
+      expect(error.code).toBe(code);
+      expect(error.message).not.toContain("_");
+      expect(error.message.length).toBeGreaterThan(0);
+    }
+    const other = new ApiError(400, "invalid path");
+    expect(other.code).toBeNull();
+    expect(other.message).toBe("invalid path");
+  });
+
+  it("say where a routed session runs, and nothing for a session here", () => {
+    expect(placementLabel("here", true)).toBeNull();
+    expect(placementLabel(undefined, undefined)).toBeNull();
+    const cloud = placementLabel({ remote: "worker-w1" }, true);
+    const computer = placementLabel({ remote: "device-d1" }, true);
+    expect(cloud).not.toBeNull();
+    expect(computer).not.toBeNull();
+    expect(cloud).not.toBe(computer);
+    expect(placementLabel({ remote: "worker-w1" }, false)).not.toBe(cloud);
+  });
+});
+
+describe("a project running elsewhere", () => {
+  afterEach(() => { vi.unstubAllGlobals(); sessionStorage.clear(); });
+
+  it("keeps an unknown owner neutral on native, host and project views", () => {
+    for (const address of ["http://localhost/", "https://fixture.invalid/app/worker-w1/", "https://fixture.invalid/app/device-d1/", "https://fixture.invalid/workspace/w-one/"]) {
+      vi.stubGlobal("location", new URL(address));
+      expect(ownerElsewhere()).toBeNull();
+      expect(new ApiError(409, "workspace_owned_elsewhere").message).toBe("This project is running somewhere else right now.");
+      expect(plainError("read_only")).toBe("This project is running somewhere else right now.");
+      expect(plainError("on_other_machine")).toBe("This file is on another computer and can’t be opened here.");
+    }
+    // Verified placement still names the actual owner.
+    expect(plainError("workspace_owned_elsewhere", "cloud")).toBe("This project is running in the cloud right now.");
+    expect(plainError("read_only", "computer")).toBe("This project is running on your computer right now.");
+    expect(plainError("on_other_machine", "cloud")).toBe("This file is in the cloud and can’t be opened here.");
+    for (const where of ["cloud", "computer", "other", null] as const) {
+      expect(plainError("workspace_owned_elsewhere", where)).not.toMatch(/device/);
+    }
+  });
+
+  it("says an idle cloud is where the project is, not a machine state", () => {
+    expect(plainError("worker_asleep")).toBe("This project is idle in your cloud.");
+  });
+});
+
+describe("a project's state, told apart from a failure", () => {
+  it("reads a sleeping or unreachable owner as a quiet note, never an error", () => {
+    expect(projectStateNote(new ApiError(409, "worker_asleep"))).toBe(ASLEEP_NOTE);
+    expect(ASLEEP_NOTE).toBe("Idle in your cloud. Send a message to continue.");
+    expect(projectStateNote(new ApiError(503, "project_unavailable"))).toBe("This project isn’t reachable right now.");
+    for (const code of ["remote_unavailable", "workspace_scope_changed", "workspace_unavailable"]) {
+      expect(projectStateNote(new ApiError(503, code))).toBe("This project can’t be reached right now.");
+    }
+  });
+
+  it("leaves a real failure to its error styling", () => {
+    expect(projectStateNote(new ApiError(400, "invalid path"))).toBeNull();
+    expect(projectStateNote(new ApiError(403, "outside_project"))).toBeNull();
+    expect(projectStateNote(new ApiError(409, "workspace_owned_elsewhere"))).toBeNull();
+    expect(projectStateNote(new Error("worker_asleep"))).toBeNull();
+    expect(projectStateNote(null)).toBeNull();
+  });
+});
 
 describe("native Home hub identity", () => {
   beforeEach(() => sessionStorage.clear());
@@ -14,5 +91,26 @@ describe("native Home hub identity", () => {
 
     reclaimHomeHub();
     expect(isHomeHub()).toBe(true);
+  });
+});
+
+describe("the viewer-workspace header", () => {
+  afterEach(() => { vi.unstubAllGlobals(); setViewerWorkspaceHeader(false); setActiveWorkspaceId(null); });
+
+  async function sentHeader(): Promise<string | null> {
+    const fetchMock = vi.fn(async (_path: string, _init: RequestInit) => new Response("{}"));
+    vi.stubGlobal("fetch", fetchMock);
+    setActiveWorkspaceId("w-one");
+    await api("/health");
+    return new Headers(fetchMock.mock.calls[0][1].headers).get("X-Chimaera-Viewer-Workspace");
+  }
+
+  it("is never sent by a window that can never have Pro", async () => {
+    expect(await sentHeader()).toBeNull();
+  });
+
+  it("names the active project once the window can have Pro", async () => {
+    setViewerWorkspaceHeader(true);
+    expect(await sentHeader()).toBe("w-one");
   });
 });

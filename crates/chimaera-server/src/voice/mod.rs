@@ -26,7 +26,7 @@
 //! `TranscriptError {description|error_code}` and `error {message}`.
 
 mod login;
-mod upstream;
+pub mod upstream;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;

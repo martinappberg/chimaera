@@ -5,7 +5,8 @@
   import { pageVisible } from "../shared/visibility";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import { agentCatalog, pollAgents, type LaunchPick } from "./launcher";
-  import { acknowledgeSetupResult, cancelAgentSetup, getAgentSetup, pendingSetupId, recoverSetupResult, setupRunning, startAgentSetup, type SetupDetails, type SetupRequest } from "./agentSetup";
+  import { acknowledgeSetupResult, cancelAgentSetup, getAgentSetup, pendingSetupId, recoverSetupResult, setupRunning, startAgentSetup } from "./agentSetupRequests";
+  import type { SetupDetails, SetupRequest } from "./agentSetup";
 
   let { request, onclose, onlaunch }: { request: SetupRequest; onclose(): void; onlaunch(pick: LaunchPick): void } = $props();
   let details = $state<SetupDetails | null>(null);

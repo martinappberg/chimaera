@@ -121,7 +121,7 @@ impl RecentEntry {
 
 /// workspace id -> ended conversations, newest first; backed by a single
 /// JSON file (save-on-change), load-tolerant like the other stores.
-pub(crate) struct RecentsStore {
+pub struct RecentsStore {
     path: PathBuf,
     items: HashMap<String, Vec<RecentEntry>>,
 }
@@ -243,7 +243,7 @@ pub(crate) fn ancestors(state: &AppState, workspace_id: &str) -> HashMap<String,
 /// seen while the session was alive, `ui` the surface it last ran on (so the
 /// recents row reopens in the same mode). Broadcasts a change when anything
 /// moved.
-pub(crate) fn retire(
+pub fn retire(
     state: &Arc<AppState>,
     session_id: &str,
     pinned: Option<&str>,
@@ -305,6 +305,7 @@ fn retire_inner(
     // but tidy is tidy).
     crate::environment::remove_prelude_file(session_id);
     crate::agents::remove_fork_context(session_id);
+    state.policy().session_retired(state, session_id);
 
     // A dead Mastermind must not stay bound (the dock would show a ghost),
     // and it never lands in Recents: it is the observer, not a roster
@@ -339,10 +340,21 @@ fn retire_inner(
         let workspace_root = crate::lock(&state.workspaces)
             .get(&workspace_id)
             .map(|w| w.root);
-        let resume = if record.kind == AgentKind::Codex
-            || (ui == SessionUi::Chat && record.kind != AgentKind::Claude)
+        // A Codex TUI only carries a verified rollout where the Pro notify
+        // shim runs; elsewhere it keeps the plain hint/ancestor fallback.
+        let codex_rollout = record.kind == AgentKind::Codex
+            && state.policy().launch_context(state, &workspace_id).tools;
+        let resume = if (ui == SessionUi::Chat && record.kind != AgentKind::Claude)
+            || (record.kind == AgentKind::Codex && !codex_rollout)
         {
             resume_hint.or_else(|| record.resumed_from.clone())
+        } else if codex_rollout {
+            record.resume_id().filter(|_| {
+                record
+                    .transcript_path
+                    .as_ref()
+                    .is_some_and(|path| path.is_file())
+            })
         } else {
             [resume_hint, record.resume_id(), record.resumed_from.clone()]
                 .into_iter()

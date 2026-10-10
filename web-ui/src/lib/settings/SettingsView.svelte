@@ -6,17 +6,26 @@
    * itself. Keybindings are ordinary rows (the keys.* settings); the few
    * spec-pinned chords render read-only at the end of the Keyboard section.
    */
-  import { CATEGORIES, SETTINGS, type SettingDef } from "./schema";
+  import { CATEGORIES, SETTINGS, listed, type SettingDef } from "./schema";
   import { isModified, settingsLoaded } from "./store.svelte";
   import SettingRow from "./SettingRow.svelte";
   import SettingsJson from "./SettingsJson.svelte";
   import AgentsSettings from "./AgentsSettings.svelte";
   import EnvironmentSettings from "./EnvironmentSettings.svelte";
   import DocumentsSettings from "./DocumentsSettings.svelte";
+  import { loadApplicationEntry } from "virtual:chimaera-application-entry";
+  const accountExtensionSelected = loadApplicationEntry !== null;
+  import { isBrowserGateway } from "../net/base";
+  import { isNativeShell, localDaemonState } from "../net/native";
+  import BrandMark from "../shared/BrandMark.svelte";
+  import { accountPlan, proTier } from "../net/plan";
+  import { legacyCloudRequest } from "../extensions/accountDaemon";
+  import { pageVisible } from "../shared/visibility";
   import PluginsSettings from "./PluginsSettings.svelte";
   import { workspacePlugins } from "../plugins/store";
   import NotificationStatus from "./NotificationStatus.svelte";
   import UpdatesStatus from "./UpdatesStatus.svelte";
+  import { updateState } from "../workspace/update.svelte";
   import ActivitySettings from "./ActivitySettings.svelte";
   import { settingsJump } from "./jump";
   import { tick, untrack } from "svelte";
@@ -24,8 +33,11 @@
   import { activeModLabel, paneMoveHint } from "../shared/keybindings";
   import { paneTabHasKeyboardFocus } from "../shared/tabNavigation";
 
-  /** The tab is showing (kept-alive tabs stay mounted while hidden). */
-  let { visible: tabVisible = true }: { visible?: boolean } = $props();
+  /** The tab is showing (kept-alive tabs stay mounted while hidden).
+   *  `account`: the web's Home, the account's own page. It has no daemon, so
+   *  Settings is only Chimaera Pro, whose plan, usage and sign-out show in
+   *  place (the private optional account presentation). */
+  let { visible: tabVisible = true, account = false }: { visible?: boolean; account?: boolean } = $props();
 
   /**
    * Nav sections: the schema categories, plus the bespoke Environment section
@@ -34,9 +46,11 @@
    * after that.
    */
   const sections = (() => {
+    if (account) return ["Chimaera Pro"];
     const out = [...CATEGORIES];
     const at = out.indexOf("Agents");
     out.splice(at >= 0 ? at + 1 : out.length, 0, "Environment", "Documents");
+    if (isBrowserGateway()) out.splice(out.indexOf("Keyboard"), 0, "Cloud");
     // Plugins' own declared settings, after the Extensions policy.
     const ext = out.indexOf("Extensions");
     out.splice(ext >= 0 ? ext + 1 : out.length, 0, "Plugins");
@@ -45,8 +59,23 @@
     // Keyboard: the pinned-chords block trails the list and belongs to it.
     const kb = out.indexOf("Keyboard");
     out.splice(kb >= 0 ? kb : out.length, 0, "Activity");
+    // Pro is an optional add-on, so it follows every working section rather
+    // than opening Settings (and its nav) with an account entry.
+    if (isNativeShell() || isBrowserGateway()) out.push("Chimaera Pro");
     return out;
   })();
+
+  /** The Cloud section belongs to a cloud machine's own page. Another daemon
+   * behind the gateway (a laptop being viewed) has no cloud status to show. */
+  let cloudMachine = $state(false);
+  $effect(() => {
+    if (!accountExtensionSelected || !isBrowserGateway() || cloudMachine || !tabVisible || !$pageVisible) return;
+    const controller = new AbortController();
+    void legacyCloudRequest({ operation: "info" }, controller.signal).then(value => value.available === true)
+      .then((value) => { if (!controller.signal.aborted) cloudMachine = value; })
+      .catch(() => { /* Passive; the next time Settings shows it asks again. */ });
+    return () => controller.abort();
+  });
 
   let tab = $state<"ui" | "json">("ui");
   let query = $state("");
@@ -56,6 +85,10 @@
   let navEl = $state<HTMLElement | null>(null);
 
   const q = $derived(query.trim().toLowerCase());
+  // The card is the tier-two entry: until a plan is active it is a quiet
+  // offer that asks the account nothing (`proTier`).
+  const paid = $derived($proTier === "active");
+  const proAction = $derived(paid ? "View account" : "Get Pro");
 
   // Focus the search box when the UI tab shows (VS Code behavior).
   $effect(() => {
@@ -73,7 +106,16 @@
     );
   }
 
-  const visible = $derived(SETTINGS.filter(matches));
+  /** A development build of the native app lists the testing settings too. */
+  let devBuild = $state(false);
+  $effect(() => {
+    if (!isNativeShell()) return;
+    void localDaemonState().then((s) => {
+      devBuild = s?.dev_build === true;
+    });
+  });
+
+  const visible = $derived(SETTINGS.filter((d) => listed(d, devBuild) && matches(d)));
   const modifiedCount = $derived(SETTINGS.filter((d) => isModified(d.id)).length);
 
   /**
@@ -99,6 +141,9 @@
   const ACTIVITY_KEYWORDS = ["activity", "usage", "sessions", "tokens", "csv", "export"];
   const activityVisible = $derived(q === "" || ACTIVITY_KEYWORDS.some((k) => k.includes(q)));
 
+  const PRO_KEYWORDS = ["chimaera pro", "chimaera max", "sessions", "files", "account", "sign in", "plan", "kept", "connected", "devices", "sign out", "cloud", "github", "repository", "ssh public key"];
+  const proVisible = $derived(q === "" || PRO_KEYWORDS.some((keyword) => keyword.includes(q)));
+
   /** Rows grouped by category, registry order, empty groups dropped. */
   const groups = $derived.by(() => {
     const out: { category: string; defs: SettingDef[] }[] = [];
@@ -109,6 +154,15 @@
       }
       if (cat === "Documents") {
         if (docsVisible) out.push({ category: cat, defs: [] });
+        continue;
+      }
+      if (cat === "Chimaera Pro") {
+        // A build without an account endpoint never shows an account group.
+        if (account || (proVisible && $proTier !== "free")) out.push({ category: cat, defs: [] });
+        continue;
+      }
+      if (cat === "Cloud") {
+        if (proVisible && cloudMachine) out.push({ category: cat, defs: [] });
         continue;
       }
       if (cat === "Plugins") {
@@ -124,9 +178,6 @@
     }
     return out;
   });
-
-  /** The pinned-chords block travels with the Keyboard section. */
-  const keyboardVisible = $derived(groups.some((g) => g.category === "Keyboard"));
 
   /** Scroll to a section, or to one setting's row when given its id
    *  ("agents.communication.enabled" — the Mastermind panel's off state),
@@ -212,6 +263,7 @@
   <header class="top">
     <div class="title-row">
       <h1 class="title">Settings</h1>
+      {#if !account}
       <div class="tabs" role="tablist" aria-label="settings mode">
         <button class="mode" class:on={tab === "ui"} role="tab" aria-selected={tab === "ui"} onclick={() => (tab = "ui")}>
           UI
@@ -226,10 +278,14 @@
           JSON
         </button>
       </div>
+      {/if}
     </div>
+    {#if account}
+      <p class="subtitle">Your Chimaera account. Each project's own settings open with the project.</p>
+    {:else}
     <p class="subtitle">
       Ground truth: <code>~/.config/chimaera/settings.json</code> on the daemon host — hand-edits
-      and other windows sync here live.
+      and changes from other windows appear here live.
       {#if modifiedCount > 0}
         <span class="mod-count">{modifiedCount} modified</span>
       {/if}
@@ -237,7 +293,8 @@
         <span class="loading">loading…</span>
       {/if}
     </p>
-    {#if tab === "ui"}
+    {/if}
+    {#if tab === "ui" && !account}
       <input
         class="search"
         type="text"
@@ -279,7 +336,31 @@
 
       <div class="list" bind:this={listEl} onscroll={onScroll}>
         {#each groups as group (group.category)}
-          {#if group.category === "Agents"}
+          {#if group.category === "Chimaera Pro"}
+            <section data-section={group.category}>
+              <h2 class="cat">Chimaera Pro</h2>
+              {#if account}
+                {#await import("../extensions/AccountApplicationView.svelte") then { default: AccountApplicationView }}
+                  <AccountApplicationView kind="account-settings" visible={tabVisible} />
+                {/await}
+              {:else}
+              <button class="pro-entry" aria-label={paid ? `View Chimaera ${$accountPlan === "max" ? "Max" : "Pro"} account` : "Get Chimaera Pro"}
+                onclick={() => window.dispatchEvent(new Event("chimaera:open-pro"))}>
+                <BrandMark size={30} />
+                <span class="pro-copy">
+                  {#if paid}
+                    <strong>Your Chimaera {$accountPlan === "max" ? "Max" : "Pro"}</strong>
+                    <span>Your plan, cloud agents and your projects on every device.</span>
+                  {:else}
+                    <strong>Chimaera Pro</strong>
+                    <span>Optional: agents keep working in the cloud while you're away, and your work opens on another device.</span>
+                  {/if}
+                </span>
+                <span class="pro-open" aria-hidden="true">{proAction} <span>→</span></span>
+              </button>
+              {/if}
+            </section>
+          {:else if group.category === "Agents"}
             <!-- Bespoke panel: fuses live daemon detection with the
                  agents.<id>.path settings and an uninstall action. It renders
                  its own <h2>, so its generic rows are skipped here. Agent
@@ -314,6 +395,12 @@
             <section data-section={group.category}>
               <DocumentsSettings />
             </section>
+          {:else if group.category === "Cloud"}
+            <section data-section={group.category}>
+              {#await import("../extensions/AccountApplicationView.svelte") then { default: AccountApplicationView }}
+                <AccountApplicationView kind="cloud-setup" visible={tabVisible} />
+              {/await}
+            </section>
           {:else if group.category === "Plugins"}
             <!-- Bespoke panel: each installed plugin's declared settings,
                  kept by the daemon per plugin (not settings.json). -->
@@ -339,12 +426,57 @@
           {:else if group.category === "Updates"}
             <!-- The status block answers "is there an update?" for the app,
                  the daemon and the agents (it renders its own <h2> with a
-                 "check now"); the auto-check switch is the generic row. -->
+                 "check now"); the auto-check switch is the generic row. The
+                 account's cloud has no switch: its updates are the service's. -->
             <section data-section={group.category}>
               <UpdatesStatus onJump={jumpTo} visible={tabVisible} />
+              {#if updateState.daemon?.managed !== true}
+                {#each group.defs as def (def.id)}
+                  <SettingRow {def} />
+                {/each}
+              {/if}
+            </section>
+          {:else if group.category === "Keyboard"}
+            <!-- Generic rows, then the reference chords that belong to them. -->
+            <section data-section={group.category}>
+              <h2 class="cat">{group.category}</h2>
               {#each group.defs as def (def.id)}
                 <SettingRow {def} />
               {/each}
+              <div class="kbd-reference">
+                <div class="kbd-group">
+                  <h3 class="kbd-group-title">Pinned chords</h3>
+                  <p class="kbd-note">
+                    Not rebindable — the terminal owns bare Ctrl on every platform, and these shadow
+                    browser conventions too carefully to open up.
+                  </p>
+                  <ul class="kbd-list">
+                    {#each pinnedRows as row (row.label)}
+                      <li class="kbd-row">
+                        <span class="kbd-label">{row.label}</span>
+                        <kbd class="kbd-pill">{row.chord}</kbd>
+                      </li>
+                    {/each}
+                  </ul>
+                </div>
+
+                <div class="kbd-group">
+                  <h3 class="kbd-group-title">chimaera app menu</h3>
+                  <p class="kbd-note">
+                    The native app's menu bar owns the chords a browser reserves, so these fire only in
+                    the chimaera app. Several are a second way to reach a rebindable action above —
+                    {APP_MENU.closeView} also closes a view, {APP_MENU.newTerminal} opens a new terminal.
+                  </p>
+                  <ul class="kbd-list">
+                    {#each appMenuRows as row (row.label)}
+                      <li class="kbd-row">
+                        <span class="kbd-label">{row.label}</span>
+                        <kbd class="kbd-pill">{row.chord}</kbd>
+                      </li>
+                    {/each}
+                  </ul>
+                </div>
+              </div>
             </section>
           {:else}
             <section data-section={group.category}>
@@ -356,41 +488,6 @@
           {/if}
         {/each}
 
-        {#if keyboardVisible}
-          <div class="kbd-group">
-            <h3 class="kbd-group-title">Pinned chords</h3>
-            <p class="kbd-note">
-              Not rebindable — the terminal owns bare Ctrl on every platform, and these shadow
-              browser conventions too carefully to open up.
-            </p>
-            <ul class="kbd-list">
-              {#each pinnedRows as row (row.label)}
-                <li class="kbd-row">
-                  <span class="kbd-label">{row.label}</span>
-                  <kbd class="kbd-pill">{row.chord}</kbd>
-                </li>
-              {/each}
-            </ul>
-          </div>
-
-          <div class="kbd-group">
-            <h3 class="kbd-group-title">chimaera app menu</h3>
-            <p class="kbd-note">
-              The native app's menu bar owns the chords a browser reserves, so these fire only in
-              the chimaera app. Several are a second way to reach a rebindable action above —
-              {APP_MENU.closeView} also closes a view, {APP_MENU.newTerminal} opens a new terminal.
-            </p>
-            <ul class="kbd-list">
-              {#each appMenuRows as row (row.label)}
-                <li class="kbd-row">
-                  <span class="kbd-label">{row.label}</span>
-                  <kbd class="kbd-pill">{row.chord}</kbd>
-                </li>
-              {/each}
-            </ul>
-          </div>
-        {/if}
-
         {#if groups.length === 0}
           <div class="empty">no settings match “{query}”</div>
         {/if}
@@ -398,7 +495,7 @@
     </div>
   {:else}
     <div class="json-body">
-      <SettingsJson />
+      <SettingsJson {devBuild} />
     </div>
   {/if}
 </div>
@@ -578,6 +675,32 @@
     color: var(--muted);
   }
 
+  .pro-entry {
+    display: grid;
+    grid-template-columns: 30px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 12px;
+    width: calc(100% - 28px);
+    margin: 10px 14px 18px;
+    padding: 14px;
+    border: 1px solid var(--edge);
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--fg) 2%, transparent);
+    color: var(--fg);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+  .pro-entry:hover { background: var(--row-hover); }
+  .pro-entry:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+  .pro-copy { display: grid; flex: 1; min-width: 0; gap: 4px; font-size: var(--text-sm); }
+  .pro-copy strong { font-size: var(--text-md); font-weight: 550; }
+  .pro-copy > span { color: var(--muted); line-height: 1.5; }
+  .pro-open { flex: none; display: flex; align-items: center; gap: 8px; font-size: var(--text-sm); color: var(--muted); }
+  @container settings (max-width: 460px) {
+    .pro-entry { grid-template-columns: 30px minmax(0, 1fr); }
+    .pro-open { grid-column: 2; }
+  }
   /* A titled block inside a section (Agents → Agent communication). */
   .subcat {
     margin: 18px 0 2px;

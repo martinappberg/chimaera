@@ -17,6 +17,8 @@ export interface ChatTransport {
   readonly healthy: boolean;
   send(command: Record<string, unknown>): boolean;
   close(): void;
+  /** Reconnect now instead of sitting out a backoff (a chat socket only). */
+  retrySoon?(): void;
 }
 
 export interface ChatEntry {
@@ -71,6 +73,7 @@ export function disposeChat(sessionId: string): void {
   const entry = pool.get(sessionId);
   if (entry === undefined) return;
   entry.socket.close();
+  entry.store.dispose();
   pool.delete(sessionId);
 }
 

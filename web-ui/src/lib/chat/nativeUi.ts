@@ -1,6 +1,10 @@
 /** Ephemeral Claude UI RPCs. Closure handles never enter the journal or a replay queue. */
 export type UiRecord = Record<string, unknown>;
 export type NativeUiNotice = { type: "ready" | "disconnected" | "reset" } | { type: "notification"; payload: UiRecord };
+/** Only controls directly dispatched by a click, edit, or selection carry intent. */
+export function isNativeUiAction(request: unknown): boolean {
+  return isRecord(request) && ["ui_press", "ui_input", "ui_select", "ui_client_press"].includes(request.subtype as string);
+}
 const MAX_PENDING = 32;
 const REQUEST_TIMEOUT = 20_000;
 const MAX_REQUEST_BYTES = 128 * 1024;

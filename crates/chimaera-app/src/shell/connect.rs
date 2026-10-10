@@ -5,11 +5,12 @@
 use std::collections::HashSet;
 
 use chimaera_remote::hosts::{HostEntry, HostsStore};
-use chimaera_remote::{ComputeTunnel, ConnectOpts, Phase, Tunnel};
+use chimaera_remote::{ComputeTunnel, ConnectOpts, Phase};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
 use super::restore::open_ui_window;
+use super::tunnel::Tunnel;
 use super::{authorize_scope_origin, lock, ConnectFlight, Shell};
 use crate::windows::WindowRecord;
 
@@ -36,7 +37,7 @@ fn claim_connect_flight(
 /// Host list entry as the UI sees it (see HostState in native.ts).
 #[derive(Clone, Serialize)]
 pub struct HostState {
-    alias: String,
+    pub(super) alias: String,
     status: &'static str,
     local_port: Option<u16>,
     last_connected_at: Option<u64>,
@@ -50,6 +51,14 @@ pub struct HostState {
     /// login nodes and the connection is pinned to one other than where a
     /// new ssh connection lands (`None` = wherever the alias lands).
     node: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    via_pro: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    kept: bool,
+    /// The direct-SSH choice: present when an account owner offers it or it
+    /// is on; absent otherwise (devices, and builds without an owner).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    direct_ssh: Option<bool>,
     /// Set when the host is a cluster: from this process's connect, else the
     /// scheduler the last connect recorded in hosts.json (a hint until the
     /// next probe). Never for a host the user said isn't one.
@@ -75,6 +84,21 @@ struct LoginDaemonWire {
 }
 
 impl HostState {
+    /// With an account owner, a direct row offers the direct-SSH choice even
+    /// while it is off; without one the field stays absent unless it is on.
+    pub(super) fn offer_direct_ssh(mut self, owner: bool) -> Self {
+        if owner && !self.via_pro && self.direct_ssh.is_none() {
+            self.direct_ssh = Some(false);
+        }
+        self
+    }
+
+    pub fn mark_kept(mut self) -> Self {
+        self.via_pro = true;
+        self.kept = true;
+        self
+    }
+
     /// Attach what is known about `entry` being a cluster: this process's
     /// live verdict when there is one, else the hint hosts.json keeps.
     pub(super) fn with_cluster(
@@ -82,6 +106,11 @@ impl HostState {
         entry: &HostEntry,
         live: Option<&super::cluster::ClusterInfo>,
     ) -> Self {
+        self.not_cluster = entry.not_cluster;
+        self.direct_ssh = match self.direct_ssh {
+            Some(_) => Some(entry.direct_ssh),
+            None => entry.direct_ssh.then_some(true),
+        };
         let scheduler = live
             .map(|i| i.scheduler)
             .or(entry.scheduler)
@@ -120,29 +149,29 @@ struct ConnectProgress {
 /// screen watching a startup-restore connect — don't stay "connecting"
 /// forever on a failure they never hear about.
 #[derive(Clone, Serialize)]
-pub(super) struct HostStatus {
-    pub(super) alias: String,
-    pub(super) status: &'static str,
-    pub(super) local_port: Option<u16>,
+pub(crate) struct HostStatus {
+    pub(crate) alias: String,
+    pub(crate) status: &'static str,
+    pub(crate) local_port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) token: Option<String>,
+    pub(crate) token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) error: Option<String>,
+    pub(crate) error: Option<String>,
     /// Human-facing context for a liveness transition. Unlike `error`, this
     /// does not mean a reconnect attempt failed; it explains why one began.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) reason: Option<String>,
+    pub(crate) reason: Option<String>,
     /// Source build behind the tunnel. Open windows use a changed build as a
     /// navigation boundary even when the forward kept its port and token:
     /// hashed UI chunks never span daemon builds.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) build: Option<String>,
+    pub(crate) build: Option<String>,
     /// On `connected`: the login node the tunnel is pinned to (a pool alias
     /// whose daemon runs on another node than where the alias lands).
     /// Every connected event carries it, so a row re-routed by a reconnect it
     /// didn't start never keeps a stale node.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) node: Option<String>,
+    pub(crate) node: Option<String>,
 }
 
 fn connected_status(
@@ -187,7 +216,10 @@ pub(super) fn state_for(
         outdated: tunnel.is_some_and(|t| t.outdated),
         remote_build: tunnel.and_then(|t| t.remote_build.clone()),
         live_sessions: tunnel.and_then(|t| t.live_sessions),
-        node: tunnel.and_then(|t| t.route.node().map(str::to_string)),
+        node: tunnel.and_then(|t| t.node().map(str::to_string)),
+        via_pro: tunnel.is_some_and(|t| t.link_id().is_some()),
+        kept: entry.kept,
+        direct_ssh: entry.direct_ssh.then_some(true),
         cluster: None,
         not_cluster: entry.not_cluster,
         cluster_setup_complete: entry.cluster_setup_complete,
@@ -198,7 +230,11 @@ pub(super) fn state_for(
 /// reply. Every success path uses this, including healthy-tunnel reuse and
 /// joined flights: a caller may still hold an old daemon token even though
 /// another window already rebuilt the shared tunnel.
-async fn publish_connected_state(app: &AppHandle, state: &Shell, alias: &str) -> Option<HostState> {
+pub(crate) async fn publish_connected_state(
+    app: &AppHandle,
+    state: &Shell,
+    alias: &str,
+) -> Option<HostState> {
     // The entry the flight stamped; a miss (none this process) is the only
     // publish that reads hosts.json.
     // The guard must not live across the fallback's await.
@@ -222,7 +258,7 @@ async fn publish_connected_state(app: &AppHandle, state: &Shell, alias: &str) ->
                 tunnel.local_port,
                 &tunnel.manifest.token,
                 tunnel.manifest.build.as_deref(),
-                tunnel.route.node(),
+                tunnel.node(),
             ),
         )
     };
@@ -251,6 +287,8 @@ async fn run_connect(
     let opts = ConnectOpts {
         local_port,
         binary: entry.binary.clone(),
+        // Direct SSH stays the free deployment path in either native assembly.
+        deployment_source: chimaera_remote::DeploymentSource::PublicRelease,
         update_daemon,
         login_serve: entry.login_serve,
         not_cluster: entry.not_cluster,
@@ -271,6 +309,7 @@ async fn run_connect(
         emit_progress_at(&progress_app, &progress_alias, phase, node);
     })
     .await
+    .map(Tunnel::from)
 }
 
 /// One `connect-progress` event: the phase label a host row shows.
@@ -294,10 +333,30 @@ fn emit_progress_at(app: &AppHandle, alias: &str, phase: &'static str, node: Opt
 /// attempt per alias runs at a time; every concurrent caller awaits that
 /// flight's outcome, so N windows reconnecting share ONE ssh auth flow (one
 /// 2FA prompt) instead of stampeding or bouncing with errors.
-pub(super) async fn do_connect(
+pub(crate) async fn do_connect(
     app: &AppHandle,
     alias: String,
     update_daemon: bool,
+) -> Result<HostState, String> {
+    connect_with_intent(app, alias, update_daemon, ConnectIntent::Explicit).await
+}
+
+pub(super) async fn restore_connect(app: &AppHandle, alias: String) -> Result<HostState, String> {
+    connect_with_intent(app, alias, false, ConnectIntent::Restore).await
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ConnectIntent {
+    Explicit,
+    Restore,
+}
+const KEEPER_CONNECT_REQUIRED: &str = "Connect to this host to resume its keeper connection";
+
+async fn connect_with_intent(
+    app: &AppHandle,
+    alias: String,
+    update_daemon: bool,
+    intent: ConnectIntent,
 ) -> Result<HostState, String> {
     let state = app.state::<Shell>();
     tracing::info!("ipc: connect_host {alias} (update_daemon: {update_daemon})");
@@ -325,6 +384,12 @@ pub(super) async fn do_connect(
                         // An update must still run its own flight — loop and
                         // own the next one.
                         Ok(()) => continue,
+                        Err(e)
+                            if intent == ConnectIntent::Explicit
+                                && e == KEEPER_CONNECT_REQUIRED =>
+                        {
+                            continue
+                        }
                         Err(e) => return Err(e),
                     },
                     // The owner died without reporting (task dropped). Clear
@@ -348,6 +413,19 @@ pub(super) async fn do_connect(
         let reused = if update_daemon {
             None
         } else {
+            // Only an account owner routes through a keeper; without one no
+            // hosts.json read is needed to know the route is direct.
+            let via_pro = if state.pro.owner().is_some() {
+                let entry = host_entry(&alias).await;
+                (!entry.direct_ssh && entry.kept)
+                    || keeper_route_selected(
+                        entry.direct_ssh,
+                        state.pro.active(),
+                        state.pro.hosts().iter().any(|host| host.alias == alias),
+                    )
+            } else {
+                false
+            };
             // Probe liveness WITHOUT holding the tunnels lock: this is a ~2s
             // HTTP round-trip, and holding the map locked across it would
             // stall every other tunnel op. A 401 from a stale/foreign daemon
@@ -357,6 +435,7 @@ pub(super) async fn do_connect(
                 .lock()
                 .await
                 .get(&alias)
+                .filter(|tunnel| tunnel.link_id().is_some() == via_pro)
                 .map(|t| (t.local_port, t.manifest.token.clone()));
             if let Some((port, token)) = endpoint {
                 if chimaera_remote::http_alive_authed(port, &token).await {
@@ -372,7 +451,7 @@ pub(super) async fn do_connect(
         // hang, whether this reused a healthy tunnel or built a new one.
         let result = match reused {
             Some(reply) => Ok(reply),
-            None => run_flight(app, &alias, update_daemon).await,
+            None => run_flight(app, &alias, update_daemon, intent).await,
         };
         lock(&state.connecting).remove(&alias);
         let _ = tx.send(Some(match &result {
@@ -398,7 +477,8 @@ pub(super) async fn do_connect(
                 },
             );
         }
-        return result;
+        let owner = state.pro.owner().is_some();
+        return result.map(|reply| reply.offer_direct_ssh(owner));
     }
 }
 
@@ -409,12 +489,21 @@ async fn run_flight(
     app: &AppHandle,
     alias: &str,
     update_daemon: bool,
+    intent: ConnectIntent,
 ) -> Result<HostState, String> {
     let state = app.state::<Shell>();
     // Attribute the whole pre-connect stall — the wedge ladder and the old
     // tunnel's teardown below — to the row's "probing" label (the same one
     // `connect` re-emits when it starts).
     emit_progress(app, alias, "probing");
+    if let Some(owner) = state.pro.owner().cloned() {
+        if let Some(reply) = owner
+            .connect(app.clone(), alias.into(), update_daemon, intent)
+            .await?
+        {
+            return Ok(reply);
+        }
+    }
     // Remove under the map lock, then do process/network teardown without it.
     // `Tunnel::close` is bounded but still asynchronous; holding this lock made
     // one dead host freeze health checks and commands for every other host.
@@ -479,7 +568,7 @@ async fn run_flight(
     let tunnel = match result {
         Ok(tunnel) => tunnel,
         Err(e) => match e.downcast_ref::<chimaera_remote::ClusterHost>() {
-            Some(found) => return Ok(landed_on_cluster(app, alias, found).await),
+            Some(found) => return Ok(landed_on_cluster(app, alias, found, None).await),
             None => return Err(format!("{e:#}")),
         },
     };
@@ -520,10 +609,76 @@ async fn run_flight(
     Ok(host_state)
 }
 
+fn keeper_route_selected(direct_ssh: bool, signed_in: bool, known_keeper: bool) -> bool {
+    !direct_ssh && signed_in && known_keeper
+}
+
+/// Drop saved windows on the account's cloud (an older build could open one):
+/// they would only ever show the cloud's own page, which the app never opens.
+pub(crate) fn forget_cloud_windows(state: &Shell, alias: &str) {
+    let mut registry = lock(&state.registry);
+    let saved: Vec<String> = registry
+        .list()
+        .into_iter()
+        .filter(|record| record.alias.as_deref() == Some(alias))
+        .map(|record| record.id)
+        .collect();
+    if !saved.is_empty() {
+        tracing::info!(
+            "not restoring {} saved window(s) on {alias}: the app never opens the cloud's own page",
+            saved.len()
+        );
+    }
+    for id in saved {
+        registry.remove(&id);
+    }
+}
+
+pub(crate) async fn remove_current_keeper_tunnel<T>(
+    tunnels: &tokio::sync::Mutex<std::collections::HashMap<String, T>>,
+    alias: &str,
+    current: impl Fn() -> bool,
+) -> Result<Option<T>, String> {
+    let mut tunnels = tunnels.lock().await;
+    if !current() {
+        return Err("Account changed while connecting".into());
+    }
+    Ok(tunnels.remove(alias))
+}
+
+type KeeperLandingAuthority = std::sync::Arc<tokio::sync::OwnedMutexGuard<()>>;
+
+pub(super) fn keeper_state(host: &chimaera_link::Host, tunnel: Option<&Tunnel>) -> HostState {
+    let entry = HostEntry {
+        alias: host.alias.clone(),
+        binary: None,
+        added_at: 0,
+        last_connected_at: None,
+        kept: true,
+        direct_ssh: false,
+        login_serve: false,
+        cluster_setup_complete: false,
+        not_cluster: false,
+        scheduler: None,
+    };
+    let status = match host.status {
+        chimaera_link::HostStatus::Connecting | chimaera_link::HostStatus::Prompting => {
+            "connecting"
+        }
+        chimaera_link::HostStatus::Connected if tunnel.is_some() => "connected",
+        _ => "disconnected",
+    };
+    let mut state = state_for(&entry, status, tunnel);
+    state.via_pro = tunnel.is_none_or(|tunnel| tunnel.link_id().is_some());
+    state.error = host.error.clone();
+    state.direct_ssh = (host.kind == chimaera_link::HostKind::Ssh).then_some(false);
+    state
+}
+
 /// Open every persisted window record for `alias` without a live window
 /// (matched on the record's stable id — an open window re-homes in place
 /// and must not be duplicated).
-fn reopen_windows(app: &AppHandle, alias: &str, port: u16, token: &str) {
+pub(crate) fn reopen_windows(app: &AppHandle, alias: &str, port: u16, token: &str) {
     let Some(shell) = app.try_state::<Shell>() else {
         return;
     };
@@ -593,10 +748,11 @@ async fn drop_compute_tunnels_of(app: &AppHandle, state: &Shell, alias: &str) {
 /// The connect landed on a cluster: nothing was started. Remember what it
 /// found, forget windows that pointed at a login-node daemon (there is none
 /// now), and answer with the cluster's state — a success, not an error.
-async fn landed_on_cluster(
+pub(crate) async fn landed_on_cluster(
     app: &AppHandle,
     alias: &str,
     found: &chimaera_remote::ClusterHost,
+    authority: Option<KeeperLandingAuthority>,
 ) -> HostState {
     let state = app.state::<Shell>();
     let info = super::cluster::ClusterInfo {
@@ -610,7 +766,11 @@ async fn landed_on_cluster(
     let entry = {
         let alias = alias.to_string();
         let scheduler = found.scheduler;
+        let persistence_authority = authority.clone();
         with_hosts(move |hosts| {
+            // Blocking persistence outlives a canceled native future. It must
+            // retain account ownership until its final file write completes.
+            let _authority = persistence_authority;
             let stamped = hosts.record_connected(&alias)?;
             Ok(hosts
                 .record_scheduler(&alias, scheduler)?
@@ -623,6 +783,8 @@ async fn landed_on_cluster(
         binary: None,
         added_at: 0,
         last_connected_at: None,
+        kept: false,
+        direct_ssh: false,
         login_serve: false,
         cluster_setup_complete: false,
         not_cluster: false,
@@ -669,7 +831,7 @@ async fn cluster_state(state: &Shell, alias: &str) -> Option<HostState> {
     Some(state_for(&entry, "cluster", None).with_cluster(&entry, Some(&info)))
 }
 
-async fn host_entry(alias: &str) -> HostEntry {
+pub(crate) async fn host_entry(alias: &str) -> HostEntry {
     let owned = alias.to_string();
     with_hosts(move |hosts| Ok(hosts.get(&owned)))
         .await
@@ -680,6 +842,8 @@ async fn host_entry(alias: &str) -> HostEntry {
             binary: None,
             added_at: 0,
             last_connected_at: None,
+            kept: false,
+            direct_ssh: false,
             login_serve: false,
             cluster_setup_complete: false,
             not_cluster: false,
@@ -700,7 +864,7 @@ static HOSTS_IO: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// on the tokio reactor, where a slow home directory would stall every other
 /// tunnel op. The closure's error is flattened here so call sites are a
 /// plain `?`.
-pub(super) async fn with_hosts<T: Send + 'static>(
+pub(crate) async fn with_hosts<T: Send + 'static>(
     f: impl FnOnce(&mut HostsStore) -> anyhow::Result<T> + Send + 'static,
 ) -> Result<T, String> {
     let _serialized = HOSTS_IO.lock().await;
@@ -717,6 +881,110 @@ mod tests {
 
     use super::{claim_connect_flight, connected_status, reusable_tunnel_port};
     use crate::shell::lock;
+    use chimaera_link::{Daemon, Host, HostKind, HostStatus};
+
+    #[test]
+    fn saved_direct_choice_overrides_known_keeper_without_changing_kept_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-direct-choice-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hosts.json");
+        let mut hosts = chimaera_remote::hosts::HostsStore::load(path.clone());
+        hosts.set_kept("cluster", true).unwrap();
+        hosts.set_direct_ssh("cluster", true).unwrap();
+        let saved = chimaera_remote::hosts::HostsStore::load(path)
+            .get("cluster")
+            .unwrap();
+        assert!(saved.kept);
+        assert!(!super::keeper_route_selected(saved.direct_ssh, true, true));
+        assert!(crate::shell::pro::direct_ssh_bypass(saved.direct_ssh, false).unwrap());
+        assert!(crate::shell::pro::direct_ssh_bypass(saved.direct_ssh, true).is_err());
+        assert!(super::keeper_route_selected(false, true, true));
+        assert!(!super::keeper_route_selected(false, false, true));
+        let device = Host {
+            kind: HostKind::Device,
+            ..row(HostStatus::Connected, true)
+        };
+        let wire = serde_json::to_value(super::keeper_state(&device, None)).unwrap();
+        assert!(
+            wire.get("direct_ssh").is_none(),
+            "device rows must not offer an SSH toggle"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn row(status: HostStatus, daemon: bool) -> Host {
+        Host {
+            id: "h-1".into(),
+            alias: "hpc".into(),
+            kind: HostKind::Ssh,
+            status,
+            daemon: daemon.then(|| Daemon {
+                token: "t".into(),
+                build: "b".into(),
+                sessions: 0,
+            }),
+            error: None,
+            cluster: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn old_keeper_flight_cannot_remove_a_replacement_tunnel_after_waiting() {
+        use std::sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        };
+        let tunnels = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let generation = Arc::new(AtomicU64::new(1));
+        let mut held = tunnels.lock().await;
+        held.insert("host".into(), "old");
+        let waiting = tunnels.clone();
+        let epoch = generation.clone();
+        let old = tokio::spawn(async move {
+            super::remove_current_keeper_tunnel(&waiting, "host", || {
+                epoch.load(Ordering::SeqCst) == 1
+            })
+            .await
+        });
+        tokio::task::yield_now().await;
+        generation.store(2, Ordering::SeqCst);
+        held.insert("host".into(), "replacement");
+        drop(held);
+        assert!(old.await.unwrap().is_err());
+        assert_eq!(tunnels.lock().await.get("host"), Some(&"replacement"));
+    }
+
+    #[test]
+    fn a_direct_host_row_keeps_the_original_wire_shape() {
+        let mut entry = super::HostEntry {
+            alias: "hpc".into(),
+            binary: None,
+            added_at: 0,
+            last_connected_at: None,
+            kept: false,
+            direct_ssh: false,
+            login_serve: false,
+            cluster_setup_complete: false,
+            not_cluster: false,
+            scheduler: None,
+        };
+        let row = super::state_for(&entry, "disconnected", None).with_cluster(&entry, None);
+        let wire = serde_json::to_value(row.clone().offer_direct_ssh(false)).unwrap();
+        for added in ["via_pro", "kept", "direct_ssh"] {
+            assert!(wire.get(added).is_none(), "{added} leaked: {wire}");
+        }
+        // An account owner offers the choice while it is off.
+        let wire = serde_json::to_value(row.offer_direct_ssh(true)).unwrap();
+        assert_eq!(wire["direct_ssh"], false);
+        // A saved choice stays visible so it can be turned off.
+        entry.direct_ssh = true;
+        let row = super::state_for(&entry, "disconnected", None).with_cluster(&entry, None);
+        let wire = serde_json::to_value(row.offer_direct_ssh(false)).unwrap();
+        assert_eq!(wire["direct_ssh"], true);
+    }
 
     #[test]
     fn tunnel_port_is_reused_only_for_the_same_source_build() {

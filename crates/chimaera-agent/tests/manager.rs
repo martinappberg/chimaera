@@ -10,13 +10,16 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use chimaera_agent::claude::ClaudeAdapter;
-use chimaera_agent::driver::SpawnSpec;
+use chimaera_agent::driver::{AgentAdapter, DriverExit, DriverIo, SpawnSpec};
 use chimaera_agent::journal::SeqEvent;
 use chimaera_agent::model::{
     AgentCommand, AgentEvent, BackgroundTask, ContentBlock, RemoteControlState, ToolContent,
     ToolStatus, UserMessageState,
 };
-use chimaera_agent::{ChatManager, CommandQueueFull, EventHook, ExitHook, RETAINED_SENDS_MAX};
+use chimaera_agent::{
+    ChatManager, ClientIdState, CommandQueueFull, EventHook, ExitHook, SendCancelled, SendOutcome,
+    SendUncertain, RETAINED_SENDS_MAX,
+};
 
 const FAKE: &str = env!("CARGO_BIN_EXE_fake-claude");
 /// Ceiling per wait. Every wait here is condition-driven, so this only bounds
@@ -48,11 +51,131 @@ fn fixture() -> Fixture {
 }
 
 fn spec(id: &str, cwd: &Path, mode: &str) -> SpawnSpec {
-    SpawnSpec::new(
-        id,
-        vec![FAKE.to_string(), mode.to_string()],
-        cwd.to_path_buf(),
-    )
+    // Cross-built fixtures run the copied fake from their disposable VM share.
+    let fake = std::env::var("CHIMAERA_TEST_FAKE_CLAUDE").unwrap_or_else(|_| FAKE.into());
+    SpawnSpec::new(id, vec![fake, mode.to_string()], cwd.to_path_buf())
+}
+
+/// Durable send receipts belong to managed execution (work that can move to
+/// another machine); an ordinary chat keeps its send record in memory.
+fn durable_spec(id: &str, cwd: &Path, mode: &str) -> SpawnSpec {
+    let mut spec = spec(id, cwd, mode);
+    spec.managed_execution = true;
+    spec
+}
+
+/// The cleanup owner survives removal of the registry row. Synthetic agent,
+/// real managed process group; no provider, network or billing.
+#[cfg(unix)]
+#[tokio::test]
+async fn paused_cleanup_tracks_captured_child_after_registry_removal() {
+    let fx = fixture();
+    let mut launch = spec("s-captured-cleanup", &fx.cwd, "artifacts");
+    launch.managed_execution = true;
+    fx.manager.spawn(&ClaudeAdapter, launch).unwrap();
+    let attached = fx.manager.attach("s-captured-cleanup", 0).unwrap();
+    let mut seen = attached.replay;
+    let mut events = attached.live;
+    if !seen
+        .iter()
+        .any(|event| matches!(event.ev, AgentEvent::Init { .. }))
+    {
+        wait_for(&mut events, &mut seen, "initialization", |event| {
+            matches!(event, AgentEvent::Init { .. })
+        })
+        .await;
+    }
+    let mut captured = fx
+        .manager
+        .pause_commands("s-captured-cleanup")
+        .await
+        .unwrap();
+    assert!(captured.cleanup_pending());
+    assert!(fx.manager.remove("s-captured-cleanup").unwrap().alive);
+    assert!(fx.manager.process_group("s-captured-cleanup").is_none());
+    assert!(captured.cleanup_pending());
+    captured.fence();
+    tokio::time::timeout(WAIT, async {
+        while captured.cleanup_pending() {
+            captured.fence();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!captured.cleanup_pending());
+}
+
+/// Real Linux child/pipe/pump path, synthetic Claude protocol only. This is
+/// neither real CLI idle acceptance nor the supervisor's full process census.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn maintenance_exact_leader_drains_and_retains_ingress_until_resumed() {
+    let fx = fixture();
+    let mut launch = spec("s-maintenance", &fx.cwd, "artifacts");
+    launch.managed_execution = true;
+    launch.agent_version = Some(chimaera_agent::claude::TESTED_CLAUDE_VERSION.into());
+    fx.manager.spawn(&ClaudeAdapter, launch).unwrap();
+    let attached = fx.manager.attach("s-maintenance", 0).unwrap();
+    let mut seen = attached.replay;
+    let mut events = attached.live;
+    if !seen
+        .iter()
+        .any(|entry| matches!(entry.ev, AgentEvent::Init { .. }))
+    {
+        wait_for(&mut events, &mut seen, "initialization", |event| {
+            matches!(event, AgentEvent::Init { .. })
+        })
+        .await;
+    }
+    assert!(fx.manager.maintenance_idle("s-maintenance").await.is_err());
+    fx.manager
+        .command(
+            "s-maintenance",
+            AgentCommand::Send {
+                blocks: vec![ContentBlock::Text {
+                    text: "synthetic idle turn".into(),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+    wait_for(&mut events, &mut seen, "completed turn", |event| {
+        matches!(event, AgentEvent::TurnCompleted { .. })
+    })
+    .await;
+    let idle = fx.manager.maintenance_idle("s-maintenance").await.unwrap();
+    let (mut idle, mut leader) = tokio::task::spawn_blocking(move || {
+        let mut leader = idle.pin_process().unwrap();
+        leader.request_stop().unwrap();
+        (idle, leader)
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !leader.is_stopped().unwrap() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let old_head = fx.manager.attach("s-maintenance", 0).unwrap().head_seq;
+    idle.drain(std::time::Instant::now() + std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+    idle.check().unwrap();
+    assert!(fx
+        .manager
+        .command("s-maintenance", AgentCommand::Interrupt)
+        .await
+        .is_err());
+    assert_eq!(
+        fx.manager.attach("s-maintenance", 0).unwrap().head_seq,
+        old_head
+    );
+    leader.resume().unwrap();
+    drop(idle);
+    assert!(fx.manager.kill("s-maintenance"));
 }
 
 /// Drain live events until the predicate matches; panics on timeout.
@@ -184,6 +307,12 @@ async fn full_turn_with_permission_allow_and_gap_replay() {
         fx.manager.get("s-1").unwrap().pending_permission,
         "info tracks the outstanding permission"
     );
+    let waiting = fx.manager.carryover("s-1").unwrap().awaiting_approval;
+    assert_eq!(
+        waiting.map(|w| (w.title, w.tool_call_id)),
+        Some(("Bash".to_string(), Some("tu-1".to_string()))),
+        "a stop now carries the open permission to the successor"
+    );
 
     fx.manager
         .command(
@@ -205,6 +334,12 @@ async fn full_turn_with_permission_allow_and_gap_replay() {
         matches!(ev, AgentEvent::PermissionResolved { .. })
     })
     .await;
+    assert!(fx
+        .manager
+        .carryover("s-1")
+        .unwrap()
+        .awaiting_approval
+        .is_none());
     wait_for(&mut rx, &mut seen, "ToolCallUpdate completed", |ev| {
         matches!(
             ev,
@@ -2734,6 +2869,949 @@ async fn conversation_settings_are_indexed_per_native_id() {
     // The other settings survived the mode write.
     assert_eq!(fx.manager.index().settings(&native).model, *model);
     assert!(fx.manager.kill("s-own"));
+}
+
+#[tokio::test]
+async fn managed_fence_stops_a_synthetic_process_during_stalled_handshake() {
+    let f = fixture();
+    let mut launch = SpawnSpec::new(
+        "managed-stalled",
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "trap '' TERM; sleep 60".into(),
+        ],
+        f.cwd.clone(),
+    );
+    launch.managed_execution = true;
+    launch.handshake_timeout = Duration::from_secs(60);
+    f.manager.spawn(&ClaudeAdapter, launch).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(f.manager.fence("managed-stalled"));
+    assert!(f
+        .manager
+        .command(
+            "managed-stalled",
+            AgentCommand::Send {
+                blocks: vec![ContentBlock::Text {
+                    text: "must not reach process".into()
+                }]
+            }
+        )
+        .await
+        .is_err());
+    tokio::time::timeout(Duration::from_secs(6), async {
+        while f
+            .manager
+            .get("managed-stalled")
+            .is_some_and(|info| info.alive)
+        {
+            f.manager.fence("managed-stalled");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn managed_fence_does_not_claim_containment_of_setsid_descendants() {
+    let f = fixture();
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::write(self.0.join("escape-stop"), b"stop");
+        }
+    }
+    let _cleanup = Cleanup(f.cwd.clone());
+    let mut launch = spec("managed-escape", &f.cwd, "detached-process-fixture");
+    launch.managed_execution = true;
+    launch.handshake_timeout = Duration::from_secs(60);
+    f.manager.spawn(&ClaudeAdapter, launch).unwrap();
+    let pulse = || {
+        std::fs::read_to_string(f.cwd.join("escape-heartbeat"))
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while pulse() == 0 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(f.manager.fence("managed-escape"));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while f
+            .manager
+            .get("managed-escape")
+            .is_some_and(|info| info.alive)
+        {
+            f.manager.fence("managed-escape");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let stopped_parent_pulse = pulse();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while pulse() <= stopped_parent_pulse {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("setsid child demonstrates why expired takeover is not advertised");
+    std::fs::write(f.cwd.join("escape-stop"), b"stop").unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !f.cwd.join("escape-done").exists() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+fn text_send(text: &str) -> AgentCommand {
+    AgentCommand::Send {
+        blocks: vec![ContentBlock::Text { text: text.into() }],
+    }
+}
+
+/// How many messages the journal holds under a client's send id.
+fn echoes_of(replay: &[Arc<SeqEvent>], client_id: &str) -> usize {
+    replay
+        .iter()
+        .filter(|e| {
+            matches!(&e.ev, AgentEvent::UserMessage { client_id: Some(id), .. } if id == client_id)
+        })
+        .count()
+}
+
+/// A send that arrives while the driver is still in its handshake is accepted
+/// at once (queued, with nothing in the journal yet). The client cannot see
+/// it there and sends it again under the same id: that copy must be dropped,
+/// or the agent would run the message twice.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_send_queued_during_the_handshake_is_accepted_once() {
+    let fx = fixture();
+    // The agent answers its handshake a moment late.
+    let launch = SpawnSpec::new(
+        "s-handshake",
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "sleep 1; exec \"$0\" normal".into(),
+            FAKE.to_string(),
+        ],
+        fx.cwd.clone(),
+    );
+    fx.manager.spawn(&ClaudeAdapter, launch).expect("spawn");
+    let att = fx.manager.attach("s-handshake", 0).expect("attach");
+    let mut seen = att.replay.clone();
+    let mut rx = att.live;
+    assert!(
+        !seen.iter().any(|e| matches!(e.ev, AgentEvent::Init { .. })),
+        "the handshake must still be running"
+    );
+
+    let outcome = fx
+        .manager
+        .send_from_client("s-handshake", text_send("once"), Some("client-handshake"))
+        .await
+        .expect("send");
+    assert_eq!(outcome, SendOutcome::Accepted);
+    assert_eq!(
+        fx.manager
+            .client_id_state("s-handshake", "client-handshake"),
+        Some(ClientIdState::Accepted)
+    );
+    // The client's resend, and a late cancel: neither changes anything.
+    let again = fx
+        .manager
+        .send_from_client("s-handshake", text_send("once"), Some("client-handshake"))
+        .await
+        .expect("resend");
+    assert_eq!(again, SendOutcome::Duplicate);
+    assert!(!fx
+        .manager
+        .cancel_send("s-handshake", "client-handshake")
+        .await
+        .unwrap());
+
+    let echo = wait_for(&mut rx, &mut seen, "the echo", |ev| {
+        matches!(ev, AgentEvent::UserMessage { .. })
+    })
+    .await;
+    assert!(
+        matches!(&echo.ev, AgentEvent::UserMessage { text, client_id: Some(id), .. }
+            if text == "once" && id == "client-handshake"),
+        "{:?}",
+        echo.ev
+    );
+    wait_for(&mut rx, &mut seen, "PermissionRequest", |ev| {
+        matches!(ev, AgentEvent::PermissionRequest { .. })
+    })
+    .await;
+    // One more resend after the echo, then the journal: one message, one turn.
+    let late = fx
+        .manager
+        .send_from_client("s-handshake", text_send("once"), Some("client-handshake"))
+        .await
+        .expect("late resend");
+    assert_eq!(late, SendOutcome::Duplicate);
+    let replay = fx.manager.attach("s-handshake", 0).expect("attach").replay;
+    assert_eq!(echoes_of(&replay, "client-handshake"), 1);
+    assert_eq!(
+        replay
+            .iter()
+            .filter(|e| matches!(e.ev, AgentEvent::UserMessage { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        replay
+            .iter()
+            .filter(|e| matches!(e.ev, AgentEvent::TurnStarted { .. }))
+            .count(),
+        1
+    );
+    assert!(fx.manager.kill("s-handshake"));
+}
+
+/// The record of accepted ids is read back from the journal, so a daemon
+/// that restarted (a new manager over the same journal) still drops a resend
+/// of a message its previous life delivered.
+#[tokio::test]
+async fn a_send_id_in_the_journal_is_still_refused_after_a_restart() {
+    let mut fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-restart", &fx.cwd, "normal"))
+        .expect("spawn");
+    let att = fx.manager.attach("s-restart", 0).expect("attach");
+    let mut seen = att.replay.clone();
+    let mut rx = att.live;
+    let outcome = fx
+        .manager
+        .send_from_client("s-restart", text_send("before"), Some("client-before"))
+        .await
+        .expect("send");
+    assert_eq!(outcome, SendOutcome::Accepted);
+    wait_for(&mut rx, &mut seen, "the echo", |ev| {
+        matches!(ev, AgentEvent::UserMessage { client_id: Some(id), .. } if id == "client-before")
+    })
+    .await;
+    assert!(fx.manager.kill("s-restart"));
+    tokio::time::timeout(WAIT, fx.exits.recv())
+        .await
+        .expect("exit hook fired")
+        .expect("channel open");
+
+    let restarted = Arc::new(ChatManager::new(
+        fx.manager.journal_dir().clone(),
+        Box::new(|_, _| {}),
+        Box::new(|_, _| {}),
+    ));
+    restarted
+        .spawn(&ClaudeAdapter, spec("s-restart", &fx.cwd, "normal"))
+        .expect("spawn again");
+    assert_eq!(
+        restarted.client_id_state("s-restart", "client-before"),
+        Some(ClientIdState::Confirmed)
+    );
+    let again = restarted
+        .send_from_client("s-restart", text_send("before"), Some("client-before"))
+        .await
+        .expect("resend");
+    assert_eq!(again, SendOutcome::Duplicate);
+    // A different id is a different message.
+    let other = restarted
+        .send_from_client("s-restart", text_send("after"), Some("client-after1"))
+        .await
+        .expect("send");
+    assert_eq!(other, SendOutcome::Accepted);
+    // The reopened journal's history is on disk: read it off the runtime.
+    let attach = |manager: Arc<ChatManager>| async move {
+        tokio::task::spawn_blocking(move || manager.attach("s-restart", 0).expect("attach"))
+            .await
+            .expect("attach task")
+    };
+    let att = attach(Arc::clone(&restarted)).await;
+    let mut seen = att.replay.clone();
+    let mut rx = att.live;
+    if echoes_of(&seen, "client-after1") == 0 {
+        wait_for(&mut rx, &mut seen, "the second echo", |ev| {
+            matches!(ev, AgentEvent::UserMessage { client_id: Some(id), .. } if id == "client-after1")
+        })
+        .await;
+    }
+    let replay = attach(Arc::clone(&restarted)).await.replay;
+    assert_eq!(echoes_of(&replay, "client-before"), 1);
+    assert_eq!(echoes_of(&replay, "client-after1"), 1);
+    assert!(restarted.kill("s-restart"));
+}
+
+/// `cancel_send` wins only against a send that was never accepted: from then
+/// on that id is refused. Against an accepted one it loses and changes
+/// nothing.
+#[tokio::test]
+async fn cancel_send_wins_before_acceptance_and_loses_after() {
+    let fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-cancel", &fx.cwd, "normal"))
+        .expect("spawn");
+
+    assert!(fx
+        .manager
+        .cancel_send("s-cancel", "client-withdrawn")
+        .await
+        .unwrap());
+    let refused = fx
+        .manager
+        .send_from_client("s-cancel", text_send("late"), Some("client-withdrawn"))
+        .await
+        .expect_err("a cancelled id is refused");
+    assert!(
+        refused.downcast_ref::<SendCancelled>().is_some(),
+        "{refused}"
+    );
+
+    let att = fx.manager.attach("s-cancel", 0).expect("attach");
+    let mut seen = att.replay.clone();
+    let mut rx = att.live;
+    let outcome = fx
+        .manager
+        .send_from_client("s-cancel", text_send("kept"), Some("client-accepted"))
+        .await
+        .expect("send");
+    assert_eq!(outcome, SendOutcome::Accepted);
+    assert!(!fx
+        .manager
+        .cancel_send("s-cancel", "client-accepted")
+        .await
+        .unwrap());
+    wait_for(&mut rx, &mut seen, "the echo", |ev| {
+        matches!(ev, AgentEvent::UserMessage { client_id: Some(id), .. } if id == "client-accepted")
+    })
+    .await;
+    assert!(!fx
+        .manager
+        .cancel_send("s-cancel", "client-accepted")
+        .await
+        .unwrap());
+    let replay = fx.manager.attach("s-cancel", 0).expect("attach").replay;
+    assert_eq!(echoes_of(&replay, "client-withdrawn"), 0);
+    assert!(
+        !replay
+            .iter()
+            .any(|e| matches!(&e.ev, AgentEvent::UserMessage { text, .. } if text == "late")),
+        "a cancelled send never reaches the agent"
+    );
+    assert!(fx.manager.kill("s-cancel"));
+}
+
+/// A send at the text limit, full of characters JSON escapes six to one, is
+/// several times too long for one journal line. Its echo is still journaled
+/// with both ids (the text cut), so the client confirms it, a resend is
+/// dropped, and the next daemon life still knows the id.
+#[tokio::test]
+async fn a_send_too_long_for_one_journal_line_keeps_its_ids_and_runs_once() {
+    use chimaera_agent::model::COMMAND_TEXT_TOTAL_MAX;
+    let mut fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-large", &fx.cwd, "normal"))
+        .expect("spawn");
+    let att = fx.manager.attach("s-large", 0).expect("attach");
+    let mut seen = att.replay.clone();
+    let mut rx = att.live;
+    let unit = "\u{1}\"\\\u{7f}";
+    let mut text = String::from("START ");
+    while text.len() + unit.len() + 4 <= COMMAND_TEXT_TOTAL_MAX {
+        text.push_str(unit);
+    }
+    text.push_str(" END");
+    let outcome = fx
+        .manager
+        .send_from_client("s-large", text_send(&text), Some("client-large"))
+        .await
+        .expect("a send at the limit passes ingress");
+    assert_eq!(outcome, SendOutcome::Accepted);
+    let echo = wait_for(&mut rx, &mut seen, "the echo", |ev| {
+        matches!(
+            ev,
+            AgentEvent::UserMessage { .. } | AgentEvent::Error { .. }
+        )
+    })
+    .await;
+    let AgentEvent::UserMessage {
+        text: kept,
+        id: Some(_),
+        client_id: Some(client_id),
+        ..
+    } = &echo.ev
+    else {
+        panic!("the echo lost its ids: {:?}", echo.ev);
+    };
+    assert_eq!(client_id, "client-large");
+    assert!(kept.starts_with("START ") && kept.ends_with(" END"));
+    assert!(kept.len() < text.len() && kept.contains("bytes omitted"));
+    let again = fx
+        .manager
+        .send_from_client("s-large", text_send(&text), Some("client-large"))
+        .await
+        .expect("resend");
+    assert_eq!(again, SendOutcome::Duplicate);
+
+    assert!(fx.manager.kill("s-large"));
+    tokio::time::timeout(WAIT, fx.exits.recv())
+        .await
+        .expect("exit hook fired")
+        .expect("channel open");
+    let restarted = Arc::new(ChatManager::new(
+        fx.manager.journal_dir().clone(),
+        Box::new(|_, _| {}),
+        Box::new(|_, _| {}),
+    ));
+    restarted
+        .spawn(&ClaudeAdapter, spec("s-large", &fx.cwd, "normal"))
+        .expect("spawn again");
+    let after = restarted
+        .send_from_client("s-large", text_send(&text), Some("client-large"))
+        .await
+        .expect("resend after the restart");
+    assert_eq!(after, SendOutcome::Duplicate);
+    assert!(restarted.kill("s-large"));
+}
+
+/// A confirmed withdrawal belongs to the logical conversation, including its
+/// next process and a new daemon manager. A delayed original never runs there.
+#[tokio::test]
+async fn a_withdrawn_send_id_survives_process_replacement_and_restart() {
+    let mut fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, durable_spec("s-keeps", &fx.cwd, "normal"))
+        .unwrap();
+    assert!(fx
+        .manager
+        .cancel_send("s-keeps", "client-withdrawn")
+        .await
+        .unwrap());
+    assert!(fx.manager.kill("s-keeps"));
+    tokio::time::timeout(WAIT, fx.exits.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(fx.manager.remove("s-keeps").is_some());
+    fx.manager
+        .spawn(&ClaudeAdapter, durable_spec("s-keeps", &fx.cwd, "normal"))
+        .unwrap();
+    assert_eq!(
+        fx.manager.client_id_state("s-keeps", "client-withdrawn"),
+        Some(ClientIdState::Cancelled)
+    );
+    let late = fx
+        .manager
+        .send_from_client("s-keeps", text_send("late"), Some("client-withdrawn"))
+        .await
+        .unwrap_err();
+    assert!(late.downcast_ref::<SendCancelled>().is_some());
+    assert!(fx.manager.kill("s-keeps"));
+    tokio::time::timeout(WAIT, fx.exits.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    fx.manager.remove("s-keeps");
+    let restarted = Arc::new(ChatManager::new(
+        fx.manager.journal_dir().clone(),
+        Box::new(|_, _| {}),
+        Box::new(|_, _| {}),
+    ));
+    restarted
+        .spawn(&ClaudeAdapter, durable_spec("s-keeps", &fx.cwd, "normal"))
+        .unwrap();
+    assert!(restarted
+        .cancel_send("s-keeps", "client-withdrawn")
+        .await
+        .unwrap());
+    let late = restarted
+        .send_from_client("s-keeps", text_send("late"), Some("client-withdrawn"))
+        .await
+        .unwrap_err();
+    assert!(late.downcast_ref::<SendCancelled>().is_some());
+    assert!(restarted.kill("s-keeps"));
+}
+
+/// Receipt boundary fixture: accepts manager commands but emits no optimistic
+/// echo. This models an agent receiving stdin just before daemon/driver loss.
+struct ReceiptlessAdapter {
+    received: mpsc::UnboundedSender<AgentCommand>,
+    drain: tokio::sync::watch::Receiver<bool>,
+}
+
+struct QueuedReceiptAdapter {
+    settle: bool,
+    cancel: bool,
+}
+impl AgentAdapter for QueuedReceiptAdapter {
+    fn kind(&self) -> &'static str {
+        "claude"
+    }
+    fn spawn(
+        &self,
+        _spec: SpawnSpec,
+        mut io: DriverIo,
+    ) -> anyhow::Result<tokio::task::JoinHandle<DriverExit>> {
+        let settle = self.settle;
+        let cancel = self.cancel;
+        Ok(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = io.kill.changed() => return DriverExit::Killed,
+                    command = io.commands.recv() => match command {
+                        Some(_) => {
+                            let echo = AgentEvent::UserMessage { text:"queued".into(), attachments:0, id:Some("driver-queued".into()), queued:true, after_turn:true, origin:None, client_id:None, attachment_paths:vec![] };
+                            if io.events.send(echo).await.is_err() { return DriverExit::Killed; }
+                            if settle && io.events.send(AgentEvent::UserMessageUpdate { id:"driver-queued".into(), state:chimaera_agent::model::UserMessageState::Sent }).await.is_err() { return DriverExit::Killed; }
+                            if cancel && io.events.send(AgentEvent::UserMessageUpdate { id:"driver-queued".into(), state:chimaera_agent::model::UserMessageState::Cancelled }).await.is_err() { return DriverExit::Killed; }
+                        },
+                        None => return DriverExit::Clean(None),
+                    }
+                }
+            }
+        }))
+    }
+}
+
+#[tokio::test]
+async fn queued_echo_is_uncertain_after_replacement_but_sent_update_confirms_it() {
+    for settle in [false, true] {
+        let mut fx = fixture();
+        let adapter = QueuedReceiptAdapter {
+            settle,
+            cancel: false,
+        };
+        fx.manager
+            .spawn(
+                &adapter,
+                durable_spec("s-queued-receipt", &fx.cwd, "normal"),
+            )
+            .unwrap();
+        let mut live = fx.manager.attach("s-queued-receipt", 0).unwrap().live;
+        fx.manager
+            .send_from_client(
+                "s-queued-receipt",
+                text_send("queued"),
+                Some("client-queued"),
+            )
+            .await
+            .unwrap();
+        loop {
+            let event = tokio::time::timeout(WAIT, live.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if matches!(&event.ev, AgentEvent::UserMessage { client_id:Some(id), queued:true, .. } if id == "client-queued")
+                && !settle
+            {
+                break;
+            }
+            if settle
+                && matches!(
+                    &event.ev,
+                    AgentEvent::UserMessageUpdate {
+                        state: chimaera_agent::model::UserMessageState::Sent,
+                        ..
+                    }
+                )
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            fx.manager
+                .client_id_state("s-queued-receipt", "client-queued"),
+            Some(if settle {
+                ClientIdState::Confirmed
+            } else {
+                ClientIdState::Accepted
+            })
+        );
+        assert_eq!(
+            fx.manager.active_queued_ids("s-queued-receipt"),
+            if settle {
+                Vec::<String>::new()
+            } else {
+                vec!["client-queued".to_owned()]
+            }
+        );
+        assert!(fx.manager.kill("s-queued-receipt"));
+        tokio::time::timeout(WAIT, fx.exits.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        fx.manager.remove("s-queued-receipt");
+        let restarted = Arc::new(ChatManager::new(
+            fx.manager.journal_dir().clone(),
+            Box::new(|_, _| {}),
+            Box::new(|_, _| {}),
+        ));
+        restarted
+            .spawn(
+                &adapter,
+                durable_spec("s-queued-receipt", &fx.cwd, "normal"),
+            )
+            .unwrap();
+        assert_eq!(
+            restarted.client_id_state("s-queued-receipt", "client-queued"),
+            Some(if settle {
+                ClientIdState::Confirmed
+            } else {
+                ClientIdState::Uncertain
+            })
+        );
+        let resend = restarted
+            .send_from_client(
+                "s-queued-receipt",
+                text_send("queued"),
+                Some("client-queued"),
+            )
+            .await;
+        if settle {
+            assert_eq!(resend.unwrap(), SendOutcome::Duplicate);
+        } else {
+            assert!(resend
+                .unwrap_err()
+                .downcast_ref::<SendUncertain>()
+                .is_some());
+        }
+        assert!(restarted.kill("s-queued-receipt"));
+    }
+}
+
+#[tokio::test]
+async fn live_queued_cancellations_release_the_durable_cap_and_late_cancel_cannot_revoke_sent() {
+    for settle in [false, true] {
+        let mut fx = fixture();
+        let adapter = QueuedReceiptAdapter {
+            settle,
+            cancel: true,
+        };
+        fx.manager
+            .spawn(&adapter, durable_spec("s-cancel-queue", &fx.cwd, "normal"))
+            .unwrap();
+        let mut live = fx.manager.attach("s-cancel-queue", 0).unwrap().live;
+        for n in 0..70 {
+            let id = format!("client-cancel-{n:03}");
+            assert_eq!(
+                fx.manager
+                    .send_from_client("s-cancel-queue", text_send("queued"), Some(&id))
+                    .await
+                    .unwrap(),
+                SendOutcome::Accepted
+            );
+            loop {
+                let event = tokio::time::timeout(WAIT, live.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if matches!(
+                    &event.ev,
+                    AgentEvent::UserMessageUpdate {
+                        state: chimaera_agent::model::UserMessageState::Cancelled,
+                        ..
+                    }
+                ) {
+                    break;
+                }
+            }
+            assert_eq!(
+                fx.manager.client_id_state("s-cancel-queue", &id),
+                Some(if settle {
+                    ClientIdState::Confirmed
+                } else {
+                    ClientIdState::Cancelled
+                })
+            );
+        }
+        assert_eq!(
+            fx.manager
+                .send_from_client(
+                    "s-cancel-queue",
+                    text_send("still admissible"),
+                    Some("client-after-cycles")
+                )
+                .await
+                .unwrap(),
+            SendOutcome::Accepted
+        );
+        assert!(fx.manager.kill("s-cancel-queue"));
+        tokio::time::timeout(WAIT, fx.exits.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        fx.manager.remove("s-cancel-queue");
+        fx.manager
+            .spawn(&adapter, durable_spec("s-cancel-queue", &fx.cwd, "normal"))
+            .unwrap();
+        assert_eq!(
+            fx.manager
+                .client_id_state("s-cancel-queue", "client-cancel-000"),
+            Some(if settle {
+                ClientIdState::Confirmed
+            } else {
+                ClientIdState::Cancelled
+            })
+        );
+        assert!(fx.manager.kill("s-cancel-queue"));
+    }
+}
+impl AgentAdapter for ReceiptlessAdapter {
+    fn kind(&self) -> &'static str {
+        "claude"
+    }
+    fn spawn(
+        &self,
+        _spec: SpawnSpec,
+        mut io: DriverIo,
+    ) -> anyhow::Result<tokio::task::JoinHandle<DriverExit>> {
+        let received = self.received.clone();
+        let mut drain = self.drain.clone();
+        Ok(tokio::spawn(async move {
+            while !*drain.borrow_and_update() {
+                tokio::select! {
+                    _ = io.kill.changed() => return DriverExit::Killed,
+                    _ = drain.changed() => {},
+                }
+            }
+            loop {
+                tokio::select! {
+                    _ = io.kill.changed() => return DriverExit::Killed,
+                    command = io.commands.recv() => match command {
+                        Some(command) => { let _ = received.send(command); },
+                        None => return DriverExit::Clean(None),
+                    }
+                }
+            }
+        }))
+    }
+}
+
+#[tokio::test]
+async fn a_received_send_without_an_echo_is_uncertain_after_restart_and_never_replayed() {
+    let mut fx = fixture();
+    let (_drain, drain) = tokio::sync::watch::channel(true);
+    let (received, mut commands) = mpsc::unbounded_channel();
+    let adapter = ReceiptlessAdapter { received, drain };
+    fx.manager
+        .spawn(&adapter, durable_spec("s-unknown", &fx.cwd, "normal"))
+        .unwrap();
+    assert_eq!(
+        fx.manager
+            .send_from_client("s-unknown", text_send("once"), Some("client-unknown"))
+            .await
+            .unwrap(),
+        SendOutcome::Accepted
+    );
+    tokio::time::timeout(WAIT, commands.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(fx.manager.kill("s-unknown"));
+    tokio::time::timeout(WAIT, fx.exits.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        fx.manager.client_id_state("s-unknown", "client-unknown"),
+        Some(ClientIdState::Uncertain)
+    );
+    fx.manager.remove("s-unknown");
+    assert_eq!(
+        fx.manager.client_id_state("s-unknown", "client-unknown"),
+        Some(ClientIdState::Uncertain)
+    );
+    assert!(fx
+        .manager
+        .send_from_client("s-unknown", text_send("once"), Some("client-unknown"))
+        .await
+        .unwrap_err()
+        .downcast_ref::<SendUncertain>()
+        .is_some());
+    assert!(fx
+        .manager
+        .cancel_send("s-unknown", "client-unknown")
+        .await
+        .unwrap_err()
+        .downcast_ref::<SendUncertain>()
+        .is_some());
+    let restarted = Arc::new(ChatManager::new(
+        fx.manager.journal_dir().clone(),
+        Box::new(|_, _| {}),
+        Box::new(|_, _| {}),
+    ));
+    restarted
+        .spawn(&adapter, durable_spec("s-unknown", &fx.cwd, "normal"))
+        .unwrap();
+    let resend = restarted
+        .send_from_client("s-unknown", text_send("once"), Some("client-unknown"))
+        .await
+        .unwrap_err();
+    assert!(resend.downcast_ref::<SendUncertain>().is_some());
+    let cancel = restarted
+        .cancel_send("s-unknown", "client-unknown")
+        .await
+        .unwrap_err();
+    assert!(cancel.downcast_ref::<SendUncertain>().is_some());
+    assert!(
+        commands.try_recv().is_err(),
+        "the agent must not receive a second command"
+    );
+    assert!(restarted.kill("s-unknown"));
+}
+
+#[tokio::test]
+async fn an_independent_receipt_without_journal_echo_is_confirmed_and_never_resent() {
+    let fx = fixture();
+    let payload = serde_json::to_vec(&serde_json::json!({"version":1,"session_id":"s-receipt","entries":[{"id":"client-confirmed","state":"confirmed"}]})).unwrap();
+    chimaera_agent::journal::import_send_state(fx.manager.journal_dir(), "s-receipt", &payload)
+        .unwrap();
+    let (_drain, drain) = tokio::sync::watch::channel(true);
+    let (received, mut commands) = mpsc::unbounded_channel();
+    let adapter = ReceiptlessAdapter { received, drain };
+    fx.manager
+        .spawn(&adapter, durable_spec("s-receipt", &fx.cwd, "normal"))
+        .unwrap();
+    assert_eq!(
+        fx.manager.client_id_state("s-receipt", "client-confirmed"),
+        Some(ClientIdState::Confirmed)
+    );
+    assert_eq!(
+        fx.manager
+            .send_from_client("s-receipt", text_send("once"), Some("client-confirmed"))
+            .await
+            .unwrap(),
+        SendOutcome::Duplicate
+    );
+    assert!(!fx
+        .manager
+        .cancel_send("s-receipt", "client-confirmed")
+        .await
+        .unwrap());
+    assert!(commands.try_recv().is_err());
+    assert_eq!(
+        fx.manager
+            .send_from_client(
+                "s-receipt",
+                text_send(&"x".repeat(chimaera_agent::model::COMMAND_TEXT_TOTAL_MAX + 1)),
+                Some("client-confirmed")
+            )
+            .await
+            .unwrap(),
+        SendOutcome::Duplicate
+    );
+    assert!(fx.manager.kill("s-receipt"));
+}
+
+#[tokio::test]
+async fn canceling_an_enqueue_before_the_channel_permit_is_proven_undispatched() {
+    let fx = fixture();
+    let (drain, held) = tokio::sync::watch::channel(false);
+    let (received, mut commands) = mpsc::unbounded_channel();
+    let adapter = ReceiptlessAdapter {
+        received,
+        drain: held,
+    };
+    fx.manager
+        .spawn(&adapter, durable_spec("s-backpressure", &fx.cwd, "normal"))
+        .unwrap();
+    // Fill the manager's bounded command channel without letting the driver
+    // receive. No persisted dispatch is needed for these unkeyed fixture sends.
+    for _ in 0..32 {
+        fx.manager
+            .command("s-backpressure", text_send("fill"))
+            .await
+            .unwrap();
+    }
+    let manager = fx.manager.clone();
+    let pending = tokio::spawn(async move {
+        manager
+            .send_from_client(
+                "s-backpressure",
+                text_send("retryable"),
+                Some("client-not-sent"),
+            )
+            .await
+    });
+    tokio::task::yield_now().await;
+    pending.abort();
+    let _ = pending.await;
+    assert_eq!(
+        fx.manager
+            .client_id_state("s-backpressure", "client-not-sent"),
+        None
+    );
+    drain.send(true).unwrap();
+    assert_eq!(
+        fx.manager
+            .send_from_client(
+                "s-backpressure",
+                text_send("retryable"),
+                Some("client-not-sent")
+            )
+            .await
+            .unwrap(),
+        SendOutcome::Accepted
+    );
+    for _ in 0..33 {
+        tokio::time::timeout(WAIT, commands.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert!(commands.try_recv().is_err());
+    assert!(fx.manager.kill("s-backpressure"));
+}
+
+#[tokio::test]
+async fn failed_dispatch_storage_and_failed_withdrawal_never_reach_the_driver() {
+    for cancel in [false, true] {
+        let fx = fixture();
+        let (_drain, drain) = tokio::sync::watch::channel(true);
+        let (received, mut commands) = mpsc::unbounded_channel();
+        let adapter = ReceiptlessAdapter { received, drain };
+        fx.manager
+            .spawn(&adapter, durable_spec("s-storage", &fx.cwd, "normal"))
+            .unwrap();
+        std::fs::create_dir(fx.manager.journal_dir().join("s-storage.send-state.json")).unwrap();
+        if cancel {
+            assert!(
+                fx.manager
+                    .cancel_send("s-storage", "client-storage")
+                    .await
+                    .is_err(),
+                "never acknowledge a withdrawal without durable evidence"
+            );
+        } else {
+            assert!(fx
+                .manager
+                .send_from_client("s-storage", text_send("never"), Some("client-storage"))
+                .await
+                .is_err());
+        }
+        let retry = fx
+            .manager
+            .send_from_client("s-storage", text_send("never"), Some("client-storage"))
+            .await
+            .unwrap_err();
+        assert!(
+            retry.downcast_ref::<SendUncertain>().is_some(),
+            "storage uncertainty must fail closed: {retry}"
+        );
+        assert!(commands.try_recv().is_err());
+        assert!(fx.manager.kill("s-storage"));
+    }
 }
 
 #[tokio::test]

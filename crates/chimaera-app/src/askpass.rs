@@ -140,6 +140,28 @@ struct PendingPrompt {
     alias: Option<String>,
     prompt: String,
     tx: oneshot::Sender<Option<String>>,
+    source: PromptSource,
+    kind: Option<PromptKind>,
+    route_guard: Option<std::sync::Arc<dyn PromptFence>>,
+    native_guard: Option<std::sync::Arc<dyn PromptFence>>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PromptSource {
+    Local,
+    Keeper {
+        host_id: String,
+        keeper_prompt_id: String,
+    },
+}
+
+/// Only the original native Connect verifier constructs host-key approval.
+/// Generic local and keeper challenges never infer this from prompt prose.
+#[derive(Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PromptKind {
+    HostKey { host: String, fingerprint: String },
 }
 
 #[derive(Debug, PartialEq)]
@@ -155,6 +177,22 @@ pub struct PromptEvent {
     id: u64,
     alias: Option<String>,
     prompt: String,
+    /// Absent for this computer's own ssh prompts (the original wire shape);
+    /// present only for a prompt relayed from elsewhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<PromptSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<PromptKind>,
+}
+
+impl PromptSource {
+    /// The event's `source` field: `None` for a local prompt.
+    fn on_wire(&self) -> Option<PromptSource> {
+        match self {
+            PromptSource::Local => None,
+            relayed => Some(relayed.clone()),
+        }
+    }
 }
 
 impl PromptEvent {
@@ -174,8 +212,29 @@ impl Askpass {
         prompt: String,
         tx: oneshot::Sender<Option<String>>,
     ) -> u64 {
+        self.register_source(alias, prompt, tx, PromptSource::Local)
+    }
+
+    fn register_source(
+        &self,
+        alias: Option<String>,
+        prompt: String,
+        tx: oneshot::Sender<Option<String>>,
+        source: PromptSource,
+    ) -> u64 {
         let id = self.seq.fetch_add(1, Ordering::Relaxed);
-        lock(&self.pending).insert(id, PendingPrompt { alias, prompt, tx });
+        lock(&self.pending).insert(
+            id,
+            PendingPrompt {
+                alias,
+                prompt,
+                tx,
+                source,
+                kind: None,
+                route_guard: None,
+                native_guard: None,
+            },
+        );
         id
     }
 
@@ -186,7 +245,7 @@ impl Askpass {
     /// Resolve a prompt only when the shell-owned caller scope is allowed to
     /// see its alias. Authorization and removal share one lock, so a caller
     /// cannot race a scope check against another answer.
-    pub fn answer_scoped(
+    pub(crate) fn answer_scoped(
         &self,
         id: u64,
         secret: Option<String>,
@@ -199,6 +258,18 @@ impl Askpass {
         if !window_scope.allows_askpass(prompt.alias.as_deref()) {
             return AnswerResult::Forbidden;
         }
+        if prompt
+            .route_guard
+            .as_ref()
+            .is_some_and(|guard| !guard.active())
+            || prompt
+                .native_guard
+                .as_ref()
+                .is_some_and(|guard| !guard.active())
+        {
+            pending.remove(&id);
+            return AnswerResult::Missing;
+        }
         let prompt = pending.remove(&id).expect("prompt checked above");
         let alias = prompt.alias.clone();
         let _ = prompt.tx.send(secret);
@@ -207,18 +278,238 @@ impl Askpass {
 
     /// Prompts this shell-owned caller scope may observe, oldest first (ssh
     /// asks sequentially, so order is answer order).
-    pub fn pending_scoped(&self, window_scope: &crate::shell::WindowScope) -> Vec<PromptEvent> {
+    pub(crate) fn pending_scoped(
+        &self,
+        window_scope: &crate::shell::WindowScope,
+    ) -> Vec<PromptEvent> {
         let mut prompts: Vec<PromptEvent> = lock(&self.pending)
             .iter()
             .filter(|(_, prompt)| window_scope.allows_askpass(prompt.alias.as_deref()))
+            .filter(|(_, _prompt)| {
+                {
+                    _prompt
+                        .route_guard
+                        .as_ref()
+                        .is_none_or(|guard| guard.active())
+                        && _prompt
+                            .native_guard
+                            .as_ref()
+                            .is_none_or(|guard| guard.active())
+                }
+            })
             .map(|(id, p)| PromptEvent {
                 id: *id,
                 alias: p.alias.clone(),
                 prompt: p.prompt.clone(),
+                source: p.source.on_wire(),
+                kind: p.kind.clone(),
             })
             .collect();
         prompts.sort_by_key(|p| p.id);
         prompts
+    }
+}
+
+/// First-use trust and local key unlock never borrow generic or keeper prompt
+/// authority. The original native Connect owner gates display and the answer.
+pub async fn native_owned_prompt(
+    app: &AppHandle,
+    alias: &str,
+    prompt: NativePrompt,
+    guard: std::sync::Arc<dyn PromptFence>,
+) -> Option<String> {
+    let kind = prompt.host_key.map(|key| PromptKind::HostKey {
+        host: key.host,
+        fingerprint: key.fingerprint,
+    });
+    let prompt = prompt.text;
+    if !guard.active() || prompt.is_empty() || prompt.len() > 16 * 1024 {
+        return None;
+    }
+    let askpass = app.state::<Askpass>();
+    let (tx, rx) = oneshot::channel();
+    let id = {
+        let mut pending = lock(&askpass.pending);
+        if pending.len() >= 64 {
+            return None;
+        }
+        let id = askpass.seq.fetch_add(1, Ordering::Relaxed);
+        pending.insert(
+            id,
+            PendingPrompt {
+                alias: Some(alias.into()),
+                prompt: prompt.clone(),
+                tx,
+                source: PromptSource::Local,
+                kind: kind.clone(),
+                route_guard: None,
+                native_guard: Some(guard.clone()),
+            },
+        );
+        id
+    };
+    struct Owner {
+        app: AppHandle,
+        alias: String,
+        id: u64,
+    }
+    impl Drop for Owner {
+        fn drop(&mut self) {
+            self.app.state::<Askpass>().discard(self.id);
+            emit_done(&self.app, self.id, Some(&self.alias));
+        }
+    }
+    let _owner = Owner {
+        app: app.clone(),
+        alias: alias.into(),
+        id,
+    };
+    emit_scoped(
+        app,
+        "ssh-askpass",
+        PromptEvent {
+            id,
+            alias: Some(alias.into()),
+            prompt,
+            source: None,
+            kind,
+        },
+        Some(alias),
+    );
+    let answer = tokio::select! {
+        biased;
+        _ = guard.stopped() => None,
+        result = rx => result.ok().flatten(),
+    };
+    answer.filter(|answer| guard.active() && answer.len() <= 16 * 1024)
+}
+
+/// Keeper prompts share local SSH's scope and timeout, but answers travel only
+/// on their original events connection. Dropping it cancels every pending input.
+pub fn relay_keeper(
+    app: &AppHandle,
+    alias: String,
+    host_id: String,
+    keeper_prompt_id: String,
+    prompt: String,
+    commands: std::sync::Arc<dyn PromptAnswerSink>,
+) {
+    let guard = None;
+    relay_keeper_inner(
+        app,
+        alias,
+        host_id,
+        keeper_prompt_id,
+        prompt,
+        commands,
+        guard,
+    );
+}
+type KeeperGuard = Option<std::sync::Arc<dyn PromptFence>>;
+
+pub fn relay_keeper_route(
+    app: &AppHandle,
+    alias: String,
+    host_id: String,
+    keeper_prompt_id: String,
+    prompt: String,
+    commands: std::sync::Arc<dyn PromptAnswerSink>,
+    guard: std::sync::Arc<dyn PromptFence>,
+) {
+    let prompt = guard.prompt(&prompt);
+    relay_keeper_inner(
+        app,
+        alias,
+        host_id,
+        keeper_prompt_id,
+        prompt,
+        commands,
+        Some(guard),
+    );
+}
+fn relay_keeper_inner(
+    app: &AppHandle,
+    alias: String,
+    host_id: String,
+    keeper_prompt_id: String,
+    prompt: String,
+    commands: std::sync::Arc<dyn PromptAnswerSink>,
+    _guard: KeeperGuard,
+) {
+    if _guard.as_ref().is_some_and(|guard| !guard.active()) {
+        return;
+    }
+    let askpass = app.state::<Askpass>();
+    // The remote peer cannot grow the prompt table without bound.
+    if lock(&askpass.pending).len() >= 64 {
+        return;
+    }
+    let (tx, rx) = oneshot::channel();
+    let source = PromptSource::Keeper {
+        host_id,
+        keeper_prompt_id: keeper_prompt_id.clone(),
+    };
+    let id = askpass.register_source(Some(alias.clone()), prompt.clone(), tx, source.clone());
+    if let Some(pending) = lock(&askpass.pending).get_mut(&id) {
+        pending.route_guard = _guard.clone();
+    }
+    let event = PromptEvent {
+        id,
+        alias: Some(alias.clone()),
+        prompt,
+        source: source.on_wire(),
+        kind: None,
+    };
+    emit_scoped(app, "ssh-askpass", event, Some(&alias));
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let answer = match &_guard {
+            Some(guard) => tokio::select! {
+                biased;
+                _ = guard.stopped() => Ok(Ok(None)),
+                result = tokio::time::timeout(PROMPT_TIMEOUT, rx) => result,
+            },
+            None => tokio::time::timeout(PROMPT_TIMEOUT, rx).await,
+        };
+        app.state::<Askpass>().discard(id);
+        emit_done(&app, id, Some(&alias));
+        let value = match answer {
+            Ok(Ok(value)) => value,
+            Err(_) => None,
+            Ok(Err(_)) => return,
+        };
+        let value = if _guard.as_ref().is_some_and(|guard| !guard.active()) {
+            None
+        } else {
+            value
+        };
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            commands.answer(keeper_prompt_id, value),
+        )
+        .await;
+    });
+}
+
+pub fn close_keeper(app: &AppHandle, keeper_id: Option<&str>) {
+    let askpass = app.state::<Askpass>();
+    let closed: Vec<_> = {
+        let mut pending = lock(&askpass.pending);
+        let ids: Vec<_> = pending
+            .iter()
+            .filter_map(|(id, prompt)| match &prompt.source {
+                PromptSource::Keeper {
+                    keeper_prompt_id, ..
+                } if keeper_id.is_none_or(|wanted| wanted == keeper_prompt_id) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        ids.into_iter()
+            .filter_map(|id| pending.remove(&id).map(|prompt| (id, prompt.alias)))
+            .collect()
+    };
+    for (id, alias) in closed {
+        emit_done(app, id, alias.as_deref());
     }
 }
 
@@ -507,7 +798,13 @@ async fn resolve_prompt(app: &AppHandle, alias: Option<String>, prompt: String) 
     let (tx, rx) = oneshot::channel();
     let prompt = prompt.trim_end().to_string();
     let id = state.register(alias.clone(), prompt.clone(), tx);
-    let event = PromptEvent { id, alias, prompt };
+    let event = PromptEvent {
+        id,
+        alias,
+        prompt,
+        source: None,
+        kind: None,
+    };
     // Emit only to matching windows that are ALREADY listening. Windows that
     // mount later find this prompt through the equally scoped list command;
     // zero targets at emit time is fine during startup restore.
@@ -812,6 +1109,84 @@ mod tests {
     }
 
     #[test]
+    fn keeper_prompts_use_the_same_host_scope_and_preserve_source() {
+        let askpass = Askpass::default();
+        let (tx, rx) = oneshot::channel();
+        let id = askpass.register_source(
+            Some("cluster".into()),
+            "Duo code:".into(),
+            tx,
+            PromptSource::Keeper {
+                host_id: "host-1".into(),
+                keeper_prompt_id: "prompt-1".into(),
+            },
+        );
+        let foreign = crate::shell::WindowScope::new(
+            Some("other".into()),
+            Some("work".into()),
+            "other-window".into(),
+        );
+        assert!(askpass.pending_scoped(&foreign).is_empty());
+        assert_eq!(
+            askpass.answer_scoped(id, Some("wrong".into()), &foreign),
+            AnswerResult::Forbidden
+        );
+        let scope = crate::shell::WindowScope::new(
+            Some("cluster".into()),
+            Some("work".into()),
+            "cluster-window".into(),
+        );
+        let pending = askpass.pending_scoped(&scope);
+        assert!(
+            matches!(&pending[0].source, Some(PromptSource::Keeper { keeper_prompt_id, .. }) if keeper_prompt_id == "prompt-1")
+        );
+        assert_eq!(
+            askpass.answer_scoped(id, None, &scope),
+            AnswerResult::Answered(Some("cluster".into()))
+        );
+        assert_eq!(rx.blocking_recv().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn retired_injected_prompt_fence_blocks_pending_answers() {
+        struct Fence(tokio::sync::watch::Receiver<bool>);
+        impl PromptFence for Fence {
+            fn active(&self) -> bool {
+                !*self.0.borrow()
+            }
+            fn stopped(&self) -> crate::account::BorrowedTask<'_, ()> {
+                let mut stop = self.0.clone();
+                Box::pin(async move {
+                    let _ = stop.wait_for(|v| *v).await;
+                })
+            }
+        }
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        let guard: std::sync::Arc<dyn PromptFence> = std::sync::Arc::new(Fence(rx));
+        let askpass = Askpass::default();
+        let (tx, answer) = oneshot::channel();
+        let id = askpass.register_source(
+            Some("cluster".into()),
+            "Password:".into(),
+            tx,
+            PromptSource::Keeper {
+                host_id: "host".into(),
+                keeper_prompt_id: "wire".into(),
+            },
+        );
+        lock(&askpass.pending).get_mut(&id).unwrap().route_guard = Some(guard);
+        let scope = crate::shell::WindowScope::new(Some("cluster".into()), None, "window".into());
+        assert_eq!(askpass.pending_scoped(&scope).len(), 1);
+        stop.send_replace(true);
+        assert!(askpass.pending_scoped(&scope).is_empty());
+        assert!(matches!(
+            askpass.answer_scoped(id, Some("never forwarded".into()), &scope),
+            AnswerResult::Missing
+        ));
+        assert!(answer.await.is_err());
+    }
+
+    #[test]
     fn compute_prompts_require_an_explicit_login_host_scope() {
         let askpass = Askpass::default();
         let (tx, rx) = oneshot::channel();
@@ -843,4 +1218,52 @@ mod tests {
         );
         assert_eq!(rx.blocking_recv().unwrap(), Some("secret".into()));
     }
+
+    #[test]
+    fn a_local_prompt_keeps_the_original_wire_shape() {
+        let askpass = Askpass::default();
+        let (local_tx, _local_rx) = oneshot::channel();
+        askpass.register(Some("cluster".into()), "Password:".into(), local_tx);
+        let (relayed_tx, _relayed_rx) = oneshot::channel();
+        askpass.register_source(
+            Some("cluster".into()),
+            "Duo code:".into(),
+            relayed_tx,
+            PromptSource::Keeper {
+                host_id: "host-1".into(),
+                keeper_prompt_id: "prompt-1".into(),
+            },
+        );
+        let scope = crate::shell::WindowScope::new(Some("cluster".into()), None, "w".into());
+        let wire = serde_json::to_value(askpass.pending_scoped(&scope)).unwrap();
+        assert_eq!(
+            wire[0],
+            serde_json::json!({ "id": 0, "alias": "cluster", "prompt": "Password:" })
+        );
+        assert_eq!(wire[1]["source"]["type"], "keeper");
+    }
+}
+
+/// Original native authority. No account token, path or socket selector crosses it.
+pub trait PromptFence: Send + Sync {
+    fn active(&self) -> bool;
+    fn stopped(&self) -> crate::account::BorrowedTask<'_, ()>;
+    fn prompt(&self, text: &str) -> String {
+        text.to_owned()
+    }
+}
+pub trait PromptAnswerSink: Send + Sync {
+    fn answer(
+        &self,
+        original_id: String,
+        value: Option<String>,
+    ) -> crate::account::BorrowedTask<'_, ()>;
+}
+pub struct NativePrompt {
+    pub text: String,
+    pub host_key: Option<NativeHostKey>,
+}
+pub struct NativeHostKey {
+    pub host: String,
+    pub fingerprint: String,
 }

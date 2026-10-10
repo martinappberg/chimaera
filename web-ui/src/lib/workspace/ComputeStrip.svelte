@@ -2,9 +2,10 @@
   import { pageVisible } from "../shared/visibility";
   import {
     formatSlurmDuration,
-    parseSlurmTimeLeft,
+    secondsLeft,
     type ComputeSelf,
   } from "./compute";
+  import { CONTINUE_LAST_CALL_SECS } from "./cluster";
 
   interface Props {
     /** The daemon's own allocation (present in every compute-node window). */
@@ -29,12 +30,8 @@
   });
 
   /** Seconds left at the last fetch; null = not a duration (UNLIMITED, …). */
-  const baseline = $derived(parseSlurmTimeLeft(alloc.time_left));
-  const remaining = $derived(
-    baseline === null
-      ? null
-      : Math.max(0, baseline - Math.floor((now - receivedAt) / 1000)),
-  );
+  /** Seconds left; null = not a duration (UNLIMITED, …). */
+  const remaining = $derived(secondsLeft(alloc, receivedAt, now));
   const countdown = $derived(
     remaining === null
       ? // Slurm's %L emits INVALID/NOT_SET while a job transitions —
@@ -44,9 +41,13 @@
         ? "—"
         : alloc.time_left
       : remaining === 0
-        ? "expiring…"
+        ? "time's up"
         : formatSlurmDuration(remaining),
   );
+
+  /** The last ten minutes wear the caution colour: the countdown shows the
+   *  end coming without a banner saying so. */
+  const soon = $derived(remaining !== null && remaining < CONTINUE_LAST_CALL_SECS);
 
   /** "4 cpu · 16G · gpu:1" — omit whatever the wire left empty. */
   const resources = $derived.by(() => {
@@ -65,7 +66,7 @@
 <div
   class="compute-strip"
   role="status"
-  title={`slurm job ${alloc.job_id} on ${alloc.node} — expires at walltime`}
+  title={`slurm job ${alloc.job_id} on ${alloc.node} — ends at its time limit`}
 >
   <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
     <rect x="2" y="2" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
@@ -73,7 +74,7 @@
     <rect x="2" y="9" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
     <rect x="9" y="9" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
   </svg>
-  <span class="cs-time" class:expiring={remaining === 0}>{countdown}</span>
+  <span class="cs-time" class:expiring={soon}>{countdown}</span>
   {#if resources !== ""}
     <span class="cs-res">· {resources}</span>
   {/if}

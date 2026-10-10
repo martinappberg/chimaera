@@ -33,10 +33,21 @@ pub(crate) struct Toast {
     /// Unique per notice; built by [`toast_id`] so it round-trips the route.
     pub(crate) id: String,
     /// Grouping key (Notification Center stacks a workspace's alerts).
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(dead_code, reason = "only Notification Center consumes grouping")
+    )]
     pub(crate) thread: String,
     pub(crate) title: String,
     pub(crate) subtitle: String,
     pub(crate) body: String,
+    #[cfg_attr(
+        windows,
+        allow(
+            dead_code,
+            reason = "WinRT backend does not expose per-toast sound control"
+        )
+    )]
     pub(crate) sound: bool,
 }
 
@@ -81,10 +92,31 @@ pub(crate) fn parse_route(id: &str) -> Option<Route> {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Permission {
     Granted,
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(
+            dead_code,
+            reason = "permission states are reported by Notification Center"
+        )
+    )]
     Denied,
     /// Never asked — the first notification (or the settings button) asks.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(
+            dead_code,
+            reason = "permission states are reported by Notification Center"
+        )
+    )]
     NotDetermined,
     /// No notification service here (an unbundled dev build, no D-Bus).
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(
+            dead_code,
+            reason = "permission states are reported by Notification Center"
+        )
+    )]
     Unsupported,
 }
 

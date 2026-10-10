@@ -251,3 +251,30 @@ _Captured 2026-07-09 — drafted from docs/design/README.md + code, confirmed li
 - **Do not change:** server-side terminal state and the vanish-on-exit semantic.
 - **Incidental (not intent).** The bell being ignored is an implementation detail, not a decision —
   don't treat it as a promise either way.
+
+## Watching without typing
+
+A terminal viewed from another device — a session routed to the cloud or
+another computer, or any terminal in a browser view of a project — has a small
+toolbar with **Just watch** and **Type here**, plus where it runs ("In the
+cloud", "On another computer", "· reconnecting"). Ordinary local terminals have
+no toolbar, and a native window of any width keeps full control.
+
+A phone-width browser view starts in **Just watching** mode: it shows the
+daemon’s existing grid and scrolls horizontally without resizing it or
+accepting input. **Type here** reconnects and fits the terminal to the current
+pane; it is not itself interaction. Explicitly opening the project may wake
+cloud; background reconnects and watching do not. On a sleeping connection, a keystroke wakes it. In a native window that
+first burst of typing waits for it (the pane says "Connecting…",
+nothing echoes until it answers, and more typing meanwhile is refused with a
+note rather than run twice). When the service keeps the connection, it queues
+typing within its byte budget and delivers it in order after wake. With an older
+service whose connection has closed, a browser view drops that keystroke,
+reconnects with wake intent and says so over the pane (see [Pro: continuing and viewing](pro.md#what-the-user-sees-and-does)).
+Typing the daemon refuses (watching, busy, running in the cloud or on your
+computer) is said in a short note over the pane, never in the scrollback; a
+project idle in the cloud is said there too ("Idle in your cloud. Press a key to
+continue."; a pane that is just watching reads "Idle in your cloud. Choose Type here, then
+press a key to continue.") until a keystroke continues it. A terminal whose session
+moves to another machine keeps its screen and reconnects; it does not show as
+exited.

@@ -1,6 +1,9 @@
 //! Shared types and helpers for the chimaera daemon and CLI.
 
+pub mod cloud_providers;
 pub mod cluster;
+#[cfg(feature = "personal-providers")]
+pub mod personal_providers;
 #[cfg(unix)]
 pub mod shellint;
 pub mod slurm;
@@ -114,6 +117,17 @@ fn data_dir_in(home: Option<&Path>) -> PathBuf {
 /// workspace. Keep explicit/dev homes isolated, but ignore CHIMAERA_DATA_DIR.
 pub fn managed_agents_dir() -> PathBuf {
     data_dir_in(state_home().as_deref()).join("agents")
+}
+
+/// Optional companion assets use the same user-scoped root as managed agents,
+/// ignoring a cluster workspace's CHIMAERA_DATA_DIR. Resolving this path never
+/// creates a directory, discovers a package or starts an account task.
+pub fn managed_companions_dir() -> PathBuf {
+    managed_companions_dir_in(state_home().as_deref())
+}
+
+fn managed_companions_dir_in(home: Option<&Path>) -> PathBuf {
+    data_dir_in(home).join("companions")
 }
 
 /// Per-user data directory (`~/.chimaera`, or `$CHIMAERA_HOME/data` when
@@ -321,6 +335,12 @@ pub struct Manifest {
     /// Cleanup must defer while an older daemon could still use those files.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub runtime_leases: bool,
+    /// This daemon was composed with a daemon extension (the official app's
+    /// Pro runtime). Read from the connect probe's own manifest read, so an
+    /// automatic public-release replacement only pays a composition probe for
+    /// such a daemon; absent (every free daemon) means none.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub daemon_extension: bool,
 }
 
 impl Manifest {
@@ -588,6 +608,18 @@ mod tests {
         assert!(data_dir_in(None).ends_with(".chimaera"));
     }
 
+    #[test]
+    fn companion_root_is_user_scoped_without_workspace_override() {
+        let isolated = Path::new("/tmp/example-chimaera-home");
+        assert_eq!(
+            managed_companions_dir_in(Some(isolated)),
+            isolated.join("data/companions")
+        );
+        assert!(managed_companions_dir_in(None).ends_with(".chimaera/companions"));
+        // No environment mutation: the pure resolver accepts only the state
+        // home, so a cluster's per-workspace data root cannot enter this path.
+    }
+
     // Relies on $HOME relocation and unix file modes.
     #[cfg(unix)]
     #[test]
@@ -609,6 +641,7 @@ mod tests {
             build: Some(BUILD_ID.to_string()),
             slurm_job_id: None,
             runtime_leases: false,
+            daemon_extension: false,
         };
         manifest.write().unwrap();
 
@@ -626,6 +659,10 @@ mod tests {
         assert_eq!(loaded.version, manifest.version);
         assert_eq!(loaded.started_at, manifest.started_at);
         assert_eq!(loaded.build, manifest.build, "build id round-trips");
+        // A daemon without an extension writes the manifest it always wrote.
+        let written = std::fs::read_to_string(Manifest::path()).unwrap();
+        assert!(!written.contains("daemon_extension"), "{written}");
+        assert!(!loaded.daemon_extension);
         assert!(loaded.is_alive(), "our own pid is alive");
 
         Manifest::remove().unwrap();
@@ -683,6 +720,7 @@ mod tests {
             build: None,
             slurm_job_id: None,
             runtime_leases: false,
+            daemon_extension: false,
         };
         assert!(manifest(&here).written_here());
         assert!(!manifest("chimaera-test-other-node.invalid").written_here());

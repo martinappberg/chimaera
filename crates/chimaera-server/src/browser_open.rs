@@ -158,7 +158,7 @@ pub(crate) fn parse_url(raw: &str) -> Result<Target, String> {
 /// The agent-open feed: the frame ring, the rate-limit history, and how many
 /// windows are listening.
 #[derive(Default)]
-pub(crate) struct BrowserOpens {
+pub struct BrowserOpens {
     inner: Mutex<Inner>,
     /// Authenticated `/ws/events` sockets right now (see [`ConsumerGuard`]).
     consumers: AtomicUsize,

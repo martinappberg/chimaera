@@ -61,6 +61,9 @@ export interface SettingDef {
   placeholder?: string;
   /** Where the value is consumed; "daemon" values act on the server side. */
   scope: "client" | "daemon";
+  /** Shown only in a development build of the native app (the shell's
+   *  `dev_build`): a setting for testing Chimaera, never offered to users. */
+  devOnly?: boolean;
   /** Extra caveat rendered small in the UI ("Applies to new sessions."). */
   note?: string;
   /** Control override: "theme-cards" renders enum options as mini theme
@@ -143,6 +146,7 @@ export type SettingsMap = {
   "chat.voiceLanguage": string;
   "update.autoCheck": boolean;
   "plugins.allowUnverified": boolean;
+  "developer.tools": boolean;
   "plugins.toolsDir": string;
   "keys.modifier": "auto" | "cmd" | "ctrl-shift" | "alt";
 } & Record<KeyBindingId, string>;
@@ -880,6 +884,18 @@ const DEFS = {
     scope: "daemon",
   },
 
+  // --- Developer ---------------------------------------------------------------
+  "developer.tools": {
+    title: "Developer Tools",
+    category: "Developer",
+    description:
+      "Show actions meant for testing and debugging Chimaera. Off: the ordinary menus only.",
+    type: "boolean",
+    default: false,
+    scope: "client",
+    devOnly: true,
+  },
+
   // --- Extensions --------------------------------------------------------------
   "plugins.allowUnverified": {
     title: "Unverified Plugins",
@@ -1020,4 +1036,17 @@ export function expectedType(def: SettingDef): string {
     case "keybinding":
       return 'chord like "Mod+e" or "Meta+Shift+d" (or "" to disable)';
   }
+}
+
+/** Whether a setting is listed at all: a `devOnly` one only in a development
+ *  build of the native app. The product decides where work runs; the moves
+ *  behind "Developer Tools" exist for testing and are never offered to users. */
+export function listed(def: SettingDef, devBuild: boolean): boolean {
+  return !def.devOnly || devBuild;
+}
+
+/** The settings the JSON editor completes: the listed ones only, so a
+ *  release build never offers a testing setting there either. */
+export function completableSettings(devBuild: boolean): SettingDef[] {
+  return SETTINGS.filter((def) => listed(def, devBuild));
 }

@@ -1,0 +1,17 @@
+[package]
+name = "chimaera-link"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+chimaera-core = { path = "../chimaera-core", features = ["personal-providers"] }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rand.workspace = true
+base64 = "0.22"
+zeroize = "1"
+url = "2"
+time = { version = "0.3", features = ["parsing", "formatting"] }

@@ -162,3 +162,78 @@ async fn workspaces_open_and_delete() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(list.as_array().unwrap().len(), 0);
 }
+
+#[tokio::test]
+async fn internal_setup_is_persisted_and_hidden_without_hiding_similarly_named_user_projects() {
+    let data = test_dir("internal-workspaces-data");
+    let state = test_state_with_data_dir(0, data.clone());
+    let projects = test_dir("internal-workspaces-roots");
+    let internal = crate::lock(&state.workspaces)
+        .add_internal(projects.join("managed-login"))
+        .unwrap();
+    let normal = crate::lock(&state.workspaces)
+        .add(projects.join(".chimaera-setup"))
+        .unwrap();
+    let (status, rows) = request(&state, Method::GET, "/api/v1/workspaces", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+    assert_eq!(rows[0]["id"], normal.id);
+    let restarted = test_state_with_data_dir(0, data);
+    assert!(
+        crate::lock(&restarted.workspaces)
+            .get(&internal.id)
+            .unwrap()
+            .cloud_internal
+    );
+    assert!(
+        !crate::lock(&restarted.workspaces)
+            .get(&normal.id)
+            .unwrap()
+            .cloud_internal
+    );
+    let (_, rows) = request(&restarted, Method::GET, "/api/v1/workspaces", None).await;
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+    assert_eq!(rows[0]["id"], normal.id);
+}
+
+/// A project Pro enrolled records its workspace id in its folder, and the
+/// id follows the folder: a new daemon (a reinstall, a state reset, a second
+/// computer) reopens the same project; a local duplicate is its own; a moved
+/// folder keeps its workspace. A project Pro never enrolled gets nothing.
+mod folder_identity {
+    use super::*;
+    use crate::workspaces::identity;
+    use std::path::Path;
+
+    fn folder(label: &str) -> PathBuf {
+        std::fs::canonicalize(test_dir(label)).unwrap()
+    }
+
+    async fn register(state: &Arc<AppState>, root: &Path) -> serde_json::Value {
+        let (status, ws) = request(
+            state,
+            Method::POST,
+            "/api/v1/workspaces",
+            Some(serde_json::json!({"root": root.to_string_lossy()})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{ws}");
+        ws
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_folder_that_cannot_be_written_still_registers() {
+        use std::os::unix::fs::PermissionsExt;
+        let state = test_state();
+        let root = folder("ident-readonly");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let ws = register(&state, &root).await;
+        let refused = std::fs::write(root.join("probe"), b"x").is_err();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(ws["id"].as_str().unwrap().starts_with("w-"));
+        if refused {
+            assert!(identity::read(&root).is_none(), "no marker, no failure");
+        }
+    }
+}

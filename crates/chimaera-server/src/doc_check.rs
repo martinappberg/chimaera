@@ -18,6 +18,9 @@
 //! may sit on a stalling NFS mount: see the constants below. Callers run it
 //! under `fs::FILESYSTEM_WORK` on a blocking thread ([`run_blocking`]).
 
+mod confined;
+pub(crate) use confined::Confined;
+
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -134,6 +137,35 @@ pub(crate) async fn check_document(Query(query): Query<CheckQuery>) -> Response 
     }
 }
 
+/// Pin the project before the viewer's separate asynchronous path proof.
+pub async fn pin_project(project: PathBuf) -> anyhow::Result<Confined> {
+    run_blocking(move || Ok(Confined::new(&project)?)).await
+}
+
+/// Check the viewer's document and targets beneath its already pinned project.
+/// A path proof made before this worker ran cannot authorize a replacement.
+pub async fn check_within(path: String, project: Confined) -> Response {
+    let result = run_blocking(move || {
+        let path = expand_tilde(&path);
+        if !path.is_absolute() {
+            anyhow::bail!("path is not absolute");
+        }
+        check_path_pinned(&path, Some(&project.root), Some(&project))
+    })
+    .await;
+    match result {
+        Ok(report) => {
+            Json(json!({"issues": report.issues, "truncated": report.truncated})).into_response()
+        }
+        // Never an owner path or error text in a viewer's answer.
+        Err(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "document_unavailable"})),
+        )
+            .into_response(),
+    }
+}
+
 /// The MCP tool: resolve `raw` against the session's cwd, then its workspace
 /// root, check it, and render a report for a model to act on. `Err` is
 /// model-facing text.
@@ -223,32 +255,75 @@ fn resolve_for_agent(
 
 /// Check the markdown file at `path`.
 pub(crate) fn check_path(path: &Path, root: Option<&Path>) -> anyhow::Result<Report> {
-    let doc = std::fs::canonicalize(path).with_context(|| path.display().to_string())?;
-    let meta =
-        std::fs::metadata(&doc).with_context(|| format!("{}: failed to stat", doc.display()))?;
-    if !meta.is_file() {
-        anyhow::bail!("{} is not a file", doc.display());
-    }
-    if meta.len() > MAX_DOC_BYTES {
-        anyhow::bail!(
-            "{} is too large to check ({} bytes, limit {MAX_DOC_BYTES})",
-            doc.display(),
-            meta.len()
-        );
-    }
-    // Bounded again at the read: the file may have grown (or been swapped)
-    // since the stat.
-    let bytes = read_regular(&doc, MAX_DOC_BYTES)
-        .with_context(|| format!("{}: failed to read", doc.display()))?
-        .with_context(|| {
-            format!(
-                "{} is too large to check (over the {MAX_DOC_BYTES}-byte limit)",
-                doc.display()
-            )
-        })?;
+    check_path_within(path, root, None)
+}
+
+/// [`check_path`] for a viewer of one project (`confine`: the project's
+/// folder). Link and embed targets outside it are never stat-ed, read or
+/// listed — their existence, headings and neighbours stay private — and are
+/// counted as not checked here.
+pub(crate) fn check_path_within(
+    path: &Path,
+    root: Option<&Path>,
+    confine: Option<&Path>,
+) -> anyhow::Result<Report> {
+    let confined = confine
+        .map(Confined::new)
+        .transpose()
+        .context("project folder unavailable")?;
+    check_path_pinned(path, root, confined.as_ref())
+}
+fn check_path_pinned(
+    path: &Path,
+    root: Option<&Path>,
+    confined: Option<&Confined>,
+) -> anyhow::Result<Report> {
+    // The main document is confined before its first read, just like targets.
+    // A previous async scope proof cannot authorize a replacement symlink.
+    // Only a confined (viewer) check hides paths; the owner's own check
+    // names the file it failed on.
+    let (doc, bytes) = match &confined {
+        Some(confined) => {
+            let doc = confined.resolve(path)?;
+            let bytes = confined
+                .read(&doc, MAX_DOC_BYTES)?
+                .context("document is too large to check")?;
+            (doc, bytes)
+        }
+        None => {
+            let doc = std::fs::canonicalize(path).with_context(|| path.display().to_string())?;
+            let meta = std::fs::metadata(&doc)
+                .with_context(|| format!("{}: failed to stat", doc.display()))?;
+            if !meta.is_file() {
+                anyhow::bail!("{} is not a file", doc.display());
+            }
+            if meta.len() > MAX_DOC_BYTES {
+                anyhow::bail!(
+                    "{} is too large to check ({} bytes, limit {MAX_DOC_BYTES})",
+                    doc.display(),
+                    meta.len()
+                );
+            }
+            // Bounded again at the read: the file may have grown (or been
+            // swapped) since the stat.
+            let bytes = read_regular(&doc, MAX_DOC_BYTES)
+                .with_context(|| format!("{}: failed to read", doc.display()))?
+                .with_context(|| {
+                    format!(
+                        "{} is too large to check (over the {MAX_DOC_BYTES}-byte limit)",
+                        doc.display()
+                    )
+                })?;
+            (doc, bytes)
+        }
+    };
     let text = String::from_utf8_lossy(&bytes);
     let root = root.map(|r| std::fs::canonicalize(r).unwrap_or_else(|_| r.to_path_buf()));
-    Ok(check_text(&text, &doc, root.as_deref()))
+    let report = check_text(&text, &doc, root.as_deref(), confined);
+    if let Some(confined) = confined {
+        confined.check_root()?;
+    }
+    Ok(report)
 }
 
 /// The report as text for a model: a summary line, then one block per issue.
@@ -331,6 +406,8 @@ enum Stat {
     Found(Meta),
     Missing,
     Unchecked,
+    /// Outside the folder a project viewer's check may touch.
+    Outside,
 }
 
 /// What a target read yields: its line count, and for a markdown target the
@@ -376,6 +453,12 @@ struct Checker<'a> {
     doc: &'a Path,
     doc_dir: PathBuf,
     root: Option<&'a Path>,
+    /// Targets outside this folder are never touched (a project viewer's
+    /// check); `None` checks everything this daemon can reach.
+    confine: Option<&'a confined::Confined>,
+    /// Targets skipped for being outside `confine`.
+    outside: usize,
+    first_outside_line: usize,
     issues: Vec<Issue>,
     truncated: bool,
     stats: HashMap<PathBuf, Option<Meta>>,
@@ -393,8 +476,14 @@ struct Checker<'a> {
     own_anchors: HashSet<String>,
 }
 
-/// Check `text` as the markdown file `doc` (absolute, canonical).
-pub(crate) fn check_text(text: &str, doc: &Path, root: Option<&Path>) -> Report {
+/// Check `text` as the markdown file `doc` (absolute, canonical), touching
+/// no target outside `confine` (canonical) when one is given.
+fn check_text(
+    text: &str,
+    doc: &Path,
+    root: Option<&Path>,
+    confine: Option<&confined::Confined>,
+) -> Report {
     let doc_dir = doc.parent().map(Path::to_path_buf).unwrap_or_default();
     let src: Vec<&str> = text
         .split('\n')
@@ -404,6 +493,9 @@ pub(crate) fn check_text(text: &str, doc: &Path, root: Option<&Path>) -> Report 
         doc,
         doc_dir,
         root,
+        confine,
+        outside: 0,
+        first_outside_line: 0,
         issues: Vec::new(),
         truncated: false,
         stats: HashMap::new(),
@@ -563,6 +655,19 @@ pub(crate) fn check_text(text: &str, doc: &Path, root: Option<&Path>) -> Report 
             "Split a very large document, or check the remaining links by hand.".to_string(),
         );
     }
+    if checker.outside > 0 {
+        let n = checker.outside;
+        checker.push(
+            checker.first_outside_line,
+            Severity::Info,
+            "outside_project",
+            format!(
+                "{n} link or embed target{} outside this project and not checked here.",
+                if n == 1 { " is" } else { "s are" },
+            ),
+            "Check those links on the machine that has the files.".to_string(),
+        );
+    }
     checker.finish()
 }
 
@@ -610,14 +715,36 @@ impl Checker<'_> {
         self.unchecked += 1;
     }
 
+    /// Whether a target may be touched at all (see `confine`).
+    fn allowed(&self, path: &Path) -> bool {
+        let Some(limit) = self.confine else {
+            return true;
+        };
+        match std::fs::canonicalize(path) {
+            // An existing target is judged where it really is (symlinks).
+            Ok(real) => real.starts_with(&limit.root),
+            Err(_) => {
+                path.starts_with(&limit.root)
+                    && !path.components().any(|c| matches!(c, Component::ParentDir))
+            }
+        }
+    }
+
     fn stat(&mut self, path: &Path) -> Stat {
         if let Some(meta) = self.stats.get(path) {
             return meta.map_or(Stat::Missing, Stat::Found);
         }
+        if !self.allowed(path) {
+            return Stat::Outside;
+        }
         if self.stats.len() >= MAX_TARGET_STATS || Instant::now() >= self.deadline {
             return Stat::Unchecked;
         }
-        let meta = match std::fs::metadata(path) {
+        let metadata = match self.confine {
+            Some(confined) => confined.open(path, false).and_then(|file| file.metadata()),
+            None => std::fs::metadata(path),
+        };
+        let meta = match metadata {
             Ok(m) => Some(Meta {
                 dir: m.is_dir(),
                 file: m.is_file(),
@@ -642,7 +769,8 @@ impl Checker<'_> {
     /// Read a target's facts (cached; bounded by count, size and budget).
     fn facts(&mut self, path: &Path, meta: Meta) -> Option<&Facts> {
         if !self.reads.contains_key(path) {
-            if self.reads.len() >= MAX_TARGET_READS
+            if !self.allowed(path)
+                || self.reads.len() >= MAX_TARGET_READS
                 || !meta.file
                 || meta.len > MAX_TARGET_READ_BYTES
                 || Instant::now() >= self.deadline
@@ -651,7 +779,12 @@ impl Checker<'_> {
             }
             // Over the cap (the file grew since the stat): too large to
             // check, like one that was already over it.
-            let bytes = read_regular(path, MAX_TARGET_READ_BYTES).ok().flatten();
+            let bytes = match self.confine {
+                Some(confined) => confined.read(path, MAX_TARGET_READ_BYTES),
+                None => read_regular(path, MAX_TARGET_READ_BYTES),
+            }
+            .ok()
+            .flatten();
             let facts = bytes.map(|bytes| {
                 let text = String::from_utf8_lossy(&bytes);
                 let anchors = is_markdown(path).then(|| markdown_anchors(&text));
@@ -1017,10 +1150,16 @@ impl Checker<'_> {
         // a local absolute path after all.
         if spelling == Spelling::RootRelative && matches!(stat, Stat::Missing) {
             let absolute = normalize(Path::new(&decoded));
-            if let Stat::Found(meta) = self.stat(&absolute) {
-                stat = Stat::Found(meta);
-                resolved = absolute;
-                spelling = Spelling::Absolute;
+            match self.stat(&absolute) {
+                Stat::Found(meta) => {
+                    stat = Stat::Found(meta);
+                    resolved = absolute;
+                    spelling = Spelling::Absolute;
+                }
+                // It may be a real path outside the project: a project
+                // viewer's check cannot say, so it never calls it broken.
+                Stat::Outside => stat = Stat::Outside,
+                Stat::Missing | Stat::Unchecked => {}
             }
         }
         // Where the written components start, for the case walk.
@@ -1031,6 +1170,12 @@ impl Checker<'_> {
         };
         match stat {
             Stat::Unchecked => self.note_unchecked(t.line),
+            Stat::Outside => {
+                if self.outside == 0 {
+                    self.first_outside_line = t.line;
+                }
+                self.outside += 1;
+            }
             Stat::Missing => {
                 self.checked_targets += 1;
                 self.broken(t, url, &decoded, &resolved, spelling, base.as_deref());
@@ -1243,23 +1388,30 @@ impl Checker<'_> {
     /// `None` when unavailable — the caller then has nothing to prove with.
     fn listing(&mut self, dir: &Path) -> Option<&Listing> {
         if !self.listings.contains_key(dir) {
-            if self.listings.len() >= MAX_DIR_LISTINGS || Instant::now() >= self.deadline {
+            if self.listings.len() >= MAX_DIR_LISTINGS
+                || Instant::now() >= self.deadline
+                || !self.allowed(dir)
+            {
                 return None;
             }
-            let listing = std::fs::read_dir(dir).ok().map(|entries| {
-                let mut names = HashSet::new();
-                let mut complete = true;
-                for entry in entries.filter_map(Result::ok) {
-                    if names.len() >= MAX_LISTING_ENTRIES {
-                        complete = false;
-                        break;
+            let listing = if let Some(confined) = self.confine {
+                confined.listing(dir).ok()
+            } else {
+                std::fs::read_dir(dir).ok().map(|entries| {
+                    let mut names = HashSet::new();
+                    let mut complete = true;
+                    for entry in entries.filter_map(Result::ok) {
+                        if names.len() >= MAX_LISTING_ENTRIES {
+                            complete = false;
+                            break;
+                        }
+                        if let Some(name) = entry.file_name().to_str() {
+                            names.insert(name.to_string());
+                        }
                     }
-                    if let Some(name) = entry.file_name().to_str() {
-                        names.insert(name.to_string());
-                    }
-                }
-                Listing { names, complete }
-            });
+                    Listing { names, complete }
+                })
+            };
             self.listings.insert(dir.to_path_buf(), listing);
         }
         self.listings.get(dir).and_then(Option::as_ref)
@@ -1373,8 +1525,15 @@ impl Checker<'_> {
 /// `fstat`), so a FIFO or device swapped in after that stat can neither
 /// block this worker (and its `FILESYSTEM_WORK` permit) nor stream without
 /// end, and `take` bounds a file that grew.
-pub(crate) fn read_regular(path: &Path, cap: u64) -> std::io::Result<Option<Vec<u8>>> {
-    let (file, meta) = crate::fs::open_regular(path)?;
+pub fn read_regular(path: &Path, cap: u64) -> std::io::Result<Option<Vec<u8>>> {
+    let (file, _) = crate::fs::open_regular(path)?;
+    read_opened(file, cap)
+}
+fn read_opened(file: std::fs::File, cap: u64) -> std::io::Result<Option<Vec<u8>>> {
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
     let mut bytes = Vec::with_capacity(meta.len().min(cap) as usize);
     file.take(cap + 1).read_to_end(&mut bytes)?;
     Ok((bytes.len() as u64 <= cap).then_some(bytes))
@@ -1914,4 +2073,44 @@ fn file_stem(file: &str) -> String {
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod unconfined_error_tests {
+    use super::*;
+
+    /// The owner's own check names the file it failed on (path, size and
+    /// limit); only a confined viewer check keeps paths out of its errors.
+    #[test]
+    fn unconfined_errors_name_the_document_and_confined_ones_do_not() {
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-doc-check-errors-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let big = dir.join("big.md");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_DOC_BYTES + 1)
+            .unwrap();
+        let error = format!("{:#}", check_path(&big, None).unwrap_err());
+        assert!(
+            error.contains(&format!(
+                "{} is too large to check ({} bytes, limit {MAX_DOC_BYTES})",
+                big.display(),
+                MAX_DOC_BYTES + 1
+            )),
+            "{error}"
+        );
+        let confined = format!(
+            "{:#}",
+            check_path_within(&big, Some(&dir), Some(&dir)).unwrap_err()
+        );
+        assert!(!confined.contains(&*dir.to_string_lossy()), "{confined}");
+        let missing = dir.join("missing.md");
+        let error = format!("{:#}", check_path(&missing, None).unwrap_err());
+        assert!(error.contains(&*missing.to_string_lossy()), "{error}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

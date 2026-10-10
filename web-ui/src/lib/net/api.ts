@@ -1,4 +1,8 @@
-import { writable } from "svelte/store";
+import { daemonPath, gatewayPrefix, gatewayWorkspace, isBrowserGateway } from "./base";
+
+import { PlacementError, workspaceHeaders, invalidatePlacementOwner, type PlacementOwner } from "./placement";
+
+import { writable, type Readable } from "svelte/store";
 
 import { healthPollDelayMs, startVisibilityPoll, type PollHandle } from "./poll";
 import { recordLinkRtt } from "./rtt";
@@ -32,9 +36,17 @@ const TERM_KEY = "chimaera.term";
  * SAME window, layout and all.
  */
 function initFromHash(): string | null {
+  if (isBrowserGateway()) {
+    const host = gatewayPrefix();
+    if (sessionStorage.getItem("chimaera.gatewayHost") !== host) {
+      for (const key of [TOKEN_KEY, WS_KEY, HOST_KEY, WIN_KEY, HOME_HUB_KEY, JOB_KEY, NODE_KEY, DETACHED_KEY]) sessionStorage.removeItem(key);
+      sessionStorage.setItem("chimaera.gatewayHost", host);
+    }
+    // Workspace/window fragments remain useful; only credentials are ignored.
+  }
   const params = new URLSearchParams(location.hash.slice(1));
-  const tokenFromHash = params.get("token");
-  const wsFromHash = params.get("ws");
+  const tokenFromHash = isBrowserGateway() ? null : params.get("token");
+  const wsFromHash = gatewayWorkspace() ?? params.get("ws");
   const hostFromHash = params.get("host");
   const winFromHash = params.get("win");
   const homeHubFromHash = params.get("hub") === "1";
@@ -110,7 +122,7 @@ function initFromHash(): string | null {
     sessionStorage.setItem(TERM_KEY, termFromHash);
   }
   if (
-    tokenFromHash !== null ||
+    params.has("token") ||
     wsFromHash !== null ||
     hostFromHash !== null ||
     winFromHash !== null ||
@@ -123,7 +135,7 @@ function initFromHash(): string | null {
   ) {
     history.replaceState(null, "", location.pathname + location.search);
   }
-  return tokenFromHash ?? sessionStorage.getItem(TOKEN_KEY);
+  return isBrowserGateway() ? null : tokenFromHash ?? sessionStorage.getItem(TOKEN_KEY);
 }
 
 /** Set by `initFromHash` before `token` (declared first so the hoisted
@@ -195,9 +207,29 @@ export function reclaimHomeHub(): void {
  * latch via {@link clearUnauthorized} instead.
  */
 export const unauthorized = writable(false);
+export interface ApiOwner { current(): boolean }
+export interface ApiGuard extends ApiOwner { readonly owner: ApiOwner; readonly placement?: PlacementOwner }
+let blocked = false;
+const ownerStore = writable<ApiOwner | null>(null);
+export const apiOwner: Readable<ApiOwner | null> = { subscribe: ownerStore.subscribe };
+let currentOwner: ApiOwner;
+function replaceApiOwner(): void {
+  invalidatePlacementOwner();
+  const origin = location.origin, prefix = gatewayPrefix();
+  const original: ApiOwner = Object.freeze({ current: () => !blocked && currentOwner === original &&
+    location.origin === origin && gatewayPrefix() === prefix });
+  currentOwner = original; ownerStore.set(blocked ? null : original);
+}
+replaceApiOwner();
+export function captureApiGuard(placement?: PlacementOwner): ApiGuard {
+  const original = currentOwner;
+  return Object.freeze({ owner: original, current: () => original.current() && (placement === undefined || placement.current()),
+    ...(placement === undefined ? {} : { placement }) });
+}
 
 /** Mark this window's auth as dead (401 from REST or a WS auth error). */
 export function notifyUnauthorized(): void {
+  if (!blocked) { blocked = true; replaceApiOwner(); }
   unauthorized.set(true);
 }
 
@@ -205,6 +237,7 @@ export function notifyUnauthorized(): void {
  *  window's in-place tunnel heal). Every other recovery navigates, which
  *  resets the latch by itself. */
 export function clearUnauthorized(): void {
+  if (blocked) { blocked = false; replaceApiOwner(); }
   unauthorized.set(false);
 }
 
@@ -214,10 +247,12 @@ export function clearUnauthorized(): void {
  * true when a new token was picked up.
  */
 export function refreshTokenFromHash(): boolean {
+  if (isBrowserGateway()) return false;
   const params = new URLSearchParams(location.hash.slice(1));
   const fresh = params.get("token");
   if (fresh === null || fresh === token) return false;
   token = fresh;
+  replaceApiOwner();
   sessionStorage.setItem(TOKEN_KEY, fresh);
   history.replaceState(null, "", location.pathname + location.search);
   return true;
@@ -229,7 +264,24 @@ export function refreshTokenFromHash(): boolean {
  * reached without a tunnel. The raw hostname stays available as hover detail.
  */
 export function getHostLabel(): string {
-  return sessionStorage.getItem(HOST_KEY) ?? "local";
+  return sessionStorage.getItem(HOST_KEY) ?? (isBrowserGateway() ? gatewayHostLabel() : "local");
+}
+
+/** The explicit host of a browser view (`/app/{host}/`); undefined for a
+ *  project view, which follows its project. */
+function gatewayHost(): string | undefined {
+  return /^\/app\/([A-Za-z0-9_-]{1,128})(?:\/|$)/.exec(location.pathname)?.[1];
+}
+
+/** A browser view's machine in plain words: a project view follows the
+ *  project wherever it runs; an explicit host names the computer, the cloud
+ *  or the cluster alias. Never "local" (that key means this very machine). */
+function gatewayHostLabel(): string {
+  const host = gatewayHost();
+  if (host === undefined) return "This project";
+  if (host.startsWith("device-")) return "Your computer";
+  if (host.startsWith("worker-")) return "The cloud";
+  return host === "local" ? "Your computer" : host;
 }
 
 /**
@@ -281,24 +333,136 @@ export function setActiveWorkspaceId(id: string | null): void {
   }
 }
 
-export class ApiError extends Error {
-  readonly status: number;
+/** A refusal identifies only that this daemon does not own the project.
+ * The daemon's host class cannot identify the other owner: it may be the
+ * cloud or another computer. Callers with verified placement pass it explicitly.
+ */
+export function ownerElsewhere(): null {
+  return null;
+}
 
-  constructor(status: number, message: string) {
-    super(message);
-    this.name = "ApiError";
-    this.status = status;
+/** "This project is running … right now", naming the machine when known.
+ *  "another computer" is a second computer that holds the project, never a
+ *  device merely viewing it. */
+export function runningElsewhere(where: "cloud" | "computer" | "other" | null): string {
+  switch (where) {
+    case "cloud":
+      return "This project is running in the cloud right now.";
+    case "computer":
+      return "This project is running on your computer right now.";
+    case "other":
+      return "This project is running on another computer right now.";
+    default:
+      return "This project is running somewhere else right now.";
   }
 }
 
+/** Plain words for the daemon's project-connection codes, which are wire
+ *  identifiers and must never reach the screen as-is. */
+const PLAIN_ERRORS: Record<string, string> = {
+  project_unavailable: "This project isn’t reachable right now.",
+  remote_unavailable: "This project can’t be reached right now.",
+  workspace_scope_changed: "This project can’t be reached right now.",
+  workspace_unavailable: "This project can’t be reached right now.",
+  worker_asleep: "This project is idle in your cloud.",
+  outside_project: "This file is outside the project.",
+};
+/** Codes meaning "this daemon may not run that project": the sentence names
+ *  where it runs instead ({@link runningElsewhere}). */
+const ELSEWHERE_CODES = new Set(["workspace_owned_elsewhere", "read_only"]);
+/** The project's owner has a different file at that path, which this window
+ *  may not show: the sentence names where the owner is. */
+const OTHER_FILE = "on_other_machine";
+
+function otherFile(where: "cloud" | "computer" | "other" | null): string {
+  switch (where) {
+    case "cloud":
+      return "This file is in the cloud and can’t be opened here.";
+    case "computer":
+      return "This file is on your computer and can’t be opened here.";
+    default:
+      return "This file is on another computer and can’t be opened here.";
+  }
+}
+
+/** A daemon error message in plain words (known codes mapped, else as-is).
+ *  `where` names the project's owner when the caller knows it. */
+export function plainError(message: string, where: "cloud" | "computer" | "other" | null = ownerElsewhere()): string {
+  if (ELSEWHERE_CODES.has(message)) return runningElsewhere(where);
+  if (message === OTHER_FILE) return otherFile(where);
+  return PLAIN_ERRORS[message] ?? message;
+}
+
+/** Codes that say where the project is right now rather than that something
+ *  went wrong: its owner sleeps, is reconnecting, or is not reachable while
+ *  the project is routed elsewhere. A surface that read something and got one
+ *  of these shows a quiet note and reads again once the owner answers; it
+ *  never paints it as an error. */
+const STATE_CODES = new Set(["worker_asleep", "project_unavailable", "remote_unavailable", "workspace_scope_changed", "workspace_unavailable"]);
+
+/** The line for a project idle in the cloud: a dashboard or panel has the
+ *  room for the way out (the chat itself just stays ready to send). */
+export const ASLEEP_NOTE = "Idle in your cloud. Send a message to continue.";
+
+/** The failure is a sleeping cloud machine: its wake is announced (a socket
+ *  ready, a placement read), so nothing needs to poll for it. */
+export function isOwnerAsleep(e: unknown): boolean {
+  return e instanceof ApiError && e.code === "worker_asleep";
+}
+
+/** The quiet note a state-code failure reads as ("Idle in your cloud. …",
+ *  "This project isn’t reachable right now."), or null for anything else —
+ *  a real failure, which keeps its error styling. */
+export function projectStateNote(e: unknown): string | null {
+  if (!(e instanceof ApiError) || e.code === null || !STATE_CODES.has(e.code)) return null;
+  return e.code === "worker_asleep" ? ASLEEP_NOTE : e.message;
+}
+
+export class ApiError extends Error {
+  readonly status: number;
+  /** The daemon's code when it sent one this module knows (additive). */
+  readonly code: string | null;
+
+  constructor(status: number, message: string) {
+    super(plainError(message));
+    this.name = "ApiError";
+    this.status = status;
+    this.code = message in PLAIN_ERRORS || ELSEWHERE_CODES.has(message) || message === OTHER_FILE ? message : null;
+  }
+}
+
+/** Whether `api()` names the window's active project to its daemon
+ *  (`X-Chimaera-Viewer-Workspace`, crates/chimaera-link/PROTOCOL.md). Only a
+ *  window that can have Pro sends it (App sets it from `proPossible` at
+ *  boot); the free daemon ignores it, so a free window never adds it. */
+let viewerWorkspaceHeader = false;
+export function setViewerWorkspaceHeader(on: boolean): void {
+  viewerWorkspaceHeader = on;
+}
+
 /** Fetch wrapper for /api/v1 that attaches the Bearer token. */
-export async function api(path: string, init: RequestInit = {}): Promise<Response> {
+export async function api(path: string, init: RequestInit = {}, guard?: ApiGuard): Promise<Response> {
+  const owner = currentOwner;
+  const check = () => { if (guard !== undefined && !guard.current()) throw new ApiError(409, "workspace_scope_changed"); };
+  check();
   const headers = new Headers(init.headers);
   if (token) {
     headers.set("Authorization", `Bearer ${token}`);
   }
-  const res = await fetch(`/api/v1${path}`, { ...init, headers });
-  if (res.status === 401) notifyUnauthorized();
+  if (isBrowserGateway()) headers.set("X-Chimaera-Browser", "1");
+  if (viewerWorkspaceHeader && !isBrowserGateway()) {
+    const workspace = getActiveWorkspaceId();
+    if (workspace !== null && /^[A-Za-z0-9_-]{1,128}$/.test(workspace)) headers.set("X-Chimaera-Viewer-Workspace", workspace);
+  }
+  try { await workspaceHeaders(headers, guard?.placement); }
+  catch (error) { if (error instanceof PlacementError && error.status === 401 && owner === currentOwner) notifyUnauthorized(); throw error; }
+  check();
+  const res = await fetch(daemonPath(`/api/v1${path}`), { ...init, headers });
+  if (res.status === 401 && owner === currentOwner) notifyUnauthorized();
+  if (guard !== undefined && !guard.current()) {
+    try { await res.body?.cancel(); } catch { /* Preserve original retirement refusal. */ }
+    check();
+  }
   return res;
 }
 

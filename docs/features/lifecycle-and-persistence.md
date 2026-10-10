@@ -34,13 +34,21 @@ PTY snapshot-on-attach ([terminals.md](terminals.md)) and the chat seq-journal g
   continuously-reconciled `sessions.json` records each session's *semantic* identity (workspace, cwd,
   agent kind, **surface** (term/chat), native conversation/thread id + transcript path, chat model,
   pinned name, dims, theme, linked-terminal edges). On boot the daemon **resurrects**: shells respawn at
-  their last cwd, claude TUI agents respawn with `--resume`, **chat sessions respawn as chat** through
+  their last cwd, Claude TUI agents respawn with `--resume`, and Codex TUIs with a verified
+  rollout respawn with `codex resume <thread-id>`. **Chat sessions respawn as chat** through
   `chat::resurrect_chat`, retaining all four providers' native handles (Claude `--resume`, Codex
   `thread/resume`, ACP session load/resume) and replaying the on-disk journal. Native resume
   still depends on the provider accepting that handle. Sessions Chimaera cannot resurrect live retire
   into Recents; a row resumes when its native handle was captured, otherwise its tooltip honestly
   says that this specific row must start fresh. A finished Codex chat carries its `ChatInfo` thread id
   into Recents before the chat registry entry is removed.
+- **Codex terminal identity (Pro-configured projects).** After the first completed turn, a generated `notify` wrapper captures
+  the native thread id and chains the user's configured notify command with the original payload.
+  The daemon checks the rollout header's id and cwd before recording it and again on restart.
+  A missing rollout retires the row into Recents without promising resumption. The hook has only a
+  completion event, so terminal Codex attention remains unknown. Config and rollouts honor `CODEX_HOME`,
+  including one the login shell exports. In other projects a Codex TUI's argv is unchanged and it
+  retires into Recents on restart as before.
 - **How it's used.** No route — this is boot/shutdown lifecycle, gated by `daemon.restoreSessions`
   (default true). A graceful stop also writes a **handoff** (port + token) so a successor daemon rebinds
   the same port with the same token — ssh forwards stay valid and every client heals with a plain
@@ -109,8 +117,18 @@ conversation. All four chat providers retain their native resume handle through 
   `stopping` set: the ledger reconciler stops writing, and the chat exit path and the agent watcher
   retire nothing, so the deliberately ended chats stay in the ledger and never land in Recents.
   Measured: 0.19 s to stop with two chats (fake agents), 0.84 s with a real Claude 2.1.283 chat whose
-  background `sleep` ended with it; after the restart that chat's agent restarted the command itself. A crash still leaves whatever the process
-  held; the ledger's last reconcile (≤ 5 s old) still carries it. TUI sessions are out of scope —
+  background `sleep` ended with it; after the restart that chat's agent restarted the command itself. A
+  daemon killed outright (SIGKILL, a crash) no longer leaves its agents running: a small watcher
+  process (`chimaera-agent` `reaper.rs`) notices the daemon's pipe close, SIGTERMs each chat agent and
+  two seconds later kills every process group of the agents and their descendants, detached shells
+  included; and the next daemon on that host stops any agent it recorded that still runs before
+  anything resumes. Measured with Claude Code 2.1.294 running a background `while true` loop: after
+  `kill -9` of the daemon the loop stopped within 0.6 s and claude within 2.4 s (before this change
+  both kept running, reparented to launchd); with the watcher killed too, the next daemon stopped them
+  2.6 s after it started, before the chat resumed. The ledger's last reconcile (≤ 5 s old) still carries what the process held. A
+  permission prompt the restart cut off is named in the pick-up as not run, and a pick-up turn that
+  fails at once with a known transient agent error (a sign-in refresh race), or whose process exits
+  before answering, is tried once more after 5 s. TUI sessions are out of scope —
   claude resumes there with `--resume`, but nothing types into a PTY on the user's behalf.
 
 ## Graceful shutdown & close-all
@@ -142,8 +160,24 @@ conversation. All four chat providers retain their native resume handle through 
   overrides; users can disable with `update.autoCheck` (an explicit `?refresh=true` still runs — the
   setting governs phoning home on its own). Test knobs: `CHIMAERA_RELEASES_API`,
   `CHIMAERA_UPDATE_CURRENT` (also reported as `current`, so a dev build exercises the whole UI).
+- **The account's cloud never checks.** The service updates the cloud's daemon, so a daemon running as
+  the account's cloud (`pro::updates_managed`: started as one, or configured as the Pro worker now or
+  before) makes no release request, periodic or asked for, and reports `state: "managed"` with
+  `managed: true`, no `latest`, nothing available and no check times. Becoming the cloud moves the epoch,
+  so attached windows hear it at once. Every view of that daemon shows the one neutral line
+  "Updates for your cloud are managed for you." with no check and no update action (Settings → Updates
+  drops "check now" and the auto-check switch; the toast answers an explicit check with that line; the
+  version stamp's hover says it). Its agents' release checks stop too (`agent_updates`; no release
+  fields on its `GET /agents` rows), since they come with the cloud's image and are updated with it.
+  Its plugins' release checks are unchanged.
+- **The official app's daemon updates with the app.** A daemon composed with the app's extension
+  (signed in or not, with or without a plan) is updated by the app's signed updater, or by a reconnect
+  for a remote one, never from the public release feed. It makes no release request and reports
+  `state: "unchecked"` with an additive `with_app: true` (no error, nothing available), and every view
+  shows "Updates arrive with the app." instead of a failed check. A daemon without the extension never
+  sends `with_app` and checks exactly as before.
 - **A failed check is reported as one.** The status carries one `state` word
-  (`unchecked | current | available | failed`), `checked_at` (last attempt) vs `succeeded_at`
+  (`unchecked | current | available | failed | managed`), `checked_at` (last attempt) vs `succeeded_at`
   (last answer), the failure in plain words (`error`: curl's own diagnosis minus its prefix; a
   GitHub 403/429 is named as the rate limit a shared login-node address hits), `dev`, and
   `interval_secs`. A known newer release outranks a later failed re-check — the release didn't stop

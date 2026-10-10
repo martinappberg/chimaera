@@ -36,6 +36,10 @@ use crate::ndjson::JsonlChild;
 /// October runtime refresh records the pending experimental-steering probe).
 pub const TESTED_CODEX_VERSION: &str = "0.160.0";
 
+/// Prefix of the non-fatal error for a refused `turn/start`: its input was
+/// delivered yet will never start a turn.
+pub(crate) const TURN_START_FAILED: &str = "turn/start failed: ";
+
 /// The `initialize` request both the probe client and the driver handshake
 /// send. Declares `experimentalApi` so `thread/settings/update` is available
 /// (live: -32600 "requires experimentalApi capability" without it).
@@ -740,6 +744,10 @@ fn thread_open_request(spec: &SpawnSpec, id: u64, effort: Option<&str>) -> Value
                 "cwd": spec.cwd,
                 "ephemeral": false,
             },
+        }),
+        (Some(thread_id), None) if spec.fork_head => json!({
+            "id": id, "method": "thread/fork",
+            "params": { "threadId": thread_id, "cwd": spec.cwd, "ephemeral": false },
         }),
         (Some(thread_id), None) => json!({
             "id": id, "method": "thread/resume",
@@ -2471,8 +2479,10 @@ impl CodexMapper {
                     self.last_thought_item = None;
                     self.flush_requested_steers(step);
                 } else {
+                    // The manager reads this prefix as "the delivered input
+                    // will never start a turn" (`CommandBudget::observe`).
                     step.events.push(AgentEvent::Error {
-                        message: format!("turn/start failed: {}", err["message"]),
+                        message: format!("{TURN_START_FAILED}{}", err["message"]),
                         fatal: false,
                     });
                     // A pending or refused model choice still owns its
@@ -4965,6 +4975,7 @@ impl CodexMapper {
             queued,
             after_turn: queued && after_turn,
             origin: None,
+            client_id: None,
         });
         if queued
             && !after_turn
@@ -5115,6 +5126,7 @@ impl CodexMapper {
                             queued: false,
                             after_turn: false,
                             origin: None,
+                            client_id: None,
                         });
                         self.dispatch_input(json!([{ "type": "text", "text": fb }]), &mut step);
                     }
@@ -6285,6 +6297,36 @@ mod tests {
             "method": "turn/started",
             "params": { "turn": { "id": "turn-A" } },
         }));
+    }
+
+    /// A send whose turn/start is refused (usage limit, expired sign-in)
+    /// reports one non-fatal error and no turn event: no turn ever started.
+    #[test]
+    fn a_refused_turn_start_reports_only_the_error() {
+        let mut m = mapper();
+        let step = m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "hello".into(),
+            }],
+        });
+        let start = step
+            .outbound
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .expect("a fresh send starts a turn");
+        let rpc_id = start["id"].as_u64().unwrap();
+        let step = m.on_frame(&json!({
+            "id": rpc_id,
+            "error": { "code": -32000, "message": "usage limit reached" },
+        }));
+        assert!(step.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Error { fatal: false, message } if message.starts_with(TURN_START_FAILED)
+        )));
+        assert!(!step.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::TurnAborted { .. } | AgentEvent::TurnCompleted { .. }
+        )));
     }
 
     /// A userMessage item for `client_id` — codex taking the input into the
@@ -8073,6 +8115,7 @@ mod tests {
                 queued,
                 after_turn: _,
                 origin: _,
+                client_id: _,
             } => {
                 assert_eq!(text, "see");
                 assert_eq!(*attachments, 1);
@@ -8759,6 +8802,13 @@ mod tests {
         assert_eq!(fork["params"]["model"], "gpt-test");
         assert_eq!(fork["params"]["effort"], "xhigh");
         assert_eq!(fork["params"]["approvalsReviewer"], "auto_review");
+
+        spec.fork_at = None;
+        spec.fork_head = true;
+        let head = thread_open_request(&spec, 10, spec.initial_effort.as_deref());
+        assert_eq!(head["method"], "thread/fork");
+        assert!(head["params"].get("lastTurnId").is_none());
+        assert_eq!(head["params"]["threadId"], "thread-old");
 
         spec.portable_context = Some("quiet imported transcript".into());
         let contextual = thread_open_request(&spec, 10, spec.initial_effort.as_deref());

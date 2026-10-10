@@ -379,6 +379,7 @@ impl Translator {
             queued: false,
             after_turn: false,
             origin: None,
+            client_id: None,
         });
     }
 
@@ -845,6 +846,7 @@ mod tests {
                 queued: false,
                 after_turn: false,
                 origin: None,
+                client_id: None,
             }
         );
         assert!(matches!(&events[1], AgentEvent::TurnStarted { turn_id } if turn_id == "t1"));

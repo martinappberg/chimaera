@@ -77,7 +77,7 @@ const COMMIT_SUBJECT_MAX: usize = 100;
 /// Who started a session. The wire form is a plain string: `you`,
 /// `mastermind`, `restart`, or another session's id.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum StartedBy {
+pub enum StartedBy {
     /// The user: the launcher, Recents, All sessions, a plugin's setup
     /// button, appointing a Mastermind.
     You,
@@ -460,7 +460,7 @@ enum Op {
 }
 
 /// The per-daemon half: open records, the writer, and small caches.
-pub(crate) struct HistoryService {
+pub struct HistoryService {
     root: PathBuf,
     index_path: PathBuf,
     live: Mutex<HashMap<String, Live>>,

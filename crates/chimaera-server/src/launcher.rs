@@ -167,18 +167,18 @@ pub(crate) fn is_outdated(kind: AgentKind, version: Option<&str>) -> bool {
 /// resolved binary is a chimaera-managed install (lives under
 /// `~/.chimaera/agents`).
 #[derive(Clone, Debug)]
-pub(crate) struct AgentDetection {
-    pub(crate) path: Result<PathBuf, String>,
-    pub(crate) version: Option<String>,
-    pub(crate) managed: bool,
+pub struct AgentDetection {
+    pub path: Result<PathBuf, String>,
+    pub version: Option<String>,
+    pub managed: bool,
     /// The resolved binary is the user's explicit `agents.<kind>.path` setting
     /// (a runnable one) — surfaced so the launcher can label provenance as the
     /// path you set, distinct from "yours" (PATH) or "chimaera" (managed).
-    pub(crate) explicit: bool,
+    pub explicit: bool,
     /// The binary's mtime when it was detected — the cache-staleness stamp
     /// (see [`validate_cache_hit`]). `None` = stat failed at detection time
     /// (or a test preset): the entry is trusted as before.
-    pub(crate) mtime: Option<std::time::SystemTime>,
+    pub mtime: Option<std::time::SystemTime>,
 }
 
 /// Cache-hit staleness verdict (see [`detect`]).
@@ -216,7 +216,7 @@ fn validate_cache_hit(hit: &AgentDetection) -> CacheHit {
 /// a managed install the moment it lands. Cache hits are stat-validated so
 /// an update that replaced or moved the binary is noticed at the next spawn
 /// (without re-running the 6s login-shell probe the cache exists to avoid).
-pub(crate) async fn detect(state: &AppState, kind: AgentKind, refresh: bool) -> AgentDetection {
+pub async fn detect(state: &AppState, kind: AgentKind, refresh: bool) -> AgentDetection {
     if !refresh {
         let hit = crate::lock(&state.agent_bins).get(&kind).cloned();
         if let Some(hit) = hit {
@@ -357,17 +357,10 @@ const SHELL_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
 /// tolerated (last non-empty stdout line is the path); stdin is `/dev/null`
 /// and a timeout backstops a slow or input-reading rc.
 async fn resolve_via_login_shell(shell: &str, bin: &str) -> Option<PathBuf> {
-    let output = tokio::process::Command::new(shell)
-        .arg("-ilc")
-        .arg(format!("command -v {bin}"))
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .output();
-    let out = tokio::time::timeout(SHELL_PROBE_TIMEOUT, output)
-        .await
-        .ok()?
-        .ok()?;
-    if !out.status.success() {
+    let mut cmd = tokio::process::Command::new(shell);
+    cmd.arg("-ilc").arg(format!("command -v {bin}"));
+    let out = crate::process::probe_output(&mut cmd, SHELL_PROBE_TIMEOUT).await?;
+    if !out.success {
         return None;
     }
     let path = String::from_utf8_lossy(&out.stdout)
@@ -475,16 +468,10 @@ const VERSION_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// First non-empty line of `<bin> --version`, or `None` on any failure.
 pub(crate) async fn probe_version(bin: &Path) -> Option<String> {
-    let output = tokio::process::Command::new(bin)
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .output();
-    let out = tokio::time::timeout(VERSION_TIMEOUT, output)
-        .await
-        .ok()?
-        .ok()?;
-    if !out.status.success() {
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.arg("--version");
+    let out = crate::process::probe_output(&mut cmd, VERSION_TIMEOUT).await?;
+    if !out.success {
         return None;
     }
     String::from_utf8_lossy(&out.stdout)
@@ -531,7 +518,13 @@ pub(crate) async fn list_agents(
     } else {
         detect_all.await
     };
-    let latest_by_kind = crate::agent_updates::snapshot(&state);
+    // The account's cloud never learns of agent releases: its agents come
+    // with its image and are updated with it (`WorkspacePolicy::updates_managed`).
+    let latest_by_kind = if state.policy().updates_managed(&state) {
+        std::collections::HashMap::new()
+    } else {
+        crate::agent_updates::snapshot(&state)
+    };
 
     let rows = detections
         .into_iter()
@@ -772,6 +765,33 @@ pub(crate) fn build_agent_resume_command(
     argv
 }
 
+/// Both native CLIs accept a trailing positional prompt on resume/fork. Keep it
+/// one argument, after an option terminator, and bound the process argv.
+pub(crate) fn append_transfer_prompt(argv: &mut Vec<String>, context: &str) {
+    argv.push("--".into());
+    argv.push(context.chars().take(8192).collect());
+}
+
+/// Native head forks isolate an offline owner without rewriting transcript IDs.
+/// Claude uses its resume flag; Codex exposes a dedicated `fork` subcommand.
+pub(crate) fn fork_native_head(kind: AgentKind, argv: &mut Vec<String>) -> anyhow::Result<()> {
+    if kind == AgentKind::Claude {
+        argv.push("--fork-session".into());
+        return Ok(());
+    }
+    if kind != AgentKind::Codex {
+        anyhow::bail!("unsupported native head fork");
+    }
+    let Some(command) = argv
+        .get_mut(1)
+        .filter(|command| command.as_str() == "resume")
+    else {
+        anyhow::bail!("head fork requires an explicit native resume");
+    };
+    *command = "fork".into();
+    Ok(())
+}
+
 /// What every CHAT spawn is told about its host — and only chat spawns: a
 /// TUI session is the agent's own screen, but a chat reply is rendered by
 /// chimaera, and the agent cannot know that a markdown image link to a local
@@ -983,13 +1003,19 @@ pub(crate) fn build_codex_chat_command(
     cmd
 }
 
-/// Escape a string for embedding in TOML basic-string quotes (`-c key="…"`).
-/// The prompt is a compile-time constant without quotes, backslashes, or
-/// control characters today; this keeps a future edit (say, a multi-line
-/// rewrite with real newlines) from silently breaking the config parse —
+/// An argv-only config override; the per-session secret stays inside the shim.
+pub fn codex_notify_args(path: &Path) -> Vec<String> {
+    vec![
+        "-c".into(),
+        format!(
+            "notify=[\"/bin/sh\",\"{}\"]",
+            toml_basic_string(&path.to_string_lossy())
+        ),
+    ]
+}
+
 /// TOML basic strings forbid raw control characters, and codex's raw-string
-/// fallback would otherwise bake the literal surrounding quotes into the
-/// value.
+/// fallback would otherwise bake the literal surrounding quotes into the value.
 fn toml_basic_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -1072,7 +1098,7 @@ pub(crate) fn login_shell() -> String {
 /// machine: `/Users/x/dev/chimaera` -> `-Users-x-dev-chimaera`, and a
 /// `.claude-worktrees` component encodes as `--claude-worktrees` (the dot
 /// becomes a dash too).
-pub(crate) fn encode_cwd(cwd: &Path) -> String {
+pub fn encode_cwd(cwd: &Path) -> String {
     cwd.to_string_lossy()
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
@@ -1120,7 +1146,7 @@ pub(crate) async fn claude_resumables(
 /// error. Transcripts with nothing user-visible to title them (warmups,
 /// empty boots) are skipped rather than listed as "untitled".
 /// (Shared with GET /recents, which merges this history into the rail.)
-pub(crate) fn scan_resumables(dir: &Path, exclude: &[PathBuf]) -> Vec<serde_json::Value> {
+pub fn scan_resumables(dir: &Path, exclude: &[PathBuf]) -> Vec<serde_json::Value> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -1410,6 +1436,15 @@ mod tests {
         assert!(!safe_arg("a b"));
         assert!(!safe_arg("a;b"));
         assert!(!safe_arg("a/b"));
+    }
+
+    #[test]
+    fn transfer_context_is_one_bounded_positional_prompt() {
+        let mut argv = vec!["codex".into(), "resume".into(), "native".into()];
+        append_transfer_prompt(&mut argv, "--unsafe\n$(never a shell command)");
+        assert_eq!(&argv[3..], &["--", "--unsafe\n$(never a shell command)"]);
+        append_transfer_prompt(&mut argv, &"x".repeat(9000));
+        assert_eq!(argv.last().unwrap().len(), 8192);
     }
 
     #[test]
@@ -2214,5 +2249,85 @@ mod tests {
         assert!(install_command(AgentKind::Claude).starts_with("curl "));
         assert!(install_command(AgentKind::Codex).contains("npm install -g @openai/codex"));
         assert!(install_command(AgentKind::Gemini).contains("npm install -g @google/gemini-cli"));
+    }
+
+    /// A stand-in login shell: backgrounds a sleeping helper the way a slow
+    /// rc does, records the helper's pid, then runs `tail` (print a path and
+    /// exit, or hang).
+    #[cfg(unix)]
+    fn fake_login_shell(name: &str, tail: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("chim-probe-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("helper");
+        let script = dir.join("sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nsleep 30 &\necho $! > '{}'\n{tail}\n",
+                pidfile.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (script, pidfile)
+    }
+
+    /// The rc's helper must be gone within ~2 s (killed, then reaped by
+    /// init once orphaned): nothing the probe started outlives it.
+    #[cfg(unix)]
+    async fn assert_helper_gone(pidfile: &Path) {
+        let pid: i32 = std::fs::read_to_string(pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let pid = nix::unistd::Pid::from_raw(pid);
+        for _ in 0..40 {
+            if nix::sys::signal::kill(pid, None) == Err(nix::errno::Errno::ESRCH) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+        panic!("the probe's helper {pid} outlived it");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_login_shell_probe_leaves_no_helper_behind() {
+        let (shell, pidfile) = fake_login_shell("done", "echo /bin/sh");
+        let found = tokio::time::timeout(
+            Duration::from_secs(3),
+            resolve_via_login_shell(shell.to_str().unwrap(), "sh"),
+        )
+        .await
+        .expect("a backgrounded helper holding stdout must not stall the probe");
+        assert_eq!(found, Some(PathBuf::from("/bin/sh")));
+        assert_helper_gone(&pidfile).await;
+        let _ = std::fs::remove_dir_all(shell.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_abandoned_login_shell_probe_kills_its_whole_group() {
+        let (shell, pidfile) = fake_login_shell("hang", "sleep 30");
+        // Dropping the probe mid-flight, once its rc has started the helper,
+        // is what daemon shutdown does.
+        let mut probe = Box::pin(resolve_via_login_shell(shell.to_str().unwrap(), "sh"));
+        let started = async {
+            while !std::fs::read_to_string(&pidfile).is_ok_and(|s| s.ends_with('\n')) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::select! {
+            _ = &mut probe => panic!("a hanging login shell must not answer"),
+            started = tokio::time::timeout(Duration::from_secs(5), started) => {
+                started.expect("the fake rc never started its helper");
+            }
+        }
+        drop(probe);
+        assert_helper_gone(&pidfile).await;
+        let _ = std::fs::remove_dir_all(shell.parent().unwrap());
     }
 }

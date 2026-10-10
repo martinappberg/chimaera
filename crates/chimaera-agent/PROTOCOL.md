@@ -3155,3 +3155,281 @@ The chat's subagent surface named the work but never the model doing it, and a s
 
 Neither ACP adapter reports subagents on its wire today, so there is nothing to name a model for or open; the chip and the view are claude- and codex-only by wire reality.
 
+## Extension passes (renumbered 2026-10-06)
+
+These passes apply only when the daemon extension is present; a daemon without it never takes these paths. They were first numbered 38–41, 43, 46, 48 and 49 and are now 43–50 in that order; main's passes keep 38–42.
+
+## Pass 43 (2026-09-26 — Claude 2.1.283 and Codex 0.157.1): native head forks and transfer origins. ADOPTED.
+
+An offline workspace takeover must preserve the imported native history while
+creating a different native conversation. Codex's generated `ThreadForkParams`
+requires `threadId` and permits omission of `lastTurnId`; `thread/fork` with
+`{threadId,cwd,ephemeral:false}` forks at the current head. The driver uses this
+only when `SpawnSpec.fork_head` is set and no explicit rewind boundary was given.
+The existing rewind fork still sends its pinned boundary. The TUI launcher uses
+`codex fork <id>` and Claude's `--resume <id> --fork-session` equivalents.
+
+The daemon stamps its single visible transfer context message with
+`UserMessage.origin: "moved" | "home"`; the manager reserves and matches the
+Send echo exactly as for `restart`. These origins update the carryover pick-up
+clock too. Transfer messages name the changed host context and any stopped
+background tasks. Mastermind remains reactive and receives no automatic turn.
+
+Addendum (2026-09-29, daemon-only — no CLI wire change, no smoke needed): a
+recovery arrival (the other machine stopped responding; the conversation
+continues from the last saved point, usually a forked copy) is tagged
+`recovered` instead, in either direction, so the chat view can key a
+different divider; `model::is_pickup_origin` covers all four daemon tags. The
+message itself is plain words (where it runs now: in the cloud / on the user's
+computer; same conversation or a copy; files installed and may differ;
+re-check tools and paths; for a recovery, how to treat work of uncertain
+state).
+Historical journal sequence numbers and public session IDs are not rewritten.
+
+Gate: local CLI help and generated JSON schema; native two-daemon transfers
+using one real conversation per CLI, clean move and return preserving the native
+ID, then offline head forks yielding a distinct native ID with the same public
+session ID. Both moved/home echoes were observed through the daemon chat socket.
+`just chat-smoke`: 24/24 passed on these CLI versions. PTY argv has hermetic
+coverage; this gate exercised the real native forks through chat mode.
+
+
+Directory-remap probe: both CLIs resumed the same isolated native conversation
+under a different working directory, reported the new absolute cwd and retained
+the earlier transfer marker. Claude's byte-identical transcript was installed
+under the destination project's encoded store directory. Codex's initial
+`session_meta.cwd` remains historical: the daemon records that original header
+cwd separately from its launch cwd rather than modifying native transcript
+records. Future verified native forks receive their own provenance.
+
+Native TUI gate: imported the same fixture histories with the terminal surface,
+observed the transfer context in each real CLI and its acknowledgment through
+the daemon PTY. Local CLI help pins positional `[PROMPT]` support for Claude and
+Codex resume/fork; the launcher bounds it and places it after `--`.
+
+
+## Pass 44 (2026-09-27 — Claude 2.1.283 and Codex 0.157.1): worker provider authentication. ADOPTED.
+
+This is daemon onboarding (`cloud/providers`), separate from the model drivers.
+No thread or turn is created by a readiness check. With fresh isolated home and
+provider config directories, real Claude `auth status --json` returned
+`loggedIn:false` and exit 1. Only the boolean and compatible exit code are used;
+account identity and credential fields are discarded. The installed CLI supports
+`auth login --claudeai` for the dedicated provider-owned terminal flow; setup-token
+is deliberately not used because it would print a credential.
+
+The installed Codex app-server's generated schema and a real isolated process
+confirm `account/read {refreshToken:false}` returns
+`{account:null,requiresOpenaiAuth:true}` when signed out. An explicit
+`account/login/start {type:"chatgptDeviceCode"}` returned a login ID,
+`verificationUrl` on `https://auth.openai.com`, and a one-time user code. The
+probe canceled it with `account/login/cancel {loginId}` and received
+`{status:"canceled"}`. Completion notifications use
+`account/login/completed {loginId,success,error?}`; the service matches its own
+login ID, ignores raw error text, and requires a fresh account/read before
+publishing Connected. No credential was entered and no existing account used
+in the probe; successful login completion has hermetic app-server coverage.
+
+The service retains only the catalog/status/action fields. Its cancel path
+terminates the owned process group and waits for cleanup before permitting a
+replacement writer. A previously issued vendor device code expires according
+to the provider; cancellation does not claim to revoke that code or sign out an
+already completed login. Official references: [Codex authentication](https://developers.openai.com/codex/auth),
+[app-server account API](https://developers.openai.com/codex/app-server),
+[Claude CLI reference](https://code.claude.com/docs/en/cli-reference), and
+[GitHub auth status](https://cli.github.com/manual/gh_auth_status).
+
+
+## Pass 45 (2026-09-28 — Claude 2.1.283): headless browser/code sign-in. ADOPTED.
+
+In a fresh temporary HOME and CLAUDE_CONFIG_DIR, `claude auth login --claudeai`
+with piped stdin/stdout and browser launching suppressed emitted an OSC hyperlink
+on `https://claude.com/cai/oauth/authorize`, followed by `Paste code here if prompted >`.
+No PTY is required. The bounded probe observed the URL/prompt then killed only
+its owned process; no account credentials were submitted and no existing account
+was used. Only origin/path and query-key names were retained as evidence.
+
+The daemon's adapter extracts that complete allowlisted URL without exposing raw
+CLI output. A one-time code is forwarded as one stdin line to the same official
+CLI, which still owns OAuth/PKCE/token storage. Process success alone does not
+confirm connection: the shared readiness helper performs a fresh `auth status`
+check. Synthetic subprocess regressions verify code framing, replay rejection,
+completion, cancellation and no workspace/session registration. This replaces
+the terminal-based Claude onboarding in Pass39. Provider authentication is separate
+from model turns; this change does not alter the structured agent driver.
+
+## Pass 46 (2026-09-28 — Codex 0.157.1, Claude 2.1.283): a refused `turn/start` leaves no input awaiting a turn; managed shutdown waits for the exit. ADOPTED.
+
+Codex: when `turn/start` answers with an error that does not name a live turn
+(a usage limit, an expired sign-in), the driver emits its non-fatal `Error`
+(prefix `codex::TURN_START_FAILED`, `turn/start failed: `) and promotes one
+queued send, exactly as before; it emits no turn event, since no turn ever
+started. The manager's command budget reads that error as proof the echoed
+input will never start a turn and clears `awaiting_turn`, so the session reads
+as idle to an extension's pause checks. (A first version also emitted
+`TurnAborted { reason: "turn failed" }`, which showed a second notice in the
+UI; it was dropped on 2026-10-06.) An error that names the live turn is still
+adopted as before. Units: `codex::tests::a_refused_turn_start_reports_only_the_error`,
+`tests::a_refused_turn_start_leaves_no_input_awaiting_a_turn`.
+
+Transport (`ndjson.rs`): a managed child's shutdown no longer sleeps a fixed two
+seconds before killing its process group. It polls the exit every 25 ms without
+reaping (`waitid` `WNOWAIT`, so the group id cannot be recycled), up to
+min(grace, 2 s), then kills the group and reaps. A clean stop (~0.3 s) is no
+longer stretched to two seconds for every stop, view switch and rewind in a managed
+project. Unit: `ndjson::tests::a_managed_child_that_exits_is_reaped_at_once_and_its_group_ended`.
+The PTY engine's managed stop now sends SIGHUP then SIGTERM before the SIGKILL
+escalation (an interactive shell ignores SIGTERM but exits on hangup).
+
+### Gate (Pass 46)
+
+`just chat-smoke` (`cargo +1.96.0 test -p chimaera-agent --test live -- --ignored
+--test-threads=1`), twice. Every Codex live test passed both times (collab
+subagents, echo turn, fork/rollback/compact, handshake, steer/settings/account,
+turn summary, driver stack end to end): 8/8 on the second run with both changes.
+The Claude live tests could not run then: the account hit its session limit
+("You've hit your session limit · resets 11pm"), so every Claude turn aborted
+at the provider (3 non-turn Claude tests passed). After the reset, the Claude
+half ran on its own (`… --ignored --test-threads=1 claude`) against Claude
+2.1.283 with the transport change: 14/14 passed (every `claude_*` protocol
+test, `driver_stack_end_to_end_against_real_claude` and
+`driver_stop_ends_claudes_detached_background_work`), so the gate is complete
+for both drivers.
+
+## Pass 47 (2026-09-29 — GitHub CLI, from its source; no live cloud probe): GitHub device-code sign-in. ADOPTED.
+
+This is daemon onboarding (`cloud/providers/github.rs`), separate from the model
+drivers, and replaces Pass 44's GitHub login terminal. With stdin and stdout not a
+TTY (and `GH_PROMPT_DISABLED=1`), `gh auth login --hostname github.com
+--git-protocol https --web` is non-interactive: `internal/authflow/flow.go` writes
+`! First copy your one-time code: XXXX-XXXX` and then `Open this URL to continue
+in your web browser: https://github.com/login/device` to stderr, never waits for
+Enter and never opens a browser, then polls GitHub until the code is approved,
+denied or expired and exits accordingly. Its interactive form instead prints
+`Press Enter to open github.com in your browser... ` and opens the page itself;
+the adapter answers that once and falls back to GitHub's own device page. A
+non-interactive login skips gh's Git credential prompt, so `gh auth setup-git
+--hostname github.com` follows (the old terminal command chained it too).
+`--skip-ssh-key` only affects SSH setup; it is passed when `gh auth login --help`
+lists it. The strings were read from gh's source at trunk (gh 2.92.0 is the
+local release); no live device-code request was made from a cloud machine, so the
+first real connection is the live gate. Hermetic fakes cover the code/page
+parsing, Enter prompt, declined, silent and stalled CLIs, cancellation and the
+Git setup.
+
+## Pass 48 (2026-10-01 — daemon-side, no CLI wire change): a send is accepted at most once, by a client-minted id. ADOPTED (initial scope; durability extended by Pass 49).
+
+Nothing on either agent's wire changes: the drivers send what they sent and echo what they echoed. This pass is about the daemon's own chat wire, where a client could not tell whether a send it made had been accepted (a socket that ended, a relay or a keeper holding it, a driver still in its handshake), and guessed.
+
+- `UserMessage` gains an additive `client_id: Option<String>`: the id the sending client minted for the `send` this echoes (`model::valid_client_id`: 8 to 64 characters of `A-Z a-z 0-9 _ -`). Absent on a send without one and on every message no client sent (Remote Control, the daemon's own pick-ups, agent messages, seeded history, permission feedback).
+- The id never enters `AgentCommand` and no driver sees it. `ChatManager::send_from_client` keeps it on the send's `SendReservation`, and `CommandBudget::observe` stamps it onto the echo that reservation pairs with, exactly as it stamps `origin`. The pairing is the existing one (`command_order` serializes reservation with enqueue; the oldest unkeyed reservation takes the next id-bearing echo), so a `SendIfRunning` and its key are untouched.
+- A session accepts an id at most once. Accepted means reserved: from the moment the send is queued for the driver (a driver in its handshake has not echoed yet), then for as long as the id is among the newest `CLIENT_IDS_REMEMBERED` (128) echoed ones. A second send under an accepted id returns `SendOutcome::Duplicate` and queues nothing. The check runs before every refusal (a paused session, a full queue), because a repeat that were refused would send a delivered message back to its composer.
+- `ChatManager::cancel_send` withdraws an id nothing was accepted under; a later send under it fails with `SendCancelled`. Against an accepted id it answers false and changes nothing. Cancelled ids share the same 128-entry record.
+- `Journal::open` collects the ids of the newest messages in the pass it already makes over the file, and `spawn` seeds the record from them: a daemon restart, a respawn or a resume still refuses the repeat. An id whose send was reserved for a driver that ended before echoing it is forgotten with that driver (`CommandBudget::clear`, and the reservation guard when the enqueue itself fails), so the client's next copy is delivered by the next process. Cancelled ids are not journaled: they last as long as the session's process.
+- The server's `/ws/chat` reads the id from the frame (`ws::command_tag`), says `send_ids: true` in `ready`, answers `cancel_send {client_id}` with `send_cancelled {client_id, cancelled}`, and copies the id into every refusal of the command that carried it.
+- The echo of a send is always journalable. `COMMAND_TEXT_TOTAL_MAX` and the journal's line cap are both 256 KiB, so a send near the limit, or a shorter one whose characters JSON escapes several bytes each, serialized past the cap, and `Journal::append` replaced the echo with an `Error`: no `id`, no `client_id`, so the send never confirmed, was uploaded again at every `ready`, and after a restart (nothing to seed) a resend ran it twice. An oversize `UserMessage` is now cut instead (`shortened_user_message`: every field kept, the text reduced to its head and tail around the `… [N bytes omitted] …` marker tool output uses, halved until the line fits). The agent received the whole text; only the journal's copy is cut.
+- Limits, on purpose: a withdrawn id is forgotten when the session's process is replaced (pinned by `a_withdrawn_send_id_is_forgotten_with_its_sessions_process`), and a daemon killed between writing the agent's stdin and journaling the echo leaves a delivered send with no id. Neither gets a journal event.
+
+Hermetic: `a_client_send_id_is_accepted_when_queued_and_rides_its_echo`, `a_send_id_is_forgotten_with_a_driver_that_never_handled_it`, `cancelling_a_send_id_only_works_before_it_is_accepted`, `the_send_id_record_keeps_only_the_newest_ids`, `reopen_reads_back_the_newest_send_ids`, `client_send_ids_are_short_and_plain`, the additive-field case in `user_message_delivery_fields_are_additive`; through `fake-claude`: `a_send_queued_during_the_handshake_is_accepted_once` (the agent answers its handshake a second late), `a_send_id_in_the_journal_is_still_refused_after_a_restart` (a second manager over the same journal), `cancel_send_wins_before_acceptance_and_loses_after`, `a_send_too_long_for_one_journal_line_keeps_its_ids_and_runs_once`, `an_oversize_user_message_is_cut_not_replaced`; server: `ws_chat_sends_are_accepted_once_under_their_client_id`. Both drivers' files changed only by the new field's `client_id: None` in their `UserMessage` literals, so `just chat-smoke` was not run for this pass.
+
+## Pass 49 (2026-10-02 — manager durability, no CLI wire change): unreceipted dispatch and withdrawals survive process replacement.
+
+Pass 48's process-local withdrawal and replay-after-unreceipted-exit limits are
+superseded for keyed sends recorded by this implementation. Driver protocols and
+`AgentCommand` remain unchanged. This is bounded delivery evidence, not an
+exactly-once guarantee for an agent's external actions.
+
+- Before a keyed command can enter the driver's bounded channel, the manager
+  atomically persists `dispatching` independently of the echo journal. A driver
+  loss or crash between stdin write and echo persistence therefore leaves
+  `ClientIdState::Uncertain`, and retries/cancellation fail `SendUncertain`.
+  Missing actors also answer conservatively: disappearance does not prove input
+  was undelivered. Cancellation before acquiring the command/IO permit remains
+  proven undispatched; its reservation is released and a later attempt is safe.
+- `Accepted` describes a live reservation or driver-owned queue. A nonqueued
+  `UserMessage` or a queued `UserMessageUpdate::Sent` records `confirmed` and
+  returns `Confirmed`. A queued echo can stop ordinary live retries, but does
+  not establish delivery across process replacement: driver-owned after-turn
+  FIFOs can die before sending any provider input. The manager retains client
+  correlation until a Sent update; without one the persisted ID stays uncertain.
+  Legacy journal extraction uses the same queued/Sent/Cancelled fold: queued-only
+  echoes seed uncertainty and cannot falsely promote incoming dispatch evidence.
+  A receipt that survives without its UI journal echo still suppresses replay
+  and is positively distinguishable from an unresolved dispatch.
+- `cancel_send` returns true only after persisting `withdrawn`; late sends under
+  it fail `SendCancelled` across remove/spawn, daemon restart and new transfers.
+  A failed write never acknowledges a withdrawal. A canceled async caller cannot
+  cancel the owned filesystem job or allow a later writer to regress its state.
+  Every session has one shared I/O gate (including replacement managers); a
+  stalled job blocks further keyed admission and transfer export/import while
+  unrelated provider events continue after the bounded wait. Storage damage or
+  ambiguous persistence fails closed rather than resetting the ID record. A
+  Cancelled update settles only its matching live queued reservation as withdrawn,
+  releasing durable outstanding capacity; a stale cancellation after Sent cannot
+  revoke Confirmed, and generic uncertain cancellation stays forbidden.
+- The v1 `{version, session_id, entries:[{id,state}]}` snapshot has no prompt or
+  credentials, validates its exact logical session and rejects unknown fields.
+  Sidecars are capped at 32 KiB, retain the newest 128 confirmed/withdrawn IDs,
+  and preserve every unresolved ID up to the fixed 64-ID outstanding cap. At
+  capacity, new dispatch is refused; unresolved IDs never roll out with settled
+  receipts. At most 512 stores may be live/retained. This bounded retention does
+  not promise replay suppression for settled IDs after they age out.
+- An enrollment marker makes missing enrolled state an error. Malformed,
+  oversized, conflicting or missing enrolled evidence is protected. Directory
+  pruning counts companion-only groups and bytes; retired settled companions
+  can be removed with history, but unknown/damaged evidence stays fail closed
+  even if its JSONL is pruned. Active and ledger-protected sessions stay intact.
+- `journal::export_send_state`, `validate_send_state`, `merge_send_state` and
+  `import_send_state` support transfer without weakening local receipts.
+  Read-only merge captures local legacy echoes before journal replacement;
+  import conservatively merges again under the same gate. An absent member in
+  a legacy bundle never clears existing state; legacy journal-only bundles carry
+  only their journal evidence; queued-only rows remain conservative and unresolved. `record_settings_checked` reports and
+  durably flushes index import failures; the ordinary settings wrapper preserves
+  its previous lightweight persistence behavior.
+
+Hermetic coverage: queued echo versus Sent across replacement; receipt without a
+journal echo; stdin acceptance without any echo then restart; withdrawal across
+replacement/restart/transfer; aborted enqueue before command/IO permits; canceled
+owned writer surviving replacement and blocking import until it settles; stale
+imports/dispatches never weakening receipts; outstanding versus settled retention;
+malformed/oversized/missing state and failed confirmation; preparation before
+journal replacement; checked settings failures; companion pruning and protection
+of unresolved/damaged orphan evidence. These tests use fixtures, not paid agents.
+The driver wire is unchanged; this pass does not claim new live CLI verification.
+
+Scope (2026-10-05): the durable sidecar applies only to a session spawned with
+`SpawnSpec.managed_execution` (work that can move to another machine). Every
+other chat keeps the same dispatch/receipt/withdrawal record in memory
+(`send_state::Receipts::Memory`): no sidecar or marker is written, a send costs
+no synced write, a slow disk cannot latch "delivery unconfirmed", and an
+existing sidecar is read when sound and ignored with a log line when damaged,
+so it never stops a chat from starting. Within one daemon life the client-visible
+answers (`Accepted`/`Duplicate`, `send_confirmed`, `send_cancelled`,
+`send_uncertain`) are unchanged; across a daemon restart such a chat has Pass 48's
+limits (journal echoes only: a send dispatched without an echo, or a withdrawal,
+is not remembered). A durable opener (managed spawn, transfer export/import)
+upgrades a cached store, whose next write persists everything kept so far, and
+refuses one whose evidence was ignored as damaged.
+
+`ChatManager::active_queued_ids` exposes at most 64 current-driver client IDs for
+ready/replay reconciliation. Only replayed queued rows at or before ready.head
+absent from this live set can be classified as lost/uncertain; newly arriving
+post-head echoes and subsequent Sent updates retain their authoritative order.
+Regression tests cover 70 queued-cancel cycles followed by valid admission and
+replacement, stale Sent→Cancelled updates, and queued journal plus unresolved
+metadata import/restart/transfer.
+
+## Pass 50 (2026-10-05 — daemon-side, no CLI wire change): where a synced project's agent runs rides the cluster carriers, once per change of machine. ADOPTED; live Claude/Codex confirmation PENDING.
+
+The daemon extension moves a project's conversations between the user's computer and their cloud machine. Each agent must know where it runs now and what did not travel. That note used to be appended to the chimaera MCP server's `initialize` instructions. **Claude Code cuts long server instructions short**: in a Claude Code session with the chimaera server connected, its instructions arrive ending "… [truncated]" inside the agent-communication paragraph, before anything appended after it, so a Claude agent never saw the note (observed 2026-10-04 and 2026-10-05; the exact cap is not read from Claude Code's source). Whether Codex puts MCP server instructions into model context is still unverified. ADOPTED instead, with no new wire use:
+
+- **Claude, chat and terminal:** the hook answer's `additionalContext` (Pass 39's carrier and the cluster context's) at `SessionStart`, or the first `UserPromptSubmit` where SessionStart did not fire. The context is kept in the conversation's history (it is part of the transcript a `--resume` reloads), so it is sent once per change of machine per conversation: a different machine, a new move, or a newly kept-both file. Which conversation heard which note is remembered on disk (`told.json`), so a restart's resurrection or a view switch adds no copy; a digest on the session record keeps two hooks racing at one start from both carrying it. In chat mode SessionStart fires before claude answers `initialize` (2.1.287, the startup-progress note above), so a resumed idle conversation has the note before its next turn. Never on a subagent's hook (`agent_id` set).
+- **Codex chat:** `SpawnSpec.developer_note` (Pass 41's `thread/inject_items`), the cluster note first when both apply, under the same once-per-change rule (an injected item is recorded in the rollout like any other). Reaches fresh and resumed threads; a newer injected note supersedes an older one (Pass 41's INJECTRESUME).
+- **Codex terminal:** no carrier proven to reach the model; the read-only `where_am_i` MCP tool is pre-approved (`approval_mode="approve"`, Pass 35) and its description asks the agent to call it before relying on earlier files, tools or paths. Looked for on 2026-10-05 against the installed codex-cli 0.158.0, without a model call (a throwaway `CODEX_HOME`, `codex app-server`, `hooks/list` and `thread/start` only):
+  - `-c developer_instructions=…` (argv) is fixed at a thread's first turn and ignored on resume (Pass 41), and argv is readable by other users on a shared host: not a carrier for a conversation that moved.
+  - The `notify` program only receives completion payloads; nothing it prints reaches the model.
+  - Codex 0.158 has command hooks (`SessionStart`, `UserPromptSubmit`, `PostToolUse`, …) whose output may carry `additionalContext` (the binary names an `additionalContextLimit` and refuses it for some events). A hook passed as a session flag, `-c 'hooks.SessionStart=[{hooks=[{type="command",command="…"}]}]'`, lists with `source: "sessionFlags"` and `trustStatus: "untrusted"`; adding `-c 'hooks.state={"/<session-flags>/config.toml:session_start:0:0"={trusted_hash="sha256:…"}}'` (the hash `hooks/list` reports) makes it `trusted` without writing any user file. It did NOT fire on `thread/start`: like the startup hooks above it runs when the first turn starts, so whether the model reads its `additionalContext`, and whether it fires again on a resumed TUI, needs a billed live turn. A synchronous SessionStart hook also blocks that first turn (the 0.159.3 note above). NOT ADOPTED until that live probe; it is the candidate.
+- The interrupted-work pick-up (`moved`/`home`/`recovered` user message, Pass 43) no longer carries the note; the note arrives through the carriers above.
+
+Hermetic: the private host's `tests/cloud_context.rs` (a Runtime stand-in: an unenrolled project gets nothing, once per conversation per change of machine, a restart's new process of the same conversation gets nothing, first-prompt fallback, never on a subagent hook, a new kept-both pair re-delivered, the Codex developer note once; and without the Runtime the free values pinned as literals: hook answers, MCP instructions, tools, pre-approved tools, Codex developer note); private `pro-daemon-runtime` `placement_tests` drives recording stand-ins for both CLIs through the real chat, terminal, move-resume and hook paths with the actual Runtime; the private loopback harness's coming-home case records what its stand-in claude's SessionStart hook was told after a real move to the cloud (before the pick-up turn), after a real return home (kept-both file named) and after a laptop daemon restart (nothing repeated; a new conversation still told). Still required (billed, live): a real Claude chat and terminal and a real Codex chat in a synced project, each asked "where are you running, which OS, are node_modules here, which files are not here?" after an idle move to the cloud, after a mid-turn move, after an idle return, after an app restart following a return (and that it was not told twice) and fresh on the cloud machine; whether a real Codex terminal calls `where_am_i` unprompted; and the Codex session-flag SessionStart hook above (does its `additionalContext` reach the model, does it fire on resume).

@@ -79,6 +79,36 @@ app-build` (never the root `cargo`).
   hidden it restores ONLY the most recently used one (the rest stay in the Dock); with no window (only
   during startup) it opens Home. A repeated launch focuses the most recent on-screen window the same way. Minimized
   windows are never mass-restored.
+- **Project windows for cloud work.** Chimaera Pro offers **Run here** in the project's host
+  indicator to move its work to this Mac. The account's cloud is not a separate host page: every window opens through
+  `open_shell_window`, which refuses the cloud's alias, and a connect to the cloud is refused before
+  anything reaches it (`shell/connect.rs` `run_flight`, `shell/tunnel.rs` `app_host`). A window on it
+  saved by an older build is not restored; launch logs it and drops the record. Cloud projects open in
+  local windows once their folder is copied here; execution stays with its current owner until a separate
+  takeover ([pro.md](pro.md#what-the-user-sees-and-does)).
+
+## Home launcher
+
+- **What & when.** Home is workspace-first: **Open folder** registers an existing folder;
+  recent workspaces on this machine show their path, live-session or approval state, and last-opened
+  time. Remote machines are grouped separately, with their own connection status and workspaces.
+- **How it's used.** A workspace row opens in the launcher. A workspace with live sessions shows a
+  visible **End sessions** beside the row (ending live work is never hidden in a menu); its action
+  menu offers a new window or removing the registration (the folder stays untouched). Cmd/Ctrl-click
+  still opens a new window. Connected remote rows show their loopback port, and a pool alias pinned
+  to one login node says so on hover. Remote menus keep **Disconnect** separate from confirmed
+  **End sessions**, **Shut down**, and **Forget machine**. Cluster compute sessions remain on that
+  host's detail page, their actions revealed on hover. The daemon version stamp sits in the corner.
+- **Navigation.** A quiet column keeps Workspaces, Chimaera Pro, and Settings in the same place across
+  Home's surfaces, collapsing to a compact top bar at narrow widths (where the Settings/Pro page
+  drops its breadcrumb and frame). Pro is available from account-hosted windows and from native
+  windows of builds with an account endpoint; ordinary browser views retain Settings. Opening a folder and using
+  local or SSH workspaces never requires a subscription. Cloud-only projects appear only when
+  available to the signed-in plan, and require their existing explicit destination-picker flow.
+- **Where it lives.** `web-ui/src/lib/workspace/{HomeScreen,HomeNavigation,HomeActions}.svelte`,
+  `App.svelte`, and the existing `net/native.ts` bridge. Home preserves the native titlebar drag
+  lane. Action disclosures support Tab, Escape, and outside-click dismissal; existing destructive
+  confirmations remain in place.
 
 ## Home launcher
 
@@ -130,6 +160,8 @@ app-build` (never the root `cargo`).
   covers it. Remote-host windows behave the same — the commands are granted per window like
   every daemon-window command — and a window whose UI predates the guard never reports, so it
   closes as it always did.
+- **Nothing else.** With Pro too, a quit asks nothing more and moves no work: the daemon keeps
+  running it and keeps the computer reachable. See [Pro › The model](pro.md#the-model).
 
 ## Notifications
 
@@ -174,8 +206,13 @@ app-build` (never the root `cargo`).
 - **An explicit check always answers** (`checkForUpdates(true)`: the menu item, the home screen's version
   stamp): "Checking for updates…", then the offer (snooze/skip don't hide what you asked for), "You're up
   to date" (fades after ~6s unless hovered), "Development build", or "Couldn't check for updates" with the
-  reason and "try again". The deciding source is what can update this window: the app's signed channel in
+  reason and "try again". A browser view of the account's cloud answers at once, without asking, with
+  "Updates for your cloud are managed for you." (it fades too; its daemon reports `managed`). The deciding source is what can update this window: the app's signed channel in
   the native shell, the daemon's release check in a browser.
+- **Never for the cloud.** The service updates the cloud's daemon; the app never offers to. Build skew is
+  window-scoped and no window shows the cloud, the shell never flags the cloud outdated
+  (`shell/tunnel.rs` `offers_daemon_update`; SSH hosts and other computers keep the note and the toast),
+  and a connect or update aimed at it is refused.
 
 ## Windows: the WSL2 engine (beta)
 
@@ -274,6 +311,9 @@ app-build` (never the root `cargo`).
 - **The unsaved-edits guard on close and quit** has unit-tested decisions (the shell's `Guard`,
   the page's dialog controller) and CI's bundle builds, but has not yet been hand-driven in the
   app; the macOS `applicationShouldTerminate:` hook (Dock › Quit, logout) is compile-checked only.
+- **Quitting with Pro** asks nothing and sends nothing: the daemon keeps the work and keeps the
+  computer reachable. The daemon's own sleep watcher (macOS) is unit-tested; a real lid close has
+  not yet been hand-driven.
 - **Reload Window** was hand-driven on macOS (⌘R, the held and cancelled notice, a page that never
   booted); its F5 path on Linux (GTK accelerator) and Windows (WebView2) is compile-checked only.
 

@@ -10,6 +10,28 @@ use crate::{app, lock, AppState, ServerConfig};
 
 /// Bind on 127.0.0.1, write the manifest, and serve until SIGINT/SIGTERM.
 pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
+    run_selected(cfg, None).await
+}
+
+/// Trusted composed assembly: the policy is built after CLI daemonization,
+/// before restore or any helper starts; public startup restrictions and the
+/// actual task owners remain the same.
+pub async fn run_with_policy(
+    cfg: ServerConfig,
+    factory: crate::PolicyFactory,
+) -> anyhow::Result<()> {
+    run_selected(cfg, Some(factory)).await
+}
+
+async fn run_selected(
+    cfg: ServerConfig,
+    factory: Option<crate::PolicyFactory>,
+) -> anyhow::Result<()> {
+    // The composition point. Without a policy the daemon runs the inert one.
+    let policy = match factory {
+        Some(factory) => Some(factory().await?),
+        None => None,
+    };
     // A cluster workspace job: its data dir is the workspace's folder on the
     // shared filesystem, and the manifest there is the workspace's lease. A
     // previous job of the same workspace may still be shutting down (a
@@ -125,8 +147,18 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         build: Some(chimaera_core::BUILD_ID.to_string()),
         slurm_job_id: own_job.clone(),
         runtime_leases: true,
+        daemon_extension: policy.is_some(),
     };
     manifest.write().context("failed to write manifest")?;
+
+    // Agents never outlive this daemon, however it ends; ones a killed
+    // predecessor on this host left running stop here, before anything
+    // resumes. Per host: a home shared across nodes holds other hosts' ids.
+    let record = chimaera_core::data_dir().join(format!(
+        "agent-processes-{}",
+        hostname.replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "_")
+    ));
+    let _ = tokio::task::spawn_blocking(move || chimaera_agent::reaper::install(record)).await;
 
     println!("chimaera daemon listening on 127.0.0.1:{port}");
     println!("http://127.0.0.1:{port}/#token={token}");
@@ -139,6 +171,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         chimaera_core::data_dir(),
         chimaera_core::config_dir(),
     );
+    state.install_policy(policy, &chimaera_core::data_dir());
     let managed_root = chimaera_core::managed_agents_dir();
     if state.managed_root != managed_root {
         state.legacy_managed_root = Some(std::mem::replace(&mut state.managed_root, managed_root));
@@ -154,6 +187,8 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
             tokio::task::spawn_blocking(move || crate::workspaces::seed_cluster_workspace(&state))
                 .await;
     }
+
+    state.policy().started(&state)?;
 
     // Theming shims: regenerated at every daemon start (and after installs /
     // uninstalls / settings edits) so they always match this build's resolution
@@ -254,6 +289,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     // live chat agents cleanly so their own teardown stops their background
     // work (see `chat::stop_all_for_exit`); they resurrect from the ledger.
     crate::chat::stop_all_for_exit(&state).await;
+    state.policy().shutdown(&state).await;
     // Plugins' programs end with the daemon, their whole process groups (a
     // build is started again on the next save; nothing resumes it).
     state.plugin_platform.jobs.kill_all();
@@ -499,6 +535,7 @@ async fn shutdown_signal(state: Arc<AppState>) {
     state
         .stopping
         .store(true, std::sync::atomic::Ordering::Relaxed);
+    state.policy().stopping(&state);
     state.changes.notify_waiters();
 }
 
@@ -585,6 +622,7 @@ mod tests {
             build: None,
             slurm_job_id: job.map(str::to_string),
             runtime_leases: false,
+            daemon_extension: false,
         };
         std::fs::write(path, serde_json::to_vec(&m).unwrap()).unwrap();
     }

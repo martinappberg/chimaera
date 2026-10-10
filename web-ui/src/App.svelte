@@ -1,15 +1,21 @@
 <script lang="ts">
   import { RecentSessions } from "./lib/workspace/recentSessions";
+  import { cloudOnboarding } from "./lib/pro/onboarding.svelte";
+  import { KEPT_NOTICE_PREFIX, keptNoticeWorkspace } from "./lib/pro/kept";
+  import { onMount, tick, untrack } from "svelte";
+  import { selectedApplication } from "./lib/extensions/selected";
+  import { paidPlan, proPossible, proTier } from "./lib/net/plan";
+  import { isBrowserGateway, gatewayPrefix, gatewayWorkspace } from "./lib/net/base";
   import AgentSetupDialog from "./lib/workspace/AgentSetupDialog.svelte";
   import { agentSetup, openAgentSetup } from "./lib/workspace/agentSetup";
   import { agentCatalog } from "./lib/workspace/launcher";
   import { nextInGroup } from "./lib/workspace/sessionCycle";
-  import { onMount, tick, untrack } from "svelte";
   import { paneTabHasKeyboardFocus } from "./lib/shared/tabNavigation";
   import { flip } from "svelte/animate";
   import { fade } from "svelte/transition";
   import { runStallDrive, stallDriveSpec } from "./lib/perf/tabSwitchDrive";
   import {
+    api,
     ApiError,
     getActiveWorkspaceId,
     getHostLabel,
@@ -25,10 +31,13 @@
     pollHealth,
     reclaimHomeHub,
     setActiveWorkspaceId,
+    setViewerWorkspaceHeader,
     unauthorized,
     type Health,
   } from "./lib/net/api";
   import { linkRtt, linkRttNow, resetLinkRtt, LINK_RTT_BADGE_MS } from "./lib/net/rtt";
+  import { notePlaces, projectWhere, projectWhereLabel } from "./lib/net/placement";
+  import { titleHost, windowTitle } from "./lib/shared/windowTitle";
   import { LOCAL_ECHO_MIN_RTT_MS } from "./lib/terminal/localEcho";
   import { healthPollDelayMs, type PollHandle } from "./lib/net/poll";
   import { pageVisible } from "./lib/shared/visibility";
@@ -89,7 +98,8 @@
     type LinkCtrl,
   } from "./lib/workspace/agentLinks";
   import { typeIntoDetachedSession } from "./lib/terminal/ws";
-  import { reconnectingSockets } from "./lib/net/reconnect";
+  import { reconnectingSockets, setSocketKeepers } from "./lib/net/reconnect";
+  import { createGatewayJobWatch, endJobWindow, jobWindowEnd, windowJobEnd } from "./lib/workspace/jobEnd";
   import {
     createReconnectListenerGate,
     selectRemoteReconnectSurface,
@@ -176,9 +186,12 @@
     openPlugins,
     openPluginViewTab,
     openSessionsList,
+    openKeptReview,
+    keptReviewShown,
     openGit,
     openSession,
     openSettings,
+    openPro,
     paneForTab,
     panes as panesOf,
     pruneDeletedPath,
@@ -272,6 +285,11 @@
   import ExtensionsGlyph from "./lib/plugins/ExtensionsGlyph.svelte";
   import { transferBlock, transferInto, type FileSource } from "./lib/workspace/fileTransfer";
   import ComputeStrip from "./lib/workspace/ComputeStrip.svelte";
+  import PlaceSlot from "./lib/extensions/PlaceSlot.svelte";
+  import { filesLoading } from "./lib/extensions/loading";
+  import ElsewhereNotice from "./lib/workspace/ElsewhereNotice.svelte";
+  import MovingOverlay from "./lib/workspace/MovingOverlay.svelte";
+  import { elsewhere as projectElsewhere } from "./lib/net/placement";
   import type JobWindowNotices from "./lib/workspace/JobWindowNotices.svelte";
   import type JobClusterHome from "./lib/workspace/JobClusterHome.svelte";
   import {
@@ -321,6 +339,7 @@
     askpassActive,
     closeThisWindow,
     clusterOpen,
+    clusterOverview,
     connectHost,
     isNativeShell,
     onAppUpdate,
@@ -344,6 +363,7 @@
   import { clearBrowserNotices, deliverBrowserNotices } from "./lib/workspace/notices";
   import {
     placeAgentBrowser,
+    admitsAgentBrowserOpen,
     shouldActOnAgentBrowserOpen,
     type AgentBrowserOpen,
   } from "./lib/browser/agentOpen";
@@ -390,6 +410,7 @@
   import ContextMenuHost from "./lib/shared/ContextMenuHost.svelte";
   import { contextMenu } from "./lib/shared/contextMenu.svelte";
   import ConfirmDialog from "./lib/shared/ConfirmDialog.svelte";
+  // Static: the unsaved-changes question must show even when a chunk cannot load.
   import CloseDirtyDialog from "./lib/layout/CloseDirtyDialog.svelte";
   import { WindowCloseGuard } from "./lib/layout/windowClose.svelte";
   import { fsDeleteOp, lastFsMutation, notifyCreated, pendingDelete } from "./lib/workspace/fsEvents";
@@ -486,8 +507,31 @@
 
   // --- remote window: auto-reconnect a dropped tunnel ------------------------
   /** This window's host alias ("local" for the local daemon). */
+  // Only a window that can have Pro has keepers that hold its sockets open
+  // for a sleeping owner (`net/reconnect.ts`); set before any socket dials.
+  setSocketKeepers(proPossible());
+  setViewerWorkspaceHeader(proPossible());
   const hostAlias = getHostLabel();
   const isRemoteWindow = hostAlias !== "local";
+  /** A browser view of a project (`/workspace/{id}/`) follows the project
+   *  between the cloud and your computer: its strip names where it runs now
+   *  ("In the cloud", "On your computer"), not a host, and a link
+   *  round trip to whichever machine that is means nothing to the person
+   *  reading it. */
+  const projectView = gatewayWorkspace() !== null;
+  /** Every view the account serves (a project, a cloud machine, a cluster
+   *  job's workspace) links back to the account's Home at `/`. */
+  const accountHomeLink = isBrowserGateway() && !isNativeShell();
+  /** A host view asked to open a project another machine runs now: the
+   *  project view's link that follows it (`placement.elsewhere`), or null. */
+  let elsewhereHref = $state<string | null>(null);
+  {
+    const asked = isBrowserGateway() && !projectView ? new URLSearchParams(location.hash.slice(1)).get("ws") : null;
+    if (asked !== null) {
+      void projectElsewhere(asked, gatewayPrefix().replace(/^\/app\//, "") || null).then((href) => { elsewhereHref = href; });
+    }
+  }
+  const stripHost = $derived(projectView ? projectWhereLabel($projectWhere) : hostAlias);
   /** Set when this window sits on a compute-node daemon (Mode 2 job). */
   const jobCtx = getJobContext();
   /** The key this window's tunnel reports `host-status` under. A job window
@@ -517,12 +561,13 @@
   let reconnecting = $state(false);
   /** Last reconnect failure, surfaced with a Retry. */
   let reconnectError = $state<string | null>(null);
-  /** A job window's job left the queue (the shell's `ended` on its key);
-   *  `reason` is Slurm's state, or "stopped" for a stop from the app. */
-  let jobEnded = $state<{ reason: string | null } | null>(null);
+  /** A job window's job left the queue (the shell's `ended` on its key, or
+   *  the cluster's overview after a reconnect failed); `reason` is Slurm's
+   *  state, or "stopped" for a stop from the app. */
+  const jobEnded = $derived($windowJobEnd);
   /** The job window's notices — their own chunk, loaded only in job windows. */
   let JobNoticesView = $state<typeof JobWindowNotices | null>(null);
-  if (jobCtx !== null) {
+  function loadJobNotices(): void {
     import("./lib/workspace/JobWindowNotices.svelte").then(
       (m) => {
         JobNoticesView = m.default;
@@ -530,14 +575,32 @@
       (err: unknown) => console.error("job window notices failed to load", err),
     );
   }
+  if (jobCtx !== null) loadJobNotices();
+  /** A browser view the account serves of one machine (`/app/{id}/`), not a
+   *  project view: when its daemon reports the job it runs in, it is a
+   *  cluster job's workspace, and only the account can say that job ended
+   *  (no shell tells a browser), so the view asks it while its link is down. */
+  const gatewayHostView = isBrowserGateway() && !projectView && !isNativeShell() && jobCtx === null;
+  let webJob = $state(false);
+  const gatewayJobWatch = gatewayHostView ? createGatewayJobWatch(() => api("/health")) : null;
+  $effect(() => {
+    if (!gatewayHostView || webJob || !$computeStatus?.self) return;
+    webJob = true;
+    loadJobNotices();
+  });
+  $effect(() => () => gatewayJobWatch?.stop());
   /** A cluster workspace window's cluster page (its own chunk), shown over
    *  the workspace in place of the folder picker: this window's chimaera
    *  knows only its one workspace; the cluster page knows them all. */
   const clusterWs = isNativeShell() ? (jobCtx?.cws ?? null) : null;
   let clusterHomeOpen = $state(false);
   let ClusterHomeView = $state<typeof JobClusterHome | null>(null);
+  /** The cluster page opened from the ended panel's Start again: it opens
+   *  its start sheet for this workspace, set up like the ended job. */
+  let clusterStartAgain = $state(false);
 
-  function openClusterHome(): void {
+  function openClusterHome(startAgain = false): void {
+    clusterStartAgain = startAgain;
     clusterHomeOpen = true;
     if (ClusterHomeView !== null) return;
     import("./lib/workspace/JobClusterHome.svelte").then(
@@ -589,9 +652,32 @@
       // Every successful shell connect republishes `host-status: connected`,
       // which clears the overlay and re-homes this window when needed.
     } catch (e) {
-      reconnectError = e instanceof Error ? e.message : String(e);
+      // A job window that can't get back may simply have nothing left to
+      // reach: its job ended (the shell's `ended` can come late, or never
+      // when its overview took the end first). Ask the cluster before
+      // offering a Retry that cannot help.
+      const end = jobCtx !== null ? await jobEndFromOverview(jobCtx.jobId, jobCtx.cws) : null;
+      if (end !== null) {
+        endJobWindow(end);
+        finishReconnect();
+      } else {
+        reconnectError = e instanceof Error ? e.message : String(e);
+      }
     } finally {
       reconnecting = false;
+    }
+  }
+
+  /** The cluster overview's word on this job window's end; null when it
+   *  still runs there, or when the overview can't be read either. */
+  async function jobEndFromOverview(
+    slurmJobId: string,
+    cws: string | null,
+  ): Promise<{ reason: string | null } | null> {
+    try {
+      return jobWindowEnd(await clusterOverview(hostAlias), slurmJobId, cws);
+    } catch {
+      return null;
     }
   }
 
@@ -624,7 +710,7 @@
       // Only a job window's composite key ends; a "down" without it is still
       // just a connection blip (the reconnect below).
       if (jobCtx === null) return;
-      jobEnded = { reason: e.reason ?? null };
+      endJobWindow({ reason: e.reason ?? null });
       finishReconnect();
       return;
     }
@@ -880,6 +966,10 @@
   // never flashes through the single-pane default.
   let layout = $state<Layout>(defaultLayout());
   let layoutReady = $state(false);
+  /** The user's own focus-mode value while a phone view forces it on; the
+   *  persisted layout carries this instead. Plain (non-reactive) on purpose:
+   *  the save effect already tracks `layout` and clears it itself. */
+  let forcedFocusRestore: boolean | null = null;
   let gotSessions = $state(false);
   let autoOpened = false;
   // Raw: a spot is an immutable value replaced wholesale (dnd + the OS-drop
@@ -994,7 +1084,7 @@
     dropSpot = null;
     const body = drop.payload as { ws?: unknown; layout?: unknown } | null;
     const decoded =
-      body !== null && typeof body === "object" ? deserializeLayout(body.layout) : null;
+      body !== null && typeof body === "object" ? deserializeLayout(body.layout, selectedApplication !== null) : null;
     const incoming = decoded !== null ? allTabs(decoded) : [];
     if (
       decoded === null ||
@@ -1107,6 +1197,14 @@
   const wsSessions = $derived(
     sessions.filter((s) => s.workspace_id === activeWsId && !isMastermind(s)),
   );
+  /** The project the host indicator may speak for: a local project in a
+   *  native window on this computer (not a remote host, an allocation or a
+   *  browser view, whose labels already name their machine). */
+  const placeWorkspaceId = $derived(
+    workspace !== null && isNativeShell() && !isRemoteWindow && !projectView && !$computeStatus?.self ? workspace.id : null,
+  );
+  // Per-session place labels speak only when the project is split.
+  $effect(() => notePlaces(wsSessions));
 
   /** How this window is named in the shell's tray window-list: the workspace
    *  name (with the host on a remote window), or "Home" for the home screen —
@@ -1206,7 +1304,14 @@
 
   /** Sessions on screen in this window (each pane's active tab). */
   const visibleSessions = $derived(
-    activeWsId !== null && layoutReady ? visibleSessionIds(layout) : [],
+    activeWsId !== null && layoutReady
+      ? [
+          ...visibleSessionIds(layout),
+          // The review of both versions stands in for the `kept_both`
+          // notice's per-project key: looking at it clears that alert.
+          ...(keptReviewShown(layout) ? [`${KEPT_NOTICE_PREFIX}${activeWsId}`] : []),
+        ]
+      : [],
   );
   // Tell the notifier what this window shows, so it never alerts about a
   // session the user is looking at (a torn-off window's whole scope; a
@@ -1666,13 +1771,17 @@
   // Persist the layout (debounced in viewState) whenever it changes, keyed
   // by (window, workspace) so each workspace keeps its own tree.
   $effect(() => {
+    // A user who reveals the rail has made their own choice; stop masking.
+    if (forcedFocusRestore !== null && !layout.focusMode) forcedFocusRestore = null;
+    const persisted =
+      forcedFocusRestore !== null ? { ...layout, focusMode: forcedFocusRestore } : layout;
     // `surfaces` is the additive, normalized "what this window shows" list
     // (design §8): the daemon reads only that key and treats `layout` as
     // opaque, so the layout blob itself stays exactly as before.
     const blob: Record<string, unknown> = {
       v: 1,
       ws: activeWsId,
-      layout: serializeLayout(layout),
+      layout: serializeLayout(persisted),
       surfaces: surfacesOf(layout, workspace?.root ?? null),
     };
     if (detachedWindow) {
@@ -1792,6 +1901,11 @@
       // The browser's notification source. The native app ignores these: its
       // shell consumes the same feed per daemon and posts OS notifications.
       onNotices: (list) => {
+        // A return that kept both versions: the chat's line and an open
+        // review read the project's answer again (native or browser).
+        if (proPossible()) for (const n of list) {
+          if (n.kind === "kept_both" && n.workspace_id !== null) void import("./lib/pro/keptReviews.svelte").then(({ keptReviews }) => keptReviews.refresh(n.workspace_id!)).catch(() => { /* A visible review retains its own explicit Refresh recovery. */ });
+        }
         if (isNativeShell()) return;
         deliverBrowserNotices(list, {
           visible: untrack(() => visibleSessions),
@@ -1810,6 +1924,7 @@
         // socket was down (or a restarted daemon renumbered).
         if (up && !eventsUp) onCommsReconnect();
         eventsUp = up;
+        if (webJob) gatewayJobWatch?.link(up);
         // A save that died with the link retries once it is back.
         noteDaemonLink(up);
       },
@@ -1833,6 +1948,9 @@
     // Native menu items the shell forwards to the focused window. Cmd+W
     // closes the focused VIEW (a home window just closes), reclaiming the
     // chords a browser reserves for tabs.
+    let proReturnLive = true;
+    const stopProReturn = proPossible() && isNativeShell() ? asyncDisposer(import("./lib/net/proReturn").then(({ listenForProReturn }) =>
+      proReturnLive ? listenForProReturn(() => { if (proReturnLive) proReturnRequests += 1; }) : () => {})) : () => {};
     let unlistenMenu: (() => void) | null = null;
     let unlistenDaemonMoved: (() => void) | null = null;
     let unlistenHostStatus: (() => void) | null = null;
@@ -1937,12 +2055,34 @@
     const onCopy = () => rememberCopy();
     // Holding the app modifier reveals numbered pane destinations.
     const stopChordHints = initChordHints();
+    const keptReviewRequested = (event: Event) => {
+      const id = (event as CustomEvent).detail;
+      if (typeof id === "string" && /^[a-zA-Z0-9_-]{1,128}$/.test(id)) void openKeptReviewFor(id);
+    };
+    const connectProviders = (event: Event) => {
+      if (cloudOnboarding.set((event as CustomEvent).detail)) openProSurface();
+    };
+    const providersReady = () => {
+      cloudOnboarding.clear();
+      if (activeWsId === null) homeSettingsOpen = false;
+      else openDashboardSurface();
+    };
+    // Pro's own requests: a window that can never have Pro listens for none.
+    const proListeners: [string, (event: Event) => void][] = !proPossible() ? [] : [
+      ["chimaera:providers-ready", providersReady],
+      ["chimaera:connect-providers", connectProviders],
+      ["chimaera:open-pro", openProSurface],
+      ["chimaera:kept-review", keptReviewRequested],
+    ];
+    for (const [name, listener] of proListeners) window.addEventListener(name, listener);
     window.addEventListener("keydown", onKeydown, true);
     window.addEventListener("pagehide", onPagehide);
     document.addEventListener("copy", onCopy);
     return () => {
+      for (const [name, listener] of proListeners) window.removeEventListener(name, listener);
       window.removeEventListener("keydown", onKeydown, true);
       window.removeEventListener("pagehide", onPagehide);
+      proReturnLive = false; stopProReturn();
       unlistenMenu?.();
       unlistenDaemonMoved?.();
       unlistenHostStatus?.();
@@ -2347,7 +2487,7 @@
    * restored yet has nothing to anchor on; the frame is not queued.
    */
   function onAgentBrowserOpen(open: AgentBrowserOpen): void {
-    if (!layoutReady) return;
+    if (!layoutReady || !admitsAgentBrowserOpen(open, sessionsById.get(open.sessionId), projectView, !proPossible())) return;
     const view = {
       layout,
       workspaceId: activeWsId,
@@ -2727,7 +2867,7 @@
     }
     if (seq !== bootSeq) return; // a later switch superseded this boot
     if (matches(raw)) {
-      const restored = deserializeLayout((raw as { layout?: unknown }).layout);
+      const restored = deserializeLayout((raw as { layout?: unknown }).layout, selectedApplication !== null);
       if (restored !== null) layout = restored;
       // Detachedness: the hash hint is authoritative (only ITS OWN blob was
       // consulted above when set); the blob's dt:1 covers pre-hint blobs. A
@@ -2743,6 +2883,17 @@
       // and the chord are gated). Heal a blob persisted before that rule so
       // an old dt window can't come up stranded rail-open, stripless.
       if (detachedWindow && !layout.focusMode) layout = { ...layout, focusMode: true };
+    }
+    // A phone opens the work itself; the bottom strip can reveal navigation.
+    // Only a phone-width account-gateway view is forced when the layout loads:
+    // a plain daemon in a browser and a native window of any width keep the
+    // layout main gives them, so free users see no change. The forced value
+    // is never saved, so the layout other windows restore keeps the user's
+    // own choice (net/AGENTS.md).
+    forcedFocusRestore = null;
+    if (isBrowserGateway() && matchMedia("(max-width: 700px)").matches && !layout.focusMode) {
+      forcedFocusRestore = layout.focusMode;
+      layout = { ...layout, focusMode: true };
     }
     layoutReady = true;
     pruneAndAutoOpen();
@@ -3039,9 +3190,10 @@
   }
 
   /**
-   * Escape on the Home settings page closes it only when nothing closer owns
-   * the key: a field holding text, a select, an editor, or an open dialog. An
-   * empty field — Settings focuses its search box on open — still closes.
+   * Escape on the Home settings/Pro surface closes it only when nothing closer
+   * owns the key: a field holding text (Escape there must not close the page
+   * and wipe a pasted sign-in code), a select, an editor, or an open dialog.
+   * An empty field — Settings focuses its search box on open — still closes.
    * This handler runs in the capture phase, before any of those see the key.
    */
   function escapeBelongsElsewhere(t: EventTarget | null): boolean {
@@ -3056,31 +3208,30 @@
 
   $effect(() => {
     // The workspace leads; a remote window wears its host so a wall of similar
-    // windows is legible:
-    //   "my_project •cluster | chimaera"  (remote, in a workspace)
-    //   "my_project | chimaera"           (local — the host is implicit)
-    // Home (no workspace) drops the workspace but keeps the host when remote.
-    // A compute-node daemon (the snapshot's `self` — daemon truth, not the
-    // URL hash) appends its node: "my_project •cluster › n042 | …",
-    // so a job window never poses as its login node.
-    const node = $computeStatus?.self?.node;
-    const hostWithNode = node ? `${hostAlias} › ${node}` : hostAlias;
-    const host = isRemoteWindow ? hostWithNode : null;
-    let scope = workspace
-      ? host
-        ? `${workspace.name} •${host}`
-        : workspace.name
-      : (host ?? "");
-    // A detached solo window is named for what it shows: the tab leads, the
-    // workspace scope trails — "claude (2) — my_project | chimaera".
+    // windows is legible (a browser view of a project wears where the project
+    // runs, not a host — see windowTitle.ts). A compute-node daemon (the
+    // snapshot's `self` — daemon truth, not the URL hash) appends its node, so
+    // a job window never poses as its login node. A detached solo window is
+    // named for what it shows: the tab leads, the workspace scope trails.
+    let tab: string | null = null;
     if (detachedWindow) {
       const only = tabCount(layout) === 1 ? panesOf(layout.root)[0]?.tabs[0] : undefined;
       const p = findPane(layout.root, layout.focusedPaneId);
       const shown = only ?? p?.tabs[p.active];
-      if (shown !== undefined) scope = scope ? `${tabLabel(shown)} — ${scope}` : tabLabel(shown);
+      if (shown !== undefined) tab = tabLabel(shown);
     }
-    const base = scope ? `${scope} | chimaera` : "chimaera";
-    const title = needsYou > 0 ? `(${needsYou}) ${base}` : base;
+    const title = windowTitle({
+      workspace: workspace?.name ?? null,
+      host: titleHost({
+        projectView,
+        projectLabel: $projectWhere !== null ? projectWhereLabel($projectWhere) : null,
+        hostAlias,
+        remote: isRemoteWindow,
+      }),
+      node: $computeStatus?.self?.node,
+      tab,
+      needsYou,
+    });
     document.title = title;
     // The native window title doesn't follow document.title — push it
     // explicitly. Overlay windows hide the text but keep this OS metadata.
@@ -3226,6 +3377,12 @@
    *  "New window" and Cmd/Ctrl-click stay the explicit "another window"
    *  gestures. */
   async function activateWorkspace(w: Workspace): Promise<void> {
+    const logicalWorkspace = gatewayWorkspace();
+    if (logicalWorkspace !== null && logicalWorkspace !== w.id) {
+      // A gateway tab is bound to its logical project, even when its owner moves.
+      location.assign(`/workspace/${encodeURIComponent(w.id)}/`);
+      return;
+    }
     workspaces = workspaces.some((x) => x.id === w.id)
       ? workspaces.map((x) => (x.id === w.id ? w : x))
       : [w, ...workspaces];
@@ -3546,6 +3703,12 @@
    * waits for the roster, then for the layout, like a worktree reveal.
    */
   function focusFromNotification(sessionId: string): void {
+    // A project notice (`kept_both`): its key names the project, not a session.
+    const keptWorkspace = keptNoticeWorkspace(sessionId);
+    if (keptWorkspace !== null) {
+      void openKeptReviewFor(keptWorkspace);
+      return;
+    }
     const s = sessionsById.get(sessionId);
     if (s === undefined) {
       if (!gotSessions) pendingNoticeFocus = sessionId;
@@ -3615,7 +3778,20 @@
    *  stays mounted underneath, parked (hidden + inert): the cluster page, an
    *  open Add-machine form and a connect's progress line are still there on
    *  return, and Home's mount-time fetches don't run again. */
+  // A request counter the effect only reads, plus a plain count of the ones
+  // it has handled: the effect never writes the state it depends on.
+  let proReturnRequests = $state(0);
+  let proReturnsHandled = 0;
+  $effect(() => {
+    if (proReturnRequests > proReturnsHandled && (activeWsId === null || layoutReady)) {
+      proReturnsHandled = proReturnRequests;
+      untrack(openProSurface);
+    }
+  });
   let homeSettingsOpen = $state(false);
+  /** Which page Home's sheet shows: Settings, or the Pro page an installed
+   *  extension provides. */
+  let homeSurface = $state<"settings" | "pro">("settings");
   let homeSettingsLoad = $state<ReturnType<typeof loadPaneView> | null>(null);
   // Workspace windows defer Home until it is visible. The shared view cache
   // retains successes; the same asset recovery used by panes owns retries.
@@ -3633,6 +3809,7 @@
    *  a layout tab; on Home it opens as Home's Settings page. */
   function openSettingsSurface(): void {
     if (activeWsId === null) {
+      homeSurface = "settings";
       homeSettingsLoad = loadPaneView("settings");
       homeSettingsOpen = true;
       return;
@@ -3642,12 +3819,69 @@
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   }
 
+  function openProSurface(): void {
+    // A build or window that can never offer Pro has no Pro page to open.
+    if (!proPossible()) return;
+    if (activeWsId === null) {
+      homeSurface = "pro";
+      homeSettingsLoad = loadPaneView("pro");
+      homeSettingsOpen = true;
+      return;
+    }
+    if (!layoutReady) return;
+    layout = openPro(layout);
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  }
+
   /** Open/focus the workspace dashboard (rail row, ⌘0, the landing default). */
   function openDashboardSurface(): void {
     if (activeWsId === null || !layoutReady) return;
     layout = openDashboard(layout);
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   }
+
+  /**
+   * Open (or focus) the review of both versions a Pro return kept for
+   * `workspaceId` — from the chat's line, Settings, the file tree, or the
+   * `kept_both` notice. Another project's review switches this window to
+   * that project first (the notification-reveal path), then opens once its
+   * layout has booted.
+   */
+  // Each request is a fresh object the effect only reads; the plain
+  // `keptReviewHandled` marks the one it has opened, so the effect never
+  // writes the state it depends on.
+  let pendingKeptReview = $state<{ id: string } | null>(null);
+  let keptReviewHandled: { id: string } | null = null;
+  async function openKeptReviewFor(workspaceId: string): Promise<void> {
+    // Only a window that can have Pro has returns to review.
+    if (!proPossible()) return;
+    if (workspaceId !== activeWsId) {
+      let target = workspaces.find((w) => w.id === workspaceId);
+      if (target === undefined) {
+        const list = await listWorkspaces().catch(() => null);
+        if (list !== null) {
+          workspaces = list;
+          target = list.find((w) => w.id === workspaceId);
+        }
+      }
+      if (target === undefined) return;
+      pendingKeptReview = { id: workspaceId };
+      void activateWorkspace(target);
+      return;
+    }
+    if (!layoutReady) {
+      pendingKeptReview = { id: workspaceId };
+      return;
+    }
+    layout = openKeptReview(layout);
+    void import("./lib/pro/keptReviews.svelte").then(({ keptReviews }) => keptReviews.refresh(workspaceId)).catch(() => { /* The review has explicit Refresh recovery. */ });
+  }
+  $effect(() => {
+    const request = pendingKeptReview;
+    if (request === null || request === keptReviewHandled || !layoutReady || activeWsId !== request.id) return;
+    keptReviewHandled = request;
+    untrack(() => void openKeptReviewFor(request.id));
+  });
 
   /** Open/focus All sessions (the Recents header, the dashboard's usage
    *  line, quick-open). */
@@ -5384,10 +5618,12 @@
               onStop={stopWorkspace}
               onOpenFolder={openPicker}
               onSettings={openSettingsSurface}
+              onPro={openProSurface}
             />
             {#snippet failed(_error, reset)}
               <div class="home-settings-shell">
-                <HomeNavigation active="workspaces" onHome={reset} onSettings={openSettingsSurface} />
+                <HomeNavigation active="workspaces" plan={$paidPlan} showPro={proPossible()}
+                  onHome={reset} onPro={openProSurface} onSettings={openSettingsSurface} />
                 <div class="home-settings-content home-surface-failed">
                   <p role="alert">Home hit an error and stopped.</p>
                   <button onclick={reset}>Try again</button>
@@ -5400,8 +5636,8 @@
       {:catch error}
         {#if !homeSettingsOpen}
           <div class="home-settings-shell">
-            <HomeNavigation active="workspaces"
-              onHome={() => (homeLoad = retryPaneView("home", error))} onSettings={openSettingsSurface} />
+            <HomeNavigation active="workspaces" plan={$paidPlan} showPro={proPossible()}
+              onHome={() => (homeLoad = retryPaneView("home", error))} onPro={openProSurface} onSettings={openSettingsSurface} />
             <div class="home-settings-content home-surface-failed">
               <p role="alert">Couldn't open Home.</p>
               <button onclick={() => (homeLoad = retryPaneView("home", error))}>Retry</button>
@@ -5413,8 +5649,8 @@
     {/if}
     {#if homeSettingsOpen}
       <div class="home-settings-shell">
-        <HomeNavigation active="settings"
-          onHome={() => (homeSettingsOpen = false)} onSettings={openSettingsSurface} />
+        <HomeNavigation active={homeSurface} plan={$paidPlan} showPro={proPossible()}
+          onHome={() => (homeSettingsOpen = false)} onPro={openProSurface} onSettings={openSettingsSurface} />
       <div class="home-settings-surface">
         <nav class="home-surface-nav" aria-label="Home navigation">
           <button class="home-settings-back" onclick={() => (homeSettingsOpen = false)}>
@@ -5422,19 +5658,19 @@
             Home
           </button>
           <span class="home-surface-divider" aria-hidden="true">/</span>
-          <span aria-current="page">Settings</span>
+          <span aria-current="page">{homeSurface === "pro" ? "Chimaera Pro" : "Settings"}</span>
           <kbd class="home-back-hint">esc</kbd>
         </nav>
         <div class="home-settings-content">
           {#await homeSettingsLoad}
-            <p>Loading settings…</p>
+            <p>Loading {homeSurface === "pro" ? "Chimaera Pro" : "settings"}…</p>
           {:then SettingsView}
             {#if SettingsView}
               <svelte:boundary onerror={(e) => console.error("settings failed", e)}>
-                <SettingsView />
+                <SettingsView onClose={() => (homeSettingsOpen = false)} />
                 {#snippet failed(_error, reset)}
                   <div class="home-surface-failed">
-                    <p role="alert">Settings hit an error and stopped.</p>
+                    <p role="alert">{homeSurface === "pro" ? "Chimaera Pro" : "Settings"} hit an error and stopped.</p>
                     <button onclick={reset}>Try again</button>
                   </div>
                 {/snippet}
@@ -5442,11 +5678,11 @@
             {/if}
           {:catch error}
             <div class="home-surface-failed">
-              <p role="alert">Couldn't open settings.</p>
+              <p role="alert">Couldn't open {homeSurface === "pro" ? "Chimaera Pro" : "settings"}.</p>
               <!-- The same asset recovery as a pane's retry: a failed CSS
                    preload is memoized by Vite, so a plain re-import would
                    fail the same way every time. -->
-              <button onclick={() => (homeSettingsLoad = retryPaneView("settings", error))}>Retry</button>
+              <button onclick={() => (homeSettingsLoad = retryPaneView(homeSurface, error))}>Retry</button>
             </div>
           {/await}
         </div>
@@ -5454,7 +5690,7 @@
       </div>
     {/if}
   {:else}
-  <div class="body" bind:clientWidth={bodyWidth}>
+  <div class="body" bind:clientWidth={bodyWidth} inert={elsewhereHref !== null}>
     <aside
       class="rail"
       class:collapsed={layout.focusMode}
@@ -5464,6 +5700,9 @@
       bind:this={railEl}
     >
       <div class="workspace">
+        {#if accountHomeLink}
+          <a class="account-home-link" href="/" aria-label="Back to account Home" title="Back to Home">Home</a>
+        {/if}
         <button
           class="ws-btn"
           class:placeholder={workspace === null && activeWsId === null}
@@ -5484,6 +5723,11 @@
             />
           </svg>
         </button>
+        {#if $paidPlan !== null && $proTier === "active"}
+          {#await import("./lib/pro/ProNavigation.svelte") then { default: ProNavigation }}
+            <ProNavigation plan={$paidPlan} onOpen={openProSurface} />
+          {/await}
+        {/if}
         {#if needsYou > 0}
           <span
             class="needs"
@@ -5964,6 +6208,7 @@
                 onDragStart={onTreeEntryDown}
                 dropAction={dropSpot?.kind === "fileOp" ? dropSpot.operation : "upload"}
                 activePath={focusedFilePath}
+                arriving={$filesLoading.has(workspace.id)}
                 reveal={treeReveal}
                 createRequest={treeCreate}
                 dropDir={(dropSpot?.kind === "uploadDir" || (dropSpot?.kind === "fileOp" && dropSpot.blocked === null)) && dropSpot.paneId === null ? dropSpot.dir : null}
@@ -5999,12 +6244,16 @@
         <!-- Inside an allocation the label carries the node ("cluster ›
              n042") so a compute-node window never poses as its login
              node — derived from the daemon's self block, hash-independent. -->
-        <span class="daemon-host" class:remote={isRemoteWindow} title={health?.hostname}
-          >{$computeStatus?.self
-            ? `${getHostLabel()} › ${$computeStatus.self.node}`
-            : getHostLabel()}</span
-        >
-        {#if isRemoteWindow && $linkRtt !== null && $linkRtt >= LINK_RTT_BADGE_MS}
+        <!-- The collapsed rail stays mounted in focus mode; the strip's slot
+             then mounts the place extension instead, so it runs once. -->
+        <PlaceSlot workspaceId={layout.focusMode ? null : placeWorkspaceId} sessions={wsSessions}>
+          {#snippet label()}<span class="daemon-host" class:remote={isRemoteWindow} title={health?.hostname}
+            >{$computeStatus?.self
+              ? `${getHostLabel()} › ${$computeStatus.self.node}`
+              : stripHost}</span
+          >{/snippet}
+        </PlaceSlot>
+        {#if isRemoteWindow && !projectView && $linkRtt !== null && $linkRtt >= LINK_RTT_BADGE_MS}
           <!-- Honest latency signal: on a distant host every keystroke echo
                and UI fetch pays at least this — better named than mysterious
                (the remote perf audit's R4). -->
@@ -6265,6 +6514,13 @@
           </div>
         {/if}
       {/if}
+      {#if projectView}
+        <!-- A project view while its project moves between the computer and
+             the cloud: no pane answers until the new machine serves it, so
+             the panes are covered; the sidebar (Home, the project list) is
+             not, since it does not depend on the moving project. -->
+        <MovingOverlay />
+      {/if}
     </main>
     {#if mastermindPanel.open && MastermindPanelView !== null && layoutReady && activeWsId !== null}
       <MastermindPanelView
@@ -6288,6 +6544,9 @@
     <!-- Deep native drag regions include the strip's padding and flex gaps;
          Tauri excludes interactive descendants, so its buttons still work. -->
     <footer class="strip" data-tauri-drag-region={nativeTitlebarOverlay ? "deep" : undefined}>
+      {#if accountHomeLink}
+        <a class="account-home-link" href="/" aria-label="Back to account Home" title="Back to Home">Home</a>
+      {/if}
       {#if !detachedWindow}
         <!-- Sidebar reveal is the MAIN window's affordance. A detached solo
              window offers no rail at all — it is just its pane; the way back
@@ -6391,10 +6650,12 @@
           re-attach
         </button>
       {/if}
-      <span class="strip-host" class:remote={isRemoteWindow} title={health?.hostname}
-        >{getHostLabel()}</span
-      >
-      {#if isRemoteWindow && $linkRtt !== null && $linkRtt >= LINK_RTT_BADGE_MS}
+      <PlaceSlot workspaceId={placeWorkspaceId} sessions={wsSessions}>
+        {#snippet label()}<span class="strip-host" class:remote={isRemoteWindow} title={health?.hostname}
+          >{stripHost}</span
+        >{/snippet}
+      </PlaceSlot>
+      {#if isRemoteWindow && !projectView && $linkRtt !== null && $linkRtt >= LINK_RTT_BADGE_MS}
         <!-- Detached windows ghost keystrokes like any remote window — they
              get the same honest latency signal. -->
         <span
@@ -6479,6 +6740,12 @@
       </svelte:boundary>
     {/key}
   {/await}
+{/if}
+
+{#if elsewhereHref !== null}
+  <!-- This host's copy of a project another machine runs: covered, with
+       the project view as the one way forward. -->
+  <ElsewhereNotice href={elsewhereHref} />
 {/if}
 
 <!-- Blocking re-auth overlay: the daemon rejected this window's token
@@ -6605,20 +6872,23 @@
     alias={hostAlias}
     here={clusterWs}
     hereName={workspace?.name ?? "workspace"}
+    startAgainFrom={clusterStartAgain ? (jobCtx?.jobId ?? null) : null}
     onClose={() => (clusterHomeOpen = false)}
   />
 {/if}
 
-{#if jobCtx !== null && JobNoticesView !== null}
+{#if (jobCtx !== null || webJob) && JobNoticesView !== null}
   <!-- A job window: the "continue on a new node" offer near the job's time
        limit, and the calm overlay once the shell says the job ended. -->
   <JobNoticesView
     alias={hostAlias}
-    cws={jobCtx.cws}
+    cws={jobCtx?.cws ?? null}
     self={$computeStatus?.self ?? null}
     receivedAt={$computeStatus?.received_at_ms ?? 0}
     ended={jobEnded}
     stacked={reconnectSurface !== "hidden" && !$askpassActive}
+    covered={clusterHomeOpen}
+    onStartAgain={clusterWs !== null ? () => openClusterHome(true) : undefined}
   />
 {/if}
 
@@ -6876,6 +7146,19 @@
     background: color-mix(in srgb, var(--accent) 55%, var(--edge));
   }
 
+  .account-home-link {
+    display: inline-flex;
+    align-items: center;
+    flex: none;
+    min-height: 28px;
+    padding: 0 5px;
+    color: var(--muted);
+    font-size: var(--text-xs);
+    text-decoration: none;
+    border-radius: 4px;
+  }
+  .account-home-link:hover { color: var(--fg); background: var(--row-hover); }
+  .account-home-link:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
   .workspace {
     display: flex;
     align-items: center;
