@@ -60,6 +60,7 @@ impl Selected {
     pub(super) async fn current_overview(&self) -> Result<ClusterOverview, String> {
         self.0.current_overview().await
     }
+    /// The local port of the route and the token its daemon answers to.
     pub(super) async fn port(
         &self,
         _shell: &Shell,
@@ -68,9 +69,9 @@ impl Selected {
         job: &str,
         workspace: Option<&str>,
         token: &str,
-    ) -> Result<u16, String> {
+    ) -> Result<(u16, String), String> {
         self.0
-            .port(
+            .open_route(
                 alias.into(),
                 key.into(),
                 job.into(),

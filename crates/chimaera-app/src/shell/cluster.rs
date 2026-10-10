@@ -1426,10 +1426,9 @@ async fn host_forward(
     let shell = app.state::<Shell>();
     let key = host_key(alias, jid);
     if let Some(selected) = kept::select(&shell, alias).await? {
-        let port = selected
+        return selected
             .port(&shell, alias, &key, jid, None, &endpoint.token)
-            .await?;
-        return Ok((port, endpoint.token.clone()));
+            .await;
     }
     let existing = {
         let tunnels = shell.compute_tunnels.lock().await;
@@ -1510,7 +1509,7 @@ async fn open_ws_window(
     let shell = app.state::<Shell>();
     let key = ws_key(alias, &endpoint.slurm_job_id, wid);
     let (url, node, local_port) = if let Some(selected) = kept::select(&shell, alias).await? {
-        let port = selected
+        let (port, token) = selected
             .port(
                 &shell,
                 alias,
@@ -1523,7 +1522,7 @@ async fn open_ws_window(
         (
             format!(
                 "http://127.0.0.1:{port}/#token={}&ws={wid}&cws={wid}",
-                url::form_urlencoded::byte_serialize(endpoint.token.as_bytes()).collect::<String>()
+                url::form_urlencoded::byte_serialize(token.as_bytes()).collect::<String>()
             ),
             endpoint.node.clone(),
             port,
@@ -1629,6 +1628,17 @@ async fn open_ws_window(
     Ok(())
 }
 
+/// Why Open has nowhere to go: a workspace that reads open (or opening) but
+/// lists no route yet is waiting on its route (a kept cluster's keeper
+/// lists it after its next poll); only a closed one isn't open in a job.
+fn no_route_words(view: &cluster::WorkspaceView) -> String {
+    if view.state == "open" || view.opening {
+        "The keeper is preparing this workspace's route; try Open again shortly".into()
+    } else {
+        format!("{} isn't open in a job", view.name)
+    }
+}
+
 /// Open a workspace's window: where it's open, else in job `job_id` (the
 /// page decides which — none, one, or a choice). A workspace waiting to open
 /// in a job that hasn't started says so.
@@ -1665,7 +1675,7 @@ pub(super) async fn cluster_open(
             return Err(format!("{} opens when its job starts", view.name));
         }
         (_, _, Some(jid)) => open_in_job(&app, &alias, &jid, &workspace_id).await?,
-        (_, _, None) => return Err(format!("{} isn't open in a job", view.name)),
+        (_, _, None) => return Err(no_route_words(&view)),
     };
     let _ = app.emit("cluster-changed", json!({ "alias": alias }));
     open_ws_window(&app, &alias, &workspace_id, &endpoint, &view.name).await
@@ -2282,6 +2292,23 @@ pub(crate) fn sweep_terminals(port: u16, token: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_without_a_route_says_why() {
+        let mut view = cluster::WorkspaceView {
+            name: "analysis".into(),
+            state: "open",
+            ..Default::default()
+        };
+        assert_eq!(
+            no_route_words(&view),
+            "The keeper is preparing this workspace's route; try Open again shortly"
+        );
+        view.state = "closed";
+        assert_eq!(no_route_words(&view), "analysis isn't open in a job");
+        view.opening = true;
+        assert!(no_route_words(&view).starts_with("The keeper is preparing"));
+    }
 
     #[test]
     fn a_notice_says_the_time_actually_left() {

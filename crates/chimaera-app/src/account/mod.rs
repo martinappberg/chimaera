@@ -247,6 +247,21 @@ pub trait DelegatedCluster: Send + Sync {
         workspace: Option<String>,
         token: String,
     ) -> Task<Result<u16, String>>;
+    /// `port`, answering also the token the route's daemon answers to. A
+    /// page's listing can name an older token than the route it opens, so a
+    /// window uses this one. Defaults to `port` with the caller's token for
+    /// delegates that match routes by token.
+    fn open_route(
+        &self,
+        alias: String,
+        key: String,
+        job: String,
+        workspace: Option<String>,
+        token: String,
+    ) -> Task<Result<(u16, String), String>> {
+        let port = self.port(alias, key, job, workspace, token.clone());
+        Box::pin(async move { Ok((port.await?, token)) })
+    }
     fn policy(
         &self,
         app: tauri::AppHandle,
