@@ -277,7 +277,9 @@ export function jobStatusLine(j: ClusterJob, nowMs: number, locale?: string, kep
     case "ended":
       return endedLine(j, nowMs, locale);
   }
-  if (j.attached) line += kept ? " · held by your cloud while you're away" : " · stops if this app disconnects";
+  // A job the account's cloud holds simply runs on: nothing to decide, so
+  // nothing said. One this app holds ends with it, which the user must know.
+  if (j.attached && !kept) line += " · stops if this app disconnects";
   return line;
 }
 
@@ -614,13 +616,13 @@ export function endedScreenWords(reason: string | null | undefined): string {
     case "CLOSED":
       return "This workspace was closed. Its chats are saved.";
     case "WORKSPACE-FAILED":
-      return "This workspace stopped unexpectedly. Its chats are saved — open it again from the cluster page.";
+      return "This workspace stopped unexpectedly. Its chats are saved.";
     case "MOVING":
-      return "Moving to the new job — this window reopens there when it's ready. Your chats come with you.";
+      return "Moving to the new job…";
     case "GONE":
-      return "This workspace's job has ended, or the workspace was closed. Its chats are saved.";
+      return "This workspace ended. Your chats are saved.";
     case "NOT-KEPT":
-      return "This host is no longer kept connected. Connect it again from your computer.";
+      return "Turn on Keep connected for this host to open it here.";
   }
   const why = endedWords(reason, false);
   return why === ""
@@ -635,7 +637,7 @@ export function endedScreenWords(reason: string | null | undefined): string {
  */
 export function clusterErrorLine(doing: string, error: string): string {
   const e = error.trim();
-  return /^[A-Z][^\n]*[.!?]$/.test(e) ? e : `${doing}: ${e}`;
+  return /^[A-Z][^\n]*[.!?…]$/.test(e) ? e : `${doing}: ${e}`;
 }
 
 /** The quiet line under the login-node terminal action for a note code

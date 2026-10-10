@@ -104,8 +104,8 @@ describe("a browser job view's watch", () => {
     };
     expect(await said("job_ended")).toBe("This job ended. Your chats are saved.");
     expect(await said("workspace_closed")).toBe("This workspace was closed. Its chats are saved.");
-    expect(await said("not_kept")).toBe("This host is no longer kept connected. Connect it again from your computer.");
-    expect(await said("host_unavailable")).toBe("This workspace's job has ended, or the workspace was closed. Its chats are saved.");
+    expect(await said("not_kept")).toBe("Turn on Keep connected for this host to open it here.");
+    expect(await said("host_unavailable")).toBe("This workspace ended. Your chats are saved.");
     expect(await said("route_pending")).toBeNull();
   });
 
@@ -173,7 +173,7 @@ describe("a browser job view's watch", () => {
 
   it("names the browser's unknown end plainly", () => {
     expect(endedScreenWords("gone")).toBe(
-      "This workspace's job has ended, or the workspace was closed. Its chats are saved.",
+      "This workspace ended. Your chats are saved.",
     );
   });
 });

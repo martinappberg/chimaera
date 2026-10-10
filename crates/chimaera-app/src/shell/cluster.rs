@@ -1421,7 +1421,7 @@ pub(super) async fn cluster_dismiss_job(
 /// route on demand when the route is bound.
 const HOST_ROUTE_WAIT: Duration = Duration::from_secs(60);
 const HOST_ROUTE_POLL: Duration = Duration::from_secs(2);
-const PREPARING_JOB_ROUTE: &str = "This job is still getting ready. Try again in a moment.";
+const PREPARING_JOB_ROUTE: &str = "Getting ready…";
 
 /// What an overview says about reaching job `jid`'s job-host.
 #[derive(Debug, PartialEq)]

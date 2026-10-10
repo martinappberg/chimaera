@@ -49,9 +49,6 @@
             {presentation?.type === "host_key" ? "Trust this SSH host?" : "Sign in"}{askpass.alias != null ? ` · ${askpass.alias}` : ""}
           </span>
         </div>
-        {#if askpass.source?.type === "keeper"}
-          <p class="askpass-source">For the connection that stays on while you’re away</p>
-        {/if}
         {#if presentation?.type === "host_key"}
           <p class="askpass-trust-note">
             Check this fingerprint with the host’s administrator before trusting it.
@@ -114,12 +111,6 @@
 {/if}
 
 <style>
-  .askpass-source {
-    margin: -4px 0 12px;
-    color: var(--muted);
-    font-size: var(--text-sm);
-  }
-
   .askpass-trust-note {
     margin: 0;
     color: var(--muted);

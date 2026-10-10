@@ -11,7 +11,7 @@
    *   after a reconnect failed): a calm overlay — the work is gone, the chats
    *   aren't — with Start again (a new job for this workspace) and Close.
    * A browser view the account serves of a job's workspace has no shell and
-   * no cluster page: its reminder only says when the job ends, its end comes
+   * no cluster page: it gets no reminder (its strip counts down), its end comes
    * from the account's answer (`jobEnd.ts` `createGatewayJobWatch`), and its
    * ended panel offers the way back to the account's Home.
    * A person starts every job (plan §2.4): nothing here queues anything
@@ -62,9 +62,9 @@
   }: Props = $props();
 
   const nativeJob = $derived(isNativeShell() && cws !== null);
-  /** A browser view the account serves: it can't start or continue a job
-   *  (that needs the cluster page), so its reminder only says when the job
-   *  ends, and its ended panel leads back to the account's Home. */
+  /** A browser view the account serves: it can't continue a job, so it has
+   *  no reminder (its job strip's countdown shows the time left), and its
+   *  ended panel leads back to the account's Home. */
   const browserJob = !isNativeShell() && isBrowserGateway();
   /** An attached job (held by the app) can't continue: its reminder only
    *  says when it ends. */
@@ -75,7 +75,7 @@
   // hidden, caught up on return (the effect re-runs).
   let now = $state(Date.now());
   $effect(() => {
-    if (!$pageVisible || ended !== null || !(nativeJob || browserJob)) return;
+    if (!$pageVisible || ended !== null || !nativeJob) return;
     now = Date.now();
     const t = setInterval(() => (now = Date.now()), 60_000);
     return () => clearInterval(t);
@@ -102,7 +102,7 @@
   let waitingHidden = $state(false);
 
   const showBanner = $derived(
-    (nativeJob || browserJob) &&
+    nativeJob &&
       ended === null &&
       (phase === "waiting"
         ? !waitingHidden
@@ -200,9 +200,7 @@
     {:else}
       <span class="copy">
         <strong>{stopsInWords(remaining ?? 0)}</strong>
-        {#if browserJob}
-          Your chats are saved.
-        {:else if attached}
+        {#if attached}
           It's held by this app, so it can't continue in a new job — start one from the cluster page to keep working. Your chats are saved.
         {:else}
           Continue in a new job and your chats come with you.

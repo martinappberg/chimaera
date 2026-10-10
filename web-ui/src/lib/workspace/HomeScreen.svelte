@@ -889,7 +889,9 @@
         <div class="welcome">
           <!-- A project view follows its project: name where it runs now. -->
           <h1>{ownAlias === null ? "Workspaces" : gatewayWorkspace() !== null ? projectWhereLabel($projectWhere) : hostLabel}</h1>
-          <p>{ownAlias === null ? "Pick up where you left off." : "Workspaces and sessions on this machine."}</p>
+          <!-- A machine's own Home: its name is the heading and its list
+               follows, so no line restates them. -->
+          {#if ownAlias === null}<p>Pick up where you left off.</p>{/if}
         </div>
       </div>
       <button class="cta open-folder" onclick={onOpenFolder}>

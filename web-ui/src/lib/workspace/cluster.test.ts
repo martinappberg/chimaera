@@ -300,9 +300,9 @@ describe("jobs in words", () => {
     expect(jobStatusLine(job({ state: "waiting", attached: true, submitted_ms: NOW }), NOW)).toBe(
       "Waiting for a node · stops if this app disconnects",
     );
-    // On a kept cluster the account's cloud holds an attached job.
+    // On a kept cluster the account's cloud holds an attached job: it just runs on.
     expect(jobStatusLine(job({ state: "waiting", attached: true, submitted_ms: NOW }), NOW, undefined, true)).toBe(
-      "Waiting for a node · held by your cloud while you're away",
+      "Waiting for a node",
     );
     expect(jobStatusLine(job({ state: "waiting", submitted_ms: NOW }), NOW, undefined, true)).toBe("Waiting for a node");
   });
@@ -333,10 +333,10 @@ describe("jobs in words", () => {
     );
     expect(endedScreenWords("closed")).toBe("This workspace was closed. Its chats are saved.");
     expect(endedScreenWords("moving")).toBe(
-      "Moving to the new job — this window reopens there when it's ready. Your chats come with you.",
+      "Moving to the new job…",
     );
     expect(endedScreenWords("workspace-failed")).toBe(
-      "This workspace stopped unexpectedly. Its chats are saved — open it again from the cluster page.",
+      "This workspace stopped unexpectedly. Its chats are saved.",
     );
     expect(endedScreenWords(null)).toBe("This job ended. Your chats are saved.");
   });
@@ -584,6 +584,7 @@ describe("clusterErrorLine", () => {
       "The cluster is busy. Try again in a moment.",
     );
     expect(clusterErrorLine("Couldn't refresh", "unknown job")).toBe("Couldn't refresh: unknown job");
+    expect(clusterErrorLine("Couldn't refresh", "Getting ready…")).toBe("Getting ready…");
     expect(clusterErrorLine("Couldn't refresh", "ssh: connect to host x port 22: Connection refused")).toBe(
       "Couldn't refresh: ssh: connect to host x port 22: Connection refused",
     );
