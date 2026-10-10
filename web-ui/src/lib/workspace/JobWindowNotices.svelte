@@ -17,7 +17,7 @@
   import { pageVisible } from "../shared/visibility";
   import { modalFocus } from "../shared/modalFocus";
   import { focusOnMount } from "../shared/focusOnMount";
-  import { parseSlurmTimeLeft, type ComputeSelf } from "./compute";
+  import { secondsLeft, type ComputeSelf } from "./compute";
   import {
     CONTINUE_LAST_CALL_SECS,
     CONTINUE_OFFER_SECS,
@@ -74,9 +74,7 @@
 
   const remaining = $derived.by(() => {
     if (alloc === null) return null;
-    const base = parseSlurmTimeLeft(alloc.time_left);
-    if (base === null) return null;
-    return Math.max(0, base - Math.floor((now - receivedAt) / 1000));
+    return secondsLeft(alloc, receivedAt, now);
   });
 
   /** Which reminder applies now: the hour one, then the ten-minute one. */

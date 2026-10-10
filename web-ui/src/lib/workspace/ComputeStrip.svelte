@@ -2,7 +2,7 @@
   import { pageVisible } from "../shared/visibility";
   import {
     formatSlurmDuration,
-    parseSlurmTimeLeft,
+    secondsLeft,
     type ComputeSelf,
   } from "./compute";
 
@@ -29,12 +29,8 @@
   });
 
   /** Seconds left at the last fetch; null = not a duration (UNLIMITED, …). */
-  const baseline = $derived(parseSlurmTimeLeft(alloc.time_left));
-  const remaining = $derived(
-    baseline === null
-      ? null
-      : Math.max(0, baseline - Math.floor((now - receivedAt) / 1000)),
-  );
+  /** Seconds left; null = not a duration (UNLIMITED, …). */
+  const remaining = $derived(secondsLeft(alloc, receivedAt, now));
   const countdown = $derived(
     remaining === null
       ? // Slurm's %L emits INVALID/NOT_SET while a job transitions —

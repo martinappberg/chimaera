@@ -30,7 +30,7 @@
   import type { ChatStore } from "../chat/store.svelte";
   import type { ChatTransport } from "../chat/chatPool";
   import { gitStatus } from "../workspace/git";
-  import { computeStatus, formatSlurmDuration, parseSlurmTimeLeft } from "../workspace/compute";
+  import { computeStatus, formatSlurmDuration, parseSlurmTimeLeft, secondsLeft } from "../workspace/compute";
   import { keyHint } from "../shared/keybindings";
   import { pageVisible } from "../shared/visibility";
   import { relativeAge } from "../workspace/launcher";
@@ -267,7 +267,7 @@
             : snap.self.time_left;
         return { text: `slurm · ${raw}`, title };
       }
-      const remaining = Math.max(0, baseline - Math.floor((computeNow - snap.received_at_ms) / 1000));
+      const remaining = secondsLeft(snap.self, snap.received_at_ms, computeNow) ?? 0;
       return {
         text: remaining === 0 ? "slurm · expiring…" : `slurm · ${formatSlurmDuration(remaining)} left`,
         title,

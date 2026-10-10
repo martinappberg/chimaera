@@ -142,9 +142,22 @@ pub(crate) struct SelfAllocation {
     /// that app disconnects, and can't continue in a new job.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub(crate) attached: bool,
+    /// When the allocation ends (epoch ms, this daemon's clock), fixed when
+    /// squeue measured `time_left`. `time_left` is only as fresh as the
+    /// cached snapshot that carries it, so a window counting down from the
+    /// moment it received it is off by that age; every window counting to
+    /// this one instant agrees. Absent for sentinels (UNLIMITED, …).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) ends_at_ms: Option<u64>,
 }
 
 impl SelfAllocation {
+    /// Fixes [`Self::ends_at_ms`] from `time_left` as measured at `at_ms`.
+    fn measured(mut self, at_ms: u64) -> Self {
+        self.ends_at_ms = slurm::parse_duration(&self.time_left)
+            .map(|left| at_ms.saturating_add(left.as_millis() as u64));
+        self
+    }
     /// This answer as it stands `elapsed` after squeue gave it: the time
     /// left counts down locally instead of asking the controller again.
     /// Sentinels (`UNLIMITED`, …) and unparseable values stay as they were.
@@ -353,9 +366,14 @@ impl ComputeService {
                 .is_none_or(|(at, _)| at.elapsed() >= SELF_ASK_FLOOR)
         });
         let asked_at = Instant::now();
+        let asked_at_ms = now_ms();
         // Holding the lock across the fetch IS the single-flight: concurrent
         // requests queue here briefly instead of stampeding the controller.
         let mut snap = fetch_snapshot(&squeue, &sinfo, ask_self).await;
+        if ask_self.is_some() {
+            // Measured now: its end is fixed once and every copy keeps it.
+            snap.self_alloc = snap.self_alloc.take().map(|a| a.measured(asked_at_ms));
+        }
         if let Some(own) = snap.self_alloc.as_mut() {
             own.attached = env_nonempty(chimaera_core::cluster::ENV_JOB_ATTACHED).is_some();
         }
@@ -712,6 +730,7 @@ fn parse_self_allocation(out: &str) -> Option<SelfAllocation> {
             gres
         },
         attached: false,
+        ends_at_ms: None,
     })
 }
 
@@ -1109,6 +1128,28 @@ mod tests {
         assert_eq!(held["attached"], true);
     }
 
+    /// The end is fixed once, from the measured time left; sentinels have
+    /// none, and aging the time left never moves it.
+    #[test]
+    fn the_self_block_ends_at_one_instant() {
+        let measured = alloc().measured(1_000_000);
+        assert_eq!(measured.ends_at_ms, Some(1_000_000 + 14_340_000));
+        assert_eq!(
+            measured.clone().aged(Duration::from_secs(90)).ends_at_ms,
+            measured.ends_at_ms
+        );
+        let unlimited = SelfAllocation {
+            time_left: "UNLIMITED".into(),
+            ..alloc()
+        }
+        .measured(1_000_000);
+        assert_eq!(unlimited.ends_at_ms, None);
+        assert!(serde_json::to_value(&unlimited)
+            .unwrap()
+            .get("ends_at_ms")
+            .is_none());
+    }
+
     fn alloc() -> SelfAllocation {
         SelfAllocation {
             job_id: "4242".into(),
@@ -1120,6 +1161,7 @@ mod tests {
             mem: "64G".into(),
             gres: "gpu:1".into(),
             attached: false,
+            ends_at_ms: None,
         }
     }
 
@@ -1208,6 +1250,7 @@ mod tests {
             mem: String::new(),
             gres: String::new(),
             attached: false,
+            ends_at_ms: None,
         };
         let text = job_context_text(&sparse, None, now, &AgentRules::default(), None);
         assert!(
@@ -1428,6 +1471,13 @@ mod tests {
         assert_eq!(own.job_id, "4242");
         assert_eq!(own.node, "node7");
         assert_eq!(own.time_left, "3:59:00");
+        // Its end is fixed at measurement: 3:59:00 after the ask.
+        let ends = own.ends_at_ms.expect("an end for a duration");
+        let expected = now_ms() + 3 * 3_600_000 + 59 * 60_000;
+        assert!(
+            ends <= expected && expected - ends < 60_000,
+            "{ends} vs {expected}"
+        );
         // A forced refresh refetches the queue but NOT `squeue -j`: once a
         // minute, whatever the UI asks.
         let refreshed = svc.snapshot(true).await;
