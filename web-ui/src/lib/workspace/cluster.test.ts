@@ -25,6 +25,7 @@ import {
   isInteractiveOnly,
   jobResources,
   jobStatusLine,
+  terminalNoteWords,
   limitWords,
   liveJobs,
   memWords,
@@ -586,5 +587,15 @@ describe("clusterErrorLine", () => {
     expect(clusterErrorLine("Couldn't refresh", "ssh: connect to host x port 22: Connection refused")).toBe(
       "Couldn't refresh: ssh: connect to host x port 22: Connection refused",
     );
+  });
+});
+
+describe("terminalNoteWords", () => {
+  it("says why a kept cluster's terminal asks to sign in, and nothing otherwise", () => {
+    expect(terminalNoteWords("login_needs_sign_in")).toBe(
+      "This terminal signs in to the login node on its own.",
+    );
+    expect(terminalNoteWords(undefined)).toBeNull();
+    expect(terminalNoteWords("something_new")).toBeNull();
   });
 });

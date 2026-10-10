@@ -52,6 +52,7 @@
     openPlan,
     otherJobsWords,
     shortHost,
+    terminalNoteWords,
     tildePath,
     parentPath,
     workspaceActivity,
@@ -429,7 +430,7 @@
   async function openTerminal(): Promise<void> {
     mastError = null;
     try {
-      await clusterOpenTerminal(alias);
+      mastNote = terminalNoteWords((await clusterOpenTerminal(alias)).note);
     } catch (e) {
       mastError = errText(e);
     }

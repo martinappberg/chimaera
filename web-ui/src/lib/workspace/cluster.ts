@@ -635,3 +635,14 @@ export function clusterErrorLine(doing: string, error: string): string {
   const e = error.trim();
   return /^[A-Z][^\n]*[.!?]$/.test(e) ? e : `${doing}: ${e}`;
 }
+
+/** The quiet line under the login-node terminal action for a note code
+ *  the shell answered (an account extension's); null for none or unknown. */
+export function terminalNoteWords(code: string | undefined): string | null {
+  switch (code) {
+    case "login_needs_sign_in":
+      return "This terminal signs in to the login node on its own.";
+    default:
+      return null;
+  }
+}

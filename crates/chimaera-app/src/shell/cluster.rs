@@ -2223,12 +2223,20 @@ fn terminals_workspace(port: u16, token: &str) -> Result<String, String> {
 /// its window: closing the window ends it ([`terminal_window_closed`]), the
 /// window is never restored, and one a crash left behind is ended at the
 /// next launch ([`sweep_terminals`]).
+/// What opening the login-node terminal answers the page: an account
+/// extension's fixed note code, if it has one for this cluster.
+#[derive(serde::Serialize)]
+pub(super) struct TerminalOpened {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<&'static str>,
+}
+
 #[tauri::command]
 pub(super) async fn cluster_open_terminal(
     app: AppHandle,
     state: State<'_, Shell>,
     alias: String,
-) -> Result<(), String> {
+) -> Result<TerminalOpened, String> {
     let alias = chimaera_remote::hosts::normalize_alias(&alias).map_err(err)?;
     tracing::info!("ipc: cluster_open_terminal {alias}");
     let (port, token) = {
@@ -2292,7 +2300,12 @@ pub(super) async fn cluster_open_terminal(
     }
     // Never restored: its session ends with the window.
     lock(&state.registry).remove(&record.id);
-    Ok(())
+    Ok(TerminalOpened {
+        note: state
+            .pro
+            .owner()
+            .and_then(|owner| owner.cluster_terminal_note(&alias)),
+    })
 }
 
 /// End one login-node terminal session (its ssh) on the local daemon.

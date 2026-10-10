@@ -56,6 +56,12 @@ pub trait AccountExtension: Send + Sync {
         alias: String,
     ) -> Task<Result<Option<Arc<dyn DelegatedCluster>>, String>>;
     fn cluster_selected(&self, alias: &str) -> bool;
+    /// A fixed code the cluster page turns into a quiet line under the
+    /// login-node terminal action (for example, that it signs in on its own
+    /// although the cluster is held elsewhere). None says nothing.
+    fn cluster_terminal_note(&self, _alias: &str) -> Option<&'static str> {
+        None
+    }
     fn close_cluster_links(&self);
     fn close_cluster_key(&self, key: &str);
     fn reconcile_cluster(&self, alias: &str, overview: &chimaera_remote::cluster::ClusterOverview);

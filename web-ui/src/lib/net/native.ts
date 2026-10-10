@@ -765,8 +765,10 @@ export async function clusterStopLoginDaemon(alias: string): Promise<void> {
 }
 
 /** Open a terminal-only window with `ssh <alias>` (the login node). */
-export async function clusterOpenTerminal(alias: string): Promise<void> {
-  await shell().core.invoke<void>("cluster_open_terminal", { alias });
+export async function clusterOpenTerminal(alias: string): Promise<{ note?: string }> {
+  // An older shell answers nothing; an account extension may add a note code.
+  const answer = await shell().core.invoke<{ note?: string } | null>("cluster_open_terminal", { alias });
+  return answer ?? {};
 }
 
 /** A cluster's jobs or workspaces changed — refetch. */
