@@ -473,15 +473,34 @@ async fn absorb_with_effects(
         follow_move(app, alias, &wid, &old_slurm, &endpoint).await;
     }
     for (jid, wid) in ensure_open.into_iter().filter(|_| background_effects) {
-        let Some(endpoint) = ov.hosts.get(&jid).cloned() else {
-            continue;
-        };
+        let listed = ov
+            .hosts
+            .get(&jid)
+            .cloned()
+            .or_else(|| is_kept.then(|| on_demand(ov, &jid)).flatten());
         let app = app.clone();
         let alias = alias.to_string();
         // Idempotent at job-host (already opening = fine); in the
         // background, and never a window — windows open only on a click.
+        // A direct job that just turned running may not have published its
+        // job-host yet: wait for it here rather than drop the queued open
+        // (this wait absorbs nothing, so it cannot start another). A kept
+        // job's route resolves on demand when bound.
         tauri::async_runtime::spawn(async move {
-            let opened = match host_forward(&app, &alias, &jid, &endpoint).await {
+            let endpoint = match listed {
+                Some(endpoint) => Ok(endpoint),
+                None => {
+                    wait_for_host_route(&jid, HOST_ROUTE_WAIT, HOST_ROUTE_POLL, || {
+                        route_overview(&app, &alias)
+                    })
+                    .await
+                }
+            };
+            let opened = match endpoint {
+                Ok(endpoint) => host_forward(&app, &alias, &jid, &endpoint).await,
+                Err(e) => Err(e),
+            };
+            let opened = match opened {
                 Ok((port, token)) => cluster::host_open(port, &token, &wid).await.map_err(err),
                 Err(e) => Err(e),
             };
@@ -1395,6 +1414,84 @@ pub(super) async fn cluster_dismiss_job(
     Ok(())
 }
 
+/// How long an action on a direct cluster waits for a running job's
+/// job-host to publish where it listens, and how often it looks: the
+/// manifest follows the scheduler's running state by seconds. A kept
+/// cluster never waits on a listing: its keeper resolves a running job's
+/// route on demand when the route is bound.
+const HOST_ROUTE_WAIT: Duration = Duration::from_secs(60);
+const HOST_ROUTE_POLL: Duration = Duration::from_secs(2);
+const PREPARING_JOB_ROUTE: &str = "The keeper is preparing this job's route; try again shortly";
+
+/// What an overview says about reaching job `jid`'s job-host.
+#[derive(Debug, PartialEq)]
+enum HostRoute {
+    Listed(cluster::HostEndpoint),
+    /// Running or starting: its route follows within the wait.
+    Coming,
+    Gone(String),
+}
+fn host_route(ov: &ClusterOverview, jid: &str) -> HostRoute {
+    if let Some(endpoint) = ov.hosts.get(jid) {
+        return HostRoute::Listed(endpoint.clone());
+    }
+    match ov.jobs.iter().find(|j| j.id == jid) {
+        Some(j) if j.stopping => HostRoute::Gone(format!("{} is stopping", j.name)),
+        Some(j) if j.state == "running" || j.state == "starting" => HostRoute::Coming,
+        Some(j) if j.state == "waiting" => {
+            HostRoute::Gone(format!("{} hasn't started yet", j.name))
+        }
+        _ => HostRoute::Gone("that job isn't running yet".into()),
+    }
+}
+/// Reads (`read`) until the overview lists job `jid`'s route, it can no
+/// longer come, or `wait` runs out.
+async fn wait_for_host_route<F, Fut>(
+    jid: &str,
+    wait: Duration,
+    poll: Duration,
+    mut read: F,
+) -> Result<cluster::HostEndpoint, String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<ClusterOverview, String>>,
+{
+    let deadline = Instant::now() + wait;
+    loop {
+        match host_route(&read().await?, jid) {
+            HostRoute::Listed(endpoint) => return Ok(endpoint),
+            HostRoute::Gone(words) => return Err(words),
+            HostRoute::Coming if Instant::now() + poll < deadline => tokio::time::sleep(poll).await,
+            HostRoute::Coming => return Err(PREPARING_JOB_ROUTE.into()),
+        }
+    }
+}
+/// A kept cluster's job the overview has running or starting, whose route
+/// the keeper hasn't listed yet: binding it resolves it on demand, and the
+/// delegate answers the token the route's daemon answers to (none is known
+/// here yet, so none is passed).
+fn on_demand(ov: &ClusterOverview, jid: &str) -> Option<cluster::HostEndpoint> {
+    let job = ov.jobs.iter().find(|j| j.id == jid)?;
+    (host_route(ov, jid) == HostRoute::Coming).then(|| cluster::HostEndpoint {
+        job: jid.to_string(),
+        slurm_job_id: job.slurm_job_id.clone().unwrap_or_default(),
+        node: job.node.clone(),
+        port: 0,
+        token: String::new(),
+        build: String::new(),
+    })
+}
+/// The overview a wait for a route reads: a kept cluster's current read
+/// (never a page's cached answer, which would never change), a direct
+/// cluster's live one.
+async fn route_overview(app: &AppHandle, alias: &str) -> Result<ClusterOverview, String> {
+    if kept::select(&app.state::<Shell>(), alias).await?.is_some() {
+        job_overview(app, alias).await
+    } else {
+        live_overview(app, alias).await
+    }
+}
+
 /// Reuse or build the forward to a running job's job-host.
 async fn host_port(app: &AppHandle, alias: &str, jid: &str) -> Result<(u16, String), String> {
     let shell = app.state::<Shell>();
@@ -1405,12 +1502,22 @@ async fn host_port(app: &AppHandle, alias: &str, jid: &str) -> Result<(u16, Stri
     let endpoint = match endpoint {
         Some(e) => e,
         None => {
-            let ov = live_overview(app, alias).await?;
+            let kept = kept::select(&shell, alias).await?.is_some();
+            let ov = route_overview(app, alias).await?;
             absorb(app, alias, &ov).await;
-            ov.hosts
-                .get(jid)
-                .cloned()
-                .ok_or("that job isn't running yet")?
+            match (host_route(&ov, jid), kept) {
+                (HostRoute::Listed(endpoint), _) => endpoint,
+                (HostRoute::Gone(words), _) => return Err(words),
+                (HostRoute::Coming, true) => on_demand(&ov, jid).ok_or(PREPARING_JOB_ROUTE)?,
+                (HostRoute::Coming, false) => {
+                    wait_for_host_route(jid, HOST_ROUTE_WAIT, HOST_ROUTE_POLL, || async {
+                        let ov = route_overview(app, alias).await?;
+                        absorb(app, alias, &ov).await;
+                        Ok(ov)
+                    })
+                    .await?
+                }
+            }
         }
     };
     host_forward(app, alias, jid, &endpoint).await
@@ -2292,6 +2399,112 @@ pub(crate) fn sweep_terminals(port: u16, token: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_job_route_is_waited_for_only_while_it_can_come() {
+        let job = |state: &'static str, stopping| cluster::JobView {
+            id: "j-00000001".into(),
+            name: "analysis job".into(),
+            state,
+            stopping,
+            ..Default::default()
+        };
+        let mut ov = ClusterOverview::default();
+        assert_eq!(
+            host_route(&ov, "j-00000001"),
+            HostRoute::Gone("that job isn't running yet".into())
+        );
+        for state in ["running", "starting"] {
+            ov.jobs = vec![job(state, false)];
+            assert_eq!(host_route(&ov, "j-00000001"), HostRoute::Coming);
+        }
+        ov.jobs = vec![job("waiting", false)];
+        assert_eq!(
+            host_route(&ov, "j-00000001"),
+            HostRoute::Gone("analysis job hasn't started yet".into())
+        );
+        ov.jobs = vec![job("ended", false)];
+        assert_eq!(
+            host_route(&ov, "j-00000001"),
+            HostRoute::Gone("that job isn't running yet".into())
+        );
+        ov.jobs = vec![job("running", true)];
+        assert_eq!(
+            host_route(&ov, "j-00000001"),
+            HostRoute::Gone("analysis job is stopping".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_action_waits_for_a_job_route_that_follows_its_start() {
+        let running = || {
+            let mut ov = ClusterOverview::default();
+            ov.jobs.push(cluster::JobView {
+                id: "j-00000001".into(),
+                name: "analysis job".into(),
+                state: "running",
+                ..Default::default()
+            });
+            ov
+        };
+        let endpoint = cluster::HostEndpoint {
+            job: "j-00000001".into(),
+            slurm_job_id: "42".into(),
+            node: "compute".into(),
+            port: 0,
+            token: "route".into(),
+            build: "b".into(),
+        };
+        // The third read lists the route.
+        let mut reads = 0;
+        let found = wait_for_host_route(
+            "j-00000001",
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+            || {
+                reads += 1;
+                let mut ov = running();
+                if reads == 3 {
+                    ov.hosts.insert("j-00000001".into(), endpoint.clone());
+                }
+                async move { Ok(ov) }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!((found, reads), (endpoint, 3));
+        // It never comes: the wait ends with the keeper's sentence.
+        let error = wait_for_host_route(
+            "j-00000001",
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+            || async { Ok(running()) },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, PREPARING_JOB_ROUTE);
+    }
+
+    #[test]
+    fn a_kept_job_without_a_listed_route_is_bound_on_demand() {
+        let mut ov = ClusterOverview::default();
+        ov.jobs.push(cluster::JobView {
+            id: "j-00000001".into(),
+            name: "analysis job".into(),
+            state: "starting",
+            slurm_job_id: Some("42".into()),
+            node: "compute".into(),
+            ..Default::default()
+        });
+        let endpoint = on_demand(&ov, "j-00000001").unwrap();
+        assert_eq!(
+            (endpoint.slurm_job_id.as_str(), endpoint.token.as_str()),
+            ("42", "")
+        );
+        ov.jobs[0].state = "waiting";
+        assert!(on_demand(&ov, "j-00000001").is_none());
+        assert!(on_demand(&ov, "j-00000002").is_none());
+    }
 
     #[test]
     fn open_without_a_route_says_why() {
