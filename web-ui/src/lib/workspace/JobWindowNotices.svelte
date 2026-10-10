@@ -10,10 +10,15 @@
    *   (`host-status` "ended" on this window's key, or the cluster's overview
    *   after a reconnect failed): a calm overlay — the work is gone, the chats
    *   aren't — with Start again (a new job for this workspace) and Close.
+   * A browser view the account serves of a job's workspace has no shell and
+   * no cluster page: its reminder only says when the job ends, its end comes
+   * from the account's answer (`jobEnd.ts` `createGatewayJobWatch`), and its
+   * ended panel offers the way back to the account's Home.
    * A person starts every job (plan §2.4): nothing here queues anything
    * without a click.
    */
   import { clusterContinueJob, closeThisWindow, isNativeShell, openWindow } from "../net/native";
+  import { isBrowserGateway } from "../net/base";
   import { pageVisible } from "../shared/visibility";
   import { modalFocus } from "../shared/modalFocus";
   import { focusOnMount } from "../shared/focusOnMount";
@@ -57,6 +62,10 @@
   }: Props = $props();
 
   const nativeJob = $derived(isNativeShell() && cws !== null);
+  /** A browser view the account serves: it can't start or continue a job
+   *  (that needs the cluster page), so its reminder only says when the job
+   *  ends, and its ended panel leads back to the account's Home. */
+  const browserJob = !isNativeShell() && isBrowserGateway();
   /** An attached job (held by the app) can't continue: its reminder only
    *  says when it ends. */
   const attached = $derived(alloc?.attached === true);
@@ -66,7 +75,7 @@
   // hidden, caught up on return (the effect re-runs).
   let now = $state(Date.now());
   $effect(() => {
-    if (!$pageVisible || ended !== null || !nativeJob) return;
+    if (!$pageVisible || ended !== null || !(nativeJob || browserJob)) return;
     now = Date.now();
     const t = setInterval(() => (now = Date.now()), 60_000);
     return () => clearInterval(t);
@@ -93,7 +102,7 @@
   let waitingHidden = $state(false);
 
   const showBanner = $derived(
-    nativeJob &&
+    (nativeJob || browserJob) &&
       ended === null &&
       (phase === "waiting"
         ? !waitingHidden
@@ -177,6 +186,8 @@
               >Back to {alias}</button
             >
           {/if}
+        {:else if browserJob && !moving}
+          <a class="primary" href="/" use:focusOnMount>Back to Home</a>
         {/if}
       </div>
     </div>
@@ -189,7 +200,9 @@
     {:else}
       <span class="copy">
         <strong>{stopsInWords(remaining ?? 0)}</strong>
-        {#if attached}
+        {#if browserJob}
+          Your chats are saved.
+        {:else if attached}
           It's held by this app, so it can't continue in a new job — start one from the cluster page to keep working. Your chats are saved.
         {:else}
           Continue in a new job and your chats come with you.
@@ -271,7 +284,12 @@
     white-space: nowrap;
   }
 
-  .primary:hover:enabled {
+  a.primary {
+    text-decoration: none;
+  }
+
+  .primary:hover:enabled,
+  a.primary:hover {
     border-color: var(--accent);
   }
 

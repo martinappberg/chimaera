@@ -59,3 +59,105 @@ export function jobWindowEnd(
     .sort((a, b) => (b.ended_at_ms ?? b.submitted_ms) - (a.ended_at_ms ?? a.submitted_ms));
   return { reason: unnamed.length > 0 ? reasonOf(unnamed[0]) : null };
 }
+
+/**
+ * Whether an account-gateway answer says this browser view's job route is
+ * gone: `503 {"error":"host_unavailable"}`, which the account sends once the
+ * keeper no longer lists the workspace in a running job, or the keeper says
+ * the job's route is gone. A restarting keeper or a stalled link answers
+ * `temporarily_unavailable` instead, which is only a connection problem.
+ */
+export async function routeGoneAnswer(res: Response): Promise<boolean> {
+  if (res.status !== 503) return false;
+  try {
+    const body = (await res.json()) as unknown;
+    return typeof body === "object" && body !== null && (body as { error?: unknown }).error === "host_unavailable";
+  } catch {
+    return false;
+  }
+}
+
+/** First look after the link drops, then the pace while it stays down. */
+const FIRST_PROBE_MS = 4_000;
+const PROBE_MS = 15_000;
+/** One answer may come from a listing read mid-transition (the account
+ *  caches a cluster's list for under a minute), so it takes two in a row. */
+const GONE_STRIKES = 2;
+
+/**
+ * Watches a browser view of a cluster job workspace for its job's end. The
+ * Mac app hears that from its shell; a browser has only the account's answer,
+ * so while this view's link is down it asks the account, gently: only while
+ * the page is visible, and never once the link is back or the end is known.
+ */
+export function createGatewayJobWatch(probe: () => Promise<Response>): {
+  link(up: boolean): void;
+  stop(): void;
+} {
+  let down = false;
+  let strikes = 0;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let onVisible: (() => void) | null = null;
+
+  function clear(): void {
+    if (timer !== null) clearTimeout(timer);
+    timer = null;
+    if (onVisible !== null) document.removeEventListener("visibilitychange", onVisible);
+    onVisible = null;
+  }
+
+  function schedule(ms: number): void {
+    clear();
+    timer = setTimeout(() => {
+      timer = null;
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") {
+        // Hidden: no asking at all; the return asks at once.
+        onVisible = () => {
+          if (document.visibilityState !== "visible") return;
+          clear();
+          void ask();
+        };
+        document.addEventListener("visibilitychange", onVisible);
+        return;
+      }
+      void ask();
+    }, ms);
+  }
+
+  async function ask(): Promise<void> {
+    if (!down) return;
+    let gone = false;
+    try {
+      gone = await routeGoneAnswer(await probe());
+    } catch {
+      gone = false;
+    }
+    if (!down) return;
+    strikes = gone ? strikes + 1 : 0;
+    if (strikes >= GONE_STRIKES) {
+      down = false;
+      endJobWindow({ reason: "gone" });
+      return;
+    }
+    schedule(PROBE_MS);
+  }
+
+  return {
+    link(up: boolean): void {
+      if (up) {
+        down = false;
+        strikes = 0;
+        clear();
+        return;
+      }
+      if (down) return;
+      down = true;
+      strikes = 0;
+      schedule(FIRST_PROBE_MS);
+    },
+    stop(): void {
+      down = false;
+      clear();
+    },
+  };
+}

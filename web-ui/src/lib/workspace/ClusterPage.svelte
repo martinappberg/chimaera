@@ -43,6 +43,7 @@
   import { clusterNow, clusterOverviews } from "./clusterStore.svelte";
   import {
     agoWords,
+    clusterErrorLine,
     endedLine,
     jobStatusLine,
     isJobStopping,
@@ -687,7 +688,7 @@
   {#if overview === null}
     {#if entry !== undefined && entry.error !== null}
       <div class="err-line">
-        Couldn't read the cluster: {entry.error}
+        {clusterErrorLine("Couldn't read the cluster", entry.error)}
         <button class="inline-act" onclick={refresh}>Try again</button>
       </div>
     {:else}
@@ -717,7 +718,7 @@
         {/if}
         {#if entry !== undefined && entry.error !== null}
           <div class="err-line quiet">
-            Couldn't refresh: {entry.error}
+            {clusterErrorLine("Couldn't refresh", entry.error)}
             <button class="inline-act" onclick={refresh}>Try again</button>
           </div>
         {/if}

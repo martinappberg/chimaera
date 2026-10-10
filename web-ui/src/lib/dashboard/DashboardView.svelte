@@ -256,7 +256,7 @@
     if (snap === null || (snap.scheduler !== "slurm" && snap.self === null)) return null;
     if (snap.self !== null) {
       // Inside an allocation the walltime IS the vital sign.
-      const title = `slurm job ${snap.self.job_id} on ${snap.self.node} — expires at walltime`;
+      const title = `slurm job ${snap.self.job_id} on ${snap.self.node} — ends at its time limit`;
       const baseline = parseSlurmTimeLeft(snap.self.time_left);
       if (baseline === null) {
         // Slurm's non-durations: a dash for the transitional placeholders,
@@ -269,7 +269,7 @@
       }
       const remaining = secondsLeft(snap.self, snap.received_at_ms, computeNow) ?? 0;
       return {
-        text: remaining === 0 ? "slurm · expiring…" : `slurm · ${formatSlurmDuration(remaining)} left`,
+        text: remaining === 0 ? "slurm · time's up" : `slurm · ${formatSlurmDuration(remaining)} left`,
         title,
       };
     }

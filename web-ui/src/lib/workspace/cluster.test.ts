@@ -9,6 +9,7 @@ import type {
   PartitionChoice,
 } from "../net/native";
 import {
+  clusterErrorLine,
   accountChoices,
   childPath,
   agoWords,
@@ -573,5 +574,17 @@ describe("the folder picker", () => {
     expect(parentPath("/scratch")).toBe("/");
     expect(parentPath("/")).toBeNull();
     expect(parentPath("~/x")).toBeNull();
+  });
+});
+
+describe("clusterErrorLine", () => {
+  it("lets a whole sentence stand alone and introduces a fragment", () => {
+    expect(clusterErrorLine("Couldn't refresh", "The cluster is busy. Try again in a moment.")).toBe(
+      "The cluster is busy. Try again in a moment.",
+    );
+    expect(clusterErrorLine("Couldn't refresh", "unknown job")).toBe("Couldn't refresh: unknown job");
+    expect(clusterErrorLine("Couldn't refresh", "ssh: connect to host x port 22: Connection refused")).toBe(
+      "Couldn't refresh: ssh: connect to host x port 22: Connection refused",
+    );
   });
 });

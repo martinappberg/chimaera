@@ -66,7 +66,7 @@
         ? "—"
         : alloc.time_left
       : remaining === 0
-        ? "expiring…"
+        ? "time's up"
         : formatSlurmDuration(remaining),
   );
   /** Under ten minutes the countdown turns cautionary. */

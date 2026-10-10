@@ -605,7 +605,9 @@ export function stopsInWords(remainingSecs: number): string {
  * The window's ended screen, from the shell's reason: Slurm's state,
  * "stopped" (stopped from the app), "closed" (this workspace was closed; its
  * job still runs), "workspace-failed" (its chimaera stopped on its own) or
- * "moving" (it is on its way to another job; the window follows).
+ * "moving" (it is on its way to another job; the window follows), or "gone"
+ * (a browser view's job route is no longer listed: the account cannot tell
+ * which of those two it was).
  */
 export function endedScreenWords(reason: string | null | undefined): string {
   switch (stateWord(reason)) {
@@ -615,9 +617,21 @@ export function endedScreenWords(reason: string | null | undefined): string {
       return "This workspace stopped unexpectedly. Its chats are saved — open it again from the cluster page.";
     case "MOVING":
       return "Moving to the new job — this window reopens there when it's ready. Your chats come with you.";
+    case "GONE":
+      return "This workspace's job has ended, or the workspace was closed. Its chats are saved.";
   }
   const why = endedWords(reason, false);
   return why === ""
     ? "This job ended. Your chats are saved."
     : `This job ended — ${why}. Your chats are saved.`;
+}
+
+/**
+ * A cluster page's error line: a whole sentence from the shell stands alone
+ * (it already says what happened and what to do); a bare fragment ("unknown
+ * job", an ssh line) is introduced by what was being done.
+ */
+export function clusterErrorLine(doing: string, error: string): string {
+  const e = error.trim();
+  return /^[A-Z][^\n]*[.!?]$/.test(e) ? e : `${doing}: ${e}`;
 }

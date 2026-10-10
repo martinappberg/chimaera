@@ -15,6 +15,7 @@
   import { fade } from "svelte/transition";
   import { runStallDrive, stallDriveSpec } from "./lib/perf/tabSwitchDrive";
   import {
+    api,
     ApiError,
     getActiveWorkspaceId,
     getHostLabel,
@@ -98,7 +99,7 @@
   } from "./lib/workspace/agentLinks";
   import { typeIntoDetachedSession } from "./lib/terminal/ws";
   import { reconnectingSockets, setSocketKeepers } from "./lib/net/reconnect";
-  import { endJobWindow, jobWindowEnd, windowJobEnd } from "./lib/workspace/jobEnd";
+  import { createGatewayJobWatch, endJobWindow, jobWindowEnd, windowJobEnd } from "./lib/workspace/jobEnd";
   import {
     createReconnectListenerGate,
     selectRemoteReconnectSurface,
@@ -566,7 +567,7 @@
   const jobEnded = $derived($windowJobEnd);
   /** The job window's notices — their own chunk, loaded only in job windows. */
   let JobNoticesView = $state<typeof JobWindowNotices | null>(null);
-  if (jobCtx !== null) {
+  function loadJobNotices(): void {
     import("./lib/workspace/JobWindowNotices.svelte").then(
       (m) => {
         JobNoticesView = m.default;
@@ -574,6 +575,20 @@
       (err: unknown) => console.error("job window notices failed to load", err),
     );
   }
+  if (jobCtx !== null) loadJobNotices();
+  /** A browser view the account serves of one machine (`/app/{id}/`), not a
+   *  project view: when its daemon reports the job it runs in, it is a
+   *  cluster job's workspace, and only the account can say that job ended
+   *  (no shell tells a browser), so the view asks it while its link is down. */
+  const gatewayHostView = isBrowserGateway() && !projectView && !isNativeShell() && jobCtx === null;
+  let webJob = $state(false);
+  const gatewayJobWatch = gatewayHostView ? createGatewayJobWatch(() => api("/health")) : null;
+  $effect(() => {
+    if (!gatewayHostView || webJob || !$computeStatus?.self) return;
+    webJob = true;
+    loadJobNotices();
+  });
+  $effect(() => () => gatewayJobWatch?.stop());
   /** A cluster workspace window's cluster page (its own chunk), shown over
    *  the workspace in place of the folder picker: this window's chimaera
    *  knows only its one workspace; the cluster page knows them all. */
@@ -1909,6 +1924,7 @@
         // socket was down (or a restarted daemon renumbered).
         if (up && !eventsUp) onCommsReconnect();
         eventsUp = up;
+        if (webJob) gatewayJobWatch?.link(up);
         // A save that died with the link retries once it is back.
         noteDaemonLink(up);
       },
@@ -6861,12 +6877,12 @@
   />
 {/if}
 
-{#if jobCtx !== null && JobNoticesView !== null}
+{#if (jobCtx !== null || webJob) && JobNoticesView !== null}
   <!-- A job window: the "continue on a new node" offer near the job's time
        limit, and the calm overlay once the shell says the job ended. -->
   <JobNoticesView
     alias={hostAlias}
-    cws={jobCtx.cws}
+    cws={jobCtx?.cws ?? null}
     self={$computeStatus?.self ?? null}
     receivedAt={$computeStatus?.received_at_ms ?? 0}
     ended={jobEnded}

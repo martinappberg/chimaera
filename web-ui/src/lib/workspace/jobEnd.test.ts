@@ -1,10 +1,10 @@
 import { get } from "svelte/store";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { ClusterJob, ClusterWorkspaceView } from "../net/native";
 import { reconnectsHalted } from "../net/reconnect";
 import { endedScreenWords } from "./cluster";
-import { endJobWindow, jobWindowEnd, windowJobEnd } from "./jobEnd";
+import { createGatewayJobWatch, endJobWindow, jobWindowEnd, routeGoneAnswer, windowJobEnd } from "./jobEnd";
 
 function job(over: Partial<ClusterJob> = {}): ClusterJob {
   return {
@@ -82,5 +82,67 @@ describe("endJobWindow", () => {
     endJobWindow({ reason: "TIMEOUT" });
     expect(get(windowJobEnd)).toEqual({ reason: "TIMEOUT" });
     expect(reconnectsHalted()).toBe(true);
+  });
+});
+
+describe("a browser job view's watch", () => {
+  const gone = () => new Response(JSON.stringify({ error: "host_unavailable" }), { status: 503 });
+  const busy = () => new Response(JSON.stringify({ error: "temporarily_unavailable" }), { status: 503 });
+
+  it("reads only the account's host_unavailable as the route being gone", async () => {
+    expect(await routeGoneAnswer(gone())).toBe(true);
+    expect(await routeGoneAnswer(busy())).toBe(false);
+    expect(await routeGoneAnswer(new Response("bad gateway", { status: 503 }))).toBe(false);
+    expect(await routeGoneAnswer(new Response("{}", { status: 200 }))).toBe(false);
+  });
+
+  it("ends the view after two gone answers in a row, and not after one", async () => {
+    vi.useFakeTimers();
+    try {
+      windowJobEnd.set(null);
+      const answers = [gone, busy, gone, gone];
+      let asked = 0;
+      const watch = createGatewayJobWatch(async () => answers[asked++]());
+      watch.link(false);
+      await vi.advanceTimersByTimeAsync(4_000);
+      expect(asked).toBe(1);
+      await vi.advanceTimersByTimeAsync(15_000);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(asked).toBe(3);
+      expect(get(windowJobEnd)).toBeNull();
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(asked).toBe(4);
+      expect(get(windowJobEnd)).toEqual({ reason: "gone" });
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(asked).toBe(4);
+      watch.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops asking once the link is back", async () => {
+    vi.useFakeTimers();
+    try {
+      let asked = 0;
+      const watch = createGatewayJobWatch(async () => {
+        asked++;
+        return gone();
+      });
+      watch.link(false);
+      await vi.advanceTimersByTimeAsync(4_000);
+      watch.link(true);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(asked).toBe(1);
+      watch.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("names the browser's unknown end plainly", () => {
+    expect(endedScreenWords("gone")).toBe(
+      "This workspace's job has ended, or the workspace was closed. Its chats are saved.",
+    );
   });
 });

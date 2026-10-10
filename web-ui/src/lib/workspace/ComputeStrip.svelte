@@ -40,7 +40,7 @@
         ? "—"
         : alloc.time_left
       : remaining === 0
-        ? "expiring…"
+        ? "time's up"
         : formatSlurmDuration(remaining),
   );
 
@@ -61,7 +61,7 @@
 <div
   class="compute-strip"
   role="status"
-  title={`slurm job ${alloc.job_id} on ${alloc.node} — expires at walltime`}
+  title={`slurm job ${alloc.job_id} on ${alloc.node} — ends at its time limit`}
 >
   <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
     <rect x="2" y="2" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />

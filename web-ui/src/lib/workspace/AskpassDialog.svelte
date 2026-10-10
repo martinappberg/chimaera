@@ -46,11 +46,11 @@
         <div class="askpass-head">
           <span class="askpass-glyph" aria-hidden="true">&#128274;</span>
           <span class="askpass-title">
-            {presentation?.type === "host_key" ? "Trust this SSH host?" : "authenticate"}{askpass.alias != null ? ` · ${askpass.alias}` : ""}
+            {presentation?.type === "host_key" ? "Trust this SSH host?" : "Sign in"}{askpass.alias != null ? ` · ${askpass.alias}` : ""}
           </span>
         </div>
         {#if askpass.source?.type === "keeper"}
-          <p class="askpass-source">Asked by a background connection</p>
+          <p class="askpass-source">For the connection that stays on while you’re away</p>
         {/if}
         {#if presentation?.type === "host_key"}
           <p class="askpass-trust-note">
@@ -100,11 +100,11 @@
           <button
             class="askpass-cancel"
             use:focusOnMount={presentation?.type !== "secret"}
-            onclick={cancel}>cancel</button
+            onclick={cancel}>Cancel</button
           >
           {#if presentation?.type !== "unsupported"}
             <button class="askpass-go" onclick={submit}>
-              {presentation?.type === "host_key" ? "Trust and connect" : "authenticate"}
+              {presentation?.type === "host_key" ? "Trust and connect" : "Continue"}
             </button>
           {/if}
         </div>
