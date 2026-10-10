@@ -650,3 +650,25 @@ export function terminalNoteWords(code: string | undefined): string | null {
       return null;
   }
 }
+
+/** The row's quiet status for a transient Open outcome code; null for none
+ *  or an unknown one. */
+export function openPendingWords(code: string | undefined): string | null {
+  switch (code) {
+    case "opening":
+      return "Still opening…";
+    case "getting_ready":
+      return "Getting ready…";
+    case "not_answering":
+      return "Not answering yet…";
+    default:
+      return null;
+  }
+}
+
+/** The Terminal action's tooltip. On a kept cluster the terminal is this
+ *  computer's own sign-in to the login node, separate from the cloud's. */
+export function terminalTitle(alias: string, kept: boolean): string {
+  const base = `A terminal on ${alias}'s login node`;
+  return kept ? `${base}. ${terminalNoteWords("login_needs_sign_in")}` : base;
+}

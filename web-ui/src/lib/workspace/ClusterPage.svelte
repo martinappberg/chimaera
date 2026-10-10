@@ -52,7 +52,8 @@
     openPlan,
     otherJobsWords,
     shortHost,
-    terminalNoteWords,
+    openPendingWords,
+    terminalTitle,
     tildePath,
     parentPath,
     workspaceActivity,
@@ -145,6 +146,16 @@
   type JobBusy = "stopping" | "cancelling" | "dismissing";
   let wsBusy = $state<Record<string, WsBusy>>({});
   let wsError = $state<Record<string, string>>({});
+  /** A transient Open outcome, shown quietly under the row (never red)
+   *  until the next action on it or PENDING_SHOWN passes. */
+  let wsPending = $state<Record<string, string>>({});
+  const PENDING_SHOWN = 20_000;
+  function showPending(id: string, words: string): void {
+    wsPending = setIn(wsPending, id, words);
+    setTimeout(() => {
+      if (wsPending[id] === words) wsPending = setIn(wsPending, id, null);
+    }, PENDING_SHOWN);
+  }
   let jobBusy = $state<Record<string, JobBusy>>({});
   let jobError = $state<Record<string, string>>({});
 
@@ -238,6 +249,7 @@
   async function wsAction(w: ClusterWorkspaceView, busy: WsBusy, run: () => Promise<void>): Promise<void> {
     if (wsBusy[w.id] !== undefined) return;
     wsError = setIn(wsError, w.id, null);
+    wsPending = setIn(wsPending, w.id, null);
     wsBusy = setIn(wsBusy, w.id, busy);
     try {
       await run();
@@ -292,7 +304,10 @@
   function openIn(w: ClusterWorkspaceView, jobId: string | null): void {
     const target = jobs.find((j) => j.id === (jobId ?? w.job));
     if (target !== undefined && isJobStopping(target)) return;
-    void wsAction(w, "opening", () => clusterOpen(alias, w.id, jobId));
+    void wsAction(w, "opening", async () => {
+      const words = openPendingWords((await clusterOpen(alias, w.id, jobId)).pending);
+      if (words !== null) showPending(w.id, words);
+    });
   }
 
   function startSheet(preselect: string[], spec: LaunchSpec | null = null): void {
@@ -430,7 +445,7 @@
   async function openTerminal(): Promise<void> {
     mastError = null;
     try {
-      mastNote = terminalNoteWords((await clusterOpenTerminal(alias)).note);
+      await clusterOpenTerminal(alias);
     } catch (e) {
       mastError = errText(e);
     }
@@ -595,6 +610,8 @@
     </div>
     {#if !stopping && wsError[w.id] !== undefined}
       <div class="row-err">{wsError[w.id]}</div>
+    {:else if !stopping && wsPending[w.id] !== undefined}
+      <div class="row-pending">{wsPending[w.id]}</div>
     {/if}
   </div>
 {/snippet}
@@ -630,7 +647,7 @@
         </div>
       </div>
       <div class="mast-acts">
-        <button class="mast-btn" title="A terminal on {alias}'s login node" onclick={() => void openTerminal()}>
+        <button class="mast-btn" title={terminalTitle(alias, overview?.kept === true)} onclick={() => void openTerminal()}>
           <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
             <rect x="1.8" y="2.8" width="12.4" height="10.4" rx="2" fill="none" stroke="currentColor" stroke-width="1.3" />
             <path d="M4.5 6.2 6.6 8l-2.1 1.8M8.2 10h3.3" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" />
@@ -1563,6 +1580,13 @@
   .busy-word {
     font-size: var(--text-xs);
     color: var(--warn);
+  }
+
+  .row-pending {
+    padding-top: 2px;
+    font-size: var(--text-xs);
+    color: var(--muted);
+    line-height: 1.5;
   }
 
   .row-err {

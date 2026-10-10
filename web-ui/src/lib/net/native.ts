@@ -706,8 +706,12 @@ export async function clusterOpen(
   alias: string,
   workspaceId: string,
   jobId: string | null = null,
-): Promise<void> {
-  await shell().core.invoke<void>("cluster_open", { alias, workspaceId, jobId });
+): Promise<{ pending?: string }> {
+  // `pending`: a transient outcome (still opening, getting ready, not
+  // answering yet) the row shows as a quiet status. An older shell answers
+  // nothing.
+  const answer = await shell().core.invoke<{ pending?: string } | null>("cluster_open", { alias, workspaceId, jobId });
+  return answer ?? {};
 }
 
 /** Close a workspace in its job (it saves its chats). */

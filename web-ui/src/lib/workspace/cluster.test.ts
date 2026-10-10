@@ -26,6 +26,8 @@ import {
   jobResources,
   jobStatusLine,
   terminalNoteWords,
+  openPendingWords,
+  terminalTitle,
   limitWords,
   liveJobs,
   memWords,
@@ -598,5 +600,24 @@ describe("terminalNoteWords", () => {
     );
     expect(terminalNoteWords(undefined)).toBeNull();
     expect(terminalNoteWords("something_new")).toBeNull();
+  });
+});
+
+describe("openPendingWords", () => {
+  it("words a transient Open outcome and nothing else", () => {
+    expect(openPendingWords("opening")).toBe("Still opening…");
+    expect(openPendingWords("getting_ready")).toBe("Getting ready…");
+    expect(openPendingWords("not_answering")).toBe("Not answering yet…");
+    expect(openPendingWords(undefined)).toBeNull();
+    expect(openPendingWords("something_new")).toBeNull();
+  });
+});
+
+describe("terminalTitle", () => {
+  it("adds the sign-in note only on a kept cluster", () => {
+    expect(terminalTitle("hpc", false)).toBe("A terminal on hpc's login node");
+    expect(terminalTitle("hpc", true)).toBe(
+      "A terminal on hpc's login node. This terminal signs in to the login node on its own.",
+    );
   });
 });

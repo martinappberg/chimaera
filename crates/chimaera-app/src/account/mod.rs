@@ -303,3 +303,24 @@ mod tests {
         assert!(status["plan"].is_null());
     }
 }
+
+/// Transient outcomes of opening a cluster workspace. They travel as these
+/// exact sentences (so any path that shows them as text still reads right),
+/// and `cluster_open` turns them into a quiet row status, never an error.
+pub mod pending {
+    /// The same Open is already under way.
+    pub const STILL_OPENING: &str = "Still opening…";
+    /// Its route isn't ready yet (a job or workspace that just started).
+    pub const GETTING_READY: &str = "Getting ready…";
+    /// The route is there, but its daemon doesn't answer yet.
+    pub const NOT_ANSWERING: &str = "Not answering yet…";
+    /// The page's code for one of the sentences above; None for an error.
+    pub fn code(message: &str) -> Option<&'static str> {
+        match message {
+            STILL_OPENING => Some("opening"),
+            GETTING_READY => Some("getting_ready"),
+            NOT_ANSWERING => Some("not_answering"),
+            _ => None,
+        }
+    }
+}

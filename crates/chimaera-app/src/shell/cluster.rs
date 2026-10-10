@@ -1421,7 +1421,7 @@ pub(super) async fn cluster_dismiss_job(
 /// route on demand when the route is bound.
 const HOST_ROUTE_WAIT: Duration = Duration::from_secs(60);
 const HOST_ROUTE_POLL: Duration = Duration::from_secs(2);
-const PREPARING_JOB_ROUTE: &str = "Getting ready…";
+const PREPARING_JOB_ROUTE: &str = crate::account::pending::GETTING_READY;
 
 /// What an overview says about reaching job `jid`'s job-host.
 #[derive(Debug, PartialEq)]
@@ -1740,9 +1740,28 @@ async fn open_ws_window(
 /// lists it after its next poll); only a closed one isn't open in a job.
 fn no_route_words(view: &cluster::WorkspaceView) -> String {
     if view.state == "open" || view.opening {
-        "The keeper is preparing this workspace's route; try Open again shortly".into()
+        crate::account::pending::GETTING_READY.into()
     } else {
         format!("{} isn't open in a job", view.name)
+    }
+}
+
+/// What Open answers the page: nothing, or a transient outcome code the row
+/// shows as a quiet status (see `account::pending`).
+#[derive(serde::Serialize)]
+pub(super) struct OpenAnswer {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pending: Option<&'static str>,
+}
+fn open_answer(result: Result<(), String>) -> Result<OpenAnswer, String> {
+    match result {
+        Ok(()) => Ok(OpenAnswer { pending: None }),
+        Err(message) => match crate::account::pending::code(&message) {
+            Some(code) => Ok(OpenAnswer {
+                pending: Some(code),
+            }),
+            None => Err(message),
+        },
     }
 }
 
@@ -1751,6 +1770,14 @@ fn no_route_words(view: &cluster::WorkspaceView) -> String {
 /// in a job that hasn't started says so.
 #[tauri::command]
 pub(super) async fn cluster_open(
+    app: AppHandle,
+    alias: String,
+    workspace_id: String,
+    job_id: Option<String>,
+) -> Result<OpenAnswer, String> {
+    open_answer(open_workspace(app, alias, workspace_id, job_id).await)
+}
+async fn open_workspace(
     app: AppHandle,
     alias: String,
     workspace_id: String,
@@ -2528,12 +2555,38 @@ mod tests {
         };
         assert_eq!(
             no_route_words(&view),
-            "The keeper is preparing this workspace's route; try Open again shortly"
+            crate::account::pending::GETTING_READY
         );
         view.state = "closed";
         assert_eq!(no_route_words(&view), "analysis isn't open in a job");
         view.opening = true;
-        assert!(no_route_words(&view).starts_with("The keeper is preparing"));
+        assert_eq!(
+            no_route_words(&view),
+            crate::account::pending::GETTING_READY
+        );
+    }
+
+    #[test]
+    fn transient_open_outcomes_are_a_status_and_errors_stay_errors() {
+        use crate::account::pending;
+        let answer = |result: Result<(), String>| {
+            open_answer(result).map(|a| serde_json::to_value(a).unwrap())
+        };
+        assert_eq!(answer(Ok(())).unwrap(), serde_json::json!({}));
+        for (sentence, code) in [
+            (pending::STILL_OPENING, "opening"),
+            (pending::GETTING_READY, "getting_ready"),
+            (pending::NOT_ANSWERING, "not_answering"),
+        ] {
+            assert_eq!(
+                answer(Err(sentence.into())).unwrap(),
+                serde_json::json!({ "pending": code })
+            );
+        }
+        assert_eq!(
+            answer(Err("analysis isn't open in a job".into())).unwrap_err(),
+            "analysis isn't open in a job"
+        );
     }
 
     #[test]
