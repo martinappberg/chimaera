@@ -2165,3 +2165,39 @@ describe("MCP input request lifecycle", () => {
     expect(fold([request, {type: "forked", source_agent: "claude", source_seq: 1, native: true}]).elicitations).toHaveLength(0);
   });
 });
+
+describe("tool timing and prose honesty", () => {
+  function foldAt(events: [number, Record<string, unknown>][]): ChatStore {
+    const store = new ChatStore();
+    events.forEach(([ts, ev], i) => store.apply({ seq: i + 1, ts, ev } as SeqEvent));
+    return store;
+  }
+
+  it("stamps a call's start and its end from the journal clock, once", () => {
+    const store = foldAt([
+      [5_000, { type: "tool_call", id: "a", kind: "execute", title: "ls", status: "in_progress" }],
+      // A re-emit enriches the row but never restarts its clock.
+      [6_000, { type: "tool_call", id: "a", kind: "execute", title: "ls -la", status: "in_progress" }],
+      [9_000, { type: "tool_call_update", id: "a", status: "completed" }],
+      // A straggling terminal update does not move the end.
+      [12_000, { type: "tool_call_update", id: "a", status: "completed" }],
+    ]);
+    expect(store.blocks.find((b) => b.kind === "tool")).toMatchObject({ startedAtMs: 5_000, endedAtMs: 9_000 });
+  });
+
+  it("prose from any runtime is a message row, reasoning a thought row — never mixed", () => {
+    const store = foldAt([
+      [1, { type: "turn_started", turn_id: "t" }],
+      [2, { type: "thought_chunk", turn_id: "t", text: "weighing options" }],
+      [3, { type: "message_chunk", turn_id: "t", text: "I'll check the config." }],
+      [4, { type: "tool_call", id: "x", kind: "read", title: "Read: a", status: "in_progress" }],
+      [5, { type: "message_chunk", turn_id: "t", text: "Done." }],
+    ]);
+    expect(store.blocks.map((b) => (b.kind === "message" || b.kind === "thought" ? [b.kind, b.text] : b.kind))).toEqual([
+      ["thought", "weighing options"],
+      ["message", "I'll check the config."],
+      "tool",
+      ["message", "Done."],
+    ]);
+  });
+});

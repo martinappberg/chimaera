@@ -61,9 +61,9 @@
 </div>
 
 <style>
-  /* The pinned-monitor chrome, sibling to the plan panel — quiet
-     (border-top, muted, theme tokens) so the work trays and the plan read
-     as one strip family. */
+  /* The pinned-monitor chrome, sibling to the plan card — quiet
+     (border-top, muted, theme tokens) so the work trays read as one strip
+     family. */
   .tray {
     flex: none;
     border-top: 1px solid var(--edge);
