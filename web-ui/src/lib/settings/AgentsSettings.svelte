@@ -14,12 +14,12 @@
   import { agentUpdateStatus } from "./agentStatus";
 
   let { visible = true }: { visible?: boolean } = $props();
-  type AgentPathKey = "agents.claude.path" | "agents.codex.path" | "agents.agy.path" | "agents.grok.path" | "agents.agy.chatPath";
+  type AgentPathKey = "agents.claude.path" | "agents.codex.path" | "agents.agy.path" | "agents.grok.path" | "agents.cursor.path" | "agents.agy.chatPath";
   // Only built-ins own schema keys. Extension identities must never be
   // coerced into settings belonging to an unrelated built-in agent.
   const pathKeys: Partial<Record<string, AgentPathKey>> = {
     claude: "agents.claude.path", codex: "agents.codex.path",
-    agy: "agents.agy.path", grok: "agents.grok.path",
+    agy: "agents.agy.path", grok: "agents.grok.path", cursor: "agents.cursor.path",
   };
   const pathKey = (id: string): AgentPathKey | undefined => pathKeys[id];
   const wsId = getActiveWorkspaceId();

@@ -13,6 +13,7 @@ import { artifactMentions, isArtifactPath, proseCovered, proseEmbedTargets } fro
 import { agentMessageFromEvent, isAgentOrigin, parseAgentText, type AgentMessage } from "./agentMessages";
 import type { AgentEvent, ChatSessionInfo, SeqEvent } from "./chatWs";
 import { parseCapabilities, type ChatCapabilities } from "./capabilities";
+import { agentProductName } from "../shared/agentNames";
 
 /** Names a reply may use that still cover their files (a reply listing
  *  thirty outputs covers thirty); resolve candidates from shell text stay
@@ -1808,13 +1809,7 @@ export class ChatStore {
           this.exited = null;
           this.degraded = false;
         }
-        const source =
-          ev.source_agent === "claude"
-            ? "Claude Code"
-            : ev.source_agent === "codex"
-              ? "Codex"
-              : ev.source_agent === "agy" ? "Antigravity"
-                : ev.source_agent === "grok" ? "Grok Build" : String(ev.source_agent ?? "agent");
+        const source = typeof ev.source_agent === "string" ? agentProductName(ev.source_agent) : "agent";
         this.notice(
           `continued from ${source}${native ? "" : " · conversation copied"}`,
           "info",

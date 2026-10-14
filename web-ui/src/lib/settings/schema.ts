@@ -131,6 +131,7 @@ export type SettingsMap = {
   "agents.agy.path": string;
   "agents.agy.chatPath": string;
   "agents.grok.path": string;
+  "agents.cursor.path": string;
   "daemon.scrollbackLines": number;
   "daemon.restoreSessions": boolean;
   "chat.remoteControlAtStart": boolean;
@@ -246,7 +247,7 @@ const DEFS = {
     title: "Agents can see and message each other",
     category: "Agents",
     description:
-      "Agents can see who else is working in the workspace and exchange messages. Works in Chat for all four built-in agents, and in Terminal for Claude Code and Codex. Messages wait in an inbox when they cannot be delivered immediately. Off also turns the Mastermind off.",
+      "Agents can see who else is working in the workspace and exchange messages. Works in Chat for every built-in agent, and in Terminal for Claude Code and Codex. Messages wait in an inbox when they cannot be delivered immediately. Off also turns the Mastermind off.",
     type: "boolean",
     default: true,
     scope: "daemon",
@@ -750,6 +751,12 @@ const DEFS = {
     title: "Grok Build Binary",
     category: "Agents",
     description: "Optional absolute path to Grok Build. Empty finds your installed copy automatically.",
+    type: "string", default: "", placeholder: "resolve from login shell / PATH", scope: "daemon",
+  },
+  "agents.cursor.path": {
+    title: "Cursor CLI Binary",
+    category: "Agents",
+    description: "Optional absolute path to the Cursor CLI. Empty finds your installed copy automatically.",
     type: "string", default: "", placeholder: "resolve from login shell / PATH", scope: "daemon",
   },
   "agents.agy.chatPath": {
