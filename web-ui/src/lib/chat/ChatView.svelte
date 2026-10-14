@@ -3411,11 +3411,11 @@
     --text-xs: max(9px, calc(var(--chat-font-size) - 2px));
     --text-sm: max(10px, calc(var(--chat-font-size) - 1px));
     --text-md: var(--chat-font-size);
-    /* The transcript's column: 48em of the message text — Claude.ai's
-       reading measure, ~100 characters — so a bigger font keeps its line
-       length, capped by the Reading Width setting (--chat-measure). The
-       document views use the same rule (previews/MarkdownView). */
-    --chat-column: min(calc(48 * var(--chat-font-size)), var(--chat-measure));
+    /* The transcript's column IS the Reading Width setting (--chat-measure):
+       a min() with 48em here once made every value above 48em a no-op. The
+       default is 48em of the default text (~100 characters); the document
+       views use the same width (previews/MarkdownView). */
+    --chat-column: var(--chat-measure);
     --text-lg: calc(var(--chat-font-size) + 2px);
   }
   .chat:not(.visible) .status-spark,
