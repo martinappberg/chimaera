@@ -260,6 +260,7 @@
 <div class="json-view">
   <div class="editor" bind:this={host}></div>
   <footer class="bar">
+    <code class="path" title="On the daemon host. Hand edits sync here live.">~/.config/chimaera/settings.json</code>
     <span class="status">
       {#if dirty}unsaved{:else if savedFlash}saved{:else}synced{/if}
     </span>
@@ -305,6 +306,17 @@
 
   .status {
     color: var(--muted);
+  }
+
+  .path {
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    color: var(--fg);
+    opacity: 0.8;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .bar-err {
