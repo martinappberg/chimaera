@@ -333,7 +333,9 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   server-summarized `thinking` blocks tagged `narration` in their signature; the driver classifies
   each block (the `narration_block_indexes` wrapper, else the decoded signature) and renders
   narration as ordinary agent prose — the way the Claude apps do — while real reasoning stays in
-  Thought lines. Codex's commentary messages already arrive as prose; Codex reasoning summaries are
+  Thought lines. A long narration paragraph may start streaming as a thought before its signature
+  arrives; once the signature (or the block's frame) says narration, that thought is retracted and
+  the same text shows as prose, live and on replay. Codex's commentary messages already arrive as prose; Codex reasoning summaries are
   now requested (`turn/start.summary: "auto"`, unless the user's config sets its own).
 - **File references are links.** A path in agent prose, in inline code (the whole span, or the
   paths inside a command like `cat results/x.csv`), in a markdown link target

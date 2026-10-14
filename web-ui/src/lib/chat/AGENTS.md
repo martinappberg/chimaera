@@ -335,6 +335,9 @@ per-chunk work proportional to the TRAILING OPEN SEGMENT, not the message:
   weight. A run of thought/tool lines that any other row has followed folds into one
   line (`activityFold.ts`); the trailing run stays unfolded, so live work is always visible. Three or more finished lines in a row that something has since followed fold the same way, on their own (maintainer, 2026-10-04). Wake markers are reducer-derived (`markWake`, pure over `blocks` + the live background
   set), so replay rebuilds them; the live status line reads `turnTokens` / `activityLine`.
+  A `thought_retracted` event (Claude narration that streamed as thought before its signature)
+  cuts exactly its UTF-16 length off the turn's trailing thought row, dropping a row left empty at
+  the tail; the same text follows as message chunks, so it renders as prose live and on replay.
 - **UI quality is an acceptance criterion.** Use the theme tokens (`--fg`,
   `--accent`, `--edge`, `--overlay-bg`, …) — no hard-coded colors — so light and
   dark both hold. Shared chrome (buttons, popovers, card headers, entrance

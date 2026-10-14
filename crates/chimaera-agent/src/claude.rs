@@ -740,6 +740,35 @@ const THINKING_HOLD_TICKS: u32 = 3;
 /// Held-text bound: past it the block is long-form reasoning, not a burst.
 const THINKING_HOLD_MAX: usize = 8 * 1024;
 
+/// Bound on the text of a thinking block kept after it streamed as thought,
+/// so a late narration verdict can retract it and re-emit it as prose
+/// ([`AgentEvent::ThoughtRetracted`]). Past it the thought copy stays and
+/// only the assistant frame's own text can still rescue the prose.
+const RELEASED_THOUGHT_MAX: usize = 64 * 1024;
+
+/// The text of the current thinking block that already streamed as thought
+/// before its kind was known (see `ClaudeMapper::released_thought`).
+#[derive(Default)]
+struct ReleasedThought {
+    text: String,
+    /// The block outgrew [`RELEASED_THOUGHT_MAX`]: no exact retraction.
+    overflow: bool,
+}
+
+impl ReleasedThought {
+    fn push(&mut self, text: &str) {
+        if self.overflow {
+            return;
+        }
+        if self.text.len() + text.len() > RELEASED_THOUGHT_MAX {
+            self.overflow = true;
+            self.text = String::new();
+            return;
+        }
+        self.text.push_str(text);
+    }
+}
+
 /// An undecided streaming thinking block (see `ClaudeMapper::held_thinking`).
 #[derive(Default)]
 struct HeldThinking {
@@ -787,6 +816,12 @@ struct ClaudeMapper {
     /// Where the open thinking block's later deltas go once it was released
     /// (thought after a hold timeout). Reset at every block start/stop.
     thinking_route: Option<ChunkKind>,
+    /// A thinking block that streamed as thought before its kind was known
+    /// (a hold timeout, the hold cap). A narration verdict arriving later —
+    /// its `signature_delta`, or the per-block assistant frame, which may
+    /// land after `content_block_stop` — retracts that thought and re-emits
+    /// the text as prose. Lives until the next block starts or the turn ends.
+    released_thought: Option<ReleasedThought>,
     /// tool_use_id → kind, to choose result rendering; cleared per turn.
     tool_kinds: HashMap<String, ToolKind>,
     /// Outstanding can_use_tool requests, keyed by request_id.
@@ -1034,6 +1069,7 @@ impl ClaudeMapper {
             render_message_id: None,
             held_thinking: None,
             thinking_route: None,
+            released_thought: None,
             tool_kinds: HashMap::new(),
             pending_permissions: HashMap::new(),
             pending_elicitations: HashMap::new(),
@@ -2416,6 +2452,7 @@ impl ClaudeMapper {
                 // Blocks never interleave: a block still undecided here lost
                 // its signature — it was reasoning as far as anyone can tell.
                 self.end_thinking_block(step);
+                self.released_thought = None;
                 // A later text/thinking block in a turn owes the paragraph
                 // break its boundary represents. break_paragraph only MARKS —
                 // the coalescer materializes the break with the block's first
@@ -2457,6 +2494,11 @@ impl ClaudeMapper {
                             }
                             return;
                         }
+                        if self.thinking_route == Some(ChunkKind::Thought) {
+                            if let Some(released) = &mut self.released_thought {
+                                released.push(text);
+                            }
+                        }
                         (
                             self.thinking_route.unwrap_or(ChunkKind::Thought),
                             Some(text),
@@ -2465,16 +2507,20 @@ impl ClaudeMapper {
                     // The block's last delta before its stop: the signature
                     // names what the block was.
                     Some("signature_delta") => {
+                        let narration = delta["signature"]
+                            .as_str()
+                            .is_some_and(signature_is_narration);
                         if self.held_thinking.is_some() {
-                            let narration = delta["signature"]
-                                .as_str()
-                                .is_some_and(signature_is_narration);
                             let route = if narration {
                                 ChunkKind::Message
                             } else {
                                 ChunkKind::Thought
                             };
                             self.release_thinking(route, step);
+                        } else if narration {
+                            // A long or slow narration block outlasted the
+                            // hold and streamed as thought: it is prose.
+                            self.reroute_released_thought(None, step);
                         }
                         return;
                     }
@@ -2510,10 +2556,57 @@ impl ClaudeMapper {
             return;
         };
         self.thinking_route = Some(route);
+        if route == ChunkKind::Thought {
+            let mut released = ReleasedThought::default();
+            released.push(&held.text);
+            self.released_thought = Some(released);
+        }
         let turn = self.turn_id();
         self.coalescer.break_paragraph(&turn, route);
         if !held.text.is_empty() {
             if let Some(flushed) = self.coalescer.push(&turn, route, &held.text) {
+                step.events.push(flushed);
+            }
+        }
+    }
+
+    /// The thinking block that already streamed as thought turned out to be
+    /// narration: retract that thought (the client trims exactly its text off
+    /// the turn's trailing thought row) and emit the text as prose instead —
+    /// one replayable correction, so a reconnect renders the same transcript.
+    /// `frame_text` is the block's whole text from the assistant frame, the
+    /// fallback when the kept copy overflowed (then the thought copy stays).
+    fn reroute_released_thought(&mut self, frame_text: Option<&str>, step: &mut DriverStep) {
+        let Some(released) = self.released_thought.take() else {
+            return;
+        };
+        let (text, retract) = if released.overflow {
+            let Some(text) = frame_text else {
+                // Only the frame can still supply the whole text.
+                self.released_thought = Some(released);
+                return;
+            };
+            (text.to_string(), false)
+        } else {
+            (released.text, true)
+        };
+        let turn = self.turn_id();
+        if let Some(flushed) = self.coalescer.flush() {
+            step.events.push(flushed);
+        }
+        if retract && !text.is_empty() {
+            step.events.push(AgentEvent::ThoughtRetracted {
+                turn_id: turn.clone(),
+                utf16_len: text.encode_utf16().count(),
+            });
+        }
+        // Its later deltas (the block may still be open) follow as prose.
+        if self.thinking_route.is_some() {
+            self.thinking_route = Some(ChunkKind::Message);
+        }
+        self.coalescer.break_paragraph(&turn, ChunkKind::Message);
+        if !text.is_empty() {
+            if let Some(flushed) = self.coalescer.push(&turn, ChunkKind::Message, &text) {
                 step.events.push(flushed);
             }
         }
@@ -2575,10 +2668,10 @@ impl ClaudeMapper {
             !text.trim().is_empty() && (narration_at.contains(&i) || block_is_narration(block))
         };
         if streamed {
-            // The complete frame (it precedes content_block_stop) decides a
-            // block the stream left undecided — and rescues narration that a
-            // hold timeout already let out as thought, as prose too (the
-            // thought copy stays; the prose is what the user must see).
+            // The complete frame (it usually precedes content_block_stop, but
+            // may follow it) decides a block the stream left undecided — and
+            // turns narration that a hold timeout already let out as thought
+            // into prose (the thought is retracted, the text re-emitted).
             if let Some((i, block)) = blocks
                 .iter()
                 .enumerate()
@@ -2593,14 +2686,9 @@ impl ClaudeMapper {
                         ChunkKind::Thought
                     };
                     self.release_thinking(route, step);
-                } else if narration && self.thinking_route == Some(ChunkKind::Thought) {
-                    self.thinking_route = Some(ChunkKind::Message);
-                    let turn = self.turn_id();
-                    self.coalescer.break_paragraph(&turn, ChunkKind::Message);
+                } else if narration {
                     let text = block["thinking"].as_str().unwrap_or_default();
-                    if let Some(flushed) = self.coalescer.push(&turn, ChunkKind::Message, text) {
-                        step.events.push(flushed);
-                    }
+                    self.reroute_released_thought(Some(text), step);
                 }
             }
         }
@@ -3439,6 +3527,7 @@ impl ClaudeMapper {
 
     fn on_result(&mut self, frame: &Value, step: &mut DriverStep) {
         self.end_thinking_block(step);
+        self.released_thought = None;
         if let Some(flushed) = self.coalescer.flush() {
             step.events.push(flushed);
         }
@@ -10127,6 +10216,49 @@ pub(crate) mod tests {
         });
         assert_eq!(thought_text(&steps), "Considering the options carefully.");
         assert!(message_text(&steps, "").is_empty());
+    }
+
+    /// Narration that outlasted the hold streamed as thought; its signature
+    /// then names it narration. The thought is retracted by its exact UTF-16
+    /// length (non-ASCII included) and the whole block, later deltas too,
+    /// becomes prose.
+    #[test]
+    fn narration_released_by_the_hold_is_retracted_into_prose() {
+        let mut m = mapper();
+        let mut steps = vec![m.on_frame(&block_start("thinking"))];
+        steps.push(m.on_frame(&thinking_delta("Earlier reasoning.")));
+        steps.push(m.on_frame(&signature_delta(&signature_with_kind("thinking"))));
+        steps.push(m.on_frame(&block_stop()));
+        steps.push(m.on_frame(&block_start("thinking")));
+        steps.push(m.on_frame(&thinking_delta("Run `login` → then ")));
+        for _ in 0..THINKING_HOLD_TICKS {
+            steps.push(m.tick());
+        }
+        steps.push(m.on_frame(&thinking_delta("upload 🚀.")));
+        steps.push(m.on_frame(&signature_delta(LIVE_NARRATION_SIGNATURE)));
+        steps.push(m.on_frame(&thinking_delta(" Done.")));
+        steps.push(m.on_frame(&block_stop()));
+        steps.push(DriverStep {
+            events: m.flush().into_iter().collect(),
+            outbound: Vec::new(),
+            native_ui: Vec::new(),
+        });
+        let block = "Run `login` → then upload 🚀.";
+        let retracted: Vec<usize> = steps
+            .iter()
+            .flat_map(|s| &s.events)
+            .filter_map(|e| match e {
+                AgentEvent::ThoughtRetracted { utf16_len, .. } => Some(*utf16_len),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(retracted, [block.encode_utf16().count()]);
+        assert_eq!(message_text(&steps, ""), format!("{block} Done."));
+        let thought = thought_text(&steps);
+        assert!(
+            thought.ends_with(block),
+            "streamed as thought first: {thought:?}"
+        );
     }
 
     /// The per-block assistant frame (it precedes content_block_stop) decides

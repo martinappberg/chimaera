@@ -1295,6 +1295,39 @@ describe("ChatStore transcript cap: hysteresis, uids, virtual total", () => {
     expect(store.structuralVersion).toBeGreaterThan(structuralBefore);
   });
 
+  it("a retracted thought becomes the prose that follows it", () => {
+    const narration = "Run these:\n\n```bash\nlogin → 🚀\n```";
+    const store = fold([
+      { type: "turn_started", turn_id: "t1" },
+      { type: "thought_chunk", turn_id: "t1", text: "Reasoning first." },
+      { type: "thought_chunk", turn_id: "t1", text: `\n\n${narration}` },
+      { type: "thought_retracted", turn_id: "t1", utf16_len: narration.length },
+      { type: "message_chunk", turn_id: "t1", text: narration },
+    ]);
+    expect(store.blocks.map((b) => [b.kind, "text" in b ? b.text : ""])).toEqual([
+      ["thought", "Reasoning first."],
+      ["message", narration],
+    ]);
+  });
+
+  it("a thought row holding only the retracted text leaves the transcript", () => {
+    const narration = "\n\nSign in with `login`, then upload.";
+    const store = fold([
+      { type: "turn_started", turn_id: "t1" },
+      { type: "message_chunk", turn_id: "t1", text: "Checking." },
+      { type: "tool_call", id: "c1", kind: "execute", title: "ls", status: "completed" },
+      { type: "thought_chunk", turn_id: "t1", text: narration },
+    ]);
+    const before = store.structuralVersion;
+    store.apply({
+      seq: 5,
+      ts: 5,
+      ev: { type: "thought_retracted", turn_id: "t1", utf16_len: narration.length },
+    } as SeqEvent);
+    expect(store.blocks.map((b) => b.kind)).toEqual(["message", "tool"]);
+    expect(store.structuralVersion).toBeGreaterThan(before);
+  });
+
   it("a journal reset bumps the transcript generation", () => {
     const store = fold([{ type: "user_message", text: "hi" }]);
     expect(store.epoch).toBe(0);

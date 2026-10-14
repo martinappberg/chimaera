@@ -21,7 +21,12 @@
 //! `subagent` (parks a turn with one live Task row and progress), `showcase`
 //! (one self-ending turn over every 2.1.281 transcript surface: reasoning,
 //! narration, per-batch tool labels, a finished subagent, a background command
-//! and a Monitor whose closes follow after `FAKE_SHOWCASE_SETTLE_MS`), `hang`
+//! and a Monitor whose closes follow after `FAKE_SHOWCASE_SETTLE_MS`),
+//! `narration` (one self-ending turn whose long narration block — two shell
+//! commands in a fenced block — streams past the driver's hold before its
+//! signature names it narration; `FAKE_NARRATION_FRAME=after` sends the
+//! per-block assistant frame after `content_block_stop`, `none` omits it, and
+//! `FAKE_NARRATION_DELAY_MS` paces the deltas for a live UI check), `hang`
 //! (opens a turn, streams content, never ends it, and acks an interrupt with NO
 //! result — the interrupt-watchdog recovery tests), `silent` (never answers —
 //! handshake watchdog tests), `startup-hooks` (SessionStart hooks, held until
@@ -161,6 +166,12 @@ fn main() {
                     // transcript surface; its background closes follow.
                     "showcase" => {
                         run_showcase_turn();
+                        turn_active = false;
+                    }
+                    // A self-ending turn whose long narration (commands in
+                    // it) streams as thought before its signature says prose.
+                    "narration" => {
+                        run_narration_turn();
                         turn_active = false;
                     }
                     // Streams content, then never ends — the driver's interrupt
@@ -544,6 +555,96 @@ fn stream_thinking(msg: &str, text: &str, kind: &str) {
     }
     emit(frame);
     stream(json!({ "type": "content_block_stop" }));
+}
+
+/// Text of the `narration` mode's narration block: past the driver's 8 KiB
+/// hold cap, with the commands the user must run in a fenced block.
+fn long_narration() -> String {
+    let mut text = String::from(
+        "Sign in to the cloud project first, then start the upload. Run these two commands:\n\n\
+         ```bash\nfake-cloud auth login --no-browser\nfake-cloud storage cp ./results gs://fake-bucket/results\n```\n\n",
+    );
+    let mut n = 1;
+    while text.len() < 9 * 1024 {
+        text.push_str(&format!(
+            "Note {n}: the upload resumes where it stopped if the connection drops, so a second run only sends the files that are missing.\n\n"
+        ));
+        n += 1;
+    }
+    text.push_str("I'll check the upload once you have signed in.");
+    text
+}
+
+/// One turn whose narration outlasts the driver's hold: a short reasoning
+/// block, then a long narration block streamed in four deltas, its signature,
+/// the per-block assistant frame (before or after the stop, or none, per
+/// `FAKE_NARRATION_FRAME`), a tool call and a short closing text.
+fn run_narration_turn() {
+    emit(json!({
+        "type": "system", "subtype": "init",
+        "session_id": "fake-native-1", "model": "fake-model",
+        "permissionMode": "default", "slash_commands": ["compact"],
+    }));
+    let delay = std::env::var("FAKE_NARRATION_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    let frame_at = std::env::var("FAKE_NARRATION_FRAME").unwrap_or_default();
+    stream(json!({ "type": "message_start", "message": { "id": "mn-1" } }));
+    stream_thinking(
+        "mn-1",
+        "The user needs to sign in before anything can upload.",
+        "thinking",
+    );
+    let text = long_narration();
+    stream(json!({ "type": "content_block_start",
+                   "content_block": { "type": "thinking", "thinking": "", "signature": "" } }));
+    let quarter = text.len() / 4;
+    let mut start = 0;
+    for i in 1..=4 {
+        let mut end = if i == 4 { text.len() } else { quarter * i };
+        while !text.is_char_boundary(end) {
+            end += 1;
+        }
+        stream(json!({ "type": "content_block_delta",
+                       "delta": { "type": "thinking_delta", "thinking": &text[start..end] } }));
+        start = end;
+        if delay > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay));
+        }
+    }
+    let sig = signature("narration");
+    stream(json!({ "type": "content_block_delta",
+                   "delta": { "type": "signature_delta", "signature": sig } }));
+    let frame = json!({
+        "type": "assistant", "narration_block_indexes": [0],
+        "message": { "id": "mn-1", "content": [
+            { "type": "thinking", "thinking": text, "signature": sig },
+        ]},
+    });
+    if frame_at.is_empty() || frame_at == "before" {
+        emit(frame.clone());
+    }
+    stream(json!({ "type": "content_block_stop" }));
+    if frame_at == "after" {
+        emit(frame);
+    }
+    tool_use(
+        "mn-1",
+        "tu-check",
+        "Bash",
+        json!({ "command": "fake-cloud auth list", "description": "Check sign-in" }),
+    );
+    stream(json!({ "type": "message_delta", "usage": { "output_tokens": 2400 } }));
+    tool_result("tu-check", "No credentialed accounts.");
+    stream(json!({ "type": "message_start", "message": { "id": "mn-2" } }));
+    stream_text("mn-2", "Waiting for you to sign in.");
+    emit(json!({
+        "type": "result", "subtype": "success", "is_error": false,
+        "result": "Waiting for you to sign in.", "session_id": "fake-native-1",
+        "total_cost_usd": 0.003, "duration_ms": 40,
+        "usage": { "input_tokens": 12, "output_tokens": 2400 },
+    }));
 }
 
 fn stream_text(msg: &str, text: &str) {

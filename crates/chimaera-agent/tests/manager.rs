@@ -747,6 +747,93 @@ async fn permission_deny_marks_tool_failed() {
     .await;
 }
 
+/// Fold a turn's thought stream the way a client does: chunks append, and a
+/// `ThoughtRetracted` cuts that many UTF-16 units off the end.
+fn folded_thought(events: &[&AgentEvent]) -> String {
+    let mut units: Vec<u16> = Vec::new();
+    for e in events {
+        match e {
+            AgentEvent::ThoughtChunk { text, .. } => units.extend(text.encode_utf16()),
+            AgentEvent::ThoughtRetracted { utf16_len, .. } => {
+                units.truncate(units.len().saturating_sub(*utf16_len));
+            }
+            _ => {}
+        }
+    }
+    String::from_utf16(&units)
+        .expect("utf16")
+        .trim_end()
+        .to_string()
+}
+
+/// A narration block longer than the driver's hold streams as thought before
+/// its signature says it is prose (the commands the user must run were in
+/// one). Wherever the per-block assistant frame lands — before the stop,
+/// after it, or never — the journal ends with the whole block as PROSE and
+/// a retraction that takes it back out of the thought stream, so a replay
+/// renders what the live view did.
+#[tokio::test]
+async fn long_narration_that_streamed_as_thought_becomes_prose() {
+    for frame_at in ["before", "after", "none"] {
+        let fx = fixture();
+        let id = format!("s-narr-{frame_at}");
+        let mut spec = spec(&id, &fx.cwd, "narration");
+        spec.env
+            .push(("FAKE_NARRATION_FRAME".into(), frame_at.into()));
+        fx.manager.spawn(&ClaudeAdapter, spec).expect("spawn");
+        let att = fx.manager.attach(&id, 0).expect("attach");
+        let mut seen: Vec<Arc<SeqEvent>> = att.replay.clone();
+        let mut rx = att.live;
+        send_text(&fx, &id, "upload the results").await;
+        wait_for(&mut rx, &mut seen, "TurnCompleted", |ev| {
+            matches!(ev, AgentEvent::TurnCompleted { .. })
+        })
+        .await;
+
+        // The replayed journal, not the live tail: what a reconnect folds.
+        let replay = fx.manager.attach(&id, 0).expect("re-attach").replay;
+        let events: Vec<&AgentEvent> = replay.iter().map(|e| &e.ev).collect();
+        let turn = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::TurnStarted { turn_id } => Some(turn_id.clone()),
+                _ => None,
+            })
+            .expect("turn");
+        let prose = prose(&replay, &turn);
+        let thought = folded_thought(&events);
+        assert!(
+            prose.contains("fake-cloud auth login --no-browser")
+                && prose.contains("fake-cloud storage cp"),
+            "{frame_at}: the commands are prose: {:?}",
+            &prose[..prose.len().min(300)]
+        );
+        assert_eq!(
+            prose.matches("fake-cloud auth login").count(),
+            1,
+            "{frame_at}: said once"
+        );
+        assert!(
+            prose.ends_with("Waiting for you to sign in."),
+            "{frame_at}: the reply follows"
+        );
+        assert!(
+            !thought.contains("fake-cloud"),
+            "{frame_at}: nothing of it stays a thought: {thought:?}"
+        );
+        assert_eq!(
+            thought, "The user needs to sign in before anything can upload.",
+            "{frame_at}: reasoning stays thought"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ThoughtRetracted { .. })),
+            "{frame_at}: the hold released it, so it was retracted"
+        );
+    }
+}
+
 /// Send a text message into a session.
 async fn send_text(fx: &Fixture, id: &str, text: &str) {
     fx.manager

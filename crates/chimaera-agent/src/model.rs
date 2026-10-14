@@ -475,6 +475,16 @@ pub enum AgentEvent {
     /// An assistant message superseded earlier output (claude `supersedes`
     /// uuids): the current turn's trailing prose is replaced, not appended.
     MessagesSuperseded,
+    /// The last `utf16_len` UTF-16 code units of this turn's thought stream
+    /// were not reasoning after all: clients cut them off the turn's trailing
+    /// thought row (dropping a row left with only whitespace), and the same
+    /// text follows as `MessageChunk`s. Claude narration (prose shipped as a
+    /// thinking block) that streamed as thought before its signature said so.
+    /// Additive: a client that ignores it shows the thought copy as well.
+    ThoughtRetracted {
+        turn_id: String,
+        utf16_len: usize,
+    },
     /// The agent named this conversation (claude generate_session_title;
     /// codex thread/name/updated) — feeds the workbench naming chain.
     SessionTitle {
