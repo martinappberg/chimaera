@@ -998,7 +998,8 @@
   /* --- the embedded chat ------------------------------------------------------ */
   /* ChatView owns its own height:100% column; the wrapper just hands it the
      remaining dock height and forbids horizontal creep at ~360px. Its reading
-     measure (52rem) never binds this narrow, so no ChatView change is needed. */
+     column (the Reading Width setting) fits the dock's width when the dock is
+     narrower, so no ChatView change is needed. */
   .dock-chat {
     flex: 1;
     min-height: 0;

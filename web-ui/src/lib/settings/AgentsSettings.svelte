@@ -186,8 +186,8 @@
 
 <style>
   .setup-result { margin:4px 14px 12px; }
-  .cat-row { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:18px 14px 8px; }
-  h2 { margin:0; font-size:var(--text-xs); font-weight:600; letter-spacing:.1em; text-transform:uppercase; color:var(--muted); }
+  .cat-row { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:30px 14px 6px; }
+  h2 { margin:0; font-size:var(--text-lg); font-weight:600; color:var(--fg); }
   .intro { margin:0 14px 14px; font-size:var(--text-sm); color:var(--muted); line-height:1.5; }
   .cards { margin:0 14px 12px; border:1px solid var(--edge); border-radius:10px; overflow:hidden; }
   article { padding:16px; background:color-mix(in srgb,var(--fg) 2%,transparent); }

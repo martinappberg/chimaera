@@ -42,18 +42,24 @@ a `settings` frame on `/ws/events`. Map: [settings/AGENTS.md](../../web-ui/src/l
   settings; Activity reads session records. Documents offers opt-in writes of the documents dialect into the workspace's `AGENTS.md` or a
   Claude Code skill over `/api/v1/agent-docs`
   ([agents.md](agents.md#documents-the-portable-dialect-check_document-and-the-issues-chip)).
-- **Interface typography applies app-wide.** `appearance.interfaceFontSize` (13 px by default)
+- **Interface typography applies app-wide.** `appearance.interfaceFontSize` (13.5 px by default;
+  11.5/12.5/13.5/15.5 px for xs/sm/md/lg)
   rebuilds the shared `--text-xs`/`--text-sm`/`--text-md`/`--text-lg` scale live, so the rail,
   file tree, pane tabs, dashboard, settings, dialogs, Git, and preview chrome move together.
   `appearance.interfaceFontFamily` supplies the shared UI font stack. Small chrome uses those
   tokens rather than fixed rem/px sizes.
-- **Content surfaces stay independently legible.** Chat defaults to a 13.5 px base and overrides
-  the shared scale within each `ChatView` (including the dashboard's embedded Mastermind) and
-  exposes font size/family, line height, and reading width. Terminal keeps its xterm-specific
-  font controls. Editor typography
-  covers code, diffs, and the JSON editor; rendered Markdown defaults to the same 13.5 px as Chat
+- **Content surfaces stay independently legible.** Chat defaults to a 14 px base at line height
+  1.57 and overrides the shared scale within each `ChatView` (panes, the subagent read-only view,
+  and the dashboard's embedded Mastermind) and exposes font size/family and line height. Terminal
+  keeps its xterm-specific font controls. Editor typography
+  covers code, diffs, and the JSON editor; rendered Markdown defaults to the same 14 px as Chat, so
+  an agent's reply and the document it wrote read alike,
   but has its own font-size and line-height settings rather than borrowing `terminal.fontSize`.
   CodeMirror views reconfigure while mounted.
+- **Reading Width is the column width.** `chat.contentWidth` (Appearance › Reading Width, 672 px by
+  default: 48em of the 14 px chat text) sets the transcript column, its composer and trays, and the
+  rendered Markdown column (plus its padding) on every chat surface; a narrower pane still fits its
+  space. It used to cap a 48em column, so any value above 48em did nothing.
 - **Newer surfaces are represented.** `dashboard.landing` controls the workspace landing and
   `dashboard.cardDensity` selects automatic, comfortable, or compact agent cards. Mastermind's
   agent/mode are workspace state edited in its setup card, while Environment preludes remain scoped

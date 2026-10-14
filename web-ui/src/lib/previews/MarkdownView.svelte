@@ -203,10 +203,8 @@
   /** The rendered document shows — reading, and live until a double-click.
    *  Every display decision reads THIS; `mode` is the tab. */
   const render = $derived(mode === "reading" || (mode === "live" && !editing));
-  /** The reading column's ceiling: the chat transcript's measure (Reading
-   *  Width, under Appearance) — a document is never wider than a transcript. The column
-   *  itself is 48em of the document font (`.md-body`), so it keeps its
-   *  characters per line through A−/A+. */
+  /** The reading column's width: the chat transcript's (Reading Width,
+   *  under Appearance), so a document and a transcript read alike. */
   const columnCap = $derived(getSetting("chat.contentWidth"));
   let chunk = $state<FileChunk | null>(null);
   let chunkError = $state<string | null>(null);
@@ -1913,15 +1911,12 @@
   /* Base font-size is set inline (per-pane text size); every size below is in
      `em` so A−/A+ scales the whole document uniformly, like the terminal. */
   .md-body {
-    /* The text column is 48em of the document font — Claude.ai's reading
-       column; ~650px at the 13.5px default, ~100 characters — so A−/A+
-       keeps the line length, and it never exceeds the chat transcript's
-       measure (Reading Width, --doc-measure on the root): a document reads
-       like a transcript on a wide pane, not wider. 70ch minus this padding
-       was ~460px of text: cramped on a desktop pane. Plus this box's side
-       padding. The properties card and the live editor's column match
-       (below; mdLive). */
-    max-width: calc(min(48em, var(--doc-measure, 52rem)) + 4rem);
+    /* The text column is the Reading Width setting (--doc-measure on the
+       root), the same width as a chat transcript, plus this box's side
+       padding. A min() with 48em once made every wider setting a no-op.
+       The properties card and the live editor's column match (below;
+       mdLive). */
+    max-width: calc(var(--doc-measure, 42rem) + 4rem);
     margin: 0 auto;
     padding: 2.2rem 2rem 3.5rem;
     font-size: var(--text-lg);
@@ -1947,7 +1942,7 @@
   /* Same box as .md-body (border-box via app.css), so the card lines up
      with the column under it. */
   .md-view :global(.md-props) {
-    max-width: calc(min(48em, var(--doc-measure, 52rem)) + 4rem);
+    max-width: calc(var(--doc-measure, 42rem) + 4rem);
     margin: 1.6rem auto 0;
     padding: 0 2rem;
     line-height: 1.45;
