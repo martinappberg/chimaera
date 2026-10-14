@@ -4,7 +4,8 @@
   import ActivityRows from "./ActivityRows.svelte";
   import ActivitySummary from "./ActivitySummary.svelte";
   import type { ChatBlock } from "./store.svelte";
-  import { isLive, toolRunHealth, type TurnTail } from "./toolLabels";
+  import { isLive, spanLabel, toolRunHealth, toolSpanMs, type TurnTail } from "./toolLabels";
+  import { liveClock } from "./liveClock.svelte";
 
   /**
    * A settled run of thought and tool lines, folded (see activityFold.ts).
@@ -28,6 +29,9 @@
     sourceEnd: number;
     sourceUid: number;
     children: Snippet;
+    /** Local clock minus the journal's (`ChatStore.clockSkewMs`), so a live
+     *  elapsed never counts a remote daemon's clock offset. */
+    clockSkewMs?: number;
   }
 
   let {
@@ -40,6 +44,7 @@
     sourceEnd,
     sourceUid,
     children,
+    clockSkewMs = 0,
   }: Props = $props();
 
   let open = $state(false);
@@ -51,6 +56,9 @@
   /** Only a hard failure surfaces on the fold; a recovered one is the
    *  inner group's detail. */
   const failed = $derived(toolRunHealth(tools, tail) === "failed");
+  /** The run's tool time, read the way a group line reads it. */
+  const clock = liveClock(() => running && visible);
+  const elapsed = $derived(spanLabel(toolSpanMs(tools, (running ? clock.ms : 0) - clockSkewMs)));
 </script>
 
 <div
@@ -65,6 +73,7 @@
     tooltip={open ? "hide these steps" : `show ${steps} steps`}
     {running}
     health={failed ? "failed" : null}
+    {elapsed}
     {visible}
     onToggle={() => (open = !open)}
   />

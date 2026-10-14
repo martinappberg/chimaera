@@ -5,7 +5,8 @@
   import type { ChatBlock, SubagentInfo } from "./store.svelte";
   import { subagentTitle } from "./subagentView";
   import ToolCallCard from "./ToolCallCard.svelte";
-  import { isLive, toolGroupTitle, toolRunHealth, type TurnTail } from "./toolLabels";
+  import { isLive, spanLabel, toolGroupTitle, toolRunHealth, toolSpanMs, type TurnTail } from "./toolLabels";
+  import { liveClock } from "./liveClock.svelte";
   import ModSite from "./ModSite.svelte";
   import type { ModsController } from "./mods.svelte";
   import { pageVisible } from "../shared/visibility";
@@ -15,8 +16,9 @@
    * line — the agent's own batch label ("Listed files in directory") or a
    * readable count ("Ran 2 commands, read a file"); expanded it is a light
    * list of rows, each openable for its output. Groups start collapsed even
-   * while running: a breathing dot and the present-tense title carry live
-   * status without turning the transcript into a wall of command rows.
+   * while running: the working glyph, the call's own description ("Locating
+   * the notify code") and its elapsed carry live status without turning the
+   * transcript into a wall of command rows.
    */
   interface Props {
     tools: Extract<ChatBlock, { kind: "tool" }>[];
@@ -45,6 +47,9 @@
      *  identity (index labels go stale when the reducer cap trims). */
     sourceUid?: number;
     mods?: ModsController;
+    /** Local clock minus the journal's (`ChatStore.clockSkewMs`), so a live
+     *  elapsed never counts a remote daemon's clock offset. */
+    clockSkewMs?: number;
   }
 
   let {
@@ -62,6 +67,7 @@
     sourceEnd,
     sourceUid,
     mods,
+    clockSkewMs = 0,
   }: Props = $props();
 
   /** The opener for one agent row, once the wire has named its subagent. */
@@ -83,6 +89,11 @@
   /** The agent's own batch labels, else readable counts ("Ran 2 commands,
    *  read a file") — see toolLabels.ts. The full list stays in the tooltip. */
   const title = $derived(toolGroupTitle(tools));
+
+  /** Elapsed while a call runs (ticking only while shown), the run's
+   *  duration once it settles. */
+  const clock = liveClock(() => running && visible);
+  const elapsed = $derived(spanLabel(toolSpanMs(tools, (running ? clock.ms : 0) - clockSkewMs)));
 </script>
 
 <div
@@ -98,6 +109,7 @@
     tooltip={open ? "hide tool activity" : `show tool activity — ${tools.length} call${tools.length === 1 ? "" : "s"}`}
     {running}
     {health}
+    {elapsed}
     {visible}
     onToggle={() => (open = !open)}
   />
