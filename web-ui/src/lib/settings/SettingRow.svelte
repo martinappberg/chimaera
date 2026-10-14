@@ -93,6 +93,17 @@
       (def.max - def.min) / (def.step ?? 1) <= 120,
   );
 
+  /** Characters the number field must show: the widest bound's integer
+   *  digits plus the step's decimals (and the separator), so 200000 or 1.57
+   *  sits inside the border rather than scrolling under it. */
+  const numChars = $derived.by(() => {
+    const intDigits = (n: number | undefined) =>
+      n === undefined ? 0 : String(Math.trunc(Math.abs(n))).length + (n < 0 ? 1 : 0);
+    const decimals = (String(def.step ?? 1).split(".")[1] ?? "").length;
+    const digits = Math.max(intDigits(def.min), intDigits(def.max), 2) + (decimals > 0 ? decimals + 1 : 0);
+    return Math.max(3, digits) + 0.5;
+  });
+
   /** The default, as the reset button's tooltip states it. */
   const defaultLabel = $derived.by(() => {
     const d = def.default;
@@ -170,11 +181,13 @@
       <div class="num">
         {#if sliderFits && def.min !== undefined && def.max !== undefined}
           <!-- Pointer-only: the number field beside it is the one tab stop
-               (arrow keys step it), so a row costs one Tab, not two. -->
+               (arrow keys step it) and the one control assistive tech hears,
+               so a row costs one Tab, not two. -->
           <input
             class="slider"
             type="range"
             tabindex="-1"
+            aria-hidden="true"
             min={def.min}
             max={def.max}
             step={def.step ?? 1}
@@ -187,6 +200,7 @@
         <label class="numfield">
           <input
             class="numbox"
+            style:width={`${numChars}ch`}
             type="number"
             min={def.min}
             max={def.max}
@@ -545,9 +559,12 @@
 
   /* The bordered box is the label, so the unit sits inside the field and a
      click on it focuses the number. */
+  /* Sized by its content (the input's ch width + the unit), never below a
+     common width so short fields still line up as a column. */
   .numfield {
+    flex: none;
     justify-content: flex-end;
-    width: 86px;
+    min-width: 86px;
     display: inline-flex;
     align-items: center;
     gap: 4px;
@@ -566,8 +583,9 @@
     outline-offset: 1px;
   }
 
+  /* Width set inline from the bounds (numChars). */
   .numbox {
-    width: 6ch;
+    flex: none;
     padding: 0;
     font: inherit;
     font-size: var(--text-sm);
@@ -589,6 +607,8 @@
   }
 
   .unit {
+    flex: none;
+    white-space: nowrap;
     font-size: var(--text-xs);
     color: var(--muted);
   }
