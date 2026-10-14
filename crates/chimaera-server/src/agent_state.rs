@@ -22,15 +22,17 @@ pub(crate) enum AgentKind {
     Gemini,
     Antigravity,
     Grok,
+    Cursor,
 }
 
 impl AgentKind {
     /// The launcher catalog: what the popover offers and detection probes.
-    pub(crate) const ALL: [AgentKind; 4] = [
+    pub(crate) const ALL: [AgentKind; 5] = [
         AgentKind::Claude,
         AgentKind::Codex,
         AgentKind::Antigravity,
         AgentKind::Grok,
+        AgentKind::Cursor,
     ];
 
     /// Stable id — also the binary name (`claude`, `codex`, `agy`, `gemini`).
@@ -41,6 +43,7 @@ impl AgentKind {
             AgentKind::Antigravity => "agy",
             AgentKind::Gemini => "gemini",
             AgentKind::Grok => "grok",
+            AgentKind::Cursor => "cursor",
         }
     }
 
@@ -52,6 +55,18 @@ impl AgentKind {
             AgentKind::Antigravity => "Antigravity",
             AgentKind::Gemini => "Gemini CLI",
             AgentKind::Grok => "Grok Build",
+            AgentKind::Cursor => "Cursor CLI",
+        }
+    }
+
+    /// The executable looked up on the user's PATH. It is the id except for
+    /// Cursor, whose `cursor` name belongs to the editor's app launcher; the
+    /// official installer links the CLI as `cursor-agent` (and `agent`).
+    /// Chimaera's own managed tree and shims keep the id.
+    pub(crate) fn path_bin(self) -> &'static str {
+        match self {
+            AgentKind::Cursor => "cursor-agent",
+            other => other.as_str(),
         }
     }
 
@@ -75,6 +90,11 @@ impl AgentKind {
         self.chat_adapter().is_some()
     }
 
+    /// Chat runs over the shared ACP adapter.
+    pub(crate) fn is_acp(self) -> bool {
+        matches!(self, Self::Antigravity | Self::Grok | Self::Cursor)
+    }
+
     pub(crate) fn native_chat_controls(self) -> bool {
         matches!(self, Self::Claude | Self::Codex)
     }
@@ -87,6 +107,7 @@ impl AgentKind {
             Self::Codex => Some(&chimaera_agent::codex::CodexAdapter),
             Self::Antigravity => Some(&chimaera_agent::acp::ANTIGRAVITY),
             Self::Grok => Some(&chimaera_agent::acp::GROK),
+            Self::Cursor => Some(&chimaera_agent::acp::CURSOR),
             Self::Gemini => None,
         }
     }

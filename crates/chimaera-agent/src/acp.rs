@@ -13,6 +13,9 @@ use tokio::task::JoinHandle;
 
 pub const TESTED_GROK_VERSION: &str = "1.0.46";
 pub const TESTED_AGY_VERSION: &str = "1.2.1";
+/// `cursor-agent --version` of the build whose `acp` server was probed
+/// (PROTOCOL.md, ACP › Cursor). Turn-level facts await a signed-in run.
+pub const TESTED_CURSOR_VERSION: &str = "2026.10.14-941492e";
 const MAX_PENDING: usize = 64;
 const MAX_CHOICES: usize = 64;
 
@@ -22,6 +25,11 @@ pub struct AcpAdapter {
     pub kind: &'static str,
     pub tested_version: &'static str,
     pub auth_method: &'static str,
+    /// What to tell the user when `authenticate` fails. Cursor's method
+    /// reuses an existing `agent login` and otherwise starts a browser
+    /// login whose challenge dies with this process, so its raw error
+    /// ("Invalid params" plus a one-time URL) is not actionable.
+    pub sign_in: Option<&'static str>,
 }
 /// Grok's own name for the mode and for the slash command that toggles it.
 const ALWAYS_APPROVE: &str = "always-approve";
@@ -29,11 +37,19 @@ pub const GROK: AcpAdapter = AcpAdapter {
     kind: "grok",
     tested_version: TESTED_GROK_VERSION,
     auth_method: "cached_token",
+    sign_in: None,
 };
 pub const ANTIGRAVITY: AcpAdapter = AcpAdapter {
     kind: "agy",
     tested_version: TESTED_AGY_VERSION,
     auth_method: "oauth-personal",
+    sign_in: None,
+};
+pub const CURSOR: AcpAdapter = AcpAdapter {
+    kind: "cursor",
+    tested_version: TESTED_CURSOR_VERSION,
+    auth_method: "cursor_login",
+    sign_in: Some("Cursor CLI is not signed in on this host. Run `cursor-agent login` in a terminal, then start the chat again."),
 };
 
 impl AgentAdapter for AcpAdapter {
@@ -108,7 +124,8 @@ impl Driver for AcpAdapter {
             "authenticate",
             json!({"methodId":self.auth_method,"_meta":{"headless":true}}),
         )
-        .await?;
+        .await
+        .map_err(|error| self.sign_in.map(str::to_owned).unwrap_or(error))?;
         let mut params = json!({"cwd":spec.cwd,"mcpServers":spec.mcp_servers});
         let method = if let Some(id) = &spec.pinned_native_id {
             if init["agentCapabilities"]["loadSession"] != true {
@@ -933,6 +950,21 @@ impl Mapper for AcpMapper {
         }
         if frame.get("id").is_some() {
             step.outbound.push(json!({"jsonrpc":"2.0","id":frame["id"],"error":{"code":-32601,"message":"Client method not supported"}}));
+            // Cursor's blocking extensions (PROTOCOL.md, ACP › Cursor) stop
+            // its turn until answered; say why the agent moved on.
+            let asked = match frame["method"].as_str() {
+                Some("cursor/ask_question") => Some("a question"),
+                Some("cursor/create_plan") => Some("plan approval"),
+                _ => None,
+            };
+            if let Some(asked) = asked {
+                self.flush_into(&mut step);
+                step.events.push(AgentEvent::Notice {
+                    text: format!(
+                        "Cursor asked for {asked}, which chat cannot show yet. Answer it in the terminal view."
+                    ),
+                });
+            }
             return step;
         }
         if frame["method"] != "session/update" || params["sessionId"] != self.native {
@@ -1468,5 +1500,46 @@ mod tests {
             step.outbound[0]["result"]["outcome"]["outcome"],
             "cancelled"
         );
+    }
+
+    /// Shapes probed from `cursor-agent acp` 2026.10.14-941492e while signed
+    /// out (PROTOCOL.md, ACP › Cursor); its documented modes are agent,
+    /// plan and ask. Nothing beyond what the session advertises is offered.
+    #[test]
+    fn cursor_offers_only_what_its_session_advertises() {
+        let init = json!({"protocolVersion":1,"agentCapabilities":{"loadSession":true,"promptCapabilities":{"image":true,"audio":false,"embeddedContext":false},"sessionCapabilities":{"list":{}}},"authMethods":[{"id":"cursor_login"}]});
+        let session = json!({"sessionId":"session","modes":{"currentModeId":"agent","availableModes":[{"id":"agent","name":"Agent"},{"id":"plan","name":"Plan"},{"id":"ask","name":"Ask"}]}});
+        let mut m = AcpMapper::new("session".into(), &init, &session);
+        m.offer_grok_modes(CURSOR.kind);
+        assert!(!m.grok_modes);
+        assert!(m.caps.image_input);
+        assert!(m.caps.commands.contains(&"set_mode".into()));
+        assert!(!m.caps.commands.contains(&"set_model".into()));
+        assert!(!m.caps.custom_model);
+        let ids: Vec<_> = m.modes.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["agent", "plan", "ask"]);
+        let step = m.on_command(AgentCommand::SetMode {
+            mode_id: "plan".into(),
+        });
+        assert_eq!(step.outbound[0]["method"], "session/set_mode");
+        let step = m.on_command(AgentCommand::SetMode {
+            mode_id: "yolo".into(),
+        });
+        assert!(step.outbound.is_empty());
+    }
+
+    #[test]
+    fn cursor_blocking_extensions_are_refused_with_a_visible_reason() {
+        let mut m = mapper();
+        let step = m.on_frame(&json!({"jsonrpc":"2.0","id":7,"method":"cursor/ask_question","params":{"toolCallId":"t","title":"Pick","questions":[]}}));
+        assert_eq!(step.outbound[0]["error"]["code"], -32601);
+        assert!(step
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Notice { text } if text.contains("terminal view"))));
+        let step =
+            m.on_frame(&json!({"jsonrpc":"2.0","id":8,"method":"fs/read_text_file","params":{}}));
+        assert_eq!(step.outbound[0]["error"]["code"], -32601);
+        assert!(step.events.is_empty());
     }
 }

@@ -374,11 +374,18 @@ async fn agents_endpoint_lists_catalog_with_installed_and_missing() {
         Err("agy not found (test)".to_string()),
         None,
     );
+    preset_agent(
+        &state,
+        agents::AgentKind::Cursor,
+        Ok(PathBuf::from("/bin/echo")),
+        Some("2026.10.14-941492e"),
+    );
     // Upstream latest knowledge (agent_updates): newer than claude's
     // install, and known for the uninstalled gemini too.
     for (kind, version) in [
         (agents::AgentKind::Claude, "2.1.207"),
         (agents::AgentKind::Grok, "0.9.0"),
+        (agents::AgentKind::Cursor, "2026.10.21-0a1b2c3"),
     ] {
         lock(&state.agent_updates).insert(
             kind,
@@ -393,9 +400,9 @@ async fn agents_endpoint_lists_catalog_with_installed_and_missing() {
     let (status, list) = request(&state, Method::GET, "/api/v1/agents", None).await;
     assert_eq!(status, StatusCode::OK);
     let list = list.as_array().unwrap();
-    assert_eq!(list.len(), 4);
+    assert_eq!(list.len(), 5);
     let ids: Vec<&str> = list.iter().map(|a| a["id"].as_str().unwrap()).collect();
-    assert_eq!(ids, ["claude", "codex", "agy", "grok"]);
+    assert_eq!(ids, ["claude", "codex", "agy", "grok", "cursor"]);
 
     // Installed and current: path + version present, no outdated flag.
     // A known-newer upstream release marks it update_available.
@@ -450,6 +457,20 @@ async fn agents_endpoint_lists_catalog_with_installed_and_missing() {
         .as_str()
         .unwrap()
         .starts_with("https://"));
+
+    // Cursor's dated build orders by its date; ACP gives it no curated
+    // models and no native view switch.
+    let cursor = &list[4];
+    assert_eq!(cursor["name"], "Cursor CLI");
+    assert_eq!(cursor["version"], "2026.10.14-941492e");
+    assert_eq!(cursor["update_available"], true);
+    assert_eq!(cursor["managed_install"], true);
+    assert_eq!(cursor["view_switchable"], false);
+    assert_eq!(cursor["models"], serde_json::json!([]));
+    assert_eq!(
+        cursor["install"]["command"],
+        "curl https://cursor.com/install -fsS | bash"
+    );
 }
 
 #[tokio::test]
@@ -1077,7 +1098,7 @@ async fn create_agent_validates_agent_model_and_resume() {
         &state,
         Method::POST,
         "/api/v1/sessions",
-        Some(sessions_body(serde_json::json!({"agent": "cursor"}))),
+        Some(sessions_body(serde_json::json!({"agent": "pi"}))),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
