@@ -12,16 +12,27 @@ import type { ImageAttachment } from "./images";
  *  paragraph (a quoted passage, which must begin a line to read as one). */
 export type InsertPlacement = "inline" | "block";
 
-type InsertFn = (text: string, placement: InsertPlacement) => void;
+/** One delivery into a composer: text for the draft ("" for none) and, with
+ *  it, an image for the attachment strip. Text and image travel together so a
+ *  region reference's locator and its pixels always land in the SAME composer
+ *  — split across two mounted views of a chat, the image would leave later
+ *  as a message of its own, with no words. */
+type InsertFn = (text: string, placement: InsertPlacement, image?: ImageAttachment) => void;
+
+interface Pending {
+  text: string;
+  placement: InsertPlacement;
+  image?: ImageAttachment;
+}
 
 const registry = new Map<string, InsertFn>();
 /** The same composers by the view that mounted them (ChatView's token), for
  *  an insert that belongs to one of two mounted views of a chat. */
 const byView = new WeakMap<object, InsertFn>();
-/** Text queued for a session whose composer hasn't mounted yet (bounded per
- *  session) — a reference dropped onto a chat pane that is still opening must
- *  not be lost to a mount race. */
-const pending = new Map<string, { text: string; placement: InsertPlacement }[]>();
+/** Deliveries queued for a session whose composer hasn't mounted yet (bounded
+ *  per session) — a reference dropped onto a chat pane that is still opening
+ *  must not be lost to a mount race. */
+const pending = new Map<string, Pending[]>();
 const MAX_PENDING = 8;
 
 /** Register a mounted composer's insert function (and, when given, the view
@@ -33,7 +44,7 @@ export function registerComposer(sessionId: string, insert: InsertFn, view?: obj
   const queued = pending.get(sessionId);
   if (queued !== undefined) {
     pending.delete(sessionId);
-    for (const item of queued) insert(item.text, item.placement);
+    for (const item of queued) insert(item.text, item.placement, item.image);
   }
   return () => {
     if (registry.get(sessionId) === insert) registry.delete(sessionId);
@@ -41,27 +52,35 @@ export function registerComposer(sessionId: string, insert: InsertFn, view?: obj
   };
 }
 
-/** Insert text into a session's composer — the one in `view` when that view
- *  is mounted, else the session's latest — buffering until one mounts.
- *  Always accepted: a not-yet-mounted composer keeps the text and drains it
- *  on registration, so a reference/@term grant onto a slow-to-open chat pane
- *  is never dropped. */
+/** Insert text — and optionally an image attachment with it — into a
+ *  session's composer: the one in `view` when that view is mounted, else the
+ *  session's latest, buffering until one mounts. Always accepted: a
+ *  not-yet-mounted composer keeps the delivery and drains it on registration,
+ *  so a reference/@term grant onto a slow-to-open chat pane is never dropped. */
 export function insertIntoComposer(
   sessionId: string,
   text: string,
   placement: InsertPlacement = "inline",
   view?: object,
+  image?: ImageAttachment,
 ): boolean {
   const insert = (view !== undefined ? byView.get(view) : undefined) ?? registry.get(sessionId);
   if (insert !== undefined) {
-    insert(text, placement);
+    insert(text, placement, image);
     return true;
   }
   const queued = pending.get(sessionId) ?? [];
-  queued.push({ text, placement });
+  queued.push(image !== undefined ? { text, placement, image } : { text, placement });
   while (queued.length > MAX_PENDING) queued.shift();
   pending.set(sessionId, queued);
   return true;
+}
+
+/** Attach an image alone (an OS drop onto a chat pane: pixels to the model
+ *  now, its uploaded path follows as text) — the same composer and buffer as
+ *  text inserts. */
+export function attachImageToComposer(sessionId: string, image: ImageAttachment): void {
+  insertIntoComposer(sessionId, "", "inline", undefined, image);
 }
 
 // --- follow the send ------------------------------------------------------------
@@ -95,43 +114,4 @@ export function registerFollow(sessionId: string, follow: () => void): () => voi
 export function followToBottom(sessionId: string): void {
   const handlers = followRegistry.get(sessionId);
   if (handlers !== undefined) for (const follow of handlers) follow();
-}
-
-// --- image attachments (OS drops onto a chat pane) ---------------------------
-// Same registry/pending shape as text inserts: the attachment channel exists
-// so an image dropped on a chat pane can ride the composer's existing
-// attachment plumbing (pixels to the model now) alongside its uploaded-path
-// reference (the durable artifact).
-
-const attachRegistry = new Map<string, (image: ImageAttachment) => void>();
-const pendingAttach = new Map<string, ImageAttachment[]>();
-
-/** Register a mounted composer's image-attach function; drains anything
- *  buffered before it mounted. Returns the unregister. */
-export function registerComposerAttach(
-  sessionId: string,
-  attach: (image: ImageAttachment) => void,
-): () => void {
-  attachRegistry.set(sessionId, attach);
-  const queued = pendingAttach.get(sessionId);
-  if (queued !== undefined) {
-    pendingAttach.delete(sessionId);
-    for (const image of queued) attach(image);
-  }
-  return () => {
-    if (attachRegistry.get(sessionId) === attach) attachRegistry.delete(sessionId);
-  };
-}
-
-/** Attach an image to a session's composer, buffering until one mounts. */
-export function attachImageToComposer(sessionId: string, image: ImageAttachment): void {
-  const attach = attachRegistry.get(sessionId);
-  if (attach !== undefined) {
-    attach(image);
-    return;
-  }
-  const queued = pendingAttach.get(sessionId) ?? [];
-  queued.push(image);
-  while (queued.length > MAX_PENDING) queued.shift();
-  pendingAttach.set(sessionId, queued);
 }

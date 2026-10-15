@@ -115,15 +115,23 @@ reads an ended session's record; the same-file line rides the claude hook answer
 
 ## Two sessions, one file
 
-- Only for two LIVE agent sessions in one workspace, only while both are live: a small warn-toned
-  notice on the dashboard card and on the chat's line just above the input (right side) —
-  "qc.py also edited by 'fix normalization' · 3 min ago". Clicking it opens that session. Never on
-  the rail. From the `files_touched` lists already on the wire (`sameFile.svelte.ts`); the times
-  from `GET /workspaces/{id}/same-file`, fetched only when the set of overlapping pairs changes.
+- Only for two LIVE agent sessions in one workspace, and only while the other session's write is
+  news: it wrote the file in the last 15 minutes, or in the turn it is running now. Both sessions
+  merely staying open is not news, so the notice ages out on its own (no reload, no poll) and
+  returns when the other session writes the file again. A small warn-toned notice on the dashboard
+  card and on the chat's line just above the input (right side) — "qc.py also edited by 'fix
+  normalization' · 3 min ago". Clicking it opens that session. Never on the rail. The
+  `files_touched` lists already on the wire say which sessions overlap (`sameFile.svelte.ts`);
+  `GET /workspaces/{id}/same-file` lists the current writes (`at`, and `active` for one made in
+  the writer's running turn), fetched only when the overlapping pairs or those sessions' turn
+  state or latest file change. One timer wakes the store when the next shown note ages out. The
+  rule is `same_file_current` in the daemon and `sameFileCurrent` (`workspace/history.ts`) in the
+  UI.
 - An agent with hooks (a claude TUI or claude chat) also gets one line of context through the
   existing hook answer, on its next `PostToolUse` or `UserPromptSubmit`: "chimaera: session 'fix
   normalization' (s-…), also running in this workspace, edited src/qc.py 3 min ago." Once per file
-  per pair, at most three lines an answer. Nothing locks. With no overlap the hook answer is
+  per pair, at most three lines an answer, and only for a write that is still news (the rule
+  above). Nothing locks. With no overlap the hook answer is
   unchanged (`{}`).
 
 ## Activity

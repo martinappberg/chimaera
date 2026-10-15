@@ -63,6 +63,11 @@ const PRIORS_MAX: usize = 256;
 const ACT_DETAIL_MAX: usize = 200;
 /// At most this many same-file lines ride one hook answer.
 const SAME_FILE_LINES_MAX: usize = 3;
+/// How long another session's write of a shared file stays news: the
+/// same-file notice and hook lines mean "wrote it recently, or is writing it
+/// in the turn running now" — never "wrote it once, hours ago, and is still
+/// open". The UI ages its notes out on the same window (`history.ts`).
+pub(crate) const SAME_FILE_FRESH_MS: u64 = 15 * 60 * 1000;
 /// Checkpoint cadence for open records whose usage moved.
 const CHECKPOINT_EVERY: Duration = Duration::from_secs(30);
 /// Acts kept through a compaction.
@@ -325,6 +330,10 @@ struct Live {
     transcript_path: Option<String>,
     /// path -> last write (ms), newest last.
     touched: VecDeque<(String, u64)>,
+    /// When the session's running turn started (ms); `None` between turns,
+    /// and always for an agent whose turns are not observable (a hook-less
+    /// TUI) — there the write's age alone decides.
+    turn_at: Option<u64>,
     distinct: HashSet<u64>,
     told: HashSet<(String, String)>,
     orphan_seen: u8,
@@ -1007,6 +1016,7 @@ pub(crate) fn open(state: &Arc<AppState>, sid: &str, started_by: StartedBy) {
         native: None,
         transcript_path: None,
         touched: VecDeque::new(),
+        turn_at: None,
         distinct: HashSet::new(),
         told: HashSet::new(),
         orphan_seen: 0,
@@ -1480,6 +1490,12 @@ pub(crate) fn observe_hook(
     if event == "UserPromptSubmit" && !is_chat {
         l.turns = l.turns.saturating_add(1);
         l.rec.ui = "term".into();
+        l.turn_at = Some(now_ms());
+    }
+    // A chat's turns are the protocol's (`observe_chat`); hooks under
+    // stream-json miss them.
+    if matches!(event, "Stop" | "StopFailure" | "SessionEnd") && !is_chat {
+        l.turn_at = None;
     }
     if let Some(path) = touched {
         l.touch(path, now_ms());
@@ -1515,6 +1531,7 @@ pub(crate) fn observe_chat(state: &AppState, sid: &str, ev: &AgentEvent) {
             }
         }
         AgentEvent::ModelSwitched { to, .. } => l.see_model(to),
+        AgentEvent::TurnStarted { .. } => l.turn_at = Some(now_ms()),
         AgentEvent::ToolCall {
             kind: ToolKind::Edit,
             locations,
@@ -1527,6 +1544,7 @@ pub(crate) fn observe_chat(state: &AppState, sid: &str, ev: &AgentEvent) {
         }
         AgentEvent::TurnCompleted { usage, .. } => {
             l.turns = l.turns.saturating_add(1);
+            l.turn_at = None;
             let prior = l.conv.as_deref().and_then(|c| history.prior(c));
             if let Some(c) = usage.cost_usd {
                 l.cost.see(c, false, prior.and_then(|p| p.cost));
@@ -1552,6 +1570,7 @@ pub(crate) fn observe_chat(state: &AppState, sid: &str, ev: &AgentEvent) {
         }
         AgentEvent::TurnAborted { .. } => {
             l.turns = l.turns.saturating_add(1);
+            l.turn_at = None;
         }
         _ => {}
     }
@@ -1580,9 +1599,36 @@ pub(crate) fn observe_exit(state: &AppState, sid: &str, exit: &chimaera_agent::d
 /// Cap on pairs one same-file answer lists.
 const SAME_FILE_PAIRS_MAX: usize = 200;
 
-/// Every (session, other session, path, when the other wrote it) among this
-/// workspace's LIVE sessions, newest first — both directions of each pair.
-pub(crate) fn same_file_pairs(state: &AppState, ws: &str) -> Vec<(String, String, String, u64)> {
+/// Whether another session's write of a shared file is still news at `now`:
+/// `Some(true)` while the writer's running turn made it (it may write again
+/// any moment), `Some(false)` while it is younger than
+/// [`SAME_FILE_FRESH_MS`], `None` once it is neither.
+pub(crate) fn same_file_current(at: u64, writer_turn_at: Option<u64>, now: u64) -> Option<bool> {
+    if writer_turn_at.is_some_and(|start| at >= start) {
+        Some(true)
+    } else if now.saturating_sub(at) < SAME_FILE_FRESH_MS {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// One same-file pair: `session` and `other` both wrote `path`; `other` last
+/// wrote it at `at`, during its running turn when `active`.
+pub(crate) struct SameFilePair {
+    pub(crate) session: String,
+    pub(crate) other: String,
+    pub(crate) path: String,
+    pub(crate) at: u64,
+    pub(crate) active: bool,
+}
+
+/// Every current same-file pair among this workspace's LIVE sessions, newest
+/// first — both directions of each pair. A pair whose write has aged out
+/// ([`same_file_current`]) is not listed: both sessions being open is not
+/// news.
+pub(crate) fn same_file_pairs(state: &AppState, ws: &str) -> Vec<SameFilePair> {
+    let now = now_ms();
     let live = crate::lock(&state.history.live);
     let mine: Vec<(&String, &Live)> = live.iter().filter(|(_, l)| l.ws == ws).collect();
     let mut out = Vec::new();
@@ -1593,19 +1639,29 @@ pub(crate) fn same_file_pairs(state: &AppState, ws: &str) -> Vec<(String, String
                 continue;
             }
             for (path, at) in &other.touched {
-                if paths.contains(path.as_str()) {
-                    out.push(((*sid).clone(), (*osid).clone(), path.clone(), *at));
+                if !paths.contains(path.as_str()) {
+                    continue;
+                }
+                if let Some(active) = same_file_current(*at, other.turn_at, now) {
+                    out.push(SameFilePair {
+                        session: (*sid).clone(),
+                        other: (*osid).clone(),
+                        path: path.clone(),
+                        at: *at,
+                        active,
+                    });
                 }
             }
         }
     }
-    out.sort_by_key(|(_, _, _, at)| std::cmp::Reverse(*at));
+    out.sort_by_key(|p| std::cmp::Reverse(p.at));
     out.truncate(SAME_FILE_PAIRS_MAX);
     out
 }
 
 /// Context lines for a hook answer: another LIVE session in this workspace
-/// wrote a file this one also wrote. Once per (other session, file) per
+/// wrote a file this one also wrote, recently or in its running turn
+/// ([`same_file_current`]). Once per (other session, file) per
 /// receiver, at most `SAME_FILE_LINES_MAX` per answer; nothing locks, and
 /// with no overlap the answer is untouched (empty).
 pub(crate) fn same_file_lines(state: &AppState, sid: &str) -> Vec<String> {
@@ -1626,7 +1682,9 @@ pub(crate) fn same_file_lines(state: &AppState, sid: &str) -> Vec<String> {
                 continue;
             }
             for (path, at) in other.touched.iter().rev() {
-                if mine.contains(path.as_str()) && !me.told.contains(&(osid.clone(), path.clone()))
+                if mine.contains(path.as_str())
+                    && same_file_current(*at, other.turn_at, now).is_some()
+                    && !me.told.contains(&(osid.clone(), path.clone()))
                 {
                     found.push((osid.clone(), path.clone(), *at));
                 }
@@ -1723,4 +1781,4 @@ pub(crate) fn live_records(state: &AppState, ws: &str) -> Vec<Record> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

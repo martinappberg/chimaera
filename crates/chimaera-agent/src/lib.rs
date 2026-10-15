@@ -1204,9 +1204,10 @@ impl ChatManager {
     pub async fn command_as(
         &self,
         id: &str,
-        cmd: AgentCommand,
+        mut cmd: AgentCommand,
         origin: Option<&'static str>,
     ) -> Result<()> {
+        cmd.strip_empty_blocks();
         cmd.validate_ingress().context("invalid agent command")?;
         let session = self.get_session(id)?;
         let _order = session.command_order.lock().await;

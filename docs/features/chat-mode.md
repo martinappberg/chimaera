@@ -112,7 +112,10 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   independently enforces those image budgets plus 256 KiB of text, a 10 MiB pre-deserialization
   WebSocket envelope, and a per-session 32 MiB / 64-message aggregate across the manager channel
   and driver-held send queue. A refused command raises a visible, nonfatal notice; the socket stays
-  healthy.
+  healthy. No send carries a blank block: the composer never builds one, the daemon strips
+  whitespace-only text and image blocks without data at ingress and refuses a send left with
+  nothing (`AgentCommand::strip_empty_blocks`), and every driver skips one as a backstop (an agent
+  reads a blank block as a message that came through empty).
 - **Your pictures stay in your message.** At WebSocket ingress the daemon saves each sent image
   into the session's upload landing pad (`upload::save_send_images`: same per-session caps as OS
   drops, a client-supplied `path` is always discarded, a failed save never refuses the send) and
@@ -348,7 +351,9 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   server-summarized `thinking` blocks tagged `narration` in their signature; the driver classifies
   each block (the `narration_block_indexes` wrapper, else the decoded signature) and renders
   narration as ordinary agent prose — the way the Claude apps do — while real reasoning stays in
-  Thought lines. Codex's commentary messages already arrive as prose; Codex reasoning summaries are
+  Thought lines. A long narration paragraph may start streaming as a thought before its signature
+  arrives; once the signature (or the block's frame) says narration, that thought is retracted and
+  the same text shows as prose, live and on replay. Codex's commentary messages already arrive as prose; Codex reasoning summaries are
   now requested (`turn/start.summary: "auto"`, unless the user's config sets its own).
 - **File references are links.** A path in agent prose, in inline code (the whole span, or the
   paths inside a command like `cat results/x.csv`), in a markdown link target

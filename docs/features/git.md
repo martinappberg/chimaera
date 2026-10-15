@@ -154,6 +154,52 @@ repos,branches,log,show,compare}`, `GET/POST/DELETE /api/v1/git/worktrees`,
   touched. Intent for the base picker, `.worktreeinclude`, locking and the unshared-commits
   fence (shipped 2026-09-29).
 
+## New agents in their own worktree
+
+- **What & when.** Start a new agent (chat or terminal; Claude, Codex, Antigravity, Grok) on a fresh
+  branch in a worktree of its own, so parallel agents never edit the same checkout. A remembered
+  per-workspace choice, not a dialog.
+- **How it's used.** In a git workspace the launcher popover ends with one switch, **In a new
+  worktree**. While it is on, every new-agent path starts there: the split button's main surface
+  (which then shows a small branch glyph), ⌘⇧E, the popover's rows, the dashboard's **+ new agent**,
+  and the Mastermind's `spawn_agent` workers. Reopening a Recents row, "+ New branch", and resumes
+  never create one. The agent's row on the rail carries its branch (the existing worktree mark), the
+  chat's branch line names it, and the row's menu offers **Open worktree in new window** (the file
+  tree of that checkout, in its own window; this one stays put). When the session is closed — or its
+  Recents row archived — and nothing else is working in that worktree, the rail offers
+  **`<branch>` kept · Remove · Keep**. Remove goes through the fenced `DELETE /git/worktrees` (never
+  `force`): uncommitted changes, commits that are neither pushed nor merged, a live session inside,
+  or another tool's lock keep it, and the rail says why.
+- **Where it lives.** UI `Launcher.svelte` (the `wtrow` switch), `App.svelte` (`spawnSession` →
+  `wantsWorktree`, `toggleNewInWorktree`, `offerWorktreeRemoval`/`removeKeptWorktree`,
+  `openWorktreeWindow`), `sessions.ts` (`wantsWorktree`, `worktreeInUse`, `setNewInWorktree`),
+  `launcher.ts` (`parseRecents`). Daemon `git/worktree.rs` (`create_session_worktree`,
+  `managed_worktree_of`), `api/sessions.rs` (`CreateSession.worktree`), `api/workspaces.rs`
+  (`patch_workspace`), `workspaces.rs` (`new_in_worktree`), `mcp.rs` (`spawn_agent`'s `worktree`).
+  Wire (all additive): `PATCH /api/v1/workspaces/{id} {new_in_worktree}`, the workspace row's
+  `new_in_worktree`, `POST /api/v1/sessions {worktree: true}`, session rows' `managed_worktree`,
+  Recents rows' `worktree`.
+- **Key behaviors.** Location and naming: branch `chimaera/<agent>-<6 hex>` off the workspace
+  repository's current HEAD, checked out at `~/.chimaera/worktrees/<repo>-<hash>/chimaera/<agent>-<6 hex>`
+  — the managed root the other worktree routes use, outside the repository so the main checkout stays
+  clean and nothing is written into a shared repository; `.worktreeinclude` is copied as for "+ New
+  branch". It is an ordinary registered worktree, locked `chimaera: <session>` while an agent works
+  inside, so `git worktree list`-based clean-up (`scripts/worktree-gc`, Claude Code's own) treats it
+  as in use; unlocked, it is judged like any worktree (a clean one whose HEAD is already in the main
+  branch is removable). `worktree: true` is agents only and never combined with `resume` or `cwd`;
+  a workspace that is not a repository answers 400, and a missing agent answers 409 before anything
+  is created; any later failure of that spawn discards the new worktree and its branch again
+  (`discard_session_worktree`: a plain `worktree remove` and `branch -d`, never forced). A session
+  row's `managed_worktree` is the top of the managed worktree its spawn folder lies in, also from a
+  subfolder, read from what the session tracker already resolved (no filesystem access per
+  snapshot; null until it has). The Mastermind's `spawn_agent` without `branch` follows the
+  workspace's choice unless it passes `worktree`; a remembered choice in a folder that is no longer
+  a repository falls back to the root. Nothing is ever removed automatically. A managed worktree
+  opened in its own window is unregistered when it is removed, and `GET /workspaces` drops such a
+  registration once its folder is gone (removed outside chimaera). Reopening a Recents row (by its
+  id or one its lineage absorbed) resumes the conversation inside its worktree while that still
+  exists (the row keeps the folder), else at the root. Intent: [pending](#new-agents-in-their-own-worktree--_intent-pending_).
+
 ## Branches (the agent↔branch map)
 
 - **What & when.** A repository's worktree branches (main checkout first) and which sessions work in
@@ -245,3 +291,8 @@ _Captured 2026-09-29 from the maintainer, in the session that built it (his word
   deleting branches; working with other people, forge integrations and commit trailers, which are
   planned separately.
 - **Do not change:** the two core bets above. The rest is open to improvement.
+
+### New agents in their own worktree — _Intent pending_
+_Shipped 2026-10-14 (issue #271). The maintainer chose Chimaera-managed worktrees with a toggle
+"done in good UI / UX"; the rest of the why has not been captured yet — run
+**capture-feature-intent** for this entry._

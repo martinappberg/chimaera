@@ -260,6 +260,234 @@ pub(crate) async fn ensure_branch_worktree(
     create_in(state, &workspace.id, &git.path, &repo, branch, base).await
 }
 
+/// Where a new agent session's own worktree goes: a fresh branch
+/// `chimaera/<agent>-<6 hex>` off the workspace repository's current HEAD,
+/// checked out at `<managed root>/<repo>-<hash>/chimaera/<agent>-<6 hex>`
+/// (the managed root is `~/.chimaera/worktrees`). Outside the repository on
+/// purpose: the main checkout's status stays clean, nothing is written into
+/// a shared repository, and the removal fences only ever act under the
+/// managed root. It is an ordinary registered worktree, locked
+/// (`chimaera: <session>`) while an agent works inside, so `git worktree
+/// list`-based clean-up (Claude Code's, `scripts/worktree-gc`) sees it as
+/// in use; once unlocked it is judged like any other worktree.
+pub(crate) async fn create_session_worktree(
+    state: &Arc<AppState>,
+    workspace: &crate::workspaces::Workspace,
+    agent: &str,
+) -> Result<Created, Refusal> {
+    let git = state.git.resolve_git(configured_git(state)).await;
+    if !git.adequate {
+        return Err(refuse(
+            StatusCode::BAD_REQUEST,
+            "git is missing or too old for worktrees",
+        ));
+    }
+    let Some(repo) = state
+        .git
+        .discover(&git.path, &workspace.id, &workspace.root)
+        .await
+        .into_repo()
+    else {
+        return Err(refuse(
+            StatusCode::BAD_REQUEST,
+            "this workspace is not a git repository",
+        ));
+    };
+    let agent: String = agent
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(24)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let agent = if agent.is_empty() {
+        "agent".into()
+    } else {
+        agent
+    };
+    // A clash (an existing branch of that name) just draws again; never
+    // check out somebody's existing branch for a "new worktree".
+    for _ in 0..4 {
+        let branch = format!("chimaera/{agent}-{}", six_hex());
+        if branch_exists(&git.path, &state.git.procs, &repo.toplevel, &branch).await {
+            continue;
+        }
+        return create_in(state, &workspace.id, &git.path, &repo, &branch, None).await;
+    }
+    Err(refuse(
+        StatusCode::CONFLICT,
+        "could not pick a free branch name for the worktree",
+    ))
+}
+
+/// Six random hex digits naming a session worktree. `generate_token` is 64
+/// lowercase hex characters drawn from 32 random bytes, so any six of them
+/// are six uniformly random hex digits — always exactly six.
+fn six_hex() -> String {
+    chimaera_core::generate_token()[..6].to_string()
+}
+
+/// Undo [`create_session_worktree`] for a spawn that then failed: the
+/// worktree is new, clean and empty, so a plain `worktree remove` (never
+/// `--force`) takes it, and the branch minted for it goes with `branch -d`
+/// (which refuses a branch holding commits of its own). A reused checkout
+/// is never touched. Failures are logged, never escalated.
+pub(crate) async fn discard_session_worktree(
+    state: &Arc<AppState>,
+    workspace: &crate::workspaces::Workspace,
+    created: &Created,
+) {
+    if created.reused {
+        return;
+    }
+    let git = state.git.resolve_git(configured_git(state)).await;
+    let Some(repo) = state
+        .git
+        .discover(&git.path, &workspace.id, &workspace.root)
+        .await
+        .into_repo()
+    else {
+        return;
+    };
+    let path = created.path.to_string_lossy().into_owned();
+    let procs = &state.git.procs;
+    match run_git(
+        &git.path,
+        procs,
+        &repo.toplevel,
+        &["worktree", "remove", &path],
+        64 * 1024,
+    )
+    .await
+    {
+        Ok(out) if out.success => {}
+        Ok(out) => {
+            tracing::warn!(%path, stderr = %out.stderr, "could not discard an unused session worktree");
+            return;
+        }
+        Err(err) => {
+            tracing::warn!(%path, %err, "could not discard an unused session worktree");
+            return;
+        }
+    }
+    // The name passed check-ref-format and never starts with '-'.
+    match run_git(
+        &git.path,
+        procs,
+        &repo.toplevel,
+        &["branch", "-d", &created.branch],
+        4096,
+    )
+    .await
+    {
+        Ok(out) if out.success => {}
+        Ok(out) => tracing::warn!(branch = %created.branch, stderr = %out.stderr,
+            "kept the branch of a discarded session worktree"),
+        Err(err) => tracing::warn!(branch = %created.branch, %err,
+            "kept the branch of a discarded session worktree"),
+    }
+    state.git.bump(&workspace.id);
+    state.git.invalidate(&workspace.id);
+    state.changes.notify_waiters();
+}
+
+/// The Chimaera-managed worktree a session started in — the worktree's top
+/// level, also when the session started in a subfolder of it. Read from
+/// what the session tracker already resolved (the spawn folder's probe, else
+/// the session's own checkout when the spawn folder lies inside it), so it
+/// does no filesystem access and is safe on every session snapshot; `None`
+/// until the tracker has looked, and outside the managed root.
+pub(crate) fn managed_worktree_of(state: &AppState, id: &str, cwd: &Path) -> Option<PathBuf> {
+    let managed = |p: &Path| {
+        p.starts_with(&state.worktrees_root_real) || p.starts_with(&state.worktrees_root)
+    };
+    if !managed(cwd) {
+        return None;
+    }
+    let top = state.git.sessions.toplevel_of(cwd).or_else(|| {
+        state
+            .git
+            .sessions
+            .repo_of(id)
+            .map(|r| r.toplevel)
+            .filter(|t| cwd.starts_with(t))
+    })?;
+    managed(&top).then_some(top)
+}
+
+/// Unregister workspace `id` and drop everything keyed by it (a worktree
+/// opened as its own window, once that worktree is gone). Never touches a
+/// folder.
+pub(crate) async fn unregister_workspace(state: &Arc<AppState>, id: &str) {
+    if let Err(err) = crate::lock(&state.workspaces).remove(id) {
+        tracing::warn!(%err, %id, "failed to unregister removed worktree");
+    }
+    // Its git state and quick-open index go with it (see `delete_workspace`
+    // — same eviction).
+    state.git.forget_workspace(id);
+    crate::lock(&state.quickopen).forget_workspace(id);
+    state.timeline.remove_workspace(id);
+    state.comms.forget_workspace(id);
+    crate::lock(&state.plugin_detect).forget_workspace(id);
+    state.plugin_runtime.forget_workspace(id);
+    crate::lock(&state.plugin_state).forget_workspace(id);
+    crate::plugins::platform::forget_workspace(state, id);
+    crate::lock(&state.knowledge).forget_workspace(id);
+    state.history.remove_workspace(id);
+    if crate::lock(&state.recents_archive).forget_workspace(id) {
+        crate::recents_archive::persist(state).await;
+    }
+}
+
+/// Drop registrations of managed worktrees whose folder is gone (removed
+/// outside chimaera — `git worktree remove`, a clean-up script — after one
+/// was opened in its own window). Only workspaces under the managed root are
+/// checked, so the usual list costs no filesystem access; only a definite
+/// "not found" counts (a slow or failing mount keeps the row).
+pub(crate) async fn forget_missing_managed_workspaces(state: &Arc<AppState>) {
+    let candidates: Vec<(String, PathBuf)> = crate::lock(&state.workspaces)
+        .list()
+        .into_iter()
+        .filter(|w| {
+            w.root.starts_with(&state.worktrees_root_real)
+                || w.root.starts_with(&state.worktrees_root)
+        })
+        .map(|w| (w.id, w.root))
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+    let gone: Vec<String> = tokio::task::spawn_blocking(move || {
+        candidates
+            .into_iter()
+            .filter(|(_, root)| {
+                matches!(std::fs::metadata(root), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+            })
+            .map(|(id, _)| id)
+            .collect()
+    })
+    .await
+    .unwrap_or_default();
+    for id in gone {
+        unregister_workspace(state, &id).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn session_worktree_suffix_is_six_hex_digits() {
+        for _ in 0..64 {
+            let s = super::six_hex();
+            assert_eq!(s.len(), 6, "{s}");
+            assert!(
+                s.chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                "{s}"
+            );
+        }
+    }
+}
+
 #[derive(Deserialize)]
 pub(crate) struct CreateWorktree {
     workspace_id: String,
@@ -549,24 +777,7 @@ pub(crate) async fn remove_worktree(
         .map(|w| w.id)
         .collect();
     for id in stale {
-        if let Err(err) = crate::lock(&state.workspaces).remove(&id) {
-            tracing::warn!(%err, %id, "failed to unregister removed worktree");
-        }
-        // The unregistered workspace's git state and quick-open index go
-        // with it (see `delete_workspace` — same eviction).
-        state.git.forget_workspace(&id);
-        crate::lock(&state.quickopen).forget_workspace(&id);
-        state.timeline.remove_workspace(&id);
-        state.comms.forget_workspace(&id);
-        crate::lock(&state.plugin_detect).forget_workspace(&id);
-        state.plugin_runtime.forget_workspace(&id);
-        crate::lock(&state.plugin_state).forget_workspace(&id);
-        crate::plugins::platform::forget_workspace(&state, &id);
-        crate::lock(&state.knowledge).forget_workspace(&id);
-        state.history.remove_workspace(&id);
-        if crate::lock(&state.recents_archive).forget_workspace(&id) {
-            crate::recents_archive::persist(&state).await;
-        }
+        unregister_workspace(&state, &id).await;
     }
 
     // Bump + invalidate, same pairing as the add path: the triggered

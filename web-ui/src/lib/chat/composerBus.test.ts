@@ -1,12 +1,32 @@
 import { describe, expect, it } from "vitest";
-import { insertIntoComposer, registerComposer, type InsertPlacement } from "./composerBus";
+import {
+  attachImageToComposer,
+  insertIntoComposer,
+  registerComposer,
+  type InsertPlacement,
+} from "./composerBus";
+import type { ImageAttachment } from "./images";
 
 type Seen = [string, InsertPlacement][];
 
-function composer(): { seen: Seen; insert: (text: string, placement: InsertPlacement) => void } {
+function composer(): {
+  seen: Seen;
+  images: string[];
+  insert: (text: string, placement: InsertPlacement, image?: ImageAttachment) => void;
+} {
   const seen: Seen = [];
-  return { seen, insert: (text, placement) => seen.push([text, placement]) };
+  const images: string[] = [];
+  return {
+    seen,
+    images,
+    insert: (text, placement, image) => {
+      if (text !== "") seen.push([text, placement]);
+      if (image !== undefined) images.push(image.label);
+    },
+  };
 }
+
+const crop: ImageAttachment = { media_type: "image/png", data: "AAAA", label: "region 40×30" };
 
 describe("composerBus", () => {
   it("drains a buffered insert with its placement once the composer mounts", () => {
@@ -36,5 +56,31 @@ describe("composerBus", () => {
     insertIntoComposer("s-twice", "> late\n\n", "block", paneView);
     expect(dock.seen.at(-1)).toEqual(["> late\n\n", "block"]);
     offDock();
+  });
+
+  it("delivers a region's pixels with its locator, to one composer", () => {
+    const pane = composer();
+    const dock = composer();
+    const offPane = registerComposer("s-region", pane.insert, {});
+    const offDock = registerComposer("s-region", dock.insert, {});
+    insertIntoComposer("s-region", "@fig.png#xywh=1,2,3,4 ", "inline", undefined, crop);
+    expect(dock.seen).toEqual([["@fig.png#xywh=1,2,3,4 ", "inline"]]);
+    expect(dock.images).toEqual([crop.label]);
+    expect(pane.images).toEqual([]);
+    // An image alone (an OS drop) goes to the same composer as text would.
+    attachImageToComposer("s-region", crop);
+    expect(dock.images).toEqual([crop.label, crop.label]);
+    expect(pane.images).toEqual([]);
+    offDock();
+    offPane();
+  });
+
+  it("buffers a region's pixels and locator together until a composer mounts", () => {
+    insertIntoComposer("s-late", "@doc.pdf#page=2 ", "inline", undefined, crop);
+    const c = composer();
+    const off = registerComposer("s-late", c.insert);
+    expect(c.seen).toEqual([["@doc.pdf#page=2 ", "inline"]]);
+    expect(c.images).toEqual([crop.label]);
+    off();
   });
 });

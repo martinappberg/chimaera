@@ -14,7 +14,7 @@
   import { composerInputKey, composerKey, decorationRuns, fillComposerDraft, type NativeComposerKey } from "./nativeComposer";
   import { uiStyle, type UiRecord } from "./nativeUi";
   import ImagePreview from "./ImagePreview.svelte";
-  import { registerComposer, registerComposerAttach } from "./composerBus";
+  import { registerComposer } from "./composerBus";
   import {
     attachmentSrc,
     imageToAttachment,
@@ -417,28 +417,25 @@
 
   // Workbench insert flows (selection references, provenance tags, quoted
   // passages) land in the draft exactly like they would type into a PTY's
-  // input — appended, never submitted.
+  // input — appended, never submitted. An image riding along (a region
+  // reference's crop, an OS drop) joins the attachment strip like a pasted
+  // screenshot, in this same composer as its words.
   $effect(() => {
     if (sessionId === null) return;
     return registerComposer(
       sessionId,
-      (inserted, placement) => {
-        const text = collapseUploadMentions(inserted, uploadTokens, draft);
-        draft = draftWithInsert(draft, text, placement);
-        focusAt(draft.length);
+      (inserted, placement, image) => {
+        if (image !== undefined) addImage(image);
+        if (inserted !== "") {
+          const text = collapseUploadMentions(inserted, uploadTokens, draft);
+          draft = draftWithInsert(draft, text, placement);
+          focusAt(draft.length);
+        } else {
+          el?.focus();
+        }
       },
       view,
     );
-  });
-
-  // Workbench attach flow (an image dropped from the OS desktop onto this
-  // chat pane): rides the same attachment state as clipboard paste.
-  $effect(() => {
-    if (sessionId === null) return;
-    return registerComposerAttach(sessionId, (image) => {
-      addImage(image);
-      el?.focus();
-    });
   });
 
   // --- voice dictation ------------------------------------------------------------

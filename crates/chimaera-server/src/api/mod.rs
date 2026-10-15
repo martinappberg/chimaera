@@ -24,7 +24,7 @@ pub(crate) use sessions::{create_session, delete_session, list_sessions, rename_
 pub(crate) use shutdown::{delete_all_sessions, shutdown};
 pub(crate) use workspaces::{
     create_workspace, delete_mastermind, delete_workspace, list_workspaces, open_workspace,
-    put_mastermind,
+    patch_workspace, put_mastermind,
 };
 
 /// Require `Authorization: Bearer {token}` on /api/v1 routes.
