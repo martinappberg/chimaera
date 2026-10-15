@@ -13,6 +13,7 @@ import { artifactMentions, isArtifactPath, proseCovered, proseEmbedTargets } fro
 import { agentMessageFromEvent, isAgentOrigin, parseAgentText, type AgentMessage } from "./agentMessages";
 import type { AgentEvent, ChatSessionInfo, SeqEvent } from "./chatWs";
 import { parseCapabilities, type ChatCapabilities } from "./capabilities";
+import { agentProductName } from "../shared/agentNames";
 
 /** Names a reply may use that still cover their files (a reply listing
  *  thirty outputs covers thirty); resolve candidates from shell text stay
@@ -370,6 +371,12 @@ export type ChatBlock = BlockIdentity &
        *  (claude `tool_use_summary`, "Listed files in directory") — the tool
        *  group's title once it lands, a model round after the batch. */
       summary: string | null;
+      /** Journal time the call first appeared, and the time it reached a
+       *  terminal status (absent on a row reconciled at turn end, whose real
+       *  end was never seen). The row's elapsed/duration; journal-backed, so
+       *  replay shows the same durations. */
+      startedAtMs?: number;
+      endedAtMs?: number;
       /** The whole command an execute tool ran (the title keeps ~120 chars,
        *  and claude's `cd "…/abs/path" && …` prefix eats them): what the
        *  turn-end gallery scans for the files a script wrote. */
@@ -771,6 +778,14 @@ export class ChatStore {
    *  the oldest message down or eagerly load every historical artifact. */
   hydrating = $state(true);
   private replayHead = 0;
+  /** Local clock minus the daemon's journal clock, sampled only from frames
+   *  the socket delivered live past the replay head (a replayed frame's `ts`
+   *  is its original time, so sampling one would read its age as skew): a
+   *  running row's elapsed is `Date.now() - (startedAtMs + skew)`, so a
+   *  remote daemon's clock offset never reads as time. 0 until a live frame. Deliberately not
+   *  reactive (a per-event signal would churn every reader); the 1 Hz
+   *  elapsed readers pick it up on their next tick. */
+  clockSkewMs = 0;
   /** Uid mint for {@link stamp}. Deliberately NOT reset with the transcript:
    *  a keyed render may still hold the old rows, and recycled keys would make
    *  Svelte patch stale DOM into unrelated new blocks instead of remounting. */
@@ -943,10 +958,11 @@ export class ChatStore {
     }));
   }
 
-  apply(entry: SeqEvent): void {
+  apply(entry: SeqEvent, live = false): void {
     if (entry.seq <= this.lastSeq) return;
     this.lastSeq = entry.seq;
     if (this.hydrating && this.lastSeq >= this.replayHead) this.hydrating = false;
+    if (live && entry.ts > 0 && entry.seq > this.replayHead) this.clockSkewMs = Date.now() - entry.ts;
     const ev = entry.ev;
     switch (ev.type) {
       case "startup_progress":
@@ -1363,6 +1379,7 @@ export class ChatStore {
               crossTurn: ev.cross_turn === true,
               summary: null,
               command: typeof ev.command === "string" ? ev.command : null,
+              ...(entry.ts > 0 ? { startedAtMs: entry.ts } : {}),
             }),
           );
           this.toolIndex.set(ev.id as string, this.blocks.length - 1);
@@ -1386,6 +1403,9 @@ export class ChatStore {
         const wasTerminal = block.status === "completed" || block.status === "failed";
         if (status !== "in_progress" || !wasTerminal) {
           block.status = status;
+        }
+        if (!wasTerminal && (status === "completed" || status === "failed") && entry.ts > 0) {
+          block.endedAtMs = entry.ts;
         }
         const content = ev.content as ToolContent | null | undefined;
         // An Edit card's diff (from tool inputs) must not be clobbered by a
@@ -1810,13 +1830,7 @@ export class ChatStore {
           this.exited = null;
           this.degraded = false;
         }
-        const source =
-          ev.source_agent === "claude"
-            ? "Claude Code"
-            : ev.source_agent === "codex"
-              ? "Codex"
-              : ev.source_agent === "agy" ? "Antigravity"
-                : ev.source_agent === "grok" ? "Grok Build" : String(ev.source_agent ?? "agent");
+        const source = typeof ev.source_agent === "string" ? agentProductName(ev.source_agent) : "agent";
         this.notice(
           `continued from ${source}${native ? "" : " · conversation copied"}`,
           "info",

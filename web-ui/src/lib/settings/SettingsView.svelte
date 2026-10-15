@@ -209,34 +209,10 @@
 </script>
 
 <div class="settings">
+  <!-- One header row in focus order: search, then the UI/JSON switch. The
+       settings.json path lives with the JSON editor, where it means something. -->
   <header class="top">
-    <div class="title-row">
-      <h1 class="title">Settings</h1>
-      <div class="tabs" role="tablist" aria-label="settings mode">
-        <button class="mode" class:on={tab === "ui"} role="tab" aria-selected={tab === "ui"} onclick={() => (tab = "ui")}>
-          UI
-        </button>
-        <button
-          class="mode"
-          class:on={tab === "json"}
-          role="tab"
-          aria-selected={tab === "json"}
-          onclick={() => (tab = "json")}
-        >
-          JSON
-        </button>
-      </div>
-    </div>
-    <p class="subtitle">
-      Ground truth: <code>~/.config/chimaera/settings.json</code> on the daemon host — hand-edits
-      and other windows sync here live.
-      {#if modifiedCount > 0}
-        <span class="mod-count">{modifiedCount} modified</span>
-      {/if}
-      {#if !settingsLoaded()}
-        <span class="loading">loading…</span>
-      {/if}
-    </p>
+    <h1 class="title">Settings</h1>
     {#if tab === "ui"}
       <input
         class="search"
@@ -257,6 +233,27 @@
         }}
       />
     {/if}
+    <span class="status">
+      {#if !settingsLoaded()}
+        loading…
+      {:else if modifiedCount > 0}
+        <span title="settings that differ from their default">{modifiedCount} changed</span>
+      {/if}
+    </span>
+    <div class="tabs" role="tablist" aria-label="settings mode">
+      <button class="mode" class:on={tab === "ui"} role="tab" aria-selected={tab === "ui"} onclick={() => (tab = "ui")}>
+        UI
+      </button>
+      <button
+        class="mode"
+        class:on={tab === "json"}
+        role="tab"
+        aria-selected={tab === "json"}
+        onclick={() => (tab = "json")}
+      >
+        JSON
+      </button>
+    </div>
   </header>
 
   {#if tab === "ui"}
@@ -358,11 +355,7 @@
 
         {#if keyboardVisible}
           <div class="kbd-group">
-            <h3 class="kbd-group-title">Pinned chords</h3>
-            <p class="kbd-note">
-              Not rebindable — the terminal owns bare Ctrl on every platform, and these shadow
-              browser conventions too carefully to open up.
-            </p>
+            <h3 class="kbd-group-title">Fixed chords</h3>
             <ul class="kbd-list">
               {#each pinnedRows as row (row.label)}
                 <li class="kbd-row">
@@ -374,12 +367,8 @@
           </div>
 
           <div class="kbd-group">
-            <h3 class="kbd-group-title">chimaera app menu</h3>
-            <p class="kbd-note">
-              The native app's menu bar owns the chords a browser reserves, so these fire only in
-              the chimaera app. Several are a second way to reach a rebindable action above —
-              {APP_MENU.closeView} also closes a view, {APP_MENU.newTerminal} opens a new terminal.
-            </p>
+            <h3 class="kbd-group-title">App menu</h3>
+            <p class="kbd-note">Only in the chimaera app: a browser keeps these chords.</p>
             <ul class="kbd-list">
               {#each appMenuRows as row (row.label)}
                 <li class="kbd-row">
@@ -415,32 +404,52 @@
     container: settings / inline-size;
   }
 
+  /* Title, search, status, mode switch: one line, aligned to the nav and the
+     reading column below it. */
   .top {
     flex: none;
-    padding: 18px 22px 12px;
-    border-bottom: 1px solid var(--edge);
-  }
-
-  .title-row {
     display: flex;
     align-items: center;
     gap: 14px;
-  }
-
-  /* The UI/JSON mode switch lives in the header's far corner — next to the
-     h1 it read as part of the title. */
-  .title-row .tabs {
-    margin-left: auto;
+    padding: 16px 22px 14px;
   }
 
   .title {
+    flex: none;
+    width: 148px;
     margin: 0;
     font-size: var(--text-lg);
     font-weight: 600;
-    letter-spacing: 0.01em;
+  }
+
+  .search {
+    flex: 0 1 380px;
+    min-width: 0;
+    height: 30px;
+    box-sizing: border-box;
+    font: inherit;
+    font-size: var(--text-md);
+    color: var(--fg);
+    background: var(--bg);
+    border: 1px solid var(--edge);
+    border-radius: 7px;
+    padding: 0 11px;
+  }
+
+  .search:focus {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: 1px;
+  }
+
+  .status {
+    margin-left: auto;
+    font-size: var(--text-sm);
+    color: var(--muted);
+    white-space: nowrap;
   }
 
   .tabs {
+    flex: none;
     display: flex;
     border: 1px solid var(--edge);
     border-radius: 7px;
@@ -453,9 +462,9 @@
     background: none;
     font: inherit;
     font-size: var(--text-xs);
-    letter-spacing: 0.05em;
+    letter-spacing: 0.04em;
     color: var(--muted);
-    padding: 2px 12px;
+    padding: 3px 12px;
     cursor: pointer;
     transition:
       background-color 0.12s ease,
@@ -477,46 +486,6 @@
     background: color-mix(in srgb, var(--accent) 14%, transparent);
   }
 
-  .subtitle {
-    margin: 5px 0 0;
-    font-size: var(--text-sm);
-    color: var(--muted);
-  }
-
-  .subtitle code {
-    font-family: var(--mono);
-    font-size: var(--text-xs);
-    /* The settings.json path is one long token — let it break when narrow. */
-    overflow-wrap: anywhere;
-  }
-
-  .mod-count {
-    margin-left: 8px;
-    color: var(--accent);
-  }
-
-  .loading {
-    margin-left: 8px;
-    opacity: 0.7;
-  }
-
-  .search {
-    margin-top: 12px;
-    width: min(440px, 100%);
-    font: inherit;
-    font-size: var(--text-md);
-    color: var(--fg);
-    background: var(--bg);
-    border: 1px solid var(--edge);
-    border-radius: 8px;
-    padding: 6px 12px;
-  }
-
-  .search:focus {
-    outline: 2px solid var(--focus-ring);
-    outline-offset: 1px;
-  }
-
   .body {
     flex: 1;
     display: flex;
@@ -525,8 +494,9 @@
 
   .nav {
     flex: none;
-    width: 148px;
-    padding: 14px 8px 14px 14px;
+    width: 162px;
+    box-sizing: border-box;
+    padding: 4px 8px 14px 14px;
     display: flex;
     flex-direction: column;
     gap: 1px;
@@ -542,7 +512,7 @@
     color: var(--muted);
     text-align: left;
     padding: 4px 9px;
-    border-radius: 5px;
+    border-radius: 6px;
     cursor: pointer;
     transition:
       background-color 0.12s ease,
@@ -564,35 +534,46 @@
     flex: 1;
     min-width: 0;
     overflow-y: auto;
-    padding: 6px 22px 40vh 8px;
-    scroll-padding-top: 8px;
+    padding: 0 22px 40vh 8px;
+    scroll-padding-top: 4px;
   }
 
+  /* A reading column, like the chat's: on a wide Home page the controls stay
+     within reach of their labels instead of drifting to the window edge. */
+  .list > :global(*) {
+    max-width: 880px;
+  }
+
+  /* Every section heading — these and the bespoke panels' own (Agents,
+     Environment, Updates, …) — share one recipe: a real title in the
+     foreground, spacing above it doing the separating. */
   .cat {
-    margin: 18px 0 4px;
+    margin: 30px 0 6px;
     padding: 0 14px;
-    font-size: var(--text-xs);
+    font-size: var(--text-lg);
     font-weight: 600;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
-    color: var(--muted);
+    color: var(--fg);
+  }
+
+  .list > section:first-child :global(h2) {
+    margin-top: 4px;
   }
 
   /* A titled block inside a section (Agents → Agent communication). */
   .subcat {
-    margin: 18px 0 2px;
+    margin: 22px 0 0;
     padding: 0 14px;
-    font-size: var(--text-sm);
+    font-size: var(--text-md);
     font-weight: 600;
     color: var(--fg);
   }
   .subnote {
-    margin: 0 0 4px;
+    margin: 2px 0 2px;
     padding: 0 14px;
     font-size: var(--text-sm);
     line-height: 1.45;
     color: var(--muted);
-    max-width: 60ch;
+    max-width: 62ch;
   }
 
   .empty {
@@ -609,37 +590,29 @@
 
   /* --- keyboard reference --- */
 
-  .kbd-note {
-    margin: 4px 0 10px;
-    padding: 0 14px;
-    font-size: var(--text-sm);
-    color: var(--muted);
-    max-width: 60ch;
-  }
-
   .kbd-group {
-    margin: 14px 14px 0;
-  }
-
-  .kbd-group:first-of-type {
-    margin-top: 8px;
+    margin: 22px 0 0;
+    padding: 0 14px;
   }
 
   .kbd-group-title {
-    margin: 0 0 5px;
-    font-size: var(--text-xs);
+    margin: 0;
+    font-size: var(--text-md);
     font-weight: 600;
-    letter-spacing: 0.06em;
+    color: var(--fg);
+  }
+
+  .kbd-note {
+    margin: 2px 0 0;
+    font-size: var(--text-sm);
     color: var(--muted);
+    max-width: 62ch;
   }
 
   .kbd-list {
     list-style: none;
-    margin: 0;
+    margin: 6px 0 0;
     padding: 0;
-    border: 1px solid var(--edge);
-    border-radius: 8px;
-    overflow: hidden;
   }
 
   .kbd-row {
@@ -648,12 +621,13 @@
     justify-content: space-between;
     flex-wrap: wrap;
     gap: 4px 16px;
-    padding: 6px 12px;
+    min-height: 32px;
+    padding: 2px 20px 2px 0;
     font-size: var(--text-md);
   }
 
   .kbd-row + .kbd-row {
-    border-top: 1px solid var(--edge);
+    border-top: 1px solid color-mix(in srgb, var(--edge) 70%, transparent);
   }
 
   .kbd-label {
@@ -676,19 +650,22 @@
   /* --- responsive: the settings pane can be dragged narrow (down to ~200px).
      Everything below keys off the pane width via the `settings` container. --- */
 
-  /* Narrow: the category rail folds into a horizontal chip bar pinned above
-     the list, and the search spans the full width. */
+  /* Narrow: the category rail folds into a horizontal strip pinned above
+     the list, and the title yields its fixed width. */
   @container settings (max-width: 640px) {
     .top {
-      padding: 16px 14px 12px;
+      flex-wrap: wrap;
+      gap: 10px;
+      padding: 14px 14px 10px;
     }
 
-    .title-row {
-      flex-wrap: wrap;
+    .title {
+      width: auto;
     }
 
     .search {
-      width: 100%;
+      order: 5;
+      flex: 1 1 100%;
     }
 
     .body {
@@ -702,7 +679,7 @@
       width: auto;
       flex-direction: row;
       gap: 2px;
-      padding: 4px 10px 0;
+      padding: 0 10px;
       overflow-x: auto;
       overflow-y: hidden;
       border-bottom: 1px solid var(--edge);
@@ -734,22 +711,11 @@
     }
 
     .list {
-      padding: 6px 12px 40vh 12px;
+      padding: 0 8px 40vh 8px;
     }
 
-    .cat {
-      padding: 0 6px;
-    }
-
-    .kbd-note,
-    .subcat,
-    .subnote {
-      padding: 0 6px;
-    }
-
-    .kbd-group {
-      margin-left: 6px;
-      margin-right: 6px;
+    .list > section:first-child :global(h2) {
+      margin-top: 14px;
     }
   }
 

@@ -12,7 +12,7 @@ const request = (agent: Partial<AgentInfo>, action: SetupRequest["action"] = "in
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
-  for (const agent of ["claude", "codex", "agy", "grok"]) {
+  for (const agent of ["claude", "codex", "agy", "grok", "cursor"]) {
     const id = pendingSetupId(agent);
     if (id) acknowledgeSetupResult(agent, id);
   }

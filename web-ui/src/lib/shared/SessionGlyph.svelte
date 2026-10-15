@@ -9,6 +9,8 @@
    *   claude — four-point spark
    *   codex  — paired code brackets
    *   agy    — dot floating over an upward arc (antigravity)
+   *   grok   — a slash between offset bars
+   *   cursor — a text-caret I-beam with curled serifs
    *   gemini — triangle (legacy sessions/recents only)
    *
    * The optional `state` class carries the session-state color (same
@@ -55,6 +57,7 @@
     codex: "M6.4 4.8L3.6 8l2.8 3.2M9.6 4.8L12.4 8l-2.8 3.2",
     agy: "M8 5.1m-1.5 0a1.5 1.5 0 1 0 3 0a1.5 1.5 0 1 0-3 0M3.7 11.4q4.3-3.1 8.6 0",
     grok: "M4 12L12 4M4 4h4M8 12h4",
+    cursor: "M8 4.6v6.8M5.6 3.2q2.4 0 2.4 1.4q0-1.4 2.4-1.4M5.6 12.8q2.4 0 2.4-1.4q0 1.4 2.4 1.4",
     agent: "M8 3a5 5 0 1 0 0 10 5 5 0 0 0 0-10M5.5 7h.01M10.5 7h.01M6 10h4",
     gemini: "M8 3.2l4.8 8.6H3.2z",
   };

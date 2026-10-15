@@ -260,11 +260,12 @@
 <div class="json-view">
   <div class="editor" bind:this={host}></div>
   <footer class="bar">
+    <code class="path" title="On the daemon host. Hand edits sync here live.">~/.config/chimaera/settings.json</code>
     <span class="status">
       {#if dirty}unsaved{:else if savedFlash}saved{:else}synced{/if}
     </span>
     {#if saveError !== null}
-      <span class="bar-err">{saveError}</span>
+      <span class="bar-err" title={saveError}>{saveError}</span>
     {/if}
     <span class="spacer"></span>
     {#if dirty}
@@ -303,11 +304,34 @@
     color: var(--muted);
   }
 
+  /* The path gives way first in a narrow pane: the state word, the save
+     button and the hint keep their size. */
   .status {
+    flex: none;
+    white-space: nowrap;
     color: var(--muted);
   }
 
+  .path {
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    color: var(--fg);
+    opacity: 0.8;
+    flex: 0 1000 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* A long parse error yields only once the path is gone (the path's
+     shrink factor is far larger); its full text stays in the tooltip. */
   .bar-err {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     color: var(--err);
   }
 
@@ -316,6 +340,8 @@
   }
 
   .save-btn {
+    flex: none;
+    white-space: nowrap;
     appearance: none;
     border: 1px solid var(--edge);
     background: none;
@@ -333,6 +359,8 @@
   }
 
   .hint {
+    flex: none;
+    white-space: nowrap;
     font-family: var(--mono);
     opacity: 0.7;
   }
