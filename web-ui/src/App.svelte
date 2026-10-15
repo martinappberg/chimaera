@@ -7516,6 +7516,7 @@
   .new-split .row.new.quick-start {
     flex: 1;
     min-width: 0;
+    overflow: hidden;
     margin-top: 0;
     gap: 6px;
     color: var(--muted);
@@ -7540,16 +7541,20 @@
     opacity: 0.75;
   }
 
-  /* The verb always reads whole; the agent's name is what gives way when
-     the rail is narrow (one ellipsis, never two). */
+  /* The agent's name gives way first when the rail is narrow (one ellipsis
+     before a second); the verb shrinks only once the name is gone, so the
+     narrowest rail still clips inside the button, never under the chevron. */
   .new-name {
-    flex: none;
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
     white-space: nowrap;
   }
 
   /* What the main surface will spawn — quiet transparency, not chrome. */
   .new-default {
-    flex: 0 1 auto;
+    flex: 0 24 auto;
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
