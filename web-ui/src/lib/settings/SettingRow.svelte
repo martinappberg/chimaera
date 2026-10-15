@@ -448,6 +448,17 @@
     padding-top: 2px;
   }
 
+  /* The theme cards are the one wide control. Above the stacking breakpoint
+     they give way first — shrink and wrap to three, then two a row — while
+     the text column keeps a readable floor; everything else stays flex-none. */
+  .control:has(.cards) {
+    flex: 0 1 auto;
+    min-width: 0;
+  }
+  .row:has(.cards) .text {
+    min-width: 240px;
+  }
+
   /* The toggle and the segmented bar are the shared primitives
      (shared/Switch.svelte, shared/Segmented.svelte) — their recipes live there. */
 
