@@ -33,13 +33,13 @@ use crate::driver::{
 };
 use crate::elicitation::{Elicitation, ElicitationAction, ELICITATION_PENDING};
 use crate::model::{
-    cap_head_tail, cap_output, clip_command, fmt_elapsed_secs, truncate_label, AgentCommand,
-    AgentEvent, BackgroundTask, BackgroundTaskClose, ChunkKind, Coalescer, CompactionPhase,
-    ContentBlock, ModeInfo, PermissionOption, PermissionOptionKind, PlanEntry, PlanStatus,
-    SlashCommand, ToolContent, ToolKind, ToolStatus, Usage, UsageWindow, UserMessageState,
-    WorkflowAgent, BG_LABEL_MAX, BG_PATH_MAX, BG_TASKS_CAP, COMMAND_ID_MAX, DIFF_FILE_BUDGET,
-    DIFF_TURN_BUDGET, PLAN_BLOCKED_CAP, PLAN_DESC_MAX, PLAN_LABEL_MAX, PLAN_TASKS_CAP,
-    SLASH_COMMANDS_CAP, SLASH_DESCRIPTION_MAX, SLASH_NAME_MAX, STATUS_DETAIL_MAX,
+    cap_head_tail, cap_output, clip_command, fmt_elapsed_secs, fmt_tokens, truncate_label,
+    AgentCommand, AgentEvent, BackgroundTask, BackgroundTaskClose, ChunkKind, Coalescer,
+    CompactionPhase, ContentBlock, ModeInfo, PermissionOption, PermissionOptionKind, PlanEntry,
+    PlanStatus, SlashCommand, ToolContent, ToolKind, ToolStatus, Usage, UsageWindow,
+    UserMessageState, WorkflowAgent, BG_LABEL_MAX, BG_PATH_MAX, BG_TASKS_CAP, COMMAND_ID_MAX,
+    DIFF_FILE_BUDGET, DIFF_TURN_BUDGET, PLAN_BLOCKED_CAP, PLAN_DESC_MAX, PLAN_LABEL_MAX,
+    PLAN_TASKS_CAP, SLASH_COMMANDS_CAP, SLASH_DESCRIPTION_MAX, SLASH_NAME_MAX, STATUS_DETAIL_MAX,
     SUBAGENT_RESULT_MAX, TOOL_SUMMARY_IDS_CAP, TOOL_SUMMARY_MAX, UNHANDLED_REQUESTS_CAP,
     UNHANDLED_REQUEST_NAME_MAX, WF_AGENTS_CAP, WF_AGENTS_SET_BUDGET, WF_AGENT_LABEL_MAX,
 };
@@ -5156,13 +5156,7 @@ fn subagent_stats(usage: &Value) -> Option<String> {
         usage["tool_uses"]
             .as_u64()
             .map(|n| format!("{n} tool{}", if n == 1 { "" } else { "s" })),
-        usage["total_tokens"].as_u64().map(|n| {
-            if n >= 1000 {
-                format!("{:.1}k tokens", n as f64 / 1000.0)
-            } else {
-                format!("{n} tokens")
-            }
-        }),
+        usage["total_tokens"].as_u64().map(fmt_tokens),
         usage["duration_ms"]
             .as_u64()
             .filter(|ms| *ms >= 1000)
