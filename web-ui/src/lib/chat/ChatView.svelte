@@ -32,6 +32,7 @@
   } from "./chatPool";
   import { dismiss } from "../shared/dismiss";
   import { formatElapsedSeconds, messageTimestampRefreshIn } from "../shared/time";
+  import { formatTokenCount } from "../shared/format";
   import ChatHeader from "./ChatHeader.svelte";
   import ChatFind from "./ChatFind.svelte";
   import { legacyCapabilities } from "./capabilities";
@@ -2184,9 +2185,7 @@
    *  the drivers' `fmt_tokens` spelling); hidden until the agent reports any. */
   const turnTokensLabel = $derived.by(() => {
     const n = store.turnTokens;
-    if (n <= 0) return null;
-    if (n >= 999_950) return `${(n / 1_000_000).toFixed(1)}M tokens`;
-    return n >= 1000 ? `${(n / 1000).toFixed(1)}k tokens` : `${n} tokens`;
+    return n > 0 ? `${formatTokenCount(n)} tokens` : null;
   });
   /** Work running beside the turn: live subagents plus the background set
    *  (commands, monitors, backgrounded agents; housekeeping excluded). A
@@ -2497,7 +2496,7 @@
       const n = block.outputTokens;
       byMessage.set(prev.uid, {
         duration: block.durationMs >= 100 ? formatDurationMs(block.durationMs) : null,
-        tokens: n > 0 ? (n >= 1000 ? `${(n / 1000).toFixed(1)}k tokens` : `${n} tokens`) : null,
+        tokens: n > 0 ? `${formatTokenCount(n)} tokens` : null,
       });
     });
     return byMessage;
@@ -3698,9 +3697,10 @@
        line reads shorter than the bubble above it (the desktop apps' 92%). */
     padding: 2px 8% 2px 0;
   }
-  /* On pointer devices the action cluster floats at the message's top right
-     (AgentMessageMeta) and takes no space; a closing paragraph keeps no
-     bottom margin, so a reply ends where its last line does. */
+  /* On pointer devices the action cluster floats at the message's bottom
+     right, over the gap below it (AgentMessageMeta), and takes no space; a
+     closing paragraph keeps no bottom margin, so a reply ends where its last
+     line does. */
   .msg.agent > :global(.md > p:last-child) {
     margin-bottom: 0;
   }
