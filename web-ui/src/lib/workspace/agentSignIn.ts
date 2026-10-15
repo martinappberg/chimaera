@@ -9,7 +9,7 @@ import { patchAgentSignedIn, type AgentInfo } from "./launcher";
 
 export interface SignInProgress {
   id: string;
-  how: "browser" | "terminal";
+  how: "browser";
   phase: "running" | "cancelling" | "succeeded" | "failed" | "cancelled";
   workspace_id: string;
   started_at: number;
@@ -19,15 +19,13 @@ export interface SignInProgress {
   code: string | null;
   /** The page will show a code to paste back (Claude). */
   accepts_code: boolean;
-  /** The managed terminal running the CLI (the terminal flow). */
-  terminal_session: string | null;
   message: string;
 }
 
 export interface SignInStatus {
   installed: boolean;
   signed_in: boolean | null;
-  how: "browser" | "terminal";
+  how: "browser";
   command: string;
   accepts_code: boolean;
   operation: SignInProgress | null;

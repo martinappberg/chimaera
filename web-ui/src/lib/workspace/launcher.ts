@@ -63,7 +63,8 @@ export interface AgentInfo {
 }
 
 export interface AgentSignIn {
-  how: "browser" | "terminal";
+  /** Headless under the daemon; the app opens the page. */
+  how: "browser";
   command: string;
   acceptsCode: boolean;
   operation?: { id: string; running: boolean; phase: string };
@@ -276,7 +277,7 @@ export function normalizeAgentCatalog(body: unknown): AgentInfo[] {
 function normalizeSignIn(raw: unknown): AgentSignIn | undefined {
   if (typeof raw !== "object" || raw === null) return undefined;
   const s = raw as Record<string, unknown>;
-  if (s.how !== "browser" && s.how !== "terminal") return undefined;
+  if (s.how !== "browser") return undefined;
   const op = typeof s.operation === "object" && s.operation !== null ? s.operation as Record<string, unknown> : null;
   return {
     how: s.how,

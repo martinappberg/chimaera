@@ -1,10 +1,10 @@
 //! Sign in to an agent CLI from the app. Two halves, one flow for every
 //! runtime: a bounded **status probe** (each CLI's own status command, cached
 //! on the agent catalog), and a bounded, cancellable **sign-in operation**
-//! that runs the CLI's own login under the daemon — headless where the CLI
-//! offers it (the URL and device code it prints are captured for the UI, a
-//! pasted code is fed back on stdin) and in a managed terminal where it does
-//! not. Chimaera never touches credentials: the CLI owns the login and its
+//! that runs the CLI's own headless login under the daemon (the URL and
+//! device code it prints are captured for the UI, a pasted code is fed back
+//! on stdin; a CLI that would open a browser itself is told not to, or gets a
+//! no-op `open` on its PATH). Chimaera never touches credentials: the CLI owns the login and its
 //! store, and success is only ever what the CLI's status command reports.
 use std::{
     collections::HashMap,
@@ -41,8 +41,6 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// be revoked outside chimaera, so the launcher's next open re-asks after
 /// this; a sign-in, a chat startup failure or `?check=true` re-ask at once.
 const STATUS_TTL: Duration = Duration::from_secs(10 * 60);
-/// A managed-terminal sign-in re-probes this often while the terminal lives.
-const TERMINAL_POLL: Duration = Duration::from_secs(15);
 const URL_LIMIT: usize = 8192;
 
 /// How this agent signs in.
@@ -52,9 +50,6 @@ pub(crate) enum How {
     /// The CLI's headless login under the daemon: it prints a URL (and for
     /// device-code flows a code) and waits; the UI opens the URL.
     Browser,
-    /// The CLI only signs in from its own interactive UI: a managed terminal
-    /// runs it and the daemon watches for the login to land.
-    Terminal,
 }
 
 /// The per-runtime truth table (docs/features/agents.md, "Sign in").
@@ -88,9 +83,14 @@ pub(crate) fn recipe(kind: AgentKind) -> Option<Recipe> {
             command: "cursor-agent login",
             accepts_code: false,
         },
+        // No login command, but print mode signs in headlessly: a native
+        // zero-turn command (`/skills`) triggers the OAuth URL and a 60 s wait
+        // for Google's hosted callback (probed 1.3.5). No pasted code: print
+        // mode reads a piped stdin as its prompt and abandons the login at
+        // once, so the login gets no stdin and only the callback completes it.
         AgentKind::Antigravity => Recipe {
-            how: How::Terminal,
-            command: "agy",
+            how: How::Browser,
+            command: "agy -p /skills",
             accepts_code: false,
         },
         AgentKind::Gemini => return None,
@@ -104,6 +104,10 @@ pub(crate) fn recipe(kind: AgentKind) -> Option<Recipe> {
 struct Headless {
     args: &'static [&'static str],
     env: &'static [(&'static str, &'static str)],
+    /// The CLI opens a browser itself and has no switch not to (Antigravity
+    /// ignores `BROWSER` and `NO_BROWSER`): a no-op `open` / `xdg-open` goes
+    /// first on its PATH, so only the app opens the page.
+    no_browser: bool,
 }
 
 fn login_launch(kind: AgentKind) -> Option<Headless> {
@@ -111,16 +115,31 @@ fn login_launch(kind: AgentKind) -> Option<Headless> {
         AgentKind::Claude => Headless {
             args: &["auth", "login"],
             env: &[("BROWSER", "true")],
+            no_browser: false,
         },
         AgentKind::Codex | AgentKind::Grok => Headless {
             args: &["login", "--device-auth"],
             env: &[],
+            no_browser: false,
         },
         AgentKind::Cursor => Headless {
             args: &["login"],
             env: &[("NO_OPEN_BROWSER", "1")],
+            no_browser: false,
         },
-        AgentKind::Antigravity | AgentKind::Gemini => return None,
+        AgentKind::Antigravity => Headless {
+            args: &[
+                "-p",
+                "/skills",
+                "--output-format",
+                "json",
+                "--print-timeout",
+                "15s",
+            ],
+            env: &[],
+            no_browser: true,
+        },
+        AgentKind::Gemini => return None,
     })
 }
 
@@ -370,8 +389,6 @@ pub(crate) struct Progress {
     code: Option<String>,
     /// The page will show a code to paste back (Claude).
     accepts_code: bool,
-    /// The managed terminal running the CLI (the terminal flow).
-    terminal_session: Option<String>,
     message: String,
 }
 impl Progress {
@@ -394,7 +411,9 @@ pub(crate) struct Operation {
 pub(crate) struct Request {
     workspace_id: String,
     request_id: String,
+    /// Accepted for compatibility; the headless flows have no theme.
     #[serde(default)]
+    #[allow(dead_code)]
     theme: Option<String>,
 }
 
@@ -505,35 +524,26 @@ pub(crate) async fn start(
             )
         }
     };
-    let theme = match body.theme.as_deref() {
-        Some("light") => "light",
-        _ => "dark",
-    };
-    let launch = match recipe.how {
-        How::Browser => {
-            let headless = login_launch(kind).expect("a browser recipe has a launch");
-            let mut argv = vec![bin.to_string_lossy().into_owned()];
-            argv.extend(headless.args.iter().map(|a| a.to_string()));
-            Launch::Browser {
-                argv,
-                env: headless
-                    .env
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-                    .collect(),
-                stdin: recipe.accepts_code,
-                cwd: workspace.root.clone(),
-            }
+    let launch = {
+        let headless = login_launch(kind).expect("a browser recipe has a launch");
+        let mut argv = vec![bin.to_string_lossy().into_owned()];
+        argv.extend(headless.args.iter().map(|a| a.to_string()));
+        Launch::Browser {
+            argv,
+            env: headless
+                .env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            stdin: recipe.accepts_code,
+            cwd: workspace.root.clone(),
+            no_browser: headless.no_browser,
         }
-        How::Terminal => Launch::Terminal {
-            workspace,
-            theme: theme.to_string(),
-        },
     };
     no_store(start_operation(state, kind, body, launch).await)
 }
 
-/// What a sign-in runs.
+/// What a sign-in runs (one shape today; tests script it).
 pub(crate) enum Launch {
     Browser {
         argv: Vec<String>,
@@ -541,10 +551,8 @@ pub(crate) enum Launch {
         /// Keep stdin open for a pasted code.
         stdin: bool,
         cwd: PathBuf,
-    },
-    Terminal {
-        workspace: crate::workspaces::Workspace,
-        theme: String,
+        /// Put a no-op `open` / `xdg-open` first on the login's PATH.
+        no_browser: bool,
     },
 }
 
@@ -566,11 +574,7 @@ async fn start_operation(
         url: None,
         code: None,
         accepts_code: recipe.accepts_code,
-        terminal_session: None,
-        message: match recipe.how {
-            How::Browser => "Starting the sign-in…".into(),
-            How::Terminal => "Opening a terminal…".into(),
-        },
+        message: "Starting the sign-in…".into(),
     };
     let operation = Arc::new(Operation {
         progress: Mutex::new(progress.clone()),
@@ -596,14 +600,12 @@ async fn start_operation(
                 env,
                 stdin,
                 cwd,
+                no_browser,
             } => {
                 run_browser(
-                    &state, &operation, kind, argv, env, stdin, cwd, cancelled, codes,
+                    &state, &operation, kind, argv, env, stdin, cwd, no_browser, cancelled, codes,
                 )
                 .await
-            }
-            Launch::Terminal { workspace, theme } => {
-                run_terminal(&state, &operation, kind, workspace, theme, cancelled).await
             }
         };
         finish(&operation, phase, &message);
@@ -757,13 +759,25 @@ async fn run_browser(
     extra_env: Vec<(String, String)>,
     stdin: bool,
     cwd: PathBuf,
+    no_browser: bool,
     cancel: watch::Receiver<bool>,
     mut codes: mpsc::Receiver<String>,
 ) -> (Phase, String) {
     if *cancel.borrow() {
         return (Phase::Cancelled, "Sign-in cancelled.".into());
     }
-    let env = crate::api::session_env(state, &lock(&op.progress).id, "dark", None);
+    let mut env = crate::api::session_env(state, &lock(&op.progress).id, "dark", None);
+    if no_browser {
+        match no_browser_dir().await {
+            Ok(dir) => env = with_path_prefix(env, &dir),
+            Err(err) => {
+                return (
+                    Phase::Failed,
+                    format!("Couldn't prepare the sign-in: {err}"),
+                )
+            }
+        }
+    }
     let remove = crate::api::spawn_env_remove(&env);
     let mut cmd = tokio::process::Command::new(&argv[0]);
     cmd.args(&argv[1..])
@@ -857,6 +871,40 @@ async fn run_browser(
     }
 }
 
+/// A folder whose `open` and `xdg-open` do nothing, for a login that would
+/// open a browser itself (the app opens the page). Under the runtime dir;
+/// rewritten when missing.
+async fn no_browser_dir() -> std::io::Result<PathBuf> {
+    let dir = chimaera_core::runtime_dir().join("no-browser");
+    tokio::task::spawn_blocking(move || {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(&dir)?;
+        for name in ["open", "xdg-open"] {
+            let path = dir.join(name);
+            if !path.exists() {
+                std::fs::write(&path, "#!/bin/sh\nexit 0\n")?;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+            }
+        }
+        Ok(dir)
+    })
+    .await
+    .map_err(|_| std::io::Error::other("the no-browser folder could not be prepared"))?
+}
+
+/// `dir` first on the environment's PATH (the session PATH, else the
+/// daemon's).
+fn with_path_prefix(mut env: Vec<(String, String)>, dir: &Path) -> Vec<(String, String)> {
+    let prefix = dir.display().to_string();
+    if let Some(entry) = env.iter_mut().find(|(k, _)| k == "PATH") {
+        entry.1 = format!("{prefix}:{}", entry.1);
+    } else {
+        let inherited = std::env::var("PATH").unwrap_or_default();
+        env.push(("PATH".into(), format!("{prefix}:{inherited}")));
+    }
+    env
+}
+
 /// The login exited cleanly: only the CLI's own status command says whether
 /// that was a sign-in.
 async fn verify(
@@ -882,85 +930,6 @@ async fn verify(
                 kind.product_name()
             ),
         ),
-    }
-}
-
-/// The terminal flow: the CLI's own UI in a managed terminal, watched until
-/// its status command reports a login, the terminal closes, or ten minutes.
-async fn run_terminal(
-    state: &Arc<AppState>,
-    op: &Operation,
-    kind: AgentKind,
-    workspace: crate::workspaces::Workspace,
-    theme: String,
-    mut cancel: watch::Receiver<bool>,
-) -> (Phase, String) {
-    let spec = crate::spawn::SpawnSpec {
-        workspace,
-        id: None,
-        name: Some(format!("sign in to {}", kind.product_name())),
-        cwd: None,
-        cols: None,
-        rows: None,
-        theme,
-        title_hint: None,
-        prelude: None,
-        kind: crate::spawn::SpawnKind::Agent {
-            kind,
-            model: None,
-            resume: None,
-        },
-        started_by: crate::history::StartedBy::You,
-    };
-    let session = match crate::spawn::spawn_session(state, spec).await {
-        Ok(json) => json["id"].as_str().unwrap_or_default().to_string(),
-        Err(crate::spawn::SpawnFailure::AgentUnavailable(why)) => return (Phase::Failed, why),
-        Err(crate::spawn::SpawnFailure::Internal(err)) => {
-            return (Phase::Failed, format!("Couldn't open a terminal: {err}"))
-        }
-    };
-    {
-        let mut p = lock(&op.progress);
-        p.terminal_session = Some(session.clone());
-        p.message = format!(
-            "Sign in to {} in the terminal that opened.",
-            kind.product_name()
-        );
-    }
-    state.changes.notify_waiters();
-    let bin = match crate::launcher::detect(state, kind, false).await.path {
-        Ok(bin) => bin,
-        Err(why) => return (Phase::Failed, why),
-    };
-    let started = Instant::now();
-    loop {
-        let alive = state.sessions.get(&session).is_some();
-        if let Some(true) = status(state, kind, &bin, true).await {
-            return (Phase::Succeeded, "Signed in.".into());
-        }
-        if !alive {
-            return (
-                Phase::Failed,
-                format!(
-                    "The terminal closed before {} reported a sign-in. Try again.",
-                    kind.product_name()
-                ),
-            );
-        }
-        if started.elapsed() >= DEADLINE {
-            return (
-                Phase::Failed,
-                "Still not signed in after ten minutes. Finish in the terminal, then check again."
-                    .into(),
-            );
-        }
-        tokio::select! {
-            _ = tokio::time::sleep(TERMINAL_POLL) => {}
-            _ = cancel.changed() => {
-                let _ = state.sessions.kill(&session);
-                return (Phase::Cancelled, "Sign-in cancelled.".into());
-            }
-        }
     }
 }
 
@@ -1086,6 +1055,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn antigravity_s_print_mode_login_shows_its_page_and_asks_for_the_code() {
+        let out = "Authentication required. Please visit the URL to log in:\n  https://accounts.google.com/o/oauth2/auth?access_type=offline&client_id=x&state=y\n\nWaiting for authentication (timeout 60s)...\nOr, paste the authorization code here and press Enter:\n";
+        assert_eq!(
+            first_url(out).as_deref(),
+            Some(
+                "https://accounts.google.com/o/oauth2/auth?access_type=offline&client_id=x&state=y"
+            )
+        );
+        assert_eq!(device_code(out), None);
+    }
+
+    #[test]
     fn urls_and_codes_come_out_of_each_login_s_output() {
         let cursor = "Starting login process...\nOpen a browser and navigate to this link: https://cursor.com/loginDeepControl?challenge=abc&uuid=1&mode=login&redirectTarget=cli\n";
         assert_eq!(
@@ -1201,6 +1182,16 @@ mod tests {
             ),
             Some(false)
         );
+        // 1.3.4 signed out: "Please sign in", exit 1.
+        assert_eq!(
+            parse_probe(
+                AgentKind::Antigravity,
+                false,
+                "Fetching available models...\nError: Please sign in to view available models. Launch the CLI without arguments to sign in.\n",
+                ""
+            ),
+            Some(false)
+        );
         // Offline is unknown, never "signed out".
         assert_eq!(
             parse_probe(
@@ -1217,16 +1208,21 @@ mod tests {
     fn every_catalog_agent_has_a_recipe_and_the_table_is_what_the_docs_say() {
         for kind in AgentKind::ALL {
             let recipe = recipe(kind).expect("a sign-in recipe");
-            match recipe.how {
-                How::Browser => assert!(login_launch(kind).is_some(), "{kind:?} launches headless"),
-                How::Terminal => {
-                    assert!(login_launch(kind).is_none(), "{kind:?} signs in in its TUI")
-                }
-            }
+            assert_eq!(recipe.how, How::Browser);
+            assert!(login_launch(kind).is_some(), "{kind:?} launches headless");
         }
-        assert_eq!(recipe(AgentKind::Antigravity).unwrap().how, How::Terminal);
+        assert_eq!(recipe(AgentKind::Antigravity).unwrap().how, How::Browser);
         assert!(recipe(AgentKind::Claude).unwrap().accepts_code);
+        assert!(!recipe(AgentKind::Antigravity).unwrap().accepts_code);
         assert!(!recipe(AgentKind::Codex).unwrap().accepts_code);
+        assert!(login_launch(AgentKind::Antigravity).unwrap().no_browser);
+        assert!(!login_launch(AgentKind::Cursor).unwrap().no_browser);
+        let env = with_path_prefix(
+            vec![("PATH".into(), "/usr/bin".into())],
+            Path::new("/x/no-browser"),
+        );
+        assert_eq!(env[0].1, "/x/no-browser:/usr/bin");
+        assert_eq!(with_path_prefix(vec![], Path::new("/x"))[0].0, "PATH");
     }
 
     #[test]
@@ -1282,6 +1278,7 @@ mod tests {
             env: vec![],
             stdin,
             cwd: "/tmp".into(),
+            no_browser: false,
         }
     }
     async fn wait_for(

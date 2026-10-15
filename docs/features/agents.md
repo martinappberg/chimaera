@@ -186,8 +186,8 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   flow uses one, and a field to paste a code back when the page shows one. Finish in the
   browser; the card says *Signed in* when the CLI itself reports the login, and a waiting chat
   starts again in place. **Cancel** stops the CLI's login; a failure says what the CLI said and
-  offers **Try again**. Antigravity signs in only from its own terminal UI: its button opens a
-  managed terminal running `agy` and the daemon notices when the login lands.
+  offers **Try again**. Antigravity's page waits 60 s for the callback (its CLI's limit), so a
+  slow sign-in simply means **Try again**.
 - **Per runtime.** Detection is each CLI's own status command, never a credential file;
   chimaera never reads, copies or refreshes a credential.
 
@@ -197,14 +197,14 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   | Codex | `codex login status` (exit 0 "Logged in" / exit 1 "Not logged in") | `codex login --device-auth` | page + a device code to enter |
   | Grok Build | `grok models` ("You are logged in" / "You are not authenticated") | `grok login --device-auth` | page + a device code to enter |
   | Cursor CLI | `cursor-agent status --format json` → `isAuthenticated` | `NO_OPEN_BROWSER=1 cursor-agent login` | page |
-  | Antigravity | `agy models` (lists the account's models; an auth-shaped failure is signed out, any other failure unknown) | its TUI, in a managed terminal | the terminal, watched |
+  | Antigravity | `agy models` (lists the account's models; signed out it says "Please sign in", exit 1; any other failure is unknown) | `agy -p /skills` (no login command, but print mode signs in headlessly: the native zero-turn `/skills` triggers its OAuth URL and waits 60 s for Google's hosted callback; no stdin — print mode reads a piped stdin as its prompt and abandons the login — so no pasted code; a no-op `open`/`xdg-open` first on its PATH keeps it from opening a browser itself, it ignores `BROWSER` and `NO_BROWSER`) | page (finish within 60 s, else Try again) |
 
   A status command that does not answer in 10 s is *unknown* (nothing is offered), never a
   verdict. A device code is single-use and leaves the wire with the operation's end.
 - **Where it lives.** `agent_auth.rs` (daemon), `workspace/agentSignIn.ts` +
   `workspace/AgentSignInCard.svelte` (the one card; Settings, the chat view). Wire, all
   additive: `GET /api/v1/agents` rows carry `signed_in: true|false|null` and
-  `sign_in: {how: browser|terminal, command, accepts_code, operation}`;
+  `sign_in: {how: browser, command, accepts_code, operation}`;
   `GET /api/v1/agents/{id}/sign-in[?check=true]` (the status, re-asked with `check`),
   `POST /api/v1/agents/{id}/sign-in {workspace_id, request_id, theme?}` (start or join — a
   repeated click, a second window — the one operation per agent),
@@ -222,8 +222,7 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   only the URL, the code and a short failure tail reach the wire), no session or PTY entry;
   cancel is SIGTERM then SIGKILL to the group. A clean exit is never success by itself — the
   status command is asked again. Concurrent status probes for one agent share a run. The
-  terminal flow re-probes every 15 s while its terminal lives, and ends when the terminal
-  closes. The chat view shows one line per failure: a startup error that a fatal banner shows
+  chat view shows one line per failure: a startup error that a fatal banner shows
   is not repeated as a transcript line, and a fatal banner is not followed by *agent exited*.
 
 ## Cursor CLI

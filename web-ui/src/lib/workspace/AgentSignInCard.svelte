@@ -15,8 +15,8 @@
 
   interface Props {
     agent: AgentInfo;
-    /** A sign-in runs in a workspace (the CLI's cwd, the terminal flow's
-     *  home); without one the card only reports. */
+    /** A sign-in runs in a workspace (the CLI's cwd); without one the card
+     *  only reports. */
     workspaceId: string | null;
     /** Start the login at once (the user already clicked Sign in elsewhere). */
     autostart?: boolean;
@@ -47,7 +47,6 @@
     status?.operation && (signInRunning(status.operation) || status.operation.id === ownAttempt) ? status.operation : null,
   );
   const running = $derived(signInRunning(operation));
-  const how = $derived(status?.how ?? agent.signIn?.how ?? "browser");
   const pageHost = $derived.by(() => {
     try { return operation?.url ? new URL(operation.url).hostname : null; } catch { return null; }
   });
@@ -132,7 +131,7 @@
   {:else if running}
     <p class="line" role="status">
       {#if operation?.url}
-        {how === "terminal" ? operation.message : `Finish signing in at ${pageHost ?? "the page"}.`}
+        {`Finish signing in at ${pageHost ?? "the page"}.`}
       {:else}
         {operation?.message ?? "Starting the sign-in…"}
       {/if}
@@ -165,8 +164,6 @@
     <p class="line" class:failure={operation?.phase === "failed"} role="status">
       {#if operation?.phase === "failed" || operation?.phase === "cancelled"}
         {operation.message}
-      {:else if how === "terminal"}
-        {agent.name} signs in from its own terminal. Chimaera opens one and notices when the login lands.
       {:else if agent.signedIn === true}
         {agent.name} is signed in on this host. Sign in again to switch accounts or refresh the login.
       {:else if agent.signedIn === null}
@@ -177,7 +174,7 @@
     </p>
     <div class="actions">
       <button class="btn primary" disabled={busy || workspaceId === null || !status} onclick={() => void start()}>
-        {busy ? "Starting…" : operation ? "Try again" : how === "terminal" ? "Sign in in a terminal" : agent.signedIn === true ? "Sign in again" : "Sign in"}
+        {busy ? "Starting…" : operation ? "Try again" : agent.signedIn === true ? "Sign in again" : "Sign in"}
       </button>
       {#if onDismiss}<button class="link quiet" onclick={onDismiss}>Not now</button>{/if}
     </div>

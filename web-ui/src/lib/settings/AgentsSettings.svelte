@@ -146,7 +146,10 @@
               <button class="btn primary" disabled={wsId === null} onclick={() => void install(a, "update")}>Update</button>
             {:else if (!a.installed || a.updateAvailable || a.outdated) && a.installUrl}
               <button class="link" onclick={() => openInSystemBrowser(a.installUrl!)}>{a.installed ? "Update instructions ↗" : "Install instructions ↗"}</button>
-            {:else if needsSignIn(a) && !signingIn[a.id] && !a.signIn?.operation?.running}
+            {/if}
+            <!-- Sign-in is its own need, beside an update or a missing chat
+                 companion rather than behind them. -->
+            {#if a.installed && needsSignIn(a) && !busy && !signingIn[a.id] && !a.signIn?.operation?.running}
               <button class="btn primary" disabled={wsId === null} onclick={() => { signingIn[a.id] = true; }}>Sign in</button>
             {/if}
           </div>
