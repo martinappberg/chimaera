@@ -957,98 +957,104 @@ async fn agents_rows_flag_managed_installs() {
     assert_eq!(row("agy")["managed_install"], true);
 }
 
-/// A detection miss is served for a short window instead of re-running the
-/// login shell per read — unless a refresh asks, the path setting now names
-/// a runnable file, or a managed install landed.
+/// A detection miss is served for a short window, to the catalog read only:
+/// a spawn probes, a refresh probes, a hit is never shadowed, and a refresh
+/// whose probe misses keeps a hit that still validates.
 #[tokio::test]
-async fn a_recent_miss_is_served_without_the_login_shell_until_something_changes() {
+async fn a_cached_miss_serves_only_catalog_reads_and_never_shadows_a_hit() {
     use std::os::unix::fs::PermissionsExt;
     let state = test_state();
     let kind = agents::AgentKind::Grok;
-    lock(&state.agent_misses).insert(
-        kind,
-        (
-            "grok not found (test)".to_string(),
-            std::time::Instant::now(),
-        ),
-    );
+    let stamp = |state: &Arc<AppState>, reason: &str, at: std::time::Instant| {
+        lock(&state.agent_misses).insert(kind, (reason.to_string(), at));
+    };
 
-    // Served at once, with the recorded reason: no shell, no version probe.
-    let started = std::time::Instant::now();
-    let miss = launcher::detect(&state, kind, false).await;
+    // The catalog read serves it, with the recorded reason.
+    stamp(&state, "grok not found (test)", std::time::Instant::now());
+    let miss = launcher::detect_for_catalog(&state, kind, false).await;
     assert_eq!(
         miss.path.as_ref().err().map(String::as_str),
         Some("grok not found (test)")
     );
     assert!(miss.version.is_none() && !miss.managed && !miss.explicit);
-    assert!(
-        started.elapsed() < std::time::Duration::from_millis(500),
-        "a cached miss must not run the login shell"
+    // A spawn's read probes instead (whatever this host has, never the stamp).
+    let probed = launcher::detect(&state, kind, false).await;
+    assert_ne!(
+        probed.path.as_ref().err().map(String::as_str),
+        Some("grok not found (test)"),
+        "a spawn never acts on a cached miss"
+    );
+    // A refresh sees past it too.
+    stamp(&state, "stale", std::time::Instant::now());
+    lock(&state.agent_bins).remove(&kind);
+    let refreshed = launcher::detect_for_catalog(&state, kind, true).await;
+    assert_ne!(
+        refreshed.path.as_ref().err().map(String::as_str),
+        Some("stale")
+    );
+    // An expired stamp is not served either.
+    stamp(
+        &state,
+        "expired",
+        std::time::Instant::now()
+            .checked_sub(launcher::MISS_TTL)
+            .unwrap_or_else(std::time::Instant::now),
+    );
+    lock(&state.agent_bins).remove(&kind);
+    let later = launcher::detect_for_catalog(&state, kind, false).await;
+    assert_ne!(
+        later.path.as_ref().err().map(String::as_str),
+        Some("expired")
     );
 
-    // An explicit path that now runs is seen past the miss.
-    let dir = test_dir("miss-explicit");
+    // A hit is never shadowed by a stamp, and a refresh whose probe misses
+    // (the login shell can't see this fake) keeps the still-valid hit and
+    // records no miss over it.
+    let dir = test_dir("miss-hit");
     let bin = dir.join("grok");
-    std::fs::write(
-        &bin,
-        "#!/bin/sh
-echo 'grok 9.9.9'
-",
-    )
-    .unwrap();
+    std::fs::write(&bin, "#!/bin/sh\necho 'grok 9.9.9'\n").unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-    lock(&state.settings)
-        .put(
-            serde_json::json!({"agents.grok.path": bin.to_string_lossy()})
-                .as_object()
-                .cloned()
-                .unwrap(),
-        )
-        .unwrap();
-    let hit = launcher::detect(&state, kind, false).await;
+    preset_agent(&state, kind, Ok(bin.clone()), Some("grok 9.9.9"));
+    stamp(&state, "shadow", std::time::Instant::now());
+    let hit = launcher::detect_for_catalog(&state, kind, false).await;
     assert_eq!(hit.path.as_deref().ok(), Some(bin.as_path()));
-    assert!(hit.explicit);
+    lock(&state.agent_misses).remove(&kind);
+    let kept = launcher::detect_for_catalog(&state, kind, true).await;
+    assert!(
+        kept.path.is_ok(),
+        "a refresh never turns a valid hit into a miss"
+    );
     assert!(
         lock(&state.agent_misses).get(&kind).is_none(),
-        "a hit forgets the miss"
+        "no miss is stamped while a validating hit exists"
     );
+}
 
-    // An expired miss is probed again (here: the explicit path still wins).
-    lock(&state.agent_misses).insert(
-        kind,
-        (
-            "stale".to_string(),
-            std::time::Instant::now() - launcher::MISS_TTL,
-        ),
-    );
-    lock(&state.agent_bins).remove(&kind);
-    assert!(launcher::detect(&state, kind, false).await.path.is_ok());
-
-    // A changed path setting forgets every miss outright.
+/// The two explicit "look again" moments forget every cached miss: a changed
+/// `agents.<id>.path` through the settings route, and Extensions' re-check.
+#[tokio::test]
+async fn a_changed_agent_path_and_an_extensions_recheck_forget_cached_misses() {
+    let state = test_state();
+    let kind = agents::AgentKind::Grok;
     lock(&state.agent_misses).insert(kind, ("x".to_string(), std::time::Instant::now()));
-    launcher::forget_misses(&state);
-    assert!(lock(&state.agent_misses).is_empty());
-
-    // A managed install landing under the managed bin dir is seen past a
-    // fresh miss too (it is what the next probe resolves).
-    lock(&state.settings)
-        .put(
-            serde_json::json!({"agents.grok.path": ""})
-                .as_object()
-                .cloned()
-                .unwrap(),
-        )
-        .unwrap();
-    lock(&state.agent_bins).remove(&kind);
-    lock(&state.agent_misses).insert(kind, ("x".to_string(), std::time::Instant::now()));
-    let managed_bin = runtimes::managed_bin_dir(&state.managed_root);
-    std::fs::create_dir_all(&managed_bin).unwrap();
-    std::fs::copy(&bin, managed_bin.join("grok")).unwrap();
-    let probed = launcher::detect(&state, kind, false).await;
+    let (status, _) = request(
+        &state,
+        Method::PUT,
+        "/api/v1/settings",
+        Some(serde_json::json!({"agents.grok.path": "/nonexistent/grok"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
     assert!(
-        probed.path.is_ok(),
-        "the managed copy is found: {:?}",
-        probed.path
+        lock(&state.agent_misses).is_empty(),
+        "the settings route forgets misses"
+    );
+
+    lock(&state.agent_misses).insert(kind, ("x".to_string(), std::time::Instant::now()));
+    agent_probe::refresh_probes(&state).await;
+    assert!(
+        lock(&state.agent_misses).is_empty(),
+        "Check again forgets misses"
     );
 }
 

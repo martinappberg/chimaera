@@ -217,10 +217,39 @@ fn validate_cache_hit(hit: &AgentDetection) -> CacheHit {
 /// an update that replaced or moved the binary is noticed at the next spawn
 /// (without re-running the 6s login-shell probe the cache exists to avoid).
 pub(crate) async fn detect(state: &AppState, kind: AgentKind, refresh: bool) -> AgentDetection {
-    if !refresh {
-        if let Some(miss) = cached_miss(state, kind) {
-            return miss;
+    detect_inner(state, kind, refresh, false).await
+}
+
+/// The catalog's read (`GET /agents` without `refresh`): the ONE caller a
+/// cached miss is served to, so a launcher paint or a Settings poll never
+/// re-runs a login shell per uninstalled agent. Every other caller — spawns,
+/// a sign-in status read, a refresh — probes on a miss, so a CLI the user
+/// just installed is found the moment they start it.
+pub(crate) async fn detect_for_catalog(
+    state: &AppState,
+    kind: AgentKind,
+    refresh: bool,
+) -> AgentDetection {
+    detect_inner(state, kind, refresh, true).await
+}
+
+async fn detect_inner(
+    state: &AppState,
+    kind: AgentKind,
+    refresh: bool,
+    serve_miss: bool,
+) -> AgentDetection {
+    // A hit that still validates outlives a transient probe miss (a slow rc
+    // on NFS, a login shell that timed out): on a refresh it is kept and no
+    // miss is recorded over it.
+    let mut validating_hit = None;
+    if refresh {
+        if let Some(hit) = crate::lock(&state.agent_bins).get(&kind).cloned() {
+            if !matches!(validate_cache_hit(&hit), CacheHit::Gone) {
+                validating_hit = Some(hit);
+            }
         }
+    } else {
         let hit = crate::lock(&state.agent_bins).get(&kind).cloned();
         if let Some(hit) = hit {
             let same_install = hit.explicit
@@ -249,6 +278,11 @@ pub(crate) async fn detect(state: &AppState, kind: AgentKind, refresh: bool) -> 
                         crate::lock(&state.agent_bins).remove(&kind);
                     }
                 }
+            }
+        }
+        if serve_miss {
+            if let Some(miss) = cached_miss(state, kind) {
+                return miss;
             }
         }
     }
@@ -286,15 +320,20 @@ pub(crate) async fn detect(state: &AppState, kind: AgentKind, refresh: bool) -> 
     // for the lifetime would wedge the agent as "not installed" until a
     // daemon restart; but every uncached miss costs the login-shell probe
     // again, and a catalog read with two uninstalled agents paid seconds per
-    // call (field-measured). So a miss is served for `MISS_TTL` only, and
-    // the launcher's own open (`refresh`), a changed path setting, a managed
-    // install landing and an explicit runnable path all see past it.
+    // call (field-measured). So a miss is stamped for `MISS_TTL` and served
+    // to the catalog read only (`detect_for_catalog`); a changed path
+    // setting, Extensions' re-check and the next hit forget it.
     match &detection.path {
         Ok(_) => {
             crate::lock(&state.agent_bins).insert(kind, detection.clone());
             crate::lock(&state.agent_misses).remove(&kind);
         }
         Err(reason) => {
+            if let Some(hit) = validating_hit {
+                // The executable is still there: the probe, not the install,
+                // failed this time.
+                return hit;
+            }
             crate::lock(&state.agent_misses).insert(kind, (reason.clone(), Instant::now()));
         }
     }
@@ -306,26 +345,12 @@ pub(crate) async fn detect(state: &AppState, kind: AgentKind, refresh: bool) -> 
 /// on the slow paths and at once on every refresh path.
 pub(crate) const MISS_TTL: Duration = Duration::from_secs(90);
 
-/// A recent miss to serve instead of probing — unless something cheap says
-/// the picture changed: the per-agent path setting now names a runnable
-/// file, or a managed install landed under the managed bin dir (one stat
-/// each; a hit there must be probed for real so its version and provenance
-/// are right).
+/// A recent miss, for the catalog read: no stats, no probe — a refresh, a
+/// spawn, a changed path setting and an install's own re-detect are the
+/// ways a landed executable is noticed before the stamp expires.
 fn cached_miss(state: &AppState, kind: AgentKind) -> Option<AgentDetection> {
     let (reason, at) = crate::lock(&state.agent_misses).get(&kind).cloned()?;
     if at.elapsed() >= MISS_TTL {
-        return None;
-    }
-    let explicit = crate::lock(&state.settings).agent_path(kind);
-    if explicit.is_some_and(|p| is_executable(Path::new(&p))) {
-        return None;
-    }
-    if managed_fallback(
-        kind.as_str(),
-        &crate::runtimes::managed_bin_for(state, kind.as_str()),
-    )
-    .is_some()
-    {
         return None;
     }
     Some(AgentDetection {
@@ -337,10 +362,10 @@ fn cached_miss(state: &AppState, kind: AgentKind) -> Option<AgentDetection> {
     })
 }
 
-/// Forget every cached miss: the next read probes again. For a changed
-/// `agents.<id>.path` (settings) — the explicit path may name a file that is
-/// not runnable yet, which the cheap check in `cached_miss` would keep
-/// serving the old miss for.
+/// Forget every cached miss: the next catalog read probes again. Called for
+/// a changed `agents.<id>.path` (settings) and by Extensions' explicit
+/// re-check (`agent_probe::refresh_probes`) — the two moments the user has
+/// said "look again" without opening the launcher.
 pub(crate) fn forget_misses(state: &AppState) {
     crate::lock(&state.agent_misses).clear();
 }
@@ -573,7 +598,7 @@ pub(crate) async fn list_agents(
     let detect_all = futures::future::join_all(AgentKind::ALL.into_iter().map(|kind| {
         let state = state.clone();
         async move {
-            let detection = detect(&state, kind, query.refresh).await;
+            let detection = detect_for_catalog(&state, kind, query.refresh).await;
             let chat_ready = match &detection.path {
                 Ok(bin) if kind.chat_capable() => chat_executable(&state, kind, bin).await.is_ok(),
                 _ => false,

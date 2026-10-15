@@ -154,10 +154,13 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   Routes `GET /api/v1/agents`, `GET /api/v1/agents/claude/sessions`.
 - **Key behaviors.** Detection runs the registered agents' login shells + version probes concurrently (serial would
   visibly stall the popover), with a 6s timeout backstopped by well-known paths. A hit is cached for
-  the daemon's lifetime (stat-validated, so an in-place update is noticed); a miss is cached for 90 s
-  only, so a catalog read with uninstalled agents doesn't re-run a login shell per agent per call,
-  while a refresh (the launcher's own open, Settings), a changed `agents.<id>.path`, an explicit path
-  that now runs, or a managed install landing all see past it at once. `is_outdated` flags
+  the daemon's lifetime (stat-validated, so an in-place update is noticed); a miss is stamped for 90 s
+  and served to **the catalog read only** (`GET /agents` without `refresh`), so a launcher paint or a
+  Settings poll doesn't re-run a login shell per uninstalled agent per call. Everything else probes:
+  a spawn, a refresh (the launcher's own open, Settings' load), Extensions' Check again (which also
+  forgets the stamps), and a changed `agents.<id>.path` (which forgets them too). A refresh whose
+  probe misses keeps a hit that still validates — a slow login shell never turns an installed agent
+  into "not installed". `is_outdated` flags
   npm-era codex (0.1.x). The Antigravity IDE's `agy` symlink (which just opens the GUI) is detected
   and refused. Resumables are scanned off the reactor, exclude transcripts already open in a live
   session, and are titled by the same custom > ai > first-prompt chain as live naming. Latest
