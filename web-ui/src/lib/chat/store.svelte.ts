@@ -127,6 +127,7 @@ const TRANSCRIPT_EVENTS = new Set([
   "elicitation_resolved",
   "usage_report",
   "messages_superseded",
+  "thought_retracted",
   "notice",
   "turn_completed",
   "turn_aborted",
@@ -1674,6 +1675,9 @@ export class ChatStore {
       case "messages_superseded":
         this.dropTrailingProse();
         break;
+      case "thought_retracted":
+        this.retractThought(ev.turn_id as string, Number(ev.utf16_len) || 0);
+        break;
       case "rewind_result":
         this.rewind = {
           userMessageId: ev.user_message_id as string,
@@ -2257,6 +2261,37 @@ export class ChatStore {
    *  pending stack), so the trailing prose run is always at the very tail — a
    *  plain tail splice. A queued send the agent read mid-turn (resolved `sent`
    *  at a step boundary) is a real boundary and correctly stops the scan. A non-tail splice → rebuild. */
+  /** The driver learned that the last `len` UTF-16 units of `turnId`'s
+   *  thought stream were prose (Claude narration that streamed as thought
+   *  before its signature said so); the same text follows as message
+   *  chunks. Cut it off the turn's newest thought row, and drop that row
+   *  when only whitespace is left and it is still the tail (a pure tail cut
+   *  moves no indexed row). Pure over the journal, so replay renders the
+   *  same transcript. */
+  private retractThought(turnId: string, len: number): void {
+    if (len <= 0) return;
+    for (let i = this.blocks.length - 1; i >= 0; i--) {
+      const block = this.blocks[i];
+      if (block.kind !== "thought") {
+        // Prose or a user row after it: the thought is not this turn's
+        // latest stream, so there is nothing of it to retract.
+        if (block.kind === "message" || block.kind === "user") return;
+        continue;
+      }
+      if (block.turnId !== turnId) return;
+      const kept = block.text.slice(0, Math.max(0, block.text.length - len)).trimEnd();
+      if (kept.length > 0) {
+        block.text = kept;
+      } else if (i === this.blocks.length - 1) {
+        this.blocks.splice(i, 1);
+        this.structuralVersion += 1;
+      } else {
+        block.text = "";
+      }
+      return;
+    }
+  }
+
   private dropTrailingProse(): void {
     const end = this.blocks.length;
     let start = end;

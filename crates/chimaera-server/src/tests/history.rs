@@ -422,6 +422,43 @@ async fn two_sessions_writing_one_file_hear_about_each_other_once() {
     assert!(pairs
         .iter()
         .any(|p| p["session"] == a.as_str() && p["other"] == b.as_str()));
+    assert!(
+        pairs.iter().all(|p| p["active"] == false),
+        "no turn running: {body}"
+    );
+
+    // Long after both wrote it, with neither in a turn, the overlap is not
+    // news any more: the route lists nothing and no hook repeats it.
+    let same_file = || {
+        let state = state.clone();
+        let uri = format!("/api/v1/workspaces/{ws}/same-file");
+        async move { request(&state, Method::GET, &uri, None).await.1 }
+    };
+    for sid in [&a, &b] {
+        history::tests::age_writes(&state, sid, history::SAME_FILE_FRESH_MS + 1);
+    }
+    let body = same_file().await;
+    assert_eq!(body["pairs"], serde_json::json!([]), "{body}");
+    let (_, body) = hook(&a, "ka", write("/w/notes.md")).await;
+    assert_eq!(body, serde_json::json!({}), "a stale overlap is not told");
+
+    // A writes it again inside a running turn: B's notice is back and says
+    // the write is live, while B's own old write stays out of A's list.
+    history::observe_hook(&state, &a, "UserPromptSubmit", None, None);
+    hook(&a, "ka", write("/w/qc.py")).await;
+    let body = same_file().await;
+    let pairs = body["pairs"].as_array().unwrap();
+    assert_eq!(pairs.len(), 1, "{body}");
+    assert_eq!(pairs[0]["session"], b.as_str());
+    assert_eq!(pairs[0]["other"], a.as_str());
+    assert_eq!(pairs[0]["active"], true);
+    // Even an old write of the running turn stays shown until it ends.
+    history::tests::age_writes(&state, &a, history::SAME_FILE_FRESH_MS + 1);
+    let body = same_file().await;
+    assert_eq!(body["pairs"].as_array().unwrap().len(), 1, "{body}");
+    history::observe_hook(&state, &a, "Stop", None, None);
+    let body = same_file().await;
+    assert_eq!(body["pairs"], serde_json::json!([]), "{body}");
 
     state.sessions.kill(&a).ok();
     state.sessions.kill(&b).ok();

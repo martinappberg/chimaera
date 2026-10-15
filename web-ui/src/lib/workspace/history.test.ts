@@ -2,12 +2,17 @@ import { describe, expect, it } from "vitest";
 import {
   aggTokens,
   commitCount,
+  currentSameFileNotes,
   formatDuration,
   formatTokens,
   isRecord,
+  nextSameFileExpiry,
   recordTitle,
+  SAME_FILE_FRESH_MS,
+  sameFileCurrent,
   sameFileOverlaps,
   startedByLabel,
+  type SameFileWrite,
 } from "./history";
 import type { Session } from "./sessions";
 
@@ -133,5 +138,60 @@ describe("sameFileOverlaps", () => {
     );
     expect(out.get("a")).toEqual([{ other: "b", path: "/w/2" }]);
     expect(out.get("c")).toEqual([{ other: "a", path: "/w/1" }]);
+  });
+});
+
+describe("same-file notice lifetime", () => {
+  const now = 50 * 3_600_000;
+  const minutes = (n: number) => n * 60_000;
+  const write = (other: string, path: string, ago: number, active = false): SameFileWrite => ({
+    other,
+    path,
+    at: now - ago,
+    active,
+  });
+
+  it("shows a write while it is recent or the writer's running turn made it", () => {
+    expect(sameFileCurrent(write("b", "/w/a", minutes(3)), now)).toBe(true);
+    expect(sameFileCurrent(write("b", "/w/a", SAME_FILE_FRESH_MS - 1), now)).toBe(true);
+    // Hours later, the other session idle: both still open is not news.
+    expect(sameFileCurrent(write("b", "/w/a", SAME_FILE_FRESH_MS), now)).toBe(false);
+    expect(sameFileCurrent(write("b", "/w/a", minutes(18 * 60)), now)).toBe(false);
+    // Its running turn wrote it: shown however long ago, until the turn ends.
+    expect(sameFileCurrent(write("b", "/w/a", minutes(120), true), now)).toBe(true);
+  });
+
+  it("keeps the newest current write per other session, newest first", () => {
+    const notes = currentSameFileNotes(
+      [
+        write("b", "/w/old", minutes(120)),
+        write("b", "/w/new", minutes(2)),
+        write("b", "/w/mid", minutes(5)),
+        write("c", "/w/x", minutes(1)),
+        write("d", "/w/stale", minutes(16)),
+        write("e", "/w/live", minutes(90), true),
+      ],
+      now,
+    );
+    expect(notes.map((n) => [n.other, n.path])).toEqual([
+      ["c", "/w/x"],
+      ["b", "/w/new"],
+      ["e", "/w/live"],
+    ]);
+    expect(currentSameFileNotes([write("b", "/w/a", minutes(1))], now + SAME_FILE_FRESH_MS)).toEqual(
+      [],
+    );
+  });
+
+  it("wakes once, when the next shown write ages out", () => {
+    expect(
+      nextSameFileExpiry(
+        [write("b", "/w/a", minutes(10)), write("c", "/w/b", minutes(2)), write("d", "/w/c", 0, true)],
+        now,
+      ),
+    ).toBe(now - minutes(10) + SAME_FILE_FRESH_MS);
+    // Nothing to wake for: only a running turn's write, or only stale ones.
+    expect(nextSameFileExpiry([write("d", "/w/c", minutes(30), true)], now)).toBeNull();
+    expect(nextSameFileExpiry([write("b", "/w/a", minutes(30))], now)).toBeNull();
   });
 });

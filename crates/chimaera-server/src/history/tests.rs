@@ -304,3 +304,37 @@ fn csv_quotes_formula_cells_and_leaves_unknown_empty() {
     // Unknown cost is an empty cell, never 0.
     assert!(row.contains(",100,10,,"), "{row}");
 }
+
+#[test]
+fn a_same_file_write_is_news_while_recent_or_in_the_running_turn() {
+    let now = 48 * 60 * 60 * 1000;
+    let just = now - 60_000;
+    let stale = now - SAME_FILE_FRESH_MS;
+    // Recent, writer idle: shown, not active.
+    assert_eq!(same_file_current(just, None, now), Some(false));
+    // Past the window, writer idle: gone — both sessions merely being open
+    // is not news.
+    assert_eq!(same_file_current(stale, None, now), None);
+    assert_eq!(
+        same_file_current(now - 18 * 60 * 60 * 1000, None, now),
+        None
+    );
+    // Written in the turn running now: shown however long the turn runs.
+    assert_eq!(same_file_current(stale, Some(stale - 1), now), Some(true));
+    // A running turn that has not written it (the write predates the turn)
+    // falls back to the age rule.
+    assert_eq!(same_file_current(stale, Some(stale + 1), now), None);
+    assert_eq!(same_file_current(just, Some(just + 1), now), Some(false));
+}
+
+/// Test-only: move every recorded write of `sid` back by `ms`.
+pub(crate) fn age_writes(state: &AppState, sid: &str, ms: u64) {
+    if let Some(l) = crate::lock(&state.history.live).get_mut(sid) {
+        for (_, at) in l.touched.iter_mut() {
+            *at = at.saturating_sub(ms);
+        }
+        if let Some(start) = l.turn_at.as_mut() {
+            *start = start.saturating_sub(ms);
+        }
+    }
+}
