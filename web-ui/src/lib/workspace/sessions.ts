@@ -16,6 +16,9 @@ export interface Workspace {
    * none is configured (and on old daemons). Exactly one per workspace.
    */
   mastermind?: { session_id: string; mode: "ask" | "auto"; agent?: string };
+  /** The remembered "new agents start in their own worktree" choice; absent
+   *  (old daemons) = off. */
+  new_in_worktree?: boolean;
 }
 
 export type SessionKind = "shell" | "agent";
@@ -165,6 +168,11 @@ export interface Session {
    * outside a repository; absent on old daemons.
    */
   git?: SessionGit | null;
+  /**
+   * The Chimaera-managed worktree folder this session was started in (under
+   * ~/.chimaera/worktrees), else null; absent on old daemons.
+   */
+  managed_worktree?: string | null;
 }
 
 /** Where a session stands in git (the daemon's session tracker). */
@@ -482,6 +490,18 @@ export async function touchWorkspace(id: string): Promise<Workspace> {
   return json(await api(`/workspaces/${id}/open`, { method: "POST" }));
 }
 
+/** Remember whether new agents in this workspace start in their own
+ *  worktree. Returns the updated row (404 for an unknown workspace). */
+export async function setNewInWorktree(id: string, on: boolean): Promise<Workspace> {
+  return json(
+    await api(`/workspaces/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ new_in_worktree: on }),
+    }),
+  );
+}
+
 /** Unregister a workspace from the daemon (the folder itself is untouched). */
 export async function deleteWorkspace(id: string): Promise<void> {
   await json<void>(await api(`/workspaces/${id}`, { method: "DELETE" }));
@@ -534,6 +554,49 @@ export interface AgentSpawn {
    *  workspace's worktrees (a branch's own checkout). The session stays in
    *  its workspace; only where it works changes. */
   cwd?: string;
+  /** Start in a fresh Chimaera-managed worktree (a new branch off the
+   *  repository's HEAD). Agents only; never with `resume` or `cwd`. */
+  worktree?: boolean;
+}
+
+/**
+ * Whether a spawn should ask for its own worktree: a NEW agent (no resume,
+ * no explicit folder) in a git workspace whose remembered choice is on.
+ * Reopens, resumes and "+ New branch" (which carries its cwd) never do.
+ */
+export function wantsWorktree(
+  kind: SessionKind,
+  spawn: AgentSpawn,
+  workspace: Pick<Workspace, "new_in_worktree"> | null,
+  isRepo: boolean,
+): boolean {
+  return (
+    kind === "agent" &&
+    isRepo &&
+    workspace?.new_in_worktree === true &&
+    spawn.resume === undefined &&
+    (spawn.cwd === undefined || spawn.cwd === "")
+  );
+}
+
+/** True when a session other than `exceptId` still works in the managed
+ *  worktree at `path` (its spawn folder, current folder, or checkout). */
+export function worktreeInUse(
+  sessions: readonly Session[],
+  path: string,
+  exceptId: string | null = null,
+): boolean {
+  const inside = (p: string | null | undefined): boolean =>
+    typeof p === "string" && (p === path || p.startsWith(`${path}/`));
+  return sessions.some(
+    (s) =>
+      s.id !== exceptId &&
+      s.alive &&
+      (s.managed_worktree === path ||
+        inside(s.cwd) ||
+        inside(s.cwd_current) ||
+        inside(s.git?.worktree)),
+  );
 }
 
 /** Saved/explicit surfaces are authoritative. Only fresh, implicit launches
@@ -568,11 +631,14 @@ export async function createSession(
           cols: Math.min(Math.max(Math.round(size.cols), 20), 500),
           rows: Math.min(Math.max(Math.round(size.rows), 5), 200),
         };
-  const extras: Record<string, string> = {};
+  const extras: Record<string, string | boolean> = {};
   if (kind === "agent") {
     if (spawn.agent !== undefined && spawn.agent !== "claude") extras.agent = spawn.agent;
     if (spawn.resume !== undefined) extras.resume = spawn.resume;
     if (spawn.titleHint !== undefined && spawn.titleHint !== "") extras.title_hint = spawn.titleHint;
+    if (spawn.worktree === true && spawn.resume === undefined && (spawn.cwd ?? "") === "") {
+      extras.worktree = true;
+    }
     // New agent sessions open in the structured chat view by default (the
     // agents.defaultView setting); an explicit launcher choice (its terminal
     // button vs "open") overrides the setting for that one spawn. The

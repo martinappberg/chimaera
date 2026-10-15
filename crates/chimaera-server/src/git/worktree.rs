@@ -260,6 +260,79 @@ pub(crate) async fn ensure_branch_worktree(
     create_in(state, &workspace.id, &git.path, &repo, branch, base).await
 }
 
+/// Where a new agent session's own worktree goes: a fresh branch
+/// `chimaera/<agent>-<6 hex>` off the workspace repository's current HEAD,
+/// checked out at `<managed root>/<repo>-<hash>/chimaera/<agent>-<6 hex>`
+/// (the managed root is `~/.chimaera/worktrees`). Outside the repository on
+/// purpose: the main checkout's status stays clean, nothing is written into
+/// a shared repository, and the removal fences only ever act under the
+/// managed root. It is an ordinary registered worktree, locked
+/// (`chimaera: <session>`) while an agent works inside, so `git worktree
+/// list`-based clean-up (Claude Code's, `scripts/worktree-gc`) sees it as
+/// in use; once unlocked it is judged like any other worktree.
+pub(crate) async fn create_session_worktree(
+    state: &Arc<AppState>,
+    workspace: &crate::workspaces::Workspace,
+    agent: &str,
+) -> Result<Created, Refusal> {
+    let git = state.git.resolve_git(configured_git(state)).await;
+    if !git.adequate {
+        return Err(refuse(
+            StatusCode::BAD_REQUEST,
+            "git is missing or too old for worktrees",
+        ));
+    }
+    let Some(repo) = state
+        .git
+        .discover(&git.path, &workspace.id, &workspace.root)
+        .await
+        .into_repo()
+    else {
+        return Err(refuse(
+            StatusCode::BAD_REQUEST,
+            "this workspace is not a git repository",
+        ));
+    };
+    let agent: String = agent
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(24)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let agent = if agent.is_empty() {
+        "agent".into()
+    } else {
+        agent
+    };
+    // A clash (an existing branch of that name) just draws again; never
+    // check out somebody's existing branch for a "new worktree".
+    for _ in 0..4 {
+        let suffix: String = chimaera_core::generate_token()
+            .chars()
+            .filter(|c| c.is_ascii_hexdigit())
+            .take(6)
+            .collect::<String>()
+            .to_ascii_lowercase();
+        let branch = format!("chimaera/{agent}-{suffix}");
+        if branch_exists(&git.path, &state.git.procs, &repo.toplevel, &branch).await {
+            continue;
+        }
+        return create_in(state, &workspace.id, &git.path, &repo, &branch, None).await;
+    }
+    Err(refuse(
+        StatusCode::CONFLICT,
+        "could not pick a free branch name for the worktree",
+    ))
+}
+
+/// The Chimaera-managed worktree a session started in: its spawn folder,
+/// when that sits under the managed root (sessions start at a worktree's
+/// top level). No filesystem access — safe on every session snapshot.
+pub(crate) fn managed_worktree_of(state: &AppState, cwd: &Path) -> Option<PathBuf> {
+    (cwd.starts_with(&state.worktrees_root_real) || cwd.starts_with(&state.worktrees_root))
+        .then(|| cwd.to_path_buf())
+}
+
 #[derive(Deserialize)]
 pub(crate) struct CreateWorktree {
     workspace_id: String,

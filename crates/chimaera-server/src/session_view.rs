@@ -301,6 +301,15 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
                     "git".to_string(),
                     facts.map_or(serde_json::Value::Null, |f| f.git.clone()),
                 );
+                // Additive: the Chimaera-managed worktree an agent was
+                // started in (its spawn folder under the managed root), so
+                // the UI can label it and offer removal once it ends.
+                let managed = (map.get("kind").and_then(|k| k.as_str()) == Some("agent"))
+                    .then(|| map.get("cwd").and_then(|c| c.as_str()))
+                    .flatten()
+                    .filter(|c| !c.is_empty())
+                    .and_then(|c| crate::git::managed_worktree_of(state, std::path::Path::new(c)));
+                map.insert("managed_worktree".to_string(), json!(managed));
             }
             row
         })

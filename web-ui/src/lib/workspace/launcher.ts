@@ -274,12 +274,19 @@ export interface RecentConvo {
    *  the same mode. Null for pre-`ui` entries and scanned transcripts → the
    *  conversation reopens in terminal view. */
   ui: "chat" | "term" | null;
+  /** The Chimaera-managed worktree the conversation ran in, only while it
+   *  still exists (reopening resumes there server-side); else null. */
+  worktree: string | null;
 }
 
 /** GET /api/v1/recents — the workspace's ended agent conversations. */
 export async function listRecents(workspaceId: string): Promise<RecentConvo[]> {
   const q = new URLSearchParams({ workspace_id: workspaceId });
-  const body = await json<unknown>(await api(`/recents?${q.toString()}`));
+  return parseRecents(await json<unknown>(await api(`/recents?${q.toString()}`)));
+}
+
+/** Defensive parse of a /recents body (old daemons omit newer fields). */
+export function parseRecents(body: unknown): RecentConvo[] {
   if (!Array.isArray(body)) return [];
   return body.flatMap((raw): RecentConvo[] => {
     if (typeof raw !== "object" || raw === null) return [];
@@ -297,6 +304,7 @@ export async function listRecents(workspaceId: string): Promise<RecentConvo[]> {
         resume,
         lastActive: typeof r.last_active === "number" ? r.last_active : 0,
         ui: r.ui === "chat" || r.ui === "term" ? r.ui : null,
+        worktree: typeof r.worktree === "string" && r.worktree !== "" ? r.worktree : null,
       },
     ];
   });

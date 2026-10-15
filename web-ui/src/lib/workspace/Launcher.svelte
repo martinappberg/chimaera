@@ -24,6 +24,10 @@
    *
    * Resuming lives in the rail's RECENT section, not here.
    *
+   * In a git workspace one quiet switch sits under the rows: new agents start
+   * in their own worktree (a fresh branch). Remembered per workspace; every
+   * new-agent path follows it, not only this popover.
+   *
    * Keyboard: ArrowUp/Down moves the highlight, Enter activates (spawn or
    * install), Escape closes.
    */
@@ -56,9 +60,23 @@
      *  Rows paint from it INSTANTLY — no "checking…" flash on every open —
      *  and the background re-detect swaps in the truth. */
     initial?: AgentInfo[] | null;
+    /** The workspace's "new agents start in a new worktree" choice; null
+     *  hides the switch (not a git repository). */
+    inWorktree?: boolean | null;
+    onToggleWorktree?: (next: boolean) => void;
   }
 
-  let { anchor, onPick, onInstall, onUpdate, onClose, onAgents, initial = null }: Props = $props();
+  let {
+    anchor,
+    onPick,
+    onInstall,
+    onUpdate,
+    onClose,
+    onAgents,
+    initial = null,
+    inWorktree = null,
+    onToggleWorktree,
+  }: Props = $props();
 
   let agents = $state<AgentInfo[] | null>(null);
   let loadError = $state<string | null>(null);
@@ -392,6 +410,40 @@
       {/each}
     </div>
 
+    {#if inWorktree !== null}
+      <!-- A remembered choice, not a step: Enter/Space toggle here and must
+           not reach the root's Enter (which would spawn). -->
+      <button
+        class="wtrow"
+        role="switch"
+        aria-checked={inWorktree}
+        title={inWorktree
+          ? "new agents start on a fresh branch in their own worktree"
+          : "start new agents on a fresh branch in their own worktree"}
+        onclick={() => onToggleWorktree?.(!inWorktree)}
+        onkeydown={(e) => {
+          if (e.key === "Enter" || e.key === " ") e.stopPropagation();
+        }}
+      >
+        <span class="gslot">
+          <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+            <path
+              d="M5 3v7.5M5 12.5v.5M11 3v3a2.5 2.5 0 0 1-2.5 2.5H5"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.4"
+              stroke-linecap="round"
+            />
+            <circle cx="5" cy="12.6" r="1.6" fill="none" stroke="currentColor" stroke-width="1.4" />
+            <circle cx="5" cy="2.4" r="1.6" fill="none" stroke="currentColor" stroke-width="1.4" />
+            <circle cx="11" cy="2.4" r="1.6" fill="none" stroke="currentColor" stroke-width="1.4" />
+          </svg>
+        </span>
+        <span class="wtlabel">In a new worktree</span>
+        <span class="wtswitch" class:on={inWorktree} aria-hidden="true"><span class="wtknob"></span></span>
+      </button>
+    {/if}
+
     <div class="foot">
       <span><kbd>↑↓</kbd> choose</span>
       <span><kbd>↵</kbd> open</span>
@@ -720,6 +772,95 @@
   .obtn:active,
   .tbtn:active {
     transform: translateY(0.5px);
+  }
+
+  /* The worktree switch: a row in the agents' own language (glyph slot,
+     label), the Switch recipe at a smaller size on the right. */
+  .wtrow {
+    appearance: none;
+    border: none;
+    background: none;
+    font: inherit;
+    flex: none;
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    margin-top: 5px;
+    padding: 6px 9px;
+    border-top: 1px solid var(--edge);
+    border-radius: 0;
+    text-align: left;
+    font-size: var(--text-sm);
+    color: var(--muted);
+    cursor: pointer;
+    transition: color 0.12s ease;
+  }
+
+  .wtrow:hover,
+  .wtrow[aria-checked="true"] {
+    color: var(--fg);
+  }
+
+  .wtrow:focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: -2px;
+    border-radius: 6px;
+  }
+
+  .wtlabel {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .wtswitch {
+    flex: none;
+    position: relative;
+    width: 26px;
+    height: 15px;
+    border: 1px solid var(--edge);
+    border-radius: 8px;
+    background: var(--row-hover);
+    transition:
+      background-color 0.14s ease,
+      border-color 0.14s ease;
+  }
+
+  .wtknob {
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--muted);
+    transition:
+      transform 0.14s ease,
+      background-color 0.14s ease;
+  }
+
+  .wtswitch.on {
+    background: color-mix(in srgb, var(--accent) 28%, var(--row-hover));
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
+  }
+
+  .wtswitch.on .wtknob {
+    transform: translateX(11px);
+    background: var(--accent);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .wtswitch,
+    .wtknob {
+      transition: none;
+    }
+  }
+
+  .wtrow + .foot {
+    margin-top: 0;
   }
 
   .foot {

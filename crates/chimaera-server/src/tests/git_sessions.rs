@@ -646,3 +646,71 @@ async fn managed_worktrees_are_locked_while_an_agent_runs_inside() {
         "someone else"
     );
 }
+/// `worktree: true` starts a new agent in a managed worktree of its own on a
+/// fresh `chimaera/<agent>-<hex>` branch, and the row says so; the
+/// per-workspace choice round-trips through PATCH. Refused for shells, with
+/// `cwd`/`resume`, and outside a repository.
+#[tokio::test]
+async fn a_new_agent_can_start_in_its_own_managed_worktree() {
+    let repo = init_temp_repo("sg-own-wt");
+    let state = test_state();
+    preset_agent(
+        &state,
+        crate::agents::AgentKind::Claude,
+        Ok(PathBuf::from("/bin/cat")),
+        None,
+    );
+    let (ws, _) = add_workspace(&state, &repo).await;
+
+    let (status, row) = request(
+        &state,
+        Method::PATCH,
+        &format!("/api/v1/workspaces/{ws}"),
+        Some(serde_json::json!({"new_in_worktree": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{row}");
+    assert_eq!(row["new_in_worktree"], true);
+    assert!(lock(&state.workspaces).get(&ws).unwrap().new_in_worktree);
+
+    for bad in [
+        serde_json::json!({"workspace_id": ws, "kind": "shell", "worktree": true}),
+        serde_json::json!({"workspace_id": ws, "kind": "agent", "worktree": true, "resume": "x"}),
+        serde_json::json!({"workspace_id": ws, "kind": "agent", "worktree": true, "cwd": repo}),
+    ] {
+        let (status, err) = request(&state, Method::POST, "/api/v1/sessions", Some(bad)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+    }
+
+    let (status, session) = request(
+        &state,
+        Method::POST,
+        "/api/v1/sessions",
+        Some(serde_json::json!({"workspace_id": ws, "kind": "agent", "worktree": true})),
+    )
+    .await;
+    assert!(status.is_success(), "spawn failed: {session}");
+    let id = session["id"].as_str().unwrap().to_string();
+    let cwd = PathBuf::from(session["cwd"].as_str().unwrap());
+    let managed = std::fs::canonicalize(&state.worktrees_root).unwrap();
+    assert!(cwd.starts_with(&managed), "{cwd:?} not under {managed:?}");
+    let branch = git_in(&cwd, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    assert!(branch.starts_with("chimaera/claude-"), "{branch}");
+    assert!(cwd.ends_with(&branch), "named after its branch: {cwd:?}");
+    assert_eq!(session["workspace_id"], ws, "it stays in this workspace");
+    let entry = session_entry(&state, &id).await;
+    assert_eq!(entry["managed_worktree"], serde_json::json!(cwd));
+    state.sessions.kill(&id).ok();
+
+    // Not a repository: refused, nothing created.
+    let plain = test_dir("sg-own-wt-plain");
+    let (plain_ws, _) = add_workspace(&state, &plain).await;
+    let (status, err) = request(
+        &state,
+        Method::POST,
+        "/api/v1/sessions",
+        Some(serde_json::json!({"workspace_id": plain_ws, "kind": "agent", "worktree": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+}

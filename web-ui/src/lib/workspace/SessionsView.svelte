@@ -215,6 +215,7 @@
       resume,
       lastActive: Math.floor((r.ended ?? r.started) / 1000),
       ui: r.reopen?.ui ?? r.ui,
+      worktree: null,
     });
   }
 
