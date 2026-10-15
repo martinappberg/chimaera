@@ -474,7 +474,7 @@
              link: a remembered setting, not a step. A focused switch's own
              Enter/Space must not also reach the root's Enter (a second flip). -->
         <button
-          class="wt"
+          class="foot-btn wt"
           class:hl={hl === wtIndex}
           role="menuitemcheckbox"
           aria-checked={inWorktree}
@@ -510,7 +510,7 @@
         <span class="hint"><kbd>{isMac ? "⌘" : "ctrl"}↵</kbd> terminal</span>
       {/if}
       <button
-        class="settings"
+        class="foot-btn settings"
         class:hl={hl === settingsIndex}
         role="menuitem"
         tabindex="-1"
@@ -550,12 +550,12 @@
     display: flex;
     flex-direction: column;
     padding: 5px;
-    /* The app's popover surface (app.css .overlay-surface): one radius and
-       shadow for every menu that hangs off the chrome. */
+    /* The app's popover surface (app.css .overlay-surface's tokens): one
+       radius and shadow for every menu that hangs off the chrome. */
     background: var(--overlay-bg);
     border: 1px solid var(--edge);
-    border-radius: 8px;
-    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.22);
+    border-radius: var(--overlay-radius);
+    box-shadow: var(--overlay-shadow);
     outline: none;
     animation: pop 0.12s ease-out;
   }
@@ -814,8 +814,8 @@
     color: var(--fg);
     background: var(--overlay-bg);
     border: 1px solid var(--edge);
-    border-radius: 6px;
-    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+    border-radius: var(--overlay-radius);
+    box-shadow: var(--overlay-shadow);
     opacity: 0;
     pointer-events: none;
     transition: opacity 0.12s ease;
@@ -830,20 +830,15 @@
     transform: translateY(0.5px);
   }
 
-  /* The worktree switch: a footer control in the settings link's language
-     (same padding, radius and hot state), the Switch recipe at a smaller
-     size after its label. Both footer controls take the rows' side padding,
-     so their hot boxes sit flush with the rows' above. */
-  .wt {
+  /* The footer's two controls — the worktree switch and the settings link —
+     share one quiet button: the rows' side padding (so their hot boxes sit
+     flush with the rows' above), the rows' radius and hot state. */
+  .foot-btn {
     appearance: none;
     border: none;
     background: none;
     font: inherit;
     font-size: var(--text-xs);
-    min-width: 0;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
     padding: 4px 9px;
     border-radius: 5px;
     color: var(--muted);
@@ -853,13 +848,22 @@
       background-color 0.12s ease;
   }
 
-  .wt.hl,
-  .wt[aria-checked="true"] {
+  .foot-btn.hl {
     color: var(--fg);
+    background: var(--row-hover);
   }
 
-  .wt.hl {
-    background: var(--row-hover);
+  /* The worktree switch: the Switch recipe at a smaller size after its
+     label; an engaged switch keeps its label in the foreground. */
+  .wt {
+    min-width: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .wt[aria-checked="true"] {
+    color: var(--fg);
   }
 
   .wt svg {
@@ -943,24 +947,6 @@
     border-radius: 4px;
   }
 
-  /* Settings → Agents: the way into everything this menu doesn't do. */
-  .settings {
-    appearance: none;
-    border: none;
-    background: none;
-    font: inherit;
-    font-size: var(--text-xs);
-    color: var(--muted);
-    padding: 4px 9px;
-    border-radius: 5px;
-    cursor: pointer;
-    transition:
-      color 0.12s ease,
-      background-color 0.12s ease;
-  }
-
-  .settings.hl {
-    color: var(--fg);
-    background: var(--row-hover);
-  }
+  /* Settings → Agents: the way into everything this menu doesn't do — the
+     footer button as is. */
 </style>

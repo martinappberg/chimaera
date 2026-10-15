@@ -429,7 +429,7 @@
   /* fg color-mix, not --row-hover: the card sits on --term-bg, where the
      solid row tokens tuned for --bg surfaces can clash. */
   .expand:not(.inert):hover {
-    background: color-mix(in srgb, var(--fg) 4%, transparent);
+    background: var(--hover-tint);
   }
   .expand.inert {
     cursor: default;
@@ -524,10 +524,12 @@
     background: var(--accent);
     animation: pulse 1.4s ease-in-out infinite;
   }
-  /* Settled and fine is the expected outcome: the row's quiet voice (the
-     finished rows' check), not the live accent. */
+  /* Settled and fine is the expected outcome: a quiet ring in the finished
+     rows' check colour — a different shape from the solid live dot, so the
+     two read apart even with the pulse off (reduced motion). */
   .dot.ok {
-    background: color-mix(in srgb, var(--accent) 55%, var(--muted));
+    background: none;
+    box-shadow: inset 0 0 0 1.5px var(--done-quiet);
   }
   .dot.bad {
     background: var(--err);

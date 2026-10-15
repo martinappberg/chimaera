@@ -732,12 +732,15 @@
     }
   }
 
-  /* The work drop-down rides the shared WorkTray shell — the same card
-     the chat trays wear, never a forked copy — inset inside this card like
-     the plan rows above it. Row content mirrors AgentsTray (subagent rows)
-     and BackgroundTray (background rows). */
+  /* The work drop-down rides the shared WorkTray shell — the same pinned
+     card the chat trays wear, never a forked copy — inset inside this card
+     like the plan rows above it, spaced by the card's own gap. Transparent
+     here: an opaque tint inside the overlay-coloured card read as a
+     recessed well and hid the unread wash. Row content mirrors AgentsTray
+     (subagent rows) and BackgroundTray (background rows). */
   .work {
-    margin: 6px 0 2px;
+    --pinned-card-bg: transparent;
+    margin: 0;
   }
   .subname {
     flex: none;
