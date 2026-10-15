@@ -483,6 +483,20 @@
     min-height: var(--line);
   }
 
+  /* The theme cards are the one wide control. Above the stacking breakpoint
+     their track may shrink below its content (the cards then wrap to three,
+     two a row) while the text track keeps a readable floor; every other
+     control keeps the auto track. Scoped to the wide layout: the stacked
+     query below redraws the grid and must win there. */
+  @container settings (width > 640px) {
+    .row:has(.cards) {
+      grid-template-columns: minmax(240px, 1fr) minmax(0, auto) 28px;
+    }
+    .control:has(.cards) {
+      min-width: 0;
+    }
+  }
+
   /* The toggle and the segmented bar are the shared primitives
      (shared/Switch.svelte, shared/Segmented.svelte) — their recipes live there. */
 
@@ -615,9 +629,14 @@
 
   /* --- theme cards --- */
   .cards {
+    --card-w: 92px;
+    --card-gap: 10px;
     display: flex;
     flex-wrap: wrap;
-    gap: 10px;
+    gap: var(--card-gap);
+    /* Four windows to a row: an auto track sizes to its content, so without
+       a cap a long list of themes keeps widening instead of wrapping. */
+    max-width: calc(4 * var(--card-w) + 3 * var(--card-gap));
   }
 
   .card {
@@ -634,7 +653,7 @@
 
   .card-window {
     display: flex;
-    width: 92px;
+    width: var(--card-w);
     height: 56px;
     border: 1px solid var(--edge);
     border-radius: 7px;

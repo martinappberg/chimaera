@@ -99,6 +99,20 @@ a `settings` frame on `/ws/events`. Map: [settings/AGENTS.md](../../web-ui/src/l
 - **Theme palettes** (`themes.ts`) — each theme carries its own hand-tuned 16-color terminal ANSI
   palette alongside the UI tokens; a UI theme without a terminal palette is "half a theme". UI quality
   (curated light/dark) is an acceptance criterion, per [rules/web-ui.md](../../.claude/rules/web-ui.md).
+  The set: the two Chimaera defaults, then GitHub Light, One Light, Catppuccin Latte, Rosé Pine Dawn,
+  Terracotta Light and Graphite Light; Tokyo Night, One Dark Pro, Catppuccin Mocha, Terracotta Dark
+  and Graphite Dark. Terracotta (ivory and charcoal, a clay accent) and Graphite (true neutrals, a
+  soft green accent) are Chimaera's own pairs; the rest start from their canonical palettes with
+  surfaces stepped for the rail/pane layering. A stored id the registry no longer knows falls back to
+  the mode's Chimaera default.
+- **Legibility contract** (`themes.contrast.test.ts`) — every color a theme uses as text holds
+  WCAG 4.5:1 on its pane sheet (comments 3.8, muted also 4:1 on a selected row, terminal ANSI 4.5 /
+  bright 3.5); a canonical tone that misses is moved by OKLab lightness only, hue and chroma kept,
+  so the theme still reads as itself. The accent is a dot-and-button color and may sit under the
+  floor; where it renders as text (markdown links, tool-card paths) it goes through
+  `--accent-text` (`app.css`: the accent a quarter toward `--fg`), which passes on every theme.
+  Secondary chat lines (thoughts, tool rows, finished work) use `--muted` at full strength — no
+  opacity tier below it — because faded-muted text was the one tier that failed everywhere.
 
 ---
 
@@ -120,3 +134,19 @@ _Captured 2026-07-09 — drafted from context, reframed by the maintainer._
   broadcast, never-brick-on-corrupt, defaults living in the web-ui schema — are how it's implemented
   today, not the point.
 - **Do not change:** the direction — that more of the app becomes user-customizable over time.
+
+### Why the theme set and the legibility floors
+_Captured 2026-10-15 from the maintainer's direction in the session that shipped them._
+
+- **Readability first, identity kept.** The complaint was that chat text sometimes read worse than
+  the Claude desktop app. Measurement showed the base colors were fine and the faded secondary tier
+  was the problem; the fix is to stop fading, not to crank contrast. The two Chimaera defaults are
+  the product's look — "it should still be the dark and the white" — and a warmed variant was tried
+  and rejected as "too prominent, almost green". A darkened accent read as "cold, less awake", so
+  the vivid accent stays and only its text use is mixed toward the foreground.
+- **Themes are "just themes".** The extra palettes exist to be nicer, readable and modern, not to
+  carry structure; swapping dated editor palettes for current ones was meant to be a small change.
+  Rosé Pine Dawn stays as the one playful light theme. Terracotta and Graphite answer a wish for a
+  warm-paper look and a true-neutral look under Chimaera's own names, never another product's.
+- **Do not change:** the floors (they are the test), the default neutrals, and the rule that a
+  palette moves by lightness only.

@@ -509,7 +509,7 @@
     display: inline-flex;
     align-items: center;
     gap: 3px;
-    color: color-mix(in srgb, var(--accent) 85%, var(--fg));
+    color: var(--accent-text);
     font-family: var(--mono, monospace);
     font-size: var(--text-xs);
   }
@@ -603,7 +603,7 @@
     background: none;
     border: none;
     padding: 0 0 4px;
-    color: var(--accent);
+    color: var(--accent-text);
     font-size: var(--text-sm);
     font-family: var(--mono, monospace);
     cursor: pointer;

@@ -1266,7 +1266,7 @@
     margin-bottom: 0;
   }
   .md :global(a) {
-    color: var(--accent);
+    color: var(--accent-text);
   }
   /* Chat's one table delta over the shared recipe (app.css "Markdown
      tables"), which styles the .md-table host tables.ts emits and every

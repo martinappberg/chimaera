@@ -11,17 +11,19 @@
  * swatches) from this list — adding a theme here is the whole job.
  *
  * Palette provenance: chimaera-* are the original hand-tuned palettes.
- * nord, gruvbox-dark, solarized-light, rose-pine-dawn, and catppuccin-* start
- * from the canonical published palettes, with surface/edge tones adapted to
- * chimaera's rail/pane/stage layering.
+ * github-light, one-light, one-dark, tokyo-night, rose-pine-dawn and
+ * catppuccin-* start from the canonical published palettes, with surface/edge
+ * tones adapted to chimaera's rail/pane/stage layering (2026-10-15: nord,
+ * gruvbox and solarized-light left — editor palettes that never sat well on a
+ * layered workbench). terracotta-* and graphite-* are chimaera's own: a warm
+ * ivory/charcoal pair and a true-neutral pair.
  *
  * Legibility contract (readability pass 2026-07-07): every color a theme uses
  * AS TEXT holds WCAG >= 4.5:1 against its sheet (>= 3.5:1 for bright ANSI
  * variants, >= 3.8:1 for comments, which must stay visibly dimmer than code).
  * Where a canonical tone missed the floor, its OKLab lightness was moved just
  * far enough to pass with the hue and chroma untouched, so each theme still
- * reads unmistakably as itself. Nord is kept exactly canonical — its softness
- * is the point, and the terminal's minimumContrastRatio floor backstops it.
+ * reads unmistakably as itself. themes.contrast.test.ts enforces the floors.
  */
 
 /** Every themable CSS custom property; each theme must define them all. */
@@ -104,9 +106,9 @@ const chimaeraLight: ThemeDef = {
     "--bg": "#fbfbfc",
     "--fg": "#1d1d20",
     "--muted": "#65656d", // holds 4.5:1 even on --row-active
-    "--accent": "#2e9e6b",
+    "--accent": "#2e9e6b", // 3.4:1 on white: never text as-is — links mix it toward --fg
     "--err": "#cc4444",
-    "--warn": "#a5730d", // renders as note TEXT, not just a dot — 4.0:1 floor
+    "--warn": "#9d6d0e", // renders as note TEXT, not just a dot
     "--rate": "#8a68c0",
     "--rail-bg": "#f3f3f5",
     "--row-hover": "#ececef",
@@ -170,7 +172,7 @@ const chimaeraDark: ThemeDef = {
   kind: "dark",
   tokens: {
     "--bg": "#17171c",
-    "--fg": "#e7e7ea",
+    "--fg": "#dcdce0", // one step off white: 15:1 glared next to every other dark theme (12–13)
     "--muted": "#9a9aa6",
     "--accent": "#3fbf85",
     "--err": "#d96b6b",
@@ -179,7 +181,7 @@ const chimaeraDark: ThemeDef = {
     "--rail-bg": "#1c1c23",
     "--row-hover": "#25252d",
     "--row-active": "#2d2d36",
-    "--term-selection": "#e7e7ea33",
+    "--term-selection": "#dcdce033",
     "--term-bg": "#121218",
     "--scrim": "rgba(0, 0, 0, 0.5)",
     "--overlay-bg": "#202028",
@@ -190,7 +192,7 @@ const chimaeraDark: ThemeDef = {
     "--syn-number": "#d0a355",
     "--syn-type": "#6fb3d2",
     "--syn-func": "#82a7e8",
-    "--syn-def": "#e7e7ea",
+    "--syn-def": "#dcdce0",
     "--syn-prop": "#a58fd6",
     "--ficon-generic": "#8b8b95",
     "--ficon-lang": "#6f9ae4",
@@ -223,263 +225,9 @@ const chimaeraDark: ThemeDef = {
   },
 };
 
-// --- Nord (arcticicestudio's canonical nord0–nord15) ------------------------
 
-const nord: ThemeDef = {
-  id: "nord",
-  label: "Nord",
-  kind: "dark",
-  tokens: {
-    "--bg": "#323947", // between panes (nord0) and rail
-    "--fg": "#d8dee9", // nord4
-    "--muted": "#8792a8", // lightened nord3 for legible secondary text
-    "--accent": "#88c0d0", // nord8, the signature frost cyan
-    "--err": "#bf616a", // nord11
-    "--warn": "#ebcb8b", // nord13
-    "--rate": "#b48ead", // nord15
-    "--rail-bg": "#373f4f",
-    "--row-hover": "#414b5e",
-    "--row-active": "#4a566c",
-    "--term-selection": "#d8dee930",
-    "--term-bg": "#2e3440", // nord0, the canonical editor bg
-    "--scrim": "rgba(0, 0, 0, 0.45)",
-    "--overlay-bg": "#3b4252", // nord1
-    "--edge": "#434c5e", // nord2
-    "--syn-keyword": "#81a1c1", // nord9
-    "--syn-string": "#a3be8c", // nord14
-    "--syn-comment": "#616e88", // the community's brightened comment tone
-    "--syn-number": "#b48ead", // nord15
-    "--syn-type": "#8fbcbb", // nord7
-    "--syn-func": "#88c0d0", // nord8
-    "--syn-def": "#d8dee9",
-    "--syn-prop": "#81a1c1",
-    "--ficon-generic": "#8792a8",
-    "--ficon-lang": "#81a1c1",
-    "--ficon-data": "#8fbcbb",
-    "--ficon-doc": "#9aa5ba",
-    "--ficon-media": "#d08770", // nord12
-    "--ficon-archive": "#ebcb8b",
-    "--ficon-config": "#95a0b5",
-    "--ficon-bio": "#b48ead",
-    "--ficon-vcs": "#d08770",
-  },
-  // Canonical Nord terminal mapping; brightBlack lifted to the widely used
-  // #616e88 (nord3 at 4.5+:1 on nord0 — the spec's #4c566a is ~2:1 and the
-  // contrast floor would repaint it anyway).
-  ansi: {
-    black: "#3b4252",
-    red: "#bf616a",
-    green: "#a3be8c",
-    yellow: "#ebcb8b",
-    blue: "#81a1c1",
-    magenta: "#b48ead",
-    cyan: "#88c0d0",
-    white: "#e5e9f0",
-    brightBlack: "#616e88",
-    brightRed: "#bf616a",
-    brightGreen: "#a3be8c",
-    brightYellow: "#ebcb8b",
-    brightBlue: "#81a1c1",
-    brightMagenta: "#b48ead",
-    brightCyan: "#8fbcbb",
-    brightWhite: "#eceff4",
-  },
-};
 
-// --- Gruvbox Dark (morhetz's canonical medium-contrast dark) ---------------
 
-const gruvboxDark: ThemeDef = {
-  id: "gruvbox-dark",
-  label: "Gruvbox Dark",
-  kind: "dark",
-  tokens: {
-    "--bg": "#282828", // bg0
-    "--fg": "#ebdbb2", // fg1
-    "--muted": "#bdae93", // fg3 — fg4 fell under 4:1 on selections
-    "--accent": "#b8bb26", // bright green — chimaera's alive-green, gruvboxed
-    "--err": "#ff533d", // bright red nudged over 4.5:1 (it renders as error TEXT)
-    "--warn": "#fabd2f",
-    "--rate": "#d3869b",
-    "--rail-bg": "#32302f", // bg0_s
-    "--row-hover": "#3c3836", // bg1
-    "--row-active": "#453f3a", // between bg1 and bg2 — bg2 drowned muted text
-    "--term-selection": "#ebdbb230",
-    "--term-bg": "#1d2021", // bg0_h — panes get the hard-contrast well
-    "--scrim": "rgba(0, 0, 0, 0.5)",
-    "--overlay-bg": "#32302f",
-    "--edge": "#45403d",
-    "--syn-keyword": "#fb4934",
-    "--syn-string": "#b8bb26",
-    "--syn-comment": "#928374",
-    "--syn-number": "#d3869b",
-    "--syn-type": "#fabd2f",
-    "--syn-func": "#8ec07c",
-    "--syn-def": "#ebdbb2",
-    "--syn-prop": "#83a598",
-    "--ficon-generic": "#928374",
-    "--ficon-lang": "#83a598",
-    "--ficon-data": "#8ec07c",
-    "--ficon-doc": "#a89984",
-    "--ficon-media": "#fe8019",
-    "--ficon-archive": "#d79921",
-    "--ficon-config": "#bdae93",
-    "--ficon-bio": "#d3869b",
-    "--ficon-vcs": "#fe8019",
-  },
-  // Normal slots take gruvbox's BRIGHT palette (the iconic tones): the spec's
-  // faded neutrals sit at 3.0–3.9:1 on bg0_h and read as mud next to their
-  // bright twins. Nord ships the same normal==bright doubling.
-  ansi: {
-    black: "#282828",
-    red: "#fb4934",
-    green: "#b8bb26",
-    yellow: "#fabd2f",
-    blue: "#83a598",
-    magenta: "#d3869b",
-    cyan: "#8ec07c",
-    white: "#a89984",
-    brightBlack: "#928374",
-    brightRed: "#fb4934",
-    brightGreen: "#b8bb26",
-    brightYellow: "#fabd2f",
-    brightBlue: "#83a598",
-    brightMagenta: "#d3869b",
-    brightCyan: "#8ec07c",
-    brightWhite: "#ebdbb2",
-  },
-};
-
-// --- Solarized Light (Ethan Schoonover's hues, floored for legibility) ------
-// Canonical solarized-light text tones sit at 2.6–3.0:1 on the paper bg —
-// famously washed out on modern panels. Text moves one base-tone darker
-// (base02/base01) and each accent keeps its hue with lightness dropped to the
-// 4.5 floor, so it still reads as solarized without the squint.
-
-const solarizedLight: ThemeDef = {
-  id: "solarized-light",
-  label: "Solarized Light",
-  kind: "light",
-  tokens: {
-    "--bg": "#f6efdb", // between base3 panes and base2 rail
-    "--fg": "#073642", // base02 — base01 hovers at the 4.5 line on the rail
-    "--muted": "#495f66", // base01 deepened to hold 4.5 on selected rows
-    "--accent": "#6b7d00", // solarized green, floored
-    "--err": "#d02425",
-    "--warn": "#986e00",
-    "--rate": "#6569bc", // violet
-    "--rail-bg": "#eee8d5", // base2
-    "--row-hover": "#e5ddc4",
-    "--row-active": "#dcd3b5",
-    "--term-selection": "#586e7526",
-    "--term-bg": "#fdf6e3", // base3, the canonical paper
-    "--scrim": "rgba(0, 0, 0, 0.25)",
-    "--overlay-bg": "#fdf6e3",
-    "--edge": "#ded5ba",
-    "--syn-keyword": "#677900", // green (Statement)
-    "--syn-string": "#007f77", // cyan
-    "--syn-comment": "#708082",
-    "--syn-number": "#cd307d", // magenta
-    "--syn-type": "#946a00", // yellow (Type)
-    "--syn-func": "#0076bc", // blue (Identifier)
-    "--syn-def": "#073642",
-    "--syn-prop": "#6569bc", // violet
-    "--ficon-generic": "#657b83",
-    "--ficon-lang": "#0076bc",
-    "--ficon-data": "#007f77",
-    "--ficon-doc": "#657b83",
-    "--ficon-media": "#c6470f",
-    "--ficon-archive": "#946a00",
-    "--ficon-config": "#708082",
-    "--ficon-bio": "#6569bc",
-    "--ficon-vcs": "#c6470f",
-  },
-  // Hue-per-slot bright mapping (the spec puts base tones on bright slots,
-  // which turns TUI text invisible on light backgrounds). Normal >= 4.5:1 on
-  // base3, bright >= 3.5:1.
-  ansi: {
-    black: "#073642",
-    red: "#d72d2b",
-    green: "#677900",
-    yellow: "#946a00",
-    blue: "#0076bc",
-    magenta: "#cd307d",
-    cyan: "#007f77",
-    white: "#eee8d5",
-    brightBlack: "#657b83",
-    brightRed: "#cb4b16",
-    brightGreen: "#768a00",
-    brightYellow: "#a67a00",
-    brightBlue: "#1f87cd",
-    brightMagenta: "#6569bc",
-    brightCyan: "#069088",
-    brightWhite: "#fdf6e3",
-  },
-};
-
-// --- Rosé Pine Dawn (official dawn hues, floored for legibility) ------------
-// Dawn's gold/rose/foam are decorative tones in the official spec (gold sits
-// at 2.2:1 on the surface). Chimaera renders them as text — warnings, strings,
-// ANSI slots — so each keeps its hue with lightness dropped to the 4.5 floor.
-
-const rosePineDawn: ThemeDef = {
-  id: "rose-pine-dawn",
-  label: "Rosé Pine Dawn",
-  kind: "light",
-  tokens: {
-    "--bg": "#faf4ed", // base
-    "--fg": "#575279", // text
-    "--muted": "#5f5a78", // subtle deepened to hold 4.5 on selected rows
-    "--accent": "#286983", // pine
-    "--err": "#a7586f", // love
-    "--warn": "#b06700", // gold
-    "--rate": "#806b99", // iris
-    "--rail-bg": "#f2e9e1", // overlay
-    "--row-hover": "#eadfd5",
-    "--row-active": "#e2d5c8",
-    "--term-selection": "#57527926",
-    "--term-bg": "#fffaf3", // surface — panes get the brightest sheet
-    "--scrim": "rgba(87, 82, 121, 0.25)",
-    "--overlay-bg": "#fffaf3",
-    "--edge": "#dfdad9", // highlight med
-    "--syn-keyword": "#286983", // pine
-    "--syn-string": "#ab6200", // gold
-    "--syn-comment": "#827d8f", // muted
-    "--syn-number": "#ad5d5a", // rose
-    "--syn-type": "#3e7d87", // foam
-    "--syn-func": "#806b99", // iris
-    "--syn-def": "#575279",
-    "--syn-prop": "#286983",
-    "--ficon-generic": "#706b89",
-    "--ficon-lang": "#3e7d87",
-    "--ficon-data": "#286983",
-    "--ficon-doc": "#7d7891",
-    "--ficon-media": "#ab6200",
-    "--ficon-archive": "#ad5d5a",
-    "--ficon-config": "#7a7590",
-    "--ficon-bio": "#806b99",
-    "--ficon-vcs": "#a7586f",
-  },
-  // Official rose-pine/terminal dawn slot mapping (green=pine, cyan=rose is
-  // the palette's own quirk), tones floored as above.
-  ansi: {
-    black: "#f2e9e1",
-    red: "#ab5b72",
-    green: "#286983",
-    yellow: "#ab6200",
-    blue: "#3e7d87",
-    magenta: "#806b99",
-    cyan: "#ad5d5a",
-    white: "#575279",
-    brightBlack: "#827d8f",
-    brightRed: "#b4637a",
-    brightGreen: "#286983",
-    brightYellow: "#bd7300",
-    brightBlue: "#508d98",
-    brightMagenta: "#907aa9",
-    brightCyan: "#bf6d69",
-    brightWhite: "#575279",
-  },
-};
 
 // --- Catppuccin Latte (the official light flavor) ---------------------------
 // Surfaces are exactly canonical (base sheet, mantle bg, crust rail). Latte's
@@ -492,11 +240,11 @@ const catppuccinLatte: ThemeDef = {
   kind: "light",
   tokens: {
     "--bg": "#e6e9ef", // mantle
-    "--fg": "#4c4f69", // text
+    "--fg": "#3d3f58", // text deepened a step: canonical #4c4f69 sat within 15% of muted, so nothing receded
     "--muted": "#555870", // subtext1, floored for selections
-    "--accent": "#1e66f5", // blue
+    "--accent": "#1b63f1", // blue
     "--err": "#cf0837", // red, floored
-    "--warn": "#ab5d00", // yellow, floored
+    "--warn": "#a55b07", // yellow, floored
     "--rate": "#8839ef", // mauve
     "--rail-bg": "#dce0e8", // crust
     "--row-hover": "#d3d8e2",
@@ -511,8 +259,8 @@ const catppuccinLatte: ThemeDef = {
     "--syn-comment": "#76798c", // overlay2
     "--syn-number": "#ce3400", // peach
     "--syn-type": "#a75a00", // yellow
-    "--syn-func": "#1e66f5", // blue
-    "--syn-def": "#4c4f69",
+    "--syn-func": "#1b63f1", // blue
+    "--syn-def": "#3d3f58",
     "--syn-prop": "#5363d6", // lavender
     "--ficon-generic": "#76798c",
     "--ficon-lang": "#1e66f5",
@@ -611,16 +359,576 @@ const catppuccinMocha: ThemeDef = {
   },
 };
 
+// --- GitHub Light (Primer's light palette) ---------------------------------
+// The most-seen light theme in developer tools: neutral white, blue accent,
+// the familiar red/blue/purple syntax. Surfaces follow Primer's canvas →
+// canvas.subtle ladder; borders are Primer's border.default.
+
+const githubLight: ThemeDef = {
+  id: "github-light",
+  label: "GitHub Light",
+  kind: "light",
+  tokens: {
+    "--bg": "#fafbfc",
+    "--fg": "#1f2328", // fg.default
+    "--muted": "#656d76", // fg.muted
+    "--accent": "#0969da", // accent.fg
+    "--err": "#cf222e", // danger.fg
+    "--warn": "#9a6700", // attention.fg
+    "--rate": "#8250df", // done.fg
+    "--rail-bg": "#f6f8fa", // canvas.subtle
+    "--row-hover": "#eef1f4",
+    "--row-active": "#e4e8ec",
+    "--term-selection": "#1f232826",
+    "--term-bg": "#ffffff", // canvas.default — panes get the paper
+    "--scrim": "rgba(0, 0, 0, 0.25)",
+    "--overlay-bg": "#ffffff",
+    "--edge": "#d0d7de", // border.default
+    "--syn-keyword": "#cf222e",
+    "--syn-string": "#0a3069",
+    "--syn-comment": "#6e7781",
+    "--syn-number": "#0550ae",
+    "--syn-type": "#953800",
+    "--syn-func": "#6639ba",
+    "--syn-def": "#1f2328",
+    "--syn-prop": "#0550ae",
+    "--ficon-generic": "#6e7781",
+    "--ficon-lang": "#0969da",
+    "--ficon-data": "#1a7f37",
+    "--ficon-doc": "#656d76",
+    "--ficon-media": "#bc4c00",
+    "--ficon-archive": "#9a6700",
+    "--ficon-config": "#57606a",
+    "--ficon-bio": "#8250df",
+    "--ficon-vcs": "#cf222e",
+  },
+  // Primer's own terminal palette.
+  ansi: {
+    black: "#24292f",
+    red: "#cf222e",
+    green: "#116329",
+    yellow: "#4d2d00",
+    blue: "#0969da",
+    magenta: "#8250df",
+    cyan: "#1b7c83",
+    white: "#6e7781",
+    brightBlack: "#57606a",
+    brightRed: "#a40e26",
+    brightGreen: "#1a7f37",
+    brightYellow: "#633c01",
+    brightBlue: "#1d88fc",
+    brightMagenta: "#9e6ef2",
+    brightCyan: "#3192aa",
+    brightWhite: "#8c959f",
+  },
+};
+
+// --- One Light (Atom's One Light) -------------------------------------------
+// Soft cool-grey paper with the One syntax set; the light half of the most
+// installed editor theme. Surfaces step from the editor's #fafafa.
+
+const oneLight: ThemeDef = {
+  id: "one-light",
+  label: "One Light",
+  kind: "light",
+  tokens: {
+    "--bg": "#f4f4f5",
+    "--fg": "#383a42",
+    "--muted": "#666973",
+    "--accent": "#4078f2", // blue
+    "--err": "#ce4237", // red
+    "--warn": "#9b6a02", // yellow
+    "--rate": "#a626a4", // purple
+    "--rail-bg": "#eeeef0",
+    "--row-hover": "#e5e5e6",
+    "--row-active": "#dcdcde",
+    "--term-selection": "#383a4226",
+    "--term-bg": "#fafafa", // the editor sheet
+    "--scrim": "rgba(0, 0, 0, 0.25)",
+    "--overlay-bg": "#ffffff",
+    "--edge": "#dbdbdc",
+    "--syn-keyword": "#a626a4",
+    "--syn-string": "#308331",
+    "--syn-comment": "#7e7f85",
+    "--syn-number": "#986801",
+    "--syn-type": "#9b6a02",
+    "--syn-func": "#356ce4",
+    "--syn-def": "#383a42",
+    "--syn-prop": "#ce4237",
+    "--ficon-generic": "#8a8b91",
+    "--ficon-lang": "#4078f2",
+    "--ficon-data": "#0184bc",
+    "--ficon-doc": "#696c77",
+    "--ficon-media": "#986801",
+    "--ficon-archive": "#c18401",
+    "--ficon-config": "#0184bc",
+    "--ficon-bio": "#a626a4",
+    "--ficon-vcs": "#e45649",
+  },
+  ansi: {
+    black: "#383a42",
+    red: "#ce4237",
+    green: "#308331",
+    yellow: "#9b6a02",
+    blue: "#356ce4",
+    magenta: "#a626a4",
+    cyan: "#0f7bae",
+    white: "#a0a1a7",
+    brightBlack: "#4f525e",
+    brightRed: "#e45649",
+    brightGreen: "#459645",
+    brightYellow: "#b27b0f",
+    brightBlue: "#4078f2",
+    brightMagenta: "#a626a4",
+    brightCyan: "#0184bc",
+    brightWhite: "#e5e5e6",
+  },
+};
+
+// --- Tokyo Night (enkia's night variant) -------------------------------------
+// Deep blue-black with cool lavender text and the blue/green/magenta syntax
+// set; the modern dark theme. Surfaces step up from the editor's #1a1b26.
+
+const tokyoNight: ThemeDef = {
+  id: "tokyo-night",
+  label: "Tokyo Night",
+  kind: "dark",
+  tokens: {
+    "--bg": "#1f2030",
+    "--fg": "#c0caf5",
+    "--muted": "#9aa5ce",
+    "--accent": "#7aa2f7", // blue
+    "--err": "#f7768e", // red
+    "--warn": "#e0af68", // yellow
+    "--rate": "#bb9af7", // magenta
+    "--rail-bg": "#24263a",
+    "--row-hover": "#2b2e45",
+    "--row-active": "#343852",
+    "--term-selection": "#c0caf530",
+    "--term-bg": "#1a1b26", // the editor well
+    "--scrim": "rgba(0, 0, 0, 0.5)",
+    "--overlay-bg": "#262a40",
+    "--edge": "#363b54",
+    "--syn-keyword": "#bb9af7",
+    "--syn-string": "#9ece6a",
+    "--syn-comment": "#6b75a0",
+    "--syn-number": "#ff9e64",
+    "--syn-type": "#2ac3de",
+    "--syn-func": "#7aa2f7",
+    "--syn-def": "#c0caf5",
+    "--syn-prop": "#7dcfff",
+    "--ficon-generic": "#8f9bc7",
+    "--ficon-lang": "#7aa2f7",
+    "--ficon-data": "#73daca",
+    "--ficon-doc": "#a9b1d6",
+    "--ficon-media": "#ff9e64",
+    "--ficon-archive": "#e0af68",
+    "--ficon-config": "#7dcfff",
+    "--ficon-bio": "#bb9af7",
+    "--ficon-vcs": "#f7768e",
+  },
+  ansi: {
+    black: "#414868",
+    red: "#f7768e",
+    green: "#9ece6a",
+    yellow: "#e0af68",
+    blue: "#7aa2f7",
+    magenta: "#bb9af7",
+    cyan: "#7dcfff",
+    white: "#a9b1d6",
+    brightBlack: "#666f9b",
+    brightRed: "#f7768e",
+    brightGreen: "#9ece6a",
+    brightYellow: "#e0af68",
+    brightBlue: "#7aa2f7",
+    brightMagenta: "#bb9af7",
+    brightCyan: "#7dcfff",
+    brightWhite: "#c0caf5",
+  },
+};
+
+// --- One Dark Pro (Atom's One Dark) ------------------------------------------
+// The de-facto dark editor theme: slate grey, soft grey text, the One
+// syntax set. Surfaces step up from the editor's #282c34.
+
+const oneDark: ThemeDef = {
+  id: "one-dark",
+  label: "One Dark Pro",
+  kind: "dark",
+  tokens: {
+    "--bg": "#2c3139",
+    "--fg": "#abb2bf",
+    "--muted": "#9fa7b3",
+    "--accent": "#61afef", // blue
+    "--err": "#e36e77", // red
+    "--warn": "#e5c07b", // yellow
+    "--rate": "#c678dd", // purple
+    "--rail-bg": "#30353f",
+    "--row-hover": "#383e4a",
+    "--row-active": "#3e4451", // selection
+    "--term-selection": "#abb2bf30",
+    "--term-bg": "#282c34", // the editor well
+    "--scrim": "rgba(0, 0, 0, 0.5)",
+    "--overlay-bg": "#2f343e",
+    "--edge": "#3b4048",
+    "--syn-keyword": "#c678dd",
+    "--syn-string": "#98c379",
+    "--syn-comment": "#7f8694",
+    "--syn-number": "#d19a66",
+    "--syn-type": "#e5c07b",
+    "--syn-func": "#61afef",
+    "--syn-def": "#abb2bf",
+    "--syn-prop": "#e36e77",
+    "--ficon-generic": "#8a919d",
+    "--ficon-lang": "#61afef",
+    "--ficon-data": "#56b6c2",
+    "--ficon-doc": "#abb2bf",
+    "--ficon-media": "#d19a66",
+    "--ficon-archive": "#e5c07b",
+    "--ficon-config": "#56b6c2",
+    "--ficon-bio": "#c678dd",
+    "--ficon-vcs": "#e06c75",
+  },
+  ansi: {
+    black: "#3f4451",
+    red: "#e36e77",
+    green: "#98c379",
+    yellow: "#e5c07b",
+    blue: "#61afef",
+    magenta: "#c678dd",
+    cyan: "#56b6c2",
+    white: "#abb2bf",
+    brightBlack: "#79808e",
+    brightRed: "#e06c75",
+    brightGreen: "#98c379",
+    brightYellow: "#e5c07b",
+    brightBlue: "#61afef",
+    brightMagenta: "#c678dd",
+    brightCyan: "#56b6c2",
+    brightWhite: "#dcdfe4",
+  },
+};
+
+// --- Rosé Pine Dawn (official dawn hues, floored for legibility) ------------
+// Dawn's gold/rose/foam are decorative tones in the official spec (gold sits
+// at 2.2:1 on the surface). Chimaera renders them as text — warnings, strings,
+// ANSI slots — so each keeps its hue with lightness dropped to the 4.5 floor.
+
+const rosePineDawn: ThemeDef = {
+  id: "rose-pine-dawn",
+  label: "Rosé Pine Dawn",
+  kind: "light",
+  tokens: {
+    "--bg": "#faf4ed", // base
+    "--fg": "#474268", // text deepened a step: canonical #575279 sat within 15% of muted, so nothing receded
+    "--muted": "#5f5a78", // subtle deepened to hold 4.5 on selected rows
+    "--accent": "#286983", // pine
+    "--err": "#a7586f", // love
+    "--warn": "#a86304", // gold
+    "--rate": "#806b99", // iris
+    "--rail-bg": "#f2e9e1", // overlay
+    "--row-hover": "#eadfd5",
+    "--row-active": "#e2d5c8",
+    "--term-selection": "#57527926",
+    "--term-bg": "#fffaf3", // surface — panes get the brightest sheet
+    "--scrim": "rgba(87, 82, 121, 0.25)",
+    "--overlay-bg": "#fffaf3",
+    "--edge": "#dfdad9", // highlight med
+    "--syn-keyword": "#286983", // pine
+    "--syn-string": "#ab6200", // gold
+    "--syn-comment": "#827d8f", // muted
+    "--syn-number": "#ad5d5a", // rose
+    "--syn-type": "#3e7d87", // foam
+    "--syn-func": "#806b99", // iris
+    "--syn-def": "#474268",
+    "--syn-prop": "#286983",
+    "--ficon-generic": "#706b89",
+    "--ficon-lang": "#3e7d87",
+    "--ficon-data": "#286983",
+    "--ficon-doc": "#7d7891",
+    "--ficon-media": "#ab6200",
+    "--ficon-archive": "#ad5d5a",
+    "--ficon-config": "#7a7590",
+    "--ficon-bio": "#806b99",
+    "--ficon-vcs": "#a7586f",
+  },
+  // Official rose-pine/terminal dawn slot mapping (green=pine, cyan=rose is
+  // the palette's own quirk), tones floored as above.
+  ansi: {
+    black: "#f2e9e1",
+    red: "#ab5b72",
+    green: "#286983",
+    yellow: "#ab6200",
+    blue: "#3e7d87",
+    magenta: "#806b99",
+    cyan: "#ad5d5a",
+    white: "#575279",
+    brightBlack: "#827d8f",
+    brightRed: "#b4637a",
+    brightGreen: "#286983",
+    brightYellow: "#bd7300",
+    brightBlue: "#508d98",
+    brightMagenta: "#907aa9",
+    brightCyan: "#bf6d69",
+    brightWhite: "#575279",
+  },
+};
+
+// --- Terracotta (ivory and charcoal, a clay accent) --------------------------
+// Warm paper tones: ivory sheets in the light half, charcoal in the dark, one
+// terracotta accent, syntax in rust/olive/ochre. Chimaera's own warm pair.
+
+const terracottaLight: ThemeDef = {
+  id: "terracotta-light",
+  label: "Terracotta Light",
+  kind: "light",
+  tokens: {
+    "--bg": "#f4f2eb",
+    "--fg": "#141413",
+    "--muted": "#6b6a63",
+    "--accent": "#c9623f",
+    "--err": "#b3261e",
+    "--warn": "#946300",
+    "--rate": "#7c5cbf",
+    "--rail-bg": "#efede5",
+    "--row-hover": "#e8e6dd",
+    "--row-active": "#e0ded4",
+    "--term-selection": "#14141326",
+    "--term-bg": "#faf9f5", // ivory — panes get the paper
+    "--scrim": "rgba(0, 0, 0, 0.25)",
+    "--overlay-bg": "#ffffff",
+    "--edge": "#dcd9cf",
+    "--syn-keyword": "#9b4d2f",
+    "--syn-string": "#3f7a4a",
+    "--syn-comment": "#807e75",
+    "--syn-number": "#a4631a",
+    "--syn-type": "#2f6f8f",
+    "--syn-func": "#3a5fa8",
+    "--syn-def": "#141413",
+    "--syn-prop": "#6a4fb0",
+    "--ficon-generic": "#85837a",
+    "--ficon-lang": "#3a5fa8",
+    "--ficon-data": "#3f7a4a",
+    "--ficon-doc": "#6b6a63",
+    "--ficon-media": "#c9623f",
+    "--ficon-archive": "#a7651d",
+    "--ficon-config": "#2f6f8f",
+    "--ficon-bio": "#7c5cbf",
+    "--ficon-vcs": "#b3261e",
+  },
+  ansi: {
+    black: "#3d3c38",
+    red: "#b3261e",
+    green: "#3f7a4a",
+    yellow: "#946300",
+    blue: "#3a5fa8",
+    magenta: "#8a4d9b",
+    cyan: "#2c7d88",
+    white: "#b8b6ad",
+    brightBlack: "#75736b",
+    brightRed: "#b3261e",
+    brightGreen: "#3f7a4a",
+    brightYellow: "#946300",
+    brightBlue: "#3a5fa8",
+    brightMagenta: "#8a4d9b",
+    brightCyan: "#2f7f8a",
+    brightWhite: "#e2e0d6",
+  },
+};
+
+const terracottaDark: ThemeDef = {
+  id: "terracotta-dark",
+  label: "Terracotta Dark",
+  kind: "dark",
+  tokens: {
+    "--bg": "#262624",
+    "--fg": "#ece9e2",
+    "--muted": "#a8a69c",
+    "--accent": "#d97757",
+    "--err": "#e8766a",
+    "--warn": "#d9a74d",
+    "--rate": "#b39ddb",
+    "--rail-bg": "#2b2a27",
+    "--row-hover": "#33322e",
+    "--row-active": "#3b3a35",
+    "--term-selection": "#ece9e233",
+    "--term-bg": "#1f1e1b", // charcoal — panes get the deepest well
+    "--scrim": "rgba(0, 0, 0, 0.5)",
+    "--overlay-bg": "#2e2d29",
+    "--edge": "#3f3e39",
+    "--syn-keyword": "#e09a7c",
+    "--syn-string": "#9ecf8c",
+    "--syn-comment": "#8a887f",
+    "--syn-number": "#e6b36a",
+    "--syn-type": "#7fc3d8",
+    "--syn-func": "#8fb5ea",
+    "--syn-def": "#ece9e2",
+    "--syn-prop": "#c5b4ea",
+    "--ficon-generic": "#8a887f",
+    "--ficon-lang": "#8fb5ea",
+    "--ficon-data": "#9ecf8c",
+    "--ficon-doc": "#a8a69c",
+    "--ficon-media": "#d97757",
+    "--ficon-archive": "#e6b36a",
+    "--ficon-config": "#7fc3d8",
+    "--ficon-bio": "#b39ddb",
+    "--ficon-vcs": "#e8766a",
+  },
+  ansi: {
+    black: "#45443f",
+    red: "#e8766a",
+    green: "#9ecf8c",
+    yellow: "#d9a74d",
+    blue: "#8fb5ea",
+    magenta: "#d19ad8",
+    cyan: "#7fc3d8",
+    white: "#c9c6bd",
+    brightBlack: "#8a887f",
+    brightRed: "#e8766a",
+    brightGreen: "#9ecf8c",
+    brightYellow: "#d9a74d",
+    brightBlue: "#8fb5ea",
+    brightMagenta: "#d19ad8",
+    brightCyan: "#7fc3d8",
+    brightWhite: "#ece9e2",
+  },
+};
+
+// --- Graphite (true neutrals, a soft green accent) ---------------------------
+// No tint at all: white and near-black sheets, grey chrome, one green accent,
+// syntax in clear primaries. The quiet pair.
+
+const graphiteLight: ThemeDef = {
+  id: "graphite-light",
+  label: "Graphite Light",
+  kind: "light",
+  tokens: {
+    "--bg": "#f9f9f9",
+    "--fg": "#0d0d0d",
+    "--muted": "#676773",
+    "--accent": "#0f8f74",
+    "--err": "#d02f2f",
+    "--warn": "#9a6500",
+    "--rate": "#7a5af5",
+    "--rail-bg": "#f4f4f5",
+    "--row-hover": "#ececee",
+    "--row-active": "#e3e3e6",
+    "--term-selection": "#0d0d0d26",
+    "--term-bg": "#ffffff",
+    "--scrim": "rgba(0, 0, 0, 0.25)",
+    "--overlay-bg": "#ffffff",
+    "--edge": "#e1e1e4",
+    "--syn-keyword": "#8b3fc9",
+    "--syn-string": "#1f7a4d",
+    "--syn-comment": "#808089",
+    "--syn-number": "#b25a12",
+    "--syn-type": "#1d7aa8",
+    "--syn-func": "#2e5fd3",
+    "--syn-def": "#0d0d0d",
+    "--syn-prop": "#5a4fd0",
+    "--ficon-generic": "#808089",
+    "--ficon-lang": "#2e5fd3",
+    "--ficon-data": "#1f7a4d",
+    "--ficon-doc": "#676773",
+    "--ficon-media": "#b25a12",
+    "--ficon-archive": "#9a6500",
+    "--ficon-config": "#1d7aa8",
+    "--ficon-bio": "#7a5af5",
+    "--ficon-vcs": "#d02f2f",
+  },
+  ansi: {
+    black: "#2b2b30",
+    red: "#d02f2f",
+    green: "#1f7a4d",
+    yellow: "#8c6300",
+    blue: "#2e5fd3",
+    magenta: "#8b3fc9",
+    cyan: "#1d7a8a",
+    white: "#b4b4ba",
+    brightBlack: "#6e6e78",
+    brightRed: "#d02f2f",
+    brightGreen: "#1f7a4d",
+    brightYellow: "#8c6300",
+    brightBlue: "#2e5fd3",
+    brightMagenta: "#8b3fc9",
+    brightCyan: "#1d7a8a",
+    brightWhite: "#e6e6ea",
+  },
+};
+
+const graphiteDark: ThemeDef = {
+  id: "graphite-dark",
+  label: "Graphite Dark",
+  kind: "dark",
+  tokens: {
+    "--bg": "#1e1e1e",
+    "--fg": "#ececec",
+    "--muted": "#a0a0a8",
+    "--accent": "#19c37d",
+    "--err": "#ef6b6b",
+    "--warn": "#e0b25a",
+    "--rate": "#a99cf0",
+    "--rail-bg": "#212121",
+    "--row-hover": "#2a2a2a",
+    "--row-active": "#333333",
+    "--term-selection": "#ececec33",
+    "--term-bg": "#171717",
+    "--scrim": "rgba(0, 0, 0, 0.5)",
+    "--overlay-bg": "#262626",
+    "--edge": "#383838",
+    "--syn-keyword": "#c792ea",
+    "--syn-string": "#8fd3a0",
+    "--syn-comment": "#7f7f88",
+    "--syn-number": "#e8a95b",
+    "--syn-type": "#6fc3e0",
+    "--syn-func": "#82aaff",
+    "--syn-def": "#ececec",
+    "--syn-prop": "#b4a7f5",
+    "--ficon-generic": "#8a8a90",
+    "--ficon-lang": "#82aaff",
+    "--ficon-data": "#8fd3a0",
+    "--ficon-doc": "#a0a0a8",
+    "--ficon-media": "#e8a95b",
+    "--ficon-archive": "#e0b25a",
+    "--ficon-config": "#6fc3e0",
+    "--ficon-bio": "#c792ea",
+    "--ficon-vcs": "#ef6b6b",
+  },
+  ansi: {
+    black: "#3a3a3a",
+    red: "#ef6b6b",
+    green: "#8fd3a0",
+    yellow: "#e0b25a",
+    blue: "#82aaff",
+    magenta: "#c792ea",
+    cyan: "#6fc3e0",
+    white: "#c4c4c4",
+    brightBlack: "#8a8a90",
+    brightRed: "#ef6b6b",
+    brightGreen: "#8fd3a0",
+    brightYellow: "#e0b25a",
+    brightBlue: "#82aaff",
+    brightMagenta: "#c792ea",
+    brightCyan: "#6fc3e0",
+    brightWhite: "#ececec",
+  },
+};
+
 /** All themes, picker order (defaults first). */
 export const THEMES: readonly ThemeDef[] = [
   chimaeraLight,
-  solarizedLight,
-  rosePineDawn,
+  githubLight,
+  oneLight,
   catppuccinLatte,
+  rosePineDawn,
+  terracottaLight,
+  graphiteLight,
   chimaeraDark,
-  nord,
-  gruvboxDark,
+  tokyoNight,
+  oneDark,
   catppuccinMocha,
+  terracottaDark,
+  graphiteDark,
 ];
 
 const BY_ID = new Map(THEMES.map((t) => [t.id, t]));

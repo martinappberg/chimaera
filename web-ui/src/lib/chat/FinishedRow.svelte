@@ -210,7 +210,7 @@
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
-    color: color-mix(in srgb, var(--muted) 75%, transparent);
+    color: var(--muted);
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
   }
@@ -225,7 +225,7 @@
     background: none;
     border: none;
     border-radius: 6px;
-    color: color-mix(in srgb, var(--muted) 70%, transparent);
+    color: var(--muted);
     font: inherit;
     font-size: var(--text-xs);
     line-height: 1.4;

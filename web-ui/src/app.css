@@ -32,6 +32,11 @@
   --notice-stack-offset: 140px;
   /* Single focus treatment for every keyboard-focusable control. */
   --focus-ring: color-mix(in srgb, var(--accent) 70%, transparent);
+  /* The accent as TEXT (links, paths, allowed-labels): an accent chosen for
+     dots and buttons can sit under 4.5:1 on the sheet (chimaera-light's green
+     is 3.4:1), so prose-sized accent text takes it a quarter toward --fg —
+     every theme passes that way (themes.contrast.test.ts). */
+  --accent-text: color-mix(in srgb, var(--accent) 75%, var(--fg));
   /* The one corner radius of a card in the transcript and above the
      composer (plan, plan approval, agent messages, the pinned trays) —
      the composer's box too, so the stack reads as one family. */
@@ -97,7 +102,7 @@
   /* Fallback only — the live palette comes inline from settings/themes.ts. */
   color-scheme: dark;
   --bg: #17171c;
-  --fg: #e7e7ea;
+  --fg: #dcdce0;
   --muted: #9a9aa6;
   --accent: #3fbf85;
   --err: #d96b6b;
@@ -106,7 +111,7 @@
   --rail-bg: #1c1c23;
   --row-hover: #25252d;
   --row-active: #2d2d36;
-  --term-selection: #e7e7ea33;
+  --term-selection: #dcdce033;
   --term-bg: #121218;
   --scrim: rgba(0, 0, 0, 0.5);
   --overlay-bg: #202028;
@@ -117,7 +122,7 @@
   --syn-number: #d0a355;
   --syn-type: #6fb3d2;
   --syn-func: #82a7e8;
-  --syn-def: #e7e7ea;
+  --syn-def: #dcdce0;
   --syn-prop: #a58fd6;
   --ficon-generic: #8b8b95;
   --ficon-lang: #6f9ae4;
