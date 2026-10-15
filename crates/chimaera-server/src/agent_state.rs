@@ -231,14 +231,11 @@ pub(crate) struct AgentRecord {
     pub(crate) state_corrected: Option<AgentState>,
     /// The hook-reported turn's start (UserPromptSubmit; cleared at Stop)
     /// and its main thread's open tool calls (own PreToolUse → PostToolUse,
-    /// capped at [`MAIN_CALLS_CAP`]). Agent communication says what a claude
-    /// terminal is waiting on from these. Never on the wire.
+    /// capped at [`chimaera_agent::MAIN_CALLS_CAP`]). Agent communication
+    /// says what a claude terminal is waiting on from these. Never on the wire.
     pub(crate) turn_started_ms: Option<u64>,
     pub(crate) main_calls: Vec<chimaera_agent::BlockingCall>,
 }
-
-/// Open main-thread calls tracked from hooks (a turn rarely holds more).
-pub(crate) const MAIN_CALLS_CAP: usize = 16;
 
 /// The descriptive half of an attention edge, stashed by whichever surface
 /// saw it (protocol event or hook) for the notice feed to read at the edge.
@@ -330,7 +327,7 @@ impl AgentRecord {
                 };
                 if id.len() > 128
                     || self.main_calls.iter().any(|c| c.id == id)
-                    || self.main_calls.len() >= MAIN_CALLS_CAP
+                    || self.main_calls.len() >= chimaera_agent::MAIN_CALLS_CAP
                 {
                     return;
                 }

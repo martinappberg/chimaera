@@ -38,7 +38,7 @@ pub const TESTED_CODEX_VERSION: &str = "0.160.0";
 
 /// The collab `wait` row's title. The main-thread fold (`lib.rs`) reads it
 /// as "waiting on a subagent": a steer ends that wait at once (0.162.1, live,
-/// PROTOCOL.md Pass 43).
+/// PROTOCOL.md Pass 44).
 pub const COLLAB_WAIT_TITLE: &str = "waiting for subagents";
 
 /// The `initialize` request both the probe client and the driver handshake

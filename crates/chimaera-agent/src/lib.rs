@@ -336,7 +336,7 @@ impl BackgroundWork {
 
 /// What a running turn's main thread is blocked on — the step a message
 /// carried "at its next step" waits for (agent communication reports it, and
-/// frees a Claude turn stuck on a foreground subagent; PROTOCOL.md Pass 43).
+/// frees a Claude turn stuck on a foreground subagent; PROTOCOL.md Pass 44).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WaitKind {
     /// A foreground subagent call (claude `Agent`/`Task`, codex collab `wait`).
@@ -378,8 +378,10 @@ impl MainWait {
     }
 }
 
-/// Bound on tracked open calls: a turn rarely runs more than a few at once.
-const MAIN_CALLS_CAP: usize = 32;
+/// Bound on a turn's tracked open main-thread calls (a turn rarely runs
+/// more than a few at once) — here and in the server's hook-fed copy for
+/// claude terminals.
+pub const MAIN_CALLS_CAP: usize = 32;
 
 /// Folds a turn's open main-thread tool calls. Only `cross_turn: false`
 /// rows count (codex delegated agents run beside the thread, not in it);

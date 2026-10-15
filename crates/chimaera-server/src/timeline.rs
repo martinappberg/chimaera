@@ -196,7 +196,7 @@ pub(crate) struct Note {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) mastermind: bool,
     /// How it reached its reader when sent: "next_step" | "now" (the reader
-    /// waited on a subagent and the message reached it at once — Pass 43) |
+    /// waited on a subagent and the message reached it at once — Pass 44) |
     /// "inbox" | "woke" | "asked". Set on every agent message and on nothing else — a
     /// plugin's own Timeline note has none and is never delivered.
     #[serde(default, skip_serializing_if = "Option::is_none")]

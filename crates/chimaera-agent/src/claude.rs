@@ -3370,7 +3370,7 @@ impl ClaudeMapper {
             }
             PendingControl::Background { for_message: true } => {
                 // The daemon moved a foreground subagent aside so a message
-                // from another agent is read now (PROTOCOL.md Pass 43). The
+                // from another agent is read now (PROTOCOL.md Pass 44). The
                 // call can finish first; that race needs no notice.
                 if payload["backgrounded"] != json!(false) {
                     step.events.push(AgentEvent::Notice {
@@ -8021,7 +8021,7 @@ pub(crate) mod tests {
         ));
     }
 
-    /// Pass 43: the daemon frees a turn blocked on a foreground subagent so
+    /// Pass 44: the daemon frees a turn blocked on a foreground subagent so
     /// a message from another agent is read now. Its notice says why; a
     /// subagent that returned first (`backgrounded: false`) says nothing.
     #[test]

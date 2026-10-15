@@ -10,13 +10,14 @@
 //!   `additionalContext` ([`hook_context`], from `agents::ingest`); a chat
 //!   session also journals an `AgentMessage` so its transcript shows it.
 //!   A claude CHAT whose turn is blocked on a foreground subagent has no
-//!   next step until that returns, so the subagent is first moved to the
-//!   background (`BackgroundTool {for_message}`, the CLI's Ctrl-B): the
-//!   Agent call returns, PostToolUse fires on the main thread, and the
-//!   message rides it (PROTOCOL.md Pass 43).
+//!   next step until that returns; with `agents.communication.freeSubagents`
+//!   on (default off) the subagent is first moved to the background
+//!   (`BackgroundTool {for_message}`, the CLI's Ctrl-B): the Agent call
+//!   returns, PostToolUse fires on the main thread, and the message rides it
+//!   (PROTOCOL.md Pass 44).
 //! - codex chat: `SendIfRunning` — steered into the running turn, settled
 //!   `Dropped` (back in the inbox) when it misses. A steer ends the parent's
-//!   collab `wait` at once (Pass 43); a running command keeps it until then.
+//!   collab `wait` at once (Pass 44); a running command keeps it until then.
 //! - codex (and other hook-less) terminals: the inbox only (`read_messages`).
 //!
 //! An idle chat reader is woken — a real, billed turn — only as the user's
@@ -54,6 +55,10 @@ use crate::AppState;
 pub(crate) const ENABLED_KEY: &str = "agents.communication.enabled";
 /// The setting that says whether a message may start a turn.
 pub(crate) const WAKES_KEY: &str = "agents.communication.wakes";
+/// The setting that lets a message move a claude chat's foreground subagent
+/// to the background so it is read now (default off: it changes the turn's
+/// flow, and the subagent's result then arrives in a turn of its own).
+pub(crate) const FREE_SUBAGENTS_KEY: &str = "agents.communication.freeSubagents";
 
 /// Every agent's comms tools, pre-allowed for workers while the feature is
 /// on (the user's switch is the standing permission).
@@ -144,6 +149,16 @@ pub(crate) fn wake_policy(state: &AppState) -> WakePolicy {
         Some("auto") => WakePolicy::Auto,
         _ => WakePolicy::Ask,
     }
+}
+
+/// Whether a message may move a waiting claude chat's foreground subagent to
+/// the background (default off). Cached map, like the other two.
+pub(crate) fn free_subagents(state: &AppState) -> bool {
+    crate::lock(&state.settings)
+        .map_cached()
+        .get(FREE_SUBAGENTS_KEY)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// The refusal every comms tool gives while the feature is off.
@@ -594,6 +609,9 @@ pub(crate) struct Reader {
     /// While busy: the running turn and what its main thread waits on
     /// (chats: the driver's events; claude terminals: its hooks).
     pub(crate) wait: Option<chimaera_agent::MainWait>,
+    /// `agents.communication.freeSubagents`: a message may move this claude
+    /// chat's foreground subagent to the background.
+    pub(crate) free_subagents: bool,
 }
 
 /// What a busy reader's next step waits on, as the message's fate turns on it.
@@ -601,10 +619,12 @@ pub(crate) struct Reader {
 enum Blocked {
     /// Thinking or writing between steps: the next step is close.
     Nothing,
-    /// A foreground subagent the carrier can't pass (a claude terminal).
+    /// A foreground subagent the carrier doesn't pass (a claude terminal, or
+    /// a claude chat while `freeSubagents` is off).
     Subagent,
     /// A subagent wait a message ends now (codex collab `wait`; a claude
-    /// chat's foreground subagent, which chimaera moves to the background).
+    /// chat's foreground subagent, which chimaera moves to the background
+    /// when the user allows it).
     SubagentPassable,
     /// A shell command: read when it ends.
     Command,
@@ -624,7 +644,8 @@ impl Reader {
         };
         match call.kind {
             WaitKind::Subagent
-                if self.chat && matches!(self.agent.as_str(), "claude" | "codex") =>
+                if self.chat
+                    && (self.agent == "codex" || (self.claude() && self.free_subagents)) =>
             {
                 Blocked::SubagentPassable
             }
@@ -635,9 +656,10 @@ impl Reader {
     }
 
     /// A claude chat's foreground subagent calls, which a message moves to
-    /// the background (empty for every other reader).
+    /// the background while the user allows it (empty for every other
+    /// reader, and while `freeSubagents` is off).
     fn subagent_calls(&self) -> Vec<String> {
-        if !(self.chat && self.claude() && self.busy) {
+        if !(self.chat && self.claude() && self.busy && self.free_subagents) {
             return Vec::new();
         }
         self.wait
@@ -765,6 +787,7 @@ pub(crate) fn reader(state: &AppState, sid: &str) -> Option<Reader> {
             } else {
                 None
             },
+            free_subagents: free_subagents(state),
         });
     }
     let info = state.sessions.get(sid)?;
@@ -785,6 +808,7 @@ pub(crate) fn reader(state: &AppState, sid: &str) -> Option<Reader> {
         mastermind,
         created_ms: info.created_at.saturating_mul(1000),
         wait: hook_wait.filter(|_| busy),
+        free_subagents: false,
     })
 }
 
@@ -1060,7 +1084,7 @@ enum Plan {
     Carrier,
     /// A claude chat blocked on these foreground subagent calls: move them
     /// to the background, so its next step — and the hook carrying the
-    /// message — comes now (PROTOCOL.md Pass 43).
+    /// message — comes now (PROTOCOL.md Pass 44).
     Free(Vec<String>),
     /// `SendIfRunning` into the running turn (codex chat).
     Steer,
@@ -1392,6 +1416,10 @@ async fn execute(
         Plan::Carrier if target.busy => {
             let now = crate::session_view::now_ms();
             match target.blocked() {
+                Blocked::Subagent if target.chat => format!(
+                    "it's {}; it reads this when that subagent returns (its next step)",
+                    target.doing(now)
+                ),
                 Blocked::Subagent => format!(
                     "it's {}; a terminal can't be interrupted, so it reads this when that \
                      subagent returns (its next step)",
@@ -1526,12 +1554,6 @@ async fn execute(
             }
         }
         Plan::Direct => {
-            // Direction to a claude chat stuck on a foreground subagent
-            // frees it the same way, so the send is read now.
-            let calls = target.subagent_calls();
-            if !calls.is_empty() {
-                free_main_thread(state, target, calls).await;
-            }
             match deliver_all(
                 state,
                 target,
@@ -1540,7 +1562,15 @@ async fn execute(
             )
             .await
             {
-                Ok(_) => {
+                Ok(sent) => {
+                    // Direction to a claude chat stuck on a foreground
+                    // subagent frees it the same way once the send is in
+                    // the CLI's queue, so it is read now. Nothing sent (a
+                    // hook took it first) leaves the subagent alone.
+                    let calls = target.subagent_calls();
+                    if sent > 0 && !calls.is_empty() {
+                        free_main_thread(state, target, calls).await;
+                    }
                     crate::history::act(
                         state,
                         &target.ws,
@@ -1622,11 +1652,22 @@ fn is_settled(state: &AppState, reader: &Reader, seq: u64) -> bool {
 }
 
 /// Wait up to `limit` for `seq` to settle for `reader`.
-async fn read_within(state: &Arc<AppState>, reader: &Reader, seq: u64, limit: Duration) -> bool {
+/// Every settle (`finish` for a hook delivery, `on_chat_event` for a steer)
+/// announces itself on `state.changes`, so this returns within moments of
+/// the read.
+pub(crate) async fn read_within(
+    state: &Arc<AppState>,
+    reader: &Reader,
+    seq: u64,
+    limit: Duration,
+) -> bool {
     let deadline = tokio::time::Instant::now() + limit;
     loop {
-        // Registered before the check: a settle in between still wakes it.
-        let changed = state.changes.notified();
+        // Enabled before the check, so a settle in between still wakes it
+        // (an un-polled `notified()` is not registered yet).
+        let changed = state.changes.subscribe();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
         if is_settled(state, reader, seq) {
             return true;
         }
@@ -1934,6 +1975,7 @@ fn reader_or_ghost(state: &AppState, sid: &str, ws: &str, note: &timeline::Note)
         mastermind: note.mastermind,
         created_ms: 0,
         wait: None,
+        free_subagents: false,
     })
 }
 
@@ -2575,6 +2617,7 @@ mod tests {
             mastermind: false,
             created_ms: 0,
             wait: None,
+            free_subagents: true,
         }
     }
 
@@ -2892,7 +2935,7 @@ mod tests {
         ));
     }
 
-    /// Pass 43: a reader blocked on a subagent hears a message now where its
+    /// Pass 44: a reader blocked on a subagent hears a message now where its
     /// runtime allows it, and the sender is told precisely where it can't.
     #[test]
     fn a_subagent_wait_is_passed_where_the_runtime_allows_it() {
@@ -2924,7 +2967,18 @@ mod tests {
                 None,
             )
         };
-        // A claude chat: the subagent moves to the background.
+        // A claude chat, by default: the subagent is left alone and the
+        // sender is told when the message will be read.
+        let mut kept = to.clone();
+        kept.free_subagents = false;
+        assert_eq!(plan(&mut st, &kept, false), Plan::Carrier);
+        assert_eq!(kept.blocked(), Blocked::Subagent);
+        assert!(kept.subagent_calls().is_empty());
+        assert_eq!(
+            kept.reach(WakePolicy::Ask, false),
+            "reads messages when its subagent returns"
+        );
+        // With freeSubagents on, the subagent moves to the background.
         assert_eq!(plan(&mut st, &to, false), Plan::Free(vec!["tu-1".into()]));
         assert_eq!(
             to.doing(now),

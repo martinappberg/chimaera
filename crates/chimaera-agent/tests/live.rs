@@ -2463,7 +2463,7 @@ async fn driver_stop_ends_claudes_detached_background_work() {
     assert!(!survived, "`{marker}` outlived its stopped agent");
 }
 
-/// Pass 43: a parent waiting on a FOREGROUND subagent has no next step until
+/// Pass 44: a parent waiting on a FOREGROUND subagent has no next step until
 /// it returns, so a queued message waits too. `background_tasks` on the
 /// Agent call is the carrier: the call returns at once, the parent's OWN
 /// PostToolUse fires for it (the hook carrier agent communication rides),
@@ -2622,7 +2622,7 @@ async fn claude_background_tasks_frees_a_parent_waiting_on_a_subagent() {
         .expect("shutdown");
 }
 
-/// Pass 43: a codex parent waiting on a spawned agent (`collab wait`) reads a
+/// Pass 44: a codex parent waiting on a spawned agent (`collab wait`) reads a
 /// `turn/steer` at once — the wait ends, the message is read, the parent
 /// waits again — and the child keeps running. (gpt-5.6-sol delegates when
 /// told to; the default model may answer itself.)

@@ -87,6 +87,7 @@ export type SettingsMap = {
   "agents.defaultView": "chat" | "terminal";
   "agents.communication.enabled": boolean;
   "agents.communication.wakes": "never" | "ask" | "auto";
+  "agents.communication.freeSubagents": boolean;
   "dashboard.landing": "auto" | "never";
   "dashboard.cardDensity": "auto" | "comfortable" | "compact";
   "dashboard.roster": "line" | "cards";
@@ -265,6 +266,18 @@ const DEFS = {
       { value: "auto", label: "Within limits" },
     ],
     scope: "daemon",
+  },
+  // Off by default: moving a subagent the user's turn waits on changes that
+  // turn's flow, and the subagent's result then arrives in a turn of its own.
+  "agents.communication.freeSubagents": {
+    title: "Messages may move a waiting subagent to the background",
+    category: "Agents",
+    description:
+      "A message from another agent may move this chat's waiting subagent to the background so it is read now; its result then arrives later.",
+    type: "boolean",
+    default: false,
+    scope: "daemon",
+    note: "Claude chats. Codex reads a message while it waits on its subagents either way.",
   },
 
   // --- Dashboard ---------------------------------------------------------------

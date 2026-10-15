@@ -9,7 +9,7 @@ Sources:
 - **live**: probed against the real CLIs (claude 2.1.206, codex 0.142.5;
   codex 0.144.2 from Pass 16 on; claude 2.1.259 + codex 0.153.0 from Pass 30
   on; claude 2.1.280/2.1.281 + codex 0.156.1 from Pass 31 on; claude 2.1.283
-  + codex 0.157.1 from Pass 33 on).
+  + codex 0.157.1 from Pass 33 on; claude 2.1.300 + codex 0.162.1 in Pass 44).
 - **official schema/docs**: Codex's upstream `codex-rs/app-server/README.md`
   and the version-specific output of `codex app-server generate-ts` /
   `generate-json-schema` (the preferred shape inventory for the installed
@@ -3155,7 +3155,7 @@ The chat's subagent surface named the work but never the model doing it, and a s
 
 Neither ACP adapter reports subagents on its wire today, so there is nothing to name a model for or open; the chip and the view are claude- and codex-only by wire reality.
 
-## Pass 43 (2026-10-14 — live probes claude 2.1.300 + codex 0.162.1): reaching an agent's main thread while it waits on a subagent. ADOPTED.
+## Pass 44 (2026-10-14 — live probes claude 2.1.300 + codex 0.162.1): reaching an agent's main thread while it waits on a subagent. ADOPTED.
 
 Issue #277: a message from another agent reached a working agent "at its next step", and an agent waiting on a long subagent has no next step until the subagent returns. Every probe ran the same scene: a raw client spawns the CLI (claude: Haiku over `-p` stream-json, `--dangerously-skip-permissions`; codex: `codex app-server`, `gpt-5.6-sol`, `approvalPolicy: never`), asks it to delegate to one subagent that sleeps 70–200 s and to wait for it, and injects a message 15–20 s after the subagent started. "Read" is the moment the parent's main thread took the message in (`command_lifecycle started` / the steer's `userMessage` item / the hook's answer), not the moment the client wrote it.
 
@@ -3191,10 +3191,10 @@ No mid-turn input on ACP v1 (`session/prompt` is one at a time) and no subagent 
 
 - **Engine (`lib.rs`):** a main-thread fold beside `BackgroundWork` — the running turn's start and its open `cross_turn: false` tool calls, each classed `Subagent` (claude `Agent`/`Task`; codex collab `wait`, by `codex::COLLAB_WAIT_TITLE`), `Command` (Execute) or `Tool`; claude's synthesized `task:` rows are not blocking calls. `ChatManager::main_wait(id)` reads it; it is not on the session-list wire.
 - **`AgentCommand::BackgroundTool` gains `for_message`** (additive, serde-defaulted false): the claude driver's notice says "subagent moved to the background to read a message from another agent; it keeps working", and a call that returned first (`backgrounded: false`) says nothing.
-- **Daemon (`comms.rs`):** a direct message (or Mastermind direction) to a claude chat whose turn waits on foreground subagents moves each to the background, so the parent's PostToolUse carries the message (`Plan::Free`); codex chats keep the steer. `message_agent` waits up to 8 s for such a message to be read and says whether it was; otherwise it names what the reader waits on and since when ("it's running a command (12 min: cargo test); it reads this when that command ends"). `workspace_agents` shows "working: waiting on a subagent (4 min: audit the loader)" and how a message reaches it. Claude terminals follow their own PreToolUse/PostToolUse hooks for the same words; nothing can free a terminal's subagent, so the sender is told it reads the message when the subagent returns. The Timeline note's `delivery` gains `"now"`. Broadcasts never move anyone's subagent.
+- **Daemon (`comms.rs`):** with `agents.communication.freeSubagents` on (default OFF — it changes the user's turn, and the subagent's result then lands in a separate CLI-started turn), a direct message (or Mastermind direction, after its send is accepted) to a claude chat whose turn waits on foreground subagents moves each to the background, so the parent's PostToolUse carries the message (`Plan::Free`); off, the hook carrier waits for the subagent and the sender is told so. Codex chats keep the steer. `message_agent` waits up to 8 s for such a message to be read and says whether it was; otherwise it names what the reader waits on and since when ("it's running a command (12 min: cargo test); it reads this when that command ends"). `workspace_agents` shows "working: waiting on a subagent (4 min: audit the loader)" and how a message reaches it. Claude terminals follow their own PreToolUse/PostToolUse hooks for the same words; nothing can free a terminal's subagent, so the sender is told it reads the message when the subagent returns. The Timeline note's `delivery` gains `"now"`. Broadcasts never move anyone's subagent.
 - Claim-once, never into a subagent, and the wake policy are unchanged: the backgrounding opens no turn, the hook carrier is the existing one, and a subagent's hooks still never carry a message.
 
-#### Gate (Pass 43)
+#### Gate (Pass 44)
 
 - Hermetic: `lib.rs` `main_thread_names_what_the_running_turn_waits_on`; claude `background_for_a_message_says_why_and_stays_quiet_when_raced`; server `comms::tests::a_subagent_wait_is_passed_where_the_runtime_allows_it`, `tests::comms::a_terminal_waiting_on_a_subagent_is_named_and_reads_when_it_returns`; live `claude_background_tasks_frees_a_parent_waiting_on_a_subagent`, `codex_steer_ends_a_parent_wait_on_a_subagent`.
 - Live, isolated daemon: see docs/features/agent-communication.md "Verified live (2026-10-14)".

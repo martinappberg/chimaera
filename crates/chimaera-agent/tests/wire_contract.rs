@@ -274,7 +274,7 @@ fn cancel_queued_command_is_additive() {
     assert_eq!(interrupt, AgentCommand::Interrupt);
 }
 
-/// `for_message` (Pass 43) is additive to `background_tool`: the UI's own
+/// `for_message` (Pass 44) is additive to `background_tool`: the UI's own
 /// Ctrl-B frame parses and serializes exactly as before.
 #[test]
 fn background_tool_for_message_is_additive() {
