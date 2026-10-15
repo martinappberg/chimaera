@@ -1368,6 +1368,11 @@ pub(crate) struct SwitchView {
     ui: String,
     #[serde(default)]
     force: bool,
+    /// Respawn the chat in place even though it is already a live chat —
+    /// after a sign-in landed for a process that started signed out. The
+    /// conversation resumes by its native id.
+    #[serde(default)]
+    relaunch: bool,
 }
 
 /// POST /api/v1/sessions/{id}/view — switch a session between the chat and
@@ -1392,12 +1397,14 @@ pub(crate) async fn switch_view(
         return err(StatusCode::NOT_FOUND, format!("unknown session {id}"));
     }
     let target_chat = body.ui == "chat";
-    if target_chat == currently_chat && (currently_chat || pty_alive) {
+    // A dead chat asked for chat again, or a live one asked to relaunch, is a
+    // respawn in place (the sign-in card's "start again"), not a surface
+    // switch: every agent gets it.
+    let relaunch =
+        target_chat && ((!currently_chat && !pty_alive) || (currently_chat && body.relaunch));
+    if target_chat == currently_chat && (currently_chat || pty_alive) && !relaunch {
         return StatusCode::NO_CONTENT.into_response();
     }
-    // A dead chat asked for chat again is a relaunch in place (the sign-in
-    // card's "start again"), not a surface switch: every agent gets it.
-    let relaunch = target_chat && !currently_chat && !pty_alive;
 
     let Some(record) = crate::lock(&state.agents).get(&id).cloned() else {
         return err(

@@ -16,6 +16,7 @@
   } from "./paths";
   import { agentCatalog, listAgents } from "../workspace/launcher";
   import { getSignIn, needsSignIn } from "../workspace/agentSignIn";
+  import { looksLikeAuthFailure } from "./authFailure";
   import AgentSignInCard from "../workspace/AgentSignInCard.svelte";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import BranchChip from "../shared/BranchChip.svelte";
@@ -255,16 +256,32 @@
   // stale "signed out" re-asks too, so the launcher row comes right.
   const catalogAgent = $derived($agentCatalog.find((a) => a.id === agentKind) ?? null);
   const signInNeeded = $derived(!readOnly && needsSignIn(catalogAgent));
+  // The newest error the agent reported that reads like a missing login: a
+  // process that started signed out (codex's app-server does) fails only at
+  // its first turn, so the status is re-asked on it.
+  const authShapedError = $derived.by(() => {
+    for (let i = store.blocks.length - 1; i >= 0 && i >= store.blocks.length - 12; i--) {
+      const b = store.blocks[i];
+      if (b.kind === "notice" && b.tone === "error" && looksLikeAuthFailure(b.text)) return `${b.uid}`;
+    }
+    return null;
+  });
   let signInAsked: string | null = null;
   $effect(() => {
     const failure = store.fatalError;
     if (readOnly || catalogAgent === null || !catalogAgent.installed) return;
-    const stale = (failure !== null && catalogAgent.signedIn !== false) || (store.initialized && catalogAgent.signedIn === false);
-    const key = failure ?? (store.initialized ? "init" : null);
+    const stale = (failure !== null && catalogAgent.signedIn !== false)
+      || (authShapedError !== null && !store.running && catalogAgent.signedIn !== false)
+      || (store.initialized && authShapedError === null && catalogAgent.signedIn === false);
+    const key = failure ?? authShapedError ?? (store.initialized ? "init" : null);
     if (!stale || key === null || signInAsked === key) return;
     signInAsked = key;
     void getSignIn(agentKind, true).catch(() => {});
   });
+  /** A live, idle chat whose CLI says it is signed out: the card sits at the
+   *  transcript's tail; signing in relaunches the chat in place, resuming
+   *  the conversation. */
+  const liveSignIn = $derived(signInNeeded && store.initialized && store.exited === null && store.fatalError === null && !store.running && !store.degraded);
   void listAgents().then((agents) => {
     const info = agents.find((a) => a.id === agentKind);
     models = info?.models ?? [];
@@ -3163,6 +3180,11 @@
       </div>
     {/if}
 
+    {#if liveSignIn && catalogAgent !== null}
+      <div class="live-signin">
+        <AgentSignInCard agent={catalogAgent} workspaceId={session.workspace_id ?? null} framed onSignedIn={onRelaunch} />
+      </div>
+    {/if}
     {#if store.fatalError !== null && signInNeeded}
       <!-- The startup failed because the CLI is signed out: the card is the
            whole story, the raw error stays in the journal. -->
@@ -3754,6 +3776,9 @@
     font-size: var(--text-sm);
     text-align: center;
     padding: 6px 0;
+  }
+  .live-signin {
+    padding: 12px 0 4px;
   }
   .notice.error {
     color: var(--err);
