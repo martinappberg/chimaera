@@ -52,6 +52,15 @@ pub(crate) struct RecentEntry {
     /// entries and transcript-scan rows (no known surface); the UI then falls
     /// back to the launcher's sticky default.
     pub(crate) ui: Option<SessionUi>,
+    /// The transcript path claude's hooks last reported (claude only) — the
+    /// file `--resume` will reopen, wherever claude filed it (an agent that
+    /// entered a worktree mid-conversation moved it there). Store-only.
+    pub(crate) transcript: Option<PathBuf>,
+    /// The folder the session ran in when it was not the workspace root (a
+    /// worktree it was started in), so reopening resumes it there while that
+    /// folder exists. Store-only; the API exposes it as `worktree` when it is
+    /// a Chimaera-managed worktree that still exists.
+    pub(crate) cwd: Option<PathBuf>,
 }
 
 /// Ancestor-chain bound: transcripts on disk outlive everything, so a
@@ -65,8 +74,10 @@ impl RecentEntry {
         crate::recents_archive::key_of(self.resume.as_deref(), self.kind.as_str(), &self.title)
     }
 
-    /// The wire shape (`supersedes` stays internal to the store file).
-    fn to_api_json(&self) -> serde_json::Value {
+    /// The wire shape (`supersedes`, `transcript` and `cwd` stay internal to
+    /// the store file). `worktree` is additive: the managed worktree this
+    /// conversation ran in, when it still exists (resolved by the caller).
+    fn to_api_json(&self, worktree: Option<&PathBuf>) -> serde_json::Value {
         json!({
             "key": self.archive_key(),
             "kind": self.kind.as_str(),
@@ -74,6 +85,7 @@ impl RecentEntry {
             "resume": self.resume,
             "last_active": self.last_active,
             "ui": self.ui,
+            "worktree": worktree,
         })
     }
 
@@ -85,6 +97,8 @@ impl RecentEntry {
             "supersedes": self.supersedes,
             "last_active": self.last_active,
             "ui": self.ui,
+            "transcript": self.transcript,
+            "cwd": self.cwd,
         })
     }
 
@@ -115,6 +129,12 @@ impl RecentEntry {
                     "term" => Some(SessionUi::Term),
                     _ => None,
                 }),
+            // Additive and tolerant: older store entries have neither.
+            transcript: value
+                .get("transcript")
+                .and_then(|t| t.as_str())
+                .map(PathBuf::from),
+            cwd: value.get("cwd").and_then(|c| c.as_str()).map(PathBuf::from),
         })
     }
 }
@@ -203,6 +223,28 @@ impl RecentsStore {
         self.items.get(workspace_id).cloned().unwrap_or_default()
     }
 
+    /// The transcript paths recorded for conversation `id` (its own row, or
+    /// a row whose lineage absorbed it), across workspaces.
+    pub(crate) fn recorded_transcripts(&self, id: &str) -> Vec<PathBuf> {
+        self.items
+            .values()
+            .flatten()
+            .filter(|e| e.resume.as_deref() == Some(id) || e.supersedes.iter().any(|s| s == id))
+            .filter_map(|e| e.transcript.clone())
+            .collect()
+    }
+
+    /// Where conversation `id` last ran in this workspace, when that was not
+    /// the root (see [`RecentEntry::cwd`]). Follows the lineage like
+    /// [`Self::recorded_transcripts`]: an absorbed older id finds its row.
+    pub(crate) fn cwd_of(&self, workspace_id: &str, id: &str) -> Option<PathBuf> {
+        self.items
+            .get(workspace_id)?
+            .iter()
+            .find(|e| e.resume.as_deref() == Some(id) || e.supersedes.iter().any(|s| s == id))
+            .and_then(|e| e.cwd.clone())
+    }
+
     /// resume id -> the ancestor ids that conversation absorbed.
     fn ancestors(&self, workspace_id: &str) -> HashMap<String, Vec<String>> {
         self.items
@@ -281,6 +323,12 @@ fn retire_inner(
         return;
     };
     let workspace_id = crate::lock(&state.session_workspaces).remove(session_id);
+    // Where it ran, read before the recipe goes below: a chat's recipe, else
+    // the PTY agent's spawn folder.
+    let session_cwd = crate::lock(&state.chat_recipes)
+        .get(session_id)
+        .map(|r| r.workspace_root.clone())
+        .or_else(|| record.spawn_cwd.clone());
     // Its history record closes here too — every session, Masterminds and
     // untitled boots included (Recents skips those below; history doesn't).
     crate::history::close(
@@ -344,21 +392,24 @@ fn retire_inner(
         {
             resume_hint.or_else(|| record.resumed_from.clone())
         } else {
-            [resume_hint, record.resume_id(), record.resumed_from.clone()]
-                .into_iter()
-                .flatten()
-                .find(|id| {
-                    record.transcript_path.as_deref().is_some_and(|p| {
-                        p.file_stem().is_some_and(|s| s == id.as_str()) && p.is_file()
-                    }) || workspace_root.as_deref().is_some_and(|root| {
-                        state
-                            .claude_projects_dir
-                            .join(crate::launcher::encode_cwd(root))
-                            .join(id)
-                            .with_extension("jsonl")
-                            .is_file()
-                    })
-                })
+            // The shared lookup: the hook-reported transcript, the session's
+            // own folder (a worktree it started in), then the root.
+            let cwds: Vec<PathBuf> = session_cwd
+                .iter()
+                .chain(workspace_root.iter())
+                .cloned()
+                .collect();
+            let recorded: Vec<PathBuf> = record.transcript_path.iter().cloned().collect();
+            let candidates: Vec<String> =
+                [resume_hint, record.resume_id(), record.resumed_from.clone()]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+            let ids: Vec<&str> = candidates.iter().map(String::as_str).collect();
+            // One lookup for all of the conversation's handles: the store is
+            // listed at most once however many of them miss.
+            crate::claude_store::find_first(&state.claude_projects_dir, &ids, &recorded, &cwds)
+                .map(|(id, _)| id.to_string())
         };
         let entry = RecentEntry {
             kind: record.kind,
@@ -370,6 +421,9 @@ fn retire_inner(
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
             ui: Some(ui),
+            transcript: record.transcript_path.clone(),
+            // Only a folder other than the root is worth remembering.
+            cwd: session_cwd.filter(|c| workspace_root.as_ref() != Some(c)),
         };
         crate::lock(&state.recents).push(&workspace_id, entry, record.resumed_from.as_deref());
         // The epoch rides /ws/events so the rail refetches exactly when a
@@ -384,6 +438,15 @@ fn retire_inner(
 #[derive(Deserialize)]
 pub(crate) struct RecentsQuery {
     workspace_id: String,
+}
+
+/// The linked worktree holding `dir` (the nearest folder with a `.git`
+/// file), searched only inside `managed`. Blocking.
+fn worktree_top(dir: &std::path::Path, managed: &std::path::Path) -> Option<PathBuf> {
+    dir.ancestors()
+        .take_while(|d| d.starts_with(managed) && *d != managed)
+        .find(|d| d.join(".git").is_file())
+        .map(std::path::Path::to_path_buf)
 }
 
 /// GET /api/v1/recents?workspace_id= — the workspace's ended agent
@@ -426,14 +489,30 @@ pub(crate) async fn list_recents(
     // or any id of their resume chain.
     let archived = crate::lock(&state.recents_archive).hidden(&query.workspace_id);
 
-    let dir = state
-        .claude_projects_dir
-        .join(crate::launcher::encode_cwd(&workspace.root));
-    // Transcripts can be tens of MB; scan them off the async runtime.
-    let scanned =
-        tokio::task::spawn_blocking(move || crate::launcher::scan_resumables(&dir, &exclude))
-            .await
-            .unwrap_or_default();
+    let store = state.claude_projects_dir.clone();
+    let root = workspace.root.clone();
+    let managed = state.worktrees_root_real.clone();
+    // A row's worktree, for the UI's "remove it" offer: the top of the
+    // managed worktree it ran in (also from a subfolder), while it exists.
+    let cwds: Vec<Option<PathBuf>> = store_entries
+        .iter()
+        .map(|e| e.cwd.clone().filter(|c| c.starts_with(&managed)))
+        .collect();
+    // Transcripts can be tens of MB; scan them off the async runtime. The
+    // root's own project dir plus its Claude worktrees' (`EnterWorktree`,
+    // `.claude/worktrees/<name>`), where conversations from outside chimaera
+    // that entered a worktree now live.
+    let (scanned, worktrees) = tokio::task::spawn_blocking(move || {
+        let mut dirs = vec![store.join(crate::launcher::encode_cwd(&root))];
+        dirs.extend(crate::claude_store::claude_worktree_dirs(&store, &[root]));
+        let worktrees: Vec<Option<PathBuf>> = cwds
+            .into_iter()
+            .map(|c| c.and_then(|c| worktree_top(&c, &managed)))
+            .collect();
+        (crate::launcher::scan_resumables(&dirs, &exclude), worktrees)
+    })
+    .await
+    .unwrap_or_default();
 
     // Daemon entries win on identity collisions: they know the agent kind
     // and the true end time, and carry non-claude history the store can't.
@@ -448,12 +527,13 @@ pub(crate) async fn list_recents(
         .collect();
     let mut merged: Vec<serde_json::Value> = store_entries
         .iter()
-        .filter(|e| e.resume.as_ref().is_none_or(|r| !live.contains(r)))
-        .filter(|e| {
+        .zip(worktrees.iter().map(Some).chain(std::iter::repeat(None)))
+        .filter(|(e, _)| e.resume.as_ref().is_none_or(|r| !live.contains(r)))
+        .filter(|(e, _)| {
             !archived.contains(&e.archive_key())
                 && !e.supersedes.iter().any(|s| archived.contains(s))
         })
-        .map(RecentEntry::to_api_json)
+        .map(|(e, wt)| e.to_api_json(wt.and_then(|w| w.as_ref())))
         .collect();
     for row in scanned {
         let Some(id) = row.get("id").and_then(|v| v.as_str()) else {
@@ -478,4 +558,55 @@ pub(crate) async fn list_recents(
     });
     merged.truncate(CAP_PER_WORKSPACE);
     Json(serde_json::Value::Array(merged)).into_response()
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(resume: &str, cwd: Option<&str>) -> RecentEntry {
+        RecentEntry {
+            kind: AgentKind::Claude,
+            title: "t".into(),
+            resume: Some(resume.into()),
+            supersedes: Vec::new(),
+            last_active: 1,
+            ui: Some(SessionUi::Chat),
+            transcript: None,
+            cwd: cwd.map(PathBuf::from),
+        }
+    }
+
+    /// Reopening by an id the conversation absorbed (an older claude forked
+    /// one per resume) still finds where it ran, like its transcripts do.
+    #[test]
+    fn cwd_of_follows_the_resume_lineage() {
+        let dir = std::env::temp_dir().join(format!("chimaera-recents-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut store = RecentsStore::load(dir.join("recents.json"));
+        store.push("w", entry("old", Some("/wt/a")), None);
+        store.push("w", entry("new", Some("/wt/a")), Some("old"));
+        assert_eq!(store.cwd_of("w", "new"), Some(PathBuf::from("/wt/a")));
+        assert_eq!(store.cwd_of("w", "old"), Some(PathBuf::from("/wt/a")));
+        assert_eq!(store.cwd_of("w", "other"), None);
+        assert_eq!(store.cwd_of("x", "new"), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn worktree_top_walks_up_only_inside_the_managed_root() {
+        let dir = std::env::temp_dir().join(format!("chimaera-recents-top-{}", std::process::id()));
+        let managed = dir.join("worktrees");
+        let top = managed
+            .join("repo-1")
+            .join("chimaera")
+            .join("claude-abc123");
+        let sub = top.join("src").join("deep");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(top.join(".git"), "gitdir: elsewhere\n").unwrap();
+        assert_eq!(worktree_top(&sub, &managed), Some(top.clone()));
+        assert_eq!(worktree_top(&top, &managed), Some(top.clone()));
+        std::fs::remove_file(top.join(".git")).unwrap();
+        assert_eq!(worktree_top(&sub, &managed), None, "gone: no worktree");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

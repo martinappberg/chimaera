@@ -23,11 +23,16 @@
    * Picking here makes that agent the saved default (the rail's primary).
    * Resuming lives in the rail's RECENT section, not here.
    *
+   * In a git workspace the footer also holds one quiet switch: new agents
+   * start in their own worktree (a fresh branch). Remembered per
+   * workspace; every new-agent path follows it, not only this menu. It
+   * joins the roving order between the agents and the settings link.
+   *
    * Keyboard: the root holds focus with a roving highlight
    * (aria-activedescendant). ArrowUp/Down (Home/End) move across the agent
-   * rows and the settings link, Enter activates (start, install, or open
-   * settings), ⌘/Ctrl+Enter starts in the terminal, Escape closes and hands
-   * focus back to the chevron.
+   * rows, the worktree switch and the settings link, Enter activates (start,
+   * install, flip the switch, or open settings), ⌘/Ctrl+Enter starts in the
+   * terminal, Escape closes and hands focus back to the chevron.
    */
   import { onMount } from "svelte";
   import {
@@ -64,9 +69,24 @@
      *  Rows paint from it INSTANTLY — no "checking…" flash on every open —
      *  and the background re-detect swaps in the truth. */
     initial?: AgentInfo[] | null;
+    /** The workspace's "new agents start in a new worktree" choice; null
+     *  hides the switch (not a git repository). */
+    inWorktree?: boolean | null;
+    onToggleWorktree?: (next: boolean) => void;
   }
 
-  let { anchor, onPick, onInstall, onUpdate, onClose, onSettings, onAgents, initial = null }: Props = $props();
+  let {
+    anchor,
+    onPick,
+    onInstall,
+    onUpdate,
+    onClose,
+    onSettings,
+    onAgents,
+    initial = null,
+    inWorktree = null,
+    onToggleWorktree,
+  }: Props = $props();
 
   /** Read once per open: the default decides which agents are "quick". */
   const defaultId = getAgentDefault().agent;
@@ -77,10 +97,12 @@
   let showLoading = $state(false);
 
   const groups = $derived(catalog === null ? null : groupAgents(catalog, defaultId));
-  /** The roving order: quick agents, others, then the settings link. */
+  /** The roving order: quick agents, others, the worktree switch (git
+   *  workspaces only), then the settings link. */
   const rows = $derived(groups === null ? [] : [...groups.quick, ...groups.others]);
   const quickCount = $derived(groups?.quick.length ?? 0);
-  const settingsIndex = $derived(rows.length);
+  const wtIndex = $derived(inWorktree !== null ? rows.length : -1);
+  const settingsIndex = $derived(rows.length + (inWorktree !== null ? 1 : 0));
 
   let hl = $state(0);
   let rootEl = $state<HTMLElement | null>(null);
@@ -105,12 +127,12 @@
   }
 
   /** Swap in a fresh catalog, keeping the highlight on the same agent (or on
-   *  the settings link) rather than the same index. */
+   *  the same footer control) rather than the same index. */
   function adopt(next: AgentInfo[]): void {
-    const onSettingsRow = catalog !== null && hl === settingsIndex;
+    const footer = catalog !== null && hl >= rows.length ? hl - rows.length : null;
     const selected = rows[hl]?.id;
     catalog = next;
-    if (onSettingsRow) hl = rows.length;
+    if (footer !== null) hl = rows.length + footer;
     else hl = Math.max(0, rows.findIndex((a) => a.id === selected));
   }
 
@@ -184,6 +206,11 @@
       onSettings();
       return;
     }
+    if (i === wtIndex) {
+      // A remembered choice, not a launch: the menu stays open.
+      onToggleWorktree?.(!inWorktree);
+      return;
+    }
     const a = rows[i];
     if (a === undefined) return;
     if (!a.installed || (a.chatSetupRequired && ui !== "term")) {
@@ -202,7 +229,7 @@
   }
 
   function move(delta: number): void {
-    const n = rows.length + 1;
+    const n = settingsIndex + 1;
     if (catalog === null) return;
     hl = (hl + delta + n) % n;
   }
@@ -402,7 +429,46 @@
     </div>
 
     <div class="foot">
-      <span class="hint"><kbd>{isMac ? "⌘" : "ctrl"}↵</kbd> terminal</span>
+      {#if inWorktree !== null}
+        <!-- The worktree choice lives in the footer, a peer of the settings
+             link: a remembered setting, not a step. A focused switch's own
+             Enter/Space must not also reach the root's Enter (a second flip). -->
+        <button
+          class="wt"
+          class:hl={hl === wtIndex}
+          role="menuitemcheckbox"
+          aria-checked={inWorktree}
+          tabindex="-1"
+          id={itemId(wtIndex)}
+          title={inWorktree
+            ? "new agents start on a fresh branch in their own worktree"
+            : "start new agents on a fresh branch in their own worktree"}
+          onpointerenter={() => (hl = wtIndex)}
+          onclick={() => activate(wtIndex)}
+          onkeydown={(e) => {
+            if (e.key === "Enter" || e.key === " ") e.stopPropagation();
+          }}
+        >
+          <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+            <path
+              d="M5 3v7.5M5 12.5v.5M11 3v3a2.5 2.5 0 0 1-2.5 2.5H5"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.4"
+              stroke-linecap="round"
+            />
+            <circle cx="5" cy="12.6" r="1.6" fill="none" stroke="currentColor" stroke-width="1.4" />
+            <circle cx="5" cy="2.4" r="1.6" fill="none" stroke="currentColor" stroke-width="1.4" />
+            <circle cx="11" cy="2.4" r="1.6" fill="none" stroke="currentColor" stroke-width="1.4" />
+          </svg>
+          <span class="wtlabel">In a new worktree</span>
+          <span class="wtswitch" class:on={inWorktree} aria-hidden="true"><span class="wtknob"></span></span>
+        </button>
+      {:else}
+        <!-- Outside a repository the footer keeps its terminal hint (the
+             terminal button's tooltip says it too). -->
+        <span class="hint"><kbd>{isMac ? "⌘" : "ctrl"}↵</kbd> terminal</span>
+      {/if}
       <button
         class="settings"
         class:hl={hl === settingsIndex}
@@ -742,6 +808,93 @@
   .obtn:active,
   .tbtn:active {
     transform: translateY(0.5px);
+  }
+
+  /* The worktree switch: a footer control in the settings link's language
+     (same padding, radius and hot state), the Switch recipe at a smaller
+     size after its label. */
+  .wt {
+    appearance: none;
+    border: none;
+    background: none;
+    font: inherit;
+    font-size: var(--text-xs);
+    min-width: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 6px;
+    margin-left: -6px;
+    border-radius: 6px;
+    color: var(--muted);
+    cursor: pointer;
+    transition:
+      color 0.12s ease,
+      background-color 0.12s ease;
+  }
+
+  .wt.hl,
+  .wt[aria-checked="true"] {
+    color: var(--fg);
+  }
+
+  .wt.hl {
+    background: var(--row-hover);
+  }
+
+  .wt svg {
+    flex: none;
+  }
+
+  .wtlabel {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .wtswitch {
+    flex: none;
+    position: relative;
+    width: 24px;
+    height: 14px;
+    border: 1px solid var(--edge);
+    border-radius: 8px;
+    background: var(--row-hover);
+    transition:
+      background-color 0.14s ease,
+      border-color 0.14s ease;
+  }
+
+  .wtknob {
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--muted);
+    transition:
+      transform 0.14s ease,
+      background-color 0.14s ease;
+  }
+
+  .wtswitch.on {
+    background: color-mix(in srgb, var(--accent) 28%, var(--row-hover));
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
+  }
+
+  .wtswitch.on .wtknob {
+    transform: translateX(10px);
+    background: var(--accent);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .wtswitch,
+    .wtknob {
+      transition: none;
+    }
   }
 
   .foot {

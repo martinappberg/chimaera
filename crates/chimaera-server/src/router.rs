@@ -33,7 +33,10 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             "/workspaces",
             get(api::list_workspaces).post(api::create_workspace),
         )
-        .route("/workspaces/{id}", delete(api::delete_workspace))
+        .route(
+            "/workspaces/{id}",
+            delete(api::delete_workspace).patch(api::patch_workspace),
+        )
         .route("/workspaces/{id}/open", post(api::open_workspace))
         // The workspace Mastermind: PUT creates-and-binds (re-PUT retires the
         // old one — that is also how the mode changes), DELETE unbinds.

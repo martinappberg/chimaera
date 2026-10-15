@@ -11,8 +11,55 @@ use serde_json::json;
 use crate::workspaces::Workspace;
 use crate::AppState;
 
+#[derive(Deserialize)]
+pub(crate) struct PatchWorkspace {
+    /// The launcher's "new agents in a worktree" choice.
+    #[serde(default)]
+    new_in_worktree: Option<bool>,
+}
+
+/// PATCH /api/v1/workspaces/{id} — change a workspace's remembered choices
+/// (today: `new_in_worktree`). Answers the updated workspace.
+pub(crate) async fn patch_workspace(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<PatchWorkspace>,
+) -> Response {
+    let not_found = || {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "unknown workspace"})),
+        )
+            .into_response()
+    };
+    let Some(on) = body.new_in_worktree else {
+        return match crate::lock(&state.workspaces).get(&id) {
+            Some(ws) => Json(ws).into_response(),
+            None => not_found(),
+        };
+    };
+    // workspaces.json is small; the store writes it atomically, as `touch`
+    // does on every open.
+    let result = crate::lock(&state.workspaces).set_new_in_worktree(&id, on);
+    match result {
+        Ok(Some(ws)) => {
+            state.changes.notify_waiters();
+            Json(ws).into_response()
+        }
+        Ok(None) => not_found(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 /// GET /api/v1/workspaces — every workspace but the app's hidden ones.
 pub(crate) async fn list_workspaces(State(state): State<Arc<AppState>>) -> Json<Vec<Workspace>> {
+    // A managed worktree opened as its own window and removed since leaves
+    // no dead row behind.
+    crate::git::forget_missing_managed_workspaces(&state).await;
     Json(crate::lock(&state.workspaces).listed())
 }
 

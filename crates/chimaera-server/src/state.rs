@@ -170,6 +170,11 @@ pub(crate) struct AppState {
     /// touching the user's own checkouts. Derived from the data dir, so an
     /// isolated `CHIMAERA_HOME` (and every test) is sandboxed for free.
     pub(crate) worktrees_root: PathBuf,
+    /// [`Self::worktrees_root`] with symlinks resolved (`/tmp` → `/private/tmp`),
+    /// once at construction: session rows ask "is this cwd a managed
+    /// worktree?" on every snapshot and must not touch the filesystem to
+    /// answer. Worktree paths are canonical when created.
+    pub(crate) worktrees_root_real: PathBuf,
     /// Theming-shim dir (`~/.chimaera/shims`), prepended to every session's
     /// PATH via spawn env only — user dotfiles are never touched.
     pub(crate) shims_dir: PathBuf,
@@ -337,6 +342,7 @@ impl AppState {
             managed_root: data_dir.join("agents"),
             legacy_managed_root: None,
             worktrees_root: data_dir.join("worktrees"),
+            worktrees_root_real: real_path(&data_dir.join("worktrees")),
             shims_dir: data_dir.join("shims"),
             uploads_root: data_dir.join("uploads"),
             drafts_root: data_dir.join("drafts"),
@@ -438,6 +444,26 @@ fn codex_home(home: &std::path::Path, env: Option<std::ffi::OsString>) -> PathBu
     env.filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".codex"))
+}
+
+/// `path` with symlinks resolved as far as it exists: the longest existing
+/// ancestor canonicalized, the rest appended (the managed worktree root is
+/// created lazily, so it usually does not exist yet at construction).
+pub(crate) fn real_path(path: &std::path::Path) -> PathBuf {
+    let mut tail = Vec::new();
+    let mut cur = path;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(cur) {
+            return tail.iter().rev().fold(real, |acc: PathBuf, c| acc.join(c));
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name.to_os_string());
+                cur = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
 }
 
 #[cfg(test)]

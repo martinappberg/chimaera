@@ -78,6 +78,12 @@ pub(crate) struct CreateSession {
     /// never an arbitrary path). Old clients never send it.
     #[serde(default)]
     cwd: Option<String>,
+    /// Start this agent in a NEW Chimaera-managed worktree of its own (a
+    /// fresh `chimaera/<agent>-<hex>` branch off the workspace repository's
+    /// HEAD; see `git::create_session_worktree`). Agents only, never with
+    /// `resume` or `cwd`. Old clients never send it.
+    #[serde(default)]
+    worktree: bool,
 }
 
 /// POST /api/v1/sessions — spawn a shell (kind "shell", the default) or an
@@ -113,7 +119,6 @@ pub(crate) async fn create_session(
             return bad_request(format!("invalid theme {other:?} (expected light or dark)"));
         }
     };
-    let theme: &str = &theme_owned;
 
     // Launch-scope prelude: opaque shell text by design, so only size and
     // NUL are policed (the same caps the stored scopes get on PUT).
@@ -131,7 +136,7 @@ pub(crate) async fn create_session(
 
     // A requested starting folder must sit inside the workspace or one of
     // its worktrees; resolved (canonical) before either surface spawns.
-    let start_cwd = match body.cwd.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+    let mut start_cwd = match body.cwd.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
         None => None,
         Some(raw) => match crate::git::allowed_session_cwd(&state, &workspace, raw).await {
             Ok(path) if path == workspace.root => None,
@@ -140,10 +145,87 @@ pub(crate) async fn create_session(
         },
     };
 
+    // A new agent in a worktree of its own: made here, before either surface
+    // spawns, so both (chat and terminal, every agent) simply start there.
+    let mut made: Option<crate::git::Created> = None;
+    if body.worktree {
+        if body.kind != SessionKind::Agent {
+            return bad_request("worktree requires kind \"agent\"".to_string());
+        }
+        if body.resume.is_some() || body.cwd.is_some() {
+            return bad_request("worktree cannot be combined with resume or cwd".to_string());
+        }
+        let name = body.agent.as_deref().unwrap_or("claude");
+        let Some(kind) = crate::agents::AgentKind::parse(name) else {
+            return bad_request(format!("unknown agent {name:?}"));
+        };
+        // Refuse before the worktree exists: a missing agent must not leave
+        // an empty worktree and branch behind.
+        if let Err(msg) = crate::launcher::detect(&state, kind, false).await.path {
+            return (StatusCode::CONFLICT, Json(json!({"error": msg}))).into_response();
+        }
+        match crate::git::create_session_worktree(&state, &workspace, kind.as_str()).await {
+            Ok(created) => {
+                tracing::info!(workspace = %workspace.id, branch = %created.branch,
+                    path = %created.path.display(), "new agent session worktree");
+                start_cwd = Some(created.path.clone());
+                made = Some(created);
+            }
+            Err((status, msg)) => return (status, Json(json!({"error": msg}))).into_response(),
+        }
+    }
+
+    // Everything past this point can fail; a worktree made for this spawn
+    // must not outlive a spawn that never happened (it is new, clean and
+    // empty, so the fenced removal takes it, branch included).
+    let response = spawn_requested(&state, body, workspace.clone(), theme_owned, start_cwd).await;
+    if !response.status().is_success() {
+        if let Some(created) = made {
+            crate::git::discard_session_worktree(&state, &workspace, &created).await;
+        }
+    }
+    response
+}
+
+/// The rest of `create_session` once the workspace, theme, prelude and
+/// starting folder are settled: resume placement, then the chat or TUI
+/// spawn. Split out so the caller can undo a worktree it made for a spawn
+/// that failed here, on whichever path.
+async fn spawn_requested(
+    state: &Arc<AppState>,
+    body: CreateSession,
+    workspace: crate::workspaces::Workspace,
+    theme_owned: String,
+    start_cwd: Option<std::path::PathBuf>,
+) -> Response {
+    let bad_request =
+        |msg: String| (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
+    let theme: &str = &theme_owned;
+
+    // Reopening a conversation that ran in a worktree (its Recents row
+    // remembers where) resumes it there while that folder still exists and
+    // still belongs to the workspace; otherwise at the root.
+    let resume_cwd = match body.resume.as_deref().filter(|_| start_cwd.is_none()) {
+        Some(id) => {
+            let remembered = crate::lock(&state.recents).cwd_of(&workspace.id, id);
+            match remembered {
+                Some(dir) => {
+                    let raw = dir.to_string_lossy().into_owned();
+                    crate::git::allowed_session_cwd(state, &workspace, &raw)
+                        .await
+                        .ok()
+                        .filter(|p| *p != workspace.root)
+                }
+                None => None,
+            }
+        }
+        None => None,
+    };
+
     // Resuming an archived conversation brings it back: it is live again,
     // and once it ends it belongs in Recents like any other.
     if let Some(resume) = body.resume.as_deref().filter(|r| !r.is_empty()) {
-        crate::recents_archive::forget_resumed(&state, &workspace.id, resume).await;
+        crate::recents_archive::forget_resumed(state, &workspace.id, resume).await;
     }
 
     // Structured chat surface: an agent driven over stream-json/app-server,
@@ -163,7 +245,7 @@ pub(crate) async fn create_session(
         }
     };
     if chat_ui {
-        return spawn_chat_ui(&state, body, workspace, theme, start_cwd).await;
+        return spawn_chat_ui(state, body, workspace, theme, start_cwd, resume_cwd).await;
     }
 
     let kind = match body.kind {
@@ -225,7 +307,7 @@ pub(crate) async fn create_session(
         workspace,
         id: None,
         name: body.name,
-        cwd: start_cwd,
+        cwd: start_cwd.or(resume_cwd),
         cols: body.cols,
         rows: body.rows,
         theme: theme.to_string(),
@@ -239,7 +321,7 @@ pub(crate) async fn create_session(
         kind,
         started_by: crate::history::StartedBy::You,
     };
-    match crate::spawn::spawn_session(&state, spec).await {
+    match crate::spawn::spawn_session(state, spec).await {
         Ok(session) => Json(session).into_response(),
         Err(crate::spawn::SpawnFailure::AgentUnavailable(msg)) => {
             (StatusCode::CONFLICT, Json(json!({"error": msg}))).into_response()
@@ -264,6 +346,7 @@ async fn spawn_chat_ui(
     workspace: crate::workspaces::Workspace,
     theme: &str,
     start_cwd: Option<std::path::PathBuf>,
+    resume_cwd: Option<std::path::PathBuf>,
 ) -> Response {
     let bad_request =
         |msg: String| (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
@@ -426,7 +509,9 @@ async fn spawn_chat_ui(
     crate::lock(&state.agents).insert(id.clone(), record.clone());
     crate::lock(&state.session_workspaces).insert(id.clone(), workspace.id.clone());
     let recipe = crate::chat::ChatRecipe {
-        workspace_root: workspace.root.clone(),
+        // Where the conversation last ran (a worktree that still exists),
+        // else the root — claude resumes by id from either.
+        workspace_root: resume_cwd.unwrap_or_else(|| workspace.root.clone()),
         workspace_id: workspace.id.clone(),
         kind: agent_kind,
         bin,

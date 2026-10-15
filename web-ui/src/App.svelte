@@ -34,7 +34,9 @@
   import { pageVisible } from "./lib/shared/visibility";
   import {
     backgrounded,
+    baseName,
     createSession,
+    createWorkspace,
     deleteSession,
     deleteWorkspace,
     displayName,
@@ -45,6 +47,9 @@
     listSessions,
     listWorkspaces,
     renameSession,
+    setNewInWorktree,
+    wantsWorktree,
+    worktreeInUse,
     needsApproval,
     pollSessions,
     switchingViews,
@@ -240,6 +245,7 @@
     openFileHistory,
     openRepoHistory,
     repoForPath,
+    removeWorktree,
     revealRepo,
     setGitFocus,
     setGitOpener,
@@ -1101,6 +1107,13 @@
   }
 
   const workspace = $derived(workspaces.find((w) => w.id === activeWsId) ?? null);
+  /** The workspace root sits in a git repository — the only place a new
+   *  agent can get its own worktree. */
+  const workspaceIsRepo = $derived(
+    $gitStatus !== null && $gitStatus.repo && $gitStatus.workspace_id === activeWsId,
+  );
+  /** New agents here start in their own worktree (the remembered choice). */
+  const newInWorktree = $derived(workspaceIsRepo && workspace?.new_in_worktree === true);
   // The Mastermind is the observer, not the observed: its flagged row never
   // enters the workspace roster — the rail, chord map, attention counts,
   // quick-open, and reference targets all derive from here. Lookups by id
@@ -3993,7 +4006,12 @@
         kind === "agent"
           ? agents?.find((a) => a.id === (spawn.agent ?? "claude"))?.chatCapable
           : undefined;
-      const s = await createSession(activeWsId, kind, null, spawnSize(), spawn, chatCapable);
+      // A new agent follows the workspace's worktree choice; reopens,
+      // resumes and explicit folders never do.
+      const req = wantsWorktree(kind, spawn, workspace, workspaceIsRepo)
+        ? { ...spawn, worktree: true }
+        : spawn;
+      const s = await createSession(activeWsId, kind, null, spawnSize(), req, chatCapable);
       recentlyCreated.add(s.id);
       // A racing events snapshot may already have delivered the session.
       if (!sessions.some((x) => x.id === s.id)) sessions.push(s);
@@ -4122,6 +4140,106 @@
     void spawnSession("agent", pick);
   }
 
+  /** Flip the workspace's "new agents start in a new worktree" choice:
+   *  optimistic, reverted when the daemon refuses. */
+  async function toggleNewInWorktree(on: boolean): Promise<void> {
+    const id = activeWsId;
+    if (id === null) return;
+    const setLocal = (v: boolean) => {
+      workspaces = workspaces.map((w) => (w.id === id ? { ...w, new_in_worktree: v } : w));
+    };
+    const prev = workspaces.find((w) => w.id === id)?.new_in_worktree === true;
+    setLocal(on);
+    try {
+      const w = await setNewInWorktree(id, on);
+      workspaces = workspaces.map((x) => (x.id === id ? { ...x, ...w } : x));
+    } catch (e) {
+      setLocal(prev);
+      createError = e instanceof ApiError ? e.message : "could not save the worktree choice";
+    }
+  }
+
+  // --- a managed worktree left behind (session ended / conversation archived) ---
+
+  /** The one "kept" notice under the agents: a managed worktree whose last
+   *  session just ended. Never auto-removed — Remove or Keep, the user's
+   *  call; a newer notice replaces it. */
+  let wtNotice = $state<{
+    ws: string;
+    path: string;
+    label: string;
+    busy: boolean;
+    error: string | null;
+  } | null>(null);
+  let wtNoticeTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function clearWtNoticeTimer(): void {
+    if (wtNoticeTimer !== null) {
+      clearTimeout(wtNoticeTimer);
+      wtNoticeTimer = null;
+    }
+  }
+
+  function dismissWtNotice(): void {
+    clearWtNoticeTimer();
+    wtNotice = null;
+  }
+
+  function offerWorktreeRemoval(ws: string, path: string, branch: string | null): void {
+    clearWtNoticeTimer();
+    // The branch's last segment: the rail is narrow, and "chimaera/" says
+    // nothing the notice needs (the full path is the tooltip).
+    wtNotice = { ws, path, label: baseName(branch ?? path), busy: false, error: null };
+  }
+
+  async function removeKeptWorktree(): Promise<void> {
+    const n = wtNotice;
+    if (n === null || n.busy) return;
+    wtNotice = { ...n, busy: true };
+    try {
+      await removeWorktree(n.ws, n.path);
+      if (wtNotice?.path === n.path) wtNotice = null;
+      if (activeWsId === n.ws) refreshRecents();
+    } catch (e) {
+      if (wtNotice?.path !== n.path) return;
+      // The daemon's refusal (uncommitted changes, unmerged commits, a live
+      // session, a lock) is the honest answer: say it, keep the worktree.
+      wtNotice = {
+        ...n,
+        busy: false,
+        error: e instanceof ApiError ? e.message : "could not remove the worktree",
+      };
+      clearWtNoticeTimer();
+      wtNoticeTimer = setTimeout(() => {
+        wtNoticeTimer = null;
+        if (wtNotice?.path === n.path) wtNotice = null;
+      }, 6000);
+    }
+  }
+
+  // A notice belongs to its workspace; a switch drops it.
+  $effect(() => {
+    const ws = activeWsId;
+    untrack(() => {
+      if (wtNotice !== null && wtNotice.ws !== ws) dismissWtNotice();
+    });
+  });
+  $effect(() => {
+    return () => clearWtNoticeTimer();
+  });
+
+  /** Open a managed worktree as its own window — the folder picker's "new
+   *  window" path; this window stays where it is. */
+  async function openWorktreeWindow(path: string): Promise<void> {
+    try {
+      const w = await createWorkspace(path);
+      const alias = getHostLabel() === "local" ? null : getHostLabel();
+      await openWindow(alias, w.id, true);
+    } catch (e) {
+      createError = e instanceof ApiError ? e.message : "could not open the worktree";
+    }
+  }
+
   function launcherInstall(a: AgentInfo): void {
     launcherOpen = false;
     if (activeWsId === null) { openPicker(); return; }
@@ -4189,6 +4307,9 @@
     const ws = activeWsId;
     if (ws === null) return;
     recents = recents.filter((x) => x.key !== r.key);
+    if (r.worktree !== null && !worktreeInUse(sessions, r.worktree)) {
+      offerWorktreeRemoval(ws, r.worktree, null);
+    }
     try {
       await archiveRecents(ws, [archiveEntry(r)]);
     } catch {
@@ -4262,6 +4383,11 @@
    *  weirdly" between the kill and the retire. */
   async function killSession(id: string): Promise<void> {
     confirmKillId = null;
+    const dying = sessions.find((x) => x.id === id);
+    const kept = dying?.kind === "agent" ? (dying.managed_worktree ?? null) : null;
+    if (dying !== undefined && kept !== null && !worktreeInUse(sessions, kept, id)) {
+      offerWorktreeRemoval(dying.workspace_id, kept, dying.git?.branch ?? null);
+    }
     chatPool.disposeChat(id); // stop its socket reconnecting right away
     tombstone([id]);
     try {
@@ -5602,10 +5728,15 @@
                   startRename(s);
                 }
               }}
-              oncontextmenu={(e) =>
+              oncontextmenu={(e) => {
+                const wt = s.kind === "agent" ? (s.managed_worktree ?? null) : null;
                 contextMenu.openAt(e, [
                   { label: "Rename…", onSelect: () => startRename(s) },
-                ])}
+                  ...(wt !== null
+                    ? [{ label: "Open worktree in new window", onSelect: () => void openWorktreeWindow(wt) }]
+                    : []),
+                ]);
+              }}
             >
               <!-- Session-type glyph carrying the state color — the same
                    mark as the pane tab (surface parity, rail included). It
@@ -5776,11 +5907,25 @@
                     ? `set up chat for ${q.name}`
                     : q.action === "setup"
                       ? `set up ${q.name} in Settings → Agents`
-                      : `start ${q.name}${q.primary ? ` (${keyHint("newAgent")})` : ""} · ${isMac ? "⌘" : "ctrl"}-click for the terminal`}
+                      : `start ${q.name}${newInWorktree ? " in a new worktree" : ""}${q.primary ? ` (${keyHint("newAgent")})` : ""} · ${isMac ? "⌘" : "ctrl"}-click for the terminal`}
                 onclick={(e) => quickStart(q, e.metaKey || e.ctrlKey)}
               >
                 <span class="new-plus" aria-hidden="true">+</span>
                 <span class="new-name">{q.name}</span>
+                {#if newInWorktree && q.action === "start"}
+                  <svg class="new-wt" viewBox="0 0 16 16" width="10" height="10" aria-hidden="true">
+                    <path
+                      d="M5 3v7.5M5 12.5v.5M11 3v3a2.5 2.5 0 0 1-2.5 2.5H5"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="1.4"
+                      stroke-linecap="round"
+                    />
+                    <circle cx="5" cy="12.6" r="1.6" fill="none" stroke="currentColor" stroke-width="1.4" />
+                    <circle cx="5" cy="2.4" r="1.6" fill="none" stroke="currentColor" stroke-width="1.4" />
+                    <circle cx="11" cy="2.4" r="1.6" fill="none" stroke="currentColor" stroke-width="1.4" />
+                  </svg>
+                {/if}
                 {#if q.action !== "start"}
                   <span class="new-need"
                     >{q.action === "install" ? "install" : q.action === "setup-chat" ? "set up chat" : "set up"}</span
@@ -5824,6 +5969,22 @@
         </div>
         {#if createError}
           <div class="create-error">{createError}</div>
+        {/if}
+        {#if wtNotice !== null && wtNotice.ws === activeWsId}
+          <div class="wt-kept" role="status" title={wtNotice.path}>
+            {#if wtNotice.error !== null}
+              <span class="wt-kept-msg err">Kept: {wtNotice.error}</span>
+            {:else}
+              <span class="wt-kept-msg"><span class="wt-kept-name">{wtNotice.label}</span> kept</span>
+              <button
+                class="wt-kept-btn strong"
+                title="delete this worktree's folder — the branch stays"
+                disabled={wtNotice.busy}
+                onclick={() => void removeKeptWorktree()}>Remove</button
+              >
+              <button class="wt-kept-btn" disabled={wtNotice.busy} onclick={dismissWtNotice}>Keep</button>
+            {/if}
+          </div>
         {/if}
 
         <!-- Recents: ended agent conversations, any agent type, newest
@@ -6461,6 +6622,8 @@
     onClose={closeLauncher}
     onSettings={openAgentSettings}
     onAgents={(a) => (agents = a)}
+    inWorktree={workspaceIsRepo ? (workspace?.new_in_worktree === true) : null}
+    onToggleWorktree={(on) => void toggleNewInWorktree(on)}
   />
 {/if}
 
@@ -7421,6 +7584,76 @@
   .new-chev:focus-visible {
     outline: 2px solid var(--focus-ring);
     outline-offset: -2px;
+  }
+
+  /* A managed worktree left behind: one quiet line, GitRepoSection's
+     Remove/Keep language. */
+  .wt-kept {
+    display: flex;
+    align-items: baseline;
+    gap: 0.4rem;
+    min-width: 0;
+    padding: 2px 8px 4px;
+    font-size: var(--text-xs);
+    line-height: 1.35;
+    color: var(--muted);
+  }
+
+  .wt-kept-msg {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .wt-kept-msg.err {
+    white-space: normal;
+    color: var(--err);
+  }
+
+  .wt-kept-name {
+    font-family: var(--mono);
+    color: var(--fg);
+  }
+
+  .wt-kept-btn {
+    flex: none;
+    appearance: none;
+    border: none;
+    background: none;
+    padding: 0.05rem 0.2rem;
+    font: inherit;
+    color: var(--muted);
+    cursor: pointer;
+    border-radius: 3px;
+  }
+
+  .wt-kept-btn.strong {
+    color: var(--fg);
+  }
+
+  .wt-kept-btn:hover:not(:disabled) {
+    color: var(--fg);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+
+  .wt-kept-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  .wt-kept-btn:focus-visible {
+    outline: 1px solid var(--focus-ring);
+  }
+
+  /* The worktree choice is on: a tiny branch glyph after the agent name,
+     inline so the split button never shifts. */
+  .new-wt {
+    flex: none;
+    color: var(--muted);
+    opacity: 0.8;
   }
 
   .create-error {
