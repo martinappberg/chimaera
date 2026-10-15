@@ -182,7 +182,9 @@ workspace-relative as `path:line`, `path#L10-L20` or a relative markdown link.";
 /// apps get that card on every multi-step request only because they ask
 /// for it. Antigravity has no plan tool at all (asked, 2026-10-15: "I do not
 /// have a built-in plan, task, or todo tool"), so it is told there is no
-/// card and asked to keep the plan in its reply. A plan written as prose
+/// card and asked to keep the plan in its reply; a runtime this daemon has
+/// not probed (no record for the session, a legacy kind) gets the neutral
+/// words, since nothing is known about its tools. A plan written as prose
 /// draws nothing, so each runtime is asked in its own tool's words. A
 /// terminal (TUI) session gets no paragraph: its own task list renders in
 /// its terminal, and there is no card to draw. Live-captured shapes:
@@ -229,12 +231,20 @@ up front, exactly one item in_progress, each marked completed as it \
 finishes, the list updated when the plan changes. The user follows that card \
 beside the chat while you work."
         }
-        _ => {
+        Some(AgentKind::Antigravity) => {
             "\n\n\
 Plan: this runtime has no plan or to-do tool that reaches the chat's plan \
 card, so for any request that edits files or runs more than one command, \
 open your reply with the steps as a short numbered list and say when each \
 is done."
+        }
+        _ => {
+            "\n\n\
+Plan card: when you have a plan or to-do tool of your own, keep it current \
+for any request that edits files or runs more than one command — the whole \
+plan up front, one step in progress at a time, each marked done as it \
+finishes. The user follows it as a card beside the chat while you work; a \
+plan written as a file or prose draws nothing there."
         }
     }
 }
@@ -2379,10 +2389,16 @@ mod tests {
             assert_eq!(task_list_instructions(Some(kind), false), "");
             assert!(!plan_tool_for(Some(kind), false));
         }
-        assert_eq!(
-            task_list_instructions(None, true),
-            task_list_instructions(Some(AgentKind::Antigravity), true)
-        );
+        // An unprobed runtime (no record, a legacy kind) gets the neutral words,
+        // never a claim about tools nobody checked.
+        for unknown in [None, Some(AgentKind::Gemini)] {
+            let text = task_list_instructions(unknown, true);
+            assert!(text.contains("plan or to-do tool of your own"), "{text}");
+            assert!(
+                !text.contains("update_plan") && !text.contains("no plan"),
+                "{text}"
+            );
+        }
         assert!(plan_tool_for(Some(AgentKind::Claude), true));
         assert!(!plan_tool_for(Some(AgentKind::Codex), true));
         let listed = |plan: bool| {
