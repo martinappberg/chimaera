@@ -1,21 +1,17 @@
 import { writable } from "svelte/store";
-import { api, ApiError } from "../net/api";
+import { ApiError } from "../net/api";
 import type { AgentInfo } from "./launcher";
 import { AGENT_PRODUCT_NAMES } from "../shared/agentNames";
+import { agentOperationPath, operationRunning, postJson, request, type OperationProgress } from "./operations";
 
 /** Built-in agents whose pending setup id survives a reload. */
 const SETUP_AGENTS: ReadonlySet<string> = new Set(Object.keys(AGENT_PRODUCT_NAMES));
 
 export type SetupAction = "install" | "update" | "reinstall";
 export interface SetupRequest { agent: AgentInfo; workspaceId: string; action: SetupAction; showResult: boolean }
-export interface SetupProgress {
-  id: string;
+export interface SetupProgress extends OperationProgress {
   action: SetupAction;
-  phase: "running" | "cancelling" | "succeeded" | "failed" | "cancelled";
-  workspace_id: string;
-  started_at: number;
   exit_status: number | null;
-  message: string;
   output: string;
   truncated: boolean;
 }
@@ -24,7 +20,6 @@ export const agentSetup = writable<SetupRequest | null>(null);
 export function openAgentSetup(agent: AgentInfo, workspaceId: string, action: SetupAction, showResult = false): void {
   agentSetup.set({ agent, workspaceId, action, showResult });
 }
-export const setupRunning = (p: SetupProgress | null) => p?.phase === "running" || p?.phase === "cancelling";
 
 // Fixed per-agent keys, scoped to this daemon origin. Remember before POST so an
 // ambiguous response also survives closing/reloading; acknowledge only once
@@ -55,27 +50,16 @@ export function recoverSetupResult(request: SetupRequest, operation: SetupProgre
     || (request.action === "install" && !request.agent.installed && installed && operation.phase === "succeeded");
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await api(path, { ...init, signal: AbortSignal.timeout(15_000) });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new ApiError(res.status, body.error ?? `Request failed (${res.status})`);
-  }
-  return res.json() as Promise<T>;
-}
-const path = (agent: string) => `/agents/${encodeURIComponent(agent)}/setup`;
+const path = (agent: string) => agentOperationPath(agent, "setup");
 export async function getAgentSetup(agent: string): Promise<SetupDetails> {
   const details = await request<SetupDetails>(path(agent));
-  if (details.operation && setupRunning(details.operation)) rememberSetupId(agent, details.operation.id);
+  if (details.operation && operationRunning(details.operation)) rememberSetupId(agent, details.operation.id);
   return details;
 }
 export async function startAgentSetup(r: SetupRequest, id: string): Promise<SetupProgress> {
   rememberSetupId(r.agent.id, id);
   try {
-    const operation = await request<SetupProgress>(path(r.agent.id), {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ workspace_id: r.workspaceId, action: r.action, request_id: id }),
-    });
+    const operation = await request<SetupProgress>(path(r.agent.id), postJson({ workspace_id: r.workspaceId, action: r.action, request_id: id }));
     rememberSetupId(r.agent.id, operation.id);
     return operation;
   } catch (error) {

@@ -167,7 +167,7 @@ fn cursor_connections(output: &str) -> Result<Vec<Connection>, &'static str> {
         ("disabled", "disabled"),
         ("not loaded (needs approval)", "needs_approval"),
     ];
-    let text = crate::agent_auth::strip_controls(output);
+    let text = crate::operation::strip_controls(output);
     let mut rows: Vec<Connection> = Vec::new();
     for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
         if line.to_ascii_lowercase().starts_with("no mcp servers") {
