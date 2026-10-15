@@ -280,6 +280,20 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             "/agents/{id}/setup/{operation}",
             delete(crate::agent_setup::cancel),
         )
+        // Sign in to an agent from the app (`agent_auth`): status + one
+        // bounded login per agent, its page/code, a pasted code, cancel.
+        .route(
+            "/agents/{id}/sign-in",
+            get(crate::agent_auth::get).post(crate::agent_auth::start),
+        )
+        .route(
+            "/agents/{id}/sign-in/{operation}",
+            delete(crate::agent_auth::cancel),
+        )
+        .route(
+            "/agents/{id}/sign-in/{operation}/code",
+            post(crate::agent_auth::code),
+        )
         .route("/agents/claude/sessions", get(launcher::claude_resumables))
         .route("/recents", get(recents::list_recents))
         // Archive hides a conversation from Recents (never deletes it); it

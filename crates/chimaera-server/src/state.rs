@@ -203,6 +203,9 @@ pub(crate) struct AppState {
     /// Latest installer result per built-in agent; bounded by the catalog.
     pub(crate) install_results: Mutex<HashMap<agents::AgentKind, crate::runtimes::InstallResult>>,
     pub(crate) agent_setup: Mutex<HashMap<agents::AgentKind, Arc<crate::agent_setup::Operation>>>,
+    /// Whether each agent CLI is signed in on this host, and its sign-in in
+    /// progress (`agent_auth`).
+    pub(crate) agent_auth: crate::agent_auth::AuthState,
     /// The user's own Claude Code settings file (`~/.claude/settings.json`);
     /// an explicit theme there suppresses chimaera's theme injection. Tests
     /// point it at a fixture.
@@ -350,6 +353,7 @@ impl AppState {
             installs: Mutex::new(HashMap::new()),
             install_results: Mutex::new(HashMap::new()),
             agent_setup: Mutex::new(HashMap::new()),
+            agent_auth: crate::agent_auth::AuthState::default(),
             claude_settings_path: home.join(".claude").join("settings.json"),
             codex_config_path: codex_home(&home, std::env::var_os("CODEX_HOME"))
                 .join("config.toml"),

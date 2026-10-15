@@ -808,6 +808,11 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   `just chat-smoke` for Claude/Codex, `just chat-smoke-acp` for Grok/Antigravity
   (existing credentials, billed turns). Keep shared behavior consistent while preserving
   provider-specific capability limits.
+- **A signed-out agent** shows its sign-in card in place of the startup error (the catalog's
+  verdict, re-asked on the failure) and relaunches in place once the CLI confirms the login
+  (`POST /sessions/{id}/view {ui:"chat"}` on the dead chat, every agent) —
+  [agents.md › Sign in](agents.md#sign-in). A fatal startup error renders once: the banner, no
+  twin transcript line and no trailing "agent exited".
 - **Startup watchdog** (`driver.rs`, `chat.rs`): all providers have 60 seconds for login-shell
   setup, workspace startup hooks, MCP discovery and protocol initialization. Once initialized,
   leaving a chat idle does not expire it. Failed launches stay visible with their diagnostic and

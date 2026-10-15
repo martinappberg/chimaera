@@ -1060,6 +1060,77 @@ async fn agents_rows_flag_managed_installs() {
     );
     assert_eq!(row("grok")["managed_install"], true);
     assert_eq!(row("agy")["managed_install"], true);
+
+    // Sign-in (additive): the CLI's own verdict, unknown for a preset path
+    // that runs no status command, null when not installed; every row says
+    // how it signs in from the app.
+    assert!(claude["signed_in"].is_null());
+    assert_eq!(claude["sign_in"]["how"], "browser");
+    assert_eq!(claude["sign_in"]["accepts_code"], true);
+    assert_eq!(claude["sign_in"]["command"], "claude auth login");
+    assert!(claude["sign_in"]["operation"].is_null());
+    assert_eq!(codex["sign_in"]["how"], "browser");
+    assert_eq!(codex["sign_in"]["command"], "codex login --device-auth");
+    assert_eq!(row("agy")["sign_in"]["how"], "terminal");
+    assert!(row("agy")["signed_in"].is_null());
+    assert_eq!(row("cursor")["sign_in"]["command"], "cursor-agent login");
+}
+
+/// A sign-in is one bounded operation per agent behind
+/// `/agents/{id}/sign-in`: unknown agents 404, a start needs an installed
+/// agent and an open workspace, and the catalog row names the operation.
+#[tokio::test]
+async fn sign_in_routes_refuse_what_they_must_and_the_catalog_names_the_operation() {
+    let state = test_state();
+    preset_agent(
+        &state,
+        agents::AgentKind::Cursor,
+        Err("cursor-agent not found (test)".to_string()),
+        None,
+    );
+    let (status, _) = request(&state, Method::GET, "/api/v1/agents/nope/sign-in", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, body) = request(&state, Method::GET, "/api/v1/agents/cursor/sign-in", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["installed"], false);
+    assert!(body["signed_in"].is_null());
+    assert_eq!(body["how"], "browser");
+    assert!(body["operation"].is_null());
+
+    // No such workspace: refused before anything runs.
+    let (status, body) = request(
+        &state,
+        Method::POST,
+        "/api/v1/agents/cursor/sign-in",
+        Some(serde_json::json!({"workspace_id": "missing", "request_id": "r-1"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body["error"].as_str().unwrap().contains("workspace"));
+    let (status, _) = request(
+        &state,
+        Method::POST,
+        "/api/v1/agents/cursor/sign-in",
+        Some(serde_json::json!({"workspace_id": "missing", "request_id": "bad id!"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = request(
+        &state,
+        Method::DELETE,
+        "/api/v1/agents/cursor/sign-in/r-1",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "nothing to cancel yet");
+    let (status, _) = request(
+        &state,
+        Method::POST,
+        "/api/v1/agents/cursor/sign-in/r-1/code",
+        Some(serde_json::json!({"code": "ABCD-1234"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "no sign-in reads a code yet");
 }
 
 /// Detection falls back to ~/.chimaera/agents/bin when the login shell

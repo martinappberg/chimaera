@@ -14,7 +14,9 @@
     resolveScope,
     type ValidateAnswer,
   } from "./paths";
-  import { listAgents } from "../workspace/launcher";
+  import { agentCatalog, listAgents } from "../workspace/launcher";
+  import { getSignIn, needsSignIn } from "../workspace/agentSignIn";
+  import AgentSignInCard from "../workspace/AgentSignInCard.svelte";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import BranchChip from "../shared/BranchChip.svelte";
   import { openBranchChanges } from "../workspace/git";
@@ -155,6 +157,9 @@
     };
     /** Open one of this chat's subagents as a view of its own. */
     onOpenSubagent?: (agentId: string, title: string, newSplit: boolean) => void;
+    /** Start this chat's agent again in place after a failed startup (the
+     *  sign-in card's success): the same session, a fresh driver. */
+    onRelaunch?: () => void;
   }
 
   let {
@@ -168,6 +173,7 @@
     onForked,
     subagent,
     onOpenSubagent,
+    onRelaunch,
   }: Props = $props();
 
   // The component is keyed on session id by its parent: one instance per
@@ -242,6 +248,23 @@
     agentCatalogName ??
       agentProductName(agentKind),
   );
+  // Signed out, per the CLI's own status: the chat shows its sign-in card
+  // instead of a doomed start or the raw startup error, and starts itself
+  // once the login lands. A startup failure re-asks the daemon once (the
+  // catalog's verdict can predate a sign-out); a successful start with a
+  // stale "signed out" re-asks too, so the launcher row comes right.
+  const catalogAgent = $derived($agentCatalog.find((a) => a.id === agentKind) ?? null);
+  const signInNeeded = $derived(!readOnly && needsSignIn(catalogAgent));
+  let signInAsked: string | null = null;
+  $effect(() => {
+    const failure = store.fatalError;
+    if (readOnly || catalogAgent === null || !catalogAgent.installed) return;
+    const stale = (failure !== null && catalogAgent.signedIn !== false) || (store.initialized && catalogAgent.signedIn === false);
+    const key = failure ?? (store.initialized ? "init" : null);
+    if (!stale || key === null || signInAsked === key) return;
+    signInAsked = key;
+    void getSignIn(agentKind, true).catch(() => {});
+  });
   void listAgents().then((agents) => {
     const info = agents.find((a) => a.id === agentKind);
     models = info?.models ?? [];
@@ -2753,6 +2776,13 @@
           <span>{subagentState?.problem ?? (store.initialized ? "this subagent has not done anything yet" : "loading this subagent's conversation…")}</span>
         </div>
       {/if}
+    {:else if signInNeeded && !store.initialized && catalogAgent !== null}
+      <!-- Known signed out before the driver even answers: the card now, the
+           startup failure (if one lands) folds into it below. -->
+      <div class="empty" role="status">
+        <SessionGlyph kind="agent" {agentKind} size={18} />
+        <AgentSignInCard agent={catalogAgent} workspaceId={session.workspace_id ?? null} framed onSignedIn={onRelaunch} />
+      </div>
     {:else if store.exited === null && !store.fatalError && (!store.initialized || store.blocks.length === 0)}
       <div class="empty" role="status">
         <SessionGlyph kind="agent" {agentKind} size={18} />
@@ -3133,7 +3163,10 @@
       </div>
     {/if}
 
-    {#if store.fatalError !== null}
+    {#if store.fatalError !== null && signInNeeded}
+      <!-- The startup failed because the CLI is signed out: the card is the
+           whole story, the raw error stays in the journal. -->
+    {:else if store.fatalError !== null}
       <div class="notice error" class:runtime-error={incompatibleRuntime}>
         {#if incompatibleRuntime}
           <strong>This agent can't start on this host</strong>

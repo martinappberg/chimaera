@@ -44,6 +44,7 @@
     type LaunchPick,
   } from "./launcher";
   import { isMac } from "../shared/keys";
+  import { needsSignIn } from "./agentSignIn";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import Chevron from "../shared/Chevron.svelte";
 
@@ -164,6 +165,7 @@
     if (!a.installed) return "not installed";
     if (a.outdated) return "needs an update";
     if (a.chatSetupRequired) return "chat needs setup";
+    if (needsSignIn(a)) return "not signed in";
     return a.version !== null ? versionNumber(a.version) : "installed";
   }
 
@@ -379,6 +381,22 @@
         }}
       >
         {!a.managedInstall ? "set up" : a.outdated ? "update" : a.chatSetupRequired ? "set up chat" : "install"}
+      </button>
+    {/if}
+    {#if a.installed && !a.outdated && !a.chatSetupRequired && a.chatCapable && needsSignIn(a)}
+      <!-- Signed out: the chat opens straight onto its sign-in card and
+           starts itself once the CLI confirms the login. -->
+      <button
+        class="achip"
+        class:solid={i < quickCount}
+        tabindex="-1"
+        title="sign in to {a.name} — the chat opens with the sign-in, then starts"
+        onclick={(e) => {
+          e.stopPropagation();
+          onPick({ agent: a.id, ui: "chat", explicit: true });
+        }}
+      >
+        sign in
       </button>
     {/if}
     {#if a.installed && (!a.chatSetupRequired || a.chatCapable)}
