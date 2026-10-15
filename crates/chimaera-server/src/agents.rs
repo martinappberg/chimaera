@@ -1045,6 +1045,7 @@ mod tests {
                 "mcp__chimaera__document_guide",
                 "mcp__chimaera__check_document",
                 "mcp__chimaera__open_browser",
+                "mcp__chimaera__update_plan",
             ])
         );
         use std::os::unix::fs::PermissionsExt;
@@ -1105,6 +1106,7 @@ mod tests {
                 "mcp__chimaera__document_guide",
                 "mcp__chimaera__check_document",
                 "mcp__chimaera__open_browser",
+                "mcp__chimaera__update_plan",
                 "mcp__chimaera__workspace_status",
                 "mcp__chimaera__list_changed_files",
                 "mcp__chimaera__read_timeline",
