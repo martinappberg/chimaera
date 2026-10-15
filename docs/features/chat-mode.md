@@ -383,6 +383,8 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   prose or a live thought row as the newest block at the reader's bottom (screen readers still hear
   it); a reasoning item that drew no thought row (Codex, empty summary) says Thinking. Waiting on
   a permission, a question or the next step always shows its word.
+  Codex says Thinking from the moment a reasoning item starts (its summary, if any, lands only
+  as the step ends), as Claude does while it thinks.
   Codex's synchronous SessionStart and UserPromptSubmit hooks show their actual phase
   and a hook row linking to the hook configuration. These can block a turn after the
   runtime has initialized but before it receives the opening message.
@@ -638,15 +640,18 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   `@name`, which is the same identity `TaskStop` accepts.
 - **Codex subagents (collab / multi-agent), same surface.** Codex 0.144.x delegation renders the
   identical way: each spawned agent is an "Agent: {name}" row (name = the model's own
-  `agentPath` name) whose progress line folds the agent's live activity (thinking · a command ·
-  N tools · M tokens), so the tray works unchanged. A subagent is a real thread multiplexed onto
+  `agentPath` name) whose progress line folds the agent's live activity in Claude's spelling
+  ("Thinking", a command, "Writing", or the newest reasoning-summary section title · N tools ·
+  12.3k tokens), so the tray works unchanged. A subagent is a real thread multiplexed onto
   the same connection — the driver scopes every frame by `threadId`, hides the agent's transcript
   from the parent's (claude symmetry), and closes the row when the agent answers ("answered"), is
   shut down ("closed"), or the process itself dies. A parent answer/abort does not close the child:
   delegated threads may keep working after the parent turn, so their cross-turn rows remain in the
   pinned Agents tray and keep the rail/dashboard's off-screen-work cue live until the child's own
-  turn ends. A follow-up to a
-  closed agent opens a fresh row (a finished card never walks back to running), and the parent's
+  turn ends. New work for a
+  closed agent opens a fresh row when the agent's own turn starts (a finished card never walks back
+  to running); a `send_message` to an agent that already answered only queues the message, starts
+  no turn, and so opens nothing (PROTOCOL.md Pass 43). The parent's
   trailing `subAgentActivity {kind:"completed"}` marker never re-opens a closed stint (PROTOCOL.md
   Pass 31). The model's `wait` renders as a "waiting for subagents" tool row; the v2 collab tools
   get readable titles ("Message → agent_a", "Interrupt agent_a", "List agents"), and a command whose

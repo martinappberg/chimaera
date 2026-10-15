@@ -53,6 +53,34 @@ const MAX_LINE_BYTES: usize = 1024 * 1024;
 const TAIL_RECORD_BUDGET: usize = 4000;
 const TAIL_BYTE_BUDGET: usize = 2 * 1024 * 1024;
 
+/// The two top-level fields that decide whether a record is worth a full
+/// parse. Deserializing only these skips every other value without
+/// allocating, so a line is classified for the cost of one scan.
+#[derive(serde::Deserialize)]
+struct RecordHead<'a> {
+    #[serde(rename = "type", borrow, default)]
+    kind: Option<std::borrow::Cow<'a, str>>,
+    #[serde(rename = "isSidechain", default)]
+    sidechain: bool,
+}
+
+/// Whether a raw transcript line is conversation the translator reads: a
+/// `user` or `assistant` record (sidechain ones only for a subagent's own
+/// file). Everything else — claude 2.1.300's per-request `api-request`,
+/// `api-request-shape` (system prompt + tools, ~40 KB) and
+/// `api-request-blob` records, `attachment`, `queue-operation`,
+/// `last-prompt`, `file-history-snapshot`, `atis-latch`, `cost-state`, any
+/// kind a later CLI adds, and a line cut at [`MAX_LINE_BYTES`] — is dropped
+/// before it is parsed or counted against the tail budget, so bookkeeping
+/// cannot crowd the conversation out of the retained tail.
+fn is_conversation_record(line: &[u8], keep_sidechain: bool) -> bool {
+    let Ok(head) = serde_json::from_slice::<RecordHead>(line) else {
+        return false;
+    };
+    (keep_sidechain || !head.sidechain)
+        && matches!(head.kind.as_deref(), Some("user") | Some("assistant"))
+}
+
 /// Read a claude transcript file and translate its retained tail into the
 /// normalized event stream. Returns an empty vec for a missing/empty/unreadable
 /// file or one with nothing user-visible. Blocking fs — call off the reactor.
@@ -75,7 +103,7 @@ pub fn import_transcript(path: &Path) -> Vec<AgentEvent> {
             Ok(_) => {}
             Err(_) => break,
         }
-        if line.iter().all(|b| b.is_ascii_whitespace()) {
+        if !is_conversation_record(&line, false) {
             continue;
         }
         tail_bytes += line.len();
@@ -170,6 +198,9 @@ pub fn import_subagent_transcript(
         // (An over-long record was cut at the cap: it fails to parse below.)
         if line.len() < MAX_LINE_BYTES && line.last() != Some(&b'\n') {
             break;
+        }
+        if !is_conversation_record(&line, true) {
+            continue;
         }
         let Ok(value) = serde_json::from_slice::<Value>(&line) else {
             continue;
@@ -966,6 +997,91 @@ mod tests {
         assert!(!events
             .iter()
             .any(|e| matches!(e, AgentEvent::UserMessage { text, .. } if text == "msg 0")));
+    }
+
+    /// Claude 2.1.300 writes each API request's system prompt, tools and
+    /// parameters beside the conversation (`api-request-shape`, `-blob`,
+    /// `api-request`, plus `atis-latch`/`cost-state`). Shaped like the live
+    /// file: tens of KB per request, the type key first. However much of it
+    /// there is, none of it counts against the tail: a short conversation
+    /// behind 4 MiB of request records imports whole, unmarked.
+    #[test]
+    fn request_records_never_crowd_out_the_conversation() {
+        let shape_body = "s".repeat(100 * 1024);
+        let mut s = String::new();
+        s.push_str(r#"{"type":"queue-operation","operation":"enqueue","timestamp":"2026-10-14T16:35:00Z"}"#);
+        s.push('\n');
+        s.push_str(r#"{"parentUuid":null,"isSidechain":false,"type":"user","message":{"role":"user","content":"first question"},"uuid":"u1"}"#);
+        s.push('\n');
+        for n in 0..40 {
+            s.push_str(&format!(
+                r#"{{"type":"api-request-shape","sessionId":"s","shape":{{"system":"{shape_body}","tools":[{{"name":"Bash","type":"user"}}]}},"shapeHash":"h{n}"}}"#
+            ));
+            s.push('\n');
+            s.push_str(&format!(
+                r#"{{"type":"api-request-blob","sessionId":"s","hash":"b{n}","message":{{"role":"user","content":"{shape_body}"}}}}"#
+            ));
+            s.push('\n');
+            s.push_str(&format!(
+                r#"{{"type":"api-request","sessionId":"s","id":"r{n}","params":{{"model":"claude-haiku-4-5"}},"shapeHash":"h{n}"}}"#
+            ));
+            s.push('\n');
+            s.push_str(r#"{"type":"atis-latch","atis":"","sessionId":"s"}"#);
+            s.push('\n');
+            s.push_str(r#"{"type":"some-future-record","payload":{"type":"assistant"}}"#);
+            s.push('\n');
+        }
+        s.push_str(r#"{"parentUuid":"u1","isSidechain":false,"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"first answer"}]},"requestRef":"r39"}"#);
+        s.push('\n');
+        s.push_str(r#"{"type":"cost-state","sessionId":"s","totalCostUSD":0.003}"#);
+        s.push('\n');
+        assert!(
+            s.len() > 2 * TAIL_BYTE_BUDGET,
+            "the noise alone overflows the tail"
+        );
+        let events = import_str(&s);
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentEvent::Truncated)),
+            "request records are not history: nothing was clipped"
+        );
+        assert!(events.iter().any(
+            |e| matches!(e, AgentEvent::UserMessage { text, .. } if text == "first question")
+        ));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::MessageChunk { text, .. } if text == "first answer")));
+        let users = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::UserMessage { .. }))
+            .count();
+        assert_eq!(users, 1, "a blob's user-shaped message is not a prompt");
+    }
+
+    #[test]
+    fn record_heads_classify_without_a_full_parse() {
+        assert!(is_conversation_record(
+            br#"{"parentUuid":null,"type":"user","message":{}}"#,
+            false
+        ));
+        assert!(is_conversation_record(br#"{"type":"assistant"}"#, false));
+        assert!(!is_conversation_record(
+            br#"{"isSidechain":true,"type":"assistant"}"#,
+            false
+        ));
+        assert!(is_conversation_record(
+            br#"{"isSidechain":true,"type":"assistant"}"#,
+            true
+        ));
+        for noise in [
+            &br#"{"type":"attachment","attachment":{"type":"user"}}"#[..],
+            br#"{"type":"api-request-blob","message":{"role":"user"}}"#,
+            br#"{"message":{"type":"user"}}"#,
+            br#"{"type":"user","message":{"#,
+            b"not json",
+            b"",
+        ] {
+            assert!(!is_conversation_record(noise, true), "{noise:?}");
+        }
     }
 
     #[test]
