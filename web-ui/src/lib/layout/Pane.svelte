@@ -431,7 +431,7 @@
         dropOnRow={active && uploadRow}
         dropAction={folderDrop?.kind === "fileOp" ? folderDrop.operation : "upload"}
         onDragStart={ctrl.dragFileEntry}
-        onOpenFile={(p: string, split: boolean) => ctrl.openFileFrom(node.id, p, split)}
+        onOpenFile={(p: string, split: boolean) => ctrl.openFileFrom(node.id, p, split, true)}
         onNavigate={(p: string) => ctrl.navigateFinder(tab.id, p)}
       />
     {:else if viewErrors.finder}
