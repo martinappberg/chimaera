@@ -172,7 +172,7 @@ const chimaeraDark: ThemeDef = {
   kind: "dark",
   tokens: {
     "--bg": "#17171c",
-    "--fg": "#e7e7ea",
+    "--fg": "#dcdce0", // one step off white: 15:1 glared next to every other dark theme (12–13)
     "--muted": "#9a9aa6",
     "--accent": "#3fbf85",
     "--err": "#d96b6b",
@@ -181,7 +181,7 @@ const chimaeraDark: ThemeDef = {
     "--rail-bg": "#1c1c23",
     "--row-hover": "#25252d",
     "--row-active": "#2d2d36",
-    "--term-selection": "#e7e7ea33",
+    "--term-selection": "#dcdce033",
     "--term-bg": "#121218",
     "--scrim": "rgba(0, 0, 0, 0.5)",
     "--overlay-bg": "#202028",
@@ -192,7 +192,7 @@ const chimaeraDark: ThemeDef = {
     "--syn-number": "#d0a355",
     "--syn-type": "#6fb3d2",
     "--syn-func": "#82a7e8",
-    "--syn-def": "#e7e7ea",
+    "--syn-def": "#dcdce0",
     "--syn-prop": "#a58fd6",
     "--ficon-generic": "#8b8b95",
     "--ficon-lang": "#6f9ae4",
@@ -429,7 +429,7 @@ const rosePineDawn: ThemeDef = {
   kind: "light",
   tokens: {
     "--bg": "#faf4ed", // base
-    "--fg": "#575279", // text
+    "--fg": "#474268", // text deepened a step: canonical #575279 sat within 15% of muted, so nothing receded
     "--muted": "#5f5a78", // subtle deepened to hold 4.5 on selected rows
     "--accent": "#286983", // pine
     "--err": "#a7586f", // love
@@ -449,7 +449,7 @@ const rosePineDawn: ThemeDef = {
     "--syn-number": "#ad5d5a", // rose
     "--syn-type": "#3e7d87", // foam
     "--syn-func": "#806b99", // iris
-    "--syn-def": "#575279",
+    "--syn-def": "#474268",
     "--syn-prop": "#286983",
     "--ficon-generic": "#706b89",
     "--ficon-lang": "#3e7d87",
@@ -494,7 +494,7 @@ const catppuccinLatte: ThemeDef = {
   kind: "light",
   tokens: {
     "--bg": "#e6e9ef", // mantle
-    "--fg": "#4c4f69", // text
+    "--fg": "#3d3f58", // text deepened a step: canonical #4c4f69 sat within 15% of muted, so nothing receded
     "--muted": "#555870", // subtext1, floored for selections
     "--accent": "#1b63f1", // blue
     "--err": "#cf0837", // red, floored
@@ -514,7 +514,7 @@ const catppuccinLatte: ThemeDef = {
     "--syn-number": "#ce3400", // peach
     "--syn-type": "#a75a00", // yellow
     "--syn-func": "#1b63f1", // blue
-    "--syn-def": "#4c4f69",
+    "--syn-def": "#3d3f58",
     "--syn-prop": "#5363d6", // lavender
     "--ficon-generic": "#76798c",
     "--ficon-lang": "#1e66f5",

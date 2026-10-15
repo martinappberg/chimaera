@@ -83,7 +83,7 @@
   /* Fallback only — the live palette comes inline from settings/themes.ts. */
   color-scheme: dark;
   --bg: #17171c;
-  --fg: #e7e7ea;
+  --fg: #dcdce0;
   --muted: #9a9aa6;
   --accent: #3fbf85;
   --err: #d96b6b;
@@ -92,7 +92,7 @@
   --rail-bg: #1c1c23;
   --row-hover: #25252d;
   --row-active: #2d2d36;
-  --term-selection: #e7e7ea33;
+  --term-selection: #dcdce033;
   --term-bg: #121218;
   --scrim: rgba(0, 0, 0, 0.5);
   --overlay-bg: #202028;
@@ -103,7 +103,7 @@
   --syn-number: #d0a355;
   --syn-type: #6fb3d2;
   --syn-func: #82a7e8;
-  --syn-def: #e7e7ea;
+  --syn-def: #dcdce0;
   --syn-prop: #a58fd6;
   --ficon-generic: #8b8b95;
   --ficon-lang: #6f9ae4;
