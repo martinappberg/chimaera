@@ -111,8 +111,15 @@ pub(crate) const MASTERMIND_READ_TOOLS: [&str; 8] = [
 /// the proxy's mint allowlist with no `confirm` path (`browser_open::open`),
 /// so a prompt per pane would be noise. The limits that stand in for the
 /// prompt are that allowlist and the per-session rate limit.
-pub(crate) const ALWAYS_ALLOWED_TOOLS: [&str; 4] =
-    ["notify", "document_guide", "check_document", "open_browser"];
+/// `update_plan` only draws the chat's plan card (a journaled level-set, no
+/// workspace effect); a prompt before every plan update would defeat it.
+pub(crate) const ALWAYS_ALLOWED_TOOLS: [&str; 5] = [
+    "notify",
+    "document_guide",
+    "check_document",
+    "open_browser",
+    "update_plan",
+];
 
 /// Every Mastermind-tier tool name — the dispatch gate's single source, so
 /// adding a tool means extending THIS list + `mastermind_tool_defs` (a
@@ -174,11 +181,11 @@ fn task_list_instructions(kind: Option<crate::agents::AgentKind>) -> &'static st
         Some(AgentKind::Claude) => {
             "\n\n\
 Plan card: for any request that edits files or runs more than one command, \
-track your steps with the TaskCreate and TaskUpdate TOOLS (never a file, a \
-markdown checklist, or prose: only those tool calls draw the card): create \
-the whole plan up front, keep exactly one step in_progress, mark each \
-completed as it finishes, and update the list when the plan changes. The \
-user follows that card beside the chat while you work."
+track your steps with the update_plan TOOL from the chimaera MCP server \
+(never a file, a markdown checklist, or prose: only that tool call draws the \
+card): the whole plan up front, exactly one step in_progress, each marked \
+completed as it finishes, the list resent whenever it changes. The user \
+follows that card beside the chat while you work."
         }
         Some(AgentKind::Codex) => {
             "\n\n\
@@ -192,10 +199,11 @@ the chat while you work."
         _ => {
             "\n\n\
 Plan card: for any request that edits files or runs more than one command, \
-track your steps with your own plan or to-do TOOL (never a file, a markdown \
-checklist, or prose: only that tool draws the card): the whole plan up \
-front, one step in progress at a time, each marked done as it finishes. The \
-user follows that card beside the chat while you work."
+track your steps with your own plan or to-do TOOL, or chimaera's update_plan \
+(never a file, a markdown checklist, or prose: only a tool call draws the \
+card): the whole plan up front, one step in progress at a time, each marked \
+done as it finishes. The user follows that card beside the chat while you \
+work."
         }
     }
 }
@@ -510,6 +518,7 @@ fn tool_defs(comms_on: bool, mastermind: bool, plugin_tools: Vec<Value>) -> Valu
     let mut tools = base_tool_defs();
     tools.push(notify_tool_def());
     tools.push(open_browser_tool_def());
+    tools.push(update_plan_tool_def());
     if comms_on {
         tools.extend(crate::comms::tool_defs());
     }
@@ -695,6 +704,116 @@ fn notify(state: &AppState, agent_id: &str, args: &Value) -> Value {
     }
 }
 
+/// The `update_plan` tool def (base tier — every session has it): the plan
+/// card beside the chat. Claude Code offers no task-list tool under `-p`
+/// (TaskCreate/TaskUpdate are interactive-only; probed on 2.1.300), so this
+/// is the one way a Claude chat draws the card; Codex has its own
+/// `update_plan`, which the driver already maps, and an ACP agent its plan.
+fn update_plan_tool_def() -> Value {
+    json!({
+        "name": "update_plan",
+        "description": "Show the user your plan as a card beside the chat and keep it \
+                        current. Send the WHOLE list every time (it replaces the last \
+                        one): the steps in order, exactly one in_progress while you work, \
+                        each completed as it finishes, pending for the rest. Call it with \
+                        the first tool call of any request that edits files or runs more \
+                        than one command, and again as each step finishes or the plan \
+                        changes. It draws the card and nothing else; a plan written as a \
+                        file, a checklist or prose shows nothing there.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["items"],
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "maxItems": UPDATE_PLAN_ITEMS_MAX,
+                    "description": "The plan, in order (1–32 steps).",
+                    "items": {
+                        "type": "object",
+                        "required": ["content", "status"],
+                        "properties": {
+                            "content": {
+                                "type": "string",
+                                "description": "The step, a short imperative phrase.",
+                            },
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed"],
+                            },
+                        },
+                        "additionalProperties": false,
+                    },
+                },
+            },
+            "additionalProperties": false,
+        },
+    })
+}
+
+/// Steps one plan may hold; a step's text is cut to [`UPDATE_PLAN_STEP_MAX`].
+const UPDATE_PLAN_ITEMS_MAX: usize = 32;
+const UPDATE_PLAN_STEP_MAX: usize = 200;
+
+/// `update_plan`: the level-set becomes the session's `Plan` event through
+/// the pump's own queue (journaled, replayed, drawn by every surface the
+/// driver's native plans reach). A terminal session has no transcript to
+/// draw it in, so it says so instead of pretending.
+fn update_plan(state: &AppState, agent_id: &str, args: &Value) -> Value {
+    use chimaera_agent::model::{AgentEvent, PlanEntry, PlanStatus};
+    let Some(items) = args.get("items").and_then(Value::as_array) else {
+        return tool_error("update_plan needs `items`: the whole plan, in order".to_string());
+    };
+    if items.is_empty() || items.len() > UPDATE_PLAN_ITEMS_MAX {
+        return tool_error(format!(
+            "update_plan takes 1 to {UPDATE_PLAN_ITEMS_MAX} steps (got {})",
+            items.len()
+        ));
+    }
+    let mut entries = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        let content = item
+            .get("content")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+        if content.is_empty() {
+            return tool_error(format!("step {} has no content", i + 1));
+        }
+        let status = match item.get("status").and_then(Value::as_str) {
+            Some("pending") | Some("todo") => PlanStatus::Todo,
+            Some("in_progress") => PlanStatus::InProgress,
+            Some("completed") | Some("done") => PlanStatus::Done,
+            other => {
+                return tool_error(format!(
+                    "step {} has status {other:?}; use pending, in_progress or completed",
+                    i + 1
+                ))
+            }
+        };
+        entries.push(PlanEntry {
+            content: content.chars().take(UPDATE_PLAN_STEP_MAX).collect(),
+            status,
+            id: Some((i + 1).to_string()),
+            active_form: None,
+            description: None,
+            owner: None,
+            blocked_by: Vec::new(),
+        });
+    }
+    let done = entries
+        .iter()
+        .filter(|e| e.status == PlanStatus::Done)
+        .count();
+    let total = entries.len();
+    match state.chat.annotate(agent_id, AgentEvent::Plan { entries }) {
+        Ok(()) => tool_text(format!("Plan shown ({done}/{total} done).")),
+        Err(_) => tool_error(
+            "this session has no chat transcript to show a plan in (a terminal session): \
+             keep your plan in your reply instead"
+                .to_string(),
+        ),
+    }
+}
 /// The `open_browser` tool def (base tier — every session has it).
 fn open_browser_tool_def() -> Value {
     json!({
@@ -798,6 +917,7 @@ async fn tools_call(
         "document_guide" => Ok(tool_text(crate::agent_docs::GUIDE.to_string())),
         "check_document" => Ok(check_document(state, agent_id, &args).await),
         "notify" => Ok(notify(state, agent_id, &args)),
+        "update_plan" => Ok(update_plan(state, agent_id, &args)),
         "open_browser" => Ok(open_browser(state, agent_id, &args).await),
         "workspace_agents" | "read_agent" | "message_agent" | "read_messages" if !comms_on => {
             Ok(tool_error(crate::comms::OFF.to_string()))

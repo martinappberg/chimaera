@@ -28,7 +28,7 @@ async fn mcp_handshake_auth_and_tool_listing() {
     let text = out["result"]["instructions"].as_str().unwrap();
     assert!(text.contains("Plan card:"), "{text}");
     assert!(
-        text.contains("TaskCreate and TaskUpdate")
+        text.contains("update_plan TOOL from the chimaera MCP server")
             || text.contains("update_plan")
             || text.contains("to-do TOOL"),
         "{text}"
@@ -70,6 +70,7 @@ async fn mcp_handshake_auth_and_tool_listing() {
             "check_document",
             "notify",
             "open_browser",
+            "update_plan",
             "workspace_agents",
             "read_agent",
             "message_agent",
@@ -178,4 +179,104 @@ async fn mcp_tools_scoped_to_links_and_exec_round_trip() {
     state.sessions.kill(&agent).ok();
     state.sessions.kill(&shell).ok();
     state.sessions.kill(&other).ok();
+}
+
+/// `update_plan` draws the plan card: a chat session's call journals one
+/// `plan` level-set (1-based ids, the three statuses), a malformed call is
+/// refused with the reason, and a terminal session (no chat journal) is told
+/// to keep its plan in the reply instead.
+#[tokio::test]
+async fn update_plan_journals_a_plan_level_set_for_chats_only() {
+    let state = test_state();
+    let root = test_dir("mcp-plan-ws");
+    let (status, ws) = request(
+        &state,
+        Method::POST,
+        "/api/v1/workspaces",
+        Some(serde_json::json!({"root": root.to_string_lossy()})),
+    )
+    .await;
+    assert!(status.is_success(), "{ws}");
+    let ws = ws["id"].as_str().unwrap().to_string();
+    preset_agent(
+        &state,
+        crate::agents::AgentKind::Claude,
+        Ok(write_fake_claude("mcp-plan-fake")),
+        Some("9.9.9-fake"),
+    );
+    let (status, body) = request(
+        &state,
+        Method::POST,
+        "/api/v1/sessions",
+        Some(serde_json::json!({"workspace_id": ws, "kind": "agent", "ui": "chat"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let sid = body["id"].as_str().unwrap().to_string();
+    let key = crate::lock(&state.agents).get(&sid).unwrap().key.clone();
+
+    let (is_error, text) = mcp_tool_call(
+        &state,
+        &sid,
+        &key,
+        "update_plan",
+        serde_json::json!({"items": [
+            {"content": "Read the config", "status": "completed"},
+            {"content": "Run the tests", "status": "in_progress"},
+            {"content": "Write the report", "status": "pending"},
+        ]}),
+    )
+    .await;
+    assert!(!is_error, "{text}");
+    assert_eq!(text, "Plan shown (1/3 done).");
+    let journal = state.chat.journal_dir().join(format!("{sid}.jsonl"));
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let plan = loop {
+        let content = std::fs::read_to_string(&journal).unwrap_or_default();
+        if let Some(line) = content.lines().find(|l| l.contains("\"type\":\"plan\"")) {
+            break serde_json::from_str::<serde_json::Value>(line).unwrap();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no plan event: {content}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    let entries = plan["ev"]["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0]["status"], "done");
+    assert_eq!(entries[1]["status"], "in_progress");
+    assert_eq!(entries[1]["content"], "Run the tests");
+    assert_eq!(entries[2]["status"], "todo");
+    assert_eq!(entries[2]["id"], "3");
+
+    // Malformed: refused with the reason, nothing journaled.
+    for (args, hint) in [
+        (serde_json::json!({}), "needs `items`"),
+        (serde_json::json!({"items": []}), "1 to 32 steps"),
+        (
+            serde_json::json!({"items": [{"content": "x", "status": "soon"}]}),
+            "status",
+        ),
+        (
+            serde_json::json!({"items": [{"content": "  ", "status": "pending"}]}),
+            "no content",
+        ),
+    ] {
+        let (is_error, text) = mcp_tool_call(&state, &sid, &key, "update_plan", args).await;
+        assert!(is_error && text.contains(hint), "{text}");
+    }
+    state.sessions.kill(&sid).ok();
+
+    // A terminal agent (hook key, no chat journal): told, not pretended.
+    let tui = inject_agent(&state, "plan-key");
+    let (is_error, text) = mcp_tool_call(
+        &state,
+        &tui,
+        "plan-key",
+        "update_plan",
+        serde_json::json!({"items": [{"content": "a", "status": "pending"}]}),
+    )
+    .await;
+    assert!(is_error && text.contains("terminal session"), "{text}");
 }
