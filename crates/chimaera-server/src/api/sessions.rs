@@ -119,7 +119,6 @@ pub(crate) async fn create_session(
             return bad_request(format!("invalid theme {other:?} (expected light or dark)"));
         }
     };
-    let theme: &str = &theme_owned;
 
     // Launch-scope prelude: opaque shell text by design, so only size and
     // NUL are policed (the same caps the stored scopes get on PUT).
@@ -148,6 +147,7 @@ pub(crate) async fn create_session(
 
     // A new agent in a worktree of its own: made here, before either surface
     // spawns, so both (chat and terminal, every agent) simply start there.
+    let mut made: Option<crate::git::Created> = None;
     if body.worktree {
         if body.kind != SessionKind::Agent {
             return bad_request("worktree requires kind \"agent\"".to_string());
@@ -168,11 +168,39 @@ pub(crate) async fn create_session(
             Ok(created) => {
                 tracing::info!(workspace = %workspace.id, branch = %created.branch,
                     path = %created.path.display(), "new agent session worktree");
-                start_cwd = Some(created.path);
+                start_cwd = Some(created.path.clone());
+                made = Some(created);
             }
             Err((status, msg)) => return (status, Json(json!({"error": msg}))).into_response(),
         }
     }
+
+    // Everything past this point can fail; a worktree made for this spawn
+    // must not outlive a spawn that never happened (it is new, clean and
+    // empty, so the fenced removal takes it, branch included).
+    let response = spawn_requested(&state, body, workspace.clone(), theme_owned, start_cwd).await;
+    if !response.status().is_success() {
+        if let Some(created) = made {
+            crate::git::discard_session_worktree(&state, &workspace, &created).await;
+        }
+    }
+    response
+}
+
+/// The rest of `create_session` once the workspace, theme, prelude and
+/// starting folder are settled: resume placement, then the chat or TUI
+/// spawn. Split out so the caller can undo a worktree it made for a spawn
+/// that failed here, on whichever path.
+async fn spawn_requested(
+    state: &Arc<AppState>,
+    body: CreateSession,
+    workspace: crate::workspaces::Workspace,
+    theme_owned: String,
+    start_cwd: Option<std::path::PathBuf>,
+) -> Response {
+    let bad_request =
+        |msg: String| (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
+    let theme: &str = &theme_owned;
 
     // Reopening a conversation that ran in a worktree (its Recents row
     // remembers where) resumes it there while that folder still exists and
@@ -183,7 +211,7 @@ pub(crate) async fn create_session(
             match remembered {
                 Some(dir) => {
                     let raw = dir.to_string_lossy().into_owned();
-                    crate::git::allowed_session_cwd(&state, &workspace, &raw)
+                    crate::git::allowed_session_cwd(state, &workspace, &raw)
                         .await
                         .ok()
                         .filter(|p| *p != workspace.root)
@@ -197,7 +225,7 @@ pub(crate) async fn create_session(
     // Resuming an archived conversation brings it back: it is live again,
     // and once it ends it belongs in Recents like any other.
     if let Some(resume) = body.resume.as_deref().filter(|r| !r.is_empty()) {
-        crate::recents_archive::forget_resumed(&state, &workspace.id, resume).await;
+        crate::recents_archive::forget_resumed(state, &workspace.id, resume).await;
     }
 
     // Structured chat surface: an agent driven over stream-json/app-server,
@@ -217,7 +245,7 @@ pub(crate) async fn create_session(
         }
     };
     if chat_ui {
-        return spawn_chat_ui(&state, body, workspace, theme, start_cwd, resume_cwd).await;
+        return spawn_chat_ui(state, body, workspace, theme, start_cwd, resume_cwd).await;
     }
 
     let kind = match body.kind {
@@ -293,7 +321,7 @@ pub(crate) async fn create_session(
         kind,
         started_by: crate::history::StartedBy::You,
     };
-    match crate::spawn::spawn_session(&state, spec).await {
+    match crate::spawn::spawn_session(state, spec).await {
         Ok(session) => Json(session).into_response(),
         Err(crate::spawn::SpawnFailure::AgentUnavailable(msg)) => {
             (StatusCode::CONFLICT, Json(json!({"error": msg}))).into_response()

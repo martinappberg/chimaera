@@ -57,6 +57,9 @@ pub(crate) async fn patch_workspace(
 
 /// GET /api/v1/workspaces — every workspace but the app's hidden ones.
 pub(crate) async fn list_workspaces(State(state): State<Arc<AppState>>) -> Json<Vec<Workspace>> {
+    // A managed worktree opened as its own window and removed since leaves
+    // no dead row behind.
+    crate::git::forget_missing_managed_workspaces(&state).await;
     Json(crate::lock(&state.workspaces).listed())
 }
 
