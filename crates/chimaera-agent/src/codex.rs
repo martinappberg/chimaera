@@ -211,12 +211,12 @@ use crate::driver::{
     SpawnSpec, IDLE_FLUSH_GRACE_TICKS, INTERRUPT_GRACE_TICKS,
 };
 use crate::model::{
-    cap_output, clip_command, fmt_elapsed_secs, truncate_label, AgentCommand, AgentEvent,
-    ChunkKind, Coalescer, CompactionPhase, ContentBlock, PermissionOption, PermissionOptionKind,
-    RemoteControlSnapshot, RemoteControlState, SlashCommand, ToolContent, ToolKind, ToolStatus,
-    Usage, UserMessageState, BG_LABEL_MAX, SKILL_PATH_MAX, SLASH_COMMANDS_CAP,
-    SLASH_DESCRIPTION_MAX, SLASH_NAME_MAX, SUBAGENT_RESULT_MAX, UNHANDLED_REQUESTS_CAP,
-    UNHANDLED_REQUEST_NAME_MAX,
+    cap_output, clip_command, fmt_elapsed_secs, fmt_tokens, truncate_label, AgentCommand,
+    AgentEvent, ChunkKind, Coalescer, CompactionPhase, ContentBlock, PermissionOption,
+    PermissionOptionKind, RemoteControlSnapshot, RemoteControlState, SlashCommand, ToolContent,
+    ToolKind, ToolStatus, Usage, UserMessageState, BG_LABEL_MAX, SKILL_PATH_MAX,
+    SLASH_COMMANDS_CAP, SLASH_DESCRIPTION_MAX, SLASH_NAME_MAX, SUBAGENT_RESULT_MAX,
+    UNHANDLED_REQUESTS_CAP, UNHANDLED_REQUEST_NAME_MAX,
 };
 use crate::ndjson::{JsonlSink, JsonlStream};
 use crate::subagent::{
@@ -1015,9 +1015,12 @@ const TURN_TOKENS_STEP: u64 = 256;
 struct CollabAgent {
     /// The subagent's thread id — the key every foreign frame carries.
     thread_id: String,
-    /// Transcript row id of the CURRENT stint (`agent:{thread}` for the
-    /// first, `agent:{thread}#N` after a re-open — see `open` below).
+    /// Transcript row id of the CURRENT stint (`row_base` for the first,
+    /// `{row_base}#N` after a re-open — see `open` below).
     row_id: String,
+    /// `agent:{thread}`, or `agent:{thread}@<ms>` for an agent this process
+    /// first met parked (see `collab_agent_park`).
+    row_base: String,
     /// The model's own name for the agent (the last `agentPath` segment) —
     /// kept so a re-open can title the new row.
     name: String,
@@ -1095,6 +1098,7 @@ impl CollabAgent {
     fn new(thread_id: &str, row_id: String, name: &str, note: &str) -> Self {
         let mut agent = CollabAgent {
             thread_id: thread_id.to_string(),
+            row_base: row_id.clone(),
             row_id,
             name: name.to_string(),
             open: true,
@@ -1134,7 +1138,7 @@ impl CollabAgent {
         let elapsed_ms = now_ms.saturating_sub(self.stint_opened_ms);
         let parts: Vec<String> = [
             (tools > 0).then(|| tools_label(tools)),
-            (tokens > 0).then(|| tokens_label(tokens)),
+            (tokens > 0).then(|| fmt_tokens(tokens)),
             (elapsed_ms >= 1000).then(|| fmt_elapsed_secs(elapsed_ms / 1000)),
         ]
         .into_iter()
@@ -1150,7 +1154,7 @@ impl CollabAgent {
         let parts: Vec<String> = [
             (!self.last.is_empty()).then(|| self.last.clone()),
             (self.tools > 0).then(|| tools_label(self.tools)),
-            (self.tokens > 0).then(|| tokens_label(self.tokens)),
+            (self.tokens > 0).then(|| fmt_tokens(self.tokens)),
         ]
         .into_iter()
         .flatten()
@@ -1182,11 +1186,13 @@ impl CollabAgent {
 /// for a progress line. `None` when there is no summary or the part does
 /// not open with a bold title.
 fn reasoning_section_title(summary: &Value) -> Option<String> {
+    // A part is a string (v2 `ThreadItem`) or a `{type: "summary_text",
+    // text}` object (the response-item form the schema also allows).
     let part = summary
         .as_array()?
         .iter()
         .rev()
-        .filter_map(Value::as_str)
+        .filter_map(|part| part.as_str().or_else(|| part["text"].as_str()))
         .find(|s| !s.trim().is_empty())?;
     let first = part.trim_start().lines().next()?.trim_end();
     let inner = first.strip_prefix("**")?.strip_suffix("**")?.trim();
@@ -1196,15 +1202,6 @@ fn reasoning_section_title(summary: &Value) -> Option<String> {
 /// "1 tool" / "12 tools" — claude's `subagent_stats` spelling.
 fn tools_label(n: u64) -> String {
     format!("{n} tool{}", if n == 1 { "" } else { "s" })
-}
-
-/// "980 tokens" / "12.3k tokens" — claude's `subagent_stats` spelling.
-fn tokens_label(n: u64) -> String {
-    if n >= 1000 {
-        format!("{:.1}k tokens", n as f64 / 1000.0)
-    } else {
-        format!("{n} tokens")
-    }
 }
 
 /// The current row's `SubagentInfo`: the child thread id is the handle the
@@ -3289,7 +3286,17 @@ impl CodexMapper {
                     // opens a row at the child's own `turn/started`, the one
                     // signal that it is working again — and whose
                     // `turn/completed` closes what it opened.
-                    "interacted" => self.collab_agent_note(&thread, "Follow-up input", step),
+                    "interacted" => {
+                        if self.collab_agent_mut(&thread).is_some() {
+                            self.collab_agent_note(&thread, "Follow-up input", step);
+                        } else {
+                            // Spawned before this process (a resumed thread
+                            // after a daemon restart) or evicted by the cap:
+                            // remember it parked, so the child's own turn
+                            // opens its row and the turn end closes it.
+                            self.collab_agent_park(&thread, &name);
+                        }
+                    }
                     "interrupted" => {
                         self.collab_agent_close(&thread, StintEnd::Stopped, "closed", step)
                     }
@@ -3647,9 +3654,13 @@ impl CodexMapper {
         {
             let reopened = !self.collab_agents[idx].open;
             if reopened {
-                self.collab_agents[idx].stint += 1;
-                self.collab_agents[idx].row_id =
-                    format!("agent:{thread}#{}", self.collab_agents[idx].stint);
+                let agent = &mut self.collab_agents[idx];
+                agent.stint += 1;
+                agent.row_id = if agent.stint == 1 {
+                    agent.row_base.clone()
+                } else {
+                    format!("{}#{}", agent.row_base, agent.stint)
+                };
                 self.collab_agents[idx].open = true;
                 self.collab_agents[idx].begin_stint();
                 if let Some(flushed) = self.coalescer.flush() {
@@ -3726,6 +3737,30 @@ impl CodexMapper {
         }
         self.collab_agents.push(agent);
         self.request_subagent_meta(thread, step);
+    }
+
+    /// Track a subagent this process never saw spawn, without a row: it is
+    /// parked (closed, no stint yet) until its own `turn/started` opens the
+    /// first stint. Its rows take a base unique to this park (`@<ms>`), since
+    /// the journal may already hold `agent:{thread}` rows from the process
+    /// that spawned it — finished rows never walk back to running, so a
+    /// reused id would hide the new work. Untracked at the cap when every
+    /// slot is live, like a spawn.
+    fn collab_agent_park(&mut self, thread: &str, name: &str) {
+        if self.collab_agents.len() >= COLLAB_AGENTS_CAP {
+            match self.collab_agents.iter().position(|a| !a.open) {
+                Some(idx) => {
+                    self.collab_agents.remove(idx);
+                }
+                None => return,
+            }
+        }
+        let row_base = format!("agent:{thread}@{}", crate::now_ms());
+        let mut agent = CollabAgent::new(thread, row_base.clone(), name, "");
+        agent.row_base = row_base;
+        agent.open = false;
+        agent.stint = 0;
+        self.collab_agents.push(agent);
     }
 
     /// Ask for a tracked child thread's metadata (`thread/read` without
@@ -11230,6 +11265,15 @@ mod tests {
                                           "**Counting `bin` files**"] } }),
         ));
         assert_eq!(progress(&step), vec!["Counting `bin` files".to_string()]);
+        // The schema's object form of a part names its section too.
+        let step = m.on_frame(&foreign(
+            "item/completed",
+            "sub-1",
+            json!({ "item": { "type": "reasoning", "id": "c-rs1",
+                              "summary": [{ "type": "summary_text",
+                                            "text": "**Counting `bin` files**\n\nTwo." }] } }),
+        ));
+        assert_eq!(progress(&step), vec!["Counting `bin` files".to_string()]);
         // A later token tick keeps the section, not "Thinking".
         let step = m.on_frame(&foreign(
             "thread/tokenUsage/updated",
@@ -11273,6 +11317,10 @@ mod tests {
         let t = |v: Value| reasoning_section_title(&v);
         assert_eq!(t(json!(["**A**", "  **B b**\n\nbody"])), Some("B b".into()));
         assert_eq!(t(json!(["**A**", "   "])), Some("A".into()));
+        assert_eq!(
+            t(json!([{ "type": "summary_text", "text": "**C**" }, { "type": "summary_text" }])),
+            Some("C".into())
+        );
         assert_eq!(t(json!(["plain prose first"])), None);
         assert_eq!(t(json!(["**unclosed"])), None);
         assert_eq!(t(json!(["**a** and **b**"])), None);
@@ -11423,6 +11471,58 @@ mod tests {
             )),
             "{teardown:?}"
         );
+    }
+
+    /// After a daemon restart the resumed thread's driver has never seen its
+    /// subagents spawn. A follow-up to one still gets a row: the marker parks
+    /// the agent (no events), its own turn opens a fresh row under an id the
+    /// previous process's rows cannot hold, and its turn end closes it.
+    #[test]
+    fn a_follow_up_to_an_agent_spawned_before_a_restart_still_gets_a_row() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let step = m.on_frame(&sub_agent_activity("interacted", "sub-old"));
+        assert_eq!(step.events, vec![], "the marker alone opens nothing");
+
+        let step = m.on_frame(&foreign(
+            "turn/started",
+            "sub-old",
+            json!({ "turn": { "id": "t-f" } }),
+        ));
+        let row = match step.events.first() {
+            Some(AgentEvent::ToolCall {
+                id,
+                kind: ToolKind::Agent,
+                title,
+                status: ToolStatus::InProgress,
+                cross_turn: true,
+                ..
+            }) => {
+                assert_eq!(title, "Agent: agent_a");
+                id.clone()
+            }
+            other => panic!("expected a fresh Agent row, got {other:?}"),
+        };
+        assert!(
+            row.starts_with("agent:sub-old@") && !row.contains('#'),
+            "a first stint under a park-unique id: {row}"
+        );
+        assert!(step
+            .events
+            .contains(&subagent_info_event(&row, "sub-old", None)));
+        assert_eq!(thread_reads(&step).len(), 1, "its model is read");
+
+        let step = m.on_frame(&foreign(
+            "turn/completed",
+            "sub-old",
+            json!({ "turn": { "id": "t-f", "status": "completed" } }),
+        ));
+        assert!(step.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolCallUpdate { id, status: ToolStatus::Completed, .. } if *id == row
+        )));
+        assert_eq!(finished(&step.events).len(), 1);
+        assert!(m.collab_agents.iter().all(|a| !a.open));
     }
 
     /// Status words, stint-scoped stats, and exactly one finish per stint
