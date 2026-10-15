@@ -297,6 +297,13 @@ pub trait Driver: Send {
     /// so a new driver cannot ship unpinned.
     fn tested_version(&self) -> &'static str;
 
+    /// The command a user runs to check the agent by hand, named in the
+    /// startup-failure advice. The kind unless the CLI is invoked by another
+    /// name (Cursor's `cursor-agent`).
+    fn executable(&self) -> &'static str {
+        self.kind()
+    }
+
     /// Env vars appended to the spawn (claude pins the auto-updater off and
     /// enables SDK file checkpointing; codex needs none).
     fn env_extra(&self) -> Vec<(String, String)> {
@@ -383,6 +390,7 @@ fn version_matches_pin(detected: &str, tested: &str) -> bool {
 async fn report_startup_failure(
     io: &DriverIo,
     kind: &str,
+    executable: &str,
     reason: &str,
     stderr_tail: &str,
     status: Option<i32>,
@@ -398,7 +406,7 @@ async fn report_startup_failure(
         message.push_str(tail);
     }
     message.push_str(&format!(
-        "\n\nCheck that `{kind}` can start and sign in, and that its startup hooks \
+        "\n\nCheck that `{executable}` can start and sign in, and that its startup hooks \
          and MCP servers finish loading. You can retry this chat or open a terminal \
          to inspect the agent's startup."
     ));
@@ -436,7 +444,8 @@ pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo)
         Ok(child) => child,
         Err(err) => {
             let reason = format!("spawn failed: {err:#}");
-            report_startup_failure(&io, driver.kind(), &reason, "", None).await;
+            report_startup_failure(&io, driver.kind(), driver.executable(), &reason, "", None)
+                .await;
             return DriverExit::HandshakeFailed {
                 reason,
                 stderr_tail: String::new(),
@@ -470,7 +479,15 @@ pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo)
         Ok(Ok(hs)) => hs,
         Ok(Err(reason)) => {
             let (status, tail) = guard.shutdown_with_stderr(Duration::ZERO).await;
-            report_startup_failure(&io, driver.kind(), &reason, &tail, status).await;
+            report_startup_failure(
+                &io,
+                driver.kind(),
+                driver.executable(),
+                &reason,
+                &tail,
+                status,
+            )
+            .await;
             return DriverExit::HandshakeFailed {
                 reason,
                 stderr_tail: tail,
@@ -479,7 +496,15 @@ pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo)
         Err(_) => {
             let reason = format!("no handshake within {:?}", spec.handshake_timeout);
             let (status, tail) = guard.shutdown_with_stderr(Duration::ZERO).await;
-            report_startup_failure(&io, driver.kind(), &reason, &tail, status).await;
+            report_startup_failure(
+                &io,
+                driver.kind(),
+                driver.executable(),
+                &reason,
+                &tail,
+                status,
+            )
+            .await;
             return DriverExit::HandshakeFailed {
                 reason,
                 stderr_tail: tail,
@@ -528,7 +553,15 @@ pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo)
             Delivery::WriteFailed(err) => {
                 let reason = format!("agent exited during startup ({err})");
                 let (status, tail) = guard.shutdown_with_stderr(Duration::ZERO).await;
-                report_startup_failure(&io, driver.kind(), &reason, &tail, status).await;
+                report_startup_failure(
+                    &io,
+                    driver.kind(),
+                    driver.executable(),
+                    &reason,
+                    &tail,
+                    status,
+                )
+                .await;
                 return DriverExit::HandshakeFailed {
                     reason,
                     stderr_tail: tail,
@@ -649,7 +682,15 @@ pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo)
             age_at_exit.as_secs(),
             status.map_or_else(|| "unknown".to_string(), |s| s.to_string()),
         );
-        report_startup_failure(&io, driver.kind(), &reason, &stderr_tail, status).await;
+        report_startup_failure(
+            &io,
+            driver.kind(),
+            driver.executable(),
+            &reason,
+            &stderr_tail,
+            status,
+        )
+        .await;
         return DriverExit::HandshakeFailed {
             reason,
             stderr_tail,

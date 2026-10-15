@@ -13,6 +13,9 @@ use tokio::task::JoinHandle;
 
 pub const TESTED_GROK_VERSION: &str = "1.0.46";
 pub const TESTED_AGY_VERSION: &str = "1.2.1";
+/// `cursor-agent --version` of the build whose `acp` server was probed
+/// (PROTOCOL.md, ACP › Cursor). Turn-level facts await a signed-in run.
+pub const TESTED_CURSOR_VERSION: &str = "2026.10.14-941492e";
 const MAX_PENDING: usize = 64;
 const MAX_CHOICES: usize = 64;
 
@@ -22,6 +25,15 @@ pub struct AcpAdapter {
     pub kind: &'static str,
     pub tested_version: &'static str,
     pub auth_method: &'static str,
+    /// The command a user runs to check this agent by hand.
+    pub executable: &'static str,
+    /// What to tell the user when `authenticate` fails. Cursor's method
+    /// reuses an existing `agent login` and otherwise starts a browser
+    /// login whose challenge dies with this process, so its raw error
+    /// ("Invalid params" plus a one-time URL) is not actionable. Only an
+    /// auth-shaped failure gets it (`needs_sign_in`); a crash or transport
+    /// error keeps its own message.
+    pub sign_in: Option<&'static str>,
 }
 /// Grok's own name for the mode and for the slash command that toggles it.
 const ALWAYS_APPROVE: &str = "always-approve";
@@ -29,11 +41,22 @@ pub const GROK: AcpAdapter = AcpAdapter {
     kind: "grok",
     tested_version: TESTED_GROK_VERSION,
     auth_method: "cached_token",
+    executable: "grok",
+    sign_in: None,
 };
 pub const ANTIGRAVITY: AcpAdapter = AcpAdapter {
     kind: "agy",
     tested_version: TESTED_AGY_VERSION,
     auth_method: "oauth-personal",
+    executable: "agy",
+    sign_in: None,
+};
+pub const CURSOR: AcpAdapter = AcpAdapter {
+    kind: "cursor",
+    tested_version: TESTED_CURSOR_VERSION,
+    auth_method: "cursor_login",
+    executable: "cursor-agent",
+    sign_in: Some("Cursor CLI is not signed in on this host. Run `cursor-agent login` in a terminal, then start the chat again."),
 };
 
 impl AgentAdapter for AcpAdapter {
@@ -47,34 +70,76 @@ impl AgentAdapter for AcpAdapter {
     }
 }
 
+/// A failed initialization request: the user-facing message, and the
+/// JSON-RPC error object when the agent answered with one (`Null` for a
+/// transport failure or an exit).
+struct RpcError {
+    message: String,
+    error: Value,
+}
+impl From<RpcError> for String {
+    fn from(e: RpcError) -> String {
+        e.message
+    }
+}
+fn transport(message: impl ToString) -> RpcError {
+    RpcError {
+        message: message.to_string(),
+        error: Value::Null,
+    }
+}
+
 async fn rpc(
     sink: &mut JsonlSink,
     stream: &mut JsonlStream,
     id: u64,
     method: &str,
     params: Value,
-) -> Result<Value, String> {
+) -> Result<Value, RpcError> {
     sink.send(&json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params}))
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(transport)?;
     loop {
         let frame = stream
             .next()
             .await
-            .map_err(|e| e.to_string())?
-            .ok_or("ACP exited during initialization")?;
+            .map_err(transport)?
+            .ok_or_else(|| transport("ACP exited during initialization"))?;
         if frame.get("id") == Some(&json!(id)) && frame.get("method").is_none() {
             if let Some(error) = frame.get("error") {
-                return Err(
-                    cap_output(error["message"].as_str().unwrap_or("ACP request failed")).0,
-                );
+                return Err(RpcError {
+                    message: cap_output(error["message"].as_str().unwrap_or("ACP request failed"))
+                        .0,
+                    error: error.clone(),
+                });
             }
             return Ok(frame["result"].clone());
         }
         // Clients advertise no filesystem/terminal callbacks. Refuse unknown
         // requests explicitly so an agent can never hang waiting for us.
         if frame.get("method").is_some() && frame.get("id").is_some() {
-            sink.send(&json!({"jsonrpc":"2.0", "id":frame["id"], "error":{"code":-32601,"message":"Client method not supported during initialization"}})).await.map_err(|e| e.to_string())?;
+            sink.send(&json!({"jsonrpc":"2.0", "id":frame["id"], "error":{"code":-32601,"message":"Client method not supported during initialization"}})).await.map_err(transport)?;
+        }
+    }
+}
+
+/// The two signed-out answers probed from `cursor-agent acp` 2026.10.14
+/// (PROTOCOL.md, ACP > Cursor): `-32000 Authentication required`, and the
+/// `-32602` whose `data.message` carries the browser-login challenge.
+fn needs_sign_in(error: &Value) -> bool {
+    let lower = |v: &Value| v.as_str().unwrap_or_default().to_ascii_lowercase();
+    match error["code"].as_i64() {
+        Some(-32000) => lower(&error["message"]).contains("authentication required"),
+        Some(-32602) => lower(&error["data"]["message"]).contains("login"),
+        _ => false,
+    }
+}
+
+impl AcpAdapter {
+    fn authenticate_error(&self, e: RpcError) -> String {
+        match self.sign_in {
+            Some(hint) if needs_sign_in(&e.error) => hint.to_owned(),
+            _ => e.message,
         }
     }
 }
@@ -85,6 +150,9 @@ impl Driver for AcpAdapter {
     }
     fn tested_version(&self) -> &'static str {
         self.tested_version
+    }
+    fn executable(&self) -> &'static str {
+        self.executable
     }
     async fn handshake(
         &self,
@@ -108,7 +176,8 @@ impl Driver for AcpAdapter {
             "authenticate",
             json!({"methodId":self.auth_method,"_meta":{"headless":true}}),
         )
-        .await?;
+        .await
+        .map_err(|e| self.authenticate_error(e))?;
         let mut params = json!({"cwd":spec.cwd,"mcpServers":spec.mcp_servers});
         let method = if let Some(id) = &spec.pinned_native_id {
             if init["agentCapabilities"]["loadSession"] != true {
@@ -933,6 +1002,21 @@ impl Mapper for AcpMapper {
         }
         if frame.get("id").is_some() {
             step.outbound.push(json!({"jsonrpc":"2.0","id":frame["id"],"error":{"code":-32601,"message":"Client method not supported"}}));
+            // Cursor's blocking extensions (PROTOCOL.md, ACP › Cursor) stop
+            // its turn until answered; say why the agent moved on.
+            let asked = match frame["method"].as_str() {
+                Some("cursor/ask_question") => Some("a question"),
+                Some("cursor/create_plan") => Some("plan approval"),
+                _ => None,
+            };
+            if let Some(asked) = asked {
+                self.flush_into(&mut step);
+                step.events.push(AgentEvent::Notice {
+                    text: format!(
+                        "Cursor asked for {asked}, which chat cannot show yet, so the request was declined. Use the terminal view for turns that need questions or plan approval."
+                    ),
+                });
+            }
             return step;
         }
         if frame["method"] != "session/update" || params["sessionId"] != self.native {
@@ -1468,5 +1552,84 @@ mod tests {
             step.outbound[0]["result"]["outcome"]["outcome"],
             "cancelled"
         );
+    }
+
+    /// Shapes probed from `cursor-agent acp` 2026.10.14-941492e while signed
+    /// out (PROTOCOL.md, ACP › Cursor); its documented modes are agent,
+    /// plan and ask. Nothing beyond what the session advertises is offered.
+    #[test]
+    fn cursor_offers_only_what_its_session_advertises() {
+        let init = json!({"protocolVersion":1,"agentCapabilities":{"loadSession":true,"promptCapabilities":{"image":true,"audio":false,"embeddedContext":false},"sessionCapabilities":{"list":{}}},"authMethods":[{"id":"cursor_login"}]});
+        let session = json!({"sessionId":"session","modes":{"currentModeId":"agent","availableModes":[{"id":"agent","name":"Agent"},{"id":"plan","name":"Plan"},{"id":"ask","name":"Ask"}]}});
+        let mut m = AcpMapper::new("session".into(), &init, &session);
+        m.offer_grok_modes(CURSOR.kind);
+        assert!(!m.grok_modes);
+        assert!(m.caps.image_input);
+        assert!(m.caps.commands.contains(&"set_mode".into()));
+        assert!(!m.caps.commands.contains(&"set_model".into()));
+        assert!(!m.caps.custom_model);
+        let ids: Vec<_> = m.modes.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["agent", "plan", "ask"]);
+        let step = m.on_command(AgentCommand::SetMode {
+            mode_id: "plan".into(),
+        });
+        assert_eq!(step.outbound[0]["method"], "session/set_mode");
+        let step = m.on_command(AgentCommand::SetMode {
+            mode_id: "yolo".into(),
+        });
+        assert!(step.outbound.is_empty());
+    }
+
+    #[test]
+    fn cursor_blocking_extensions_are_refused_with_a_visible_reason() {
+        let mut m = mapper();
+        let step = m.on_frame(&json!({"jsonrpc":"2.0","id":7,"method":"cursor/ask_question","params":{"toolCallId":"t","title":"Pick","questions":[]}}));
+        assert_eq!(step.outbound[0]["error"]["code"], -32601);
+        assert!(step
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Notice { text }
+                if text.contains("was declined") && text.contains("terminal view"))));
+        let step =
+            m.on_frame(&json!({"jsonrpc":"2.0","id":8,"method":"fs/read_text_file","params":{}}));
+        assert_eq!(step.outbound[0]["error"]["code"], -32601);
+        assert!(step.events.is_empty());
+    }
+
+    #[test]
+    fn only_a_signed_out_answer_becomes_the_sign_in_hint() {
+        let failure = |error: Value| RpcError {
+            message: cap_output(error["message"].as_str().unwrap_or("ACP request failed")).0,
+            error,
+        };
+        let hint = CURSOR.sign_in.unwrap();
+        // The probed signed-out answers.
+        for error in [
+            json!({"code":-32000,"message":"Authentication required","data":{"message":"Authentication required. Please run 'agent login' first"}}),
+            json!({"code":-32602,"message":"Invalid params","data":{"message":"Failed to open browser for login. Please visit: https://cursor.com/loginDeepControl?challenge=x"}}),
+        ] {
+            assert_eq!(CURSOR.authenticate_error(failure(error.clone())), hint);
+            // Other agents never borrow Cursor's advice.
+            assert_ne!(GROK.authenticate_error(failure(error)), hint);
+        }
+        // A crash, a transport failure or an unrelated error keeps its own words.
+        assert_eq!(
+            CURSOR.authenticate_error(transport("ACP exited during initialization")),
+            "ACP exited during initialization"
+        );
+        assert_eq!(
+            CURSOR.authenticate_error(failure(
+                json!({"code":-32603,"message":"Internal error: ECONNRESET"})
+            )),
+            "Internal error: ECONNRESET"
+        );
+        assert_eq!(
+            CURSOR.authenticate_error(failure(
+                json!({"code":-32602,"message":"Invalid params","data":{"message":"methodId must be a string"}})
+            )),
+            "Invalid params"
+        );
+        assert_eq!(Driver::executable(&CURSOR), "cursor-agent");
+        assert_eq!(Driver::executable(&GROK), "grok");
     }
 }

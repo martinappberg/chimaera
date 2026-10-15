@@ -101,7 +101,7 @@ fn checked_result(
 }
 
 /// A snapshot of the cached latest-release map, for the /agents row builder
-/// (one lock take for all four rows).
+/// (one lock take for every row).
 pub(crate) fn snapshot(state: &AppState) -> HashMap<AgentKind, AgentLatest> {
     crate::lock(&state.agent_updates).clone()
 }
@@ -116,11 +116,33 @@ pub(crate) fn update_available(current_line: Option<&str>, latest: &str) -> bool
         return false;
     };
     match (
-        chimaera_core::parse_version(current),
-        chimaera_core::parse_version(latest),
+        chimaera_core::parse_version(release_core(current)),
+        chimaera_core::parse_version(release_core(latest)),
     ) {
         (Some(cur), Some(new)) => new > cur,
         _ => false,
+    }
+}
+
+/// A release with a build hash (Cursor's `2026.10.14-941492e`) orders by
+/// its `X.Y.Z` core; two builds of one core are not ordered. The rule is
+/// `^(\d+\.\d+\.\d+)-([0-9A-Fa-f]{7,40})$`, the same as the web UI's
+/// `releaseCore`: a git hash may be all digits, so a numeric suffix of 7+
+/// digits counts as a hash too; anything else (`-beta`, a 6-char suffix,
+/// a two-part core) is left whole.
+fn release_core(version: &str) -> &str {
+    let Some((core, hash)) = version.split_once('-') else {
+        return version;
+    };
+    let numeric_core = core.split('.').count() == 3
+        && core
+            .split('.')
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    if numeric_core && (7..=40).contains(&hash.len()) && hash.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        core
+    } else {
+        version
     }
 }
 
@@ -170,6 +192,12 @@ async fn fetch_latest(kind: AgentKind) -> anyhow::Result<String> {
         AgentKind::Grok => {
             let body = curl("https://registry.npmjs.org/@xai-official/grok/latest", &[]).await?;
             parse_npm_latest(&body)
+        }
+        // Cursor publishes no version endpoint; its official installer pins
+        // the current release inside its download URL.
+        AgentKind::Cursor => {
+            let body = curl(crate::runtimes::CURSOR_INSTALLER, &[]).await?;
+            parse_cursor_installer(&body)
         }
         AgentKind::Gemini => {
             let body = curl("https://registry.npmjs.org/@google/gemini-cli/latest", &[]).await?;
@@ -347,6 +375,19 @@ fn parse_agy_manifest(body: &[u8]) -> anyhow::Result<String> {
     checked_version(version)
 }
 
+/// `https://cursor.com/install` — the official installer script, whose
+/// download URL names the release: `downloads.cursor.com/lab/<version>/`.
+pub(crate) fn parse_cursor_installer(body: &[u8]) -> anyhow::Result<String> {
+    let text = std::str::from_utf8(body).context("non-utf8 installer")?;
+    let marker = "downloads.cursor.com/lab/";
+    let start = text.find(marker).context("installer names no release")? + marker.len();
+    let version = text[start..]
+        .split('/')
+        .next()
+        .context("installer names no release")?;
+    checked_version(version)
+}
+
 /// The npm registry's `/latest` dist-tag document — one version manifest.
 fn parse_npm_latest(body: &[u8]) -> anyhow::Result<String> {
     let value: serde_json::Value = serde_json::from_slice(body).context("bad registry JSON")?;
@@ -360,6 +401,47 @@ fn parse_npm_latest(body: &[u8]) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_release_comes_from_the_official_installer_and_orders_by_date() {
+        let script = br#"DOWNLOAD_URL="https://downloads.cursor.com/lab/2026.10.14-941492e/${OS}/${ARCH}/agent-cli-package.tar.gz""#;
+        assert_eq!(
+            parse_cursor_installer(script).unwrap(),
+            "2026.10.14-941492e"
+        );
+        assert!(parse_cursor_installer(b"echo hi").is_err());
+        assert!(parse_cursor_installer(b"downloads.cursor.com/lab/$(id)/x").is_err());
+        assert!(update_available(
+            Some("2026.10.14-941492e"),
+            "2026.10.21-0a1b2c3"
+        ));
+        assert!(!update_available(
+            Some("2026.10.14-941492e"),
+            "2026.10.14-0a1b2c3"
+        ));
+        assert!(!update_available(
+            Some("2026.10.14-941492e"),
+            "2026.10.14-941492e"
+        ));
+        // A pre-release tag is not a build hash.
+        assert!(!update_available(Some("1.2.3-beta"), "1.2.3"));
+    }
+
+    /// Pinned in step with the web UI's `releaseCore` tests.
+    #[test]
+    fn release_core_rule_matches_the_ui() {
+        for (version, core) in [
+            ("2026.10.14-941492e", "2026.10.14"),
+            ("2026.10.14-941492E", "2026.10.14"),
+            ("1.2.3-20261014", "1.2.3"),
+            ("1.2.3-beta", "1.2.3-beta"),
+            ("1.2.3-abcdef", "1.2.3-abcdef"),
+            ("1.2-abcdef0", "1.2-abcdef0"),
+            ("1.2.3", "1.2.3"),
+        ] {
+            assert_eq!(release_core(version), core, "{version}");
+        }
+    }
 
     #[test]
     fn failed_rechecks_keep_the_release_but_report_failure() {

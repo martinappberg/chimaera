@@ -25,6 +25,7 @@
   import { getSetting, resolvedTheme } from "../settings/store.svelte";
   import { ApiError } from "../net/api";
   import { deleteMastermind, putMastermind, type Session } from "../workspace/sessions";
+  import { getAgentDefault } from "../workspace/launcher";
   import type { LayoutCtrl } from "../layout/dnd";
   import { deliver, unreadFor } from "../workspace/comms.svelte";
   import { knowledgePlugin, openAttachSheet } from "../plugins/store";
@@ -81,8 +82,9 @@
   /** Setup-card agent choice — both chat-driver agents enforce the mode
    *  through their own harness (claude: settings pre-allows; codex: the
    *  driver answering its MCP tool-call elicitations from the recorded
-   *  mode). */
-  let agent = $state<"claude" | "codex">("claude");
+   *  mode). These are the rail's two quick agents; the choice starts on
+   *  whichever of them the user made the launcher default. */
+  let agent = $state<"claude" | "codex">(getAgentDefault().agent === "codex" ? "codex" : "claude");
   /** A PUT/DELETE is in flight — buttons disable, the chat gap shows busy. */
   let pending = $state(false);
   /** The server's own words for a refused/failed call, shown verbatim. */
@@ -998,7 +1000,8 @@
   /* --- the embedded chat ------------------------------------------------------ */
   /* ChatView owns its own height:100% column; the wrapper just hands it the
      remaining dock height and forbids horizontal creep at ~360px. Its reading
-     measure (52rem) never binds this narrow, so no ChatView change is needed. */
+     column (the Reading Width setting) fits the dock's width when the dock is
+     narrower, so no ChatView change is needed. */
   .dock-chat {
     flex: 1;
     min-height: 0;

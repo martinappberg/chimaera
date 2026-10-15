@@ -15,6 +15,7 @@
    * never polled.
    */
   import { untrack } from "svelte";
+  import { agentProductName } from "../shared/agentNames";
   import type { DashCtx } from "../dashboard/dash";
   import type { LayoutCtrl } from "../layout/dnd";
   import { ApiError } from "../net/api";
@@ -287,7 +288,7 @@
           <div class="seg" role="radiogroup" aria-label="agent">
             <button role="radio" aria-checked={agent === "" && !showArchived} class:on={agent === "" && !showArchived} onclick={() => ((agent = ""), (showArchived = false))}>All</button>
             {#each kinds as k (k)}
-              <button role="radio" aria-checked={agent === k && !showArchived} class:on={agent === k && !showArchived} onclick={() => ((agent = k), (showArchived = false))}>{k === "claude" ? "Claude" : k === "codex" ? "Codex" : k}</button>
+              <button role="radio" aria-checked={agent === k && !showArchived} class:on={agent === k && !showArchived} onclick={() => ((agent = k), (showArchived = false))}>{k === "claude" ? "Claude" : agentProductName(k)}</button>
             {/each}
           </div>
         {/if}

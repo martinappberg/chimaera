@@ -2,17 +2,48 @@
   import { copyText } from "../shared/clipboard";
   import { formatFullTimestamp, formatMessageTimestamp } from "../shared/time";
 
+  /**
+   * The quiet action cluster on an agent message — time, then usage, copy,
+   * rewind-to-here and fork-from-here as small icons — at the message's top
+   * right, shown on hover or keyboard focus (the buttons stay in the tab
+   * order, so focus is what reveals them). Each action is optional: a
+   * read-only view offers copy alone; rewind exists only once a later
+   * message of yours gives the agent a point to return to.
+   */
   interface Props {
     text: string;
     sentAtMs: number;
     nowMs: number;
-    onFork: () => void;
+    onFork?: () => void;
+    /** Rewind the conversation to just after this reply (the RewindDialog
+     *  flow, anchored on the next message you sent). */
+    onRewind?: () => void;
+    rewindTitle?: string;
+    /** Show plan usage (the UsagePanel flow). */
+    onUsage?: () => void;
+    /** The turn's footprint for the usage icon's tooltip ("12.3k tokens"). */
+    turnTokens?: string | null;
     /** The turn's duration ("5.4s") when this is the turn's closing message —
      *  a detail for the timestamp's tooltip, not the page. */
     turnDuration?: string | null;
   }
 
-  let { text, sentAtMs, nowMs, onFork, turnDuration = null }: Props = $props();
+  let {
+    text,
+    sentAtMs,
+    nowMs,
+    onFork,
+    onRewind,
+    rewindTitle = "rewind to here",
+    onUsage,
+    turnTokens = null,
+    turnDuration = null,
+  }: Props = $props();
+  const usageTitle = $derived(
+    [turnTokens !== null ? `this turn: ${turnTokens}` : null, turnDuration, "show plan usage"]
+      .filter((part) => part !== null)
+      .join(" · "),
+  );
 
   const timeLabel = $derived(formatMessageTimestamp(sentAtMs, nowMs));
   const fullTime = $derived(
@@ -50,6 +81,20 @@
     <time datetime={isoTime} title={fullTime}>{timeLabel}</time>
   {/if}
   <span class="actions">
+    {#if onUsage !== undefined}
+      <button aria-label="show plan usage" title={usageTitle} onclick={onUsage}>
+        <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+          <path
+            d="M2 11.5l3.2-3.6 2.6 2.2L11 5.5l3 3"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.4"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+        </svg>
+      </button>
+    {/if}
     <button
       class="copy-action"
       class:copied
@@ -89,48 +134,75 @@
         </svg>
       </span>
     </button>
-    <button
-      aria-label="fork conversation from this message"
-      title="fork from this message into a new session (source keeps running)"
-      onclick={onFork}
-    >
-      <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
-        <circle cx="4" cy="3.5" r="1.5" fill="none" stroke="currentColor" stroke-width="1.4" />
-        <circle cx="4" cy="12.5" r="1.5" fill="none" stroke="currentColor" stroke-width="1.4" />
-        <circle cx="12" cy="8" r="1.5" fill="none" stroke="currentColor" stroke-width="1.4" />
-        <path
-          d="M5.5 3.5h.5A2 2 0 0 1 8 5.5v5A2 2 0 0 1 6 12.5h-.5M8 8h2.5"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="1.4"
-          stroke-linecap="round"
-        />
-      </svg>
-    </button>
+    {#if onRewind !== undefined}
+      <button aria-label={rewindTitle} title={rewindTitle} onclick={onRewind}>
+        <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+          <path
+            d="M3.5 5.5h6a3.5 3.5 0 0 1 0 7H6M3.5 5.5L6 3M3.5 5.5L6 8"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.4"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+        </svg>
+      </button>
+    {/if}
+    {#if onFork !== undefined}
+      <button
+        aria-label="fork conversation from this message"
+        title="fork from this message into a new session (source keeps running)"
+        onclick={onFork}
+      >
+        <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+          <circle cx="4" cy="3.5" r="1.5" fill="none" stroke="currentColor" stroke-width="1.4" />
+          <circle cx="4" cy="12.5" r="1.5" fill="none" stroke="currentColor" stroke-width="1.4" />
+          <circle cx="12" cy="8" r="1.5" fill="none" stroke="currentColor" stroke-width="1.4" />
+          <path
+            d="M5.5 3.5h.5A2 2 0 0 1 8 5.5v5A2 2 0 0 1 6 12.5h-.5M8 8h2.5"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.4"
+            stroke-linecap="round"
+          />
+        </svg>
+      </button>
+    {/if}
   </span>
 </div>
 
 <style>
-  /* Inline: the host flows it right after the message's last word, on a
-     new line only when that line is full (ChatView owns that layout). */
+  /* The message's top right, floating over the gap above it: it reserves no
+     row, and when it shows it sits on the page's own background so the
+     prose under its corner stays legible around it. */
   .agent-message-meta {
+    position: absolute;
+    top: -13px;
+    right: 0;
+    z-index: 1;
     display: inline-flex;
     align-items: center;
     gap: 5px;
-    height: 20px;
-    margin-left: 0.6em;
-    vertical-align: middle;
+    height: 22px;
+    padding: 0 3px 0 8px;
+    border-radius: 7px;
+    background: var(--bg);
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--edge) 70%, transparent);
     color: color-mix(in srgb, var(--muted) 78%, transparent);
     font-size: var(--text-xs);
     line-height: 1;
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
     opacity: 0;
+    /* Invisible, it must not catch the pointer over the prose it covers
+       (selection drags start there); focus still reaches its buttons. */
+    pointer-events: none;
     transition: opacity 0.12s ease;
   }
   :global(.msg.agent:hover) .agent-message-meta,
   .agent-message-meta:focus-within {
     opacity: 1;
+    pointer-events: auto;
   }
   time {
     user-select: none;
@@ -198,9 +270,19 @@
     opacity: 0.68;
     transform: scale(1);
   }
+  /* Touch: nothing hovers, so the cluster stays visible — inline after
+     the message's last word (ChatView flows it), never over the prose. */
   @media (hover: none) {
     .agent-message-meta {
+      position: static;
+      height: 20px;
+      margin-left: 0.6em;
+      padding: 0;
+      vertical-align: middle;
+      background: none;
+      box-shadow: none;
       opacity: 1;
+      pointer-events: auto;
     }
   }
   @media (prefers-reduced-motion: reduce) {

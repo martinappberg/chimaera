@@ -42,18 +42,24 @@ a `settings` frame on `/ws/events`. Map: [settings/AGENTS.md](../../web-ui/src/l
   settings; Activity reads session records. Documents offers opt-in writes of the documents dialect into the workspace's `AGENTS.md` or a
   Claude Code skill over `/api/v1/agent-docs`
   ([agents.md](agents.md#documents-the-portable-dialect-check_document-and-the-issues-chip)).
-- **Interface typography applies app-wide.** `appearance.interfaceFontSize` (13 px by default)
+- **Interface typography applies app-wide.** `appearance.interfaceFontSize` (13.5 px by default;
+  11.5/12.5/13.5/15.5 px for xs/sm/md/lg)
   rebuilds the shared `--text-xs`/`--text-sm`/`--text-md`/`--text-lg` scale live, so the rail,
   file tree, pane tabs, dashboard, settings, dialogs, Git, and preview chrome move together.
   `appearance.interfaceFontFamily` supplies the shared UI font stack. Small chrome uses those
   tokens rather than fixed rem/px sizes.
-- **Content surfaces stay independently legible.** Chat defaults to a 13.5 px base and overrides
-  the shared scale within each `ChatView` (including the dashboard's embedded Mastermind) and
-  exposes font size/family, line height, and reading width. Terminal keeps its xterm-specific
-  font controls. Editor typography
-  covers code, diffs, and the JSON editor; rendered Markdown defaults to the same 13.5 px as Chat
+- **Content surfaces stay independently legible.** Chat defaults to a 14 px base at line height
+  1.57 and overrides the shared scale within each `ChatView` (panes, the subagent read-only view,
+  and the dashboard's embedded Mastermind) and exposes font size/family and line height. Terminal
+  keeps its xterm-specific font controls. Editor typography
+  covers code, diffs, and the JSON editor; rendered Markdown defaults to the same 14 px as Chat, so
+  an agent's reply and the document it wrote read alike,
   but has its own font-size and line-height settings rather than borrowing `terminal.fontSize`.
   CodeMirror views reconfigure while mounted.
+- **Reading Width is the column width.** `chat.contentWidth` (Appearance › Reading Width, 672 px by
+  default: 48em of the 14 px chat text) sets the transcript column, its composer and trays, and the
+  rendered Markdown column (plus its padding) on every chat surface; a narrower pane still fits its
+  space. It used to cap a 48em column, so any value above 48em did nothing.
 - **Newer surfaces are represented.** `dashboard.landing` controls the workspace landing and
   `dashboard.cardDensity` selects automatic, comfortable, or compact agent cards. Mastermind's
   agent/mode are workspace state edited in its setup card, while Environment preludes remain scoped
@@ -76,12 +82,16 @@ a `settings` frame on `/ws/events`. Map: [settings/AGENTS.md](../../web-ui/src/l
 
 ## Agents settings & themes
 
-- **Agents panel** (`AgentsSettings.svelte`) — four built-in cards show version, chat/terminal readiness,
+- **Agents panel** (`AgentsSettings.svelte`) — one card per built-in agent (Claude Code, Codex,
+  Antigravity, Grok Build, Cursor CLI) shows version, chat/terminal readiness,
   and whether Chimaera manages the installation. Install, Set up chat, or Update is offered when
   applicable; personal installations link to official update instructions. Antigravity's chat setup
   installs Google's companion. Advanced holds custom executable paths, Reinstall and Uninstall.
   Installation progress follows a retained daemon result from the terminal's actual exit status, with bounded polling only while
   Settings is visible. Re-checking and saving another row preserve unfinished path edits.
+  The agent menu's **agent settings →** opens this panel; it is where agents beyond the rail's
+  two defaults are set up. Cursor's custom executable is `agents.cursor.path`; a dated Cursor
+  build reads as its date and is "Up to date" only when the installed build is the latest one.
   See [agents.md](agents.md).
 - **Theme palettes** (`themes.ts`) — each theme carries its own hand-tuned 16-color terminal ANSI
   palette alongside the UI tokens; a UI theme without a terminal palette is "half a theme". UI quality
