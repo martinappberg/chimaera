@@ -6,7 +6,7 @@ import {
   planProgress,
   planSummary,
   stepDetail,
-  stepKey,
+  stepKeys,
   stepMark,
   stepText,
 } from "./planCard";
@@ -58,7 +58,7 @@ describe("the plan card's reading of every runtime's plan", () => {
 
   it("a level-set update keeps every row's key, so the card updates in place", () => {
     const store = fold([CLAUDE_PLAN]);
-    const before = store.plan.map(stepKey);
+    const before = stepKeys(store.plan);
     store.apply({
       seq: 99,
       ts: 2000,
@@ -67,9 +67,25 @@ describe("the plan card's reading of every runtime's plan", () => {
         entries: CLAUDE_PLAN.entries.map((e) => ({ ...e, status: "done", blocked_by: [] })),
       },
     } as SeqEvent);
-    expect(store.plan.map(stepKey)).toEqual(before);
+    expect(stepKeys(store.plan)).toEqual(before);
     // Positional keys for id-less plans are stable across updates too.
-    expect(fold([CODEX_PLAN]).plan.map(stepKey)).toEqual(["ix:0", "ix:1", "ix:2"]);
+    expect(stepKeys(fold([CODEX_PLAN]).plan)).toEqual(["ix:0", "ix:1", "ix:2"]);
+  });
+
+  it("keys stay unique even when the agent repeats an id", () => {
+    const entry = (id: string | null, content: string): PlanEntry => ({
+      content,
+      status: "todo",
+      id,
+      activeForm: null,
+      description: null,
+      owner: null,
+      blockedBy: [],
+    });
+    const keys = stepKeys([entry("1", "a"), entry("1", "b"), entry("1#1", "c"), entry("1", "d"), entry(null, "e")]);
+    expect(new Set(keys).size).toBe(keys.length);
+    expect(keys[0]).toBe("id:1");
+    expect(keys[4]).toBe("ix:4");
   });
 
   it("a finished plan folds to one line only once the turn is over", () => {

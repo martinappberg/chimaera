@@ -2167,19 +2167,6 @@
         return a.detail === "starting" ? "Starting" : "Working";
     }
   });
-  /** The status row says a phase only where the page doesn't already show
-   *  it: a live tool row, streaming prose and the working glyph speak for
-   *  themselves ("Running tools", "Writing", "Working", and "Thinking"
-   *  while a live thought row says it, are left to the screen-reader text);
-   *  the agent's own phrase, token-only thinking, starting and compacting
-   *  have nothing else on the page saying them. */
-  const activityShown = $derived(
-    store.compacting ||
-      store.activityLine !== null ||
-      (store.activity !== null &&
-        ((store.activity.kind === "thinking" && store.activity.detail !== "") ||
-          (store.activity.kind === "waiting" && store.activity.detail === "starting"))),
-  );
   /** The exact phase detail for the tooltip (a tool title, a thinking-token
    *  estimate) — the line itself stays short. */
   const activityDetail = $derived.by(() => {
@@ -2452,6 +2439,39 @@
     }
     folded.push(...items.slice(at));
     return folded;
+  });
+
+  /** The newest rows are on screen: the window holds the live tail and the
+   *  reader is at the bottom. */
+  const tailInView = $derived(atBottom && renderEnd >= store.blocks.length);
+  /** A running call's line is mounted in the open trailing run (not folded,
+   *  not scrolled away), so it already says what is running. */
+  const liveToolLineInView = $derived.by(() => {
+    if (!tailInView) return false;
+    for (let i = renderItems.length - 1; i >= 0; i--) {
+      const item = renderItems[i];
+      if (item.t === "group") {
+        if (item.tools.some(isLive)) return true;
+        continue;
+      }
+      if (item.t === "single" && item.block.kind === "thought") continue;
+      return false;
+    }
+    return false;
+  });
+  /** The status row drops a phase word only where a row in view already says
+   *  it — a live tool line in the open trailing run, streaming prose or a
+   *  live thought row at the reader's bottom; the word stays for the screen
+   *  reader. Waiting (on a permission, a question, the next step), the
+   *  agent's own phrase, token-only thinking and compacting always show:
+   *  when in doubt, it is said. */
+  const activityShown = $derived.by(() => {
+    if (store.compacting || store.activityLine !== null) return true;
+    const a = store.activity;
+    if (a === null || a.kind === "waiting") return true;
+    if (a.kind === "tool") return !liveToolLineInView;
+    if (a.kind === "thinking" && a.detail !== "") return true;
+    return !tailInView;
   });
 
   /** A finished turn's duration and output tokens, kept out of the page
@@ -3664,22 +3684,30 @@
     position: relative;
     padding: 2px 0;
   }
-  /* A settled message and its hover rail are one inline flow: the rail
-     follows the last word and takes a line of its own only when that line
-     is full — no row reserved under every message. The markdown shell is
-     layout-neutral (its children lay out here; inherited type still
-     applies) and a closing paragraph goes inline; any other closing block
-     (list, table, code) keeps its box, and the rail starts flush below it.
-     While streaming the rail has nothing to act on, so it takes no space. */
-  .msg.agent > :global(.md) {
-    display: contents;
-  }
+  /* On pointer devices the action cluster floats at the message's top right
+     (AgentMessageMeta) and takes no space; a closing paragraph keeps no
+     bottom margin, so a reply ends where its last line does. */
   .msg.agent > :global(.md > p:last-child) {
-    display: inline;
+    margin-bottom: 0;
   }
-  .msg.agent:not(:has(> :global(.md > p:last-child))) :global(.agent-message-meta) {
-    margin-left: 0;
+  /* Touch: nothing hovers, so the cluster is shown inline — it follows the
+     last word and takes a line of its own only when that line is full, with
+     no row reserved under every message. The markdown shell is
+     layout-neutral (its children lay out here; inherited type still applies)
+     and a closing paragraph goes inline; any other closing block (list,
+     table, code) keeps its box, and the cluster starts flush below it. */
+  @media (hover: none) {
+    .msg.agent > :global(.md) {
+      display: contents;
+    }
+    .msg.agent > :global(.md > p:last-child) {
+      display: inline;
+    }
+    .msg.agent:not(:has(> :global(.md > p:last-child))) :global(.agent-message-meta) {
+      margin-left: 0;
+    }
   }
+  /* While a message streams the cluster has nothing to act on. */
   .msg.agent.streaming :global(.agent-message-meta) {
     display: none;
   }
@@ -3749,14 +3777,6 @@
   .status-spark {
     display: inline-flex;
     animation: spark-pulse 1.6s ease-in-out infinite;
-  }
-  .sr-only {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    clip-path: inset(50%);
-    white-space: nowrap;
   }
   .status-label {
     min-width: 0;

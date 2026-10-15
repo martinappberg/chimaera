@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import ActivityRows from "./ActivityRows.svelte";
   import ActivitySummary from "./ActivitySummary.svelte";
   import type { OpenPathFn, PathResolver } from "./paths";
@@ -93,7 +94,11 @@
   /** Elapsed while a call runs (ticking only while shown), the run's
    *  duration once it settles. */
   const clock = liveClock(() => running && visible);
-  const elapsed = $derived(spanLabel(toolSpanMs(tools, (running ? clock.ms : 0) - clockSkewMs)));
+  // Only a shown live line follows the shared tick; a hidden tab's line
+  // reads the time once and stays still.
+  const elapsed = $derived(
+    spanLabel(toolSpanMs(tools, (running ? (visible ? clock.ms : untrack(() => clock.ms)) : 0) - clockSkewMs)),
+  );
 </script>
 
 <div

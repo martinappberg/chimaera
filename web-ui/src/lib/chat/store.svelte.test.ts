@@ -1,7 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { SeqEvent } from "./chatWs";
 import { ChatStore } from "./store.svelte";
+import { toolSpanMs } from "./toolLabels";
 
 /** Build a numbered event stream (seq assigned in order) and fold it through a
  *  fresh store — the reducer's only input, exactly as the wire delivers it. */
@@ -2183,6 +2184,38 @@ describe("tool timing and prose honesty", () => {
       [12_000, { type: "tool_call_update", id: "a", status: "completed" }],
     ]);
     expect(store.blocks.find((b) => b.kind === "tool")).toMatchObject({ startedAtMs: 5_000, endedAtMs: 9_000 });
+  });
+
+  it("samples clock skew only from live frames, never from replay", () => {
+    vi.useFakeTimers();
+    try {
+      const now = 1_800_000_000_000;
+      vi.setSystemTime(now);
+      const store = new ChatStore();
+      const info = { id: "s", agent: "claude", alive: true, exit_status: null, native_session_id: null, model: null, current_mode: null, pending_permission: false };
+      store.onReady(info, 0, 2);
+      // Replay: a still-running command started ten minutes ago is the head.
+      store.apply({ seq: 1, ts: now - 600_000, ev: { type: "turn_started", turn_id: "t" } } as SeqEvent, false);
+      store.apply(
+        { seq: 2, ts: now - 600_000, ev: { type: "tool_call", id: "b", kind: "execute", title: "sleep", status: "in_progress" } } as SeqEvent,
+        false,
+      );
+      const row = store.blocks.find((b) => b.kind === "tool")!;
+      const elapsed = () => toolSpanMs([row], Date.now() - store.clockSkewMs);
+      expect(store.clockSkewMs).toBe(0);
+      expect(elapsed()).toBe(600_000);
+      // A reconnect's gap replay is replay too.
+      store.onReady(info, 2, 3);
+      store.apply({ seq: 3, ts: now - 300_000, ev: { type: "turn_tokens", output: 5 } } as SeqEvent, false);
+      expect(elapsed()).toBe(600_000);
+      // The first live frame: this daemon's clock runs 2s behind ours.
+      vi.setSystemTime(now + 5_000);
+      store.apply({ seq: 4, ts: now + 3_000, ev: { type: "turn_tokens", output: 9 } } as SeqEvent, true);
+      expect(store.clockSkewMs).toBe(2_000);
+      expect(elapsed()).toBe(603_000);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("prose from any runtime is a message row, reasoning a thought row — never mixed", () => {

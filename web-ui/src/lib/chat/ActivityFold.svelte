@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import type { Snippet } from "svelte";
   import { foldTitle } from "./activityFold";
   import ActivityRows from "./ActivityRows.svelte";
@@ -58,7 +59,11 @@
   const failed = $derived(toolRunHealth(tools, tail) === "failed");
   /** The run's tool time, read the way a group line reads it. */
   const clock = liveClock(() => running && visible);
-  const elapsed = $derived(spanLabel(toolSpanMs(tools, (running ? clock.ms : 0) - clockSkewMs)));
+  // Only a shown live line follows the shared tick; a hidden tab's line
+  // reads the time once and stays still.
+  const elapsed = $derived(
+    spanLabel(toolSpanMs(tools, (running ? (visible ? clock.ms : untrack(() => clock.ms)) : 0) - clockSkewMs)),
+  );
 </script>
 
 <div

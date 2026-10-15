@@ -7,7 +7,7 @@
     planProgress,
     planSummary,
     stepDetail,
-    stepKey,
+    stepKeys,
     stepMark,
     stepText,
     type StepMark,
@@ -51,18 +51,23 @@
   /** Keep the step in flight inside the bounded list — moving only the
    *  list's own scroll, never the page, and only when it left the view. */
   let list = $state<HTMLOListElement | undefined>();
+  /** The list's box height: a pane resize can push the current step out. */
+  let listHeight = $state(0);
+  const keys = $derived(stepKeys(entries));
   const currentKey = $derived.by(() => {
     const i = entries.findIndex((e) => e.status === "in_progress");
-    return i === -1 ? null : stepKey(entries[i], i);
+    return i === -1 ? null : keys[i];
   });
   $effect(() => {
     const key = currentKey;
+    void listHeight;
     const el = list;
     if (key === null || el === undefined || !visible) return;
     void tick().then(() => {
       const row = el.querySelector<HTMLElement>(`[data-step="${CSS.escape(key)}"]`);
       if (row === null) return;
-      const top = row.offsetTop - el.offsetTop;
+      // The list is the rows' offset parent (position: relative).
+      const top = row.offsetTop;
       const bottom = top + row.offsetHeight;
       if (top < el.scrollTop) el.scrollTop = top;
       else if (bottom > el.scrollTop + el.clientHeight) el.scrollTop = bottom - el.clientHeight;
@@ -89,6 +94,8 @@
 {/snippet}
 
 <section class="plan-card" class:visible aria-label="plan">
+  <!-- The toggle is a flex column of its own at the card's right, so no row —
+       first, scrolled-to, or "12/15" wide — ever runs under it. -->
   <button
     class="toggle"
     aria-expanded={!folded}
@@ -106,16 +113,16 @@
       <span class="text">{summary}</span>
     </button>
   {:else}
-    <ol class="steps" bind:this={list}>
-      {#each entries as entry, i (stepKey(entry, i))}
+    <ol class="steps" bind:this={list} bind:clientHeight={listHeight}>
+      {#each entries as entry, i (keys[i])}
         {@const mark = stepMark(entry)}
         {@const detail = stepDetail(entry)}
-        <li class="step {mark}" data-step={stepKey(entry, i)}>
+        <li class="step {mark}" data-step={keys[i]}>
           {@render circle(mark)}
           <span class="body">
             <span class="line">
               <span class="text">{stepText(entry)}</span>
-              <span class="sr">({MARK_WORD[mark]})</span>
+              <span class="sr-only">({MARK_WORD[mark]})</span>
               {#if entry.owner}<span class="owner">@{entry.owner}</span>{/if}
               {#if mark === "blocked"}
                 <span class="aside">after {entry.blockedBy.map((id) => `#${id}`).join(", ")}</span>
@@ -130,14 +137,15 @@
     </ol>
   {/if}
   <!-- One polite announcement per step change, never per row. -->
-  <span class="sr" role="status" aria-live={visible ? "polite" : "off"}
+  <span class="sr-only" role="status" aria-live={visible ? "polite" : "off"}
     >{progress.current !== null ? stepText(progress.current) : progress.allDone ? "plan done" : ""}</span
   >
 </section>
 
 <style>
   .plan-card {
-    position: relative;
+    display: flex;
+    align-items: flex-start;
     flex: none;
     margin-top: 6px;
     margin-bottom: 6px;
@@ -152,10 +160,9 @@
     animation: none;
   }
   .toggle {
-    position: absolute;
-    top: 4px;
-    right: 6px;
-    z-index: 1;
+    order: 1;
+    flex: none;
+    margin: 4px 6px 0 0;
     display: inline-flex;
     align-items: center;
     gap: 4px;
@@ -179,7 +186,9 @@
     align-items: center;
     gap: 9px;
     width: 100%;
-    padding: 6px 64px 6px 11px;
+    flex: 1;
+    min-width: 0;
+    padding: 6px 8px 6px 11px;
     background: none;
     border: none;
     border-radius: 10px;
@@ -193,12 +202,14 @@
     color: var(--fg);
   }
   .steps {
+    flex: 1;
+    min-width: 0;
     list-style: none;
     margin: 0;
-    padding: 5px 11px 6px;
+    padding: 5px 8px 6px 11px;
     /* About eight steps; a longer plan scrolls inside the card, which
        keeps the step in flight in view (see the script). */
-    max-height: 196px;
+    max-height: min(196px, 30vh);
     overflow-y: auto;
     position: relative;
   }
@@ -208,10 +219,6 @@
     gap: 9px;
     padding: 2px 0;
     color: color-mix(in srgb, var(--fg) 80%, var(--muted));
-  }
-  /* Room for the corner toggle on the first line only. */
-  .step:first-child {
-    padding-right: 54px;
   }
   .step.current {
     color: var(--fg);
@@ -291,14 +298,6 @@
      the light theme. */
   .owner {
     color: color-mix(in srgb, var(--accent) 70%, var(--fg));
-  }
-  .sr {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    clip-path: inset(50%);
-    white-space: nowrap;
   }
   @media (prefers-reduced-motion: reduce) {
     .plan-card {

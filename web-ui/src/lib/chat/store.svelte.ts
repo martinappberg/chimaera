@@ -777,9 +777,11 @@ export class ChatStore {
    *  the oldest message down or eagerly load every historical artifact. */
   hydrating = $state(true);
   private replayHead = 0;
-  /** Local clock minus the daemon's journal clock, sampled from live frames:
-   *  a running row's elapsed is `Date.now() - (startedAtMs + skew)`, so a
-   *  remote daemon's clock offset never reads as time. Deliberately not
+  /** Local clock minus the daemon's journal clock, sampled only from frames
+   *  the socket delivered live past the replay head (a replayed frame's `ts`
+   *  is its original time, so sampling one would read its age as skew): a
+   *  running row's elapsed is `Date.now() - (startedAtMs + skew)`, so a
+   *  remote daemon's clock offset never reads as time. 0 until a live frame. Deliberately not
    *  reactive (a per-event signal would churn every reader); the 1 Hz
    *  elapsed readers pick it up on their next tick. */
   clockSkewMs = 0;
@@ -955,11 +957,11 @@ export class ChatStore {
     }));
   }
 
-  apply(entry: SeqEvent): void {
+  apply(entry: SeqEvent, live = false): void {
     if (entry.seq <= this.lastSeq) return;
     this.lastSeq = entry.seq;
     if (this.hydrating && this.lastSeq >= this.replayHead) this.hydrating = false;
-    if (!this.hydrating && entry.ts > 0) this.clockSkewMs = Date.now() - entry.ts;
+    if (live && entry.ts > 0 && entry.seq > this.replayHead) this.clockSkewMs = Date.now() - entry.ts;
     const ev = entry.ev;
     switch (ev.type) {
       case "startup_progress":

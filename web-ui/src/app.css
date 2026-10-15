@@ -384,6 +384,17 @@ body {
   height: 100vh;
 }
 
+/* Visually hidden, still read by assistive tech (a live region's text, a
+   state word a glyph already shows). */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
 /* Session state is carried by the type glyphs now (SessionGlyph, shared by
    the rail, pane tabs, and the session strip) — the old state dots are gone. */
 
