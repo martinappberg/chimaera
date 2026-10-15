@@ -335,13 +335,17 @@ the lifecycle, keep them consistent:
 
 ## Agent integration and view persistence
 
-The built-in catalog is Claude Code, Codex, Antigravity (`agy`) and Grok Build.
-`AgentKind::chat_adapter` registers each adapter explicitly; `launcher::chat_executable`
+The built-in catalog is Claude Code, Codex, Antigravity (`agy`), Grok Build and Cursor CLI
+(`cursor`). An id doubles as the managed tree/shim name; `AgentKind::path_bin` is what the
+user's PATH is searched for — Cursor's is `cursor-agent`, because `cursor` is the Cursor
+editor's launcher and must never be resolved or shadowed. `AgentKind::is_acp` marks the
+shared-ACP registrations (Antigravity, Grok, Cursor). `AgentKind::chat_adapter` registers
+each adapter explicitly; `launcher::chat_executable`
 resolves Antigravity’s separate Google chat package, including its companion harness.
 `runtimes.rs` installs both executables while the picker presents one agent. Gemini CLI
 identifiers remain parseable for saved history but are absent from new-agent choices.
 
-Keep `chat_capable`, `fork_capable` and `view_switchable` separate: all four support chat
+Keep `chat_capable`, `fork_capable` and `view_switchable` separate: every agent supports chat
 and conversation-copy forks; only Claude/Codex have a verified native terminal/chat switch.
 Every session-row builder, including `chat_session_json` used by create/fork responses,
 must report the same additive flags. A failed resumed chat keeps its view and recipe.

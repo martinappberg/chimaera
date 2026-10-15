@@ -10,7 +10,7 @@ replay a press; reconnect creates fresh render handles. See
 [Claude Mods](../../../../docs/features/claude-mods.md).
 
 Orientation for coding agents. This directory is the **front half of chat mode**:
-the rich UI that renders Claude, Codex, Antigravity and Grok agent streams,
+the rich UI that renders Claude, Codex, Antigravity, Grok and Cursor agent streams,
 the sibling of the xterm.js terminal surface. Parent map: repo-root
 [AGENTS.md](../../../../AGENTS.md). The back half it talks to is
 [`crates/chimaera-agent`](../../../../crates/chimaera-agent/AGENTS.md).

@@ -2078,7 +2078,7 @@ describe("ChatStore messages from other agents", () => {
 });
 
 describe("model selection before the first prompt", () => {
-  for (const agent of ["claude", "codex", "agy", "grok"]) {
+  for (const agent of ["claude", "codex", "agy", "grok", "cursor"]) {
     it(`${agent}: keeps a selection pending through initialization until read-back`, () => {
       const store = new ChatStore();
       store.markModelPending("chosen-model");

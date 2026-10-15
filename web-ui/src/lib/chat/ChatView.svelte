@@ -1,5 +1,6 @@
 <script lang="ts">
   import { customModelSelection, modelChoice } from "./modelPicker";
+  import { agentProductName } from "../shared/agentNames";
   import { onDestroy, tick, untrack } from "svelte";
   import { displayName, forkSession, rewindSession, renameSession, type Session } from "../workspace/sessions";
   import { fsValidate } from "../previews/files";
@@ -239,7 +240,7 @@
   let forkAgents = $state<{ id: string; name: string }[]>([]);
   const agentName = $derived(
     agentCatalogName ??
-      (agentKind === "claude" ? "Claude Code" : agentKind === "codex" ? "Codex" : agentKind === "agy" ? "Antigravity" : agentKind === "grok" ? "Grok Build" : agentKind),
+      agentProductName(agentKind),
   );
   void listAgents().then((agents) => {
     const info = agents.find((a) => a.id === agentKind);

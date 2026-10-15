@@ -56,7 +56,7 @@ const REPLY = /\b(?:re|reply to|in reply to|replying to|answering)\s+#(\d+)\b/i;
 /** The vendors that have a mark (`SessionGlyph`); any other word — the
  *  daemon writes "agent" when it doesn't know — shows none rather than a
  *  wrong one. */
-const VENDORS = new Set(["claude", "codex", "agy", "gemini"]);
+const VENDORS = new Set(["claude", "codex", "agy", "grok", "cursor", "gemini"]);
 
 /** A sender's vendor worth a mark, or null. */
 export function knownVendor(agent: string | null | undefined): string | null {
