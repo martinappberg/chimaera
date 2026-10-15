@@ -32,6 +32,10 @@
   --notice-stack-offset: 140px;
   /* Single focus treatment for every keyboard-focusable control. */
   --focus-ring: color-mix(in srgb, var(--accent) 70%, transparent);
+  /* The one corner radius of a card in the transcript and above the
+     composer (plan, plan approval, agent messages, the pinned trays) —
+     the composer's box too, so the stack reads as one family. */
+  --radius-card: 8px;
   --bg: #fbfbfc;
   --fg: #1d1d20;
   --muted: #65656d;

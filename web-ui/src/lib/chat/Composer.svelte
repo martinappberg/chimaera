@@ -1321,7 +1321,7 @@
     resize: none;
     background: color-mix(in srgb, var(--fg) 3%, transparent);
     border: 1px solid var(--edge);
-    border-radius: 8px;
+    border-radius: var(--radius-card);
     color: var(--fg);
     font: inherit;
     font-size: var(--text-md);
