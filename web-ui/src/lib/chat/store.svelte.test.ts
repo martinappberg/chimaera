@@ -1679,6 +1679,16 @@ describe("ChatStore transcript surfaces (tool labels, turn tokens, activity line
     store.apply({ seq: 7, ts: 7, ev: { type: "turn_started", turn_id: "t2" } } as SeqEvent);
     expect(store.turnTokens).toBe(0);
   });
+
+  it("reads a thinking signal with no estimate as plain thinking", () => {
+    const store = fold([
+      { type: "turn_started", turn_id: "t1" },
+      { type: "thinking_tokens", tokens: 0 },
+    ]);
+    expect(store.activity).toEqual({ kind: "thinking", detail: "" });
+    store.apply({ seq: 3, ts: 3, ev: { type: "thinking_tokens", tokens: 1500 } } as SeqEvent);
+    expect(store.activity).toEqual({ kind: "thinking", detail: "~1.5k tokens" });
+  });
 });
 
 describe("ChatStore wake markers (turns nobody typed)", () => {

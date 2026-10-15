@@ -31,10 +31,10 @@ use sha2::{Digest, Sha256};
 
 use crate::ndjson::JsonlChild;
 
-/// CLI version these frame shapes were verified against (2026-10-03,
-/// ten existing Codex live cases + generated-schema diff; PROTOCOL.md's
-/// October runtime refresh records the pending experimental-steering probe).
-pub const TESTED_CODEX_VERSION: &str = "0.160.0";
+/// CLI version these frame shapes were verified against (2026-10-14,
+/// full chat-smoke 29/29 incl. the experimental-steering case +
+/// generated-schema diff from 0.160.0; PROTOCOL.md Pass 43).
+pub const TESTED_CODEX_VERSION: &str = "0.162.1";
 
 /// The `initialize` request both the probe client and the driver handshake
 /// send. Declares `experimentalApi` so `thread/settings/update` is available
@@ -1036,7 +1036,8 @@ struct CollabAgent {
     tokens: u64,
     /// Token total at the last emitted progress update (the throttle).
     tokens_emitted: u64,
-    /// Latest activity label ("thinking", a command title, "answered", …).
+    /// Latest activity label: the chat status line's own words ("Thinking",
+    /// "Writing", "Working"), a command title, or a close note ("answered").
     last: String,
     /// The agent's thread has a turn running (its own `turn/started` seen,
     /// no turn end yet). The thread's turn end owns the stint's close; a
@@ -1059,6 +1060,8 @@ struct CollabAgent {
     /// Metadata reads sent for this thread: one at the spawn, one retry at
     /// its turn start when the first did not name a model.
     meta_reads: u8,
+    /// `last` is a reasoning section title (see `on_foreign_frame`).
+    section: bool,
 }
 
 /// How a subagent stint ended — the `SubagentFinished.status` word and the
@@ -1108,6 +1111,7 @@ impl CollabAgent {
             model: None,
             agent_type: None,
             meta_reads: 0,
+            section: false,
         };
         agent.begin_stint();
         agent
@@ -1129,14 +1133,8 @@ impl CollabAgent {
         let tokens = self.tokens.saturating_sub(self.stint_tokens);
         let elapsed_ms = now_ms.saturating_sub(self.stint_opened_ms);
         let parts: Vec<String> = [
-            (tools > 0).then(|| format!("{tools} tool{}", if tools == 1 { "" } else { "s" })),
-            (tokens > 0).then(|| {
-                if tokens >= 1000 {
-                    format!("{:.1}k tokens", tokens as f64 / 1000.0)
-                } else {
-                    format!("{tokens} tokens")
-                }
-            }),
+            (tools > 0).then(|| tools_label(tools)),
+            (tokens > 0).then(|| tokens_label(tokens)),
             (elapsed_ms >= 1000).then(|| fmt_elapsed_secs(elapsed_ms / 1000)),
         ]
         .into_iter()
@@ -1145,14 +1143,14 @@ impl CollabAgent {
         (!parts.is_empty()).then(|| parts.join(" · "))
     }
 
-    /// The row's one-line progress — claude's task_progress format
-    /// ("{last} · {n} tools · {tok} tokens"), driver-built so replay
+    /// The row's one-line progress — claude's task_progress spelling
+    /// ("Thinking · 3 tools · 12.3k tokens"), driver-built so replay
     /// reproduces it byte-identically.
     fn progress(&self) -> Option<String> {
         let parts: Vec<String> = [
             (!self.last.is_empty()).then(|| self.last.clone()),
-            (self.tools > 0).then(|| format!("{} tools", self.tools)),
-            (self.tokens > 0).then(|| format!("{} tokens", self.tokens)),
+            (self.tools > 0).then(|| tools_label(self.tools)),
+            (self.tokens > 0).then(|| tokens_label(self.tokens)),
         ]
         .into_iter()
         .flatten()
@@ -1176,6 +1174,36 @@ impl CollabAgent {
             status: ToolStatus::InProgress,
             content: self.progress_content(),
         }
+    }
+}
+
+/// The newest section title of a reasoning item's `summary` (an array of
+/// parts, each `**Title**` then an optional body), as plain text capped
+/// for a progress line. `None` when there is no summary or the part does
+/// not open with a bold title.
+fn reasoning_section_title(summary: &Value) -> Option<String> {
+    let part = summary
+        .as_array()?
+        .iter()
+        .rev()
+        .filter_map(Value::as_str)
+        .find(|s| !s.trim().is_empty())?;
+    let first = part.trim_start().lines().next()?.trim_end();
+    let inner = first.strip_prefix("**")?.strip_suffix("**")?.trim();
+    (!inner.is_empty() && !inner.contains("**")).then(|| truncate_label(inner, 80))
+}
+
+/// "1 tool" / "12 tools" — claude's `subagent_stats` spelling.
+fn tools_label(n: u64) -> String {
+    format!("{n} tool{}", if n == 1 { "" } else { "s" })
+}
+
+/// "980 tokens" / "12.3k tokens" — claude's `subagent_stats` spelling.
+fn tokens_label(n: u64) -> String {
+    if n >= 1000 {
+        format!("{:.1}k tokens", n as f64 / 1000.0)
+    } else {
+        format!("{n} tokens")
     }
 }
 
@@ -2897,6 +2925,18 @@ impl CodexMapper {
         }
         match item["type"].as_str() {
             Some("userMessage") if !completed => self.on_user_message_item(item, step),
+            // The model started reasoning. Its summary (if any) arrives only
+            // as the item ends, sometimes not at all (gpt-5.6-sol on 0.162:
+            // `summary: []`), so without this the status line read
+            // "Working" through every reasoning step and "Thinking" only
+            // after it — claude's status says "Thinking" while it thinks.
+            // The estimate-less `ThinkingTokens` is that phase signal.
+            Some("reasoning") if !completed && current_turn => {
+                if let Some(flushed) = self.coalescer.flush() {
+                    step.events.push(flushed);
+                }
+                step.events.push(AgentEvent::ThinkingTokens { tokens: 0 });
+            }
             Some("agentMessage") if completed => {
                 // Fallback for messages that never streamed (none observed
                 // live, but the completed frame is authoritative).
@@ -3226,8 +3266,30 @@ impl CodexMapper {
                     .to_string();
                 let name = truncate_label(&name, 60);
                 match item["kind"].as_str().unwrap_or_default() {
-                    "started" => self.collab_agent_open(&thread, &name, "", step),
-                    "interacted" => self.collab_agent_open(&thread, &name, "follow-up input", step),
+                    "started" => {
+                        self.collab_agent_open(&thread, &name, "", step);
+                        // 0.162 names the resolved model on the spawn
+                        // marker itself, before any metadata read answers.
+                        if let Some(agent) = self.collab_agent_mut(&thread) {
+                            if learn_subagent_facts(agent, item) {
+                                if let Some(info) = subagent_info(agent) {
+                                    step.events.push(info);
+                                }
+                            }
+                        }
+                    }
+                    // Input reached the agent: `send_message`, `followup_task`
+                    // or the legacy `send_input` all mark it "interacted",
+                    // and only some of them set it working. `send_message`
+                    // to an agent that already answered only queues the
+                    // message for its next turn — no child turn follows
+                    // (live 0.160–0.162: the child's rollout ends at its
+                    // previous task_complete). So the marker never opens a
+                    // stint: a running agent just notes it, and new work
+                    // opens a row at the child's own `turn/started`, the one
+                    // signal that it is working again — and whose
+                    // `turn/completed` closes what it opened.
+                    "interacted" => self.collab_agent_note(&thread, "Follow-up input", step),
                     "interrupted" => {
                         self.collab_agent_close(&thread, StintEnd::Stopped, "closed", step)
                     }
@@ -3611,6 +3673,7 @@ impl CodexMapper {
             let agent = &mut self.collab_agents[idx];
             if !note.is_empty() {
                 agent.last = note.to_string();
+                agent.section = false;
             }
             if !note.is_empty() || reopened {
                 step.events.push(agent.progress_event());
@@ -3731,6 +3794,7 @@ impl CodexMapper {
         }
         agent.open = false;
         agent.last = note.to_string();
+        agent.section = false;
         step.events.push(AgentEvent::ToolCallUpdate {
             id: agent.row_id.clone(),
             status: end.tool_status(),
@@ -3751,6 +3815,7 @@ impl CodexMapper {
             return;
         };
         agent.last = label.to_string();
+        agent.section = false;
         if agent.open {
             step.events.push(agent.progress_event());
         }
@@ -3839,17 +3904,17 @@ impl CodexMapper {
                         ),
                         true,
                     ),
-                    Some("imageGeneration") => ("generating an image".to_string(), true),
-                    Some("imageView") => ("viewing an image".to_string(), true),
+                    Some("imageGeneration") => ("Generating an image".to_string(), true),
+                    Some("imageView") => ("Viewing an image".to_string(), true),
                     Some("dynamicToolCall") => (
                         truncate_label(item["tool"].as_str().unwrap_or("dynamic tool"), 80),
                         true,
                     ),
                     // A subagent delegating further (nested agents get no
                     // rows of their own; their work reads as this agent's).
-                    Some("collabAgentToolCall") => ("delegating".to_string(), true),
-                    Some("reasoning") => ("thinking".to_string(), false),
-                    Some("agentMessage") => ("replying".to_string(), false),
+                    Some("collabAgentToolCall") => ("Delegating".to_string(), true),
+                    Some("reasoning") => ("Thinking".to_string(), false),
+                    Some("agentMessage") => ("Writing".to_string(), false),
                     _ => return,
                 };
                 let Some(agent) = self.collab_agent_mut(thread) else {
@@ -3871,14 +3936,34 @@ impl CodexMapper {
                         agent.answer = Some(truncate_label(text, SUBAGENT_RESULT_MAX));
                     }
                 }
-                agent.last = label;
+                // A finished reasoning item names what the agent is on in its
+                // summary's section title — codex's own status line, and the
+                // nearest thing to claude's per-agent summary line. Like that
+                // status line, the title holds through the reasoning items
+                // that follow it until other work (a tool, a reply) replaces
+                // it; with no title yet, reasoning reads "Thinking".
+                let reasoning = item["type"] == "reasoning";
+                let section = (completed && reasoning)
+                    .then(|| reasoning_section_title(&item["summary"]))
+                    .flatten();
+                let changed = if let Some(title) = &section {
+                    agent.section = true;
+                    agent.last = title.clone();
+                    true
+                } else if reasoning && (completed || agent.section) {
+                    false
+                } else {
+                    agent.section = false;
+                    agent.last = label;
+                    !completed
+                };
                 // One progress emit per item: the started frame carries the
                 // label change; the completed frame only matters when it
-                // bumps the tool count (the label is the same item's).
+                // bumps the tool count or names a section.
                 if completed && is_tool {
                     agent.tools += 1;
                 }
-                if agent.open && (!completed || is_tool) {
+                if agent.open && (changed || (completed && is_tool)) {
                     step.events.push(agent.progress_event());
                 }
             }
@@ -3888,7 +3973,7 @@ impl CodexMapper {
                 if let Some(agent) = self.collab_agent_mut(thread) {
                     agent.turn_running = true;
                     let name = agent.name.clone();
-                    self.collab_agent_open(thread, &name, "running", step);
+                    self.collab_agent_open(thread, &name, "Working", step);
                     // The thread is surely readable once it runs a turn:
                     // retry a spawn-time metadata read that came back empty.
                     self.request_subagent_meta(thread, step);
@@ -10122,7 +10207,7 @@ mod tests {
                 id: "agent:sub-1".into(),
                 status: ToolStatus::InProgress,
                 content: Some(ToolContent::Output {
-                    text: "thinking".into(),
+                    text: "Thinking".into(),
                     truncated: false,
                 }),
             }]
@@ -10142,7 +10227,7 @@ mod tests {
             AgentEvent::ToolCallUpdate {
                 content: Some(ToolContent::Output { text, .. }),
                 ..
-            } => assert_eq!(text, "thinking · 1234 tokens"),
+            } => assert_eq!(text, "Thinking · 1.2k tokens"),
             other => panic!("expected progress update, got {other:?}"),
         }
         // A sub-step token tick is throttled out; a big move emits.
@@ -10179,10 +10264,18 @@ mod tests {
         // …and the parent turn is untouched by any of it.
         assert!(m.turn_active, "foreign turn end must not close the parent");
 
-        // A follow-up (send_input) re-opens as a NEW row (next stint): the
-        // UI's tool-status guard is monotonic, so the closed row stays
-        // closed and the fresh work gets a fresh card.
+        // Input to an agent that already answered opens nothing by itself:
+        // `send_message` only queues it for the agent's next turn.
         let step = m.on_frame(&sub_agent_activity("interacted", "sub-1"));
+        assert_eq!(step.events, vec![], "a marker alone is not new work");
+        assert!(!m.collab_agents[0].open);
+        // New work is the child's own turn: it re-opens as a NEW row (next
+        // stint) — the UI's tool-status guard is monotonic, so the closed
+        // row stays closed and the fresh work gets a fresh card.
+        let step = m.on_frame(&json!({
+            "method": "turn/started",
+            "params": { "threadId": "sub-1", "turn": { "id": "t-s2" } },
+        }));
         assert_eq!(
             step.events,
             vec![
@@ -10202,11 +10295,24 @@ mod tests {
                     content: Some(ToolContent::Output {
                         // reasoning items aren't tools — only the token total
                         // rides along with the note.
-                        text: "follow-up input · 2000 tokens".into(),
+                        text: "Working · 2.0k tokens".into(),
                         truncated: false,
                     }),
                 },
             ]
+        );
+        // Input while it works is a note on the live row.
+        let step = m.on_frame(&sub_agent_activity("interacted", "sub-1"));
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::ToolCallUpdate {
+                id: "agent:sub-1#2".into(),
+                status: ToolStatus::InProgress,
+                content: Some(ToolContent::Output {
+                    text: "Follow-up input · 2.0k tokens".into(),
+                    truncated: false,
+                }),
+            }]
         );
 
         // An explicit shutdown (close_agent) closes the current stint's row.
@@ -10379,8 +10485,11 @@ mod tests {
         m.on_frame(&json!({ "method": "turn/completed",
             "params": { "threadId": CHILD, "turn": { "id": "turn-c1", "status": "completed" } } }));
 
-        // The next stint's row carries what is cached.
-        let step = m.on_frame(&sub_agent_activity("interacted", CHILD));
+        // The next stint's row (its child turn opens it) carries what is
+        // cached.
+        m.on_frame(&sub_agent_activity("interacted", CHILD));
+        let step = m.on_frame(&json!({ "method": "turn/started",
+            "params": { "threadId": CHILD, "turn": { "id": "turn-c2" } } }));
         assert!(
             step.events.contains(&AgentEvent::SubagentInfo {
                 id: format!("{row}#2"),
@@ -11056,6 +11165,264 @@ mod tests {
         let step = m.on_frame(&sub_agent_activity("completed", "sub-unknown"));
         assert_eq!(step.events, vec![]);
         assert_eq!(m.collab_agents.len(), 1);
+    }
+
+    /// Reasoning reads as claude's thinking does: "Thinking" while the item
+    /// runs (an estimate-less `ThinkingTokens`, whether or not a summary
+    /// ever streams), and a subagent's row names the section its finished
+    /// summary titles, the way codex's own status line does.
+    #[test]
+    fn reasoning_is_thinking_while_it_runs_and_names_its_section() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let step = m.on_frame(&json!({
+            "method": "item/started",
+            "params": { "threadId": "thr-1", "turnId": "turn-A",
+                        "item": { "type": "reasoning", "id": "rs-1",
+                                  "summary": [], "content": [] } },
+        }));
+        assert_eq!(step.events, vec![AgentEvent::ThinkingTokens { tokens: 0 }]);
+        // A summary-less item ends silently; a stale turn's item says nothing.
+        let step = m.on_frame(&json!({
+            "method": "item/completed",
+            "params": { "threadId": "thr-1", "turnId": "turn-A",
+                        "item": { "type": "reasoning", "id": "rs-1",
+                                  "summary": [], "content": [] } },
+        }));
+        assert_eq!(step.events, vec![]);
+        let step = m.on_frame(&json!({
+            "method": "item/started",
+            "params": { "threadId": "thr-1", "turnId": "turn-old",
+                        "item": { "type": "reasoning", "id": "rs-0" } },
+        }));
+        assert_eq!(step.events, vec![]);
+
+        m.on_frame(&sub_agent_activity("started", "sub-1"));
+        let progress = |step: &DriverStep| -> Vec<String> {
+            step.events
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::ToolCallUpdate {
+                        content: Some(ToolContent::Output { text, .. }),
+                        ..
+                    } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let step = m.on_frame(&foreign(
+            "item/started",
+            "sub-1",
+            json!({ "item": { "type": "reasoning", "id": "c-rs" } }),
+        ));
+        assert_eq!(progress(&step), vec!["Thinking".to_string()]);
+        assert!(
+            !step
+                .events
+                .contains(&AgentEvent::ThinkingTokens { tokens: 0 }),
+            "a child's reasoning is not the parent's status"
+        );
+        let step = m.on_frame(&foreign(
+            "item/completed",
+            "sub-1",
+            json!({ "item": { "type": "reasoning", "id": "c-rs",
+                              "summary": ["**Reading the config**\n\nIt sets the port.",
+                                          "**Counting `bin` files**"] } }),
+        ));
+        assert_eq!(progress(&step), vec!["Counting `bin` files".to_string()]);
+        // A later token tick keeps the section, not "Thinking".
+        let step = m.on_frame(&foreign(
+            "thread/tokenUsage/updated",
+            "sub-1",
+            json!({ "tokenUsage": { "total": { "totalTokens": 4_000 } } }),
+        ));
+        assert_eq!(
+            progress(&step),
+            vec!["Counting `bin` files · 4.0k tokens".to_string()]
+        );
+        // The title holds through more reasoning (codex's status line does)…
+        let step = m.on_frame(&foreign(
+            "item/started",
+            "sub-1",
+            json!({ "item": { "type": "reasoning", "id": "c-rs2" } }),
+        ));
+        assert_eq!(progress(&step), Vec::<String>::new());
+        let step = m.on_frame(&foreign(
+            "item/completed",
+            "sub-1",
+            json!({ "item": { "type": "reasoning", "id": "c-rs2", "summary": [] } }),
+        ));
+        assert_eq!(progress(&step), Vec::<String>::new());
+        // …until other work replaces it; reasoning after that is "Thinking".
+        let step = m.on_frame(&foreign(
+            "item/started",
+            "sub-1",
+            json!({ "item": { "type": "commandExecution", "id": "c-1", "command": "ls" } }),
+        ));
+        assert_eq!(progress(&step), vec!["ls · 4.0k tokens".to_string()]);
+        let step = m.on_frame(&foreign(
+            "item/started",
+            "sub-1",
+            json!({ "item": { "type": "reasoning", "id": "c-rs3" } }),
+        ));
+        assert_eq!(progress(&step), vec!["Thinking · 4.0k tokens".to_string()]);
+    }
+
+    #[test]
+    fn reasoning_section_titles_parse_only_a_leading_bold_line() {
+        let t = |v: Value| reasoning_section_title(&v);
+        assert_eq!(t(json!(["**A**", "  **B b**\n\nbody"])), Some("B b".into()));
+        assert_eq!(t(json!(["**A**", "   "])), Some("A".into()));
+        assert_eq!(t(json!(["plain prose first"])), None);
+        assert_eq!(t(json!(["**unclosed"])), None);
+        assert_eq!(t(json!(["**a** and **b**"])), None);
+        assert_eq!(t(json!([])), None);
+        assert_eq!(t(json!(null)), None);
+        let long = format!("**{}**", "x".repeat(300));
+        assert!(t(json!([long])).unwrap().chars().count() <= 81);
+    }
+
+    /// The 0.162 spawn marker (also 0.160 rollouts' `SubAgentActivity`):
+    /// `model`/`reasoningEffort` ride the "started" item.
+    fn spawn_marker_with_model(thread: &str, path: &str, model: &str) -> Value {
+        json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thr-1",
+                "turnId": "turn-A",
+                "item": {
+                    "type": "subAgentActivity",
+                    "id": format!("call_{thread}"),
+                    "kind": "started",
+                    "agentThreadId": thread,
+                    "agentPath": path,
+                    "model": model,
+                    "reasoningEffort": "high",
+                },
+            },
+        })
+    }
+
+    /// The live order behind a row that stayed "running" forever (codex
+    /// 0.160, a maintainer's chat): the agent answers (its turn ends, then
+    /// the `completed` marker), and LATER the parent's `send_message` to it
+    /// lands as an "interacted" marker. That only queues the message — the
+    /// child starts no turn and sends no frame again — so nothing would
+    /// ever close a stint opened there; at teardown the row failed as
+    /// "subagent stopped with the agent process". A `followup_task` to a
+    /// sibling, by contrast, starts a child turn, which opens the stint and
+    /// closes it.
+    #[test]
+    fn a_message_to_a_finished_agent_opens_no_stint_that_cannot_close() {
+        const REVIEWER: &str = "01a138b1-66fb-76f2-a00e-d9f0498f5383";
+        const SIBLING: &str = "01a138b1-99a4-72a2-b7fa-60ea6d313e22";
+        let mut m = mapper();
+        active_turn(&mut m);
+        let mut events = Vec::new();
+        for (thread, path) in [(REVIEWER, "/root/reviewer"), (SIBLING, "/root/sibling")] {
+            events.extend(
+                m.on_frame(&spawn_marker_with_model(thread, path, "gpt-6-astra"))
+                    .events,
+            );
+            events.extend(
+                m.on_frame(&foreign(
+                    "turn/started",
+                    thread,
+                    json!({ "turn": { "id": format!("t1-{thread}") } }),
+                ))
+                .events,
+            );
+        }
+        assert!(
+            events.contains(&AgentEvent::SubagentInfo {
+                id: format!("agent:{REVIEWER}"),
+                agent_id: Some(REVIEWER.into()),
+                model: Some("gpt-6-astra".into()),
+                agent_type: None,
+            }),
+            "the spawn marker names the model: {events:?}"
+        );
+        // A message while the reviewer works is a note on its live row.
+        m.on_frame(&sub_agent_activity("interacted", REVIEWER));
+        // Both answer: final answer, turn end, then the trailing marker.
+        for thread in [REVIEWER, SIBLING] {
+            m.on_frame(&foreign(
+                "item/completed",
+                thread,
+                json!({ "item": { "type": "agentMessage", "id": "m1",
+                                  "phase": "final_answer", "text": "Review written." } }),
+            ));
+            let step = m.on_frame(&foreign(
+                "turn/completed",
+                thread,
+                json!({ "turn": { "id": format!("t1-{thread}"), "status": "completed" } }),
+            ));
+            assert_eq!(finished(&step.events).len(), 1);
+            let step = m.on_frame(&sub_agent_activity("completed", thread));
+            assert_eq!(step.events, vec![]);
+        }
+
+        // The parent `send_message`s the finished reviewer: the marker, and
+        // then nothing at all from the reviewer's thread.
+        let step = m.on_frame(&sub_agent_activity("interacted", REVIEWER));
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolCall { .. })),
+            "no new row for input that sets no work going: {:?}",
+            step.events
+        );
+        let reviewer = m
+            .collab_agents
+            .iter()
+            .find(|a| a.thread_id == REVIEWER)
+            .unwrap();
+        assert!(!reviewer.open);
+        assert_eq!(reviewer.stint, 1);
+
+        // `followup_task` to the sibling: marker, then its own turn.
+        m.on_frame(&sub_agent_activity("interacted", SIBLING));
+        let step = m.on_frame(&foreign(
+            "turn/started",
+            SIBLING,
+            json!({ "turn": { "id": "t2" } }),
+        ));
+        let reopened = format!("agent:{SIBLING}#2");
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::ToolCall { id, status: ToolStatus::InProgress, .. } if *id == reopened
+            )),
+            "the child's own turn opens the next stint: {:?}",
+            step.events
+        );
+        let step = m.on_frame(&foreign(
+            "turn/completed",
+            SIBLING,
+            json!({ "turn": { "id": "t2", "status": "completed" } }),
+        ));
+        assert_eq!(finished(&step.events).len(), 1, "and closes it");
+
+        // The parent's turn ends; nothing is left live, so a later process
+        // end fails no row.
+        m.on_frame(&json!({
+            "method": "turn/completed",
+            "params": { "threadId": "thr-1",
+                        "turn": { "id": "turn-A", "status": "completed" } },
+        }));
+        assert!(m.collab_agents.iter().all(|a| !a.open));
+        let teardown = m.drain_pending();
+        assert!(
+            !teardown.iter().any(|e| matches!(
+                e,
+                AgentEvent::ToolCallUpdate {
+                    status: ToolStatus::Failed,
+                    ..
+                }
+            )),
+            "{teardown:?}"
+        );
     }
 
     /// Status words, stint-scoped stats, and exactly one finish per stint
