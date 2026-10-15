@@ -82,6 +82,7 @@
   import { modsFor } from "./mods.svelte";
   import type { NativeComposer } from "./nativeComposer";
   import { pageVisible } from "../shared/visibility";
+  import { liveClock } from "../shared/liveClock.svelte";
   import { sameFile } from "../workspace/sameFile.svelte";
   import ReferenceChip from "../shared/ReferenceChip.svelte";
   import { activeSelection, clearSelection, setSelection } from "../shared/reference";
@@ -2203,27 +2204,19 @@
   });
 
   // Elapsed-turn timer: a quiet counter that surfaces once a turn passes 5s and
-  // ticks each second. The START is held in the chat pool (per session), so
-  // switching away mid-turn and back keeps counting from the real turn start
-  // instead of resetting — and performance.now() never leaks into replay. The
-  // interval tears down when the turn ends or the component unmounts.
-  let turnElapsedMs = $state(0);
+  // ticks on the workbench's shared 1 Hz clock. The START is held in the chat
+  // pool (per session, epoch ms), so switching away mid-turn and back keeps
+  // counting from the real turn start instead of resetting — and a client
+  // clock never leaks into replay. The clock runs for this view only while
+  // the turn runs and the view is shown: a retained background chat keeps its
+  // transcript DOM, but a counter the user cannot see must not wake the main
+  // thread every second (re-entering re-reads the time before painting).
+  let turnStart = $state<number | null>(null);
   $effect(() => {
-    const start = chatTurnStart(chatId, agentBusy, performance.now());
-    if (start === null) {
-      turnElapsedMs = 0;
-      return;
-    }
-    turnElapsedMs = performance.now() - start;
-    // Retained background chats keep their transcript DOM, but a counter the
-    // user cannot see must not wake the main thread every second. Re-entering
-    // the tab recomputes from the pool's original turn start before painting.
-    if (!visible) return;
-    const iv = setInterval(() => {
-      turnElapsedMs = performance.now() - start;
-    }, 1000);
-    return () => clearInterval(iv);
+    turnStart = chatTurnStart(chatId, agentBusy, Date.now());
   });
+  const turnClock = liveClock(() => turnStart !== null && visible);
+  const turnElapsedMs = $derived(turnStart === null ? 0 : Math.max(0, turnClock.ms - turnStart));
   /** Upward elapsed for the live status row (shared ladder: "7s", "1m 04s",
    *  "1h 02m 03s") — how long the running turn has been going, from its
    *  first second. */

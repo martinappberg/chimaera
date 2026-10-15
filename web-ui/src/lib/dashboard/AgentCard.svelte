@@ -17,8 +17,8 @@
   import WorkTray from "../shared/WorkTray.svelte";
   import WorkTrayRow from "../shared/WorkTrayRow.svelte";
   import { basename } from "../previews/files";
-  import { formatElapsedSeconds } from "../shared/time";
-  import { pageVisible } from "../shared/visibility";
+  import { elapsedSince } from "../shared/time";
+  import { liveClock } from "../shared/liveClock.svelte";
   import { relativeAge } from "../workspace/launcher";
   import {
     agentKind,
@@ -172,26 +172,16 @@
    *  (bound below) overrides until the hero default itself changes. */
   let workOpen = $derived(hero);
 
-  /** 1 Hz clock for the rows' elapsed/age columns (background elapsed, wire
-   *  subagent age) — only while the rows are actually visible (the
-   *  BackgroundTray idiom: collapsed cards must not tick a wake-up per
-   *  second for hours), the pane is shown, AND the document is visible
-   *  (catch-up on return via the re-run). */
-  let now = $state(Date.now());
-  $effect(() => {
-    if (!visible || !$pageVisible || !workOpen || (bgTasks.length === 0 && wireAgents.length === 0))
-      return;
-    now = Date.now();
-    const timer = setInterval(() => (now = Date.now()), 1000);
-    return () => clearInterval(timer);
-  });
+  /** The shared 1 Hz clock for the rows' elapsed/age columns (background
+   *  elapsed, wire subagent age), read only while the rows are actually
+   *  visible: collapsed cards must not tick a wake-up per second for
+   *  hours. The clock itself gates on the document being shown. */
+  const clock = liveClock(
+    () => visible && workOpen && (bgTasks.length > 0 || wireAgents.length > 0),
+  );
 
-  /** Elapsed since the driver first saw the task. Daemon-side epoch ms, so
-   *  clamp: a skewed client clock must not render "-3s". */
-  function elapsed(t: BackgroundTask): string {
-    if (t.startedAtMs <= 0) return "";
-    return formatElapsedSeconds(Math.max(0, Math.floor((now - t.startedAtMs) / 1000)));
-  }
+  /** Elapsed since the driver first saw the task. */
+  const elapsed = (t: BackgroundTask): string => elapsedSince(t.startedAtMs, clock.ms);
 
   /** Driver titles are "Agent: {description}" — the prefix is the tray's. */
   function subName(title: string): string {
@@ -353,7 +343,7 @@
                the agent's own type name — canonical, never relabeled. -->
           <WorkTrayRow {visible}>
             <span class="subname" title={a.label}>{a.label}</span>
-            <span class="subage">{relativeAge(Math.floor(a.started_at / 1000), now)}</span>
+            <span class="subage">{relativeAge(Math.floor(a.started_at / 1000), clock.ms)}</span>
           </WorkTrayRow>
         {/each}
         {#each bgTasks as t (t.id)}

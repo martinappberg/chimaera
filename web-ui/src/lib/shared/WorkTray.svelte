@@ -20,11 +20,6 @@
     /** Expanded state — bindable so a tray can gate its own work (e.g. a
      *  1 Hz elapsed clock) on whether the rows are actually visible. */
     open?: boolean;
-    /** Whether the glyph breathes. The animation means "work is happening
-     *  right now", so a strip that can sit idle (the plan, once every step is
-     *  finished or merely waiting) must be able to go still — a permanent
-     *  pulse over nothing is the exact noise these strips exist to avoid. */
-    pulse?: boolean;
     /** False while the retained owner is hidden. Keep the tray mounted so its
      *  expanded state survives tab switches, but do not animate invisible
      *  work or announce background count churn. */
@@ -36,7 +31,6 @@
     glyph,
     label,
     open = $bindable(false),
-    pulse = true,
     visible = true,
     children,
   }: Props = $props();
@@ -49,7 +43,9 @@
     onclick={() => (open = !open)}
     title={open ? "collapse" : "expand"}
   >
-    <span class="spark" class:still={!pulse || !visible} aria-hidden="true">{glyph}</span>
+    <!-- The breath means "work is happening right now"; a hidden tab's
+         glyph goes still (nobody sees it). -->
+    <span class="spark" class:still={!visible} aria-hidden="true">{glyph}</span>
     <!-- aria-live on the summary only: the count changing is worth
          announcing, per-row churn is not. -->
     <span class="head-label" role="status" aria-live={visible ? "polite" : "off"}>{label}</span>

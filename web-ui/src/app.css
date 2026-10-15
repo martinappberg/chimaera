@@ -288,6 +288,29 @@
   opacity: 0.45;
   cursor: default;
 }
+/* The text-link button beside them ("Refresh status", "paste a code"):
+   accent ink, no box, an underline only under the pointer; `.quiet` for
+   the secondary one. */
+.opt-link {
+  font: inherit;
+  font-size: var(--text-xs);
+  padding: 3px 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  cursor: pointer;
+}
+.opt-link.quiet {
+  color: var(--muted);
+}
+.opt-link:not(:disabled):hover {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.opt-link:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
 
 /* Floating overlay surface (dropdown menus, the composer's mention/slash
    popover). Callers add their own position offsets, min-width, and z-index. */
