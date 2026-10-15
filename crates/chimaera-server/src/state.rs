@@ -209,7 +209,9 @@ pub(crate) struct AppState {
     pub(crate) installs: Mutex<HashMap<agents::AgentKind, (String, Instant)>>,
     /// Latest installer result per built-in agent; bounded by the catalog.
     pub(crate) install_results: Mutex<HashMap<agents::AgentKind, crate::runtimes::InstallResult>>,
-    pub(crate) agent_setup: Mutex<HashMap<agents::AgentKind, Arc<crate::agent_setup::Operation>>>,
+    /// Each agent's managed install or update in progress, and its last
+    /// result (`agent_setup`, on `operation`).
+    pub(crate) agent_setup: crate::agent_setup::Operations,
     /// Whether each agent CLI is signed in on this host, and its sign-in in
     /// progress (`agent_auth`).
     pub(crate) agent_auth: crate::agent_auth::AuthState,
@@ -360,7 +362,7 @@ impl AppState {
             fs_touched: tokio::sync::broadcast::channel(crate::fs_watch::TOUCHED_CAPACITY).0,
             installs: Mutex::new(HashMap::new()),
             install_results: Mutex::new(HashMap::new()),
-            agent_setup: Mutex::new(HashMap::new()),
+            agent_setup: Default::default(),
             agent_auth: crate::agent_auth::AuthState::default(),
             claude_settings_path: home.join(".claude").join("settings.json"),
             codex_config_path: codex_home(&home, std::env::var_os("CODEX_HOME"))

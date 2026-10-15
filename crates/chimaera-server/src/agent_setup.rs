@@ -1,12 +1,10 @@
 //! Noninteractive managed installs. One bounded result per built-in provider,
 //! shared host install locks, and no PTY/session/ledger entries. Account and
 //! chat readiness are deliberately not inferred from an installer exit code.
-use std::{
-    path::PathBuf,
-    process::Stdio,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+//! The operation itself — join, cancel, output cap, the process loop — is
+//! `operation`'s; this module owns the install script, the words and the
+//! shared install lock.
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
     extract::{Path, State},
@@ -16,14 +14,14 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::{
-    io::{AsyncRead, AsyncReadExt},
-    sync::watch,
+
+use crate::{
+    agents::AgentKind,
+    lock,
+    operation::{self, CancelRefused, Exit, OutputEnd, Phase, Run, Stdin},
+    AppState,
 };
 
-use crate::{agents::AgentKind, lock, AppState};
-
-const LOG_LIMIT: usize = 64 * 1024;
 const DEADLINE: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -34,16 +32,8 @@ pub(crate) enum Action {
     Reinstall,
 }
 
-#[derive(Clone, Copy, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum Phase {
-    Running,
-    Cancelling,
-    Succeeded,
-    Failed,
-    Cancelled,
-}
-
+/// The wire record of `GET /agents/{id}/setup` (`operation`) and every
+/// POST/DELETE answer; the catalog row carries its `summary`.
 #[derive(Clone, Serialize)]
 pub(crate) struct Progress {
     id: String,
@@ -56,16 +46,31 @@ pub(crate) struct Progress {
     output: String,
     truncated: bool,
 }
-impl Progress {
-    fn running(&self) -> bool {
-        matches!(self.phase, Phase::Running | Phase::Cancelling)
+impl operation::Progress for Progress {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn phase(&self) -> Phase {
+        self.phase
+    }
+    fn set_phase(&mut self, phase: Phase) {
+        self.phase = phase;
+    }
+    fn set_message(&mut self, message: &str) {
+        self.message = message.into();
+    }
+    fn on_output(&mut self, bytes: &[u8]) {
+        // Plain text on the wire: the installer's colours and cursor moves
+        // go, newlines and tabs stay.
+        let text = operation::strip_controls(&String::from_utf8_lossy(bytes));
+        if operation::append_capped(&mut self.output, &text) {
+            self.truncated = true;
+        }
     }
 }
 
-pub(crate) struct Operation {
-    progress: Mutex<Progress>,
-    cancel: watch::Sender<bool>,
-}
+pub(crate) type Operations = operation::Operations<Progress>;
+type Operation = operation::Operation<Progress>;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -75,24 +80,16 @@ pub(crate) struct Request {
     request_id: String,
 }
 
-fn kind(id: &str) -> Option<AgentKind> {
-    AgentKind::parse(id).filter(|k| AgentKind::ALL.contains(k))
-}
-fn error(status: StatusCode, message: &str) -> Response {
-    (status, Json(json!({"error": message}))).into_response()
-}
 fn snapshot(state: &AppState, kind: AgentKind) -> Option<Progress> {
-    lock(&state.agent_setup)
-        .get(&kind)
-        .map(|op| lock(&op.progress).clone())
+    state.agent_setup.snapshot(kind)
 }
 pub(crate) fn summary(state: &AppState, kind: AgentKind) -> Option<serde_json::Value> {
-    snapshot(state, kind).map(|p| json!({"id": p.id, "running": p.running(), "phase": p.phase}))
+    state.agent_setup.summary(kind)
 }
 
 pub(crate) async fn get(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    let Some(kind) = kind(&id) else {
-        return error(StatusCode::NOT_FOUND, "Unknown agent.");
+    let Some(kind) = operation::kind(&id) else {
+        return operation::error(StatusCode::NOT_FOUND, "Unknown agent.");
     };
     Json(json!({
         "host": hostname::get().unwrap_or_default().to_string_lossy(),
@@ -107,31 +104,25 @@ pub(crate) async fn start(
     Path(id): Path<String>,
     Json(body): Json<Request>,
 ) -> Response {
-    let Some(kind) = kind(&id) else {
-        return error(StatusCode::NOT_FOUND, "Unknown agent.");
+    let Some(kind) = operation::kind(&id) else {
+        return operation::error(StatusCode::NOT_FOUND, "Unknown agent.");
     };
-    if body.request_id.is_empty()
-        || body.request_id.len() > 128
-        || !body
-            .request_id
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || c == b'-')
-    {
-        return error(StatusCode::BAD_REQUEST, "Invalid setup request ID.");
+    if !operation::valid_request_id(&body.request_id) {
+        return operation::error(StatusCode::BAD_REQUEST, "Invalid setup request ID.");
     }
     // A repeated POST after a lost response observes the same operation. A
     // second window joins active work instead of creating a competing run.
-    if let Some(p) = snapshot(&state, kind).filter(|p| p.running() || p.id == body.request_id) {
+    if let Some(p) = state.agent_setup.joinable(kind, &body.request_id) {
         return Json(p).into_response();
     }
     let Some(workspace) = lock(&state.workspaces).get(&body.workspace_id) else {
-        return error(
+        return operation::error(
             StatusCode::NOT_FOUND,
             "Open a workspace on this host first.",
         );
     };
     if crate::agent_auth::running(&state, kind) {
-        return error(
+        return operation::error(
             StatusCode::CONFLICT,
             "Finish signing in to this agent first.",
         );
@@ -139,10 +130,10 @@ pub(crate) async fn start(
     if !matches!(body.action, Action::Install)
         && !crate::launcher::detect(&state, kind, false).await.managed
     {
-        return error(StatusCode::BAD_REQUEST, "Chimaera only updates or reinstalls its own copy. Check the executable in Agents settings.");
+        return operation::error(StatusCode::BAD_REQUEST, "Chimaera only updates or reinstalls its own copy. Check the executable in Agents settings.");
     }
     let Some(script) = crate::runtimes::install_script(kind, &state.managed_root) else {
-        return error(
+        return operation::error(
             StatusCode::BAD_REQUEST,
             "This agent has no managed installer.",
         );
@@ -160,20 +151,12 @@ async fn start_script(
     let install_lock = match crate::runtimes::lock_install(&state.managed_root, kind).await {
         Ok(file) => file,
         Err(response) => {
-            if let Some(p) =
-                snapshot(&state, kind).filter(|p| p.running() || p.id == body.request_id)
-            {
+            if let Some(p) = state.agent_setup.joinable(kind, &body.request_id) {
                 return Json(p).into_response();
             }
             return *response;
         }
     };
-    // Re-check after the await: an exceptionally fast first call can already
-    // have finished and released the lock while this idempotent retry waited.
-    if let Some(p) = snapshot(&state, kind).filter(|p| p.running() || p.id == body.request_id) {
-        return Json(p).into_response();
-    }
-    let (cancel, receiver) = watch::channel(false);
     let progress = Progress {
         id: body.request_id,
         action: body.action,
@@ -185,18 +168,20 @@ async fn start_script(
         output: String::new(),
         truncated: false,
     };
-    let operation = Arc::new(Operation {
-        progress: Mutex::new(progress.clone()),
-        cancel,
-    });
-    lock(&state.agent_setup).insert(kind, operation.clone());
+    // Decided under the lock, after the await above: an exceptionally fast
+    // first call can already have finished and released the install lock
+    // while this idempotent retry waited.
+    let operation = match state.agent_setup.start(kind, progress.clone()) {
+        Ok(operation) => operation,
+        Err(existing) => return Json(existing).into_response(),
+    };
     tokio::spawn(async move {
         crate::runtimes::prune_install_versions(state.managed_root.clone(), kind).await;
-        let (phase, code, message) = run(&state, &operation, receiver, cwd, script).await;
+        let (phase, code, message) = run(&state, &operation, cwd, script).await;
         if phase == Phase::Succeeded {
             crate::runtimes::prune_install_versions(state.managed_root.clone(), kind).await;
         }
-        lock(&operation.progress).message = "Refreshing the installed version…".into();
+        operation.set_message("Refreshing the installed version…");
         // Keep the shared lock through detection; there must be no false
         // completion while a competing workspace changes the executable.
         crate::launcher::detect(&state, kind, true).await;
@@ -204,7 +189,11 @@ async fn start_script(
         let _ =
             tokio::task::spawn_blocking(move || crate::runtimes::regenerate_shims(&update)).await;
         drop(install_lock);
-        finish(&operation, phase, code, &message);
+        operation.update(|p| {
+            p.phase = phase;
+            p.exit_status = code;
+            p.message = message;
+        });
         state.changes.notify_waiters();
     });
     Json(progress).into_response()
@@ -214,165 +203,76 @@ pub(crate) async fn cancel(
     State(state): State<Arc<AppState>>,
     Path((id, operation)): Path<(String, String)>,
 ) -> Response {
-    let Some(kind) = kind(&id) else {
-        return error(StatusCode::NOT_FOUND, "Unknown agent.");
+    let Some(kind) = operation::kind(&id) else {
+        return operation::error(StatusCode::NOT_FOUND, "Unknown agent.");
     };
-    let Some(op) = lock(&state.agent_setup).get(&kind).cloned() else {
-        return error(
+    match state
+        .agent_setup
+        .cancel(kind, &operation, "Stopping the installer…")
+    {
+        Ok(p) => Json(p).into_response(),
+        Err(CancelRefused::Gone) => operation::error(
             StatusCode::NOT_FOUND,
             "This setup result is no longer available.",
-        );
-    };
-    let mut p = lock(&op.progress);
-    // An old dialog must never cancel a newer retry.
-    if p.id != operation {
-        return error(
+        ),
+        // An old dialog must never cancel a newer retry.
+        Err(CancelRefused::Newer) => operation::error(
             StatusCode::CONFLICT,
             "A newer setup operation has started. Refresh its status.",
-        );
-    }
-    if p.running() {
-        p.phase = Phase::Cancelling;
-        p.message = "Stopping the installer…".into();
-        op.cancel.send_replace(true);
-    }
-    Json(p.clone()).into_response()
-}
-
-fn append(op: &Operation, bytes: &[u8]) {
-    let mut p = lock(&op.progress);
-    // Render plain text only. Keep newlines/tabs but remove terminal controls.
-    p.output.extend(
-        String::from_utf8_lossy(bytes)
-            .chars()
-            .filter(|c| !c.is_control() || matches!(c, '\n' | '\t')),
-    );
-    if p.output.len() > LOG_LIMIT {
-        let mut cut = p.output.len() - LOG_LIMIT;
-        while !p.output.is_char_boundary(cut) {
-            cut += 1;
-        }
-        p.output.drain(..cut);
-        p.truncated = true;
-    }
-}
-async fn drain(mut pipe: impl AsyncRead + Unpin, op: &Operation) {
-    let mut buf = [0; 4096];
-    while let Ok(n) = pipe.read(&mut buf).await {
-        if n == 0 {
-            break;
-        }
-        append(op, &buf[..n]);
-    }
-}
-
-struct Group(nix::unistd::Pid);
-impl Drop for Group {
-    fn drop(&mut self) {
-        let _ = nix::sys::signal::killpg(self.0, nix::sys::signal::Signal::SIGKILL);
+        ),
     }
 }
 
 async fn run(
     state: &AppState,
-    op: &Operation,
-    mut cancel: watch::Receiver<bool>,
+    op: &Arc<Operation>,
     cwd: PathBuf,
     script: String,
 ) -> (Phase, Option<i32>, String) {
-    if *cancel.borrow() {
-        return (
+    let env = crate::api::session_env(state, &op.snapshot().id, "dark", None);
+    let remove = crate::api::spawn_env_remove(&env);
+    let argv = vec!["/bin/bash".to_string(), "-c".to_string(), script];
+    let exit = op
+        .run(Run {
+            command: operation::command(&argv, &cwd, env, remove),
+            stdin: Stdin::Closed,
+            deadline: DEADLINE,
+            // The installer's output is the result: read it to the end.
+            output: OutputEnd::Drained,
+        })
+        .await;
+    match exit {
+        Exit::NotStarted => (
             Phase::Cancelled,
             None,
             "Installation cancelled before it started.".into(),
-        );
-    }
-    let env = crate::api::session_env(state, &lock(&op.progress).id, "dark", None);
-    let remove = crate::api::spawn_env_remove(&env);
-    let mut cmd = tokio::process::Command::new("/bin/bash");
-    cmd.args(["-c", &script])
-        .current_dir(cwd)
-        .envs(env)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .process_group(0);
-    for name in remove {
-        cmd.env_remove(name);
-    }
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(err) => {
-            return (
-                Phase::Failed,
-                None,
-                format!("Could not start the installer: {err}"),
-            );
-        }
-    };
-    let group = Group(nix::unistd::Pid::from_raw(child.id().unwrap() as i32));
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
-    let reads = async {
-        tokio::join!(drain(stdout, op), drain(stderr, op));
-    };
-    tokio::pin!(reads);
-    // Cancellation also handles a request received before the process started.
-    let stopped = async {
-        if !*cancel.borrow() {
-            let _ = cancel.changed().await;
-        }
-    };
-    let result = tokio::select! {
-        // Keep the leader unreaped while descendants hold the pipes open, so
-        // cancellation cannot signal a recycled process-group ID.
-        result = async { (&mut reads).await; child.wait().await } => Some(result),
-        _ = stopped => None,
-        _ = tokio::time::sleep(DEADLINE) => None,
-    };
-    if let Some(result) = result {
-        // The leader is reaped; do not signal a potentially recycled group ID.
-        std::mem::forget(group);
-        let code = result.ok().and_then(|s| s.code());
-        if code == Some(0) {
-            (
-                Phase::Succeeded,
-                code,
-                "Installation finished. Sign-in and chat have not been checked.".into(),
-            )
-        } else {
-            let hint = failure_hint(&lock(&op.progress).output);
-            (Phase::Failed, code, hint.into())
-        }
-    } else {
-        let cancelled = *cancel.borrow();
-        // Give EXIT traps time to remove staging downloads, then stop the
-        // entire group. Wait AFTER kill so the group ID cannot be recycled.
-        let _ = nix::sys::signal::killpg(group.0, nix::sys::signal::Signal::SIGTERM);
-        let _ = tokio::time::timeout(Duration::from_secs(2), &mut reads).await;
-        drop(group);
-        let code = child.wait().await.ok().and_then(|s| s.code());
-        (
-            if cancelled {
-                Phase::Cancelled
-            } else {
-                Phase::Failed
-            },
+        ),
+        Exit::SpawnFailed(err) => (
+            Phase::Failed,
+            None,
+            format!("Could not start the installer: {err}"),
+        ),
+        Exit::Exited(Some(0)) => (
+            Phase::Succeeded,
+            Some(0),
+            "Installation finished. Sign-in and chat have not been checked.".into(),
+        ),
+        Exit::Exited(code) => (
+            Phase::Failed,
             code,
-            if cancelled {
-                "Installation cancelled. Files may already have changed; check the installed version before retrying."
-            } else {
-                "The installer exceeded 15 minutes and was stopped. Check the output and connection, then retry."
-            }.into(),
-        )
+            failure_hint(&op.snapshot().output).into(),
+        ),
+        Exit::Cancelled(code) => (
+            Phase::Cancelled,
+            code,
+            "Installation cancelled. Files may already have changed; check the installed version before retrying.".into(),
+        ),
+        Exit::TimedOut(code) => (
+            Phase::Failed,
+            code,
+            "The installer exceeded 15 minutes and was stopped. Check the output and connection, then retry.".into(),
+        ),
     }
-}
-fn finish(op: &Operation, phase: Phase, code: Option<i32>, message: &str) {
-    let mut p = lock(&op.progress);
-    p.phase = phase;
-    p.exit_status = code;
-    p.message = message.into();
 }
 fn failure_hint(output: &str) -> &'static str {
     let lower = output.to_ascii_lowercase();
@@ -393,6 +293,7 @@ fn failure_hint(output: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operation::Progress as _;
 
     fn state() -> Arc<AppState> {
         let root = std::env::temp_dir().join(format!(
@@ -498,7 +399,7 @@ mod tests {
         .await;
         let p = completed(&state).await;
         assert!(p.phase == Phase::Succeeded);
-        assert!(p.output.len() <= LOG_LIMIT);
+        assert!(p.output.len() <= operation::OUTPUT_LIMIT);
         assert!(p.output.ends_with("end\n"));
         assert!(p.truncated);
         assert!(p.message.contains("have not been checked"));
