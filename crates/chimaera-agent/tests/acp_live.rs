@@ -1,7 +1,7 @@
 //! Explicitly opt-in ACP verification. The binaries come from official releases;
 //! each test uses a throwaway workspace and the user's existing agent login.
 use chimaera_agent::{
-    acp::{AcpAdapter, ANTIGRAVITY, GROK},
+    acp::{AcpAdapter, ANTIGRAVITY, CURSOR, GROK},
     driver::SpawnSpec,
     journal::SeqEvent,
     model::{AgentCommand, AgentEvent, ContentBlock, PermissionOptionKind, UserMessageState},
@@ -350,4 +350,13 @@ async fn grok_stream_replay_and_resume() {
         &["agent", "--no-leader", "stdio"],
     )
     .await;
+}
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: needs `cursor-agent login` and bills short chat and approval turns"]
+async fn cursor_stream_replay_and_resume() {
+    // CHIMAERA_TEST_CURSOR names the official `cursor-agent` executable.
+    // NO_OPEN_BROWSER keeps a signed-out run from starting a browser login;
+    // the daemon sets the same for its chat spawns.
+    std::env::set_var("NO_OPEN_BROWSER", "1");
+    exercise(CURSOR, "CHIMAERA_TEST_CURSOR", &["acp"]).await;
 }

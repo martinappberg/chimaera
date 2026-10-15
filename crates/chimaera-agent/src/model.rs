@@ -237,7 +237,8 @@ pub enum AgentEvent {
     },
     /// Live thinking-token estimate (claude system/thinking_tokens) — the
     /// "thinking · ~N tokens" status signal; fires even when the thinking
-    /// display is summarized and no thought text streams.
+    /// display is summarized and no thought text streams. `0` is "thinking,
+    /// no estimate" (codex: a reasoning item started).
     ThinkingTokens {
         tokens: u64,
     },
@@ -1631,6 +1632,20 @@ pub fn fmt_elapsed_secs(s: u64) -> String {
     }
 }
 
+/// A token count for a progress or finish line ("980 tokens", "12.3k
+/// tokens", "2.3M tokens") — one spelling for both drivers, matching the
+/// chat status line's turn tokens. The M step starts where the k form would
+/// round to "1000.0k".
+pub fn fmt_tokens(n: u64) -> String {
+    if n >= 999_950 {
+        format!("{:.1}M tokens", n as f64 / 1_000_000.0)
+    } else if n >= 1000 {
+        format!("{:.1}k tokens", n as f64 / 1000.0)
+    } else {
+        format!("{n} tokens")
+    }
+}
+
 /// What a call to chimaera's agent-communication tools is about, for its
 /// card title: ` → <to>` for `message_agent`, ` → <agent>` for `read_agent`
 /// (one line, capped). Empty for every other tool — both drivers append it
@@ -1861,6 +1876,16 @@ impl Default for Coalescer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_counts_step_from_k_to_m() {
+        assert_eq!(fmt_tokens(980), "980 tokens");
+        assert_eq!(fmt_tokens(1000), "1.0k tokens");
+        assert_eq!(fmt_tokens(12_345), "12.3k tokens");
+        assert_eq!(fmt_tokens(999_949), "999.9k tokens");
+        assert_eq!(fmt_tokens(999_950), "1.0M tokens");
+        assert_eq!(fmt_tokens(2_334_950), "2.3M tokens");
+    }
 
     /// The paragraph-boundary contract: `break_paragraph` MARKS, `push`
     /// materializes — never before the scope's first text, never dangling

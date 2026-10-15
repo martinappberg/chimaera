@@ -175,13 +175,11 @@
   }
 
   .cat {
-    margin: 18px 0 4px;
+    margin: 30px 0 6px;
     padding: 0 14px;
-    font-size: var(--text-xs);
+    font-size: var(--text-lg);
     font-weight: 600;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
-    color: var(--muted);
+    color: var(--fg);
   }
 
   .intro {

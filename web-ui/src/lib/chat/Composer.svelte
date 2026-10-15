@@ -972,6 +972,7 @@
           title={choice.description}
           onclick={() => pickSlash(choice)}
         >
+          <span class="pop-ptr" aria-hidden="true">❯</span>
           <span class="pop-name">{choice.label}</span>
           {#if choice.description}
             <span class="pop-desc">{choice.description}</span>
@@ -990,6 +991,7 @@
           aria-selected={i === selected}
           onclick={() => pickTerm(t)}
         >
+          <span class="pop-ptr" aria-hidden="true">❯</span>
           <span class="pop-name">@term:{t.name}</span>
           <span class="pop-desc">link this terminal to the agent</span>
         </button>
@@ -1007,6 +1009,7 @@
           title="@{entry.rel}{entry.kind === 'dir' ? '/' : ''}"
           onclick={() => pickFile(entry)}
         >
+          <span class="pop-ptr" aria-hidden="true">❯</span>
           <span class="pop-icon">
             {#if entry.kind === "dir"}
               <FolderIcon size={14} />
@@ -1107,9 +1110,9 @@
             : "Listening…"
           : running
             ? afterTurnHint !== ""
-              ? `add to this turn… (${afterTurnHint} after it ends · Esc to stop)`
-              : "add to this turn… (Esc to stop)"
-            : nativeSuggestion ? `${nativeSuggestion} (Tab to accept)` : "message the agent… (Enter to send · / commands · @ files)"}
+              ? `add to this turn… · ${afterTurnHint} after it ends`
+              : "add to this turn…"
+            : nativeSuggestion ? `${nativeSuggestion} (Tab to accept)` : "message the agent… · / commands · @ files"}
       rows={1}
       {disabled}
     ></textarea>
@@ -1231,6 +1234,19 @@
      highlight (.sel) wins even on a hovered selected row. */
   .pop-row.sel {
     background: var(--row-active);
+  }
+  /* The selected row also leads with a pointer, so the choice reads
+     without colour. The slot is always reserved: rows never shift. */
+  .pop-ptr {
+    flex: none;
+    width: 0.9em;
+    margin-right: -2px;
+    color: var(--accent);
+    font-size: 0.85em;
+    visibility: hidden;
+  }
+  .pop-row.sel .pop-ptr {
+    visibility: visible;
   }
   .pop-icon {
     flex: none;

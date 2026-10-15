@@ -87,6 +87,16 @@ wakes row always shows.
   so importing it mutates document styles. Intentional, but be aware of import-order
   sensitivity during any restructure. Interface chrome consumes the shared `--text-*`
   scale; chat overrides it locally, while terminal/editor keep content-specific settings.
+  Defaults: interface 13.5 px (`--text-xs/sm/md/lg` = 11.5/12.5/13.5/15.5, mirrored as
+  `app.css` fallbacks), chat 14 px at line height 1.57, rendered Markdown 14 px.
+- **Reading Width (`chat.contentWidth`) is the column width**, not a cap on 48em:
+  `ChatView`'s `--chat-column` and `MarkdownView`/`mdLive`'s `--doc-measure` use it
+  directly (default 672 = 48em of 14 px). Wrapping it in a `min()` with an em measure
+  again makes every wider value a no-op — the bug #284 fixed.
+- **Every key needs a consumer.** A new schema row is read at its consumption site
+  (`getSetting`, or `settings.rs` for daemon keys) and applies live; the PR that adds
+  it says where. Numeric rows can carry a display `unit`; a slider shows only when the
+  range has ≤120 steps.
 - **The `dirtySince` echo-guard** ignores our own writes coming back over the
   `/ws/events` settings-change push, so a local edit doesn't fight itself. Keep it
   when you touch the persist path.

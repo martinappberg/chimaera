@@ -14,12 +14,12 @@
   import { agentUpdateStatus } from "./agentStatus";
 
   let { visible = true }: { visible?: boolean } = $props();
-  type AgentPathKey = "agents.claude.path" | "agents.codex.path" | "agents.agy.path" | "agents.grok.path" | "agents.agy.chatPath";
+  type AgentPathKey = "agents.claude.path" | "agents.codex.path" | "agents.agy.path" | "agents.grok.path" | "agents.cursor.path" | "agents.agy.chatPath";
   // Only built-ins own schema keys. Extension identities must never be
   // coerced into settings belonging to an unrelated built-in agent.
   const pathKeys: Partial<Record<string, AgentPathKey>> = {
     claude: "agents.claude.path", codex: "agents.codex.path",
-    agy: "agents.agy.path", grok: "agents.grok.path",
+    agy: "agents.agy.path", grok: "agents.grok.path", cursor: "agents.cursor.path",
   };
   const pathKey = (id: string): AgentPathKey | undefined => pathKeys[id];
   const wsId = getActiveWorkspaceId();
@@ -186,8 +186,8 @@
 
 <style>
   .setup-result { margin:4px 14px 12px; }
-  .cat-row { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:18px 14px 8px; }
-  h2 { margin:0; font-size:var(--text-xs); font-weight:600; letter-spacing:.1em; text-transform:uppercase; color:var(--muted); }
+  .cat-row { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:30px 14px 6px; }
+  h2 { margin:0; font-size:var(--text-lg); font-weight:600; color:var(--fg); }
   .intro { margin:0 14px 14px; font-size:var(--text-sm); color:var(--muted); line-height:1.5; }
   .cards { margin:0 14px 12px; border:1px solid var(--edge); border-radius:10px; overflow:hidden; }
   article { padding:16px; background:color-mix(in srgb,var(--fg) 2%,transparent); }
