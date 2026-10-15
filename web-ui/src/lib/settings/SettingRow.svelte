@@ -539,6 +539,10 @@
     display: flex;
     flex-wrap: wrap;
     gap: 10px;
+    /* Four windows to a row: the control column is flex-none, so without a
+       cap a long list of themes keeps widening and squeezes the row's text
+       instead of wrapping. */
+    max-width: calc(4 * 92px + 3 * 10px);
   }
 
   .card {

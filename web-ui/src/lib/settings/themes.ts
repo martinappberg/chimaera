@@ -11,11 +11,12 @@
  * swatches) from this list — adding a theme here is the whole job.
  *
  * Palette provenance: chimaera-* are the original hand-tuned palettes.
- * github-light, one-light, one-dark, tokyo-night and catppuccin-* start from
- * the canonical published palettes, with surface/edge tones adapted to
- * chimaera's rail/pane/stage layering (2026-10-15: these replaced nord,
- * gruvbox, solarized-light and rosé-pine-dawn — editor palettes that never
- * sat well on a layered workbench).
+ * github-light, one-light, one-dark, tokyo-night, rose-pine-dawn and
+ * catppuccin-* start from the canonical published palettes, with surface/edge
+ * tones adapted to chimaera's rail/pane/stage layering (2026-10-15: nord,
+ * gruvbox and solarized-light left — editor palettes that never sat well on a
+ * layered workbench). terracotta-* and graphite-* are chimaera's own: a warm
+ * ivory/charcoal pair and a true-neutral pair.
  *
  * Legibility contract (readability pass 2026-07-07): every color a theme uses
  * AS TEXT holds WCAG >= 4.5:1 against its sheet (>= 3.5:1 for bright ANSI
@@ -608,16 +609,326 @@ const oneDark: ThemeDef = {
   },
 };
 
+// --- Rosé Pine Dawn (official dawn hues, floored for legibility) ------------
+// Dawn's gold/rose/foam are decorative tones in the official spec (gold sits
+// at 2.2:1 on the surface). Chimaera renders them as text — warnings, strings,
+// ANSI slots — so each keeps its hue with lightness dropped to the 4.5 floor.
+
+const rosePineDawn: ThemeDef = {
+  id: "rose-pine-dawn",
+  label: "Rosé Pine Dawn",
+  kind: "light",
+  tokens: {
+    "--bg": "#faf4ed", // base
+    "--fg": "#474268", // text deepened a step: canonical #575279 sat within 15% of muted, so nothing receded
+    "--muted": "#5f5a78", // subtle deepened to hold 4.5 on selected rows
+    "--accent": "#286983", // pine
+    "--err": "#a7586f", // love
+    "--warn": "#a86304", // gold
+    "--rate": "#806b99", // iris
+    "--rail-bg": "#f2e9e1", // overlay
+    "--row-hover": "#eadfd5",
+    "--row-active": "#e2d5c8",
+    "--term-selection": "#57527926",
+    "--term-bg": "#fffaf3", // surface — panes get the brightest sheet
+    "--scrim": "rgba(87, 82, 121, 0.25)",
+    "--overlay-bg": "#fffaf3",
+    "--edge": "#dfdad9", // highlight med
+    "--syn-keyword": "#286983", // pine
+    "--syn-string": "#ab6200", // gold
+    "--syn-comment": "#827d8f", // muted
+    "--syn-number": "#ad5d5a", // rose
+    "--syn-type": "#3e7d87", // foam
+    "--syn-func": "#806b99", // iris
+    "--syn-def": "#474268",
+    "--syn-prop": "#286983",
+    "--ficon-generic": "#706b89",
+    "--ficon-lang": "#3e7d87",
+    "--ficon-data": "#286983",
+    "--ficon-doc": "#7d7891",
+    "--ficon-media": "#ab6200",
+    "--ficon-archive": "#ad5d5a",
+    "--ficon-config": "#7a7590",
+    "--ficon-bio": "#806b99",
+    "--ficon-vcs": "#a7586f",
+  },
+  // Official rose-pine/terminal dawn slot mapping (green=pine, cyan=rose is
+  // the palette's own quirk), tones floored as above.
+  ansi: {
+    black: "#f2e9e1",
+    red: "#ab5b72",
+    green: "#286983",
+    yellow: "#ab6200",
+    blue: "#3e7d87",
+    magenta: "#806b99",
+    cyan: "#ad5d5a",
+    white: "#575279",
+    brightBlack: "#827d8f",
+    brightRed: "#b4637a",
+    brightGreen: "#286983",
+    brightYellow: "#bd7300",
+    brightBlue: "#508d98",
+    brightMagenta: "#907aa9",
+    brightCyan: "#bf6d69",
+    brightWhite: "#575279",
+  },
+};
+
+// --- Terracotta (ivory and charcoal, a clay accent) --------------------------
+// Warm paper tones: ivory sheets in the light half, charcoal in the dark, one
+// terracotta accent, syntax in rust/olive/ochre. Chimaera's own warm pair.
+
+const terracottaLight: ThemeDef = {
+  id: "terracotta-light",
+  label: "Terracotta Light",
+  kind: "light",
+  tokens: {
+    "--bg": "#f4f2eb",
+    "--fg": "#141413",
+    "--muted": "#6b6a63",
+    "--accent": "#c9623f",
+    "--err": "#b3261e",
+    "--warn": "#946300",
+    "--rate": "#7c5cbf",
+    "--rail-bg": "#efede5",
+    "--row-hover": "#e8e6dd",
+    "--row-active": "#e0ded4",
+    "--term-selection": "#14141326",
+    "--term-bg": "#faf9f5", // ivory — panes get the paper
+    "--scrim": "rgba(0, 0, 0, 0.25)",
+    "--overlay-bg": "#ffffff",
+    "--edge": "#dcd9cf",
+    "--syn-keyword": "#9b4d2f",
+    "--syn-string": "#3f7a4a",
+    "--syn-comment": "#807e75",
+    "--syn-number": "#a4631a",
+    "--syn-type": "#2f6f8f",
+    "--syn-func": "#3a5fa8",
+    "--syn-def": "#141413",
+    "--syn-prop": "#6a4fb0",
+    "--ficon-generic": "#85837a",
+    "--ficon-lang": "#3a5fa8",
+    "--ficon-data": "#3f7a4a",
+    "--ficon-doc": "#6b6a63",
+    "--ficon-media": "#c9623f",
+    "--ficon-archive": "#a7651d",
+    "--ficon-config": "#2f6f8f",
+    "--ficon-bio": "#7c5cbf",
+    "--ficon-vcs": "#b3261e",
+  },
+  ansi: {
+    black: "#3d3c38",
+    red: "#b3261e",
+    green: "#3f7a4a",
+    yellow: "#946300",
+    blue: "#3a5fa8",
+    magenta: "#8a4d9b",
+    cyan: "#2c7d88",
+    white: "#b8b6ad",
+    brightBlack: "#75736b",
+    brightRed: "#b3261e",
+    brightGreen: "#3f7a4a",
+    brightYellow: "#946300",
+    brightBlue: "#3a5fa8",
+    brightMagenta: "#8a4d9b",
+    brightCyan: "#2f7f8a",
+    brightWhite: "#e2e0d6",
+  },
+};
+
+const terracottaDark: ThemeDef = {
+  id: "terracotta-dark",
+  label: "Terracotta Dark",
+  kind: "dark",
+  tokens: {
+    "--bg": "#262624",
+    "--fg": "#ece9e2",
+    "--muted": "#a8a69c",
+    "--accent": "#d97757",
+    "--err": "#e8766a",
+    "--warn": "#d9a74d",
+    "--rate": "#b39ddb",
+    "--rail-bg": "#2b2a27",
+    "--row-hover": "#33322e",
+    "--row-active": "#3b3a35",
+    "--term-selection": "#ece9e233",
+    "--term-bg": "#1f1e1b", // charcoal — panes get the deepest well
+    "--scrim": "rgba(0, 0, 0, 0.5)",
+    "--overlay-bg": "#2e2d29",
+    "--edge": "#3f3e39",
+    "--syn-keyword": "#e09a7c",
+    "--syn-string": "#9ecf8c",
+    "--syn-comment": "#8a887f",
+    "--syn-number": "#e6b36a",
+    "--syn-type": "#7fc3d8",
+    "--syn-func": "#8fb5ea",
+    "--syn-def": "#ece9e2",
+    "--syn-prop": "#c5b4ea",
+    "--ficon-generic": "#8a887f",
+    "--ficon-lang": "#8fb5ea",
+    "--ficon-data": "#9ecf8c",
+    "--ficon-doc": "#a8a69c",
+    "--ficon-media": "#d97757",
+    "--ficon-archive": "#e6b36a",
+    "--ficon-config": "#7fc3d8",
+    "--ficon-bio": "#b39ddb",
+    "--ficon-vcs": "#e8766a",
+  },
+  ansi: {
+    black: "#45443f",
+    red: "#e8766a",
+    green: "#9ecf8c",
+    yellow: "#d9a74d",
+    blue: "#8fb5ea",
+    magenta: "#d19ad8",
+    cyan: "#7fc3d8",
+    white: "#c9c6bd",
+    brightBlack: "#8a887f",
+    brightRed: "#e8766a",
+    brightGreen: "#9ecf8c",
+    brightYellow: "#d9a74d",
+    brightBlue: "#8fb5ea",
+    brightMagenta: "#d19ad8",
+    brightCyan: "#7fc3d8",
+    brightWhite: "#ece9e2",
+  },
+};
+
+// --- Graphite (true neutrals, a soft green accent) ---------------------------
+// No tint at all: white and near-black sheets, grey chrome, one green accent,
+// syntax in clear primaries. The quiet pair.
+
+const graphiteLight: ThemeDef = {
+  id: "graphite-light",
+  label: "Graphite Light",
+  kind: "light",
+  tokens: {
+    "--bg": "#f9f9f9",
+    "--fg": "#0d0d0d",
+    "--muted": "#676773",
+    "--accent": "#0f8f74",
+    "--err": "#d02f2f",
+    "--warn": "#9a6500",
+    "--rate": "#7a5af5",
+    "--rail-bg": "#f4f4f5",
+    "--row-hover": "#ececee",
+    "--row-active": "#e3e3e6",
+    "--term-selection": "#0d0d0d26",
+    "--term-bg": "#ffffff",
+    "--scrim": "rgba(0, 0, 0, 0.25)",
+    "--overlay-bg": "#ffffff",
+    "--edge": "#e1e1e4",
+    "--syn-keyword": "#8b3fc9",
+    "--syn-string": "#1f7a4d",
+    "--syn-comment": "#808089",
+    "--syn-number": "#b25a12",
+    "--syn-type": "#1d7aa8",
+    "--syn-func": "#2e5fd3",
+    "--syn-def": "#0d0d0d",
+    "--syn-prop": "#5a4fd0",
+    "--ficon-generic": "#808089",
+    "--ficon-lang": "#2e5fd3",
+    "--ficon-data": "#1f7a4d",
+    "--ficon-doc": "#676773",
+    "--ficon-media": "#b25a12",
+    "--ficon-archive": "#9a6500",
+    "--ficon-config": "#1d7aa8",
+    "--ficon-bio": "#7a5af5",
+    "--ficon-vcs": "#d02f2f",
+  },
+  ansi: {
+    black: "#2b2b30",
+    red: "#d02f2f",
+    green: "#1f7a4d",
+    yellow: "#8c6300",
+    blue: "#2e5fd3",
+    magenta: "#8b3fc9",
+    cyan: "#1d7a8a",
+    white: "#b4b4ba",
+    brightBlack: "#6e6e78",
+    brightRed: "#d02f2f",
+    brightGreen: "#1f7a4d",
+    brightYellow: "#8c6300",
+    brightBlue: "#2e5fd3",
+    brightMagenta: "#8b3fc9",
+    brightCyan: "#1d7a8a",
+    brightWhite: "#e6e6ea",
+  },
+};
+
+const graphiteDark: ThemeDef = {
+  id: "graphite-dark",
+  label: "Graphite Dark",
+  kind: "dark",
+  tokens: {
+    "--bg": "#1e1e1e",
+    "--fg": "#ececec",
+    "--muted": "#a0a0a8",
+    "--accent": "#19c37d",
+    "--err": "#ef6b6b",
+    "--warn": "#e0b25a",
+    "--rate": "#a99cf0",
+    "--rail-bg": "#212121",
+    "--row-hover": "#2a2a2a",
+    "--row-active": "#333333",
+    "--term-selection": "#ececec33",
+    "--term-bg": "#171717",
+    "--scrim": "rgba(0, 0, 0, 0.5)",
+    "--overlay-bg": "#262626",
+    "--edge": "#383838",
+    "--syn-keyword": "#c792ea",
+    "--syn-string": "#8fd3a0",
+    "--syn-comment": "#7f7f88",
+    "--syn-number": "#e8a95b",
+    "--syn-type": "#6fc3e0",
+    "--syn-func": "#82aaff",
+    "--syn-def": "#ececec",
+    "--syn-prop": "#b4a7f5",
+    "--ficon-generic": "#8a8a90",
+    "--ficon-lang": "#82aaff",
+    "--ficon-data": "#8fd3a0",
+    "--ficon-doc": "#a0a0a8",
+    "--ficon-media": "#e8a95b",
+    "--ficon-archive": "#e0b25a",
+    "--ficon-config": "#6fc3e0",
+    "--ficon-bio": "#c792ea",
+    "--ficon-vcs": "#ef6b6b",
+  },
+  ansi: {
+    black: "#3a3a3a",
+    red: "#ef6b6b",
+    green: "#8fd3a0",
+    yellow: "#e0b25a",
+    blue: "#82aaff",
+    magenta: "#c792ea",
+    cyan: "#6fc3e0",
+    white: "#c4c4c4",
+    brightBlack: "#8a8a90",
+    brightRed: "#ef6b6b",
+    brightGreen: "#8fd3a0",
+    brightYellow: "#e0b25a",
+    brightBlue: "#82aaff",
+    brightMagenta: "#c792ea",
+    brightCyan: "#6fc3e0",
+    brightWhite: "#ececec",
+  },
+};
+
 /** All themes, picker order (defaults first). */
 export const THEMES: readonly ThemeDef[] = [
   chimaeraLight,
   githubLight,
   oneLight,
   catppuccinLatte,
+  rosePineDawn,
+  terracottaLight,
+  graphiteLight,
   chimaeraDark,
   tokyoNight,
   oneDark,
   catppuccinMocha,
+  terracottaDark,
+  graphiteDark,
 ];
 
 const BY_ID = new Map(THEMES.map((t) => [t.id, t]));
