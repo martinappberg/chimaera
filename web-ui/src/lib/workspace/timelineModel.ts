@@ -333,6 +333,9 @@ export function deliveryLabel(note: TimelineNote): string | null {
   switch (note.delivery) {
     case "next_step":
       return "read at its next step";
+    // It was waiting on a subagent; the message reached it anyway.
+    case "now":
+      return "reached it mid-wait";
     case "inbox":
       return "in its inbox";
     case "woke":

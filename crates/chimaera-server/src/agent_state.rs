@@ -229,7 +229,16 @@ pub(crate) struct AgentRecord {
     /// change since (a failed process, a permission asked by a queued turn)
     /// is news as usual.
     pub(crate) state_corrected: Option<AgentState>,
+    /// The hook-reported turn's start (UserPromptSubmit; cleared at Stop)
+    /// and its main thread's open tool calls (own PreToolUse → PostToolUse,
+    /// capped at [`MAIN_CALLS_CAP`]). Agent communication says what a claude
+    /// terminal is waiting on from these. Never on the wire.
+    pub(crate) turn_started_ms: Option<u64>,
+    pub(crate) main_calls: Vec<chimaera_agent::BlockingCall>,
 }
+
+/// Open main-thread calls tracked from hooks (a turn rarely holds more).
+pub(crate) const MAIN_CALLS_CAP: usize = 16;
 
 /// The descriptive half of an attention edge, stashed by whichever surface
 /// saw it (protocol event or hook) for the notice feed to read at the edge.
@@ -299,6 +308,73 @@ impl AgentRecord {
             notice_note: None,
             reply_draft: String::new(),
             state_corrected: None,
+            turn_started_ms: None,
+            main_calls: Vec::new(),
+        }
+    }
+
+    /// Follow the main thread's open tool calls from one of the session's
+    /// OWN hooks (a subagent's hooks are its own calls, never the
+    /// session's). A failed call fires no PostToolUse here, so it stays
+    /// listed until the turn ends.
+    pub(crate) fn note_main_call(&mut self, event: &str, payload: &serde_json::Value, now: u64) {
+        use chimaera_agent::{BlockingCall, WaitKind};
+        match event {
+            "UserPromptSubmit" => {
+                self.turn_started_ms = Some(now);
+                self.main_calls.clear();
+            }
+            "PreToolUse" => {
+                let Some(id) = payload.get("tool_use_id").and_then(|v| v.as_str()) else {
+                    return;
+                };
+                if id.len() > 128
+                    || self.main_calls.iter().any(|c| c.id == id)
+                    || self.main_calls.len() >= MAIN_CALLS_CAP
+                {
+                    return;
+                }
+                let name = payload
+                    .get("tool_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("a tool");
+                let input = payload.get("tool_input");
+                let said = |key: &str| {
+                    input
+                        .and_then(|i| i.get(key))
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                };
+                let (kind, title) = match name {
+                    "Agent" | "Task" => (WaitKind::Subagent, said("description")),
+                    "Bash" | "PowerShell" => {
+                        (WaitKind::Command, said("description").or(said("command")))
+                    }
+                    _ => (WaitKind::Tool, None),
+                };
+                self.turn_started_ms.get_or_insert(now);
+                self.main_calls.push(BlockingCall {
+                    id: id.to_string(),
+                    kind,
+                    title: title
+                        .unwrap_or(name)
+                        .chars()
+                        .take(SMALL_STRING_MAX)
+                        .collect(),
+                    since_ms: now,
+                });
+            }
+            "PostToolUse" => {
+                if let Some(id) = payload.get("tool_use_id").and_then(|v| v.as_str()) {
+                    self.main_calls.retain(|c| c.id != id);
+                }
+            }
+            "Stop" | "StopFailure" | "SessionEnd" => {
+                self.turn_started_ms = None;
+                self.main_calls.clear();
+            }
+            _ => {}
         }
     }
 

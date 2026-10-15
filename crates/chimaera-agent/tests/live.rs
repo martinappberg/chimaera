@@ -2462,3 +2462,296 @@ async fn driver_stop_ends_claudes_detached_background_work() {
     }
     assert!(!survived, "`{marker}` outlived its stopped agent");
 }
+
+/// Pass 43: a parent waiting on a FOREGROUND subagent has no next step until
+/// it returns, so a queued message waits too. `background_tasks` on the
+/// Agent call is the carrier: the call returns at once, the parent's OWN
+/// PostToolUse fires for it (the hook carrier agent communication rides),
+/// the queued message is read, and the subagent keeps running to its end.
+#[tokio::test]
+#[ignore = "live: spawns real claude, needs auth, bills two tiny turns + a ~40s subagent"]
+async fn claude_background_tasks_frees_a_parent_waiting_on_a_subagent() {
+    let dir = tmpdir();
+    let hooks_log = dir.path().join("hooks.jsonl");
+    let settings = dir.path().join("hooks-settings.json");
+    let append = format!(
+        "python3 -c \"import sys,json; open('{}','a').write(json.dumps(json.load(sys.stdin))+'\\n')\"",
+        hooks_log.display()
+    );
+    std::fs::write(
+        &settings,
+        serde_json::to_vec(&json!({ "hooks": { "PostToolUse": [
+            { "matcher": "*", "hooks": [{ "type": "command", "command": append }] }
+        ] } }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut chat = spawn_claude(
+        dir.path(),
+        &["--settings".to_string(), settings.display().to_string()],
+    );
+    chat.initialize(HANDSHAKE).await.expect("initialize");
+    chat.send_user_text(
+        "Call the Agent tool once, in the foreground (run_in_background false), with \
+         subagent_type general-purpose, description 'sleeper', and this prompt: \"Run the Bash \
+         command python3 -c 'import time; time.sleep(40)' with a 120000 ms timeout, then reply \
+         DONE.\" Wait for it, then reply with its answer.",
+    )
+    .await
+    .expect("send");
+
+    let mut agent_call: Option<String> = None;
+    let mut agent_task: Option<String> = None;
+    let mut message: Option<String> = None;
+    let mut ctl: Option<String> = None;
+    let mut backgrounded = Value::Null;
+    let mut returned_async = false;
+    let mut read_before_agent_ended = false;
+    let mut agent_status = String::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
+    while agent_status.is_empty() {
+        let left = deadline - tokio::time::Instant::now();
+        let frame = chat
+            .recv(left)
+            .await
+            .expect("recv")
+            .expect("claude exited before the subagent ended");
+        let subtype = frame["subtype"].as_str().unwrap_or_default();
+        match frame["type"].as_str() {
+            Some("control_request") if frame["request"]["subtype"] == "can_use_tool" => {
+                let input = frame["request"]["input"].clone();
+                chat.respond_permission(
+                    &frame["request_id"],
+                    PermissionDecision::Allow {
+                        updated_input: input,
+                    },
+                )
+                .await
+                .expect("respond allow");
+            }
+            Some("assistant") if frame["parent_tool_use_id"].is_null() => {
+                for block in frame["message"]["content"].as_array().into_iter().flatten() {
+                    if block["type"] == "tool_use" && block["name"] == "Agent" {
+                        agent_call = block["id"].as_str().map(String::from);
+                    }
+                }
+            }
+            Some("system") if subtype == "task_started" && frame["task_type"] == "local_agent" => {
+                agent_task = frame["task_id"].as_str().map(String::from);
+            }
+            // The subagent's own command is running: the parent is blocked.
+            Some("system")
+                if subtype == "task_started"
+                    && frame["owned_by_subagent"] == json!(true)
+                    && message.is_none() =>
+            {
+                let call = agent_call.clone().expect("the Agent call came first");
+                message = Some(
+                    chat.send_queued_text("Reply with exactly: KIWI", "next")
+                        .await
+                        .expect("queue a message"),
+                );
+                ctl = Some(
+                    chat.send_control(
+                        json!({ "subtype": "background_tasks", "tool_use_id": call }),
+                    )
+                    .await
+                    .expect("background_tasks"),
+                );
+            }
+            Some("control_response")
+                if ctl.is_some() && frame["response"]["request_id"].as_str() == ctl.as_deref() =>
+            {
+                backgrounded = frame["response"]["response"]["backgrounded"].clone();
+            }
+            Some("user") if frame["tool_use_result"]["isAsync"] == json!(true) => {
+                returned_async = true;
+            }
+            Some("command_lifecycle")
+                if frame["state"] == "started"
+                    && frame["command_uuid"].as_str() == message.as_deref() =>
+            {
+                read_before_agent_ended = agent_status.is_empty();
+            }
+            Some("system")
+                if subtype == "task_notification"
+                    && frame["task_id"].as_str() == agent_task.as_deref() =>
+            {
+                agent_status = frame["status"].as_str().unwrap_or("?").to_string();
+            }
+            _ => {}
+        }
+    }
+
+    let hooks = std::fs::read_to_string(&hooks_log).unwrap_or_default();
+    let parent_saw_the_call_return = hooks.lines().any(|line| {
+        let hook: Value = serde_json::from_str(line).unwrap_or(Value::Null);
+        hook["tool_name"] == "Agent"
+            && hook["tool_use_id"].as_str() == agent_call.as_deref()
+            && hook.get("agent_id").is_none()
+    });
+    eprintln!(
+        "LIVE background for a message: backgrounded={backgrounded} async={returned_async} \
+         read_first={read_before_agent_ended} agent={agent_status} parent_hook={parent_saw_the_call_return}"
+    );
+    assert!(
+        message.is_some(),
+        "the parent reached its subagent's command"
+    );
+    assert_eq!(
+        backgrounded,
+        json!(true),
+        "the Agent call moved to the background"
+    );
+    assert!(returned_async, "the blocked Agent call returned at once");
+    assert!(
+        read_before_agent_ended,
+        "the parent read the message while its subagent still ran"
+    );
+    assert!(
+        parent_saw_the_call_return,
+        "the parent's own PostToolUse fired for the returned Agent call: {hooks}"
+    );
+    assert_eq!(
+        agent_status, "completed",
+        "the subagent kept running to its end"
+    );
+
+    chat.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+}
+
+/// Pass 43: a codex parent waiting on a spawned agent (`collab wait`) reads a
+/// `turn/steer` at once — the wait ends, the message is read, the parent
+/// waits again — and the child keeps running. (gpt-5.6-sol delegates when
+/// told to; the default model may answer itself.)
+#[tokio::test]
+#[ignore = "live: spawns real codex, needs auth, bills a small multi-agent turn + a ~45s sleep"]
+async fn codex_steer_ends_a_parent_wait_on_a_subagent() {
+    let dir = tmpdir();
+    let mut chat = CodexChat::spawn("codex", dir.path()).expect("spawn codex");
+    chat.initialize(HANDSHAKE).await.expect("initialize");
+    // No approval round-trips: the child's `sleep` must just run.
+    let started = chat
+        .request_raw(
+            "thread/start",
+            json!({ "cwd": dir.path(), "approvalPolicy": "never", "sandbox": "danger-full-access" }),
+            HANDSHAKE,
+        )
+        .await
+        .expect("thread/start");
+    let thread_id = started["result"]["thread"]["id"]
+        .as_str()
+        .expect("thread id")
+        .to_string();
+    chat.turn_start_with(
+        &thread_id,
+        "Use your spawn_agent tool now: delegate to exactly one sub-agent (this is required). \
+         The sub-agent must run the shell command `sleep 45` and then reply DONE. After \
+         spawning, wait for the sub-agent to finish (use your wait tool), then tell me its \
+         answer. If a message arrives while you wait, answer it first.",
+        json!({ "model": "gpt-5.6-sol" }),
+    )
+    .await
+    .expect("turn/start");
+
+    let mut turn_id = String::new();
+    let mut child = String::new();
+    let mut steer: Option<u64> = None;
+    let mut wait_ended_by_steer = false;
+    let mut read_while_child_ran = false;
+    let mut answered = false;
+    let mut child_done = false;
+    loop {
+        let frame = chat
+            .recv(Duration::from_secs(240))
+            .await
+            .expect("recv")
+            .expect("codex exited before the turn completed");
+        let on = frame["params"]["threadId"].as_str().unwrap_or_default();
+        let item = &frame["params"]["item"];
+        match frame["method"].as_str() {
+            Some("turn/started") if on == thread_id && turn_id.is_empty() => {
+                turn_id = frame["params"]["turn"]["id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .into();
+            }
+            Some("item/completed") if item["type"] == "subAgentActivity" && child.is_empty() => {
+                child = item["agentThreadId"].as_str().unwrap_or_default().into();
+            }
+            // The parent waits and the child's command runs: steer now.
+            Some("item/started")
+                if on == child && item["type"] == "commandExecution" && steer.is_none() =>
+            {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                steer = Some(
+                    chat.request_nowait(
+                        "turn/steer",
+                        json!({
+                            "threadId": thread_id,
+                            "clientUserMessageId": "smoke-steer",
+                            "expectedTurnId": turn_id,
+                            "input": [{ "type": "text",
+                                        "text": "Reply with exactly KIWI now, then keep waiting." }],
+                        }),
+                    )
+                    .await
+                    .expect("turn/steer"),
+                );
+            }
+            Some("item/completed")
+                if on == thread_id
+                    && steer.is_some()
+                    && item["type"] == "collabAgentToolCall"
+                    && item["tool"] == "wait"
+                    && !read_while_child_ran =>
+            {
+                wait_ended_by_steer = !child_done;
+            }
+            Some("item/started")
+                if on == thread_id
+                    && item["type"] == "userMessage"
+                    && item["clientId"] == "smoke-steer" =>
+            {
+                read_while_child_ran = !child_done;
+            }
+            Some("item/completed")
+                if on == thread_id
+                    && item["type"] == "agentMessage"
+                    && read_while_child_ran
+                    && !child_done =>
+            {
+                answered |= item["text"].as_str().is_some_and(|t| t.contains("KIWI"));
+            }
+            Some("turn/completed") if on == child && !child.is_empty() => child_done = true,
+            Some("turn/completed") if on == thread_id => break,
+            _ => {}
+        }
+    }
+    eprintln!(
+        "LIVE codex steer in a wait: child={} wait_ended={wait_ended_by_steer} \
+         read={read_while_child_ran} answered={answered} child_done={child_done}",
+        !child.is_empty()
+    );
+    assert!(
+        !child.is_empty(),
+        "the model delegated (subAgentActivity started)"
+    );
+    assert!(steer.is_some(), "the child's command started");
+    assert!(
+        wait_ended_by_steer,
+        "the steer ended the parent's wait early"
+    );
+    assert!(
+        read_while_child_ran,
+        "the parent read the steer while the child ran"
+    );
+    assert!(answered, "the parent answered it before the child finished");
+    assert!(child_done, "the child ran to its end");
+
+    chat.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+}

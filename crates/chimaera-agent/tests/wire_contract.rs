@@ -274,6 +274,33 @@ fn cancel_queued_command_is_additive() {
     assert_eq!(interrupt, AgentCommand::Interrupt);
 }
 
+/// `for_message` (Pass 43) is additive to `background_tool`: the UI's own
+/// Ctrl-B frame parses and serializes exactly as before.
+#[test]
+fn background_tool_for_message_is_additive() {
+    let ui: AgentCommand =
+        serde_json::from_str(r#"{"type":"background_tool","tool_call_id":"tu-1"}"#).unwrap();
+    assert_eq!(
+        ui,
+        AgentCommand::BackgroundTool {
+            tool_call_id: "tu-1".into(),
+            for_message: false,
+        }
+    );
+    assert_eq!(
+        serde_json::to_value(&ui).unwrap(),
+        json!({ "type": "background_tool", "tool_call_id": "tu-1" })
+    );
+    let daemon = AgentCommand::BackgroundTool {
+        tool_call_id: "tu-1".into(),
+        for_message: true,
+    };
+    assert_eq!(
+        serde_json::to_value(&daemon).unwrap(),
+        json!({ "type": "background_tool", "tool_call_id": "tu-1", "for_message": true })
+    );
+}
+
 /// `SteerQueued` is the explicit Codex queue-promotion action. It is additive
 /// to the public WS command vocabulary; ordinary sends keep their old shape.
 #[test]

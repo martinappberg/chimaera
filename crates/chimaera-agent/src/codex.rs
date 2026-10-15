@@ -36,6 +36,11 @@ use crate::ndjson::JsonlChild;
 /// October runtime refresh records the pending experimental-steering probe).
 pub const TESTED_CODEX_VERSION: &str = "0.160.0";
 
+/// The collab `wait` row's title. The main-thread fold (`lib.rs`) reads it
+/// as "waiting on a subagent": a steer ends that wait at once (0.162.1, live,
+/// PROTOCOL.md Pass 43).
+pub const COLLAB_WAIT_TITLE: &str = "waiting for subagents";
+
 /// The `initialize` request both the probe client and the driver handshake
 /// send. Declares `experimentalApi` so `thread/settings/update` is available
 /// (live: -32600 "requires experimentalApi capability" without it).
@@ -128,6 +133,17 @@ impl CodexChat {
     /// Next raw frame (notification, response, or server-initiated request).
     pub async fn recv(&mut self, timeout: Duration) -> Result<Option<Value>> {
         self.io.recv(timeout).await
+    }
+
+    /// Arbitrary request that does not wait: its response surfaces through
+    /// `recv` with the notifications around it (a probe timing a `turn/steer`
+    /// needs both). Returns the request id.
+    pub async fn request_nowait(&mut self, method: &str, params: Value) -> Result<u64> {
+        let id = self.request_id();
+        self.io
+            .send(&json!({ "id": id, "method": method, "params": params }))
+            .await?;
+        Ok(id)
     }
 
     /// Arbitrary request; returns the raw response FRAME (result or error) so
@@ -3510,7 +3526,7 @@ impl CodexMapper {
             None => head,
         };
         let title = match (tool, targets) {
-            ("wait", _) => "waiting for subagents".to_string(),
+            ("wait", _) => COLLAB_WAIT_TITLE.to_string(),
             ("listAgents", _) => "List agents".to_string(),
             ("spawnAgent", _) => with_prompt("Spawn agent".to_string()),
             ("sendMessage", Some(t)) => with_prompt(format!("Message → {t}")),
