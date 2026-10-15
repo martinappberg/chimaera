@@ -5,7 +5,8 @@
   import { pageVisible } from "../shared/visibility";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import { agentCatalog, pollAgents, type LaunchPick } from "./launcher";
-  import { acknowledgeSetupResult, cancelAgentSetup, getAgentSetup, pendingSetupId, recoverSetupResult, setupRunning, startAgentSetup, type SetupDetails, type SetupRequest } from "./agentSetup";
+  import { acknowledgeSetupResult, cancelAgentSetup, getAgentSetup, pendingSetupId, recoverSetupResult, startAgentSetup, type SetupDetails, type SetupRequest } from "./agentSetup";
+  import { operationRunning } from "./operations";
   import AgentSignInCard from "./AgentSignInCard.svelte";
 
   let { request, onclose, onlaunch }: { request: SetupRequest; onclose(): void; onlaunch(pick: LaunchPick): void } = $props();
@@ -20,7 +21,7 @@
   let ignoredOperationId: string | null = null;
   let disposed = false;
   const operation = $derived(details?.operation ?? null);
-  const running = $derived(setupRunning(operation));
+  const running = $derived(operationRunning(operation));
   const agent = $derived($agentCatalog.find(a => a.id === request.agent.id) ?? request.agent);
   const verb = $derived(({ install: "Install", update: "Update", reinstall: "Reinstall" })[request.action]);
   const title = $derived(operation?.phase === "succeeded" ? `${agent.name} ${operation.action === "update" ? "updated" : operation.action === "reinstall" ? "reinstalled" : "installed"}` : operation?.phase === "failed" ? `Couldn't install ${agent.name}` : operation?.phase === "cancelled" ? "Installation cancelled" : operation?.phase === "cancelling" ? "Stopping installation…" : running ? `${operation?.action === "update" ? "Updating" : operation?.action === "reinstall" ? "Reinstalling" : "Installing"} ${agent.name}…` : `${verb} ${agent.name}`);
@@ -31,7 +32,7 @@
     try {
       const next = await getAgentSetup(agent.id);
       if (disposed) return;
-      if (next.operation && !setupRunning(next.operation) && (initial || next.operation.phase !== details?.operation?.phase || pendingSetupId(agent.id) === next.operation.id)) {
+      if (next.operation && !operationRunning(next.operation) && (initial || next.operation.phase !== details?.operation?.phase || pendingSetupId(agent.id) === next.operation.id)) {
         // Refresh before deciding whether this is an old result: nobody polls
         // the catalog while the dialog and Settings are both closed.
         const catalog = await pollAgents(AbortSignal.timeout(15_000));
@@ -40,13 +41,13 @@
           ignoredOperationId = next.operation.id;
         }
       }
-      if (next.operation?.id === ignoredOperationId && !setupRunning(next.operation)) next.operation = null;
+      if (next.operation?.id === ignoredOperationId && !operationRunning(next.operation)) next.operation = null;
       initial = false;
       if (next.operation?.id === requestId) requestId = null;
       details = next;
       connected = true;
       refreshError = null;
-      if (next.operation && !setupRunning(next.operation)) acknowledgeSetupResult(agent.id, next.operation.id);
+      if (next.operation && !operationRunning(next.operation)) acknowledgeSetupResult(agent.id, next.operation.id);
     } catch (e) {
       if (!disposed) {
         connected = false;
@@ -69,7 +70,7 @@
       if (!disposed) details = { ...details, operation: next };
       requestId = null;
       void pollAgents(AbortSignal.timeout(15_000)).catch(() => {});
-      if (!disposed && !setupRunning(next)) void check();
+      if (!disposed && !operationRunning(next)) void check();
     } catch (e) {
       if (!disposed) {
         error = e instanceof Error ? e.message : "Couldn't start installation.";
@@ -84,7 +85,7 @@
     busy = true;
     try {
       details = { ...details, operation: await cancelAgentSetup(agent.id, operation.id) };
-      if (!setupRunning(details.operation)) void check();
+      if (!operationRunning(details.operation)) void check();
     }
     catch (e) { error = e instanceof Error ? e.message : "Couldn't stop the installer."; }
     finally { busy = false; }

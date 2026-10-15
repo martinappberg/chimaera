@@ -11,7 +11,8 @@
   import { resolvedTheme } from "../settings/store.svelte";
   import { ApiError } from "../net/api";
   import type { AgentInfo } from "./launcher";
-  import { cancelSignIn, getSignIn, sendSignInCode, signInRunning, startSignIn, type SignInProgress, type SignInStatus } from "./agentSignIn";
+  import { cancelSignIn, getSignIn, sendSignInCode, startSignIn, type SignInProgress, type SignInStatus } from "./agentSignIn";
+  import { operationRunning } from "./operations";
 
   interface Props {
     agent: AgentInfo;
@@ -47,9 +48,9 @@
   let ownAttempt = $state<string | null>(null);
 
   const operation = $derived<SignInProgress | null>(
-    status?.operation && (signInRunning(status.operation) || status.operation.id === ownAttempt) ? status.operation : null,
+    status?.operation && (operationRunning(status.operation) || status.operation.id === ownAttempt) ? status.operation : null,
   );
-  const running = $derived(signInRunning(operation));
+  const running = $derived(operationRunning(operation));
   const pageHost = $derived.by(() => {
     try { return operation?.url ? new URL(operation.url).hostname : null; } catch { return null; }
   });
