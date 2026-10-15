@@ -2982,9 +2982,6 @@
             rewindTitle={agentKind === "claude"
               ? "rewind to here (restores files; optionally forks the conversation)"
               : "rewind the conversation to here"}
-            onUsage={readOnly || !supports("get_usage")
-              ? undefined
-              : () => sendCommand({ type: "get_usage" }, "usage request not sent")}
             turnTokens={turn?.tokens ?? null}
             turnDuration={turn?.duration ?? null}
           />
