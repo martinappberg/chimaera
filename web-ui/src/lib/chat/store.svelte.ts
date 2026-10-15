@@ -2282,11 +2282,13 @@ export class ChatStore {
       const kept = block.text.slice(0, Math.max(0, block.text.length - len)).trimEnd();
       if (kept.length > 0) {
         block.text = kept;
-      } else if (i === this.blocks.length - 1) {
+      } else {
+        // Nothing of the thought remains: the row leaves, wherever it sits
+        // (an empty thought row would draw as a blank line between a fold
+        // and the prose that follows). A non-tail splice rebuilds the keyed
+        // list, which is rare and cheap next to a phantom line.
         this.blocks.splice(i, 1);
         this.structuralVersion += 1;
-      } else {
-        block.text = "";
       }
       return;
     }
