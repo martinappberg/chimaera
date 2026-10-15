@@ -9,7 +9,6 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    process::Stdio,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -22,15 +21,17 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    sync::{mpsc, watch},
+use tokio::io::{AsyncRead, AsyncReadExt};
+
+use crate::{
+    agents::AgentKind,
+    lock,
+    operation::{
+        self, strip_controls, CancelRefused, Exit, OutputEnd, Phase, Progress as _, Run, Stdin,
+    },
+    AppState,
 };
 
-use crate::{agents::AgentKind, lock, AppState};
-
-/// A login's whole output stays private to the daemon; this bounds it.
-const OUTPUT_LIMIT: usize = 64 * 1024;
 /// A browser login that nobody finishes is abandoned, like the connector
 /// sign-ins.
 const DEADLINE: Duration = Duration::from_secs(10 * 60);
@@ -167,7 +168,8 @@ pub(crate) struct AuthState {
     status: Mutex<HashMap<AgentKind, Status>>,
     /// One probe per agent at a time; later callers wait and read the cache.
     probing: Mutex<HashMap<AgentKind, Arc<tokio::sync::Mutex<()>>>>,
-    operations: Mutex<HashMap<AgentKind, Arc<Operation>>>,
+    /// Each agent's sign-in in progress and its last result.
+    operations: operation::Operations<Progress>,
 }
 
 fn probe_lock(state: &AppState, kind: AgentKind) -> Arc<tokio::sync::Mutex<()>> {
@@ -284,8 +286,8 @@ async fn read_capped(mut pipe: impl AsyncRead + Unpin) -> String {
         if n == 0 {
             break;
         }
-        if kept.len() < OUTPUT_LIMIT {
-            let room = OUTPUT_LIMIT - kept.len();
+        if kept.len() < operation::OUTPUT_LIMIT {
+            let room = operation::OUTPUT_LIMIT - kept.len();
             kept.extend_from_slice(&buf[..n.min(room)]);
         }
     }
@@ -413,16 +415,8 @@ pub(crate) fn descriptor(state: &AppState, kind: AgentKind) -> Option<serde_json
 
 // ------------------------------------------------------------- operation --
 
-#[derive(Clone, Copy, PartialEq, Serialize, Debug)]
-#[serde(rename_all = "snake_case")]
-enum Phase {
-    Running,
-    Cancelling,
-    Succeeded,
-    Failed,
-    Cancelled,
-}
-
+/// The wire record of `GET /agents/{id}/sign-in` (`operation`) and every
+/// POST/DELETE answer; the catalog row carries its `summary`.
 #[derive(Clone, Serialize)]
 pub(crate) struct Progress {
     id: String,
@@ -437,21 +431,57 @@ pub(crate) struct Progress {
     /// The page will show a code to paste back (Claude).
     accepts_code: bool,
     message: String,
+    /// Private: the login's own output — the page and code are read out of
+    /// it, a failure's tail comes from it. Never on the wire.
+    #[serde(skip)]
+    output: String,
+    #[serde(skip)]
+    kind: AgentKind,
+}
+impl operation::Progress for Progress {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn phase(&self) -> Phase {
+        self.phase
+    }
+    fn set_phase(&mut self, phase: Phase) {
+        self.phase = phase;
+    }
+    fn set_message(&mut self, message: &str) {
+        self.message = message.into();
+    }
+    fn on_output(&mut self, bytes: &[u8]) {
+        operation::append_capped(&mut self.output, &String::from_utf8_lossy(bytes));
+        self.harvest();
+    }
 }
 impl Progress {
-    fn running(&self) -> bool {
-        matches!(self.phase, Phase::Running | Phase::Cancelling)
+    /// Read the login's URL and code out of what it has printed so far. Only
+    /// text up to the last whitespace counts: a URL split across pipe reads
+    /// must never reach the UI incomplete.
+    fn harvest(&mut self) {
+        if self.url.is_some() && self.code.is_some() {
+            // Nothing left to find: don't re-scan the tail for every chunk.
+            return;
+        }
+        let text = strip_controls(&self.output);
+        let complete = text
+            .rfind(char::is_whitespace)
+            .map_or("", |end| &text[..end]);
+        if self.url.is_none() {
+            if let Some(url) = login_url(complete, self.kind) {
+                self.url = Some(url);
+                self.message = "Finish signing in in your browser.".into();
+            }
+        }
+        if self.code.is_none() {
+            self.code = device_code(complete);
+        }
     }
 }
 
-pub(crate) struct Operation {
-    progress: Mutex<Progress>,
-    cancel: watch::Sender<bool>,
-    /// A pasted code, for a login that reads one on stdin.
-    input: mpsc::Sender<String>,
-    /// Private: the login's own output, for a failure hint. Never on the wire.
-    output: Mutex<String>,
-}
+type Operation = operation::Operation<Progress>;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -480,12 +510,6 @@ pub(crate) struct Code {
     code: String,
 }
 
-fn kind(id: &str) -> Option<AgentKind> {
-    AgentKind::parse(id).filter(|k| AgentKind::ALL.contains(k))
-}
-fn error(status: StatusCode, message: &str) -> Response {
-    (status, Json(json!({"error": message}))).into_response()
-}
 fn no_store(mut response: Response) -> Response {
     response.headers_mut().insert(
         axum::http::header::CACHE_CONTROL,
@@ -494,12 +518,10 @@ fn no_store(mut response: Response) -> Response {
     response
 }
 fn snapshot(state: &AppState, kind: AgentKind) -> Option<Progress> {
-    lock(&state.agent_auth.operations)
-        .get(&kind)
-        .map(|op| lock(&op.progress).clone())
+    state.agent_auth.operations.snapshot(kind)
 }
 pub(crate) fn summary(state: &AppState, kind: AgentKind) -> Option<serde_json::Value> {
-    snapshot(state, kind).map(|p| json!({"id": p.id, "running": p.running(), "phase": p.phase}))
+    state.agent_auth.operations.summary(kind)
 }
 
 /// GET /api/v1/agents/{id}/sign-in[?check=true] — the status and the
@@ -509,11 +531,11 @@ pub(crate) async fn get(
     AxPath(id): AxPath<String>,
     Query(query): Query<StatusQuery>,
 ) -> Response {
-    let Some(kind) = kind(&id) else {
-        return error(StatusCode::NOT_FOUND, "Unknown agent.");
+    let Some(kind) = operation::kind(&id) else {
+        return operation::error(StatusCode::NOT_FOUND, "Unknown agent.");
     };
     let Some(recipe) = recipe(kind) else {
-        return error(StatusCode::NOT_FOUND, "This agent has no sign-in.");
+        return operation::error(StatusCode::NOT_FOUND, "This agent has no sign-in.");
     };
     let detection = crate::launcher::detect(&state, kind, false).await;
     let signed_in = match &detection.path {
@@ -540,28 +562,22 @@ pub(crate) async fn start(
     AxPath(id): AxPath<String>,
     Json(body): Json<Request>,
 ) -> Response {
-    let Some(kind) = kind(&id) else {
-        return error(StatusCode::NOT_FOUND, "Unknown agent.");
+    let Some(kind) = operation::kind(&id) else {
+        return operation::error(StatusCode::NOT_FOUND, "Unknown agent.");
     };
     let Some(recipe) = recipe(kind) else {
-        return error(StatusCode::NOT_FOUND, "This agent has no sign-in.");
+        return operation::error(StatusCode::NOT_FOUND, "This agent has no sign-in.");
     };
-    if body.request_id.is_empty()
-        || body.request_id.len() > 128
-        || !body
-            .request_id
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || c == b'-')
-    {
-        return error(StatusCode::BAD_REQUEST, "Invalid sign-in request ID.");
+    if !operation::valid_request_id(&body.request_id) {
+        return operation::error(StatusCode::BAD_REQUEST, "Invalid sign-in request ID.");
     }
     // A repeated POST after a lost response observes the same operation; a
     // second window joins the running one instead of starting a competitor.
-    if let Some(p) = snapshot(&state, kind).filter(|p| p.running() || p.id == body.request_id) {
+    if let Some(p) = state.agent_auth.operations.joinable(kind, &body.request_id) {
         return no_store(Json(p).into_response());
     }
     let Some(workspace) = lock(&state.workspaces).get(&body.workspace_id) else {
-        return error(
+        return operation::error(
             StatusCode::NOT_FOUND,
             "Open a workspace on this host first.",
         );
@@ -569,7 +585,7 @@ pub(crate) async fn start(
     // Never beside an install or update of the same agent: the executable
     // may be swapped under the login.
     if crate::agent_setup::summary(&state, kind).is_some_and(|s| s["running"] == true) {
-        return error(
+        return operation::error(
             StatusCode::CONFLICT,
             "Finish installing or updating this agent first.",
         );
@@ -585,7 +601,7 @@ pub(crate) async fn start(
     let bin = match detection.path {
         Ok(bin) => bin,
         Err(_) => {
-            return error(
+            return operation::error(
                 StatusCode::CONFLICT,
                 &format!("{} is not installed on this host.", kind.product_name()),
             )
@@ -630,8 +646,6 @@ async fn start_operation(
     launch: Launch,
 ) -> Response {
     let recipe = recipe(kind).expect("checked by the caller");
-    let (cancel, cancelled) = watch::channel(false);
-    let (input, codes) = mpsc::channel(1);
     let progress = Progress {
         id: body.request_id,
         how: recipe.how,
@@ -642,50 +656,16 @@ async fn start_operation(
         code: None,
         accepts_code: recipe.accepts_code,
         message: "Starting the sign-in…".into(),
+        output: String::new(),
+        kind,
     };
-    let operation = Arc::new(Operation {
-        progress: Mutex::new(progress.clone()),
-        cancel,
-        input,
-        output: Mutex::new(String::new()),
-    });
-    {
-        let mut operations = lock(&state.agent_auth.operations);
-        // Re-check under the lock: two first clicks must not both start.
-        if let Some(existing) = operations.get(&kind) {
-            let p = lock(&existing.progress).clone();
-            if p.running() || p.id == progress.id {
-                return Json(p).into_response();
-            }
-        }
-        operations.insert(kind, operation.clone());
-    }
+    // Decided under the lock: two first clicks must not both start.
+    let operation = match state.agent_auth.operations.start(kind, progress.clone()) {
+        Ok(operation) => operation,
+        Err(existing) => return Json(existing).into_response(),
+    };
     tokio::spawn(async move {
-        let (phase, message) = match launch {
-            Launch::Browser {
-                argv,
-                env,
-                stdin,
-                cwd,
-                no_browser,
-            } => {
-                run_browser(
-                    &state,
-                    operation.clone(),
-                    kind,
-                    Launch::Browser {
-                        argv,
-                        env,
-                        stdin,
-                        cwd,
-                        no_browser,
-                    },
-                    cancelled,
-                    codes,
-                )
-                .await
-            }
-        };
+        let (phase, message) = run_login(&state, &operation, kind, launch).await;
         finish(&operation, phase, &message);
         // The verdict the flow ended on is the one the catalog serves.
         state.changes.notify_waiters();
@@ -702,29 +682,25 @@ pub(crate) async fn cancel(
     State(state): State<Arc<AppState>>,
     AxPath((id, operation)): AxPath<(String, String)>,
 ) -> Response {
-    let Some(kind) = kind(&id) else {
-        return error(StatusCode::NOT_FOUND, "Unknown agent.");
+    let Some(kind) = operation::kind(&id) else {
+        return operation::error(StatusCode::NOT_FOUND, "Unknown agent.");
     };
-    let Some(op) = lock(&state.agent_auth.operations).get(&kind).cloned() else {
-        return error(
+    match state
+        .agent_auth
+        .operations
+        .cancel(kind, &operation, "Stopping the sign-in…")
+    {
+        Ok(p) => no_store(Json(p).into_response()),
+        Err(CancelRefused::Gone) => operation::error(
             StatusCode::NOT_FOUND,
             "This sign-in is no longer available.",
-        );
-    };
-    let mut p = lock(&op.progress);
-    // An old card must never cancel a newer attempt.
-    if p.id != operation {
-        return error(
+        ),
+        // An old card must never cancel a newer attempt.
+        Err(CancelRefused::Newer) => operation::error(
             StatusCode::CONFLICT,
             "A newer sign-in has started. Refresh its status.",
-        );
+        ),
     }
-    if p.running() {
-        p.phase = Phase::Cancelling;
-        p.message = "Stopping the sign-in…".into();
-        op.cancel.send_replace(true);
-    }
-    no_store(Json(p.clone()).into_response())
 }
 
 /// POST /api/v1/agents/{id}/sign-in/{operation}/code — the code the sign-in
@@ -734,11 +710,11 @@ pub(crate) async fn code(
     AxPath((id, operation)): AxPath<(String, String)>,
     Json(body): Json<Code>,
 ) -> Response {
-    let Some(kind) = kind(&id) else {
-        return error(StatusCode::NOT_FOUND, "Unknown agent.");
+    let Some(kind) = operation::kind(&id) else {
+        return operation::error(StatusCode::NOT_FOUND, "Unknown agent.");
     };
-    let Some(op) = lock(&state.agent_auth.operations).get(&kind).cloned() else {
-        return error(
+    let Some(op) = state.agent_auth.operations.get(kind) else {
+        return operation::error(
             StatusCode::NOT_FOUND,
             "This sign-in is no longer available.",
         );
@@ -748,93 +724,40 @@ pub(crate) async fn code(
         || code.len() > 512
         || code.chars().any(|c| c.is_control() || c.is_whitespace())
     {
-        return error(
+        return operation::error(
             StatusCode::BAD_REQUEST,
             "Paste the code exactly as the page shows it.",
         );
     }
     {
-        let p = lock(&op.progress);
+        let p = op.snapshot();
         if p.id != operation {
-            return error(
+            return operation::error(
                 StatusCode::CONFLICT,
                 "A newer sign-in has started. Refresh its status.",
             );
         }
         if !p.accepts_code || !p.running() {
-            return error(
+            return operation::error(
                 StatusCode::CONFLICT,
                 "This sign-in isn't waiting for a code.",
             );
         }
     }
-    if op.input.try_send(code.to_string()).is_err() {
-        return error(StatusCode::CONFLICT, "A code is already being checked.");
+    if op.send_line(code.to_string()).is_err() {
+        return operation::error(StatusCode::CONFLICT, "A code is already being checked.");
     }
-    let mut p = lock(&op.progress);
-    p.message = "Checking the code…".into();
-    no_store(Json(p.clone()).into_response())
+    op.set_message("Checking the code…");
+    no_store(Json(op.snapshot()).into_response())
 }
 
 // --------------------------------------------------------------- running --
 
-struct Group(nix::unistd::Pid);
-impl Drop for Group {
-    fn drop(&mut self) {
-        let _ = nix::sys::signal::killpg(self.0, nix::sys::signal::Signal::SIGKILL);
-    }
-}
-
-fn append(op: &Operation, bytes: &[u8]) {
-    let mut out = lock(&op.output);
-    out.push_str(&String::from_utf8_lossy(bytes));
-    if out.len() > OUTPUT_LIMIT {
-        let mut cut = out.len() - OUTPUT_LIMIT;
-        while !out.is_char_boundary(cut) {
-            cut += 1;
-        }
-        out.drain(..cut);
-    }
-}
-
-/// Read the login's URL and code out of what it has printed so far. Only
-/// text up to the last whitespace counts: a URL split across pipe reads must
-/// never reach the UI incomplete.
-fn harvest(op: &Operation, kind: AgentKind) {
-    let text = strip_controls(&lock(&op.output));
-    let complete = text
-        .rfind(char::is_whitespace)
-        .map_or("", |end| &text[..end]);
-    let mut p = lock(&op.progress);
-    if p.url.is_none() {
-        if let Some(url) = login_url(complete, kind) {
-            p.url = Some(url);
-            p.message = "Finish signing in in your browser.".into();
-        }
-    }
-    if p.code.is_none() {
-        p.code = device_code(complete);
-    }
-}
-
-async fn drain(mut pipe: impl AsyncRead + Unpin, op: Arc<Operation>, kind: AgentKind) {
-    let mut buf = [0; 4096];
-    while let Ok(n) = pipe.read(&mut buf).await {
-        if n == 0 {
-            break;
-        }
-        append(&op, &buf[..n]);
-        harvest(&op, kind);
-    }
-}
-
-async fn run_browser(
+async fn run_login(
     state: &Arc<AppState>,
-    op: Arc<Operation>,
+    op: &Arc<Operation>,
     kind: AgentKind,
     launch: Launch,
-    cancel: watch::Receiver<bool>,
-    mut codes: mpsc::Receiver<String>,
 ) -> (Phase, String) {
     let Launch::Browser {
         argv,
@@ -843,16 +766,10 @@ async fn run_browser(
         cwd,
         no_browser,
     } = launch;
-    if *cancel.borrow() {
-        return (Phase::Cancelled, "Sign-in cancelled.".into());
-    }
     // The way a chat runs the CLI: the user's login shell, the host and
     // workspace prelude, the session env — so the login writes to the store
     // the chats read.
-    let (id, workspace) = {
-        let p = lock(&op.progress);
-        (p.id.clone(), p.workspace_id.clone())
-    };
+    let (id, workspace) = op.read(|p| (p.id.clone(), p.workspace_id.clone()));
     let prelude = crate::agent_probe::ProbePrelude::write(state, Some(&workspace)).await;
     let mut env = crate::api::session_env(state, &id, "dark", prelude.path());
     if no_browser {
@@ -868,105 +785,47 @@ async fn run_browser(
     }
     let remove = crate::api::spawn_env_remove(&env);
     let argv = crate::launcher::wrap_login_shell(&crate::launcher::login_shell(), argv);
-    let mut cmd = tokio::process::Command::new(&argv[0]);
-    cmd.args(&argv[1..])
-        .current_dir(cwd)
-        .envs(env)
-        .envs(extra_env)
-        .stdin(if stdin { Stdio::piped() } else { Stdio::null() })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .process_group(0);
-    for name in remove {
-        cmd.env_remove(name);
-    }
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(err) => return (Phase::Failed, format!("Couldn't start the sign-in: {err}")),
-    };
-    let Some(pid) = child.id() else {
-        return (Phase::Failed, "The sign-in ended before it started.".into());
-    };
-    let group = Group(nix::unistd::Pid::from_raw(pid as i32));
-    let stdout = child.stdout.take().expect("piped");
-    let stderr = child.stderr.take().expect("piped");
-    let mut stdin = child.stdin.take();
-    lock(&op.progress).message = "Waiting for the sign-in page…".into();
-    // The pipes are read on their own: the verdict is the exit status plus
-    // the status command, never pipe EOF — a helper the login left behind
-    // holding stdout must not turn a success into a ten-minute timeout.
-    let reads = tokio::spawn({
-        let op = op.clone();
-        async move {
-            tokio::join!(drain(stdout, op.clone(), kind), drain(stderr, op, kind));
-        }
-    });
-    let mut cancel_wait = cancel.clone();
-    let stopped = async move {
-        if !*cancel_wait.borrow() {
-            let _ = cancel_wait.changed().await;
-        }
-    };
-    tokio::pin!(stopped);
-    let deadline = tokio::time::sleep(DEADLINE);
-    tokio::pin!(deadline);
-    let exit = loop {
-        tokio::select! {
-            result = child.wait() => break Some(result),
-            _ = &mut stopped => break None,
-            _ = &mut deadline => break None,
-            Some(code) = codes.recv(), if stdin.is_some() => {
+    let mut command = operation::command(&argv, &cwd, env, remove);
+    command.envs(extra_env);
+    op.set_message("Waiting for the sign-in page…");
+    let exit = op
+        .run(Run {
+            command,
+            stdin: if stdin {
                 // Claude's prompt reads a line.
-                let Some(pipe) = stdin.as_mut() else { continue };
-                let write = async {
-                    pipe.write_all(code.as_bytes()).await?;
-                    pipe.write_all(b"\n").await?;
-                    pipe.flush().await
-                };
-                if write.await.is_err() {
-                    lock(&op.progress).message = "The sign-in stopped accepting input.".into();
+                Stdin::Lines {
+                    closed: "The sign-in stopped accepting input.",
                 }
-            }
-        }
-    };
+            } else {
+                Stdin::Closed
+            },
+            deadline: DEADLINE,
+            // The verdict is the exit status plus the status command, never
+            // pipe EOF — a helper the login left behind holding stdout must
+            // not turn a success into a ten-minute timeout. Whatever the
+            // pipes still hold lands in the output for the failure tail.
+            output: OutputEnd::Grace(Duration::from_millis(300)),
+        })
+        .await;
     match exit {
-        Some(result) => {
-            // The leader is reaped: never signal a possibly recycled group id.
-            std::mem::forget(group);
-            // Whatever the pipes still hold lands in the output for the
-            // failure tail; a holder that stays open is not waited for.
-            let _ = tokio::time::timeout(Duration::from_millis(300), reads).await;
-            let code = result.ok().and_then(|s| s.code());
-            if code == Some(0) {
-                verify(state, &op, kind).await
-            } else {
-                let tail = failure_tail(&lock(&op.output));
-                (
-                    Phase::Failed,
-                    if tail.is_empty() {
-                        "The sign-in didn't complete. Try again.".to_string()
-                    } else {
-                        format!("The sign-in didn't complete. {tail}")
-                    },
-                )
-            }
+        Exit::NotStarted | Exit::Cancelled(_) => (Phase::Cancelled, "Sign-in cancelled.".into()),
+        Exit::SpawnFailed(err) => (Phase::Failed, format!("Couldn't start the sign-in: {err}")),
+        Exit::Exited(Some(0)) => verify(state, op, kind).await,
+        Exit::Exited(_) => {
+            let tail = failure_tail(&op.snapshot().output);
+            (
+                Phase::Failed,
+                if tail.is_empty() {
+                    "The sign-in didn't complete. Try again.".to_string()
+                } else {
+                    format!("The sign-in didn't complete. {tail}")
+                },
+            )
         }
-        None => {
-            let cancelled = *cancel.borrow();
-            let _ = nix::sys::signal::killpg(group.0, nix::sys::signal::Signal::SIGTERM);
-            let _ = tokio::time::timeout(Duration::from_secs(2), reads).await;
-            drop(group);
-            let _ = child.wait().await;
-            if cancelled {
-                (Phase::Cancelled, "Sign-in cancelled.".into())
-            } else {
-                (
-                    Phase::Failed,
-                    "The sign-in wasn't finished within ten minutes. Try again.".into(),
-                )
-            }
-        }
+        Exit::TimedOut(_) => (
+            Phase::Failed,
+            "The sign-in wasn't finished within ten minutes. Try again.".into(),
+        ),
     }
 }
 
@@ -1007,7 +866,7 @@ fn with_path_prefix(mut env: Vec<(String, String)>, dir: &Path) -> Vec<(String, 
 /// The login exited cleanly: only the CLI's own status command says whether
 /// that was a sign-in.
 async fn verify(state: &Arc<AppState>, op: &Operation, kind: AgentKind) -> (Phase, String) {
-    lock(&op.progress).message = "Checking the sign-in…".into();
+    op.set_message("Checking the sign-in…");
     let bin = match crate::launcher::detect(state, kind, false).await.path {
         Ok(bin) => bin,
         Err(why) => return (Phase::Failed, why),
@@ -1032,60 +891,18 @@ async fn verify(state: &Arc<AppState>, op: &Operation, kind: AgentKind) -> (Phas
 }
 
 fn finish(op: &Operation, phase: Phase, message: &str) {
-    let mut p = lock(&op.progress);
-    p.phase = phase;
-    p.message = message.into();
-    if !p.running() {
-        // A finished page is stale; a code is single-use.
-        p.url = None;
-        p.code = None;
-    }
+    op.update(|p| {
+        p.phase = phase;
+        p.message = message.into();
+        if !p.running() {
+            // A finished page is stale; a code is single-use.
+            p.url = None;
+            p.code = None;
+        }
+    });
 }
 
 // ------------------------------------------------------------------ text --
-
-/// Terminal output minus its controls: ANSI CSI/OSC sequences and other
-/// control characters, newlines and tabs kept.
-pub(crate) fn strip_controls(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            match chars.peek() {
-                Some('[') => {
-                    chars.next();
-                    // CSI: parameters/intermediates, then one final byte.
-                    for c in chars.by_ref() {
-                        if ('\x40'..='\x7e').contains(&c) {
-                            break;
-                        }
-                    }
-                }
-                Some(']') => {
-                    chars.next();
-                    // OSC: until BEL or ST (ESC \).
-                    while let Some(c) = chars.next() {
-                        if c == '\x07' {
-                            break;
-                        }
-                        if c == '\x1b' && chars.peek() == Some(&'\\') {
-                            chars.next();
-                            break;
-                        }
-                    }
-                }
-                _ => {
-                    chars.next();
-                }
-            }
-            continue;
-        }
-        if !c.is_control() || matches!(c, '\n' | '\t') {
-            out.push(c);
-        }
-    }
-    out
-}
 
 fn safe_url(url: &str) -> bool {
     if url.len() > URL_LIMIT || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
@@ -1507,11 +1324,8 @@ mod tests {
             StatusCode::CONFLICT,
             "codex never reads a code"
         );
-        let op = lock(&state.agent_auth.operations)
-            .get(&AgentKind::Codex)
-            .cloned()
-            .unwrap();
-        lock(&op.progress).accepts_code = true;
+        let op = state.agent_auth.operations.get(AgentKind::Codex).unwrap();
+        op.update(|p| p.accepts_code = true);
         let fed = code(
             State(state.clone()),
             AxPath(("codex".into(), "one".into())),
@@ -1530,7 +1344,7 @@ mod tests {
             p.url.is_none() && p.code.is_none(),
             "a finished page is stale"
         );
-        assert!(lock(&op.output).contains("got PASTED-1"));
+        assert!(op.snapshot().output.contains("got PASTED-1"));
     }
 
     #[tokio::test]

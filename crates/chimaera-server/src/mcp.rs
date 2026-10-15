@@ -97,8 +97,9 @@ pub(crate) const MASTERMIND_READ_TOOLS: [&str; 8] = [
 ];
 
 /// Tools every session may call without a prompt: the harness pre-allows
-/// them for workers and Masterminds alike (claude `permissions.allow`, codex
-/// `mcp_auto_approve`). Only side-effect-free-for-the-workspace tools belong
+/// them for workers and Masterminds alike (claude `permissions.allow`; codex
+/// and the ACP chats `mcp_auto_approve`, answered by their drivers at the
+/// prompt). Only side-effect-free-for-the-workspace tools belong
 /// here — `notify` shows the user a notification and nothing else, and a
 /// permission prompt for "may I notify you?" would itself be a notification.
 /// The document tools are read-only (`document_guide` is fixed text;
@@ -175,12 +176,19 @@ workspace-relative as `path:line`, `path#L10-L20` or a relative markdown link.";
 /// The plan paragraph: the workbench draws one plan card beside a CHAT from
 /// the agent's plan level-set — a Claude chat through chimaera's own
 /// `update_plan` (Claude Code offers no TaskCreate/TaskUpdate under `-p`;
-/// probed on 2.1.300), Codex through its built-in `update_plan`, an ACP
-/// agent through the plan its protocol reports — and the desktop apps get
-/// that card on every multi-step request only because they ask for it. A
-/// plan written as prose draws nothing, so each runtime is asked in its own
-/// tool's words. A terminal (TUI) session gets no paragraph: its own task
-/// list renders in its terminal, and there is no card to draw.
+/// probed on 2.1.300), Codex through its built-in `update_plan`, Cursor
+/// through its built-in TodoWrite (`cursor/update_todos` to the client),
+/// Grok through its `todo_write` (the ACP `plan` update) — and the desktop
+/// apps get that card on every multi-step request only because they ask
+/// for it. Antigravity has no plan tool at all (asked, 2026-10-15: "I do not
+/// have a built-in plan, task, or todo tool"), so it is told there is no
+/// card and asked to keep the plan in its reply; a runtime this daemon has
+/// not probed (no record for the session, a legacy kind) gets the neutral
+/// words, since nothing is known about its tools. A plan written as prose
+/// draws nothing, so each runtime is asked in its own tool's words. A
+/// terminal (TUI) session gets no paragraph: its own task list renders in
+/// its terminal, and there is no card to draw. Live-captured shapes:
+/// PROTOCOL.md Pass 45.
 fn task_list_instructions(kind: Option<crate::agents::AgentKind>, chat: bool) -> &'static str {
     use crate::agents::AgentKind;
     if !chat {
@@ -204,6 +212,31 @@ markdown checklist, or prose: only that tool call draws the card): the whole \
 plan up front, exactly one step in_progress, each marked completed as it \
 finishes, the list updated when the plan changes. The user follows that card \
 beside the chat while you work."
+        }
+        Some(AgentKind::Cursor) => {
+            "\n\n\
+Plan card: for any request that edits files or runs more than one command, \
+track your steps with your built-in TodoWrite TOOL (never a file, a markdown \
+checklist, or prose: only that tool draws the card): the whole list up \
+front, exactly one item in_progress, each marked completed as it finishes, \
+the list updated when the plan changes. The user follows that card beside \
+the chat while you work."
+        }
+        Some(AgentKind::Grok) => {
+            "\n\n\
+Plan card: for any request that edits files or runs more than one command, \
+track your steps with your built-in todo_write TOOL (never a file, a \
+markdown checklist, or prose: only that tool draws the card): the whole list \
+up front, exactly one item in_progress, each marked completed as it \
+finishes, the list updated when the plan changes. The user follows that card \
+beside the chat while you work."
+        }
+        Some(AgentKind::Antigravity) => {
+            "\n\n\
+Plan: this runtime has no plan or to-do tool that reaches the chat's plan \
+card, so for any request that edits files or runs more than one command, \
+open your reply with the steps as a short numbered list and say when each \
+is done."
         }
         _ => {
             "\n\n\
@@ -1299,6 +1332,11 @@ fn render_journal_tail(
         }
     }
     let mut items: Vec<String> = Vec::new();
+    // A driver re-emits a call to retitle it (an ACP update naming its MCP
+    // tool, codex's file changes): the call's line is replaced, not repeated.
+    // Positions count from the journal's start; `drained` items have left.
+    let mut tool_lines: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut drained = 0;
     for line in content.lines() {
         let Ok(entry) = serde_json::from_str::<SeqEvent>(line) else {
             continue;
@@ -1317,13 +1355,22 @@ fn render_journal_tail(
                 }
                 _ => items.push(format!("assistant: {}", head(&text, ITEM_HEAD_CHARS))),
             },
-            AgentEvent::ToolCall { title, status, .. } => {
+            AgentEvent::ToolCall {
+                id, title, status, ..
+            } => {
                 let status = json!(status);
-                items.push(format!(
+                let line = format!(
                     "tool [{}]: {}",
                     status.as_str().unwrap_or("?"),
                     head(&title, ITEM_HEAD_CHARS)
-                ));
+                );
+                match tool_lines.get(&id) {
+                    Some(&at) if at >= drained => items[at - drained] = line,
+                    _ => {
+                        tool_lines.insert(id, drained + items.len());
+                        items.push(line);
+                    }
+                }
             }
             AgentEvent::PermissionRequest {
                 request_id, title, ..
@@ -1395,7 +1442,10 @@ fn render_journal_tail(
         // The journal is size-capped, but a pathological file must not grow
         // this vec without bound: keep at most one window past the ask.
         if items.len() > max_items * 2 {
-            items.drain(..items.len() - max_items);
+            let gone = items.len() - max_items;
+            items.drain(..gone);
+            drained += gone;
+            tool_lines.retain(|_, at| *at >= drained);
         }
     }
     if items.len() > max_items {
@@ -2336,20 +2386,36 @@ mod tests {
         let codex = task_list_instructions(Some(AgentKind::Codex), true);
         assert!(codex.contains("your built-in update_plan TOOL"));
         assert!(!codex.contains("chimaera"));
-        for kind in [AgentKind::Antigravity, AgentKind::Grok, AgentKind::Cursor] {
-            let acp = task_list_instructions(Some(kind), true);
-            assert!(acp.contains("plan or to-do tool of your own"), "{acp}");
+        // Each ACP agent is told what it really has (live-probed, PROTOCOL.md
+        // Pass 45): Cursor its TodoWrite, Grok its todo_write, Antigravity
+        // nothing that reaches the card.
+        let cursor = task_list_instructions(Some(AgentKind::Cursor), true);
+        assert!(cursor.contains("your built-in TodoWrite TOOL"), "{cursor}");
+        let grok = task_list_instructions(Some(AgentKind::Grok), true);
+        assert!(grok.contains("your built-in todo_write TOOL"), "{grok}");
+        let agy = task_list_instructions(Some(AgentKind::Antigravity), true);
+        assert!(agy.contains("no plan or to-do tool"), "{agy}");
+        for acp in [cursor, grok, agy] {
             assert!(!acp.contains("update_plan"), "{acp}");
+            assert!(!acp.contains("chimaera"), "{acp}");
+        }
+        for kind in [AgentKind::Antigravity, AgentKind::Grok, AgentKind::Cursor] {
             assert!(!plan_tool_for(Some(kind), true));
         }
         for kind in [AgentKind::Claude, AgentKind::Codex, AgentKind::Grok] {
             assert_eq!(task_list_instructions(Some(kind), false), "");
             assert!(!plan_tool_for(Some(kind), false));
         }
-        assert_eq!(
-            task_list_instructions(None, true),
-            task_list_instructions(Some(AgentKind::Grok), true)
-        );
+        // An unprobed runtime (no record, a legacy kind) gets the neutral words,
+        // never a claim about tools nobody checked.
+        for unknown in [None, Some(AgentKind::Gemini)] {
+            let text = task_list_instructions(unknown, true);
+            assert!(text.contains("plan or to-do tool of your own"), "{text}");
+            assert!(
+                !text.contains("update_plan") && !text.contains("no plan"),
+                "{text}"
+            );
+        }
         assert!(plan_tool_for(Some(AgentKind::Claude), true));
         assert!(!plan_tool_for(Some(AgentKind::Codex), true));
         let listed = |plan: bool| {
@@ -2418,6 +2484,55 @@ mod tests {
         assert!(
             live.ends_with("[live] a decision is waiting on the user RIGHT NOW"),
             "{live}"
+        );
+    }
+
+    /// A call re-emitted under a new title (an ACP update naming its MCP
+    /// tool) is one line, the latest; it still counts toward the window
+    /// once, and a call drained out of the window is listed again.
+    #[test]
+    fn journal_tail_lists_a_re_emitted_call_once() {
+        let dir = std::env::temp_dir().join(format!("chimaera-mcp-retitle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s-test.jsonl");
+        let call = |seq: u64, id: &str, title: &str, status: &str| {
+            serde_json::json!({"seq": seq, "ts": seq, "ev": {"type": "tool_call", "id": id,
+                "kind": "other", "title": title, "status": status}})
+        };
+        let mut lines = vec![
+            call(1, "m1", "MCP: tool", "pending"),
+            serde_json::json!({"seq": 2, "ts": 2, "ev": {"type": "notice", "text": "between"}}),
+            call(3, "m1", "chimaera: notify", "in_progress"),
+        ];
+        let content = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, content).unwrap();
+        let tail = render_journal_tail(&path, 10, false).unwrap();
+        assert_eq!(
+            tail, "tool [in_progress]: chimaera: notify\nnotice: between",
+            "{tail}"
+        );
+
+        // Past the window the first line is gone: a late re-emit is new.
+        for seq in 4..30 {
+            lines.push(
+                serde_json::json!({"seq": seq, "ts": seq, "ev": {"type": "notice", "text": "x"}}),
+            );
+        }
+        lines.push(call(30, "m1", "chimaera: notify", "in_progress"));
+        let content = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, content).unwrap();
+        let tail = render_journal_tail(&path, 3, false).unwrap();
+        assert_eq!(
+            tail, "notice: x\nnotice: x\ntool [in_progress]: chimaera: notify",
+            "{tail}"
         );
     }
 }

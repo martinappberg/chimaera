@@ -33,6 +33,7 @@ mod mcp;
 mod naming;
 mod notebook;
 mod notices;
+mod operation;
 mod persist;
 mod plugins;
 mod proxy;

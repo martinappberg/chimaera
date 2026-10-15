@@ -49,7 +49,7 @@ pub(crate) async fn run(
     let Some(workspace) = crate::lock(&state.workspaces).get(&ws) else {
         return not_found();
     };
-    let Some(kind) = AgentKind::parse(&body.agent).filter(|k| AgentKind::ALL.contains(k)) else {
+    let Some(kind) = crate::operation::kind(&body.agent) else {
         return crate::plugins::bad_request("Unknown agent.");
     };
     let args = match crate::launcher::extension_action(kind, &body.action, body.target.as_deref()) {

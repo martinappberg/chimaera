@@ -10,7 +10,7 @@ ended conversations.
 
 **Where it lives (shared):** UI `web-ui/src/lib/workspace/{Launcher.svelte,launcher.ts,
 sessions.ts}` + the rail/split-button in `web-ui/src/App.svelte`. Daemon:
-`crates/chimaera-server/src/{api/sessions.rs,launcher.rs,agents.rs,runtimes.rs,agent_setup.rs,agent_state.rs,
+`crates/chimaera-server/src/{api/sessions.rs,launcher.rs,agents.rs,runtimes.rs,agent_setup.rs,operation.rs,agent_state.rs,
 spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /api/v1/agents`,
 `POST/DELETE /api/v1/agents/{id}/install`, `GET /api/v1/agents/claude/sessions`,
 `GET /api/v1/recents`, `POST /agent-events/{id}?key=`, and `/ws/events` for the roster.
@@ -122,8 +122,9 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   while signed out shows the same card in place of the startup error. The terminal is never the
   way in. Settings says “Installed · Supports chat and terminal” rather than claiming readiness.
   Running conversations and account data are kept.
-- **Where it lives.** `agent_setup.rs`, `workspace/agentSetup.ts`, and
-  `workspace/AgentSetupDialog.svelte`: authenticated `GET/POST /api/v1/agents/{id}/setup` and
+- **Where it lives.** `agent_setup.rs` (on `operation.rs`, the bounded-operation engine it shares
+  with the sign-in), `workspace/agentSetup.ts` (on `workspace/operations.ts`, the shared client
+  half: phases, `operationRunning`, the request helper), and `workspace/AgentSetupDialog.svelte`: authenticated `GET/POST /api/v1/agents/{id}/setup` and
   `DELETE /api/v1/agents/{id}/setup/{operation}`. POST carries `workspace_id`, an
   `install|update|reinstall` action, and an idempotency `request_id`; same-daemon duplicate clicks
   join active work. The catalog's additive `setup` summary lets Settings rediscover it. One result
@@ -211,7 +212,8 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
 
   A status command that does not answer in 10 s is *unknown* (nothing is offered), never a
   verdict. A device code is single-use and leaves the wire with the operation's end.
-- **Where it lives.** `agent_auth.rs` (daemon), `workspace/agentSignIn.ts` +
+- **Where it lives.** `agent_auth.rs` (daemon; its operation runs on `operation.rs`, shared with
+  the managed installs), `workspace/agentSignIn.ts` (on `workspace/operations.ts`) +
   `workspace/AgentSignInCard.svelte` (the one card; Settings, the chat view). Wire, all
   additive: `GET /api/v1/agents` rows carry `signed_in: true|false|null` and
   `sign_in: {how: browser, command, accepts_code, operation}`;

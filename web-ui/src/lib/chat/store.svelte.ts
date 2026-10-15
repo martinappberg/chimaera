@@ -1350,11 +1350,13 @@ export class ChatStore {
       }
       case "tool_call": {
         // Drivers may re-emit a call to enrich it (e.g. an image's saved
-        // path arrives at completion) — upsert by id, never duplicate.
+        // path arrives at completion, an ACP update names the MCP tool a
+        // row opened without) — upsert by id, never duplicate.
         const existing = this.toolIndex.get(ev.id as string);
         const row = existing !== undefined ? this.blocks[existing] : undefined;
         if (row !== undefined && row.kind === "tool") {
           row.title = ev.title as string;
+          if (typeof ev.kind === "string") row.tool = ev.kind;
           row.locations = (ev.locations as string[]) ?? [];
           if (typeof ev.command === "string") row.command = ev.command;
           // A late enriching re-emit must never walk a finished tool back to
@@ -2085,8 +2087,9 @@ export class ChatStore {
   /** Keep {@link activeAgents} consistent with one agent tool row's status.
    *  Idempotent; entries stay in event (= transcript) order. */
   private syncAgentRow(block: Extract<ChatBlock, { kind: "tool" }>): void {
-    if (block.tool !== "agent") return;
-    const live = block.status === "pending" || block.status === "in_progress";
+    // A re-emit can change a row's kind: one that stopped being an agent
+    // leaves the live set too.
+    const live = block.tool === "agent" && (block.status === "pending" || block.status === "in_progress");
     const i = this.activeAgents.findIndex((a) => a.id === block.id);
     if (live && i === -1) this.activeAgents.push(block);
     else if (!live && i !== -1) this.activeAgents.splice(i, 1);
