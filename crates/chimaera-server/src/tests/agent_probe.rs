@@ -624,11 +624,15 @@ esac
     .await;
     assert_eq!(status, StatusCode::OK);
     let agents = plugins["agents"].as_array().unwrap();
-    assert_eq!(agents.len(), 4);
+    assert_eq!(agents.len(), 5);
     assert!(
         agents[2]["plugins"][0]["enabled"].is_null(),
         "installed is not proof of enabled"
     );
+    // Cursor is a core agent of the report too; not installed here, it says
+    // so without inventing an inventory.
+    assert_eq!(agents[4]["agent"], "cursor");
+    assert_eq!(agents[4]["available"], false);
     assert_eq!(agents[3]["plugins"][0]["origin"], "Claude compatibility");
     assert!(agents[3]["notice"].as_str().unwrap().contains("trust"));
     let (_, skills) = request(

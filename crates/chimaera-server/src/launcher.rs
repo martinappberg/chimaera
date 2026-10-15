@@ -80,6 +80,22 @@ pub(crate) fn extension_action(
     target: Option<&str>,
 ) -> Result<Vec<String>, &'static str> {
     use AgentKind::*;
+    // Cursor's MCP sign-in has no no-browser mode, so it runs in a managed
+    // terminal where the CLI opens the browser itself (never the daemon).
+    if action == "login_connection" {
+        if kind != Cursor {
+            return Err("Use this agent's connection sign-in instead.");
+        }
+        let target = target
+            .filter(|s| {
+                !s.is_empty()
+                    && s.len() <= 256
+                    && !s.starts_with('-')
+                    && !s.chars().any(|c| c.is_control() || c.is_whitespace())
+            })
+            .ok_or("Choose a connection to sign in to.")?;
+        return Ok(vec!["mcp".into(), "login".into(), target.into()]);
+    }
     if matches!(action, "manage_plugins" | "manage_connections") {
         let command = if action == "manage_plugins" {
             "/plugins"
@@ -1379,6 +1395,14 @@ mod tests {
             vec!["plugin", "install", "/tmp/a space/$(file)"]
         );
         assert!(extension_action(AgentKind::Grok, "install_plugin", Some("--trust")).is_err());
+        assert_eq!(
+            extension_action(AgentKind::Cursor, "login_connection", Some("goldfish")).unwrap(),
+            vec!["mcp", "login", "goldfish"]
+        );
+        assert!(extension_action(AgentKind::Cursor, "login_connection", Some("--x")).is_err());
+        assert!(extension_action(AgentKind::Cursor, "login_connection", Some("a b")).is_err());
+        assert!(extension_action(AgentKind::Claude, "login_connection", Some("x")).is_err());
+        assert!(extension_action(AgentKind::Cursor, "manage_connections", None).is_err());
         assert!(extension_action(AgentKind::Antigravity, "update_plugin", Some("test")).is_err());
         assert!(extension_action(AgentKind::Gemini, "manage_plugins", None).is_err());
     }

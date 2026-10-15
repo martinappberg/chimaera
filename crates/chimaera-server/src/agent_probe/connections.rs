@@ -24,6 +24,11 @@ struct Connection {
     status: String,
     source: String,
     login: bool,
+    /// The CLI signs this server in only from its own terminal flow (Cursor's
+    /// `mcp login <name>` has no no-browser mode): the UI offers a managed
+    /// terminal (`login_connection`) instead of the in-app job.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    login_terminal: bool,
 }
 
 fn valid_name(name: &str) -> bool {
@@ -44,6 +49,7 @@ fn connection(name: &str, kind: &str, status: &str, login: bool) -> Connection {
             "MCP server"
         }
         .into(),
+        login_terminal: false,
     }
 }
 
@@ -138,6 +144,58 @@ fn agy_connections(output: &str) -> Result<Vec<Connection>, &'static str> {
             _ => "unknown",
         };
         rows.push(connection(fields[0], "mcp", status, false));
+        if rows.len() > MAX_ROWS {
+            return Err("Too many connections to list.");
+        }
+    }
+    Ok(rows)
+}
+
+/// `cursor-agent mcp list`: one `name: status` line per server from
+/// `.cursor/mcp.json` and `~/.cursor/mcp.json`. The status words are Cursor's
+/// own (`ready`, `connecting`, `disabled`, `failed`, `unavailable`, an auth
+/// wording); only the name and a normalized status leave here.
+fn cursor_connections(output: &str) -> Result<Vec<Connection>, &'static str> {
+    let text = crate::agent_auth::strip_controls(output);
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines
+        .iter()
+        .any(|l| l.to_ascii_lowercase().starts_with("no mcp servers"))
+    {
+        return Ok(vec![]);
+    }
+    let mut rows = Vec::new();
+    for line in lines {
+        let Some((name, status)) = line.split_once(':') else {
+            return Err("Cursor returned an unrecognized connection.");
+        };
+        let name = name.trim();
+        if !valid_name(name) || name.contains(char::is_whitespace) {
+            return Err("Cursor returned an unrecognized connection.");
+        }
+        let word = status.trim().to_ascii_lowercase();
+        // Cursor's own kinds: ready, connecting, needsAuth, needsApproval,
+        // disabled, failed, unavailable, error.
+        let status = if word.contains("approval") {
+            "needs_approval"
+        } else if word.contains("auth") || word.contains("login") {
+            "needs_auth"
+        } else if word.starts_with("ready") || word.contains("connected") {
+            "connected"
+        } else if word.contains("disabled") {
+            "disabled"
+        } else if word.contains("fail") || word.contains("error") || word.contains("unavailable") {
+            "failed"
+        } else {
+            "configured"
+        };
+        let mut row = connection(name, "mcp", status, false);
+        row.login_terminal = status == "needs_auth";
+        rows.push(row);
         if rows.len() > MAX_ROWS {
             return Err("Too many connections to list.");
         }
@@ -266,6 +324,7 @@ async fn probe(state: &Arc<AppState>, ws: &str, root: &Path, kind: AgentKind) ->
                 AgentKind::Codex => codex_connections(&out),
                 AgentKind::Antigravity => agy_connections(&out),
                 AgentKind::Grok => grok_connections(&out),
+                AgentKind::Cursor => cursor_connections(&out),
                 _ => Err("Connection discovery is unavailable for this agent."),
             });
         let (mut rows, mut errors) = match parsed {
@@ -321,13 +380,17 @@ pub(crate) async fn list(
         refresh_probes(&state).await;
     }
     // Each holds the shared agent-probe gate; the whole request is bounded.
-    let (claude, codex, mut agy, mut grok, effective) = tokio::join!(
+    let (claude, codex, mut agy, mut grok, mut cursor, effective) = tokio::join!(
         probe(&state, &ws, &root, AgentKind::Claude),
         probe(&state, &ws, &root, AgentKind::Codex),
         probe(&state, &ws, &root, AgentKind::Antigravity),
         probe(&state, &ws, &root, AgentKind::Grok),
+        probe(&state, &ws, &root, AgentKind::Cursor),
         super::extensions::inventory(&state, &ws, &root, AgentKind::Grok),
     );
+    if cursor["available"] == true {
+        cursor["notice"] = json!("Lists the MCP servers Cursor's CLI knows from .cursor/mcp.json and ~/.cursor/mcp.json. A server that needs a login signs in from a terminal, where Cursor opens its own browser flow.");
+    }
     agy["actions"] = json!(["manage_connections"]);
     agy["notice"] = json!("Lists connections managed by Antigravity's CLI. Project and plugin connections can also load when an agent starts. Manage sign-in in Antigravity.");
     grok["actions"] = json!(["manage_connections"]);
@@ -343,7 +406,7 @@ pub(crate) async fn list(
             errors.push(json!(error));
         }
     }
-    Json(json!({"host":state.hostname,"agents":[claude,codex,agy,grok]})).into_response()
+    Json(json!({"host":state.hostname,"agents":[claude,codex,agy,grok,cursor]})).into_response()
 }
 
 #[cfg(test)]
@@ -365,6 +428,45 @@ mod tests {
         assert!(!serde_json::to_string(&grok).unwrap().contains("secret"));
         assert!(!serde_json::to_string(&agy).unwrap().contains("secret"));
         assert!(agy_connections("unknown output").is_err());
+    }
+
+    #[test]
+    fn cursor_connections_read_name_and_status_lines_and_offer_a_terminal_login() {
+        let rows = cursor_connections(
+            "goldfish: ready
+notes: needsAuth
+old: disabled
+broken: failed to start
+new: needsApproval
+",
+        )
+        .unwrap();
+        let by: std::collections::BTreeMap<_, _> =
+            rows.iter().map(|r| (r.name.as_str(), r)).collect();
+        assert_eq!(by["goldfish"].status, "connected");
+        assert_eq!(by["notes"].status, "needs_auth");
+        assert!(by["notes"].login_terminal && !by["notes"].login);
+        assert!(!by["goldfish"].login_terminal);
+        assert_eq!(by["old"].status, "disabled");
+        assert_eq!(by["broken"].status, "failed");
+        assert_eq!(by["new"].status, "needs_approval");
+        assert!(
+            !by["new"].login_terminal,
+            "approval is granted in Cursor, not a login"
+        );
+        assert!(cursor_connections(
+            "No MCP servers configured
+"
+        )
+        .unwrap()
+        .is_empty());
+        assert!(cursor_connections("Starting login process...").is_err());
+        let wire = serde_json::to_string(&rows).unwrap();
+        assert!(wire.contains("\"login_terminal\":true"));
+        assert!(
+            !wire.contains("\"login_terminal\":false"),
+            "absent when false, additive"
+        );
     }
 
     #[test]

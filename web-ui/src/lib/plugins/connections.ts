@@ -7,6 +7,9 @@ export interface Connection {
   status: string;
   source: string;
   login: boolean;
+  /** The CLI signs this server in only from its own terminal flow (Cursor's
+   *  `mcp login <name>` opens a browser itself): offered as a terminal. */
+  login_terminal?: boolean;
 }
 
 export interface AgentConnections {

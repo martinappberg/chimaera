@@ -18,6 +18,9 @@ Agent plugin/skill/connection reports accept namespaced identities and explicit 
 actions. Never default unknown agents to Codex, synthesize `$skill` syntax for them, or show
 management actions they did not advertise. Antigravity/Grok native discovery has its own
 limits: `notice` explains partial inventories and `enabled: null` means only installed.
+Cursor CLI appears in Plugins (a notice only — its CLI lists no plugins or skills) and in
+Connections (`cursor-agent mcp list`); a row with `login_terminal` offers **Sign in in a
+terminal** (`agentExtensionAction(…, "login_connection", name)`), never the in-app job.
 `AgentExtensionControls.svelte` opens verified native actions in a retained terminal;
 Antigravity command help never sends `/plugins` as a model prompt.
 

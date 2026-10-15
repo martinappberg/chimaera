@@ -162,6 +162,13 @@ pub(super) async fn inventory(
         let prelude = ProbePrelude::write(state, Some(ws)).await;
         let mut result = json!({"agent":agent,"available":true,"version":version,"plugins":[],"skills":[],"connections":[],"actions":["manage_plugins","manage_connections","install_plugin"]});
         match kind {
+            AgentKind::Cursor => {
+                // `cursor-agent plugin` manages marketplaces only, and there is
+                // no skills command: nothing to ask, and nothing derived from
+                // `.cursor/` by hand. Connections are the CLI's `mcp list`.
+                result["actions"] = json!([]);
+                result["notice"] = json!("Cursor's CLI lists no plugins or skills; manage them in Cursor. Its MCP servers are under Connections.");
+            }
             AgentKind::Grok => {
                 let raw = connections::run_cli(&bin, &["inspect", "--json"], root, prelude.path())
                     .await

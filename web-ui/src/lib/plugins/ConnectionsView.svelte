@@ -3,7 +3,7 @@
   import { ApiError, getHostLabel } from "../net/api";
   import { pageVisible } from "../shared/visibility";
   import { openInSystemBrowser } from "../shared/urlOpen";
-  import { agentName, agentPluginsRevision, type AgentId } from "./store";
+  import { agentExtensionAction, agentName, agentPluginsRevision, type AgentId } from "./store";
   import { connectionStatus, fetchConnections, managementUrl, type ConnectionsReport } from "./connections";
 
   import AgentExtensionControls from "./AgentExtensionControls.svelte";
@@ -15,6 +15,16 @@
   let unavailable = $state(false);
   let error = $state<string | null>(null);
   let signingIn = $state<{agent: AgentId; name: string} | null>(null);
+  /** A CLI whose MCP sign-in runs only in its own terminal: open one. */
+  let terminalBusy = $state<string | null>(null);
+  async function signInInTerminal(agent: AgentId, name: string): Promise<void> {
+    if (terminalBusy !== null) return;
+    terminalBusy = `${agent}:${name}`;
+    error = null;
+    try { onOpenSession(await agentExtensionAction(wsId, agent, "login_connection", name)); }
+    catch (e) { error = e instanceof Error ? e.message : String(e); }
+    finally { terminalBusy = null; }
+  }
   let sequence = 0;
   $effect(() => () => { sequence++; });
   const host = $derived(report?.host || getHostLabel());
@@ -78,6 +88,8 @@
             <div class="actions">
               {#if connection.login}
                 <button class="opt" disabled={loading} title={`Connect with ${agent.agent} on ${host}`} onclick={() => signingIn = {agent: agent.agent, name: connection.name}}>{connection.source === "claude.ai" ? "Set up" : "Sign in"}</button>
+              {:else if connection.login_terminal}
+                <button class="opt" disabled={loading || terminalBusy !== null} title={`${agentName(agent.agent)} signs this server in from its own terminal; one opens here`} onclick={() => void signInInTerminal(agent.agent, connection.name)}>Sign in in a terminal</button>
               {:else if manage}
                 <a href={manage} rel="noopener noreferrer" onclick={(event) => { event.preventDefault(); void openInSystemBrowser(manage); }}>Manage ↗</a>
               {/if}

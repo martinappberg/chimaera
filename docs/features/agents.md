@@ -243,6 +243,9 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   `~/.chimaera/agents/cursor/<package>/` with `bin/cursor` linking its entrypoint, and never
   writes `~/.local/bin`. Releases are dated builds (`2026.10.14-941492e`): updates order by
   date, and two builds of one date are never claimed newer.
+- **Extensions.** Cursor is a core agent of Extensions → Connections (`cursor-agent mcp list`,
+  with **Sign in in a terminal** for a server that needs a login) and of the Plugins group (a
+  notice: its CLI lists no plugins or skills) — [plugins.md](plugins.md#antigravity-grok-build-and-cursor-cli).
 - **Status.** Terminal use and detection/installation are verified; chat turns await a
   signed-in run of `CHIMAERA_TEST_CURSOR=… just chat-smoke-acp` (PROTOCOL.md, ACP › Cursor).
 
