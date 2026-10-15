@@ -119,12 +119,12 @@
     </button>
     {#if onRewind !== undefined}
       <button aria-label={rewindTitle} title={rewindTitle} onclick={onRewind}>
-        <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+        <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
           <path
             d="M3.5 5.5h6a3.5 3.5 0 0 1 0 7H6M3.5 5.5L6 3M3.5 5.5L6 8"
             fill="none"
             stroke="currentColor"
-            stroke-width="1.4"
+            stroke-width="1.5"
             stroke-linecap="round"
             stroke-linejoin="round"
           />
@@ -137,15 +137,15 @@
         title="fork from this message into a new session (source keeps running)"
         onclick={onFork}
       >
-        <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
-          <circle cx="4" cy="3.5" r="1.5" fill="none" stroke="currentColor" stroke-width="1.4" />
-          <circle cx="4" cy="12.5" r="1.5" fill="none" stroke="currentColor" stroke-width="1.4" />
-          <circle cx="12" cy="8" r="1.5" fill="none" stroke="currentColor" stroke-width="1.4" />
+        <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+          <circle cx="4" cy="3.5" r="1.5" fill="none" stroke="currentColor" stroke-width="1.5" />
+          <circle cx="4" cy="12.5" r="1.5" fill="none" stroke="currentColor" stroke-width="1.5" />
+          <circle cx="12" cy="8" r="1.5" fill="none" stroke="currentColor" stroke-width="1.5" />
           <path
             d="M5.5 3.5h.5A2 2 0 0 1 8 5.5v5A2 2 0 0 1 6 12.5h-.5M8 8h2.5"
             fill="none"
             stroke="currentColor"
-            stroke-width="1.4"
+            stroke-width="1.5"
             stroke-linecap="round"
           />
         </svg>

@@ -10,7 +10,7 @@ Sources:
   codex 0.144.2 from Pass 16 on; claude 2.1.259 + codex 0.153.0 from Pass 30
   on; claude 2.1.280/2.1.281 + codex 0.156.1 from Pass 31 on; claude 2.1.283
   + codex 0.157.1 from Pass 33 on; claude 2.1.289 + codex 0.160.0 from the
-  October refresh; claude 2.1.300 + codex 0.162.1 from Pass 43 on).
+  October refresh; claude 2.1.300 + codex 0.162.1 from Pass 43 on, Pass 44 too).
 - **official schema/docs**: Codex's upstream `codex-rs/app-server/README.md`
   and the version-specific output of `codex app-server generate-ts` /
   `generate-json-schema` (the preferred shape inventory for the installed

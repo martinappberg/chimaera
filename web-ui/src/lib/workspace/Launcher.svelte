@@ -45,6 +45,7 @@
     type LaunchPick,
   } from "./launcher";
   import { isMac } from "../shared/keys";
+  import { needsSignIn } from "./agentSignIn";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import Chevron from "../shared/Chevron.svelte";
 
@@ -165,6 +166,7 @@
     if (!a.installed) return "not installed";
     if (a.outdated) return "needs an update";
     if (a.chatSetupRequired) return "chat needs setup";
+    if (needsSignIn(a)) return "not signed in";
     return a.version !== null ? versionNumber(a.version) : "installed";
   }
 
@@ -382,6 +384,22 @@
         {!a.managedInstall ? "set up" : a.outdated ? "update" : a.chatSetupRequired ? "set up chat" : "install"}
       </button>
     {/if}
+    {#if a.installed && !a.outdated && !a.chatSetupRequired && a.chatCapable && needsSignIn(a)}
+      <!-- Signed out: the chat opens straight onto its sign-in card and
+           starts itself once the CLI confirms the login. -->
+      <button
+        class="achip"
+        class:solid={i < installedCount}
+        tabindex="-1"
+        title="sign in to {a.name} — the chat opens with the sign-in, then starts"
+        onclick={(e) => {
+          e.stopPropagation();
+          onPick({ agent: a.id, ui: "chat", explicit: true });
+        }}
+      >
+        sign in
+      </button>
+    {/if}
     {#if a.installed && (!a.chatSetupRequired || a.chatCapable)}
       <!-- The row (and ↵) opens the chat; the one hover-only glyph (⌘↵)
            is the explicit terminal path. An agent with no chat view opens
@@ -398,16 +416,16 @@
           }}
         >
           <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
-            <rect x="1.5" y="2.5" width="13" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="1.2" />
+            <rect x="1.5" y="2.5" width="13" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="1.4" />
             <path
               d="M4.2 6l2.4 2-2.4 2"
               fill="none"
               stroke="currentColor"
-              stroke-width="1.3"
+              stroke-width="1.4"
               stroke-linecap="round"
               stroke-linejoin="round"
             />
-            <path d="M8.4 10.6h3.2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+            <path d="M8.4 10.6h3.2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
           </svg>
         </button>
       {/if}
@@ -475,7 +493,7 @@
              link: a remembered setting, not a step. A focused switch's own
              Enter/Space must not also reach the root's Enter (a second flip). -->
         <button
-          class="wt"
+          class="foot-btn wt"
           class:hl={hl === wtIndex}
           role="menuitemcheckbox"
           aria-checked={inWorktree}
@@ -511,7 +529,7 @@
         <span class="hint"><kbd>{isMac ? "⌘" : "ctrl"}↵</kbd> terminal</span>
       {/if}
       <button
-        class="settings"
+        class="foot-btn settings"
         class:hl={hl === settingsIndex}
         role="menuitem"
         tabindex="-1"
@@ -524,14 +542,11 @@
 </div>
 
 <style>
-  /* The quiet seam between the quick agents and the rest: a hairline and a
-     lowercase word, no chrome. */
-  /* The fold row: the quiet seam between the two quick agents and the rest
-     of the catalog — a hairline above, the agents' own row language. */
+  /* The fold row: the rest of the catalog behind one muted row in the
+     agents' own row language. No hairline of its own — the footer's is the
+     menu's one seam, and two a row apart read as chrome. */
   .arow.others {
-    margin-top: 4px;
-    border-top: 1px solid var(--edge);
-    border-radius: 0 0 6px 6px;
+    margin-top: 2px;
     color: var(--muted);
     user-select: none;
   }
@@ -554,12 +569,12 @@
     display: flex;
     flex-direction: column;
     padding: 5px;
+    /* The app's popover surface (app.css .overlay-surface's tokens): one
+       radius and shadow for every menu that hangs off the chrome. */
     background: var(--overlay-bg);
     border: 1px solid var(--edge);
-    border-radius: 10px;
-    box-shadow:
-      0 1px 2px rgba(0, 0, 0, 0.08),
-      0 12px 32px rgba(0, 0, 0, 0.22);
+    border-radius: var(--overlay-radius);
+    box-shadow: var(--overlay-shadow);
     outline: none;
     animation: pop 0.12s ease-out;
   }
@@ -617,7 +632,7 @@
     align-items: center;
     gap: 9px;
     padding: 6px 9px;
-    border-radius: 6px;
+    border-radius: 5px; /* the rail's row radius */
     font-size: var(--text-md);
     cursor: pointer;
     user-select: none;
@@ -758,45 +773,49 @@
     outline-offset: 1px;
   }
 
-  /* The two ways in, quiet until the row is hot: "open" (the default — the
-     chat view) and the terminal-icon button (the agent's own TUI). */
   /* The one trailing control: a glyph that fades in with the row, no
-     border — the row is the button, this is its alternative. */
+     border — the row is the button, this is its alternative. The fade is
+     on the GLYPH, not the button: faint on a hot row (it must not read as
+     the row's one button), full strength under the pointer itself, and
+     the tooltip below never inherits the fade. `:where` keeps the hot-row
+     rule below the direct-hover rule in specificity. */
   .tbtn {
     appearance: none;
     background: none;
     font: inherit;
     flex: none;
     border: none;
-    color: var(--muted);
-    cursor: pointer;
-    opacity: 0;
-    transition:
-      opacity 0.12s ease,
-      color 0.12s ease,
-      background-color 0.12s ease,
-      transform 0.08s ease;
-  }
-
-  .arow.hl .tbtn,
-  .arow:hover .tbtn {
-    opacity: 0.75;
-  }
-
-  .tbtn {
     position: relative;
     display: inline-flex;
     align-items: center;
     justify-content: center;
     width: 22px;
     height: 22px;
-    border-radius: 6px;
+    border-radius: 5px;
+    color: var(--muted);
+    cursor: pointer;
+    transition:
+      color 0.12s ease,
+      background-color 0.12s ease,
+      transform 0.08s ease;
+  }
+
+  .tbtn svg {
+    opacity: 0;
+    transition: opacity 0.12s ease;
+  }
+
+  :where(.arow.hl, .arow:hover) .tbtn svg {
+    opacity: 0.55;
   }
 
   .tbtn:hover {
-    opacity: 1;
     color: var(--fg);
     background: color-mix(in srgb, var(--fg) 8%, transparent);
+  }
+
+  .tbtn:hover svg {
+    opacity: 1;
   }
 
   /* The delayed tooltip: nothing on a pass-through hover, fades in after
@@ -814,8 +833,8 @@
     color: var(--fg);
     background: var(--overlay-bg);
     border: 1px solid var(--edge);
-    border-radius: 6px;
-    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+    border-radius: var(--overlay-radius);
+    box-shadow: var(--overlay-shadow);
     opacity: 0;
     pointer-events: none;
     transition: opacity 0.12s ease;
@@ -830,22 +849,17 @@
     transform: translateY(0.5px);
   }
 
-  /* The worktree switch: a footer control in the settings link's language
-     (same padding, radius and hot state), the Switch recipe at a smaller
-     size after its label. */
-  .wt {
+  /* The footer's two controls — the worktree switch and the settings link —
+     share one quiet button: the rows' side padding (so their hot boxes sit
+     flush with the rows' above), the rows' radius and hot state. */
+  .foot-btn {
     appearance: none;
     border: none;
     background: none;
     font: inherit;
     font-size: var(--text-xs);
-    min-width: 0;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 4px 6px;
-    margin-left: -6px;
-    border-radius: 6px;
+    padding: 4px 9px;
+    border-radius: 5px;
     color: var(--muted);
     cursor: pointer;
     transition:
@@ -853,13 +867,22 @@
       background-color 0.12s ease;
   }
 
-  .wt.hl,
-  .wt[aria-checked="true"] {
+  .foot-btn.hl {
     color: var(--fg);
+    background: var(--row-hover);
   }
 
-  .wt.hl {
-    background: var(--row-hover);
+  /* The worktree switch: the Switch recipe at a smaller size after its
+     label; an engaged switch keeps its label in the foreground. */
+  .wt {
+    min-width: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .wt[aria-checked="true"] {
+    color: var(--fg);
   }
 
   .wt svg {
@@ -924,11 +947,15 @@
     justify-content: space-between;
     gap: 12px;
     margin-top: 5px;
-    padding: 5px 3px 0 9px;
+    padding: 5px 0 0;
     border-top: 1px solid var(--edge);
     font-size: var(--text-xs);
     color: var(--muted);
     user-select: none;
+  }
+
+  .foot .hint {
+    padding-left: 9px;
   }
 
   .foot kbd {
@@ -939,24 +966,6 @@
     border-radius: 4px;
   }
 
-  /* Settings → Agents: the way into everything this menu doesn't do. */
-  .settings {
-    appearance: none;
-    border: none;
-    background: none;
-    font: inherit;
-    font-size: var(--text-xs);
-    color: var(--muted);
-    padding: 4px 6px;
-    border-radius: 6px;
-    cursor: pointer;
-    transition:
-      color 0.12s ease,
-      background-color 0.12s ease;
-  }
-
-  .settings.hl {
-    color: var(--fg);
-    background: var(--row-hover);
-  }
+  /* Settings → Agents: the way into everything this menu doesn't do — the
+     footer button as is. */
 </style>

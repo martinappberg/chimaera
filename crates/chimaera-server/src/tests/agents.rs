@@ -1060,6 +1060,437 @@ async fn agents_rows_flag_managed_installs() {
     );
     assert_eq!(row("grok")["managed_install"], true);
     assert_eq!(row("agy")["managed_install"], true);
+
+    // Sign-in (additive): the CLI's own verdict, unknown for a preset path
+    // that runs no status command, null when not installed; every row says
+    // how it signs in from the app.
+    assert!(claude["signed_in"].is_null());
+    assert_eq!(claude["sign_in"]["how"], "browser");
+    assert_eq!(claude["sign_in"]["accepts_code"], true);
+    assert_eq!(claude["sign_in"]["command"], "claude auth login");
+    assert!(claude["sign_in"]["operation"].is_null());
+    assert_eq!(codex["sign_in"]["how"], "browser");
+    assert_eq!(codex["sign_in"]["command"], "codex login --device-auth");
+    assert_eq!(row("agy")["sign_in"]["how"], "browser");
+    assert_eq!(row("agy")["sign_in"]["accepts_code"], false);
+    assert!(row("agy")["signed_in"].is_null());
+    assert_eq!(row("cursor")["sign_in"]["command"], "cursor-agent login");
+}
+
+/// A chat that died at startup for want of a login is started again, in
+/// place, when that agent's sign-in lands — the same session id, a second
+/// life in the same journal — and a chat of another agent is left alone.
+#[tokio::test]
+async fn a_landed_sign_in_relaunches_the_chats_that_waited_on_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let state = test_state();
+    let ws = make_workspace(&state, "signin-relaunch").await;
+    // Signed out: the fake refuses at startup with claude's own words.
+    let bin = test_dir("signin-relaunch-bin").join("claude");
+    std::fs::write(
+        &bin,
+        "#!/bin/sh\nprintf '%s\\n' 'Not logged in · Please run /login' >&2\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    preset_agent(
+        &state,
+        agents::AgentKind::Claude,
+        Ok(bin.clone()),
+        Some("9.9.9-fake"),
+    );
+    let (status, row) = request(
+        &state,
+        Method::POST,
+        "/api/v1/sessions",
+        Some(serde_json::json!({"workspace_id": ws, "kind": "agent", "ui": "chat"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{row}");
+    let id = row["id"].as_str().unwrap().to_string();
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let dead = state.chat.get(&id).is_some_and(|c| !c.alive);
+            let flagged = lock(&state.agents)
+                .get(&id)
+                .is_some_and(|r| r.signed_out_at_start);
+            if dead && flagged {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the startup failure settles and is read as a sign-in one");
+
+    // The login lands: the same executable now answers the handshake.
+    std::fs::copy(write_fake_claude("signin-relaunch-ok"), &bin).unwrap();
+    assert_eq!(
+        chat::relaunch_after_sign_in(state.clone(), agents::AgentKind::Claude).await,
+        1
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while !state.chat.get(&id).is_some_and(|c| c.alive) {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the chat lives again under the same id");
+    assert!(
+        !lock(&state.agents).get(&id).unwrap().signed_out_at_start,
+        "the relaunch clears the mark"
+    );
+    // Nothing waits any more: a second landing does nothing.
+    assert_eq!(
+        chat::relaunch_after_sign_in(state.clone(), agents::AgentKind::Claude).await,
+        0
+    );
+    assert_eq!(
+        chat::relaunch_after_sign_in(state.clone(), agents::AgentKind::Codex).await,
+        0
+    );
+}
+
+/// A live chat that waited on a sign-in is started again in place when the
+/// login lands; one mid-task is left alone (and unmarked); a chat spawned
+/// while the cached verdict said signed out carries the mark from the start.
+#[tokio::test]
+async fn a_live_chat_that_waited_on_a_sign_in_is_relaunched_unless_mid_task() {
+    let state = test_state();
+    let ws = make_workspace(&state, "signin-live").await;
+    let bin = write_fake_claude("signin-live-fake");
+    preset_agent(
+        &state,
+        agents::AgentKind::Claude,
+        Ok(bin.clone()),
+        Some("9.9.9-fake"),
+    );
+    // The CLI said signed out a moment ago: the chat is marked at spawn.
+    agent_auth::preset_verdict(&state, agents::AgentKind::Claude, &bin, Some(false));
+    let (status, row) = request(
+        &state,
+        Method::POST,
+        "/api/v1/sessions",
+        Some(serde_json::json!({"workspace_id": ws, "kind": "agent", "ui": "chat"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{row}");
+    let id = row["id"].as_str().unwrap().to_string();
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while !state.chat.get(&id).is_some_and(|c| c.alive) {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the fake handshakes");
+    assert!(
+        lock(&state.agents).get(&id).unwrap().signed_out_at_start,
+        "spawned while the verdict said signed out"
+    );
+    let first = state.chat.get(&id).unwrap().created_at_ms;
+
+    // Mid-task: left alone, and no longer waiting (it is authenticated).
+    lock(&state.agents).get_mut(&id).unwrap().state = agent_state::AgentState::Running;
+    assert_eq!(
+        chat::relaunch_after_sign_in(state.clone(), agents::AgentKind::Claude).await,
+        0
+    );
+    assert!(!lock(&state.agents).get(&id).unwrap().signed_out_at_start);
+    assert_eq!(
+        state.chat.get(&id).unwrap().created_at_ms,
+        first,
+        "not respawned"
+    );
+
+    // Idle and marked again: a second life under the same id.
+    lock(&state.agents).get_mut(&id).unwrap().state = agent_state::AgentState::Finished;
+    lock(&state.agents)
+        .get_mut(&id)
+        .unwrap()
+        .signed_out_at_start = true;
+    assert_eq!(
+        chat::relaunch_after_sign_in(state.clone(), agents::AgentKind::Claude).await,
+        1
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while !state
+            .chat
+            .get(&id)
+            .is_some_and(|c| c.alive && c.created_at_ms != first)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("relaunched alive under the same id");
+    assert!(!lock(&state.agents).get(&id).unwrap().signed_out_at_start);
+}
+
+/// The sign-in routes' happy path against a scripted CLI: start answers
+/// running, the page shows up, a repeated start joins, cancel ends it, and
+/// the catalog row names the operation throughout.
+#[tokio::test]
+async fn sign_in_routes_show_the_page_join_a_repeat_and_cancel() {
+    use std::os::unix::fs::PermissionsExt;
+    let state = test_state();
+    let ws = make_workspace(&state, "signin-routes").await;
+    let bin = test_dir("signin-routes-bin").join("claude");
+    std::fs::write(
+        &bin,
+        "#!/bin/sh\ncase \"$1 $2\" in\n'auth status') echo '{\"loggedIn\": false}'; exit 1 ;;\n'auth login') echo 'visit: https://claude.com/cai/oauth/authorize?code=true&state=t'; sleep 60 ;;\n*) echo '9.9.9 (Claude Code)' ;;\nesac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    preset_agent(
+        &state,
+        agents::AgentKind::Claude,
+        Ok(bin.clone()),
+        Some("9.9.9 (Claude Code)"),
+    );
+    let (status, started) = request(
+        &state,
+        Method::POST,
+        "/api/v1/agents/claude/sign-in",
+        Some(serde_json::json!({"workspace_id": ws, "request_id": "r-1"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{started}");
+    assert_eq!(started["phase"], "running");
+    assert_eq!(started["accepts_code"], true);
+    let page = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let (_, now) =
+                request(&state, Method::GET, "/api/v1/agents/claude/sign-in", None).await;
+            if now["operation"]["url"].is_string() {
+                return now;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the login's page reaches the wire");
+    assert_eq!(
+        page["operation"]["url"],
+        "https://claude.com/cai/oauth/authorize?code=true&state=t"
+    );
+    assert!(
+        page["operation"].get("output").is_none(),
+        "raw output never reaches the wire"
+    );
+    // A repeated click joins.
+    let (_, again) = request(
+        &state,
+        Method::POST,
+        "/api/v1/agents/claude/sign-in",
+        Some(serde_json::json!({"workspace_id": ws, "request_id": "r-2"})),
+    )
+    .await;
+    assert_eq!(again["id"], "r-1");
+    let (_, list) = request(&state, Method::GET, "/api/v1/agents", None).await;
+    let claude = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == "claude")
+        .unwrap();
+    assert_eq!(claude["sign_in"]["operation"]["id"], "r-1");
+    assert_eq!(claude["sign_in"]["operation"]["running"], true);
+    // Cancel ends it, generation-scoped.
+    let (status, _) = request(
+        &state,
+        Method::DELETE,
+        "/api/v1/agents/claude/sign-in/r-2",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, cancelled) = request(
+        &state,
+        Method::DELETE,
+        "/api/v1/agents/claude/sign-in/r-1",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cancelled["phase"], "cancelling");
+    let done = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let (_, now) =
+                request(&state, Method::GET, "/api/v1/agents/claude/sign-in", None).await;
+            if now["operation"]["phase"] == "cancelled" {
+                return now;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("cancel settles");
+    assert!(
+        done["operation"]["url"].is_null(),
+        "a finished page is stale"
+    );
+    assert!(
+        state.sessions.list().is_empty(),
+        "a sign-in is never a session"
+    );
+}
+
+/// A sign-in is one bounded operation per agent behind
+/// `/agents/{id}/sign-in`: unknown agents 404, a start needs an installed
+/// agent and an open workspace, and the catalog row names the operation.
+#[tokio::test]
+async fn sign_in_routes_refuse_what_they_must_and_the_catalog_names_the_operation() {
+    let state = test_state();
+    preset_agent(
+        &state,
+        agents::AgentKind::Cursor,
+        Err("cursor-agent not found (test)".to_string()),
+        None,
+    );
+    let (status, _) = request(&state, Method::GET, "/api/v1/agents/nope/sign-in", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, body) = request(&state, Method::GET, "/api/v1/agents/cursor/sign-in", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["installed"], false);
+    assert!(body["signed_in"].is_null());
+    assert_eq!(body["how"], "browser");
+    assert!(body["operation"].is_null());
+
+    // No such workspace: refused before anything runs.
+    let (status, body) = request(
+        &state,
+        Method::POST,
+        "/api/v1/agents/cursor/sign-in",
+        Some(serde_json::json!({"workspace_id": "missing", "request_id": "r-1"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body["error"].as_str().unwrap().contains("workspace"));
+    let (status, _) = request(
+        &state,
+        Method::POST,
+        "/api/v1/agents/cursor/sign-in",
+        Some(serde_json::json!({"workspace_id": "missing", "request_id": "bad id!"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = request(
+        &state,
+        Method::DELETE,
+        "/api/v1/agents/cursor/sign-in/r-1",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "nothing to cancel yet");
+    let (status, _) = request(
+        &state,
+        Method::POST,
+        "/api/v1/agents/cursor/sign-in/r-1/code",
+        Some(serde_json::json!({"code": "ABCD-1234"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "no sign-in reads a code yet");
+}
+
+/// A detection miss is served for a short window, to the catalog read only:
+/// a spawn probes, a refresh probes, a hit is never shadowed, and a refresh
+/// whose probe misses keeps a hit that still validates.
+#[tokio::test]
+async fn a_cached_miss_serves_only_catalog_reads_and_never_shadows_a_hit() {
+    use std::os::unix::fs::PermissionsExt;
+    let state = test_state();
+    let kind = agents::AgentKind::Grok;
+    let stamp = |state: &Arc<AppState>, reason: &str, at: std::time::Instant| {
+        lock(&state.agent_misses).insert(kind, (reason.to_string(), at));
+    };
+
+    // The catalog read serves it, with the recorded reason.
+    stamp(&state, "grok not found (test)", std::time::Instant::now());
+    let miss = launcher::detect_for_catalog(&state, kind, false).await;
+    assert_eq!(
+        miss.path.as_ref().err().map(String::as_str),
+        Some("grok not found (test)")
+    );
+    assert!(miss.version.is_none() && !miss.managed && !miss.explicit);
+    // A spawn's read probes instead (whatever this host has, never the stamp).
+    let probed = launcher::detect(&state, kind, false).await;
+    assert_ne!(
+        probed.path.as_ref().err().map(String::as_str),
+        Some("grok not found (test)"),
+        "a spawn never acts on a cached miss"
+    );
+    // A refresh sees past it too.
+    stamp(&state, "stale", std::time::Instant::now());
+    lock(&state.agent_bins).remove(&kind);
+    let refreshed = launcher::detect_for_catalog(&state, kind, true).await;
+    assert_ne!(
+        refreshed.path.as_ref().err().map(String::as_str),
+        Some("stale")
+    );
+    // An expired stamp is not served either.
+    stamp(
+        &state,
+        "expired",
+        std::time::Instant::now()
+            .checked_sub(launcher::MISS_TTL)
+            .unwrap_or_else(std::time::Instant::now),
+    );
+    lock(&state.agent_bins).remove(&kind);
+    let later = launcher::detect_for_catalog(&state, kind, false).await;
+    assert_ne!(
+        later.path.as_ref().err().map(String::as_str),
+        Some("expired")
+    );
+
+    // A hit is never shadowed by a stamp, and a refresh whose probe misses
+    // (the login shell can't see this fake) keeps the still-valid hit and
+    // records no miss over it.
+    let dir = test_dir("miss-hit");
+    let bin = dir.join("grok");
+    std::fs::write(&bin, "#!/bin/sh\necho 'grok 9.9.9'\n").unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    preset_agent(&state, kind, Ok(bin.clone()), Some("grok 9.9.9"));
+    stamp(&state, "shadow", std::time::Instant::now());
+    let hit = launcher::detect_for_catalog(&state, kind, false).await;
+    assert_eq!(hit.path.as_deref().ok(), Some(bin.as_path()));
+    lock(&state.agent_misses).remove(&kind);
+    let kept = launcher::detect_for_catalog(&state, kind, true).await;
+    assert!(
+        kept.path.is_ok(),
+        "a refresh never turns a valid hit into a miss"
+    );
+    assert!(
+        lock(&state.agent_misses).get(&kind).is_none(),
+        "no miss is stamped while a validating hit exists"
+    );
+}
+
+/// The two explicit "look again" moments forget every cached miss: a changed
+/// `agents.<id>.path` through the settings route, and Extensions' re-check.
+#[tokio::test]
+async fn a_changed_agent_path_and_an_extensions_recheck_forget_cached_misses() {
+    let state = test_state();
+    let kind = agents::AgentKind::Grok;
+    lock(&state.agent_misses).insert(kind, ("x".to_string(), std::time::Instant::now()));
+    let (status, _) = request(
+        &state,
+        Method::PUT,
+        "/api/v1/settings",
+        Some(serde_json::json!({"agents.grok.path": "/nonexistent/grok"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(
+        lock(&state.agent_misses).is_empty(),
+        "the settings route forgets misses"
+    );
+
+    lock(&state.agent_misses).insert(kind, ("x".to_string(), std::time::Instant::now()));
+    agent_probe::refresh_probes(&state).await;
+    assert!(
+        lock(&state.agent_misses).is_empty(),
+        "Check again forgets misses"
+    );
 }
 
 /// Detection falls back to ~/.chimaera/agents/bin when the login shell

@@ -116,11 +116,12 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   system-library failures explain what to fix. Results last until the daemon restarts; a lost
   connection is unknown status, never success.
 - **Installation is one step.** A zero installer exit code says files were installed, not that
-  the account is signed in or structured chat works. Afterward, Sign in opens the
-  provider's interactive agent in a terminal; Open chat starts a chat using the existing account.
-  The dialog tells users who aren't signed in to sign in first. Open chat does not perform login;
-  authentication failures appear in the normal chat startup or turn UI. Settings says “Installed · Supports chat and
-  terminal” rather than claiming readiness. Running conversations and account data are kept.
+  the account is signed in or structured chat works. Afterward the dialog shows the agent's
+  [sign-in card](#sign-in) unless the CLI already reports a login (then "Signed in. Open chat
+  when you're ready."); Open chat starts a chat using the account on the host, and a chat started
+  while signed out shows the same card in place of the startup error. The terminal is never the
+  way in. Settings says “Installed · Supports chat and terminal” rather than claiming readiness.
+  Running conversations and account data are kept.
 - **Where it lives.** `agent_setup.rs`, `workspace/agentSetup.ts`, and
   `workspace/AgentSetupDialog.svelte`: authenticated `GET/POST /api/v1/agents/{id}/setup` and
   `DELETE /api/v1/agents/{id}/setup/{operation}`. POST carries `workspace_id`, an
@@ -166,15 +167,88 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   install method for a bare binary behind our symlink, and claude's would install a second copy
   elsewhere, leaving the managed link stale); your own binary's `update` passes through untouched.
 
+## Sign in
+
+- **What & when.** Every built-in agent signs in from the app: no terminal, no "run `x login`
+  and start the chat again". The daemon knows per agent whether its CLI is signed in on the
+  workspace host, and one small flow signs it in — from the agent's card in Settings → Agents,
+  from the launcher row (a signed-out agent reads *not signed in* with a **sign in** chip), and
+  in a chat that could not start because the agent is signed out, where the card replaces the
+  raw error and the chat starts itself once the login lands, and at the tail of a live chat whose
+  CLI turns out to be signed out — Codex's app-server starts without a login and fails only at the
+  first turn (`401 Unauthorized`), so an auth-shaped turn error re-asks the status command and,
+  when it says signed out, the card appears there with **Check again** (a login done in a
+  terminal or another window) and the composer open — only a chat that has not started yet keeps
+  its composer closed ("sign in to Codex first") so its first turn isn't a 401. A sign-in that lands — from any card, Settings or
+  another window — relaunches every chat of that agent that waited on it: the ones that died at
+  startup for want of a login and the live ones started while the CLI said signed out (their
+  process never reloads credentials). Same session id, a second life in the same journal; a
+  conversation that had a prompt resumes by its native id, one that had none starts fresh (Cursor
+  refuses to load an empty session). A chat mid-task is left alone, and a chat that completed a
+  turn no longer counts as waiting. The daemon is the one owner of that relaunch; a card only
+  refreshes the verdict. `/login` typed in a chat relaunches that chat too (`session_id` on the
+  start request). No sign-in runs beside an install or update of the same agent.
+- **How it's used.** Click **Sign in** — or type `/login` in any chat, which opens the card there
+  even when the agent is signed in (switch accounts, refresh a stale login; Antigravity's headless
+  login only finds the existing one, so its card offers no second sign-in). The card shows the page to open (**Open ↗** goes
+  through the native shell's browser opener, so it works for a daemon on another host;
+  **Copy link** for a browser elsewhere), a device code to enter on that page when the CLI's
+  flow uses one, and a field to paste a code back when the page shows one. Finish in the
+  browser; the card says *Signed in* when the CLI itself reports the login, and a waiting chat
+  starts again in place. **Cancel** stops the CLI's login; a failure says what the CLI said and
+  offers **Try again**. Antigravity's page waits 60 s for the callback (its CLI's limit), so a
+  slow sign-in simply means **Try again**.
+- **Per runtime.** Detection is each CLI's own status command, never a credential file;
+  chimaera never reads, copies or refreshes a credential.
+
+  | Agent | Signed in? | Sign in | In the card |
+  |---|---|---|---|
+  | Claude Code | `claude auth status --json` → `loggedIn` | `claude auth login` under the daemon (`BROWSER=true`, so only the app opens the page) | page + paste back the code the page shows |
+  | Codex | `codex login status` (exit 0 "Logged in" / exit 1 "Not logged in") | `codex login --device-auth` | page + a device code to enter |
+  | Grok Build | `grok models` ("You are logged in" / "You are not authenticated") | `grok login --device-auth` | page + a device code to enter |
+  | Cursor CLI | `cursor-agent status --format json` → `isAuthenticated` | `NO_OPEN_BROWSER=1 cursor-agent login` | page |
+  | Antigravity | `agy models` (lists the account's models; signed out it says "Please sign in", exit 1; any other failure is unknown) | `agy -p /skills` (no login command, but print mode signs in headlessly: the native zero-turn `/skills` triggers its OAuth URL and waits 60 s for Google's hosted callback; no stdin — print mode reads a piped stdin as its prompt and abandons the login — so no pasted code; a no-op `open`/`xdg-open` first on its PATH keeps it from opening a browser itself, it ignores `BROWSER` and `NO_BROWSER`) | page (finish within 60 s, else Try again) |
+
+  A status command that does not answer in 10 s is *unknown* (nothing is offered), never a
+  verdict. A device code is single-use and leaves the wire with the operation's end.
+- **Where it lives.** `agent_auth.rs` (daemon), `workspace/agentSignIn.ts` +
+  `workspace/AgentSignInCard.svelte` (the one card; Settings, the chat view). Wire, all
+  additive: `GET /api/v1/agents` rows carry `signed_in: true|false|null` and
+  `sign_in: {how: browser, command, accepts_code, operation}`;
+  `GET /api/v1/agents/{id}/sign-in[?check=true]` (the status, re-asked with `check`),
+  `POST /api/v1/agents/{id}/sign-in {workspace_id, request_id, theme?}` (start or join — a
+  repeated click, a second window — the one operation per agent),
+  `DELETE …/sign-in/{operation}` (cancel, generation-scoped), `POST …/sign-in/{operation}/code
+  {code}` (the pasted code, for a login that reads one). A relaunch after a failed startup is
+  `POST /sessions/{id}/view {ui: "chat"}` on the dead chat, for every agent (a surface switch
+  stays Claude/Codex-only); `{ui: "chat", relaunch: true}` does the same for a live chat.
+- **Key behaviors.** The catalog answers at once: the verdict cached in the last 10 minutes, or
+  *unknown* while a missing one is probed in the background (the catalog refetches on the change
+  bus), so a launcher paint never waits on five CLIs and `?refresh=true` forces no probe. A probe
+  runs inline only for an explicit ask — Settings' Check (`?check=true`), a card's Check again, a
+  sign-in's end, a chat's startup failure (so the row and card say *not signed in* when that is
+  why) — and like a chat it runs the CLI through the login shell with the host prelude, in its own
+  process group, output capped. A verdict is the CLI's own words only: an offline or quota failure
+  is unknown, never "signed out". A startup failure
+  whose words are a missing login, or a chat started while the status said signed out, marks the
+  session as waiting on a sign-in (`AgentRecord.signed_out_at_start`); a landed sign-in relaunches
+  those (`chat::relaunch_after_sign_in`, at most 8) and clears the mark. The login runs
+  as its own process group with a 10-minute deadline, output private to the daemon (64 KiB;
+  only the URL, the code and a short failure tail reach the wire), no session or PTY entry;
+  cancel is SIGTERM then SIGKILL to the group. A clean exit is never success by itself — the
+  status command is asked again. Concurrent status probes for one agent share a run. The
+  chat view shows one line per failure: a startup error that a fatal banner shows
+  is not repeated as a transcript line, and a fatal banner is not followed by *agent exited*.
+
 ## Cursor CLI
 
 - **What & when.** Cursor's terminal agent (`cursor-agent`, linked as `agent` too) as a fifth
   built-in runtime: its own TUI in a PTY, or structured chat over ACP.
 - **How it's used.** Start it from the agent menu (under *other agents* while it isn't installed),
   or make it the default.
-  The CLI keeps its own sign-in: run `cursor-agent login` once on the workspace host (the
-  terminal view shows Cursor's "Press any key to log in…" until then). Chat started while
-  signed out fails fast with that instruction instead of opening a browser from the daemon.
+  The CLI keeps its own sign-in, done from the app ([Sign in](#sign-in)): a chat started while
+  signed out fails fast — never a browser opened from the daemon — and shows the sign-in card.
+  The terminal view shows Cursor's "Press any key to log in…" until then.
 - **Where it lives.** `agent_state.rs` (`AgentKind::Cursor`, id `cursor`, `path_bin()` =
   `cursor-agent`), `launcher.rs` (detection, `build_acp_chat_command` → `cursor-agent acp`),
   `chat.rs` (ACP spawn, `NO_OPEN_BROWSER=1`), `runtimes.rs` (managed install, `cursor-agent`
@@ -193,6 +267,9 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   `~/.chimaera/agents/cursor/<package>/` with `bin/cursor` linking its entrypoint, and never
   writes `~/.local/bin`. Releases are dated builds (`2026.10.14-941492e`): updates order by
   date, and two builds of one date are never claimed newer.
+- **Extensions.** Cursor is a core agent of Extensions → Connections (`cursor-agent mcp list`,
+  with **Sign in in a terminal** for a server that needs a login) and of the Plugins group (a
+  notice: its CLI lists no plugins or skills) — [plugins.md](plugins.md#antigravity-grok-build-and-cursor-cli).
 - **Status.** Terminal use and detection/installation are verified; chat turns await a
   signed-in run of `CHIMAERA_TEST_CURSOR=… just chat-smoke-acp` (PROTOCOL.md, "Cursor CLI over
   ACP").
@@ -206,7 +283,14 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   `is_outdated`, `claude_resumables`); upstream latest-release probes in `agent_updates.rs`.
   Routes `GET /api/v1/agents`, `GET /api/v1/agents/claude/sessions`.
 - **Key behaviors.** Detection runs the registered agents' login shells + version probes concurrently (serial would
-  visibly stall the popover), with a 6s timeout backstopped by well-known paths. `is_outdated` flags
+  visibly stall the popover), with a 6s timeout backstopped by well-known paths. A hit is cached for
+  the daemon's lifetime (stat-validated, so an in-place update is noticed); a miss is stamped for 90 s
+  and served to **the catalog read only** (`GET /agents` without `refresh`), so a launcher paint or a
+  Settings poll doesn't re-run a login shell per uninstalled agent per call. Everything else probes:
+  a spawn, a refresh (the launcher's own open, Settings' load), Extensions' Check again (which also
+  forgets the stamps), and a changed `agents.<id>.path` (which forgets them too). A refresh whose
+  probe misses keeps a hit that still validates — a slow login shell never turns an installed agent
+  into "not installed". `is_outdated` flags
   npm-era codex (0.1.x). The Antigravity IDE's `agy` symlink (which just opens the GUI) is detected
   and refused. Resumables are scanned off the reactor, exclude transcripts already open in a live
   session, and are titled by the same custom > ai > first-prompt chain as live naming. Latest

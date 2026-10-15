@@ -155,6 +155,13 @@ pub(crate) struct AppState {
     /// cached per agent for the daemon's lifetime;
     /// `GET /api/v1/agents?refresh=true` bypasses and refills it.
     pub(crate) agent_bins: Mutex<HashMap<agents::AgentKind, launcher::AgentDetection>>,
+    /// Recent detection MISSES (the reason + when), served only to the
+    /// catalog read (`launcher::detect_for_catalog`, `GET /agents` without
+    /// `refresh`) for `launcher::MISS_TTL`, so a launcher paint or a Settings
+    /// poll doesn't re-run a login shell per uninstalled agent. Spawns and
+    /// refreshes always probe (a refresh that misses re-stamps it); forgotten
+    /// by a changed `agents.<id>.path`, Extensions' re-check, and the next hit.
+    pub(crate) agent_misses: Mutex<HashMap<agents::AgentKind, (String, Instant)>>,
     /// Root of Claude Code's per-project transcript store, normally
     /// `~/.claude/projects`; tests point it at a fixture dir.
     pub(crate) claude_projects_dir: PathBuf,
@@ -203,6 +210,9 @@ pub(crate) struct AppState {
     /// Latest installer result per built-in agent; bounded by the catalog.
     pub(crate) install_results: Mutex<HashMap<agents::AgentKind, crate::runtimes::InstallResult>>,
     pub(crate) agent_setup: Mutex<HashMap<agents::AgentKind, Arc<crate::agent_setup::Operation>>>,
+    /// Whether each agent CLI is signed in on this host, and its sign-in in
+    /// progress (`agent_auth`).
+    pub(crate) agent_auth: crate::agent_auth::AuthState,
     /// The user's own Claude Code settings file (`~/.claude/settings.json`);
     /// an explicit theme there suppresses chimaera's theme injection. Tests
     /// point it at a fixture.
@@ -338,6 +348,7 @@ impl AppState {
             notices: crate::notices::Notices::new(),
             browser_opens: crate::browser_open::BrowserOpens::default(),
             agent_bins: Mutex::new(HashMap::new()),
+            agent_misses: Mutex::new(HashMap::new()),
             claude_projects_dir: home.join(".claude").join("projects"),
             managed_root: data_dir.join("agents"),
             legacy_managed_root: None,
@@ -350,6 +361,7 @@ impl AppState {
             installs: Mutex::new(HashMap::new()),
             install_results: Mutex::new(HashMap::new()),
             agent_setup: Mutex::new(HashMap::new()),
+            agent_auth: crate::agent_auth::AuthState::default(),
             claude_settings_path: home.join(".claude").join("settings.json"),
             codex_config_path: codex_home(&home, std::env::var_os("CODEX_HOME"))
                 .join("config.toml"),
