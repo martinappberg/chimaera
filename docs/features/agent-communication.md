@@ -129,7 +129,8 @@ is not moved to the background: its result may be what the next step needs.
   wakes, inside the caps), **Ask me** (a wake request, every time), **Never** (it waits for the
   agent's next turn or the user's hand-over).
 - **How it's used.** A wake request shows where the user looks: a bar above the idle agent's
-  own composer — the sender, the message on one line, **Leave** · **Wake** (`WakeRequestBar`)
+  own composer — the sender, the message on one line, **Leave** · **Wake** (**Continue** past a
+  limit; `WakeRequestBar`)
   — an attention-colored glyph on its rail row, tab and focus-strip chip ("analyst sent a
   message — wake it?"), a "Message waiting" notification (`notifications.needsYou`; a click
   opens the agent), and a card in the dashboard's Needs you ("analyst wants to wake reviewer:
@@ -141,13 +142,20 @@ is not moved to the background: its result may be what the next step needs.
   Mastermind panel's inbox chip) or one Timeline message (`POST /timeline/{seq}/deliver`); a
   prompt the user types carries waiting messages too (claude's UserPromptSubmit hook).
 - **Key behaviors.** Caps: a fresh message wakes the same reader at most once per sender per 3
-  minutes (per pair, so a coordinator handing work to three idle agents wakes all three), 10
-  wakes per workspace per hour, 4 per conversation (a reply chain; a reply isn't held to the 3
-  minutes — a quick second question's answer would otherwise sit unread). Past a cap nothing
-  is left unseen: a message inside the 3 minutes wakes its reader once they have passed (the
-  sender is told "chimaera wakes it again in 2 min"); past the hour's wakes the user is asked
-  (the request says "hour's wakes used"); past the conversation's limit the user is asked "X
-  and Y have been going back and forth — let them continue?" (Continue resets it). A wake
+  minutes (per pair, so a coordinator handing work to three idle agents wakes all three), 4
+  wakes per conversation (a reply chain; a reply isn't held to the 3 minutes — a quick second
+  question's answer would otherwise sit unread), and 20 agent wakes in a workspace since the
+  user last stepped in there — a prompt to any of its agents (a chat's send at the socket, a
+  claude terminal's UserPromptSubmit; a chat's own UserPromptSubmit also fires for a wake, so
+  it doesn't count), a Wake or Continue, or a hand-over starts a new round. Time alone never
+  refills it: a loop left running overnight costs one round, while a coordinator's busy
+  afternoon never meets it as long as the user is there. Past a cap nothing is left unseen: a
+  message inside the 3 minutes wakes its reader once they have passed (the sender is told
+  "chimaera wakes it again in 2 min"); past the round the user is asked once — one
+  notification however many agents wait, each request saying "agents kept going" — and one
+  **Continue** lets every held agent go on and starts a new round; past the conversation's
+  limit the user is asked "X and Y have been going back and forth — let them continue?"
+  (Continue resets it). A wake
   starts with a line saying why ("[chimaera delivered this while you were idle: it answers a
   question you asked]"). Terminal agents are never woken, whatever the policy. Wake requests
   are one per reader (a notification only for a new one), at most 16 per workspace, and vanish
@@ -233,7 +241,10 @@ _Captured 2026-09-29/30 from the maintainer, in the design conversation that pro
 - **Wakes default to Automatically (2026-10-15).** The default was **Ask me** until a peer's
   message sat unread in an idle chat while its wake request waited in the dashboard, out of
   sight: "IT should be auto by default I feel", and a request that does need the user "should
-  come up there" — in the agent's own chat.
+  come up there" — in the agent's own chat. The same day the hourly workspace cap (10 wakes an
+  hour) gave way to a budget of about 20 agent wakes since the user last stepped in (a prompt
+  to any agent in the workspace, or answering a wake request), asked once past it, with
+  Continue refilling it — after the maintainer asked whether 10 an hour "really make[s] sense".
 - **How settled it is (intended vs provisional):** the calls above are the maintainer's.
   The mechanics — the carriers, the caps, the tool names, the header format — are how it
   works now.

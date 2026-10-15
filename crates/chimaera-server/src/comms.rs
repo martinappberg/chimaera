@@ -76,21 +76,28 @@ pub(crate) const SEND_TOOL: &str = "message_agent";
 /// (shared with plugins' Timeline appends).
 const POSTS_PER_MINUTE: usize = 10;
 /// A fresh message (no `reply_to`) wakes the same reader at most this often
-/// per sender, a workspace sees at most `WAKES_PER_HOUR` wakes, and one
-/// conversation (a reply chain) at most `THREAD_WAKES_MAX` — two agents
-/// messaging each other can't become a billed loop. A reply is bounded by
-/// its conversation, not the gap: a second question within the gap would
+/// per sender, one conversation (a reply chain) at most `THREAD_WAKES_MAX`
+/// times, and a workspace's agents at most `UNATTENDED_WAKES_MAX` times
+/// between two of the user's own actions there — agents messaging each
+/// other can't become a billed loop. A reply is bounded by its
+/// conversation, not the gap: a second question within the gap would
 /// otherwise leave its answer unread beside an asker waiting for it. Past a
 /// cap nothing is silently stranded: a message inside the gap wakes its
-/// reader once the gap has passed, and past the hour's or the
-/// conversation's wakes the user is asked. Short under test, so the
-/// deferred wake can be watched.
+/// reader once the gap has passed, and past the conversation's or the
+/// unattended limit the user is asked. Short under test, so the deferred
+/// wake can be watched.
 const WAKE_GAP: Duration = if cfg!(test) {
     Duration::from_secs(2)
 } else {
     Duration::from_secs(180)
 };
-const WAKES_PER_HOUR: usize = 10;
+/// Agent wakes a workspace's agents may make on their own since the user
+/// last stepped in there (a prompt to any of its agents, a Wake or Continue,
+/// a hand-over): past it the user is asked once, and Continue gives another
+/// round. It bounds what a loop left running overnight costs, where a rate
+/// per hour refilled forever and still stopped a busy coordinator's second
+/// round.
+const UNATTENDED_WAKES_MAX: usize = 20;
 const THREAD_WAKES_MAX: usize = 4;
 /// Conversations whose wake counts are kept (oldest forgotten first).
 const THREADS_TRACKED: usize = 512;
@@ -217,8 +224,8 @@ pub(crate) struct WakeRequest {
     pub(crate) message: u64,
     pub(crate) text: String,
     /// "ask" (the wake policy asks first) | "hop_limit" (a conversation
-    /// used its wakes; continuing is the user's call) | "hourly" (the
-    /// workspace used the hour's wakes).
+    /// used its wakes; continuing is the user's call) | "unattended" (the
+    /// workspace's agents used their wakes since the user last stepped in).
     pub(crate) reason: &'static str,
     pub(crate) created_ms: u64,
     #[serde(skip)]
@@ -235,8 +242,8 @@ struct CommsState {
     /// Per (workspace, reader): a wake held back by the gap is scheduled
     /// (one timer per reader, however many messages wait behind it).
     deferred: HashSet<(String, String)>,
-    /// Per workspace: the wakes in the last hour.
-    wakes: HashMap<String, VecDeque<Instant>>,
+    /// Per workspace: agent wakes since the user last stepped in.
+    unattended: HashMap<String, usize>,
     /// Per (workspace, thread root): wakes so far, with insertion order for
     /// forgetting the oldest.
     thread_wakes: HashMap<(String, u64), usize>,
@@ -316,7 +323,7 @@ impl Comms {
         let mut st = crate::lock(&self.inner);
         st.inboxes.remove(ws);
         st.requests.remove(ws);
-        st.wakes.remove(ws);
+        st.unattended.remove(ws);
         st.epochs.remove(ws);
         st.dirty.remove(ws);
         st.awaiting.retain(|(w, _), _| w != ws);
@@ -429,8 +436,9 @@ pub(crate) fn take_post_slot(state: &AppState, sid: &str) -> Result<(), String> 
 enum Capped {
     /// The conversation used its wakes: continuing is the user's call.
     Conversation,
-    /// The workspace's wakes for the hour are used: the user is asked.
-    Hourly,
+    /// The workspace's agents used their wakes since the user last stepped
+    /// in: the user is asked whether they keep going.
+    Unattended,
     /// This sender woke this reader moments ago: the wake waits this long.
     Gap(Duration),
 }
@@ -457,17 +465,11 @@ impl CommsState {
                 return Err(Capped::Gap(WAKE_GAP.saturating_sub(t.elapsed())));
             }
         }
-        let window = self.wakes.entry(ws.to_string()).or_default();
-        while window
-            .front()
-            .is_some_and(|t| t.elapsed() > Duration::from_secs(3600))
-        {
-            window.pop_front();
+        let used = self.unattended.entry(ws.to_string()).or_insert(0);
+        if *used >= UNATTENDED_WAKES_MAX {
+            return Err(Capped::Unattended);
         }
-        if window.len() >= WAKES_PER_HOUR {
-            return Err(Capped::Hourly);
-        }
-        window.push_back(Instant::now());
+        *used += 1;
         // The gap is a fresh message's: a reply neither checks nor sets it.
         match thread {
             Some(key) => self.count_thread_wake(key),
@@ -499,8 +501,8 @@ impl CommsState {
         ws: &str,
         thread: Option<&(String, u64)>,
     ) {
-        if let Some(window) = self.wakes.get_mut(ws) {
-            window.pop_back();
+        if let Some(used) = self.unattended.get_mut(ws) {
+            *used = used.saturating_sub(1);
         }
         match thread {
             Some(key) => {
@@ -1169,7 +1171,9 @@ fn decide_idle(
             Err(Capped::Conversation) => {
                 Plan::Inbox("this conversation woke the Mastermind enough for now")
             }
-            Err(Capped::Hourly) => Plan::Inbox("the Mastermind was woken enough this hour"),
+            Err(Capped::Unattended) => Plan::Inbox(
+                "the agents here have woken each other enough since the user last stepped in",
+            ),
         };
     }
     if policy == WakePolicy::Ask && !reply_wake {
@@ -1180,7 +1184,7 @@ fn decide_idle(
         Ok(()) => Plan::Wake("the user lets agents in this workspace wake each other"),
         Err(Capped::Gap(after)) => Plan::Later(after),
         Err(Capped::Conversation) => Plan::Request("hop_limit"),
-        Err(Capped::Hourly) => Plan::Request("hourly"),
+        Err(Capped::Unattended) => Plan::Request("unattended"),
     }
 }
 
@@ -1669,7 +1673,7 @@ async fn execute(
             ask_user(state, &target.ws, req);
             match reason {
                 "hop_limit" => "you two have gone back and forth enough for now; the user was asked whether to let the conversation continue — until then it waits in its inbox".into(),
-                "hourly" => "agents here have used this hour's wakes; the user was asked whether to wake it — until then it waits in its inbox".into(),
+                "unattended" => "agents here have woken each other enough since the user last stepped in; the user was asked whether to let them keep going — until then it waits in its inbox".into(),
                 _ => "it's idle; the user was asked whether to wake it — until then it waits in its inbox".into(),
             }
         }
@@ -1787,6 +1791,11 @@ async fn deliver_all(
 pub(crate) async fn hook_context(state: &Arc<AppState>, sid: &str, event: &str) -> Vec<String> {
     if !matches!(event, "PostToolUse" | "UserPromptSubmit" | "SessionStart") || !enabled(state) {
         return Vec::new();
+    }
+    // A terminal's prompt is the user's own (nothing types into one); a
+    // chat's also fires for a wake, so a chat's counts at the socket.
+    if event == "UserPromptSubmit" && state.chat.get(sid).is_none() {
+        user_stepped_in(state, sid);
     }
     let Some(reader) = reader(state, sid) else {
         return Vec::new();
@@ -1912,14 +1921,52 @@ fn defer_wake(state: &Arc<AppState>, ws: &str, sid: &str, after: Duration) {
 }
 
 /// Put a wake request in front of the user — Needs you, the reader's own
-/// chat, and (once per request) a notification.
+/// chat, and (once per request) a notification. Past the unattended limit
+/// the user is asked once: one notification however many agents wait
+/// behind it, and one Continue lets them all go on (`post_wake`).
 fn ask_user(state: &Arc<AppState>, ws: &str, req: WakeRequest) {
     let announce = req.clone();
-    let fresh = crate::lock(&state.comms.inner).request(ws, req);
+    let fresh = {
+        let mut st = crate::lock(&state.comms.inner);
+        let asked = req.reason == "unattended"
+            && st
+                .requests
+                .get(ws)
+                .is_some_and(|list| list.iter().any(|r| r.reason == "unattended"));
+        st.request(ws, req) && !asked
+    };
     if fresh {
         crate::notices::push_wake_notice(state, &announce);
     }
     state.changes.notify_waiters();
+}
+
+/// Use up a workspace's unattended wakes (tests drive the limit without
+/// twenty real wakes).
+#[cfg(test)]
+pub(crate) fn use_unattended_wakes_for_tests(state: &AppState, ws: &str) {
+    crate::lock(&state.comms.inner)
+        .unattended
+        .insert(ws.to_string(), UNATTENDED_WAKES_MAX);
+}
+
+/// How many unattended wakes a workspace's agents have used.
+#[cfg(test)]
+pub(crate) fn unattended_wakes_for_tests(state: &AppState, ws: &str) -> usize {
+    crate::lock(&state.comms.inner)
+        .unattended
+        .get(ws)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// The user acted in `sid`'s workspace — a prompt to one of its agents, a
+/// Wake or Continue, a hand-over: its agents' unattended wakes start over.
+pub(crate) fn user_stepped_in(state: &AppState, sid: &str) {
+    let Some(ws) = crate::lock(&state.session_workspaces).get(sid).cloned() else {
+        return;
+    };
+    crate::lock(&state.comms.inner).unattended.remove(&ws);
 }
 
 /// A chat reader went idle with messages it never read (its turn ended, or
@@ -2507,13 +2554,33 @@ pub(crate) async fn post_wake(
     let Some(target) = reader(&state, &req.to_sid) else {
         return fail(StatusCode::CONFLICT, "that agent is gone");
     };
-    // The user approved continuing: the conversation's wake count restarts.
-    if let Some(key) = &req.thread {
-        crate::lock(&state.comms.inner).thread_wakes.remove(key);
-    }
+    // The user approved: the conversation's wake count restarts, the
+    // workspace's agents get a new round of wakes, and a Continue past that
+    // limit lets every agent it held back go on — the user is asked once.
+    let held: Vec<WakeRequest> = {
+        let mut st = crate::lock(&state.comms.inner);
+        if let Some(key) = &req.thread {
+            st.thread_wakes.remove(key);
+        }
+        st.unattended.remove(&id);
+        let held = if req.reason == "unattended" {
+            let list = st.requests.entry(id.clone()).or_default();
+            let (held, keep): (Vec<_>, Vec<_>) = std::mem::take(list)
+                .into_iter()
+                .partition(|r| r.reason == "unattended");
+            *list = keep;
+            held
+        } else {
+            Vec::new()
+        };
+        if !held.is_empty() {
+            bump(&mut st, &id);
+        }
+        held
+    };
     let why = "[chimaera delivered these because the user approved waking you for messages from \
                other agents in this workspace]";
-    match deliver_all(
+    let answer = match deliver_all(
         &state,
         &target,
         Some(why),
@@ -2526,7 +2593,68 @@ pub(crate) async fn post_wake(
             Json(json!({ "woke": true, "delivered": n })).into_response()
         }
         Err(err) => fail(StatusCode::CONFLICT, err),
+    };
+    for other in held {
+        let Some(reader) = reader(&state, &other.to_sid).filter(|r| r.alive && r.chat) else {
+            continue;
+        };
+        // Each is an agent wake like any other: it counts against the new
+        // round and keeps the pair's gap and the conversation's limit.
+        let claim = crate::lock(&state.comms.inner).claim_wake(
+            &other.from_sid,
+            &reader.sid,
+            &id,
+            other.thread.clone(),
+        );
+        match claim {
+            Ok(()) => {
+                let why = "[chimaera delivered these because the user let the agents in this \
+                           workspace keep going]";
+                match deliver_all(
+                    &state,
+                    &reader,
+                    Some(why),
+                    chimaera_agent::model::ORIGIN_AGENT,
+                )
+                .await
+                {
+                    Ok(n) if n > 0 => crate::history::act(
+                        &state,
+                        &id,
+                        "you",
+                        "wake_agent",
+                        Some(&reader.sid),
+                        None,
+                    ),
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::warn!(%err, session = %reader.sid, "continued wake not delivered");
+                        crate::lock(&state.comms.inner).release_wake(
+                            &other.from_sid,
+                            &reader.sid,
+                            &id,
+                            other.thread.as_ref(),
+                        );
+                    }
+                }
+            }
+            Err(Capped::Gap(after)) => {
+                crate::lock(&state.comms.inner).await_turn_end(&id, &reader.sid, other.message);
+                defer_wake(&state, &id, &reader.sid, after);
+            }
+            Err(Capped::Conversation) => ask_user(
+                &state,
+                &id,
+                WakeRequest {
+                    reason: "hop_limit",
+                    ..other
+                },
+            ),
+            Err(Capped::Unattended) => ask_user(&state, &id, other),
+        }
     }
+    state.changes.notify_waiters();
+    answer
 }
 
 #[derive(Deserialize)]
@@ -2547,6 +2675,7 @@ pub(crate) async fn post_deliver(
     let Some(target) = reader(&state, &body.session).filter(|r| r.ws == id) else {
         return fail(StatusCode::NOT_FOUND, "no such agent in this workspace");
     };
+    user_stepped_in(&state, &target.sid);
     let why = "[the user handed you these messages from other agents in this workspace]";
     match deliver_all(
         &state,
@@ -2647,6 +2776,7 @@ pub(crate) async fn deliver(
         .then_some(chimaera_agent::model::ORIGIN_AGENT);
     match state.chat.command_as(&target, command, origin).await {
         Ok(()) => {
+            user_stepped_in(&state, &target);
             tracing::info!(workspace = %id, note = seq, target = %target, "note delivered by the user");
             crate::history::act(
                 &state,
@@ -2869,19 +2999,25 @@ mod tests {
             Ok(()),
             "a coordinator wakes each idle agent it hands work to"
         );
-        for i in 0..WAKES_PER_HOUR - 2 {
+        for i in 0..UNATTENDED_WAKES_MAX - 2 {
             assert_eq!(st.claim_wake(&format!("s{i}"), "r", "w", None), Ok(()));
         }
         assert_eq!(
             st.claim_wake("late", "r", "w", None),
-            Err(Capped::Hourly),
-            "the hourly cap"
+            Err(Capped::Unattended),
+            "the agents' wakes since the user last stepped in"
         );
         assert_eq!(
             st.claim_wake("late", "r", "other", None),
             Ok(()),
             "per workspace"
         );
+        // Time alone never refills it; the user stepping in does.
+        st.unattended.remove("w");
+        assert_eq!(st.claim_wake("late", "r3", "w", None), Ok(()));
+        // A failed wake gives its share back.
+        st.release_wake("late", "r3", "w", None);
+        assert_eq!(st.unattended["w"], 0);
 
         let mut st = CommsState::default();
         let thread = Some(("w".to_string(), 7u64));
@@ -2937,14 +3073,14 @@ mod tests {
             "inside the gap: woken once it passes, never left unseen"
         );
         let mut st = CommsState::default();
-        for i in 0..WAKES_PER_HOUR {
+        for i in 0..UNATTENDED_WAKES_MAX {
             st.claim_wake(&format!("s{i}"), "elsewhere", "w", None)
                 .unwrap();
         }
         assert_eq!(
             plan(&mut st, WakePolicy::Auto),
-            Plan::Request("hourly"),
-            "the hour's wakes used: the user decides"
+            Plan::Request("unattended"),
+            "the agents used their wakes since the user stepped in: the user decides"
         );
         assert_eq!(soon(Duration::from_secs(40)), "in 40 s");
         assert_eq!(soon(Duration::from_secs(170)), "in 3 min");

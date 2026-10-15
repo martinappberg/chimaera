@@ -513,6 +513,131 @@ async fn a_wake_inside_the_gap_comes_when_it_passes() {
     }
 }
 
+/// Agents get a round of wakes between two of the user's own actions in a
+/// workspace. Past it the user is asked once — one notification however
+/// many agents wait — and one Continue lets every held agent go on; a
+/// prompt the user sends (a chat's socket, a terminal's own hook) starts a
+/// new round too, while a chat's hook (it fires for a wake as well) doesn't.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn past_the_unattended_limit_the_user_is_asked_once_and_continue_lets_all_go_on() {
+    let state = test_state();
+    set_comms(&state, true, "auto").await;
+    let ws = make_workspace(&state, "comms-unattended").await;
+    let a = tui(&state, &ws, "ka");
+    let (c1, _) = chat(&state, &ws, "comms-unattended-1").await;
+    let (c2, _) = chat(&state, &ws, "comms-unattended-2").await;
+    crate::comms::use_unattended_wakes_for_tests(&state, &ws);
+
+    let (_, text) = send(
+        &state,
+        &a,
+        "ka",
+        serde_json::json!({"to": c1, "text": "held-one"}),
+    )
+    .await;
+    assert!(text.contains("keep going"), "{text}");
+    let (_, text) = send(
+        &state,
+        &a,
+        "ka",
+        serde_json::json!({"to": c2, "text": "held-two"}),
+    )
+    .await;
+    assert!(text.contains("keep going"), "{text}");
+    let body = comms(&state, &ws).await;
+    let requests = body["wake_requests"].as_array().unwrap();
+    assert_eq!(requests.len(), 2, "{body}");
+    assert!(
+        requests.iter().all(|r| r["reason"] == "unattended"),
+        "{body}"
+    );
+    let announced = state
+        .notices
+        .since(0)
+        .into_iter()
+        .filter(|n| n.kind == notices::NoticeKind::Wake)
+        .count();
+    assert_eq!(announced, 1, "asked once, however many agents wait");
+
+    let wid = requests
+        .iter()
+        .find(|r| r["to_sid"] == c1.as_str())
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (status, out) = request(
+        &state,
+        Method::POST,
+        &format!("/api/v1/workspaces/{ws}/comms/wakes/{wid}"),
+        Some(serde_json::json!({"wake": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    journal_has(&state, &c1, "held-one").await;
+    let content = journal_has(&state, &c2, "held-two").await;
+    assert!(content.contains("keep going"), "{content}");
+    assert!(comms(&state, &ws).await["wake_requests"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        crate::comms::unattended_wakes_for_tests(&state, &ws),
+        1,
+        "a new round; the released agent's wake counts against it"
+    );
+
+    // The user's own prompt in a chat (its socket's send) starts a new round.
+    {
+        use futures::SinkExt;
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = app(state.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/chat/{c1}"))
+            .await
+            .unwrap();
+        socket
+            .send(WsMessage::text(
+                serde_json::json!({"type": "auth", "token": "test-token", "last_seq": 0})
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+        socket
+            .send(WsMessage::text(
+                serde_json::json!({"type": "send", "blocks": [{"type": "text", "text": "carry on"}]})
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while crate::comms::unattended_wakes_for_tests(&state, &ws) != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the chat prompt didn't count"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        server.abort();
+    }
+
+    // So does the user's own prompt in a terminal agent.
+    crate::comms::use_unattended_wakes_for_tests(&state, &ws);
+    hook(&state, &a, "ka", "UserPromptSubmit").await;
+    assert_eq!(crate::comms::unattended_wakes_for_tests(&state, &ws), 0);
+    // A chat's own UserPromptSubmit also fires for a wake: it never counts.
+    crate::comms::use_unattended_wakes_for_tests(&state, &ws);
+    let key = lock(&state.agents).get(&c2).unwrap().key.clone();
+    hook(&state, &c2, &key, "UserPromptSubmit").await;
+    assert_ne!(crate::comms::unattended_wakes_for_tests(&state, &ws), 0);
+
+    state.chat.kill(&c1);
+    state.chat.kill(&c2);
+    state.sessions.kill(&a).ok();
+}
+
 /// A reply to a question the reader asked (`expect_reply`) wakes it even
 /// when the policy asks first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

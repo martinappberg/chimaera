@@ -261,7 +261,7 @@ const DEFS = {
     title: "Agents may wake each other",
     category: "Agents",
     description:
-      "Whether another agent's message may start a turn in an idle agent — a turn billed to your account. Automatically wakes it, up to 10 wakes an hour per workspace and 4 rounds of one back-and-forth; past those you're asked. Ask me asks every time, in the agent's chat and in Needs you; a reply to a question it asked still wakes it. Never keeps messages in its inbox until it looks or you hand them over. Terminal agents are never woken.",
+      "Whether another agent's message may start a turn in an idle agent — a turn billed to your account. Automatically wakes it — up to 20 wakes in a workspace since you last stepped in (a prompt to any of its agents, or a Wake) and 4 rounds of one back-and-forth; past those you're asked once. Ask me asks every time, in the agent's chat and in Needs you; a reply to a question it asked still wakes it. Never keeps messages in its inbox until it looks or you hand them over. Terminal agents are never woken.",
     type: "enum",
     default: "auto",
     options: [

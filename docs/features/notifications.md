@@ -23,7 +23,8 @@ and in `App.svelte` the view reporting + `focusFromNotification`.
   edge of an agent session: `done` (running → finished), `input` (the turn ended waiting on
   you), `permission`, `question`, `error`, `rate_limited`, `agent` (the `notify` tool), and
   `wake` — another agent's message waiting for the user's OK to wake an idle agent ("Message
-  waiting", subtitle "Message from ⟨sender⟩"; one per new wake request, pushed by
+  waiting", subtitle "Message from ⟨sender⟩"; one per new wake request — one in all past the
+  unattended-wakes limit, however many agents it holds — pushed by
   `comms.rs`, never by the state watcher — [agent-communication.md](agent-communication.md#wakes-and-wake-requests)).
   Each carries the session's display name, its workspace, a state phrase, and a body quoting
   what it was about — how the final reply starts, the permission line ("Bash: rm -rf build"),

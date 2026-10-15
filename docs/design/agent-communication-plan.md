@@ -225,6 +225,11 @@ origin's chip, generalized). It bills the user, so it's policy-gated:
   it). Past a cap the message still lands
   in the inbox, the sender is told so, and a hop-limit hit tells the user
   "X and Y have been going back and forth — let them continue?"
+  *As built since 2026-10-15:* the gap is per sender AND reader, a message
+  inside it wakes its reader once it passes, and the hourly cap is replaced
+  by 20 agent wakes per workspace since the user last stepped in (a prompt,
+  a Wake/Continue, a hand-over), asked once past it, one Continue releasing
+  every held agent.
 - Broadcasts (`"everyone"`) never wake anyone.
 - Terminal agents are never woken, whatever the policy.
 

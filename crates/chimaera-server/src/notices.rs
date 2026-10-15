@@ -422,10 +422,10 @@ pub(crate) fn push_wake_notice(state: &AppState, req: &crate::comms::WakeRequest
     }
     let from = crate::session_view::display_name_now(state, &req.from_sid)
         .unwrap_or_else(|| req.from_name.clone());
-    let lead = if req.reason == "hop_limit" {
-        format!("Back and forth with {from}")
-    } else {
-        format!("Message from {from}")
+    let lead = match req.reason {
+        "hop_limit" => format!("Back and forth with {from}"),
+        "unattended" => format!("Agents kept going · message from {from}"),
+        _ => format!("Message from {from}"),
     };
     let subtitle = match &subject.workspace {
         Some(ws) => format!("{lead} · {ws}"),

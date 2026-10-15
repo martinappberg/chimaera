@@ -20,8 +20,8 @@ import { dotState, dotTitle, type Session } from "./sessions";
 export type WakePolicy = "never" | "ask" | "auto";
 
 /** A message that would start a turn in an idle agent, waiting on the user:
- *  the "Ask me" policy, a thread that hit its hop limit, or a workspace that
- *  used the hour's wakes. */
+ *  the "Ask me" policy, a thread that hit its hop limit, or a workspace whose
+ *  agents used their wakes since the user last stepped in. */
 export interface WakeRequest {
   id: string;
   to_sid: string;
@@ -34,7 +34,7 @@ export interface WakeRequest {
   message: number;
   /** That message's text (the card shows one clamped line). */
   text: string;
-  /** "ask" | "hop_limit" | "hourly", verbatim; anything else reads as "ask". */
+  /** "ask" | "hop_limit" | "unattended", verbatim; anything else reads as "ask". */
   reason: string;
   created_ms: number;
 }

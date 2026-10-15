@@ -29,6 +29,8 @@
   const from = $derived(names.get(request.from_sid) ?? request.from_name);
   const to = $derived(names.get(request.to_sid) ?? request.to_name);
   const hop = $derived(request.reason === "hop_limit");
+  /** Past a limit the question is whether to let them keep going. */
+  const cont = $derived(hop || request.reason === "unattended");
   const oneLine = $derived(request.text.replace(/\s+/g, " ").trim());
 
   let busy = $state<"wake" | "leave" | null>(null);
@@ -67,8 +69,8 @@
       {@render who(request.from_sid, from)}
       <span class="words">wants to wake</span>
       {@render who(request.to_sid, to)}
-      {#if request.reason === "hourly"}
-        <span class="words" title="agents in this workspace used this hour's wakes, so chimaera asks before the next">· hour's wakes used</span>
+      {#if request.reason === "unattended"}
+        <span class="words" title="agents here have woken each other many times since you last stepped in — Continue lets them keep going">· agents kept going</span>
       {/if}
     {/if}
   </div>
@@ -77,7 +79,7 @@
   {/if}
   {#if failure !== null}
     <div class="actions">
-      <span class="err" role="alert">couldn't {hop ? "continue" : "wake"} {to} — {failure}</span>
+      <span class="err" role="alert">couldn't {cont ? "continue" : "wake"} {to} — {failure}</span>
       <button class="btn" onclick={() => dismissWakeFailure(request.id)}>Dismiss</button>
     </div>
   {:else}
@@ -88,7 +90,7 @@
         title="deliver {to}'s waiting messages now — one turn, billed to your account"
         onclick={() => answer(true)}
       >
-        {busy === "wake" ? (hop ? "continuing…" : "waking…") : hop ? "Continue" : "Wake"}
+        {busy === "wake" ? (cont ? "continuing…" : "waking…") : cont ? "Continue" : "Wake"}
       </button>
       <button
         class="btn"

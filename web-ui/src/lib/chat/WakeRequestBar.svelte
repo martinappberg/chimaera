@@ -4,8 +4,11 @@
    * agent (agent communication's wake request), pinned above the composer
    * of the agent it would wake — where the user is looking — as well as in
    * the dashboard's Needs you. **Wake** delivers every waiting message as
-   * one turn, billed to the user; **Leave** keeps them in the inbox (the
-   * agent reads them when it next works, or with the user's next prompt).
+   * one turn, billed to the user (**Continue** past a limit: a conversation
+   * that went back and forth, or agents that kept waking each other while
+   * the user was away — one Continue lets every held agent go on); **Leave**
+   * keeps them in the inbox (the agent reads them when it next works, or
+   * with the user's next prompt).
    * A refused answer stays as the bar with the daemon's words until
    * dismissed. The message is an agent's words: plain text, one line.
    */
@@ -24,14 +27,18 @@
 
   let busy = $state<"wake" | "leave" | null>(null);
 
-  const hop = $derived(request?.reason === "hop_limit");
+  /** Past a limit the question is whether to let them keep going. */
+  const cont = $derived(request?.reason === "hop_limit" || request?.reason === "unattended");
   const oneLine = $derived((request?.text ?? "").replace(/\s+/g, " ").trim());
   /** Why chimaera asks although the user lets agents wake each other. */
   const why = $derived(
     request?.reason === "hop_limit"
       ? { words: "back and forth", title: "these two agents have woken each other several times — continue?" }
-      : request?.reason === "hourly"
-        ? { words: "hour's wakes used", title: "agents here used this hour's wakes, so chimaera asks before the next" }
+      : request?.reason === "unattended"
+        ? {
+            words: "agents kept going",
+            title: "agents here have woken each other many times since you last stepped in — Continue lets them keep going",
+          }
         : null,
   );
 
@@ -50,7 +57,9 @@
 
 {#if failure !== null && request === null}
   <div class="pinned-card wake-card" class:visible role="alert">
-    <span class="text err">couldn't {failure.request.reason === "hop_limit" ? "continue" : "wake"} — {failure.message}</span>
+    <span class="text err"
+      >couldn't {failure.request.reason === "hop_limit" || failure.request.reason === "unattended" ? "continue" : "wake"} — {failure.message}</span
+    >
     <span class="actions">
       <button class="opt quiet" onclick={() => dismissWakeFailure(failure.request.id)}>Dismiss</button>
     </span>
@@ -75,7 +84,7 @@
         disabled={busy !== null}
         title="deliver it now — a turn billed to your account"
         onclick={() => void answer(true)}
-        >{busy === "wake" ? (hop ? "Continuing…" : "Waking…") : hop ? "Continue" : "Wake"}</button
+        >{busy === "wake" ? (cont ? "Continuing…" : "Waking…") : cont ? "Continue" : "Wake"}</button
       >
     </span>
   </div>
