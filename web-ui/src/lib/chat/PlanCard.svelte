@@ -147,8 +147,6 @@
     display: flex;
     align-items: flex-start;
     flex: none;
-    margin-top: 6px;
-    margin-bottom: 6px;
     border: 1px solid var(--edge);
     border-radius: 8px; /* the composer's and the approval card's */
     background: color-mix(in srgb, var(--fg) 2%, var(--bg));

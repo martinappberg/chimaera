@@ -732,12 +732,12 @@
     }
   }
 
-  /* The work drop-down rides the shared WorkTray shell full-bleed, so its
-     border-top + tint read as the card's own strip — the same chrome the
-     chat trays wear, never a forked copy. Row content mirrors AgentsTray
-     (subagent rows) and BackgroundTray (background rows). */
+  /* The work drop-down rides the shared WorkTray shell — the same card
+     the chat trays wear, never a forked copy — inset inside this card like
+     the plan rows above it. Row content mirrors AgentsTray (subagent rows)
+     and BackgroundTray (background rows). */
   .work {
-    margin: 2px -12px;
+    margin: 6px 0 2px;
   }
   .subname {
     flex: none;

@@ -148,7 +148,7 @@
   .head {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 2px;
     min-width: 0;
   }
   .line {
@@ -232,8 +232,7 @@
   .output:hover,
   .output:focus-visible {
     color: var(--fg);
-    text-decoration: underline;
-    text-underline-offset: 2px;
+    background: color-mix(in srgb, var(--fg) 4%, transparent);
   }
   .report {
     margin: 2px 0 8px 2px;

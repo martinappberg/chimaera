@@ -524,8 +524,10 @@
     background: var(--accent);
     animation: pulse 1.4s ease-in-out infinite;
   }
+  /* Settled and fine is the expected outcome: the row's quiet voice (the
+     finished rows' check), not the live accent. */
   .dot.ok {
-    background: var(--accent);
+    background: color-mix(in srgb, var(--accent) 55%, var(--muted));
   }
   .dot.bad {
     background: var(--err);
