@@ -37,12 +37,11 @@ function pairKey(session: string, other: string, path: string): string {
 }
 
 /** What, about a session in an overlap, can change which of its writes are
- *  current: its turn state and the files it last wrote. */
+ *  current: its turn state and the file it last wrote. Nothing that moves
+ *  per snapshot (`output_active` flips while a terminal agent streams), or
+ *  an overlap would refetch the route continuously. */
 function writerSignature(s: Session): string {
-  const files = s.files_touched ?? [];
-  return [s.id, s.agent_state ?? "", s.output_active ?? "", files.length, files.at(-1) ?? ""].join(
-    "\u0000",
-  );
+  return [s.id, s.agent_state ?? "", s.files_touched?.at(-1) ?? ""].join("\u0000");
 }
 
 class SameFileState {
