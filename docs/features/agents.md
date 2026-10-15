@@ -68,13 +68,15 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   never reorder on click — only a menu choice moves the default. A missing quick agent keeps its
   row with a small accent step instead of spawning a doomed pane: **install** (curated install,
   opens the setup dialog), **set up chat**, or **set up** (no curated install → Settings → Agents).
-- **The agent menu.** The chevron opens it on hover, click, or ArrowDown. The quick agents come
-  first in rail order; a hairline labelled *other agents* separates the rest, ready ones first.
-  Each row is one line: glyph, name, version in mono (binary + path in the tooltip; a dated build
-  such as Cursor's `2026.10.14-941492e` reads as its date), `→ <new>` when a newer release is
-  known, docs ↗ on hover, a **chat** button and a terminal icon — or, when not ready, *not
-  installed* / *needs an update* / *chat needs setup* with an install/update/set-up chip. The
-  footer holds the `⌘↵ terminal` hint and **agent settings →**, which opens Settings at Agents.
+- **The agent menu.** The chevron opens it on hover, click, or ArrowDown. The installed agents
+  come first, the saved default leading (no built-in bias); the ones not installed stay folded
+  behind one *other agents* row (remembered open/closed), and with nothing installed every agent
+  shows. Each row is one line: glyph, name, version in mono (binary + path in the tooltip; a dated
+  build such as Cursor's `2026.10.14-941492e` reads as its date), `→ <new>` when a newer release is
+  known, and a terminal glyph that fades in on hover — the row itself opens the chat — or, when
+  not ready, *not installed* / *needs an update* / *chat needs setup* with an install/update/set-up
+  chip. Docs live in Settings → Agents. The footer holds the `⌘↵ terminal` hint, the worktree
+  switch in git workspaces, and **agent settings →**, which opens Settings at Agents.
   Keyboard: focus stays in the menu with a roving highlight (`aria-activedescendant`);
   Arrow keys wrap through the rows and the settings link, Home/End jump, Enter does the row's
   action, ⌘/Ctrl+Enter opens the terminal, Escape closes and returns focus to the chevron.
