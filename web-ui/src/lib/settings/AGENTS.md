@@ -90,7 +90,7 @@ wakes row always shows.
   `app.css` fallbacks), chat 14 px at line height 1.57, rendered Markdown 14 px.
 - **Reading Width (`chat.contentWidth`) is the column width**, not a cap on 48em:
   `ChatView`'s `--chat-column` and `MarkdownView`/`mdLive`'s `--doc-measure` use it
-  directly (default 672 = 48em of 14 px). Wrapping it in a `min()` with an em measure
+  directly (default 680, the desktop app's column). Wrapping it in a `min()` with an em measure
   again makes every wider value a no-op — the bug #284 fixed.
 - **Every key needs a consumer.** A new schema row is read at its consumption site
   (`getSetting`, or `settings.rs` for daemon keys) and applies live; the PR that adds

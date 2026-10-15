@@ -2865,6 +2865,14 @@ impl ClaudeMapper {
             self.tool_kinds.insert(id, ToolKind::Think);
             return;
         }
+        // Chimaera's own plan tool (the MCP server's `update_plan`, what a
+        // headless claude has instead of TaskCreate): the daemon journals the
+        // plan level-set itself, and the card is the whole surface — a
+        // "mcp__chimaera__update_plan" row under it would say nothing.
+        if name == CHIMAERA_PLAN_TOOL {
+            self.tool_kinds.insert(id, ToolKind::Think);
+            return;
+        }
 
         // Questions are a first-class card (QuestionRequest via the
         // can_use_tool path), not a tool row: a bare "AskUserQuestion" card
@@ -4717,6 +4725,9 @@ const PENDING_TASK_CAP: usize = 64;
 
 /// The agent's task list, reconstructed from claude's `Task*` tool family.
 ///
+/// The chimaera MCP server's plan tool as claude names it (`mcp__<server>__<tool>`).
+const CHIMAERA_PLAN_TOOL: &str = "mcp__chimaera__update_plan";
+
 /// `TodoWrite` was a LEVEL-SET — every call carried the whole list, so the
 /// driver was a pure translator. `TaskCreate`/`TaskUpdate` are INCREMENTAL
 /// (create one, patch one by id), so the list has to be held here and
@@ -7197,6 +7208,46 @@ pub(crate) mod tests {
             }
             other => panic!("expected diff update, got {other:?}"),
         }
+    }
+
+    /// Chimaera's own `update_plan` (the MCP tool a headless claude keeps
+    /// its plan with) draws the card through the daemon's journal, so the
+    /// call itself renders no row; its result is still absorbed, not
+    /// reported as an update to a row that never was.
+    #[test]
+    fn chimaera_update_plan_renders_no_row() {
+        let mut m = mapper();
+        m.turn_active = true;
+        let step = m.on_frame(&json!({
+            "type": "assistant",
+            "message": { "id": "m1", "content": [
+                { "type": "tool_use", "id": "tu-plan", "name": CHIMAERA_PLAN_TOOL,
+                  "input": { "items": [ { "content": "a", "status": "pending" } ] } },
+            ]},
+        }));
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolCall { .. })),
+            "{:?}",
+            step.events
+        );
+        let step = m.on_frame(&json!({
+            "type": "user",
+            "message": { "content": [
+                { "type": "tool_result", "tool_use_id": "tu-plan",
+                  "content": "Plan shown (0/1 done)." },
+            ]},
+        }));
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolCall { .. })),
+            "{:?}",
+            step.events
+        );
     }
 
     #[test]

@@ -3685,7 +3685,10 @@
   }
   .msg.agent {
     position: relative;
-    padding: 2px 0;
+    /* A reply stops short of the column's right edge, where the user's
+       bubbles end: the two voices never share a right margin, and a long
+       line reads shorter than the bubble above it (the desktop apps' 92%). */
+    padding: 2px 8% 2px 0;
   }
   /* On pointer devices the action cluster floats at the message's top right
      (AgentMessageMeta) and takes no space; a closing paragraph keeps no
