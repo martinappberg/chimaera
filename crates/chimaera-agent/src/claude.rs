@@ -698,7 +698,9 @@ enum PendingControl {
     /// generate_session_title round-trip (feeds the naming chain).
     Title,
     /// background_tasks ack ({backgrounded}) — Ctrl-B parity per tool call.
-    Background,
+    Background {
+        for_message: bool,
+    },
     /// stop_task ack (subagent stop).
     StopTask,
     /// `interrupt {send_now}` receipt: its `send_now` word says whether the
@@ -3551,7 +3553,19 @@ impl ClaudeMapper {
                     chosen,
                 });
             }
-            PendingControl::Background => {
+            PendingControl::Background { for_message: true } => {
+                // The daemon moved a foreground subagent aside so a message
+                // from another agent is read now (PROTOCOL.md Pass 44). The
+                // call can finish first; that race needs no notice.
+                if payload["backgrounded"] != json!(false) {
+                    step.events.push(AgentEvent::Notice {
+                        text: "subagent moved to the background to read a message from another \
+                               agent; it keeps working"
+                            .into(),
+                    });
+                }
+            }
+            PendingControl::Background { for_message: false } => {
                 // Missing flag ⇒ backgrounded (the extension's read).
                 if payload["backgrounded"] == json!(false) {
                     step.events.push(AgentEvent::Notice {
@@ -4245,10 +4259,13 @@ impl ClaudeMapper {
                     json!({ "subtype": "get_usage" }),
                 ));
             }
-            AgentCommand::BackgroundTool { tool_call_id } => {
+            AgentCommand::BackgroundTool {
+                tool_call_id,
+                for_message,
+            } => {
                 let id = self.ctl_id();
                 self.pending_controls
-                    .insert(id.clone(), PendingControl::Background);
+                    .insert(id.clone(), PendingControl::Background { for_message });
                 step.outbound.push(control_request_frame(
                     &id,
                     json!({ "subtype": "background_tasks", "tool_use_id": tool_call_id }),
@@ -8176,6 +8193,7 @@ pub(crate) mod tests {
         let mut m = mapper();
         let step = m.on_command(AgentCommand::BackgroundTool {
             tool_call_id: "tu-1".into(),
+            for_message: false,
         });
         assert_eq!(step.outbound[0]["request"]["subtype"], "background_tasks");
         assert_eq!(step.outbound[0]["request"]["tool_use_id"], "tu-1");
@@ -8188,6 +8206,35 @@ pub(crate) mod tests {
             &step.events[0],
             AgentEvent::Notice { text } if text.contains("background")
         ));
+    }
+
+    /// Pass 44: the daemon frees a turn blocked on a foreground subagent so
+    /// a message from another agent is read now. Its notice says why; a
+    /// subagent that returned first (`backgrounded: false`) says nothing.
+    #[test]
+    fn background_for_a_message_says_why_and_stays_quiet_when_raced() {
+        let mut m = mapper();
+        let ack = |m: &mut ClaudeMapper, backgrounded: bool| {
+            let step = m.on_command(AgentCommand::BackgroundTool {
+                tool_call_id: "tu-agent".into(),
+                for_message: true,
+            });
+            assert_eq!(step.outbound[0]["request"]["subtype"], "background_tasks");
+            assert_eq!(step.outbound[0]["request"]["tool_use_id"], "tu-agent");
+            let ctl = step.outbound[0]["request_id"].as_str().unwrap().to_string();
+            m.on_frame(&json!({
+                "type": "control_response",
+                "response": { "subtype": "success", "request_id": ctl,
+                              "response": { "backgrounded": backgrounded } },
+            }))
+        };
+        let moved = ack(&mut m, true);
+        assert!(matches!(
+            &moved.events[..],
+            [AgentEvent::Notice { text }] if text.contains("message from another agent")
+        ));
+        let raced = ack(&mut m, false);
+        assert!(raced.events.is_empty(), "{:?}", raced.events);
     }
 
     #[test]

@@ -59,7 +59,7 @@ export interface TimelineKnowledge {
 }
 
 /** How a message reached its recipient (agent communication §4/§5). */
-export type NoteDelivery = "next_step" | "inbox" | "woke" | "asked";
+export type NoteDelivery = "next_step" | "now" | "inbox" | "woke" | "asked";
 
 /** An agent's message (the wire keeps the kind `note`; the UI says
  *  "message"). Every field past `text` is additive — absent on notes written

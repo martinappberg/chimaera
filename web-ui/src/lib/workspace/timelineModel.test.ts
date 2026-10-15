@@ -244,6 +244,7 @@ describe("messages", () => {
 
   it("says how each message was delivered, old notes included", () => {
     expect(deliveryLabel(note({ delivery: "next_step" }))).toBe("read at its next step");
+    expect(deliveryLabel(note({ delivery: "now" }))).toBe("reached it mid-wait");
     expect(deliveryLabel(note({ delivery: "inbox" }))).toBe("in its inbox");
     expect(deliveryLabel(note({ delivery: "woke", woke: true }))).toBe("woke it");
     expect(deliveryLabel(note({ delivery: "asked" }))).toBe("asked you");
