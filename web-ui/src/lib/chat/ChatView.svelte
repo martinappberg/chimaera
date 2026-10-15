@@ -39,6 +39,7 @@
   import ThoughtRow from "./ThoughtRow.svelte";
   import ToolGroup from "./ToolGroup.svelte";
   import { isLive, type TurnTail } from "./toolLabels";
+  import { statusWordShown } from "./statusWord";
   import FinishedRow from "./FinishedRow.svelte";
   import AgentMessageCards from "./AgentMessageCards.svelte";
   import { isAgentOrigin, parseAgentText } from "./agentMessages";
@@ -2459,20 +2460,19 @@
     }
     return false;
   });
-  /** The status row drops a phase word only where a row in view already says
-   *  it — a live tool line in the open trailing run, streaming prose or a
-   *  live thought row at the reader's bottom; the word stays for the screen
-   *  reader. Waiting (on a permission, a question, the next step), the
-   *  agent's own phrase, token-only thinking and compacting always show:
-   *  when in doubt, it is said. */
-  const activityShown = $derived.by(() => {
-    if (store.compacting || store.activityLine !== null) return true;
-    const a = store.activity;
-    if (a === null || a.kind === "waiting") return true;
-    if (a.kind === "tool") return !liveToolLineInView;
-    if (a.kind === "thinking" && a.detail !== "") return true;
-    return !tailInView;
-  });
+  /** The status row drops a phase word only where a row in view already
+   *  says it (statusWord.ts); the word stays for the screen reader. */
+  const activityShown = $derived(
+    statusWordShown({
+      compacting: store.compacting,
+      activityLine: store.activityLine,
+      activity: store.activity,
+      running: store.running,
+      newest: store.blocks[store.blocks.length - 1],
+      tailInView,
+      liveToolLineInView,
+    }),
+  );
 
   /** A finished turn's duration and output tokens, kept out of the page
    *  (the live elapsed on the status line is the number that matters while

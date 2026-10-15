@@ -375,7 +375,8 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   (Claude `task_summary`, "Measuring file sizes…"), else Starting / Working / Thinking / Writing /
   Running tools / Compacting. The word is dropped only while a row in view already says it: a
   running call's line in the open trailing run (not folded, not scrolled away), or streaming
-  prose or a live thought row at the reader's bottom (screen readers still hear it). Waiting on
+  prose or a live thought row as the newest block at the reader's bottom (screen readers still hear
+  it); a reasoning item that drew no thought row (Codex, empty summary) says Thinking. Waiting on
   a permission, a question or the next step always shows its word.
   Codex's synchronous SessionStart and UserPromptSubmit hooks show their actual phase
   and a hook row linking to the hook configuration. These can block a turn after the
