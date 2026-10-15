@@ -93,7 +93,7 @@
   </svg>
 {/snippet}
 
-<section class="plan-card" class:visible class:folded aria-label="plan">
+<section class="plan-card pinned-card" class:visible class:folded aria-label="plan">
   <!-- The toggle is a flex column of its own at the card's right, so no row —
        first, scrolled-to, or "12/15" wide — ever runs under it. -->
   <button
@@ -143,19 +143,13 @@
 </section>
 
 <style>
+  /* Chrome (edge, radius, tint, entrance) is the shared .pinned-card recipe
+     in app.css; this is the card's own layout. */
   .plan-card {
     display: flex;
     align-items: flex-start;
-    flex: none;
-    border: 1px solid var(--edge);
-    border-radius: var(--radius-card);
-    background: color-mix(in srgb, var(--fg) 2%, var(--bg));
     font-size: var(--text-sm);
     line-height: 1.45;
-    animation: rise 0.15s ease; /* shared keyframe in app.css */
-  }
-  .plan-card:not(.visible) {
-    animation: none;
   }
   .toggle {
     order: 1;
@@ -182,7 +176,7 @@
   .toggle:hover,
   .toggle:focus-visible {
     color: var(--fg);
-    background: color-mix(in srgb, var(--fg) 4%, transparent); /* the activity lines' hover */
+    background: var(--hover-tint);
   }
   .folded-line {
     display: flex;
@@ -301,10 +295,5 @@
      the light theme. */
   .owner {
     color: color-mix(in srgb, var(--accent) 70%, var(--fg));
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .plan-card {
-      animation: none;
-    }
   }
 </style>

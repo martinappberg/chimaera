@@ -7,6 +7,14 @@
  * gating (the turn timer hides below 5s; the turn-end badge keeps a
  * decimal for sub-minute durations).
  */
+/** Elapsed since a daemon-stamped start ("1m 04s"), "" before it is known.
+ *  The stamp is daemon-side epoch ms, so clamp: a skewed client clock must
+ *  not render "-3s". */
+export function elapsedSince(startedAtMs: number, nowMs: number): string {
+  if (startedAtMs <= 0) return "";
+  return formatElapsedSeconds(Math.max(0, Math.floor((nowMs - startedAtMs) / 1000)));
+}
+
 export function formatElapsedSeconds(total: number): string {
   const h = Math.floor(total / 3600);
   const m = Math.floor((total % 3600) / 60);
