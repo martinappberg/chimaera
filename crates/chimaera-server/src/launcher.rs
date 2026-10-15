@@ -23,7 +23,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -218,6 +218,9 @@ fn validate_cache_hit(hit: &AgentDetection) -> CacheHit {
 /// (without re-running the 6s login-shell probe the cache exists to avoid).
 pub(crate) async fn detect(state: &AppState, kind: AgentKind, refresh: bool) -> AgentDetection {
     if !refresh {
+        if let Some(miss) = cached_miss(state, kind) {
+            return miss;
+        }
         let hit = crate::lock(&state.agent_bins).get(&kind).cloned();
         if let Some(hit) = hit {
             let same_install = hit.explicit
@@ -277,16 +280,69 @@ pub(crate) async fn detect(state: &AppState, kind: AgentKind, refresh: bool) -> 
         explicit: used_explicit,
         mtime,
     };
-    // Cache only a positive result for the daemon's lifetime. A miss is often
+    // A positive result is cached for the daemon's lifetime. A miss is often
     // transient — the daemon started before the login environment was ready,
-    // or the user just fixed their PATH / installed the CLI — and caching it
-    // would wedge the agent as "not installed" until a daemon restart. Leaving
-    // a miss uncached lets the next probe self-heal (the popover already
-    // refreshes on mount; a spawn re-probes rather than acting on stale news).
-    if detection.path.is_ok() {
-        crate::lock(&state.agent_bins).insert(kind, detection.clone());
+    // or the user just fixed their PATH / installed the CLI — so caching it
+    // for the lifetime would wedge the agent as "not installed" until a
+    // daemon restart; but every uncached miss costs the login-shell probe
+    // again, and a catalog read with two uninstalled agents paid seconds per
+    // call (field-measured). So a miss is served for `MISS_TTL` only, and
+    // the launcher's own open (`refresh`), a changed path setting, a managed
+    // install landing and an explicit runnable path all see past it.
+    match &detection.path {
+        Ok(_) => {
+            crate::lock(&state.agent_bins).insert(kind, detection.clone());
+            crate::lock(&state.agent_misses).remove(&kind);
+        }
+        Err(reason) => {
+            crate::lock(&state.agent_misses).insert(kind, (reason.clone(), Instant::now()));
+        }
     }
     detection
+}
+
+/// How long a detection miss is served without re-running the login shell.
+/// Short: a user who installs a CLI in a terminal sees it within this window
+/// on the slow paths and at once on every refresh path.
+pub(crate) const MISS_TTL: Duration = Duration::from_secs(90);
+
+/// A recent miss to serve instead of probing — unless something cheap says
+/// the picture changed: the per-agent path setting now names a runnable
+/// file, or a managed install landed under the managed bin dir (one stat
+/// each; a hit there must be probed for real so its version and provenance
+/// are right).
+fn cached_miss(state: &AppState, kind: AgentKind) -> Option<AgentDetection> {
+    let (reason, at) = crate::lock(&state.agent_misses).get(&kind).cloned()?;
+    if at.elapsed() >= MISS_TTL {
+        return None;
+    }
+    let explicit = crate::lock(&state.settings).agent_path(kind);
+    if explicit.is_some_and(|p| is_executable(Path::new(&p))) {
+        return None;
+    }
+    if managed_fallback(
+        kind.as_str(),
+        &crate::runtimes::managed_bin_for(state, kind.as_str()),
+    )
+    .is_some()
+    {
+        return None;
+    }
+    Some(AgentDetection {
+        path: Err(reason),
+        version: None,
+        managed: false,
+        explicit: false,
+        mtime: None,
+    })
+}
+
+/// Forget every cached miss: the next read probes again. For a changed
+/// `agents.<id>.path` (settings) — the explicit path may name a file that is
+/// not runnable yet, which the cheap check in `cached_miss` would keep
+/// serving the old miss for.
+pub(crate) fn forget_misses(state: &AppState) {
+    crate::lock(&state.agent_misses).clear();
 }
 
 /// The managed install of `bin` under the managed bin dir, if present and

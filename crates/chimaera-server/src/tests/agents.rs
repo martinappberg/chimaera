@@ -957,6 +957,101 @@ async fn agents_rows_flag_managed_installs() {
     assert_eq!(row("agy")["managed_install"], true);
 }
 
+/// A detection miss is served for a short window instead of re-running the
+/// login shell per read — unless a refresh asks, the path setting now names
+/// a runnable file, or a managed install landed.
+#[tokio::test]
+async fn a_recent_miss_is_served_without_the_login_shell_until_something_changes() {
+    use std::os::unix::fs::PermissionsExt;
+    let state = test_state();
+    let kind = agents::AgentKind::Grok;
+    lock(&state.agent_misses).insert(
+        kind,
+        (
+            "grok not found (test)".to_string(),
+            std::time::Instant::now(),
+        ),
+    );
+
+    // Served at once, with the recorded reason: no shell, no version probe.
+    let started = std::time::Instant::now();
+    let miss = launcher::detect(&state, kind, false).await;
+    assert_eq!(
+        miss.path.as_ref().err().map(String::as_str),
+        Some("grok not found (test)")
+    );
+    assert!(miss.version.is_none() && !miss.managed && !miss.explicit);
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(500),
+        "a cached miss must not run the login shell"
+    );
+
+    // An explicit path that now runs is seen past the miss.
+    let dir = test_dir("miss-explicit");
+    let bin = dir.join("grok");
+    std::fs::write(
+        &bin,
+        "#!/bin/sh
+echo 'grok 9.9.9'
+",
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    lock(&state.settings)
+        .put(
+            serde_json::json!({"agents.grok.path": bin.to_string_lossy()})
+                .as_object()
+                .cloned()
+                .unwrap(),
+        )
+        .unwrap();
+    let hit = launcher::detect(&state, kind, false).await;
+    assert_eq!(hit.path.as_deref().ok(), Some(bin.as_path()));
+    assert!(hit.explicit);
+    assert!(
+        lock(&state.agent_misses).get(&kind).is_none(),
+        "a hit forgets the miss"
+    );
+
+    // An expired miss is probed again (here: the explicit path still wins).
+    lock(&state.agent_misses).insert(
+        kind,
+        (
+            "stale".to_string(),
+            std::time::Instant::now() - launcher::MISS_TTL,
+        ),
+    );
+    lock(&state.agent_bins).remove(&kind);
+    assert!(launcher::detect(&state, kind, false).await.path.is_ok());
+
+    // A changed path setting forgets every miss outright.
+    lock(&state.agent_misses).insert(kind, ("x".to_string(), std::time::Instant::now()));
+    launcher::forget_misses(&state);
+    assert!(lock(&state.agent_misses).is_empty());
+
+    // A managed install landing under the managed bin dir is seen past a
+    // fresh miss too (it is what the next probe resolves).
+    lock(&state.settings)
+        .put(
+            serde_json::json!({"agents.grok.path": ""})
+                .as_object()
+                .cloned()
+                .unwrap(),
+        )
+        .unwrap();
+    lock(&state.agent_bins).remove(&kind);
+    lock(&state.agent_misses).insert(kind, ("x".to_string(), std::time::Instant::now()));
+    let managed_bin = runtimes::managed_bin_dir(&state.managed_root);
+    std::fs::create_dir_all(&managed_bin).unwrap();
+    std::fs::copy(&bin, managed_bin.join("grok")).unwrap();
+    let probed = launcher::detect(&state, kind, false).await;
+    assert!(
+        probed.path.is_ok(),
+        "the managed copy is found: {:?}",
+        probed.path
+    );
+}
+
 /// Detection falls back to ~/.chimaera/agents/bin when the login shell
 /// misses (managed installs are deliberately not on the user's PATH),
 /// and such rows read as installed + managed.
