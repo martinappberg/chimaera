@@ -15,6 +15,9 @@
       preceding: string | null;
       fork: boolean;
       stage: "dry" | "confirm" | "applying";
+      /** Asked from a reply ("rewind to here"): the anchor is the next
+       *  message you sent, and the reply itself stays. */
+      fromReply?: boolean;
     };
     /** The dry-run/apply report for this intent, once it lands (claude). */
     report: RewindReport | null;
@@ -27,6 +30,12 @@
 
   let { intent, report, conversationOnly = false, onCancel, onConfirm, onOpenFile }: Props =
     $props();
+  const point = $derived(intent.fromReply === true ? "this reply" : "before this message");
+  const drops = $derived(
+    intent.fromReply === true
+      ? "keeps this reply and drops everything after it"
+      : "drops this message and everything after it",
+  );
 </script>
 
 <div class="dialog-veil">
@@ -34,9 +43,9 @@
     {#if intent.stage === "applying"}
       <div class="dialog-title">rewinding…</div>
     {:else if conversationOnly}
-      <div class="dialog-title">rewind the conversation to before this message</div>
+      <div class="dialog-title">rewind the conversation to {point}</div>
       <div class="dialog-note">
-        drops this message and everything after it — files on disk are not touched
+        {drops} — files on disk are not touched
       </div>
       <div class="dialog-actions">
         <button class="opt primary" onclick={() => onConfirm(true)}>rewind conversation</button>
@@ -57,7 +66,7 @@
       </div>
     {:else}
       <div class="dialog-title">
-        rewind files to before this message
+        rewind files to {point}
         {#if report.filesChanged.length > 0}
           — {report.filesChanged.length} file{report.filesChanged.length > 1 ? "s" : ""} will change
         {/if}

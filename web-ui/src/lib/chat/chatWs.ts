@@ -36,7 +36,9 @@ export interface ChatSocketHandlers {
   /** `head` is the journal's highest seq now; when it is below our own
    *  lastSeq the journal was recreated (seq reset) and we must hard-reset. */
   onReady(session: ChatSessionInfo, replayFrom: number, head: number | undefined): void;
-  onEvent(entry: SeqEvent): void;
+  /** `live` = a frame the socket delivered as it happened (`ev`), not
+   *  journal replay (`batch`, incl. a reconnect's gap). */
+  onEvent(entry: SeqEvent, live?: boolean): void;
   /** The session degraded (or toggled) to a terminal under the same id. */
   onDegraded(): void;
   onExited(status: number | null): void;
@@ -58,7 +60,7 @@ type ChatDelivery =
       replayFrom: number;
       head: number | undefined;
     }
-  | { kind: "event"; entry: SeqEvent }
+  | { kind: "event"; entry: SeqEvent; live: boolean }
   | { kind: "degraded" }
   | { kind: "exited"; status: number | null }
   | { kind: "error"; message: string }
@@ -100,7 +102,7 @@ export class ChatSocket {
           if (this.ws?.readyState === WebSocket.OPEN && this.healthy) this.nativeUi.connected();
           break;
         case "event":
-          this.handlers.onEvent(delivery.entry);
+          this.handlers.onEvent(delivery.entry, delivery.live);
           break;
         case "degraded":
           this.handlers.onDegraded();
@@ -170,6 +172,7 @@ export class ChatSocket {
             ((msg.events as SeqEvent[]) ?? []).map((entry) => ({
               kind: "event" as const,
               entry,
+              live: false,
             })),
           );
           break;
@@ -181,6 +184,7 @@ export class ChatSocket {
               ts: msg.ts as number,
               ev: msg.ev as AgentEvent,
             },
+            live: true,
           });
           break;
         case "degraded":

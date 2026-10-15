@@ -44,7 +44,7 @@ function makeSocket(sessionId: string, store: ChatStore): ChatTransport {
   return new ChatSocket(sessionId, {
     onReady: (info: ChatSessionInfo, replayFrom: number, head: number | undefined) =>
       store.onReady(info, replayFrom, head),
-    onEvent: (entry: SeqEvent) => store.apply(entry),
+    onEvent: (entry: SeqEvent, live?: boolean) => store.apply(entry, live === true),
     onDegraded: () => store.onDegraded(),
     onExited: (status: number | null) => store.onExited(status),
     onError: (message: string) => store.onFatalError(message),
