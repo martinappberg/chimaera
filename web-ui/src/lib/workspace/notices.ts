@@ -28,7 +28,8 @@ export type NoticeKind =
   | "question"
   | "error"
   | "rate_limited"
-  | "agent";
+  | "agent"
+  | "wake";
 
 /** One notice, as the daemon words it (`chimaera-server/src/notices.rs`). */
 export interface Notice {

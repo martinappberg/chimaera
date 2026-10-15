@@ -11,7 +11,7 @@
    * its words and a Dismiss (the request itself is gone either way).
    */
   import SessionGlyph from "../shared/SessionGlyph.svelte";
-  import { dismissWakeFailure, wake, type WakeRequest } from "../workspace/comms.svelte";
+  import { dismissWakeFailure, wake, wakeAsk, type WakeRequest } from "../workspace/comms.svelte";
 
   interface Props {
     request: WakeRequest;
@@ -29,6 +29,8 @@
   const from = $derived(names.get(request.from_sid) ?? request.from_name);
   const to = $derived(names.get(request.to_sid) ?? request.to_name);
   const hop = $derived(request.reason === "hop_limit");
+  const ask = $derived(wakeAsk(request.reason));
+  const cont = $derived(ask.cont);
   const oneLine = $derived(request.text.replace(/\s+/g, " ").trim());
 
   let busy = $state<"wake" | "leave" | null>(null);
@@ -49,7 +51,7 @@
 </script>
 
 {#snippet who(sid: string, name: string)}
-  {@const agent = agentOf(sid)}
+  {@const agent = agentOf(sid) ?? (sid === request.from_sid ? request.from_agent : null)}
   <button class="who" title="open {name}" onclick={() => onOpenSession(sid)}>
     {#if agent !== null}<SessionGlyph kind="agent" agentKind={agent} size={11} />{/if}
     <span class="name">{name}</span>
@@ -67,6 +69,9 @@
       {@render who(request.from_sid, from)}
       <span class="words">wants to wake</span>
       {@render who(request.to_sid, to)}
+      {#if ask.words !== null}
+        <span class="words" title={ask.title}>· {ask.words}</span>
+      {/if}
     {/if}
   </div>
   {#if oneLine !== ""}
@@ -74,7 +79,7 @@
   {/if}
   {#if failure !== null}
     <div class="actions">
-      <span class="err" role="alert">couldn't {hop ? "continue" : "wake"} {to} — {failure}</span>
+      <span class="err" role="alert">couldn't {cont ? "continue" : "wake"} {to} — {failure}</span>
       <button class="btn" onclick={() => dismissWakeFailure(request.id)}>Dismiss</button>
     </div>
   {:else}
@@ -85,7 +90,7 @@
         title="deliver {to}'s waiting messages now — one turn, billed to your account"
         onclick={() => answer(true)}
       >
-        {busy === "wake" ? (hop ? "continuing…" : "waking…") : hop ? "Continue" : "Wake"}
+        {busy === "wake" ? (cont ? "continuing…" : "waking…") : cont ? "Continue" : "Wake"}
       </button>
       <button
         class="btn"

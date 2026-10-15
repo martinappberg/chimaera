@@ -880,7 +880,19 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                             // A send's images get a saved copy the echoed
                             // message can show after replay.
                             let saved = crate::upload::save_send_images(&state, &id, &mut cmd).await;
-                            if let Err(err) = state.chat.command(&id, cmd).await {
+                            // The user's own prompt: agent communication's
+                            // unattended wakes start over in this workspace.
+                            let prompt = matches!(
+                                cmd,
+                                chimaera_agent::model::AgentCommand::Send { .. }
+                                    | chimaera_agent::model::AgentCommand::SendAfterTurn { .. }
+                                    | chimaera_agent::model::AgentCommand::SendNow { .. }
+                            );
+                            let sent = state.chat.command(&id, cmd).await;
+                            if sent.is_ok() && prompt {
+                                crate::comms::user_stepped_in(&state, &id);
+                            }
+                            if let Err(err) = sent {
                                 // The send never happened: neither do its copies.
                                 crate::upload::discard_saved_images(saved);
                                 tracing::debug!(%id, %err, "chat command failed");

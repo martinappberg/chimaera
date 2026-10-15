@@ -15,22 +15,26 @@
  * same counts.
  */
 import { api, ApiError } from "../net/api";
+import { dotState, dotTitle, type Session } from "./sessions";
 
 export type WakePolicy = "never" | "ask" | "auto";
 
-/** A message that would start a turn in an idle agent, waiting on the user
- *  (the "Ask me" policy), or a thread that hit its hop limit. */
+/** A message that would start a turn in an idle agent, waiting on the user:
+ *  the "Ask me" policy, a thread that hit its hop limit, or a workspace whose
+ *  agents used their wakes since the user last stepped in. */
 export interface WakeRequest {
   id: string;
   to_sid: string;
   to_name: string;
   from_sid: string;
   from_name: string;
+  /** The sender's agent ("claude", "codex", …); null from an older daemon. */
+  from_agent: string | null;
   /** The newest message seq the request covers. */
   message: number;
   /** That message's text (the card shows one clamped line). */
   text: string;
-  /** "ask" | "hop_limit", verbatim; anything else reads as "ask". */
+  /** "ask" | "hop_limit" | "unattended", verbatim; anything else reads as "ask". */
   reason: string;
   created_ms: number;
 }
@@ -71,13 +75,14 @@ export function parseComms(raw: unknown): CommsSnapshot {
       to_name: str(o.to_name, str(o.to_sid)),
       from_sid: str(o.from_sid),
       from_name: str(o.from_name, str(o.from_sid, "an agent")),
+      from_agent: str(o.from_agent) || null,
       message: num(o.message),
       text: str(o.text),
       reason: str(o.reason, "ask"),
       created_ms: num(o.created_ms),
     });
   }
-  const wakes = r.wakes === "never" || r.wakes === "auto" ? r.wakes : "ask";
+  const wakes = r.wakes === "never" || r.wakes === "ask" ? r.wakes : "auto";
   return { enabled: r.enabled !== false, wakes, unread, wake_requests: wakeRequests };
 }
 
@@ -120,7 +125,7 @@ class CommsStore {
   available = $state<boolean | null>(null);
   /** The daemon's view of the setting (the settings store is the live one). */
   enabled = $state(true);
-  wakes = $state<WakePolicy>("ask");
+  wakes = $state<WakePolicy>("auto");
   unread = $state<Record<string, number>>({});
   wakeRequests = $state<WakeRequest[]>([]);
   /** Answers the daemon refused (the agent is gone, the setting went off).
@@ -132,6 +137,42 @@ class CommsStore {
 }
 
 export const commsStore = new CommsStore();
+
+/** How a wake request asks, by its reason — the one wording the idle
+ *  agent's bar and the Needs-you card share. `cont`: past a limit the
+ *  question is whether to let them keep going (Continue, not Wake). */
+export function wakeAsk(reason: string): { cont: boolean; words: string; title: string } | { cont: false; words: null; title: null } {
+  if (reason === "hop_limit")
+    return { cont: true, words: "back and forth", title: "these two agents have woken each other several times — continue?" };
+  if (reason === "unattended")
+    return {
+      cont: true,
+      words: "agents kept going",
+      title: "agents here have woken each other many times since you last stepped in — Continue lets them keep going",
+    };
+  return { cont: false, words: null, title: null };
+}
+
+/** The wake request waiting on the user for `sid`'s inbox, or null (the
+ *  daemon keeps at most one per agent). */
+export function wakeRequestFor(sid: string | null | undefined): WakeRequest | null {
+  if (sid === null || sid === undefined) return null;
+  return commsStore.wakeRequests.find((r) => r.to_sid === sid) ?? null;
+}
+
+/** A session glyph's state class (rail, tabs, focus strip) with a waiting
+ *  wake request folded in: an idle agent another agent wants to wake is
+ *  waiting on the user, so it reads as needing attention. Never a count —
+ *  counts stay approvals only (`needsApproval`). */
+export function glyphState(s: Session): string {
+  return s.alive && wakeRequestFor(s.id) !== null ? "attn" : dotState(s);
+}
+
+/** The glyph's tooltip, naming who wants to wake it. */
+export function glyphTitle(s: Session): string {
+  const r = s.alive ? wakeRequestFor(s.id) : null;
+  return r !== null ? `${r.from_name} sent a message — wake it?` : dotTitle(s);
+}
 
 /** Unread messages waiting for `sid` (0 when none, or nothing is known). */
 export function unreadFor(sid: string | null | undefined): number {

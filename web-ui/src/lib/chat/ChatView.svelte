@@ -67,6 +67,8 @@
   import type { PendingElicitation } from "./elicitation";
   import PlanApprovalCard from "./PlanApprovalCard.svelte";
   import PlanCard from "./PlanCard.svelte";
+  import WakeRequestBar from "./WakeRequestBar.svelte";
+  import { commsStore, wakeRequestFor } from "../workspace/comms.svelte";
   import QuestionCard from "./QuestionCard.svelte";
   import UsagePanel from "./UsagePanel.svelte";
   import McpPanel from "./McpPanel.svelte";
@@ -2315,6 +2317,13 @@
   const planAllDone = $derived(
     pinnedPlan.length > 0 && pinnedPlan.every((p) => p.status === "done"),
   );
+  /** Another agent's message waiting on the user to wake this one (rare,
+   *  and read from the workspace's comms store, so it is not frozen with
+   *  the pinned cards while hidden). */
+  const wakeRequest = $derived(readOnly ? null : wakeRequestFor(session.id));
+  const wakeFailure = $derived(
+    readOnly ? null : (commsStore.wakeFailures.find((f) => f.request.to_sid === session.id) ?? null),
+  );
 
   const jumpLabel = $derived(
     followedVersion !== store.transcriptVersion
@@ -3356,6 +3365,12 @@
     <PlanCard entries={pinnedPlan} running={agentBusy} {visible} />
   {/if}
 
+  {#if wakeRequest !== null || wakeFailure !== null}
+    <!-- Another agent's message waits for the user's OK to wake this one:
+         asked here, where the user is looking, not only in Needs you. -->
+    <WakeRequestBar request={wakeRequest} failure={wakeFailure} {visible} />
+  {/if}
+
   {#if rewindIntent !== null}
     <RewindDialog
       intent={rewindIntent}
@@ -3572,13 +3587,14 @@
   /* The pinned cards (subagents, background, plan) keep their borders on
      the column's text edges and stack 6px apart. */
   .chat > :global(.plan-card),
-  .chat > :global(.tray) {
+  .chat > :global(.tray),
+  .chat > :global(.wake-card) {
     width: calc(100% - 36px);
     max-width: var(--chat-column);
     margin: 6px auto;
     box-sizing: border-box;
   }
-  .chat > :global(:is(.tray, .plan-card) + :is(.tray, .plan-card)) {
+  .chat > :global(:is(.tray, .plan-card, .wake-card) + :is(.tray, .plan-card, .wake-card)) {
     margin-top: 0;
   }
   .startup-detail {

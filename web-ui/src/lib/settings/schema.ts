@@ -261,13 +261,13 @@ const DEFS = {
     title: "Agents may wake each other",
     category: "Agents",
     description:
-      "Whether a message may start a turn in an idle agent — a turn billed to your account. Never keeps messages in the agent's inbox until it looks or you hand them over. Ask me asks you in Needs you on the dashboard; a reply to a question an agent asked wakes it without asking. Within limits wakes it on its own, within caps per sender, per hour and per conversation. Terminal agents are never woken.",
+      "Whether another agent's message may start a turn in an idle agent — a turn billed to your account. Automatically wakes it — up to 20 wakes in a workspace since you last stepped in (a prompt in one of its chats or Claude terminals, a Wake, a hand-over) and 4 rounds of one back-and-forth; past those you're asked once. Ask me asks every time, in the agent's chat and in Needs you; a reply to a question it asked still wakes it. Never keeps messages in its inbox until it looks or you hand them over. Terminal agents are never woken.",
     type: "enum",
-    default: "ask",
+    default: "auto",
     options: [
       { value: "never", label: "Never" },
       { value: "ask", label: "Ask me" },
-      { value: "auto", label: "Within limits" },
+      { value: "auto", label: "Automatically" },
     ],
     scope: "daemon",
   },
@@ -343,7 +343,7 @@ const DEFS = {
     title: "When an Agent Needs You",
     category: "Notifications",
     description:
-      "Notify when an agent is blocked on you — a permission to approve, a question to answer, waiting for input — or stops on an error or a usage limit.",
+      "Notify when an agent is blocked on you — a permission to approve, a question to answer, waiting for input, another agent's message waiting for you to wake it — or stops on an error or a usage limit.",
     type: "boolean",
     default: true,
     scope: "daemon",

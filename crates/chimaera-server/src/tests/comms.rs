@@ -340,17 +340,19 @@ async fn broadcasts_reach_everyone_but_never_wake() {
     }
 }
 
-/// An idle chat and the wake policy: "ask" puts a request in Needs you and
-/// the user's Wake delivers; "never" leaves it for the user's hand-over;
-/// "auto" wakes at once.
+/// An idle chat and the wake policy: "ask" puts a request in Needs you (and
+/// announces it) and the user's Wake delivers; "never" leaves it for the
+/// user's hand-over; "auto" (the default) wakes at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_wake_policy_decides_what_an_idle_chat_gets() {
     let state = test_state();
     let ws = make_workspace(&state, "comms-wake").await;
     let a = tui(&state, &ws, "ka");
     let (c, _) = chat(&state, &ws, "comms-wake-fake").await;
+    assert_eq!(comms(&state, &ws).await["wakes"], "auto", "the default");
 
-    // Ask (the default).
+    // Ask.
+    set_comms(&state, true, "ask").await;
     let (is_err, text) = send(
         &state,
         &a,
@@ -367,6 +369,15 @@ async fn the_wake_policy_decides_what_an_idle_chat_gets() {
     assert_eq!(requests[0]["reason"], "ask");
     let wid = requests[0]["id"].as_str().unwrap().to_string();
     assert!(!journal(&state, &c).contains("please rerun the QC"));
+    let announced: Vec<_> = state
+        .notices
+        .since(0)
+        .into_iter()
+        .filter(|n| n.kind == notices::NoticeKind::Wake)
+        .collect();
+    assert_eq!(announced.len(), 1, "the ask is announced once");
+    assert_eq!(announced[0].session_id, c, "a click opens the idle agent");
+    assert!(announced[0].body.contains("please rerun the QC"));
     let (status, out) = request(
         &state,
         Method::POST,
@@ -437,11 +448,202 @@ async fn the_wake_policy_decides_what_an_idle_chat_gets() {
     state.sessions.kill(&a).ok();
 }
 
+/// Inside the per-pair gap a fresh message is not stranded: it wakes its
+/// idle reader once the gap has passed — and another sender's message to
+/// the same reader isn't held by it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wake_inside_the_gap_comes_when_it_passes() {
+    let state = test_state();
+    set_comms(&state, true, "auto").await;
+    let ws = make_workspace(&state, "comms-gap").await;
+    let a = tui(&state, &ws, "ka");
+    let b = tui(&state, &ws, "kb");
+    let (c, _) = chat(&state, &ws, "comms-gap-fake").await;
+    let idle = |state: &Arc<AppState>| {
+        lock(&state.agents).get_mut(&c).unwrap().state = agent_state::AgentState::Finished;
+    };
+
+    let (_, text) = send(
+        &state,
+        &a,
+        "ka",
+        serde_json::json!({"to": c, "text": "first-task"}),
+    )
+    .await;
+    assert!(text.contains("started a turn"), "{text}");
+    journal_has(&state, &c, "first-task").await;
+    idle(&state);
+
+    let (_, text) = send(
+        &state,
+        &a,
+        "ka",
+        serde_json::json!({"to": c, "text": "second-task"}),
+    )
+    .await;
+    assert!(text.contains("wakes it again in"), "{text}");
+    assert!(!journal(&state, &c).contains("second-task"));
+    assert!(
+        comms(&state, &ws).await["wake_requests"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "held back, not asked"
+    );
+    let content = journal_has(&state, &c, "second-task").await;
+    assert!(content.contains("while you were idle"), "{content}");
+    idle(&state);
+
+    let (_, text) = send(
+        &state,
+        &b,
+        "kb",
+        serde_json::json!({"to": c, "text": "other-sender"}),
+    )
+    .await;
+    assert!(
+        text.contains("started a turn"),
+        "another sender's gap is its own: {text}"
+    );
+    journal_has(&state, &c, "other-sender").await;
+
+    state.chat.kill(&c);
+    for sid in [a, b] {
+        state.sessions.kill(&sid).ok();
+    }
+}
+
+/// Agents get a round of wakes between two of the user's own actions in a
+/// workspace. Past it the user is asked once — one notification however
+/// many agents wait — and one Continue lets every held agent go on; a
+/// prompt the user sends (a chat's socket, a terminal's own hook) starts a
+/// new round too, while a chat's hook (it fires for a wake as well) doesn't.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn past_the_unattended_limit_the_user_is_asked_once_and_continue_lets_all_go_on() {
+    let state = test_state();
+    set_comms(&state, true, "auto").await;
+    let ws = make_workspace(&state, "comms-unattended").await;
+    let a = tui(&state, &ws, "ka");
+    let (c1, _) = chat(&state, &ws, "comms-unattended-1").await;
+    let (c2, _) = chat(&state, &ws, "comms-unattended-2").await;
+    crate::comms::use_unattended_wakes_for_tests(&state, &ws);
+
+    let (_, text) = send(
+        &state,
+        &a,
+        "ka",
+        serde_json::json!({"to": c1, "text": "held-one"}),
+    )
+    .await;
+    assert!(text.contains("keep going"), "{text}");
+    let (_, text) = send(
+        &state,
+        &a,
+        "ka",
+        serde_json::json!({"to": c2, "text": "held-two"}),
+    )
+    .await;
+    assert!(text.contains("keep going"), "{text}");
+    let body = comms(&state, &ws).await;
+    let requests = body["wake_requests"].as_array().unwrap();
+    assert_eq!(requests.len(), 2, "{body}");
+    assert!(
+        requests.iter().all(|r| r["reason"] == "unattended"),
+        "{body}"
+    );
+    let announced = state
+        .notices
+        .since(0)
+        .into_iter()
+        .filter(|n| n.kind == notices::NoticeKind::Wake)
+        .count();
+    assert_eq!(announced, 1, "asked once, however many agents wait");
+
+    let wid = requests
+        .iter()
+        .find(|r| r["to_sid"] == c1.as_str())
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (status, out) = request(
+        &state,
+        Method::POST,
+        &format!("/api/v1/workspaces/{ws}/comms/wakes/{wid}"),
+        Some(serde_json::json!({"wake": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    journal_has(&state, &c1, "held-one").await;
+    let content = journal_has(&state, &c2, "held-two").await;
+    assert!(content.contains("keep going"), "{content}");
+    assert!(comms(&state, &ws).await["wake_requests"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        crate::comms::unattended_wakes_for_tests(&state, &ws),
+        1,
+        "a new round; the released agent's wake counts against it"
+    );
+
+    // The user's own prompt in a chat (its socket's send) starts a new round.
+    {
+        use futures::SinkExt;
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = app(state.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/chat/{c1}"))
+            .await
+            .unwrap();
+        socket
+            .send(WsMessage::text(
+                serde_json::json!({"type": "auth", "token": "test-token", "last_seq": 0})
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+        socket
+            .send(WsMessage::text(
+                serde_json::json!({"type": "send", "blocks": [{"type": "text", "text": "carry on"}]})
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while crate::comms::unattended_wakes_for_tests(&state, &ws) != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the chat prompt didn't count"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        server.abort();
+    }
+
+    // So does the user's own prompt in a terminal agent.
+    crate::comms::use_unattended_wakes_for_tests(&state, &ws);
+    hook(&state, &a, "ka", "UserPromptSubmit").await;
+    assert_eq!(crate::comms::unattended_wakes_for_tests(&state, &ws), 0);
+    // A chat's own UserPromptSubmit also fires for a wake: it never counts.
+    crate::comms::use_unattended_wakes_for_tests(&state, &ws);
+    let key = lock(&state.agents).get(&c2).unwrap().key.clone();
+    hook(&state, &c2, &key, "UserPromptSubmit").await;
+    assert_ne!(crate::comms::unattended_wakes_for_tests(&state, &ws), 0);
+
+    state.chat.kill(&c1);
+    state.chat.kill(&c2);
+    state.sessions.kill(&a).ok();
+}
+
 /// A reply to a question the reader asked (`expect_reply`) wakes it even
 /// when the policy asks first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_reply_the_asker_wanted_wakes_it_without_asking() {
     let state = test_state();
+    set_comms(&state, true, "ask").await;
     let ws = make_workspace(&state, "comms-reply").await;
     let b = tui(&state, &ws, "kb");
     let (c, ck) = chat(&state, &ws, "comms-reply-fake").await;
