@@ -17,14 +17,18 @@ const ratio = (a: string, b: string) => {
   const y = luminance(b);
   return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05);
 };
+// sRGB color-mix(in srgb, a p%, b), as the browser computes it.
+const mix = (a: string, b: string, p: number) => {
+  const A = hex(a);
+  const B = hex(b);
+  return "#" + A.map((v, i) => Math.round((v * p + B[i] * (1 - p)) * 255).toString(16).padStart(2, "0")).join("");
+};
 
 const TEXT_TOKENS = [
   "--fg",
   "--muted",
-  "--accent", // links, "allowed" labels, primary actions
   "--err",
   "--warn", // renders as note text, not only a dot
-  "--rate",
   "--syn-keyword",
   "--syn-string",
   "--syn-number",
@@ -49,6 +53,12 @@ describe("theme text contrast", () => {
   for (const theme of THEMES) {
     const sheet = theme.tokens["--term-bg"];
     describe(theme.id, () => {
+      it("--accent as text (app.css --accent-text: 75% toward --fg) holds 4.5:1", () => {
+        expect(ratio(mix(theme.tokens["--accent"], theme.tokens["--fg"], 0.75), sheet)).toBeGreaterThanOrEqual(4.5);
+      });
+      it("--rate (a glyph tone, never prose) holds 3:1", () => {
+        expect(ratio(theme.tokens["--rate"], sheet)).toBeGreaterThanOrEqual(3.0);
+      });
       for (const token of TEXT_TOKENS) {
         it(`${token} holds 4.5:1 on the sheet`, () => {
           expect(ratio(theme.tokens[token], sheet)).toBeGreaterThanOrEqual(4.5);

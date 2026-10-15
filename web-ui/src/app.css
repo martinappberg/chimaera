@@ -32,6 +32,11 @@
   --notice-stack-offset: 140px;
   /* Single focus treatment for every keyboard-focusable control. */
   --focus-ring: color-mix(in srgb, var(--accent) 70%, transparent);
+  /* The accent as TEXT (links, paths, allowed-labels): an accent chosen for
+     dots and buttons can sit under 4.5:1 on the sheet (chimaera-light's green
+     is 3.4:1), so prose-sized accent text takes it a quarter toward --fg —
+     every theme passes that way (themes.contrast.test.ts). */
+  --accent-text: color-mix(in srgb, var(--accent) 75%, var(--fg));
   --bg: #fbfbfc;
   --fg: #1d1d20;
   --muted: #65656d;

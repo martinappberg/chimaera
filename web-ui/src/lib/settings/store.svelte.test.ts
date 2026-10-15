@@ -102,7 +102,7 @@ describe("settings appearance bootstrap", () => {
     expect(document.documentElement.dataset.theme).toBe("light");
     expect(document.documentElement.style.colorScheme).toBe("light");
     expect(document.documentElement.style.getPropertyValue("--bg")).toBe("#fbfbfc");
-    expect(document.documentElement.style.getPropertyValue("--accent")).toBe("#1f8757");
+    expect(document.documentElement.style.getPropertyValue("--accent")).toBe("#2e9e6b");
     expect(mocks.cacheAppearanceBootstrap).toHaveBeenLastCalledWith({
       mode: "light",
       themeId: "chimaera-light",
