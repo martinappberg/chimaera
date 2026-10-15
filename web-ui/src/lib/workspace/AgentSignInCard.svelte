@@ -128,7 +128,7 @@
   }
 </script>
 
-<div class="signin" class:framed role="group" aria-label="Sign in to {agent.name}">
+<div class="signin" class:framed class:pinned-card={framed} role="group" aria-label="Sign in to {agent.name}">
   {#if operation?.phase === "succeeded"}
     <p class="line ok" role="status">Signed in to {agent.name}.</p>
   {:else if running}
@@ -141,8 +141,8 @@
     </p>
     {#if operation?.url}
       <div class="actions">
-        <button class="btn primary" onclick={() => openInSystemBrowser(operation!.url!)}>Open ↗</button>
-        <button class="link" onclick={() => void copy("url")}>{copied === "url" ? "Copied" : "Copy link"}</button>
+        <button class="opt primary" onclick={() => openInSystemBrowser(operation!.url!)}>Open ↗</button>
+        <button class="opt-link" onclick={() => void copy("url")}>{copied === "url" ? "Copied" : "Copy link"}</button>
       </div>
       {#if operation.code}
         <!-- A device-code flow: the page asks for this. Large and copyable;
@@ -156,12 +156,12 @@
         <!-- The page shows a code to bring back (Claude). -->
         <form class="paste" onsubmit={(e) => { e.preventDefault(); void submitCode(); }}>
           <input bind:value={code} placeholder="Paste the code the page shows" spellcheck="false" autocomplete="off" disabled={busy} aria-label="Code from the sign-in page" />
-          <button class="btn" type="submit" disabled={busy || code.trim() === ""}>Continue</button>
+          <button class="opt" type="submit" disabled={busy || code.trim() === ""}>Continue</button>
         </form>
       {/if}
     {/if}
     <div class="actions">
-      <button class="link quiet" disabled={busy || operation?.phase === "cancelling"} onclick={() => void cancel()}>{operation?.phase === "cancelling" ? "Stopping…" : "Cancel"}</button>
+      <button class="opt-link quiet" disabled={busy || operation?.phase === "cancelling"} onclick={() => void cancel()}>{operation?.phase === "cancelling" ? "Stopping…" : "Cancel"}</button>
     </div>
   {:else}
     <p class="line" class:failure={operation?.phase === "failed"} role="status">
@@ -179,13 +179,13 @@
     </p>
     <div class="actions">
       {#if !(agent.signedIn === true && agent.signIn?.relogin === false)}
-        <button class="btn primary" disabled={busy || workspaceId === null || !status} onclick={() => void start()}>
+        <button class="opt primary" disabled={busy || workspaceId === null || !status} onclick={() => void start()}>
           {busy ? "Starting…" : operation ? "Try again" : agent.signedIn === true ? "Sign in again" : "Sign in"}
         </button>
       {/if}
       <!-- A login done elsewhere (a terminal, another window): ask the CLI again. -->
-      <button class="link quiet" disabled={checking} onclick={() => void check(true)}>Check again</button>
-      {#if onDismiss}<button class="link quiet" onclick={onDismiss}>Not now</button>{/if}
+      <button class="opt-link quiet" disabled={checking} onclick={() => void check(true)}>Check again</button>
+      {#if onDismiss}<button class="opt-link quiet" onclick={onDismiss}>Not now</button>{/if}
     </div>
   {/if}
   {#if error}<p class="line failure" role="alert">{error}</p>{/if}
@@ -193,20 +193,15 @@
 
 <style>
   .signin { display: flex; flex-direction: column; gap: 10px; font-size: var(--text-sm); color: var(--fg); min-width: 0; }
-  .signin.framed { width: min(420px, 100%); margin: 0 auto; padding: 18px 20px; border: 1px solid var(--edge); border-radius: 12px; background: color-mix(in srgb, var(--fg) 2%, transparent); text-align: left; }
+  /* Frame, radius and fill come from the shared `.pinned-card` (app.css);
+     a card that replaces a startup error should not animate in. */
+  .signin.framed { width: min(420px, 100%); margin: 0 auto; padding: 18px 20px; text-align: left; animation: none; }
   .line { margin: 0; line-height: 1.5; color: var(--muted); overflow-wrap: anywhere; }
   .line.ok { color: var(--fg); }
   .line.failure { color: var(--err); }
   .actions { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
-  button { font: inherit; font-size: var(--text-xs); cursor: pointer; }
-  button:disabled { opacity: .5; cursor: default; }
-  .btn { border: 1px solid var(--edge); border-radius: 6px; padding: 6px 12px; background: var(--term-bg); color: var(--fg); }
-  .btn:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 8%, transparent); }
-  .primary { border-color: color-mix(in srgb, var(--accent) 45%, var(--edge)); color: var(--accent); }
-  .link { border: 0; padding: 3px 0; background: none; color: var(--accent); }
-  .link.quiet { color: var(--muted); }
-  .link:hover:not(:disabled) { text-decoration: underline; }
-  .code { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; width: fit-content; padding: 8px 14px; border: 1px dashed color-mix(in srgb, var(--fg) 25%, transparent); border-radius: 8px; background: none; color: var(--fg); text-align: left; }
+  /* Buttons are the shared `.opt` / `.opt.primary` / `.opt-link` (app.css). */
+  .code { font: inherit; cursor: pointer; display: flex; flex-direction: column; align-items: flex-start; gap: 2px; width: fit-content; padding: 8px 14px; border: 1px dashed color-mix(in srgb, var(--fg) 25%, transparent); border-radius: 8px; background: none; color: var(--fg); text-align: left; }
   .code:hover { border-color: var(--accent); }
   .digits { font: 600 20px/1.2 var(--mono); letter-spacing: .14em; }
   .hint { font-size: var(--text-xs); color: var(--muted); }
