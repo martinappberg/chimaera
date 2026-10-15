@@ -1332,6 +1332,11 @@ fn render_journal_tail(
         }
     }
     let mut items: Vec<String> = Vec::new();
+    // A driver re-emits a call to retitle it (an ACP update naming its MCP
+    // tool, codex's file changes): the call's line is replaced, not repeated.
+    // Positions count from the journal's start; `drained` items have left.
+    let mut tool_lines: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut drained = 0;
     for line in content.lines() {
         let Ok(entry) = serde_json::from_str::<SeqEvent>(line) else {
             continue;
@@ -1350,13 +1355,22 @@ fn render_journal_tail(
                 }
                 _ => items.push(format!("assistant: {}", head(&text, ITEM_HEAD_CHARS))),
             },
-            AgentEvent::ToolCall { title, status, .. } => {
+            AgentEvent::ToolCall {
+                id, title, status, ..
+            } => {
                 let status = json!(status);
-                items.push(format!(
+                let line = format!(
                     "tool [{}]: {}",
                     status.as_str().unwrap_or("?"),
                     head(&title, ITEM_HEAD_CHARS)
-                ));
+                );
+                match tool_lines.get(&id) {
+                    Some(&at) if at >= drained => items[at - drained] = line,
+                    _ => {
+                        tool_lines.insert(id, drained + items.len());
+                        items.push(line);
+                    }
+                }
             }
             AgentEvent::PermissionRequest {
                 request_id, title, ..
@@ -1428,7 +1442,10 @@ fn render_journal_tail(
         // The journal is size-capped, but a pathological file must not grow
         // this vec without bound: keep at most one window past the ask.
         if items.len() > max_items * 2 {
-            items.drain(..items.len() - max_items);
+            let gone = items.len() - max_items;
+            items.drain(..gone);
+            drained += gone;
+            tool_lines.retain(|_, at| *at >= drained);
         }
     }
     if items.len() > max_items {
@@ -2467,6 +2484,55 @@ mod tests {
         assert!(
             live.ends_with("[live] a decision is waiting on the user RIGHT NOW"),
             "{live}"
+        );
+    }
+
+    /// A call re-emitted under a new title (an ACP update naming its MCP
+    /// tool) is one line, the latest; it still counts toward the window
+    /// once, and a call drained out of the window is listed again.
+    #[test]
+    fn journal_tail_lists_a_re_emitted_call_once() {
+        let dir = std::env::temp_dir().join(format!("chimaera-mcp-retitle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s-test.jsonl");
+        let call = |seq: u64, id: &str, title: &str, status: &str| {
+            serde_json::json!({"seq": seq, "ts": seq, "ev": {"type": "tool_call", "id": id,
+                "kind": "other", "title": title, "status": status}})
+        };
+        let mut lines = vec![
+            call(1, "m1", "MCP: tool", "pending"),
+            serde_json::json!({"seq": 2, "ts": 2, "ev": {"type": "notice", "text": "between"}}),
+            call(3, "m1", "chimaera: notify", "in_progress"),
+        ];
+        let content = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, content).unwrap();
+        let tail = render_journal_tail(&path, 10, false).unwrap();
+        assert_eq!(
+            tail, "tool [in_progress]: chimaera: notify\nnotice: between",
+            "{tail}"
+        );
+
+        // Past the window the first line is gone: a late re-emit is new.
+        for seq in 4..30 {
+            lines.push(
+                serde_json::json!({"seq": seq, "ts": seq, "ev": {"type": "notice", "text": "x"}}),
+            );
+        }
+        lines.push(call(30, "m1", "chimaera: notify", "in_progress"));
+        let content = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, content).unwrap();
+        let tail = render_journal_tail(&path, 3, false).unwrap();
+        assert_eq!(
+            tail, "notice: x\nnotice: x\ntool [in_progress]: chimaera: notify",
+            "{tail}"
         );
     }
 }

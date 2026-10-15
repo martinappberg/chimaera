@@ -24,7 +24,7 @@
 //! workspace, so a turn's baseline is taken before its end is diffed and
 //! entries land in the order their turns ended.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -37,6 +37,8 @@ use crate::AppState;
 const TEXT_KEEP: usize = 8 * 1024;
 /// Queued-but-unsent prompts remembered per session (a backstop).
 const QUEUED_MAX: usize = 16;
+/// Distinct calls remembered per turn for the tool count.
+const COUNTED_MAX: usize = 512;
 
 /// A finished turn, before workspace/session context is attached.
 #[derive(Debug, Clone, PartialEq)]
@@ -64,6 +66,10 @@ struct TurnAcc {
     files: Vec<String>,
     announced: HashMap<String, Vec<String>>,
     tools: usize,
+    /// Calls already counted: a driver re-emits a call to retitle it
+    /// (codex's file changes, an ACP update naming its MCP tool), which is
+    /// still one tool. Past `COUNTED_MAX` every call counts.
+    counted: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -170,7 +176,9 @@ impl ChatEpisodes {
                 status,
                 ..
             } => {
-                acc.turn.tools += 1;
+                if acc.turn.counted.len() >= COUNTED_MAX || acc.turn.counted.insert(id.clone()) {
+                    acc.turn.tools += 1;
+                }
                 acc.turn.text_stale = true;
                 if *kind == ToolKind::Edit {
                     match status {
@@ -956,6 +964,27 @@ mod tests {
         assert_eq!(d.files, vec!["/w/qc.R".to_string()]);
         assert_eq!(d.tools, 2);
         assert_eq!((d.start_ts, d.end_ts, d.end), (2, 9, "finished"));
+    }
+
+    #[test]
+    fn a_re_emitted_call_counts_once() {
+        let mut eps = ChatEpisodes::default();
+        eps.observe("a", 1, &user("notify", Some("u"), false));
+        eps.observe("a", 2, &started());
+        let call = |title: &str| AgentEvent::ToolCall {
+            id: "m1".into(),
+            kind: ToolKind::Other,
+            title: title.into(),
+            locations: Vec::new(),
+            status: ToolStatus::InProgress,
+            cross_turn: false,
+            command: None,
+        };
+        eps.observe("a", 3, &call("MCP: tool"));
+        eps.observe("a", 4, &call("chimaera: notify"));
+        eps.observe("a", 5, &done("m1", ToolStatus::Completed));
+        let d = eps.observe("a", 6, &completed()).expect("closed");
+        assert_eq!(d.tools, 1);
     }
 
     #[test]
