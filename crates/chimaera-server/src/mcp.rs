@@ -163,6 +163,41 @@ absolute local ones. Call document_guide for the full rules; run \
 check_document on a document before handing it over. In replies, cite files \
 workspace-relative as `path:line`, `path#L10-L20` or a relative markdown link.";
 
+/// The plan paragraph: the workbench draws one plan card from the agent's
+/// own task list (claude `TaskCreate`/`TaskUpdate`, codex `update_plan`, an
+/// ACP agent's plan), and the desktop apps get that card on every
+/// multi-step request only because they ask for it. A plan written as prose
+/// draws nothing, so each runtime is asked in its own tool's words.
+fn task_list_instructions(kind: Option<crate::agents::AgentKind>) -> &'static str {
+    use crate::agents::AgentKind;
+    match kind {
+        Some(AgentKind::Claude) => {
+            "\n\n\
+Task list: for any request that edits files or runs more than one command, \
+keep your task list current with TaskCreate/TaskUpdate — the whole plan up \
+front, one step in_progress at a time, each marked completed as it finishes, \
+the list replaced when the plan changes. The user follows it as a plan card \
+beside the chat; a plan written only as prose shows nothing there."
+        }
+        Some(AgentKind::Codex) => {
+            "\n\n\
+Task list: for any request that edits files or runs more than one command, \
+keep your plan current with update_plan — the whole plan up front, one step \
+in_progress at a time, each marked completed as it finishes, the list \
+replaced when the plan changes. The user follows it as a plan card beside \
+the chat; a plan written only as prose shows nothing there."
+        }
+        _ => {
+            "\n\n\
+Task list: for any request that edits files or runs more than one command, \
+keep your plan or to-do list current with your own plan tool — the whole \
+plan up front, one step in progress at a time, each marked done as it \
+finishes. The user follows it as a plan card beside the chat; a plan written \
+only as prose shows nothing there."
+        }
+    }
+}
+
 /// Extra instructions when the session is its workspace's Mastermind.
 const MASTERMIND_INSTRUCTIONS: &str = "\n\n\
 This session is the workspace's Mastermind: the one agent the user \
@@ -263,6 +298,7 @@ pub(crate) async fn mcp(
         "initialize" => Ok(initialize_result(
             &params,
             &agent_id,
+            crate::lock(&state.agents).get(&agent_id).map(|r| r.kind),
             comms_on,
             mastermind,
             mastermind_here,
@@ -308,6 +344,7 @@ pub(crate) fn mastermind_of(state: &AppState, agent_id: &str) -> bool {
 fn initialize_result(
     params: &Value,
     agent_id: &str,
+    kind: Option<crate::agents::AgentKind>,
     comms_on: bool,
     mastermind: bool,
     mastermind_here: bool,
@@ -320,6 +357,7 @@ fn initialize_result(
         .and_then(|v| v.as_str())
         .unwrap_or(PROTOCOL_FALLBACK);
     let mut instructions = format!("{INSTRUCTIONS}{DOCUMENTS_INSTRUCTIONS}");
+    instructions.push_str(task_list_instructions(kind));
     if comms_on {
         instructions.push_str(&crate::comms::instructions(
             agent_id,

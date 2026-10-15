@@ -24,6 +24,15 @@ async fn mcp_handshake_auth_and_tool_listing() {
         .as_str()
         .unwrap()
         .contains("@term:"));
+    // The plan card asks for the agent's own task list, in its tool's words.
+    let text = out["result"]["instructions"].as_str().unwrap();
+    assert!(text.contains("Task list:"), "{text}");
+    assert!(
+        text.contains("TaskCreate/TaskUpdate")
+            || text.contains("update_plan")
+            || text.contains("plan tool"),
+        "{text}"
+    );
 
     // Notifications (no id) are 202-acknowledged.
     let (status, _) = mcp_post(
