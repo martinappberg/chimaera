@@ -278,6 +278,7 @@ pub(crate) async fn spawn_session(
             // name: it loses to any real title the agent produces, exactly
             // like a first prompt would.
             record.first_prompt = spec.title_hint.clone();
+            record.spawn_cwd = Some(opts.cwd.clone());
             crate::lock(&state.agents).insert(id.clone(), record);
             spawned_agent = Some(agent_kind);
         }

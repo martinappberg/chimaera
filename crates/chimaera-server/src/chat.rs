@@ -1419,7 +1419,7 @@ pub(crate) async fn switch_view(
             "session has no workspace".to_string(),
         );
     };
-    let Some(workspace_root) = crate::lock(&state.workspaces)
+    let Some(ws_root) = crate::lock(&state.workspaces)
         .get(&workspace_id)
         .map(|w| w.root.clone())
     else {
@@ -1429,7 +1429,7 @@ pub(crate) async fn switch_view(
         );
     };
     // A session started in a worktree respawns there, where its transcript is.
-    let workspace_root = session_root(&state, &id).unwrap_or(workspace_root);
+    let workspace_root = session_root(&state, &id).unwrap_or_else(|| ws_root.clone());
 
     // Serialize before the first await below. Acquiring after transcript
     // validation allowed a fast competing switch/rewind to complete while
@@ -1474,14 +1474,18 @@ pub(crate) async fn switch_view(
     // Validate against the project store; no transcript = fresh start.
     let resume = match resume {
         Some(uuid) if record.kind == AgentKind::Claude => {
-            let path = state
-                .claude_projects_dir
-                .join(crate::launcher::encode_cwd(&workspace_root))
-                .join(format!("{uuid}.jsonl"));
-            tokio::fs::try_exists(&path)
-                .await
-                .unwrap_or(false)
-                .then_some(uuid)
+            // Wherever claude filed it: the hook-reported path (an agent
+            // that entered a worktree), this session's folder, the root.
+            let mut recorded = crate::claude_store::recorded_for(&state, &uuid);
+            recorded.extend(record.transcript_path.clone());
+            crate::claude_store::find(
+                state.claude_projects_dir.clone(),
+                uuid.clone(),
+                recorded,
+                vec![workspace_root.clone(), ws_root.clone()],
+            )
+            .await
+            .map(|_| uuid)
         }
         other => other,
     };
@@ -2898,13 +2902,22 @@ pub(crate) fn seed_resumed_journal(state: &Arc<AppState>, id: &str, recipe: &Cha
     if recipe.kind != AgentKind::Claude {
         return false;
     }
-    let transcript = state
-        .claude_projects_dir
-        .join(crate::launcher::encode_cwd(&recipe.workspace_root))
-        .join(format!("{native}.jsonl"));
-    if !transcript.exists() {
+    // The shared lookup: a recorded path (a Recents row's, a live record's),
+    // the session's folder, the workspace root, its Claude worktrees.
+    let root = crate::lock(&state.workspaces)
+        .get(&recipe.workspace_id)
+        .map(|w| w.root);
+    let cwds: Vec<PathBuf> = std::iter::once(recipe.workspace_root.clone())
+        .chain(root)
+        .collect();
+    let Some(transcript) = crate::claude_store::find_blocking(
+        &state.claude_projects_dir,
+        native,
+        &crate::claude_store::recorded_for(state, native),
+        &cwds,
+    ) else {
         return false;
-    }
+    };
     let events = chimaera_agent::transcript::import_transcript(&transcript);
     if events.is_empty() {
         return false;
@@ -3212,6 +3225,12 @@ pub(crate) async fn spawn_chat_session(
     pinned_override: Option<String>,
 ) -> anyhow::Result<ChatInfo> {
     let chat_bin = crate::launcher::chat_executable(state, recipe.kind, &recipe.bin).await?;
+    // Where it runs, on the record: the exit path retires it into Recents
+    // after the chat registry has let go, and a worktree's conversation
+    // must reopen in that worktree.
+    if let Some(record) = crate::lock(&state.agents).get_mut(&id) {
+        record.spawn_cwd = Some(recipe.workspace_root.clone());
+    }
     let (usage, binaries) = crate::runtime_retention::acquire(
         state,
         Some(recipe.kind),
@@ -3593,13 +3612,25 @@ pub(crate) async fn resurrect_chat(
     // resumes its thread in-protocol, so its id passes straight through. Without
     // a usable handle the chat boots fresh — the journal still replays for the
     // reader (the same "nothing to lose" fallback the TUI path takes).
+    // The transcript the lookup found, carried onto the new record so the
+    // next ledger snapshot keeps it even before a hook reports it again.
+    let mut found_transcript: Option<PathBuf> = None;
     let resume = match &agent.resume {
         Some(uuid) if agent.kind == AgentKind::Claude => {
-            let path = state
-                .claude_projects_dir
-                .join(crate::launcher::encode_cwd(&root))
-                .join(format!("{uuid}.jsonl"));
-            if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            // The one shared lookup: the transcript claude's hooks reported
+            // (the ledger's record — after an `EnterWorktree` it lives in the
+            // worktree's project dir), the folder the chat ran in (a
+            // worktree it was started in, even one removed since), the root.
+            // Claude resumes by id from the root even then (2.1.300).
+            let found = crate::claude_store::find(
+                state.claude_projects_dir.clone(),
+                uuid.clone(),
+                agent.transcript.iter().cloned().collect(),
+                vec![entry.cwd.clone(), root.clone(), workspace.root.clone()],
+            )
+            .await;
+            if found.is_some() {
+                found_transcript = found;
                 Some(uuid.clone())
             } else {
                 tracing::info!(session = %entry.id, "chat transcript is gone; resurrecting fresh");
@@ -3620,6 +3651,7 @@ pub(crate) async fn resurrect_chat(
     // chat is dropped from the following snapshot and lost on the NEXT restart.
     let mut record = crate::agents::AgentRecord::new(key, agent.kind);
     record.resumed_from = resume.clone();
+    record.transcript_path = found_transcript;
     record.custom_title = entry.pinned_name.clone();
     if record.custom_title.is_none() && agent.title != agent.kind.as_str() {
         record.ai_title = Some(crate::agents::truncate_prompt(&agent.title));

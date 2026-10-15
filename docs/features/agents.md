@@ -250,6 +250,43 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   rail without deleting anything; a quiet **All sessions** link ends the list
   ([session-history.md](session-history.md#archiving-recents)).
 
+## Where each agent keeps a conversation (resume from any folder)
+
+- **What & when.** Chimaera resumes a native conversation after a restart, from Recents and from
+  history. An agent's folder can change under it — a session started in a worktree, a Claude agent
+  that calls `EnterWorktree` mid-conversation, a worktree removed since — so each runtime's lookup
+  has to match how that runtime files conversations.
+- **Where it lives.** `claude_store.rs` (the one Claude lookup: `find`/`find_blocking`,
+  `find_known` + `worktree_index` for history's per-row check, `claude_worktree_dirs`), used by
+  `chat.rs` (`resurrect_chat`, `switch_view`, `seed_resumed_journal`), `ledger.rs`
+  (`resolve_resume`), `recents.rs` (`retire_inner`, the Recents scan), `history/routes.rs`
+  (`reopen`) and `launcher.rs` (`claude_resumables`). Codex: `chimaera-agent/src/codex.rs`
+  (`thread/resume`). ACP: `chimaera-agent/src/acp.rs` (`session/resume` / `session/load`).
+- **Key behaviors.**
+  - **Claude** files a conversation under the folder it is working in:
+    `~/.claude/projects/<encoded cwd>/<id>.jsonl`, the encoding folding every non-alphanumeric
+    character into `-`. `EnterWorktree` moves the file to the worktree's directory
+    (`<root>--claude-worktrees-<name>`). Chimaera looks, in order: the transcript path Claude's
+    hooks reported (`transcript_path`, now recorded for chats as well as terminals in the ledger,
+    Recents and history), the session's own cwd, the workspace root, then the root's own Claude
+    worktree directories (one bounded `read_dir` of the store, exact `<id>.jsonl` only; the
+    `--claude-worktrees-` part keeps a sibling such as `proj-pro` out). Claude itself resumes by id
+    from the repository root even after the worktree is gone (claude 2.1.300, `--resume <id>`, no
+    fork), so a chat that entered a worktree and a chat whose managed worktree was removed both come
+    back with their memory.
+  - **Codex** keeps rollouts by date and thread id (`~/.codex/sessions/YYYY/MM/DD/rollout-…-<thread
+    id>.jsonl`), independent of the folder, and resumes in-protocol (`thread/resume`; `codex resume
+    <id>` in the TUI). A thread started in one folder resumes from another, including after the
+    first folder is deleted (codex 0.162.1). Chimaera passes the id straight through.
+  - **Antigravity and Grok (ACP)** resume by session id through the adapter (`session/resume` when
+    the agent advertises it, else `session/load`, both with the cwd). Antigravity keeps conversations
+    by id with the cwd as metadata (`~/.gemini/antigravity-acp/conversations/<id>.*`). Grok files
+    sessions under a directory per cwd (`~/.grok/sessions/<url-encoded cwd>/<id>`), so a Grok chat
+    resumes in the folder it ran in: a worktree session comes back while its worktree exists;
+    after the worktree is removed it starts at the root, where Grok may not find it.
+  - A resurrected chat runs in the folder it ran in while that still exists, else the workspace
+    root; a Recents row keeps that folder too and reopens there.
+
 ## Documents: the portable dialect, `check_document` and the issues chip
 
 - **What & when.** Agents write reports, READMEs and notes the user reads in the markdown

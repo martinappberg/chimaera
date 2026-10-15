@@ -179,6 +179,10 @@ pub(crate) struct AgentRecord {
     pub(crate) state: AgentState,
     /// Latest transcript path reported by any hook payload.
     pub(crate) transcript_path: Option<PathBuf>,
+    /// The folder a PTY agent was spawned in (a chat's lives on its recipe),
+    /// so the conversation's Recents row can say where it ran once the PTY
+    /// is gone — a worktree's conversation resumes in that worktree.
+    pub(crate) spawn_cwd: Option<PathBuf>,
     /// Latest `customTitle` transcript record (wins over `ai_title`).
     pub(crate) custom_title: Option<String>,
     /// Latest `{"type":"ai-title"}` transcript record.
@@ -287,6 +291,7 @@ impl AgentRecord {
             kind,
             state: AgentState::Unknown,
             transcript_path: None,
+            spawn_cwd: None,
             custom_title: None,
             ai_title: None,
             first_prompt: None,
