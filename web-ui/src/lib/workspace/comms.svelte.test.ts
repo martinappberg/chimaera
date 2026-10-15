@@ -10,6 +10,7 @@ import {
   parseComms,
   unreadFor,
   wake,
+  wakeAsk,
   wakeRequestFor,
 } from "./comms.svelte";
 
@@ -48,6 +49,15 @@ describe("parseComms", () => {
     expect(parseComms(null)).toEqual({ enabled: true, wakes: "auto", unread: {}, wake_requests: [] });
     expect(parseComms({ enabled: false, wakes: "sometimes" })).toMatchObject({ enabled: false, wakes: "auto" });
     expect(parseComms({ wakes: "ask" }).wakes).toBe("ask");
+  });
+});
+
+describe("wakeAsk", () => {
+  it("asks to continue past either limit, to wake otherwise", () => {
+    expect(wakeAsk("hop_limit")).toMatchObject({ cont: true, words: "back and forth" });
+    expect(wakeAsk("unattended")).toMatchObject({ cont: true, words: "agents kept going" });
+    expect(wakeAsk("ask")).toEqual({ cont: false, words: null, title: null });
+    expect(wakeAsk("a reason from a newer daemon").cont).toBe(false);
   });
 });
 

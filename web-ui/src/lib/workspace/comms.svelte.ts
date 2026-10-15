@@ -138,6 +138,21 @@ class CommsStore {
 
 export const commsStore = new CommsStore();
 
+/** How a wake request asks, by its reason — the one wording the idle
+ *  agent's bar and the Needs-you card share. `cont`: past a limit the
+ *  question is whether to let them keep going (Continue, not Wake). */
+export function wakeAsk(reason: string): { cont: boolean; words: string; title: string } | { cont: false; words: null; title: null } {
+  if (reason === "hop_limit")
+    return { cont: true, words: "back and forth", title: "these two agents have woken each other several times — continue?" };
+  if (reason === "unattended")
+    return {
+      cont: true,
+      words: "agents kept going",
+      title: "agents here have woken each other many times since you last stepped in — Continue lets them keep going",
+    };
+  return { cont: false, words: null, title: null };
+}
+
 /** The wake request waiting on the user for `sid`'s inbox, or null (the
  *  daemon keeps at most one per agent). */
 export function wakeRequestFor(sid: string | null | undefined): WakeRequest | null {

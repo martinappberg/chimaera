@@ -145,9 +145,10 @@ is not moved to the background: its result may be what the next step needs.
   minutes (per pair, so a coordinator handing work to three idle agents wakes all three), 4
   wakes per conversation (a reply chain; a reply isn't held to the 3 minutes — a quick second
   question's answer would otherwise sit unread), and 20 agent wakes in a workspace since the
-  user last stepped in there — a prompt to any of its agents (a chat's send at the socket, a
-  claude terminal's UserPromptSubmit; a chat's own UserPromptSubmit also fires for a wake, so
-  it doesn't count), a Wake or Continue, or a hand-over starts a new round. Time alone never
+  user last stepped in there — a prompt in one of its chats (the send at the socket) or Claude
+  terminals (their UserPromptSubmit; a chat's own UserPromptSubmit also fires for a wake, so it
+  doesn't count, and a Codex terminal's prompt never reaches the daemon), a Wake or Continue,
+  or a hand-over starts a new round. Time alone never
   refills it: a loop left running overnight costs one round, while a coordinator's busy
   afternoon never meets it as long as the user is there. Past a cap nothing is left unseen: a
   message inside the 3 minutes wakes its reader once they have passed (the sender is told
@@ -236,8 +237,9 @@ _Captured 2026-09-29/30 from the maintainer, in the design conversation that pro
   running — "extend it to be better and have agents be able to talk to each other".
 - **Deliberate calls (settled by the maintainer):** built in, not a plugin — the Agent notes
   plugin is deleted; **enabled by default**, and "it is important one can turn it off"; the
-  **Mastermind is part of it**; waking an idle agent is a policy; peers reading each other's
-  work (`read_agent`) — "yes most definitely".
+  **Mastermind is part of it**; waking an idle agent is a policy defaulting to **Ask me**
+  (superseded 2026-10-15, below); peers reading each other's work (`read_agent`) — "yes most
+  definitely".
 - **Wakes default to Automatically (2026-10-15).** The default was **Ask me** until a peer's
   message sat unread in an idle chat while its wake request waited in the dashboard, out of
   sight: "IT should be auto by default I feel", and a request that does need the user "should

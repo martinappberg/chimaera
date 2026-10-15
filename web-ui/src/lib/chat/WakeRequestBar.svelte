@@ -13,7 +13,7 @@
    * dismissed. The message is an agent's words: plain text, one line.
    */
   import SessionGlyph from "../shared/SessionGlyph.svelte";
-  import { dismissWakeFailure, wake, type WakeRequest } from "../workspace/comms.svelte";
+  import { dismissWakeFailure, wake, wakeAsk, type WakeRequest } from "../workspace/comms.svelte";
 
   interface Props {
     request: WakeRequest | null;
@@ -27,20 +27,9 @@
 
   let busy = $state<"wake" | "leave" | null>(null);
 
-  /** Past a limit the question is whether to let them keep going. */
-  const cont = $derived(request?.reason === "hop_limit" || request?.reason === "unattended");
-  const oneLine = $derived((request?.text ?? "").replace(/\s+/g, " ").trim());
   /** Why chimaera asks although the user lets agents wake each other. */
-  const why = $derived(
-    request?.reason === "hop_limit"
-      ? { words: "back and forth", title: "these two agents have woken each other several times — continue?" }
-      : request?.reason === "unattended"
-        ? {
-            words: "agents kept going",
-            title: "agents here have woken each other many times since you last stepped in — Continue lets them keep going",
-          }
-        : null,
-  );
+  const ask = $derived(wakeAsk(request?.reason ?? "ask"));
+  const oneLine = $derived((request?.text ?? "").replace(/\s+/g, " ").trim());
 
   async function answer(yes: boolean): Promise<void> {
     if (request === null || busy !== null) return;
@@ -57,9 +46,7 @@
 
 {#if failure !== null && request === null}
   <div class="pinned-card wake-card" class:visible role="alert">
-    <span class="text err"
-      >couldn't {failure.request.reason === "hop_limit" || failure.request.reason === "unattended" ? "continue" : "wake"} — {failure.message}</span
-    >
+    <span class="text err">couldn't {wakeAsk(failure.request.reason).cont ? "continue" : "wake"} — {failure.message}</span>
     <span class="actions">
       <button class="opt quiet" onclick={() => dismissWakeFailure(failure.request.id)}>Dismiss</button>
     </span>
@@ -70,7 +57,7 @@
       {#if request.from_agent !== null}<SessionGlyph kind="agent" agentKind={request.from_agent} size={11} />{/if}
       <span class="name">{request.from_name}</span>
     </span>
-    {#if why !== null}<span class="why" title={why.title}>{why.words}</span>{/if}
+    {#if ask.words !== null}<span class="why" title={ask.title}>{ask.words}</span>{/if}
     <span class="text" title={request.text}>{oneLine}</span>
     <span class="actions">
       <button
@@ -84,7 +71,7 @@
         disabled={busy !== null}
         title="deliver it now — a turn billed to your account"
         onclick={() => void answer(true)}
-        >{busy === "wake" ? (cont ? "Continuing…" : "Waking…") : cont ? "Continue" : "Wake"}</button
+        >{busy === "wake" ? (ask.cont ? "Continuing…" : "Waking…") : ask.cont ? "Continue" : "Wake"}</button
       >
     </span>
   </div>

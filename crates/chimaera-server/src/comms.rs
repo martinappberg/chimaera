@@ -87,7 +87,7 @@ const POSTS_PER_MINUTE: usize = 10;
 /// unattended limit the user is asked. Short under test, so the deferred
 /// wake can be watched.
 const WAKE_GAP: Duration = if cfg!(test) {
-    Duration::from_secs(2)
+    Duration::from_secs(5)
 } else {
     Duration::from_secs(180)
 };
@@ -2578,32 +2578,50 @@ pub(crate) async fn post_wake(
         }
         held
     };
+    // Detached: a window that closes mid-answer must neither strand the
+    // held agents (already taken out of the list) nor half-finish a send's
+    // claim, and the click answers once its own agent has the message.
+    if !held.is_empty() {
+        tokio::spawn(release_held(state.clone(), id.clone(), held));
+    }
     let why = "[chimaera delivered these because the user approved waking you for messages from \
                other agents in this workspace]";
-    let answer = match deliver_all(
-        &state,
-        &target,
-        Some(why),
-        chimaera_agent::model::ORIGIN_AGENT,
-    )
-    .await
-    {
-        Ok(n) => {
+    let send = {
+        let state = state.clone();
+        let target = target.clone();
+        tokio::spawn(async move {
+            deliver_all(
+                &state,
+                &target,
+                Some(why),
+                chimaera_agent::model::ORIGIN_AGENT,
+            )
+            .await
+        })
+    };
+    match send.await {
+        Ok(Ok(n)) => {
             crate::history::act(&state, &id, "you", "wake_agent", Some(&target.sid), None);
             Json(json!({ "woke": true, "delivered": n })).into_response()
         }
-        Err(err) => fail(StatusCode::CONFLICT, err),
-    };
+        Ok(Err(err)) => fail(StatusCode::CONFLICT, err),
+        Err(_) => fail(StatusCode::INTERNAL_SERVER_ERROR, "the wake didn't finish"),
+    }
+}
+
+/// After the user's Continue past the unattended limit: wake every other
+/// agent the limit held back. Each is an agent wake like any other — it
+/// counts against the new round and keeps the pair's gap and the
+/// conversation's limit.
+async fn release_held(state: Arc<AppState>, ws: String, held: Vec<WakeRequest>) {
     for other in held {
-        let Some(reader) = reader(&state, &other.to_sid).filter(|r| r.alive && r.chat) else {
+        let Some(target) = reader(&state, &other.to_sid).filter(|r| r.alive && r.chat) else {
             continue;
         };
-        // Each is an agent wake like any other: it counts against the new
-        // round and keeps the pair's gap and the conversation's limit.
         let claim = crate::lock(&state.comms.inner).claim_wake(
             &other.from_sid,
-            &reader.sid,
-            &id,
+            &target.sid,
+            &ws,
             other.thread.clone(),
         );
         match claim {
@@ -2612,7 +2630,7 @@ pub(crate) async fn post_wake(
                            workspace keep going]";
                 match deliver_all(
                     &state,
-                    &reader,
+                    &target,
                     Some(why),
                     chimaera_agent::model::ORIGIN_AGENT,
                 )
@@ -2620,41 +2638,40 @@ pub(crate) async fn post_wake(
                 {
                     Ok(n) if n > 0 => crate::history::act(
                         &state,
-                        &id,
+                        &ws,
                         "you",
                         "wake_agent",
-                        Some(&reader.sid),
+                        Some(&target.sid),
                         None,
                     ),
                     Ok(_) => {}
                     Err(err) => {
-                        tracing::warn!(%err, session = %reader.sid, "continued wake not delivered");
+                        tracing::warn!(%err, session = %target.sid, "continued wake not delivered");
                         crate::lock(&state.comms.inner).release_wake(
                             &other.from_sid,
-                            &reader.sid,
-                            &id,
+                            &target.sid,
+                            &ws,
                             other.thread.as_ref(),
                         );
                     }
                 }
             }
             Err(Capped::Gap(after)) => {
-                crate::lock(&state.comms.inner).await_turn_end(&id, &reader.sid, other.message);
-                defer_wake(&state, &id, &reader.sid, after);
+                crate::lock(&state.comms.inner).await_turn_end(&ws, &target.sid, other.message);
+                defer_wake(&state, &ws, &target.sid, after);
             }
             Err(Capped::Conversation) => ask_user(
                 &state,
-                &id,
+                &ws,
                 WakeRequest {
                     reason: "hop_limit",
                     ..other
                 },
             ),
-            Err(Capped::Unattended) => ask_user(&state, &id, other),
+            Err(Capped::Unattended) => ask_user(&state, &ws, other),
         }
     }
     state.changes.notify_waiters();
-    answer
 }
 
 #[derive(Deserialize)]

@@ -11,7 +11,7 @@
    * its words and a Dismiss (the request itself is gone either way).
    */
   import SessionGlyph from "../shared/SessionGlyph.svelte";
-  import { dismissWakeFailure, wake, type WakeRequest } from "../workspace/comms.svelte";
+  import { dismissWakeFailure, wake, wakeAsk, type WakeRequest } from "../workspace/comms.svelte";
 
   interface Props {
     request: WakeRequest;
@@ -29,8 +29,8 @@
   const from = $derived(names.get(request.from_sid) ?? request.from_name);
   const to = $derived(names.get(request.to_sid) ?? request.to_name);
   const hop = $derived(request.reason === "hop_limit");
-  /** Past a limit the question is whether to let them keep going. */
-  const cont = $derived(hop || request.reason === "unattended");
+  const ask = $derived(wakeAsk(request.reason));
+  const cont = $derived(ask.cont);
   const oneLine = $derived(request.text.replace(/\s+/g, " ").trim());
 
   let busy = $state<"wake" | "leave" | null>(null);
@@ -69,8 +69,8 @@
       {@render who(request.from_sid, from)}
       <span class="words">wants to wake</span>
       {@render who(request.to_sid, to)}
-      {#if request.reason === "unattended"}
-        <span class="words" title="agents here have woken each other many times since you last stepped in — Continue lets them keep going">· agents kept going</span>
+      {#if ask.words !== null}
+        <span class="words" title={ask.title}>· {ask.words}</span>
       {/if}
     {/if}
   </div>
