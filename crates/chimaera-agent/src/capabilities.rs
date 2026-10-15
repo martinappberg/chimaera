@@ -90,6 +90,7 @@ mod tests {
             ("codex", true),
             ("agy", false),
             ("grok", false),
+            ("cursor", false),
         ] {
             assert_eq!(
                 ChatCapabilities::legacy(kind).custom_model,

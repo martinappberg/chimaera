@@ -6,6 +6,7 @@
  * plain counts: "Ran 2 commands, read a file". Still-running calls are said in
  * the present tense, so a live group never claims work it has not finished.
  */
+import { formatElapsedSeconds } from "../shared/time";
 
 /** The fields of a tool row the title reads. */
 export interface LabelledTool {
@@ -419,7 +420,72 @@ export function toolRunHealth(tools: HealthTool[], tail?: TurnTail): "failed" | 
   return tools.some((t) => t.status === "failed" || t.denied) ? "recovered" : null;
 }
 
+/** Where a description stops reading as a label. */
+const DESCRIPTION_MAX = 160;
+
+/** What a command says it is doing, in the agent's own plain words —
+ *  claude's Bash `description` ("Sum the BAM sizes") — on one line; null when
+ *  the wire gave none (codex commands, ACP rows, whose titles already are
+ *  the readable label). Execute rows only: other tools' `description`
+ *  arguments say something else (an Artifact's gallery caption, a
+ *  CronCreate's or an MCP tool's own field), not what the call is doing. */
+export function toolDescription(t: { tool: string; nativeInput?: unknown }): string | null {
+  if (t.tool !== "execute") return null;
+  const input = t.nativeInput;
+  if (typeof input !== "object" || input === null) return null;
+  const raw = (input as { description?: unknown }).description;
+  if (typeof raw !== "string") return null;
+  const line = raw.replace(/\s+/g, " ").trim();
+  if (line === "") return null;
+  return line.length > DESCRIPTION_MAX ? `${line.slice(0, DESCRIPTION_MAX - 1)}…` : line;
+}
+
+/** The fields a run's elapsed reads. */
+export interface TimedTool {
+  status: string;
+  startedAtMs?: number;
+  endedAtMs?: number;
+}
+
+/** How long a run of calls has taken: from its first start to now while any
+ *  call runs (`nowMs` on the journal's clock), else to its last recorded
+ *  end. Null when the rows carry no times (old journals) or no end was ever
+ *  seen (a row reconciled at turn end). */
+export function toolSpanMs(tools: readonly TimedTool[], nowMs: number): number | null {
+  let start = Infinity;
+  let end = -Infinity;
+  let live = false;
+  for (const t of tools) {
+    if (t.startedAtMs !== undefined) start = Math.min(start, t.startedAtMs);
+    if (t.endedAtMs !== undefined) end = Math.max(end, t.endedAtMs);
+    if (isLive(t)) live = true;
+  }
+  if (start === Infinity) return null;
+  if (live) return Math.max(0, nowMs - start);
+  return end === -Infinity ? null : Math.max(0, end - start);
+}
+
+/** A run's elapsed as its line shows it: nothing under a second (a quick
+ *  read needs no clock), else the chat's one ladder ("7s", "1m 04s"). */
+export function spanLabel(ms: number | null): string | null {
+  if (ms === null || ms < 1000) return null;
+  return formatElapsedSeconds(Math.floor(ms / 1000));
+}
+
+/** A group's line. While calls run it says what the newest described one is
+ *  doing, in the agent's words ("Locating the notify code"); settled, the
+ *  agent's own batch labels come first, then a lone described call's
+ *  description, then readable counts. */
 export function toolGroupTitle(tools: LabelledTool[]): string {
+  for (let i = tools.length - 1; i >= 0; i--) {
+    if (!isLive(tools[i])) continue;
+    const doing = toolDescription(tools[i]);
+    if (doing !== null) return doing;
+  }
+  if (tools.length === 1 && (tools[0].summary ?? "") === "") {
+    const said = toolDescription(tools[0]);
+    if (said !== null) return said;
+  }
   const labels: string[] = [];
   let lastLabelled = -1;
   tools.forEach((t, i) => {

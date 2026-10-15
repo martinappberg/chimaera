@@ -408,8 +408,20 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
                 created_at: c.created_at_ms / 1000,
                 agent: Some(LedgerAgent {
                     kind,
-                    resume: c.native_session_id.clone(),
-                    transcript: None,
+                    // A resumed claude reports its id only with its first
+                    // turn's system/init; until then the handle is the one
+                    // it was resumed from (2.1.283+ keeps it). Without this
+                    // a chat restored twice with no turn between forgot
+                    // its conversation (observed live while fixing #271).
+                    resume: c
+                        .native_session_id
+                        .clone()
+                        .filter(|id| !id.is_empty())
+                        .or_else(|| record.and_then(|r| r.resumed_from.clone())),
+                    // What claude's hooks report it is writing — after an
+                    // `EnterWorktree` that is the worktree's project dir, not
+                    // the one this chat's cwd derives (option 3 of #271).
+                    transcript: record.and_then(|r| r.transcript_path.clone()),
                     title,
                     ui: SessionUi::Chat,
                     model: c.model.clone(),
@@ -544,25 +556,27 @@ fn plan_restore(entry: &LedgerEntry, restore_enabled: bool, workspace_exists: bo
     }
 }
 
-/// The resume id to actually pass, verified against disk: the recorded
-/// transcript path, or the conventional store location for this cwd. A
-/// conversation whose transcript does not exist gets `None` — resuming it
-/// would only produce an instantly-dead "No conversation found" pane.
-/// (Claude 2.1.204 interactive sessions persist no transcript, so this is
-/// a normal case, not a corruption case.)
-fn resolve_resume(claude_projects_dir: &std::path::Path, entry: &LedgerEntry) -> Option<String> {
+/// The resume id to actually pass, verified against disk through the one
+/// shared lookup (`claude_store`): the recorded transcript path, the
+/// session's own cwd's store location, then the workspace root's (`root`;
+/// the cwd may be a worktree that is gone now). A conversation whose
+/// transcript does not exist gets `None` — resuming it would only produce an
+/// instantly-dead "No conversation found" pane. (Claude 2.1.204 interactive
+/// sessions persist no transcript, so this is a normal case, not a
+/// corruption case.) Blocking.
+fn resolve_resume(
+    claude_projects_dir: &std::path::Path,
+    entry: &LedgerEntry,
+    root: Option<&std::path::Path>,
+) -> Option<String> {
     let agent = entry.agent.as_ref()?;
     let id = agent.resume.as_deref()?;
-    let recorded = agent
-        .transcript
-        .as_deref()
-        .is_some_and(|path| path.is_file());
-    let derived = claude_projects_dir
-        .join(crate::launcher::encode_cwd(&entry.cwd))
-        .join(id)
-        .with_extension("jsonl")
-        .is_file();
-    (recorded || derived).then(|| id.to_string())
+    let recorded: Vec<PathBuf> = agent.transcript.iter().cloned().collect();
+    let cwds: Vec<PathBuf> = std::iter::once(entry.cwd.clone())
+        .chain(root.map(std::path::Path::to_path_buf))
+        .collect();
+    crate::claude_store::find_blocking(claude_projects_dir, id, &recorded, &cwds)
+        .map(|_| id.to_string())
 }
 
 async fn respawn(
@@ -592,7 +606,15 @@ async fn respawn(
     let kind = match &entry.agent {
         None => crate::spawn::SpawnKind::Shell,
         Some(agent) => {
-            let resume = resolve_resume(&state.claude_projects_dir, entry);
+            let resume = {
+                let store = state.claude_projects_dir.clone();
+                let entry = entry.clone();
+                let root = workspace.root.clone();
+                tokio::task::spawn_blocking(move || resolve_resume(&store, &entry, Some(&root)))
+                    .await
+                    .ok()
+                    .flatten()
+            };
             if resume.is_none() && agent.resume.is_some() {
                 tracing::info!(session = %entry.id,
                     "conversation transcript is gone; respawning fresh instead of --resume");
@@ -645,6 +667,9 @@ fn retire_to_recents(state: &Arc<AppState>, entry: &LedgerEntry, last_active: u6
         return false;
     }
     let is_chat = agent.ui == SessionUi::Chat;
+    let root = crate::lock(&state.workspaces)
+        .get(&entry.workspace_id)
+        .map(|w| w.root);
     let recent = crate::recents::RecentEntry {
         kind: agent.kind,
         title,
@@ -656,7 +681,7 @@ fn retire_to_recents(state: &Arc<AppState>, entry: &LedgerEntry, last_active: u6
         resume: if is_chat && agent.kind != AgentKind::Claude {
             agent.resume.clone()
         } else {
-            resolve_resume(&state.claude_projects_dir, entry)
+            resolve_resume(&state.claude_projects_dir, entry, root.as_deref())
         },
         supersedes: Vec::new(),
         last_active: if last_active > 0 {
@@ -670,6 +695,8 @@ fn retire_to_recents(state: &Arc<AppState>, entry: &LedgerEntry, last_active: u6
         } else {
             SessionUi::Term
         }),
+        transcript: agent.transcript.clone(),
+        cwd: (root.as_ref() != Some(&entry.cwd)).then(|| entry.cwd.clone()),
     };
     crate::lock(&state.recents).push(&entry.workspace_id, recent, None);
     true
@@ -731,25 +758,48 @@ mod tests {
         entry.cwd = cwd.clone();
 
         // No transcript anywhere: no resume.
-        assert_eq!(resolve_resume(&store, &entry), None);
+        assert_eq!(resolve_resume(&store, &entry, None), None);
 
         // The conventional store location for this cwd counts.
         let derived_dir = store.join(crate::launcher::encode_cwd(&cwd));
         std::fs::create_dir_all(&derived_dir).unwrap();
         std::fs::write(derived_dir.join("conv-1.jsonl"), "{}\n").unwrap();
-        assert_eq!(resolve_resume(&store, &entry), Some("conv-1".to_string()));
+        assert_eq!(
+            resolve_resume(&store, &entry, None),
+            Some("conv-1".to_string())
+        );
         std::fs::remove_file(derived_dir.join("conv-1.jsonl")).unwrap();
 
-        // The hook-recorded path counts wherever it points.
-        let recorded = dir.join("elsewhere-conv-1.jsonl");
+        // The hook-recorded path counts wherever claude filed it in the
+        // store (an agent that entered a worktree moved it there).
+        let moved_dir = store.join("-elsewhere--claude-worktrees-x");
+        std::fs::create_dir_all(&moved_dir).unwrap();
+        let recorded = moved_dir.join("conv-1.jsonl");
         std::fs::write(&recorded, "{}\n").unwrap();
-        entry.agent.as_mut().unwrap().transcript = Some(recorded);
-        assert_eq!(resolve_resume(&store, &entry), Some("conv-1".to_string()));
+        entry.agent.as_mut().unwrap().transcript = Some(recorded.clone());
+        assert_eq!(
+            resolve_resume(&store, &entry, None),
+            Some("conv-1".to_string())
+        );
+        std::fs::remove_file(&recorded).unwrap();
+        entry.agent.as_mut().unwrap().transcript = None;
+
+        // A worktree cwd that is gone: the root's store location still counts.
+        let root = dir.join("root");
+        entry.cwd = dir.join("gone-worktree");
+        let root_dir = store.join(crate::launcher::encode_cwd(&root));
+        std::fs::create_dir_all(&root_dir).unwrap();
+        std::fs::write(root_dir.join("conv-1.jsonl"), "{}\n").unwrap();
+        assert_eq!(resolve_resume(&store, &entry, None), None);
+        assert_eq!(
+            resolve_resume(&store, &entry, Some(&root)),
+            Some("conv-1".to_string())
+        );
 
         // Shells and resume-less agents never resolve.
-        assert_eq!(resolve_resume(&store, &shell_entry()), None);
+        assert_eq!(resolve_resume(&store, &shell_entry(), Some(&root)), None);
         assert_eq!(
-            resolve_resume(&store, &agent_entry(AgentKind::Claude, None)),
+            resolve_resume(&store, &agent_entry(AgentKind::Claude, None), Some(&root)),
             None
         );
 

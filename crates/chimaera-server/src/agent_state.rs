@@ -6,8 +6,9 @@
 
 use std::path::PathBuf;
 
-/// Which agent CLI a kind-"agent" session runs. The id doubles as the binary
-/// name probed on the login-shell PATH. Hook-driven attention state exists
+/// Which agent CLI a kind-"agent" session runs. The login-shell PATH is
+/// searched for [`AgentKind::path_bin`] (the id, except Cursor's
+/// `cursor-agent`). Hook-driven attention state exists
 /// only for Claude; other agents surface `agent_state: "unknown"` (the muted
 /// dot in the UI) until their integrations land.
 ///
@@ -22,18 +23,23 @@ pub(crate) enum AgentKind {
     Gemini,
     Antigravity,
     Grok,
+    Cursor,
 }
 
 impl AgentKind {
     /// The launcher catalog: what the popover offers and detection probes.
-    pub(crate) const ALL: [AgentKind; 4] = [
+    pub(crate) const ALL: [AgentKind; 5] = [
         AgentKind::Claude,
         AgentKind::Codex,
         AgentKind::Antigravity,
         AgentKind::Grok,
+        AgentKind::Cursor,
     ];
 
-    /// Stable id — also the binary name (`claude`, `codex`, `agy`, `gemini`).
+    /// Stable id (`claude`, `codex`, `agy`, `grok`, `cursor`): the wire and
+    /// settings identity, and the name of the managed tree and its shim
+    /// target under `~/.chimaera/agents`. The PATH is searched for
+    /// [`Self::path_bin`], which differs for Cursor.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             AgentKind::Claude => "claude",
@@ -41,6 +47,7 @@ impl AgentKind {
             AgentKind::Antigravity => "agy",
             AgentKind::Gemini => "gemini",
             AgentKind::Grok => "grok",
+            AgentKind::Cursor => "cursor",
         }
     }
 
@@ -52,6 +59,18 @@ impl AgentKind {
             AgentKind::Antigravity => "Antigravity",
             AgentKind::Gemini => "Gemini CLI",
             AgentKind::Grok => "Grok Build",
+            AgentKind::Cursor => "Cursor CLI",
+        }
+    }
+
+    /// The executable looked up on the user's PATH. It is the id except for
+    /// Cursor, whose `cursor` name belongs to the editor's app launcher; the
+    /// official installer links the CLI as `cursor-agent` (and `agent`).
+    /// Chimaera's own managed tree and shims keep the id.
+    pub(crate) fn path_bin(self) -> &'static str {
+        match self {
+            AgentKind::Cursor => "cursor-agent",
+            other => other.as_str(),
         }
     }
 
@@ -75,6 +94,11 @@ impl AgentKind {
         self.chat_adapter().is_some()
     }
 
+    /// Chat runs over the shared ACP adapter.
+    pub(crate) fn is_acp(self) -> bool {
+        matches!(self, Self::Antigravity | Self::Grok | Self::Cursor)
+    }
+
     pub(crate) fn native_chat_controls(self) -> bool {
         matches!(self, Self::Claude | Self::Codex)
     }
@@ -87,6 +111,7 @@ impl AgentKind {
             Self::Codex => Some(&chimaera_agent::codex::CodexAdapter),
             Self::Antigravity => Some(&chimaera_agent::acp::ANTIGRAVITY),
             Self::Grok => Some(&chimaera_agent::acp::GROK),
+            Self::Cursor => Some(&chimaera_agent::acp::CURSOR),
             Self::Gemini => None,
         }
     }
@@ -179,6 +204,10 @@ pub(crate) struct AgentRecord {
     pub(crate) state: AgentState,
     /// Latest transcript path reported by any hook payload.
     pub(crate) transcript_path: Option<PathBuf>,
+    /// The folder a PTY agent was spawned in (a chat's lives on its recipe),
+    /// so the conversation's Recents row can say where it ran once the PTY
+    /// is gone — a worktree's conversation resumes in that worktree.
+    pub(crate) spawn_cwd: Option<PathBuf>,
     /// Latest `customTitle` transcript record (wins over `ai_title`).
     pub(crate) custom_title: Option<String>,
     /// Latest `{"type":"ai-title"}` transcript record.
@@ -287,6 +316,7 @@ impl AgentRecord {
             kind,
             state: AgentState::Unknown,
             transcript_path: None,
+            spawn_cwd: None,
             custom_title: None,
             ai_title: None,
             first_prompt: None,

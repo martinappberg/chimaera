@@ -55,6 +55,8 @@ export interface SettingDef {
   min?: number;
   max?: number;
   step?: number;
+  /** Unit suffix shown beside a numeric field ("px", "ms"). Display only. */
+  unit?: string;
   /** Choices (enum type). */
   options?: readonly EnumOption[];
   /** Input placeholder for string types whose "" default means "built-in". */
@@ -131,6 +133,7 @@ export type SettingsMap = {
   "agents.agy.path": string;
   "agents.agy.chatPath": string;
   "agents.grok.path": string;
+  "agents.cursor.path": string;
   "daemon.scrollbackLines": number;
   "daemon.restoreSessions": boolean;
   "chat.remoteControlAtStart": boolean;
@@ -164,7 +167,7 @@ const DEFS = {
     title: "Mode",
     category: "Appearance",
     description:
-      "Light or dark for the whole window. System follows the OS preference live; the palette comes from the Light Theme / Dark Theme choices below.",
+      "System follows the OS; the palettes for each mode are below.",
     type: "enum",
     default: "system",
     options: [
@@ -198,7 +201,7 @@ const DEFS = {
     title: "Accent Color",
     category: "Appearance",
     description:
-      "Accent used for focus, selection, live-session dots, and primary actions. Empty uses the selected theme's own accent.",
+      "Focus, selection, live-session dots and primary actions. Empty uses the theme's own accent.",
     type: "color",
     default: "",
     scope: "client",
@@ -207,19 +210,20 @@ const DEFS = {
     title: "Interface Font Size",
     category: "Appearance",
     description:
-      "Base size in pixels for application chrome: the workspace rail, file tree, tabs, dashboard, settings, dialogs, and preview controls. Content surfaces keep their own Terminal, Chat, and Editor sizes below.",
+      "The rail, file tree, tabs, dashboard, dialogs and this page. Chat, Terminal and Editor have their own sizes.",
     type: "number",
-    default: 13,
+    default: 13.5,
     min: 11,
     max: 18,
     step: 0.5,
+    unit: "px",
     scope: "client",
   },
   "appearance.interfaceFontFamily": {
     title: "Interface Font Family",
     category: "Appearance",
     description:
-      "Font stack for application chrome. Empty uses the operating system's interface font. Custom fonts must be installed on the machine running the browser.",
+      "Empty uses the system font. A custom font must be installed on the machine showing the window.",
     type: "string",
     default: "",
     placeholder: "system interface font",
@@ -231,7 +235,7 @@ const DEFS = {
     title: "New Agent Sessions",
     category: "Agents",
     description:
-      "How the + new agent button's instant spawn opens: the structured chat view, or the agent's own terminal UI. The launcher popover chooses explicitly per spawn (open = chat, the terminal button = TUI). Every session can be switched either way from the pane bar; if the chat protocol ever fails to start, the session falls back to a terminal on its own.",
+      "How the + new agent button opens a session. Any session switches between the two from its pane bar.",
     type: "enum",
     default: "chat",
     options: [
@@ -246,7 +250,7 @@ const DEFS = {
     title: "Agents can see and message each other",
     category: "Agents",
     description:
-      "Agents can see who else is working in the workspace and exchange messages. Works in Chat for all four built-in agents, and in Terminal for Claude Code and Codex. Messages wait in an inbox when they cannot be delivered immediately. Off also turns the Mastermind off.",
+      "Agents can see who else is working in the workspace and exchange messages. Works in Chat for every built-in agent, and in Terminal for Claude Code and Codex. Messages wait in an inbox when they cannot be delivered immediately. Off also turns the Mastermind off.",
     type: "boolean",
     default: true,
     scope: "daemon",
@@ -272,7 +276,7 @@ const DEFS = {
     title: "Workspace Landing",
     category: "Dashboard",
     description:
-      "What an empty workspace window opens on. Auto lands on the dashboard — the overview of every agent and terminal in the workspace (⌘0 / the rail's dashboard row open it any time). Never restores the old behavior: the first session opens instead.",
+      "What an empty workspace window opens on.",
     type: "enum",
     default: "auto",
     options: [
@@ -285,7 +289,7 @@ const DEFS = {
     title: "Agent Card Density",
     category: "Dashboard",
     description:
-      "Card detail in the dashboard roster. Auto uses comfortable cards for smaller rosters and compact rows once seven or more agents are present.",
+      "Auto switches to compact rows once seven or more agents are present.",
     type: "enum",
     default: "auto",
     options: [
@@ -299,7 +303,7 @@ const DEFS = {
     title: "Now",
     category: "Dashboard",
     description:
-      "How the dashboard shows who is running. One line keeps the rail as the place with the detail; Cards shows today's roster as agent cards (the dashboard's \"show cards\" link flips this too).",
+      "How the dashboard shows who is running.",
     type: "enum",
     default: "line",
     options: [
@@ -372,19 +376,20 @@ const DEFS = {
     title: "Font Size",
     category: "Chat",
     description:
-      "Base size in pixels for the complete structured-chat surface, including transcript prose, the composer, tool cards, trays, and the embedded Mastermind chat.",
+      "The whole chat surface: transcript, composer, tool cards, trays and the dashboard's Mastermind.",
     type: "number",
-    default: 13.5,
+    default: 14,
     min: 11,
     max: 24,
     step: 0.5,
+    unit: "px",
     scope: "client",
   },
   "chat.fontFamily": {
     title: "Font Family",
     category: "Chat",
     description:
-      "Font stack for chat prose and controls. Empty follows the Interface Font Family; code remains in the bundled monospace face.",
+      "Empty follows the interface font; code stays in the monospace face.",
     type: "string",
     default: "",
     placeholder: "follow interface font",
@@ -395,25 +400,27 @@ const DEFS = {
     category: "Chat",
     description: "Line height multiplier for messages and the composer.",
     type: "number",
-    default: 1.55,
+    default: 1.57,
     min: 1.2,
     max: 2.2,
-    step: 0.05,
+    step: 0.01,
     scope: "client",
   },
-  // Keyed `chat.*` from when only the transcript read it; it now caps every
+  // Keyed `chat.*` from when only the transcript read it; it now sets every
   // reading column, so it sits with the window-wide Appearance choices. The
   // key stays: stored values and the wire never see the category.
   "chat.contentWidth": {
     title: "Reading Width",
     category: "Appearance",
     description:
-      "The widest a reading column gets, in pixels: the chat transcript (with its composer and live work trays) and a Markdown document alike. Each column is 48em of its own text — about a hundred characters, so a bigger font keeps its line length — and never wider than this. Narrower panes still fit their available space.",
+      "Width of the reading column in chat transcripts (composer included) and rendered Markdown. Narrower panes fit their space.",
     type: "integer",
-    default: 832,
+    // 48em of the 14px chat text: about a hundred characters per line.
+    default: 672,
     min: 480,
     max: 1400,
     step: 16,
+    unit: "px",
     scope: "client",
   },
 
@@ -428,6 +435,7 @@ const DEFS = {
     min: 9,
     max: 28,
     step: 0.5,
+    unit: "px",
     scope: "client",
   },
   "terminal.fontFamily": {
@@ -483,6 +491,7 @@ const DEFS = {
     min: 200,
     max: 100000,
     step: 100,
+    unit: "lines",
     scope: "client",
   },
   "terminal.minimumContrastRatio": {
@@ -525,6 +534,7 @@ const DEFS = {
     min: 9,
     max: 28,
     step: 0.5,
+    unit: "px",
     scope: "client",
   },
   "editor.fontFamily": {
@@ -552,12 +562,13 @@ const DEFS = {
     title: "Markdown Preview Font Size",
     category: "Editor",
     description:
-      "Body size in pixels for rendered Markdown previews. Defaults to the same size as Chat; Pane actions → Smaller / Larger text can still override it.",
+      "Body size for rendered Markdown. Defaults to the Chat size; Pane actions → Smaller / Larger text overrides it per pane.",
     type: "number",
-    default: 13.5,
+    default: 14,
     min: 10,
     max: 32,
     step: 0.5,
+    unit: "px",
     scope: "client",
   },
   "editor.markdownLineHeight": {
@@ -635,6 +646,7 @@ const DEFS = {
     min: 200,
     max: 60000,
     step: 100,
+    unit: "ms",
     scope: "client",
   },
 
@@ -657,6 +669,7 @@ const DEFS = {
     min: 50,
     max: 1000,
     step: 50,
+    unit: "rows",
     scope: "client",
   },
 
@@ -689,7 +702,7 @@ const DEFS = {
     title: "Git Binary Path",
     category: "Git",
     description:
-      "Absolute path to the git the source-control features use (status, diffs, worktrees). Empty resolves git from your login shell, then PATH. Set this when the host's default git is too old — e.g. an HPC login node still on git 1.8: run `module load git` (or similar), then paste `command -v git` here. chimaera needs git ≥ 2.15.",
+      "Empty resolves git from your login shell, then PATH. Set it when the host's git is older than 2.15: after `module load git` (or similar), paste the output of `command -v git`.",
     type: "string",
     default: "",
     placeholder: "resolve from login shell / PATH",
@@ -752,6 +765,12 @@ const DEFS = {
     description: "Optional absolute path to Grok Build. Empty finds your installed copy automatically.",
     type: "string", default: "", placeholder: "resolve from login shell / PATH", scope: "daemon",
   },
+  "agents.cursor.path": {
+    title: "Cursor CLI Binary",
+    category: "Agents",
+    description: "Optional absolute path to the Cursor CLI. Empty finds your installed copy automatically.",
+    type: "string", default: "", placeholder: "resolve from login shell / PATH", scope: "daemon",
+  },
   "agents.agy.chatPath": {
     title: "Antigravity Chat Binary",
     category: "Agents",
@@ -770,6 +789,7 @@ const DEFS = {
     min: 1000,
     max: 200000,
     step: 1000,
+    unit: "lines",
     scope: "daemon",
     note: "Applies to sessions started after the change.",
   },
@@ -803,7 +823,7 @@ const DEFS = {
     title: "Remote Control at Start (Claude)",
     category: "Chat",
     description:
-      "Turn on Claude Code's Remote Control for every new Claude chat session as soon as it starts, so you can pick it up from the Claude mobile app or claude.ai/code. Off: use Chat options → Remote Control (or /remote-control) per session. Registers the session with claude.ai; only offered where your account and organization allow it.",
+      "Start every new Claude chat with Remote Control on, so the Claude app or claude.ai/code can pick it up. Otherwise turn it on per chat from Chat options. Only where your account allows it.",
     type: "boolean",
     default: false,
     scope: "daemon",
@@ -822,7 +842,7 @@ const DEFS = {
     title: "Pick Up Interrupted Work After a Restart",
     category: "Chat",
     description:
-      "When the daemon restarts (an update, a crash) while a chat was mid-turn or had background commands, monitors or workflows running, send the resumed agent one message listing what stopped, so it restarts what it still needs and finishes its turn. The message shows in the transcript and starts a turn on your account. Off: those chats come back idle. Remote Control, model, effort, mode and ultracode come back either way.",
+      "When the daemon restarts while a chat was mid-turn or running background work, tell the resumed agent what stopped so it can finish. This starts a turn on your account. Off: those chats come back idle.",
     type: "boolean",
     default: true,
     scope: "daemon",
@@ -831,7 +851,7 @@ const DEFS = {
     title: "Voice Dictation",
     category: "Chat",
     description:
-      "A mic button in every chat composer: click it (or press the Dictate shortcut) and speak — the words fill your message as they're heard; click again to keep them, Enter to send, Esc to discard. `/voice on|off` flips this too. Your speech goes to Claude's speech-to-text service (the one Claude Code's own /voice uses) with the claude.ai login on the daemon's host, so the button only shows where that login exists; the microphone is on only while you're dictating.",
+      "A mic button in every chat composer (`/voice on|off` flips this too). Speech goes to Claude's speech-to-text with the claude.ai login on the daemon's host, so the button shows only where that login exists; the mic is on only while you dictate.",
     type: "boolean",
     default: true,
     scope: "client",
@@ -894,7 +914,7 @@ const DEFS = {
     title: "Plugin Tools Folder",
     category: "Extensions",
     description:
-      "Where plugins put the programs they download on your click (TeX Live for LaTeX is about 500 MB). Empty keeps them in chimaera's own folder under your home. On a cluster whose home is a small quota, name a folder with room: $SCRATCH/chimaera-tools, or a group folder. `~` and $VARIABLES are expanded on the daemon's host. Tools already installed stay where they were: install them again after changing this.",
+      "Where plugins put the tools they download (TeX Live is about 500 MB). Empty uses chimaera's folder under your home; on a small home quota, name a folder with room, such as $SCRATCH/chimaera-tools. `~` and $VARIABLES expand on the daemon's host. Tools already installed stay where they are.",
     type: "string",
     default: "",
     placeholder: "chimaera's own folder (under your home)",

@@ -29,6 +29,7 @@ the module you need and read its header doc.
 | `session_view.rs` | The session-row JSON builders (`session_json`/`sessions_json`), shared by `api/` and `ws.rs` (so `ws` doesn't depend on `api`). |
 | `ws.rs` | WebSockets: `/ws/sessions/{id}` (PTY byte pipe; 1 MiB frames chunked to the input queue; output coalesced — leading-edge first chunk, then one frame per ~8 ms tick or 32 KiB, and always flushed ahead of event frames and resizes so the byte stream is never overtaken; attach/resync snapshot renders AND resizes run under `spawn_blocking`, off the reactor; a reset-bearing frame and its snapshot are sent adjacently — a client contract; `park`/`unpark` client frames stop and resume output forwarding for hidden pooled terminals, with the session's broadcast ring as the catch-up buffer and a repaint when it can't cover the gap — `auth.parked` attaches without a snapshot at all), **`/ws/chat/{id}`** (structured events; 10 MiB command frames and ~512 KiB replay batches), `/ws/events` (the session-list bus; the sessions frame is built ONCE per change generation and shared across every connected window — per-client state like fs_watch, git epochs, and the last-sent compare stays per-client — and the settings frame reads only the cached generation, never a reactor stat: external edits arrive via `settings::watch_external_edits`). |
 | `chat.rs` | **The chat-mode glue** (see below). |
+| `claude_store.rs` | The ONE lookup for where a Claude conversation's transcript lives: the hook-reported path, the session's own cwd, the root, then the root's `.claude/worktrees/*` project dirs (one bounded store `read_dir`). Every resume check goes through it (resurrect, view switch, journal seed, ledger, Recents, history reopen, resumables); never join `claude_projects_dir` + `encode_cwd(root)` by hand. Blocking: `find` wraps it in `spawn_blocking`. |
 | `agent_setup.rs` | Noninteractive managed installs via `/agents/{id}/setup`: no session/PTY entries, one 64 KiB result per provider until restart, idempotent POST/join, generation-scoped cancel, 15-minute deadline, whole-process-group teardown. Shares `runtimes` install locks and retention cleanup with legacy PTY installers. Success never asserts account or chat readiness. |
 | `launcher.rs` | argv assembly (`build_agent_command`, `build_chat_command`, `build_agent_resume_command` — the switch-to-TUI argv), binary `detect`, login-shell wrapping, per-agent binary resolution. `safe_model_arg` permits bounded provider/model:tag selectors; resume handles retain `safe_arg`'s stricter grammar. Unit-tested — argv logic lives HERE, not in drivers or `chat.rs`. |
 | `agent_state.rs` | The pure state core: `AgentKind`/`AgentState`/`AgentRecord` + the hook→state / title helpers. A leaf (no transport/fs/`AppState`) — this is what lets `chat.rs` depend on it without the old agents↔chat cycle. |
@@ -335,13 +336,17 @@ the lifecycle, keep them consistent:
 
 ## Agent integration and view persistence
 
-The built-in catalog is Claude Code, Codex, Antigravity (`agy`) and Grok Build.
-`AgentKind::chat_adapter` registers each adapter explicitly; `launcher::chat_executable`
+The built-in catalog is Claude Code, Codex, Antigravity (`agy`), Grok Build and Cursor CLI
+(`cursor`). An id doubles as the managed tree/shim name; `AgentKind::path_bin` is what the
+user's PATH is searched for — Cursor's is `cursor-agent`, because `cursor` is the Cursor
+editor's launcher and must never be resolved or shadowed. `AgentKind::is_acp` marks the
+shared-ACP registrations (Antigravity, Grok, Cursor). `AgentKind::chat_adapter` registers
+each adapter explicitly; `launcher::chat_executable`
 resolves Antigravity’s separate Google chat package, including its companion harness.
 `runtimes.rs` installs both executables while the picker presents one agent. Gemini CLI
 identifiers remain parseable for saved history but are absent from new-agent choices.
 
-Keep `chat_capable`, `fork_capable` and `view_switchable` separate: all four support chat
+Keep `chat_capable`, `fork_capable` and `view_switchable` separate: every agent supports chat
 and conversation-copy forks; only Claude/Codex have a verified native terminal/chat switch.
 Every session-row builder, including `chat_session_json` used by create/fork responses,
 must report the same additive flags. A failed resumed chat keeps its view and recipe.

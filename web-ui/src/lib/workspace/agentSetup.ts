@@ -1,6 +1,10 @@
 import { writable } from "svelte/store";
 import { api, ApiError } from "../net/api";
 import type { AgentInfo } from "./launcher";
+import { AGENT_PRODUCT_NAMES } from "../shared/agentNames";
+
+/** Built-in agents whose pending setup id survives a reload. */
+const SETUP_AGENTS: ReadonlySet<string> = new Set(Object.keys(AGENT_PRODUCT_NAMES));
 
 export type SetupAction = "install" | "update" | "reinstall";
 export interface SetupRequest { agent: AgentInfo; workspaceId: string; action: SetupAction; showResult: boolean }
@@ -22,7 +26,7 @@ export function openAgentSetup(agent: AgentInfo, workspaceId: string, action: Se
 }
 export const setupRunning = (p: SetupProgress | null) => p?.phase === "running" || p?.phase === "cancelling";
 
-// Four fixed keys, scoped to this daemon origin. Remember before POST so an
+// Fixed per-agent keys, scoped to this daemon origin. Remember before POST so an
 // ambiguous response also survives closing/reloading; acknowledge only once
 // the completed result is displayed. Storage denial still keeps in-tab state.
 const pendingIds = new Map<string, string | null>();
@@ -32,7 +36,7 @@ export function pendingSetupId(agent: string): string | null {
   try { return sessionStorage.getItem(storageKey(agent)); } catch { return null; }
 }
 export function rememberSetupId(agent: string, id: string): void {
-  if (!["claude", "codex", "agy", "grok"].includes(agent) || !/^[A-Za-z0-9-]{1,128}$/.test(id)) return;
+  if (!SETUP_AGENTS.has(agent) || !/^[A-Za-z0-9-]{1,128}$/.test(id)) return;
   if (pendingIds.get(agent) === id) return;
   pendingIds.set(agent, id);
   try { sessionStorage.setItem(storageKey(agent), id); } catch { /* in-tab fallback */ }

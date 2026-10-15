@@ -860,8 +860,12 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                     }
                     match serde_json::from_str::<chimaera_agent::model::AgentCommand>(&text) {
                         Ok(mut cmd) => {
+                            // Before the images are saved: a blank block never
+                            // reaches an agent, and a send left with nothing is
+                            // refused like an oversized one.
+                            cmd.strip_empty_blocks();
                             if let Err(err) = cmd.validate_ingress() {
-                                tracing::debug!(%id, %err, "chat command exceeds ingress budget");
+                                tracing::debug!(%id, %err, "chat command refused at ingress");
                                 // Reject only this command. The authenticated
                                 // socket and agent remain healthy, so the UI
                                 // can correct the payload and retry.

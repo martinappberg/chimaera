@@ -34,7 +34,9 @@
   import { pageVisible } from "./lib/shared/visibility";
   import {
     backgrounded,
+    baseName,
     createSession,
+    createWorkspace,
     deleteSession,
     deleteWorkspace,
     displayName,
@@ -45,6 +47,9 @@
     listSessions,
     listWorkspaces,
     renameSession,
+    setNewInWorktree,
+    wantsWorktree,
+    worktreeInUse,
     needsApproval,
     pollSessions,
     switchingViews,
@@ -72,12 +77,15 @@
     getAgentDefault,
     listAgents,
     listRecents,
+    quickStarts,
     relativeAge,
     setAgentDefault,
     type AgentInfo,
     type LaunchPick,
+    type QuickStart,
     type RecentConvo,
   } from "./lib/workspace/launcher";
+  import { agentProductName } from "./lib/shared/agentNames";
   import { EventsSocket } from "./lib/net/events";
   import {
     agentHue,
@@ -96,7 +104,7 @@
   } from "./lib/net/remoteReconnect";
   import { attachImageToComposer, insertIntoComposer } from "./lib/chat/composerBus";
   import { volatileChatDrafts } from "./lib/chat/drafts";
-  import { imageToAttachment } from "./lib/chat/images";
+  import { imageToAttachment, type ImageAttachment } from "./lib/chat/images";
   import {
     reportUploadError,
     setUploadPathInserter,
@@ -237,6 +245,7 @@
     openFileHistory,
     openRepoHistory,
     repoForPath,
+    removeWorktree,
     revealRepo,
     setGitFocus,
     setGitOpener,
@@ -770,15 +779,13 @@
    *  the launcher popover reports its fresher probe back via onAgents. */
   let agents = $state<AgentInfo[] | null>(null);
   $effect(() => { if ($agentCatalog.length) agents = $agentCatalog; });
-  /** The catalog row for the default agent, once the catalog is loaded. */
-  const defaultAgentInfo = $derived(
-    agents?.find((a) => a.id === agentDefault.agent) ?? null,
+  /** The rail's one-click starts: the saved default (the primary — it
+   *  carries the chevron and the new-agent shortcut), then Claude Code and
+   *  Codex. Each knows what its click does: start, or the setup step that
+   *  unblocks a missing agent (launcher.ts `quickStarts`). */
+  const railQuick = $derived(
+    quickStarts(agents, agentDefault.agent, getSetting("agents.defaultView"), agentProductName),
   );
-  /** Known-missing: the catalog is loaded and says the default isn't here.
-   *  (Null catalog / unknown agent falls back to spawn — the common path.) */
-  const defaultMissing = $derived(agents !== null && (defaultAgentInfo === null || !defaultAgentInfo.installed || (defaultAgentInfo.chatSetupRequired && getSetting("agents.defaultView") === "chat")));
-  /** Missing but chimaera can install it in place (managed runtime). */
-  const defaultInstallable = $derived(defaultMissing && (defaultAgentInfo?.managedInstall ?? false));
   let launcherOpen = $state(false);
   /** The split button's rect at open time; the popover hangs below it. */
   let launcherAnchor = $state<DOMRect | null>(null);
@@ -1100,6 +1107,13 @@
   }
 
   const workspace = $derived(workspaces.find((w) => w.id === activeWsId) ?? null);
+  /** The workspace root sits in a git repository — the only place a new
+   *  agent can get its own worktree. */
+  const workspaceIsRepo = $derived(
+    $gitStatus !== null && $gitStatus.repo && $gitStatus.workspace_id === activeWsId,
+  );
+  /** New agents here start in their own worktree (the remembered choice). */
+  const newInWorktree = $derived(workspaceIsRepo && workspace?.new_in_worktree === true);
   // The Mastermind is the observer, not the observed: its flagged row never
   // enters the workspace roster — the rail, chord map, attention counts,
   // quick-open, and reference targets all derive from here. Lookups by id
@@ -2010,15 +2024,15 @@
    * a newline, so nothing is ever submitted. If the session is open in a
    * pane, surface it so the typed reference is reviewable at a glance.
    */
-  function typeIntoSession(id: string, text: string): void {
+  function typeIntoSession(id: string, text: string, image?: ImageAttachment): void {
     // Chat sessions: the input is the mounted Composer, not a PTY socket.
     // insertIntoComposer buffers when the composer hasn't mounted yet (a chat
     // pane restored on a slow snapshot) and drains on registration, so the
-    // grant is never lost to a mount race.
+    // grant is never lost to a mount race. `image` (chat only) rides along.
     if (sessionsById.get(id)?.ui === "chat") {
       const loc = paneForTab(layout.root, { surface: "terminal", sessionId: id });
       if (loc !== null) layout = activateTab(layout, loc.paneId, loc.index);
-      insertIntoComposer(id, text);
+      insertIntoComposer(id, text, "inline", undefined, image);
       return;
     }
     if (!pool.sendText(id, text)) typeIntoDetachedSession(id, text);
@@ -2077,15 +2091,20 @@
       ).then((up) => typeIntoSession(targetId, composeSelectionReference(rel, sel, kind, up?.path ?? null)));
       return;
     }
+    const reference = composeSelectionReference(rel, sel, kind);
     if (crop !== undefined && kind === "chat") {
       // Chat sees the pixels as an attachment, through the same downscale
-      // and payload caps as a pasted screenshot.
+      // and payload caps as a pasted screenshot — delivered WITH the locator
+      // in one insert, so both land in the same composer and leave in the
+      // same message (a crop alone would reach the agent with no words).
       const label = sel.label;
       void imageToAttachment(crop).then((image) => {
-        if (image !== null) attachImageToComposer(targetId, label !== undefined ? { ...image, label } : image);
+        const attachment = image === null ? undefined : label !== undefined ? { ...image, label } : image;
+        typeIntoSession(targetId, reference, attachment);
       });
+      return;
     }
-    typeIntoSession(targetId, composeSelectionReference(rel, sel, kind));
+    typeIntoSession(targetId, reference);
   }
 
   /** Names each region image a terminal agent receives (`ref-1.png`, …);
@@ -3992,7 +4011,12 @@
         kind === "agent"
           ? agents?.find((a) => a.id === (spawn.agent ?? "claude"))?.chatCapable
           : undefined;
-      const s = await createSession(activeWsId, kind, null, spawnSize(), spawn, chatCapable);
+      // A new agent follows the workspace's worktree choice; reopens,
+      // resumes and explicit folders never do.
+      const req = wantsWorktree(kind, spawn, workspace, workspaceIsRepo)
+        ? { ...spawn, worktree: true }
+        : spawn;
+      const s = await createSession(activeWsId, kind, null, spawnSize(), req, chatCapable);
       recentlyCreated.add(s.id);
       // A racing events snapshot may already have delivered the session.
       if (!sessions.some((x) => x.id === s.id)) sessions.push(s);
@@ -4013,24 +4037,42 @@
     void spawnSession("shell");
   }
 
-  /** The split button's main surface / Cmd+Shift+E: the persisted default
-   *  agent, instantly — no popover in the way. */
-  function spawnDefaultAgent(): void {
-    void spawnSession("agent", { agent: agentDefault.agent });
-  }
-
-  /** What the main surface / new-agent shortcut does: normally spawn the
-   *  default instantly, but when it isn't installed, don't launch a doomed
-   *  pane — install it in place (managed) or, if there's no managed install,
-   *  open the launcher to pick an agent that has one. */
-  function newAgentPrimary(): void {
+  /** One rail quick start: spawn that agent instantly in the default view
+   *  (`term` = the ⌘/ctrl-click terminal path) — or, when it could only open
+   *  a doomed pane, the step that unblocks it: the curated install / chat
+   *  setup (managed runtimes) or Settings → Agents. A quick start does NOT
+   *  change the saved default: the rows never reorder under the pointer;
+   *  choosing in the launcher menu is what moves the primary. */
+  function quickStart(q: QuickStart, term = false): void {
     launcherOpen = false;
-    if (defaultMissing) {
-      if (defaultInstallable && defaultAgentInfo !== null) launcherInstall(defaultAgentInfo);
-      else openLauncher();
+    if (term && q.info?.installed !== false) {
+      void spawnSession("agent", { agent: q.id, ui: "term" });
       return;
     }
-    spawnDefaultAgent();
+    if ((q.action === "install" || q.action === "setup-chat") && q.info !== null) {
+      launcherInstall(q.info);
+      return;
+    }
+    if (q.action === "setup") {
+      openAgentSettings();
+      return;
+    }
+    void spawnSession("agent", { agent: q.id });
+  }
+
+  /** The primary quick start / Cmd+Shift+E: the saved default, instantly
+   *  (or its setup step when it isn't runnable here). */
+  function newAgentPrimary(): void {
+    const primary = railQuick[0];
+    if (primary !== undefined) quickStart(primary);
+  }
+
+  /** Settings → Agents: where every agent is installed, updated and pointed
+   *  at a binary (the launcher's footer, a set-up chip). */
+  function openAgentSettings(): void {
+    launcherOpen = false;
+    openSettingsSurface();
+    requestSettingsSection("Agents");
   }
 
   /** Re-probe the host's agent catalog. `force` bypasses the daemon's
@@ -4057,8 +4099,14 @@
     launcherOpen = true;
   }
 
-  function closeLauncher(): void {
+  /** Escape hands focus back to the chevron (menu-button pattern); an
+   *  outside press returns it to the focused terminal. */
+  function closeLauncher(how?: "escape"): void {
     launcherOpen = false;
+    if (how === "escape") {
+      newSplitEl?.querySelector<HTMLElement>(".new-chev")?.focus();
+      return;
+    }
     const sid = focusedSessionOf(layout);
     if (sid !== null) pool.focusTerminal(sid);
   }
@@ -4095,6 +4143,106 @@
       setSetting("agents.defaultView", pick.ui === "term" ? "terminal" : "chat");
     }
     void spawnSession("agent", pick);
+  }
+
+  /** Flip the workspace's "new agents start in a new worktree" choice:
+   *  optimistic, reverted when the daemon refuses. */
+  async function toggleNewInWorktree(on: boolean): Promise<void> {
+    const id = activeWsId;
+    if (id === null) return;
+    const setLocal = (v: boolean) => {
+      workspaces = workspaces.map((w) => (w.id === id ? { ...w, new_in_worktree: v } : w));
+    };
+    const prev = workspaces.find((w) => w.id === id)?.new_in_worktree === true;
+    setLocal(on);
+    try {
+      const w = await setNewInWorktree(id, on);
+      workspaces = workspaces.map((x) => (x.id === id ? { ...x, ...w } : x));
+    } catch (e) {
+      setLocal(prev);
+      createError = e instanceof ApiError ? e.message : "could not save the worktree choice";
+    }
+  }
+
+  // --- a managed worktree left behind (session ended / conversation archived) ---
+
+  /** The one "kept" notice under the agents: a managed worktree whose last
+   *  session just ended. Never auto-removed — Remove or Keep, the user's
+   *  call; a newer notice replaces it. */
+  let wtNotice = $state<{
+    ws: string;
+    path: string;
+    label: string;
+    busy: boolean;
+    error: string | null;
+  } | null>(null);
+  let wtNoticeTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function clearWtNoticeTimer(): void {
+    if (wtNoticeTimer !== null) {
+      clearTimeout(wtNoticeTimer);
+      wtNoticeTimer = null;
+    }
+  }
+
+  function dismissWtNotice(): void {
+    clearWtNoticeTimer();
+    wtNotice = null;
+  }
+
+  function offerWorktreeRemoval(ws: string, path: string, branch: string | null): void {
+    clearWtNoticeTimer();
+    // The branch's last segment: the rail is narrow, and "chimaera/" says
+    // nothing the notice needs (the full path is the tooltip).
+    wtNotice = { ws, path, label: baseName(branch ?? path), busy: false, error: null };
+  }
+
+  async function removeKeptWorktree(): Promise<void> {
+    const n = wtNotice;
+    if (n === null || n.busy) return;
+    wtNotice = { ...n, busy: true };
+    try {
+      await removeWorktree(n.ws, n.path);
+      if (wtNotice?.path === n.path) wtNotice = null;
+      if (activeWsId === n.ws) refreshRecents();
+    } catch (e) {
+      if (wtNotice?.path !== n.path) return;
+      // The daemon's refusal (uncommitted changes, unmerged commits, a live
+      // session, a lock) is the honest answer: say it, keep the worktree.
+      wtNotice = {
+        ...n,
+        busy: false,
+        error: e instanceof ApiError ? e.message : "could not remove the worktree",
+      };
+      clearWtNoticeTimer();
+      wtNoticeTimer = setTimeout(() => {
+        wtNoticeTimer = null;
+        if (wtNotice?.path === n.path) wtNotice = null;
+      }, 6000);
+    }
+  }
+
+  // A notice belongs to its workspace; a switch drops it.
+  $effect(() => {
+    const ws = activeWsId;
+    untrack(() => {
+      if (wtNotice !== null && wtNotice.ws !== ws) dismissWtNotice();
+    });
+  });
+  $effect(() => {
+    return () => clearWtNoticeTimer();
+  });
+
+  /** Open a managed worktree as its own window — the folder picker's "new
+   *  window" path; this window stays where it is. */
+  async function openWorktreeWindow(path: string): Promise<void> {
+    try {
+      const w = await createWorkspace(path);
+      const alias = getHostLabel() === "local" ? null : getHostLabel();
+      await openWindow(alias, w.id, true);
+    } catch (e) {
+      createError = e instanceof ApiError ? e.message : "could not open the worktree";
+    }
   }
 
   function launcherInstall(a: AgentInfo): void {
@@ -4164,6 +4312,9 @@
     const ws = activeWsId;
     if (ws === null) return;
     recents = recents.filter((x) => x.key !== r.key);
+    if (r.worktree !== null && !worktreeInUse(sessions, r.worktree)) {
+      offerWorktreeRemoval(ws, r.worktree, null);
+    }
     try {
       await archiveRecents(ws, [archiveEntry(r)]);
     } catch {
@@ -4237,6 +4388,11 @@
    *  weirdly" between the kill and the retire. */
   async function killSession(id: string): Promise<void> {
     confirmKillId = null;
+    const dying = sessions.find((x) => x.id === id);
+    const kept = dying?.kind === "agent" ? (dying.managed_worktree ?? null) : null;
+    if (dying !== undefined && kept !== null && !worktreeInUse(sessions, kept, id)) {
+      offerWorktreeRemoval(dying.workspace_id, kept, dying.git?.branch ?? null);
+    }
     chatPool.disposeChat(id); // stop its socket reconnecting right away
     tombstone([id]);
     try {
@@ -5577,10 +5733,15 @@
                   startRename(s);
                 }
               }}
-              oncontextmenu={(e) =>
+              oncontextmenu={(e) => {
+                const wt = s.kind === "agent" ? (s.managed_worktree ?? null) : null;
                 contextMenu.openAt(e, [
                   { label: "Rename…", onSelect: () => startRename(s) },
-                ])}
+                  ...(wt !== null
+                    ? [{ label: "Open worktree in new window", onSelect: () => void openWorktreeWindow(wt) }]
+                    : []),
+                ]);
+              }}
             >
               <!-- Session-type glyph carrying the state color — the same
                    mark as the pane tab (surface parity, rail included). It
@@ -5731,56 +5892,104 @@
         {#each agentSessions as s (s.id)}
           {@render sessionRow(s)}
         {/each}
-        <!-- Split button: the main surface spawns the persisted default
-             agent instantly — always. Only the CHEVRON opens the launcher
-             popover (hover ~150ms or click). -->
+        <!-- Quick starts: one click starts Claude Code / Codex (and the
+             saved default, which leads and is the shortcut's target). The
+             primary row is a split button: its CHEVRON — hover ~150ms or a
+             click — opens the launcher menu with every other agent and the
+             way into Settings → Agents. ⌘/ctrl-click starts in the terminal.
+             A missing agent's row says what its click will set up. -->
         <div class="new-split" role="group" aria-label="new agent" bind:this={newSplitEl}>
-          <button
-            class="row new primary main"
-            class:want-install={defaultMissing}
-            title={defaultMissing
-              ? defaultAgentInfo?.chatSetupRequired
-                ? `set up chat for ${defaultAgentInfo.name}`
-                : `choose an agent to set up`
-              : `start ${defaultAgentInfo?.name ?? agentDefault.agent} (${keyHint("newAgent")})`}
-            onclick={newAgentPrimary}
-          >
-            <!-- When the default isn't installed the surface installs it
-                 (managed) rather than spawning a pane that would just print
-                 the shim's error — so the label becomes the action and the
-                 agent name takes the accent. -->
-            <span class="new-label"
-              >{defaultMissing ? (defaultAgentInfo?.chatSetupRequired ? "set up chat" : defaultInstallable ? "install" : "set up") : "+ new agent"}</span
-            >
-            <span class="new-default" class:accent={defaultMissing}>{defaultAgentInfo?.name ?? agentDefault.agent}</span>
-          </button>
-          <button
-            class="new-chev"
-            aria-haspopup="menu"
-            aria-expanded={launcherOpen}
-            aria-label="choose an agent"
-            title="choose an agent"
-            onpointerenter={armLauncherHover}
-            onpointerleave={disarmLauncherHover}
-            onclick={() => {
-              if (launcherOpen && Date.now() - launcherOpenedAt > 400) closeLauncher();
-              else openLauncher();
-            }}
-          >
-            <svg viewBox="0 0 16 16" width="10" height="10" aria-hidden="true">
-              <path
-                d="M4 6l4 4 4-4"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.5"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-              />
-            </svg>
-          </button>
+          {#each railQuick as q (q.id)}
+            <div class="quick">
+              <button
+                class="row new quick-start"
+                class:primary={q.primary}
+                class:want-setup={q.action !== "start"}
+                data-agent={q.id}
+                title={q.action === "install"
+                  ? `install ${q.name}`
+                  : q.action === "setup-chat"
+                    ? `set up chat for ${q.name}`
+                    : q.action === "setup"
+                      ? `set up ${q.name} in Settings → Agents`
+                      : `start ${q.name}${newInWorktree ? " in a new worktree" : ""}${q.primary ? ` (${keyHint("newAgent")})` : ""} · ${isMac ? "⌘" : "ctrl"}-click for the terminal`}
+                onclick={(e) => quickStart(q, e.metaKey || e.ctrlKey)}
+              >
+                <span class="new-plus" aria-hidden="true">+</span>
+                <span class="new-name">{q.name}</span>
+                {#if newInWorktree && q.action === "start"}
+                  <svg class="new-wt" viewBox="0 0 16 16" width="10" height="10" aria-hidden="true">
+                    <path
+                      d="M5 3v7.5M5 12.5v.5M11 3v3a2.5 2.5 0 0 1-2.5 2.5H5"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="1.4"
+                      stroke-linecap="round"
+                    />
+                    <circle cx="5" cy="12.6" r="1.6" fill="none" stroke="currentColor" stroke-width="1.4" />
+                    <circle cx="5" cy="2.4" r="1.6" fill="none" stroke="currentColor" stroke-width="1.4" />
+                    <circle cx="11" cy="2.4" r="1.6" fill="none" stroke="currentColor" stroke-width="1.4" />
+                  </svg>
+                {/if}
+                {#if q.action !== "start"}
+                  <span class="new-need"
+                    >{q.action === "install" ? "install" : q.action === "setup-chat" ? "set up chat" : "set up"}</span
+                  >
+                {/if}
+              </button>
+              {#if q.primary}
+                <button
+                  class="new-chev"
+                  aria-haspopup="menu"
+                  aria-expanded={launcherOpen}
+                  aria-label="more agents"
+                  title="more agents"
+                  onpointerenter={armLauncherHover}
+                  onpointerleave={disarmLauncherHover}
+                  onkeydown={(e) => {
+                    if (e.key === "ArrowDown" && !launcherOpen) {
+                      e.preventDefault();
+                      openLauncher();
+                    }
+                  }}
+                  onclick={() => {
+                    if (launcherOpen && Date.now() - launcherOpenedAt > 400) closeLauncher();
+                    else openLauncher();
+                  }}
+                >
+                  <svg viewBox="0 0 16 16" width="10" height="10" aria-hidden="true">
+                    <path
+                      d="M4 6l4 4 4-4"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="1.5"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                    />
+                  </svg>
+                </button>
+              {/if}
+            </div>
+          {/each}
         </div>
         {#if createError}
           <div class="create-error">{createError}</div>
+        {/if}
+        {#if wtNotice !== null && wtNotice.ws === activeWsId}
+          <div class="wt-kept" role="status" title={wtNotice.path}>
+            {#if wtNotice.error !== null}
+              <span class="wt-kept-msg err">Kept: {wtNotice.error}</span>
+            {:else}
+              <span class="wt-kept-msg"><span class="wt-kept-name">{wtNotice.label}</span> kept</span>
+              <button
+                class="wt-kept-btn strong"
+                title="delete this worktree's folder — the branch stays"
+                disabled={wtNotice.busy}
+                onclick={() => void removeKeptWorktree()}>Remove</button
+              >
+              <button class="wt-kept-btn" disabled={wtNotice.busy} onclick={dismissWtNotice}>Keep</button>
+            {/if}
+          </div>
         {/if}
 
         <!-- Recents: ended agent conversations, any agent type, newest
@@ -6416,7 +6625,10 @@
     onInstall={launcherInstall}
     onUpdate={launcherUpdate}
     onClose={closeLauncher}
+    onSettings={openAgentSettings}
     onAgents={(a) => (agents = a)}
+    inWorktree={workspaceIsRepo ? (workspace?.new_in_worktree === true) : null}
+    onToggleWorktree={(on) => void toggleNewInWorktree(on)}
   />
 {/if}
 
@@ -7285,42 +7497,66 @@
     font-weight: 500;
   }
 
-  /* --- the agent launcher's split button --- */
+  /* --- the rail's quick starts (the launcher's split button) --- */
 
   .new-split {
     display: flex;
-    align-items: stretch;
+    flex-direction: column;
     gap: 1px;
     margin-top: 0.15rem;
   }
 
-  .new-split .row.new.main {
+  .quick {
+    display: flex;
+    align-items: stretch;
+    gap: 1px;
+  }
+
+  .new-split .row.new.quick-start {
     flex: 1;
     min-width: 0;
     margin-top: 0;
     gap: 6px;
+    color: var(--muted);
+    font-weight: 400;
   }
 
-  .new-label {
+  .new-split .row.new.quick-start:hover {
+    color: var(--fg);
+  }
+
+  /* The primary (the saved default, the shortcut's target) reads a step
+     stronger than its siblings — the only emphasis the group carries. */
+  .new-split .row.new.quick-start.primary {
+    color: var(--fg);
+    font-weight: 500;
+  }
+
+  .new-plus {
     flex: none;
+    width: 0.7em;
+    text-align: center;
+    opacity: 0.75;
   }
 
-  /* What the main surface will spawn — quiet transparency, not chrome. */
-  .new-default {
+  .new-name {
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-family: var(--mono);
-    font-size: var(--text-xs);
-    color: var(--muted);
   }
 
-  /* Default agent isn't installed: the surface installs instead of spawning,
-     so the agent name takes the accent — the label ("install"/"set up") and
-     tooltip say what will happen. */
-  .new-default.accent {
+  /* A missing agent: the click sets it up rather than spawning a doomed
+     pane, so the row says which step — quiet, in the accent. */
+  .new-need {
+    margin-left: auto;
+    flex: none;
+    font-size: var(--text-xs);
     color: var(--accent);
+  }
+
+  .new-split .row.new.quick-start.want-setup .new-name {
+    opacity: 0.8;
   }
 
   .new-chev {
@@ -7348,6 +7584,81 @@
 
   .new-chev:active {
     background: var(--row-active);
+  }
+
+  .new-chev:focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: -2px;
+  }
+
+  /* A managed worktree left behind: one quiet line, GitRepoSection's
+     Remove/Keep language. */
+  .wt-kept {
+    display: flex;
+    align-items: baseline;
+    gap: 0.4rem;
+    min-width: 0;
+    padding: 2px 8px 4px;
+    font-size: var(--text-xs);
+    line-height: 1.35;
+    color: var(--muted);
+  }
+
+  .wt-kept-msg {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .wt-kept-msg.err {
+    white-space: normal;
+    color: var(--err);
+  }
+
+  .wt-kept-name {
+    font-family: var(--mono);
+    color: var(--fg);
+  }
+
+  .wt-kept-btn {
+    flex: none;
+    appearance: none;
+    border: none;
+    background: none;
+    padding: 0.05rem 0.2rem;
+    font: inherit;
+    color: var(--muted);
+    cursor: pointer;
+    border-radius: 3px;
+  }
+
+  .wt-kept-btn.strong {
+    color: var(--fg);
+  }
+
+  .wt-kept-btn:hover:not(:disabled) {
+    color: var(--fg);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+
+  .wt-kept-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  .wt-kept-btn:focus-visible {
+    outline: 1px solid var(--focus-ring);
+  }
+
+  /* The worktree choice is on: a tiny branch glyph after the agent name,
+     inline so the split button never shifts. */
+  .new-wt {
+    flex: none;
+    color: var(--muted);
+    opacity: 0.8;
   }
 
   .create-error {

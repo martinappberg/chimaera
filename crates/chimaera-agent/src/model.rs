@@ -237,7 +237,8 @@ pub enum AgentEvent {
     },
     /// Live thinking-token estimate (claude system/thinking_tokens) — the
     /// "thinking · ~N tokens" status signal; fires even when the thinking
-    /// display is summarized and no thought text streams.
+    /// display is summarized and no thought text streams. `0` is "thinking,
+    /// no estimate" (codex: a reasoning item started).
     ThinkingTokens {
         tokens: u64,
     },
@@ -475,6 +476,16 @@ pub enum AgentEvent {
     /// An assistant message superseded earlier output (claude `supersedes`
     /// uuids): the current turn's trailing prose is replaced, not appended.
     MessagesSuperseded,
+    /// The last `utf16_len` UTF-16 code units of this turn's thought stream
+    /// were not reasoning after all: clients cut them off the turn's trailing
+    /// thought row (dropping a row left with only whitespace), and the same
+    /// text follows as `MessageChunk`s. Claude narration (prose shipped as a
+    /// thinking block) that streamed as thought before its signature said so.
+    /// Additive: a client that ignores it shows the thought copy as well.
+    ThoughtRetracted {
+        turn_id: String,
+        utf16_len: usize,
+    },
     /// The agent named this conversation (claude generate_session_title;
     /// codex thread/name/updated) — feeds the workbench naming chain.
     SessionTitle {
@@ -1057,6 +1068,17 @@ fn check_command_len(field: &str, actual: usize, max: usize) -> Result<(), Comma
 }
 
 impl AgentCommand {
+    /// Drop a send's blocks that carry nothing for the agent: whitespace-only
+    /// text and images without data. An agent reads an empty block as a
+    /// message that "came through empty", so no client's leftover may reach
+    /// one. Runs before [`Self::validate_ingress`], which then refuses a send
+    /// with nothing left.
+    pub fn strip_empty_blocks(&mut self) {
+        if let Some(blocks) = self.send_blocks_mut() {
+            blocks.retain(ContentBlock::has_content);
+        }
+    }
+
     /// Validate every client-controlled collection and string before this
     /// command enters the driver's bounded channel. WebSocket framing has its
     /// own earlier byte ceiling; this remains authoritative for programmatic
@@ -1070,6 +1092,11 @@ impl AgentCommand {
             | Self::SendAfterTurn { blocks }
             | Self::SendIfRunning { blocks, .. } => {
                 check_command_len("send blocks", blocks.len(), COMMAND_BLOCKS_MAX)?;
+                if !blocks.iter().any(ContentBlock::has_content) {
+                    return Err(CommandValidationError {
+                        message: "a send needs text or an image".into(),
+                    });
+                }
                 let mut images = 0usize;
                 let mut skills = 0usize;
                 let mut text_total = 0usize;
@@ -1300,6 +1327,18 @@ pub enum ContentBlock {
     },
 }
 
+impl ContentBlock {
+    /// Whether the block carries anything for the agent: non-blank text, an
+    /// image with data, or a skill invocation.
+    pub fn has_content(&self) -> bool {
+        match self {
+            Self::Text { text } => !text.trim().is_empty(),
+            Self::Image { data, .. } => !data.is_empty(),
+            Self::Skill { name, .. } => !name.is_empty(),
+        }
+    }
+}
+
 /// The text of a user message: its text blocks joined, non-text blocks dropped —
 /// the prompt string both drivers hand their child. Shared so the two `Send`
 /// handlers can't drift.
@@ -1307,7 +1346,7 @@ pub fn blocks_text(blocks: &[ContentBlock]) -> String {
     blocks
         .iter()
         .filter_map(|b| match b {
-            ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::Text { text } if !text.trim().is_empty() => Some(text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -1625,6 +1664,20 @@ pub fn fmt_elapsed_secs(s: u64) -> String {
     }
 }
 
+/// A token count for a progress or finish line ("980 tokens", "12.3k
+/// tokens", "2.3M tokens") — one spelling for both drivers, matching the
+/// chat status line's turn tokens. The M step starts where the k form would
+/// round to "1000.0k".
+pub fn fmt_tokens(n: u64) -> String {
+    if n >= 999_950 {
+        format!("{:.1}M tokens", n as f64 / 1_000_000.0)
+    } else if n >= 1000 {
+        format!("{:.1}k tokens", n as f64 / 1000.0)
+    } else {
+        format!("{n} tokens")
+    }
+}
+
 /// What a call to chimaera's agent-communication tools is about, for its
 /// card title: ` → <to>` for `message_agent`, ` → <agent>` for `read_agent`
 /// (one line, capped). Empty for every other tool — both drivers append it
@@ -1856,6 +1909,16 @@ impl Default for Coalescer {
 mod tests {
     use super::*;
 
+    #[test]
+    fn token_counts_step_from_k_to_m() {
+        assert_eq!(fmt_tokens(980), "980 tokens");
+        assert_eq!(fmt_tokens(1000), "1.0k tokens");
+        assert_eq!(fmt_tokens(12_345), "12.3k tokens");
+        assert_eq!(fmt_tokens(999_949), "999.9k tokens");
+        assert_eq!(fmt_tokens(999_950), "1.0M tokens");
+        assert_eq!(fmt_tokens(2_334_950), "2.3M tokens");
+    }
+
     /// The paragraph-boundary contract: `break_paragraph` MARKS, `push`
     /// materializes — never before the scope's first text, never dangling
     /// when no text follows, collapsed across consecutive boundaries, and
@@ -2051,6 +2114,64 @@ mod tests {
         assert!(
             serde_json::from_str::<AgentCommand>(r#"{"type":"prime_fork","blocks":[]}"#).is_err(),
             "removed internal commands must not become callable from the public WS wire"
+        );
+    }
+
+    /// A blank text block or an image without data never reaches an agent:
+    /// ingress strips them, and a send left with nothing is refused.
+    #[test]
+    fn blank_send_blocks_are_stripped_and_an_empty_send_refused() {
+        let image = |data: &str| ContentBlock::Image {
+            media_type: "image/png".into(),
+            data: data.into(),
+            path: None,
+        };
+        let mut cmd = AgentCommand::Send {
+            blocks: vec![
+                image("AAAA"),
+                ContentBlock::Text {
+                    text: " \n ".into(),
+                },
+                image(""),
+                ContentBlock::Text {
+                    text: "this region".into(),
+                },
+                ContentBlock::Text {
+                    text: String::new(),
+                },
+            ],
+        };
+        cmd.strip_empty_blocks();
+        assert_eq!(
+            cmd,
+            AgentCommand::Send {
+                blocks: vec![
+                    image("AAAA"),
+                    ContentBlock::Text {
+                        text: "this region".into()
+                    },
+                ],
+            }
+        );
+        assert!(cmd.validate_ingress().is_ok());
+
+        for blocks in [
+            vec![],
+            vec![ContentBlock::Text { text: "  ".into() }],
+            vec![image("")],
+        ] {
+            let mut cmd = AgentCommand::SendAfterTurn { blocks };
+            assert!(cmd.validate_ingress().is_err(), "unstripped: {cmd:?}");
+            cmd.strip_empty_blocks();
+            assert!(cmd.validate_ingress().is_err(), "stripped: {cmd:?}");
+        }
+        assert_eq!(
+            blocks_text(&[
+                ContentBlock::Text { text: "a".into() },
+                ContentBlock::Text { text: " ".into() },
+                ContentBlock::Text { text: "b".into() },
+            ]),
+            "a\nb"
         );
     }
 

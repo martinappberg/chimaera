@@ -4,7 +4,7 @@
   import { menuPoint, resolveAndOpen, type OpenPathFn, type PathResolver } from "./paths";
   import type { ChatBlock, SubagentInfo, ToolContent } from "./store.svelte";
   import ModelChip from "./ModelChip.svelte";
-  import { readableToolTitle } from "./toolLabels";
+  import { readableToolTitle, toolDescription } from "./toolLabels";
 
   interface Props {
     block: Extract<ChatBlock, { kind: "tool" }>;
@@ -68,6 +68,12 @@
   /** Agent-communication calls read as what they did ("Message to …");
    *  the driver's own title stays on hover. */
   const shownTitle = $derived(readableToolTitle(block));
+  /** The call's own plain-language description (claude Bash), when the
+   *  wire gave one: it leads, the command follows in mono. */
+  const described = $derived.by(() => {
+    const d = toolDescription(block);
+    return d !== null && d !== shownTitle ? d : null;
+  });
   const hasBody = $derived(
     block.content !== null &&
       !(block.content.kind === "output" && (block.content.text ?? "").trim() === ""),
@@ -191,11 +197,16 @@
       title={statusTitle}
     >
       <span class="glyph">{glyph}</span>
-      <span
-        class="title"
-        class:with-live={liveLine !== null}
-        title={shownTitle !== block.title ? block.title : undefined}>{shownTitle}</span
-      >
+      {#if described !== null && liveLine === null}
+        <span class="title described">{described}</span>
+        <span class="cmd" title={block.title}>{shownTitle}</span>
+      {:else}
+        <span
+          class="title"
+          class:with-live={liveLine !== null}
+          title={shownTitle !== block.title ? block.title : undefined}>{shownTitle}</span
+        >
+      {/if}
       {#if liveLine !== null}
         <span class="live">{liveLine}</span>
       {/if}
@@ -459,6 +470,22 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     font-family: var(--mono, monospace);
+  }
+  /* A described call: the agent's words lead in the prose face, the
+     command trails, quieter, in mono — clipped first when space runs out. */
+  .title.described {
+    flex: 0 1 auto;
+    max-width: 65%;
+    font-family: inherit;
+  }
+  .cmd {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--mono, monospace);
+    color: var(--muted);
   }
   /* When a subagent's live progress rides the head, the title yields room —
      same split as the AgentsTray rows. */

@@ -1419,7 +1419,7 @@ pub(crate) async fn switch_view(
             "session has no workspace".to_string(),
         );
     };
-    let Some(workspace_root) = crate::lock(&state.workspaces)
+    let Some(ws_root) = crate::lock(&state.workspaces)
         .get(&workspace_id)
         .map(|w| w.root.clone())
     else {
@@ -1429,7 +1429,7 @@ pub(crate) async fn switch_view(
         );
     };
     // A session started in a worktree respawns there, where its transcript is.
-    let workspace_root = session_root(&state, &id).unwrap_or(workspace_root);
+    let workspace_root = session_root(&state, &id).unwrap_or_else(|| ws_root.clone());
 
     // Serialize before the first await below. Acquiring after transcript
     // validation allowed a fast competing switch/rewind to complete while
@@ -1474,14 +1474,18 @@ pub(crate) async fn switch_view(
     // Validate against the project store; no transcript = fresh start.
     let resume = match resume {
         Some(uuid) if record.kind == AgentKind::Claude => {
-            let path = state
-                .claude_projects_dir
-                .join(crate::launcher::encode_cwd(&workspace_root))
-                .join(format!("{uuid}.jsonl"));
-            tokio::fs::try_exists(&path)
-                .await
-                .unwrap_or(false)
-                .then_some(uuid)
+            // Wherever claude filed it: the hook-reported path (an agent
+            // that entered a worktree), this session's folder, the root.
+            let mut recorded = crate::claude_store::recorded_for(&state, &uuid);
+            recorded.extend(record.transcript_path.clone());
+            crate::claude_store::find(
+                state.claude_projects_dir.clone(),
+                uuid.clone(),
+                recorded,
+                vec![workspace_root.clone(), ws_root.clone()],
+            )
+            .await
+            .map(|_| uuid)
         }
         other => other,
     };
@@ -2359,7 +2363,7 @@ fn recover_portable_context(entries: &[Arc<SeqEvent>], target: AgentKind) -> Opt
     // ACP attaches the handoff to the first real user prompt. Once accepted,
     // it lives in the provider's persisted session and must not be reattached
     // on every daemon restart. A fork closed before its first send still needs it.
-    if matches!(target, AgentKind::Antigravity | AgentKind::Grok)
+    if target.is_acp()
         && entries[marker_index + 1..]
             .iter()
             .any(|entry| matches!(entry.ev, AgentEvent::ForkContextConsumed))
@@ -2898,13 +2902,22 @@ pub(crate) fn seed_resumed_journal(state: &Arc<AppState>, id: &str, recipe: &Cha
     if recipe.kind != AgentKind::Claude {
         return false;
     }
-    let transcript = state
-        .claude_projects_dir
-        .join(crate::launcher::encode_cwd(&recipe.workspace_root))
-        .join(format!("{native}.jsonl"));
-    if !transcript.exists() {
+    // The shared lookup: a recorded path (a Recents row's, a live record's),
+    // the session's folder, the workspace root, its Claude worktrees.
+    let root = crate::lock(&state.workspaces)
+        .get(&recipe.workspace_id)
+        .map(|w| w.root);
+    let cwds: Vec<PathBuf> = std::iter::once(recipe.workspace_root.clone())
+        .chain(root)
+        .collect();
+    let Some(transcript) = crate::claude_store::find_blocking(
+        &state.claude_projects_dir,
+        native,
+        &crate::claude_store::recorded_for(state, native),
+        &cwds,
+    ) else {
         return false;
-    }
+    };
     let events = chimaera_agent::transcript::import_transcript(&transcript);
     if events.is_empty() {
         return false;
@@ -3212,6 +3225,12 @@ pub(crate) async fn spawn_chat_session(
     pinned_override: Option<String>,
 ) -> anyhow::Result<ChatInfo> {
     let chat_bin = crate::launcher::chat_executable(state, recipe.kind, &recipe.bin).await?;
+    // Where it runs, on the record: the exit path retires it into Recents
+    // after the chat registry has let go, and a worktree's conversation
+    // must reopen in that worktree.
+    if let Some(record) = crate::lock(&state.agents).get_mut(&id) {
+        record.spawn_cwd = Some(recipe.workspace_root.clone());
+    }
     let (usage, binaries) = crate::runtime_retention::acquire(
         state,
         Some(recipe.kind),
@@ -3337,7 +3356,7 @@ pub(crate) async fn spawn_chat_session(
                 recipe.resume.clone(),
             )
         }
-        AgentKind::Grok | AgentKind::Antigravity => (
+        AgentKind::Grok | AgentKind::Antigravity | AgentKind::Cursor => (
             crate::launcher::build_acp_chat_command(recipe.kind, chat_bin),
             recipe.resume.clone(),
         ),
@@ -3361,7 +3380,7 @@ pub(crate) async fn spawn_chat_session(
     // the chat agent it spawns.
     spec.env_remove = crate::api::spawn_env_remove(&spec.env);
     spec.pinned_native_id = pinned;
-    if matches!(recipe.kind, AgentKind::Grok | AgentKind::Antigravity) {
+    if recipe.kind.is_acp() {
         if let Some(key) = crate::lock(&state.agents).get(&id).map(|r| r.key.clone()) {
             spec.mcp_servers
                 .push(json!({"type":"http","name":"chimaera",
@@ -3371,6 +3390,13 @@ pub(crate) async fn spawn_chat_session(
         spec.initial_model = model.clone();
         spec.initial_mode = initial_mode.clone();
         spec.initial_effort = initial_effort.clone();
+    }
+    // Cursor's ACP `authenticate` starts a browser login when the host is
+    // signed out (PROTOCOL.md, ACP › Cursor). A daemon must never open one:
+    // the chat fails with the sign-in hint instead.
+    if recipe.kind == AgentKind::Cursor {
+        spec.env
+            .push(("NO_OPEN_BROWSER".to_string(), "1".to_string()));
     }
     // The codex MCP key rides the env, never argv (see mcp_url_bare): the
     // record is re-read here rather than threaded — the spawn paths insert
@@ -3505,7 +3531,7 @@ pub(crate) async fn spawn_chat_session(
         let _ = tokio::task::block_in_place(|| seed_resumed_journal(state, &id, &recipe));
     }
 
-    if matches!(recipe.kind, AgentKind::Grok | AgentKind::Antigravity) {
+    if recipe.kind.is_acp() {
         // Also covers a copied chat closed before its first real send: Recents
         // has a new Chimaera id, but seed_resumed_journal copied its marker.
         spec.portable_context = recover_portable_context_from_disk(state, &id, recipe.kind).await;
@@ -3593,13 +3619,25 @@ pub(crate) async fn resurrect_chat(
     // resumes its thread in-protocol, so its id passes straight through. Without
     // a usable handle the chat boots fresh — the journal still replays for the
     // reader (the same "nothing to lose" fallback the TUI path takes).
+    // The transcript the lookup found, carried onto the new record so the
+    // next ledger snapshot keeps it even before a hook reports it again.
+    let mut found_transcript: Option<PathBuf> = None;
     let resume = match &agent.resume {
         Some(uuid) if agent.kind == AgentKind::Claude => {
-            let path = state
-                .claude_projects_dir
-                .join(crate::launcher::encode_cwd(&root))
-                .join(format!("{uuid}.jsonl"));
-            if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            // The one shared lookup: the transcript claude's hooks reported
+            // (the ledger's record — after an `EnterWorktree` it lives in the
+            // worktree's project dir), the folder the chat ran in (a
+            // worktree it was started in, even one removed since), the root.
+            // Claude resumes by id from the root even then (2.1.300).
+            let found = crate::claude_store::find(
+                state.claude_projects_dir.clone(),
+                uuid.clone(),
+                agent.transcript.iter().cloned().collect(),
+                vec![entry.cwd.clone(), root.clone(), workspace.root.clone()],
+            )
+            .await;
+            if found.is_some() {
+                found_transcript = found;
                 Some(uuid.clone())
             } else {
                 tracing::info!(session = %entry.id, "chat transcript is gone; resurrecting fresh");
@@ -3620,6 +3658,7 @@ pub(crate) async fn resurrect_chat(
     // chat is dropped from the following snapshot and lost on the NEXT restart.
     let mut record = crate::agents::AgentRecord::new(key, agent.kind);
     record.resumed_from = resume.clone();
+    record.transcript_path = found_transcript;
     record.custom_title = entry.pinned_name.clone();
     if record.custom_title.is_none() && agent.title != agent.kind.as_str() {
         record.ai_title = Some(crate::agents::truncate_prompt(&agent.title));
@@ -4046,7 +4085,7 @@ mod tests {
         assert!(recover_portable_context(&durable, AgentKind::Codex)
             .as_deref()
             .is_some_and(|context| context.contains(r#"{"role":"assistant","content":"answer"}"#)));
-        for target in [AgentKind::Antigravity, AgentKind::Grok] {
+        for target in [AgentKind::Antigravity, AgentKind::Grok, AgentKind::Cursor] {
             let mut resumed = durable.clone();
             assert!(recover_portable_context(&resumed, target).is_some());
             // Sending is not acceptance: the provider may reject a request.
@@ -5431,6 +5470,15 @@ mod tests {
         assert!(!AgentKind::Gemini.chat_capable());
         assert!(AgentKind::Antigravity.chat_capable());
         assert!(AgentKind::Grok.chat_capable());
+        assert!(AgentKind::Cursor.chat_capable());
+        assert!(AgentKind::Cursor.is_acp() && !AgentKind::Cursor.native_chat_controls());
+        assert_eq!(
+            crate::launcher::build_acp_chat_command(
+                AgentKind::Cursor,
+                std::path::Path::new("/x/cursor-agent")
+            ),
+            ["/x/cursor-agent", "acp"]
+        );
     }
 
     #[test]

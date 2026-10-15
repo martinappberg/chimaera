@@ -13,6 +13,7 @@ import { artifactMentions, isArtifactPath, proseCovered, proseEmbedTargets } fro
 import { agentMessageFromEvent, isAgentOrigin, parseAgentText, type AgentMessage } from "./agentMessages";
 import type { AgentEvent, ChatSessionInfo, SeqEvent } from "./chatWs";
 import { parseCapabilities, type ChatCapabilities } from "./capabilities";
+import { agentProductName } from "../shared/agentNames";
 
 /** Names a reply may use that still cover their files (a reply listing
  *  thirty outputs covers thirty); resolve candidates from shell text stay
@@ -126,6 +127,7 @@ const TRANSCRIPT_EVENTS = new Set([
   "elicitation_resolved",
   "usage_report",
   "messages_superseded",
+  "thought_retracted",
   "notice",
   "turn_completed",
   "turn_aborted",
@@ -370,6 +372,12 @@ export type ChatBlock = BlockIdentity &
        *  (claude `tool_use_summary`, "Listed files in directory") — the tool
        *  group's title once it lands, a model round after the batch. */
       summary: string | null;
+      /** Journal time the call first appeared, and the time it reached a
+       *  terminal status (absent on a row reconciled at turn end, whose real
+       *  end was never seen). The row's elapsed/duration; journal-backed, so
+       *  replay shows the same durations. */
+      startedAtMs?: number;
+      endedAtMs?: number;
       /** The whole command an execute tool ran (the title keeps ~120 chars,
        *  and claude's `cd "…/abs/path" && …` prefix eats them): what the
        *  turn-end gallery scans for the files a script wrote. */
@@ -771,6 +779,14 @@ export class ChatStore {
    *  the oldest message down or eagerly load every historical artifact. */
   hydrating = $state(true);
   private replayHead = 0;
+  /** Local clock minus the daemon's journal clock, sampled only from frames
+   *  the socket delivered live past the replay head (a replayed frame's `ts`
+   *  is its original time, so sampling one would read its age as skew): a
+   *  running row's elapsed is `Date.now() - (startedAtMs + skew)`, so a
+   *  remote daemon's clock offset never reads as time. 0 until a live frame. Deliberately not
+   *  reactive (a per-event signal would churn every reader); the 1 Hz
+   *  elapsed readers pick it up on their next tick. */
+  clockSkewMs = 0;
   /** Uid mint for {@link stamp}. Deliberately NOT reset with the transcript:
    *  a keyed render may still hold the old rows, and recycled keys would make
    *  Svelte patch stale DOM into unrelated new blocks instead of remounting. */
@@ -943,10 +959,11 @@ export class ChatStore {
     }));
   }
 
-  apply(entry: SeqEvent): void {
+  apply(entry: SeqEvent, live = false): void {
     if (entry.seq <= this.lastSeq) return;
     this.lastSeq = entry.seq;
     if (this.hydrating && this.lastSeq >= this.replayHead) this.hydrating = false;
+    if (live && entry.ts > 0 && entry.seq > this.replayHead) this.clockSkewMs = Date.now() - entry.ts;
     const ev = entry.ev;
     switch (ev.type) {
       case "startup_progress":
@@ -1322,10 +1339,12 @@ export class ChatStore {
       case "thinking_tokens": {
         // Fires even when no thought text streams (summarized display) —
         // the status row shows a live token estimate instead of "starting".
+        // 0 is "thinking, no estimate" (codex at a reasoning item's start).
         const tokens = (ev.tokens as number) ?? 0;
         this.activity = {
           kind: "thinking",
-          detail: tokens >= 1000 ? `~${(tokens / 1000).toFixed(1)}k tokens` : `~${tokens} tokens`,
+          detail:
+            tokens <= 0 ? "" : tokens >= 1000 ? `~${(tokens / 1000).toFixed(1)}k tokens` : `~${tokens} tokens`,
         };
         break;
       }
@@ -1361,6 +1380,7 @@ export class ChatStore {
               crossTurn: ev.cross_turn === true,
               summary: null,
               command: typeof ev.command === "string" ? ev.command : null,
+              ...(entry.ts > 0 ? { startedAtMs: entry.ts } : {}),
             }),
           );
           this.toolIndex.set(ev.id as string, this.blocks.length - 1);
@@ -1384,6 +1404,9 @@ export class ChatStore {
         const wasTerminal = block.status === "completed" || block.status === "failed";
         if (status !== "in_progress" || !wasTerminal) {
           block.status = status;
+        }
+        if (!wasTerminal && (status === "completed" || status === "failed") && entry.ts > 0) {
+          block.endedAtMs = entry.ts;
         }
         const content = ev.content as ToolContent | null | undefined;
         // An Edit card's diff (from tool inputs) must not be clobbered by a
@@ -1652,6 +1675,9 @@ export class ChatStore {
       case "messages_superseded":
         this.dropTrailingProse();
         break;
+      case "thought_retracted":
+        this.retractThought(ev.turn_id as string, Number(ev.utf16_len) || 0);
+        break;
       case "rewind_result":
         this.rewind = {
           userMessageId: ev.user_message_id as string,
@@ -1808,13 +1834,7 @@ export class ChatStore {
           this.exited = null;
           this.degraded = false;
         }
-        const source =
-          ev.source_agent === "claude"
-            ? "Claude Code"
-            : ev.source_agent === "codex"
-              ? "Codex"
-              : ev.source_agent === "agy" ? "Antigravity"
-                : ev.source_agent === "grok" ? "Grok Build" : String(ev.source_agent ?? "agent");
+        const source = typeof ev.source_agent === "string" ? agentProductName(ev.source_agent) : "agent";
         this.notice(
           `continued from ${source}${native ? "" : " · conversation copied"}`,
           "info",
@@ -2241,6 +2261,37 @@ export class ChatStore {
    *  pending stack), so the trailing prose run is always at the very tail — a
    *  plain tail splice. A queued send the agent read mid-turn (resolved `sent`
    *  at a step boundary) is a real boundary and correctly stops the scan. A non-tail splice → rebuild. */
+  /** The driver learned that the last `len` UTF-16 units of `turnId`'s
+   *  thought stream were prose (Claude narration that streamed as thought
+   *  before its signature said so); the same text follows as message
+   *  chunks. Cut it off the turn's newest thought row, and drop that row
+   *  when only whitespace is left and it is still the tail (a pure tail cut
+   *  moves no indexed row). Pure over the journal, so replay renders the
+   *  same transcript. */
+  private retractThought(turnId: string, len: number): void {
+    if (len <= 0) return;
+    for (let i = this.blocks.length - 1; i >= 0; i--) {
+      const block = this.blocks[i];
+      if (block.kind !== "thought") {
+        // Prose or a user row after it: the thought is not this turn's
+        // latest stream, so there is nothing of it to retract.
+        if (block.kind === "message" || block.kind === "user") return;
+        continue;
+      }
+      if (block.turnId !== turnId) return;
+      const kept = block.text.slice(0, Math.max(0, block.text.length - len)).trimEnd();
+      if (kept.length > 0) {
+        block.text = kept;
+      } else if (i === this.blocks.length - 1) {
+        this.blocks.splice(i, 1);
+        this.structuralVersion += 1;
+      } else {
+        block.text = "";
+      }
+      return;
+    }
+  }
+
   private dropTrailingProse(): void {
     const end = this.blocks.length;
     let start = end;

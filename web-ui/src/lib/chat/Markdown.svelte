@@ -1074,7 +1074,7 @@
 
 <style>
   .md {
-    line-height: var(--chat-line-height, 1.55);
+    line-height: var(--chat-line-height, 1.57);
     font-size: var(--text-md);
     word-break: break-word;
     /* Table spacing over the shared recipe (app.css "Markdown tables"): the

@@ -1,6 +1,6 @@
 # Agents — launch, lifecycle & runtimes
 
-Launching and managing Claude Code, Codex, Antigravity and Grok Build. Chimaera runs
+Launching and managing Claude Code, Codex, Antigravity, Grok Build and Cursor CLI. Chimaera runs
 the agent's own runtime as its **real interactive TUI** in a daemon-owned PTY
 (Tier A) or as a **structured chat session** through its native protocol
 (Tier B — see [chat-mode.md](chat-mode.md)). Claude Code and Codex can switch a
@@ -53,30 +53,44 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   a nested child. Terminal `resume` is accepted for Claude and Codex (400 for other
   agents); all four chat adapters resume saved native sessions. Codex TUI resumes map to
   `codex resume <thread-id>`. Chat is gated to
-  `chat_capable()` agents: Claude, Codex, Antigravity and Grok Build. Gemini CLI remains readable in old records but is retired from the new-agent catalog.
+  `chat_capable()` agents: Claude, Codex, Antigravity, Grok Build and Cursor CLI. Gemini CLI remains readable in old records but is retired from the new-agent catalog.
 
-## The launcher — split button & popover
+## The launcher — rail quick starts & the agent menu
 
-- **What & when.** The primary way to start an agent: one click spawns your persisted default;
-  the popover answers "*which* agent" with provenance and install state.
-- **How it's used.** The split button starts the saved default. Its chevron opens a ready-first
-  agent menu with one **chat** action per ready agent and a secondary terminal button. Agents
-  needing installation or Antigravity chat setup appear below. Installation provenance is visible;
-  binary/version provenance lives in the tooltip and Agents settings. Arrow keys navigate,
-  Enter follows the visible chat action, and Command/Ctrl+Enter opens terminal.
-- **Where it lives.** `App.svelte` (`.new-split`, `spawnDefaultAgent`), `Launcher.svelte`,
-  `launcher.ts` (`listAgents` → `GET /api/v1/agents`; `?refresh=true` bypasses the detection cache;
-  `LaunchPick.ui` carries the explicit surface choice into `createSession`).
-- **Key behaviors.** Default persists in localStorage (`chimaera.agentDefault`, falls back to
-  `claude`). If the default is missing, the main surface doesn't spawn a doomed pane — it installs
-  in place (if managed) or opens the popover. Binary provenance and the resolved path stay in the tooltip. When the daemon knows a strictly newer release, the version line grows **`→ <new>`**:
-  an accent one-click curated update for a chimaera-managed build, quiet muted information for your
-  own (chimaera never touches an install it doesn't own — the docs link is the affordance). The
-  popover paints INSTANTLY from the window's last-known catalog (no "checking…"
-  flash per open) and re-detects in the background, swapping in the truth; only a window that has
-  never seen a catalog shows the pulse. The picker’s chat/terminal choice overrides the
-  `agents.defaultView` setting for that one spawn (the setting still governs the split button's
-  instant spawn). Agents with no curated managed install get only the official setup link.
+- **What & when.** The primary way to start an agent. The rail's **Agents** section ends in
+  one-click rows — **+ Claude Code** and **+ Codex**, the two defaults — styled like
+  **+ terminal**. Everything else (Antigravity, Grok Build, Cursor CLI, extension agents) waits
+  one step away in the agent menu, so the rail never lists every runtime a host might have.
+- **How it's used.** Click a row to start that agent in the `agents.defaultView` surface (chat or
+  terminal); ⌘/Ctrl-click starts it in the terminal. A default the user picked that is not one
+  of the two (say Cursor CLI) joins the top of the rail as the primary row; the primary is what
+  ⇧⌘E and the dashboard's **+ new agent** start, and it alone carries the menu chevron. Rows
+  never reorder on click — only a menu choice moves the default. A missing quick agent keeps its
+  row with a small accent step instead of spawning a doomed pane: **install** (curated install,
+  opens the setup dialog), **set up chat**, or **set up** (no curated install → Settings → Agents).
+- **The agent menu.** The chevron opens it on hover, click, or ArrowDown. The quick agents come
+  first in rail order; a hairline labelled *other agents* separates the rest, ready ones first.
+  Each row is one line: glyph, name, version in mono (binary + path in the tooltip; a dated build
+  such as Cursor's `2026.10.14-941492e` reads as its date), `→ <new>` when a newer release is
+  known, docs ↗ on hover, a **chat** button and a terminal icon — or, when not ready, *not
+  installed* / *needs an update* / *chat needs setup* with an install/update/set-up chip. The
+  footer holds the `⌘↵ terminal` hint and **agent settings →**, which opens Settings at Agents.
+  Keyboard: focus stays in the menu with a roving highlight (`aria-activedescendant`);
+  Arrow keys wrap through the rows and the settings link, Home/End jump, Enter does the row's
+  action, ⌘/Ctrl+Enter opens the terminal, Escape closes and returns focus to the chevron.
+- **Where it lives.** `App.svelte` (`.new-split`, `railQuick`, `quickStart`, `openAgentSettings`,
+  `launcherPick`), `Launcher.svelte`, `launcher.ts` (`quickStarts`, `groupAgents`, `quickAction`,
+  `QUICK_AGENTS`; `listAgents` → `GET /api/v1/agents`, `?refresh=true` bypasses the detection
+  cache; `LaunchPick.ui` carries an explicit surface choice into `createSession`).
+- **Key behaviors.** The default persists in localStorage (`chimaera.agentDefault`, falling back
+  to `claude`, and to Claude Code when the catalog no longer lists it, e.g. gemini). A menu choice
+  becomes the default; an explicit chat/terminal choice there also becomes the sticky
+  `agents.defaultView`. When the daemon knows a strictly newer release, a chimaera-managed build
+  gets an accent one-click update; your own install gets quiet information (chimaera never
+  touches an install it doesn't own). The menu paints instantly from the window's last-known
+  catalog and re-detects in the background; only a window that has never seen a catalog shows
+  the pulse. The Mastermind dock still offers Claude Code and Codex and starts on whichever of
+  them is the launcher default. Home has no agent list of its own.
 
 ## Managed runtimes — install / update / theming shims
 
@@ -134,7 +148,8 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   replaces companions a running session still needs. It installs the package rather than just the entrypoint — it spawns companions
   (`codex-code-mode-host`, bundled rg/zsh) from beside its own executable, and an entrypoint-only
   install shipped a codex whose code mode failed closed. One install/update per agent across both setup APIs (409 when another workspace holds the shared lock). Antigravity installs its complete Google chat package alongside the
-  terminal executable. Grok uses xAI’s standalone release. These two chat/runtime artifacts are
+  terminal executable. Grok uses xAI’s standalone release. Cursor CLI installs the package the
+  official installer names (see [Cursor CLI](#cursor-cli)). These two chat/runtime artifacts are
   fetched over HTTPS from the vendor; they do not publish separate checksums at these endpoints.
   Gemini CLI is retained for reading existing records, with no new managed install. Shims are written **only**
   when chimaera owns the binary (never shadow your own install) and theme injection is skipped when
@@ -144,6 +159,35 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   install method for a bare binary behind our symlink, and claude's would install a second copy
   elsewhere, leaving the managed link stale); your own binary's `update` passes through untouched.
 
+## Cursor CLI
+
+- **What & when.** Cursor's terminal agent (`cursor-agent`, linked as `agent` too) as a fifth
+  built-in runtime: its own TUI in a PTY, or structured chat over ACP.
+- **How it's used.** Start it from the agent menu's *other agents*, or make it the default.
+  The CLI keeps its own sign-in: run `cursor-agent login` once on the workspace host (the
+  terminal view shows Cursor's "Press any key to log in…" until then). Chat started while
+  signed out fails fast with that instruction instead of opening a browser from the daemon.
+- **Where it lives.** `agent_state.rs` (`AgentKind::Cursor`, id `cursor`, `path_bin()` =
+  `cursor-agent`), `launcher.rs` (detection, `build_acp_chat_command` → `cursor-agent acp`),
+  `chat.rs` (ACP spawn, `NO_OPEN_BROWSER=1`), `runtimes.rs` (managed install, `cursor-agent`
+  shim), `agent_updates.rs` (release from the official installer),
+  `chimaera_agent::acp::CURSOR` (pinned to `TESTED_CURSOR_VERSION` 2026.10.14-941492e).
+- **Key behaviors.** Detection searches the PATH for `cursor-agent`, never `cursor` — that name
+  is the Cursor editor's app launcher — and the shim is named `cursor-agent` for the same
+  reason. Chat is the shared ACP adapter: approvals, cancel, queued sends, resume through
+  `session/load`, conversation-copy forks; models and the `agent`/`plan`/`ask` modes appear only
+  as the signed-in session advertises them (no curated list, no custom model input, no native
+  terminal↔chat switch). Cursor's blocking `cursor/ask_question` and `cursor/create_plan`
+  requests are refused with a notice pointing at the terminal view. The managed install reads
+  the release from `https://cursor.com/install`, downloads
+  `downloads.cursor.com/lab/<version>/<os>/<arch>/agent-cli-package.tar.gz` over HTTPS (Cursor
+  publishes no checksum), unpacks the whole ~600 MB package (bundled node + modules) into
+  `~/.chimaera/agents/cursor/<package>/` with `bin/cursor` linking its entrypoint, and never
+  writes `~/.local/bin`. Releases are dated builds (`2026.10.14-941492e`): updates order by
+  date, and two builds of one date are never claimed newer.
+- **Status.** Terminal use and detection/installation are verified; chat turns await a
+  signed-in run of `CHIMAERA_TEST_CURSOR=… just chat-smoke-acp` (PROTOCOL.md, ACP › Cursor).
+
 ## Agent detection & catalog
 
 - **What & when.** The launcher popover's truth: which agents this host has (installed? version?
@@ -152,7 +196,7 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
 - **Where it lives.** `launcher.rs` (`list_agents`, `detect`, `resolve_bin`, `models`,
   `is_outdated`, `claude_resumables`); upstream latest-release probes in `agent_updates.rs`.
   Routes `GET /api/v1/agents`, `GET /api/v1/agents/claude/sessions`.
-- **Key behaviors.** Detection runs the four registered agents' login shells + version probes concurrently (serial would
+- **Key behaviors.** Detection runs the registered agents' login shells + version probes concurrently (serial would
   visibly stall the popover), with a 6s timeout backstopped by well-known paths. `is_outdated` flags
   npm-era codex (0.1.x). The Antigravity IDE's `agy` symlink (which just opens the GUI) is detected
   and refused. Resumables are scanned off the reactor, exclude transcripts already open in a live
@@ -238,7 +282,8 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   the row's title seeds the soft `ai_title` (`title_hint`), and the journal is seeded from the
   previous life — copied when a chat journal exists, otherwise **imported from the claude
   transcript** (`~/.claude/projects/<enc>/<id>.jsonl` → `AgentEvent`s, bounded newest-tail with an
-  explicit `Truncated` marker). A saved Claude chat whose history cannot be reconstructed reports
+  explicit `Truncated` marker; only user/assistant records count toward that tail, so the per-request
+  `api-request*` records Claude 2.1.300 writes there never crowd out the conversation). A saved Claude chat whose history cannot be reconstructed reports
   a recoverable error with a terminal suggestion, rather than silently changing views. A Codex
   recent resumes on its last surface: `thread/resume` in chat, `codex resume <thread-id>` in the
   TUI. A normally finished Codex chat copies its native `ChatInfo` thread id into Recents before
@@ -249,6 +294,43 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   row → **Archive**, or the header → **Archive all** (with an Undo), hides conversations from the
   rail without deleting anything; a quiet **All sessions** link ends the list
   ([session-history.md](session-history.md#archiving-recents)).
+
+## Where each agent keeps a conversation (resume from any folder)
+
+- **What & when.** Chimaera resumes a native conversation after a restart, from Recents and from
+  history. An agent's folder can change under it — a session started in a worktree, a Claude agent
+  that calls `EnterWorktree` mid-conversation, a worktree removed since — so each runtime's lookup
+  has to match how that runtime files conversations.
+- **Where it lives.** `claude_store.rs` (the one Claude lookup: `find`/`find_blocking`,
+  `find_known` + `worktree_index` for history's per-row check, `claude_worktree_dirs`), used by
+  `chat.rs` (`resurrect_chat`, `switch_view`, `seed_resumed_journal`), `ledger.rs`
+  (`resolve_resume`), `recents.rs` (`retire_inner`, the Recents scan), `history/routes.rs`
+  (`reopen`) and `launcher.rs` (`claude_resumables`). Codex: `chimaera-agent/src/codex.rs`
+  (`thread/resume`). ACP: `chimaera-agent/src/acp.rs` (`session/resume` / `session/load`).
+- **Key behaviors.**
+  - **Claude** files a conversation under the folder it is working in:
+    `~/.claude/projects/<encoded cwd>/<id>.jsonl`, the encoding folding every non-alphanumeric
+    character into `-`. `EnterWorktree` moves the file to the worktree's directory
+    (`<root>--claude-worktrees-<name>`). Chimaera looks, in order: the transcript path Claude's
+    hooks reported (`transcript_path`, now recorded for chats as well as terminals in the ledger,
+    Recents and history), the session's own cwd, the workspace root, then the root's own Claude
+    worktree directories (one bounded `read_dir` of the store, exact `<id>.jsonl` only; the
+    `--claude-worktrees-` part keeps a sibling such as `proj-pro` out). Claude itself resumes by id
+    from the repository root even after the worktree is gone (claude 2.1.300, `--resume <id>`, no
+    fork), so a chat that entered a worktree and a chat whose managed worktree was removed both come
+    back with their memory.
+  - **Codex** keeps rollouts by date and thread id (`~/.codex/sessions/YYYY/MM/DD/rollout-…-<thread
+    id>.jsonl`), independent of the folder, and resumes in-protocol (`thread/resume`; `codex resume
+    <id>` in the TUI). A thread started in one folder resumes from another, including after the
+    first folder is deleted (codex 0.162.1). Chimaera passes the id straight through.
+  - **Antigravity and Grok (ACP)** resume by session id through the adapter (`session/resume` when
+    the agent advertises it, else `session/load`, both with the cwd). Antigravity keeps conversations
+    by id with the cwd as metadata (`~/.gemini/antigravity-acp/conversations/<id>.*`). Grok files
+    sessions under a directory per cwd (`~/.grok/sessions/<url-encoded cwd>/<id>`), so a Grok chat
+    resumes in the folder it ran in: a worktree session comes back while its worktree exists;
+    after the worktree is removed it starts at the root, where Grok may not find it.
+  - A resurrected chat runs in the folder it ran in while that still exists, else the workspace
+    root; a Recents row keeps that folder too and reopens there.
 
 ## Documents: the portable dialect, `check_document` and the issues chip
 
@@ -308,7 +390,9 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
 
 ## Status: partial
 
-- Antigravity and Grok Build share ACP chat; their same-session terminal/chat switch and native
+- Cursor CLI chat is implemented from the signed-out handshake and Cursor's ACP docs; its turn
+  wire awaits a signed-in `just chat-smoke-acp` run.
+- Antigravity, Grok Build and Cursor CLI share ACP chat; their same-session terminal/chat switch and native
   rewind are not offered. Managed installs include their official native runtimes. Google's
   chat package is pinned independently of `agy`; Linux chat needs glibc. Third-party harness
   registration (including Pi) is [designed, not yet implemented](../agent-guides/agent-integrations.md).
@@ -353,6 +437,10 @@ _Captured 2026-07-09 (from the maintainer, in-session)._
 - **How settled:** the outcome (name + history, or an honest terminal) is the requirement; the
   import mechanics (bounded tail, `Truncated` marker, reuse of the driver's block mapping) are
   implementation, free to improve.
+
+### Why the rail shows two agents and hides the rest — _Intent pending_
+
+- **Problem it solves (verbatim, issue #283):** “I think new agents in left pane, Claude Code + Codex default, then others ? takes you to settings agent view maybe.”
 
 ### Why the launcher spells out open-vs-terminal
 _Captured 2026-07-09 (from the maintainer, in-session)._

@@ -169,6 +169,14 @@ impl SessionGits {
         crate::lock(&self.live).get(id).and_then(|t| t.repo.clone())
     }
 
+    /// The checkout top of a folder the tracker has already probed (no
+    /// filesystem access; `None` when unprobed or outside a repository).
+    pub(crate) fn toplevel_of(&self, cwd: &Path) -> Option<PathBuf> {
+        crate::lock(&self.probes)
+            .get(cwd)
+            .and_then(|r| r.as_ref().map(|r| r.toplevel.clone()))
+    }
+
     fn cached_probe(&self, cwd: &Path) -> Option<Option<RepoInfo>> {
         crate::lock(&self.probes).get(cwd).cloned()
     }

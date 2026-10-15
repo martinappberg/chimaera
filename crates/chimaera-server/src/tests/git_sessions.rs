@@ -646,3 +646,212 @@ async fn managed_worktrees_are_locked_while_an_agent_runs_inside() {
         "someone else"
     );
 }
+/// A stand-in agent binary that ignores its argv and stays alive for a
+/// while, so its session stays listed while the tracker resolves it.
+fn lingering_agent(label: &str) -> PathBuf {
+    let dir = test_dir(label);
+    let bin = dir.join("fake-agent");
+    std::fs::write(&bin, "#!/bin/sh\nsleep 30\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+/// The session's `managed_worktree` once the tracker has resolved it.
+async fn managed_worktree_eventually(state: &Arc<AppState>, id: &str) -> serde_json::Value {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let entry = session_entry(state, id).await;
+        if !entry["managed_worktree"].is_null() {
+            return entry["managed_worktree"].clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "managed_worktree never resolved: {entry}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// `worktree: true` starts a new agent in a managed worktree of its own on a
+/// fresh `chimaera/<agent>-<hex>` branch, and the row says so; the
+/// per-workspace choice round-trips through PATCH. Refused for shells, with
+/// `cwd`/`resume`, and outside a repository.
+#[tokio::test]
+async fn a_new_agent_can_start_in_its_own_managed_worktree() {
+    let repo = init_temp_repo("sg-own-wt");
+    let state = test_state();
+    tokio::spawn(crate::git::track_sessions(state.clone()));
+    preset_agent(
+        &state,
+        crate::agents::AgentKind::Claude,
+        Ok(lingering_agent("sg-own-wt-bin")),
+        None,
+    );
+    let (ws, _) = add_workspace(&state, &repo).await;
+
+    let (status, row) = request(
+        &state,
+        Method::PATCH,
+        &format!("/api/v1/workspaces/{ws}"),
+        Some(serde_json::json!({"new_in_worktree": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{row}");
+    assert_eq!(row["new_in_worktree"], true);
+    assert!(lock(&state.workspaces).get(&ws).unwrap().new_in_worktree);
+
+    for bad in [
+        serde_json::json!({"workspace_id": ws, "kind": "shell", "worktree": true}),
+        serde_json::json!({"workspace_id": ws, "kind": "agent", "worktree": true, "resume": "x"}),
+        serde_json::json!({"workspace_id": ws, "kind": "agent", "worktree": true, "cwd": repo}),
+    ] {
+        let (status, err) = request(&state, Method::POST, "/api/v1/sessions", Some(bad)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+    }
+
+    let (status, session) = request(
+        &state,
+        Method::POST,
+        "/api/v1/sessions",
+        Some(serde_json::json!({"workspace_id": ws, "kind": "agent", "worktree": true})),
+    )
+    .await;
+    assert!(status.is_success(), "spawn failed: {session}");
+    let id = session["id"].as_str().unwrap().to_string();
+    let cwd = PathBuf::from(session["cwd"].as_str().unwrap());
+    let managed = std::fs::canonicalize(&state.worktrees_root).unwrap();
+    assert!(cwd.starts_with(&managed), "{cwd:?} not under {managed:?}");
+    let branch = git_in(&cwd, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    assert!(branch.starts_with("chimaera/claude-"), "{branch}");
+    assert!(cwd.ends_with(&branch), "named after its branch: {cwd:?}");
+    assert_eq!(session["workspace_id"], ws, "it stays in this workspace");
+    assert_eq!(
+        managed_worktree_eventually(&state, &id).await,
+        serde_json::json!(cwd)
+    );
+    state.sessions.kill(&id).ok();
+
+    // Not a repository: refused, nothing created.
+    let plain = test_dir("sg-own-wt-plain");
+    let (plain_ws, _) = add_workspace(&state, &plain).await;
+    let (status, err) = request(
+        &state,
+        Method::POST,
+        "/api/v1/sessions",
+        Some(serde_json::json!({"workspace_id": plain_ws, "kind": "agent", "worktree": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+}
+/// A spawn that fails after its worktree was made (here: a model id the
+/// argv check refuses) leaves neither the worktree nor its branch behind.
+#[tokio::test]
+async fn a_failed_spawn_discards_its_new_worktree_and_branch() {
+    let repo = init_temp_repo("sg-own-wt-fail");
+    let state = test_state();
+    preset_agent(
+        &state,
+        crate::agents::AgentKind::Claude,
+        Ok(PathBuf::from("/bin/cat")),
+        None,
+    );
+    let (ws, _) = add_workspace(&state, &repo).await;
+    for ui in ["term", "chat"] {
+        let (status, err) = request(
+            &state,
+            Method::POST,
+            "/api/v1/sessions",
+            Some(serde_json::json!({
+                "workspace_id": ws, "kind": "agent", "worktree": true,
+                "ui": ui, "model": "--not-a-model",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{ui}: {err}");
+        let list = git_in(&repo, &["worktree", "list", "--porcelain"]);
+        assert_eq!(
+            list.lines().filter(|l| l.starts_with("worktree ")).count(),
+            1,
+            "{ui}: only the main checkout remains: {list}"
+        );
+        let branches = git_in(&repo, &["branch", "--list", "chimaera/*"]);
+        assert!(branches.is_empty(), "{ui}: no branch left: {branches}");
+    }
+}
+
+/// A session started in a SUBFOLDER of a managed worktree reports the
+/// worktree's top as `managed_worktree` (what the Remove offer targets),
+/// never the subfolder. And a managed worktree opened as its own workspace
+/// stops being listed once its folder is gone.
+#[tokio::test]
+async fn managed_worktree_is_the_worktree_top_and_dead_registrations_go() {
+    let repo = init_temp_repo("sg-own-wt-sub");
+    let state = test_state();
+    tokio::spawn(crate::git::track_sessions(state.clone()));
+    preset_agent(
+        &state,
+        crate::agents::AgentKind::Claude,
+        Ok(lingering_agent("sg-own-wt-sub-bin")),
+        None,
+    );
+    let (ws, _) = add_workspace(&state, &repo).await;
+    let (_, body) = request(
+        &state,
+        Method::POST,
+        "/api/v1/git/worktrees",
+        Some(serde_json::json!({"workspace_id": ws, "branch": "feat/sub"})),
+    )
+    .await;
+    let wt = PathBuf::from(body["worktree"]["path"].as_str().unwrap());
+    let sub = wt.join("deep").join("er");
+    std::fs::create_dir_all(&sub).unwrap();
+    let (status, session) = request(
+        &state,
+        Method::POST,
+        "/api/v1/sessions",
+        Some(serde_json::json!({"workspace_id": ws, "kind": "agent", "cwd": sub})),
+    )
+    .await;
+    assert!(status.is_success(), "spawn failed: {session}");
+    let id = session["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        managed_worktree_eventually(&state, &id).await,
+        serde_json::json!(wt),
+        "the worktree's top, not the subfolder it started in"
+    );
+    state.sessions.kill(&id).ok();
+
+    // Opened as its own window, then removed outside chimaera.
+    let (_, opened) = request(
+        &state,
+        Method::POST,
+        "/api/v1/workspaces",
+        Some(serde_json::json!({"root": wt})),
+    )
+    .await;
+    let opened_id = opened["id"].as_str().unwrap().to_string();
+    // Forcefully, as an outside tool might: past the lock the just-killed
+    // session may still hold until the tracker's next pass.
+    git_in(
+        &repo,
+        &["worktree", "remove", "-f", "-f", wt.to_str().unwrap()],
+    );
+    let (_, listed) = request(&state, Method::GET, "/api/v1/workspaces", None).await;
+    assert!(
+        !listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["id"] == opened_id.as_str()),
+        "a gone managed worktree is unregistered: {listed}"
+    );
+    assert!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["id"] == ws.as_str()),
+        "the repository's own workspace stays"
+    );
+}

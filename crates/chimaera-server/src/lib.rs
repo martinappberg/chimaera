@@ -8,6 +8,7 @@ mod api;
 mod assets;
 mod browser_open;
 mod chat;
+mod claude_store;
 mod comms;
 mod compute;
 mod doc_check;

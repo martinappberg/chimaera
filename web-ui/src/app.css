@@ -20,10 +20,10 @@
      locally (chat) or use their own pixel settings (terminal/editor).
      xs: tabs/titles/strip/crumbs/badges · sm: mono names/hints ·
      md: rows/buttons/inputs · lg: body/terminal. */
-  --text-xs: 12px;
-  --text-sm: 13px;
-  --text-md: 14px;
-  --text-lg: 16px;
+  --text-xs: 11.5px;
+  --text-sm: 12.5px;
+  --text-md: 13.5px;
+  --text-lg: 15.5px;
   /* Overlay stacking: the clearance a top-centre surface leaves for the
      asset-transition notice above it (App.svelte's reconnect strip stacks
      under it while a transition is pending). Sized to the notice's tallest
@@ -387,6 +387,17 @@ body {
 
 #app {
   height: 100vh;
+}
+
+/* Visually hidden, still read by assistive tech (a live region's text, a
+   state word a glyph already shows). */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 
 /* Session state is carried by the type glyphs now (SessionGlyph, shared by

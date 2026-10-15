@@ -1,37 +1,45 @@
 <script lang="ts">
   /**
    * The agent launcher popover (docs/design/README.md "The agent launcher"), opened by
-   * the split button's chevron ONLY — hover (~150ms) on the chevron or a
-   * click; the main surface is a pure instant spawn and never opens this.
+   * the rail's chevron ONLY — hover (~150ms) or a click; the rail's quick
+   * starts are pure instant spawns and never open this.
    *
-   * One question: WHICH agent. One row per known CLI, every row carrying a
-   * link to its official docs (opens in the browser):
-   * - installed → click spawns; the row names whose binary runs — "yours"
-   *   (your own on PATH) or "chimaera" (accent, a build chimaera installed
-   *   under ~/.chimaera/agents) — with the version and the resolved path in
-   *   the tooltip. When the daemon knows a strictly newer release, the
-   *   version line grows "→ <new>": a one-click curated update for a
-   *   chimaera-managed build, quiet muted information for the user's own
-   *   (chimaera never touches an install it doesn't own);
-   * - installed but outdated (npm-era codex, pre-`codex login`) → click
-   *   still spawns, an "update" chip runs the daemon's curated update
-   *   in-app (managed runtimes), streaming into a visible terminal;
-   * - not installed → muted, an "install" chip does the same for a fresh
-   *   install. One explicit click, never silent: the tooltip says exactly
-   *   what is fetched and where it lands. No curated install (gemini,
-   *   phase 2: node runtime) → no chip at all; the docs link is the
-   *   affordance — the POST would only 400.
+   * The rail already starts Claude Code and Codex (and the saved default) in
+   * one click, so this answers the rest of "which agent, and how":
+   * - the quick agents first, in rail order — here for their terminal start
+   *   (the icon button, or ⌘↵) and update affordance;
+   * - then "other agents" (Antigravity, Grok Build, Cursor CLI, extension
+   *   agents), ready chats first, each showing its install state: the
+   *   version when installed, "not installed" with an install chip (a
+   *   curated managed install) or a set-up chip into Settings → Agents;
+   * - a footer link into Settings → Agents, where every agent is managed.
    *
+   * Installed rows read as just a version; whose binary it is ("installed by
+   * chimaera" vs your own, with the resolved path) is the version's tooltip.
+   * A strictly newer known release grows "→ <new>": a one-click curated
+   * update for a chimaera-managed build, quiet information for your own.
+   * Every row links its official docs when hot.
+   *
+   * Picking here makes that agent the saved default (the rail's primary).
    * Resuming lives in the rail's RECENT section, not here.
    *
-   * Keyboard: ArrowUp/Down moves the highlight, Enter activates (spawn or
-   * install), Escape closes.
+   * In a git workspace the footer also holds one quiet switch: new agents
+   * start in their own worktree (a fresh branch). Remembered per
+   * workspace; every new-agent path follows it, not only this menu. It
+   * joins the roving order between the agents and the settings link.
+   *
+   * Keyboard: the root holds focus with a roving highlight
+   * (aria-activedescendant). ArrowUp/Down (Home/End) move across the agent
+   * rows, the worktree switch and the settings link, Enter activates (start,
+   * install, flip the switch, or open settings), ⌘/Ctrl+Enter starts in the
+   * terminal, Escape closes and hands focus back to the chevron.
    */
   import { onMount } from "svelte";
   import {
     getAgentDefault,
+    groupAgents,
     listAgents,
-    orderAgents,
+    versionNumber,
     type AgentInfo,
     type LaunchPick,
   } from "./launcher";
@@ -40,7 +48,7 @@
   import SessionGlyph from "../shared/SessionGlyph.svelte";
 
   interface Props {
-    /** The split button's rect; the popover hangs below it (fixed). */
+    /** The rail's quick-start group rect; the popover hangs below it (fixed). */
     anchor: DOMRect;
     onPick: (pick: LaunchPick) => void;
     onInstall: (agent: AgentInfo) => void;
@@ -48,28 +56,59 @@
      *  curated script in a visible pane). Only reachable when the row is
      *  managed AND a strictly newer release is known. */
     onUpdate: (agent: AgentInfo) => void;
-    onClose: () => void;
-    /** Report the freshly-probed catalog up so the split button reflects it
+    /** Escape passes "escape" so focus returns to the chevron (menu-button
+     *  pattern); an outside press leaves focus where it landed. */
+    onClose: (how?: "escape") => void;
+    /** Open Settings → Agents (the footer link, and the set-up path for an
+     *  agent chimaera has no curated install for). */
+    onSettings: () => void;
+    /** Report the freshly-probed catalog up so the rail reflects it
      *  (this popover always re-detects on open). */
     onAgents?: (agents: AgentInfo[]) => void;
     /** The window's last-known catalog (App keeps it from boot + installs).
      *  Rows paint from it INSTANTLY — no "checking…" flash on every open —
      *  and the background re-detect swaps in the truth. */
     initial?: AgentInfo[] | null;
+    /** The workspace's "new agents start in a new worktree" choice; null
+     *  hides the switch (not a git repository). */
+    inWorktree?: boolean | null;
+    onToggleWorktree?: (next: boolean) => void;
   }
 
-  let { anchor, onPick, onInstall, onUpdate, onClose, onAgents, initial = null }: Props = $props();
+  let {
+    anchor,
+    onPick,
+    onInstall,
+    onUpdate,
+    onClose,
+    onSettings,
+    onAgents,
+    initial = null,
+    inWorktree = null,
+    onToggleWorktree,
+  }: Props = $props();
 
-  let agents = $state<AgentInfo[] | null>(null);
+  /** Read once per open: the default decides which agents are "quick". */
+  const defaultId = getAgentDefault().agent;
+
+  let catalog = $state<AgentInfo[] | null>(null);
   let loadError = $state<string | null>(null);
   /** Loading is invisible <150ms, then a soft pulse (polish inventory). */
   let showLoading = $state(false);
 
+  const groups = $derived(catalog === null ? null : groupAgents(catalog, defaultId));
+  /** The roving order: quick agents, others, the worktree switch (git
+   *  workspaces only), then the settings link. */
+  const rows = $derived(groups === null ? [] : [...groups.quick, ...groups.others]);
+  const quickCount = $derived(groups?.quick.length ?? 0);
+  const wtIndex = $derived(inWorktree !== null ? rows.length : -1);
+  const settingsIndex = $derived(rows.length + (inWorktree !== null ? 1 : 0));
+
   let hl = $state(0);
   let rootEl = $state<HTMLElement | null>(null);
 
-  /** Version-tag tooltip: whose binary this is and where it resolves — the
-   *  answer to "chimaera's install or mine?" the rail alone can't give. */
+  /** Version tooltip: whose binary this is and where it resolves — the
+   *  answer to "chimaera's install or mine?" the row alone doesn't spell out. */
   function whereTitle(a: AgentInfo): string {
     const whose = a.managed
       ? "installed by chimaera in ~/.chimaera/agents"
@@ -79,44 +118,50 @@
     return a.version !== null ? `${a.version} — ${whose}` : whose;
   }
 
+  /** The row's one quiet state word: a version when it can run, else what it needs. */
+  function stateLine(a: AgentInfo): string {
+    if (!a.installed) return "not installed";
+    if (a.outdated) return "needs an update";
+    if (a.chatSetupRequired) return "chat needs setup";
+    return a.version !== null ? versionNumber(a.version) : "installed";
+  }
+
+  /** Swap in a fresh catalog, keeping the highlight on the same agent (or on
+   *  the same footer control) rather than the same index. */
+  function adopt(next: AgentInfo[]): void {
+    const footer = catalog !== null && hl >= rows.length ? hl - rows.length : null;
+    const selected = rows[hl]?.id;
+    catalog = next;
+    if (footer !== null) hl = rows.length + footer;
+    else hl = Math.max(0, rows.findIndex((a) => a.id === selected));
+  }
+
   onMount(() => {
-    const def = getAgentDefault();
     // The window's last-known catalog paints the rows synchronously; only a
-    // cold window (boot probe never landed) fetches before first paint.
-    if (initial !== null && initial.length > 0) {
-      agents = orderAgents(initial);
-      hl = Math.max(
-        0,
-        agents.findIndex((x) => x.id === def.agent),
-      );
-    }
+    // cold window (boot probe never landed) fetches before first paint. The
+    // highlight starts on the default, which leads the quick group.
+    if (initial !== null && initial.length > 0) catalog = initial;
     const loadTimer = setTimeout(() => (showLoading = true), 150);
     // The detection cache is daemon-lifetime, so an install/update made
     // since (field report: codex updated, chip still said "update") would
     // never surface. Whatever painted first — the prop or the daemon's
     // cached rows — a background re-detect swaps in the truth.
-    const first = agents !== null ? Promise.resolve(agents) : listAgents();
+    const first = catalog !== null ? Promise.resolve(catalog) : listAgents();
     void first
       .then((a) => {
-        if (agents === null) {
-          agents = orderAgents(a);
+        if (catalog === null) {
+          catalog = a;
           onAgents?.(a);
-          hl = Math.max(
-            0,
-            agents.findIndex((x) => x.id === def.agent),
-          );
         }
         return listAgents(true).then((fresh) => {
           if (fresh.length > 0) {
-            const selected = agents?.[hl]?.id;
-            agents = orderAgents(fresh);
-            hl = Math.max(0, agents.findIndex((a) => a.id === selected));
+            adopt(fresh);
             onAgents?.(fresh);
           }
         });
       })
       .catch((e) => {
-        if (agents === null) {
+        if (catalog === null) {
           loadError = e instanceof Error ? e.message : "failed to load agents";
         }
         // refresh failures keep the shown rows — never blank a shown list
@@ -126,7 +171,7 @@
     rootEl?.focus();
 
     // Overlay language: any outside press or Escape closes. Presses on the
-    // split button are the anchor's own toggle/spawn semantics — not
+    // rail's quick-start group are its own toggle/spawn semantics — not
     // "outside" (closing here would race the button's click handler).
     const onDown = (e: PointerEvent) => {
       if (rootEl === null || !(e.target instanceof Node)) return;
@@ -144,9 +189,9 @@
   const pos = $derived.by(() => {
     const viewW = window.innerWidth || document.documentElement.clientWidth || 1280;
     const viewH = window.innerHeight || document.documentElement.clientHeight || 800;
-    // 348: wide enough that a hot row keeps its whole subheader — provenance,
-    // version, the "→ <new>" update affordance AND the docs link — un-truncated.
-    const width = 348;
+    // Wide enough that a hot row keeps name, version, the "→ <new>" update
+    // affordance, the docs link and both actions un-truncated.
+    const width = 320;
     const left = Math.max(8, Math.min(anchor.left, viewW - width - 8));
     const top = anchor.bottom + 6;
     const maxH = Math.max(180, viewH - top - 12);
@@ -154,14 +199,24 @@
   });
 
   /** Row/Enter must do what the visible primary action says. The separate
-   * terminal action stays explicit; the rail's main button uses the saved default. */
+   *  terminal action stays explicit; the rail's quick starts use the saved
+   *  default view. */
   function activate(i: number, ui: "chat" | "term" = "chat"): void {
-    const a = agents?.[i];
+    if (i === settingsIndex) {
+      onSettings();
+      return;
+    }
+    if (i === wtIndex) {
+      // A remembered choice, not a launch: the menu stays open.
+      onToggleWorktree?.(!inWorktree);
+      return;
+    }
+    const a = rows[i];
     if (a === undefined) return;
     if (!a.installed || (a.chatSetupRequired && ui !== "term")) {
-      // No curated install: nothing to run — the docs link is the
-      // affordance (the POST would 400).
+      // No curated install: Settings → Agents is where it gets set up.
       if (a.managedInstall) onInstall(a);
+      else onSettings();
       return;
     }
     if (!a.chatCapable) {
@@ -174,8 +229,8 @@
   }
 
   function move(delta: number): void {
-    const n = agents?.length ?? 0;
-    if (n === 0) return;
+    const n = settingsIndex + 1;
+    if (catalog === null) return;
     hl = (hl + delta + n) % n;
   }
 
@@ -183,31 +238,170 @@
     if (e.key === "Escape") {
       e.preventDefault();
       e.stopPropagation();
-      onClose();
+      onClose("escape");
       return;
     }
-    if (e.key === "ArrowDown") {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
       e.preventDefault();
-      move(1);
+      move(e.key === "ArrowDown" ? 1 : -1);
       return;
     }
-    if (e.key === "ArrowUp") {
+    if (e.key === "Home" || e.key === "End") {
       e.preventDefault();
-      move(-1);
+      if (catalog !== null) hl = e.key === "Home" ? 0 : settingsIndex;
       return;
     }
     if (e.key === "Enter") {
       e.preventDefault();
-      activate(hl, e.metaKey || e.ctrlKey ? "term" : undefined);
+      if (catalog !== null) activate(hl, e.metaKey || e.ctrlKey ? "term" : undefined);
     }
   }
+
+  const itemId = (i: number) => `agent-launcher-item-${i}`;
 </script>
+
+{#snippet agentRow(a: AgentInfo, i: number)}
+  <!-- div, not button: rows contain a real link (docs) and real buttons
+       (chips); interactive elements cannot nest. The popover root owns all
+       keyboard handling (roving highlight). -->
+  <div
+    class="arow"
+    class:hl={hl === i}
+    class:missing={!a.installed}
+    role="menuitem"
+    tabindex="-1"
+    id={itemId(i)}
+    data-agent={a.id}
+    onpointerenter={() => (hl = i)}
+    onclick={() => activate(i)}
+    onkeydown={(e) => {
+      // Direct-focus semantics for when focus lands inside a row (e.g.
+      // after clicking the docs link). stopPropagation is load-bearing: the
+      // popover root also handles Enter, and a bubbled event would activate
+      // twice — two spawned sessions.
+      if (e.key === "Enter") {
+        e.preventDefault();
+        e.stopPropagation();
+        activate(i, e.metaKey || e.ctrlKey ? "term" : undefined);
+      }
+    }}
+  >
+    <span class="gslot"><SessionGlyph kind="agent" agentKind={a.id} size={13} /></span>
+    <span class="aname">{a.name}</span>
+    <span class="asub">
+      <span class="aver" class:managed={a.managed && a.installed} title={a.installed ? whereTitle(a) : undefined}>{stateLine(a)}</span>
+      {#if a.installed && !a.outdated && a.updateAvailable && a.latestVersion !== null}
+        {#if a.managed}
+          <!-- One-click update of chimaera's own install: the same curated,
+               checksum-verified script as install, atomic swap. -->
+          <button
+            class="aup"
+            tabindex="-1"
+            title="update to {a.latestVersion} — downloads the official {a.name} build into ~/.chimaera/agents, with progress and results in agent setup"
+            onclick={(e) => {
+              e.stopPropagation();
+              onUpdate(a);
+            }}>→&thinsp;{a.latestVersion}</button
+          >
+        {:else}
+          <!-- The user's own binary: chimaera never touches it — the newer
+               release is information, docs is the way. -->
+          <span class="aup info" title="{a.latestVersion} is out — this is your own install; update it your way (docs ↗)"
+            >→&thinsp;{a.latestVersion}</span
+          >
+        {/if}
+      {/if}
+      {#if a.installUrl !== null}
+        <!-- Official docs, in the browser — quiet until the row is hot. -->
+        <a
+          class="adocs"
+          href={a.installUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+          title="open the official docs"
+          tabindex="-1"
+          onclick={(e) => {
+            // Through the shell: in the app a _blank navigation is
+            // swallowed by the window's origin guard.
+            e.stopPropagation();
+            e.preventDefault();
+            openInSystemBrowser(a.installUrl ?? "");
+          }}>docs&thinsp;↗</a
+        >
+      {/if}
+    </span>
+    {#if !a.installed || a.chatSetupRequired || a.outdated}
+      <!-- The one explicit click that unblocks it: a curated install/update
+           (visible progress in agent setup), or Settings → Agents when
+           chimaera has no curated install for it. -->
+      <button
+        class="achip"
+        class:solid={i < quickCount}
+        tabindex="-1"
+        title={a.managedInstall
+          ? `downloads the official ${a.name} build into ~/.chimaera/agents — runs with progress and results in agent setup`
+          : `set up ${a.name} in Settings → Agents`}
+        onclick={(e) => {
+          e.stopPropagation();
+          if (a.managedInstall) onInstall(a);
+          else onSettings();
+        }}
+      >
+        {!a.managedInstall ? "set up" : a.outdated ? "update" : a.chatSetupRequired ? "set up chat" : "install"}
+      </button>
+    {/if}
+    {#if a.installed && (!a.chatSetupRequired || a.chatCapable)}
+      <!-- The two ways in: "chat" (and the whole row, and ↵) is the
+           structured chat UI — the default; the terminal button (⌘↵) is the
+           explicit TUI path. No chat view → one "terminal" button. -->
+      {#if a.chatCapable}
+        <button
+          class="tbtn"
+          tabindex="-1"
+          aria-label="open {a.name} in the terminal"
+          data-tip="terminal · {isMac ? '⌘' : 'ctrl'}↵"
+          onclick={(e) => {
+            e.stopPropagation();
+            activate(i, "term");
+          }}
+        >
+          <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+            <rect x="1.5" y="2.5" width="13" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="1.2" />
+            <path
+              d="M4.2 6l2.4 2-2.4 2"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.3"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            />
+            <path d="M8.4 10.6h3.2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+          </svg>
+        </button>
+      {/if}
+      {#if !a.chatSetupRequired && !a.outdated}
+        <button
+          class="obtn"
+          tabindex="-1"
+          title={a.chatCapable ? "open in the chat view (↵)" : `opens in the terminal — ${a.name} has no chat view`}
+          onclick={(e) => {
+            e.stopPropagation();
+            activate(i, a.chatCapable ? "chat" : "term");
+          }}
+        >
+          {a.chatCapable ? "chat" : "terminal"}
+        </button>
+      {/if}
+    {/if}
+  </div>
+{/snippet}
 
 <div
   class="launcher"
   role="menu"
   aria-label="new agent"
   tabindex="-1"
+  aria-activedescendant={catalog !== null ? itemId(hl) : undefined}
   bind:this={rootEl}
   style:left="{pos.left}px"
   style:top="{pos.top}px"
@@ -215,7 +409,7 @@
   style:max-height="{pos.maxH}px"
   onkeydown={onKeydown}
 >
-  {#if agents === null}
+  {#if groups === null}
     {#if loadError !== null}
       <div class="state err">{loadError}</div>
     {:else if showLoading}
@@ -223,186 +417,82 @@
     {/if}
   {:else}
     <div class="agents">
-      {#each agents as a, i (a.id)}
-        {@const ready = a.installed && !a.outdated && a.chatCapable}
-        {#if i === 0 || ready !== (agents[i - 1].installed && !agents[i - 1].outdated && agents[i - 1].chatCapable)}
-          <div class="group-label">{ready ? "start a conversation" : "set up an agent"}</div>
-        {/if}
-        <!-- div, not button: rows contain a real link (docs) and a real
-             button (update chip); interactive elements cannot nest. The
-             popover root owns all keyboard handling (roving highlight). -->
-        <div
-          class="arow"
-          class:hl={hl === i}
-          class:missing={!a.installed}
-          role="menuitem"
-          tabindex="-1"
-          data-item={i}
-          onpointerenter={() => (hl = i)}
-          onclick={() => activate(i)}
-          onkeydown={(e) => {
-            // Direct-focus semantics for when focus lands inside a row
-            // (e.g. after clicking the docs link). stopPropagation is
-            // load-bearing: the popover root also handles Enter, and a
-            // bubbled event would activate twice — two spawned sessions.
-            if (e.key === "Enter") {
-              e.preventDefault();
-              e.stopPropagation();
-              activate(i, e.metaKey || e.ctrlKey ? "term" : undefined);
-            }
-          }}
-        >
-          <span class="gslot"><SessionGlyph kind="agent" agentKind={a.id} size={13} /></span>
-          <!-- Name over a quiet subheader: provenance ("chimaera" = a build
-               chimaera installed itself, "yours" = your own on PATH — the
-               answer to "whose claude runs?"), the version, and the docs
-               link. The tooltip carries the resolved path. -->
-          <span class="acol">
-            <span class="aname">{a.name}</span>
-            <span class="asub">
-              {#if a.installed && !a.outdated}
-                <span class="aver" class:managed={a.managed} title={whereTitle(a)}>
-                  <span>{a.chatSetupRequired ? "finish chat setup" : a.managed ? "managed installation" : "your installation"}</span>
-                </span>
-                {#if a.updateAvailable && a.latestVersion !== null}
-                  {#if a.managed}
-                    <!-- One-click update of chimaera's own install: the same
-                         curated, checksum-verified script as install, atomic
-                         swap, streaming into a terminal you can watch. -->
-                    <button
-                      class="aup"
-                      tabindex="-1"
-                      title="update to {a.latestVersion} — downloads the official {a.name} build into ~/.chimaera/agents, with progress and results in agent setup"
-                      onclick={(e) => {
-                        e.stopPropagation();
-                        onUpdate(a);
-                      }}>→&thinsp;{a.latestVersion}</button
-                    >
-                  {:else}
-                    <!-- The user's own binary: chimaera never touches it —
-                         the newer release is information, docs is the way. -->
-                    <span
-                      class="aup info"
-                      title="{a.latestVersion} is out — this is your own install; update it your way (docs ↗)"
-                      >→&thinsp;{a.latestVersion}</span
-                    >
-                  {/if}
-                {/if}
-              {/if}
-              {#if a.installUrl !== null}
-                <!-- Official docs, in the browser — quiet until the row is hot. -->
-                <a
-                  class="adocs"
-                  href={a.installUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                  title="open the official docs"
-                  tabindex="-1"
-                  onclick={(e) => {
-                    // Through the shell: in the app a _blank navigation is
-                    // swallowed by the window's origin guard.
-                    e.stopPropagation();
-                    e.preventDefault();
-                    openInSystemBrowser(a.installUrl ?? "");
-                  }}>docs&thinsp;↗</a
-                >
-              {/if}
-            </span>
-          </span>
-          {#if (!a.installed || a.chatSetupRequired) && a.managedInstall}
-            <button
-              class="achip"
-              tabindex="-1"
-              title="downloads the official {a.name} build into ~/.chimaera/agents — runs with progress and results in agent setup"
-              onclick={(e) => {
-                e.stopPropagation();
-                onInstall(a);
-              }}
-            >
-              {a.chatSetupRequired ? "set up chat" : "install"}
-            </button>
-          {:else if a.outdated}
-            <button
-              class="achip"
-              tabindex="-1"
-              title="this build is too old to sign in — downloads the official {a.name} build into ~/.chimaera/agents — runs with progress and results in agent setup"
-              onclick={(e) => {
-                e.stopPropagation();
-                onInstall(a);
-              }}
-            >
-              update
-            </button>
-          {:else if a.installed}
-            <!-- The two ways in: "open" (and the whole row, and ↵) is the
-                 structured chat UI — the default; the terminal button (⌘↵)
-                 is the explicit TUI path. No chat view → one "open", the TUI. -->
-            {#if a.chatCapable}
-              <!-- Icon-only, so it explains itself: a custom tooltip on a
-                   ~0.5s delay (the native title's is longer and easy to
-                   miss). data-tip is the ::after content. -->
-              <button
-                class="tbtn"
-                tabindex="-1"
-                aria-label="open in the terminal"
-                data-tip="open in the terminal · {isMac ? '⌘' : 'ctrl'}↵"
-                onclick={(e) => {
-                  e.stopPropagation();
-                  activate(i, "term");
-                }}
-              >
-                <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
-                  <rect
-                    x="1.5"
-                    y="2.5"
-                    width="13"
-                    height="11"
-                    rx="2"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="1.2"
-                  />
-                  <path
-                    d="M4.2 6l2.4 2-2.4 2"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="1.3"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                  />
-                  <path d="M8.4 10.6h3.2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
-                </svg>
-              </button>
-            {/if}
-            <button
-              class="obtn"
-              tabindex="-1"
-              title={a.chatCapable
-                ? "open in the chat view (↵)"
-                : `opens in the terminal — ${a.name} has no chat view`}
-              onclick={(e) => {
-                e.stopPropagation();
-                activate(i, a.chatCapable ? "chat" : "term");
-              }}
-            >
-              {a.chatCapable ? "chat" : "terminal"}
-            </button>
-          {/if}
-        </div>
+      {#each groups.quick as a, i (a.id)}
+        {@render agentRow(a, i)}
       {/each}
+      {#if groups.others.length > 0}
+        <div class="group-label" role="presentation">other agents</div>
+        {#each groups.others as a, j (a.id)}
+          {@render agentRow(a, quickCount + j)}
+        {/each}
+      {/if}
     </div>
 
     <div class="foot">
-      <span><kbd>↑↓</kbd> choose</span>
-      <span><kbd>↵</kbd> open</span>
-      <span><kbd>{isMac ? "⌘" : "ctrl"}↵</kbd> terminal</span>
-      <span><kbd>esc</kbd> close</span>
+      {#if inWorktree !== null}
+        <!-- The worktree choice lives in the footer, a peer of the settings
+             link: a remembered setting, not a step. A focused switch's own
+             Enter/Space must not also reach the root's Enter (a second flip). -->
+        <button
+          class="wt"
+          class:hl={hl === wtIndex}
+          role="menuitemcheckbox"
+          aria-checked={inWorktree}
+          tabindex="-1"
+          id={itemId(wtIndex)}
+          title={inWorktree
+            ? "new agents start on a fresh branch in their own worktree"
+            : "start new agents on a fresh branch in their own worktree"}
+          onpointerenter={() => (hl = wtIndex)}
+          onclick={() => activate(wtIndex)}
+          onkeydown={(e) => {
+            if (e.key === "Enter" || e.key === " ") e.stopPropagation();
+          }}
+        >
+          <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+            <path
+              d="M5 3v7.5M5 12.5v.5M11 3v3a2.5 2.5 0 0 1-2.5 2.5H5"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.4"
+              stroke-linecap="round"
+            />
+            <circle cx="5" cy="12.6" r="1.6" fill="none" stroke="currentColor" stroke-width="1.4" />
+            <circle cx="5" cy="2.4" r="1.6" fill="none" stroke="currentColor" stroke-width="1.4" />
+            <circle cx="11" cy="2.4" r="1.6" fill="none" stroke="currentColor" stroke-width="1.4" />
+          </svg>
+          <span class="wtlabel">In a new worktree</span>
+          <span class="wtswitch" class:on={inWorktree} aria-hidden="true"><span class="wtknob"></span></span>
+        </button>
+      {:else}
+        <!-- Outside a repository the footer keeps its terminal hint (the
+             terminal button's tooltip says it too). -->
+        <span class="hint"><kbd>{isMac ? "⌘" : "ctrl"}↵</kbd> terminal</span>
+      {/if}
+      <button
+        class="settings"
+        class:hl={hl === settingsIndex}
+        role="menuitem"
+        tabindex="-1"
+        id={itemId(settingsIndex)}
+        onpointerenter={() => (hl = settingsIndex)}
+        onclick={onSettings}>agent settings <span aria-hidden="true">→</span></button
+      >
     </div>
   {/if}
 </div>
 
 <style>
-  .group-label { padding: 7px 9px 4px; color: var(--muted); font-size: var(--text-xs); }
+  /* The quiet seam between the quick agents and the rest: a hairline and a
+     lowercase word, no chrome. */
+  .group-label {
+    margin: 4px 9px 0;
+    padding: 7px 0 3px;
+    border-top: 1px solid var(--edge);
+    color: var(--muted);
+    font-size: var(--text-xs);
+    user-select: none;
+  }
   .launcher {
     position: fixed;
     z-index: 120;
@@ -491,16 +581,10 @@
     justify-content: center;
   }
 
-  /* Name over its subheader — the two-line left column. */
-  .acol {
-    flex: 1;
-    min-width: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 1px;
-  }
-
+  /* One line per agent: name, then its quiet state (version / what it
+     needs), then the actions. */
   .aname {
+    flex: 0 1 auto;
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -508,11 +592,10 @@
     font-weight: 500;
   }
 
-  /* The subheader: provenance · version · docs, one quiet line. Reserves its
-     line even when empty (uninstalled rows) so names align across rows. */
+  /* The state line: version (provenance in its tooltip) · update · docs. */
   .asub {
+    flex: 1;
     min-width: 0;
-    min-height: 0.9rem;
     display: flex;
     align-items: baseline;
     gap: 7px;
@@ -549,10 +632,10 @@
     display: inline-flex;
     align-items: baseline;
     gap: 5px;
-    max-width: 170px;
+    max-width: 110px;
     overflow: hidden;
     white-space: nowrap;
-
+    font-family: var(--mono);
   }
 
   /* Update-available: "→ <new>" appended to the version line, only when a
@@ -625,6 +708,11 @@
   .arow:hover .achip {
     color: var(--fg);
     border-color: color-mix(in srgb, var(--fg) 30%, transparent);
+  }
+
+  .achip.solid {
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 40%, transparent);
   }
 
   .achip:active {
@@ -722,13 +810,101 @@
     transform: translateY(0.5px);
   }
 
+  /* The worktree switch: a footer control in the settings link's language
+     (same padding, radius and hot state), the Switch recipe at a smaller
+     size after its label. */
+  .wt {
+    appearance: none;
+    border: none;
+    background: none;
+    font: inherit;
+    font-size: var(--text-xs);
+    min-width: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 6px;
+    margin-left: -6px;
+    border-radius: 6px;
+    color: var(--muted);
+    cursor: pointer;
+    transition:
+      color 0.12s ease,
+      background-color 0.12s ease;
+  }
+
+  .wt.hl,
+  .wt[aria-checked="true"] {
+    color: var(--fg);
+  }
+
+  .wt.hl {
+    background: var(--row-hover);
+  }
+
+  .wt svg {
+    flex: none;
+  }
+
+  .wtlabel {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .wtswitch {
+    flex: none;
+    position: relative;
+    width: 24px;
+    height: 14px;
+    border: 1px solid var(--edge);
+    border-radius: 8px;
+    background: var(--row-hover);
+    transition:
+      background-color 0.14s ease,
+      border-color 0.14s ease;
+  }
+
+  .wtknob {
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--muted);
+    transition:
+      transform 0.14s ease,
+      background-color 0.14s ease;
+  }
+
+  .wtswitch.on {
+    background: color-mix(in srgb, var(--accent) 28%, var(--row-hover));
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
+  }
+
+  .wtswitch.on .wtknob {
+    transform: translateX(10px);
+    background: var(--accent);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .wtswitch,
+    .wtknob {
+      transition: none;
+    }
+  }
+
   .foot {
     flex: none;
     display: flex;
     align-items: center;
+    justify-content: space-between;
     gap: 12px;
     margin-top: 5px;
-    padding: 6px 9px 2px;
+    padding: 5px 3px 0 9px;
     border-top: 1px solid var(--edge);
     font-size: var(--text-xs);
     color: var(--muted);
@@ -741,5 +917,26 @@
     padding: 0 0.25rem;
     border: 1px solid var(--edge);
     border-radius: 4px;
+  }
+
+  /* Settings → Agents: the way into everything this menu doesn't do. */
+  .settings {
+    appearance: none;
+    border: none;
+    background: none;
+    font: inherit;
+    font-size: var(--text-xs);
+    color: var(--muted);
+    padding: 4px 6px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition:
+      color 0.12s ease,
+      background-color 0.12s ease;
+  }
+
+  .settings.hl {
+    color: var(--fg);
+    background: var(--row-hover);
   }
 </style>

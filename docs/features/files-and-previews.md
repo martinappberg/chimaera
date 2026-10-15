@@ -1022,7 +1022,8 @@ superseded folder navigation cannot start a create operation in a different dire
   | notebook cell / slide | `@analysis.ipynb#cell=2 "import pandas…"`, `@deck.md#slide=2 "Results…"` |
 
   The pixels: a **chat** target gets the crop as an image attachment (the pasted-screenshot
-  pipeline and its caps); a **terminal** agent (Claude, Codex, anything) gets it uploaded to the
+  pipeline and its caps), delivered in one insert with the locator so both land in the same
+  composer and leave in the same message (`composerBus.ts`); a **terminal** agent (Claude, Codex, anything) gets it uploaded to the
   session's landing pad (`POST /sessions/{id}/upload`, `ref-N.png`) and ` (region image: <path>)`
   appended, so any agent can open it. A failed upload still types the locator; its chip says why.
 - **Where it lives.** `web-ui/src/lib/shared/locator.ts` (the fragment grammar, both directions,

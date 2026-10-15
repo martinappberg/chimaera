@@ -4,7 +4,10 @@ import {
   commsTitle,
   readableToolTitle,
   setAgentNames,
+  spanLabel,
+  toolDescription,
   toolGroupTitle,
+  toolSpanMs,
   toolRunHealth,
   type HealthTool,
   type LabelledTool,
@@ -283,5 +286,67 @@ describe("open_browser", () => {
       "open_browser_v2 (chimaera)",
     );
     expect(readableToolTitle({ tool: "fetch", title: "open_browser (chimaera)" })).toBe("open_browser (chimaera)");
+  });
+});
+
+describe("described tool lines", () => {
+  const bash = (description: string, over: Partial<LabelledTool> = {}) =>
+    tool("execute", { title: "du -sh *.bam", nativeInput: { command: "du -sh *.bam", description }, ...over });
+
+  it("a running call leads with what it says it is doing", () => {
+    expect(toolGroupTitle([bash("Sum the BAM sizes", { status: "in_progress" })])).toBe("Sum the BAM sizes");
+    // The newest described running call speaks for a mixed group.
+    expect(
+      toolGroupTitle([tool("read"), bash("Locate the notify code", { status: "in_progress" })]),
+    ).toBe("Locate the notify code");
+  });
+
+  it("settled, the agent's batch label still wins; a lone call keeps its words", () => {
+    expect(toolGroupTitle([bash("Sum the BAM sizes")])).toBe("Sum the BAM sizes");
+    expect(toolGroupTitle([bash("Sum the BAM sizes", { summary: "Measured the BAMs" })])).toBe(
+      "Measured the BAMs",
+    );
+    expect(toolGroupTitle([bash("a"), bash("b")])).toBe("Ran 2 commands");
+  });
+
+  it("rows with no description on the wire (codex, ACP) read as before", () => {
+    expect(toolDescription({ tool: "execute" })).toBeNull();
+    expect(toolDescription({ tool: "execute", nativeInput: { description: "  " } })).toBeNull();
+    // Agent spawns are named as agents by the count phrase.
+    expect(toolDescription({ tool: "agent", nativeInput: { description: "Audit" } })).toBeNull();
+    // Other tools' `description` arguments are not what the call is doing.
+    const artifact = tool("other", {
+      title: "Artifact: report.html",
+      status: "in_progress",
+      nativeInput: { file_path: "report.html", description: "Quarterly figures for the team" },
+    });
+    expect(toolDescription(artifact)).toBeNull();
+    expect(toolGroupTitle([artifact])).toBe("Using a tool");
+    expect(toolGroupTitle([{ ...artifact, status: "completed" }])).toBe("Used a tool");
+    expect(toolDescription({ tool: "execute", nativeInput: { description: "two\nlines" } })).toBe("two lines");
+    expect(toolGroupTitle([tool("execute", { status: "in_progress" })])).toBe("Running a command");
+  });
+});
+
+describe("a run's elapsed", () => {
+  it("counts from the first start: to now while live, to the last end once settled", () => {
+    const live = [
+      { status: "completed", startedAtMs: 1_000, endedAtMs: 3_000 },
+      { status: "in_progress", startedAtMs: 2_000 },
+    ];
+    expect(toolSpanMs(live, 83_000)).toBe(82_000);
+    expect(spanLabel(toolSpanMs(live, 83_000))).toBe("1m 22s");
+    const settled = [
+      { status: "completed", startedAtMs: 1_000, endedAtMs: 3_000 },
+      { status: "failed", startedAtMs: 2_000, endedAtMs: 7_500 },
+    ];
+    expect(spanLabel(toolSpanMs(settled, 99_999))).toBe("6s");
+  });
+
+  it("says nothing it cannot know, or that would be noise", () => {
+    expect(toolSpanMs([{ status: "completed" }], 5_000)).toBeNull(); // old journal
+    expect(toolSpanMs([{ status: "completed", startedAtMs: 1 }], 5_000)).toBeNull(); // reconciled
+    expect(spanLabel(400)).toBeNull();
+    expect(spanLabel(null)).toBeNull();
   });
 });
