@@ -3025,7 +3025,8 @@
         {@const hook = item.block.tone === "info" ? hookNotice(item.block.text) : null}
         {#if hook}
           <HookRow said={hook} sourceIndex={item.index} sourceUid={item.block.uid} />
-        {:else if !(incompatibleRuntime && item.block.text === store.fatalError)}
+        {:else if item.block.text !== store.fatalError}
+        <!-- The failure a fatal banner is showing is not repeated as a line. -->
         <div
           class="notice"
           class:error={item.block.tone === "error"}
@@ -3145,7 +3146,8 @@
     {/if}
     {#if store.degraded}
       <div class="notice">continued in terminal — this pane will switch</div>
-    {:else if store.exited !== null}
+    {:else if store.exited !== null && store.fatalError === null}
+      <!-- A fatal startup error already says the driver is gone. -->
       <div class="notice">
         agent exited{store.exited.status !== null ? ` (status ${store.exited.status})` : ""}
       </div>
