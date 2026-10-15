@@ -436,10 +436,12 @@ with one bracketed line saying why (`[chimaera delivered these while you
 were idle: …]`, `[the user handed you these messages …]`).
 
 **Timeline `note` entries** gain optional fields (absent = old meaning):
-`from_agent` (`"claude"`/`"codex"`), `to_name`, `reply_to` (a seq),
+`from_agent` (the sender's agent id: `"claude"`, `"codex"`, `"agy"`, `"grok"`, `"cursor"`), `to_name`, `reply_to` (a seq),
 `thread` (the root seq, absent on a root), `expect_reply`, `mastermind`
-(sent by the Mastermind), `delivery` (`"next_step"` · `"inbox"` · `"woke"` ·
-`"asked"`). `woke` stays set when `delivery` is `"woke"`. The entry's `seq`
+(sent by the Mastermind), `delivery` (`"next_step"` · `"now"` · `"inbox"` ·
+`"woke"` · `"asked"`; `"now"` — added by PROTOCOL.md Pass 44 — when the message
+reaches a reader whose turn waits on a subagent without waiting for it to
+return). `woke` stays set when `delivery` is `"woke"`. The entry's `seq`
 is the message's id (`#12`).
 
 **Chat journal.** A new journal-only event, never emitted by a driver:

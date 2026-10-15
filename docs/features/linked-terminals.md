@@ -50,6 +50,7 @@ leash-drawing in `web-ui/src/App.svelte`; the drag band that arms a link is in
   (the command journal). The same server also carries `notify` (every MCP-equipped session; native Claude/Codex pre-allow it) — see
   [notifications.md](notifications.md) — and `open_browser` (show the user a web app in a browser pane beside the
   session; one-way, pre-allowed like `notify`) — see [browser-pane.md](browser-pane.md#agent-opened-panes-open_browser).
+  A Claude chat is also offered `update_plan`, the plan card's source there (Codex and ACP chats keep their own plan tools, terminals get none) — see [chat-mode.md](chat-mode.md). `mcp::ALWAYS_ALLOWED_TOOLS` pre-allows `notify`, `document_guide`, `check_document`, `open_browser` and `update_plan` for native Claude/Codex sessions.
 - **Where it lives.** `mcp.rs` (`mcp`, `tool_defs`, `list_terminals`/`run_in_terminal`/`read_terminal`,
   `autolink_mentions`, `resolve_terminal`). The same server gives every session the document
   tools `document_guide` and `check_document`; see

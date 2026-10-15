@@ -89,8 +89,8 @@ a `settings` frame on `/ws/events`. Map: [settings/AGENTS.md](../../web-ui/src/l
   installs Google's companion. Advanced holds custom executable paths, Reinstall and Uninstall.
   Installation progress follows a retained daemon result from the terminal's actual exit status, with bounded polling only while
   Settings is visible. Re-checking and saving another row preserve unfinished path edits.
-  The agent menu's **agent settings →** opens this panel; it is where agents beyond the rail's
-  two defaults are set up. Cursor's custom executable is `agents.cursor.path`; a dated Cursor
+  The agent menu's **agent settings →** opens this panel; it is where every agent is set up and
+  managed. Cursor's custom executable is `agents.cursor.path`; a dated Cursor
   build reads as its date and is "Up to date" only when the installed build is the latest one.
   See [agents.md](agents.md).
 - **Theme palettes** (`themes.ts`) — each theme carries its own hand-tuned 16-color terminal ANSI
