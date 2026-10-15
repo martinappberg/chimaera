@@ -67,6 +67,9 @@ export interface AgentSignIn {
   how: "browser";
   command: string;
   acceptsCode: boolean;
+  /** Signing in while signed in means a switch of account (false for a CLI
+   *  whose headless login only finds the existing one). */
+  relogin: boolean;
   operation?: { id: string; running: boolean; phase: string };
 }
 
@@ -283,6 +286,7 @@ function normalizeSignIn(raw: unknown): AgentSignIn | undefined {
     how: s.how,
     command: typeof s.command === "string" ? s.command.slice(0, 128) : "",
     acceptsCode: s.accepts_code === true,
+    relogin: s.relogin !== false,
     operation: op && typeof op.id === "string" && op.id.length <= 128 && typeof op.phase === "string"
       ? { id: op.id, phase: op.phase, running: op.running === true } : undefined,
   };

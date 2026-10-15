@@ -526,12 +526,12 @@ pub(crate) async fn list_agents(
                 Ok(bin) if kind.chat_capable() => chat_executable(&state, kind, bin).await.is_ok(),
                 _ => false,
             };
-            // Whether the CLI says it is signed in here (its own status
-            // command, cached; a re-check re-asks). Unknown until installed.
+            // Whether the CLI says it is signed in here: the cached verdict
+            // at once (a missing one probes in the background and refetches
+            // through the change bus); only Settings' Check (`check`) asks
+            // inline. Unknown until installed.
             let signed_in = match &detection.path {
-                Ok(bin) => {
-                    crate::agent_auth::status(&state, kind, bin, query.check || query.refresh).await
-                }
+                Ok(bin) => crate::agent_auth::status(&state, kind, bin, query.check).await,
                 Err(_) => None,
             };
             (kind, detection, chat_ready, signed_in)

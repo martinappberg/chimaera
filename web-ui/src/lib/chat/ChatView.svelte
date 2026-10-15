@@ -16,7 +16,6 @@
   } from "./paths";
   import { agentCatalog, listAgents } from "../workspace/launcher";
   import { getSignIn, needsSignIn } from "../workspace/agentSignIn";
-  import { looksLikeAuthFailure } from "./authFailure";
   import AgentSignInCard from "../workspace/AgentSignInCard.svelte";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import BranchChip from "../shared/BranchChip.svelte";
@@ -154,9 +153,6 @@
     };
     /** Open one of this chat's subagents as a view of its own. */
     onOpenSubagent?: (agentId: string, title: string, newSplit: boolean) => void;
-    /** Start this chat's agent again in place after a failed startup (the
-     *  sign-in card's success): the same session, a fresh driver. */
-    onRelaunch?: () => void;
   }
 
   let {
@@ -169,7 +165,6 @@
     onForked,
     subagent,
     onOpenSubagent,
-    onRelaunch,
   }: Props = $props();
 
   // The component is keyed on session id by its parent: one instance per
@@ -257,7 +252,7 @@
   const authShapedError = $derived.by(() => {
     for (let i = store.blocks.length - 1; i >= 0 && i >= store.blocks.length - 12; i--) {
       const b = store.blocks[i];
-      if (b.kind === "notice" && b.tone === "error" && looksLikeAuthFailure(b.text)) return `${b.uid}`;
+      if (b.kind === "notice" && b.signIn === true) return `${b.uid}`;
     }
     return null;
   });
@@ -277,6 +272,11 @@
    *  transcript's tail; signing in relaunches the chat in place, resuming
    *  the conversation. */
   const liveSignIn = $derived(signInNeeded && store.initialized && store.exited === null && store.fatalError === null && !store.running && !store.degraded);
+  /** A chat that has not started yet while its CLI says signed out: the
+   *  one case the composer closes, so the first turn isn't a 401. A live
+   *  chat keeps its composer — the verdict may be stale, or the login may
+   *  have landed outside the app — and the card offers Check again. */
+  const preflightSignIn = $derived(signInNeeded && !store.initialized && store.exited === null && store.fatalError === null && !readOnly);
   /** `/login` typed here: the card runs whether or not the catalog thinks
    *  the agent is signed in (a switch of account, a stale login). */
   let signInRequested = $state(false);
@@ -1766,8 +1766,10 @@
         // the model it is a billed prompt) and the chat relaunches in place
         // once the login lands. Claude's native /login still lives in its
         // terminal view (the pane-bar toggle) for anyone who prefers it.
-        if (readOnly || catalogAgent?.signIn === undefined) return false;
+        if (readOnly) return false;
         signInRequested = true;
+        // Never a prompt to the model, even before the catalog answers.
+        if (catalogAgent === null) void listAgents(true).catch(() => {});
         return true;
       default:
         return false;
@@ -1979,7 +1981,7 @@
       });
     }
     if (supports("get_mcp")) native.push({ name: "mcp", description: "MCP servers — chimaera panel" });
-    if (catalogAgent?.signIn !== undefined) {
+    if (!readOnly) {
       native.push({ name: "login", description: `sign in to ${agentName} — in the app` });
     }
     if (supports("compact")) {
@@ -2604,7 +2606,7 @@
   /** Nothing to type into (and so nothing to quote into): a read-only
    *  subagent view, or a session that ended, degraded or failed. */
   const composerDisabled = $derived(
-    readOnly || store.exited !== null || store.degraded || store.fatalError !== null || liveSignIn,
+    readOnly || store.exited !== null || store.degraded || store.fatalError !== null || preflightSignIn,
   );
   const incompatibleRuntime = $derived(/GLIBC_[\d.]+[^\n]*not found/.test(store.fatalError ?? ""));
 
@@ -2795,7 +2797,7 @@
            startup failure (if one lands) folds into it below. -->
       <div class="empty" role="status">
         <SessionGlyph kind="agent" {agentKind} size={18} />
-        <AgentSignInCard agent={catalogAgent} workspaceId={session.workspace_id ?? null} framed onSignedIn={onRelaunch} />
+        <AgentSignInCard agent={catalogAgent} workspaceId={session.workspace_id ?? null} sessionId={session.id} framed onSignedIn={() => void getSignIn(agentKind, true).catch(() => {})} />
       </div>
     {:else if store.exited === null && !store.fatalError && (!store.initialized || store.blocks.length === 0)}
       <div class="empty" role="status">
@@ -3069,9 +3071,14 @@
         {@const hook = item.block.tone === "info" ? hookNotice(item.block.text) : null}
         {#if hook}
           <HookRow said={hook} sourceIndex={item.index} sourceUid={item.block.uid} />
-        {:else if item.block.text !== store.fatalError && !(signInNeeded && item.block.tone === "error" && looksLikeAuthFailure(item.block.text))}
-        <!-- The failure a fatal banner is showing is not repeated as a line,
-             and a login's refusal is the sign-in card, not raw 401 text. -->
+        {:else if item.block.signIn === true}
+          <!-- A login's refusal: the sign-in card while one is needed, a
+               quiet line once it isn't (the raw text never returns). -->
+          {#if !signInNeeded}
+            <div class="notice" data-block-index={item.index} data-block-uid={item.block.uid}>{agentName} needed a sign-in</div>
+          {/if}
+        {:else if item.block.text !== store.fatalError}
+        <!-- The failure a fatal banner is showing is not repeated as a line. -->
         <div
           class="notice"
           class:error={item.block.tone === "error"}
@@ -3180,7 +3187,9 @@
 
     {#if (liveSignIn || (signInRequested && store.fatalError === null && store.exited === null)) && catalogAgent !== null}
       <div class="live-signin">
-        <AgentSignInCard agent={catalogAgent} workspaceId={session.workspace_id ?? null} framed autostart={signInRequested} onSignedIn={() => { signInRequested = false; onRelaunch?.(); }} onDismiss={signInRequested ? () => { signInRequested = false; } : undefined} />
+        <!-- The daemon relaunches a chat that waited on the login (and the
+             one /login was typed in); the card only refreshes the verdict. -->
+        <AgentSignInCard agent={catalogAgent} workspaceId={session.workspace_id ?? null} sessionId={session.id} framed autostart={signInRequested} onSignedIn={() => { signInRequested = false; void getSignIn(agentKind, true).catch(() => {}); }} onDismiss={signInRequested ? () => { signInRequested = false; } : undefined} />
       </div>
     {/if}
     {#if store.fatalError !== null && signInNeeded}
@@ -3436,7 +3445,7 @@
     view={quoteOwner}
     running={agentBusy}
     disabled={composerDisabled}
-    disabledHint={liveSignIn ? `sign in to ${agentName} first` : null}
+    disabledHint={preflightSignIn ? `sign in to ${agentName} first` : null}
     slashCommands={composerCommands}
     workspaceId={session.workspace_id ?? null}
     {terminals}

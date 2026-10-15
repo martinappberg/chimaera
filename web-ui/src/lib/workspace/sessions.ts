@@ -698,15 +698,13 @@ export async function switchSessionView(
   id: string,
   ui: "chat" | "term",
   force = false,
-  relaunch = false,
 ): Promise<void> {
   const res = await api(`/sessions/${id}/view`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     // Carry the UI's scheme so the server respawns the process themed to match
     // (same source createSession uses); harmless on servers that ignore it.
-    // `relaunch` respawns a live chat in place (a sign-in landed).
-    body: JSON.stringify({ ui, force, relaunch, theme: resolvedTheme() }),
+    body: JSON.stringify({ ui, force, theme: resolvedTheme() }),
   });
   if (res.status === 409) {
     let busy = false;

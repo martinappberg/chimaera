@@ -157,7 +157,7 @@
         {#if a.installed && (signingIn[a.id] || a.signIn?.operation?.running)}
           <!-- The same card a chat shows; here under the row that names the agent. -->
           <div class="signin-slot">
-            <AgentSignInCard agent={a} workspaceId={wsId} autostart={signingIn[a.id] === true && !a.signIn?.operation?.running} onSignedIn={() => { void load(); setTimeout(() => { signingIn[a.id] = false; }, 2500); }} onDismiss={() => { signingIn[a.id] = false; }} />
+            <AgentSignInCard agent={a} workspaceId={wsId} autostart={signingIn[a.id] === true && !a.signIn?.operation?.running} onSignedIn={() => { signingIn[a.id] = false; void load(); }} onDismiss={() => { signingIn[a.id] = false; }} />
           </div>
         {/if}
         {#if a.installation?.running && !a.setup?.running}<p class="notice">Follow this installation in its terminal in the sidebar.</p>{/if}

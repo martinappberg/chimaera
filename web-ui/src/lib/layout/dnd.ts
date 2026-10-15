@@ -197,7 +197,7 @@ export interface LayoutCtrl {
    * Switch an agent session between the chat and terminal surfaces (the
    * pane-bar toggle). Confirms with the user when the agent is mid-task.
    */
-  switchView(sessionId: string, target: "chat" | "term", relaunch?: boolean): void;
+  switchView(sessionId: string, target: "chat" | "term"): void;
   /**
    * Tear the tab at `index` out into its own window (the context-menu
    * sibling of the drag-out gesture; the new window opens near the pane).

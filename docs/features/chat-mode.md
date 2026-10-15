@@ -842,8 +842,9 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   fresh transcript hook arrives. A busy `Running` agent needs `force` (409); the UI then asks in an
   in-app `ConfirmDialog` ("Open as chat?", Enter switches, Escape keeps the turn). **Account use:**
   the agent runs under its own credentials and settings; the chat side drives its structured protocol. This
-  is also the **`/login` recovery** path (see [Composing & sending](#composing--sending)): an
-  expired-auth session flips to its TUI so claude's native auth flow can run.
+  `/login` no longer rides this switch: it opens the in-app sign-in card (see
+  [Composing & sending](#composing--sending)); the terminal view remains where claude's own
+  `/login` can be run by hand.
 - **Branch at any message, without stopping the source.** Hover an assistant response and choose its
   fork action to create a new idle chat immediately after that response. The composer is empty and no
   synthetic prompt or agent turn is sent. Forking from your own message instead branches immediately
@@ -1089,10 +1090,13 @@ _Captured 2026-07-12 (from the maintainer, in-session)._
 - **Deliberate defaults:** thinking defaults ON for claude ("the reasoning pass earns its keep in a
   coding workbench") — shown on the chip, one click off, and easy to reverse if it's the wrong call.
   The subagents tray is collapsed by default (a quiet one-line indicator, expand for detail).
-- **Auth is native-only, by decision:** `/login` routes to the CLI's own auth flow (in the TUI);
-  chimaera **never** builds credential entry or handles secrets — auth methods vary (OAuth,
-  `setup-token`, SSO) and a custom in-app flow was judged too risky. The `/login`→TUI flip is the
-  minimal unblock; the fuller auth UX (auth-fail card, `/logout`, `/auth status`, codex parity, and
+- **Auth was native-only, by decision — reversed 2026-10-15 (PR #295, wording pending the
+  maintainer's):** `/login` used to route to the CLI's own auth flow in the TUI, because auth
+  methods vary (OAuth, `setup-token`, SSO) and a custom in-app flow was judged too risky. The
+  in-app sign-in keeps the part of that decision that mattered — chimaera still **never** builds
+  credential entry or handles secrets; it runs each CLI's own login headlessly and shows the page
+  and code the CLI prints — and drops the terminal detour. The original note follows: the
+  `/login`→TUI flip was the minimal unblock; the fuller auth UX (auth-fail card, `/logout`, `/auth status`, codex parity, and
   the stuck-`Running`-after-auth-fail state) is a conscious follow-up.
 - **Grade — additions, open to change:** all improvable; the load-bearing bits are the
   **native-auth-only** rule and the **workbench-promotion** principle (pin long-lived work, keep the

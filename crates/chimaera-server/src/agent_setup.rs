@@ -130,6 +130,12 @@ pub(crate) async fn start(
             "Open a workspace on this host first.",
         );
     };
+    if crate::agent_auth::running(&state, kind) {
+        return error(
+            StatusCode::CONFLICT,
+            "Finish signing in to this agent first.",
+        );
+    }
     if !matches!(body.action, Action::Install)
         && !crate::launcher::detect(&state, kind, false).await.managed
     {

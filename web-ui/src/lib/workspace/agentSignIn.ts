@@ -28,6 +28,7 @@ export interface SignInStatus {
   how: "browser";
   command: string;
   accepts_code: boolean;
+  relogin: boolean;
   operation: SignInProgress | null;
 }
 
@@ -59,10 +60,12 @@ export async function getSignIn(agent: string, check = false): Promise<SignInSta
   return status;
 }
 
-export function startSignIn(agent: string, workspaceId: string, requestId: string, theme: "light" | "dark"): Promise<SignInProgress> {
+export function startSignIn(agent: string, workspaceId: string, requestId: string, theme: "light" | "dark", sessionId: string | null = null): Promise<SignInProgress> {
   return request<SignInProgress>(path(agent), {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ workspace_id: workspaceId, request_id: requestId, theme }),
+    // `session_id`: the chat the sign-in was asked from, relaunched by the
+    // daemon once the login lands.
+    body: JSON.stringify({ workspace_id: workspaceId, request_id: requestId, theme, ...(sessionId ? { session_id: sessionId } : {}) }),
   });
 }
 

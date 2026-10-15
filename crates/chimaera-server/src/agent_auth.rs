@@ -59,6 +59,10 @@ pub(crate) struct Recipe {
     pub(crate) command: &'static str,
     /// Claude's browser page shows a code the user pastes back.
     pub(crate) accepts_code: bool,
+    /// Signing in while signed in means something (a switch of account):
+    /// true for a CLI whose login replaces the stored one; Antigravity's
+    /// print mode just finds the existing login and reports it.
+    pub(crate) relogin: bool,
 }
 
 pub(crate) fn recipe(kind: AgentKind) -> Option<Recipe> {
@@ -67,21 +71,25 @@ pub(crate) fn recipe(kind: AgentKind) -> Option<Recipe> {
             how: How::Browser,
             command: "claude auth login",
             accepts_code: true,
+            relogin: true,
         },
         AgentKind::Codex => Recipe {
             how: How::Browser,
             command: "codex login --device-auth",
             accepts_code: false,
+            relogin: true,
         },
         AgentKind::Grok => Recipe {
             how: How::Browser,
             command: "grok login --device-auth",
             accepts_code: false,
+            relogin: true,
         },
         AgentKind::Cursor => Recipe {
             how: How::Browser,
             command: "cursor-agent login",
             accepts_code: false,
+            relogin: true,
         },
         // No login command, but print mode signs in headlessly: a native
         // zero-turn command (`/skills`) triggers the OAuth URL and a 60 s wait
@@ -92,6 +100,7 @@ pub(crate) fn recipe(kind: AgentKind) -> Option<Recipe> {
             how: How::Browser,
             command: "agy -p /skills",
             accepts_code: false,
+            relogin: false,
         },
         AgentKind::Gemini => return None,
     })
@@ -208,17 +217,10 @@ fn parse_probe(kind: AgentKind, success: bool, stdout: &str, stderr: &str) -> Op
             if success && text.lines().any(|l| l.contains('\t')) {
                 Some(true)
             } else if !success
-                && [
-                    "log in",
-                    "login",
-                    "sign in",
-                    "authenticat",
-                    "credential",
-                    "oauth",
-                ]
-                .iter()
-                .any(|needle| lower.contains(needle))
+                && (lower.contains("please sign in") || lower.contains("not logged in"))
             {
+                // Its own signed-out words only: an offline or quota failure
+                // is unknown, never "signed out".
                 Some(false)
             } else {
                 None
@@ -238,64 +240,110 @@ fn probe_argv(kind: AgentKind) -> Option<&'static [&'static str]> {
     })
 }
 
-/// Ask the CLI itself whether it is signed in. `None` = unknown (no status
-/// command, it did not answer in time, or an unreadable answer).
-async fn run_probe(kind: AgentKind, bin: &Path) -> Option<bool> {
+/// Ask the CLI itself whether it is signed in, the way a chat would run
+/// it: through the user's login shell with the host prelude (`CODEX_HOME`,
+/// `CLAUDE_CONFIG_DIR`, a proxy, an nvm node or a module load all come from
+/// there), in its own process group, output capped. `None` = unknown (no
+/// status command, no answer in time, or an unreadable one).
+async fn run_probe(state: &Arc<AppState>, kind: AgentKind, bin: &Path) -> Option<bool> {
     let argv = probe_argv(kind)?;
-    let output = tokio::process::Command::new(bin)
-        .args(argv)
-        .stdin(Stdio::null())
-        .kill_on_drop(true)
-        .output();
-    let out = tokio::time::timeout(PROBE_TIMEOUT, output)
-        .await
-        .ok()?
-        .ok()?;
-    let cap = |bytes: &[u8]| {
-        String::from_utf8_lossy(&bytes[..bytes.len().min(OUTPUT_LIMIT)]).into_owned()
+    let prelude = crate::agent_probe::ProbePrelude::write(state, None).await;
+    let mut cmd = crate::agent_probe::base_command(
+        &crate::agent_probe::wrapped(bin, argv),
+        None,
+        prelude.path(),
+    );
+    cmd.process_group(0);
+    let mut child = cmd.spawn().ok()?;
+    let pid = nix::unistd::Pid::from_raw(child.id()? as i32);
+    let stdout = child.stdout.take()?;
+    let stderr = child.stderr.take()?;
+    let work = async {
+        let (out, err) = tokio::join!(read_capped(stdout), read_capped(stderr));
+        let status = child.wait().await.ok()?;
+        Some((status.success(), out, err))
     };
-    parse_probe(
-        kind,
-        out.status.success(),
-        &cap(&out.stdout),
-        &cap(&out.stderr),
-    )
+    match tokio::time::timeout(PROBE_TIMEOUT, work).await {
+        Ok(Some((success, out, err))) => parse_probe(kind, success, &out, &err),
+        Ok(None) => None,
+        Err(_) => {
+            // The leader is unreaped: the group id is still its own.
+            let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL);
+            let _ = child.wait().await;
+            None
+        }
+    }
 }
 
-/// The cached verdict for `bin`, probing when the cache has none, is stale,
-/// is about another executable, or `fresh` is asked. Concurrent callers for
-/// one agent share a single probe.
+/// Read a pipe to its end, keeping the first `OUTPUT_LIMIT` bytes and
+/// draining the rest so the child never blocks on a full pipe.
+async fn read_capped(mut pipe: impl AsyncRead + Unpin) -> String {
+    let mut kept = Vec::new();
+    let mut buf = [0; 4096];
+    while let Ok(n) = pipe.read(&mut buf).await {
+        if n == 0 {
+            break;
+        }
+        if kept.len() < OUTPUT_LIMIT {
+            let room = OUTPUT_LIMIT - kept.len();
+            kept.extend_from_slice(&buf[..n.min(room)]);
+        }
+    }
+    String::from_utf8_lossy(&kept).into_owned()
+}
+
+fn cached(state: &AppState, kind: AgentKind, bin: &Path) -> Option<Option<bool>> {
+    lock(&state.agent_auth.status)
+        .get(&kind)
+        .filter(|s| s.bin == bin && s.checked_at.elapsed() < STATUS_TTL)
+        .map(|s| s.signed_in)
+}
+
+/// The verdict for `bin`, answered at once: the cached one while it lives;
+/// without one, `None` now and a probe in the background (the catalog
+/// refetches on the change bus), so a launcher paint never waits on five
+/// CLIs. Only an explicit ask (`fresh`: Settings' Check, `?check=true`, a
+/// sign-in's end, a chat's startup failure) probes inline. One probe per
+/// agent at a time either way.
 pub(crate) async fn status(
-    state: &AppState,
+    state: &Arc<AppState>,
     kind: AgentKind,
     bin: &Path,
     fresh: bool,
 ) -> Option<bool> {
     recipe(kind)?;
-    let cached = |state: &AppState| {
-        lock(&state.agent_auth.status)
-            .get(&kind)
-            .filter(|s| s.bin == bin && s.checked_at.elapsed() < STATUS_TTL)
-            .map(|s| s.signed_in)
-    };
     if !fresh {
-        if let Some(verdict) = cached(state) {
+        if let Some(verdict) = cached(state, kind, bin) {
             return verdict;
         }
+        let probing = probe_lock(state, kind);
+        if let Ok(guard) = probing.clone().try_lock_owned() {
+            let state = state.clone();
+            let bin = bin.to_path_buf();
+            tokio::spawn(async move {
+                let _guard = guard;
+                probe_and_store(&state, kind, &bin).await;
+                state.changes.notify_waiters();
+            });
+        }
+        return None;
     }
     let probing = probe_lock(state, kind);
     let _guard = probing.lock().await;
     // A waiter behind a fresh probe reads what it found.
-    if !fresh
-        || lock(&state.agent_auth.status)
-            .get(&kind)
-            .is_some_and(|s| s.bin == bin && s.checked_at.elapsed() < Duration::from_secs(2))
+    if lock(&state.agent_auth.status)
+        .get(&kind)
+        .is_some_and(|s| s.bin == bin && s.checked_at.elapsed() < Duration::from_secs(2))
     {
-        if let Some(verdict) = cached(state) {
+        if let Some(verdict) = cached(state, kind, bin) {
             return verdict;
         }
     }
-    let signed_in = run_probe(kind, bin).await;
+    probe_and_store(state, kind, bin).await
+}
+
+async fn probe_and_store(state: &Arc<AppState>, kind: AgentKind, bin: &Path) -> Option<bool> {
+    let signed_in = run_probe(state, kind, bin).await;
     lock(&state.agent_auth.status).insert(
         kind,
         Status {
@@ -307,6 +355,24 @@ pub(crate) async fn status(
     signed_in
 }
 
+/// A verdict as if just probed — tests plant what a CLI would have said.
+#[cfg(test)]
+pub(crate) fn preset_verdict(
+    state: &AppState,
+    kind: AgentKind,
+    bin: &Path,
+    signed_in: Option<bool>,
+) {
+    lock(&state.agent_auth.status).insert(
+        kind,
+        Status {
+            signed_in,
+            checked_at: Instant::now(),
+            bin: bin.to_path_buf(),
+        },
+    );
+}
+
 /// The cached verdict, never a probe (a spawn must not wait on one).
 pub(crate) fn cached_verdict(state: &AppState, kind: AgentKind) -> Option<bool> {
     lock(&state.agent_auth.status)
@@ -315,29 +381,9 @@ pub(crate) fn cached_verdict(state: &AppState, kind: AgentKind) -> Option<bool> 
         .and_then(|s| s.signed_in)
 }
 
-/// Whether an error the agent reported reads like a missing or rejected
-/// login (the UI's `chat/authFailure.ts` keeps the same cues): a hint to
-/// treat the failure as a sign-in one, never a verdict by itself.
-pub(crate) fn auth_shaped(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    [
-        "unauthorized",
-        "missing bearer",
-        "not logged in",
-        "not signed in",
-        "run /login",
-        "authentication required",
-        "invalid api key",
-        "login required",
-        "login expired",
-        "expired token",
-        "expired credential",
-    ]
-    .iter()
-    .any(|cue| lower.contains(cue))
-        || lower
-            .split(|c: char| !c.is_ascii_digit())
-            .any(|w| w == "401")
+/// Whether a sign-in for `kind` is running (an install must not run beside it).
+pub(crate) fn running(state: &AppState, kind: AgentKind) -> bool {
+    snapshot(state, kind).is_some_and(|p| p.running())
 }
 
 /// A chat failed to start: re-ask this agent's status so the launcher row
@@ -360,6 +406,7 @@ pub(crate) fn descriptor(state: &AppState, kind: AgentKind) -> Option<serde_json
         "how": recipe.how,
         "command": recipe.command,
         "accepts_code": recipe.accepts_code,
+        "relogin": recipe.relogin,
         "operation": summary(state, kind),
     }))
 }
@@ -411,6 +458,10 @@ pub(crate) struct Operation {
 pub(crate) struct Request {
     workspace_id: String,
     request_id: String,
+    /// The chat this sign-in was asked from (`/login`): relaunched in place
+    /// when the login lands, like a chat that waited on it.
+    #[serde(default)]
+    session_id: Option<String>,
     /// Accepted for compatibility; the headless flows have no theme.
     #[serde(default)]
     #[allow(dead_code)]
@@ -476,6 +527,7 @@ pub(crate) async fn get(
             "how": recipe.how,
             "command": recipe.command,
             "accepts_code": recipe.accepts_code,
+            "relogin": recipe.relogin,
             "operation": snapshot(&state, kind),
         }))
         .into_response(),
@@ -514,6 +566,21 @@ pub(crate) async fn start(
             "Open a workspace on this host first.",
         );
     };
+    // Never beside an install or update of the same agent: the executable
+    // may be swapped under the login.
+    if crate::agent_setup::summary(&state, kind).is_some_and(|s| s["running"] == true) {
+        return error(
+            StatusCode::CONFLICT,
+            "Finish installing or updating this agent first.",
+        );
+    }
+    if let Some(session) = body.session_id.as_deref() {
+        if let Some(record) = lock(&state.agents).get_mut(session) {
+            if record.kind == kind {
+                record.signed_out_at_start = true;
+            }
+        }
+    }
     let detection = crate::launcher::detect(&state, kind, false).await;
     let bin = match detection.path {
         Ok(bin) => bin,
@@ -603,7 +670,18 @@ async fn start_operation(
                 no_browser,
             } => {
                 run_browser(
-                    &state, &operation, kind, argv, env, stdin, cwd, no_browser, cancelled, codes,
+                    &state,
+                    operation.clone(),
+                    kind,
+                    Launch::Browser {
+                        argv,
+                        env,
+                        stdin,
+                        cwd,
+                        no_browser,
+                    },
+                    cancelled,
+                    codes,
                 )
                 .await
             }
@@ -722,14 +800,14 @@ fn append(op: &Operation, bytes: &[u8]) {
 /// Read the login's URL and code out of what it has printed so far. Only
 /// text up to the last whitespace counts: a URL split across pipe reads must
 /// never reach the UI incomplete.
-fn harvest(op: &Operation) {
+fn harvest(op: &Operation, kind: AgentKind) {
     let text = strip_controls(&lock(&op.output));
     let complete = text
         .rfind(char::is_whitespace)
         .map_or("", |end| &text[..end]);
     let mut p = lock(&op.progress);
     if p.url.is_none() {
-        if let Some(url) = first_url(complete) {
+        if let Some(url) = login_url(complete, kind) {
             p.url = Some(url);
             p.message = "Finish signing in in your browser.".into();
         }
@@ -739,34 +817,44 @@ fn harvest(op: &Operation) {
     }
 }
 
-async fn drain(mut pipe: impl AsyncRead + Unpin, op: &Operation) {
+async fn drain(mut pipe: impl AsyncRead + Unpin, op: Arc<Operation>, kind: AgentKind) {
     let mut buf = [0; 4096];
     while let Ok(n) = pipe.read(&mut buf).await {
         if n == 0 {
             break;
         }
-        append(op, &buf[..n]);
-        harvest(op);
+        append(&op, &buf[..n]);
+        harvest(&op, kind);
     }
 }
 
-#[allow(clippy::too_many_arguments)] // one call site; a struct would wrap the launch again
 async fn run_browser(
     state: &Arc<AppState>,
-    op: &Operation,
+    op: Arc<Operation>,
     kind: AgentKind,
-    argv: Vec<String>,
-    extra_env: Vec<(String, String)>,
-    stdin: bool,
-    cwd: PathBuf,
-    no_browser: bool,
+    launch: Launch,
     cancel: watch::Receiver<bool>,
     mut codes: mpsc::Receiver<String>,
 ) -> (Phase, String) {
+    let Launch::Browser {
+        argv,
+        env: extra_env,
+        stdin,
+        cwd,
+        no_browser,
+    } = launch;
     if *cancel.borrow() {
         return (Phase::Cancelled, "Sign-in cancelled.".into());
     }
-    let mut env = crate::api::session_env(state, &lock(&op.progress).id, "dark", None);
+    // The way a chat runs the CLI: the user's login shell, the host and
+    // workspace prelude, the session env — so the login writes to the store
+    // the chats read.
+    let (id, workspace) = {
+        let p = lock(&op.progress);
+        (p.id.clone(), p.workspace_id.clone())
+    };
+    let prelude = crate::agent_probe::ProbePrelude::write(state, Some(&workspace)).await;
+    let mut env = crate::api::session_env(state, &id, "dark", prelude.path());
     if no_browser {
         match no_browser_dir().await {
             Ok(dir) => env = with_path_prefix(env, &dir),
@@ -779,6 +867,7 @@ async fn run_browser(
         }
     }
     let remove = crate::api::spawn_env_remove(&env);
+    let argv = crate::launcher::wrap_login_shell(&crate::launcher::login_shell(), argv);
     let mut cmd = tokio::process::Command::new(&argv[0]);
     cmd.args(&argv[1..])
         .current_dir(cwd)
@@ -796,15 +885,23 @@ async fn run_browser(
         Ok(child) => child,
         Err(err) => return (Phase::Failed, format!("Couldn't start the sign-in: {err}")),
     };
-    let group = Group(nix::unistd::Pid::from_raw(child.id().unwrap_or(0) as i32));
+    let Some(pid) = child.id() else {
+        return (Phase::Failed, "The sign-in ended before it started.".into());
+    };
+    let group = Group(nix::unistd::Pid::from_raw(pid as i32));
     let stdout = child.stdout.take().expect("piped");
     let stderr = child.stderr.take().expect("piped");
     let mut stdin = child.stdin.take();
     lock(&op.progress).message = "Waiting for the sign-in page…".into();
-    let reads = async {
-        tokio::join!(drain(stdout, op), drain(stderr, op));
-    };
-    tokio::pin!(reads);
+    // The pipes are read on their own: the verdict is the exit status plus
+    // the status command, never pipe EOF — a helper the login left behind
+    // holding stdout must not turn a success into a ten-minute timeout.
+    let reads = tokio::spawn({
+        let op = op.clone();
+        async move {
+            tokio::join!(drain(stdout, op.clone(), kind), drain(stderr, op, kind));
+        }
+    });
     let mut cancel_wait = cancel.clone();
     let stopped = async move {
         if !*cancel_wait.borrow() {
@@ -816,9 +913,7 @@ async fn run_browser(
     tokio::pin!(deadline);
     let exit = loop {
         tokio::select! {
-            // Keep the leader unreaped while its pipes are open so a cancel
-            // cannot signal a recycled process-group id.
-            result = async { (&mut reads).await; child.wait().await } => break Some(result),
+            result = child.wait() => break Some(result),
             _ = &mut stopped => break None,
             _ = &mut deadline => break None,
             Some(code) = codes.recv(), if stdin.is_some() => {
@@ -837,10 +932,14 @@ async fn run_browser(
     };
     match exit {
         Some(result) => {
+            // The leader is reaped: never signal a possibly recycled group id.
             std::mem::forget(group);
+            // Whatever the pipes still hold lands in the output for the
+            // failure tail; a holder that stays open is not waited for.
+            let _ = tokio::time::timeout(Duration::from_millis(300), reads).await;
             let code = result.ok().and_then(|s| s.code());
             if code == Some(0) {
-                verify(state, op, kind, &PathBuf::from(&argv[0])).await
+                verify(state, &op, kind).await
             } else {
                 let tail = failure_tail(&lock(&op.output));
                 (
@@ -856,7 +955,7 @@ async fn run_browser(
         None => {
             let cancelled = *cancel.borrow();
             let _ = nix::sys::signal::killpg(group.0, nix::sys::signal::Signal::SIGTERM);
-            let _ = tokio::time::timeout(Duration::from_secs(2), &mut reads).await;
+            let _ = tokio::time::timeout(Duration::from_secs(2), reads).await;
             drop(group);
             let _ = child.wait().await;
             if cancelled {
@@ -907,14 +1006,13 @@ fn with_path_prefix(mut env: Vec<(String, String)>, dir: &Path) -> Vec<(String, 
 
 /// The login exited cleanly: only the CLI's own status command says whether
 /// that was a sign-in.
-async fn verify(
-    state: &Arc<AppState>,
-    op: &Operation,
-    kind: AgentKind,
-    bin: &Path,
-) -> (Phase, String) {
+async fn verify(state: &Arc<AppState>, op: &Operation, kind: AgentKind) -> (Phase, String) {
     lock(&op.progress).message = "Checking the sign-in…".into();
-    match status(state, kind, bin, true).await {
+    let bin = match crate::launcher::detect(state, kind, false).await.path {
+        Ok(bin) => bin,
+        Err(why) => return (Phase::Failed, why),
+    };
+    match status(state, kind, &bin, true).await {
         Some(true) => (Phase::Succeeded, "Signed in.".into()),
         Some(false) => (
             Phase::Failed,
@@ -999,7 +1097,56 @@ fn safe_url(url: &str) -> bool {
     uri.scheme_str() == Some("https") && uri.authority().is_some_and(|a| !a.as_str().contains('@'))
 }
 
-/// The first https URL in `text` — the sign-in page every login prints.
+/// Every https URL in `text`, in order.
+fn urls(text: &str) -> Vec<String> {
+    text.match_indices("https://")
+        .filter_map(|(start, _)| {
+            let rest = &text[start..];
+            let end = rest
+                .find(|c: char| {
+                    c.is_whitespace() || c.is_control() || matches!(c, '"' | '\'' | '<' | '>')
+                })
+                .unwrap_or(rest.len());
+            let url = rest[..end].trim_end_matches(['.', ',', ')', ']']);
+            safe_url(url).then(|| url.to_string())
+        })
+        .collect()
+}
+
+/// The hosts each CLI's sign-in page lives on (probed 2026-10-14).
+fn login_hosts(kind: AgentKind) -> &'static [&'static str] {
+    match kind {
+        AgentKind::Claude => &["claude.com", "claude.ai", "anthropic.com"],
+        AgentKind::Codex => &["auth.openai.com", "openai.com"],
+        AgentKind::Grok => &["accounts.x.ai", "x.ai", "grok.com"],
+        AgentKind::Cursor => &["cursor.com", "cursor.sh"],
+        AgentKind::Antigravity => &["accounts.google.com", "google.com"],
+        AgentKind::Gemini => &[],
+    }
+}
+
+/// The sign-in page in `text`: a URL on the vendor's login host, else the
+/// LAST URL printed — an update banner's link must not win over the login's.
+pub(crate) fn login_url(text: &str, kind: AgentKind) -> Option<String> {
+    let found = urls(text);
+    found
+        .iter()
+        .find(|url| {
+            url.parse::<axum::http::Uri>()
+                .ok()
+                .and_then(|u| u.host().map(str::to_string))
+                .is_some_and(|host| {
+                    login_hosts(kind)
+                        .iter()
+                        .any(|h| host == *h || host.ends_with(&format!(".{h}")))
+                })
+        })
+        .or(found.last())
+        .cloned()
+}
+
+/// The first https URL in `text` (tests of the URL grammar).
+#[cfg(test)]
 pub(crate) fn first_url(text: &str) -> Option<String> {
     text.match_indices("https://").find_map(|(start, _)| {
         let rest = &text[start..];
@@ -1043,8 +1190,9 @@ fn failure_tail(output: &str) -> String {
         .copied()
         .collect::<Vec<_>>()
         .join(" ");
+    let whole = tail.chars().count();
     let mut tail: String = tail.chars().take(300).collect();
-    if tail.len() < tail.capacity() && lines.join(" ").chars().count() > 300 {
+    if whole > 300 {
         tail.push('…');
     }
     tail
@@ -1053,6 +1201,21 @@ fn failure_tail(output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_vendor_s_login_page_wins_over_a_banner_s_link_else_the_last_url() {
+        let out = "A new version is available: https://github.com/vendor/cli/releases\nOpen this link: https://auth.openai.com/codex/device\n";
+        assert_eq!(
+            login_url(out, AgentKind::Codex).as_deref(),
+            Some("https://auth.openai.com/codex/device")
+        );
+        let out = "see https://docs.example.test/help\nthen https://login.example.test/start\n";
+        assert_eq!(
+            login_url(out, AgentKind::Cursor).as_deref(),
+            Some("https://login.example.test/start")
+        );
+        assert_eq!(login_url("nothing here", AgentKind::Grok), None);
+    }
 
     #[test]
     fn antigravity_s_print_mode_login_shows_its_page_and_asks_for_the_code() {
@@ -1226,26 +1389,6 @@ mod tests {
     }
 
     #[test]
-    fn auth_shaped_errors_are_the_sign_in_cues_and_nothing_else() {
-        for text in [
-            "unexpected status 401 Unauthorized: Missing bearer or basic authentication in header",
-            "Not logged in · Please run /login",
-            "Cursor CLI is not signed in on this host.",
-            "Authentication required. Please run 'agent login' first",
-        ] {
-            assert!(auth_shaped(text), "{text}");
-        }
-        for text in [
-            "turn failed",
-            "GLIBC_2.28 not found",
-            "rate limit (status 429)",
-            "port 4011 in use",
-        ] {
-            assert!(!auth_shaped(text), "{text}");
-        }
-    }
-
-    #[test]
     fn a_failure_tail_is_short_and_plain() {
         let tail =
             failure_tail("\x1b[31merror:\x1b[0m something went wrong\n\nSee https://x.test\n");
@@ -1269,6 +1412,7 @@ mod tests {
         Request {
             workspace_id: "test".into(),
             request_id: id.into(),
+            session_id: None,
             theme: None,
         }
     }
@@ -1302,6 +1446,27 @@ mod tests {
     async fn a_browser_login_shows_its_page_and_code_takes_a_pasted_code_and_never_claims_success_itself(
     ) {
         let state = state();
+        // The verdict after a clean exit is the CLI's status command, here a
+        // stand-in that answers nothing readable (never the host's real codex).
+        let stand_in = std::env::temp_dir().join(format!(
+            "chimaera-auth-codex-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::write(&stand_in, "#!/bin/sh\nexit 0\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stand_in, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        lock(&state.agent_bins).insert(
+            AgentKind::Codex,
+            crate::launcher::AgentDetection {
+                path: Ok(stand_in),
+                version: None,
+                managed: false,
+                explicit: false,
+                mtime: None,
+            },
+        );
         // Prints a URL and a device code, then waits for the pasted code.
         start_operation(
             state.clone(),
