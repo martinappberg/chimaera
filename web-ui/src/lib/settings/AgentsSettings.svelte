@@ -146,7 +146,10 @@
               <button class="btn primary" disabled={wsId === null} onclick={() => void install(a, "update")}>Update</button>
             {:else if (!a.installed || a.updateAvailable || a.outdated) && a.installUrl}
               <button class="link" onclick={() => openInSystemBrowser(a.installUrl!)}>{a.installed ? "Update instructions ↗" : "Install instructions ↗"}</button>
-            {:else if needsSignIn(a) && !signingIn[a.id] && !a.signIn?.operation?.running}
+            {/if}
+            <!-- Sign-in is its own need, beside an update or a missing chat
+                 companion rather than behind them. -->
+            {#if a.installed && needsSignIn(a) && !busy && !signingIn[a.id] && !a.signIn?.operation?.running}
               <button class="btn primary" disabled={wsId === null} onclick={() => { signingIn[a.id] = true; }}>Sign in</button>
             {/if}
           </div>
@@ -154,7 +157,7 @@
         {#if a.installed && (signingIn[a.id] || a.signIn?.operation?.running)}
           <!-- The same card a chat shows; here under the row that names the agent. -->
           <div class="signin-slot">
-            <AgentSignInCard agent={a} workspaceId={wsId} autostart={signingIn[a.id] === true && !a.signIn?.operation?.running} onSignedIn={() => { void load(); setTimeout(() => { signingIn[a.id] = false; }, 2500); }} onDismiss={() => { signingIn[a.id] = false; }} />
+            <AgentSignInCard agent={a} workspaceId={wsId} autostart={signingIn[a.id] === true && !a.signIn?.operation?.running} onSignedIn={() => { signingIn[a.id] = false; void load(); }} onDismiss={() => { signingIn[a.id] = false; }} />
           </div>
         {/if}
         {#if a.installation?.running && !a.setup?.running}<p class="notice">Follow this installation in its terminal in the sidebar.</p>{/if}

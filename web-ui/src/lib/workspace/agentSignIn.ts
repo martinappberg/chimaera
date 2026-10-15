@@ -9,7 +9,7 @@ import { patchAgentSignedIn, type AgentInfo } from "./launcher";
 
 export interface SignInProgress {
   id: string;
-  how: "browser" | "terminal";
+  how: "browser";
   phase: "running" | "cancelling" | "succeeded" | "failed" | "cancelled";
   workspace_id: string;
   started_at: number;
@@ -19,17 +19,16 @@ export interface SignInProgress {
   code: string | null;
   /** The page will show a code to paste back (Claude). */
   accepts_code: boolean;
-  /** The managed terminal running the CLI (the terminal flow). */
-  terminal_session: string | null;
   message: string;
 }
 
 export interface SignInStatus {
   installed: boolean;
   signed_in: boolean | null;
-  how: "browser" | "terminal";
+  how: "browser";
   command: string;
   accepts_code: boolean;
+  relogin: boolean;
   operation: SignInProgress | null;
 }
 
@@ -61,10 +60,12 @@ export async function getSignIn(agent: string, check = false): Promise<SignInSta
   return status;
 }
 
-export function startSignIn(agent: string, workspaceId: string, requestId: string, theme: "light" | "dark"): Promise<SignInProgress> {
+export function startSignIn(agent: string, workspaceId: string, requestId: string, theme: "light" | "dark", sessionId: string | null = null): Promise<SignInProgress> {
   return request<SignInProgress>(path(agent), {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ workspace_id: workspaceId, request_id: requestId, theme }),
+    // `session_id`: the chat the sign-in was asked from, relaunched by the
+    // daemon once the login lands.
+    body: JSON.stringify({ workspace_id: workspaceId, request_id: requestId, theme, ...(sessionId ? { session_id: sessionId } : {}) }),
   });
 }
 

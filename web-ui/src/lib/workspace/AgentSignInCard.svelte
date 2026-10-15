@@ -15,9 +15,12 @@
 
   interface Props {
     agent: AgentInfo;
-    /** A sign-in runs in a workspace (the CLI's cwd, the terminal flow's
-     *  home); without one the card only reports. */
+    /** A sign-in runs in a workspace (the CLI's cwd); without one the card
+     *  only reports. */
     workspaceId: string | null;
+    /** The chat this card sits in: the daemon relaunches it in place once
+     *  the login lands. */
+    sessionId?: string | null;
     /** Start the login at once (the user already clicked Sign in elsewhere). */
     autostart?: boolean;
     /** Framed as a card of its own (a chat's empty state) or inline under a
@@ -28,7 +31,7 @@
     /** The user is done here without signing in. */
     onDismiss?: () => void;
   }
-  let { agent, workspaceId, autostart = false, framed = false, onSignedIn, onDismiss }: Props = $props();
+  let { agent, workspaceId, sessionId = null, autostart = false, framed = false, onSignedIn, onDismiss }: Props = $props();
 
   let status = $state<SignInStatus | null>(null);
   let error = $state<string | null>(null);
@@ -36,7 +39,7 @@
   let code = $state("");
   let copied = $state<"url" | "code" | null>(null);
   let requestId: string | null = null;
-  let checking = false;
+  let checking = $state(false);
   let disposed = false;
   let announced: string | null = null;
   /** The attempt this card started: a finished attempt from elsewhere (an
@@ -47,16 +50,15 @@
     status?.operation && (signInRunning(status.operation) || status.operation.id === ownAttempt) ? status.operation : null,
   );
   const running = $derived(signInRunning(operation));
-  const how = $derived(status?.how ?? agent.signIn?.how ?? "browser");
   const pageHost = $derived.by(() => {
     try { return operation?.url ? new URL(operation.url).hostname : null; } catch { return null; }
   });
 
-  async function check(): Promise<void> {
+  async function check(fresh = false): Promise<void> {
     if (checking || disposed) return;
     checking = true;
     try {
-      const next = await getSignIn(agent.id);
+      const next = await getSignIn(agent.id, fresh);
       if (disposed) return;
       status = next;
       if (next.operation?.id === requestId) { ownAttempt = requestId; requestId = null; }
@@ -85,7 +87,7 @@
     busy = true; error = null; code = "";
     requestId ??= crypto.randomUUID();
     try {
-      const next = await startSignIn(agent.id, workspaceId, requestId, resolvedTheme());
+      const next = await startSignIn(agent.id, workspaceId, requestId, resolvedTheme(), sessionId);
       if (disposed) return;
       ownAttempt = next.id;
       status = status ? { ...status, operation: next } : null;
@@ -132,7 +134,7 @@
   {:else if running}
     <p class="line" role="status">
       {#if operation?.url}
-        {how === "terminal" ? operation.message : `Finish signing in at ${pageHost ?? "the page"}.`}
+        {`Finish signing in at ${pageHost ?? "the page"}.`}
       {:else}
         {operation?.message ?? "Starting the sign-in…"}
       {/if}
@@ -165,8 +167,8 @@
     <p class="line" class:failure={operation?.phase === "failed"} role="status">
       {#if operation?.phase === "failed" || operation?.phase === "cancelled"}
         {operation.message}
-      {:else if how === "terminal"}
-        {agent.name} signs in from its own terminal. Chimaera opens one and notices when the login lands.
+      {:else if agent.signedIn === true && agent.signIn?.relogin === false}
+        {agent.name} is signed in on this host.
       {:else if agent.signedIn === true}
         {agent.name} is signed in on this host. Sign in again to switch accounts or refresh the login.
       {:else if agent.signedIn === null}
@@ -176,9 +178,13 @@
       {/if}
     </p>
     <div class="actions">
-      <button class="btn primary" disabled={busy || workspaceId === null || !status} onclick={() => void start()}>
-        {busy ? "Starting…" : operation ? "Try again" : how === "terminal" ? "Sign in in a terminal" : agent.signedIn === true ? "Sign in again" : "Sign in"}
-      </button>
+      {#if !(agent.signedIn === true && agent.signIn?.relogin === false)}
+        <button class="btn primary" disabled={busy || workspaceId === null || !status} onclick={() => void start()}>
+          {busy ? "Starting…" : operation ? "Try again" : agent.signedIn === true ? "Sign in again" : "Sign in"}
+        </button>
+      {/if}
+      <!-- A login done elsewhere (a terminal, another window): ask the CLI again. -->
+      <button class="link quiet" disabled={checking} onclick={() => void check(true)}>Check again</button>
       {#if onDismiss}<button class="link quiet" onclick={onDismiss}>Not now</button>{/if}
     </div>
   {/if}

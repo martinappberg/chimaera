@@ -1071,7 +1071,8 @@ async fn agents_rows_flag_managed_installs() {
     assert!(claude["sign_in"]["operation"].is_null());
     assert_eq!(codex["sign_in"]["how"], "browser");
     assert_eq!(codex["sign_in"]["command"], "codex login --device-auth");
-    assert_eq!(row("agy")["sign_in"]["how"], "terminal");
+    assert_eq!(row("agy")["sign_in"]["how"], "browser");
+    assert_eq!(row("agy")["sign_in"]["accepts_code"], false);
     assert!(row("agy")["signed_in"].is_null());
     assert_eq!(row("cursor")["sign_in"]["command"], "cursor-agent login");
 }
@@ -1147,6 +1148,190 @@ async fn a_landed_sign_in_relaunches_the_chats_that_waited_on_it() {
     assert_eq!(
         chat::relaunch_after_sign_in(state.clone(), agents::AgentKind::Codex).await,
         0
+    );
+}
+
+/// A live chat that waited on a sign-in is started again in place when the
+/// login lands; one mid-task is left alone (and unmarked); a chat spawned
+/// while the cached verdict said signed out carries the mark from the start.
+#[tokio::test]
+async fn a_live_chat_that_waited_on_a_sign_in_is_relaunched_unless_mid_task() {
+    let state = test_state();
+    let ws = make_workspace(&state, "signin-live").await;
+    let bin = write_fake_claude("signin-live-fake");
+    preset_agent(
+        &state,
+        agents::AgentKind::Claude,
+        Ok(bin.clone()),
+        Some("9.9.9-fake"),
+    );
+    // The CLI said signed out a moment ago: the chat is marked at spawn.
+    agent_auth::preset_verdict(&state, agents::AgentKind::Claude, &bin, Some(false));
+    let (status, row) = request(
+        &state,
+        Method::POST,
+        "/api/v1/sessions",
+        Some(serde_json::json!({"workspace_id": ws, "kind": "agent", "ui": "chat"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{row}");
+    let id = row["id"].as_str().unwrap().to_string();
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while !state.chat.get(&id).is_some_and(|c| c.alive) {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the fake handshakes");
+    assert!(
+        lock(&state.agents).get(&id).unwrap().signed_out_at_start,
+        "spawned while the verdict said signed out"
+    );
+    let first = state.chat.get(&id).unwrap().created_at_ms;
+
+    // Mid-task: left alone, and no longer waiting (it is authenticated).
+    lock(&state.agents).get_mut(&id).unwrap().state = agent_state::AgentState::Running;
+    assert_eq!(
+        chat::relaunch_after_sign_in(state.clone(), agents::AgentKind::Claude).await,
+        0
+    );
+    assert!(!lock(&state.agents).get(&id).unwrap().signed_out_at_start);
+    assert_eq!(
+        state.chat.get(&id).unwrap().created_at_ms,
+        first,
+        "not respawned"
+    );
+
+    // Idle and marked again: a second life under the same id.
+    lock(&state.agents).get_mut(&id).unwrap().state = agent_state::AgentState::Finished;
+    lock(&state.agents)
+        .get_mut(&id)
+        .unwrap()
+        .signed_out_at_start = true;
+    assert_eq!(
+        chat::relaunch_after_sign_in(state.clone(), agents::AgentKind::Claude).await,
+        1
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while !state
+            .chat
+            .get(&id)
+            .is_some_and(|c| c.alive && c.created_at_ms != first)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("relaunched alive under the same id");
+    assert!(!lock(&state.agents).get(&id).unwrap().signed_out_at_start);
+}
+
+/// The sign-in routes' happy path against a scripted CLI: start answers
+/// running, the page shows up, a repeated start joins, cancel ends it, and
+/// the catalog row names the operation throughout.
+#[tokio::test]
+async fn sign_in_routes_show_the_page_join_a_repeat_and_cancel() {
+    use std::os::unix::fs::PermissionsExt;
+    let state = test_state();
+    let ws = make_workspace(&state, "signin-routes").await;
+    let bin = test_dir("signin-routes-bin").join("claude");
+    std::fs::write(
+        &bin,
+        "#!/bin/sh\ncase \"$1 $2\" in\n'auth status') echo '{\"loggedIn\": false}'; exit 1 ;;\n'auth login') echo 'visit: https://claude.com/cai/oauth/authorize?code=true&state=t'; sleep 60 ;;\n*) echo '9.9.9 (Claude Code)' ;;\nesac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    preset_agent(
+        &state,
+        agents::AgentKind::Claude,
+        Ok(bin.clone()),
+        Some("9.9.9 (Claude Code)"),
+    );
+    let (status, started) = request(
+        &state,
+        Method::POST,
+        "/api/v1/agents/claude/sign-in",
+        Some(serde_json::json!({"workspace_id": ws, "request_id": "r-1"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{started}");
+    assert_eq!(started["phase"], "running");
+    assert_eq!(started["accepts_code"], true);
+    let page = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let (_, now) =
+                request(&state, Method::GET, "/api/v1/agents/claude/sign-in", None).await;
+            if now["operation"]["url"].is_string() {
+                return now;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the login's page reaches the wire");
+    assert_eq!(
+        page["operation"]["url"],
+        "https://claude.com/cai/oauth/authorize?code=true&state=t"
+    );
+    assert!(
+        page["operation"].get("output").is_none(),
+        "raw output never reaches the wire"
+    );
+    // A repeated click joins.
+    let (_, again) = request(
+        &state,
+        Method::POST,
+        "/api/v1/agents/claude/sign-in",
+        Some(serde_json::json!({"workspace_id": ws, "request_id": "r-2"})),
+    )
+    .await;
+    assert_eq!(again["id"], "r-1");
+    let (_, list) = request(&state, Method::GET, "/api/v1/agents", None).await;
+    let claude = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == "claude")
+        .unwrap();
+    assert_eq!(claude["sign_in"]["operation"]["id"], "r-1");
+    assert_eq!(claude["sign_in"]["operation"]["running"], true);
+    // Cancel ends it, generation-scoped.
+    let (status, _) = request(
+        &state,
+        Method::DELETE,
+        "/api/v1/agents/claude/sign-in/r-2",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, cancelled) = request(
+        &state,
+        Method::DELETE,
+        "/api/v1/agents/claude/sign-in/r-1",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cancelled["phase"], "cancelling");
+    let done = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let (_, now) =
+                request(&state, Method::GET, "/api/v1/agents/claude/sign-in", None).await;
+            if now["operation"]["phase"] == "cancelled" {
+                return now;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("cancel settles");
+    assert!(
+        done["operation"]["url"].is_null(),
+        "a finished page is stale"
+    );
+    assert!(
+        state.sessions.list().is_empty(),
+        "a sign-in is never a session"
     );
 }
 
