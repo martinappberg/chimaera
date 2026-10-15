@@ -572,6 +572,139 @@ async fn a_working_chat_hears_it_at_its_next_step_and_its_transcript_shows_it() 
     }
 }
 
+/// Pass 44: a claude terminal blocked on a foreground subagent has no next
+/// step until it returns, and nothing can free it. The sender and the roster
+/// say so; the parent's own PostToolUse for that call is the carrier, never
+/// the subagent's hooks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_terminal_waiting_on_a_subagent_is_named_and_reads_when_it_returns() {
+    let state = test_state();
+    set_comms(&state, true, "ask").await;
+    let ws = make_workspace(&state, "comms-subagent").await;
+    let a = tui(&state, &ws, "ka");
+    let b = tui(&state, &ws, "kb");
+    let post = |payload: serde_json::Value| {
+        let state = state.clone();
+        let b = b.clone();
+        async move {
+            let (status, answer) = request(
+                &state,
+                Method::POST,
+                &format!("/api/v1/agent-events/{b}?key=kb"),
+                Some(payload),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{answer}");
+            answer["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap_or("")
+                .to_string()
+        }
+    };
+    post(serde_json::json!({"hook_event_name": "UserPromptSubmit", "prompt": "audit"})).await;
+    post(serde_json::json!({
+        "hook_event_name": "PreToolUse", "tool_name": "Agent", "tool_use_id": "tu-agent",
+        "tool_input": {"description": "audit the loader", "prompt": "…"},
+    }))
+    .await;
+    assert_eq!(
+        lock(&state.agents).get(&b).unwrap().state,
+        agent_state::AgentState::Running
+    );
+
+    let (_, roster) =
+        mcp_tool_call(&state, &a, "ka", "workspace_agents", serde_json::json!({})).await;
+    assert!(
+        roster.contains("working: waiting on a subagent for under a minute (audit the loader)"),
+        "{roster}"
+    );
+    assert!(
+        roster.contains("reads messages when its subagent returns"),
+        "{roster}"
+    );
+    let (is_err, text) = send(
+        &state,
+        &a,
+        "ka",
+        serde_json::json!({"to": b, "text": "is target/ still in use?"}),
+    )
+    .await;
+    assert!(!is_err, "{text}");
+    assert!(
+        text.contains("waiting on a subagent") && text.contains("when that subagent returns"),
+        "{text}"
+    );
+
+    // The subagent's own calls never carry it.
+    let inside = post(serde_json::json!({
+        "hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_use_id": "tu-sub",
+        "agent_id": "a55d52603606673c2", "agent_type": "general-purpose",
+    }))
+    .await;
+    assert_eq!(inside, "");
+    // The Agent call returning is the parent's next step.
+    let back = post(serde_json::json!({
+        "hook_event_name": "PostToolUse", "tool_name": "Agent", "tool_use_id": "tu-agent",
+    }))
+    .await;
+    assert!(back.contains("is target/ still in use?"), "{back}");
+    assert!(lock(&state.agents).get(&b).unwrap().main_calls.is_empty());
+    for sid in [a, b] {
+        state.sessions.kill(&sid).ok();
+    }
+}
+
+/// `message_agent` waits for a "now" delivery to be read: the settle (here
+/// the hook carrier's `finish`) must wake that wait at once, not let it run
+/// to its 8 s limit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settle_wakes_a_sender_waiting_for_the_read() {
+    let state = test_state();
+    set_comms(&state, true, "ask").await;
+    let ws = make_workspace(&state, "comms-read-wait").await;
+    let a = tui(&state, &ws, "ka");
+    let b = tui(&state, &ws, "kb");
+    let (_, text) = send(
+        &state,
+        &a,
+        "ka",
+        serde_json::json!({"to": b, "text": "ping"}),
+    )
+    .await;
+    let seq: u64 = text
+        .strip_prefix("Sent (#")
+        .and_then(|rest| rest.split(')').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("{text}"));
+    let reader = crate::comms::reader(&state, &b).expect("b reads");
+    let limit = std::time::Duration::from_secs(8);
+    let waiter = {
+        let state = state.clone();
+        let reader = reader.clone();
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let read = crate::comms::read_within(&state, &reader, seq, limit).await;
+            (read, started.elapsed())
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let carried = hook(&state, &b, "kb", "PostToolUse").await;
+    assert!(carried.contains("ping"), "{carried}");
+    let (read, took) = waiter.await.unwrap();
+    assert!(read, "the hook settled it");
+    assert!(
+        took < std::time::Duration::from_secs(2),
+        "woke after {took:?}"
+    );
+    // Already settled: no wait at all.
+    let started = std::time::Instant::now();
+    assert!(crate::comms::read_within(&state, &reader, seq, limit).await);
+    assert!(started.elapsed() < std::time::Duration::from_millis(500));
+    for sid in [a, b] {
+        state.sessions.kill(&sid).ok();
+    }
+}
+
 /// ACP chats cannot be steered mid-turn. Their direct messages must still meet
 /// the wake policy at turn end, without being lost or asking more than once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

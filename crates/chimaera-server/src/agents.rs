@@ -593,6 +593,12 @@ pub(crate) async fn ingest(
             _ => {}
         }
 
+        // What the main thread is blocked on (agent communication reports
+        // it to a sender). Off the wire, so it never counts as a change.
+        if subagent_identity(&payload).is_none() {
+            record.note_main_call(event, &payload, crate::session_view::now_ms());
+        }
+
         // One-line "what it's doing now" for the dashboard card, replaced
         // per event and cleared at turn boundaries.
         if let Some(update) = now_line_update(event, &payload) {

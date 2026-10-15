@@ -334,6 +334,130 @@ impl BackgroundWork {
     }
 }
 
+/// What a running turn's main thread is blocked on — the step a message
+/// carried "at its next step" waits for (agent communication reports it, and
+/// frees a Claude turn stuck on a foreground subagent; PROTOCOL.md Pass 44).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitKind {
+    /// A foreground subagent call (claude `Agent`/`Task`, codex collab `wait`).
+    Subagent,
+    /// A shell command (claude Bash, codex command execution).
+    Command,
+    /// Any other tool call.
+    Tool,
+}
+
+/// One blocking call of the running turn's main thread.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockingCall {
+    /// The tool row id (claude: the tool_use id `background_tasks` takes).
+    pub id: String,
+    pub kind: WaitKind,
+    pub title: String,
+    pub since_ms: u64,
+}
+
+/// [`ChatManager::main_wait`]: the running turn and what it waits on now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MainWait {
+    /// When the running turn started (epoch ms).
+    pub turn_since_ms: u64,
+    /// Open main-thread calls, oldest first (empty: the model is thinking or
+    /// writing, so the next step is close).
+    pub calls: Vec<BlockingCall>,
+}
+
+impl MainWait {
+    /// The call that decides when the next step comes: a subagent first
+    /// (the longest wait), else the oldest call.
+    pub fn longest(&self) -> Option<&BlockingCall> {
+        self.calls
+            .iter()
+            .find(|c| c.kind == WaitKind::Subagent)
+            .or_else(|| self.calls.first())
+    }
+}
+
+/// Bound on a turn's tracked open main-thread calls (a turn rarely runs
+/// more than a few at once) — here and in the server's hook-fed copy for
+/// claude terminals.
+pub const MAIN_CALLS_CAP: usize = 32;
+
+/// Folds a turn's open main-thread tool calls. Only `cross_turn: false`
+/// rows count (codex delegated agents run beside the thread, not in it);
+/// subagent-internal calls never reach the journal as rows. Claude's
+/// synthesized `task:` rows name a subagent without a foreground Agent call,
+/// so they are not a blocking call either.
+#[derive(Default)]
+struct MainThread {
+    turn_since_ms: Option<u64>,
+    calls: Vec<BlockingCall>,
+}
+
+impl MainThread {
+    fn observe(&mut self, ev: &AgentEvent) {
+        use model::{ToolKind, ToolStatus};
+
+        match ev {
+            AgentEvent::TurnStarted { .. } => {
+                self.turn_since_ms = Some(now_ms());
+                self.calls.clear();
+            }
+            AgentEvent::ToolCall {
+                id,
+                kind,
+                title,
+                status: ToolStatus::Pending | ToolStatus::InProgress,
+                cross_turn: false,
+                ..
+            } => {
+                if self.turn_since_ms.is_none() || self.calls.iter().any(|c| &c.id == id) {
+                    return;
+                }
+                let kind = match kind {
+                    ToolKind::Agent if id.starts_with("task:") => return,
+                    ToolKind::Agent => WaitKind::Subagent,
+                    ToolKind::Other if title == codex::COLLAB_WAIT_TITLE => WaitKind::Subagent,
+                    ToolKind::Execute => WaitKind::Command,
+                    _ => WaitKind::Tool,
+                };
+                if self.calls.len() < MAIN_CALLS_CAP {
+                    self.calls.push(BlockingCall {
+                        id: id.clone(),
+                        kind,
+                        title: title.chars().take(160).collect(),
+                        since_ms: now_ms(),
+                    });
+                }
+            }
+            AgentEvent::ToolCall {
+                id,
+                status: ToolStatus::Completed | ToolStatus::Failed,
+                ..
+            }
+            | AgentEvent::ToolCallUpdate {
+                id,
+                status: ToolStatus::Completed | ToolStatus::Failed,
+                ..
+            } => self.calls.retain(|c| &c.id != id),
+            AgentEvent::TurnCompleted { .. }
+            | AgentEvent::TurnAborted { .. }
+            | AgentEvent::Exited { .. } => {
+                self.turn_since_ms = None;
+                self.calls.clear();
+            }
+            _ => {}
+        }
+    }
+
+    fn snapshot(&self) -> Option<MainWait> {
+        self.turn_since_ms.map(|turn_since_ms| MainWait {
+            turn_since_ms,
+            calls: self.calls.clone(),
+        })
+    }
+}
+
 /// What a session's driver PROCESS holds that dies with it — the part of the
 /// session a daemon restart cannot resume from the conversation alone. The
 /// server's ledger snapshots it, and resurrection re-establishes what it can
@@ -493,6 +617,7 @@ struct ChatSession {
     annotate_tx: mpsc::WeakSender<AgentEvent>,
     info: Mutex<ChatInfo>,
     background_work: Mutex<BackgroundWork>,
+    main_thread: Mutex<MainThread>,
     pending_asks: Mutex<HashSet<(u8, String)>>,
     carryover: Mutex<Carryover>,
     journal: Arc<Journal>,
@@ -658,6 +783,7 @@ impl ChatManager {
             annotate_tx: ev_tx.downgrade(),
             info: Mutex::new(info.clone()),
             background_work: Mutex::new(BackgroundWork::default()),
+            main_thread: Mutex::new(MainThread::default()),
             pending_asks: Mutex::new(HashSet::new()),
             carryover: Mutex::new(Carryover::default()),
             journal: Arc::clone(&journal),
@@ -752,6 +878,11 @@ impl ChatManager {
             .carryover
             .lock()
             .expect("carryover lock")
+            .observe(&ev);
+        session
+            .main_thread
+            .lock()
+            .expect("main thread lock")
             .observe(&ev);
         let background_running = session
             .background_work
@@ -1163,6 +1294,17 @@ impl ChatManager {
         Some((carry, budget.sends != 0))
     }
 
+    /// The running turn and the main-thread calls it waits on; `None` while
+    /// no turn runs. Not on the session-list wire: agent communication reads
+    /// it when a message arrives.
+    pub fn main_wait(&self, id: &str) -> Option<MainWait> {
+        self.sessions
+            .lock()
+            .expect("sessions lock")
+            .get(id)
+            .and_then(|s| s.main_thread.lock().expect("main thread lock").snapshot())
+    }
+
     /// The live process's [`Carryover`] — what a restart would cut off.
     pub fn carryover(&self, id: &str) -> Option<Carryover> {
         self.sessions
@@ -1314,6 +1456,63 @@ mod tests {
             },
         );
         assert_eq!(info.current_mode.as_deref(), Some("auto-review"));
+    }
+
+    #[test]
+    fn main_thread_names_what_the_running_turn_waits_on() {
+        use model::{ToolKind, ToolStatus};
+        let call = |id: &str, kind: ToolKind, title: &str, cross_turn: bool| AgentEvent::ToolCall {
+            id: id.into(),
+            kind,
+            title: title.into(),
+            locations: Vec::new(),
+            status: ToolStatus::InProgress,
+            cross_turn,
+            command: None,
+        };
+        let done = |id: &str| AgentEvent::ToolCallUpdate {
+            id: id.into(),
+            status: ToolStatus::Completed,
+            content: None,
+        };
+        let mut main = MainThread::default();
+        assert_eq!(main.snapshot(), None, "no turn, nothing to wait on");
+        main.observe(&AgentEvent::TurnStarted {
+            turn_id: "t1".into(),
+        });
+        assert!(main.snapshot().is_some_and(|w| w.calls.is_empty()));
+        main.observe(&call("cmd", ToolKind::Execute, "Run tests", false));
+        main.observe(&call("tu-agent", ToolKind::Agent, "Agent: audit", false));
+        // Beside the thread, not in it: a codex delegated agent and a
+        // claude subagent row with no foreground Agent call.
+        main.observe(&call("agent:th#1", ToolKind::Agent, "Agent: Dewey", true));
+        main.observe(&call("task:a1", ToolKind::Agent, "Agent: bg", false));
+        let wait = main.snapshot().unwrap();
+        assert_eq!(wait.calls.len(), 2);
+        let longest = wait.longest().unwrap();
+        assert_eq!(
+            (longest.id.as_str(), longest.kind),
+            ("tu-agent", WaitKind::Subagent)
+        );
+        main.observe(&done("tu-agent"));
+        let wait = main.snapshot().unwrap();
+        assert_eq!(wait.longest().map(|c| c.kind), Some(WaitKind::Command));
+        // Codex's collab wait is a subagent wait too.
+        main.observe(&call(
+            "call_w",
+            ToolKind::Other,
+            codex::COLLAB_WAIT_TITLE,
+            false,
+        ));
+        assert_eq!(
+            main.snapshot().unwrap().longest().map(|c| c.id.clone()),
+            Some("call_w".into())
+        );
+        main.observe(&AgentEvent::TurnCompleted {
+            turn_id: "t1".into(),
+            usage: model::Usage::default(),
+        });
+        assert_eq!(main.snapshot(), None);
     }
 
     #[test]
