@@ -26,11 +26,11 @@ async fn mcp_handshake_auth_and_tool_listing() {
         .contains("@term:"));
     // The plan card asks for the agent's own task list, in its tool's words.
     let text = out["result"]["instructions"].as_str().unwrap();
-    assert!(text.contains("Task list:"), "{text}");
+    assert!(text.contains("Plan card:"), "{text}");
     assert!(
-        text.contains("TaskCreate/TaskUpdate")
+        text.contains("TaskCreate and TaskUpdate")
             || text.contains("update_plan")
-            || text.contains("plan tool"),
+            || text.contains("to-do TOOL"),
         "{text}"
     );
 
