@@ -151,7 +151,7 @@ async fn exercise(adapter: AcpAdapter, env: &str, args: &[&str]) {
         reply.to_lowercase().contains("copper"),
         "resume lost context: {reply}"
     );
-    exercise_controls(&manager, &mut rx, dir.path()).await;
+    exercise_controls(&manager, &mut rx, dir.path(), adapter).await;
     manager.kill("acp");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while manager.get("acp").unwrap().alive {
@@ -198,6 +198,7 @@ async fn exercise_controls(
     manager: &ChatManager,
     rx: &mut tokio::sync::broadcast::Receiver<Arc<SeqEvent>>,
     cwd: &std::path::Path,
+    adapter: AcpAdapter,
 ) {
     // Model changes use acknowledged readback, even when selecting the current model.
     let model = manager.get("acp").unwrap().model.unwrap();
@@ -221,7 +222,15 @@ async fn exercise_controls(
 
     for choice in ["allow", "deny", "stop"] {
         let name = format!("{choice}.txt");
-        send(manager, &format!("Use your file-writing tool to create {name} in the current directory containing only copper. Do not use shell commands or delegate. If denied or cancelled, stop without retrying.")).await;
+        // Cursor applies its own file edits without a permission request
+        // over ACP (probed 2026-10-15: "Edit File" wrote at once); a shell
+        // command outside its allowlist asks ("Not in allowlist: printf").
+        let prompt = if adapter.kind == CURSOR.kind {
+            format!("Use your shell tool to run exactly: printf copper > {name} . Do not use the file-writing tool or delegate. If denied or cancelled, stop without retrying.")
+        } else {
+            format!("Use your file-writing tool to create {name} in the current directory containing only copper. Do not use shell commands or delegate. If denied or cancelled, stop without retrying.")
+        };
+        send(manager, &prompt).await;
         let ask = until(rx, |e| {
             matches!(
                 e,

@@ -221,6 +221,8 @@ impl Driver for AcpAdapter {
             return Err("Invalid ACP sessionId".into());
         }
         let mut mapper = AcpMapper::new(native.to_owned(), &init, &session);
+        mapper.kind = self.kind;
+        mapper.mcp_auto_approve = spec.mcp_auto_approve.clone();
         mapper.offer_grok_modes(self.kind);
         // ACP has no portable system-context field. Hold the bounded handoff
         // until a real user send: opening a fork must stay idle and unbilled.
@@ -296,6 +298,23 @@ pub struct AcpMapper {
     /// between turns, and its command is listed only after the handshake.
     /// The request waits here (mode id, chosen) until it can be sent.
     deferred_mode: Option<(String, bool)>,
+    /// Which agent the frames come from: each names an MCP tool call in its
+    /// own pinned shape (`mcp_call`, PROTOCOL.md Pass 45).
+    kind: &'static str,
+    /// The embedder's standing consent (`SpawnSpec.mcp_auto_approve`),
+    /// applied at the permission request — ACP has no pre-allow config.
+    mcp_auto_approve: Option<crate::driver::McpAutoApprove>,
+    /// Cursor names the MCP server and tool only on the `tool_call_update`
+    /// that precedes its permission request (whose `toolCall` carries no
+    /// `rawInput`): `toolCallId` → (provider, tool), dropped when the call
+    /// ends or the turn does.
+    mcp_calls: HashMap<String, (String, String)>,
+    /// Calls of the agent's own plan tool: the plan card is their whole
+    /// surface, so they draw no row (as claude's TodoWrite).
+    hidden_calls: HashSet<String>,
+    /// Cursor's to-do list — `cursor/update_todos {merge: true}` upserts by
+    /// id into it: (id, content, status) in the order first seen.
+    todos: Vec<(String, String, String)>,
 }
 fn text(v: &Value) -> String {
     cap_output(v.as_str().unwrap_or_default()).0
@@ -391,6 +410,11 @@ impl AcpMapper {
             grok_modes: false,
             always_approve: false,
             deferred_mode: None,
+            kind: "",
+            mcp_auto_approve: None,
+            mcp_calls: HashMap::new(),
+            hidden_calls: HashSet::new(),
+            todos: Vec::new(),
         };
         if !mapper.models.is_empty() {
             mapper.caps.commands.push("set_model".into());
@@ -694,6 +718,129 @@ impl AcpMapper {
             step.events.push(AgentEvent::ForkContextConsumed);
         }
     }
+    /// The MCP server a permission request names, and the tool when the
+    /// whole frame has this agent's pinned shape (live-captured, PROTOCOL.md
+    /// Pass 45) — `None` for anything that is not an MCP call (a shell
+    /// command, a file edit, an agent this adapter has no shape for). The
+    /// model-chosen tool name is interpolated verbatim into every title, so
+    /// the title is checked against the structured fields, never parsed on
+    /// its own; the tool keeps a quote-free charset.
+    fn mcp_call(&self, call: &Value) -> Option<(String, Option<String>)> {
+        let title = call["title"].as_str()?;
+        let plain = |s: &str| {
+            !s.is_empty()
+                && s.len() <= 128
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        };
+        let (server, tool, pinned) = match self.kind {
+            // agy-acp 1.2.1: `_meta {mcp: {server, tool}, is_mcp_tool_call}`,
+            // title `<server>_<tool>`.
+            k if k == ANTIGRAVITY.kind => {
+                let meta = &call["_meta"];
+                if meta["is_mcp_tool_call"] != true {
+                    return None;
+                }
+                let server = identifier(&meta["mcp"]["server"])?;
+                let tool = identifier(&meta["mcp"]["tool"])?;
+                let pinned = title == format!("{server}_{tool}");
+                (server, tool, pinned)
+            }
+            // grok 1.0.46: `rawInput {variant: "UseTool", tool_name:
+            // "<server>__<tool>"}` under `_meta["x.ai/tool"].kind ==
+            // "use_tool"`; the title is the tool_name again.
+            k if k == GROK.kind => {
+                let input = &call["rawInput"];
+                if input["variant"] != "UseTool" || call["_meta"]["x.ai/tool"]["kind"] != "use_tool"
+                {
+                    return None;
+                }
+                let name = identifier(&input["tool_name"])?;
+                let (server, tool) = name.split_once("__")?;
+                (server.to_owned(), tool.to_owned(), title == name)
+            }
+            // cursor 2026.10.14: the request's toolCall has no rawInput; the
+            // `tool_call_update` before it said `{providerIdentifier,
+            // toolName}` (kept in `mcp_calls`), and the title must agree:
+            // `<server>-<tool>: <tool>`.
+            k if k == CURSOR.kind => {
+                let (provider, tool) = self.mcp_calls.get(call["toolCallId"].as_str()?)?;
+                let pinned = title == format!("{provider}-{tool}: {tool}");
+                (provider.clone(), tool.clone(), pinned)
+            }
+            _ => return None,
+        };
+        if !plain(&server) {
+            return None;
+        }
+        Some((server, (pinned && plain(&tool)).then_some(tool)))
+    }
+    /// The embedder's standing consent, answered at the prompt: the id of
+    /// an offered `allow_once` option — never `allow_always`, which the agent
+    /// would keep past this process — or `None` to surface the ask. Scoped
+    /// hard, as the codex driver's: one server; a listed tool only in the
+    /// exact pinned shape (a reworded title, with a consent, warns so drift
+    /// is diagnosable); whole-server consent needs the structured server
+    /// match alone.
+    fn pre_approved(&self, call: &Value, options: &[PermissionOption]) -> Option<String> {
+        let allow = self.mcp_auto_approve.as_ref()?;
+        let (server, tool) = self.mcp_call(call)?;
+        if server != allow.server {
+            return None;
+        }
+        let approved = match (&allow.tools, tool) {
+            (None, _) => true,
+            (Some(list), Some(tool)) => list.contains(&tool),
+            (Some(_), None) => {
+                tracing::warn!(
+                    agent = self.kind,
+                    title = call["title"].as_str().unwrap_or_default(),
+                    "ACP MCP permission request did not match the pinned shape; \
+                     surfacing the prompt instead of pre-approving"
+                );
+                false
+            }
+        };
+        if !approved {
+            return None;
+        }
+        options
+            .iter()
+            .find(|o| o.kind == PermissionOptionKind::AllowOnce)
+            .map(|o| o.id.clone())
+    }
+    /// Fold a `cursor/update_todos` into the session's list (`merge: false`
+    /// replaces it, `true` upserts by id, order of first sight) and return
+    /// the plan card's entries. The card has no "cancelled" state, so a
+    /// cancelled to-do leaves it; the list keeps it for the reply.
+    fn cursor_todos(&mut self, params: &Value) -> Vec<PlanEntry> {
+        if params["merge"] != true {
+            self.todos.clear();
+        }
+        for todo in rows(&params["todos"]) {
+            let Some(id) = identifier(&todo["id"]) else {
+                continue;
+            };
+            let content = cap_head_tail(todo["content"].as_str().unwrap_or_default(), 2048, 0).0;
+            let status = small(&todo["status"]);
+            if let Some(row) = self.todos.iter_mut().find(|r| r.0 == id) {
+                row.1 = content;
+                row.2 = status;
+            } else if self.todos.len() < PLAN_TASKS_CAP {
+                self.todos.push((id, content, status));
+            }
+        }
+        self.todos
+            .iter()
+            .filter(|(_, _, status)| status != "cancelled")
+            .map(|(id, content, status)| PlanEntry {
+                content: truncate_label(content, PLAN_LABEL_MAX),
+                status: crate::claude::plan_status(status),
+                id: Some(id.clone()),
+                ..Default::default()
+            })
+            .collect()
+    }
     fn config_command(&mut self, category: &str, value: &str, step: &mut DriverStep) {
         let control = rows(&self.config)
             .find(|c| c["category"] == category)
@@ -912,6 +1059,8 @@ impl Mapper for AcpMapper {
                         });
                     }
                     self.turn = None;
+                    self.mcp_calls.clear();
+                    self.hidden_calls.clear();
                     for (request_id, _) in self.asks.drain() {
                         step.events.push(AgentEvent::PermissionResolved {
                             request_id,
@@ -997,13 +1146,19 @@ impl Mapper for AcpMapper {
                     })
                 })
                 .collect();
+            let call = &params["toolCall"];
+            if params["sessionId"] == self.native {
+                if let Some(option) = self.pre_approved(call, &options) {
+                    step.outbound.push(json!({"jsonrpc":"2.0","id":frame["id"],"result":{"outcome":{"outcome":"selected","optionId":option}}}));
+                    return step;
+                }
+            }
             if params["sessionId"] != self.native
                 || self.asks.len() >= MAX_PENDING
                 || options.is_empty()
             {
                 step.outbound.push(json!({"jsonrpc":"2.0","id":frame["id"],"result":{"outcome":{"outcome":"cancelled"}}}));
             } else {
-                let call = &params["toolCall"];
                 self.asks.insert(
                     request_id.clone(),
                     Ask {
@@ -1019,6 +1174,24 @@ impl Mapper for AcpMapper {
                     input_preview: cap_preview(&call["rawInput"]),
                     plan: None,
                 });
+            }
+            return step;
+        }
+        // Cursor's to-do list IS its plan (PROTOCOL.md Pass 45): the agent's
+        // `TodoWrite` reaches the client as `cursor/update_todos` — a request
+        // on 2026.10.14 (the docs call it a notification; either is answered
+        // the same) — and draws the plan card like every other level-set.
+        if frame["method"] == "cursor/update_todos" {
+            self.flush_into(&mut step);
+            let entries = self.cursor_todos(params);
+            step.events.push(AgentEvent::Plan { entries });
+            if frame.get("id").is_some() {
+                let todos: Vec<Value> = self
+                    .todos
+                    .iter()
+                    .map(|(id, content, status)| json!({"id":id,"content":content,"status":status}))
+                    .collect();
+                step.outbound.push(json!({"jsonrpc":"2.0","id":frame["id"],"result":{"outcome":{"outcome":"accepted","todos":todos}}}));
             }
             return step;
         }
@@ -1080,6 +1253,43 @@ impl Mapper for AcpMapper {
                     Some("pending") => ToolStatus::Pending,
                     _ => ToolStatus::InProgress,
                 };
+                let ended = matches!(status, ToolStatus::Completed | ToolStatus::Failed);
+                // Cursor's `tool_call_update` is where an MCP call names its
+                // server and tool (`rawInput {providerIdentifier, toolName}`);
+                // the permission request that follows carries only a title.
+                if self.kind == CURSOR.kind {
+                    let input = &update["rawInput"];
+                    if let (Some(provider), Some(tool)) = (
+                        identifier(&input["providerIdentifier"]),
+                        identifier(&input["toolName"]),
+                    ) {
+                        if self.mcp_calls.len() < MAX_PENDING || self.mcp_calls.contains_key(&id) {
+                            self.mcp_calls.insert(id.clone(), (provider, tool));
+                        }
+                    }
+                    if ended {
+                        self.mcp_calls.remove(&id);
+                    }
+                }
+                // The agent's own plan tool — Cursor's `updateTodos` (its
+                // list arrives as `cursor/update_todos`), Grok's `todo_write`
+                // (its list arrives as the `plan` update) — is the plan
+                // card's bookkeeping and draws no row, like claude's TodoWrite.
+                if update["sessionUpdate"] == "tool_call"
+                    && (update["rawInput"]["_toolName"] == "updateTodos"
+                        || update["_meta"]["x.ai/tool"]["kind"] == "plan")
+                {
+                    if self.hidden_calls.len() < MAX_PENDING {
+                        self.hidden_calls.insert(id);
+                    }
+                    return step;
+                }
+                if self.hidden_calls.contains(&id) {
+                    if ended {
+                        self.hidden_calls.remove(&id);
+                    }
+                    return step;
+                }
                 if update["sessionUpdate"] == "tool_call" {
                     let kind =
                         serde_json::from_value(update["kind"].clone()).unwrap_or(ToolKind::Other);
@@ -1657,5 +1867,350 @@ mod tests {
         );
         assert_eq!(Driver::executable(&CURSOR), "cursor-agent");
         assert_eq!(Driver::executable(&GROK), "grok");
+    }
+
+    fn consent(tools: Option<&[&str]>) -> crate::driver::McpAutoApprove {
+        crate::driver::McpAutoApprove {
+            server: "chimaera".into(),
+            tools: tools.map(|t| t.iter().map(|s| s.to_string()).collect()),
+        }
+    }
+    fn update(update: Value) -> Value {
+        json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session","update":update}})
+    }
+    fn ask(id: u64, tool_call: Value, options: Value) -> Value {
+        json!({"jsonrpc":"2.0","id":id,"method":"session/request_permission","params":{"sessionId":"session","toolCall":tool_call,"options":options}})
+    }
+    fn selected(step: &DriverStep, id: u64, option: &str) -> bool {
+        step.events.is_empty()
+            && step.outbound.len() == 1
+            && step.outbound[0]["id"] == id
+            && step.outbound[0]["result"]["outcome"]
+                == json!({"outcome":"selected","optionId":option})
+    }
+    fn surfaced(step: &DriverStep) -> bool {
+        step.outbound.is_empty()
+            && matches!(
+                step.events.as_slice(),
+                [AgentEvent::PermissionRequest { .. }]
+            )
+    }
+
+    /// The embedder's consent, answered in each agent's live-captured shape
+    /// (PROTOCOL.md Pass 45): a listed chimaera tool runs with no
+    /// PermissionRequest, answered with the offered allow_once (never
+    /// allow_always); an unlisted tool, another server, a reworded title
+    /// and an ordinary tool call still surface; without a consent nothing
+    /// is answered.
+    #[test]
+    fn antigravity_pre_approval_reads_the_mcp_meta_and_the_title() {
+        let mut m = mapper();
+        m.kind = ANTIGRAVITY.kind;
+        m.mcp_auto_approve = Some(consent(Some(&["notify", "open_browser"])));
+        // agy-acp 1.2.1, captured 2026-10-15.
+        let options = json!([{"optionId":"allow_always","name":"Allow Always","kind":"allow_always"},{"optionId":"allow","name":"Allow","kind":"allow_once"},{"optionId":"deny","name":"Deny","kind":"reject_once"}]);
+        let call = |title: &str, server: &str, tool: &str| {
+            json!({"toolCallId":"cab0087fdc5748f3b428d0cc480cd5a7","kind":"other","status":"pending","title":title,"content":[],
+                "rawInput":{"arguments":{"text":"hello from probe"},"text":"hello from probe"},
+                "_meta":{"mcp":{"tool":tool,"server":server},"is_mcp_tool_call":true}})
+        };
+        let step = m.on_frame(&ask(
+            0,
+            call("chimaera_notify", "chimaera", "notify"),
+            options.clone(),
+        ));
+        assert!(selected(&step, 0, "allow"), "{:?}", step.events);
+        assert!(m.asks.is_empty());
+        assert!(surfaced(&m.on_frame(&ask(
+            1,
+            call("chimaera_list_terminals", "chimaera", "list_terminals"),
+            options.clone()
+        ))));
+        // Another server's tool of a listed name.
+        assert!(surfaced(&m.on_frame(&ask(
+            2,
+            call("other_notify", "other", "notify"),
+            options.clone()
+        ))));
+        // The structured fields say notify but the title doesn't: no match.
+        assert!(surfaced(&m.on_frame(&ask(
+            3,
+            call("chimaera_list_terminals", "chimaera", "notify"),
+            options.clone()
+        ))));
+        // A shell command is never an MCP call.
+        assert!(surfaced(&m.on_frame(&ask(
+            4,
+            json!({"toolCallId":"t","kind":"execute","title":"ls","rawInput":{"command":"ls"}}),
+            options.clone()
+        ))));
+        // Whole-server consent: the structured server match alone.
+        m.mcp_auto_approve = Some(consent(None));
+        let step = m.on_frame(&ask(
+            5,
+            call("chimaera_list_terminals", "chimaera", "list_terminals"),
+            options.clone(),
+        ));
+        assert!(selected(&step, 5, "allow"));
+        assert!(surfaced(&m.on_frame(&ask(
+            6,
+            call("other_notify", "other", "notify"),
+            options.clone()
+        ))));
+        // No allow_once offered: surface rather than pick a standing grant.
+        let only_always = json!([{"optionId":"allow_always","name":"Allow Always","kind":"allow_always"},{"optionId":"deny","name":"Deny","kind":"reject_once"}]);
+        assert!(surfaced(&m.on_frame(&ask(
+            7,
+            call("chimaera_notify", "chimaera", "notify"),
+            only_always
+        ))));
+        // No consent at all.
+        m.mcp_auto_approve = None;
+        assert!(surfaced(&m.on_frame(&ask(
+            8,
+            call("chimaera_notify", "chimaera", "notify"),
+            options
+        ))));
+    }
+
+    #[test]
+    fn grok_pre_approval_reads_the_use_tool_input_and_the_title() {
+        let mut m = mapper();
+        m.kind = GROK.kind;
+        m.mcp_auto_approve = Some(consent(Some(&["notify"])));
+        // grok 1.0.46, captured 2026-10-15.
+        let options = json!([{"optionId":"always-allow","name":"always allow","kind":"allow_always"},{"optionId":"allow-once","name":"allow once","kind":"allow_once"},{"optionId":"reject-once","name":"reject once","kind":"reject_once"}]);
+        let call = |title: &str, name: &str| {
+            json!({"toolCallId":"call-a49db86c-3bb4-445f-887b-27c3370ef139-1","kind":"other","title":title,
+                "rawInput":{"variant":"UseTool","tool_name":name,"tool_input":{"text":"hello from probe"}},
+                "_meta":{"x.ai/tool":{"version":1,"name":"use_tool","kind":"use_tool","namespace":"grok_build","label":"Use Tool","read_only":false}}})
+        };
+        let step = m.on_frame(&ask(
+            0,
+            call("chimaera__notify", "chimaera__notify"),
+            options.clone(),
+        ));
+        assert!(selected(&step, 0, "allow-once"), "{:?}", step.events);
+        assert!(surfaced(&m.on_frame(&ask(
+            1,
+            call("chimaera__list_terminals", "chimaera__list_terminals"),
+            options.clone()
+        ))));
+        assert!(surfaced(&m.on_frame(&ask(
+            2,
+            call("other__notify", "other__notify"),
+            options.clone()
+        ))));
+        // A title that disagrees with the structured name.
+        assert!(surfaced(&m.on_frame(&ask(
+            3,
+            call("chimaera__notify", "chimaera__list_terminals"),
+            options.clone()
+        ))));
+        // Grok's own plan tool is not a use_tool frame.
+        assert!(surfaced(&m.on_frame(&ask(
+            4,
+            json!({"toolCallId":"t","title":"chimaera__notify","rawInput":{"variant":"UseTool","tool_name":"chimaera__notify"},"_meta":{"x.ai/tool":{"kind":"plan"}}}),
+            options.clone()
+        ))));
+        // Whole-server consent still needs the structured server.
+        m.mcp_auto_approve = Some(consent(None));
+        assert!(selected(
+            &m.on_frame(&ask(
+                5,
+                call("chimaera__list_terminals", "chimaera__list_terminals"),
+                options.clone()
+            )),
+            5,
+            "allow-once"
+        ));
+        assert!(surfaced(&m.on_frame(&ask(
+            6,
+            call("other__notify", "other__notify"),
+            options
+        ))));
+    }
+
+    #[test]
+    fn cursor_pre_approval_needs_the_preceding_update_and_the_title_to_agree() {
+        let mut m = mapper();
+        m.kind = CURSOR.kind;
+        m.mcp_auto_approve = Some(consent(Some(&["notify"])));
+        // cursor-agent 2026.10.14-941492e, captured 2026-10-15: the id
+        // carries a newline; the request's toolCall has no rawInput.
+        let id = "call-dff99f2e-b536-4ea5-82b2-409a16e88c4c-1\nfc_77bc5181-0275-9386-833a-574b551b67aa_0";
+        let options = json!([{"optionId":"allow-once","name":"Allow once","kind":"allow_once"},{"optionId":"allow-always","name":"Allow always","kind":"allow_always"},{"optionId":"reject-once","name":"Reject","kind":"reject_once"}]);
+        let named = |id: &str, provider: &str, tool: &str| {
+            update(
+                json!({"sessionUpdate":"tool_call_update","toolCallId":id,"title":format!("{provider}: {tool}"),
+                "rawInput":{"providerIdentifier":provider,"toolName":tool,"args":{"text":"hello from probe"}}}),
+            )
+        };
+        let request = |n: u64, id: &str, title: &str| {
+            ask(
+                n,
+                json!({"toolCallId":id,"title":title,"kind":"other","status":"pending",
+                "content":[{"type":"content","content":{"type":"text","text":"```json\n{\n  \"text\": \"hello from probe\"\n}\n```"}}]}),
+                options.clone(),
+            )
+        };
+        // The row opens as "MCP: tool", then the update names the call.
+        m.on_frame(&update(json!({"sessionUpdate":"tool_call","toolCallId":id,"title":"MCP: tool","kind":"other","status":"pending","rawInput":{}})));
+        m.on_frame(&named(id, "chimaera", "notify"));
+        let step = m.on_frame(&request(0, id, "chimaera-notify: notify"));
+        assert!(selected(&step, 0, "allow-once"), "{:?}", step.events);
+        // The same id, completed: a later request for it surfaces.
+        m.on_frame(&update(json!({"sessionUpdate":"tool_call_update","toolCallId":id,"status":"completed","rawOutput":{"success":true}})));
+        assert!(surfaced(&m.on_frame(&request(
+            1,
+            id,
+            "chimaera-notify: notify"
+        ))));
+        // A title alone never matches: no update named the call.
+        assert!(surfaced(&m.on_frame(&request(
+            2,
+            "call-x",
+            "chimaera-notify: notify"
+        ))));
+        // The update and the title disagree.
+        m.on_frame(&named("call-y", "chimaera", "list_terminals"));
+        assert!(surfaced(&m.on_frame(&request(
+            3,
+            "call-y",
+            "chimaera-notify: notify"
+        ))));
+        // Unlisted, and another provider's tool of the listed name.
+        m.on_frame(&named("call-z", "chimaera", "list_terminals"));
+        assert!(surfaced(&m.on_frame(&request(
+            4,
+            "call-z",
+            "chimaera-list_terminals: list_terminals"
+        ))));
+        m.on_frame(&named("call-w", "other", "notify"));
+        assert!(surfaced(&m.on_frame(&request(
+            5,
+            "call-w",
+            "other-notify: notify"
+        ))));
+        // A turn's end forgets what it named.
+        m.on_frame(&named("call-v", "chimaera", "notify"));
+        let prompt = send(&mut m, "go");
+        m.on_frame(&json!({"id":prompt.outbound[0]["id"],"result":{"stopReason":"end_turn"}}));
+        assert!(m.mcp_calls.is_empty());
+        assert!(surfaced(&m.on_frame(&request(
+            6,
+            "call-v",
+            "chimaera-notify: notify"
+        ))));
+    }
+
+    /// Cursor's to-do list is the plan card (PROTOCOL.md Pass 45): the
+    /// captured `cursor/update_todos` request draws a Plan level-set and is
+    /// answered with the documented accepted outcome; `merge: true` upserts
+    /// by id; a cancelled item leaves the card; the agent's own
+    /// `updateTodos` rows draw nothing.
+    #[test]
+    fn cursor_update_todos_draws_the_plan_card_and_is_accepted() {
+        let mut m = mapper();
+        m.kind = CURSOR.kind;
+        let id = "call-e7813dbd-f14c-4d36-9bc1-581803d671d3-1\nfc_20676f0e-24ad-9ed8-8c29-cde7d2c8d719_0";
+        // The tool rows around the list: hidden, their updates too.
+        let opened = m.on_frame(&update(json!({"sessionUpdate":"tool_call","toolCallId":id,"title":"Update TODOs","kind":"other","status":"pending","rawInput":{"_toolName":"updateTodos"}})));
+        assert!(opened.events.is_empty(), "{:?}", opened.events);
+        let updated = m.on_frame(&update(json!({"sessionUpdate":"tool_call_update","toolCallId":id,"title":"Update TODOs: inspect, draft, verify",
+            "rawInput":{"_toolName":"updateTodos","todos":[{"id":"inspect","content":"inspect","status":"TODO_STATUS_IN_PROGRESS","createdAt":"1792051486990","updatedAt":"1792051488874","dependencies":[]}]}})));
+        assert!(updated.events.is_empty(), "{:?}", updated.events);
+        let done = m.on_frame(&update(
+            json!({"sessionUpdate":"tool_call_update","toolCallId":id,"status":"completed"}),
+        ));
+        assert!(done.events.is_empty() && m.hidden_calls.is_empty());
+        // The captured request, verbatim.
+        let step = m.on_frame(&json!({"jsonrpc":"2.0","id":0,"method":"cursor/update_todos","params":{"toolCallId":id,
+            "todos":[{"id":"inspect","content":"inspect","status":"pending"},{"id":"draft","content":"draft","status":"pending"},{"id":"verify","content":"verify","status":"pending"}],"merge":false}}));
+        let [AgentEvent::Plan { entries }] = step.events.as_slice() else {
+            panic!("{:?}", step.events);
+        };
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| (e.id.as_deref().unwrap(), e.status))
+                .collect::<Vec<_>>(),
+            [
+                ("inspect", PlanStatus::Todo),
+                ("draft", PlanStatus::Todo),
+                ("verify", PlanStatus::Todo)
+            ]
+        );
+        assert_eq!(step.outbound[0]["id"], 0);
+        assert_eq!(step.outbound[0]["result"]["outcome"]["outcome"], "accepted");
+        assert_eq!(
+            step.outbound[0]["result"]["outcome"]["todos"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        // merge: true upserts by id and keeps the order of first sight.
+        let step = m.on_frame(&json!({"jsonrpc":"2.0","id":1,"method":"cursor/update_todos","params":{"toolCallId":id,
+            "todos":[{"id":"verify","content":"verify it","status":"cancelled"},{"id":"inspect","content":"inspect","status":"completed"},{"id":"ship","content":"ship","status":"in_progress"}],"merge":true}}));
+        let [AgentEvent::Plan { entries }] = step.events.as_slice() else {
+            panic!("{:?}", step.events);
+        };
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| (e.content.as_str(), e.status))
+                .collect::<Vec<_>>(),
+            [
+                ("inspect", PlanStatus::Done),
+                ("draft", PlanStatus::Todo),
+                ("ship", PlanStatus::InProgress)
+            ]
+        );
+        let echoed = &step.outbound[0]["result"]["outcome"]["todos"];
+        assert_eq!(
+            echoed[2],
+            json!({"id":"verify","content":"verify it","status":"cancelled"})
+        );
+        assert_eq!(echoed.as_array().unwrap().len(), 4);
+        // A notification-shaped delivery (the documented form) draws too and
+        // gets no reply; the list stays bounded.
+        let mut many: Vec<Value> = (0..200)
+            .map(|i| json!({"id":format!("t{i}"),"content":"x","status":"pending"}))
+            .collect();
+        many.push(json!({"id":"","content":"no id","status":"pending"}));
+        let step = m.on_frame(&json!({"jsonrpc":"2.0","method":"cursor/update_todos","params":{"toolCallId":id,"todos":many,"merge":false}}));
+        assert!(step.outbound.is_empty());
+        let [AgentEvent::Plan { entries }] = step.events.as_slice() else {
+            panic!("{:?}", step.events);
+        };
+        assert_eq!(entries.len(), PLAN_TASKS_CAP);
+    }
+
+    /// Grok's own plan tool rows (`todo_write`, `_meta["x.ai/tool"].kind ==
+    /// "plan"`) draw nothing; its list arrives as the `plan` update, which
+    /// still draws the card.
+    #[test]
+    fn grok_plan_tool_rows_are_hidden_and_the_plan_update_draws() {
+        let mut m = mapper();
+        m.kind = GROK.kind;
+        let id = "call-d033afac-0960-49db-8ea6-4c820319112a-0";
+        let opened = m.on_frame(&update(json!({"sessionUpdate":"tool_call","toolCallId":id,"title":"todo_write",
+            "rawInput":{"todos":[{"id":"inspect","content":"inspect","status":"in_progress"}],"merge":false},
+            "_meta":{"x.ai/tool":{"version":1,"name":"todo_write","kind":"plan","namespace":"grok_build","label":"Plan","read_only":false}}})));
+        assert!(opened.events.is_empty(), "{:?}", opened.events);
+        let updated = m.on_frame(&update(json!({"sessionUpdate":"tool_call_update","toolCallId":id,"kind":"think","title":"Updating plan","status":"completed"})));
+        assert!(updated.events.is_empty() && m.hidden_calls.is_empty());
+        let step = m.on_frame(&update(json!({"sessionUpdate":"plan","entries":[{"content":"inspect","priority":"medium","status":"in_progress"},{"content":"draft","priority":"medium","status":"pending"}]})));
+        assert!(
+            matches!(step.events.as_slice(), [AgentEvent::Plan { entries }] if entries.len() == 2)
+        );
+        // An ordinary tool row still draws.
+        let step = m.on_frame(&update(json!({"sessionUpdate":"tool_call","toolCallId":"call-2","title":"use_tool","rawInput":{"tool_name":"chimaera__notify","tool_input":{}},
+            "_meta":{"x.ai/tool":{"kind":"use_tool"}}})));
+        assert!(matches!(
+            step.events.first(),
+            Some(AgentEvent::ToolCall { .. })
+        ));
     }
 }

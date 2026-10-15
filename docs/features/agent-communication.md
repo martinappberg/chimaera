@@ -37,9 +37,10 @@ on the per-session MCP endpoint ([linked-terminals.md](linked-terminals.md#the-m
   question) and when not (progress chatter). The UI names the calls in words — "Message to
   analyst", "Listed agents" — from the drivers' titles, which carry the target
   (`message_agent (chimaera) → s-…`, `chimaera.message_agent → s-…`).
-- **Key behaviors.** Pre-allowed for workers (claude `permissions.allow`, codex
-  `mcp_auto_approve`, the codex-terminal `approval_mode`), because the setting is the
-  standing permission. Antigravity, Grok and Cursor retain native ACP approval requests; an ask-first Mastermind's `message_agent` keeps its prompt. The names
+- **Key behaviors.** Pre-allowed for workers (claude `permissions.allow`; codex and the ACP
+  chats — Antigravity, Grok, Cursor — `mcp_auto_approve`, answered by their drivers at the
+  prompt in each agent's live-captured frame shape, PROTOCOL.md Pass 45; the codex-terminal
+  `approval_mode`), because the setting is the standing permission; an ask-first Mastermind's `message_agent` keeps its prompt. The names
   avoid Claude Code's own `ListAgents` / `SendMessage` (machine-wide, other Claude sessions):
   asked to "use list_agents", a live haiku loaded those instead, so the instructions also say
   the harness's own agent tools never reach this workspace's agents. Those tools stay the

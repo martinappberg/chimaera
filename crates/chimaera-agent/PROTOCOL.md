@@ -3300,3 +3300,60 @@ No mid-turn input on ACP v1 (`session/prompt` is one at a time) and no subagent 
 - Live, isolated daemon: see docs/features/agent-communication.md "Verified live (2026-10-14)".
 - `just chat-smoke` on claude 2.1.300 + codex 0.162.1: 31/31. The `TESTED_*_VERSION` pins are already 2.1.300 and 0.162.1 (set by Pass 43).
 
+
+## Pass 45 (2026-10-15 — live probes cursor-agent 2026.10.14-941492e, grok 1.0.46, agy-acp 1.2.1): chimaera's pre-allowed tools on ACP, and Cursor's to-do list. ADOPTED.
+
+Two gaps the batch review found: every pre-allowed chimaera tool (`mcp::ALWAYS_ALLOWED_TOOLS`: `notify`, the document tools, `open_browser`, `update_plan`) still raised a permission card in an ACP chat — ACP has no pre-allow config, Codex's `SpawnSpec.mcp_auto_approve` was Codex-only, and the ACP driver surfaced every `session/request_permission` — and Cursor's own to-do list (`cursor/update_todos`) was answered `-32601` and drawn nowhere. Both needed the frames.
+
+**Method.** A raw ACP client ran the adapter's own sequence (`initialize` with no fs/terminal capabilities, `authenticate {methodId, _meta.headless}`, `session/new {cwd, mcpServers}` with the entry the daemon sends — `{type: "http", name: "chimaera", url, headers: [{name: "Authorization", value: "Bearer …"}]}`) against a stand-in streamable-HTTP MCP server named `chimaera` offering `notify`, `open_browser`, `document_guide` and `list_terminals`, and asked each agent for the three calls in order. The shapes below are the agents', not the server's; the same calls then ran through the isolated daemon against the real endpoint (the gate). All three honored the stdin `mcpServers` entry: Cursor sent `Authorization: Bearer …` with `clientInfo {name: "Cursor", version: "1.0.0"}` and MCP `protocolVersion: "2025-11-25"` (its docs name `.cursor/mcp.json` as the source; the session's list works too), Grok and Antigravity likewise. Agy-acp must be launched by its resolved path: through the managed `agy-acp` symlink alone, `session/new` fails `-32603 "Could not find default localharness binary"` (the daemon's launcher already resolves it).
+
+### The permission request for an MCP tool, per agent
+
+Every agent names the server and the tool, each in its own place; the title alone is never enough, because the model's tool name is interpolated into it verbatim.
+
+**Antigravity (agy-acp 1.2.1)** — structured `_meta`; the title is `<server>_<tool>`; the request's `toolCall` equals the preceding `tool_call` update:
+
+```json
+{"jsonrpc":"2.0","id":0,"method":"session/request_permission","params":{"sessionId":"ee4a…","toolCall":{"toolCallId":"cab0087fdc5748f3b428d0cc480cd5a7","kind":"other","status":"pending","title":"chimaera_notify","content":[],"rawInput":{"arguments":{"text":"hello from probe"},"text":"hello from probe"},"_meta":{"mcp":{"tool":"notify","server":"chimaera"},"is_mcp_tool_call":true}},"options":[{"optionId":"allow_always","name":"Allow Always","kind":"allow_always"},{"optionId":"allow","name":"Allow","kind":"allow_once"},{"optionId":"deny","name":"Deny","kind":"reject_once"}]}}
+```
+
+**Grok Build 1.0.46** — an MCP call is its `use_tool` tool: `rawInput {variant: "UseTool", tool_name: "<server>__<tool>", tool_input}` under `_meta["x.ai/tool"].kind == "use_tool"`, the title repeating `tool_name`. (The `tool_call` update that precedes it has `title: "use_tool"` and the unprefixed `rawInput`; a `tool_call_update` then renames it; the completed update's `rawOutput` carries `{type: "MCP", tool_name, server_name}`.)
+
+```json
+{"jsonrpc":"2.0","id":0,"method":"session/request_permission","params":{"sessionId":"01a1…","toolCall":{"toolCallId":"call-a49db86c-3bb4-445f-887b-27c3370ef139-1","kind":"other","title":"chimaera__notify","rawInput":{"variant":"UseTool","tool_name":"chimaera__notify","tool_input":{"text":"hello from probe"}},"_meta":{"x.ai/tool":{"version":1,"name":"use_tool","kind":"use_tool","namespace":"grok_build","label":"Use Tool","read_only":false}}},"options":[{"optionId":"always-allow","name":"always allow","kind":"allow_always"},{"optionId":"allow-once","name":"allow once","kind":"allow_once"},{"optionId":"reject-once","name":"reject once","kind":"reject_once"}]}}
+```
+
+**Cursor CLI 2026.10.14** — the request's `toolCall` has NO `rawInput` (only a `content` text block with the arguments as a JSON fence) and its title is `<server>-<tool>: <tool>`; the server and tool are named by the `tool_call_update` that precedes it, same `toolCallId` (which contains a newline). The row opens as `tool_call {title: "MCP: tool", rawInput: {}}`, then:
+
+```json
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"e787…","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-dff99f2e-b536-4ea5-82b2-409a16e88c4c-1\nfc_77bc5181-0275-9386-833a-574b551b67aa_0","title":"chimaera: notify","rawInput":{"providerIdentifier":"chimaera","toolName":"notify","args":{"text":"hello from probe"}}}}}
+{"jsonrpc":"2.0","id":0,"method":"session/request_permission","params":{"sessionId":"e787…","toolCall":{"toolCallId":"call-dff99f2e-b536-4ea5-82b2-409a16e88c4c-1\nfc_77bc5181-0275-9386-833a-574b551b67aa_0","title":"chimaera-notify: notify","kind":"other","status":"pending","content":[{"type":"content","content":{"type":"text","text":"```json\n{\n  \"text\": \"hello from probe\"\n}\n```"}}]},"options":[{"optionId":"allow-once","name":"Allow once","kind":"allow_once"},{"optionId":"allow-always","name":"Allow always","kind":"allow_always"},{"optionId":"reject-once","name":"Reject","kind":"reject_once"}]}}
+```
+
+Cursor's completed update: `{"status":"completed","rawOutput":{"success":true}}`. Grok's: `{"status":"completed","rawOutput":{"type":"MCP","tool_name":"notify","server_name":"chimaera","output":{"OkayOutput":"ok"}}}`. Antigravity's carries the tool text as `content` and `rawOutput`.
+
+### Cursor's to-do list
+
+Cursor's built-in `TodoWrite` reaches the client as **`cursor/update_todos`, a JSON-RPC REQUEST (it has an `id`)** on this build, while [Cursor's ACP page](https://cursor.com/docs/cli/acp) calls it a notification ("Sent as a notification; no response required") and still documents a response type. Captured, three updates in one turn:
+
+```json
+{"jsonrpc":"2.0","id":0,"method":"cursor/update_todos","params":{"toolCallId":"call-e7813dbd-f14c-4d36-9bc1-581803d671d3-1\nfc_20676f0e-24ad-9ed8-8c29-cde7d2c8d719_0","todos":[{"id":"inspect","content":"inspect","status":"pending"},{"id":"draft","content":"draft","status":"pending"},{"id":"verify","content":"verify","status":"pending"}],"merge":false}}
+{"jsonrpc":"2.0","id":1,"method":"cursor/update_todos","params":{"toolCallId":"call-0904…","todos":[{"id":"inspect","content":"inspect","status":"in_progress"},{"id":"draft","content":"draft","status":"pending"},{"id":"verify","content":"verify","status":"pending"}],"merge":true}}
+```
+
+- `status` is `pending | in_progress | completed | cancelled`; `merge: false` on the first write, `true` after, each time with the whole list (Cursor's own merge is by `id`).
+- Each is preceded by the agent's tool row: `tool_call {title: "Update TODOs", rawInput: {_toolName: "updateTodos"}}` and `tool_call_update`s whose `rawInput.todos` carry Cursor's internal statuses (`TODO_STATUS_IN_PROGRESS`, `createdAt`, `dependencies`); the request is the documented carrier.
+- **Reply:** the documented accepted outcome, `{"outcome":{"outcome":"accepted","todos":[{id, content, status}…]}}`, was answered live and the turn went on with no complaint; so did the earlier `-32601` (Cursor keeps its list itself either way). The adapter answers the accepted outcome with the list as it now holds it, and only when the frame has an id.
+
+**Grok's plan** needs nothing new: its `todo_write` tool (`_meta["x.ai/tool"] {name: "todo_write", kind: "plan"}`, `rawInput {todos, merge}`) is followed by the ACP `plan` update (`entries: [{content, priority, status}]`) the adapter already mapped. **Antigravity** has no plan tool: asked to use one, it answered "I do not have a built-in plan, task, or todo tool." — nothing reaches the card.
+
+### ADOPTED
+
+- **`SpawnSpec.mcp_auto_approve` reaches the ACP adapter** (chat.rs sets the worker consent for every ACP chat: `ALWAYS_ALLOWED_TOOLS` + the workspace's `plugins::spawn_allow`, never a Mastermind tier). The adapter answers a matching `session/request_permission` with the offered **`allow_once`** option (never `allow_always`: a standing grant the agent would keep) and no `PermissionRequest`. Scoped like Codex's: one server; the tool only in the pinned shape — agy's `_meta.mcp` + title `<server>_<tool>`, Grok's `UseTool` + `use_tool` meta + title = `tool_name` split at `__`, Cursor's remembered `tool_call_update {providerIdentifier, toolName}` + title `<server>-<tool>: <tool>` — with a `[A-Za-z0-9_-]` tool charset; whole-server consent (`tools: None`, no ACP caller today) needs the structured server alone; a consent with a server match but no pinned tool tracing-warns and surfaces the ask. A shell command, a file edit, another server, a title that disagrees with the structured fields, or a request with no `allow_once` option all surface as before. Cursor's names are forgotten when the call ends and at turn end.
+- **`cursor/update_todos` draws the plan card:** a `Plan` level-set with `id`s (merge by id into the session's list; a cancelled item leaves the card, which has no such state; ≤ 64), journaled like every other plan, answered `accepted`. The agent's own plan rows — Cursor's `updateTodos`, Grok's `kind: "plan"` tool — draw no transcript row, as claude's TodoWrite.
+- **The MCP plan paragraph says what each ACP agent has** (`mcp.rs` `task_list_instructions`): Cursor its TodoWrite, Grok its `todo_write`, Antigravity that no tool reaches the card (so it keeps the steps in its reply).
+
+### Gate (Pass 45)
+
+- Hermetic (`acp.rs`): `antigravity_pre_approval_reads_the_mcp_meta_and_the_title`, `grok_pre_approval_reads_the_use_tool_input_and_the_title`, `cursor_pre_approval_needs_the_preceding_update_and_the_title_to_agree`, `cursor_update_todos_draws_the_plan_card_and_is_accepted`, `grok_plan_tool_rows_are_hidden_and_the_plan_update_draws`; `mcp.rs` `plan_paragraph_and_tool_follow_runtime_and_surface`.
+- Live: `just chat-smoke-acp` with `CHIMAERA_TEST_GROK`, `CHIMAERA_TEST_AGY_ACP` (the resolved `.par`) and `CHIMAERA_TEST_CURSOR`; and the isolated daemon — see docs/features/chat-mode.md ("Verified live", Pass 45).

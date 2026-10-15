@@ -69,9 +69,11 @@ and in `App.svelte` the view reporting + `focusFromNotification`.
   asked for or would want while away: turn ends and permission asks are already automatic.
 - **Where it lives.** `mcp.rs` (`notify_tool_def`, `notify`, `ALWAYS_ALLOWED_TOOLS`),
   `notices.rs::push_agent_notice`.
-- **Key behaviors.** Pre-approved for native Claude/Codex sessions — Claude via `permissions.allow: ["mcp__chimaera__notify", …]` in the generated
+- **Key behaviors.** Pre-approved on every chat runtime — Claude via `permissions.allow: ["mcp__chimaera__notify", …]` in the generated
   settings, codex via `SpawnSpec.mcp_auto_approve` (the driver answers those tools'
-  elicitations). ACP sessions retain their provider's native approval behavior.
+  elicitations), the ACP chats (Antigravity, Grok, Cursor) via the same `mcp_auto_approve`,
+  answered by the ACP driver at the permission request in each agent's live-captured shape
+  (PROTOCOL.md Pass 45).
   `ALWAYS_ALLOWED_TOOLS` also holds the read-only document tools, `open_browser` and `update_plan`. Rate-limited per session (one per 5s, 20 per hour; the refusal text tells the
   agent why). An agent message supersedes the automatic `done`/`input` notice for the same
   session for 2 minutes, so "notify me when done" pings once, in the agent's words. With
