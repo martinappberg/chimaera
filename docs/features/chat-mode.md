@@ -812,8 +812,9 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   verdict, re-asked on the failure) and relaunches in place once the CLI confirms the login
   (`POST /sessions/{id}/view {ui:"chat"}` on the dead chat, every agent); a live chat whose turn
   fails with an auth-shaped error (`chat/authFailure.ts`) re-asks the status command and shows the
-  card at its tail, and signing in relaunches it in place (`{ui:"chat", relaunch:true}`, resuming
-  the native conversation) — [agents.md › Sign in](agents.md#sign-in). A fatal startup error renders once: the banner, no
+  card at its tail with the composer closed, and a landed sign-in relaunches every chat of that
+  agent that waited on it (`chat::relaunch_after_sign_in` → `{ui:"chat", relaunch:true}`, resuming
+  the native conversation once it had a prompt) — [agents.md › Sign in](agents.md#sign-in). A fatal startup error renders once: the banner, no
   twin transcript line and no trailing "agent exited".
 - **Startup watchdog** (`driver.rs`, `chat.rs`): all providers have 60 seconds for login-shell
   setup, workspace startup hooks, MCP discovery and protocol initialization. Once initialized,

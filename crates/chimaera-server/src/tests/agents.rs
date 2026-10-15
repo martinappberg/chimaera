@@ -1076,6 +1076,80 @@ async fn agents_rows_flag_managed_installs() {
     assert_eq!(row("cursor")["sign_in"]["command"], "cursor-agent login");
 }
 
+/// A chat that died at startup for want of a login is started again, in
+/// place, when that agent's sign-in lands — the same session id, a second
+/// life in the same journal — and a chat of another agent is left alone.
+#[tokio::test]
+async fn a_landed_sign_in_relaunches_the_chats_that_waited_on_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let state = test_state();
+    let ws = make_workspace(&state, "signin-relaunch").await;
+    // Signed out: the fake refuses at startup with claude's own words.
+    let bin = test_dir("signin-relaunch-bin").join("claude");
+    std::fs::write(
+        &bin,
+        "#!/bin/sh\nprintf '%s\\n' 'Not logged in · Please run /login' >&2\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    preset_agent(
+        &state,
+        agents::AgentKind::Claude,
+        Ok(bin.clone()),
+        Some("9.9.9-fake"),
+    );
+    let (status, row) = request(
+        &state,
+        Method::POST,
+        "/api/v1/sessions",
+        Some(serde_json::json!({"workspace_id": ws, "kind": "agent", "ui": "chat"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{row}");
+    let id = row["id"].as_str().unwrap().to_string();
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let dead = state.chat.get(&id).is_some_and(|c| !c.alive);
+            let flagged = lock(&state.agents)
+                .get(&id)
+                .is_some_and(|r| r.signed_out_at_start);
+            if dead && flagged {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the startup failure settles and is read as a sign-in one");
+
+    // The login lands: the same executable now answers the handshake.
+    std::fs::copy(write_fake_claude("signin-relaunch-ok"), &bin).unwrap();
+    assert_eq!(
+        chat::relaunch_after_sign_in(state.clone(), agents::AgentKind::Claude).await,
+        1
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while !state.chat.get(&id).is_some_and(|c| c.alive) {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the chat lives again under the same id");
+    assert!(
+        !lock(&state.agents).get(&id).unwrap().signed_out_at_start,
+        "the relaunch clears the mark"
+    );
+    // Nothing waits any more: a second landing does nothing.
+    assert_eq!(
+        chat::relaunch_after_sign_in(state.clone(), agents::AgentKind::Claude).await,
+        0
+    );
+    assert_eq!(
+        chat::relaunch_after_sign_in(state.clone(), agents::AgentKind::Codex).await,
+        0
+    );
+}
+
 /// A sign-in is one bounded operation per agent behind
 /// `/agents/{id}/sign-in`: unknown agents 404, a start needs an installed
 /// agent and an open workspace, and the catalog row names the operation.

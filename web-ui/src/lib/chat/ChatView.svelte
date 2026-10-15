@@ -2607,7 +2607,7 @@
   /** Nothing to type into (and so nothing to quote into): a read-only
    *  subagent view, or a session that ended, degraded or failed. */
   const composerDisabled = $derived(
-    readOnly || store.exited !== null || store.degraded || store.fatalError !== null,
+    readOnly || store.exited !== null || store.degraded || store.fatalError !== null || liveSignIn,
   );
   const incompatibleRuntime = $derived(/GLIBC_[\d.]+[^\n]*not found/.test(store.fatalError ?? ""));
 
@@ -2803,7 +2803,7 @@
     {:else if store.exited === null && !store.fatalError && (!store.initialized || store.blocks.length === 0)}
       <div class="empty" role="status">
         <SessionGlyph kind="agent" {agentKind} size={18} />
-        <span>{!store.connected ? `connecting to ${agentName}…` : store.initialized ? `${agentName} is ready` : `starting ${agentName}…`}</span>
+        <span>{!store.connected ? `connecting to ${agentName}…` : store.initialized ? (liveSignIn ? `${agentName} is waiting for a sign-in` : `${agentName} is ready`) : `starting ${agentName}…`}</span>
         {#if store.connected && !store.initialized && store.startupDetail}
           <span class="startup-detail">{store.startupDetail}</span>
         {/if}
@@ -3072,8 +3072,9 @@
         {@const hook = item.block.tone === "info" ? hookNotice(item.block.text) : null}
         {#if hook}
           <HookRow said={hook} sourceIndex={item.index} sourceUid={item.block.uid} />
-        {:else if item.block.text !== store.fatalError}
-        <!-- The failure a fatal banner is showing is not repeated as a line. -->
+        {:else if item.block.text !== store.fatalError && !(signInNeeded && item.block.tone === "error" && looksLikeAuthFailure(item.block.text))}
+        <!-- The failure a fatal banner is showing is not repeated as a line,
+             and a login's refusal is the sign-in card, not raw 401 text. -->
         <div
           class="notice"
           class:error={item.block.tone === "error"}
@@ -3438,6 +3439,7 @@
     view={quoteOwner}
     running={agentBusy}
     disabled={composerDisabled}
+    disabledHint={liveSignIn ? `sign in to ${agentName} first` : null}
     slashCommands={composerCommands}
     workspaceId={session.workspace_id ?? null}
     {terminals}

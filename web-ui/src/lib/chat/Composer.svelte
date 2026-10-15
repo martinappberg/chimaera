@@ -58,6 +58,8 @@
     view?: object;
     running: boolean;
     disabled: boolean;
+    /** Why the composer is closed, when not "chat ended" (a sign-in first). */
+    disabledHint?: string | null;
     slashCommands: ComposerCommand[];
     /** Quick-open scope for @-mentions; null disables them. */
     workspaceId: string | null;
@@ -92,6 +94,7 @@
     view,
     running,
     disabled,
+    disabledHint = null,
     slashCommands,
     workspaceId,
     terminals,
@@ -1100,7 +1103,7 @@
       class:mod-decorated={hasNativeDecorations && spoken === null}
       readonly={spoken !== null}
       placeholder={disabled
-        ? "chat ended"
+        ? (disabledHint ?? "chat ended")
         : spoken !== null
           ? dictation.state === "starting"
             ? "Starting the mic…"
