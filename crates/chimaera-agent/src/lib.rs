@@ -414,12 +414,6 @@ impl MainThread {
                 if self.turn_since_ms.is_none() {
                     return;
                 }
-                // A re-emit renames the call (an ACP update naming its MCP
-                // tool); the wait keeps its start.
-                if let Some(call) = self.calls.iter_mut().find(|c| &c.id == id) {
-                    call.title = title.chars().take(160).collect();
-                    return;
-                }
                 let kind = match kind {
                     ToolKind::Agent if id.starts_with("task:") => return,
                     ToolKind::Agent => WaitKind::Subagent,
@@ -427,6 +421,13 @@ impl MainThread {
                     ToolKind::Execute => WaitKind::Command,
                     _ => WaitKind::Tool,
                 };
+                // A re-emit renames the call (an ACP update naming its MCP
+                // tool); the wait keeps its start.
+                if let Some(call) = self.calls.iter_mut().find(|c| &c.id == id) {
+                    call.kind = kind;
+                    call.title = title.chars().take(160).collect();
+                    return;
+                }
                 if self.calls.len() < MAIN_CALLS_CAP {
                     self.calls.push(BlockingCall {
                         id: id.clone(),

@@ -439,6 +439,13 @@ describe("ChatStore pending-send ordering", () => {
     const tools = store.blocks.filter((b) => b.kind === "tool");
     expect(tools).toHaveLength(1);
     expect(tools[0]).toMatchObject({ tool: "fetch", title: "chimaera: notify", status: "completed" });
+
+    // A live row re-emitted as another kind leaves the live-agents set.
+    const agent = fold([
+      { type: "tool_call", id: "a1", kind: "agent", title: "Task: probe", status: "in_progress" },
+      { type: "tool_call", id: "a1", kind: "other", title: "probe", status: "in_progress" },
+    ]);
+    expect(agent.activeAgents).toHaveLength(0);
   });
 
   it("a codex-style allow (option 'accept') marks the tool allowed, never denied", () => {

@@ -1340,8 +1340,10 @@ impl Mapper for AcpMapper {
                         moved |= renamed != *kind;
                         *kind = renamed;
                     }
-                    if update["locations"].is_array() {
-                        let renamed = locations();
+                    // An empty list never erases the paths the row showed:
+                    // an edit's files are what the turn says it wrote.
+                    let renamed = locations();
+                    if !renamed.is_empty() {
                         moved |= renamed != *locations_now;
                         *locations_now = renamed;
                     }
@@ -2205,9 +2207,11 @@ mod tests {
         assert!(
             matches!(named.events.last(), Some(AgentEvent::ToolCallUpdate { id: i, .. }) if i == id)
         );
-        // The same title again, or a status-only update: no re-emit.
+        // The same title again, a status-only update, or an empty location
+        // list: no re-emit.
         let again = m.on_frame(&update(
-            json!({"sessionUpdate":"tool_call_update","toolCallId":id,"title":"chimaera: notify"}),
+            json!({"sessionUpdate":"tool_call_update","toolCallId":id,
+            "title":"chimaera: notify","locations":[]}),
         ));
         assert!(rows(&again).is_empty());
         let done = m.on_frame(&update(json!({"sessionUpdate":"tool_call_update","toolCallId":id,"status":"completed","rawOutput":{"success":true}})));

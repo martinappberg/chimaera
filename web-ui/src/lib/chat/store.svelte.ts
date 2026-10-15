@@ -2087,8 +2087,9 @@ export class ChatStore {
   /** Keep {@link activeAgents} consistent with one agent tool row's status.
    *  Idempotent; entries stay in event (= transcript) order. */
   private syncAgentRow(block: Extract<ChatBlock, { kind: "tool" }>): void {
-    if (block.tool !== "agent") return;
-    const live = block.status === "pending" || block.status === "in_progress";
+    // A re-emit can change a row's kind: one that stopped being an agent
+    // leaves the live set too.
+    const live = block.tool === "agent" && (block.status === "pending" || block.status === "in_progress");
     const i = this.activeAgents.findIndex((a) => a.id === block.id);
     if (live && i === -1) this.activeAgents.push(block);
     else if (!live && i !== -1) this.activeAgents.splice(i, 1);
