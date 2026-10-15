@@ -24,15 +24,9 @@ async fn mcp_handshake_auth_and_tool_listing() {
         .as_str()
         .unwrap()
         .contains("@term:"));
-    // The plan card asks for the agent's own task list, in its tool's words.
+    // A terminal session has no plan card to draw: no paragraph asks for one.
     let text = out["result"]["instructions"].as_str().unwrap();
-    assert!(text.contains("Plan card:"), "{text}");
-    assert!(
-        text.contains("update_plan TOOL from the chimaera MCP server")
-            || text.contains("update_plan")
-            || text.contains("to-do TOOL"),
-        "{text}"
-    );
+    assert!(!text.contains("Plan card:"), "{text}");
 
     // Notifications (no id) are 202-acknowledged.
     let (status, _) = mcp_post(
@@ -45,7 +39,8 @@ async fn mcp_handshake_auth_and_tool_listing() {
     assert_eq!(status, StatusCode::ACCEPTED);
 
     // tools/list names the three linked-terminal tools, the two document
-    // tools, notify, open_browser, and agent communication's four.
+    // tools, notify, open_browser, and agent communication's four — and no
+    // update_plan for a terminal session.
     let (status, out) = mcp_post(
         &state,
         &id,
@@ -70,7 +65,6 @@ async fn mcp_handshake_auth_and_tool_listing() {
             "check_document",
             "notify",
             "open_browser",
-            "update_plan",
             "workspace_agents",
             "read_agent",
             "message_agent",
@@ -214,6 +208,39 @@ async fn update_plan_journals_a_plan_level_set_for_chats_only() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let sid = body["id"].as_str().unwrap().to_string();
     let key = crate::lock(&state.agents).get(&sid).unwrap().key.clone();
+
+    // A Claude chat is the one session offered the tool, and asked for the
+    // card in its words.
+    let (status, out) = mcp_post(
+        &state,
+        &sid,
+        &key,
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let text = out["result"]["instructions"].as_str().unwrap();
+    assert!(
+        text.contains("Plan card:")
+            && text.contains("update_plan TOOL from the chimaera MCP server"),
+        "{text}"
+    );
+    let (_, out) = mcp_post(
+        &state,
+        &sid,
+        &key,
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+    )
+    .await;
+    assert!(
+        out["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["name"] == "update_plan"),
+        "{out}"
+    );
 
     let (is_error, text) = mcp_tool_call(
         &state,

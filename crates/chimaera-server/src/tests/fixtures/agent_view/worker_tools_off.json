@@ -127,46 +127,6 @@
         "type": "object"
       },
       "name": "open_browser"
-    },
-    {
-      "description": "Show the user your plan as a card beside the chat and keep it current. Send the WHOLE list every time (it replaces the last one): the steps in order, exactly one in_progress while you work, each completed as it finishes, pending for the rest. Call it with the first tool call of any request that edits files or runs more than one command, and again as each step finishes or the plan changes. It draws the card and nothing else; a plan written as a file, a checklist or prose shows nothing there.",
-      "inputSchema": {
-        "additionalProperties": false,
-        "properties": {
-          "items": {
-            "description": "The plan, in order (1–32 steps).",
-            "items": {
-              "additionalProperties": false,
-              "properties": {
-                "content": {
-                  "description": "The step, a short imperative phrase.",
-                  "type": "string"
-                },
-                "status": {
-                  "enum": [
-                    "pending",
-                    "in_progress",
-                    "completed"
-                  ],
-                  "type": "string"
-                }
-              },
-              "required": [
-                "content",
-                "status"
-              ],
-              "type": "object"
-            },
-            "maxItems": 32,
-            "type": "array"
-          }
-        },
-        "required": [
-          "items"
-        ],
-        "type": "object"
-      },
-      "name": "update_plan"
     }
   ]
 }

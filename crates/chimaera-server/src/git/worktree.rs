@@ -82,6 +82,7 @@ async fn branch_exists(git: &Path, procs: &Semaphore, dir: &Path, branch: &str) 
 }
 
 /// A created (or, for [`ensure_branch_worktree`], reused) worktree.
+#[derive(Clone)]
 pub(crate) struct Created {
     pub(crate) path: PathBuf,
     pub(crate) branch: String,
