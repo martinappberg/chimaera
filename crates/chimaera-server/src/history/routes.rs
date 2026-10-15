@@ -52,7 +52,13 @@ pub(crate) struct ListQuery {
 /// What reopening a record means, computed per row at list time (a stat or
 /// two): its native handle when the agent can still resume it, and in plain
 /// words why not when it can't.
-fn reopen(rec: &Record, root: &Path, claude_store: &Path, journal_dir: &Path) -> serde_json::Value {
+fn reopen(
+    rec: &Record,
+    root: &Path,
+    claude_store: &Path,
+    journal_dir: &Path,
+    worktree_index: &std::collections::HashMap<String, std::path::PathBuf>,
+) -> serde_json::Value {
     let native = rec.transcript.as_ref().and_then(|t| t.native.clone());
     let journal = rec
         .transcript
@@ -68,16 +74,27 @@ fn reopen(rec: &Record, root: &Path, claude_store: &Path, journal_dir: &Path) ->
         match rec.agent.as_str() {
             "claude" => match &native {
                 Some(id) => {
-                    let recorded = rec
+                    // The shared lookup, minus its scan (one index per page
+                    // stands in): the recorded path, the folders the session
+                    // story saw it in (a worktree it started or ended in),
+                    // the root, then the root's Claude worktrees.
+                    let recorded: Vec<std::path::PathBuf> = rec
                         .transcript
                         .as_ref()
                         .and_then(|t| t.path.as_deref())
-                        .is_some_and(|p| Path::new(p).is_file());
-                    let derived = claude_store
-                        .join(crate::launcher::encode_cwd(root))
-                        .join(format!("{id}.jsonl"))
-                        .is_file();
-                    if recorded || derived {
+                        .map(std::path::PathBuf::from)
+                        .into_iter()
+                        .collect();
+                    let mut cwds: Vec<std::path::PathBuf> = ["start", "current"]
+                        .iter()
+                        .filter_map(|k| rec.git.as_ref()?.get(k)?.get("worktree")?.as_str())
+                        .map(std::path::PathBuf::from)
+                        .collect();
+                    cwds.push(root.to_path_buf());
+                    let found = crate::claude_store::find_known(claude_store, id, &recorded, &cwds)
+                        .is_some()
+                        || worktree_index.contains_key(id.as_str());
+                    if found {
                         (Some(id.clone()), None)
                     } else {
                         (
@@ -141,6 +158,9 @@ pub(crate) async fn list(
     let epoch = state.history.epoch();
     let answer = tokio::task::spawn_blocking(move || {
         let parsed = merge(read_lines(&path));
+        // One bounded pass for the whole page, not a scan per row.
+        let worktree_index =
+            crate::claude_store::worktree_index(&claude_store, std::slice::from_ref(&root));
         let live_rids: std::collections::HashSet<String> =
             live.iter().map(|r| r.rid.clone()).collect();
         let mut rows: Vec<(bool, Record)> = live.into_iter().map(|r| (true, r)).collect();
@@ -174,7 +194,7 @@ pub(crate) async fn list(
                 v["reopen"] = if is_live {
                     json!(null)
                 } else {
-                    reopen(&rec, &root, &claude_store, &journal_dir)
+                    reopen(&rec, &root, &claude_store, &journal_dir, &worktree_index)
                 };
                 // The raw running totals are the baseline's business.
                 if let Some(map) = v.as_object_mut() {

@@ -58,6 +58,11 @@ pub(crate) struct Workspace {
     /// its sessions never enter the ledger. Absent for every user workspace.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) hidden: bool,
+    /// New agent sessions start in a Chimaera-managed worktree of their own
+    /// (the launcher's remembered per-workspace choice; the Mastermind's
+    /// `spawn_agent` follows it too). Additive wire field: absent = off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) new_in_worktree: bool,
 }
 
 /// In-memory workspace list backed by a JSON file (save-on-change).
@@ -206,6 +211,7 @@ impl WorkspaceStore {
             last_opened_at: unix_now(),
             mastermind: None,
             plugins_on: Vec::new(),
+            new_in_worktree: false,
             hidden: false,
         };
         self.items.push(workspace.clone());
@@ -238,6 +244,7 @@ impl WorkspaceStore {
                 last_opened_at: unix_now(),
                 mastermind: None,
                 plugins_on: Vec::new(),
+                new_in_worktree: false,
                 hidden: false,
             },
         );
@@ -255,6 +262,26 @@ impl WorkspaceStore {
             tracing::warn!(%err, "failed to persist workspace touch");
         }
         Some(workspace)
+    }
+
+    /// Remember whether new agents in `id` start in their own worktree.
+    /// `Ok(None)` = unknown workspace. A lost write is cosmetic (the choice
+    /// reverts at the next restart), so the in-memory value stays either way.
+    pub(crate) fn set_new_in_worktree(
+        &mut self,
+        id: &str,
+        on: bool,
+    ) -> anyhow::Result<Option<Workspace>> {
+        let Some(entry) = self.items.iter_mut().find(|w| w.id == id) else {
+            return Ok(None);
+        };
+        if entry.new_in_worktree == on {
+            return Ok(Some(entry.clone()));
+        }
+        entry.new_in_worktree = on;
+        let workspace = entry.clone();
+        self.save()?;
+        Ok(Some(workspace))
     }
 
     /// Set (or clear) `id`'s Mastermind binding, persisting on change.

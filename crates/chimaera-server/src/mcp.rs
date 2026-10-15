@@ -421,6 +421,13 @@ fn mastermind_tool_defs() -> Vec<Value> {
                         "type": "string",
                         "description": "Start point for a NEW branch (default: the current HEAD)",
                     },
+                    "worktree": {
+                        "type": "boolean",
+                        "description": "Without `branch`: run the worker in a new worktree of \
+                                        its own on a fresh branch (true) or at the workspace \
+                                        root (false). Default: the user's per-workspace choice \
+                                        for new agents",
+                    },
                 },
                 "additionalProperties": false,
             },
@@ -1542,6 +1549,13 @@ async fn spawn_agent(
     if base.is_some() && branch.is_none() {
         return tool_error("`base` needs a `branch`".to_string());
     }
+    // A worker without a branch follows the user's launcher choice for this
+    // workspace unless the Mastermind says otherwise.
+    let own_worktree = branch.is_none()
+        && args
+            .get("worktree")
+            .and_then(|w| w.as_bool())
+            .unwrap_or(workspace.new_in_worktree);
     // Held across the spawn await: releases only once the session is
     // registered (or the spawn failed), closing the check-then-act window.
     let _slot = match SpawnReservation::acquire(state, &workspace.id) {
@@ -1551,6 +1565,17 @@ async fn spawn_agent(
     // The worker stays in THIS workspace (so message_agent reaches it) and
     // runs in the branch's worktree.
     let place = match branch {
+        None if own_worktree => {
+            match crate::git::create_session_worktree(state, &workspace, kind.as_str()).await {
+                Ok(created) => Some(created),
+                // Asked for: say why not. Only the remembered default (which
+                // may outlive the folder being a repository): the root.
+                Err((_, msg)) if args.get("worktree").is_some() => {
+                    return tool_error(format!("no worktree for the worker: {msg}"));
+                }
+                Err(_) => None,
+            }
+        }
         None => None,
         Some(branch) => {
             match crate::git::ensure_branch_worktree(state, &workspace, branch, base).await {

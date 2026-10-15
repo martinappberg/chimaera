@@ -1106,29 +1106,36 @@ pub(crate) async fn claude_resumables(
         )
             .into_response();
     };
-    let dir = state.claude_projects_dir.join(encode_cwd(&workspace.root));
+    let store = state.claude_projects_dir.clone();
+    let root = workspace.root.clone();
     let exclude: Vec<PathBuf> = crate::lock(&state.agents)
         .values()
         .filter_map(|a| a.transcript_path.clone())
         .collect();
-    // Transcripts can be tens of MB; scan them off the async runtime.
-    let list = tokio::task::spawn_blocking(move || scan_resumables(&dir, &exclude))
-        .await
-        .unwrap_or_default();
+    // Transcripts can be tens of MB; scan them off the async runtime. The
+    // root's project dir plus its Claude worktrees' (`EnterWorktree` moves a
+    // conversation into `.claude/worktrees/<name>`'s dir).
+    let list = tokio::task::spawn_blocking(move || {
+        let mut dirs = vec![store.join(encode_cwd(&root))];
+        dirs.extend(crate::claude_store::claude_worktree_dirs(&store, &[root]));
+        scan_resumables(&dirs, &exclude)
+    })
+    .await
+    .unwrap_or_default();
     Json(serde_json::Value::Array(list)).into_response()
 }
 
-/// Resumable sessions under one project-store dir: `*.jsonl` files, newest
+/// Resumable sessions under the given project-store dirs: `*.jsonl` files, newest
 /// mtime first, summarized to id/title/mtime/approx_messages, capped. A
 /// missing dir (workspace never used with claude) is an empty list, not an
 /// error. Transcripts with nothing user-visible to title them (warmups,
 /// empty boots) are skipped rather than listed as "untitled".
 /// (Shared with GET /recents, which merges this history into the rail.)
-pub(crate) fn scan_resumables(dir: &Path, exclude: &[PathBuf]) -> Vec<serde_json::Value> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut files: Vec<(PathBuf, std::time::SystemTime)> = entries
+pub(crate) fn scan_resumables(dirs: &[PathBuf], exclude: &[PathBuf]) -> Vec<serde_json::Value> {
+    let mut files: Vec<(PathBuf, std::time::SystemTime)> = dirs
+        .iter()
+        .filter_map(|dir| std::fs::read_dir(dir).ok())
+        .flatten()
         .filter_map(|entry| {
             let entry = entry.ok()?;
             let path = entry.path();

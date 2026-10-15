@@ -56,7 +56,12 @@ PTY snapshot-on-attach ([terminals.md](terminals.md)) and the chat seq-journal g
   need re-granting (see [linked-terminals.md](linked-terminals.md)). A
   recorded claude resume id is a *claim*, not a promise — restore verifies the transcript on disk first
   (claude 2.1.204 interactive sessions persist no transcript, so a missing file boots fresh, not "No
-  conversation found"). A client connecting mid-restore waits `wait_restored()` (cap 15s) so it never
+  conversation found"). The check follows the conversation wherever claude filed it: the
+  hook-reported transcript path (recorded for chats and terminals alike), the session's own cwd (a
+  worktree it started in), the root, and the root's Claude worktrees
+  ([agents.md](agents.md#where-each-agent-keeps-a-conversation-resume-from-any-folder)). A resumed
+  claude chat reports its id only with its first turn, so until then the ledger keeps the id it was
+  resumed from — a chat restarted twice without a turn between still resumes. A client connecting mid-restore waits `wait_restored()` (cap 15s) so it never
   prunes still-respawning tabs. A busy handoff port after ~5s falls back to an OS-assigned port (stay up
   on a fresh port rather than die); a crash leaves no handoff; an explicit conflicting `--port` wins.
 - **Chat journals survive the restart too.** The chat-journal dir budget (100 MiB / 200 files) waits
