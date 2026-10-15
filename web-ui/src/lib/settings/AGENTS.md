@@ -49,9 +49,10 @@ section (`requestSettingsSection`) — or at one setting's row, given its id.
 
 **Agents holds schema rows too.** The Agents category renders the bespoke
 `AgentsSettings` panel (its `agents.<id>.path` rows are presented there, not
-generically), then **Agent communication** — `agents.communication.enabled` and
-`agents.communication.wakes` — as ordinary `SettingRow`s under their own
-subheading (`SettingsView`). The schema has no "show only when" yet, so the
+generically), then **Agent communication** — `agents.communication.enabled`,
+`agents.communication.wakes` and `agents.communication.freeSubagents` — as ordinary
+`SettingRow`s under their own subheading (`SettingsView`, every
+`agents.communication.*` row). The schema has no "show only when" yet, so the
 wakes row always shows.
 
 ## File map
@@ -62,7 +63,7 @@ wakes row always shows.
 | `schema.ts` | The settings schema: keys, types, defaults, labels, groups. Ground truth. |
 | `store.svelte.ts` | The reactive settings store: load/patch/persist against `/api/v1/settings`, sparse-map semantics, the `dirtySince` echo-guard, and document-wide theme/interface/editor CSS variables. |
 | `themes.ts` | The curated light/dark theme definitions + `applyAppearance`. |
-| `AgentsSettings.svelte` | Installed-agent cards; Advanced paths and removal. Opens the shared `../workspace/AgentSetupDialog.svelte` through `agentSetup.ts` for install/update/reinstall and recoverable progress/results; the compact dialog keeps technical output under Details and separates Sign in from Open chat. Polls only while visible and preserves unfinished edits. |
+| `AgentsSettings.svelte` | Installed-agent cards; Advanced paths and removal. Opens the shared `../workspace/AgentSetupDialog.svelte` through `agentSetup.ts` for install/update/reinstall and recoverable progress/results; the compact dialog keeps technical output under Details and, after an install lands for a signed-out agent, shows the in-app sign-in card (`../workspace/AgentSignInCard.svelte`), never the agent's terminal. A signed-out card's **Sign in** opens that same card under its row (`signingIn`; the card a chat shows), which follows the login and reloads the catalog once the CLI confirms it. Polls only while visible and preserves unfinished edits. |
 | `agentStatus.ts` | Honest update and installer status rules; unknown/failure never means up to date or installed. |
 | `EnvironmentSettings.svelte` | The Environment prelude panel (bespoke, `/api/v1/environment`-backed — see the exception above). |
 | `environment.ts` | Wire types + `getEnvironment`/`putEnvironment` for the prelude map. |
@@ -90,7 +91,7 @@ wakes row always shows.
   `app.css` fallbacks), chat 14 px at line height 1.57, rendered Markdown 14 px.
 - **Reading Width (`chat.contentWidth`) is the column width**, not a cap on 48em:
   `ChatView`'s `--chat-column` and `MarkdownView`/`mdLive`'s `--doc-measure` use it
-  directly (default 672 = 48em of 14 px). Wrapping it in a `min()` with an em measure
+  directly (default 680, the desktop app's column). Wrapping it in a `min()` with an em measure
   again makes every wider value a no-op — the bug #284 fixed.
 - **Every key needs a consumer.** A new schema row is read at its consumption site
   (`getSetting`, or `settings.rs` for daemon keys) and applies live; the PR that adds

@@ -58,6 +58,8 @@
     view?: object;
     running: boolean;
     disabled: boolean;
+    /** Why the composer is closed, when not "chat ended" (a sign-in first). */
+    disabledHint?: string | null;
     slashCommands: ComposerCommand[];
     /** Quick-open scope for @-mentions; null disables them. */
     workspaceId: string | null;
@@ -92,6 +94,7 @@
     view,
     running,
     disabled,
+    disabledHint = null,
     slashCommands,
     workspaceId,
     terminals,
@@ -1100,7 +1103,7 @@
       class:mod-decorated={hasNativeDecorations && spoken === null}
       readonly={spoken !== null}
       placeholder={disabled
-        ? "chat ended"
+        ? (disabledHint ?? "chat ended")
         : spoken !== null
           ? dictation.state === "starting"
             ? "Starting the mic…"
@@ -1318,7 +1321,7 @@
     resize: none;
     background: color-mix(in srgb, var(--fg) 3%, transparent);
     border: 1px solid var(--edge);
-    border-radius: 8px;
+    border-radius: var(--radius-card);
     color: var(--fg);
     font: inherit;
     font-size: var(--text-md);
@@ -1332,6 +1335,12 @@
   }
   textarea:focus {
     border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
+  }
+  /* The hint in the empty box: the theme's muted ink, not the browser's
+     default grey, so both curated themes hold. */
+  textarea::placeholder {
+    color: var(--muted);
+    opacity: 0.85;
   }
   /* Room for the mic beside the action button. */
   textarea.voice {

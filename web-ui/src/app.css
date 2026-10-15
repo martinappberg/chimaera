@@ -37,6 +37,20 @@
      is 3.4:1), so prose-sized accent text takes it a quarter toward --fg —
      every theme passes that way (themes.contrast.test.ts). */
   --accent-text: color-mix(in srgb, var(--accent) 75%, var(--fg));
+  /* The one corner radius of a card in the transcript and above the
+     composer (plan, plan approval, agent messages, the pinned trays) —
+     the composer's box too, so the stack reads as one family. */
+  --radius-card: 8px;
+  /* A floating surface's corners and shadow (menus, popovers, tooltips). */
+  --overlay-radius: 8px;
+  --overlay-shadow: 0 6px 24px rgba(0, 0, 0, 0.22);
+  /* The hover wash of a quiet text control (activity lines, card toggles,
+     the finished rows' links): a breath of the ink, never a solid row. */
+  --hover-tint: color-mix(in srgb, var(--fg) 4%, transparent);
+  /* Settled-and-fine: the expected outcome, in the row's quiet voice (a
+     finished row's check, a completed tool row's mark) — never the live
+     accent, which belongs to running work. */
+  --done-quiet: color-mix(in srgb, var(--accent) 55%, var(--muted));
   --bg: #fbfbfc;
   --fg: #1d1d20;
   --muted: #65656d;
@@ -279,6 +293,29 @@
   opacity: 0.45;
   cursor: default;
 }
+/* The text-link button beside them ("Refresh status", "paste a code"):
+   accent ink, no box, an underline only under the pointer; `.quiet` for
+   the secondary one. */
+.opt-link {
+  font: inherit;
+  font-size: var(--text-xs);
+  padding: 3px 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  cursor: pointer;
+}
+.opt-link.quiet {
+  color: var(--muted);
+}
+.opt-link:not(:disabled):hover {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.opt-link:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
 
 /* Floating overlay surface (dropdown menus, the composer's mention/slash
    popover). Callers add their own position offsets, min-width, and z-index. */
@@ -287,9 +324,31 @@
   padding: 4px;
   background: var(--overlay-bg);
   border: 1px solid var(--edge);
-  border-radius: 8px;
-  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.22);
+  border-radius: var(--overlay-radius);
+  box-shadow: var(--overlay-shadow);
   overflow: hidden;
+}
+
+/* The pinned cards above the chat composer — the plan (chat/PlanCard), the
+   subagent and background trays (shared/WorkTray) — and the dashboard's
+   agent card tray: one recipe, so the stack reads as one family. The host
+   sets width and stacking; a host inside another card re-tints through
+   --pinned-card-bg. `visible` is the owner's "this tab is shown" flag — a
+   hidden tab's card must not animate when it mounts. */
+.pinned-card {
+  flex: none;
+  border: 1px solid var(--edge);
+  border-radius: var(--radius-card);
+  background: var(--pinned-card-bg, color-mix(in srgb, var(--fg) 2%, var(--bg)));
+  animation: rise 0.15s ease;
+}
+.pinned-card:not(.visible) {
+  animation: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .pinned-card {
+    animation: none;
+  }
 }
 .overlay-row {
   width: 100%;

@@ -6,7 +6,7 @@
   import ActivitySummary from "./ActivitySummary.svelte";
   import type { ChatBlock } from "./store.svelte";
   import { isLive, spanLabel, toolRunHealth, toolSpanMs, type TurnTail } from "./toolLabels";
-  import { liveClock } from "./liveClock.svelte";
+  import { liveClock } from "../shared/liveClock.svelte";
 
   /**
    * A settled run of thought and tool lines, folded (see activityFold.ts).

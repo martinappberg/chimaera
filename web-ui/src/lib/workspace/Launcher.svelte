@@ -1,24 +1,25 @@
 <script lang="ts">
   /**
-   * The agent launcher popover (docs/design/README.md "The agent launcher"), opened by
-   * the rail's chevron ONLY — hover (~150ms) or a click; the rail's quick
-   * starts are pure instant spawns and never open this.
+   * The agent launcher popover (docs/features/agents.md "The agent launcher"), opened by
+   * the rail's chevron ONLY — hover (~150ms) or a click; the rail's one row
+   * is a pure instant spawn of the saved default and never opens this.
    *
-   * The rail already starts Claude Code and Codex (and the saved default) in
-   * one click, so this answers the rest of "which agent, and how":
-   * - the quick agents first, in rail order — here for their terminal start
-   *   (the icon button, or ⌘↵) and update affordance;
-   * - then "other agents" (Antigravity, Grok Build, Cursor CLI, extension
-   *   agents), ready chats first, each showing its install state: the
-   *   version when installed, "not installed" with an install chip (a
-   *   curated managed install) or a set-up chip into Settings → Agents;
+   * The rail already starts the saved default in one click, so this answers
+   * the rest of "which agent, and how", with no built-in bias:
+   * - the agents this host has installed, the default first, then catalog
+   *   order — each for its chat start, its terminal start (the icon button
+   *   on hover, or ⌘↵) and its update affordance;
+   * - then "other agents", folded behind one row: the ones not installed,
+   *   "not installed" with an install chip (a curated managed install) or a
+   *   set-up chip into Settings → Agents. With nothing installed every agent
+   *   shows up front;
    * - a footer link into Settings → Agents, where every agent is managed.
    *
    * Installed rows read as just a version; whose binary it is ("installed by
    * chimaera" vs your own, with the resolved path) is the version's tooltip.
    * A strictly newer known release grows "→ <new>": a one-click curated
    * update for a chimaera-managed build, quiet information for your own.
-   * Every row links its official docs when hot.
+   * Docs live in Settings → Agents, not on the rows.
    *
    * Picking here makes that agent the saved default (the rail's primary).
    * Resuming lives in the rail's RECENT section, not here.
@@ -44,8 +45,9 @@
     type LaunchPick,
   } from "./launcher";
   import { isMac } from "../shared/keys";
-  import { openInSystemBrowser } from "../shared/urlOpen";
+  import { needsSignIn } from "./agentSignIn";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
+  import Chevron from "../shared/Chevron.svelte";
 
   interface Props {
     /** The rail's quick-start group rect; the popover hangs below it (fixed). */
@@ -97,12 +99,53 @@
   let showLoading = $state(false);
 
   const groups = $derived(catalog === null ? null : groupAgents(catalog, defaultId));
-  /** The roving order: quick agents, others, the worktree switch (git
-   *  workspaces only), then the settings link. */
-  const rows = $derived(groups === null ? [] : [...groups.quick, ...groups.others]);
-  const quickCount = $derived(groups?.quick.length ?? 0);
-  const wtIndex = $derived(inWorktree !== null ? rows.length : -1);
-  const settingsIndex = $derived(rows.length + (inWorktree !== null ? 1 : 0));
+  const installedCount = $derived(groups?.installed.length ?? 0);
+  const hasOthers = $derived((groups?.others.length ?? 0) > 0);
+  /** The other agents stay folded behind one row until asked for — the
+   *  menu is "which of the two" most days, not a catalog. Remembered. */
+  const OTHERS_KEY = "chimaera.launcherOthersOpen";
+  let othersOpen = $state(readOthersOpen());
+  function readOthersOpen(): boolean {
+    try {
+      return localStorage.getItem(OTHERS_KEY) === "1";
+    } catch {
+      return false;
+    }
+  }
+  function setOthersOpen(open: boolean): void {
+    othersOpen = open;
+    try {
+      localStorage.setItem(OTHERS_KEY, open ? "1" : "0");
+    } catch {
+      // Per-viewer convenience only.
+    }
+  }
+  const shownOthers = $derived(hasOthers && othersOpen ? (groups?.others ?? []) : []);
+  /** The roving order: installed agents, the "other agents" row, the others
+   *  while unfolded, the worktree switch (git workspaces only), then the
+   *  settings link. */
+  const othersIndex = $derived(hasOthers ? installedCount : -1);
+  const agentRowCount = $derived(installedCount + (hasOthers ? 1 : 0) + shownOthers.length);
+  const wtIndex = $derived(inWorktree !== null ? agentRowCount : -1);
+  const settingsIndex = $derived(agentRowCount + (inWorktree !== null ? 1 : 0));
+  /** The agent at roving index `i`, null for the non-agent rows. */
+  function rowAt(i: number): AgentInfo | null {
+    if (groups === null) return null;
+    if (i < installedCount) return groups.installed[i] ?? null;
+    if (!hasOthers || i === othersIndex) return null;
+    return shownOthers[i - installedCount - 1] ?? null;
+  }
+  function indexOfAgent(id: string | undefined): number {
+    if (groups === null || id === undefined) return -1;
+    const q = groups.installed.findIndex((a) => a.id === id);
+    if (q !== -1) return q;
+    const o = shownOthers.findIndex((a) => a.id === id);
+    return o === -1 ? -1 : installedCount + 1 + o;
+  }
+  function toggleOthers(): void {
+    setOthersOpen(!othersOpen);
+    if (hl > othersIndex && hl < agentRowCount) hl = othersIndex;
+  }
 
   let hl = $state(0);
   let rootEl = $state<HTMLElement | null>(null);
@@ -123,17 +166,22 @@
     if (!a.installed) return "not installed";
     if (a.outdated) return "needs an update";
     if (a.chatSetupRequired) return "chat needs setup";
+    if (needsSignIn(a)) return "not signed in";
     return a.version !== null ? versionNumber(a.version) : "installed";
   }
 
   /** Swap in a fresh catalog, keeping the highlight on the same agent (or on
    *  the same footer control) rather than the same index. */
   function adopt(next: AgentInfo[]): void {
-    const footer = catalog !== null && hl >= rows.length ? hl - rows.length : null;
-    const selected = rows[hl]?.id;
+    const onSettingsRow = catalog !== null && hl === settingsIndex;
+    const onWtRow = catalog !== null && wtIndex !== -1 && hl === wtIndex;
+    const onOthersRow = catalog !== null && hl === othersIndex;
+    const selected = rowAt(hl)?.id;
     catalog = next;
-    if (footer !== null) hl = rows.length + footer;
-    else hl = Math.max(0, rows.findIndex((a) => a.id === selected));
+    if (onSettingsRow) hl = settingsIndex;
+    else if (onWtRow) hl = wtIndex;
+    else if (onOthersRow) hl = othersIndex;
+    else hl = Math.max(0, indexOfAgent(selected));
   }
 
   onMount(() => {
@@ -211,8 +259,12 @@
       onToggleWorktree?.(!inWorktree);
       return;
     }
-    const a = rows[i];
-    if (a === undefined) return;
+    if (i === othersIndex) {
+      toggleOthers();
+      return;
+    }
+    const a = rowAt(i);
+    if (a === null) return;
     if (!a.installed || (a.chatSetupRequired && ui !== "term")) {
       // No curated install: Settings → Agents is where it gets set up.
       if (a.managedInstall) onInstall(a);
@@ -311,24 +363,6 @@
           >
         {/if}
       {/if}
-      {#if a.installUrl !== null}
-        <!-- Official docs, in the browser — quiet until the row is hot. -->
-        <a
-          class="adocs"
-          href={a.installUrl}
-          target="_blank"
-          rel="noopener noreferrer"
-          title="open the official docs"
-          tabindex="-1"
-          onclick={(e) => {
-            // Through the shell: in the app a _blank navigation is
-            // swallowed by the window's origin guard.
-            e.stopPropagation();
-            e.preventDefault();
-            openInSystemBrowser(a.installUrl ?? "");
-          }}>docs&thinsp;↗</a
-        >
-      {/if}
     </span>
     {#if !a.installed || a.chatSetupRequired || a.outdated}
       <!-- The one explicit click that unblocks it: a curated install/update
@@ -336,7 +370,7 @@
            chimaera has no curated install for it. -->
       <button
         class="achip"
-        class:solid={i < quickCount}
+        class:solid={i < installedCount}
         tabindex="-1"
         title={a.managedInstall
           ? `downloads the official ${a.name} build into ~/.chimaera/agents — runs with progress and results in agent setup`
@@ -350,10 +384,26 @@
         {!a.managedInstall ? "set up" : a.outdated ? "update" : a.chatSetupRequired ? "set up chat" : "install"}
       </button>
     {/if}
+    {#if a.installed && !a.outdated && !a.chatSetupRequired && a.chatCapable && needsSignIn(a)}
+      <!-- Signed out: the chat opens straight onto its sign-in card and
+           starts itself once the CLI confirms the login. -->
+      <button
+        class="achip"
+        class:solid={i < installedCount}
+        tabindex="-1"
+        title="sign in to {a.name} — the chat opens with the sign-in, then starts"
+        onclick={(e) => {
+          e.stopPropagation();
+          onPick({ agent: a.id, ui: "chat", explicit: true });
+        }}
+      >
+        sign in
+      </button>
+    {/if}
     {#if a.installed && (!a.chatSetupRequired || a.chatCapable)}
-      <!-- The two ways in: "chat" (and the whole row, and ↵) is the
-           structured chat UI — the default; the terminal button (⌘↵) is the
-           explicit TUI path. No chat view → one "terminal" button. -->
+      <!-- The row (and ↵) opens the chat; the one hover-only glyph (⌘↵)
+           is the explicit terminal path. An agent with no chat view opens
+           in the terminal from the row itself. -->
       {#if a.chatCapable}
         <button
           class="tbtn"
@@ -366,30 +416,17 @@
           }}
         >
           <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
-            <rect x="1.5" y="2.5" width="13" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="1.2" />
+            <rect x="1.5" y="2.5" width="13" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="1.4" />
             <path
               d="M4.2 6l2.4 2-2.4 2"
               fill="none"
               stroke="currentColor"
-              stroke-width="1.3"
+              stroke-width="1.4"
               stroke-linecap="round"
               stroke-linejoin="round"
             />
-            <path d="M8.4 10.6h3.2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+            <path d="M8.4 10.6h3.2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
           </svg>
-        </button>
-      {/if}
-      {#if !a.chatSetupRequired && !a.outdated}
-        <button
-          class="obtn"
-          tabindex="-1"
-          title={a.chatCapable ? "open in the chat view (↵)" : `opens in the terminal — ${a.name} has no chat view`}
-          onclick={(e) => {
-            e.stopPropagation();
-            activate(i, a.chatCapable ? "chat" : "term");
-          }}
-        >
-          {a.chatCapable ? "chat" : "terminal"}
         </button>
       {/if}
     {/if}
@@ -417,13 +454,35 @@
     {/if}
   {:else}
     <div class="agents">
-      {#each groups.quick as a, i (a.id)}
+      {#each groups.installed as a, i (a.id)}
         {@render agentRow(a, i)}
       {/each}
-      {#if groups.others.length > 0}
-        <div class="group-label" role="presentation">other agents</div>
-        {#each groups.others as a, j (a.id)}
-          {@render agentRow(a, quickCount + j)}
+      {#if hasOthers}
+        <!-- The rest of the catalog, one row until asked: the menu is
+             "which of the two" most days. -->
+        <div
+          class="arow others"
+          class:hl={hl === othersIndex}
+          role="menuitem"
+          tabindex="-1"
+          id={itemId(othersIndex)}
+          aria-expanded={othersOpen}
+          onpointerenter={() => (hl = othersIndex)}
+          onclick={toggleOthers}
+          onkeydown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              e.stopPropagation();
+              toggleOthers();
+            }
+          }}
+        >
+          <span class="gslot others-chev"><Chevron open={othersOpen} /></span>
+          <span class="aname others-label">other agents</span>
+          <span class="asub"><span class="aver">{groups.others.length}</span></span>
+        </div>
+        {#each shownOthers as a, j (a.id)}
+          {@render agentRow(a, installedCount + 1 + j)}
         {/each}
       {/if}
     </div>
@@ -434,7 +493,7 @@
              link: a remembered setting, not a step. A focused switch's own
              Enter/Space must not also reach the root's Enter (a second flip). -->
         <button
-          class="wt"
+          class="foot-btn wt"
           class:hl={hl === wtIndex}
           role="menuitemcheckbox"
           aria-checked={inWorktree}
@@ -470,7 +529,7 @@
         <span class="hint"><kbd>{isMac ? "⌘" : "ctrl"}↵</kbd> terminal</span>
       {/if}
       <button
-        class="settings"
+        class="foot-btn settings"
         class:hl={hl === settingsIndex}
         role="menuitem"
         tabindex="-1"
@@ -483,15 +542,26 @@
 </div>
 
 <style>
-  /* The quiet seam between the quick agents and the rest: a hairline and a
-     lowercase word, no chrome. */
-  .group-label {
-    margin: 4px 9px 0;
-    padding: 7px 0 3px;
-    border-top: 1px solid var(--edge);
+  /* The fold row: the rest of the catalog behind one muted row in the
+     agents' own row language. No hairline of its own — the footer's is the
+     menu's one seam, and two a row apart read as chrome. */
+  .arow.others {
+    margin-top: 2px;
     color: var(--muted);
-    font-size: var(--text-xs);
     user-select: none;
+  }
+  .arow.others .others-label {
+    font-weight: 400;
+    color: var(--muted);
+  }
+  .arow.others.hl .others-label,
+  .arow.others:hover .others-label {
+    color: var(--fg);
+  }
+  .others-chev {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
   }
   .launcher {
     position: fixed;
@@ -499,12 +569,12 @@
     display: flex;
     flex-direction: column;
     padding: 5px;
+    /* The app's popover surface (app.css .overlay-surface's tokens): one
+       radius and shadow for every menu that hangs off the chrome. */
     background: var(--overlay-bg);
     border: 1px solid var(--edge);
-    border-radius: 10px;
-    box-shadow:
-      0 1px 2px rgba(0, 0, 0, 0.08),
-      0 12px 32px rgba(0, 0, 0, 0.22);
+    border-radius: var(--overlay-radius);
+    box-shadow: var(--overlay-shadow);
     outline: none;
     animation: pop 0.12s ease-out;
   }
@@ -562,7 +632,7 @@
     align-items: center;
     gap: 9px;
     padding: 6px 9px;
-    border-radius: 6px;
+    border-radius: 5px; /* the rail's row radius */
     font-size: var(--text-md);
     cursor: pointer;
     user-select: none;
@@ -606,27 +676,6 @@
   }
 
   /* Official-docs link: invisible weight until the row is hot. */
-  .adocs {
-    flex: none;
-    color: var(--muted);
-    text-decoration: none;
-    opacity: 0;
-    transition:
-      opacity 0.12s ease,
-      color 0.12s ease;
-  }
-
-  .arow.hl .adocs,
-  .arow:hover .adocs {
-    opacity: 0.8;
-  }
-
-  .adocs:hover {
-    color: var(--fg);
-    opacity: 1;
-    text-decoration: underline;
-  }
-
   .aver {
     flex: none;
     display: inline-flex;
@@ -724,58 +773,49 @@
     outline-offset: 1px;
   }
 
-  /* The two ways in, quiet until the row is hot: "open" (the default — the
-     chat view) and the terminal-icon button (the agent's own TUI). */
-  .obtn,
+  /* The one trailing control: a glyph that fades in with the row, no
+     border — the row is the button, this is its alternative. The fade is
+     on the GLYPH, not the button: faint on a hot row (it must not read as
+     the row's one button), full strength under the pointer itself, and
+     the tooltip below never inherits the fade. `:where` keeps the hot-row
+     rule below the direct-hover rule in specificity. */
   .tbtn {
     appearance: none;
     background: none;
     font: inherit;
     flex: none;
-    border: 1px solid var(--edge);
-    color: var(--muted);
-    cursor: pointer;
-    opacity: 0;
-    transition:
-      opacity 0.12s ease,
-      color 0.12s ease,
-      border-color 0.12s ease,
-      transform 0.08s ease;
-  }
-
-  .arow.hl .obtn,
-  .arow:hover .obtn,
-  .arow.hl .tbtn,
-  .arow:hover .tbtn {
-    opacity: 1;
-  }
-
-  .obtn {
-    padding: 2px 10px;
-    border-radius: 10px;
-    font-size: var(--text-xs);
-    color: var(--fg);
-    border-color: color-mix(in srgb, var(--fg) 25%, transparent);
-  }
-
-  .obtn:hover {
-    color: var(--accent);
-    border-color: color-mix(in srgb, var(--accent) 45%, transparent);
-  }
-
-  .tbtn {
+    border: none;
     position: relative;
     display: inline-flex;
     align-items: center;
     justify-content: center;
     width: 22px;
     height: 22px;
-    border-radius: 6px;
+    border-radius: 5px;
+    color: var(--muted);
+    cursor: pointer;
+    transition:
+      color 0.12s ease,
+      background-color 0.12s ease,
+      transform 0.08s ease;
+  }
+
+  .tbtn svg {
+    opacity: 0;
+    transition: opacity 0.12s ease;
+  }
+
+  :where(.arow.hl, .arow:hover) .tbtn svg {
+    opacity: 0.55;
   }
 
   .tbtn:hover {
     color: var(--fg);
-    border-color: color-mix(in srgb, var(--fg) 30%, transparent);
+    background: color-mix(in srgb, var(--fg) 8%, transparent);
+  }
+
+  .tbtn:hover svg {
+    opacity: 1;
   }
 
   /* The delayed tooltip: nothing on a pass-through hover, fades in after
@@ -793,8 +833,8 @@
     color: var(--fg);
     background: var(--overlay-bg);
     border: 1px solid var(--edge);
-    border-radius: 6px;
-    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+    border-radius: var(--overlay-radius);
+    box-shadow: var(--overlay-shadow);
     opacity: 0;
     pointer-events: none;
     transition: opacity 0.12s ease;
@@ -805,27 +845,21 @@
     transition-delay: 0.5s;
   }
 
-  .obtn:active,
   .tbtn:active {
     transform: translateY(0.5px);
   }
 
-  /* The worktree switch: a footer control in the settings link's language
-     (same padding, radius and hot state), the Switch recipe at a smaller
-     size after its label. */
-  .wt {
+  /* The footer's two controls — the worktree switch and the settings link —
+     share one quiet button: the rows' side padding (so their hot boxes sit
+     flush with the rows' above), the rows' radius and hot state. */
+  .foot-btn {
     appearance: none;
     border: none;
     background: none;
     font: inherit;
     font-size: var(--text-xs);
-    min-width: 0;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 4px 6px;
-    margin-left: -6px;
-    border-radius: 6px;
+    padding: 4px 9px;
+    border-radius: 5px;
     color: var(--muted);
     cursor: pointer;
     transition:
@@ -833,13 +867,22 @@
       background-color 0.12s ease;
   }
 
-  .wt.hl,
-  .wt[aria-checked="true"] {
+  .foot-btn.hl {
     color: var(--fg);
+    background: var(--row-hover);
   }
 
-  .wt.hl {
-    background: var(--row-hover);
+  /* The worktree switch: the Switch recipe at a smaller size after its
+     label; an engaged switch keeps its label in the foreground. */
+  .wt {
+    min-width: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .wt[aria-checked="true"] {
+    color: var(--fg);
   }
 
   .wt svg {
@@ -904,11 +947,15 @@
     justify-content: space-between;
     gap: 12px;
     margin-top: 5px;
-    padding: 5px 3px 0 9px;
+    padding: 5px 0 0;
     border-top: 1px solid var(--edge);
     font-size: var(--text-xs);
     color: var(--muted);
     user-select: none;
+  }
+
+  .foot .hint {
+    padding-left: 9px;
   }
 
   .foot kbd {
@@ -919,24 +966,6 @@
     border-radius: 4px;
   }
 
-  /* Settings → Agents: the way into everything this menu doesn't do. */
-  .settings {
-    appearance: none;
-    border: none;
-    background: none;
-    font: inherit;
-    font-size: var(--text-xs);
-    color: var(--muted);
-    padding: 4px 6px;
-    border-radius: 6px;
-    cursor: pointer;
-    transition:
-      color 0.12s ease,
-      background-color 0.12s ease;
-  }
-
-  .settings.hl {
-    color: var(--fg);
-    background: var(--row-hover);
-  }
+  /* Settings → Agents: the way into everything this menu doesn't do — the
+     footer button as is. */
 </style>

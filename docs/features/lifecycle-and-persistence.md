@@ -35,7 +35,7 @@ PTY snapshot-on-attach ([terminals.md](terminals.md)) and the chat seq-journal g
   agent kind, **surface** (term/chat), native conversation/thread id + transcript path, chat model,
   pinned name, dims, theme, linked-terminal edges). On boot the daemon **resurrects**: shells respawn at
   their last cwd, claude TUI agents respawn with `--resume`, **chat sessions respawn as chat** through
-  `chat::resurrect_chat`, retaining all four providers' native handles (Claude `--resume`, Codex
+  `chat::resurrect_chat`, retaining all five providers' native handles (Claude `--resume`, Codex
   `thread/resume`, ACP session load/resume) and replaying the on-disk journal. Native resume
   still depends on the provider accepting that handle. Sessions Chimaera cannot resurrect live retire
   into Recents; a row resumes when its native handle was captured, otherwise its tooltip honestly
@@ -76,7 +76,7 @@ The default view applies only to new conversations. Saved chats reopen in chat, 
 conversations reopen in terminal, and legacy entries without a view default to terminal. This
 prevents upgrades or a changed launcher preference from migrating old CLI conversations into chat.
 A failed resumed handshake remains visible in chat; it never automatically reroutes the saved
-conversation. All four chat providers retain their native resume handle through the ledger.
+conversation. All five chat providers retain their native resume handle through the ledger.
 
 ## Restart carryover (chat sessions)
 

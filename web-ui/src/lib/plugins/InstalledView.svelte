@@ -9,6 +9,7 @@
    * from the daemon.
    */
   import ConfirmDialog from "../shared/ConfirmDialog.svelte";
+  import { formatTokenCount } from "../shared/format";
   import { pageVisible } from "../shared/visibility";
   import { knowledge } from "../workspace/knowledge";
   import { installedOutcome, type Outcome } from "./installCopy";
@@ -233,7 +234,7 @@
   }
 
   function fmtTokens(n: number): string {
-    return n >= 1000 ? `~${(n / 1000).toFixed(1).replace(/\.0$/, "")}k` : `~${n}`;
+    return `~${formatTokenCount(n)}`;
   }
 
   /** "4 skills · 2 hooks · ~1.2k tokens in every session". */
@@ -409,7 +410,9 @@
             <p class="gline err">{a.error}</p>
           {:else if !a.available}
             <p class="gline">{agentName(a.agent)} isn't installed on this host</p>
-          {:else if a.plugins.length === 0}
+          {:else if a.plugins.length === 0 && (a.actions?.length ?? 1) > 0}
+            <!-- An agent with no plugin actions at all (Cursor) said why in
+                 its notice; every other agent's empty list is news. -->
             <p class="gline">No plugins reported for {agentName(a.agent)}</p>
           {:else}
             <ul class="plist">

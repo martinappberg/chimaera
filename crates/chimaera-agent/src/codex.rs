@@ -36,6 +36,11 @@ use crate::ndjson::JsonlChild;
 /// generated-schema diff from 0.160.0; PROTOCOL.md Pass 43).
 pub const TESTED_CODEX_VERSION: &str = "0.162.1";
 
+/// The collab `wait` row's title. The main-thread fold (`lib.rs`) reads it
+/// as "waiting on a subagent": a steer ends that wait at once (0.162.1, live,
+/// PROTOCOL.md Pass 44).
+pub const COLLAB_WAIT_TITLE: &str = "waiting for subagents";
+
 /// The `initialize` request both the probe client and the driver handshake
 /// send. Declares `experimentalApi` so `thread/settings/update` is available
 /// (live: -32600 "requires experimentalApi capability" without it).
@@ -128,6 +133,17 @@ impl CodexChat {
     /// Next raw frame (notification, response, or server-initiated request).
     pub async fn recv(&mut self, timeout: Duration) -> Result<Option<Value>> {
         self.io.recv(timeout).await
+    }
+
+    /// Arbitrary request that does not wait: its response surfaces through
+    /// `recv` with the notifications around it (a probe timing a `turn/steer`
+    /// needs both). Returns the request id.
+    pub async fn request_nowait(&mut self, method: &str, params: Value) -> Result<u64> {
+        let id = self.request_id();
+        self.io
+            .send(&json!({ "id": id, "method": method, "params": params }))
+            .await?;
+        Ok(id)
     }
 
     /// Arbitrary request; returns the raw response FRAME (result or error) so
@@ -2192,6 +2208,7 @@ impl CodexMapper {
                     step.events.push(AgentEvent::Error {
                         message: msg.to_string(),
                         fatal: false,
+                        sign_in: false,
                     });
                 }
             }
@@ -2499,6 +2516,7 @@ impl CodexMapper {
                     step.events.push(AgentEvent::Error {
                         message: format!("turn/start failed: {}", err["message"]),
                         fatal: false,
+                        sign_in: false,
                     });
                     // A pending or refused model choice still owns its
                     // queued input; every promotion uses the same gates.
@@ -2588,6 +2606,7 @@ impl CodexMapper {
                     step.events.push(AgentEvent::Error {
                         message: format!("interrupt failed: {msg}"),
                         fatal: false,
+                        sign_in: false,
                     });
                 }
             }
@@ -2623,6 +2642,7 @@ impl CodexMapper {
                     step.events.push(AgentEvent::Error {
                         message: format!("mode change failed: {}", err["message"]),
                         fatal: false,
+                        sign_in: false,
                     });
                 }
             }
@@ -2651,7 +2671,7 @@ impl CodexMapper {
                             } else {
                                 format!("model change failed: {}", error["message"])
                             },
-                            fatal: false,
+                            fatal: false, sign_in: false,
                         });
                     }
                 } else {
@@ -2690,6 +2710,7 @@ impl CodexMapper {
                     step.events.push(AgentEvent::Error {
                         message: format!("effort change failed: {}", err["message"]),
                         fatal: false,
+                        sign_in: false,
                     });
                 }
             }
@@ -2700,6 +2721,7 @@ impl CodexMapper {
                 step.events.push(AgentEvent::Error {
                     message: format!("compact failed: {}", err["message"]),
                     fatal: false,
+                    sign_in: false,
                 });
             }
             (
@@ -3579,7 +3601,7 @@ impl CodexMapper {
             None => head,
         };
         let title = match (tool, targets) {
-            ("wait", _) => "waiting for subagents".to_string(),
+            ("wait", _) => COLLAB_WAIT_TITLE.to_string(),
             ("listAgents", _) => "List agents".to_string(),
             ("spawnAgent", _) => with_prompt("Spawn agent".to_string()),
             ("sendMessage", Some(t)) => with_prompt(format!("Message → {t}")),
@@ -4127,6 +4149,7 @@ impl CodexMapper {
         step.events.push(AgentEvent::Error {
             message: format!("steer failed: {msg}"),
             fatal: false,
+            sign_in: false,
         });
         true
     }
@@ -5248,6 +5271,7 @@ impl CodexMapper {
                         message: "Wait for the current model change before selecting another model"
                             .into(),
                         fatal: false,
+                        sign_in: false,
                     });
                     return step;
                 }
@@ -5261,7 +5285,7 @@ impl CodexMapper {
                         self.model_change_failed = true;
                         step.events.push(AgentEvent::Error {
                             message: "This Codex version cannot confirm custom model changes; update Codex or choose a listed model".into(),
-                            fatal: false,
+                            fatal: false, sign_in: false,
                         });
                     }
                 } else {
@@ -5308,6 +5332,7 @@ impl CodexMapper {
                     step.events.push(AgentEvent::Error {
                         message: "Wait for the model change before changing effort".into(),
                         fatal: false,
+                        sign_in: false,
                     });
                     return step;
                 }
@@ -5360,6 +5385,7 @@ impl CodexMapper {
                     step.events.push(AgentEvent::Error {
                         message: "Wait for the model change before changing mode".into(),
                         fatal: false,
+                        sign_in: false,
                     });
                     return step;
                 }
@@ -9978,7 +10004,7 @@ mod tests {
         }));
         assert!(matches!(
             &step.events[0],
-            AgentEvent::Error { fatal: false, message } if message.contains("not now")
+            AgentEvent::Error { fatal: false, message, sign_in: false } if message.contains("not now")
         ));
     }
 

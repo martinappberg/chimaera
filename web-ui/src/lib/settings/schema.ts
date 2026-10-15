@@ -89,6 +89,7 @@ export type SettingsMap = {
   "agents.defaultView": "chat" | "terminal";
   "agents.communication.enabled": boolean;
   "agents.communication.wakes": "never" | "ask" | "auto";
+  "agents.communication.freeSubagents": boolean;
   "dashboard.landing": "auto" | "never";
   "dashboard.cardDensity": "auto" | "comfortable" | "compact";
   "dashboard.roster": "line" | "cards";
@@ -270,6 +271,18 @@ const DEFS = {
     ],
     scope: "daemon",
   },
+  // Off by default: moving a subagent the user's turn waits on changes that
+  // turn's flow, and the subagent's result then arrives in a turn of its own.
+  "agents.communication.freeSubagents": {
+    title: "Messages may move a waiting subagent to the background",
+    category: "Agents",
+    description:
+      "A message from another agent may move this chat's waiting subagent to the background so it is read now; its result then arrives later.",
+    type: "boolean",
+    default: false,
+    scope: "daemon",
+    note: "Claude chats. Codex reads a message while it waits on its subagents either way.",
+  },
 
   // --- Dashboard ---------------------------------------------------------------
   "dashboard.landing": {
@@ -415,11 +428,11 @@ const DEFS = {
     description:
       "Width of the reading column in chat transcripts (composer included) and rendered Markdown. Narrower panes fit their space.",
     type: "integer",
-    // 48em of the 14px chat text: about a hundred characters per line.
-    default: 672,
+    // The Claude desktop app's reading column; ~97 characters of 14px text.
+    default: 680,
     min: 480,
     max: 1400,
-    step: 16,
+    step: 8,
     unit: "px",
     scope: "client",
   },

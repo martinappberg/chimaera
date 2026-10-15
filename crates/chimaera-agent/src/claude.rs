@@ -698,7 +698,9 @@ enum PendingControl {
     /// generate_session_title round-trip (feeds the naming chain).
     Title,
     /// background_tasks ack ({backgrounded}) — Ctrl-B parity per tool call.
-    Background,
+    Background {
+        for_message: bool,
+    },
     /// stop_task ack (subagent stop).
     StopTask,
     /// `interrupt {send_now}` receipt: its `send_now` word says whether the
@@ -2865,6 +2867,14 @@ impl ClaudeMapper {
             self.tool_kinds.insert(id, ToolKind::Think);
             return;
         }
+        // Chimaera's own plan tool (the MCP server's `update_plan`, what a
+        // headless claude has instead of TaskCreate): the daemon journals the
+        // plan level-set itself, and the card is the whole surface — a
+        // "mcp__chimaera__update_plan" row under it would say nothing.
+        if name == CHIMAERA_PLAN_TOOL {
+            self.tool_kinds.insert(id, ToolKind::Think);
+            return;
+        }
 
         // Questions are a first-class card (QuestionRequest via the
         // can_use_tool path), not a tool row: a bare "AskUserQuestion" card
@@ -3354,6 +3364,7 @@ impl ClaudeMapper {
                     format!("control request failed: {}", frame["response"])
                 },
                 fatal: false,
+                sign_in: false,
             });
             return;
         }
@@ -3551,7 +3562,19 @@ impl ClaudeMapper {
                     chosen,
                 });
             }
-            PendingControl::Background => {
+            PendingControl::Background { for_message: true } => {
+                // The daemon moved a foreground subagent aside so a message
+                // from another agent is read now (PROTOCOL.md Pass 44). The
+                // call can finish first; that race needs no notice.
+                if payload["backgrounded"] != json!(false) {
+                    step.events.push(AgentEvent::Notice {
+                        text: "subagent moved to the background to read a message from another \
+                               agent; it keeps working"
+                            .into(),
+                    });
+                }
+            }
+            PendingControl::Background { for_message: false } => {
                 // Missing flag ⇒ backgrounded (the extension's read).
                 if payload["backgrounded"] == json!(false) {
                     step.events.push(AgentEvent::Notice {
@@ -4245,10 +4268,13 @@ impl ClaudeMapper {
                     json!({ "subtype": "get_usage" }),
                 ));
             }
-            AgentCommand::BackgroundTool { tool_call_id } => {
+            AgentCommand::BackgroundTool {
+                tool_call_id,
+                for_message,
+            } => {
                 let id = self.ctl_id();
                 self.pending_controls
-                    .insert(id.clone(), PendingControl::Background);
+                    .insert(id.clone(), PendingControl::Background { for_message });
                 step.outbound.push(control_request_frame(
                     &id,
                     json!({ "subtype": "background_tasks", "tool_use_id": tool_call_id }),
@@ -4717,6 +4743,9 @@ const PENDING_TASK_CAP: usize = 64;
 
 /// The agent's task list, reconstructed from claude's `Task*` tool family.
 ///
+/// The chimaera MCP server's plan tool as claude names it (`mcp__<server>__<tool>`).
+const CHIMAERA_PLAN_TOOL: &str = "mcp__chimaera__update_plan";
+
 /// `TodoWrite` was a LEVEL-SET — every call carried the whole list, so the
 /// driver was a pure translator. `TaskCreate`/`TaskUpdate` are INCREMENTAL
 /// (create one, patch one by id), so the list has to be held here and
@@ -7199,6 +7228,46 @@ pub(crate) mod tests {
         }
     }
 
+    /// Chimaera's own `update_plan` (the MCP tool a headless claude keeps
+    /// its plan with) draws the card through the daemon's journal, so the
+    /// call itself renders no row; its result is still absorbed, not
+    /// reported as an update to a row that never was.
+    #[test]
+    fn chimaera_update_plan_renders_no_row() {
+        let mut m = mapper();
+        m.turn_active = true;
+        let step = m.on_frame(&json!({
+            "type": "assistant",
+            "message": { "id": "m1", "content": [
+                { "type": "tool_use", "id": "tu-plan", "name": CHIMAERA_PLAN_TOOL,
+                  "input": { "items": [ { "content": "a", "status": "pending" } ] } },
+            ]},
+        }));
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolCall { .. })),
+            "{:?}",
+            step.events
+        );
+        let step = m.on_frame(&json!({
+            "type": "user",
+            "message": { "content": [
+                { "type": "tool_result", "tool_use_id": "tu-plan",
+                  "content": "Plan shown (0/1 done)." },
+            ]},
+        }));
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolCall { .. })),
+            "{:?}",
+            step.events
+        );
+    }
+
     #[test]
     fn todo_write_becomes_plan() {
         let mut m = mapper();
@@ -8176,6 +8245,7 @@ pub(crate) mod tests {
         let mut m = mapper();
         let step = m.on_command(AgentCommand::BackgroundTool {
             tool_call_id: "tu-1".into(),
+            for_message: false,
         });
         assert_eq!(step.outbound[0]["request"]["subtype"], "background_tasks");
         assert_eq!(step.outbound[0]["request"]["tool_use_id"], "tu-1");
@@ -8188,6 +8258,35 @@ pub(crate) mod tests {
             &step.events[0],
             AgentEvent::Notice { text } if text.contains("background")
         ));
+    }
+
+    /// Pass 44: the daemon frees a turn blocked on a foreground subagent so
+    /// a message from another agent is read now. Its notice says why; a
+    /// subagent that returned first (`backgrounded: false`) says nothing.
+    #[test]
+    fn background_for_a_message_says_why_and_stays_quiet_when_raced() {
+        let mut m = mapper();
+        let ack = |m: &mut ClaudeMapper, backgrounded: bool| {
+            let step = m.on_command(AgentCommand::BackgroundTool {
+                tool_call_id: "tu-agent".into(),
+                for_message: true,
+            });
+            assert_eq!(step.outbound[0]["request"]["subtype"], "background_tasks");
+            assert_eq!(step.outbound[0]["request"]["tool_use_id"], "tu-agent");
+            let ctl = step.outbound[0]["request_id"].as_str().unwrap().to_string();
+            m.on_frame(&json!({
+                "type": "control_response",
+                "response": { "subtype": "success", "request_id": ctl,
+                              "response": { "backgrounded": backgrounded } },
+            }))
+        };
+        let moved = ack(&mut m, true);
+        assert!(matches!(
+            &moved.events[..],
+            [AgentEvent::Notice { text }] if text.contains("message from another agent")
+        ));
+        let raced = ack(&mut m, false);
+        assert!(raced.events.is_empty(), "{:?}", raced.events);
     }
 
     #[test]
@@ -9480,7 +9579,7 @@ pub(crate) mod tests {
         }}));
         assert_eq!(m.model.as_deref(), Some("opus[1m]"));
         assert!(
-            matches!(rejected.events.as_slice(), [AgentEvent::Error { message, fatal: false }] if message == "model change failed: Unknown model")
+            matches!(rejected.events.as_slice(), [AgentEvent::Error { message, fatal: false, .. }] if message == "model change failed: Unknown model")
         );
     }
 

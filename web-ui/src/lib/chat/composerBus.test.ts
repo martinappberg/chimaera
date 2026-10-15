@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  attachImageToComposer,
   insertIntoComposer,
   registerComposer,
   type InsertPlacement,
@@ -66,10 +65,6 @@ describe("composerBus", () => {
     insertIntoComposer("s-region", "@fig.png#xywh=1,2,3,4 ", "inline", undefined, crop);
     expect(dock.seen).toEqual([["@fig.png#xywh=1,2,3,4 ", "inline"]]);
     expect(dock.images).toEqual([crop.label]);
-    expect(pane.images).toEqual([]);
-    // An image alone (an OS drop) goes to the same composer as text would.
-    attachImageToComposer("s-region", crop);
-    expect(dock.images).toEqual([crop.label, crop.label]);
     expect(pane.images).toEqual([]);
     offDock();
     offPane();

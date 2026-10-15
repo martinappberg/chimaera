@@ -56,6 +56,26 @@ pub(crate) async fn run(
         Ok(args) => args,
         Err(message) => return crate::plugins::bad_request(message),
     };
+    // A terminal sign-in names one of the servers the last report listed as
+    // needing one — never an arbitrary id typed into argv.
+    if body.action == "login_connection" {
+        let listed = state
+            .probes
+            .get(&format!("connections:{}:{ws}", body.agent))
+            .and_then(|report| {
+                report["connections"].as_array().map(|rows| {
+                    rows.iter().any(|r| {
+                        r["name"].as_str() == body.target.as_deref() && r["login_terminal"] == true
+                    })
+                })
+            })
+            .unwrap_or(false);
+        if !listed {
+            return crate::plugins::bad_request(
+                "Check connections again, then sign in to a server that asks for it.",
+            );
+        }
+    }
     let (bin, _, usage) = match bin_of(&state, kind).await {
         Ok(found) => found,
         Err(_) => return crate::plugins::bad_request("Install this agent first."),

@@ -129,7 +129,7 @@
       "name": "open_browser"
     },
     {
-      "description": "Who is working in this chimaera workspace: every agent session (claude, codex; chat or terminal) with its id, what it is doing right now, its branch and recent files, whether it is the Mastermind, and how a message reaches it. Not your harness's own peers or subagents. Check it before starting work that could overlap someone else's.",
+      "description": "Who is working in this chimaera workspace: every agent session (Claude, Codex, Antigravity, Grok or Cursor; chat or terminal) with its id, what it is doing right now, its branch and recent files, whether it is the Mastermind, and how a message reaches it. Not your harness's own peers or subagents. Check it before starting work that could overlap someone else's.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {

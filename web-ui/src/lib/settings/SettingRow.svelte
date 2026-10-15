@@ -420,7 +420,7 @@
     align-items: center;
     min-height: var(--line);
     font-size: var(--text-md);
-    font-weight: 550;
+    font-weight: 500;
     line-height: 1.3;
     color: var(--fg);
   }

@@ -27,13 +27,15 @@ pub struct AcpAdapter {
     pub auth_method: &'static str,
     /// The command a user runs to check this agent by hand.
     pub executable: &'static str,
-    /// What to tell the user when `authenticate` fails. Cursor's method
-    /// reuses an existing `agent login` and otherwise starts a browser
-    /// login whose challenge dies with this process, so its raw error
-    /// ("Invalid params" plus a one-time URL) is not actionable. Only an
-    /// auth-shaped failure gets it (`needs_sign_in`); a crash or transport
-    /// error keeps its own message.
-    pub sign_in: Option<&'static str>,
+    /// The product name, for the words a signed-out `authenticate` gets.
+    pub name: &'static str,
+    /// Whether a failed `authenticate` reads as "not signed in" (Cursor's
+    /// method reuses an existing `agent login` and otherwise starts a
+    /// browser login whose challenge dies with this process, so its raw
+    /// error — "Invalid params" plus a one-time URL — is not actionable).
+    /// Only an auth-shaped failure gets the words (`needs_sign_in`); a crash
+    /// or transport error keeps its own message.
+    pub sign_in: bool,
 }
 /// Grok's own name for the mode and for the slash command that toggles it.
 const ALWAYS_APPROVE: &str = "always-approve";
@@ -42,21 +44,24 @@ pub const GROK: AcpAdapter = AcpAdapter {
     tested_version: TESTED_GROK_VERSION,
     auth_method: "cached_token",
     executable: "grok",
-    sign_in: None,
+    name: "Grok Build",
+    sign_in: false,
 };
 pub const ANTIGRAVITY: AcpAdapter = AcpAdapter {
     kind: "agy",
     tested_version: TESTED_AGY_VERSION,
     auth_method: "oauth-personal",
     executable: "agy",
-    sign_in: None,
+    name: "Antigravity",
+    sign_in: false,
 };
 pub const CURSOR: AcpAdapter = AcpAdapter {
     kind: "cursor",
     tested_version: TESTED_CURSOR_VERSION,
     auth_method: "cursor_login",
     executable: "cursor-agent",
-    sign_in: Some("Cursor CLI is not signed in on this host. Run `cursor-agent login` in a terminal, then start the chat again."),
+    name: "Cursor CLI",
+    sign_in: true,
 };
 
 impl AgentAdapter for AcpAdapter {
@@ -136,10 +141,19 @@ fn needs_sign_in(error: &Value) -> bool {
 }
 
 impl AcpAdapter {
+    /// The words the host and the UI act on (`model::sign_in_failure`): the
+    /// chat shows this agent's sign-in card, never a terminal instruction.
+    pub fn sign_in_hint(&self) -> String {
+        format!(
+            "{} is not signed in on this host. Sign in from this chat's card or in Settings → Agents.",
+            self.name
+        )
+    }
     fn authenticate_error(&self, e: RpcError) -> String {
-        match self.sign_in {
-            Some(hint) if needs_sign_in(&e.error) => hint.to_owned(),
-            _ => e.message,
+        if self.sign_in && needs_sign_in(&e.error) {
+            self.sign_in_hint()
+        } else {
+            e.message
         }
     }
 }
@@ -576,6 +590,7 @@ impl AcpMapper {
             step.events.push(AgentEvent::Error {
                 message: "Too many pending agent requests".into(),
                 fatal: false,
+                sign_in: false,
             });
             return;
         }
@@ -615,6 +630,7 @@ impl AcpMapper {
             step.events.push(AgentEvent::Error {
                 message: "Too many pending agent requests; resend this message".into(),
                 fatal: false,
+                sign_in: false,
             });
             return;
         }
@@ -800,6 +816,7 @@ impl Mapper for AcpMapper {
                             "The agent cannot accept this message's content or its queue is full"
                                 .into(),
                         fatal: false,
+                        sign_in: false,
                     });
                     return step;
                 }
@@ -911,6 +928,7 @@ impl Mapper for AcpMapper {
                         step.events.push(AgentEvent::Error {
                             message,
                             fatal: false,
+                            sign_in: false,
                         });
                     } else if result["_meta"]["totalTokens"] == 0
                         && result["stopReason"] != "cancelled"
@@ -927,6 +945,7 @@ impl Mapper for AcpMapper {
                 _ if error.is_some() => step.events.push(AgentEvent::Error {
                     message: error.unwrap(),
                     fatal: false,
+                    sign_in: false,
                 }),
                 Pending::Config(category, value, chosen) => {
                     let before_model = self.model.clone();
@@ -1605,7 +1624,11 @@ mod tests {
             message: cap_output(error["message"].as_str().unwrap_or("ACP request failed")).0,
             error,
         };
-        let hint = CURSOR.sign_in.unwrap();
+        let hint = CURSOR.sign_in_hint();
+        assert!(
+            crate::model::sign_in_failure(&hint),
+            "the hint is itself a cue"
+        );
         // The probed signed-out answers.
         for error in [
             json!({"code":-32000,"message":"Authentication required","data":{"message":"Authentication required. Please run 'agent login' first"}}),

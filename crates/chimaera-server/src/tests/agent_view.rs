@@ -10,6 +10,11 @@
 //!
 //! Re-bless deliberately (a real, reviewed change to the worker view):
 //! `CHIMAERA_BLESS_AGENT_VIEW=1 cargo test -p chimaera-server agent_view`.
+//! Re-blessed 2026-10-15: the comms tool and paragraph name every runtime
+//! (Claude, Codex, Antigravity, Grok, Cursor), and the generated settings
+//! pre-allow `mcp__chimaera__update_plan`. The worker here is a terminal
+//! session, so the plan paragraph and tool a Claude CHAT gets (`mcp.rs`
+//! `plan_tool_for`) are pinned in `tests/mcp.rs`, not in these fixtures.
 
 use super::support::*;
 use crate::{lock, AppState};

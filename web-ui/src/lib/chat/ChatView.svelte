@@ -14,7 +14,9 @@
     resolveScope,
     type ValidateAnswer,
   } from "./paths";
-  import { listAgents } from "../workspace/launcher";
+  import { agentCatalog, listAgents } from "../workspace/launcher";
+  import { getSignIn, needsSignIn } from "../workspace/agentSignIn";
+  import AgentSignInCard from "../workspace/AgentSignInCard.svelte";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import BranchChip from "../shared/BranchChip.svelte";
   import { openBranchChanges } from "../workspace/git";
@@ -32,6 +34,7 @@
   } from "./chatPool";
   import { dismiss } from "../shared/dismiss";
   import { formatElapsedSeconds, messageTimestampRefreshIn } from "../shared/time";
+  import { formatTokenCount } from "../shared/format";
   import ChatHeader from "./ChatHeader.svelte";
   import ChatFind from "./ChatFind.svelte";
   import { legacyCapabilities } from "./capabilities";
@@ -82,6 +85,7 @@
   import { modsFor } from "./mods.svelte";
   import type { NativeComposer } from "./nativeComposer";
   import { pageVisible } from "../shared/visibility";
+  import { liveClock } from "../shared/liveClock.svelte";
   import { sameFile } from "../workspace/sameFile.svelte";
   import ReferenceChip from "../shared/ReferenceChip.svelte";
   import { activeSelection, clearSelection, setSelection } from "../shared/reference";
@@ -135,10 +139,6 @@
      *  path links open through the workbench opener (`shared/openPath.ts`)
      *  whenever App has registered one. */
     onOpenPath?: (path: string, kind: "file" | "dir") => void;
-    /** Flip this session to its real TUI (the pane-bar view toggle). Used for
-     *  interactive CLI flows the `-p` stream-json mode can't run — `/login`
-     *  above all — so the native auth flow runs where it belongs. */
-    onSwitchToTerminal?: () => void;
     /** Focus the newly-created session while the source remains alive. */
     onForked?: (session: Session) => void;
     /** Show one of this session's SUBAGENTS instead of the session itself:
@@ -164,7 +164,6 @@
     terminals = [],
     onOpenFile,
     onOpenPath,
-    onSwitchToTerminal,
     onForked,
     subagent,
     onOpenSubagent,
@@ -242,6 +241,47 @@
     agentCatalogName ??
       agentProductName(agentKind),
   );
+  // Signed out, per the CLI's own status: the chat shows its sign-in card
+  // instead of a doomed start or the raw startup error, and starts itself
+  // once the login lands. A startup failure re-asks the daemon once (the
+  // catalog's verdict can predate a sign-out); a successful start with a
+  // stale "signed out" re-asks too, so the launcher row comes right.
+  const catalogAgent = $derived($agentCatalog.find((a) => a.id === agentKind) ?? null);
+  const signInNeeded = $derived(!readOnly && needsSignIn(catalogAgent));
+  // The newest error the agent reported that reads like a missing login: a
+  // process that started signed out (codex's app-server does) fails only at
+  // its first turn, so the status is re-asked on it.
+  const authShapedError = $derived.by(() => {
+    for (let i = store.blocks.length - 1; i >= 0 && i >= store.blocks.length - 12; i--) {
+      const b = store.blocks[i];
+      if (b.kind === "notice" && b.signIn === true) return `${b.uid}`;
+    }
+    return null;
+  });
+  let signInAsked: string | null = null;
+  $effect(() => {
+    const failure = store.fatalError;
+    if (readOnly || catalogAgent === null || !catalogAgent.installed) return;
+    const stale = (failure !== null && catalogAgent.signedIn !== false)
+      || (authShapedError !== null && !store.running && catalogAgent.signedIn !== false)
+      || (store.initialized && authShapedError === null && catalogAgent.signedIn === false);
+    const key = failure ?? authShapedError ?? (store.initialized ? "init" : null);
+    if (!stale || key === null || signInAsked === key) return;
+    signInAsked = key;
+    void getSignIn(agentKind, true).catch(() => {});
+  });
+  /** A live, idle chat whose CLI says it is signed out: the card sits at the
+   *  transcript's tail; signing in relaunches the chat in place, resuming
+   *  the conversation. */
+  const liveSignIn = $derived(signInNeeded && store.initialized && store.exited === null && store.fatalError === null && !store.running && !store.degraded);
+  /** A chat that has not started yet while its CLI says signed out: the
+   *  one case the composer closes, so the first turn isn't a 401. A live
+   *  chat keeps its composer — the verdict may be stale, or the login may
+   *  have landed outside the app — and the card offers Check again. */
+  const preflightSignIn = $derived(signInNeeded && !store.initialized && store.exited === null && store.fatalError === null && !readOnly);
+  /** `/login` typed here: the card runs whether or not the catalog thinks
+   *  the agent is signed in (a switch of account, a stale login). */
+  let signInRequested = $state(false);
   void listAgents().then((agents) => {
     const info = agents.find((a) => a.id === agentKind);
     models = info?.models ?? [];
@@ -1722,15 +1762,16 @@
           return toggleUltracode();
         }
       case "login":
-        // /login is an interactive OAuth / setup-token / SSO flow the `-p`
-        // stream-json CLI can't run ("/login isn't available in this
-        // environment") — so an expired session dead-ends in chat with no way
-        // back. Flip to the real TUI, where claude's own /login handles every
-        // auth method safely (chimaera never sees the credentials); sign in
-        // there, then toggle back to chat with the pane-bar button. Claude
-        // only for now — codex's auth flow (`codex login`) is a follow-up.
-        if (agentKind !== "claude" || onSwitchToTerminal === undefined) return false;
-        onSwitchToTerminal();
+        // /login in any chat is the in-app sign-in: the card at the
+        // transcript's tail runs the CLI's own login under the daemon (the
+        // `-p` / app-server processes can't run it themselves, and sent to
+        // the model it is a billed prompt) and the chat relaunches in place
+        // once the login lands. Claude's native /login still lives in its
+        // terminal view (the pane-bar toggle) for anyone who prefers it.
+        if (readOnly) return false;
+        signInRequested = true;
+        // Never a prompt to the model, even before the catalog answers.
+        if (catalogAgent === null) void listAgents(true).catch(() => {});
         return true;
       default:
         return false;
@@ -1942,8 +1983,8 @@
       });
     }
     if (supports("get_mcp")) native.push({ name: "mcp", description: "MCP servers — chimaera panel" });
-    if (agentKind === "claude") {
-      native.push({ name: "login", description: "sign in — opens the terminal for Claude's native auth" });
+    if (!readOnly) {
+      native.push({ name: "login", description: `sign in to ${agentName} — in the app` });
     }
     if (supports("compact")) {
       native.push({ name: "compact", description: "compact conversation context" });
@@ -2184,9 +2225,7 @@
    *  the drivers' `fmt_tokens` spelling); hidden until the agent reports any. */
   const turnTokensLabel = $derived.by(() => {
     const n = store.turnTokens;
-    if (n <= 0) return null;
-    if (n >= 999_950) return `${(n / 1_000_000).toFixed(1)}M tokens`;
-    return n >= 1000 ? `${(n / 1000).toFixed(1)}k tokens` : `${n} tokens`;
+    return n > 0 ? `${formatTokenCount(n)} tokens` : null;
   });
   /** Work running beside the turn: live subagents plus the background set
    *  (commands, monitors, backgrounded agents; housekeeping excluded). A
@@ -2203,27 +2242,19 @@
   });
 
   // Elapsed-turn timer: a quiet counter that surfaces once a turn passes 5s and
-  // ticks each second. The START is held in the chat pool (per session), so
-  // switching away mid-turn and back keeps counting from the real turn start
-  // instead of resetting — and performance.now() never leaks into replay. The
-  // interval tears down when the turn ends or the component unmounts.
-  let turnElapsedMs = $state(0);
+  // ticks on the workbench's shared 1 Hz clock. The START is held in the chat
+  // pool (per session, epoch ms), so switching away mid-turn and back keeps
+  // counting from the real turn start instead of resetting — and a client
+  // clock never leaks into replay. The clock runs for this view only while
+  // the turn runs and the view is shown: a retained background chat keeps its
+  // transcript DOM, but a counter the user cannot see must not wake the main
+  // thread every second (re-entering re-reads the time before painting).
+  let turnStart = $state<number | null>(null);
   $effect(() => {
-    const start = chatTurnStart(chatId, agentBusy, performance.now());
-    if (start === null) {
-      turnElapsedMs = 0;
-      return;
-    }
-    turnElapsedMs = performance.now() - start;
-    // Retained background chats keep their transcript DOM, but a counter the
-    // user cannot see must not wake the main thread every second. Re-entering
-    // the tab recomputes from the pool's original turn start before painting.
-    if (!visible) return;
-    const iv = setInterval(() => {
-      turnElapsedMs = performance.now() - start;
-    }, 1000);
-    return () => clearInterval(iv);
+    turnStart = chatTurnStart(chatId, agentBusy, Date.now());
   });
+  const turnClock = liveClock(() => turnStart !== null && visible);
+  const turnElapsedMs = $derived(turnStart === null ? 0 : Math.max(0, turnClock.ms - turnStart));
   /** Upward elapsed for the live status row (shared ladder: "7s", "1m 04s",
    *  "1h 02m 03s") — how long the running turn has been going, from its
    *  first second. */
@@ -2280,6 +2311,10 @@
     pinnedElicitations = store.elicitations;
     pinnedSends = store.pendingSends;
   });
+  /** Every step done: the card has nothing left to follow once the turn ends. */
+  const planAllDone = $derived(
+    pinnedPlan.length > 0 && pinnedPlan.every((p) => p.status === "done"),
+  );
 
   const jumpLabel = $derived(
     followedVersion !== store.transcriptVersion
@@ -2493,7 +2528,7 @@
       const n = block.outputTokens;
       byMessage.set(prev.uid, {
         duration: block.durationMs >= 100 ? formatDurationMs(block.durationMs) : null,
-        tokens: n > 0 ? (n >= 1000 ? `${(n / 1000).toFixed(1)}k tokens` : `${n} tokens`) : null,
+        tokens: n > 0 ? `${formatTokenCount(n)} tokens` : null,
       });
     });
     return byMessage;
@@ -2567,7 +2602,7 @@
   /** Nothing to type into (and so nothing to quote into): a read-only
    *  subagent view, or a session that ended, degraded or failed. */
   const composerDisabled = $derived(
-    readOnly || store.exited !== null || store.degraded || store.fatalError !== null,
+    readOnly || store.exited !== null || store.degraded || store.fatalError !== null || preflightSignIn,
   );
   const incompatibleRuntime = $derived(/GLIBC_[\d.]+[^\n]*not found/.test(store.fatalError ?? ""));
 
@@ -2753,10 +2788,17 @@
           <span>{subagentState?.problem ?? (store.initialized ? "this subagent has not done anything yet" : "loading this subagent's conversation…")}</span>
         </div>
       {/if}
+    {:else if signInNeeded && !store.initialized && catalogAgent !== null}
+      <!-- Known signed out before the driver even answers: the card now, the
+           startup failure (if one lands) folds into it below. -->
+      <div class="empty" role="status">
+        <SessionGlyph kind="agent" {agentKind} size={18} />
+        <AgentSignInCard agent={catalogAgent} workspaceId={session.workspace_id ?? null} sessionId={session.id} framed onSignedIn={() => void getSignIn(agentKind, true).catch(() => {})} />
+      </div>
     {:else if store.exited === null && !store.fatalError && (!store.initialized || store.blocks.length === 0)}
       <div class="empty" role="status">
         <SessionGlyph kind="agent" {agentKind} size={18} />
-        <span>{!store.connected ? `connecting to ${agentName}…` : store.initialized ? `${agentName} is ready` : `starting ${agentName}…`}</span>
+        <span>{!store.connected ? `connecting to ${agentName}…` : store.initialized ? (liveSignIn ? `${agentName} is waiting for a sign-in` : `${agentName} is ready`) : `starting ${agentName}…`}</span>
         {#if store.connected && !store.initialized && store.startupDetail}
           <span class="startup-detail">{store.startupDetail}</span>
         {/if}
@@ -2982,9 +3024,6 @@
             rewindTitle={agentKind === "claude"
               ? "rewind to here (restores files; optionally forks the conversation)"
               : "rewind the conversation to here"}
-            onUsage={readOnly || !supports("get_usage")
-              ? undefined
-              : () => sendCommand({ type: "get_usage" }, "usage request not sent")}
             turnTokens={turn?.tokens ?? null}
             turnDuration={turn?.duration ?? null}
           />
@@ -3028,7 +3067,14 @@
         {@const hook = item.block.tone === "info" ? hookNotice(item.block.text) : null}
         {#if hook}
           <HookRow said={hook} sourceIndex={item.index} sourceUid={item.block.uid} />
-        {:else if !(incompatibleRuntime && item.block.text === store.fatalError)}
+        {:else if item.block.signIn === true}
+          <!-- A login's refusal: the sign-in card while one is needed, a
+               quiet line once it isn't (the raw text never returns). -->
+          {#if !signInNeeded}
+            <div class="notice" data-block-index={item.index} data-block-uid={item.block.uid}>{agentName} needed a sign-in</div>
+          {/if}
+        {:else if item.block.text !== store.fatalError}
+        <!-- The failure a fatal banner is showing is not repeated as a line. -->
         <div
           class="notice"
           class:error={item.block.tone === "error"}
@@ -3135,7 +3181,17 @@
       </div>
     {/if}
 
-    {#if store.fatalError !== null}
+    {#if (liveSignIn || (signInRequested && store.fatalError === null && store.exited === null)) && catalogAgent !== null}
+      <div class="live-signin">
+        <!-- The daemon relaunches a chat that waited on the login (and the
+             one /login was typed in); the card only refreshes the verdict. -->
+        <AgentSignInCard agent={catalogAgent} workspaceId={session.workspace_id ?? null} sessionId={session.id} framed autostart={signInRequested} onSignedIn={() => { signInRequested = false; void getSignIn(agentKind, true).catch(() => {}); }} onDismiss={signInRequested ? () => { signInRequested = false; } : undefined} />
+      </div>
+    {/if}
+    {#if store.fatalError !== null && signInNeeded}
+      <!-- The startup failed because the CLI is signed out: the card is the
+           whole story, the raw error stays in the journal. -->
+    {:else if store.fatalError !== null}
       <div class="notice error" class:runtime-error={incompatibleRuntime}>
         {#if incompatibleRuntime}
           <strong>This agent can't start on this host</strong>
@@ -3148,7 +3204,8 @@
     {/if}
     {#if store.degraded}
       <div class="notice">continued in terminal — this pane will switch</div>
-    {:else if store.exited !== null}
+    {:else if store.exited !== null && store.fatalError === null}
+      <!-- A fatal startup error already says the driver is gone. -->
       <div class="notice">
         agent exited{store.exited.status !== null ? ` (status ${store.exited.status})` : ""}
       </div>
@@ -3291,7 +3348,11 @@
     />
   {/if}
 
-  {#if pinnedPlan.length > 0}
+  <!-- The card is for the plan in flight: once the turn ends with every
+       step done it has nothing left to follow, so it leaves (the desktop
+       apps keep a finished list only in the transcript, never pinned). A
+       plan with open steps stays through the idle gap for the next turn. -->
+  {#if pinnedPlan.length > 0 && !(planAllDone && !agentBusy)}
     <PlanCard entries={pinnedPlan} running={agentBusy} {visible} />
   {/if}
 
@@ -3384,6 +3445,7 @@
     view={quoteOwner}
     running={agentBusy}
     disabled={composerDisabled}
+    disabledHint={preflightSignIn ? `sign in to ${agentName} first` : null}
     slashCommands={composerCommands}
     workspaceId={session.workspace_id ?? null}
     {terminals}
@@ -3493,10 +3555,7 @@
      padding rides OUTSIDE the measure so text edges line up with it. */
   .chat > :global(.composer),
   .chat > .suggestion-row,
-  .chat > .branch-line,
-  /* Every pinned strip (subagents, background, plan) — they were full-bleed
-     while the plan alone was inset, so the group never lined up. */
-  .chat > :global(.tray) {
+  .chat > .branch-line {
     width: 100%;
     max-width: calc(var(--chat-column) + 36px);
     margin-left: auto;
@@ -3510,13 +3569,17 @@
   .chat > :global(.composer) {
     border-top: none;
   }
-  /* The plan card keeps its border on the column's text edges. */
-  .chat > :global(.plan-card) {
+  /* The pinned cards (subagents, background, plan) keep their borders on
+     the column's text edges and stack 6px apart. */
+  .chat > :global(.plan-card),
+  .chat > :global(.tray) {
     width: calc(100% - 36px);
     max-width: var(--chat-column);
-    margin-left: auto;
-    margin-right: auto;
+    margin: 6px auto;
     box-sizing: border-box;
+  }
+  .chat > :global(:is(.tray, .plan-card) + :is(.tray, .plan-card)) {
+    margin-top: 0;
   }
   .startup-detail {
     font-size: var(--text-sm);
@@ -3688,11 +3751,15 @@
   }
   .msg.agent {
     position: relative;
-    padding: 2px 0;
+    /* A reply stops short of the column's right edge, where the user's
+       bubbles end: the two voices never share a right margin, and a long
+       line reads shorter than the bubble above it (the desktop apps' 92%). */
+    padding: 2px 8% 2px 0;
   }
-  /* On pointer devices the action cluster floats at the message's top right
-     (AgentMessageMeta) and takes no space; a closing paragraph keeps no
-     bottom margin, so a reply ends where its last line does. */
+  /* On pointer devices the action cluster floats at the message's bottom
+     right, over the gap below it (AgentMessageMeta), and takes no space; a
+     closing paragraph keeps no bottom margin, so a reply ends where its last
+     line does. */
   .msg.agent > :global(.md > p:last-child) {
     margin-bottom: 0;
   }
@@ -3722,6 +3789,9 @@
     font-size: var(--text-sm);
     text-align: center;
     padding: 6px 0;
+  }
+  .live-signin {
+    padding: 12px 0 4px;
   }
   .notice.error {
     color: var(--err);

@@ -23,7 +23,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -80,6 +80,26 @@ pub(crate) fn extension_action(
     target: Option<&str>,
 ) -> Result<Vec<String>, &'static str> {
     use AgentKind::*;
+    // Cursor's MCP sign-in has no no-browser mode and waits for the OAuth
+    // callback on a localhost port of ITS host, so it runs in a managed
+    // terminal where the CLI opens the browser itself (never the daemon) —
+    // and only completes where that browser is on the daemon's host: the UI
+    // offers it for local workspaces alone, and `actions.rs` requires the
+    // target to be a server the last report said needs a login.
+    if action == "login_connection" {
+        if kind != Cursor {
+            return Err("Use this agent's connection sign-in instead.");
+        }
+        let target = target
+            .filter(|s| {
+                !s.is_empty()
+                    && s.len() <= 256
+                    && !s.starts_with('-')
+                    && !s.chars().any(|c| c.is_control() || c.is_whitespace())
+            })
+            .ok_or("Choose a connection to sign in to.")?;
+        return Ok(vec!["mcp".into(), "login".into(), target.into()]);
+    }
     if matches!(action, "manage_plugins" | "manage_connections") {
         let command = if action == "manage_plugins" {
             "/plugins"
@@ -221,7 +241,39 @@ fn validate_cache_hit(hit: &AgentDetection) -> CacheHit {
 /// an update that replaced or moved the binary is noticed at the next spawn
 /// (without re-running the 6s login-shell probe the cache exists to avoid).
 pub(crate) async fn detect(state: &AppState, kind: AgentKind, refresh: bool) -> AgentDetection {
-    if !refresh {
+    detect_inner(state, kind, refresh, false).await
+}
+
+/// The catalog's read (`GET /agents` without `refresh`): the ONE caller a
+/// cached miss is served to, so a launcher paint or a Settings poll never
+/// re-runs a login shell per uninstalled agent. Every other caller — spawns,
+/// a sign-in status read, a refresh — probes on a miss, so a CLI the user
+/// just installed is found the moment they start it.
+pub(crate) async fn detect_for_catalog(
+    state: &AppState,
+    kind: AgentKind,
+    refresh: bool,
+) -> AgentDetection {
+    detect_inner(state, kind, refresh, true).await
+}
+
+async fn detect_inner(
+    state: &AppState,
+    kind: AgentKind,
+    refresh: bool,
+    serve_miss: bool,
+) -> AgentDetection {
+    // A hit that still validates outlives a transient probe miss (a slow rc
+    // on NFS, a login shell that timed out): on a refresh it is kept and no
+    // miss is recorded over it.
+    let mut validating_hit = None;
+    if refresh {
+        if let Some(hit) = crate::lock(&state.agent_bins).get(&kind).cloned() {
+            if !matches!(validate_cache_hit(&hit), CacheHit::Gone) {
+                validating_hit = Some(hit);
+            }
+        }
+    } else {
         let hit = crate::lock(&state.agent_bins).get(&kind).cloned();
         if let Some(hit) = hit {
             let same_install = hit.explicit
@@ -250,6 +302,11 @@ pub(crate) async fn detect(state: &AppState, kind: AgentKind, refresh: bool) -> 
                         crate::lock(&state.agent_bins).remove(&kind);
                     }
                 }
+            }
+        }
+        if serve_miss {
+            if let Some(miss) = cached_miss(state, kind) {
+                return miss;
             }
         }
     }
@@ -281,16 +338,60 @@ pub(crate) async fn detect(state: &AppState, kind: AgentKind, refresh: bool) -> 
         explicit: used_explicit,
         mtime,
     };
-    // Cache only a positive result for the daemon's lifetime. A miss is often
+    // A positive result is cached for the daemon's lifetime. A miss is often
     // transient — the daemon started before the login environment was ready,
-    // or the user just fixed their PATH / installed the CLI — and caching it
-    // would wedge the agent as "not installed" until a daemon restart. Leaving
-    // a miss uncached lets the next probe self-heal (the popover already
-    // refreshes on mount; a spawn re-probes rather than acting on stale news).
-    if detection.path.is_ok() {
-        crate::lock(&state.agent_bins).insert(kind, detection.clone());
+    // or the user just fixed their PATH / installed the CLI — so caching it
+    // for the lifetime would wedge the agent as "not installed" until a
+    // daemon restart; but every uncached miss costs the login-shell probe
+    // again, and a catalog read with two uninstalled agents paid seconds per
+    // call (field-measured). So a miss is stamped for `MISS_TTL` and served
+    // to the catalog read only (`detect_for_catalog`); a changed path
+    // setting, Extensions' re-check and the next hit forget it.
+    match &detection.path {
+        Ok(_) => {
+            crate::lock(&state.agent_bins).insert(kind, detection.clone());
+            crate::lock(&state.agent_misses).remove(&kind);
+        }
+        Err(reason) => {
+            if let Some(hit) = validating_hit {
+                // The executable is still there: the probe, not the install,
+                // failed this time.
+                return hit;
+            }
+            crate::lock(&state.agent_misses).insert(kind, (reason.clone(), Instant::now()));
+        }
     }
     detection
+}
+
+/// How long a detection miss is served without re-running the login shell.
+/// Short: a user who installs a CLI in a terminal sees it within this window
+/// on the slow paths and at once on every refresh path.
+pub(crate) const MISS_TTL: Duration = Duration::from_secs(90);
+
+/// A recent miss, for the catalog read: no stats, no probe — a refresh, a
+/// spawn, a changed path setting and an install's own re-detect are the
+/// ways a landed executable is noticed before the stamp expires.
+fn cached_miss(state: &AppState, kind: AgentKind) -> Option<AgentDetection> {
+    let (reason, at) = crate::lock(&state.agent_misses).get(&kind).cloned()?;
+    if at.elapsed() >= MISS_TTL {
+        return None;
+    }
+    Some(AgentDetection {
+        path: Err(reason),
+        version: None,
+        managed: false,
+        explicit: false,
+        mtime: None,
+    })
+}
+
+/// Forget every cached miss: the next catalog read probes again. Called for
+/// a changed `agents.<id>.path` (settings) and by Extensions' explicit
+/// re-check (`agent_probe::refresh_probes`) — the two moments the user has
+/// said "look again" without opening the launcher.
+pub(crate) fn forget_misses(state: &AppState) {
+    crate::lock(&state.agent_misses).clear();
 }
 
 /// The managed install of `bin` under the managed bin dir, if present and
@@ -521,12 +622,20 @@ pub(crate) async fn list_agents(
     let detect_all = futures::future::join_all(AgentKind::ALL.into_iter().map(|kind| {
         let state = state.clone();
         async move {
-            let detection = detect(&state, kind, query.refresh).await;
+            let detection = detect_for_catalog(&state, kind, query.refresh).await;
             let chat_ready = match &detection.path {
                 Ok(bin) if kind.chat_capable() => chat_executable(&state, kind, bin).await.is_ok(),
                 _ => false,
             };
-            (kind, detection, chat_ready)
+            // Whether the CLI says it is signed in here: the cached verdict
+            // at once (a missing one probes in the background and refetches
+            // through the change bus); only Settings' Check (`check`) asks
+            // inline. Unknown until installed.
+            let signed_in = match &detection.path {
+                Ok(bin) => crate::agent_auth::status(&state, kind, bin, query.check).await,
+                Err(_) => None,
+            };
+            (kind, detection, chat_ready, signed_in)
         }
     }));
     let detections = if query.check {
@@ -539,11 +648,18 @@ pub(crate) async fn list_agents(
 
     let rows = detections
         .into_iter()
-        .map(|(kind, detection, chat_ready)| {
+        .map(|(kind, detection, chat_ready, signed_in)| {
             let mut row = serde_json::Map::new();
             row.insert("id".into(), json!(kind.as_str()));
             row.insert("name".into(), json!(kind.product_name()));
             row.insert("installed".into(), json!(detection.path.is_ok()));
+            // Additive: `signed_in` is the CLI's own verdict (null = unknown
+            // or not installed); `sign_in` says how this agent signs in from
+            // the app and names any sign-in in progress.
+            row.insert("signed_in".into(), json!(signed_in));
+            if let Some(sign_in) = crate::agent_auth::descriptor(&state, kind) {
+                row.insert("sign_in".into(), sign_in);
+            }
             if let Some(status) = crate::runtimes::installation_status(&state, kind) {
                 row.insert("installation".into(), status);
             }
@@ -1364,6 +1480,14 @@ mod tests {
             vec!["plugin", "install", "/tmp/a space/$(file)"]
         );
         assert!(extension_action(AgentKind::Grok, "install_plugin", Some("--trust")).is_err());
+        assert_eq!(
+            extension_action(AgentKind::Cursor, "login_connection", Some("goldfish")).unwrap(),
+            vec!["mcp", "login", "goldfish"]
+        );
+        assert!(extension_action(AgentKind::Cursor, "login_connection", Some("--x")).is_err());
+        assert!(extension_action(AgentKind::Cursor, "login_connection", Some("a b")).is_err());
+        assert!(extension_action(AgentKind::Claude, "login_connection", Some("x")).is_err());
+        assert!(extension_action(AgentKind::Cursor, "manage_connections", None).is_err());
         assert!(extension_action(AgentKind::Antigravity, "update_plugin", Some("test")).is_err());
         assert!(extension_action(AgentKind::Gemini, "manage_plugins", None).is_err());
     }

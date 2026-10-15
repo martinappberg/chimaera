@@ -1,22 +1,24 @@
 # Agent integrations and the shared chat core
 
-Status: four built-in agents; third-party harness registration remains a proposed extension.
+Status: five built-in agents (Claude Code, Codex, Antigravity, Grok Build, Cursor CLI); third-party harness registration remains a proposed extension.
 
 ## Product boundary
 
 Choose an agent, then choose one of the models its signed-in account offers. Users do not
 choose protocols. Antigravity is Google's harness for Gemini models; its official ACP
 server is how Chimaera connects to that harness, not a new Chimaera-owned Gemini agent.
-Grok Build exposes ACP from its own executable. Claude Code and Codex keep their native
+Grok Build exposes ACP from its own executable, and Cursor CLI from its hidden `cursor-agent acp`
+subcommand. Claude Code and Codex keep their native
 protocols because their controls and lifecycle features are richer than this common subset.
 
-The new-agent menu keeps ready chats first, with installation/setup below. A conversation
+The new-agent menu lists installed agents first (the saved default leading) and folds the
+uninstalled ones under *other agents*; with nothing installed it shows every agent. A conversation
 remembers its own view independently of the default for new conversations. Unknown legacy
 CLI histories reopen in terminal. A failed resumed chat stays a visible failed chat.
 
 ## Implemented seams
 
-- `AgentKind::chat_adapter` explicitly registers the four built-in adapters. There is no
+- `AgentKind::chat_adapter` explicitly registers the five built-in adapters. There is no
   default-to-Codex branch for an unknown identity.
 - `driver.rs` owns process lifetime, framing, startup deadlines, delivery ordering and
   teardown. `ChatManager` owns command admission, the retained-send budget, journals and
@@ -78,7 +80,7 @@ unavailable conversations; never substitute another agent silently.
 
 Do not conflate an extension that adds a new agent with an add-on installed *inside* Claude,
 Codex or another agent. The existing Extensions Plugins/Connections/Skills reports use each
-agent's own plugin, authentication and skill APIs. Those probes cover all four built-ins through separate native adapters;
+agent's own plugin, authentication and skill APIs. Those probes cover all five built-ins through separate native adapters (Cursor's CLI lists MCP connections only — no plugins or skills);
 ACP chat support alone does not imply plugin, connection or skill discovery.
 Each registration needs separate capabilities for those surfaces. Unknown capability means
 unavailable, not an empty list of plugins or a fallback to Codex's commands or `$skill` syntax.
@@ -92,9 +94,9 @@ add Pi to the picker.
 
 ## Chimaera MCP and messages
 
-All four Chat adapters receive the same per-session Chimaera MCP endpoint. Tool visibility,
+All five Chat adapters receive the same per-session Chimaera MCP endpoint. Tool visibility,
 workspace isolation, plugin tools, inbox storage and wake policies belong to the daemon.
-Claude has a hook carrier and Codex has native mid-turn steering. Antigravity and Grok keep
+Claude has a hook carrier and Codex has native mid-turn steering. Antigravity, Grok and Cursor keep
 a busy chat's messages in its inbox; unread direct messages meet the wake policy when that
 turn ends. Broadcasts never wake a chat. ACP still shows the provider's approval requests;
 Chimaera does not infer standing consent from an arbitrary tool title.

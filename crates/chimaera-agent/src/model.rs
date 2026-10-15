@@ -543,6 +543,12 @@ pub enum AgentEvent {
         message: String,
         /// Fatal = the driver is dead; non-fatal = noted in the transcript.
         fatal: bool,
+        /// The message reads like a missing or rejected login
+        /// (`sign_in_failure`): the host's cue to ask the CLI's own status
+        /// again and show its sign-in, never a verdict by itself. Set once,
+        /// in the pump, for every driver.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        sign_in: bool,
     },
     Exited {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -956,6 +962,12 @@ pub enum AgentCommand {
     /// the TUI's Ctrl-B).
     BackgroundTool {
         tool_call_id: String,
+        /// The daemon freed the main thread so it reads a message from
+        /// another agent now (agent communication): its notice says so, and
+        /// a call that finished first (a benign race) says nothing.
+        /// Additive: absent from the UI's own Ctrl-B.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        for_message: bool,
     },
     /// Stop a running task — a subagent row id or a background task's
     /// native key (claude stop_task, generic over its task registry).
@@ -1210,7 +1222,7 @@ impl AgentCommand {
             } => {
                 check_command_len("user_message_id", user_message_id.len(), COMMAND_ID_MAX)?;
             }
-            Self::BackgroundTool { tool_call_id } => {
+            Self::BackgroundTool { tool_call_id, .. } => {
                 check_command_len("tool_call_id", tool_call_id.len(), COMMAND_ID_MAX)?;
             }
             Self::StopTask { task_id } => {
@@ -2375,5 +2387,67 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
         assert!(c.is_empty());
+    }
+}
+
+/// Whether an error the agent reported reads like a missing or rejected
+/// login — each CLI's own words (claude's "Not logged in · Please run
+/// /login" / "Invalid API key", codex's `401 Unauthorized: Missing bearer…`
+/// and "Please log out and sign in again", Cursor's "Authentication
+/// required" / "not signed in", Grok's "You are not authenticated", and
+/// Antigravity's "Please sign in"). A bare `401` counts only in an HTTP
+/// shape (`401 Unauthorized`, `status 401`, `HTTP 401`), never a line
+/// number. A hint for the host, never a verdict: the CLI's status command
+/// decides.
+pub fn sign_in_failure(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    const CUES: [&str; 14] = [
+        "401 unauthorized",
+        "status 401",
+        "http 401",
+        "missing bearer",
+        "not logged in",
+        "not signed in",
+        "not authenticated",
+        "please sign in",
+        "please log in",
+        "log out and sign in again",
+        "run /login",
+        "authentication required",
+        "invalid api key",
+        "login expired",
+    ];
+    CUES.iter().any(|cue| lower.contains(cue))
+}
+
+#[cfg(test)]
+mod sign_in_tests {
+    use super::sign_in_failure;
+
+    #[test]
+    fn each_cli_s_signed_out_words_are_cues_and_a_line_number_is_not() {
+        for text in [
+            "unexpected status 401 Unauthorized: Missing bearer or basic authentication in header",
+            "Not logged in · Please run /login",
+            "Invalid API key · Please run /login",
+            "Cursor CLI is not signed in on this host.",
+            "Authentication required. Please run 'agent login' first",
+            "You are not authenticated.",
+            "Error: Please sign in to view available models.",
+            "Please log out and sign in again.",
+            "request failed with status 401",
+        ] {
+            assert!(sign_in_failure(text), "{text}");
+        }
+        for text in [
+            "turn failed",
+            "GLIBC_2.28 not found",
+            "rate limit reached (status 429)",
+            "panicked at src/x.rs:401:5",
+            "listening on port 4011",
+            "the login page loaded",
+        ] {
+            assert!(!sign_in_failure(text), "{text}");
+        }
     }
 }

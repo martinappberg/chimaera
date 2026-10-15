@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { formatElapsedSeconds } from "../shared/time";
+  import { elapsedSince } from "../shared/time";
+  import { liveClock } from "../shared/liveClock.svelte";
   import WorkTray from "../shared/WorkTray.svelte";
   import WorkTrayRow from "../shared/WorkTrayRow.svelte";
   import SubagentChip from "./SubagentChip.svelte";
@@ -39,25 +40,13 @@
   /** Bound to the shell's expanded state — the clock below gates on it. */
   let open = $state(false);
 
-  /** 1 Hz clock for the elapsed column — only while the rows are actually
-   *  visible: collapsed (the default) nothing reads `now`, so the effect
-   *  bails and a long-running task doesn't tick a wake-up per second for
-   *  hours. Re-arms on expand (with a fresh `now`), torn down with the
-   *  tray (it unmounts on an empty set). */
-  let now = $state(Date.now());
-  $effect(() => {
-    if (!visible || !open) return;
-    now = Date.now();
-    const timer = setInterval(() => (now = Date.now()), 1000);
-    return () => clearInterval(timer);
-  });
+  /** The shared 1 Hz clock, read only while the rows are actually visible:
+   *  collapsed (the default) nothing reads it, so a long-running task
+   *  doesn't tick a wake-up per second for hours. */
+  const clock = liveClock(() => visible && open);
 
-  /** Elapsed since the driver first saw the task. The stamp is daemon-side
-   *  epoch ms, so clamp: a skewed client clock must not render "-3s". */
-  function elapsed(t: BackgroundTask): string {
-    if (t.startedAtMs <= 0) return "";
-    return formatElapsedSeconds(Math.max(0, Math.floor((now - t.startedAtMs) / 1000)));
-  }
+  /** Elapsed since the driver first saw the task. */
+  const elapsed = (t: BackgroundTask): string => elapsedSince(t.startedAtMs, clock.ms);
 
   /** The dot row stays glanceable: at most this many dots; the newest win
    *  (the entries are already the server-capped newest) and the count text

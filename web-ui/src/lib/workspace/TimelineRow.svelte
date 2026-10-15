@@ -167,7 +167,7 @@
     const n = first.note;
     if (n === undefined || onDeliver === undefined) return false;
     if (n.to === undefined || n.to === "everyone" || n.to === "mastermind") return false;
-    if (n.delivery === "next_step" || n.delivery === "woke") return false;
+    if (n.delivery === "next_step" || n.delivery === "now" || n.delivery === "woke") return false;
     return unreadFor(n.to) > 0;
   });
 

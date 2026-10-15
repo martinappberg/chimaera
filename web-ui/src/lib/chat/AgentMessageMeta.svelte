@@ -3,12 +3,14 @@
   import { formatFullTimestamp, formatMessageTimestamp } from "../shared/time";
 
   /**
-   * The quiet action cluster on an agent message — time, then usage, copy,
-   * rewind-to-here and fork-from-here as small icons — at the message's top
-   * right, shown on hover or keyboard focus (the buttons stay in the tab
-   * order, so focus is what reveals them). Each action is optional: a
-   * read-only view offers copy alone; rewind exists only once a later
-   * message of yours gives the agent a point to return to.
+   * The quiet actions on an agent message — time, then copy, rewind-to-here
+   * and fork-from-here as small icons — at the message's bottom right, where
+   * the reader is when a long reply ends; bare icons with no card, shown on
+   * hover or keyboard focus (the buttons stay in the tab order, so focus is
+   * what reveals them). The turn's tokens and duration ride the time's
+   * tooltip. Each action is optional: a read-only view offers copy alone;
+   * rewind exists only once a later message of yours gives the agent a
+   * point to return to.
    */
   interface Props {
     text: string;
@@ -19,9 +21,7 @@
      *  flow, anchored on the next message you sent). */
     onRewind?: () => void;
     rewindTitle?: string;
-    /** Show plan usage (the UsagePanel flow). */
-    onUsage?: () => void;
-    /** The turn's footprint for the usage icon's tooltip ("12.3k tokens"). */
+    /** The turn's footprint ("12.3k tokens"), for the time's tooltip. */
     turnTokens?: string | null;
     /** The turn's duration ("5.4s") when this is the turn's closing message —
      *  a detail for the timestamp's tooltip, not the page. */
@@ -35,21 +35,18 @@
     onFork,
     onRewind,
     rewindTitle = "rewind to here",
-    onUsage,
     turnTokens = null,
     turnDuration = null,
   }: Props = $props();
-  const usageTitle = $derived(
-    [turnTokens !== null ? `this turn: ${turnTokens}` : null, turnDuration, "show plan usage"]
-      .filter((part) => part !== null)
-      .join(" · "),
-  );
-
   const timeLabel = $derived(formatMessageTimestamp(sentAtMs, nowMs));
   const fullTime = $derived(
-    turnDuration !== null
-      ? `${formatFullTimestamp(sentAtMs)} · turn took ${turnDuration}`
-      : formatFullTimestamp(sentAtMs),
+    [
+      formatFullTimestamp(sentAtMs),
+      turnDuration !== null ? `turn took ${turnDuration}` : null,
+      turnTokens,
+    ]
+      .filter((part) => part !== null)
+      .join(" · "),
   );
   const isoTime = $derived(sentAtMs > 0 ? new Date(sentAtMs).toISOString() : "");
 
@@ -81,20 +78,6 @@
     <time datetime={isoTime} title={fullTime}>{timeLabel}</time>
   {/if}
   <span class="actions">
-    {#if onUsage !== undefined}
-      <button aria-label="show plan usage" title={usageTitle} onclick={onUsage}>
-        <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
-          <path
-            d="M2 11.5l3.2-3.6 2.6 2.2L11 5.5l3 3"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.4"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-          />
-        </svg>
-      </button>
-    {/if}
     <button
       class="copy-action"
       class:copied
@@ -136,12 +119,12 @@
     </button>
     {#if onRewind !== undefined}
       <button aria-label={rewindTitle} title={rewindTitle} onclick={onRewind}>
-        <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+        <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
           <path
             d="M3.5 5.5h6a3.5 3.5 0 0 1 0 7H6M3.5 5.5L6 3M3.5 5.5L6 8"
             fill="none"
             stroke="currentColor"
-            stroke-width="1.4"
+            stroke-width="1.5"
             stroke-linecap="round"
             stroke-linejoin="round"
           />
@@ -154,15 +137,15 @@
         title="fork from this message into a new session (source keeps running)"
         onclick={onFork}
       >
-        <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
-          <circle cx="4" cy="3.5" r="1.5" fill="none" stroke="currentColor" stroke-width="1.4" />
-          <circle cx="4" cy="12.5" r="1.5" fill="none" stroke="currentColor" stroke-width="1.4" />
-          <circle cx="12" cy="8" r="1.5" fill="none" stroke="currentColor" stroke-width="1.4" />
+        <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+          <circle cx="4" cy="3.5" r="1.5" fill="none" stroke="currentColor" stroke-width="1.5" />
+          <circle cx="4" cy="12.5" r="1.5" fill="none" stroke="currentColor" stroke-width="1.5" />
+          <circle cx="12" cy="8" r="1.5" fill="none" stroke="currentColor" stroke-width="1.5" />
           <path
             d="M5.5 3.5h.5A2 2 0 0 1 8 5.5v5A2 2 0 0 1 6 12.5h-.5M8 8h2.5"
             fill="none"
             stroke="currentColor"
-            stroke-width="1.4"
+            stroke-width="1.5"
             stroke-linecap="round"
           />
         </svg>
@@ -172,22 +155,19 @@
 </div>
 
 <style>
-  /* The message's top right, floating over the gap above it: it reserves no
-     row, and when it shows it sits on the page's own background so the
-     prose under its corner stays legible around it. */
+  /* The message's bottom right, floating over the gap below it: it reserves
+     no row and draws no card — bare glyphs that fade in, where a long reply
+     leaves the reader. */
   .agent-message-meta {
     position: absolute;
-    top: -13px;
+    bottom: -11px;
     right: 0;
     z-index: 1;
     display: inline-flex;
     align-items: center;
     gap: 5px;
-    height: 22px;
-    padding: 0 3px 0 8px;
-    border-radius: 7px;
-    background: var(--bg);
-    box-shadow: 0 0 0 1px color-mix(in srgb, var(--edge) 70%, transparent);
+    height: 20px;
+    padding: 0;
     color: color-mix(in srgb, var(--muted) 78%, transparent);
     font-size: var(--text-xs);
     line-height: 1;
@@ -277,10 +257,7 @@
       position: static;
       height: 20px;
       margin-left: 0.6em;
-      padding: 0;
       vertical-align: middle;
-      background: none;
-      box-shadow: none;
       opacity: 1;
       pointer-events: auto;
     }

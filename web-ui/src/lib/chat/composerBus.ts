@@ -76,13 +76,6 @@ export function insertIntoComposer(
   return true;
 }
 
-/** Attach an image alone (an OS drop onto a chat pane: pixels to the model
- *  now, its uploaded path follows as text) — the same composer and buffer as
- *  text inserts. */
-export function attachImageToComposer(sessionId: string, image: ImageAttachment): void {
-  insertIntoComposer(sessionId, "", "inline", undefined, image);
-}
-
 // --- follow the send ------------------------------------------------------------
 // A prompt sent from OUTSIDE the composer (the Mastermind panel's Brief me and
 // suggestion chips go straight over the socket) is still the user's send: the

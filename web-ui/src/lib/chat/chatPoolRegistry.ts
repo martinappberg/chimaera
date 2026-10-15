@@ -40,7 +40,7 @@ export interface ChatEntry {
    *  manufacture a "new activity" badge, and an MRU eviction must not forget
    *  that background output is still unread. */
   followedVersion: number | null;
-  /** performance.now() when the current turn started (null when idle). Kept
+  /** Epoch ms (Date.now) when the current turn started (null when idle). Kept
    *  here, NOT in the reducer, so the elapsed-turn counter survives a remount
    *  (a tab switch mid-turn) without ever leaking a clock into journal replay. */
   turnStart: number | null;

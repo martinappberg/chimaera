@@ -1,9 +1,9 @@
 <script lang="ts">
   import { untrack } from "svelte";
-  import { ApiError, getHostLabel } from "../net/api";
+  import { ApiError, getHostLabel, isRemoteHost } from "../net/api";
   import { pageVisible } from "../shared/visibility";
   import { openInSystemBrowser } from "../shared/urlOpen";
-  import { agentName, agentPluginsRevision, type AgentId } from "./store";
+  import { agentExtensionAction, agentName, agentPluginsRevision, type AgentId } from "./store";
   import { connectionStatus, fetchConnections, managementUrl, type ConnectionsReport } from "./connections";
 
   import AgentExtensionControls from "./AgentExtensionControls.svelte";
@@ -15,10 +15,24 @@
   let unavailable = $state(false);
   let error = $state<string | null>(null);
   let signingIn = $state<{agent: AgentId; name: string} | null>(null);
+  /** A CLI whose MCP sign-in runs only in its own terminal: open one. */
+  let terminalBusy = $state<string | null>(null);
+  async function signInInTerminal(agent: AgentId, name: string): Promise<void> {
+    if (terminalBusy !== null) return;
+    terminalBusy = `${agent}:${name}`;
+    error = null;
+    try { onOpenSession(await agentExtensionAction(wsId, agent, "login_connection", name)); }
+    catch (e) { error = e instanceof Error ? e.message : String(e); }
+    finally { terminalBusy = null; }
+  }
   let sequence = 0;
   $effect(() => () => { sequence++; });
   const host = $derived(report?.host || getHostLabel());
   const agents = $derived(report?.agents.filter(a => a.available) ?? []);
+  /** Cursor's terminal sign-in waits for its OAuth callback on a localhost
+   *  port of the daemon's host, so it only completes where this browser is
+   *  that host: a local workspace. */
+  const terminalSignIn = !isRemoteHost();
 
   async function load(refresh = false): Promise<void> {
     const mine = ++sequence;
@@ -78,6 +92,10 @@
             <div class="actions">
               {#if connection.login}
                 <button class="opt" disabled={loading} title={`Connect with ${agent.agent} on ${host}`} onclick={() => signingIn = {agent: agent.agent, name: connection.name}}>{connection.source === "claude.ai" ? "Set up" : "Sign in"}</button>
+              {:else if connection.login_terminal && terminalSignIn}
+                <button class="opt" disabled={loading || terminalBusy !== null} title={`Opens a terminal running ${agentName(agent.agent)}'s own sign-in for this server (local workspaces only: it waits for the browser's callback on this host)`} onclick={() => void signInInTerminal(agent.agent, connection.name)}>Sign in</button>
+              {:else if connection.login_terminal}
+                <span class="hint" title="Cursor's sign-in waits for the browser's callback on the daemon's host">sign in on the host</span>
               {:else if manage}
                 <a href={manage} rel="noopener noreferrer" onclick={(event) => { event.preventDefault(); void openInSystemBrowser(manage); }}>Manage ↗</a>
               {/if}
@@ -87,7 +105,7 @@
       </section>
     {/each}
     {#if agents.length > 0}
-      <p class="footnote">Set up opens Claude's connector settings; Sign in guides you through an MCP server's browser authorization. “Configured” means the server is listed; it doesn't confirm a live connection. Changes may require reconnecting or reopening an existing agent session.</p>
+      <p class="footnote">Set up opens Claude's connector settings; Sign in guides you through an MCP server's browser authorization — for Cursor it opens a terminal running the CLI's own sign-in, which waits for the browser's callback on this host, so it is offered in local workspaces only. “Configured” means the server is listed; it doesn't confirm a live connection. Changes may require reconnecting or reopening an existing agent session.</p>
     {/if}
   {/if}
 </div>
@@ -109,6 +127,7 @@
   .identity { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
   .name { font-size: var(--text-sm); overflow-wrap: anywhere; }
   .actions { display: flex; justify-content: flex-end; }
+  .hint { color: var(--muted); font-size: var(--text-xs); white-space: nowrap; }
   .actions a { color: var(--muted); font-size: var(--text-xs); text-decoration: none; }
   .actions a:hover { color: var(--fg); text-decoration: underline; }
   .attention, .error { color: var(--warn); }

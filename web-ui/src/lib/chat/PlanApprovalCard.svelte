@@ -181,7 +181,7 @@
   .plan-approval {
     border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--edge));
     background: color-mix(in srgb, var(--accent) 5%, transparent);
-    border-radius: 8px;
+    border-radius: var(--radius-card);
     padding: 10px 12px;
     margin: 6px 0;
     outline: none;
