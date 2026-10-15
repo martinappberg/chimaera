@@ -1,6 +1,6 @@
 # Agent communication
 
-Claude, Codex, Antigravity and Grok chats, plus Claude/Codex terminals, can see which other agents
+Claude, Codex, Antigravity, Grok and Cursor chats, plus Claude/Codex terminals, can see which other agents
 are running and what they're doing, read one's recent work, and send them messages that
 actually arrive. The workspace **Mastermind** is part of it: the one coordinator the user
 appoints, whose messages carry direction. Built into Chimaera (it replaced the Agent notes
@@ -39,7 +39,7 @@ on the per-session MCP endpoint ([linked-terminals.md](linked-terminals.md#the-m
   (`message_agent (chimaera) → s-…`, `chimaera.message_agent → s-…`).
 - **Key behaviors.** Pre-allowed for workers (claude `permissions.allow`, codex
   `mcp_auto_approve`, the codex-terminal `approval_mode`), because the setting is the
-  standing permission. Antigravity and Grok retain native ACP approval requests; an ask-first Mastermind's `message_agent` keeps its prompt. The names
+  standing permission. Antigravity, Grok and Cursor retain native ACP approval requests; an ask-first Mastermind's `message_agent` keeps its prompt. The names
   avoid Claude Code's own `ListAgents` / `SendMessage` (machine-wide, other Claude sessions):
   asked to "use list_agents", a live haiku loaded those instead, so the instructions also say
   the harness's own agent tools never reach this workspace's agents. Those tools stay the
@@ -77,12 +77,12 @@ on the per-session MCP endpoint ([linked-terminals.md](linked-terminals.md#the-m
     waits on its spawned agents (`wait`), the steer ends that wait at once: it reads and
     answers, then waits again. One that misses its turn settles `dropped` and goes back to
     the inbox; it never opens a turn.
-  - **Antigravity and Grok chats, mid-turn:** messages stay in the inbox. Unread direct
+  - **Antigravity, Grok and Cursor chats, mid-turn:** messages stay in the inbox. Unread direct
     messages meet the wake policy after the current turn; these agents do not support
     Codex steering.
   - **Codex terminals:** the inbox only — it sees messages when it calls
     `read_messages` (`workspace_agents` says so, and says how many wait).
-  - **Antigravity and Grok terminals:** automatic Chimaera MCP injection is not available
+  - **Antigravity, Grok and Cursor terminals:** automatic Chimaera MCP injection is not available
     in the verified CLIs. Use Chat for Chimaera messages; no global configuration is changed.
   - **An idle chat:** the wake policy decides (below).
 - **Key behaviors.** What the agent reads: a header line
@@ -113,7 +113,7 @@ on the per-session MCP endpoint ([linked-terminals.md](linked-terminals.md#the-m
 | Claude chat | read when the subagent returns; with `freeSubagents` on, read now: the subagent moves to the background and keeps working | read when the command ends | what it waits on, for how long, and when (or, freed, whether) it read it |
 | Codex chat | read now: the steer ends the `wait`, the subagent keeps working | read when the command ends | the same |
 | Claude terminal | read when the subagent returns: nothing can move a terminal's subagent | read when the command ends | "waiting on a subagent for N min (…); a terminal can't be interrupted, so it reads this when that subagent returns" |
-| Antigravity / Grok chat | no subagent surface; nothing reaches a running ACP turn | read after the turn, by the wake policy | "it waits in its inbox (its current turn is still running; it is …) and reads it when that turn ends" |
+| Antigravity / Grok / Cursor chat | no subagent surface; nothing reaches a running ACP turn | read after the turn, by the wake policy | "it waits in its inbox (its current turn is still running; it is …) until that turn ends, when the user's wake setting decides whether it reads it then" |
 | Codex terminal | inbox only (`read_messages`) | inbox only | "sees messages when it calls read_messages" |
 
 Claude Code's own queued input (stdin messages, its cross-session peer messages, its task

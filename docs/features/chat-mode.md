@@ -325,8 +325,9 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
     working glyph (paused when the window is hidden) and the elapsed time; settled, it is titled by
     the agent's own past-tense batch label when it offers one (Claude `tool_use_summary`: "Listed
     files in the workspace"; on by default, `chat.toolSummaries`), else a lone described call's
-    description, else readable counts ("Ran 2 commands, read a file") — Codex commands and ACP
-    rows carry no description, so they read this way — followed by the run's duration (nothing
+    description, else readable counts ("Ran 2 commands, read a file") — described lines are
+    Claude's alone: Codex and ACP rows carry no description, so their line is always the counts
+    (present tense while a call runs) and each expanded row shows the agent's own title — followed by the run's duration (nothing
     under a second; descriptions are read from execute rows only — other tools' `description`
     arguments, like an Artifact's caption, say something else). Calls still running without a
     description read in the present tense
@@ -595,7 +596,7 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   finished/abandoned run drops from the tray (reconciled shut at turn end; a deliberate Stop settles
   neutrally, a genuine error fails).
   The plan card likewise names the current step (its active form) when folded. Both are pure derivations over `blocks`/`plan` — no new events
-  (`AgentsTray.svelte`).
+  (`AgentsTray.svelte`; the plan's folded line is `planCard.ts` `planSummary`).
 - **Which model each subagent runs on, and open a subagent as its own chat.** Every subagent row —
   the agents tray, the background tray's `agent` lanes, the "Agent:" tool card and the "Agent “…”
   finished" line — shows the model actually serving it, in the agent's own words (claude's served id
@@ -612,18 +613,10 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   with its parent chat. Where it comes from: claude writes each subagent's full conversation to
   `<session>/subagents/agent-<id>.jsonl` beside the parent's transcript (read by the daemon,
   `GET /sessions/{id}/subagents/{agent_id}/transcript`); codex keeps it as a child thread readable
-  only on the live app-server connection (`thread/read`, through the driver). Antigravity and Grok
-  report no subagents on their wires, so they show neither. PROTOCOL.md Pass 42.
-- **The task list is the plan panel, whichever tool spells it.** Claude replaced `TodoWrite` with an
-  incremental `TaskCreate`/`TaskUpdate`/`TaskList` family; both feed the same pinned panel and
-  neither leaves bookkeeping rows in the transcript. Because the new family carries more than a
-  checklist, a row can show **who owns it** (`@name`) and **what blocks it** ("blocked by #1", with
-  a dashed circle and "after #1", since a blocked task is still `todo`), plus a muted detail line when the task's
-  description says more than its subject. Blockers are filtered to ones still open, so finishing a
-  dependency visibly unblocks its dependents. The in-progress summary prefers the agent's own
-  present-continuous `activeForm` ("Running tests"). Older CLIs and codex, whose plans carry none of
-  this, render exactly as before — the extra fields are simply absent.
-- **Every chat is asked to keep a plan card.** The chimaera MCP server offers every session an `update_plan` tool (a whole-list level-set of `{content, status}` steps that the daemon journals as the normalized `plan` event, pre-allowed like `notify`), and its `initialize` instructions ask each runtime for the card for any request that edits files or runs more than one command: Claude through that tool (Claude Code offers no TaskCreate/TaskUpdate under `-p`; probed on 2.1.300), Codex through its native `update_plan`, an ACP agent through its own plan tool or chimaera's. A plan written as a file or prose draws nothing (`mcp.rs` `update_plan`, `task_list_instructions`).
+  only on the live app-server connection (`thread/read`, through the driver). Antigravity, Grok
+  and Cursor report no subagents on their ACP wires, so they show neither. PROTOCOL.md Pass 42.
+- **The task list is the plan card, whichever tool spells it.** Every plan source — Claude's `TodoWrite` or its incremental `TaskCreate`/`TaskUpdate`/`TaskList` family, chimaera's `update_plan`, Codex's built-in `update_plan`, an ACP agent's plan — arrives as the one `plan` level-set, and none leaves bookkeeping rows in the transcript. The Task family carries more than a checklist, so its rows can show **who owns a step** (`@name`) and **what blocks it** (a dashed circle and "after #1": a blocked task is still `todo`), plus a muted detail line when the task's description says more than its subject. Blockers are filtered to ones still open, so finishing a dependency visibly unblocks its dependents. The in-progress summary prefers the agent's own present-continuous `activeForm` ("Running tests"). Plans without these fields render without them.
+- **Chats are asked to keep a plan card, each in its own runtime's words.** The chimaera MCP server's `initialize` instructions ask a chat for the card on any request that edits files or runs more than one command, and the wording depends on the runtime and surface (`mcp.rs` `task_list_instructions(kind, chat)`, `plan_tool_for`). A **Claude chat** is offered chimaera's `update_plan` tool (a whole-list level-set of `{content, status}` steps that the daemon journals as the normalized `plan` event) and asked to use it: Claude Code offers no TaskCreate/TaskUpdate under `-p` (probed on 2.1.300). A **Codex chat** is pointed at its built-in `update_plan` and is not offered chimaera's, so it never sees two tools of that name. An **ACP chat** (Antigravity, Grok, Cursor) is asked to keep its own plan or to-do tool current and is not offered chimaera's. A **terminal session** of any kind gets neither: its own task list renders in the terminal. `update_plan` stays in `mcp::ALWAYS_ALLOWED_TOOLS` (Claude `permissions.allow`, Codex `mcp_auto_approve`), harmless where the tool isn't listed, and the Claude driver hides its `mcp__chimaera__update_plan` call row (`claude.rs` `CHIMAERA_PLAN_TOOL`). A plan written as a file or prose draws nothing.
 - **The plan card, and two pinned strips.** Plan, subagents, and background work are three
   orthogonal readings of a session — what the agent *means* to do, *who* is working, what is
   *detached* — stacked above the composer; only non-empty ones render. Subagents and background
@@ -631,10 +624,10 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   card (`PlanCard.svelte`, derivations in `planCard.ts`) with one row per step whose circle says its
   state without colour: a filled check for done (quiet text), a plain circle for the step in flight
   (foreground, its active form), a dashed circle for waiting. It is the same card for every runtime —
-  Claude's Task family or TodoWrite, Codex `update_plan`, an ACP plan all arrive as the one `plan`
-  level-set. Rows update in place (keyed by the agent's id, else position) and never reorder; a
+  Claude's Task family, TodoWrite or chimaera's `update_plan`, Codex's `update_plan`, an ACP plan all
+  arrive as the one `plan` level-set. Rows update in place (keyed by the agent's id, else position) and never reorder; a
   long plan scrolls inside the card, which keeps the step in flight in view by moving only its own
-  scroll. Once the turn ends with every step done the card leaves (the desktop apps keep a
+  scroll. Once the turn ends with every step done the card leaves — ChatView unmounts it (the desktop apps keep a
   finished list only in the transcript, never pinned); while steps are open, the corner count +
   chevron (`2/4 ⌄`) folds it to one line or unfolds it at any time (the automatic state wins again
   when it next changes). The workspace dashboard card follows the same rule —

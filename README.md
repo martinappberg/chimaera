@@ -62,7 +62,7 @@ see questions and approvals in the dashboard, and follow recent activity. Agents
 can exchange messages within the workspace. An optional **Mastermind** coordinator
 helps brief you and direct the work.
 
-All four supported agents have structured chat. Claude Code and Codex also let you
+All five supported agents — Claude Code, Codex, Antigravity, Grok Build and Cursor CLI — have structured chat. Claude Code and Codex also let you
 switch the same conversation between chat and their real terminal interfaces.
 Provider authentication, usage limits, and billing apply to the mode you use.
 
