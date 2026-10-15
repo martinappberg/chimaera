@@ -14,8 +14,10 @@
 //! that stays in `api.rs`, with argv assembly here so it is unit-testable.
 //!
 //! Detection resolves each binary the way a human terminal would — through
-//! the user's *interactive login* shell (`-ilc`), then a set of well-known
-//! install prefixes, then the chimaera-managed bin dir. Field-tested: `claude`
+//! the user's *interactive login* shell (`-ilc`), then the daemon's PATH,
+//! well-known install prefixes, then the chimaera-managed bin dir. Only a
+//! completed shell probe can authorize fallback; a failed probe is retryable.
+//! Field-tested: `claude`
 //! is not on the non-interactive ssh PATH on HPC login nodes, and on macOS the
 //! claude installer's `~/.local/bin` PATH line lives in the interactive-only
 //! `.zshrc` — a login-only `-lc` (or a GUI launch with no usable `$SHELL`)
@@ -263,6 +265,27 @@ async fn detect_inner(
     refresh: bool,
     serve_miss: bool,
 ) -> AgentDetection {
+    detect_with_resolver(
+        state,
+        kind,
+        refresh,
+        serve_miss,
+        |managed, explicit| async move { resolve_bin(kind, &managed, explicit).await },
+    )
+    .await
+}
+
+async fn detect_with_resolver<F, Fut>(
+    state: &AppState,
+    kind: AgentKind,
+    refresh: bool,
+    serve_miss: bool,
+    resolve: F,
+) -> AgentDetection
+where
+    F: FnOnce(PathBuf, Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<PathBuf, String>>,
+{
     // A hit that still validates outlives a transient probe miss (a slow rc
     // on NFS, a login shell that timed out): on a refresh it is kept and no
     // miss is recorded over it.
@@ -311,9 +334,8 @@ async fn detect_inner(
         }
     }
     let explicit = crate::lock(&state.settings).agent_path(kind);
-    let path = resolve_bin(
-        kind,
-        &crate::runtimes::managed_bin_for(state, kind.as_str()),
+    let path = resolve(
+        crate::runtimes::managed_bin_for(state, kind.as_str()),
         explicit.clone(),
     )
     .await;
@@ -353,9 +375,11 @@ async fn detect_inner(
             crate::lock(&state.agent_misses).remove(&kind);
         }
         Err(reason) => {
+            tracing::warn!(agent = kind.as_str(), %reason, "agent executable resolution failed");
             if let Some(hit) = validating_hit {
                 // The executable is still there: the probe, not the install,
                 // failed this time.
+                tracing::info!(agent = kind.as_str(), path = ?hit.path, "retaining cached agent executable");
                 return hit;
             }
             crate::lock(&state.agent_misses).insert(kind, (reason.clone(), Instant::now()));
@@ -424,12 +448,9 @@ fn exec_mtime(path: &Path) -> Option<std::time::SystemTime> {
     meta.modified().ok()
 }
 
-/// Concrete locations an agent binary lands in, checked when the login-shell
-/// probe misses (or is unavailable). Recovers a user's own install even when
-/// the daemon's shell can't see it — a GUI launch with no usable `$SHELL`, a
-/// PATH addition confined to an rc the probe couldn't source, or a hung shell
-/// the timeout gave up on. `home` is the user's home dir (threaded in so the
-/// list is testable without mutating the process environment).
+/// Concrete installer locations, used only after a completed login-shell
+/// probe and the inherited PATH both miss. Do not scan version-manager
+/// directories: an installed version is not necessarily the user's selection.
 fn well_known_agent_paths(bin: &str, home: Option<&Path>) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Some(home) = home {
@@ -448,102 +469,201 @@ fn well_known_agent_paths(bin: &str, home: Option<&Path>) -> Vec<PathBuf> {
     out
 }
 
-/// Timeout for the login-shell resolution probe. An interactive rc can be
-/// slow (completion init, prompt frameworks) or, pathologically, block on
-/// input; the well-known-path and managed fallbacks backstop a timeout, so
-/// this need not be generous.
+/// A slow/blocked rc is an error, not evidence that the agent is absent.
 const SHELL_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
+const SHELL_PROBE_OUTPUT_CAP: u64 = 64 * 1024;
 
-/// `command -v <bin>` through the user's *interactive login* shell. `-ilc`
-/// (not the old login-only `-lc`) so zsh sources `.zshrc` and bash sources
-/// `.bashrc` — where the claude installer and most users keep their PATH
-/// additions; login-only init misses them, and that was the "claude no longer
-/// resolves" bug when the app launched outside a terminal. Banners are
-/// tolerated (last non-empty stdout line is the path); stdin is `/dev/null`
-/// and a timeout backstops a slow or input-reading rc.
-async fn resolve_via_login_shell(shell: &str, bin: &str) -> Option<PathBuf> {
-    let output = tokio::process::Command::new(shell)
-        .arg("-ilc")
-        .arg(format!("command -v {bin}"))
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .output();
-    let out = tokio::time::timeout(SHELL_PROBE_TIMEOUT, output)
-        .await
-        .ok()?
-        .ok()?;
-    if !out.status.success() {
-        return None;
+/// Kill rc children as well as the shell on timeout or cancellation. The
+/// guard drops before the child is reaped, while its process-group id is owned.
+struct ShellProbeGroup(Option<nix::unistd::Pid>);
+
+impl Drop for ShellProbeGroup {
+    fn drop(&mut self) {
+        if let Some(group) = self.0 {
+            let _ = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL);
+        }
     }
-    let path = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find(|l| !l.is_empty())?
-        .to_string();
-    path.starts_with('/').then(|| PathBuf::from(path))
 }
 
-/// Resolve an agent binary: an explicit `agents.<kind>.path` setting wins when
-/// runnable, else the way a human terminal would, then concrete locations the
-/// daemon can see without any shell:
-///   1. the explicit per-agent path setting (if it points at a runnable file);
-///   2. the user's interactive login shell (`command -v`);
-///   3. well-known install prefixes (the official installers' targets);
-///   4. the chimaera-managed bin dir (installs are deliberately NOT on the
-///      user's PATH — dotfiles stay theirs).
-///
-/// The user's own install always wins over the managed one.
+/// `command -v` in the interactive login shell. Nonce markers separate the
+/// answer from startup/logout banners and prove startup reached our command.
+/// A completed empty answer is the ONLY shell result that permits fallback.
+async fn resolve_via_login_shell(shell: &str, bin: &str) -> Result<Option<PathBuf>, String> {
+    probe_login_shell(shell, bin, SHELL_PROBE_TIMEOUT).await
+}
+
+async fn probe_login_shell(
+    shell: &str,
+    bin: &str,
+    timeout: Duration,
+) -> Result<Option<PathBuf>, String> {
+    use tokio::io::AsyncReadExt;
+    let nonce = chimaera_core::generate_token();
+    let start = format!("chimaera-{nonce}-start");
+    let end = format!("chimaera-{nonce}-end");
+    // `bin` is a fixed registration name, never user-supplied shell text.
+    // Semicolons + printf work in both POSIX shells and fish.
+    let script = format!("printf '\\n{start}\\n'; command -v {bin} || true; printf '\\n{end}\\n'");
+    let mut child = tokio::process::Command::new(shell)
+        .arg("-ilc")
+        .arg(script)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("could not start login shell `{shell}`: {e}"))?;
+    let mut group = ShellProbeGroup(child.id().map(|pid| nix::unistd::Pid::from_raw(pid as i32)));
+    let stdout = child.stdout.take().expect("piped stdout");
+    let work = async {
+        let mut bytes = Vec::new();
+        stdout
+            .take(SHELL_PROBE_OUTPUT_CAP + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|e| format!("could not read login shell `{shell}`: {e}"))?;
+        if bytes.len() as u64 > SHELL_PROBE_OUTPUT_CAP {
+            return Err(format!("login shell `{shell}` exceeded the output limit"));
+        }
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| format!("could not wait for login shell `{shell}`: {e}"))?;
+        // The leader has been reaped: never signal this group id again.
+        group.0 = None;
+        if !status.success() {
+            return Err(format!("login shell `{shell}` exited with {status}"));
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        let mut lines = text.lines().skip_while(|line| *line != start);
+        if lines.next().is_none() {
+            return Err(format!(
+                "login shell `{shell}` did not complete executable discovery"
+            ));
+        }
+        let mut answer = None;
+        for line in lines {
+            if line == end {
+                return Ok(answer);
+            }
+            if !line.is_empty() {
+                if answer.is_some() || !Path::new(line).is_absolute() {
+                    return Err(format!(
+                        "login shell `{shell}` returned an unsupported executable for {bin}"
+                    ));
+                }
+                answer = Some(PathBuf::from(line));
+            }
+        }
+        Err(format!(
+            "login shell `{shell}` did not complete executable discovery"
+        ))
+    };
+    let result = tokio::time::timeout(timeout, work)
+        .await
+        .unwrap_or_else(|_| {
+            Err(format!(
+                "login shell `{shell}` timed out after {} seconds",
+                timeout.as_secs_f64()
+            ))
+        });
+    if group.0.is_some() {
+        drop(group);
+        // Tokio reaps a dropped kill_on_drop child. Do not extend the probe's
+        // deadline waiting for a process stuck in uninterruptible filesystem IO.
+    }
+    result
+}
+
+struct BinarySearch {
+    shell: String,
+    path: Option<std::ffi::OsString>,
+    well_known: Vec<PathBuf>,
+}
+
+impl BinarySearch {
+    fn current(kind: AgentKind) -> Self {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        Self {
+            shell: login_shell(),
+            path: std::env::var_os("PATH"),
+            well_known: well_known_agent_paths(kind.path_bin(), home.as_deref()),
+        }
+    }
+}
+
+/// Explicit setting → interactive login shell → inherited PATH → installer
+/// prefixes → managed install. Never rank by version: an older CLI can be the
+/// user's deliberate choice. A failed shell cannot authorize another install.
 async fn resolve_bin(
     kind: AgentKind,
     managed_bin: &Path,
     explicit: Option<String>,
 ) -> Result<PathBuf, String> {
-    // An explicit path the user set is authoritative when it's actually
-    // runnable. A stale/typo'd one falls through to normal resolution rather
-    // than hard-failing every spawn — the launcher surfaces the setting either
-    // way, so a mistake is visible without bricking the agent.
-    if let Some(p) = explicit.as_deref() {
-        let path = PathBuf::from(p);
-        if is_executable(&path) {
-            return Ok(path);
-        }
+    let search = BinarySearch::current(kind);
+    let probe = resolve_via_login_shell(&search.shell, kind.path_bin());
+    resolve_with_search(kind, managed_bin, explicit, &search, probe).await
+}
+
+async fn resolve_with_search(
+    kind: AgentKind,
+    managed_bin: &Path,
+    explicit: Option<String>,
+    search: &BinarySearch,
+    probe: impl std::future::Future<Output = Result<Option<PathBuf>, String>>,
+) -> Result<PathBuf, String> {
+    // Preserve the existing stale/typo'd-setting behavior: fall through when
+    // it isn't runnable. A valid explicit setting needs no shell at all.
+    let explicit = explicit.map(PathBuf::from);
+    let explicit = tokio::task::spawn_blocking(move || explicit.filter(|p| is_executable(p)))
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Some(path) = explicit {
+        return Ok(resolved_binary(kind, "explicit setting", path));
     }
-
-    let bin = kind.path_bin();
-    let shell = login_shell();
-
-    let candidate = match resolve_via_login_shell(&shell, bin).await {
-        Some(path) => Some(path),
-        None => {
-            let home = std::env::var_os("HOME").map(PathBuf::from);
-            well_known_agent_paths(bin, home.as_deref())
-                .into_iter()
-                .find(|p| is_executable(p))
-        }
-    };
-
-    // Default miss reason; the agy IDE-shim case overrides it before falling
-    // through to the managed binary.
-    let mut miss = not_found(kind, &shell);
-    if let Some(path) = candidate {
-        // The Antigravity IDE ships an `agy` symlink to its own app launcher
-        // (like VS Code's `code`): it opens the GUI and exits 0 silently — NOT
-        // the CLI. Field-found: spawning it made a pane that just said
-        // "[exited]". Refuse it from every source and prefer a managed agy.
-        if kind == AgentKind::Antigravity && agy_is_ide_shim(&path) {
-            miss = format!(
-                "the `agy` on your PATH is the Antigravity IDE's app launcher, \
-                 not the Antigravity CLI; install the CLI (`{cmd}`, see {url})",
-                cmd = install_command(kind),
-                url = docs_url(kind),
-            );
+    let shell_path = probe.await.map_err(|reason| format!(
+        "{reason}; could not determine the configured {bin} executable. Retry, fix your login shell, or set agents.{id}.path to the intended executable in Settings",
+        bin = kind.path_bin(), id = kind.as_str(),
+    ))?;
+    let search_path = search.path.clone();
+    let well_known = search.well_known.clone();
+    let managed_bin = managed_bin.to_path_buf();
+    let shell = search.shell.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut miss = not_found(kind, &shell);
+        if let Some(path) = shell_path {
+            if !is_executable(&path) {
+                return Err(format!("login shell selected {} for {}, but it is not executable; retry or set agents.{}.path in Settings", path.display(), kind.path_bin(), kind.as_str()));
+            }
+            if kind == AgentKind::Antigravity && agy_is_ide_shim(&path) {
+                miss = format!("the `agy` on your PATH is the Antigravity IDE's app launcher, not the Antigravity CLI; install the CLI (`{cmd}`, see {url})", cmd = install_command(kind), url = docs_url(kind));
+            } else {
+                return Ok(resolved_binary(kind, "login shell", path));
+            }
         } else {
-            return Ok(path);
+            // Relative/empty PATH entries depend on the daemon's incidental
+            // working directory, not the workspace an agent will run in.
+            let inherited = search_path.as_deref().into_iter()
+                .flat_map(std::env::split_paths)
+                .filter(|dir| dir.is_absolute())
+                .map(|dir| ("inherited PATH", dir.join(kind.path_bin())));
+            let known = well_known.into_iter().map(|path| ("well-known location", path));
+            for (source, path) in inherited.chain(known) {
+                if is_executable(&path) && !(kind == AgentKind::Antigravity && agy_is_ide_shim(&path)) {
+                    return Ok(resolved_binary(kind, source, path));
+                }
+            }
         }
-    }
+        managed_fallback(kind.as_str(), &managed_bin)
+            .map(|path| resolved_binary(kind, "managed install", path))
+            .ok_or(miss)
+    }).await.map_err(|e| e.to_string())?
+}
 
-    managed_fallback(kind.as_str(), managed_bin).ok_or(miss)
+fn resolved_binary(kind: AgentKind, source: &str, path: PathBuf) -> PathBuf {
+    tracing::info!(agent = kind.as_str(), source, path = %path.display(), "resolved agent executable");
+    path
 }
 
 /// The actionable "couldn't find it" message the launcher surfaces on a spawn
@@ -551,7 +671,7 @@ async fn resolve_bin(
 fn not_found(kind: AgentKind, shell: &str) -> String {
     let bin = kind.path_bin();
     format!(
-        "{bin} not found via `{shell} -ilc 'command -v {bin}'`, well-known install \
+        "{bin} not found via `{shell} -ilc 'command -v {bin}'`, the inherited PATH, well-known install \
          locations, or a chimaera-managed install; install {name} (`{cmd}`, see {url}) \
          or make `{bin}` resolvable from your login shell",
         name = kind.product_name(),
@@ -1437,6 +1557,7 @@ pub(crate) async fn chat_executable(
     }
     if let Some(path) = resolve_via_login_shell(&login_shell(), "agy_acp_server.par")
         .await
+        .map_err(anyhow::Error::msg)?
         .filter(|p| is_executable(p))
     {
         return Ok(tokio::fs::canonicalize(path).await?);
@@ -1460,6 +1581,10 @@ pub(crate) fn build_acp_chat_command(kind: AgentKind, bin: &Path) -> Vec<String>
     }
     argv
 }
+
+#[cfg(test)]
+#[path = "launcher_detection_tests.rs"]
+mod detection_tests;
 
 #[cfg(test)]
 mod tests {
