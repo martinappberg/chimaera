@@ -1333,6 +1333,12 @@
   textarea:focus {
     border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
   }
+  /* The hint in the empty box: the theme's muted ink, not the browser's
+     default grey, so both curated themes hold. */
+  textarea::placeholder {
+    color: var(--muted);
+    opacity: 0.85;
+  }
   /* Room for the mic beside the action button. */
   textarea.voice {
     padding-right: 66px;

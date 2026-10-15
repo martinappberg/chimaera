@@ -397,16 +397,16 @@
           }}
         >
           <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
-            <rect x="1.5" y="2.5" width="13" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="1.2" />
+            <rect x="1.5" y="2.5" width="13" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="1.4" />
             <path
               d="M4.2 6l2.4 2-2.4 2"
               fill="none"
               stroke="currentColor"
-              stroke-width="1.3"
+              stroke-width="1.4"
               stroke-linecap="round"
               stroke-linejoin="round"
             />
-            <path d="M8.4 10.6h3.2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+            <path d="M8.4 10.6h3.2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
           </svg>
         </button>
       {/if}
@@ -523,14 +523,11 @@
 </div>
 
 <style>
-  /* The quiet seam between the quick agents and the rest: a hairline and a
-     lowercase word, no chrome. */
-  /* The fold row: the quiet seam between the two quick agents and the rest
-     of the catalog — a hairline above, the agents' own row language. */
+  /* The fold row: the rest of the catalog behind one muted row in the
+     agents' own row language. No hairline of its own — the footer's is the
+     menu's one seam, and two a row apart read as chrome. */
   .arow.others {
-    margin-top: 4px;
-    border-top: 1px solid var(--edge);
-    border-radius: 0 0 6px 6px;
+    margin-top: 2px;
     color: var(--muted);
     user-select: none;
   }
@@ -553,12 +550,12 @@
     display: flex;
     flex-direction: column;
     padding: 5px;
+    /* The app's popover surface (app.css .overlay-surface): one radius and
+       shadow for every menu that hangs off the chrome. */
     background: var(--overlay-bg);
     border: 1px solid var(--edge);
-    border-radius: 10px;
-    box-shadow:
-      0 1px 2px rgba(0, 0, 0, 0.08),
-      0 12px 32px rgba(0, 0, 0, 0.22);
+    border-radius: 8px;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.22);
     outline: none;
     animation: pop 0.12s ease-out;
   }
@@ -616,7 +613,7 @@
     align-items: center;
     gap: 9px;
     padding: 6px 9px;
-    border-radius: 6px;
+    border-radius: 5px; /* the rail's row radius */
     font-size: var(--text-md);
     cursor: pointer;
     user-select: none;
@@ -777,9 +774,12 @@
       transform 0.08s ease;
   }
 
+  /* Faint on a hot row: the row is the action, this glyph the alternative
+     — it must not read as the row's one button. Full strength under the
+     pointer itself. */
   .arow.hl .tbtn,
   .arow:hover .tbtn {
-    opacity: 0.75;
+    opacity: 0.55;
   }
 
   .tbtn {
@@ -789,7 +789,7 @@
     justify-content: center;
     width: 22px;
     height: 22px;
-    border-radius: 6px;
+    border-radius: 5px;
   }
 
   .tbtn:hover {
@@ -831,7 +831,8 @@
 
   /* The worktree switch: a footer control in the settings link's language
      (same padding, radius and hot state), the Switch recipe at a smaller
-     size after its label. */
+     size after its label. Both footer controls take the rows' side padding,
+     so their hot boxes sit flush with the rows' above. */
   .wt {
     appearance: none;
     border: none;
@@ -842,9 +843,8 @@
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    padding: 4px 6px;
-    margin-left: -6px;
-    border-radius: 6px;
+    padding: 4px 9px;
+    border-radius: 5px;
     color: var(--muted);
     cursor: pointer;
     transition:
@@ -923,11 +923,15 @@
     justify-content: space-between;
     gap: 12px;
     margin-top: 5px;
-    padding: 5px 3px 0 9px;
+    padding: 5px 0 0;
     border-top: 1px solid var(--edge);
     font-size: var(--text-xs);
     color: var(--muted);
     user-select: none;
+  }
+
+  .foot .hint {
+    padding-left: 9px;
   }
 
   .foot kbd {
@@ -946,8 +950,8 @@
     font: inherit;
     font-size: var(--text-xs);
     color: var(--muted);
-    padding: 4px 6px;
-    border-radius: 6px;
+    padding: 4px 9px;
+    border-radius: 5px;
     cursor: pointer;
     transition:
       color 0.12s ease,
