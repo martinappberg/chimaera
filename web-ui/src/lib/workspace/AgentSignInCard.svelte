@@ -167,13 +167,15 @@
         {operation.message}
       {:else if how === "terminal"}
         {agent.name} signs in from its own terminal. Chimaera opens one and notices when the login lands.
+      {:else if agent.signedIn === true}
+        {agent.name} is signed in on this host. Sign in again to switch accounts or refresh the login.
       {:else}
         {agent.name} isn't signed in on this host.
       {/if}
     </p>
     <div class="actions">
       <button class="btn primary" disabled={busy || workspaceId === null || !status} onclick={() => void start()}>
-        {busy ? "Starting…" : operation ? "Try again" : how === "terminal" ? "Sign in in a terminal" : "Sign in"}
+        {busy ? "Starting…" : operation ? "Try again" : how === "terminal" ? "Sign in in a terminal" : agent.signedIn === true ? "Sign in again" : "Sign in"}
       </button>
       {#if onDismiss}<button class="link quiet" onclick={onDismiss}>Not now</button>{/if}
     </div>

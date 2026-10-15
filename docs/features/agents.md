@@ -179,7 +179,8 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   process never reloads credentials). Same session id, a second life in the same journal; a
   conversation that had a prompt resumes by its native id, one that had none starts fresh (Cursor
   refuses to load an empty session). A chat mid-task is left alone.
-- **How it's used.** Click **Sign in**. The card shows the page to open (**Open ↗** goes
+- **How it's used.** Click **Sign in** — or type `/login` in any chat, which opens the card there
+  even when the agent is signed in (switch accounts, refresh a stale login). The card shows the page to open (**Open ↗** goes
   through the native shell's browser opener, so it works for a daemon on another host;
   **Copy link** for a browser elsewhere), a device code to enter on that page when the CLI's
   flow uses one, and a field to paste a code back when the page shows one. Finish in the

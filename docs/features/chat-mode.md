@@ -153,11 +153,14 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   containing an exact skill token preserves the visible text and adds Codex's native
   `{type:"skill", name, path}` input block; Claude continues to execute its advertised commands as
   text. Skill invocations are de-duplicated and capped at eight per send.
-- **`/login` recovery (claude).** An expired-auth chat session dead-ends — the `-p stream-json`
-  CLI answers "/login isn't available in this environment". `/login` (palette + intercepted on
-  send) instead flips the session to its real TUI (the [view switch](#view-switch-rewind-and-branch)),
-  where claude's own `/login` runs the native auth flow (OAuth / setup-token / SSO); chimaera
-  never touches the credentials. Sign in there, toggle back to chat.
+- **`/login` — every agent.** A chat process can't run its CLI's login itself (claude's `-p
+  stream-json` answers "/login isn't available in this environment"; sent to codex it is a billed
+  prompt). `/login` (palette + intercepted on send, in any chat whose agent has a sign-in) opens the
+  [sign-in card](agents.md#sign-in) at the transcript's tail and starts the CLI's own login under
+  the daemon — whether or not the agent is currently signed in (a switch of account, a stale
+  login) — and the chat relaunches in place once it lands; chimaera never touches the
+  credentials. Claude's native `/login` remains in its terminal view (the
+  [view switch](#view-switch-rewind-and-branch)) for anyone who prefers it.
 - **Voice dictation — the mic button.** Every chat composer has a mic beside
   send (on by default; shown only where the daemon's host can dictate — `GET /api/v1/voice`,
   asked once per window and again after a login failure). Click it and speak: the words fill the
