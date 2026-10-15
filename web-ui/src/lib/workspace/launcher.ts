@@ -82,9 +82,76 @@ let agentsCache: Promise<AgentInfo[]> | null = null;
 
 /** Ready chats first; setup never looks like a launch action. Stable sorting
  * preserves the curated/provider order within each group. */
-export function orderAgents(agents: AgentInfo[]): AgentInfo[] {
+export function orderAgents(agents: readonly AgentInfo[]): AgentInfo[] {
   const rank = (a: AgentInfo) => a.installed && !a.outdated && a.chatCapable ? 0 : 1;
   return [...agents].sort((a, b) => rank(a) - rank(b));
+}
+
+// --- the launcher's shape: quick starts first, the rest behind "more" -------
+
+/** The agents the rail always offers as one-click starts. Everything else in
+ *  the catalog sits behind the launcher's chevron, with its install state. */
+export const QUICK_AGENTS: readonly string[] = ["claude", "codex"];
+
+/** The rail's quick-start ids, the primary (what the main click and the
+ *  new-agent shortcut start) first: the saved default, then the built-in
+ *  quick agents. A default the loaded catalog no longer lists (a retired
+ *  agent) yields to Claude Code rather than pointing at nothing. Before the
+ *  catalog loads every id is offered; after, a non-primary id the host's
+ *  catalog lacks is dropped. */
+export function quickAgentIds(defaultId: string, catalog: readonly AgentInfo[] | null): string[] {
+  const loaded = catalog !== null && catalog.length > 0;
+  const primary = loaded && !catalog.some((a) => a.id === defaultId) ? QUICK_AGENTS[0] : defaultId;
+  const ids = [primary, ...QUICK_AGENTS.filter((id) => id !== primary)];
+  return loaded ? ids.filter((id, i) => i === 0 || catalog.some((a) => a.id === id)) : ids;
+}
+
+/** The launcher menu's two groups: the quick agents in rail order, then the
+ *  others — ready chats first, catalog order within (see `orderAgents`). */
+export function groupAgents(
+  agents: readonly AgentInfo[],
+  defaultId: string,
+): { quick: AgentInfo[]; others: AgentInfo[] } {
+  const ids = quickAgentIds(defaultId, agents);
+  const quick = ids.flatMap((id) => agents.filter((a) => a.id === id));
+  const others = orderAgents(agents.filter((a) => !ids.includes(a.id)));
+  return { quick, others };
+}
+
+/** What one quick start does when clicked: start the agent, or — when it
+ *  could only open a doomed pane — the setup step that unblocks it
+ *  (a curated install / chat setup in the setup dialog, else Settings →
+ *  Agents). An unloaded catalog starts: the daemon answers honestly. */
+export type QuickAction = "start" | "install" | "setup-chat" | "setup";
+
+export function quickAction(a: AgentInfo | null, defaultView: "chat" | "terminal"): QuickAction {
+  if (a === null) return "start";
+  if (!a.installed) return a.managedInstall ? "install" : "setup";
+  if (a.chatSetupRequired && defaultView === "chat") return a.managedInstall ? "setup-chat" : "setup";
+  return "start";
+}
+
+/** One rail quick-start row. */
+export interface QuickStart {
+  id: string;
+  /** Catalog name, else the built-in product name. */
+  name: string;
+  action: QuickAction;
+  /** The default: carries the chevron and the new-agent shortcut. */
+  primary: boolean;
+  info: AgentInfo | null;
+}
+
+export function quickStarts(
+  catalog: readonly AgentInfo[] | null,
+  defaultId: string,
+  defaultView: "chat" | "terminal",
+  fallbackName: (id: string) => string = (id) => id,
+): QuickStart[] {
+  return quickAgentIds(defaultId, catalog).map((id, i) => {
+    const info = catalog?.find((a) => a.id === id) ?? null;
+    return { id, name: info?.name ?? fallbackName(id), action: quickAction(info, defaultView), primary: i === 0, info };
+  });
 }
 
 /** GET /api/v1/agents — what this host has, per known agent. `check` also
@@ -340,7 +407,22 @@ export function setAgentDefault(d: AgentDefault): void {
 /** The bare version number, wherever the CLI buried it ("codex-cli 0.52.0",
  *  "2.1.202 (Claude Code)"). Shared by the launcher and both settings panels. */
 export function versionNumber(version: string): string {
+  return releaseCore(versionToken(version));
+}
+
+/** The digit-leading token of a `--version` line, build hash included. */
+export function versionToken(version: string): string {
   return version.split(" ").find((t) => /^\d/.test(t)) ?? version.split(" ")[0];
+}
+
+/** A build with a hash (Cursor's `2026.10.14-941492e`) reads as its X.Y.Z
+ * core; the full token stays in the tooltip. Same rule as the daemon's
+ * `agent_updates::release_core`: a git hash may be all digits, so a 7–40
+ * character hex suffix in either case counts; `-beta` and shorter suffixes
+ * stay whole. */
+export function releaseCore(token: string): string {
+  const m = /^(\d+\.\d+\.\d+)-[0-9A-Fa-f]{7,40}$/.exec(token);
+  return m ? m[1] : token;
 }
 
 export function relativeAge(mtimeSecs: number, nowMs = Date.now()): string {

@@ -62,7 +62,7 @@ pub(crate) fn models(kind: AgentKind) -> &'static [(&'static str, &'static str)]
             ("gpt-5.6-sol", "GPT-5.6 Sol"),
         ],
         // ACP catalogs come from the signed-in session; never guess a model.
-        AgentKind::Antigravity | AgentKind::Grok => &[],
+        AgentKind::Antigravity | AgentKind::Grok | AgentKind::Cursor => &[],
         // Static list (gemini is not installed here to probe): the models
         // the gemini-cli README documents for interactive use.
         AgentKind::Gemini => &[
@@ -102,7 +102,9 @@ pub(crate) fn extension_action(
                 command
             }
             .into()],
-            Claude | Codex => return Err("Manage extensions in this agent’s own settings."),
+            Claude | Codex | Cursor => {
+                return Err("Manage extensions in this agent’s own settings.")
+            }
             Gemini => return Err("Choose Antigravity to manage Google agent extensions."),
         });
     }
@@ -140,6 +142,7 @@ pub(crate) fn install_command(kind: AgentKind) -> &'static str {
         AgentKind::Antigravity => "curl -fsSL https://antigravity.google/cli/install.sh | bash",
         AgentKind::Gemini => "npm install -g @google/gemini-cli",
         AgentKind::Grok => "curl -fsSL https://x.ai/cli/install.sh | bash",
+        AgentKind::Cursor => "curl https://cursor.com/install -fsS | bash",
     }
 }
 
@@ -151,6 +154,7 @@ pub(crate) fn docs_url(kind: AgentKind) -> &'static str {
         AgentKind::Antigravity => "https://antigravity.google/docs",
         AgentKind::Gemini => "https://github.com/google-gemini/gemini-cli",
         AgentKind::Grok => "https://docs.x.ai/build/overview",
+        AgentKind::Cursor => "https://cursor.com/docs/cli/overview",
     }
 }
 
@@ -486,7 +490,7 @@ async fn resolve_bin(
         }
     }
 
-    let bin = kind.as_str();
+    let bin = kind.path_bin();
     let shell = login_shell();
 
     let candidate = match resolve_via_login_shell(&shell, bin).await {
@@ -519,13 +523,13 @@ async fn resolve_bin(
         }
     }
 
-    managed_fallback(bin, managed_bin).ok_or(miss)
+    managed_fallback(kind.as_str(), managed_bin).ok_or(miss)
 }
 
 /// The actionable "couldn't find it" message the launcher surfaces on a spawn
 /// attempt (GET /agents only exposes the `installed` boolean).
 fn not_found(kind: AgentKind, shell: &str) -> String {
-    let bin = kind.as_str();
+    let bin = kind.path_bin();
     format!(
         "{bin} not found via `{shell} -ilc 'command -v {bin}'`, well-known install \
          locations, or a chimaera-managed install; install {name} (`{cmd}`, see {url}) \
@@ -1402,6 +1406,9 @@ pub(crate) fn build_acp_chat_command(kind: AgentKind, bin: &Path) -> Vec<String>
     let mut argv = vec![bin.to_string_lossy().into_owned()];
     match kind {
         AgentKind::Grok => argv.extend(["agent", "--no-leader", "stdio"].map(str::to_owned)),
+        // `cursor-agent acp` (hidden from the top-level --help, listed by
+        // `cursor-agent acp --help`): ACP v1 over stdio.
+        AgentKind::Cursor => argv.push("acp".into()),
         AgentKind::Antigravity => {
             if cfg!(target_os = "linux") {
                 argv.push("--uid=".into());

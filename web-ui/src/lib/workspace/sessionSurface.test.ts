@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { sessionSurface, dotTitle, type Session } from "./sessions";
 
 describe("conversation surface survives updates", () => {
-  for (const agent of ["claude", "codex", "agy", "grok", "plugin:pi"]) {
+  for (const agent of ["claude", "codex", "agy", "grok", "cursor", "plugin:pi"]) {
     it(`${agent}: reopening ignores new-chat defaults and readiness changes`, () => {
       for (const defaultChat of [true, false]) {
         for (const chatCapable of [true, false, undefined]) {
@@ -23,7 +23,7 @@ describe("conversation surface survives updates", () => {
 
 
 it("an unreported terminal state does not claim perpetual startup", () => {
-  for (const agent_kind of ["claude", "codex", "agy", "grok", "plugin:pi"]) {
+  for (const agent_kind of ["claude", "codex", "agy", "grok", "cursor", "plugin:pi"]) {
     const session = { kind: "agent", alive: true, ui: "term", agent_kind, agent_state: "unknown" } as Session;
     expect(dotTitle(session)).toBe("terminal open");
   }

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { customModelSelection, modelChoice } from "./modelPicker";
+  import { agentProductName } from "../shared/agentNames";
   import { onDestroy, tick, untrack } from "svelte";
   import { displayName, forkSession, rewindSession, renameSession, type Session } from "../workspace/sessions";
   import { fsValidate } from "../previews/files";
@@ -39,6 +40,7 @@
   import ThoughtRow from "./ThoughtRow.svelte";
   import ToolGroup from "./ToolGroup.svelte";
   import { isLive, type TurnTail } from "./toolLabels";
+  import { statusWordShown } from "./statusWord";
   import FinishedRow from "./FinishedRow.svelte";
   import AgentMessageCards from "./AgentMessageCards.svelte";
   import { isAgentOrigin, parseAgentText } from "./agentMessages";
@@ -52,8 +54,6 @@
   import SubagentBanner from "./SubagentBanner.svelte";
   import { SubagentSocket } from "./subagentSocket.svelte";
   import { subagentChatId, subagentModel, subagentRunning } from "./subagentView";
-  import WorkTray from "../shared/WorkTray.svelte";
-  import Chevron from "../shared/Chevron.svelte";
   import ArtifactGallery from "./ArtifactGallery.svelte";
   import { EmbedResolver } from "./embeds";
   import { HoverTargets } from "./hoverTargets";
@@ -63,6 +63,7 @@
   import ElicitationCard from "./ElicitationCard.svelte";
   import type { PendingElicitation } from "./elicitation";
   import PlanApprovalCard from "./PlanApprovalCard.svelte";
+  import PlanCard from "./PlanCard.svelte";
   import QuestionCard from "./QuestionCard.svelte";
   import UsagePanel from "./UsagePanel.svelte";
   import McpPanel from "./McpPanel.svelte";
@@ -91,6 +92,7 @@
   import type {
     BackgroundTask,
     ChatBlock,
+    CheckpointRef,
     PendingPermission,
     PendingQuestion,
     PendingSend,
@@ -238,7 +240,7 @@
   let forkAgents = $state<{ id: string; name: string }[]>([]);
   const agentName = $derived(
     agentCatalogName ??
-      (agentKind === "claude" ? "Claude Code" : agentKind === "codex" ? "Codex" : agentKind === "agy" ? "Antigravity" : agentKind === "grok" ? "Grok Build" : agentKind),
+      agentProductName(agentKind),
   );
   void listAgents().then((agents) => {
     const info = agents.find((a) => a.id === agentKind);
@@ -1961,6 +1963,7 @@
     preceding: string | null;
     fork: boolean;
     stage: "dry" | "confirm" | "applying";
+    fromReply?: boolean;
   }>(null);
   const rewindReport = $derived(
     rewindIntent !== null && store.rewind?.userMessageId === rewindIntent.id
@@ -1968,12 +1971,12 @@
       : null,
   );
 
-  function askRewind(checkpoint: { id: string; preceding: string | null }) {
+  function askRewind(checkpoint: { id: string; preceding: string | null }, fromReply = false) {
     store.rewind = null;
     if (conversationOnlyRewind) {
-      rewindIntent = { id: checkpoint.id, preceding: checkpoint.preceding, fork: true, stage: "confirm" };
+      rewindIntent = { id: checkpoint.id, preceding: checkpoint.preceding, fork: true, stage: "confirm", fromReply };
     } else {
-      rewindIntent = { id: checkpoint.id, preceding: checkpoint.preceding, fork: false, stage: "dry" };
+      rewindIntent = { id: checkpoint.id, preceding: checkpoint.preceding, fork: false, stage: "dry", fromReply };
       if (
         !sendCommand(
           { type: "rewind", user_message_id: checkpoint.id, dry_run: true },
@@ -2281,49 +2284,6 @@
         : "jump to newest",
   );
 
-  const planDone = $derived(pinnedPlan.filter((p) => p.status === "done").length);
-  /** The step the agent is on now — surfaced in the plan summary so the
-   *  current goal is legible without expanding the panel. `activeForm` is the
-   *  agent's own present-continuous phrasing for exactly this spot ("Running
-   *  tests"), so prefer it and fall back to the subject. */
-  const planActive = $derived.by(() => {
-    const active = pinnedPlan.find((p) => p.status === "in_progress");
-    return active ? (active.activeForm ?? active.content) : null;
-  });
-
-  /** Blocked is orthogonal to status: a blocked task is still `todo`, so it
-   *  would otherwise render identically to one that simply hasn't started.
-   *  The server already filters `blockedBy` to blockers that are still open. */
-  const isBlocked = (entry: PlanEntry) => entry.status !== "done" && entry.blockedBy.length > 0;
-  const planMark = (entry: PlanEntry) =>
-    entry.status === "done"
-      ? "✓"
-      : entry.status === "in_progress"
-        ? "◐"
-        : isBlocked(entry)
-          ? "⊘"
-          : "○";
-  /** Agents often restate the subject as the description; showing both then is
-   *  pure noise in a panel this small. */
-  const planDetail = (entry: PlanEntry) => {
-    const detail = entry.description?.trim();
-    return detail && detail !== entry.content.trim() ? detail : null;
-  };
-  /** Finished work folds away: on a long plan the ✓ rows are the majority and
-   *  push what's actually next out of view. They stay one click away, and when
-   *  EVERYTHING is done there is nothing else to show, so the fold steps
-   *  aside rather than leaving an empty panel. */
-  let showFinished = $state(false);
-  let planOpen = $state(false);
-  const planLive = $derived(pinnedPlan.filter((p) => p.status !== "done"));
-  const planFinished = $derived(pinnedPlan.filter((p) => p.status === "done"));
-  const planFolds = $derived(planLive.length > 0 && planFinished.length > 0);
-  const planRows = $derived(planFolds && !showFinished ? planLive : pinnedPlan);
-  const planLabel = $derived(
-    `plan · ${planDone}/${pinnedPlan.length}` +
-      (planActive !== null ? ` · ◐ ${planActive}` : planLive.length === 0 ? " · all done" : ""),
-  );
-
   /** Render list for the bounded page: consecutive tool blocks coalesce into
    *  one ToolGroup, a settled run of activity rows folds above whatever row
    *  followed it, and a settled run of finished-work lines folds on its
@@ -2483,16 +2443,77 @@
     return folded;
   });
 
-  /** A finished turn's duration, kept out of the page (the live elapsed on
-   *  the status line is the number that matters while it runs) and offered
-   *  on the closing message's timestamp tooltip instead. Keyed by uid. */
-  const turnDurations = $derived.by(() => {
-    const byMessage = new Map<number, string>();
+  /** The newest rows are on screen: the window holds the live tail and the
+   *  reader is at the bottom. */
+  const tailInView = $derived(atBottom && renderEnd >= store.blocks.length);
+  /** A running call's line is mounted in the open trailing run (not folded,
+   *  not scrolled away), so it already says what is running. */
+  const liveToolLineInView = $derived.by(() => {
+    if (!tailInView) return false;
+    for (let i = renderItems.length - 1; i >= 0; i--) {
+      const item = renderItems[i];
+      if (item.t === "group") {
+        if (item.tools.some(isLive)) return true;
+        continue;
+      }
+      if (item.t === "single" && item.block.kind === "thought") continue;
+      return false;
+    }
+    return false;
+  });
+  /** The status row drops a phase word only where a row in view already
+   *  says it (statusWord.ts); the word stays for the screen reader. */
+  const activityShown = $derived(
+    statusWordShown({
+      compacting: store.compacting,
+      activityLine: store.activityLine,
+      activity: store.activity,
+      running: store.running,
+      newest: store.blocks[store.blocks.length - 1],
+      tailInView,
+      liveToolLineInView,
+    }),
+  );
+
+  /** A finished turn's duration and output tokens, kept out of the page
+   *  (the live elapsed on the status line is the number that matters while
+   *  it runs) and offered on the closing message's time and usage tooltips
+   *  instead. Keyed by uid. */
+  const turnStats = $derived.by(() => {
+    const byMessage = new Map<number, { duration: string | null; tokens: string | null }>();
     renderBlocks.forEach((block, i) => {
-      if (block.kind !== "turn_end" || block.durationMs < 100 || i === 0) return;
+      if (block.kind !== "turn_end" || i === 0) return;
       const prev = renderBlocks[i - 1];
-      if (prev.kind === "message") byMessage.set(prev.uid, formatDurationMs(block.durationMs));
+      if (prev.kind !== "message") return;
+      const n = block.outputTokens;
+      byMessage.set(prev.uid, {
+        duration: block.durationMs >= 100 ? formatDurationMs(block.durationMs) : null,
+        tokens: n > 0 ? (n >= 1000 ? `${(n / 1000).toFixed(1)}k tokens` : `${n} tokens`) : null,
+      });
     });
+    return byMessage;
+  });
+
+  /** Where "rewind to here" on a reply goes: the checkpoint of the next
+   *  message you sent after it (rewinding to before that message keeps this
+   *  reply and drops what followed). One backward pass over the mounted
+   *  window; a reply whose next message lies past the window offers none
+   *  until that page mounts. Codex rewinds whole turns from a preceding
+   *  anchor, so it needs one. */
+  const rewindPoints = $derived.by(() => {
+    const byMessage = new Map<number, CheckpointRef>();
+    let next: CheckpointRef | null = null;
+    for (let i = renderBlocks.length - 1; i >= 0; i--) {
+      const block = renderBlocks[i];
+      if (block.kind === "user") {
+        next =
+          block.checkpoint !== null && (agentKind === "claude" || block.checkpoint.preceding !== null)
+            ? block.checkpoint
+            : null;
+      } else if (block.kind === "message" && next !== null) {
+        byMessage.set(block.uid, next);
+      }
+    }
     return byMessage;
   });
 
@@ -2766,6 +2787,7 @@
           sourceEnd={item.endIndex}
           sourceUid={item.tools[0]?.uid}
           {visible}
+          clockSkewMs={store.clockSkewMs}
           onOpenPath={openProsePath}
           resolvePaths={prosePaths}
           onBackground={!readOnly && supports("background_tool") ? backgroundTool : undefined}
@@ -2814,6 +2836,7 @@
           thoughts={item.thoughts}
           steps={item.items.length}
           {visible}
+          clockSkewMs={store.clockSkewMs}
           sourceIndex={item.index}
           sourceEnd={item.endIndex}
           sourceUid={item.uid}
@@ -2913,6 +2936,8 @@
         />
       {:else if item.block.kind === "message"}
         {@const message = item.block}
+        {@const turn = turnStats.get(item.block.uid)}
+        {@const rewindTo = rewindPoints.get(item.block.uid)}
         <div
           class="msg agent"
           class:streaming={store.running && item.block.uid === lastInlineUid}
@@ -2947,8 +2972,16 @@
             text={item.block.text}
             sentAtMs={item.block.sentAtMs}
             nowMs={messageTimeNowMs}
-            onFork={() => askFork(item.block, item.index)}
-            turnDuration={turnDurations.get(item.block.uid) ?? null}
+            onFork={readOnly ? undefined : () => askFork(item.block, item.index)}
+            onRewind={readOnly || rewindTo === undefined ? undefined : () => askRewind(rewindTo, true)}
+            rewindTitle={agentKind === "claude"
+              ? "rewind to here (restores files; optionally forks the conversation)"
+              : "rewind the conversation to here"}
+            onUsage={readOnly || !supports("get_usage")
+              ? undefined
+              : () => sendCommand({ type: "get_usage" }, "usage request not sent")}
+            turnTokens={turn?.tokens ?? null}
+            turnDuration={turn?.duration ?? null}
           />
         </div>
       {:else if item.block.kind === "question"}
@@ -3085,9 +3118,10 @@
         {/if}
         {#if agentKind === "claude"}
           <ModSite {mods} component="Spinner" instanceId="spinner" active={visible && $pageVisible} props={{ word: activityLabel, message: null, suffix: "…", mode: store.activity?.kind === "thinking" ? "thinking" : store.activity?.kind === "writing" ? "responding" : store.activity?.kind === "tool" ? "tool-use" : "requesting" }}>
-            {#snippet children(draw)}<span class="status-label" title={activityDetail}>{typeof draw.message === "string" ? draw.message : typeof draw.word === "string" ? draw.word : activityLabel}</span>{/snippet}
+            {#snippet children(draw)}{#if typeof draw.message === "string"}<span class="status-label" title={activityDetail}>{draw.message}</span>{:else if activityShown}<span class="status-label" title={activityDetail}>{typeof draw.word === "string" ? draw.word : activityLabel}</span>{:else}<span class="sr-only">{activityLabel}</span>{/if}{/snippet}
           </ModSite>
-        {:else}<span class="status-label" title={activityDetail}>{activityLabel}</span>{/if}
+        {:else if activityShown}<span class="status-label" title={activityDetail}>{activityLabel}</span>
+        {:else}<span class="sr-only">{activityLabel}</span>{/if}
         {#if store.compacting}
           <span class="compaction-progress" role="progressbar" aria-label="Compacting conversation">
             <span></span>
@@ -3253,44 +3287,7 @@
   {/if}
 
   {#if pinnedPlan.length > 0}
-    <!-- Same shell as the subagent/background strips: one collapsible family
-         above the composer instead of three different-looking bars. The glyph
-         only breathes while a step is actually in flight. -->
-    <WorkTray
-      glyph="≡"
-      label={planLabel}
-      bind:open={planOpen}
-      pulse={planActive !== null}
-      {visible}
-    >
-      {#if planFolds}
-        <button class="plan-fold" onclick={() => (showFinished = !showFinished)}>
-          <Chevron open={showFinished} />
-          <span>{planFinished.length} done</span>
-        </button>
-      {/if}
-      {#each planRows as entry, i (entry.id ? `id:${entry.id}` : `ix:${i}`)}
-        <div
-          class="plan-row"
-          class:done={entry.status === "done"}
-          class:blocked={isBlocked(entry)}
-        >
-          <span class="plan-mark">{planMark(entry)}</span>
-          <span class="plan-body">
-            <span class="plan-line">
-              <span class="plan-subject">{entry.content}</span>
-              {#if entry.owner}<span class="plan-owner">@{entry.owner}</span>{/if}
-              {#if isBlocked(entry)}<span class="plan-blocked"
-                  >blocked by {entry.blockedBy.map((id) => `#${id}`).join(", ")}</span
-                >{/if}
-            </span>
-            {#if planDetail(entry)}
-              <span class="plan-desc">{planDetail(entry)}</span>
-            {/if}
-          </span>
-        </div>
-      {/each}
-    </WorkTray>
+    <PlanCard entries={pinnedPlan} running={agentBusy} {visible} />
   {/if}
 
   {#if rewindIntent !== null}
@@ -3411,11 +3408,11 @@
     --text-xs: max(9px, calc(var(--chat-font-size) - 2px));
     --text-sm: max(10px, calc(var(--chat-font-size) - 1px));
     --text-md: var(--chat-font-size);
-    /* The transcript's column: 48em of the message text — Claude.ai's
-       reading measure, ~100 characters — so a bigger font keeps its line
-       length, capped by the Reading Width setting (--chat-measure). The
-       document views use the same rule (previews/MarkdownView). */
-    --chat-column: min(calc(48 * var(--chat-font-size)), var(--chat-measure));
+    /* The transcript's column IS the Reading Width setting (--chat-measure):
+       a min() with 48em here once made every value above 48em a no-op. The
+       default is 48em of the default text (~100 characters); the document
+       views use the same width (previews/MarkdownView). */
+    --chat-column: var(--chat-measure);
     --text-lg: calc(var(--chat-font-size) + 2px);
   }
   .chat:not(.visible) .status-spark,
@@ -3507,6 +3504,14 @@
      is the boundary (the Claude Desktop treatment). */
   .chat > :global(.composer) {
     border-top: none;
+  }
+  /* The plan card keeps its border on the column's text edges. */
+  .chat > :global(.plan-card) {
+    width: calc(100% - 36px);
+    max-width: var(--chat-column);
+    margin-left: auto;
+    margin-right: auto;
+    box-sizing: border-box;
   }
   .startup-detail {
     font-size: var(--text-sm);
@@ -3677,24 +3682,33 @@
     color: var(--err);
   }
   .msg.agent {
+    position: relative;
     padding: 2px 0;
   }
-  /* A settled message and its hover rail are one inline flow: the rail
-     follows the last word and takes a line of its own only when that line
-     is full — no row reserved under every message. The markdown shell is
-     layout-neutral (its children lay out here; inherited type still
-     applies) and a closing paragraph goes inline; any other closing block
-     (list, table, code) keeps its box, and the rail starts flush below it.
-     While streaming the rail has nothing to act on, so it takes no space. */
-  .msg.agent > :global(.md) {
-    display: contents;
-  }
+  /* On pointer devices the action cluster floats at the message's top right
+     (AgentMessageMeta) and takes no space; a closing paragraph keeps no
+     bottom margin, so a reply ends where its last line does. */
   .msg.agent > :global(.md > p:last-child) {
-    display: inline;
+    margin-bottom: 0;
   }
-  .msg.agent:not(:has(> :global(.md > p:last-child))) :global(.agent-message-meta) {
-    margin-left: 0;
+  /* Touch: nothing hovers, so the cluster is shown inline — it follows the
+     last word and takes a line of its own only when that line is full, with
+     no row reserved under every message. The markdown shell is
+     layout-neutral (its children lay out here; inherited type still applies)
+     and a closing paragraph goes inline; any other closing block (list,
+     table, code) keeps its box, and the cluster starts flush below it. */
+  @media (hover: none) {
+    .msg.agent > :global(.md) {
+      display: contents;
+    }
+    .msg.agent > :global(.md > p:last-child) {
+      display: inline;
+    }
+    .msg.agent:not(:has(> :global(.md > p:last-child))) :global(.agent-message-meta) {
+      margin-left: 0;
+    }
   }
+  /* While a message streams the cluster has nothing to act on. */
   .msg.agent.streaming :global(.agent-message-meta) {
     display: none;
   }
@@ -3786,7 +3800,6 @@
   /* Elapsed counter: a still, muted number beside the pulsing label (only
      appears past 5s). No animation — reduced-motion safe by construction. */
   .status-elapsed {
-    font-family: var(--mono, monospace);
     font-variant-numeric: tabular-nums;
     color: color-mix(in srgb, var(--muted) 80%, transparent);
   }
@@ -3837,74 +3850,6 @@
     .compaction-progress > span {
       inset-inline-start: 29%;
     }
-  }
-  /* The strip chrome (border, padding, collapse header, bounded scroll) now
-     comes from the shared WorkTray, so only the rows are styled here. */
-  .plan-fold {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    width: 100%;
-    padding: 1px 0 3px;
-    background: none;
-    border: none;
-    color: var(--muted);
-    font: inherit;
-    font-size: var(--text-xs);
-    text-align: left;
-    cursor: pointer;
-  }
-  .plan-row {
-    display: flex;
-    gap: 8px;
-    padding: 1px 0;
-  }
-  .plan-row.done {
-    color: var(--muted);
-  }
-  .plan-mark {
-    color: var(--accent);
-    flex: none;
-  }
-  /* Blocked reads as "waiting", not "active": the mark drops to muted so a
-     ⊘ can't be mistaken for progress at a glance. */
-  .plan-row.blocked .plan-mark {
-    color: var(--muted);
-  }
-  .plan-body {
-    display: flex;
-    flex-direction: column;
-    gap: 1px;
-    min-width: 0;
-  }
-  .plan-line {
-    display: flex;
-    align-items: baseline;
-    gap: 6px;
-    min-width: 0;
-  }
-  /* Every text span clips rather than wraps — the panel is a glance surface,
-     and an agent subject can be arbitrarily long. */
-  .plan-subject,
-  .plan-desc {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .plan-owner,
-  .plan-blocked {
-    flex: none;
-    font-size: var(--text-xs);
-    color: var(--muted);
-  }
-  /* Mixed toward --fg, not --muted: accent-over-muted lands near 3.5:1 on the
-     light background, too weak for an 11px chip. Same blend as .plan-active. */
-  .plan-owner {
-    color: color-mix(in srgb, var(--accent) 70%, var(--fg));
-  }
-  .plan-desc {
-    color: var(--muted);
-    font-size: var(--text-xs);
   }
   .bubble-row {
     display: flex;
