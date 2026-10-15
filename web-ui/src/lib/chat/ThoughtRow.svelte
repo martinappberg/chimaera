@@ -113,7 +113,7 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    color: color-mix(in srgb, var(--muted) 82%, transparent);
+    color: var(--muted);
     font-style: italic;
   }
   .thought[open] .thought-preview {

@@ -67,6 +67,11 @@ describe("theme text contrast", () => {
       it("--syn-comment holds 3.8:1 (dimmer than code, still readable)", () => {
         expect(ratio(theme.tokens["--syn-comment"], sheet)).toBeGreaterThanOrEqual(3.8);
       });
+      it("--fg holds on the workspace surfaces it is read on", () => {
+        expect(ratio(theme.tokens["--fg"], theme.tokens["--bg"])).toBeGreaterThanOrEqual(4.5);
+        expect(ratio(theme.tokens["--fg"], theme.tokens["--rail-bg"])).toBeGreaterThanOrEqual(4.5);
+        expect(ratio(theme.tokens["--fg"], theme.tokens["--row-active"])).toBeGreaterThanOrEqual(4.5);
+      });
       it("--muted holds on the workspace surfaces it is read on", () => {
         expect(ratio(theme.tokens["--muted"], theme.tokens["--bg"])).toBeGreaterThanOrEqual(4.5);
         expect(ratio(theme.tokens["--muted"], theme.tokens["--rail-bg"])).toBeGreaterThanOrEqual(4.5);
