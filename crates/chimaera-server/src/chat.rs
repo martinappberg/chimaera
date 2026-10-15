@@ -424,6 +424,9 @@ fn note_for_notices(record: &mut crate::agent_state::AgentRecord, ev: &AgentEven
         AgentEvent::TurnCompleted { .. } => {
             let reply = std::mem::take(&mut record.reply_draft);
             record.set_notice_note(&reply, false);
+            // A completed turn is an authenticated process: it no longer
+            // waits on any sign-in (a stale verdict at spawn marked it).
+            record.signed_out_at_start = false;
         }
         AgentEvent::PermissionRequest {
             title,
@@ -450,6 +453,7 @@ fn note_for_notices(record: &mut crate::agent_state::AgentRecord, ev: &AgentEven
         AgentEvent::Error {
             message,
             fatal: true,
+            ..
         } => record.set_notice_note(message, false),
         AgentEvent::TurnAborted {
             reason,
@@ -742,8 +746,13 @@ async fn handle_chat_exit(state: &Arc<AppState>, id: &str, exit: DriverExit) {
             if let Some(recipe) = recipe {
                 crate::lock(&state.chat_recipes).insert(id.to_string(), recipe);
             }
+            let auth = chimaera_agent::model::sign_in_failure(&reason)
+                || chimaera_agent::model::sign_in_failure(&stderr_tail);
             let kind = crate::lock(&state.agents).get_mut(id).map(|record| {
                 record.state = AgentState::Errored;
+                if auth {
+                    record.signed_out_at_start = true;
+                }
                 record.kind
             });
             // A signed-out CLI is the common startup failure: re-ask its
@@ -1481,6 +1490,11 @@ pub(crate) async fn switch_view(
                     .get(&id)
                     .and_then(|r| r.resume.clone())
             })
+            // A relaunch of a conversation that never had a prompt starts
+            // fresh under the same id: Cursor's `session/load` of an empty
+            // session answers "Invalid params" (seen live), and there is
+            // nothing to resume anyway.
+            .filter(|_| !relaunch || record.first_prompt.is_some())
     } else {
         terminal_resume_handle(&record)
     };
@@ -1520,6 +1534,7 @@ pub(crate) async fn switch_view(
         &id,
         target_chat,
         currently_chat,
+        relaunch,
         resume,
         workspace_root,
         workspace_id,
@@ -1536,6 +1551,72 @@ pub(crate) async fn switch_view(
     }
 }
 
+/// A sign-in landed for `kind`: start every chat of it that waited on a
+/// login again, in place — the ones that died at startup for want of one and
+/// the live ones started while the CLI said signed out (their process never
+/// reloads credentials). The same respawn as the view route's `relaunch`;
+/// a chat mid-task (409) is left alone. Bounded: at most 8 per sign-in.
+pub(crate) async fn relaunch_after_sign_in(state: Arc<AppState>, kind: AgentKind) -> usize {
+    // Only chats the registry still knows (dead or alive) count toward the
+    // cap; a retired record has nothing to start and is unmarked.
+    let mut waiting = Vec::new();
+    {
+        let mut agents = crate::lock(&state.agents);
+        let marked: Vec<String> = agents
+            .iter()
+            .filter(|(_, r)| r.kind == kind && r.signed_out_at_start)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in marked {
+            if state.chat.get(&id).is_some() {
+                if waiting.len() < 8 {
+                    waiting.push(id);
+                }
+            } else if let Some(record) = agents.get_mut(&id) {
+                record.signed_out_at_start = false;
+            }
+        }
+    }
+    let mut relaunched = 0;
+    for id in waiting {
+        match relaunch_chat(&state, &id).await {
+            Ok(()) => {
+                tracing::info!(%id, kind = kind.as_str(), "chat relaunched after sign-in");
+                relaunched += 1;
+            }
+            Err(why) => {
+                // Mid-task (409) is an authenticated process doing work; a
+                // refusal of any kind is final for this landing.
+                tracing::info!(%id, %why, "chat not relaunched after sign-in");
+            }
+        }
+        if let Some(record) = crate::lock(&state.agents).get_mut(&id) {
+            record.signed_out_at_start = false;
+        }
+    }
+    relaunched
+}
+
+/// Start a chat again in place — the view route's `relaunch`, for callers
+/// inside the daemon.
+pub(crate) async fn relaunch_chat(state: &Arc<AppState>, id: &str) -> Result<(), String> {
+    let response = switch_view(
+        State(state.clone()),
+        Path(id.to_string()),
+        Json(SwitchView {
+            ui: "chat".into(),
+            force: false,
+            relaunch: true,
+        }),
+    )
+    .await;
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(response.status().to_string())
+    }
+}
+
 /// Resume identity for a TUI→chat switch. A live hook-derived transcript is
 /// newest; `resumed_from` is the durable ledger fallback before hooks fire.
 fn terminal_resume_handle(record: &crate::agent_state::AgentRecord) -> Option<String> {
@@ -1548,6 +1629,7 @@ async fn perform_switch(
     id: &str,
     target_chat: bool,
     currently_chat: bool,
+    relaunch: bool,
     resume: Option<String>,
     workspace_root: PathBuf,
     workspace_id: String,
@@ -1565,11 +1647,15 @@ async fn perform_switch(
         .get(id)
         .map(|r| r.theme.clone())
         .unwrap_or_else(|| "dark".to_string());
-    // A relaunch after a failed startup keeps the model the user picked; a
-    // surface switch never had one on the recipe.
-    let model = crate::lock(&state.chat_recipes)
-        .get(id)
-        .and_then(|r| r.model.clone());
+    // A relaunch keeps the launch-time model; a surface switch carries none
+    // (the recipe's pick is from launch, not the chat's current model).
+    let model = if relaunch {
+        crate::lock(&state.chat_recipes)
+            .get(id)
+            .and_then(|r| r.model.clone())
+    } else {
+        None
+    };
     // A user-pinned name lives in different stores per surface: chat sessions
     // pin it on the AgentRecord (customTitle), PTY sessions on SessionInfo.name
     // (renamed). Capture it from whichever holds it NOW so the toggle carries
@@ -2217,6 +2303,7 @@ fn render_fork_context(events: &[AgentEvent]) -> Vec<ForkContextRow> {
             AgentEvent::Error {
                 message,
                 fatal: false,
+                ..
             } => push_fork_context_row(&mut rows, &mut assistant_turn, "notice", message.clone()),
             AgentEvent::TurnAborted { reason, .. } => {
                 push_fork_context_row(
@@ -3098,6 +3185,9 @@ pub(crate) async fn spawn_fresh_chat_at(
     };
 
     let mut record = crate::agents::AgentRecord::new(key, spec.kind);
+    // Started while the CLI says signed out (codex's app-server starts anyway
+    // and 401s at the first turn): the sign-in that lands later relaunches it.
+    record.signed_out_at_start = crate::agent_auth::cached_verdict(state, spec.kind) == Some(false);
     if is_fork {
         // A branch now opens quietly: the driver is alive but no turn has
         // started, so "finished" is the honest idle state (not "starting").

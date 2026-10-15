@@ -1233,7 +1233,7 @@ fn render_journal_tail(
                     head(&text, ITEM_HEAD_CHARS)
                 ));
             }
-            AgentEvent::Error { message, fatal } => {
+            AgentEvent::Error { message, fatal, .. } => {
                 let kind = if fatal { "fatal error" } else { "error" };
                 items.push(format!("{kind}: {}", head(&message, ITEM_HEAD_CHARS)));
             }

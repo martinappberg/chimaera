@@ -392,12 +392,10 @@
             .map((t) => ({ id: t.id, name: names.get(t.id) ?? t.name }))}
           onOpenFile={(p: string) => ctrl.openFileFrom(node.id, p, false)}
           onOpenPath={(p: string, k: "file" | "dir") => ctrl.openPathFrom(node.id, p, k, false)}
-          onSwitchToTerminal={s.view_switchable === false ? undefined : () => ctrl.switchView(s.id, "term")}
           onForked={(forked: Session) =>
             ctrl.revealWorktreeSession(forked.id, forked.workspace_id)}
           onOpenSubagent={(agentId: string, title: string, newSplit: boolean) =>
             ctrl.openSubagentFrom(node.id, s.id, agentId, title, newSplit)}
-          onRelaunch={() => ctrl.switchView(s.id, "chat", true)}
         />
       {:else if viewErrors.chat}
         {@render loadFailure("chat", "chat view")}

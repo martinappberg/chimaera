@@ -383,7 +383,7 @@ export type ChatBlock = BlockIdentity &
        *  turn-end gallery scans for the files a script wrote. */
       command: string | null;
     }
-  | { kind: "notice"; text: string; tone: "info" | "error" }
+  | { kind: "notice"; text: string; tone: "info" | "error"; signIn?: boolean }
   | {
       /** A turn nobody typed: the agent woke on its own — a monitor event, a
        *  scheduled wake-up, work it left running. The wire never carries the
@@ -1844,7 +1844,7 @@ export class ChatStore {
       case "error":
         if (ev.fatal) this.startupDetail = null;
         this.pendingModel = null;
-        this.notice(ev.message as string, "error");
+        this.notice(ev.message as string, "error", ev.sign_in === true);
         if (ev.fatal === true) {
           this.fatalError = ev.message as string;
           this.fatalSource = "journal";
@@ -2094,8 +2094,10 @@ export class ChatStore {
 
   /** Also the client's own channel for local notices (usage summaries,
    *  intercepted commands) — they are NOT journaled, deliberately. */
-  notice(text: string, tone: "info" | "error"): void {
-    this.blocks.push(this.stamp({ kind: "notice", text, tone }));
+  notice(text: string, tone: "info" | "error", signIn = false): void {
+    // `signIn`: the daemon classified this error as a missing login
+    // (`sign_in` on the event) — the view shows the agent's sign-in instead.
+    this.blocks.push(this.stamp(signIn ? { kind: "notice", text, tone, signIn: true } : { kind: "notice", text, tone }));
     // Local notices do not pass through `apply`, whose epilogue normally
     // enforces the transcript cap. Repeated disconnected-action feedback must
     // not become an unbounded side channel around that cap.

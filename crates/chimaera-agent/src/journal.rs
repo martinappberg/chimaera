@@ -217,6 +217,7 @@ impl Journal {
                                 "event exceeded the {MAX_ENTRY_BYTES}-byte journal cap"
                             ),
                             fatal: false,
+                            sign_in: false,
                         },
                     });
                     line = serde_json::to_vec(&*entry).expect("Error event serializes");
@@ -926,6 +927,7 @@ pub fn seed_journal(dir: &Path, session_id: &str, events: &[AgentEvent]) -> Resu
                 entry.ev = AgentEvent::Error {
                     message: format!("event exceeded the {MAX_ENTRY_BYTES}-byte journal cap"),
                     fatal: false,
+                    sign_in: false,
                 };
                 line = serde_json::to_vec(&entry)?;
             }
@@ -1237,7 +1239,7 @@ mod tests {
         let all = journal.replay_from(0).unwrap();
         assert_eq!(all.len(), 1);
         match &all[0].ev {
-            AgentEvent::Error { message, fatal } => {
+            AgentEvent::Error { message, fatal, .. } => {
                 assert!(message.contains("cap"));
                 assert!(!fatal);
             }

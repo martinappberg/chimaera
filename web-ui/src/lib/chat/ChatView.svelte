@@ -16,7 +16,6 @@
   } from "./paths";
   import { agentCatalog, listAgents } from "../workspace/launcher";
   import { getSignIn, needsSignIn } from "../workspace/agentSignIn";
-  import { looksLikeAuthFailure } from "./authFailure";
   import AgentSignInCard from "../workspace/AgentSignInCard.svelte";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import BranchChip from "../shared/BranchChip.svelte";
@@ -138,10 +137,6 @@
      *  path links open through the workbench opener (`shared/openPath.ts`)
      *  whenever App has registered one. */
     onOpenPath?: (path: string, kind: "file" | "dir") => void;
-    /** Flip this session to its real TUI (the pane-bar view toggle). Used for
-     *  interactive CLI flows the `-p` stream-json mode can't run — `/login`
-     *  above all — so the native auth flow runs where it belongs. */
-    onSwitchToTerminal?: () => void;
     /** Focus the newly-created session while the source remains alive. */
     onForked?: (session: Session) => void;
     /** Show one of this session's SUBAGENTS instead of the session itself:
@@ -158,9 +153,6 @@
     };
     /** Open one of this chat's subagents as a view of its own. */
     onOpenSubagent?: (agentId: string, title: string, newSplit: boolean) => void;
-    /** Start this chat's agent again in place after a failed startup (the
-     *  sign-in card's success): the same session, a fresh driver. */
-    onRelaunch?: () => void;
   }
 
   let {
@@ -170,11 +162,9 @@
     terminals = [],
     onOpenFile,
     onOpenPath,
-    onSwitchToTerminal,
     onForked,
     subagent,
     onOpenSubagent,
-    onRelaunch,
   }: Props = $props();
 
   // The component is keyed on session id by its parent: one instance per
@@ -262,7 +252,7 @@
   const authShapedError = $derived.by(() => {
     for (let i = store.blocks.length - 1; i >= 0 && i >= store.blocks.length - 12; i--) {
       const b = store.blocks[i];
-      if (b.kind === "notice" && b.tone === "error" && looksLikeAuthFailure(b.text)) return `${b.uid}`;
+      if (b.kind === "notice" && b.signIn === true) return `${b.uid}`;
     }
     return null;
   });
@@ -282,6 +272,14 @@
    *  transcript's tail; signing in relaunches the chat in place, resuming
    *  the conversation. */
   const liveSignIn = $derived(signInNeeded && store.initialized && store.exited === null && store.fatalError === null && !store.running && !store.degraded);
+  /** A chat that has not started yet while its CLI says signed out: the
+   *  one case the composer closes, so the first turn isn't a 401. A live
+   *  chat keeps its composer — the verdict may be stale, or the login may
+   *  have landed outside the app — and the card offers Check again. */
+  const preflightSignIn = $derived(signInNeeded && !store.initialized && store.exited === null && store.fatalError === null && !readOnly);
+  /** `/login` typed here: the card runs whether or not the catalog thinks
+   *  the agent is signed in (a switch of account, a stale login). */
+  let signInRequested = $state(false);
   void listAgents().then((agents) => {
     const info = agents.find((a) => a.id === agentKind);
     models = info?.models ?? [];
@@ -1762,15 +1760,16 @@
           return toggleUltracode();
         }
       case "login":
-        // /login is an interactive OAuth / setup-token / SSO flow the `-p`
-        // stream-json CLI can't run ("/login isn't available in this
-        // environment") — so an expired session dead-ends in chat with no way
-        // back. Flip to the real TUI, where claude's own /login handles every
-        // auth method safely (chimaera never sees the credentials); sign in
-        // there, then toggle back to chat with the pane-bar button. Claude
-        // only for now — codex's auth flow (`codex login`) is a follow-up.
-        if (agentKind !== "claude" || onSwitchToTerminal === undefined) return false;
-        onSwitchToTerminal();
+        // /login in any chat is the in-app sign-in: the card at the
+        // transcript's tail runs the CLI's own login under the daemon (the
+        // `-p` / app-server processes can't run it themselves, and sent to
+        // the model it is a billed prompt) and the chat relaunches in place
+        // once the login lands. Claude's native /login still lives in its
+        // terminal view (the pane-bar toggle) for anyone who prefers it.
+        if (readOnly) return false;
+        signInRequested = true;
+        // Never a prompt to the model, even before the catalog answers.
+        if (catalogAgent === null) void listAgents(true).catch(() => {});
         return true;
       default:
         return false;
@@ -1982,8 +1981,8 @@
       });
     }
     if (supports("get_mcp")) native.push({ name: "mcp", description: "MCP servers — chimaera panel" });
-    if (agentKind === "claude") {
-      native.push({ name: "login", description: "sign in — opens the terminal for Claude's native auth" });
+    if (!readOnly) {
+      native.push({ name: "login", description: `sign in to ${agentName} — in the app` });
     }
     if (supports("compact")) {
       native.push({ name: "compact", description: "compact conversation context" });
@@ -2607,7 +2606,7 @@
   /** Nothing to type into (and so nothing to quote into): a read-only
    *  subagent view, or a session that ended, degraded or failed. */
   const composerDisabled = $derived(
-    readOnly || store.exited !== null || store.degraded || store.fatalError !== null,
+    readOnly || store.exited !== null || store.degraded || store.fatalError !== null || preflightSignIn,
   );
   const incompatibleRuntime = $derived(/GLIBC_[\d.]+[^\n]*not found/.test(store.fatalError ?? ""));
 
@@ -2798,12 +2797,12 @@
            startup failure (if one lands) folds into it below. -->
       <div class="empty" role="status">
         <SessionGlyph kind="agent" {agentKind} size={18} />
-        <AgentSignInCard agent={catalogAgent} workspaceId={session.workspace_id ?? null} framed onSignedIn={onRelaunch} />
+        <AgentSignInCard agent={catalogAgent} workspaceId={session.workspace_id ?? null} sessionId={session.id} framed onSignedIn={() => void getSignIn(agentKind, true).catch(() => {})} />
       </div>
     {:else if store.exited === null && !store.fatalError && (!store.initialized || store.blocks.length === 0)}
       <div class="empty" role="status">
         <SessionGlyph kind="agent" {agentKind} size={18} />
-        <span>{!store.connected ? `connecting to ${agentName}…` : store.initialized ? `${agentName} is ready` : `starting ${agentName}…`}</span>
+        <span>{!store.connected ? `connecting to ${agentName}…` : store.initialized ? (liveSignIn ? `${agentName} is waiting for a sign-in` : `${agentName} is ready`) : `starting ${agentName}…`}</span>
         {#if store.connected && !store.initialized && store.startupDetail}
           <span class="startup-detail">{store.startupDetail}</span>
         {/if}
@@ -3072,6 +3071,12 @@
         {@const hook = item.block.tone === "info" ? hookNotice(item.block.text) : null}
         {#if hook}
           <HookRow said={hook} sourceIndex={item.index} sourceUid={item.block.uid} />
+        {:else if item.block.signIn === true}
+          <!-- A login's refusal: the sign-in card while one is needed, a
+               quiet line once it isn't (the raw text never returns). -->
+          {#if !signInNeeded}
+            <div class="notice" data-block-index={item.index} data-block-uid={item.block.uid}>{agentName} needed a sign-in</div>
+          {/if}
         {:else if item.block.text !== store.fatalError}
         <!-- The failure a fatal banner is showing is not repeated as a line. -->
         <div
@@ -3180,9 +3185,11 @@
       </div>
     {/if}
 
-    {#if liveSignIn && catalogAgent !== null}
+    {#if (liveSignIn || (signInRequested && store.fatalError === null && store.exited === null)) && catalogAgent !== null}
       <div class="live-signin">
-        <AgentSignInCard agent={catalogAgent} workspaceId={session.workspace_id ?? null} framed onSignedIn={onRelaunch} />
+        <!-- The daemon relaunches a chat that waited on the login (and the
+             one /login was typed in); the card only refreshes the verdict. -->
+        <AgentSignInCard agent={catalogAgent} workspaceId={session.workspace_id ?? null} sessionId={session.id} framed autostart={signInRequested} onSignedIn={() => { signInRequested = false; void getSignIn(agentKind, true).catch(() => {}); }} onDismiss={signInRequested ? () => { signInRequested = false; } : undefined} />
       </div>
     {/if}
     {#if store.fatalError !== null && signInNeeded}
@@ -3438,6 +3445,7 @@
     view={quoteOwner}
     running={agentBusy}
     disabled={composerDisabled}
+    disabledHint={preflightSignIn ? `sign in to ${agentName} first` : null}
     slashCommands={composerCommands}
     workspaceId={session.workspace_id ?? null}
     {terminals}

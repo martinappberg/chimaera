@@ -63,9 +63,13 @@ export interface AgentInfo {
 }
 
 export interface AgentSignIn {
-  how: "browser" | "terminal";
+  /** Headless under the daemon; the app opens the page. */
+  how: "browser";
   command: string;
   acceptsCode: boolean;
+  /** Signing in while signed in means a switch of account (false for a CLI
+   *  whose headless login only finds the existing one). */
+  relogin: boolean;
   operation?: { id: string; running: boolean; phase: string };
 }
 
@@ -276,12 +280,13 @@ export function normalizeAgentCatalog(body: unknown): AgentInfo[] {
 function normalizeSignIn(raw: unknown): AgentSignIn | undefined {
   if (typeof raw !== "object" || raw === null) return undefined;
   const s = raw as Record<string, unknown>;
-  if (s.how !== "browser" && s.how !== "terminal") return undefined;
+  if (s.how !== "browser") return undefined;
   const op = typeof s.operation === "object" && s.operation !== null ? s.operation as Record<string, unknown> : null;
   return {
     how: s.how,
     command: typeof s.command === "string" ? s.command.slice(0, 128) : "",
     acceptsCode: s.accepts_code === true,
+    relogin: s.relogin !== false,
     operation: op && typeof op.id === "string" && op.id.length <= 128 && typeof op.phase === "string"
       ? { id: op.id, phase: op.phase, running: op.running === true } : undefined,
   };
