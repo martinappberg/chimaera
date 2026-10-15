@@ -47,11 +47,13 @@
     onclick={() => (open = !open)}
     title={open ? "collapse" : "expand"}
   >
-    <Chevron {open} />
     <span class="spark" class:still={!pulse || !visible} aria-hidden="true">{glyph}</span>
     <!-- aria-live on the summary only: the count changing is worth
          announcing, per-row churn is not. -->
     <span class="head-label" role="status" aria-live={visible ? "polite" : "off"}>{label}</span>
+    <!-- The disclosure trails, as on the activity lines and the plan card:
+         one glyph leads the line. -->
+    <Chevron {open} />
   </button>
   {#if open}
     <div class="rows">
@@ -61,17 +63,21 @@
 </div>
 
 <style>
-  /* The pinned-monitor chrome, sibling to the plan card — quiet
-     (border-top, muted, theme tokens) so the work trays read as one strip
-     family. */
+  /* The pinned-monitor chrome: the plan card's recipe (chat/PlanCard.svelte
+     — the same edge, radius and neutral tint), so the three pinned cards
+     above the composer read as one stack. Colour is reserved for the live
+     glyph: "alive", never "a tray". The host (ChatView) sets the width and
+     the stacking margins. */
   .tray {
     flex: none;
-    border-top: 1px solid var(--edge);
-    padding: 5px 14px 6px;
+    border: 1px solid var(--edge);
+    border-radius: 8px;
+    padding: 4px 8px 5px 11px;
     font-size: var(--text-sm);
+    line-height: 1.45;
     max-height: 168px;
     overflow-y: auto;
-    background: color-mix(in srgb, var(--accent) 4%, transparent);
+    background: color-mix(in srgb, var(--fg) 2%, var(--bg));
     animation: rise 0.15s ease; /* shared keyframe in app.css */
   }
   .tray:not(.visible) {
@@ -82,7 +88,7 @@
   .tray-head {
     display: flex;
     align-items: center;
-    gap: 7px;
+    gap: 9px;
     width: 100%;
     background: none;
     border: none;
@@ -90,8 +96,29 @@
     font: inherit;
     font-size: var(--text-sm);
     text-align: left;
-    padding: 1px 0 3px;
+    padding: 2px 0;
     cursor: pointer;
+    transition: color 0.12s ease;
+  }
+  .tray-head:hover,
+  .tray-head:focus-visible {
+    color: var(--fg);
+  }
+  .tray-head :global(.chev) {
+    opacity: 0.55;
+  }
+  .tray-head:hover :global(.chev) {
+    opacity: 1;
+  }
+  /* The glyph is a text character; a fixed slot keeps the label's edge where
+     the plan card's marks put theirs. */
+  .spark {
+    width: 14px;
+    text-align: center;
+  }
+  /* Rows start under the label, not under the glyph. */
+  .rows {
+    padding: 1px 0 1px 23px;
   }
   .head-label {
     flex: 1;

@@ -3490,10 +3490,7 @@
      padding rides OUTSIDE the measure so text edges line up with it. */
   .chat > :global(.composer),
   .chat > .suggestion-row,
-  .chat > .branch-line,
-  /* Every pinned strip (subagents, background, plan) — they were full-bleed
-     while the plan alone was inset, so the group never lined up. */
-  .chat > :global(.tray) {
+  .chat > .branch-line {
     width: 100%;
     max-width: calc(var(--chat-column) + 36px);
     margin-left: auto;
@@ -3507,13 +3504,17 @@
   .chat > :global(.composer) {
     border-top: none;
   }
-  /* The plan card keeps its border on the column's text edges. */
-  .chat > :global(.plan-card) {
+  /* The pinned cards (subagents, background, plan) keep their borders on
+     the column's text edges and stack 6px apart. */
+  .chat > :global(.plan-card),
+  .chat > :global(.tray) {
     width: calc(100% - 36px);
     max-width: var(--chat-column);
-    margin-left: auto;
-    margin-right: auto;
+    margin: 6px auto;
     box-sizing: border-box;
+  }
+  .chat > :global(:is(.tray, .plan-card) + :is(.tray, .plan-card)) {
+    margin-top: 0;
   }
   .startup-detail {
     font-size: var(--text-sm);
