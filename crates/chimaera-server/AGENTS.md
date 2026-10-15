@@ -158,7 +158,10 @@ One privileged chat session per workspace (the dashboard plan §6/§7 —
   config (live-probed — PROTOCOL.md Pass 19), so the mode rides
   `SpawnSpec.mcp_auto_approve` (chat.rs sets it; the driver answers listed
   tools' elicitations itself, everything else surfaces); the role prompt is
-  `-c developer_instructions`.
+  `-c developer_instructions`. ACP chats (never a Mastermind) get the worker
+  consent through the same `mcp_auto_approve` — ACP has no pre-allow config,
+  so the ACP driver answers a listed tool's `session/request_permission` in
+  each agent's pinned shape (PROTOCOL.md Pass 45).
 - **Messages** — workers reach it with `message_agent {to: "mastermind"}`
   (`comms`): its next step while it works; idle, an auto-mode Mastermind is
   woken within the wake caps, an ask-first one keeps it for the panel's
