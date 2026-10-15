@@ -754,35 +754,18 @@
     outline-offset: 1px;
   }
 
-  /* The two ways in, quiet until the row is hot: "open" (the default — the
-     chat view) and the terminal-icon button (the agent's own TUI). */
   /* The one trailing control: a glyph that fades in with the row, no
-     border — the row is the button, this is its alternative. */
+     border — the row is the button, this is its alternative. The fade is
+     on the GLYPH, not the button: faint on a hot row (it must not read as
+     the row's one button), full strength under the pointer itself, and
+     the tooltip below never inherits the fade. `:where` keeps the hot-row
+     rule below the direct-hover rule in specificity. */
   .tbtn {
     appearance: none;
     background: none;
     font: inherit;
     flex: none;
     border: none;
-    color: var(--muted);
-    cursor: pointer;
-    opacity: 0;
-    transition:
-      opacity 0.12s ease,
-      color 0.12s ease,
-      background-color 0.12s ease,
-      transform 0.08s ease;
-  }
-
-  /* Faint on a hot row: the row is the action, this glyph the alternative
-     — it must not read as the row's one button. Full strength under the
-     pointer itself. */
-  .arow.hl .tbtn,
-  .arow:hover .tbtn {
-    opacity: 0.55;
-  }
-
-  .tbtn {
     position: relative;
     display: inline-flex;
     align-items: center;
@@ -790,12 +773,30 @@
     width: 22px;
     height: 22px;
     border-radius: 5px;
+    color: var(--muted);
+    cursor: pointer;
+    transition:
+      color 0.12s ease,
+      background-color 0.12s ease,
+      transform 0.08s ease;
+  }
+
+  .tbtn svg {
+    opacity: 0;
+    transition: opacity 0.12s ease;
+  }
+
+  :where(.arow.hl, .arow:hover) .tbtn svg {
+    opacity: 0.55;
   }
 
   .tbtn:hover {
-    opacity: 1;
     color: var(--fg);
     background: color-mix(in srgb, var(--fg) 8%, transparent);
+  }
+
+  .tbtn:hover svg {
+    opacity: 1;
   }
 
   /* The delayed tooltip: nothing on a pass-through hover, fades in after

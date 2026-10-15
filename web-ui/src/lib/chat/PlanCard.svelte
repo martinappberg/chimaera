@@ -150,7 +150,7 @@
     margin-top: 6px;
     margin-bottom: 6px;
     border: 1px solid var(--edge);
-    border-radius: 8px; /* the composer's and the approval card's */
+    border-radius: var(--radius-card);
     background: color-mix(in srgb, var(--fg) 2%, var(--bg));
     font-size: var(--text-sm);
     line-height: 1.45;
@@ -191,7 +191,7 @@
     padding: 6px 8px 6px 11px;
     background: none;
     border: none;
-    border-radius: 8px;
+    border-radius: var(--radius-card);
     color: var(--muted);
     font: inherit;
     text-align: left;
