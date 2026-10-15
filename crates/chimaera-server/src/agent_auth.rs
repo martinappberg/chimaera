@@ -32,8 +32,6 @@ use crate::{
     AppState,
 };
 
-/// A login's whole output stays private to the daemon; this bounds it.
-const OUTPUT_LIMIT: usize = 64 * 1024;
 /// A browser login that nobody finishes is abandoned, like the connector
 /// sign-ins.
 const DEADLINE: Duration = Duration::from_secs(10 * 60);
@@ -288,8 +286,8 @@ async fn read_capped(mut pipe: impl AsyncRead + Unpin) -> String {
         if n == 0 {
             break;
         }
-        if kept.len() < OUTPUT_LIMIT {
-            let room = OUTPUT_LIMIT - kept.len();
+        if kept.len() < operation::OUTPUT_LIMIT {
+            let room = operation::OUTPUT_LIMIT - kept.len();
             kept.extend_from_slice(&buf[..n.min(room)]);
         }
     }
@@ -463,6 +461,10 @@ impl Progress {
     /// text up to the last whitespace counts: a URL split across pipe reads
     /// must never reach the UI incomplete.
     fn harvest(&mut self) {
+        if self.url.is_some() && self.code.is_some() {
+            // Nothing left to find: don't re-scan the tail for every chunk.
+            return;
+        }
         let text = strip_controls(&self.output);
         let complete = text
             .rfind(char::is_whitespace)
@@ -767,7 +769,7 @@ async fn run_login(
     // The way a chat runs the CLI: the user's login shell, the host and
     // workspace prelude, the session env — so the login writes to the store
     // the chats read.
-    let (id, workspace) = op.update(|p| (p.id.clone(), p.workspace_id.clone()));
+    let (id, workspace) = op.read(|p| (p.id.clone(), p.workspace_id.clone()));
     let prelude = crate::agent_probe::ProbePrelude::write(state, Some(&workspace)).await;
     let mut env = crate::api::session_env(state, &id, "dark", prelude.path());
     if no_browser {

@@ -89,8 +89,12 @@ impl<P: Progress> Operation<P> {
     pub(crate) fn snapshot(&self) -> P {
         lock(&self.progress).clone()
     }
-    /// Read or change the record under its lock — briefly, never across an
-    /// await.
+    /// Read the record under its lock without cloning it — briefly, never
+    /// across an await.
+    pub(crate) fn read<T>(&self, f: impl FnOnce(&P) -> T) -> T {
+        f(&lock(&self.progress))
+    }
+    /// Change the record under its lock — briefly, never across an await.
     pub(crate) fn update<T>(&self, f: impl FnOnce(&mut P) -> T) -> T {
         f(&mut lock(&self.progress))
     }
@@ -189,8 +193,8 @@ impl<P: Progress> Operation<P> {
                 // The leader is reaped: never signal a possibly recycled
                 // group id.
                 std::mem::forget(group);
-                if let (OutputEnd::Grace(grace), Some(reads)) = (&run.output, reads.take()) {
-                    let _ = tokio::time::timeout(*grace, reads).await;
+                if let OutputEnd::Grace(grace) = run.output {
+                    settle_reads(&mut reads, grace).await;
                 }
                 Exit::Exited(result.ok().and_then(|s| s.code()))
             }
@@ -200,9 +204,7 @@ impl<P: Progress> Operation<P> {
                 // to land the rest, then the whole group goes. Wait AFTER the
                 // kill so the group id cannot be recycled in between.
                 let _ = nix::sys::signal::killpg(group.0, nix::sys::signal::Signal::SIGTERM);
-                if let Some(reads) = reads.take() {
-                    let _ = tokio::time::timeout(TERM_GRACE, reads).await;
-                }
+                settle_reads(&mut reads, TERM_GRACE).await;
                 drop(group);
                 let code = child.wait().await.ok().and_then(|s| s.code());
                 if cancelled {
@@ -234,15 +236,16 @@ impl<P: Progress> Operations<P> {
     }
     /// The catalog row's summary of this agent's operation.
     pub(crate) fn summary(&self, kind: AgentKind) -> Option<serde_json::Value> {
-        self.snapshot(kind)
-            .map(|p| json!({"id": p.id(), "running": p.running(), "phase": p.phase()}))
+        self.get(kind).map(|op| {
+            op.read(|p| json!({"id": p.id(), "running": p.running(), "phase": p.phase()}))
+        })
     }
     /// The operation a POST joins instead of starting another: one still
     /// running (a second window), or the finished one this same request
     /// started (a retry after a lost reply).
     pub(crate) fn joinable(&self, kind: AgentKind, request_id: &str) -> Option<P> {
-        self.snapshot(kind)
-            .filter(|p| p.running() || p.id() == request_id)
+        self.get(kind)
+            .and_then(|op| op.read(|p| joins(p, request_id).then(|| p.clone())))
     }
     /// Register `progress` as the agent's operation — unless one is joinable,
     /// which comes back instead. Decided under the lock: two first clicks
@@ -250,8 +253,7 @@ impl<P: Progress> Operations<P> {
     pub(crate) fn start(&self, kind: AgentKind, progress: P) -> Result<Arc<Operation<P>>, P> {
         let mut map = lock(&self.0);
         if let Some(existing) = map.get(&kind) {
-            let p = existing.snapshot();
-            if p.running() || p.id() == progress.id() {
+            if let Some(p) = existing.read(|p| joins(p, progress.id()).then(|| p.clone())) {
                 return Err(p);
             }
         }
@@ -280,6 +282,12 @@ impl<P: Progress> Operations<P> {
         }
         Ok(p.clone())
     }
+}
+
+/// Whether a POST carrying `request_id` observes `p` instead of starting
+/// anew: still running, or the finished operation this same request started.
+fn joins<P: Progress>(p: &P, request_id: &str) -> bool {
+    p.running() || p.id() == request_id
 }
 
 pub(crate) enum CancelRefused {
@@ -431,6 +439,18 @@ impl Drop for Group {
     fn drop(&mut self) {
         let _ = nix::sys::signal::killpg(self.0, nix::sys::signal::Signal::SIGKILL);
     }
+}
+
+/// Give the pipe readers `grace` to land what the pipes still hold, then end
+/// them: a helper the process left behind holding stdout must not keep this
+/// task, the pipes and the record alive for its own lifetime.
+async fn settle_reads(reads: &mut Option<JoinHandle<()>>, grace: Duration) {
+    if let Some(handle) = reads.as_mut() {
+        if tokio::time::timeout(grace, &mut *handle).await.is_err() {
+            handle.abort();
+        }
+    }
+    *reads = None;
 }
 
 async fn drain<P: Progress>(mut pipe: impl AsyncRead + Unpin, op: &Operation<P>) {
