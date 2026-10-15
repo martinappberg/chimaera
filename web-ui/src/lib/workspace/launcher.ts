@@ -415,10 +415,13 @@ export function versionToken(version: string): string {
   return version.split(" ").find((t) => /^\d/.test(t)) ?? version.split(" ")[0];
 }
 
-/** A dated build (Cursor's `2026.10.14-941492e`) reads as its date; the
- * full token stays in the tooltip. A pre-release tag is not a build hash. */
+/** A build with a hash (Cursor's `2026.10.14-941492e`) reads as its X.Y.Z
+ * core; the full token stays in the tooltip. Same rule as the daemon's
+ * `agent_updates::release_core`: a git hash may be all digits, so a 7–40
+ * character hex suffix in either case counts; `-beta` and shorter suffixes
+ * stay whole. */
 export function releaseCore(token: string): string {
-  const m = /^(\d+\.\d+\.\d+)-[0-9a-f]{7,}$/.exec(token);
+  const m = /^(\d+\.\d+\.\d+)-[0-9A-Fa-f]{7,40}$/.exec(token);
   return m ? m[1] : token;
 }
 

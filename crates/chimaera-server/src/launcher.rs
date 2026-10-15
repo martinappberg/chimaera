@@ -154,7 +154,7 @@ pub(crate) fn docs_url(kind: AgentKind) -> &'static str {
         AgentKind::Antigravity => "https://antigravity.google/docs",
         AgentKind::Gemini => "https://github.com/google-gemini/gemini-cli",
         AgentKind::Grok => "https://docs.x.ai/build/overview",
-        AgentKind::Cursor => "https://cursor.com/docs/cli",
+        AgentKind::Cursor => "https://cursor.com/docs/cli/overview",
     }
 }
 

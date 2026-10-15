@@ -124,14 +124,25 @@ pub(crate) fn update_available(current_line: Option<&str>, latest: &str) -> bool
     }
 }
 
-/// A dated release with a build hash (Cursor's `2026.10.14-941492e`)
-/// orders by its date; two builds of one date are not ordered.
+/// A release with a build hash (Cursor's `2026.10.14-941492e`) orders by
+/// its `X.Y.Z` core; two builds of one core are not ordered. The rule is
+/// `^(\d+\.\d+\.\d+)-([0-9A-Fa-f]{7,40})$`, the same as the web UI's
+/// `releaseCore`: a git hash may be all digits, so a numeric suffix of 7+
+/// digits counts as a hash too; anything else (`-beta`, a 6-char suffix,
+/// a two-part core) is left whole.
 fn release_core(version: &str) -> &str {
-    match version.split_once('-') {
-        Some((core, hash)) if hash.len() >= 7 && hash.chars().all(|c| c.is_ascii_hexdigit()) => {
-            core
-        }
-        _ => version,
+    let Some((core, hash)) = version.split_once('-') else {
+        return version;
+    };
+    let numeric_core = core.split('.').count() == 3
+        && core
+            .split('.')
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    if numeric_core && (7..=40).contains(&hash.len()) && hash.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        core
+    } else {
+        version
     }
 }
 
@@ -414,6 +425,22 @@ mod tests {
         ));
         // A pre-release tag is not a build hash.
         assert!(!update_available(Some("1.2.3-beta"), "1.2.3"));
+    }
+
+    /// Pinned in step with the web UI's `releaseCore` tests.
+    #[test]
+    fn release_core_rule_matches_the_ui() {
+        for (version, core) in [
+            ("2026.10.14-941492e", "2026.10.14"),
+            ("2026.10.14-941492E", "2026.10.14"),
+            ("1.2.3-20261014", "1.2.3"),
+            ("1.2.3-beta", "1.2.3-beta"),
+            ("1.2.3-abcdef", "1.2.3-abcdef"),
+            ("1.2-abcdef0", "1.2-abcdef0"),
+            ("1.2.3", "1.2.3"),
+        ] {
+            assert_eq!(release_core(version), core, "{version}");
+        }
     }
 
     #[test]

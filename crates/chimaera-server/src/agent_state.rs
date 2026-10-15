@@ -6,8 +6,9 @@
 
 use std::path::PathBuf;
 
-/// Which agent CLI a kind-"agent" session runs. The id doubles as the binary
-/// name probed on the login-shell PATH. Hook-driven attention state exists
+/// Which agent CLI a kind-"agent" session runs. The login-shell PATH is
+/// searched for [`AgentKind::path_bin`] (the id, except Cursor's
+/// `cursor-agent`). Hook-driven attention state exists
 /// only for Claude; other agents surface `agent_state: "unknown"` (the muted
 /// dot in the UI) until their integrations land.
 ///
@@ -35,7 +36,10 @@ impl AgentKind {
         AgentKind::Cursor,
     ];
 
-    /// Stable id — also the binary name (`claude`, `codex`, `agy`, `gemini`).
+    /// Stable id (`claude`, `codex`, `agy`, `grok`, `cursor`): the wire and
+    /// settings identity, and the name of the managed tree and its shim
+    /// target under `~/.chimaera/agents`. The PATH is searched for
+    /// [`Self::path_bin`], which differs for Cursor.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             AgentKind::Claude => "claude",
