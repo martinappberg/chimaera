@@ -31,7 +31,8 @@ the module you need and read its header doc.
 | `chat.rs` | **The chat-mode glue** (see below). |
 | `claude_store.rs` | The ONE lookup for where a Claude conversation's transcript lives: the hook-reported path, the session's own cwd, the root, then the root's `.claude/worktrees/*` project dirs (one bounded store `read_dir`). Every resume check goes through it (resurrect, view switch, journal seed, ledger, Recents, history reopen, resumables); never join `claude_projects_dir` + `encode_cwd(root)` by hand. Blocking: `find` wraps it in `spawn_blocking`. |
 | `agent_setup.rs` | Noninteractive managed installs via `/agents/{id}/setup`: no session/PTY entries, one 64 KiB result per provider until restart, idempotent POST/join, generation-scoped cancel, 15-minute deadline, whole-process-group teardown. Shares `runtimes` install locks and retention cleanup with legacy PTY installers. Success never asserts account or chat readiness. |
-| `launcher.rs` | argv assembly (`build_agent_command`, `build_chat_command`, `build_agent_resume_command` — the switch-to-TUI argv), binary `detect`, login-shell wrapping, per-agent binary resolution. `safe_model_arg` permits bounded provider/model:tag selectors; resume handles retain `safe_arg`'s stricter grammar. Unit-tested — argv logic lives HERE, not in drivers or `chat.rs`. |
+| `agent_auth.rs` | Sign in to an agent CLI from the app: per-agent status (each CLI's own status command — `claude auth status --json`, `codex login status`, `cursor-agent status --format json`, `grok models`, `agy models` — run like a chat through the login shell + host prelude, own process group, 10 s, capped; cached 10 min; the catalog answers from the cache or `null` with a background probe, inline only for `?check`, a sign-in's end or a chat startup failure; one probe per agent) on the `GET /agents` rows (`signed_in`, `sign_in`), and one bounded sign-in operation per agent behind `/agents/{id}/sign-in`: the CLI's headless login under the daemon (`claude auth login` with `BROWSER=true`, `codex`/`grok login --device-auth`, `NO_OPEN_BROWSER=1 cursor-agent login`, `agy -p /skills` with a no-op `open`/`xdg-open` first on its PATH since Antigravity ignores `BROWSER`/`NO_BROWSER`) with the URL and device code harvested from its output and a pasted code fed to stdin. 10-minute deadline, process-group teardown, output private (64 KiB), a clean exit verified by the status command and never trusted alone. Never reads a credential. |
+| `launcher.rs` | argv assembly (`build_agent_command`, `build_chat_command`, `build_agent_resume_command` — the switch-to-TUI argv), binary `detect` (hits cached for the daemon's lifetime; a miss is stamped for `MISS_TTL` = 90 s in `agent_misses` and served ONLY by `detect_for_catalog` — `GET /agents` without `refresh` — while spawns and refreshes probe, a refresh never records a miss over a hit that still validates, and `forget_misses` runs on a path-setting change and in `agent_probe::refresh_probes`), login-shell wrapping, per-agent binary resolution. `safe_model_arg` permits bounded provider/model:tag selectors; resume handles retain `safe_arg`'s stricter grammar. Unit-tested — argv logic lives HERE, not in drivers or `chat.rs`. |
 | `agent_state.rs` | The pure state core: `AgentKind`/`AgentState`/`AgentRecord` + the hook→state / title helpers. A leaf (no transport/fs/`AppState`) — this is what lets `chat.rs` depend on it without the old agents↔chat cycle. |
 | `agents.rs` | The agent glue over `agent_state`: hook ingest, settings/mcp writers, the transcript watcher. |
 | `spawn.rs` | PTY session spawn (the Tier-A TUI path), theme injection. |
@@ -235,8 +236,11 @@ the lifecycle, keep them consistent:
 ## Invariants / gotchas
 
 - **Five native extension adapters, open report identities.** `agent_probe/extensions.rs`
-  owns Antigravity's zero-turn skills/imports and Grok's effective inspect inventory;
-  Cursor's CLI lists no plugins or skills, so its report is a notice with no actions.
+  owns Antigravity's zero-turn skills/imports and Grok's effective inspect inventory; Cursor's
+  inventory is a notice only (its CLI lists no plugins or skills — nothing runs, no gate, no
+  prelude), its Connections come from `cursor-agent mcp list` (`connections::cursor_connections`:
+  the real status words, an `Error:` line is a failure never a sign-in prompt, unparseable lines
+  skipped).
   Never turn an unknown slash command into a discovery prompt; version-gate Antigravity's
   native print command. Reports whitelist fields and separate skill source files/scopes.
   `agent_probe/actions.rs` uses `launcher::extension_action` fixed argv in a visible PTY;
@@ -252,7 +256,11 @@ the lifecycle, keep them consistent:
   cleanup, output/row caps and a 60-second budget including queue time. Reports
   whitelist names/statuses only; no endpoints, environment values or raw errors.
   Connector sign-in (`connections/auth.rs`) is a bounded in-memory job, never a
-  workbench terminal session. Claude requires an internal PTY for input and output even with
+  workbench terminal session — with one deliberate exception: Cursor's `login_connection`
+  (`actions.rs`, argv `cursor-agent mcp login <name>`) runs in a managed terminal, because the
+  CLI has no no-browser mode and waits for its OAuth callback on a localhost port of its host, so
+  the UI offers it for local workspaces only and the daemon accepts only a server the last report
+  listed with `login_terminal`. Claude requires an internal PTY for input and output even with
   `--no-browser` (`connections/auth_pty.rs`); nonblocking I/O is cancellable, raw
   input avoids canonical line truncation, and output is private and capped. Codex
   accepts pipes. Neither transport creates a terminal pane or persists output.

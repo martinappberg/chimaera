@@ -3364,6 +3364,7 @@ impl ClaudeMapper {
                     format!("control request failed: {}", frame["response"])
                 },
                 fatal: false,
+                sign_in: false,
             });
             return;
         }
@@ -9578,7 +9579,7 @@ pub(crate) mod tests {
         }}));
         assert_eq!(m.model.as_deref(), Some("opus[1m]"));
         assert!(
-            matches!(rejected.events.as_slice(), [AgentEvent::Error { message, fatal: false }] if message == "model change failed: Unknown model")
+            matches!(rejected.events.as_slice(), [AgentEvent::Error { message, fatal: false, .. }] if message == "model change failed: Unknown model")
         );
     }
 

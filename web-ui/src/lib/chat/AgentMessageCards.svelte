@@ -151,7 +151,7 @@
     min-width: 0;
     padding: 7px 12px 8px;
     border: 1px solid color-mix(in srgb, var(--edge) 85%, transparent);
-    border-radius: 10px;
+    border-radius: var(--radius-card);
     background: color-mix(in srgb, var(--fg) 2.5%, transparent);
   }
   /* The Mastermind's direction: the same card, a quiet accent edge. */

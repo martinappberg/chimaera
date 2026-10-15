@@ -53,6 +53,24 @@ export interface AgentInfo {
    *  information for the user's own. Never guessed: unparseable versions
    *  stay false. */
   updateAvailable: boolean;
+  /** Whether the CLI reports being signed in on the host — its own status
+   *  command's verdict (null = unknown, or not installed). */
+  signedIn: boolean | null;
+  /** How this agent signs in from the app (`agent_auth`): headless under the
+   *  daemon with a page (and maybe a code) to open, or in its own terminal
+   *  UI; and the sign-in in progress, if any. */
+  signIn?: AgentSignIn;
+}
+
+export interface AgentSignIn {
+  /** Headless under the daemon; the app opens the page. */
+  how: "browser";
+  command: string;
+  acceptsCode: boolean;
+  /** Signing in while signed in means a switch of account (false for a CLI
+   *  whose headless login only finds the existing one). */
+  relogin: boolean;
+  operation?: { id: string; running: boolean; phase: string };
 }
 
 
@@ -235,9 +253,33 @@ export function normalizeAgentCatalog(body: unknown): AgentInfo[] {
         latestError: typeof a.latest_error === "string" ? a.latest_error : null,
         latestCheckedAt: typeof a.latest_checked_at === "number" ? a.latest_checked_at : null,
         updateAvailable: a.update_available === true,
+        signedIn: typeof a.signed_in === "boolean" ? a.signed_in : null,
+        signIn: normalizeSignIn(a.sign_in),
       },
     ];
   });
+}
+
+function normalizeSignIn(raw: unknown): AgentSignIn | undefined {
+  if (typeof raw !== "object" || raw === null) return undefined;
+  const s = raw as Record<string, unknown>;
+  if (s.how !== "browser") return undefined;
+  const op = typeof s.operation === "object" && s.operation !== null ? s.operation as Record<string, unknown> : null;
+  return {
+    how: s.how,
+    command: typeof s.command === "string" ? s.command.slice(0, 128) : "",
+    acceptsCode: s.accepts_code === true,
+    relogin: s.relogin !== false,
+    operation: op && typeof op.id === "string" && op.id.length <= 128 && typeof op.phase === "string"
+      ? { id: op.id, phase: op.phase, running: op.running === true } : undefined,
+  };
+}
+
+/** Fold one agent's fresh sign-in verdict into the shared catalog, so every
+ *  surface reading it (launcher rows, Settings, a chat's card) agrees without
+ *  a full re-detect. */
+export function patchAgentSignedIn(id: string, signedIn: boolean | null): void {
+  catalog.update((rows) => rows.map((a) => (a.id === id ? { ...a, signedIn } : a)));
 }
 
 /**

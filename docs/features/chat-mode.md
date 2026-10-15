@@ -153,11 +153,14 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   containing an exact skill token preserves the visible text and adds Codex's native
   `{type:"skill", name, path}` input block; Claude continues to execute its advertised commands as
   text. Skill invocations are de-duplicated and capped at eight per send.
-- **`/login` recovery (claude).** An expired-auth chat session dead-ends — the `-p stream-json`
-  CLI answers "/login isn't available in this environment". `/login` (palette + intercepted on
-  send) instead flips the session to its real TUI (the [view switch](#view-switch-rewind-and-branch)),
-  where claude's own `/login` runs the native auth flow (OAuth / setup-token / SSO); chimaera
-  never touches the credentials. Sign in there, toggle back to chat.
+- **`/login` — every agent.** A chat process can't run its CLI's login itself (claude's `-p
+  stream-json` answers "/login isn't available in this environment"; sent to codex it is a billed
+  prompt). `/login` (palette + intercepted on send, in any chat whose agent has a sign-in) opens the
+  [sign-in card](agents.md#sign-in) at the transcript's tail and starts the CLI's own login under
+  the daemon — whether or not the agent is currently signed in (a switch of account, a stale
+  login) — and the chat relaunches in place once it lands; chimaera never touches the
+  credentials. Claude's native `/login` remains in its terminal view (the
+  [view switch](#view-switch-rewind-and-branch)) for anyone who prefers it.
 - **Voice dictation — the mic button.** Every chat composer has a mic beside
   send (on by default; shown only where the daemon's host can dictate — `GET /api/v1/voice`,
   asked once per window and again after a login failure). Click it and speak: the words fill the
@@ -383,9 +386,9 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   running call's line in the open trailing run (not folded, not scrolled away), or streaming
   prose or a live thought row as the newest block at the reader's bottom (screen readers still hear
   it); a reasoning item that drew no thought row (Codex, empty summary) says Thinking. Waiting on
-  a permission, a question or the next step always shows its word.
-  Codex says Thinking from the moment a reasoning item starts (its summary, if any, lands only
-  as the step ends), as Claude does while it thinks.
+  a permission, a question or the next step always shows its word. Codex says Thinking from the
+  moment a reasoning item starts (its summary, if any, lands only as the step ends), as Claude
+  does while it thinks.
   Codex's synchronous SessionStart and UserPromptSubmit hooks show their actual phase
   and a hook row linking to the hook configuration. These can block a turn after the
   runtime has initialized but before it receives the opening message.
@@ -614,11 +617,13 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   and Cursor report no subagents on their ACP wires, so they show neither. PROTOCOL.md Pass 42.
 - **The task list is the plan card, whichever tool spells it.** Every plan source — Claude's `TodoWrite` or its incremental `TaskCreate`/`TaskUpdate`/`TaskList` family, chimaera's `update_plan`, Codex's built-in `update_plan`, an ACP agent's plan — arrives as the one `plan` level-set, and none leaves bookkeeping rows in the transcript. The Task family carries more than a checklist, so its rows can show **who owns a step** (`@name`) and **what blocks it** (a dashed circle and "after #1": a blocked task is still `todo`), plus a muted detail line when the task's description says more than its subject. Blockers are filtered to ones still open, so finishing a dependency visibly unblocks its dependents. The in-progress summary prefers the agent's own present-continuous `activeForm` ("Running tests"). Plans without these fields render without them.
 - **Chats are asked to keep a plan card, each in its own runtime's words.** The chimaera MCP server's `initialize` instructions ask a chat for the card on any request that edits files or runs more than one command, and the wording depends on the runtime and surface (`mcp.rs` `task_list_instructions(kind, chat)`, `plan_tool_for`). A **Claude chat** is offered chimaera's `update_plan` tool (a whole-list level-set of `{content, status}` steps that the daemon journals as the normalized `plan` event) and asked to use it: Claude Code offers no TaskCreate/TaskUpdate under `-p` (probed on 2.1.300). A **Codex chat** is pointed at its built-in `update_plan` and is not offered chimaera's, so it never sees two tools of that name. An **ACP chat** (Antigravity, Grok, Cursor) is asked to keep its own plan or to-do tool current and is not offered chimaera's. A **terminal session** of any kind gets neither: its own task list renders in the terminal. `update_plan` stays in `mcp::ALWAYS_ALLOWED_TOOLS` (Claude `permissions.allow`, Codex `mcp_auto_approve`), harmless where the tool isn't listed, and the Claude driver hides its `mcp__chimaera__update_plan` call row (`claude.rs` `CHIMAERA_PLAN_TOOL`). A plan written as a file or prose draws nothing.
-- **The plan card, and two pinned strips.** Plan, subagents, and background work are three
+- **Three pinned cards.** Plan, subagents, and background work are three
   orthogonal readings of a session — what the agent *means* to do, *who* is working, what is
-  *detached* — stacked above the composer; only non-empty ones render. Subagents and background
-  work share the `WorkTray` chrome, collapsed by default to a one-line glance. The plan is a rounded
-  card (`PlanCard.svelte`, derivations in `planCard.ts`) with one row per step whose circle says its
+  *detached* — stacked above the composer as cards of one recipe (`app.css` `.pinned-card`: the
+  transcript's card radius, a hairline edge, a neutral tint); only non-empty ones render. Subagents
+  and background work share the `WorkTray` shell, collapsed by default to a one-line glance whose
+  live glyph leads and whose chevron trails. The plan card (`PlanCard.svelte`, derivations in
+  `planCard.ts`) has one row per step whose circle says its
   state without colour: a filled check for done (quiet text), a plain circle for the step in flight
   (foreground, its active form), a dashed circle for waiting. It is the same card for every runtime —
   Claude's Task family, TodoWrite or chimaera's `update_plan`, Codex's `update_plan`, an ACP plan all
@@ -802,6 +807,14 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   `just chat-smoke` for Claude/Codex, `just chat-smoke-acp` for Grok/Antigravity
   (existing credentials, billed turns). Keep shared behavior consistent while preserving
   provider-specific capability limits.
+- **A signed-out agent** shows its sign-in card in place of the startup error (the catalog's
+  verdict, re-asked on the failure) and relaunches in place once the CLI confirms the login
+  (`POST /sessions/{id}/view {ui:"chat"}` on the dead chat, every agent); a live chat whose turn
+  fails with an auth-shaped error (`chat/authFailure.ts`) re-asks the status command and shows the
+  card at its tail with the composer closed, and a landed sign-in relaunches every chat of that
+  agent that waited on it (`chat::relaunch_after_sign_in` → `{ui:"chat", relaunch:true}`, resuming
+  the native conversation once it had a prompt) — [agents.md › Sign in](agents.md#sign-in). A fatal startup error renders once: the banner, no
+  twin transcript line and no trailing "agent exited".
 - **Startup watchdog** (`driver.rs`, `chat.rs`): all providers have 60 seconds for login-shell
   setup, workspace startup hooks, MCP discovery and protocol initialization. Once initialized,
   leaving a chat idle does not expire it. Failed launches stay visible with their diagnostic and
@@ -825,8 +838,9 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   fresh transcript hook arrives. A busy `Running` agent needs `force` (409); the UI then asks in an
   in-app `ConfirmDialog` ("Open as chat?", Enter switches, Escape keeps the turn). **Account use:**
   the agent runs under its own credentials and settings; the chat side drives its structured protocol. This
-  is also the **`/login` recovery** path (see [Composing & sending](#composing--sending)): an
-  expired-auth session flips to its TUI so claude's native auth flow can run.
+  `/login` no longer rides this switch: it opens the in-app sign-in card (see
+  [Composing & sending](#composing--sending)); the terminal view remains where claude's own
+  `/login` can be run by hand.
 - **Branch at any message, without stopping the source.** Hover an assistant response and choose its
   fork action to create a new idle chat immediately after that response. The composer is empty and no
   synthetic prompt or agent turn is sent. Forking from your own message instead branches immediately
@@ -1072,10 +1086,13 @@ _Captured 2026-07-12 (from the maintainer, in-session)._
 - **Deliberate defaults:** thinking defaults ON for claude ("the reasoning pass earns its keep in a
   coding workbench") — shown on the chip, one click off, and easy to reverse if it's the wrong call.
   The subagents tray is collapsed by default (a quiet one-line indicator, expand for detail).
-- **Auth is native-only, by decision:** `/login` routes to the CLI's own auth flow (in the TUI);
-  chimaera **never** builds credential entry or handles secrets — auth methods vary (OAuth,
-  `setup-token`, SSO) and a custom in-app flow was judged too risky. The `/login`→TUI flip is the
-  minimal unblock; the fuller auth UX (auth-fail card, `/logout`, `/auth status`, codex parity, and
+- **Auth was native-only, by decision — reversed 2026-10-15 (PR #295, wording pending the
+  maintainer's):** `/login` used to route to the CLI's own auth flow in the TUI, because auth
+  methods vary (OAuth, `setup-token`, SSO) and a custom in-app flow was judged too risky. The
+  in-app sign-in keeps the part of that decision that mattered — chimaera still **never** builds
+  credential entry or handles secrets; it runs each CLI's own login headlessly and shows the page
+  and code the CLI prints — and drops the terminal detour. The original note follows: the
+  `/login`→TUI flip was the minimal unblock; the fuller auth UX (auth-fail card, `/logout`, `/auth status`, codex parity, and
   the stuck-`Running`-after-auth-fail state) is a conscious follow-up.
 - **Grade — additions, open to change:** all improvable; the load-bearing bits are the
   **native-auth-only** rule and the **workbench-promotion** principle (pin long-lived work, keep the

@@ -147,6 +147,20 @@ pub(super) async fn inventory(
     if let Some(hit) = state.probes.get(&key) {
         return hit;
     }
+    if kind == AgentKind::Cursor {
+        // `cursor-agent plugin` manages marketplaces only, and there is no
+        // skills command: nothing to ask, so no gate, no prelude, and nothing
+        // derived from `.cursor/` by hand. Connections are the CLI's `mcp list`.
+        return match bin_of(state, kind).await {
+            Ok((_, version, _usage)) => {
+                json!({"agent":agent,"available":true,"version":version,"plugins":[],"skills":[],"connections":[],"actions":[],
+                "notice":"Cursor's CLI lists no plugins or skills; manage them in Cursor. Its MCP servers are under Connections."})
+            }
+            Err(_) => {
+                json!({"agent":agent,"available":false,"plugins":[],"skills":[],"connections":[]})
+            }
+        };
+    }
     let work = async {
         let _permit = GATE.acquire().await;
         if let Some(hit) = state.probes.get(&key) {

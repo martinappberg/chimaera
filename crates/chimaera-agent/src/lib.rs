@@ -869,6 +869,15 @@ impl ChatManager {
         if matches!(ev, AgentEvent::Init { .. } | AgentEvent::UserMessage { .. }) {
             session.unused_startup.store(false, Ordering::Relaxed);
         }
+        // Classified once, here, for every driver: a startup failure or a
+        // turn error whose words are a missing login carries the cue the
+        // host and the UI act on.
+        if let AgentEvent::Error {
+            message, sign_in, ..
+        } = &mut ev
+        {
+            *sign_in = model::sign_in_failure(message);
+        }
         session
             .command_budget
             .lock()

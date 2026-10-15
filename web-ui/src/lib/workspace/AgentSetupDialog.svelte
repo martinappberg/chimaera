@@ -6,6 +6,7 @@
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import { agentCatalog, pollAgents, type LaunchPick } from "./launcher";
   import { acknowledgeSetupResult, cancelAgentSetup, getAgentSetup, pendingSetupId, recoverSetupResult, setupRunning, startAgentSetup, type SetupDetails, type SetupRequest } from "./agentSetup";
+  import AgentSignInCard from "./AgentSignInCard.svelte";
 
   let { request, onclose, onlaunch }: { request: SetupRequest; onclose(): void; onlaunch(pick: LaunchPick): void } = $props();
   let details = $state<SetupDetails | null>(null);
@@ -105,7 +106,14 @@
     </header>
     <div class="body">
       {#if operation?.phase === "succeeded"}
-        <p class="intro">Already signed in? Open chat. Otherwise, sign in first.</p>
+        {#if agent.installed && agent.signedIn === true}
+          <p class="intro">Signed in. Open chat when you're ready.</p>
+        {:else if agent.installed}
+          <!-- The same sign-in every surface uses; the terminal is never the way in. -->
+          <div class="signin"><AgentSignInCard {agent} workspaceId={request.workspaceId} onSignedIn={() => { void pollAgents(AbortSignal.timeout(15_000)).catch(() => {}); }} /></div>
+        {:else}
+          <p class="intro">Installed. Open chat when you're ready.</p>
+        {/if}
       {:else if running}
         <p class="intro">You can keep working. Check back in Settings → Agents.</p>
       {:else if operation}
@@ -129,18 +137,18 @@
       </details>
       {#if error}<p class="error" role="alert">{error}</p>{/if}
       {#if refreshError}<p class="error" role="alert">{refreshError}</p>{/if}
-      {#if !connected}<button class="link" disabled={checking} onclick={() => void check()}>Refresh status</button>{/if}
+      {#if !connected}<button class="opt-link" disabled={checking} onclick={() => void check()}>Refresh status</button>{/if}
     </div>
     <footer>
-      <button class="btn" onclick={onclose}>{running ? "Keep working" : operation?.phase === "succeeded" ? "Done" : operation ? "Close" : "Cancel"}</button>
+      <button class="opt" onclick={onclose}>{running ? "Keep working" : operation?.phase === "succeeded" ? "Done" : operation ? "Close" : "Cancel"}</button>
       <div class="next">
         {#if running}
-          <button class="btn" disabled={busy || operation?.phase === "cancelling" || !connected} onclick={() => void cancel()}>{operation?.phase === "cancelling" ? "Stopping…" : "Cancel installation"}</button>
+          <button class="opt" disabled={busy || operation?.phase === "cancelling" || !connected} onclick={() => void cancel()}>{operation?.phase === "cancelling" ? "Stopping…" : "Cancel installation"}</button>
         {:else if operation?.phase === "succeeded"}
-          {#if agent.installed}<button class="btn" title={`Open ${agent.name} in a terminal to sign in`} onclick={() => launch("term")}>Sign in</button>{/if}
-          {#if agent.installed && agent.chatCapable}<button class="btn primary" onclick={() => launch("chat")}>Open chat</button>{/if}
+          {#if agent.installed && !agent.chatCapable}<button class="opt" onclick={() => launch("term")}>Open terminal</button>{/if}
+          {#if agent.installed && agent.chatCapable}<button class="opt primary" onclick={() => launch("chat")}>Open chat</button>{/if}
         {:else}
-          <button class="btn primary" disabled={busy || !connected} onclick={() => void start()}>{busy ? "Starting…" : operation ? "Retry installation" : verb}</button>
+          <button class="opt primary" disabled={busy || !connected} onclick={() => void start()}>{busy ? "Starting…" : operation ? "Retry installation" : verb}</button>
         {/if}
       </div>
     </footer>
@@ -156,6 +164,7 @@
   .close { margin-left:auto; align-self:flex-start; background:none; border:0; color:var(--muted); font-size:24px; cursor:pointer; }
   .body { padding:20px 24px; }
   .intro { color:var(--muted); font-size:13px; line-height:1.6; margin:0 0 16px; }
+  .signin { margin:0 0 16px; }
   code { overflow-wrap:anywhere; color:var(--fg); font-size:11px; }
   .details { color:var(--muted); font-size:12px; }
   summary { cursor:pointer; width:fit-content; }
@@ -166,9 +175,6 @@
   .error { color:var(--err); font-size:12px; line-height:1.6; }
   footer { display:flex; justify-content:space-between; flex-wrap:wrap; gap:10px; padding:16px 24px; border-top:1px solid var(--edge); }
   .next { display:flex; gap:8px; flex-wrap:wrap; }
-  .btn { font:inherit; font-size:12px; padding:9px 13px; border:1px solid var(--edge); border-radius:7px; background:var(--bg); color:var(--fg); cursor:pointer; }
-  .primary { background:var(--accent); border-color:var(--accent); color:var(--bg); }
-  button:disabled { opacity:.5; cursor:default; }
-  .link { background:none; border:0; padding:0; color:var(--accent); cursor:pointer; font-size:12px; }
+  /* Buttons are the app's shared .opt / .opt.primary / .opt-link recipes (app.css). */
   @media(max-width:520px) { .backdrop { padding:10px; } header { padding:16px 16px 0; } .body { padding:16px; } footer { padding:14px 16px; } }
 </style>

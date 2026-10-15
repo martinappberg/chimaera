@@ -124,12 +124,12 @@ impl ProbeState {
 
 /// One probe's Environment prelude file. It lives exactly as long as the
 /// probe; removal is best effort and never on the reactor.
-struct ProbePrelude(Option<PathBuf>);
+pub(crate) struct ProbePrelude(Option<PathBuf>);
 
 impl ProbePrelude {
     /// `workspace` None = the host scope alone. A failed write is "no
     /// prelude", never a failed probe — the same degrade sessions get.
-    async fn write(state: &Arc<AppState>, workspace: Option<&str>) -> Self {
+    pub(crate) async fn write(state: &Arc<AppState>, workspace: Option<&str>) -> Self {
         let state = Arc::clone(state);
         let workspace = workspace.map(str::to_string);
         let path = tokio::task::spawn_blocking(move || {
@@ -141,7 +141,7 @@ impl ProbePrelude {
         ProbePrelude(path)
     }
 
-    fn path(&self) -> Option<&Path> {
+    pub(crate) fn path(&self) -> Option<&Path> {
         self.0.as_deref()
     }
 }
@@ -160,13 +160,13 @@ impl Drop for ProbePrelude {
     }
 }
 
-fn wrapped(bin: &Path, args: &[&str]) -> Vec<String> {
+pub(crate) fn wrapped(bin: &Path, args: &[&str]) -> Vec<String> {
     let mut argv = vec![bin.to_string_lossy().into_owned()];
     argv.extend(args.iter().map(|a| a.to_string()));
     crate::launcher::wrap_login_shell(&crate::launcher::login_shell(), argv)
 }
 
-fn base_command(
+pub(crate) fn base_command(
     argv: &[String],
     cwd: Option<&Path>,
     prelude: Option<&Path>,
@@ -816,8 +816,11 @@ pub(crate) struct ProbeQuery {
     refresh: bool,
 }
 
-async fn refresh_probes(state: &AppState) {
+pub(crate) async fn refresh_probes(state: &AppState) {
     state.probes.invalidate();
+    // "Check again" means the agents too: a cached detection miss must not
+    // outlive the user's explicit ask.
+    crate::launcher::forget_misses(state);
     // A transient version timeout must not disable inventory until a daemon
     // restart. Explicit retries reuse the resolved binary, preserving the
     // configured installation and avoiding expensive PATH probes for others.
@@ -856,16 +859,17 @@ pub(crate) async fn agent_plugins(
     if query.refresh {
         refresh_probes(&state).await;
     }
-    let (claude, codex, agy, grok) = tokio::join!(
+    let (claude, codex, agy, grok, cursor) = tokio::join!(
         claude_state(&state),
         codex_state(&state, &id, &root),
         extensions::inventory(&state, &id, &root, AgentKind::Antigravity),
         extensions::inventory(&state, &id, &root, AgentKind::Grok),
+        extensions::inventory(&state, &id, &root, AgentKind::Cursor),
     );
     axum::Json(json!({
         "schema": 1,
         "host": state.hostname,
-        "agents": [claude, codex, agy, grok],
+        "agents": [claude, codex, agy, grok, cursor],
     }))
     .into_response()
 }
