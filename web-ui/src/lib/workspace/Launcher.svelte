@@ -18,7 +18,7 @@
    * chimaera" vs your own, with the resolved path) is the version's tooltip.
    * A strictly newer known release grows "→ <new>": a one-click curated
    * update for a chimaera-managed build, quiet information for your own.
-   * Every row links its official docs when hot.
+   * Docs live in Settings → Agents, not on the rows.
    *
    * Picking here makes that agent the saved default (the rail's primary).
    * Resuming lives in the rail's RECENT section, not here.
@@ -44,7 +44,6 @@
     type LaunchPick,
   } from "./launcher";
   import { isMac } from "../shared/keys";
-  import { openInSystemBrowser } from "../shared/urlOpen";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import Chevron from "../shared/Chevron.svelte";
 
@@ -361,24 +360,6 @@
           >
         {/if}
       {/if}
-      {#if a.installUrl !== null}
-        <!-- Official docs, in the browser — quiet until the row is hot. -->
-        <a
-          class="adocs"
-          href={a.installUrl}
-          target="_blank"
-          rel="noopener noreferrer"
-          title="open the official docs"
-          tabindex="-1"
-          onclick={(e) => {
-            // Through the shell: in the app a _blank navigation is
-            // swallowed by the window's origin guard.
-            e.stopPropagation();
-            e.preventDefault();
-            openInSystemBrowser(a.installUrl ?? "");
-          }}>docs&thinsp;↗</a
-        >
-      {/if}
     </span>
     {#if !a.installed || a.chatSetupRequired || a.outdated}
       <!-- The one explicit click that unblocks it: a curated install/update
@@ -401,9 +382,9 @@
       </button>
     {/if}
     {#if a.installed && (!a.chatSetupRequired || a.chatCapable)}
-      <!-- The two ways in: "chat" (and the whole row, and ↵) is the
-           structured chat UI — the default; the terminal button (⌘↵) is the
-           explicit TUI path. No chat view → one "terminal" button. -->
+      <!-- The row (and ↵) opens the chat; the one hover-only glyph (⌘↵)
+           is the explicit terminal path. An agent with no chat view opens
+           in the terminal from the row itself. -->
       {#if a.chatCapable}
         <button
           class="tbtn"
@@ -427,19 +408,6 @@
             />
             <path d="M8.4 10.6h3.2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
           </svg>
-        </button>
-      {/if}
-      {#if !a.chatSetupRequired && !a.outdated}
-        <button
-          class="obtn"
-          tabindex="-1"
-          title={a.chatCapable ? "open in the chat view (↵)" : `opens in the terminal — ${a.name} has no chat view`}
-          onclick={(e) => {
-            e.stopPropagation();
-            activate(i, a.chatCapable ? "chat" : "term");
-          }}
-        >
-          {a.chatCapable ? "chat" : "terminal"}
         </button>
       {/if}
     {/if}
@@ -692,27 +660,6 @@
   }
 
   /* Official-docs link: invisible weight until the row is hot. */
-  .adocs {
-    flex: none;
-    color: var(--muted);
-    text-decoration: none;
-    opacity: 0;
-    transition:
-      opacity 0.12s ease,
-      color 0.12s ease;
-  }
-
-  .arow.hl .adocs,
-  .arow:hover .adocs {
-    opacity: 0.8;
-  }
-
-  .adocs:hover {
-    color: var(--fg);
-    opacity: 1;
-    text-decoration: underline;
-  }
-
   .aver {
     flex: none;
     display: inline-flex;
@@ -812,41 +759,27 @@
 
   /* The two ways in, quiet until the row is hot: "open" (the default — the
      chat view) and the terminal-icon button (the agent's own TUI). */
-  .obtn,
+  /* The one trailing control: a glyph that fades in with the row, no
+     border — the row is the button, this is its alternative. */
   .tbtn {
     appearance: none;
     background: none;
     font: inherit;
     flex: none;
-    border: 1px solid var(--edge);
+    border: none;
     color: var(--muted);
     cursor: pointer;
     opacity: 0;
     transition:
       opacity 0.12s ease,
       color 0.12s ease,
-      border-color 0.12s ease,
+      background-color 0.12s ease,
       transform 0.08s ease;
   }
 
-  .arow.hl .obtn,
-  .arow:hover .obtn,
   .arow.hl .tbtn,
   .arow:hover .tbtn {
-    opacity: 1;
-  }
-
-  .obtn {
-    padding: 2px 10px;
-    border-radius: 10px;
-    font-size: var(--text-xs);
-    color: var(--fg);
-    border-color: color-mix(in srgb, var(--fg) 25%, transparent);
-  }
-
-  .obtn:hover {
-    color: var(--accent);
-    border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+    opacity: 0.75;
   }
 
   .tbtn {
@@ -860,8 +793,9 @@
   }
 
   .tbtn:hover {
+    opacity: 1;
     color: var(--fg);
-    border-color: color-mix(in srgb, var(--fg) 30%, transparent);
+    background: color-mix(in srgb, var(--fg) 8%, transparent);
   }
 
   /* The delayed tooltip: nothing on a pass-through hover, fades in after
@@ -891,7 +825,6 @@
     transition-delay: 0.5s;
   }
 
-  .obtn:active,
   .tbtn:active {
     transform: translateY(0.5px);
   }
